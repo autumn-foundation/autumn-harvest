@@ -20,6 +20,7 @@ testing = []
 autumn-web = { workspace = true, features = ["maud", "htmx", "tailwind"] }
 autumn-harvest-macros = { path = "../autumn-harvest-macros" }
 tokio = { workspace = true }
+tokio-util = { version = "0.7", features = ["rt"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

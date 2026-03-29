@@ -422,25 +422,36 @@ impl WorkflowContext {
 }
 
 // ---------------------------------------------------------------------------
-// ActivityContext (Phase 1 stub -- Task 5 will update)
+// ActivityContext
 // ---------------------------------------------------------------------------
 
 /// Context passed to every activity function.
 ///
 /// Activities may perform I/O, call external services, and interact with the
-/// database. The context provides heartbeating to signal liveness and state
-/// access for shared resources.
+/// database. The context provides heartbeating to signal liveness, cancellation
+/// detection, and state access for shared resources.
 pub struct ActivityContext {
     /// Shared state map.
     state: Arc<HashMap<TypeId, Box<dyn Any + Send + Sync>>>,
-    // Phase 2 will add: heartbeat sender, cancellation token, DB pool handle
+    /// Heartbeat channel -- `None` in test contexts.
+    heartbeat_tx: Option<tokio::sync::mpsc::Sender<serde_json::Value>>,
+    /// Cancellation token -- allows the worker to signal graceful shutdown.
+    cancel: tokio_util::sync::CancellationToken,
 }
 
 impl ActivityContext {
-    /// Production constructor -- creates a context with the provided shared state.
-    #[allow(dead_code)] // Phase 2 worker executor will call this
-    pub(crate) fn new(state: Arc<HashMap<TypeId, Box<dyn Any + Send + Sync>>>) -> Self {
-        Self { state }
+    /// Production constructor -- creates a context with heartbeat channel and
+    /// cancellation token.
+    pub(crate) fn new(
+        state: Arc<HashMap<TypeId, Box<dyn Any + Send + Sync>>>,
+        heartbeat_tx: Option<tokio::sync::mpsc::Sender<serde_json::Value>>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Self {
+        Self {
+            state,
+            heartbeat_tx,
+            cancel,
+        }
     }
 
     /// Access typed shared state.
@@ -451,23 +462,58 @@ impl ActivityContext {
 
     /// Send a heartbeat to signal the activity is still running.
     ///
-    /// Phase 1 stub -- full implementation in Phase 2 (worker heartbeat loop).
+    /// The `details` payload is serialized to JSON and forwarded to the worker's
+    /// heartbeat loop, which batches writes to the database. Always check the
+    /// return value -- an `Err(Cancelled)` means the workflow was cancelled and
+    /// the activity should wind down promptly.
     ///
     /// # Errors
     ///
-    /// Returns an error if the workflow was cancelled and the activity should
-    /// stop. Activities should check this return value on long operations.
-    #[allow(clippy::unused_async)] // Phase 2 will add .await for the heartbeat channel send
-    pub async fn heartbeat(&self, _details: impl serde::Serialize) -> crate::HarvestResult<()> {
-        // Phase 2: serialize details and send via heartbeat channel to the worker's batch sender
+    /// - [`HarvestError::Cancelled`] if the cancellation token has been triggered
+    ///   or the heartbeat channel is closed.
+    /// - [`HarvestError::Serialization`] if `details` fails to serialize.
+    pub async fn heartbeat(
+        &self,
+        details: impl serde::Serialize,
+    ) -> crate::HarvestResult<()> {
+        // Check cancellation first -- fast path.
+        if self.cancel.is_cancelled() {
+            return Err(HarvestError::Cancelled(
+                "activity cancelled via cancellation token".into(),
+            ));
+        }
+
+        let payload = serde_json::to_value(details)?;
+
+        if let Some(ref tx) = self.heartbeat_tx {
+            tx.send(payload).await.map_err(|_| {
+                HarvestError::Cancelled(
+                    "activity cancelled: heartbeat channel closed".into(),
+                )
+            })?;
+        }
+
         Ok(())
     }
 
-    /// Constructor for testing.
+    /// Returns `true` if the cancellation token has been triggered.
+    ///
+    /// Activities performing long-running loops should check this periodically
+    /// and exit cleanly when it returns `true`.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.is_cancelled()
+    }
+
+    /// Constructor for testing -- no heartbeat channel, default cancel token.
     #[cfg(any(test, feature = "testing"))]
     #[must_use]
     pub fn new_test() -> Self {
-        Self::new(Arc::new(HashMap::new()))
+        Self::new(
+            Arc::new(HashMap::new()),
+            None,
+            tokio_util::sync::CancellationToken::new(),
+        )
     }
 }
 
@@ -485,6 +531,64 @@ mod tests {
         let ctx = ActivityContext::new_test();
         let state: Option<&String> = ctx.state::<String>();
         assert!(state.is_none());
+    }
+
+    #[tokio::test]
+    async fn activity_context_heartbeat_sends_on_channel() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let ctx = ActivityContext::new(Arc::new(HashMap::new()), Some(tx), cancel);
+
+        // Send a couple of heartbeats with different payloads.
+        ctx.heartbeat(serde_json::json!({"progress": 50}))
+            .await
+            .expect("heartbeat should succeed");
+        ctx.heartbeat(serde_json::json!({"progress": 100}))
+            .await
+            .expect("heartbeat should succeed");
+
+        // Verify both payloads arrived in order.
+        let first = rx.recv().await.expect("should receive first heartbeat");
+        assert_eq!(first, serde_json::json!({"progress": 50}));
+
+        let second = rx.recv().await.expect("should receive second heartbeat");
+        assert_eq!(second, serde_json::json!({"progress": 100}));
+    }
+
+    #[tokio::test]
+    async fn activity_context_detects_cancellation() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let ctx = ActivityContext::new(Arc::new(HashMap::new()), Some(tx), cancel.clone());
+
+        // Before cancellation -- should not be cancelled.
+        assert!(!ctx.is_cancelled());
+
+        // Trigger cancellation.
+        cancel.cancel();
+
+        // Now is_cancelled() should return true.
+        assert!(ctx.is_cancelled());
+
+        // Heartbeat should return Cancelled error.
+        let result = ctx.heartbeat(serde_json::json!({})).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, HarvestError::Cancelled(_)));
+    }
+
+    #[tokio::test]
+    async fn activity_context_heartbeat_errors_when_channel_closed() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let ctx = ActivityContext::new(Arc::new(HashMap::new()), Some(tx), cancel);
+
+        // Drop the receiver -- channel is now closed.
+        drop(rx);
+
+        let result = ctx.heartbeat(serde_json::json!({})).await;
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), HarvestError::Cancelled(_)));
     }
 
     #[test]
