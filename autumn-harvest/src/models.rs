@@ -90,7 +90,14 @@ pub struct NewHarvestEvent<'a> {
 
 /// A pending or in-progress task in the work queue.
 #[derive(
-    Debug, Clone, Queryable, Selectable, Identifiable, serde::Serialize, serde::Deserialize,
+    Debug,
+    Clone,
+    Queryable,
+    QueryableByName,
+    Selectable,
+    Identifiable,
+    serde::Serialize,
+    serde::Deserialize,
 )]
 #[diesel(table_name = harvest_task_queue)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
