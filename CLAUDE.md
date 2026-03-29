@@ -5,23 +5,38 @@ Postgres-backed durable workflow engine, companion to the Autumn web framework. 
 ## Workspace Structure
 
 ```
-autumn-harvest/          ← workspace root (this file lives here)
-  autumn-harvest/        ← core library crate
+autumn-harvest/          <- workspace root (this file lives here)
+  autumn-harvest/        <- core library crate
     src/
       lib.rs
-      types.rs
-      error.rs
-      policy.rs
-      event.rs
-      context.rs
-      info.rs
-      builder.rs
-      prelude.rs
-      schema.rs          ← db feature only
-      models.rs          ← db feature only
+      types.rs           <- Phase 1
+      error.rs           <- Phase 1
+      policy.rs          <- Phase 1
+      event.rs           <- Phase 1
+      context.rs         <- Phase 1 stubs, Phase 2 full impl
+      info.rs            <- Phase 1
+      builder.rs         <- Phase 1
+      prelude.rs         <- Phase 1
+      schema.rs          <- Phase 1, db feature only
+      models.rs          <- Phase 1, db feature only
+      store.rs           <- Phase 2: event store (append/load history)
+      replay.rs          <- Phase 2: deterministic replay engine
+      executor.rs        <- Phase 2: workflow executor (replay + suspension)
+      queue.rs           <- Phase 2: Postgres task queue (SKIP LOCKED)
+      notify.rs          <- Phase 2: LISTEN/NOTIFY wrapper
+      worker.rs          <- Phase 2: worker runtime (poll loop, semaphore dispatch)
+      heartbeat.rs       <- Phase 2: batched heartbeat flusher
+      timeout.rs         <- Phase 2: timeout enforcement scanner
+      cache.rs           <- Phase 2: LRU workflow state cache
+      dlq.rs             <- Phase 2: dead letter queue
+      pool.rs            <- Phase 2: separate pool config with shared ceiling
     migrations/
       00000000000000_harvest_initial/
-  autumn-harvest-macros/ ← proc-macro crate
+    tests/
+      integration_e2e.rs <- testcontainers integration tests
+      replay_tests.rs    <- replay engine integration tests
+      macros_*.rs        <- proc-macro integration tests
+  autumn-harvest-macros/ <- proc-macro crate
     src/
       lib.rs
       workflow.rs
@@ -31,9 +46,12 @@ autumn-harvest/          ← workspace root (this file lives here)
 
 Two crates in the workspace. `autumn-harvest` is the public library. `autumn-harvest-macros` is a separate proc-macro crate consumed by `autumn-harvest` via `prelude.rs`.
 
-**Phase 1 scope** (complete): types, event sourcing, Diesel schema/models, proc macros, fluent builder.
+### Phase Status
 
-**Phase 2 planned**: worker executor (poll loop, task claim, heartbeat), replay engine in `WorkflowContext`, DB query layer, scheduler (cron evaluation, DAG run creation), `HarvestExt` trait on Autumn's `AppBuilder`.
+- **Phase 1** (complete): types, error, event, policy, context stubs, models, macros, builder
+- **Phase 2** (complete): event store, replay engine, workflow context, activity context, task queue (SKIP LOCKED), LISTEN/NOTIFY, worker runtime, heartbeating, timeout enforcement, workflow versioning (ctx.version), LRU workflow cache, dead letter queue, separate worker pool with shared ceiling, testcontainers integration tests
+- **Phase 3** (next): DAG scheduler, DagBuilder, topological sort, #[dag] macro, trigger rules, timetable, signals/queries, saga pattern, management HTTP API
+- **Phase 4**: production hardening -- sharding, sticky cross-worker routing, observability, metrics, dashboard (autumn-harvest-ui)
 
 ---
 
@@ -101,19 +119,30 @@ Single-param workflows/activities: input is passed as a single JSON value and de
 
 ## Module Guide
 
-| Module | Purpose |
-|--------|---------|
-| `types.rs` | Newtypes: `WorkflowId` (String), `ExecutionId` (Uuid v4), `ActivityExecId` (Uuid v4), `TimerId` (String), `WorkerId` (String) |
-| `error.rs` | `HarvestError` (thiserror), `HarvestResult<T>`, `TimeoutType` enum |
-| `policy.rs` | `RetryPolicy`, `TriggerRule`, `Schedule`, `TaskStatus`, `compute_retry_delay` |
-| `event.rs` | `WorkflowEvent` enum (17 variants, adjacently-tagged serde), `type_name()` |
-| `context.rs` | `WorkflowContext` (replay flag, typed state map), `ActivityContext` (state map, heartbeat stub) |
-| `info.rs` | `WorkflowInfo`, `ActivityInfo`, `WorkflowHandlerFn`, `ActivityHandlerFn` type aliases |
-| `builder.rs` | `HarvestBuilder` (fluent), `WorkerConfig` (queues, concurrency, timeouts) |
-| `prelude.rs` | Glob re-export surface including macros |
-| `schema.rs` | Diesel `table!` macros — 8 tables: `harvest_workflow_executions`, `harvest_events`, `harvest_task_queue`, `harvest_dag_runs`, `harvest_schedules`, `harvest_signals`, `harvest_timers`, `harvest_dead_letters` |
-| `models.rs` | `Queryable`/`Selectable` read structs and `Insertable` `New*` write structs for all 8 tables |
-| `migrations/` | SQL — run with `diesel migration run` |
+| Module | Phase | Purpose |
+|--------|-------|---------|
+| `types.rs` | 1 | Newtypes: `WorkflowId` (String), `ExecutionId` (Uuid v4), `ActivityExecId` (Uuid v4), `TimerId` (String), `WorkerId` (String) |
+| `error.rs` | 1 | `HarvestError` (thiserror), `HarvestResult<T>`, `TimeoutType` enum |
+| `policy.rs` | 1 | `RetryPolicy`, `TriggerRule`, `Schedule`, `TaskStatus`, `compute_retry_delay` |
+| `event.rs` | 1 | `WorkflowEvent` enum (17 variants, adjacently-tagged serde), `type_name()` |
+| `context.rs` | 1+2 | `WorkflowContext` (replay, suspension, version gate, timers), `ActivityContext` (heartbeat channel, cancellation) |
+| `info.rs` | 1 | `WorkflowInfo`, `ActivityInfo`, `WorkflowHandlerFn`, `ActivityHandlerFn` type aliases |
+| `builder.rs` | 1 | `HarvestBuilder` (fluent), `WorkerConfig` (queues, concurrency, timeouts) |
+| `prelude.rs` | 1 | Glob re-export surface including macros |
+| `schema.rs` | 1 | Diesel `table!` macros -- 8 tables |
+| `models.rs` | 1 | `Queryable`/`Selectable` read structs and `Insertable` `New*` write structs for all 8 tables |
+| `store.rs` | 2 | Event store: `append_events`, `load_history`, `events_to_rows` with sequential event IDs |
+| `replay.rs` | 2 | Deterministic replay engine: `HistoryMatcher` walks event history, detects non-determinism |
+| `executor.rs` | 2 | Workflow executor: `run_workflow` drives replay + live execution, handles suspension |
+| `queue.rs` | 2 | Postgres task queue: `enqueue`, `claim` (FOR UPDATE SKIP LOCKED), `complete`, `fail` |
+| `notify.rs` | 2 | LISTEN/NOTIFY wrapper: `Listener` (async stream), `Notifier` (pg_notify), channel naming |
+| `worker.rs` | 2 | Worker runtime: poll loop, semaphore-bounded concurrent dispatch, graceful shutdown |
+| `heartbeat.rs` | 2 | Batched heartbeat flusher: debounced channel receiver, bulk DB update |
+| `timeout.rs` | 2 | Timeout enforcement scanner: start-to-close, schedule-to-start, heartbeat timeout queries |
+| `cache.rs` | 2 | LRU workflow state cache: bounded capacity, access-order eviction |
+| `dlq.rs` | 2 | Dead letter queue: `DeadLetterEntry` builder, move-to-DLQ on retry exhaustion |
+| `pool.rs` | 2 | Separate DB pool config: web pool + worker pool with shared ceiling, minimum guarantees |
+| `migrations/` | 1 | SQL -- run with `diesel migration run` |
 
 ### Macro Modules (`autumn-harvest-macros`)
 
@@ -223,11 +252,61 @@ The `testing` feature in `autumn-harvest/Cargo.toml` gates `WorkflowContext::new
 
 ---
 
-## Phase 2 Scope
+## Phase 2 Modules
 
-- **Worker executor**: poll loop, `FOR UPDATE SKIP LOCKED` task claim, heartbeat sender channel, graceful shutdown with `shutdown_timeout`
-- **Replay engine**: event history pointer in `WorkflowContext`, deterministic re-execution by returning recorded results from the event log
-- **DB query layer**: `execute_workflow`, `claim_task`, `append_event`, `fire_timer`, `consume_signal`
-- **Scheduler**: cron expression evaluation, catchup logic, `max_active_runs` enforcement, DAG run creation
-- **Integration tests**: `testcontainers-modules` postgres, full workflow round-trip
+| Module | Purpose |
+|--------|---------|
+| `store.rs` | Event store (append/load history) |
+| `replay.rs` | Deterministic replay engine (`HistoryMatcher`) |
+| `executor.rs` | Workflow executor (`run_workflow` with replay + suspension) |
+| `queue.rs` | Postgres task queue (SKIP LOCKED) |
+| `notify.rs` | LISTEN/NOTIFY wrapper |
+| `worker.rs` | Worker runtime (poll loop, semaphore-bounded dispatch) |
+| `heartbeat.rs` | Batched heartbeat flusher |
+| `timeout.rs` | Timeout enforcement scanner |
+| `cache.rs` | LRU workflow state cache |
+| `dlq.rs` | Dead letter queue |
+| `pool.rs` | Separate pool configuration with shared ceiling |
+
+---
+
+## Testing
+
+```bash
+# Unit tests (no DB required for most)
+cargo test -p autumn-harvest
+
+# Integration tests (requires Docker for testcontainers)
+cargo test -p autumn-harvest --test integration_e2e
+
+# Replay tests
+cargo test -p autumn-harvest --test replay_tests
+
+# Macro tests
+cargo test -p autumn-harvest-macros
+```
+
+---
+
+## Design Decisions (Phase 2)
+
+**DD-1: Oneshot suspension model**
+Coroutine stays in memory; durability comes from the event history. When an activity is scheduled during live execution, the workflow function suspends via a oneshot channel. The executor re-invokes the workflow from the top on each replay cycle, replaying recorded events until it reaches the suspension point.
+
+**DD-2: Separate DB pools with shared ceiling**
+Worker pool and web pool are independently sized but share a total connection ceiling (`PoolConfig`). This prevents a burst of worker activity from starving HTTP request handling. `pool.rs` enforces minimum guarantees (at least 1 connection per pool) and distributes remainder to the web pool.
+
+**DD-3: Workflow versioning via ctx.version()**
+`WorkflowContext::version()` emits a `VersionMarker` event on first live call and replays the recorded version on subsequent runs. This allows workflow code to branch on version (`if ctx.version() >= 2 { ... }`) to handle non-determinism across deploys without breaking replay of in-flight executions.
+
+**DD-4: Basic in-process LRU cache**
+`WorkflowCache` is a bounded LRU cache for workflow state, keyed by `ExecutionId`. Cross-worker sticky routing (ensuring the same execution always lands on the same worker) is deferred to Phase 3/4. For now, cache misses just reload from the event store.
+
+---
+
+## Phase 3 Scope (next)
+
+- **DAG scheduler**: `DagBuilder`, topological sort, `#[dag]` macro
+- **Trigger rules**: timetable, signals/queries, saga pattern
+- **Management HTTP API**: start/cancel/query workflow executions
 - **`HarvestExt` trait**: embeds the worker into Autumn's `AppBuilder` lifecycle (start/stop with the server)
