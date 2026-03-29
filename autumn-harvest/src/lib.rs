@@ -7,6 +7,7 @@ pub mod event;
 pub mod info;
 pub mod policy;
 pub mod prelude;
+pub mod replay;
 pub mod types;
 
 #[cfg(feature = "db")]
@@ -22,6 +23,7 @@ pub use error::{HarvestError, HarvestResult, TimeoutType};
 pub use event::WorkflowEvent;
 pub use info::{ActivityHandlerFn, ActivityInfo, WorkflowHandlerFn, WorkflowInfo};
 pub use policy::{RetryPolicy, Schedule, TaskStatus, TriggerRule};
+pub use replay::{HistoryMatch, HistoryMatcher};
 pub use types::{ActivityExecId, ExecutionId, TimerId, WorkerId, WorkflowId};
 
 #[cfg(feature = "db")]
