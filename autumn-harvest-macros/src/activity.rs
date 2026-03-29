@@ -2,10 +2,10 @@
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
-use syn::{parse::Parser as _, ItemFn, LitStr};
+use syn::{parse::Parser as _, Expr, ItemFn, LitStr};
 
 struct ActivityAttrs {
-    retry: Option<TokenStream>,
+    retry: Option<Expr>,
     start_to_close: Option<String>,
     heartbeat_timeout: Option<String>,
     schedule_to_start: Option<String>,
@@ -23,8 +23,10 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<ActivityAttrs> {
 
     syn::meta::parser(|meta| {
         if meta.path.is_ident("retry") {
-            let value = meta.value()?;
-            result.retry = Some(value.parse::<TokenStream>()?);
+            // Parse as Expr so nested function calls with commas work correctly,
+            // e.g. `retry = RetryPolicy::fixed(3, Duration::from_secs(1))`.
+            let value: Expr = meta.value()?.parse()?;
+            result.retry = Some(value);
             Ok(())
         } else if meta.path.is_ident("start_to_close") {
             let value: LitStr = meta.value()?.parse()?;
