@@ -24,6 +24,9 @@ pub use info::{ActivityHandlerFn, ActivityInfo, WorkflowHandlerFn, WorkflowInfo}
 pub use policy::{RetryPolicy, Schedule, TaskStatus, TriggerRule};
 pub use types::{ActivityExecId, ExecutionId, TimerId, WorkerId, WorkflowId};
 
+#[cfg(feature = "db")]
+pub use store::EventHistory;
+
 // Allow macro-generated code to use ::autumn_harvest::serde_json
 pub use serde_json;
 

@@ -4,6 +4,8 @@
 //! The `UNIQUE(workflow_exec_id, event_id)` constraint guarantees
 //! that two workers can't append conflicting events to the same workflow.
 
+use diesel::ExpressionMethods;
+use diesel::QueryDsl;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 
@@ -12,6 +14,17 @@ use crate::event::WorkflowEvent;
 use crate::models::NewHarvestEvent;
 use crate::schema::harvest_events;
 use crate::types::ExecutionId;
+
+/// Loaded event history for a single workflow execution.
+///
+/// Contains the deserialized events and the next `event_id` to use when
+/// appending new events (i.e. one past the last existing event).
+#[derive(Debug)]
+pub struct EventHistory {
+    pub exec_id: ExecutionId,
+    pub events: Vec<WorkflowEvent>,
+    pub next_event_id: i32,
+}
 
 /// Convert in-memory events to insertable rows with sequential event IDs
 /// starting from 0.
@@ -86,6 +99,48 @@ pub async fn append_events(
         .execute(conn)
         .await
         .map_err(|e| HarvestError::Database(e.to_string()))
+}
+
+/// Load the full event history for a workflow execution, ordered by `event_id`.
+///
+/// Deserializes each row's `event_data` JSON back into [`WorkflowEvent`].
+/// The returned [`EventHistory::next_event_id`] is set to one past the last
+/// loaded event (or 0 if the history is empty), ready for use with
+/// [`append_events()`].
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] on connection or query errors, or
+/// [`HarvestError::Serialization`] if a stored JSON value can't be deserialized
+/// into `WorkflowEvent`.
+pub async fn load_history(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> HarvestResult<EventHistory> {
+    use crate::models::HarvestEvent;
+
+    let rows: Vec<HarvestEvent> = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
+        .order(harvest_events::event_id.asc())
+        .load(conn)
+        .await
+        .map_err(|e| HarvestError::Database(e.to_string()))?;
+
+    let mut events = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let event: WorkflowEvent = serde_json::from_value(row.event_data.clone())?;
+        events.push(event);
+    }
+
+    let next_event_id = rows
+        .last()
+        .map_or(0, |r| r.event_id.saturating_add(1));
+
+    Ok(EventHistory {
+        exec_id,
+        events,
+        next_event_id,
+    })
 }
 
 #[cfg(test)]
@@ -203,6 +258,63 @@ mod tests {
         let exec_id = ExecutionId::new();
         let rows = events_to_insert_rows(exec_id, &[]);
         assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn history_from_rows_deserializes_events() {
+        let exec_id = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: serde_json::json!({"user": "alice"}),
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: ActivityExecId::new(),
+                name: "send_email".into(),
+                input: serde_json::json!({"to": "bob@example.com"}),
+                queue: "default".into(),
+            },
+            WorkflowEvent::WorkflowCompleted {
+                output: serde_json::json!({"status": "ok"}),
+            },
+        ];
+
+        // Serialize via the writer path
+        let rows = events_to_insert_rows(exec_id, &events);
+        assert_eq!(rows.len(), 3);
+
+        // Deserialize each row's event_data back into WorkflowEvent
+        let deserialized: Vec<WorkflowEvent> = rows
+            .iter()
+            .map(|row| serde_json::from_value(row.event_data.clone()).unwrap())
+            .collect();
+
+        assert_eq!(deserialized.len(), 3);
+        assert!(matches!(deserialized[0], WorkflowEvent::WorkflowStarted { .. }));
+        assert!(matches!(deserialized[1], WorkflowEvent::ActivityScheduled { .. }));
+        assert!(matches!(deserialized[2], WorkflowEvent::WorkflowCompleted { .. }));
+
+        // Verify data fidelity on WorkflowStarted
+        if let WorkflowEvent::WorkflowStarted { ref input, .. } = deserialized[0] {
+            assert_eq!(input, &serde_json::json!({"user": "alice"}));
+        } else {
+            panic!("expected WorkflowStarted");
+        }
+
+        // Verify data fidelity on ActivityScheduled
+        if let WorkflowEvent::ActivityScheduled { ref name, ref queue, .. } = deserialized[1] {
+            assert_eq!(name, "send_email");
+            assert_eq!(queue, "default");
+        } else {
+            panic!("expected ActivityScheduled");
+        }
+
+        // Verify data fidelity on WorkflowCompleted
+        if let WorkflowEvent::WorkflowCompleted { ref output } = deserialized[2] {
+            assert_eq!(output, &serde_json::json!({"status": "ok"}));
+        } else {
+            panic!("expected WorkflowCompleted");
+        }
     }
 
     #[test]
