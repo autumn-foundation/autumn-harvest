@@ -48,7 +48,7 @@ impl ExecutionId {
     }
 
     #[must_use]
-    pub fn as_uuid(&self) -> Uuid {
+    pub const fn as_uuid(&self) -> Uuid {
         self.0
     }
 }
@@ -83,7 +83,7 @@ impl ActivityExecId {
     }
 
     #[must_use]
-    pub fn as_uuid(&self) -> Uuid {
+    pub const fn as_uuid(&self) -> Uuid {
         self.0
     }
 }
@@ -116,6 +116,11 @@ impl TimerId {
     pub fn new(id: impl Into<String>) -> Self {
         Self(id.into())
     }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 impl fmt::Display for TimerId {
@@ -132,6 +137,11 @@ impl WorkerId {
     #[must_use]
     pub fn new(id: impl Into<String>) -> Self {
         Self(id.into())
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
