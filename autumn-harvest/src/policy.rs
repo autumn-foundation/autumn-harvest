@@ -37,6 +37,7 @@ pub struct RetryPolicy {
 impl RetryPolicy {
     /// Exponential backoff: doubles each retry, capped at 5 minutes.
     #[must_use]
+    #[allow(clippy::missing_const_for_fn)] // vec![] prevents const fn
     pub fn exponential(max_attempts: u32, initial: Duration) -> Self {
         Self {
             max_attempts,
@@ -49,6 +50,7 @@ impl RetryPolicy {
 
     /// Fixed delay: same interval every retry.
     #[must_use]
+    #[allow(clippy::missing_const_for_fn)] // vec![] prevents const fn
     pub fn fixed(max_attempts: u32, interval: Duration) -> Self {
         Self {
             max_attempts,

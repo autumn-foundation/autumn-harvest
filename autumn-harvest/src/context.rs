@@ -24,14 +24,24 @@ pub struct WorkflowContext {
 }
 
 impl WorkflowContext {
+    /// Production constructor — creates a context in normal (non-replay) mode
+    /// with the provided shared state.
+    #[allow(dead_code)] // Phase 2 worker executor will call this
+    pub(crate) fn new(state: Arc<HashMap<TypeId, Box<dyn Any + Send + Sync>>>) -> Self {
+        Self {
+            replaying: false,
+            state,
+        }
+    }
+
     /// Returns `true` if currently replaying recorded event history.
     #[must_use]
-    pub fn is_replaying(&self) -> bool {
+    pub const fn is_replaying(&self) -> bool {
         self.replaying
     }
 
     /// Switch replay mode on or off. Called by the worker executor.
-    pub fn set_replaying(&mut self, replaying: bool) {
+    pub const fn set_replaying(&mut self, replaying: bool) {
         self.replaying = replaying;
     }
 
@@ -48,10 +58,7 @@ impl WorkflowContext {
     #[cfg(any(test, feature = "testing"))]
     #[must_use]
     pub fn new_test() -> Self {
-        Self {
-            replaying: false,
-            state: Arc::new(HashMap::new()),
-        }
+        Self::new(Arc::new(HashMap::new()))
     }
 }
 
@@ -67,6 +74,12 @@ pub struct ActivityContext {
 }
 
 impl ActivityContext {
+    /// Production constructor — creates a context with the provided shared state.
+    #[allow(dead_code)] // Phase 2 worker executor will call this
+    pub(crate) fn new(state: Arc<HashMap<TypeId, Box<dyn Any + Send + Sync>>>) -> Self {
+        Self { state }
+    }
+
     /// Access typed shared state.
     #[must_use]
     pub fn state<T: Any + Send + Sync>(&self) -> Option<&T> {
@@ -81,8 +94,9 @@ impl ActivityContext {
     ///
     /// Returns an error if the workflow was cancelled and the activity should
     /// stop. Activities should check this return value on long operations.
+    #[allow(clippy::unused_async)] // Phase 2 will add .await for the heartbeat channel send
     pub async fn heartbeat(&self, _details: impl serde::Serialize) -> crate::HarvestResult<()> {
-        // Phase 2: send details via heartbeat channel to the worker's batch sender
+        // Phase 2: serialize details and send via heartbeat channel to the worker's batch sender
         Ok(())
     }
 
@@ -90,9 +104,7 @@ impl ActivityContext {
     #[cfg(any(test, feature = "testing"))]
     #[must_use]
     pub fn new_test() -> Self {
-        Self {
-            state: Arc::new(HashMap::new()),
-        }
+        Self::new(Arc::new(HashMap::new()))
     }
 }
 
