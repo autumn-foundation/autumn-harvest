@@ -117,7 +117,7 @@ mod tests {
             next_timer_seq: 1,
         };
 
-        cache.insert(id, state.clone());
+        cache.insert(id, state);
 
         let retrieved = cache.get(&id).expect("should find cached state");
         assert_eq!(retrieved.replay_position, 5);

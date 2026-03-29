@@ -99,7 +99,8 @@ mod tests {
 
     #[test]
     fn harvest_result_ok() {
-        let r: HarvestResult<i32> = Ok(42);
-        assert_eq!(r.unwrap(), 42);
+        let value = 42;
+        let r: HarvestResult<i32> = Ok(value);
+        assert_eq!(r.unwrap_or(0), value);
     }
 }

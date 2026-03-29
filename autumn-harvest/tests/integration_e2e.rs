@@ -1,32 +1,57 @@
-//! End-to-end integration tests requiring a live Postgres instance.
+//! End-to-end integration tests using testcontainers for a real Postgres instance.
 //!
-//! All tests are marked `#[ignore]` because they need `DATABASE_URL` pointing
-//! to a Postgres database with the harvest schema applied. Run them explicitly:
-//!
-//! ```sh
-//! DATABASE_URL=postgres://... cargo test -p autumn-harvest --test integration_e2e -- --ignored
-//! ```
+//! These tests spin up a throwaway Postgres container per test, run the harvest
+//! migration SQL via `with_init_sql`, and exercise the full store/queue/DLQ stack
+//! against a real database.
 
+use autumn_harvest::dlq::{self, NewDeadLetterEntry};
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::models::NewWorkflowExecution;
 use autumn_harvest::queue::{EnqueueParams, TaskType};
 use autumn_harvest::schema::{harvest_task_queue, harvest_workflow_executions};
 use autumn_harvest::store;
 use autumn_harvest::types::{ActivityExecId, ExecutionId};
-use autumn_harvest::{queue, HarvestError};
+use autumn_harvest::{HarvestError, queue};
 
 use chrono::Utc;
 use diesel::prelude::*;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
+use testcontainers::ContainerAsync;
+use testcontainers_modules::postgres::Postgres;
+use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use uuid::Uuid;
 
-/// Connect to Postgres using the `DATABASE_URL` environment variable.
-async fn connect() -> AsyncPgConnection {
-    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for E2E tests");
-    <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&url)
+/// The migration SQL embedded at compile time.
+const INIT_SQL: &str = include_str!("../migrations/00000000000000_harvest_initial/up.sql");
+
+/// Start a Postgres container with the harvest schema applied and return
+/// an `AsyncPgConnection` ready for use.
+///
+/// CRITICAL: the returned `ContainerAsync` must be held alive for the duration
+/// of the test -- dropping it kills the container.
+async fn setup_test_db() -> (AsyncPgConnection, ContainerAsync<Postgres>) {
+    let container = Postgres::default()
+        .with_init_sql(INIT_SQL.to_string().into_bytes())
+        .start()
         .await
-        .expect("failed to connect to Postgres")
+        .expect("failed to start Postgres container");
+
+    let host = container
+        .get_host()
+        .await
+        .expect("failed to get container host");
+    let port = container
+        .get_host_port_ipv4(5432)
+        .await
+        .expect("failed to get container port");
+    let database_url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+
+    let conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect to Postgres container");
+
+    (conn, container)
 }
 
 /// Insert a minimal `harvest_workflow_executions` row and return its UUID.
@@ -54,10 +79,13 @@ async fn insert_workflow_execution(conn: &mut AsyncPgConnection) -> ExecutionId 
     exec_id
 }
 
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 #[tokio::test]
-#[ignore] // Requires DATABASE_URL pointing to a Postgres instance
 async fn full_workflow_lifecycle() {
-    let mut conn = connect().await;
+    let (mut conn, _container) = setup_test_db().await;
     let exec_id = insert_workflow_execution(&mut conn).await;
 
     // 1. Append WorkflowStarted event
@@ -82,6 +110,9 @@ async fn full_workflow_lifecycle() {
     assert_eq!(history.next_event_id, 1);
 
     // 3. Enqueue an activity task
+    //    Set scheduled_at slightly in the past to avoid clock skew between
+    //    the host (where Utc::now() runs) and the Docker container (where
+    //    Postgres NOW() runs).
     let mut params = EnqueueParams::new(
         "default",
         TaskType::Activity,
@@ -89,6 +120,7 @@ async fn full_workflow_lifecycle() {
     );
     params.workflow_exec_id = Some(exec_id.as_uuid());
     params.activity_name = Some("send_email".into());
+    params.scheduled_at = Utc::now() - chrono::Duration::seconds(5);
 
     let task_id = queue::enqueue(&mut conn, &params)
         .await
@@ -166,9 +198,56 @@ async fn full_workflow_lifecycle() {
 }
 
 #[tokio::test]
-#[ignore] // Requires DATABASE_URL pointing to a Postgres instance
+async fn claim_task_returns_none_on_empty_queue() {
+    let (mut conn, _container) = setup_test_db().await;
+
+    let queues = vec!["default".to_string()];
+    let claimed = queue::claim_task(&mut conn, &queues, "worker-empty-1")
+        .await
+        .expect("claim_task failed");
+    assert!(
+        claimed.is_none(),
+        "expected None from empty queue, got {claimed:?}"
+    );
+}
+
+#[tokio::test]
+async fn dead_letter_queue_lifecycle() {
+    let (mut conn, _container) = setup_test_db().await;
+
+    // Verify DLQ starts empty
+    let initial_count = dlq::dead_letter_count(&mut conn)
+        .await
+        .expect("dead_letter_count failed");
+    assert_eq!(initial_count, 0);
+
+    // Insert a dead letter entry
+    let entry = NewDeadLetterEntry {
+        original_task_id: Uuid::new_v4(),
+        queue_name: "default".into(),
+        task_type: "ACTIVITY".into(),
+        workflow_exec_id: None,
+        activity_name: Some("flaky_step".into()),
+        input: serde_json::json!({"attempt": 3}),
+        error: "SMTP connection refused after 3 retries".into(),
+        attempts: 3,
+    };
+
+    let dlq_id = dlq::dead_letter(&mut conn, &entry)
+        .await
+        .expect("dead_letter insert failed");
+    assert!(!dlq_id.is_nil(), "DLQ entry should have a valid UUID");
+
+    // Verify count is now 1
+    let count = dlq::dead_letter_count(&mut conn)
+        .await
+        .expect("dead_letter_count failed");
+    assert_eq!(count, 1);
+}
+
+#[tokio::test]
 async fn event_store_round_trip() {
-    let mut conn = connect().await;
+    let (mut conn, _container) = setup_test_db().await;
     let exec_id = insert_workflow_execution(&mut conn).await;
 
     let activity_id_1 = ActivityExecId::new();
@@ -256,9 +335,8 @@ async fn event_store_round_trip() {
 }
 
 #[tokio::test]
-#[ignore] // Requires DATABASE_URL pointing to a Postgres instance
 async fn duplicate_event_id_is_rejected() {
-    let mut conn = connect().await;
+    let (mut conn, _container) = setup_test_db().await;
     let exec_id = insert_workflow_execution(&mut conn).await;
 
     let events = vec![WorkflowEvent::WorkflowStarted {

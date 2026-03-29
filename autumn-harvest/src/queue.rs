@@ -29,11 +29,13 @@ pub enum TaskType {
 
 impl TaskType {
     /// Returns the string representation stored in the `task_type` column.
+    ///
+    /// Must match the DB CHECK constraint: `('workflow','activity')`.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Workflow => "WORKFLOW",
-            Self::Activity => "ACTIVITY",
+            Self::Workflow => "workflow",
+            Self::Activity => "activity",
         }
     }
 }
@@ -287,10 +289,10 @@ mod tests {
 
     #[test]
     fn task_type_display() {
-        assert_eq!(TaskType::Workflow.as_str(), "WORKFLOW");
-        assert_eq!(TaskType::Activity.as_str(), "ACTIVITY");
-        assert_eq!(format!("{}", TaskType::Workflow), "WORKFLOW");
-        assert_eq!(format!("{}", TaskType::Activity), "ACTIVITY");
+        assert_eq!(TaskType::Workflow.as_str(), "workflow");
+        assert_eq!(TaskType::Activity.as_str(), "activity");
+        assert_eq!(format!("{}", TaskType::Workflow), "workflow");
+        assert_eq!(format!("{}", TaskType::Activity), "activity");
     }
 
     #[test]

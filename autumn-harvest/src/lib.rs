@@ -24,6 +24,7 @@ pub mod notify;
 #[cfg(feature = "db")]
 pub mod queue;
 #[cfg(feature = "db")]
+#[allow(clippy::wildcard_imports)]
 pub mod schema;
 #[cfg(feature = "db")]
 pub mod store;
