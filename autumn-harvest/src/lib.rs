@@ -13,6 +13,8 @@ pub mod types;
 #[cfg(feature = "db")]
 pub mod models;
 #[cfg(feature = "db")]
+pub mod notify;
+#[cfg(feature = "db")]
 pub mod queue;
 #[cfg(feature = "db")]
 pub mod schema;

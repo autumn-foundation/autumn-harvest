@@ -12,6 +12,7 @@ default = ["db"]
 db = [
     "dep:diesel",
     "dep:diesel-async",
+    "dep:tokio-postgres",
     "autumn-web/db",
 ]
 testing = []
@@ -30,6 +31,7 @@ tracing = { workspace = true }
 futures = { workspace = true }
 diesel = { workspace = true, optional = true }
 diesel-async = { workspace = true, optional = true }
+tokio-postgres = { version = "0.7", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
