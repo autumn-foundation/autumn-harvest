@@ -21,7 +21,7 @@ use crate::schema::{
     Debug, Clone, Queryable, Selectable, Identifiable, serde::Serialize, serde::Deserialize,
 )]
 #[diesel(table_name = harvest_workflow_executions)]
-#[diesel(check_fields)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct WorkflowExecution {
     pub id: Uuid,
     pub workflow_name: String,
@@ -66,7 +66,7 @@ pub struct NewWorkflowExecution<'a> {
     Debug, Clone, Queryable, Selectable, Identifiable, serde::Serialize, serde::Deserialize,
 )]
 #[diesel(table_name = harvest_events)]
-#[diesel(check_fields)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct HarvestEvent {
     pub id: i64,
     pub workflow_exec_id: Uuid,
@@ -93,7 +93,7 @@ pub struct NewHarvestEvent<'a> {
     Debug, Clone, Queryable, Selectable, Identifiable, serde::Serialize, serde::Deserialize,
 )]
 #[diesel(table_name = harvest_task_queue)]
-#[diesel(check_fields)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct TaskQueueItem {
     pub id: Uuid,
     pub queue_name: String,
@@ -144,7 +144,7 @@ pub struct NewTaskQueueItem<'a> {
     Debug, Clone, Queryable, Selectable, Identifiable, serde::Serialize, serde::Deserialize,
 )]
 #[diesel(table_name = harvest_dag_runs)]
-#[diesel(check_fields)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct DagRun {
     pub id: Uuid,
     pub dag_name: String,
@@ -179,7 +179,7 @@ pub struct NewDagRun<'a> {
     Debug, Clone, Queryable, Selectable, Identifiable, serde::Serialize, serde::Deserialize,
 )]
 #[diesel(table_name = harvest_schedules)]
-#[diesel(check_fields)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct HarvestSchedule {
     pub id: Uuid,
     pub dag_name: String,
@@ -213,7 +213,7 @@ pub struct NewHarvestSchedule<'a> {
     Debug, Clone, Queryable, Selectable, Identifiable, serde::Serialize, serde::Deserialize,
 )]
 #[diesel(table_name = harvest_signals)]
-#[diesel(check_fields)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct HarvestSignal {
     pub id: Uuid,
     pub workflow_exec_id: Uuid,
@@ -239,7 +239,7 @@ pub struct NewHarvestSignal<'a> {
     Debug, Clone, Queryable, Selectable, Identifiable, serde::Serialize, serde::Deserialize,
 )]
 #[diesel(table_name = harvest_timers)]
-#[diesel(check_fields)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct HarvestTimer {
     pub id: Uuid,
     pub workflow_exec_id: Uuid,
@@ -264,7 +264,7 @@ pub struct NewHarvestTimer<'a> {
     Debug, Clone, Queryable, Selectable, Identifiable, serde::Serialize, serde::Deserialize,
 )]
 #[diesel(table_name = harvest_dead_letters)]
-#[diesel(check_fields)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct DeadLetter {
     pub id: Uuid,
     pub original_task_id: Uuid,

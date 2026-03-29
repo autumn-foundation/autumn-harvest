@@ -13,6 +13,8 @@ pub mod types;
 pub mod models;
 #[cfg(feature = "db")]
 pub mod schema;
+#[cfg(feature = "db")]
+pub mod store;
 
 pub use builder::{HarvestBuilder, WorkerConfig};
 pub use context::{ActivityContext, WorkflowContext};
