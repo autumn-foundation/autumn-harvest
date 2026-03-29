@@ -12,6 +12,6 @@ pub use policy::{RetryPolicy, Schedule, TaskStatus, TriggerRule, compute_retry_d
 pub mod event;
 pub use event::WorkflowEvent;
 
-pub mod context; // populated in Task 7
+pub mod context;
 pub mod info;
 pub use info::{ActivityHandlerFn, ActivityInfo, WorkflowHandlerFn, WorkflowInfo};
