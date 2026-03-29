@@ -10,6 +10,7 @@ repository.workspace = true
 [features]
 default = ["db"]
 db = [
+    "dep:deadpool",
     "dep:diesel",
     "dep:diesel-async",
     "dep:tokio-postgres",
@@ -30,6 +31,7 @@ chrono = { workspace = true }
 tracing = { workspace = true }
 futures = { workspace = true }
 lru = "0.12"
+deadpool = { workspace = true, optional = true }
 diesel = { workspace = true, optional = true }
 diesel-async = { workspace = true, optional = true }
 tokio-postgres = { version = "0.7", optional = true }

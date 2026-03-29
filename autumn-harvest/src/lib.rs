@@ -29,6 +29,8 @@ pub mod schema;
 pub mod store;
 #[cfg(feature = "db")]
 pub mod timeout;
+#[cfg(feature = "db")]
+pub mod worker;
 
 pub use builder::{HarvestBuilder, WorkerConfig};
 pub use cache::{CachedWorkflowState, WorkflowCache};
