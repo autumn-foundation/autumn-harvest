@@ -18,7 +18,7 @@ pub mod schema;
 pub mod store;
 
 pub use builder::{HarvestBuilder, WorkerConfig};
-pub use context::{ActivityContext, WorkflowContext};
+pub use context::{ActivityContext, WorkflowCommand, WorkflowContext};
 pub use error::{HarvestError, HarvestResult, TimeoutType};
 pub use event::WorkflowEvent;
 pub use info::{ActivityHandlerFn, ActivityInfo, WorkflowHandlerFn, WorkflowInfo};
