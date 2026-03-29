@@ -16,7 +16,10 @@ use crate::schema::{
 
 // ── WorkflowExecution ─────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Queryable, Selectable, Identifiable)]
+/// A single workflow execution instance (one row per run).
+#[derive(
+    Debug, Clone, Queryable, Selectable, Identifiable, serde::Serialize, serde::Deserialize,
+)]
 #[diesel(table_name = harvest_workflow_executions)]
 #[diesel(check_fields)]
 pub struct WorkflowExecution {
@@ -40,7 +43,8 @@ pub struct WorkflowExecution {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Insertable)]
+/// Insert struct for creating a new workflow execution.
+#[derive(Debug, Insertable, serde::Serialize, serde::Deserialize)]
 #[diesel(table_name = harvest_workflow_executions)]
 pub struct NewWorkflowExecution<'a> {
     pub id: Uuid,
@@ -57,7 +61,10 @@ pub struct NewWorkflowExecution<'a> {
 
 // ── HarvestEvent ──────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Queryable, Selectable, Identifiable)]
+/// A single event in the workflow execution history (append-only).
+#[derive(
+    Debug, Clone, Queryable, Selectable, Identifiable, serde::Serialize, serde::Deserialize,
+)]
 #[diesel(table_name = harvest_events)]
 #[diesel(check_fields)]
 pub struct HarvestEvent {
@@ -69,7 +76,8 @@ pub struct HarvestEvent {
     pub timestamp: DateTime<Utc>,
 }
 
-#[derive(Debug, Insertable)]
+/// Insert struct for appending a new event to a workflow's history.
+#[derive(Debug, Insertable, serde::Serialize, serde::Deserialize)]
 #[diesel(table_name = harvest_events)]
 pub struct NewHarvestEvent<'a> {
     pub workflow_exec_id: Uuid,
@@ -80,7 +88,10 @@ pub struct NewHarvestEvent<'a> {
 
 // ── TaskQueueItem ─────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Queryable, Selectable, Identifiable)]
+/// A pending or in-progress task in the work queue.
+#[derive(
+    Debug, Clone, Queryable, Selectable, Identifiable, serde::Serialize, serde::Deserialize,
+)]
 #[diesel(table_name = harvest_task_queue)]
 #[diesel(check_fields)]
 pub struct TaskQueueItem {
@@ -107,7 +118,8 @@ pub struct TaskQueueItem {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Insertable)]
+/// Insert struct for enqueuing a new task.
+#[derive(Debug, Insertable, serde::Serialize, serde::Deserialize)]
 #[diesel(table_name = harvest_task_queue)]
 pub struct NewTaskQueueItem<'a> {
     pub id: Uuid,
@@ -127,7 +139,10 @@ pub struct NewTaskQueueItem<'a> {
 
 // ── DagRun ────────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Queryable, Selectable, Identifiable)]
+/// A single DAG run instance.
+#[derive(
+    Debug, Clone, Queryable, Selectable, Identifiable, serde::Serialize, serde::Deserialize,
+)]
 #[diesel(table_name = harvest_dag_runs)]
 #[diesel(check_fields)]
 pub struct DagRun {
@@ -144,7 +159,8 @@ pub struct DagRun {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Insertable)]
+/// Insert struct for creating a new DAG run.
+#[derive(Debug, Insertable, serde::Serialize, serde::Deserialize)]
 #[diesel(table_name = harvest_dag_runs)]
 pub struct NewDagRun<'a> {
     pub id: Uuid,
@@ -158,7 +174,10 @@ pub struct NewDagRun<'a> {
 
 // ── Schedule ──────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Queryable, Selectable, Identifiable)]
+/// A DAG schedule configuration.
+#[derive(
+    Debug, Clone, Queryable, Selectable, Identifiable, serde::Serialize, serde::Deserialize,
+)]
 #[diesel(table_name = harvest_schedules)]
 #[diesel(check_fields)]
 pub struct HarvestSchedule {
@@ -175,7 +194,8 @@ pub struct HarvestSchedule {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Insertable)]
+/// Insert struct for registering a new DAG schedule.
+#[derive(Debug, Insertable, serde::Serialize, serde::Deserialize)]
 #[diesel(table_name = harvest_schedules)]
 pub struct NewHarvestSchedule<'a> {
     pub id: Uuid,
@@ -188,7 +208,10 @@ pub struct NewHarvestSchedule<'a> {
 
 // ── Signal ────────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Queryable, Selectable, Identifiable)]
+/// A pending signal queued for delivery to a workflow execution.
+#[derive(
+    Debug, Clone, Queryable, Selectable, Identifiable, serde::Serialize, serde::Deserialize,
+)]
 #[diesel(table_name = harvest_signals)]
 #[diesel(check_fields)]
 pub struct HarvestSignal {
@@ -200,7 +223,8 @@ pub struct HarvestSignal {
     pub consumed: bool,
 }
 
-#[derive(Debug, Insertable)]
+/// Insert struct for queuing a new signal.
+#[derive(Debug, Insertable, serde::Serialize, serde::Deserialize)]
 #[diesel(table_name = harvest_signals)]
 pub struct NewHarvestSignal<'a> {
     pub workflow_exec_id: Uuid,
@@ -210,7 +234,10 @@ pub struct NewHarvestSignal<'a> {
 
 // ── Timer ─────────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Queryable, Selectable, Identifiable)]
+/// A durable timer registered by a workflow execution.
+#[derive(
+    Debug, Clone, Queryable, Selectable, Identifiable, serde::Serialize, serde::Deserialize,
+)]
 #[diesel(table_name = harvest_timers)]
 #[diesel(check_fields)]
 pub struct HarvestTimer {
@@ -221,7 +248,8 @@ pub struct HarvestTimer {
     pub fired: bool,
 }
 
-#[derive(Debug, Insertable)]
+/// Insert struct for registering a new timer.
+#[derive(Debug, Insertable, serde::Serialize, serde::Deserialize)]
 #[diesel(table_name = harvest_timers)]
 pub struct NewHarvestTimer<'a> {
     pub workflow_exec_id: Uuid,
@@ -231,7 +259,10 @@ pub struct NewHarvestTimer<'a> {
 
 // ── DeadLetter ────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Queryable, Selectable, Identifiable)]
+/// A task that exhausted all retry attempts and was moved to the dead-letter queue.
+#[derive(
+    Debug, Clone, Queryable, Selectable, Identifiable, serde::Serialize, serde::Deserialize,
+)]
 #[diesel(table_name = harvest_dead_letters)]
 #[diesel(check_fields)]
 pub struct DeadLetter {
@@ -247,7 +278,8 @@ pub struct DeadLetter {
     pub failed_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Insertable)]
+/// Insert struct for moving a failed task to the dead-letter queue.
+#[derive(Debug, Insertable, serde::Serialize, serde::Deserialize)]
 #[diesel(table_name = harvest_dead_letters)]
 pub struct NewDeadLetter<'a> {
     pub original_task_id: Uuid,
