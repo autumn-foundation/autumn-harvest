@@ -24,12 +24,16 @@ futures = "0.3"
 # Database
 diesel = { version = "2.3", features = ["postgres", "uuid", "chrono", "serde_json"] }
 diesel-async = { version = "0.8", features = ["deadpool", "postgres"] }
-deadpool = "0.12"
+deadpool = "0.13"
 
 # Proc macro
 syn = { version = "2", features = ["full"] }
 quote = "1"
 proc-macro2 = "1"
+
+# Dev / test
+testcontainers = "0.23"
+testcontainers-modules = { version = "0.11", features = ["postgres"] }
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
