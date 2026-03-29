@@ -15,3 +15,8 @@ pub use event::WorkflowEvent;
 pub mod context;
 pub mod info;
 pub use info::{ActivityHandlerFn, ActivityInfo, WorkflowHandlerFn, WorkflowInfo};
+
+#[cfg(feature = "db")]
+pub mod schema;
+#[cfg(feature = "db")]
+pub mod models;
