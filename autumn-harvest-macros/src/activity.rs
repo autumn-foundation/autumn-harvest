@@ -2,7 +2,7 @@
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
-use syn::{parse::Parser as _, Expr, ItemFn, LitStr};
+use syn::{Expr, ItemFn, LitStr, parse::Parser as _};
 
 struct ActivityAttrs {
     retry: Option<Expr>,
@@ -60,6 +60,10 @@ fn duration_expr(s: &str) -> TokenStream {
     }
 }
 
+// The function necessarily handles multiple code-gen paths (0/1/N params,
+// 5 optional attribute fields, quote! blocks) — splitting it further would
+// hurt readability more than the length lint helps.
+#[allow(clippy::too_many_lines)]
 pub fn activity_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let attrs = match parse_attrs(attr) {
         Ok(a) => a,
@@ -73,7 +77,7 @@ pub fn activity_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     if input_fn.sig.asyncness.is_none() {
         return syn::Error::new_spanned(
-            &input_fn.sig.fn_token,
+            input_fn.sig.fn_token,
             "#[activity] functions must be async",
         )
         .to_compile_error();
@@ -83,10 +87,10 @@ pub fn activity_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let fn_name_str = fn_name.to_string();
     let companion_name = format_ident!("__autumn_activity_info_{fn_name}");
 
-    let retry_expr = attrs.retry.as_ref().map_or_else(
-        || quote! { None },
-        |policy| quote! { Some(#policy) },
-    );
+    let retry_expr = attrs
+        .retry
+        .as_ref()
+        .map_or_else(|| quote! { None }, |policy| quote! { Some(#policy) });
 
     let start_to_close_expr = attrs.start_to_close.as_deref().map_or_else(
         || quote! { None },
@@ -112,10 +116,10 @@ pub fn activity_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         },
     );
 
-    let queue_expr = attrs.queue.as_deref().map_or_else(
-        || quote! { None },
-        |q| quote! { Some(#q) },
-    );
+    let queue_expr = attrs
+        .queue
+        .as_deref()
+        .map_or_else(|| quote! { None }, |q| quote! { Some(#q) });
 
     let params: Vec<_> = input_fn.sig.inputs.iter().skip(1).collect();
     let param_names: Vec<_> = params

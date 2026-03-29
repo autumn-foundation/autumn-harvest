@@ -5,7 +5,7 @@
 
 use proc_macro2::TokenStream;
 use quote::quote;
-use syn::{parse::Parser, punctuated::Punctuated, Ident, Token};
+use syn::{Ident, Token, parse::Parser, punctuated::Punctuated};
 
 pub fn workflows_macro(input: TokenStream) -> TokenStream {
     let names = match Punctuated::<Ident, Token![,]>::parse_terminated.parse2(input) {

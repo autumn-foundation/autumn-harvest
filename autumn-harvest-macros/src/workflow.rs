@@ -15,7 +15,7 @@ pub fn workflow_macro(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
     if input_fn.sig.asyncness.is_none() {
         return syn::Error::new_spanned(
-            &input_fn.sig.fn_token,
+            input_fn.sig.fn_token,
             "#[workflow] functions must be async",
         )
         .to_compile_error();

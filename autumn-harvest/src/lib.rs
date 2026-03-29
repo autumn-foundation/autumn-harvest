@@ -10,9 +10,9 @@ pub mod prelude;
 pub mod types;
 
 #[cfg(feature = "db")]
-pub mod schema;
-#[cfg(feature = "db")]
 pub mod models;
+#[cfg(feature = "db")]
+pub mod schema;
 
 pub use builder::{HarvestBuilder, WorkerConfig};
 pub use context::{ActivityContext, WorkflowContext};
@@ -29,6 +29,7 @@ pub use serde_json;
 ///
 /// Used by macro-generated code — not intended for direct use.
 #[doc(hidden)]
+#[must_use]
 pub fn task_duration(s: &str) -> Option<std::time::Duration> {
     autumn_web::task::parse_duration(s)
 }
