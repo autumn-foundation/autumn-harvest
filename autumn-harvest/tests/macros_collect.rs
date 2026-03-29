@@ -1,3 +1,5 @@
+#![allow(clippy::unused_async, clippy::used_underscore_binding)]
+
 use autumn_harvest::prelude::*;
 
 #[workflow]

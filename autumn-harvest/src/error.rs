@@ -98,9 +98,9 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::unnecessary_literal_unwrap)]
     fn harvest_result_ok() {
-        let value = 42;
-        let r: HarvestResult<i32> = Ok(value);
-        assert_eq!(r.unwrap_or(0), value);
+        let r: HarvestResult<i32> = Ok(42);
+        assert_eq!(r.unwrap(), 42);
     }
 }

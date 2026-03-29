@@ -1,3 +1,5 @@
+#![allow(clippy::unused_async)]
+
 use autumn_harvest::prelude::*;
 use std::time::Duration;
 
