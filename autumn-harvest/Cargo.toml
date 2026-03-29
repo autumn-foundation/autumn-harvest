@@ -1,0 +1,24 @@
+[package]
+name = "autumn-harvest"
+description = "Durable workflow orchestration engine for the Autumn web framework"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+autumn-web = { workspace = true }
+autumn-harvest-macros = { path = "../autumn-harvest-macros" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+futures = { workspace = true }
+diesel = { workspace = true }
+diesel-async = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
