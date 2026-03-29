@@ -7,8 +7,16 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = ["db"]
+db = [
+    "dep:diesel",
+    "dep:diesel-async",
+    "autumn-web/db",
+]
+
 [dependencies]
-autumn-web = { workspace = true }
+autumn-web = { workspace = true, features = ["maud", "htmx", "tailwind"] }
 autumn-harvest-macros = { path = "../autumn-harvest-macros" }
 tokio = { workspace = true }
 serde = { workspace = true }
@@ -18,8 +26,8 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }
 futures = { workspace = true }
-diesel = { workspace = true }
-diesel-async = { workspace = true }
+diesel = { workspace = true, optional = true }
+diesel-async = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

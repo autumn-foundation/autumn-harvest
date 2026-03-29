@@ -11,7 +11,7 @@ repository = "https://github.com/madmax983/autumn-harvest"
 
 [workspace.dependencies]
 # Core
-autumn-web = { path = "../autumn/autumn" }
+autumn-web = { path = "../autumn/autumn", default-features = false }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
