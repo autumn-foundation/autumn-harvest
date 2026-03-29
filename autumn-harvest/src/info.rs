@@ -60,6 +60,31 @@ pub struct ActivityInfo {
     pub handler: ActivityHandlerFn,
 }
 
+impl std::fmt::Debug for WorkflowInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkflowInfo")
+            .field("name", &self.name)
+            .field("module", &self.module)
+            .field("handler", &"<fn>")
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for ActivityInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ActivityInfo")
+            .field("name", &self.name)
+            .field("module", &self.module)
+            .field("default_retry_policy", &self.default_retry_policy)
+            .field("default_start_to_close", &self.default_start_to_close)
+            .field("default_heartbeat_timeout", &self.default_heartbeat_timeout)
+            .field("default_schedule_to_start", &self.default_schedule_to_start)
+            .field("default_queue", &self.default_queue)
+            .field("handler", &"<fn>")
+            .finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

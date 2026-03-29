@@ -43,9 +43,11 @@ pub fn workflow_macro(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let dispatch = if param_names.is_empty() {
         quote! {
             let result = #fn_name(ctx).await;
-            result.map(|v| ::autumn_harvest::serde_json::to_value(v)
-                .unwrap_or(::autumn_harvest::serde_json::Value::Null))
-                .map_err(|e| e.to_string())
+            result.map_err(|e| e.to_string())
+                .and_then(|v| {
+                    ::autumn_harvest::serde_json::to_value(v)
+                        .map_err(|e| e.to_string())
+                })
         }
     } else if param_names.len() == 1 {
         let name = &param_names[0];
@@ -53,9 +55,11 @@ pub fn workflow_macro(_attr: TokenStream, item: TokenStream) -> TokenStream {
             let #name = ::autumn_harvest::serde_json::from_value(input)
                 .map_err(|e| e.to_string())?;
             let result = #fn_name(ctx, #name).await;
-            result.map(|v| ::autumn_harvest::serde_json::to_value(v)
-                .unwrap_or(::autumn_harvest::serde_json::Value::Null))
-                .map_err(|e| e.to_string())
+            result.map_err(|e| e.to_string())
+                .and_then(|v| {
+                    ::autumn_harvest::serde_json::to_value(v)
+                        .map_err(|e| e.to_string())
+                })
         }
     } else {
         // Multiple params: expect input to be a JSON array [arg1, arg2, ...]
@@ -68,9 +72,11 @@ pub fn workflow_macro(_attr: TokenStream, item: TokenStream) -> TokenStream {
                     .map_err(|e| e.to_string())?;
             )*
             let result = #fn_name(ctx, #(#names),*).await;
-            result.map(|v| ::autumn_harvest::serde_json::to_value(v)
-                .unwrap_or(::autumn_harvest::serde_json::Value::Null))
-                .map_err(|e| e.to_string())
+            result.map_err(|e| e.to_string())
+                .and_then(|v| {
+                    ::autumn_harvest::serde_json::to_value(v)
+                        .map_err(|e| e.to_string())
+                })
         }
     };
 

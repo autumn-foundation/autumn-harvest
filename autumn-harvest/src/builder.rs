@@ -8,7 +8,7 @@ use crate::info::{ActivityInfo, WorkflowInfo};
 ///
 /// In a full Autumn app, this is consumed by the `HarvestExt` trait on
 /// `AppBuilder`. In tests or standalone use, call `.build()` directly.
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct HarvestBuilder {
     workflows: Vec<WorkflowInfo>,
     activities: Vec<ActivityInfo>,
