@@ -9,7 +9,7 @@ use std::pin::Pin;
 
 use autumn_harvest::context::WorkflowContext;
 use autumn_harvest::event::WorkflowEvent;
-use autumn_harvest::executor::{run_workflow, WorkflowOutcome};
+use autumn_harvest::executor::{WorkflowOutcome, run_workflow};
 use autumn_harvest::types::{ActivityExecId, ExecutionId};
 use chrono::Utc;
 use serde_json::Value;
@@ -41,7 +41,7 @@ fn two_activity_workflow<'a>(
     })
 }
 
-/// Workflow that calls an activity named "wrong_name" — used to test
+/// Workflow that calls an activity named `wrong_name` -- used to test
 /// non-determinism detection when history has a different activity name.
 fn wrong_name_workflow<'a>(
     ctx: &'a WorkflowContext,
@@ -156,7 +156,7 @@ async fn replay_two_sequential_activities() {
     }
 }
 
-/// History has "step_1" but workflow calls "wrong_name" at that position.
+/// History has `step_1` but workflow calls `wrong_name` at that position.
 /// The replay engine should detect the non-determinism and the workflow
 /// should fail with an error message mentioning the mismatch.
 #[tokio::test]
@@ -196,7 +196,7 @@ async fn replay_detects_non_determinism() {
 
 /// Version gate routes code paths:
 /// - With a recorded marker in history, returns the recorded version.
-/// - With empty history (past end), returns max_version.
+/// - With empty history (past end), returns `max_version`.
 #[tokio::test]
 async fn version_gate_routes_code_paths_with_marker() {
     let exec_id = ExecutionId::new();
@@ -223,7 +223,7 @@ async fn version_gate_routes_code_paths_with_marker() {
     }
 }
 
-/// Version gate with empty history (new code path) returns max_version.
+/// Version gate with empty history (new code path) returns `max_version`.
 #[tokio::test]
 async fn version_gate_new_execution_returns_max() {
     let exec_id = ExecutionId::new();
@@ -290,7 +290,7 @@ async fn workflow_suspends_mid_execution() {
     }
 }
 
-/// History has ActivityFailed for the activity — workflow should get the
+/// History has `ActivityFailed` for the activity -- workflow should get the
 /// error and propagate it as a Failed outcome.
 #[tokio::test]
 async fn replay_handles_failed_activity() {
