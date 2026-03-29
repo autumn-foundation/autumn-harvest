@@ -104,7 +104,7 @@ impl WorkflowEvent {
     /// Stable string identifier for this event variant, stored in
     /// `harvest_events.event_type`.
     #[must_use]
-    pub fn type_name(&self) -> &'static str {
+    pub const fn type_name(&self) -> &'static str {
         match self {
             Self::WorkflowStarted { .. } => "WorkflowStarted",
             Self::WorkflowCompleted { .. } => "WorkflowCompleted",
@@ -167,22 +167,78 @@ mod tests {
 
     #[test]
     fn all_type_names_are_unique() {
+        use crate::types::{ActivityExecId, ExecutionId, TimerId, WorkerId};
         use std::collections::HashSet;
-        // Spot-check a sample of variants for uniqueness
-        let names = vec![
+
+        let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: serde_json::Value::Null,
                 timestamp: Utc::now(),
-            }
-            .type_name(),
+            },
             WorkflowEvent::WorkflowCompleted {
                 output: serde_json::Value::Null,
-            }
-            .type_name(),
-            WorkflowEvent::WorkflowFailed { error: "x".into() }.type_name(),
-            WorkflowEvent::WorkflowCancelled { reason: "x".into() }.type_name(),
+            },
+            WorkflowEvent::WorkflowFailed { error: "x".into() },
+            WorkflowEvent::WorkflowCancelled { reason: "x".into() },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: ActivityExecId::new(),
+                name: "a".into(),
+                input: serde_json::Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityStarted {
+                activity_id: ActivityExecId::new(),
+                worker_id: WorkerId::new("w"),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id: ActivityExecId::new(),
+                output: serde_json::Value::Null,
+            },
+            WorkflowEvent::ActivityFailed {
+                activity_id: ActivityExecId::new(),
+                error: "x".into(),
+                attempt: 1,
+            },
+            WorkflowEvent::ActivityTimedOut {
+                activity_id: ActivityExecId::new(),
+                timeout_type: crate::error::TimeoutType::StartToClose,
+            },
+            WorkflowEvent::ActivityHeartbeat {
+                activity_id: ActivityExecId::new(),
+                details: serde_json::Value::Null,
+            },
+            WorkflowEvent::TimerStarted {
+                timer_id: TimerId::new("t"),
+                duration_secs: 10,
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: TimerId::new("t"),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "s".into(),
+                payload: serde_json::Value::Null,
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id: ExecutionId::new(),
+                workflow_name: "w".into(),
+                input: serde_json::Value::Null,
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id: ExecutionId::new(),
+                output: serde_json::Value::Null,
+            },
+            WorkflowEvent::ChildWorkflowFailed {
+                child_id: ExecutionId::new(),
+                error: "x".into(),
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "m".into(),
+                details: serde_json::Value::Null,
+            },
         ];
-        let set: HashSet<_> = names.iter().collect();
-        assert_eq!(names.len(), set.len());
+
+        assert_eq!(events.len(), 17);
+        let names: HashSet<_> = events.iter().map(WorkflowEvent::type_name).collect();
+        assert_eq!(names.len(), 17, "duplicate type names detected");
     }
 }

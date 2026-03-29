@@ -8,8 +8,6 @@
 //! — it's an HTTP response wrapper. `HarvestError` converts to `AutumnError` via
 //! the blanket `From<E: Error> for AutumnError` impl automatically.
 
-use std::time::Duration;
-
 /// The kind of timeout that fired.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TimeoutType {
@@ -79,20 +77,6 @@ pub enum HarvestError {
 /// Standard result type for internal harvest engine operations.
 pub type HarvestResult<T> = Result<T, HarvestError>;
 
-/// Compute the next retry delay using exponential backoff.
-///
-/// `attempt` is 1-based (attempt 1 = first retry, gets `initial`).
-#[must_use]
-pub fn compute_retry_delay(
-    initial: Duration,
-    backoff_coefficient: f64,
-    max_interval: Duration,
-    attempt: u32,
-) -> Duration {
-    let secs = initial.as_secs_f64() * backoff_coefficient.powi((attempt - 1) as i32);
-    Duration::from_secs_f64(secs.min(max_interval.as_secs_f64()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,34 +101,5 @@ mod tests {
     fn harvest_result_ok() {
         let r: HarvestResult<i32> = Ok(42);
         assert_eq!(r.unwrap(), 42);
-    }
-
-    #[test]
-    fn compute_retry_delay_exponential() {
-        let d1 = compute_retry_delay(
-            std::time::Duration::from_secs(1),
-            2.0,
-            std::time::Duration::from_secs(300),
-            1,
-        );
-        let d2 = compute_retry_delay(
-            std::time::Duration::from_secs(1),
-            2.0,
-            std::time::Duration::from_secs(300),
-            2,
-        );
-        assert_eq!(d1, std::time::Duration::from_secs(1));
-        assert_eq!(d2, std::time::Duration::from_secs(2));
-    }
-
-    #[test]
-    fn compute_retry_delay_caps_at_max() {
-        let d = compute_retry_delay(
-            std::time::Duration::from_secs(60),
-            2.0,
-            std::time::Duration::from_secs(120),
-            6, // would be 60 * 2^5 = 1920s without cap
-        );
-        assert_eq!(d, std::time::Duration::from_secs(120));
     }
 }

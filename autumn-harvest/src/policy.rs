@@ -4,7 +4,20 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::compute_retry_delay;
+/// Compute the next retry delay using exponential backoff.
+///
+/// `attempt` is 1-based (attempt 1 = first retry, gets `initial`).
+#[must_use]
+pub fn compute_retry_delay(
+    initial: Duration,
+    backoff_coefficient: f64,
+    max_interval: Duration,
+    attempt: u32,
+) -> Duration {
+    let exp = i32::try_from(attempt.saturating_sub(1)).unwrap_or(i32::MAX);
+    let secs = initial.as_secs_f64() * backoff_coefficient.powi(exp);
+    Duration::from_secs_f64(secs.min(max_interval.as_secs_f64()))
+}
 
 /// How an activity failure is retried.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,6 +91,8 @@ pub enum TaskStatus {
 }
 
 /// When a DAG task with multiple upstreams should execute.
+///
+/// All rules vacuously fire when `upstream_statuses` is empty (no dependencies).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum TriggerRule {
     /// Run when all upstream tasks succeeded (default).
@@ -102,7 +117,7 @@ impl TriggerRule {
             Self::AllSuccess => upstream_statuses
                 .iter()
                 .all(|s| *s == TaskStatus::Succeeded),
-            Self::AllDone => !upstream_statuses.is_empty(),
+            Self::AllDone => true,
             Self::OneSuccess => upstream_statuses.contains(&TaskStatus::Succeeded),
             Self::OneFailed => upstream_statuses.contains(&TaskStatus::Failed),
             Self::AllFailed => {
@@ -174,5 +189,55 @@ mod tests {
     #[test]
     fn trigger_rule_all_done_runs_on_any_completion() {
         assert!(TriggerRule::AllDone.should_run(&[TaskStatus::Succeeded, TaskStatus::Failed]));
+    }
+
+    #[test]
+    fn trigger_rule_one_success() {
+        assert!(TriggerRule::OneSuccess.should_run(&[TaskStatus::Failed, TaskStatus::Succeeded]));
+        assert!(!TriggerRule::OneSuccess.should_run(&[TaskStatus::Failed]));
+    }
+
+    #[test]
+    fn trigger_rule_one_failed() {
+        assert!(TriggerRule::OneFailed.should_run(&[TaskStatus::Succeeded, TaskStatus::Failed]));
+        assert!(!TriggerRule::OneFailed.should_run(&[TaskStatus::Succeeded]));
+    }
+
+    #[test]
+    fn trigger_rule_all_failed() {
+        assert!(TriggerRule::AllFailed.should_run(&[TaskStatus::Failed, TaskStatus::Failed]));
+        assert!(!TriggerRule::AllFailed.should_run(&[TaskStatus::Succeeded, TaskStatus::Failed]));
+    }
+
+    #[test]
+    fn trigger_rule_manual_never_fires() {
+        assert!(!TriggerRule::Manual.should_run(&[TaskStatus::Succeeded]));
+        assert!(!TriggerRule::Manual.should_run(&[]));
+    }
+
+    #[test]
+    fn trigger_rule_vacuous_empty_slice() {
+        // All rules fire vacuously when there are no upstreams
+        assert!(TriggerRule::AllSuccess.should_run(&[]));
+        assert!(TriggerRule::AllDone.should_run(&[]));
+    }
+
+    #[test]
+    fn compute_retry_delay_exponential() {
+        let d1 = compute_retry_delay(Duration::from_secs(1), 2.0, Duration::from_secs(300), 1);
+        let d2 = compute_retry_delay(Duration::from_secs(1), 2.0, Duration::from_secs(300), 2);
+        assert_eq!(d1, Duration::from_secs(1));
+        assert_eq!(d2, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn compute_retry_delay_caps_at_max() {
+        let d = compute_retry_delay(
+            Duration::from_secs(60),
+            2.0,
+            Duration::from_secs(120),
+            6, // would be 60 * 2^5 = 1920s without cap
+        );
+        assert_eq!(d, Duration::from_secs(120));
     }
 }
