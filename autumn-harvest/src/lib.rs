@@ -8,6 +8,7 @@ pub mod event;
 pub mod executor;
 pub mod info;
 pub mod policy;
+pub mod pool;
 pub mod prelude;
 pub mod replay;
 pub mod types;
@@ -37,6 +38,7 @@ pub use event::WorkflowEvent;
 pub use executor::{WorkflowOutcome, run_workflow};
 pub use info::{ActivityHandlerFn, ActivityInfo, WorkflowHandlerFn, WorkflowInfo};
 pub use policy::{RetryPolicy, Schedule, TaskStatus, TriggerRule};
+pub use pool::{HarvestPoolConfig, compute_pool_sizes};
 pub use replay::{HistoryMatch, HistoryMatcher};
 pub use types::{ActivityExecId, ExecutionId, TimerId, WorkerId, WorkflowId};
 
