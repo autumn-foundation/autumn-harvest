@@ -1,15 +1,21 @@
 //! Durable workflow orchestration engine for the Autumn web framework.
 
 pub mod builder;
+pub mod cache;
 pub mod context;
 pub mod error;
 pub mod event;
+pub mod executor;
 pub mod info;
 pub mod policy;
 pub mod prelude;
 pub mod replay;
 pub mod types;
 
+#[cfg(feature = "db")]
+pub mod dlq;
+#[cfg(feature = "db")]
+pub mod heartbeat;
 #[cfg(feature = "db")]
 pub mod models;
 #[cfg(feature = "db")]
@@ -20,11 +26,15 @@ pub mod queue;
 pub mod schema;
 #[cfg(feature = "db")]
 pub mod store;
+#[cfg(feature = "db")]
+pub mod timeout;
 
 pub use builder::{HarvestBuilder, WorkerConfig};
+pub use cache::{CachedWorkflowState, WorkflowCache};
 pub use context::{ActivityContext, WorkflowCommand, WorkflowContext};
 pub use error::{HarvestError, HarvestResult, TimeoutType};
 pub use event::WorkflowEvent;
+pub use executor::{WorkflowOutcome, run_workflow};
 pub use info::{ActivityHandlerFn, ActivityInfo, WorkflowHandlerFn, WorkflowInfo};
 pub use policy::{RetryPolicy, Schedule, TaskStatus, TriggerRule};
 pub use replay::{HistoryMatch, HistoryMatcher};
