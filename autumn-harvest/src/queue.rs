@@ -68,7 +68,11 @@ pub struct EnqueueParams {
 impl EnqueueParams {
     /// Create minimal enqueue params with sensible defaults.
     #[must_use]
-    pub fn new(queue_name: impl Into<String>, task_type: TaskType, input: serde_json::Value) -> Self {
+    pub fn new(
+        queue_name: impl Into<String>,
+        task_type: TaskType,
+        input: serde_json::Value,
+    ) -> Self {
         Self {
             queue_name: queue_name.into(),
             task_type,
@@ -95,10 +99,7 @@ impl EnqueueParams {
 /// # Errors
 ///
 /// Returns [`HarvestError::Database`] on insert failure.
-pub async fn enqueue(
-    conn: &mut AsyncPgConnection,
-    params: &EnqueueParams,
-) -> HarvestResult<Uuid> {
+pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> HarvestResult<Uuid> {
     use crate::schema::harvest_task_queue;
 
     let task_id = Uuid::new_v4();
@@ -215,10 +216,7 @@ pub async fn fail_task(
 /// # Errors
 ///
 /// Returns [`HarvestError::Database`] on update failure.
-pub async fn record_heartbeat(
-    conn: &mut AsyncPgConnection,
-    task_id: Uuid,
-) -> HarvestResult<()> {
+pub async fn record_heartbeat(conn: &mut AsyncPgConnection, task_id: Uuid) -> HarvestResult<()> {
     use crate::schema::harvest_task_queue::dsl;
 
     diesel::update(dsl::harvest_task_queue.find(task_id))
@@ -268,7 +266,11 @@ mod tests {
 
     #[test]
     fn enqueue_params_builds_correctly() {
-        let params = EnqueueParams::new("email-queue", TaskType::Activity, serde_json::json!({"to": "alice"}));
+        let params = EnqueueParams::new(
+            "email-queue",
+            TaskType::Activity,
+            serde_json::json!({"to": "alice"}),
+        );
 
         assert_eq!(params.queue_name, "email-queue");
         assert_eq!(params.task_type, TaskType::Activity);

@@ -109,10 +109,9 @@ impl QueueListener {
     ///
     /// Returns [`HarvestError::Database`] if the connection or LISTEN fails.
     pub async fn connect(database_url: &str, queues: &[String]) -> HarvestResult<Self> {
-        let (client, mut connection) =
-            tokio_postgres::connect(database_url, tokio_postgres::NoTls)
-                .await
-                .map_err(|e| HarvestError::Database(format!("pg connect failed: {e}")))?;
+        let (client, mut connection) = tokio_postgres::connect(database_url, tokio_postgres::NoTls)
+            .await
+            .map_err(|e| HarvestError::Database(format!("pg connect failed: {e}")))?;
 
         // Channel for forwarding notifications from the connection driver.
         let (tx, rx) = tokio::sync::mpsc::channel(128);
@@ -178,10 +177,8 @@ impl QueueListener {
     ) -> HarvestResult<Option<NotifyPayload>> {
         match tokio::time::timeout(poll_interval, self.rx.recv()).await {
             Ok(Some(notification)) => {
-                let payload: NotifyPayload =
-                    serde_json::from_str(notification.payload()).map_err(|e| {
-                        HarvestError::Database(format!("bad notify payload: {e}"))
-                    })?;
+                let payload: NotifyPayload = serde_json::from_str(notification.payload())
+                    .map_err(|e| HarvestError::Database(format!("bad notify payload: {e}")))?;
                 Ok(Some(payload))
             }
             Ok(None) => {

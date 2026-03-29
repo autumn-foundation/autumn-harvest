@@ -304,8 +304,7 @@ mod tests {
 
     #[test]
     fn matcher_replays_failed_activity() {
-        let (_id, events) =
-            activity_failed_events("send_email", "SMTP connection refused", 3);
+        let (_id, events) = activity_failed_events("send_email", "SMTP connection refused", 3);
 
         let mut matcher = HistoryMatcher::new(events);
         let result = matcher.match_activity("send_email");

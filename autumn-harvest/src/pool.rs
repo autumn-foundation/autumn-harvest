@@ -93,18 +93,13 @@ pub fn compute_pool_sizes(
         return (requested_web, requested_worker);
     }
 
-    // Scale proportionally.
-    let ratio = ceiling as f64 / combined as f64;
-    let mut scaled_worker = ((requested_worker as f64 * ratio).floor() as usize).max(1);
-    let mut scaled_web = ((requested_web as f64 * ratio).floor() as usize).max(1);
+    // Scale proportionally using integer arithmetic to avoid cast warnings.
+    // worker gets floor(ceiling * requested_worker / combined), minimum 1.
+    let mut scaled_worker = (ceiling * requested_worker / combined).max(1);
+    // web gets the rest, minimum 1.
+    let mut scaled_web = ceiling.saturating_sub(scaled_worker).max(1);
 
-    // Award remainder to web (prioritise HTTP).
-    let used = scaled_web + scaled_worker;
-    if used < ceiling {
-        scaled_web += ceiling - used;
-    }
-
-    // Safety: clamp in case of extreme edge cases.
+    // If rounding pushed us over ceiling, trim worker (prioritise web).
     if scaled_web + scaled_worker > ceiling {
         scaled_worker = ceiling.saturating_sub(scaled_web).max(1);
         scaled_web = ceiling.saturating_sub(scaled_worker);

@@ -238,17 +238,14 @@ impl Worker {
 
         let pool = pool.clone();
         let task_id = task.id;
-        let task_type = task.task_type.clone();
+        let task_type = task.task_type;
         let worker_id = self.config.worker_id.clone();
 
         tokio::spawn(async move {
             // Acquire semaphore permit — blocks if at concurrency limit.
-            let _permit = match semaphore.acquire().await {
-                Ok(permit) => permit,
-                Err(_) => {
-                    tracing::error!(task_id = %task_id, "semaphore closed");
-                    return;
-                }
+            let Ok(_permit) = semaphore.acquire().await else {
+                tracing::error!(task_id = %task_id, "semaphore closed");
+                return;
             };
 
             tracing::info!(
@@ -259,12 +256,9 @@ impl Worker {
             );
 
             // Stub: mark completed with empty output.
-            let mut conn = match pool.get().await {
-                Ok(conn) => conn,
-                Err(e) => {
-                    tracing::error!(task_id = %task_id, error = %e, "failed to get connection for completion");
-                    return;
-                }
+            let Ok(mut conn) = pool.get().await else {
+                tracing::error!(task_id = %task_id, "failed to get connection for completion");
+                return;
             };
 
             if let Err(e) = queue::complete_task(&mut conn, task_id, serde_json::json!(null)).await
@@ -278,6 +272,7 @@ impl Worker {
     ///
     /// We wait until all semaphore permits are available again, meaning all
     /// spawned tasks have completed and dropped their permits.
+    #[allow(clippy::cast_possible_truncation)] // concurrency limits are well under u32::MAX
     async fn drain_in_flight(&self) {
         let total_permits =
             self.config.max_concurrent_workflows + self.config.max_concurrent_activities;

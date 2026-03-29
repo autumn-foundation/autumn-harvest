@@ -132,9 +132,7 @@ pub async fn load_history(
         events.push(event);
     }
 
-    let next_event_id = rows
-        .last()
-        .map_or(0, |r| r.event_id.saturating_add(1));
+    let next_event_id = rows.last().map_or(0, |r| r.event_id.saturating_add(1));
 
     Ok(EventHistory {
         exec_id,
@@ -290,9 +288,18 @@ mod tests {
             .collect();
 
         assert_eq!(deserialized.len(), 3);
-        assert!(matches!(deserialized[0], WorkflowEvent::WorkflowStarted { .. }));
-        assert!(matches!(deserialized[1], WorkflowEvent::ActivityScheduled { .. }));
-        assert!(matches!(deserialized[2], WorkflowEvent::WorkflowCompleted { .. }));
+        assert!(matches!(
+            deserialized[0],
+            WorkflowEvent::WorkflowStarted { .. }
+        ));
+        assert!(matches!(
+            deserialized[1],
+            WorkflowEvent::ActivityScheduled { .. }
+        ));
+        assert!(matches!(
+            deserialized[2],
+            WorkflowEvent::WorkflowCompleted { .. }
+        ));
 
         // Verify data fidelity on WorkflowStarted
         if let WorkflowEvent::WorkflowStarted { ref input, .. } = deserialized[0] {
@@ -302,7 +309,12 @@ mod tests {
         }
 
         // Verify data fidelity on ActivityScheduled
-        if let WorkflowEvent::ActivityScheduled { ref name, ref queue, .. } = deserialized[1] {
+        if let WorkflowEvent::ActivityScheduled {
+            ref name,
+            ref queue,
+            ..
+        } = deserialized[1]
+        {
             assert_eq!(name, "send_email");
             assert_eq!(queue, "default");
         } else {

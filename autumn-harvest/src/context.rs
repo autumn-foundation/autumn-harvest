@@ -45,18 +45,11 @@ pub enum WorkflowCommand {
         result_tx: oneshot::Sender<()>,
     },
     /// Record an opaque marker (used by version gates, side-effect-free notes).
-    RecordMarker {
-        name: String,
-        details: Value,
-    },
+    RecordMarker { name: String, details: Value },
     /// The workflow function returned `Ok(output)`.
-    Complete {
-        output: Value,
-    },
+    Complete { output: Value },
     /// The workflow function returned `Err(error)`.
-    Fail {
-        error: String,
-    },
+    Fail { error: String },
 }
 
 // Manual Debug because oneshot::Sender is not Debug.
@@ -88,10 +81,9 @@ impl std::fmt::Debug for WorkflowCommand {
                 .field("name", name)
                 .field("details", details)
                 .finish(),
-            Self::Complete { output } => f
-                .debug_struct("Complete")
-                .field("output", output)
-                .finish(),
+            Self::Complete { output } => {
+                f.debug_struct("Complete").field("output", output).finish()
+            }
             Self::Fail { error } => f.debug_struct("Fail").field("error", error).finish(),
         }
     }
@@ -297,11 +289,9 @@ impl WorkflowContext {
                 source: error.into(),
             }),
 
-            HistoryMatch::Diverged { expected, actual } => {
-                Err(HarvestError::NonDeterministic(format!(
-                    "activity mismatch: expected {expected}, got {actual}"
-                )))
-            }
+            HistoryMatch::Diverged { expected, actual } => Err(HarvestError::NonDeterministic(
+                format!("activity mismatch: expected {expected}, got {actual}"),
+            )),
 
             HistoryMatch::NoMatch => {
                 // Live execution: emit a ScheduleActivity command and suspend
@@ -359,11 +349,9 @@ impl WorkflowContext {
         match history_match {
             HistoryMatch::Matched { .. } => Ok(()),
 
-            HistoryMatch::Diverged { expected, actual } => {
-                Err(HarvestError::NonDeterministic(format!(
-                    "timer mismatch: expected {expected}, got {actual}"
-                )))
-            }
+            HistoryMatch::Diverged { expected, actual } => Err(HarvestError::NonDeterministic(
+                format!("timer mismatch: expected {expected}, got {actual}"),
+            )),
 
             HistoryMatch::Failed { .. } => {
                 // Timers don't fail in the traditional sense, but handle gracefully.
@@ -405,7 +393,10 @@ impl WorkflowContext {
     /// Generate the next sequential activity execution ID.
     fn next_activity_id(&self) -> ActivityExecId {
         {
-            let mut seq = self.activity_seq.lock().expect("activity_seq lock poisoned");
+            let mut seq = self
+                .activity_seq
+                .lock()
+                .expect("activity_seq lock poisoned");
             *seq += 1;
         }
         // Only called during live execution (NoMatch), so a random UUID is fine.
@@ -472,10 +463,7 @@ impl ActivityContext {
     /// - [`HarvestError::Cancelled`] if the cancellation token has been triggered
     ///   or the heartbeat channel is closed.
     /// - [`HarvestError::Serialization`] if `details` fails to serialize.
-    pub async fn heartbeat(
-        &self,
-        details: impl serde::Serialize,
-    ) -> crate::HarvestResult<()> {
+    pub async fn heartbeat(&self, details: impl serde::Serialize) -> crate::HarvestResult<()> {
         // Check cancellation first -- fast path.
         if self.cancel.is_cancelled() {
             return Err(HarvestError::Cancelled(
@@ -487,9 +475,7 @@ impl ActivityContext {
 
         if let Some(ref tx) = self.heartbeat_tx {
             tx.send(payload).await.map_err(|_| {
-                HarvestError::Cancelled(
-                    "activity cancelled: heartbeat channel closed".into(),
-                )
+                HarvestError::Cancelled("activity cancelled: heartbeat channel closed".into())
             })?;
         }
 
@@ -593,17 +579,14 @@ mod tests {
 
     #[test]
     fn context_now_returns_deterministic_time() {
-        let fixed_time =
-            DateTime::parse_from_rfc3339("2026-01-15T10:30:00Z")
-                .expect("valid timestamp")
-                .with_timezone(&Utc);
+        let fixed_time = DateTime::parse_from_rfc3339("2026-01-15T10:30:00Z")
+            .expect("valid timestamp")
+            .with_timezone(&Utc);
 
-        let events = vec![
-            WorkflowEvent::WorkflowStarted {
-                input: Value::Null,
-                timestamp: fixed_time,
-            },
-        ];
+        let events = vec![WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: fixed_time,
+        }];
 
         let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
 
@@ -642,7 +625,11 @@ mod tests {
 
         // execute_activity_raw should return the recorded output immediately.
         let result = ctx
-            .execute_activity_raw("send_email", serde_json::json!({"to": "alice@example.com"}), "default")
+            .execute_activity_raw(
+                "send_email",
+                serde_json::json!({"to": "alice@example.com"}),
+                "default",
+            )
             .await;
 
         assert!(result.is_ok());
@@ -720,7 +707,9 @@ mod tests {
 
         let cmds = ctx.drain_commands();
         assert_eq!(cmds.len(), 1);
-        assert!(matches!(&cmds[0], WorkflowCommand::RecordMarker { name, .. } if name == "version:billing_v2"));
+        assert!(
+            matches!(&cmds[0], WorkflowCommand::RecordMarker { name, .. } if name == "version:billing_v2")
+        );
     }
 
     #[tokio::test]
@@ -740,11 +729,8 @@ mod tests {
 
         // The handle should NOT be finished yet -- the activity is suspended.
         // Use a brief timeout to verify.
-        let timeout_result = tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            handle,
-        )
-        .await;
+        let timeout_result =
+            tokio::time::timeout(std::time::Duration::from_millis(50), handle).await;
 
         // The timeout should fire (the task is still suspended), which means
         // the outer Result is Err(Elapsed).
@@ -780,7 +766,9 @@ mod tests {
         } = cmds.into_iter().next().unwrap()
         {
             assert_eq!(name, "send_email");
-            result_tx.send(Ok(expected_output2)).expect("send should succeed");
+            result_tx
+                .send(Ok(expected_output2))
+                .expect("send should succeed");
         } else {
             panic!("expected ScheduleActivity command");
         }
@@ -974,6 +962,9 @@ mod tests {
         let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
         let result = ctx.timer("cooldown", 300).await;
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), HarvestError::NonDeterministic(_)));
+        assert!(matches!(
+            result.unwrap_err(),
+            HarvestError::NonDeterministic(_)
+        ));
     }
 }
