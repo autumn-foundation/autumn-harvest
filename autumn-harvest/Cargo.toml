@@ -1,6 +1,6 @@
 [package]
 name = "autumn-harvest"
-description = "Durable workflow orchestration engine for the Autumn web framework"
+description = "Durable workflow orchestration engine core"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,13 +13,13 @@ db = [
     "dep:deadpool",
     "dep:diesel",
     "dep:diesel-async",
+    "dep:diesel_migrations",
+    "dep:scoped-futures",
     "dep:tokio-postgres",
-    "autumn-web/db",
 ]
 testing = []
 
 [dependencies]
-autumn-web = { workspace = true, features = ["maud", "htmx", "tailwind"] }
 autumn-harvest-macros = { path = "../autumn-harvest-macros" }
 tokio = { workspace = true }
 tokio-util = { version = "0.7", features = ["rt"] }
@@ -30,10 +30,13 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }
 futures = { workspace = true }
-lru = "0.12"
+lru = "0.16"
+croner = "2.2"
 deadpool = { workspace = true, optional = true }
 diesel = { workspace = true, optional = true }
 diesel-async = { workspace = true, optional = true }
+diesel_migrations = { workspace = true, optional = true }
+scoped-futures = { version = "0.1", optional = true }
 tokio-postgres = { version = "0.7", optional = true }
 
 [dev-dependencies]

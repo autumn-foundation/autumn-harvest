@@ -31,7 +31,7 @@ autumn-harvest/          <- workspace root (this file lives here)
       dlq.rs             <- Phase 2: dead letter queue
       pool.rs            <- Phase 2: separate pool config with shared ceiling
     migrations/
-      00000000000000_harvest_initial/
+      20260409000000_harvest_initial/
     tests/
       integration_e2e.rs <- testcontainers integration tests
       replay_tests.rs    <- replay engine integration tests
@@ -50,8 +50,8 @@ Two crates in the workspace. `autumn-harvest` is the public library. `autumn-har
 
 - **Phase 1** (complete): types, error, event, policy, context stubs, models, macros, builder
 - **Phase 2** (complete): event store, replay engine, workflow context, activity context, task queue (SKIP LOCKED), LISTEN/NOTIFY, worker runtime, heartbeating, timeout enforcement, workflow versioning (ctx.version), LRU workflow cache, dead letter queue, separate worker pool with shared ceiling, testcontainers integration tests
-- **Phase 3** (next): DAG scheduler, DagBuilder, topological sort, #[dag] macro, trigger rules, timetable, signals/queries, saga pattern, management HTTP API
-- **Phase 4**: production hardening -- sharding, sticky cross-worker routing, observability, metrics, dashboard (autumn-harvest-ui)
+- **Phase 3** (implemented): DAG scheduler/runtime, `DagBuilder`, `#[dag]` macro, trigger rules, signals/queries, management HTTP API, Autumn adapter crate with `HarvestExt` lifecycle integration
+- **Phase 4** (next): production hardening -- cancellation/saga semantics, sharding, sticky cross-worker routing, observability, metrics, dashboard (autumn-harvest-ui)
 
 ---
 
@@ -59,9 +59,9 @@ Two crates in the workspace. `autumn-harvest` is the public library. `autumn-har
 
 ### Crate Relationship
 
-`autumn-harvest` re-exports everything from `autumn-harvest-macros` through `prelude.rs`. Downstream crates depend only on `autumn-harvest` — they never add `autumn-harvest-macros` directly.
+`autumn-harvest` is the core engine crate. It re-exports everything from `autumn-harvest-macros` through `prelude.rs`. Autumn-specific integration lives in the separate `autumn-harvest-plugin` crate, which provides `HarvestPlugin`, the management API router, and app lifecycle wiring.
 
-Macro-generated code must use `::autumn_harvest::` paths for everything. The proc-macro crate has no dependency on `serde_json` or `autumn-web` itself; it emits token streams that resolve via the `::autumn_harvest::` path. `lib.rs` re-exports `serde_json` at `::autumn_harvest::serde_json` and exposes `task_duration()` at `::autumn_harvest::task_duration` for exactly this reason.
+Macro-generated code must use `::autumn_harvest::` paths for everything. The proc-macro crate has no dependency on `serde_json` or `autumn-web` itself; it emits token streams that resolve via the `::autumn_harvest::` path. `lib.rs` re-exports `serde_json` at `::autumn_harvest::serde_json` and exposes its own local `task_duration()` parser at `::autumn_harvest::task_duration` for exactly this reason.
 
 Do not change macros to emit `::serde_json::` or `::autumn_web::` paths — downstream crates will not have those as direct dependencies and the code will fail to compile.
 
@@ -128,7 +128,7 @@ Single-param workflows/activities: input is passed as a single JSON value and de
 | `context.rs` | 1+2 | `WorkflowContext` (replay, suspension, version gate, timers), `ActivityContext` (heartbeat channel, cancellation) |
 | `info.rs` | 1 | `WorkflowInfo`, `ActivityInfo`, `WorkflowHandlerFn`, `ActivityHandlerFn` type aliases |
 | `builder.rs` | 1 | `HarvestBuilder` (fluent), `WorkerConfig` (queues, concurrency, timeouts) |
-| `prelude.rs` | 1 | Glob re-export surface including macros |
+| `prelude.rs` | 1 | Core glob re-export surface including macros |
 | `schema.rs` | 1 | Diesel `table!` macros -- 8 tables |
 | `models.rs` | 1 | `Queryable`/`Selectable` read structs and `Insertable` `New*` write structs for all 8 tables |
 | `store.rs` | 2 | Event store: `append_events`, `load_history`, `events_to_rows` with sequential event IDs |
@@ -172,11 +172,14 @@ async fn send_email(ctx: &ActivityContext, addr: String) -> Result<(), String> {
     Ok(())
 }
 
-let engine = HarvestBuilder::new()
+let app = autumn_web::app()
     .workflows(workflows![onboarding])
     .activities(activities![send_email])
-    .worker(WorkerConfig::default());
+    .worker(WorkerConfig::default())
+    .harvest_api("/api/harvest");
 ```
+
+The `workflows`, `activities`, `worker`, and `harvest_api` methods above are provided by `autumn-harvest-plugin::HarvestPlugin`, not the core crate.
 
 Supported `#[activity]` attribute keys:
 - `start_to_close = "30s"` — duration string parsed by `task_duration()`
@@ -185,7 +188,7 @@ Supported `#[activity]` attribute keys:
 - `retry = RetryPolicy::exponential(3, Duration::from_secs(1))` — any expression
 - `queue = "email-workers"` — task queue name
 
-Duration strings: `"30s"`, `"5m"`, `"1h"`. Parsed via `autumn_web::task::parse_duration` (bridged through `::autumn_harvest::task_duration`).
+Duration strings: `"30s"`, `"5m"`, `"1h"`. Parsed via Harvest core's local `task_duration()` helper.
 
 `#[workflow]` takes no attributes in Phase 1.
 
@@ -304,9 +307,9 @@ Worker pool and web pool are independently sized but share a total connection ce
 
 ---
 
-## Phase 3 Scope (next)
+## Phase 4 Scope (next)
 
-- **DAG scheduler**: `DagBuilder`, topological sort, `#[dag]` macro
-- **Trigger rules**: timetable, signals/queries, saga pattern
-- **Management HTTP API**: start/cancel/query workflow executions
-- **`HarvestExt` trait**: embeds the worker into Autumn's `AppBuilder` lifecycle (start/stop with the server)
+- **Cancellation semantics**: explicit workflow/activity cancellation and propagation
+- **Saga primitives**: compensations and failure orchestration
+- **Cross-worker routing**: sticky execution affinity and shard-aware placement
+- **Operational surface**: richer metrics, observability, and dashboard/UI work

@@ -1,0 +1,34 @@
+[package]
+name = "autumn-harvest-plugin"
+description = "Autumn plugin for autumn-harvest durable workflows"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+autumn-harvest = { path = "../autumn-harvest" }
+autumn-web = { path = "../../autumn" }
+tokio = { workspace = true }
+tokio-util = { version = "0.7", features = ["rt"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+diesel = { workspace = true }
+diesel-async = { workspace = true }
+diesel_migrations = { workspace = true }
+deadpool = { workspace = true }
+scoped-futures = "0.1"
+tower = "0.5"
+
+[dev-dependencies]
+tower = "0.5"
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,5 +1,5 @@
 // autumn-harvest/src/schema.rs
-// Hand-written to match migrations/00000000000000_harvest_initial/up.sql.
+// Hand-written to match migrations/20260409000000_harvest_initial/up.sql.
 // Keep in sync with the migration. In production, regenerate via `diesel print-schema`.
 
 diesel::table! {

@@ -77,6 +77,20 @@ pub enum HarvestError {
 /// Standard result type for internal harvest engine operations.
 pub type HarvestResult<T> = Result<T, HarvestError>;
 
+/// Wrap any displayable error into [`HarvestError::Database`].
+///
+/// Use with `.map_err(database_error)` to reduce boilerplate on diesel calls.
+pub fn database_error(e: impl std::fmt::Display) -> HarvestError {
+    HarvestError::Database(e.to_string())
+}
+
+#[cfg(feature = "db")]
+impl From<diesel::result::Error> for HarvestError {
+    fn from(value: diesel::result::Error) -> Self {
+        database_error(value)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -99,8 +113,9 @@ mod tests {
 
     #[test]
     #[allow(clippy::unnecessary_literal_unwrap)]
-    fn harvest_result_ok() {
+    fn harvest_result_ok() -> HarvestResult<()> {
         let r: HarvestResult<i32> = Ok(42);
-        assert_eq!(r.unwrap(), 42);
+        assert_eq!(r?, 42);
+        Ok(())
     }
 }

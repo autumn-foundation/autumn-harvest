@@ -9,7 +9,7 @@ use diesel::QueryDsl;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 
-use crate::error::{HarvestError, HarvestResult};
+use crate::error::HarvestResult;
 use crate::event::WorkflowEvent;
 use crate::models::NewHarvestEvent;
 use crate::schema::harvest_events;
@@ -98,7 +98,7 @@ pub async fn append_events(
         .values(&rows)
         .execute(conn)
         .await
-        .map_err(|e| HarvestError::Database(e.to_string()))
+        .map_err(crate::error::database_error)
 }
 
 /// Load the full event history for a workflow execution, ordered by `event_id`.
@@ -124,15 +124,15 @@ pub async fn load_history(
         .order(harvest_events::event_id.asc())
         .load(conn)
         .await
-        .map_err(|e| HarvestError::Database(e.to_string()))?;
-
-    let mut events = Vec::with_capacity(rows.len());
-    for row in &rows {
-        let event: WorkflowEvent = serde_json::from_value(row.event_data.clone())?;
-        events.push(event);
-    }
+        .map_err(crate::error::database_error)?;
 
     let next_event_id = rows.last().map_or(0, |r| r.event_id.saturating_add(1));
+
+    let mut events = Vec::with_capacity(rows.len());
+    for row in rows {
+        let event: WorkflowEvent = serde_json::from_value(row.event_data)?;
+        events.push(event);
+    }
 
     Ok(EventHistory {
         exec_id,
@@ -259,7 +259,7 @@ mod tests {
     }
 
     #[test]
-    fn history_from_rows_deserializes_events() {
+    fn history_from_rows_deserializes_events() -> Result<(), serde_json::Error> {
         let exec_id = ExecutionId::new();
         let events = vec![
             WorkflowEvent::WorkflowStarted {
@@ -282,10 +282,11 @@ mod tests {
         assert_eq!(rows.len(), 3);
 
         // Deserialize each row's event_data back into WorkflowEvent
-        let deserialized: Vec<WorkflowEvent> = rows
+        let deserialized: Result<Vec<WorkflowEvent>, _> = rows
             .iter()
-            .map(|row| serde_json::from_value(row.event_data.clone()).unwrap())
+            .map(|row| serde_json::from_value(row.event_data.clone()))
             .collect();
+        let deserialized = deserialized?;
 
         assert_eq!(deserialized.len(), 3);
         assert!(matches!(
@@ -327,6 +328,7 @@ mod tests {
         } else {
             panic!("expected WorkflowCompleted");
         }
+        Ok(())
     }
 
     #[test]

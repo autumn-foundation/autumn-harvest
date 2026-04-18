@@ -12,8 +12,10 @@ use uuid::Uuid;
 /// User-provided idempotency key for a workflow execution.
 ///
 /// This is the business-level identifier chosen by the caller (e.g.
-/// `"user-123"` or `"order-456"`). It is NOT the run ID — multiple
-/// runs of the same workflow may share a `WorkflowId` in a retry scenario.
+/// `"user-123"` or `"order-456"`). It is NOT the run ID. Reusing the same
+/// `WorkflowId` for the same workflow name should resolve to the same logical
+/// workflow start; explicit reruns should use a fresh key until Harvest grows a
+/// dedicated restart API.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct WorkflowId(String);
 
@@ -45,6 +47,11 @@ impl ExecutionId {
     #[must_use]
     pub fn new() -> Self {
         Self(Uuid::new_v4())
+    }
+
+    #[must_use]
+    pub const fn from_uuid(id: Uuid) -> Self {
+        Self(id)
     }
 
     #[must_use]
@@ -171,10 +178,11 @@ mod tests {
     }
 
     #[test]
-    fn activity_exec_id_display_roundtrip() {
+    fn activity_exec_id_display_roundtrip() -> Result<(), uuid::Error> {
         let id = ActivityExecId::new();
         let s = id.to_string();
-        let parsed: ActivityExecId = s.parse().unwrap();
+        let parsed: ActivityExecId = s.parse()?;
         assert_eq!(id, parsed);
+        Ok(())
     }
 }

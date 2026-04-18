@@ -169,7 +169,7 @@ mod tests {
     }
 
     #[test]
-    fn exponential_caps_at_max_interval() {
+    fn exponential_caps_at_max_interval() -> Result<(), String> {
         let policy = RetryPolicy {
             max_attempts: 10,
             initial_interval: Duration::from_secs(60),
@@ -177,7 +177,11 @@ mod tests {
             max_interval: Duration::from_secs(120),
             non_retryable_errors: vec![],
         };
-        assert_eq!(policy.next_delay(6).unwrap(), Duration::from_secs(120));
+        assert_eq!(
+            policy.next_delay(6).ok_or("no delay")?,
+            Duration::from_secs(120)
+        );
+        Ok(())
     }
 
     #[test]

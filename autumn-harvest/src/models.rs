@@ -53,6 +53,7 @@ pub struct NewWorkflowExecution<'a> {
     pub run_id: Uuid,
     pub shard_id: i32,
     pub input: serde_json::Value,
+    pub parent_id: Option<Uuid>,
     pub queue_name: &'a str,
     pub execution_timeout: Option<chrono::Duration>,
     pub memo: Option<serde_json::Value>,

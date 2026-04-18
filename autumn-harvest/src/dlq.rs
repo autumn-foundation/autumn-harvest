@@ -55,7 +55,7 @@ pub async fn dead_letter(
         .returning(harvest_dead_letters::id)
         .get_results(conn)
         .await
-        .map_err(|e| HarvestError::Database(e.to_string()))?;
+        .map_err(crate::error::database_error)?;
 
     inserted
         .into_iter()
@@ -75,7 +75,7 @@ pub async fn dead_letter_count(conn: &mut AsyncPgConnection) -> HarvestResult<i6
         .count()
         .get_result(conn)
         .await
-        .map_err(|e| HarvestError::Database(e.to_string()))?;
+        .map_err(crate::error::database_error)?;
 
     Ok(count)
 }

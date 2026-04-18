@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::context::{WorkflowCommand, WorkflowContext};
+use crate::context::{SharedState, WorkflowCommand, WorkflowContext, empty_shared_state};
 use crate::event::WorkflowEvent;
 use crate::info::WorkflowHandlerFn;
 use crate::types::ExecutionId;
@@ -54,7 +54,18 @@ pub async fn run_workflow(
     handler: WorkflowHandlerFn,
     input: Value,
 ) -> WorkflowOutcome {
-    let ctx = WorkflowContext::for_replay(exec_id, history);
+    run_workflow_with_state(exec_id, history, handler, input, empty_shared_state()).await
+}
+
+/// Run a workflow function through replay and live execution with shared state.
+pub async fn run_workflow_with_state(
+    exec_id: ExecutionId,
+    history: Vec<WorkflowEvent>,
+    handler: WorkflowHandlerFn,
+    input: Value,
+    state: SharedState,
+) -> WorkflowOutcome {
+    let ctx = WorkflowContext::for_replay_with_state(exec_id, history, state);
 
     // Run the handler with a timeout. If it completes, we get the result.
     // If it blocks on a oneshot (suspended), the timeout fires and we drain

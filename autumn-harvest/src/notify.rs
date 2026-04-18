@@ -7,6 +7,7 @@
 
 use std::time::Duration;
 
+use diesel::sql_types::Text;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use uuid::Uuid;
@@ -33,15 +34,31 @@ pub fn queue_channel(queue_name: &str) -> String {
     format!("harvest_queue_{}", queue_name.replace('-', "_"))
 }
 
+#[must_use]
+fn quote_pg_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
 // ---------------------------------------------------------------------------
 // NotifyPayload
 // ---------------------------------------------------------------------------
 
 /// Payload sent via Postgres NOTIFY when a task is enqueued.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NotifyPayload {
     /// The UUID of the newly enqueued task.
     pub task_id: Uuid,
+}
+
+/// Outcome of waiting on a queue listener.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueueWaitOutcome {
+    /// A notification payload arrived before the timeout elapsed.
+    Notification(NotifyPayload),
+    /// No payload arrived before `poll_interval` elapsed.
+    TimedOut,
+    /// The listener channel closed because the underlying connection died.
+    ChannelClosed,
 }
 
 // ---------------------------------------------------------------------------
@@ -65,16 +82,12 @@ pub async fn notify_task_enqueued(
     let payload = serde_json::to_string(&NotifyPayload { task_id })
         .map_err(|e| HarvestError::Database(format!("failed to serialize notify payload: {e}")))?;
 
-    // Postgres NOTIFY requires the channel as an identifier (not a parameter),
-    // so we must format it into the SQL string. The channel name is derived from
-    // our own queue_channel() function which only produces [a-z0-9_] characters,
-    // so this is safe from injection.
-    let sql = format!("NOTIFY {channel}, '{payload}'");
-
-    diesel::sql_query(sql)
+    diesel::sql_query("SELECT pg_notify($1, $2)")
+        .bind::<Text, _>(&channel)
+        .bind::<Text, _>(&payload)
         .execute(conn)
         .await
-        .map_err(|e| HarvestError::Database(e.to_string()))?;
+        .map_err(crate::error::database_error)?;
 
     Ok(())
 }
@@ -90,6 +103,8 @@ pub async fn notify_task_enqueued(
 /// notifications. The connection is driven by a background task that forwards
 /// notifications through an `mpsc` channel.
 pub struct QueueListener {
+    /// Client handle kept alive so the LISTEN connection stays open.
+    _client: tokio_postgres::Client,
     /// Receiver for notifications forwarded by the connection driver task.
     rx: tokio::sync::mpsc::Receiver<tokio_postgres::Notification>,
     /// Background connection driver handle -- kept alive for the connection's lifetime.
@@ -149,13 +164,17 @@ impl QueueListener {
         // Subscribe to all queue channels.
         for queue in queues {
             let channel = queue_channel(queue);
+            let quoted_channel = quote_pg_identifier(&channel);
             client
-                .batch_execute(&format!("LISTEN {channel}"))
+                .batch_execute(&format!("LISTEN {quoted_channel}"))
                 .await
-                .map_err(|e| HarvestError::Database(format!("LISTEN {channel} failed: {e}")))?;
+                .map_err(|e| {
+                    HarvestError::Database(format!("LISTEN {quoted_channel} failed: {e}"))
+                })?;
         }
 
         Ok(Self {
+            _client: client,
             rx,
             _connection_handle: handle,
             queues: queues.to_vec(),
@@ -175,20 +194,29 @@ impl QueueListener {
         &mut self,
         poll_interval: Duration,
     ) -> HarvestResult<Option<NotifyPayload>> {
+        match self.wait_for_notification_outcome(poll_interval).await? {
+            QueueWaitOutcome::Notification(payload) => Ok(Some(payload)),
+            QueueWaitOutcome::TimedOut | QueueWaitOutcome::ChannelClosed => Ok(None),
+        }
+    }
+
+    /// Wait for a notification and distinguish timeout from listener shutdown.
+    ///
+    /// This is useful for callers that need to reconnect after the underlying
+    /// LISTEN connection dies instead of treating every wake miss as a normal
+    /// timeout.
+    pub async fn wait_for_notification_outcome(
+        &mut self,
+        poll_interval: Duration,
+    ) -> HarvestResult<QueueWaitOutcome> {
         match tokio::time::timeout(poll_interval, self.rx.recv()).await {
             Ok(Some(notification)) => {
                 let payload: NotifyPayload = serde_json::from_str(notification.payload())
                     .map_err(|e| HarvestError::Database(format!("bad notify payload: {e}")))?;
-                Ok(Some(payload))
+                Ok(QueueWaitOutcome::Notification(payload))
             }
-            Ok(None) => {
-                // Channel closed -- connection died.
-                Ok(None)
-            }
-            Err(_elapsed) => {
-                // Timeout -- no notification received, fall back to poll.
-                Ok(None)
-            }
+            Ok(None) => Ok(QueueWaitOutcome::ChannelClosed),
+            Err(_elapsed) => Ok(QueueWaitOutcome::TimedOut),
         }
     }
 
@@ -233,6 +261,14 @@ mod tests {
         assert!(
             !channel.contains('-'),
             "channel name must not contain hyphens: {channel}"
+        );
+    }
+
+    #[test]
+    fn quoted_identifier_escapes_embedded_quotes() {
+        assert_eq!(
+            quote_pg_identifier("harvest_queue_priority\"queue"),
+            "\"harvest_queue_priority\"\"queue\""
         );
     }
 }

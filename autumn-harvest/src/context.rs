@@ -16,8 +16,21 @@ use tokio::sync::oneshot;
 
 use crate::error::{HarvestError, HarvestResult};
 use crate::event::WorkflowEvent;
+use crate::query::QueryRegistry;
 use crate::replay::{HistoryMatch, HistoryMatcher};
 use crate::types::{ActivityExecId, ExecutionId, TimerId};
+
+/// Runtime map of typed shared state registered on the harvest builder.
+pub type SharedStateMap = HashMap<TypeId, Box<dyn Any + Send + Sync>>;
+
+/// Shared reference to the registered typed state map.
+pub type SharedState = Arc<SharedStateMap>;
+
+/// Create an empty shared-state map.
+#[must_use]
+pub fn empty_shared_state() -> SharedState {
+    Arc::new(HashMap::new())
+}
 
 // ---------------------------------------------------------------------------
 // WorkflowCommand -- commands emitted during live execution
@@ -44,8 +57,21 @@ pub enum WorkflowCommand {
         /// Fires when the timer completes.
         result_tx: oneshot::Sender<()>,
     },
+    /// Start a child workflow execution.
+    StartChildWorkflow {
+        child_id: ExecutionId,
+        workflow_name: String,
+        input: Value,
+        /// The worker sends the terminal child result back through this channel.
+        result_tx: oneshot::Sender<Result<Value, String>>,
+    },
     /// Record an opaque marker (used by version gates, side-effect-free notes).
     RecordMarker { name: String, details: Value },
+    /// Suspend until a named signal is delivered.
+    WaitForSignal {
+        signal_name: String,
+        result_tx: oneshot::Sender<Value>,
+    },
     /// The workflow function returned `Ok(output)`.
     Complete { output: Value },
     /// The workflow function returned `Err(error)`.
@@ -76,11 +102,24 @@ impl std::fmt::Debug for WorkflowCommand {
                 .field("timer_id", timer_id)
                 .field("duration_secs", duration_secs)
                 .finish_non_exhaustive(),
+            Self::StartChildWorkflow {
+                child_id,
+                workflow_name,
+                ..
+            } => f
+                .debug_struct("StartChildWorkflow")
+                .field("child_id", child_id)
+                .field("workflow_name", workflow_name)
+                .finish_non_exhaustive(),
             Self::RecordMarker { name, details } => f
                 .debug_struct("RecordMarker")
                 .field("name", name)
                 .field("details", details)
                 .finish(),
+            Self::WaitForSignal { signal_name, .. } => f
+                .debug_struct("WaitForSignal")
+                .field("signal_name", signal_name)
+                .finish_non_exhaustive(),
             Self::Complete { output } => {
                 f.debug_struct("Complete").field("output", output).finish()
             }
@@ -116,7 +155,9 @@ pub struct WorkflowContext {
     /// Monotonically increasing counter for generating activity sequence IDs.
     activity_seq: Mutex<u32>,
     /// Shared typed state map (same `AppState` extras as the web server).
-    state: Arc<HashMap<TypeId, Box<dyn Any + Send + Sync>>>,
+    state: SharedState,
+    /// In-memory query handlers (not persisted to history).
+    query_registry: Mutex<QueryRegistry>,
 }
 
 impl WorkflowContext {
@@ -129,7 +170,7 @@ impl WorkflowContext {
     /// with the cursor past the `WorkflowStarted` event.
     #[must_use]
     pub fn for_replay(exec_id: ExecutionId, events: Vec<WorkflowEvent>) -> Self {
-        Self::for_replay_with_state(exec_id, events, Arc::new(HashMap::new()))
+        Self::for_replay_with_state(exec_id, events, empty_shared_state())
     }
 
     /// Create a replay context with shared application state.
@@ -137,7 +178,7 @@ impl WorkflowContext {
     pub fn for_replay_with_state(
         exec_id: ExecutionId,
         events: Vec<WorkflowEvent>,
-        state: Arc<HashMap<TypeId, Box<dyn Any + Send + Sync>>>,
+        state: SharedState,
     ) -> Self {
         // Extract the start_time from WorkflowStarted (first event).
         let start_time = events
@@ -160,6 +201,7 @@ impl WorkflowContext {
             start_time,
             activity_seq: Mutex::new(0),
             state,
+            query_registry: Mutex::new(QueryRegistry::new()),
         }
     }
 
@@ -176,7 +218,8 @@ impl WorkflowContext {
             commands: Mutex::new(Vec::new()),
             start_time,
             activity_seq: Mutex::new(0),
-            state: Arc::new(HashMap::new()),
+            state: empty_shared_state(),
+            query_registry: Mutex::new(QueryRegistry::new()),
         }
     }
 
@@ -289,6 +332,11 @@ impl WorkflowContext {
                 source: error.into(),
             }),
 
+            HistoryMatch::TimedOut { timeout_type } => Err(HarvestError::Timeout {
+                timeout_type,
+                task_name: name.to_string(),
+            }),
+
             HistoryMatch::Diverged { expected, actual } => Err(HarvestError::NonDeterministic(
                 format!("activity mismatch: expected {expected}, got {actual}"),
             )),
@@ -353,7 +401,7 @@ impl WorkflowContext {
                 format!("timer mismatch: expected {expected}, got {actual}"),
             )),
 
-            HistoryMatch::Failed { .. } => {
+            HistoryMatch::Failed { .. } | HistoryMatch::TimedOut { .. } => {
                 // Timers don't fail in the traditional sense, but handle gracefully.
                 Ok(())
             }
@@ -373,6 +421,146 @@ impl WorkflowContext {
                 })
             }
         }
+    }
+
+    /// Spawn a child workflow and await its terminal result.
+    ///
+    /// During replay, returns the recorded child output or failure.
+    /// During live execution, emits a `StartChildWorkflow` command and suspends.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::ActivityFailed`] or [`HarvestError::Timeout`] when
+    /// replay finds a terminal child-workflow event, [`HarvestError::NonDeterministic`]
+    /// if the recorded history does not match the requested child workflow, or
+    /// [`HarvestError::Cancelled`] if the workflow task is dropped before a live
+    /// child result arrives.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal replay matcher mutex is poisoned.
+    pub async fn spawn_child_workflow_raw(
+        &self,
+        workflow_name: &str,
+        input: Value,
+    ) -> HarvestResult<Value> {
+        let history_match = self
+            .matcher
+            .lock()
+            .expect("matcher lock poisoned")
+            .match_child_workflow(workflow_name, &input);
+
+        match history_match {
+            HistoryMatch::Matched { output } => Ok(output),
+            HistoryMatch::Failed { error, attempt } => Err(HarvestError::ActivityFailed {
+                name: format!("child-workflow:{workflow_name}"),
+                attempt,
+                source: error.into(),
+            }),
+            HistoryMatch::TimedOut { timeout_type } => Err(HarvestError::Timeout {
+                timeout_type,
+                task_name: format!("child-workflow:{workflow_name}"),
+            }),
+            HistoryMatch::Diverged { expected, actual } => Err(HarvestError::NonDeterministic(
+                format!("child workflow mismatch: expected {expected}, got {actual}"),
+            )),
+            HistoryMatch::NoMatch => {
+                let (tx, rx) = oneshot::channel();
+                self.push_command(WorkflowCommand::StartChildWorkflow {
+                    child_id: ExecutionId::new(),
+                    workflow_name: workflow_name.to_string(),
+                    input,
+                    result_tx: tx,
+                });
+
+                match rx.await {
+                    Ok(Ok(output)) => Ok(output),
+                    Ok(Err(error)) => Err(HarvestError::ActivityFailed {
+                        name: format!("child-workflow:{workflow_name}"),
+                        attempt: 1,
+                        source: error.into(),
+                    }),
+                    Err(_) => Err(HarvestError::Cancelled(format!(
+                        "child workflow '{workflow_name}' cancelled: result channel dropped"
+                    ))),
+                }
+            }
+        }
+    }
+
+    /// Wait for the next delivered signal with the given name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::NonDeterministic`] if replay history diverges from
+    /// the requested signal wait, or [`HarvestError::Cancelled`] if the workflow
+    /// task is dropped before a live signal arrives.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal replay matcher mutex is poisoned.
+    pub async fn wait_for_signal(&self, signal_name: &str) -> HarvestResult<Value> {
+        let history_match = self
+            .matcher
+            .lock()
+            .expect("matcher lock poisoned")
+            .match_signal(signal_name);
+
+        match history_match {
+            HistoryMatch::Matched { output } => Ok(output),
+            HistoryMatch::Diverged { expected, actual } => Err(HarvestError::NonDeterministic(
+                format!("signal mismatch: expected {expected}, got {actual}"),
+            )),
+            HistoryMatch::Failed { .. } | HistoryMatch::TimedOut { .. } => Err(
+                HarvestError::NonDeterministic("signal history contains unexpected failure".into()),
+            ),
+            HistoryMatch::NoMatch => {
+                let (tx, rx) = oneshot::channel();
+                self.push_command(WorkflowCommand::WaitForSignal {
+                    signal_name: signal_name.to_string(),
+                    result_tx: tx,
+                });
+                rx.await.map_err(|_| {
+                    HarvestError::Cancelled(format!(
+                        "signal '{signal_name}' cancelled: result channel dropped"
+                    ))
+                })
+            }
+        }
+    }
+
+    /// Register a named query handler for this workflow execution.
+    ///
+    /// Query handlers are in-memory only and do not emit workflow commands.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal query registry mutex is poisoned.
+    pub fn register_query<F>(&self, name: &str, handler: F)
+    where
+        F: Fn() -> Value + Send + Sync + 'static,
+    {
+        self.query_registry
+            .lock()
+            .expect("query_registry lock poisoned")
+            .register(name, Arc::new(handler));
+    }
+
+    /// Execute a previously registered query by name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::NotFound`] if no query handler is registered under
+    /// `name`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal query registry mutex is poisoned.
+    pub fn execute_query(&self, name: &str) -> HarvestResult<Value> {
+        self.query_registry
+            .lock()
+            .expect("query_registry lock poisoned")
+            .execute(name)
     }
 
     // ── Command drain ─────────────────────────────────────────────────
@@ -423,7 +611,7 @@ impl WorkflowContext {
 /// detection, and state access for shared resources.
 pub struct ActivityContext {
     /// Shared state map.
-    state: Arc<HashMap<TypeId, Box<dyn Any + Send + Sync>>>,
+    state: SharedState,
     /// Heartbeat channel -- `None` in test contexts.
     heartbeat_tx: Option<tokio::sync::mpsc::Sender<serde_json::Value>>,
     /// Cancellation token -- allows the worker to signal graceful shutdown.
@@ -433,9 +621,9 @@ pub struct ActivityContext {
 impl ActivityContext {
     /// Production constructor -- creates a context with heartbeat channel and
     /// cancellation token.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Used by worker dispatch (not yet wired in Phase 2)
     pub(crate) fn new(
-        state: Arc<HashMap<TypeId, Box<dyn Any + Send + Sync>>>,
+        state: SharedState,
         heartbeat_tx: Option<tokio::sync::mpsc::Sender<serde_json::Value>>,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Self {
@@ -497,7 +685,7 @@ impl ActivityContext {
     #[must_use]
     pub fn new_test() -> Self {
         Self::new(
-            Arc::new(HashMap::new()),
+            empty_shared_state(),
             None,
             tokio_util::sync::CancellationToken::new(),
         )
@@ -511,7 +699,9 @@ impl ActivityContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::TimeoutType;
     use crate::types::ActivityExecId;
+    use chrono::Utc;
 
     #[test]
     fn activity_context_state_returns_none_when_not_registered() {
@@ -598,7 +788,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn context_replays_completed_activity() {
+    async fn context_replays_completed_activity() -> Result<(), crate::error::HarvestError> {
         let activity_id = ActivityExecId::new();
         let output = serde_json::json!({"email_id": "msg-001"});
 
@@ -634,13 +824,14 @@ mod tests {
             .await;
 
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), output);
+        assert_eq!(result?, output);
 
         // After consuming all events, no longer replaying.
         assert!(!ctx.is_replaying());
 
         // No commands emitted during replay.
         assert!(ctx.drain_commands().is_empty());
+        Ok(())
     }
 
     #[tokio::test]
@@ -675,6 +866,42 @@ mod tests {
         let err = result.unwrap_err();
         assert!(matches!(err, HarvestError::ActivityFailed { .. }));
         assert!(err.to_string().contains("send_email"));
+    }
+
+    #[tokio::test]
+    async fn context_replays_timed_out_activity() {
+        let activity_id = ActivityExecId::new();
+
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "send_email".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityTimedOut {
+                activity_id,
+                timeout_type: TimeoutType::StartToClose,
+            },
+        ];
+
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+
+        let result = ctx
+            .execute_activity_raw("send_email", Value::Null, "default")
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(HarvestError::Timeout {
+                timeout_type: TimeoutType::StartToClose,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -742,7 +969,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn context_live_activity_resolves_via_oneshot() {
+    async fn context_live_activity_resolves_via_oneshot() -> Result<(), String> {
         let ctx = Arc::new(WorkflowContext::new_test());
         let ctx2 = Arc::clone(&ctx);
 
@@ -764,7 +991,7 @@ mod tests {
 
         if let WorkflowCommand::ScheduleActivity {
             result_tx, name, ..
-        } = cmds.into_iter().next().unwrap()
+        } = cmds.into_iter().next().ok_or("no command")?
         {
             assert_eq!(name, "send_email");
             result_tx
@@ -777,7 +1004,8 @@ mod tests {
         // The coroutine should now resolve with the output.
         let result = handle.await.expect("task should not panic");
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), expected_output);
+        assert_eq!(result.map_err(|e| e.to_string())?, expected_output);
+        Ok(())
     }
 
     #[tokio::test]
@@ -816,7 +1044,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn context_replays_multiple_activities_in_sequence() {
+    async fn context_replays_multiple_activities_in_sequence()
+    -> Result<(), crate::error::HarvestError> {
         let id1 = ActivityExecId::new();
         let id2 = ActivityExecId::new();
         let output1 = serde_json::json!({"email_id": "msg-001"});
@@ -854,15 +1083,16 @@ mod tests {
         let r1 = ctx
             .execute_activity_raw("send_email", Value::Null, "default")
             .await;
-        assert_eq!(r1.unwrap(), output1);
+        assert_eq!(r1?, output1);
 
         let r2 = ctx
             .execute_activity_raw("charge_payment", Value::Null, "billing")
             .await;
-        assert_eq!(r2.unwrap(), output2);
+        assert_eq!(r2?, output2);
 
         assert!(!ctx.is_replaying());
         assert!(ctx.drain_commands().is_empty());
+        Ok(())
     }
 
     #[tokio::test]
@@ -967,5 +1197,252 @@ mod tests {
             result.unwrap_err(),
             HarvestError::NonDeterministic(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn context_replays_child_workflow_completion() {
+        let child_id = ExecutionId::new();
+        let output = serde_json::json!({"order_id": "A-1001"});
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "process_order".into(),
+                input: serde_json::json!({"sku": "book"}),
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id,
+                output: output.clone(),
+            },
+        ];
+
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let result = ctx
+            .spawn_child_workflow_raw("process_order", serde_json::json!({"sku": "book"}))
+            .await
+            .expect("child should replay from history");
+
+        assert_eq!(result, output);
+        assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[tokio::test]
+    async fn context_live_child_command_round_trip() {
+        let ctx = Arc::new(WorkflowContext::new_test());
+        let ctx_for_task = Arc::clone(&ctx);
+        let workflow_name = "process_order";
+
+        let join = tokio::spawn(async move {
+            ctx_for_task
+                .spawn_child_workflow_raw(workflow_name, serde_json::json!({"sku":"book"}))
+                .await
+        });
+        tokio::task::yield_now().await;
+
+        let mut commands = ctx.drain_commands();
+        assert_eq!(commands.len(), 1);
+        let WorkflowCommand::StartChildWorkflow {
+            workflow_name: emitted_name,
+            result_tx,
+            ..
+        } = commands.remove(0)
+        else {
+            panic!("expected StartChildWorkflow command");
+        };
+        assert_eq!(emitted_name, workflow_name);
+        result_tx
+            .send(Ok(serde_json::json!({"ok": true})))
+            .expect("receiver should exist");
+
+        let result = join.await.expect("join should succeed");
+        assert_eq!(
+            result.expect("child call should succeed"),
+            serde_json::json!({"ok": true})
+        );
+    }
+
+    #[tokio::test]
+    async fn context_child_without_terminal_does_not_emit_live_start() {
+        let child_id = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "process_order".into(),
+                input: serde_json::json!({"sku": "book"}),
+            },
+        ];
+
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let result = ctx
+            .spawn_child_workflow_raw("process_order", serde_json::json!({"sku":"book"}))
+            .await;
+
+        assert!(matches!(result, Err(HarvestError::NonDeterministic(_))));
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "replay must not emit new child start command"
+        );
+    }
+
+    #[tokio::test]
+    async fn context_child_input_mismatch_is_nondeterministic_and_no_live_start() {
+        let child_id = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "process_order".into(),
+                input: serde_json::json!({"sku": "book"}),
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id,
+                output: serde_json::json!({"order_id":"A-1001"}),
+            },
+        ];
+
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let result = ctx
+            .spawn_child_workflow_raw("process_order", serde_json::json!({"sku":"magazine"}))
+            .await;
+
+        assert!(matches!(result, Err(HarvestError::NonDeterministic(_))));
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "replay must not emit new child start command on input mismatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn context_replays_interleaved_child_starts_without_live_commands() {
+        let child_a = ExecutionId::new();
+        let child_b = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id: child_a,
+                workflow_name: "process_order".into(),
+                input: serde_json::json!({"id":"A"}),
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id: child_b,
+                workflow_name: "process_order".into(),
+                input: serde_json::json!({"id":"B"}),
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id: child_a,
+                output: serde_json::json!({"id":"A","ok":true}),
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id: child_b,
+                output: serde_json::json!({"id":"B","ok":true}),
+            },
+        ];
+
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let a = ctx
+            .spawn_child_workflow_raw("process_order", serde_json::json!({"id":"A"}))
+            .await
+            .expect("A should replay");
+        let b = ctx
+            .spawn_child_workflow_raw("process_order", serde_json::json!({"id":"B"}))
+            .await
+            .expect("B should replay");
+
+        assert_eq!(a, serde_json::json!({"id":"A","ok":true}));
+        assert_eq!(b, serde_json::json!({"id":"B","ok":true}));
+        assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[tokio::test]
+    async fn context_replays_child_with_interleaved_activity_without_live_commands() {
+        let child_id = ExecutionId::new();
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "process_order".into(),
+                input: serde_json::json!({"id":"A"}),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "send_email".into(),
+                input: serde_json::json!({"id":"A"}),
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: serde_json::json!({"sent":true}),
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id,
+                output: serde_json::json!({"id":"A","ok":true}),
+            },
+        ];
+
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let child = ctx
+            .spawn_child_workflow_raw("process_order", serde_json::json!({"id":"A"}))
+            .await
+            .expect("child should replay");
+        let activity = ctx
+            .execute_activity_raw("send_email", serde_json::json!({"id":"A"}), "default")
+            .await
+            .expect("activity should replay");
+
+        assert_eq!(child, serde_json::json!({"id":"A","ok":true}));
+        assert_eq!(activity, serde_json::json!({"sent":true}));
+        assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[tokio::test]
+    async fn wait_for_signal_replays_recorded_signal() {
+        let exec_id = ExecutionId::new();
+        let history = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "approved".to_string(),
+                payload: serde_json::json!({"ok": true}),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(exec_id, history);
+
+        let payload = ctx
+            .wait_for_signal("approved")
+            .await
+            .expect("signal should replay");
+        assert_eq!(payload, serde_json::json!({"ok": true}));
+    }
+
+    #[test]
+    fn query_registry_does_not_emit_commands() {
+        let ctx = WorkflowContext::new_test();
+        ctx.register_query("status", || serde_json::json!({"state": "running"}));
+
+        let value = ctx.execute_query("status").expect("query should execute");
+        assert_eq!(value, serde_json::json!({"state": "running"}));
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "queries must not emit events"
+        );
     }
 }

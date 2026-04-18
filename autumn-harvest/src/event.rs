@@ -134,27 +134,29 @@ mod tests {
     use chrono::Utc;
 
     #[test]
-    fn workflow_started_round_trips_serde() {
+    fn workflow_started_round_trips_serde() -> Result<(), serde_json::Error> {
         let event = WorkflowEvent::WorkflowStarted {
             input: serde_json::json!({"user_id": 42}),
             timestamp: Utc::now(),
         };
-        let json = serde_json::to_string(&event).unwrap();
-        let back: WorkflowEvent = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&event)?;
+        let back: WorkflowEvent = serde_json::from_str(&json)?;
         assert!(matches!(back, WorkflowEvent::WorkflowStarted { .. }));
+        Ok(())
     }
 
     #[test]
-    fn activity_scheduled_round_trips() {
+    fn activity_scheduled_round_trips() -> Result<(), serde_json::Error> {
         let event = WorkflowEvent::ActivityScheduled {
             activity_id: ActivityExecId::new(),
             name: "send_email".into(),
             input: serde_json::Value::Null,
             queue: "default".into(),
         };
-        let json = serde_json::to_string(&event).unwrap();
-        let back: WorkflowEvent = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&event)?;
+        let back: WorkflowEvent = serde_json::from_str(&json)?;
         assert!(matches!(back, WorkflowEvent::ActivityScheduled { .. }));
+        Ok(())
     }
 
     #[test]

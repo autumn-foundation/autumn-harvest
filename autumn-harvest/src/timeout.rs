@@ -10,15 +10,21 @@
 //! - **Schedule-to-start timeout**: PENDING tasks whose `scheduled_at` plus
 //!   `schedule_to_start` interval has elapsed.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
-use diesel_async::AsyncPgConnection;
+use chrono::Utc;
+use diesel::{ExpressionMethods, OptionalExtension, QueryDsl, SelectableHelper};
 use diesel_async::RunQueryDsl;
 use diesel_async::pooled_connection::deadpool::Pool;
+use diesel_async::{AsyncConnection, AsyncPgConnection};
+use scoped_futures::ScopedFutureExt;
 use tokio_util::sync::CancellationToken;
 
-use crate::error::{HarvestError, HarvestResult};
-use crate::models::TaskQueueItem;
+use crate::error::{HarvestError, HarvestResult, TimeoutType};
+use crate::event::WorkflowEvent;
+use crate::models::{TaskQueueItem, WorkflowExecution};
+use crate::{queue, store};
 
 /// The reason a task was identified as timed out.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,6 +43,16 @@ impl std::fmt::Display for TimeoutReason {
             Self::Heartbeat => write!(f, "Heartbeat"),
             Self::StartToClose => write!(f, "StartToClose"),
             Self::ScheduleToStart => write!(f, "ScheduleToStart"),
+        }
+    }
+}
+
+impl TimeoutReason {
+    const fn timeout_type(&self) -> TimeoutType {
+        match self {
+            Self::Heartbeat => TimeoutType::Heartbeat,
+            Self::StartToClose => TimeoutType::StartToClose,
+            Self::ScheduleToStart => TimeoutType::ScheduleToStart,
         }
     }
 }
@@ -99,23 +115,28 @@ pub async fn find_timed_out_tasks(
     conn: &mut AsyncPgConnection,
 ) -> HarvestResult<Vec<(TaskQueueItem, TimeoutReason)>> {
     let mut results = Vec::new();
+    let mut seen = HashSet::new();
 
     // Heartbeat timeouts
     let heartbeat_tasks: Vec<TaskQueueItem> = diesel::sql_query(heartbeat_timeout_query())
         .load(conn)
         .await
-        .map_err(|e| HarvestError::Database(e.to_string()))?;
+        .map_err(crate::error::database_error)?;
     for task in heartbeat_tasks {
-        results.push((task, TimeoutReason::Heartbeat));
+        if seen.insert(task.id) {
+            results.push((task, TimeoutReason::Heartbeat));
+        }
     }
 
     // Start-to-close timeouts
     let start_close_tasks: Vec<TaskQueueItem> = diesel::sql_query(start_to_close_timeout_query())
         .load(conn)
         .await
-        .map_err(|e| HarvestError::Database(e.to_string()))?;
+        .map_err(crate::error::database_error)?;
     for task in start_close_tasks {
-        results.push((task, TimeoutReason::StartToClose));
+        if seen.insert(task.id) {
+            results.push((task, TimeoutReason::StartToClose));
+        }
     }
 
     // Schedule-to-start timeouts
@@ -123,19 +144,241 @@ pub async fn find_timed_out_tasks(
         diesel::sql_query(schedule_to_start_timeout_query())
             .load(conn)
             .await
-            .map_err(|e| HarvestError::Database(e.to_string()))?;
+            .map_err(crate::error::database_error)?;
     for task in sched_start_tasks {
-        results.push((task, TimeoutReason::ScheduleToStart));
+        if seen.insert(task.id) {
+            results.push((task, TimeoutReason::ScheduleToStart));
+        }
     }
 
     Ok(results)
 }
 
+fn execution_id_from_uuid(id: uuid::Uuid) -> crate::types::ExecutionId {
+    id.to_string()
+        .parse()
+        .expect("database UUIDs must round-trip into ExecutionId")
+}
+
+fn timeout_error(task_name: &str, reason: &TimeoutReason) -> String {
+    HarvestError::Timeout {
+        timeout_type: reason.timeout_type(),
+        task_name: task_name.to_string(),
+    }
+    .to_string()
+}
+
+fn find_pending_scheduled_activity(
+    history: &[WorkflowEvent],
+    activity_name: &str,
+) -> HarvestResult<crate::types::ActivityExecId> {
+    let terminal_ids = history
+        .iter()
+        .filter_map(|event| match event {
+            WorkflowEvent::ActivityCompleted { activity_id, .. }
+            | WorkflowEvent::ActivityFailed { activity_id, .. }
+            | WorkflowEvent::ActivityTimedOut { activity_id, .. } => Some(*activity_id),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+
+    let pending = history
+        .iter()
+        .filter_map(|event| match event {
+            WorkflowEvent::ActivityScheduled {
+                activity_id, name, ..
+            } if name == activity_name && !terminal_ids.contains(activity_id) => Some(*activity_id),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    match pending.as_slice() {
+        [activity_id] => Ok(*activity_id),
+        [] => Err(HarvestError::NotFound(format!(
+            "no pending scheduled activity '{activity_name}' in workflow history"
+        ))),
+        _ => Err(HarvestError::NonDeterministic(format!(
+            "multiple pending scheduled activities named '{activity_name}' found in history"
+        ))),
+    }
+}
+
+async fn load_workflow_execution(
+    conn: &mut AsyncPgConnection,
+    exec_id: crate::types::ExecutionId,
+) -> HarvestResult<WorkflowExecution> {
+    use crate::schema::harvest_workflow_executions::dsl;
+
+    dsl::harvest_workflow_executions
+        .find(exec_id.as_uuid())
+        .select(WorkflowExecution::as_select())
+        .first(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?
+        .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))
+}
+
+async fn update_workflow_execution_timed_out(
+    conn: &mut AsyncPgConnection,
+    exec_id: crate::types::ExecutionId,
+    error: &str,
+) -> HarvestResult<()> {
+    use crate::schema::harvest_workflow_executions::dsl;
+
+    let updated = diesel::update(dsl::harvest_workflow_executions.find(exec_id.as_uuid()))
+        .set((
+            dsl::state.eq("TIMED_OUT"),
+            dsl::output.eq(None::<serde_json::Value>),
+            dsl::error.eq(Some(error.to_string())),
+            dsl::completed_at.eq(Some(Utc::now())),
+        ))
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    if updated == 0 {
+        return Err(HarvestError::NotFound(format!(
+            "workflow execution {exec_id}"
+        )));
+    }
+
+    Ok(())
+}
+
+async fn wake_parent_for_child_timeout(
+    conn: &mut AsyncPgConnection,
+    parent_exec_id: crate::types::ExecutionId,
+    child_exec_id: crate::types::ExecutionId,
+    error: &str,
+) -> HarvestResult<()> {
+    let parent_history = store::load_history(conn, parent_exec_id).await?;
+    let event = WorkflowEvent::ChildWorkflowFailed {
+        child_id: child_exec_id,
+        error: error.to_string(),
+    };
+    store::append_events(conn, parent_exec_id, &[event], parent_history.next_event_id).await?;
+    queue::wake_workflow_task(conn, parent_exec_id).await
+}
+
+async fn enforce_activity_timeout(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+    exec_id: crate::types::ExecutionId,
+    reason: &TimeoutReason,
+) -> HarvestResult<()> {
+    let Some(activity_name) = task.activity_name.as_deref() else {
+        return queue::fail_task(conn, task.id, &timeout_error("activity", reason)).await;
+    };
+    let error = timeout_error(activity_name, reason);
+    let history = store::load_history(conn, exec_id).await?;
+
+    let activity_id = match find_pending_scheduled_activity(&history.events, activity_name) {
+        Ok(activity_id) => activity_id,
+        Err(missing_error) => {
+            let fallback = missing_error.to_string();
+            queue::fail_task(conn, task.id, &fallback).await?;
+            return Ok(());
+        }
+    };
+
+    let timeout_event = WorkflowEvent::ActivityTimedOut {
+        activity_id,
+        timeout_type: reason.timeout_type(),
+    };
+
+    conn.transaction::<(), HarvestError, _>(|conn| {
+        let error = error.clone();
+        async move {
+            store::append_events(conn, exec_id, &[timeout_event], history.next_event_id).await?;
+            queue::fail_task(conn, task.id, &error).await?;
+            queue::wake_workflow_task(conn, exec_id).await
+        }
+        .scope_boxed()
+    })
+    .await
+}
+
+async fn enforce_workflow_timeout(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+    exec_id: crate::types::ExecutionId,
+    reason: &TimeoutReason,
+) -> HarvestResult<()> {
+    let execution = load_workflow_execution(conn, exec_id).await?;
+    let error = timeout_error(&execution.workflow_name, reason);
+    let history = store::load_history(conn, exec_id).await?;
+    let workflow_event = WorkflowEvent::WorkflowFailed {
+        error: error.clone(),
+    };
+
+    conn.transaction::<(), HarvestError, _>(|conn| {
+        let error = error.clone();
+        async move {
+            store::append_events(conn, exec_id, &[workflow_event], history.next_event_id).await?;
+            update_workflow_execution_timed_out(conn, exec_id, &error).await?;
+            queue::fail_task(conn, task.id, &error).await?;
+            if let Some(parent_uuid) = execution.parent_id {
+                wake_parent_for_child_timeout(
+                    conn,
+                    execution_id_from_uuid(parent_uuid),
+                    exec_id,
+                    &error,
+                )
+                .await?;
+            }
+            Ok(())
+        }
+        .scope_boxed()
+    })
+    .await
+}
+
+/// Enforce all currently expired task timeouts against the database state.
+///
+/// This mutates queue rows and workflow history so timed-out tasks are not
+/// retried indefinitely in the logs while the rest of the runtime remains
+/// oblivious.
+///
+/// # Errors
+///
+/// Returns the first database or persistence error encountered.
+pub async fn enforce_timeouts_once(conn: &mut AsyncPgConnection) -> HarvestResult<usize> {
+    let timed_out = find_timed_out_tasks(conn).await?;
+    let count = timed_out.len();
+
+    for (task, reason) in timed_out {
+        let result = match (task.task_type.as_str(), task.workflow_exec_id) {
+            ("activity", Some(exec_uuid)) => {
+                enforce_activity_timeout(conn, &task, execution_id_from_uuid(exec_uuid), &reason)
+                    .await
+            }
+            ("workflow", Some(exec_uuid)) => {
+                enforce_workflow_timeout(conn, &task, execution_id_from_uuid(exec_uuid), &reason)
+                    .await
+            }
+            _ => queue::fail_task(conn, task.id, &timeout_error(&task.task_type, &reason)).await,
+        };
+
+        if let Err(error) = result {
+            tracing::error!(
+                task_id = %task.id,
+                queue = %task.queue_name,
+                reason = %reason,
+                error = %error,
+                "failed to enforce timed-out task"
+            );
+            return Err(error);
+        }
+    }
+
+    Ok(count)
+}
+
 /// Spawn a background task that periodically checks for timed-out tasks.
 ///
-/// The checker runs every `interval` duration and logs any timed-out tasks
-/// it finds. The caller is responsible for handling the timed-out tasks
-/// (e.g., failing them, requeueing for retry).
+/// The checker runs every `interval` duration and enforces any timed-out tasks
+/// it finds by mutating queue state and workflow history.
 ///
 /// Stops when the cancellation token is triggered.
 #[must_use]
@@ -157,19 +400,13 @@ pub fn spawn_timeout_checker(
             }
 
             match pool.get().await {
-                Ok(mut conn) => match find_timed_out_tasks(&mut conn).await {
-                    Ok(timed_out) => {
-                        for (task, reason) in &timed_out {
-                            tracing::warn!(
-                                task_id = %task.id,
-                                queue = %task.queue_name,
-                                reason = %reason,
-                                "task timed out"
-                            );
-                        }
+                Ok(mut conn) => match enforce_timeouts_once(&mut conn).await {
+                    Ok(enforced_count) if enforced_count > 0 => {
+                        tracing::warn!(enforced_count, "enforced timed-out tasks");
                     }
+                    Ok(_) => {}
                     Err(e) => {
-                        tracing::error!(error = %e, "failed to check for timed-out tasks");
+                        tracing::error!(error = %e, "failed to enforce timed-out tasks");
                     }
                 },
                 Err(e) => {
