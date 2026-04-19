@@ -303,95 +303,92 @@ fn marker_events_from_commands(commands: &[WorkflowCommand]) -> Vec<WorkflowEven
         .collect()
 }
 
+fn extract_single_command<T>(
+    commands: &[WorkflowCommand],
+    extractor: impl Fn(&WorkflowCommand) -> Option<T>,
+) -> Option<T> {
+    let mut result = None;
+
+    for cmd in commands {
+        if matches!(cmd, WorkflowCommand::RecordMarker { .. }) {
+            continue;
+        }
+
+        if let Some(val) = extractor(cmd) {
+            if result.is_some() {
+                return None;
+            }
+            result = Some(val);
+        } else {
+            return None;
+        }
+    }
+
+    result
+}
+
 fn extract_single_schedule_activity(
     commands: &[WorkflowCommand],
 ) -> Option<ScheduledActivityCommand> {
-    let mut scheduled = None;
-
-    for cmd in commands {
-        match cmd {
-            WorkflowCommand::RecordMarker { .. } => {}
-            WorkflowCommand::ScheduleActivity {
-                activity_id,
-                name,
-                input,
-                queue,
-                ..
-            } => {
-                if scheduled.is_some() {
-                    return None;
-                }
-
-                scheduled = Some(ScheduledActivityCommand {
-                    activity_id: *activity_id,
-                    name: name.clone(),
-                    input: input.clone(),
-                    queue: queue.clone(),
-                });
-            }
-            _ => return None,
+    extract_single_command(commands, |cmd| {
+        if let WorkflowCommand::ScheduleActivity {
+            activity_id,
+            name,
+            input,
+            queue,
+            ..
+        } = cmd
+        {
+            Some(ScheduledActivityCommand {
+                activity_id: *activity_id,
+                name: name.clone(),
+                input: input.clone(),
+                queue: queue.clone(),
+            })
+        } else {
+            None
         }
-    }
-
-    scheduled
+    })
 }
 
 fn extract_single_started_timer(commands: &[WorkflowCommand]) -> Option<StartedTimerCommand> {
-    let mut timer = None;
-
-    for cmd in commands {
-        match cmd {
-            WorkflowCommand::RecordMarker { .. } => {}
-            WorkflowCommand::StartTimer {
-                timer_id,
-                duration_secs,
-                ..
-            } => {
-                if timer.is_some() {
-                    return None;
-                }
-
-                timer = Some(StartedTimerCommand {
-                    timer_id: timer_id.clone(),
-                    duration_secs: *duration_secs,
-                });
-            }
-            _ => return None,
+    extract_single_command(commands, |cmd| {
+        if let WorkflowCommand::StartTimer {
+            timer_id,
+            duration_secs,
+            ..
+        } = cmd
+        {
+            Some(StartedTimerCommand {
+                timer_id: timer_id.clone(),
+                duration_secs: *duration_secs,
+            })
+        } else {
+            None
         }
-    }
-
-    timer
+    })
 }
 
 fn extract_single_started_child_workflow(
     commands: &[WorkflowCommand],
 ) -> Option<StartedChildWorkflowCommand> {
-    let mut child = None;
-
-    for cmd in commands {
-        match cmd {
-            WorkflowCommand::RecordMarker { .. } => {}
-            WorkflowCommand::StartChildWorkflow {
-                child_id,
-                workflow_name,
-                input,
-                ..
-            } => {
-                if child.is_some() {
-                    return None;
-                }
-
-                child = Some(StartedChildWorkflowCommand {
-                    child_id: *child_id,
-                    workflow_name: workflow_name.clone(),
-                    input: input.clone(),
-                });
-            }
-            _ => return None,
+    extract_single_command(commands, |cmd| {
+        if let WorkflowCommand::StartChildWorkflow {
+            child_id,
+            workflow_name,
+            input,
+            ..
+        } = cmd
+        {
+            Some(StartedChildWorkflowCommand {
+                child_id: *child_id,
+                workflow_name: workflow_name.clone(),
+                input: input.clone(),
+            })
+        } else {
+            None
         }
-    }
-
-    child
+    })
 }
 
 fn chrono_duration_from_std(
@@ -1105,32 +1102,19 @@ async fn process_activity_task(
         return Err(HarvestError::Config(error));
     };
 
-    let history = match store::load_history(conn, exec_id).await {
-        Ok(history) => history,
-        Err(error) => {
-            fail_task_and_execution(conn, task, worker_id, &error.to_string()).await?;
-            return Err(error);
-        }
-    };
+    let history_result = store::load_history(conn, exec_id).await;
+    let history = fail_execution_on_error(conn, task, worker_id, history_result).await?;
 
-    let activity_id = match find_pending_scheduled_activity(&history.events, activity_name) {
-        Ok(activity_id) => activity_id,
-        Err(error) => {
-            fail_task_and_execution(conn, task, worker_id, &error.to_string()).await?;
-            return Err(error);
-        }
-    };
+    let activity_id_result = find_pending_scheduled_activity(&history.events, activity_name);
+    let activity_id = fail_execution_on_error(conn, task, worker_id, activity_id_result).await?;
 
     let started_event = WorkflowEvent::ActivityStarted {
         activity_id,
         worker_id: WorkerId::new(worker_id),
     };
-    if let Err(error) =
-        store::append_events(conn, exec_id, &[started_event], history.next_event_id).await
-    {
-        fail_task_and_execution(conn, task, worker_id, &error.to_string()).await?;
-        return Err(error);
-    }
+    let append_result =
+        store::append_events(conn, exec_id, &[started_event], history.next_event_id).await;
+    fail_execution_on_error(conn, task, worker_id, append_result).await?;
 
     let cancel = CancellationToken::new();
     let heartbeat_tx =
@@ -1140,13 +1124,8 @@ async fn process_activity_task(
     let activity_result = (activity.handler)(&ctx, task.input.clone()).await;
     cancel.cancel();
 
-    let retry_policy = match configured_retry_policy(task) {
-        Ok(retry_policy) => retry_policy,
-        Err(error) => {
-            fail_task_and_execution(conn, task, worker_id, &error.to_string()).await?;
-            return Err(error);
-        }
-    };
+    let retry_policy_result = configured_retry_policy(task);
+    let retry_policy = fail_execution_on_error(conn, task, worker_id, retry_policy_result).await?;
 
     match activity_result {
         Ok(output) => {
@@ -1161,14 +1140,8 @@ async fn process_activity_task(
             .await
         }
         Err(error) => {
-            let delay = match next_retry_delay(task, &error, retry_policy.as_ref()) {
-                Ok(delay) => delay,
-                Err(delay_error) => {
-                    fail_task_and_execution(conn, task, worker_id, &delay_error.to_string())
-                        .await?;
-                    return Err(delay_error);
-                }
-            };
+            let delay_result = next_retry_delay(task, &error, retry_policy.as_ref());
+            let delay = fail_execution_on_error(conn, task, worker_id, delay_result).await?;
 
             if let Some(delay) = delay {
                 return queue::requeue_for_retry(conn, task.id, delay).await;
@@ -1193,27 +1166,18 @@ async fn handle_suspended_workflow(
     context: SuspendedWorkflowContext<'_>,
     commands: &[WorkflowCommand],
 ) -> HarvestResult<()> {
-    if should_requeue_signal_wait(commands) {
+    let result = if should_requeue_signal_wait(commands) {
         let marker_events = marker_events_from_commands(commands);
-        let result = persist_signal_wait_park(
+        persist_signal_wait_park(
             conn,
             context.persistence.task.id,
             context.persistence.exec_id,
             context.persistence.next_event_id,
             &marker_events,
         )
-        .await;
-        return settle_suspended_result(
-            conn,
-            context.persistence.task,
-            context.persistence.worker_id,
-            result,
-        )
-        .await;
-    }
-
-    if let Some(scheduled) = extract_single_schedule_activity(commands) {
-        let result = persist_scheduled_activity(
+        .await
+    } else if let Some(scheduled) = extract_single_schedule_activity(commands) {
+        persist_scheduled_activity(
             conn,
             registry,
             context.persistence.task.id,
@@ -1222,18 +1186,9 @@ async fn handle_suspended_workflow(
             commands,
             &scheduled,
         )
-        .await;
-        return settle_suspended_result(
-            conn,
-            context.persistence.task,
-            context.persistence.worker_id,
-            result,
-        )
-        .await;
-    }
-
-    if let Some(timer) = extract_single_started_timer(commands) {
-        let result = persist_started_timer(
+        .await
+    } else if let Some(timer) = extract_single_started_timer(commands) {
+        persist_started_timer(
             conn,
             context.persistence.exec_id,
             context.persistence.next_event_id,
@@ -1241,18 +1196,9 @@ async fn handle_suspended_workflow(
             commands,
             &timer,
         )
-        .await;
-        return settle_suspended_result(
-            conn,
-            context.persistence.task,
-            context.persistence.worker_id,
-            result,
-        )
-        .await;
-    }
-
-    if let Some(child) = extract_single_started_child_workflow(commands) {
-        let result = persist_started_child_workflow(
+        .await
+    } else if let Some(child) = extract_single_started_child_workflow(commands) {
+        persist_started_child_workflow(
             conn,
             registry,
             context.persistence.task.id,
@@ -1261,29 +1207,30 @@ async fn handle_suspended_workflow(
             commands,
             &child,
         )
-        .await;
-        return settle_suspended_result(
+        .await
+    } else {
+        let error = suspended_workflow_error(commands);
+        persist_workflow_failure(
             conn,
-            context.persistence.task,
+            context.persistence.task.id,
+            context.persistence.exec_id,
+            context.persistence.next_event_id,
             context.persistence.worker_id,
-            result,
+            &error,
         )
-        .await;
-    }
+        .await
+    };
 
-    let error = suspended_workflow_error(commands);
-    persist_workflow_failure(
+    fail_execution_on_error(
         conn,
-        context.persistence.task.id,
-        context.persistence.exec_id,
-        context.persistence.next_event_id,
+        context.persistence.task,
         context.persistence.worker_id,
-        &error,
+        result,
     )
     .await
 }
 
-async fn settle_suspended_result<T>(
+async fn fail_execution_on_error<T>(
     conn: &mut AsyncPgConnection,
     task: &TaskQueueItem,
     worker_id: &str,
@@ -1318,41 +1265,22 @@ async fn load_workflow_replay_state(
     worker_id: &str,
     exec_id: ExecutionId,
 ) -> HarvestResult<store::EventHistory> {
-    let initial_history = match store::load_history(conn, exec_id).await {
-        Ok(history) => history,
-        Err(error) => {
-            fail_task_and_execution(conn, task, worker_id, &error.to_string()).await?;
-            return Err(error);
-        }
-    };
+    let history_result = store::load_history(conn, exec_id).await;
+    let initial_history = fail_execution_on_error(conn, task, worker_id, history_result).await?;
 
-    if let Err(error) = ingest_fired_timers(conn, exec_id, initial_history.next_event_id).await {
-        fail_task_and_execution(conn, task, worker_id, &error.to_string()).await?;
-        return Err(error);
-    }
+    let timers_result = ingest_fired_timers(conn, exec_id, initial_history.next_event_id).await;
+    fail_execution_on_error(conn, task, worker_id, timers_result).await?;
 
-    let history_after_timers = match store::load_history(conn, exec_id).await {
-        Ok(history) => history,
-        Err(error) => {
-            fail_task_and_execution(conn, task, worker_id, &error.to_string()).await?;
-            return Err(error);
-        }
-    };
+    let history_after_timers_result = store::load_history(conn, exec_id).await;
+    let history_after_timers =
+        fail_execution_on_error(conn, task, worker_id, history_after_timers_result).await?;
 
-    if let Err(error) =
-        ingest_pending_signals(conn, exec_id, history_after_timers.next_event_id).await
-    {
-        fail_task_and_execution(conn, task, worker_id, &error.to_string()).await?;
-        return Err(error);
-    }
+    let signals_result =
+        ingest_pending_signals(conn, exec_id, history_after_timers.next_event_id).await;
+    fail_execution_on_error(conn, task, worker_id, signals_result).await?;
 
-    match store::load_history(conn, exec_id).await {
-        Ok(history) => Ok(history),
-        Err(error) => {
-            fail_task_and_execution(conn, task, worker_id, &error.to_string()).await?;
-            Err(error)
-        }
-    }
+    let final_history_result = store::load_history(conn, exec_id).await;
+    fail_execution_on_error(conn, task, worker_id, final_history_result).await
 }
 
 async fn prepare_workflow_task(
@@ -1384,16 +1312,18 @@ async fn persist_workflow_outcome(
     persistence: WorkflowTaskPersistence<'_>,
     outcome: WorkflowOutcome,
 ) -> HarvestResult<()> {
+    let parent_exec_id = execution.parent_id.map(execution_id_from_uuid);
+
     match outcome {
         WorkflowOutcome::Completed { output } => {
-            if let Some(parent_uuid) = execution.parent_id {
+            if let Some(parent_id) = parent_exec_id {
                 persist_child_workflow_completion(
                     conn,
                     persistence.task.id,
                     persistence.exec_id,
                     persistence.next_event_id,
                     persistence.worker_id,
-                    execution_id_from_uuid(parent_uuid),
+                    parent_id,
                     output,
                 )
                 .await
@@ -1410,14 +1340,14 @@ async fn persist_workflow_outcome(
             }
         }
         WorkflowOutcome::Failed { error } => {
-            if let Some(parent_uuid) = execution.parent_id {
+            if let Some(parent_id) = parent_exec_id {
                 persist_child_workflow_failure(
                     conn,
                     persistence.task.id,
                     persistence.exec_id,
                     persistence.next_event_id,
                     persistence.worker_id,
-                    execution_id_from_uuid(parent_uuid),
+                    parent_id,
                     &error,
                 )
                 .await
