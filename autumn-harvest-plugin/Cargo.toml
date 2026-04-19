@@ -12,7 +12,7 @@ keywords = ["workflow", "durable", "postgres", "orchestration", "autumn"]
 categories = ["asynchronous", "database"]
 
 [dependencies]
-autumn-harvest = { path = "../autumn-harvest" }
+autumn-harvest = { version = "0.1.0", path = "../autumn-harvest" }
 autumn-web = "0.2"
 tokio = { workspace = true }
 tokio-util = { version = "0.7", features = ["rt"] }
