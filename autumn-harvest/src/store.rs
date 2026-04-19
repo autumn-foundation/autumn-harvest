@@ -55,20 +55,20 @@ pub fn events_to_insert_rows_from(
     events: &[WorkflowEvent],
     start_id: i32,
 ) -> Vec<NewHarvestEvent<'_>> {
-    events
-        .iter()
-        .enumerate()
-        .map(|(i, event)| {
-            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-            let event_id = start_id + i as i32;
-            NewHarvestEvent {
-                workflow_exec_id: exec_id.as_uuid(),
-                event_id,
-                event_type: event.type_name(),
-                event_data: serde_json::to_value(event).expect("WorkflowEvent must serialize"),
-            }
-        })
-        .collect()
+    // ⚡ Pre-allocate vector to exactly `events.len()` to prevent repeated
+    // reallocations when saving history records to Postgres.
+    let mut rows = Vec::with_capacity(events.len());
+    for (i, event) in events.iter().enumerate() {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let event_id = start_id + i as i32;
+        rows.push(NewHarvestEvent {
+            workflow_exec_id: exec_id.as_uuid(),
+            event_id,
+            event_type: event.type_name(),
+            event_data: serde_json::to_value(event).expect("WorkflowEvent must serialize"),
+        });
+    }
+    rows
 }
 
 /// Append events to a workflow's history in a single INSERT.
