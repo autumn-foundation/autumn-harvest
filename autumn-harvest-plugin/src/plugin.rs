@@ -22,7 +22,7 @@ use autumn_harvest::builder::{HarvestBuilder, WorkerConfig};
 use autumn_harvest::info::{ActivityInfo, DagInfo, WorkflowInfo};
 use autumn_harvest::worker::DbPool;
 
-const HARVEST_MIGRATIONS: EmbeddedMigrations = embed_migrations!("../autumn-harvest/migrations");
+const HARVEST_MIGRATIONS: EmbeddedMigrations = autumn_harvest::MIGRATIONS;
 const OUTBOX_MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 
 struct OutboxRuntime {
