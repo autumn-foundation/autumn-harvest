@@ -16,7 +16,15 @@ pub fn compute_retry_delay(
 ) -> Duration {
     let exp = i32::try_from(attempt.saturating_sub(1)).unwrap_or(i32::MAX);
     let secs = initial.as_secs_f64() * backoff_coefficient.powi(exp);
-    Duration::from_secs_f64(secs.min(max_interval.as_secs_f64()))
+
+    // Protect against negative floats and NaN, which would cause from_secs_f64 to panic
+    let clamped_secs = if secs.is_nan() || secs < 0.0 {
+        0.0
+    } else {
+        secs
+    };
+
+    Duration::from_secs_f64(clamped_secs.min(max_interval.as_secs_f64()))
 }
 
 /// How an activity failure is retried.

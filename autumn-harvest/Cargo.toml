@@ -47,6 +47,8 @@ tokio-postgres = { version = "0.7", optional = true }
 tokio = { workspace = true, features = ["test-util"] }
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
+proptest = "1.11.0"
+loom = "0.7.2"
 
 [lints]
 workspace = true
