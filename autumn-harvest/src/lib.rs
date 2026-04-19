@@ -134,6 +134,25 @@ mod tests {
     use super::task_duration;
     use std::time::Duration;
 
+    #[cfg(feature = "db")]
+    #[test]
+    fn embedded_migrations_include_one_harvest_initial() {
+        use diesel::migration::MigrationSource;
+        use diesel::pg::Pg;
+
+        let migrations =
+            <diesel_migrations::EmbeddedMigrations as MigrationSource<Pg>>::migrations(
+                &super::MIGRATIONS,
+            )
+            .expect("embedded migrations should load");
+        let harvest_initial_count = migrations
+            .iter()
+            .filter(|migration| migration.name().to_string().ends_with("_harvest_initial"))
+            .count();
+
+        assert_eq!(harvest_initial_count, 1);
+    }
+
     #[test]
     fn task_duration_parses_compound_values() {
         assert_eq!(task_duration("1h 30m"), Some(Duration::from_secs(5_400)));
