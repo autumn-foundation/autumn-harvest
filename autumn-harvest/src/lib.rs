@@ -25,6 +25,7 @@ pub mod event;
 #[doc(hidden)]
 pub mod execution;
 pub mod executor;
+pub mod history_export;
 pub mod info;
 pub mod policy;
 pub mod pool;
@@ -79,6 +80,7 @@ pub use execution::{
     StartWorkflowParams, StartedWorkflowExecution, start_or_load_workflow_execution,
 };
 pub use executor::{WorkflowOutcome, run_workflow};
+pub use history_export::export_mermaid_sequence;
 pub use info::{ActivityHandlerFn, ActivityInfo, DagInfo, WorkflowHandlerFn, WorkflowInfo};
 pub use policy::{RetryPolicy, Schedule, TaskStatus, TriggerRule};
 pub use pool::{HarvestPoolConfig, compute_pool_sizes};
