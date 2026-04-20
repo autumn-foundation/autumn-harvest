@@ -4,13 +4,19 @@
 //! table for post-mortem inspection and potential manual reprocessing. This is
 //! the final resting place for permanently failed tasks.
 
+use diesel::ExpressionMethods;
+use diesel::OptionalExtension;
 use diesel::QueryDsl;
+use diesel::SelectableHelper;
+use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
+use scoped_futures::ScopedFutureExt;
 use uuid::Uuid;
 
 use crate::error::{HarvestError, HarvestResult};
-use crate::models::NewDeadLetter;
+use crate::models::{DeadLetter, NewDeadLetter};
+use crate::queue::{EnqueueParams, TaskType};
 
 /// Convenience struct for building a new dead-letter entry.
 ///
@@ -78,6 +84,89 @@ pub async fn dead_letter_count(conn: &mut AsyncPgConnection) -> HarvestResult<i6
         .map_err(crate::error::database_error)?;
 
     Ok(count)
+}
+
+/// List dead-letter entries, newest first.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] on query failure.
+pub async fn list_dead_letters(
+    conn: &mut AsyncPgConnection,
+    limit: i64,
+) -> HarvestResult<Vec<DeadLetter>> {
+    use crate::schema::harvest_dead_letters::dsl;
+
+    dsl::harvest_dead_letters
+        .order(dsl::failed_at.desc())
+        .limit(limit)
+        .select(DeadLetter::as_select())
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)
+}
+
+/// Requeue a dead-letter entry and remove it from the DLQ.
+///
+/// The replayed task starts fresh in `PENDING` state with the same queue, task
+/// type, activity name, workflow execution ID, and input as the dead-letter row.
+/// Its `max_attempts` is set to the number of attempts recorded on the original
+/// dead-letter entry, with a floor of one.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::NotFound`] if the DLQ entry does not exist, or
+/// [`HarvestError::Database`] if requeue/delete work fails.
+pub async fn replay_dead_letter(
+    conn: &mut AsyncPgConnection,
+    dead_letter_id: Uuid,
+) -> HarvestResult<Uuid> {
+    use crate::schema::harvest_dead_letters::dsl;
+
+    conn.transaction::<Uuid, HarvestError, _>(|conn| {
+        async move {
+            let entry = dsl::harvest_dead_letters
+                .find(dead_letter_id)
+                .select(DeadLetter::as_select())
+                .for_update()
+                .first(conn)
+                .await
+                .optional()
+                .map_err(crate::error::database_error)?
+                .ok_or_else(|| HarvestError::NotFound(format!("dead-letter {dead_letter_id}")))?;
+
+            let task_type = if entry.task_type.eq_ignore_ascii_case("workflow") {
+                TaskType::Workflow
+            } else if entry.task_type.eq_ignore_ascii_case("activity") {
+                TaskType::Activity
+            } else {
+                return Err(HarvestError::Database(format!(
+                    "dead-letter {dead_letter_id} has invalid task_type '{}'",
+                    entry.task_type
+                )));
+            };
+
+            let mut params = EnqueueParams::new(entry.queue_name, task_type, entry.input);
+            params.workflow_exec_id = entry.workflow_exec_id;
+            params.activity_name = entry.activity_name;
+            params.max_attempts = entry.attempts.max(1);
+
+            let task_id = crate::queue::enqueue(conn, &params).await?;
+            let deleted = diesel::delete(dsl::harvest_dead_letters.find(dead_letter_id))
+                .execute(conn)
+                .await
+                .map_err(crate::error::database_error)?;
+            if deleted == 0 {
+                return Err(HarvestError::NotFound(format!(
+                    "dead-letter {dead_letter_id}"
+                )));
+            }
+
+            Ok(task_id)
+        }
+        .scope_boxed()
+    })
+    .await
 }
 
 // ---------------------------------------------------------------------------

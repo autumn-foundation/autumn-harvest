@@ -259,3 +259,45 @@ async fn eris_require_auth_blocks_patch_dag() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 }
+
+#[tokio::test]
+async fn eris_unauthenticated_list_dead_letters_is_accessible() {
+    let app = unauthenticated_app();
+    let res = app.oneshot(get("/dead-letters")).await.unwrap();
+    assert_ne!(res.status(), StatusCode::UNAUTHORIZED);
+    assert_ne!(res.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn eris_unauthenticated_replay_dead_letter_is_accessible() {
+    let app = unauthenticated_app();
+    let res = app
+        .oneshot(post_json(
+            "/dead-letters/00000000-0000-0000-0000-000000000001/replay",
+            "{}",
+        ))
+        .await
+        .unwrap();
+    assert_ne!(res.status(), StatusCode::UNAUTHORIZED);
+    assert_ne!(res.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn eris_require_auth_blocks_list_dead_letters() {
+    let app = authenticated_app();
+    let res = app.oneshot(get("/dead-letters")).await.unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn eris_require_auth_blocks_replay_dead_letter() {
+    let app = authenticated_app();
+    let res = app
+        .oneshot(post_json(
+            "/dead-letters/00000000-0000-0000-0000-000000000001/replay",
+            "{}",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}

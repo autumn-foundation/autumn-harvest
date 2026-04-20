@@ -14,9 +14,9 @@ single-Postgres operational footprint.
 
 Most Rust async work is fire-and-forget. autumn-harvest is for the work that
 *can't* be: long-running orchestrations that survive process restarts, retries
-with exactly-once semantics, multi-step business processes with rollback, and
-scheduled DAGs. If you've reached for Temporal, Cadence, or Inngest from a Rust
-service, this is the same shape with one fewer service to operate.
+with durable history, signal-driven waits, queryable state, and scheduled DAGs.
+If you've reached for Temporal, Cadence, or Inngest from a Rust service, this is
+the same shape with one fewer service to operate.
 
 ## Quick example
 
@@ -72,15 +72,16 @@ async fn main() {
   with configurable `start_to_close`, `heartbeat_timeout`, and `retry` policies.
 - **Signals & queries.** Send a signal into a running workflow, query its
   state, or block on a timer.
-- **Child workflows.** Compose orchestrations from smaller workflows; parent
-  failures cascade or compensate per your design.
+- **Child workflows.** Compose orchestrations from smaller workflows and model
+  recovery paths in normal workflow code.
 - **DAG scheduling.** Declare DAGs of activities with trigger rules and
   cron/interval schedules; built-in scheduler dispatches them.
 - **Management API.** Optional HTTP surface for inspecting executions, sending
-  signals, querying state, and triggering DAG runs.
+  signals, querying state, triggering DAG runs, and managing dead letters.
 - **SKIP LOCKED task queue + LISTEN/NOTIFY** for low-latency dispatch without
   polling backoff.
-- **Dead letter queue** for tasks that exhaust their retry policy.
+- **Dead letter queue** for tasks that exhaust their retry policy, with
+  management endpoints to inspect and replay entries.
 - **Separate worker/web connection pools** with a shared ceiling so worker
   bursts can't starve HTTP request handling.
 
@@ -106,9 +107,11 @@ a non-web context.
 
 ## Status
 
-Phase 3 (DAG scheduling, signals, queries, management API) is implemented and
-exercised by integration tests. Phase 4 (cancellation/saga semantics, sticky
-cross-worker routing, richer observability, dashboard UI) is the next focus.
+Version 0.2.0 wraps the Phase 3 surface: DAG scheduling, `#[dag]`, trigger
+rules, signal delivery, `ctx.wait_for_signal`, query registration/dispatch, the
+management API, and dead-letter list/replay endpoints are implemented and
+covered by integration tests. Workflow cancellation and first-class Saga
+compensation are the remaining 0.2.0 work.
 
 API stability: pre-1.0. Breaking changes happen in minor versions per Cargo's
 0.x semver convention. Each release notes the migration where applicable.
