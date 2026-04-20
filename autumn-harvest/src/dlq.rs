@@ -18,6 +18,18 @@ use crate::error::{HarvestError, HarvestResult};
 use crate::models::{DeadLetter, NewDeadLetter};
 use crate::queue::{EnqueueParams, TaskType};
 
+fn dead_letter_task_type(dead_letter_id: Uuid, task_type: &str) -> HarvestResult<TaskType> {
+    if task_type.eq_ignore_ascii_case("workflow") {
+        Ok(TaskType::Workflow)
+    } else if task_type.eq_ignore_ascii_case("activity") {
+        Ok(TaskType::Activity)
+    } else {
+        Err(HarvestError::Config(format!(
+            "dead-letter {dead_letter_id} has invalid task_type '{task_type}'"
+        )))
+    }
+}
+
 /// Convenience struct for building a new dead-letter entry.
 ///
 /// Mirrors [`NewDeadLetter`] but owns its strings, making it easier to
@@ -115,7 +127,8 @@ pub async fn list_dead_letters(
 ///
 /// # Errors
 ///
-/// Returns [`HarvestError::NotFound`] if the DLQ entry does not exist, or
+/// Returns [`HarvestError::NotFound`] if the DLQ entry does not exist,
+/// [`HarvestError::Config`] if the stored task type is invalid, or
 /// [`HarvestError::Database`] if requeue/delete work fails.
 pub async fn replay_dead_letter(
     conn: &mut AsyncPgConnection,
@@ -135,16 +148,7 @@ pub async fn replay_dead_letter(
                 .map_err(crate::error::database_error)?
                 .ok_or_else(|| HarvestError::NotFound(format!("dead-letter {dead_letter_id}")))?;
 
-            let task_type = if entry.task_type.eq_ignore_ascii_case("workflow") {
-                TaskType::Workflow
-            } else if entry.task_type.eq_ignore_ascii_case("activity") {
-                TaskType::Activity
-            } else {
-                return Err(HarvestError::Database(format!(
-                    "dead-letter {dead_letter_id} has invalid task_type '{}'",
-                    entry.task_type
-                )));
-            };
+            let task_type = dead_letter_task_type(dead_letter_id, &entry.task_type)?;
 
             let mut params = EnqueueParams::new(entry.queue_name, task_type, entry.input);
             params.workflow_exec_id = entry.workflow_exec_id;
@@ -214,6 +218,16 @@ mod tests {
         assert!(entry.workflow_exec_id.is_none());
         assert!(entry.activity_name.is_none());
         assert_eq!(entry.attempts, 1);
+    }
+
+    #[test]
+    fn invalid_dead_letter_task_type_is_config_error() {
+        let dead_letter_id = Uuid::new_v4();
+        let error = dead_letter_task_type(dead_letter_id, "timer").unwrap_err();
+
+        assert!(
+            matches!(error, HarvestError::Config(message) if message.contains("invalid task_type"))
+        );
     }
 
     #[test]

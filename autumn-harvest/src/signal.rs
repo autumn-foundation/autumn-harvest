@@ -1,7 +1,9 @@
 #[cfg(feature = "db")]
 use diesel::{ExpressionMethods, OptionalExtension, QueryDsl, SelectableHelper};
 #[cfg(feature = "db")]
-use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+#[cfg(feature = "db")]
+use scoped_futures::ScopedFutureExt;
 
 use crate::error::{HarvestError, HarvestResult};
 #[cfg(feature = "db")]
@@ -12,8 +14,13 @@ use crate::types::ExecutionId;
 ///
 /// # Errors
 ///
-/// Returns [`HarvestError::Database`](crate::error::HarvestError::Database) if
-/// the insert or wake fails.
+/// Returns [`HarvestError::NotFound`](crate::error::HarvestError::NotFound) if
+/// the workflow execution does not exist,
+/// [`HarvestError::Cancelled`](crate::error::HarvestError::Cancelled) or
+/// [`HarvestError::Config`](crate::error::HarvestError::Config) if the
+/// execution is already terminal, and
+/// [`HarvestError::Database`](crate::error::HarvestError::Database) if the
+/// insert or wake fails.
 #[cfg(feature = "db")]
 pub async fn send_signal(
     conn: &mut AsyncPgConnection,
@@ -24,42 +31,49 @@ pub async fn send_signal(
     use crate::schema::harvest_signals;
     use crate::schema::harvest_workflow_executions;
 
-    let execution = harvest_workflow_executions::table
-        .find(exec_id.as_uuid())
-        .select(crate::models::WorkflowExecution::as_select())
-        .first(conn)
-        .await
-        .optional()
-        .map_err(crate::error::database_error)?
-        .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))?;
+    conn.transaction::<(), HarvestError, _>(|conn| {
+        async move {
+            let execution = harvest_workflow_executions::table
+                .find(exec_id.as_uuid())
+                .for_update()
+                .select(crate::models::WorkflowExecution::as_select())
+                .first(conn)
+                .await
+                .optional()
+                .map_err(crate::error::database_error)?
+                .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))?;
 
-    match execution.state.as_str() {
-        "RUNNING" => {}
-        "CANCELLED" => {
-            return Err(HarvestError::Cancelled(execution.error.unwrap_or_else(
-                || format!("workflow execution {exec_id} is cancelled"),
-            )));
+            match execution.state.as_str() {
+                "RUNNING" => {}
+                "CANCELLED" => {
+                    return Err(HarvestError::Cancelled(execution.error.unwrap_or_else(
+                        || format!("workflow execution {exec_id} is cancelled"),
+                    )));
+                }
+                state => {
+                    return Err(HarvestError::Config(format!(
+                        "workflow execution {exec_id} is terminal ({state})"
+                    )));
+                }
+            }
+
+            let row = NewHarvestSignal {
+                workflow_exec_id: exec_id.as_uuid(),
+                signal_name,
+                payload,
+            };
+
+            diesel::insert_into(harvest_signals::table)
+                .values(&row)
+                .execute(conn)
+                .await
+                .map_err(crate::error::database_error)?;
+
+            crate::queue::wake_workflow_task(conn, exec_id).await
         }
-        state => {
-            return Err(HarvestError::Config(format!(
-                "workflow execution {exec_id} is terminal ({state})"
-            )));
-        }
-    }
-
-    let row = NewHarvestSignal {
-        workflow_exec_id: exec_id.as_uuid(),
-        signal_name,
-        payload,
-    };
-
-    diesel::insert_into(harvest_signals::table)
-        .values(&row)
-        .execute(conn)
-        .await
-        .map_err(crate::error::database_error)?;
-
-    crate::queue::wake_workflow_task(conn, exec_id).await
+        .scope_boxed()
+    })
+    .await
 }
 
 /// Load all unconsumed queued signals for an execution, ordered by receive time.

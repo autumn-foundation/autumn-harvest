@@ -497,6 +497,54 @@ async fn load_workflow_execution(
         .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))
 }
 
+fn terminal_execution_transition_error(
+    exec_id: ExecutionId,
+    state: &str,
+    error: Option<&str>,
+) -> HarvestError {
+    match state {
+        "CANCELLED" => HarvestError::Cancelled(error.map_or_else(
+            || format!("workflow execution {exec_id} is cancelled"),
+            ToOwned::to_owned,
+        )),
+        "RUNNING" => HarvestError::Config(format!(
+            "workflow execution {exec_id} did not transition from RUNNING"
+        )),
+        state => HarvestError::Config(format!(
+            "workflow execution {exec_id} is already terminal ({state})"
+        )),
+    }
+}
+
+async fn workflow_execution_transition_error(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> HarvestResult<HarvestError> {
+    use crate::schema::harvest_workflow_executions::dsl;
+
+    dsl::harvest_workflow_executions
+        .find(exec_id.as_uuid())
+        .select((dsl::state, dsl::error))
+        .first::<(String, Option<String>)>(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?
+        .map_or_else(
+            || {
+                Ok(HarvestError::NotFound(format!(
+                    "workflow execution {exec_id}"
+                )))
+            },
+            |(state, error)| {
+                Ok(terminal_execution_transition_error(
+                    exec_id,
+                    &state,
+                    error.as_deref(),
+                ))
+            },
+        )
+}
+
 async fn update_workflow_execution_completed(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
@@ -522,9 +570,7 @@ async fn update_workflow_execution_completed(
     .map_err(crate::error::database_error)?;
 
     if updated == 0 {
-        return Err(HarvestError::NotFound(format!(
-            "workflow execution {exec_id} is not running"
-        )));
+        return Err(workflow_execution_transition_error(conn, exec_id).await?);
     }
 
     Ok(())
@@ -555,9 +601,7 @@ async fn update_workflow_execution_failed(
     .map_err(crate::error::database_error)?;
 
     if updated == 0 {
-        return Err(HarvestError::NotFound(format!(
-            "workflow execution {exec_id} is not running"
-        )));
+        return Err(workflow_execution_transition_error(conn, exec_id).await?);
     }
 
     Ok(())
@@ -1748,6 +1792,27 @@ mod tests {
         };
         let err = cfg.validate().unwrap_err();
         assert!(err.to_string().contains("queue"));
+    }
+
+    #[test]
+    fn terminal_execution_transition_error_reports_cancelled_state() {
+        let exec_id = ExecutionId::new();
+        let error =
+            terminal_execution_transition_error(exec_id, "CANCELLED", Some("operator stop"));
+
+        assert!(
+            matches!(error, HarvestError::Cancelled(message) if message.contains("operator stop"))
+        );
+    }
+
+    #[test]
+    fn terminal_execution_transition_error_reports_conflicting_terminal_state() {
+        let exec_id = ExecutionId::new();
+        let error = terminal_execution_transition_error(exec_id, "COMPLETED", None);
+
+        assert!(
+            matches!(error, HarvestError::Config(message) if message.contains("already terminal"))
+        );
     }
 
     #[test]

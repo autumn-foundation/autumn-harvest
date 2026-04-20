@@ -14,6 +14,7 @@ use autumn_harvest::{
 use diesel::ExpressionMethods;
 use diesel::QueryDsl;
 use diesel::SelectableHelper;
+use diesel::sql_query;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
@@ -298,6 +299,74 @@ async fn signals_to_cancelled_workflows_are_rejected() {
 
     assert!(
         matches!(error, HarvestError::Cancelled(message) if message.contains("no more signals"))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn signal_insert_waits_for_concurrent_cancellation_lock() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut locker = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect locker to Postgres container");
+    let mut sender = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect sender to Postgres container");
+    let exec_id = start_test_workflow(&mut locker).await;
+
+    sql_query("BEGIN")
+        .execute(&mut locker)
+        .await
+        .expect("begin cancellation simulation");
+    harvest_workflow_executions::table
+        .find(exec_id.as_uuid())
+        .for_update()
+        .select(WorkflowExecution::as_select())
+        .first::<WorkflowExecution>(&mut locker)
+        .await
+        .expect("lock workflow execution row");
+    diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
+        .set((
+            harvest_workflow_executions::state.eq("CANCELLED"),
+            harvest_workflow_executions::error.eq(Some("racing cancel")),
+            harvest_workflow_executions::completed_at.eq(Some(chrono::Utc::now())),
+        ))
+        .execute(&mut locker)
+        .await
+        .expect("stage cancellation update");
+
+    let send_task = tokio::spawn(async move {
+        signal::send_signal(
+            &mut sender,
+            exec_id,
+            "approved",
+            serde_json::json!({ "approved": true }),
+        )
+        .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        !send_task.is_finished(),
+        "signal delivery should wait on the execution row lock before deciding terminal state"
+    );
+
+    sql_query("COMMIT")
+        .execute(&mut locker)
+        .await
+        .expect("commit cancellation simulation");
+
+    let error = send_task
+        .await
+        .expect("signal task should not panic")
+        .expect_err("signal should be rejected after cancellation commits");
+    assert!(matches!(error, HarvestError::Cancelled(message) if message.contains("racing cancel")));
+
+    let pending = signal::load_pending_signals(&mut locker, exec_id)
+        .await
+        .expect("pending signal query should succeed");
+    assert!(
+        pending.is_empty(),
+        "cancelled workflow must not receive a signal from the race window"
     );
 }
 
