@@ -220,7 +220,7 @@ impl DagBuilder {
             .enumerate()
             .filter_map(|(index, degree)| (*degree == 0).then_some(index))
             .collect();
-        let mut execution_levels = Vec::new();
+        let mut execution_levels = Vec::with_capacity(tasks.len());
         let mut visited = 0_usize;
 
         while !ready.is_empty() {

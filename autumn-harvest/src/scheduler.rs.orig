@@ -442,7 +442,7 @@ async fn activate_queued_runs(
         .load(conn)
         .await
         .map_err(crate::error::database_error)?;
-    let mut runnable = Vec::with_capacity(schedules.len());
+    let mut runnable = Vec::new();
 
     for schedule in schedules {
         let Some(dag) = dags.get(&schedule.dag_name) else {
@@ -509,8 +509,7 @@ async fn execute_dag_run(
 
     for level in dag.definition.execution_levels() {
         let tasks = level.iter().map(|task_index| {
-            // Avoid an unnecessary heap allocation of `DagTask` per task when `&DagTask` works.
-            let task = &dag.definition.tasks()[*task_index];
+            let task = dag.definition.tasks()[*task_index].clone();
             let upstream_statuses = task
                 .upstreams
                 .iter()
@@ -518,7 +517,7 @@ async fn execute_dag_run(
                 .collect::<Vec<_>>();
             let registry = Arc::clone(&registry);
             let task_input = run_input.clone();
-            async move { execute_dag_task(&registry, task, &upstream_statuses, &task_input).await }
+            async move { execute_dag_task(&registry, &task, &upstream_statuses, &task_input).await }
         });
         let results = futures::future::join_all(tasks).await;
         for (task_index, result) in level.iter().zip(results) {
@@ -704,7 +703,7 @@ fn due_run_plan(
         return (vec![first_due], next_run_after(schedule, now));
     }
 
-    let mut created = Vec::with_capacity(1);
+    let mut created = Vec::new();
     let mut cursor = first_due;
 
     loop {
