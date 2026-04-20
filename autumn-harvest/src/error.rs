@@ -52,6 +52,14 @@ pub enum HarvestError {
     #[error("workflow cancelled: {0}")]
     Cancelled(String),
 
+    #[error(
+        "saga compensation failed after original error: {original}; compensation errors: {compensation_errors:?}"
+    )]
+    SagaCompensationFailed {
+        original: String,
+        compensation_errors: Vec<String>,
+    },
+
     #[error("timeout: {timeout_type} for {task_name}")]
     Timeout {
         timeout_type: TimeoutType,

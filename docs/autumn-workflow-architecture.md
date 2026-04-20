@@ -9,8 +9,8 @@
 management API, dead-letter list/replay endpoints, and durable workflow
 cancellation are implemented. Cancellation is currently a terminal workflow
 transition with activity heartbeat checks; workflow-level `ctx.cancelled()`
-cleanup remains an architecture target. First-class Saga compensation is the
-remaining 0.2.0 work.
+cleanup remains an architecture target. First-class Saga compensation is
+implemented through the `Saga` builder.
 
 ---
 
@@ -1068,7 +1068,7 @@ Harvest provides first-class support for the saga pattern through the `Saga` bui
 ```rust
 #[workflow]
 async fn book_trip(ctx: &WorkflowContext, trip: TripRequest) -> AutumnResult<TripConfirmation> {
-    let saga = Saga::new(ctx);
+    let mut saga = Saga::new(ctx);
 
     // Each step has a forward action and a compensating action
     let flight = saga.step(
@@ -1087,13 +1087,13 @@ async fn book_trip(ctx: &WorkflowContext, trip: TripRequest) -> AutumnResult<Tri
     ).await?;
 
     // If any step fails, all previous steps are compensated in reverse order.
-    // saga.step() returns Err if the forward action fails AND compensation completes.
+    // saga.step() returns Err after prior successful steps are compensated.
 
     Ok(TripConfirmation { flight, hotel, car })
 }
 ```
 
-If `book_hotel` fails, the saga automatically calls `cancel_flight` (the compensation for the first step) before propagating the error. Compensation actions run with their own retry policies and are recorded in the event history for durability.
+If `book_hotel` fails, the saga automatically calls `cancel_flight` (the compensation for the first step) before propagating the error. Compensation actions run with their own retry policies and are recorded in the event history for durability when they execute workflow commands such as `ctx.execute_activity(...)`. If a compensation fails, Harvest keeps unwinding remaining compensations and returns `HarvestError::SagaCompensationFailed` with the original failure plus the compensation failures.
 
 ### 10.4 Dead Letter Queue
 
@@ -1224,6 +1224,9 @@ pub enum HarvestError {
 
     #[error("workflow cancelled: {0}")]
     Cancelled(String),
+
+    #[error("saga compensation failed after original error: {original}; compensation errors: {compensation_errors:?}")]
+    SagaCompensationFailed { original: String, compensation_errors: Vec<String> },
 
     #[error("timeout: {timeout_type} for {task_name}")]
     Timeout { timeout_type: TimeoutType, task_name: String },

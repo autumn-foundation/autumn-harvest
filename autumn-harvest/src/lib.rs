@@ -30,6 +30,7 @@ pub mod pool;
 pub mod prelude;
 pub mod query;
 pub mod replay;
+pub mod saga;
 pub mod types;
 
 #[cfg(feature = "db")]
@@ -83,6 +84,7 @@ pub use policy::{RetryPolicy, Schedule, TaskStatus, TriggerRule};
 pub use pool::{HarvestPoolConfig, compute_pool_sizes};
 pub use query::QueryRegistry;
 pub use replay::{HistoryMatch, HistoryMatcher};
+pub use saga::Saga;
 #[cfg(feature = "db")]
 pub use scheduler::{
     DagCatalog, RegisteredDag, SchedulerMonitor, SchedulerRuntime, compile_dag_catalog,
