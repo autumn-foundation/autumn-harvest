@@ -1,0 +1,23 @@
+--- autumn-harvest/src/worker.rs
++++ autumn-harvest/src/worker.rs
+@@ -314,14 +314,13 @@
+             continue;
+         }
+
+-        if let Some(val) = extractor(cmd) {
+-            if result.is_some() {
+-                return None;
+-            }
+-            result = Some(val);
+-        } else {
++        let Some(val) = extractor(cmd) else {
+             return None;
+-        }
++        };
++        if result.is_some() {
++            return None;
++        }
++        result = Some(val);
+     }
+
+     result
