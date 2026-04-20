@@ -110,8 +110,9 @@ a non-web context.
 Version 0.2.0 wraps the Phase 3 surface: DAG scheduling, `#[dag]`, trigger
 rules, signal delivery, `ctx.wait_for_signal`, query registration/dispatch, the
 management API, and dead-letter list/replay endpoints are implemented and
-covered by integration tests. Workflow cancellation and first-class Saga
-compensation are the remaining 0.2.0 work.
+covered by integration tests. Durable workflow cancellation is implemented with
+management API support and activity heartbeat cancellation checks. First-class
+Saga compensation is the remaining 0.2.0 work.
 
 API stability: pre-1.0. Breaking changes happen in minor versions per Cargo's
 0.x semver convention. Each release notes the migration where applicable.

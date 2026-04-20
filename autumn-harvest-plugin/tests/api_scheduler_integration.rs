@@ -610,6 +610,92 @@ async fn harvest_api_duplicate_start_reuses_existing_execution() {
 }
 
 #[tokio::test]
+async fn harvest_api_cancels_workflows_and_rejects_late_signals() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let registry = approval_registry();
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
+    api_state.install(HarvestApiRuntime::new(
+        Arc::clone(&registry),
+        Arc::new(HashMap::new()),
+        Some("test-worker".to_string()),
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+    ));
+    let app = harvest_api_router(api_state).with_state(test_app_state(pool));
+
+    let (start_status, start_json) = post_json(
+        &app,
+        "/workflows/approval_workflow/start",
+        json!({
+            "workflow_id": "approval-cancelled",
+            "input": { "request_id": "cancelled" },
+        }),
+    )
+    .await;
+    assert_eq!(start_status, StatusCode::CREATED);
+    let exec_id = start_json["execution_id"]
+        .as_str()
+        .expect("start response should include execution_id")
+        .to_string();
+
+    let cancel_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/workflows/{exec_id}/cancel"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "reason": "operator changed their mind" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .expect("cancel request failed");
+    let cancel_status = cancel_response.status();
+    assert_eq!(cancel_status, StatusCode::ACCEPTED);
+    let cancel_json = read_json_response(cancel_response).await;
+    assert_eq!(cancel_json["ok"], true);
+    assert_eq!(cancel_json["execution_id"], exec_id);
+    assert_eq!(cancel_json["state"], "CANCELLED");
+    assert_eq!(cancel_json["reason"], "operator changed their mind");
+    assert_eq!(cancel_json["newly_cancelled"], true);
+    assert_eq!(cancel_json["failed_task_count"], 1);
+
+    let (details_status, details_json) = get_json(&app, format!("/workflows/{exec_id}")).await;
+    assert_eq!(details_status, StatusCode::OK);
+    assert_eq!(details_json["execution"]["state"], "CANCELLED");
+    assert_eq!(
+        details_json["execution"]["error"],
+        "operator changed their mind"
+    );
+    let history = details_json["history"]
+        .as_array()
+        .expect("workflow history must be an array");
+    assert!(
+        history.iter().any(|event| {
+            event["type"] == "WorkflowCancelled"
+                && event["data"]["reason"] == "operator changed their mind"
+        }),
+        "history should include the cancellation event"
+    );
+
+    let (signal_status, _signal_json) = post_json(
+        &app,
+        format!("/workflows/{exec_id}/signal/approved"),
+        json!({ "approved": true }),
+    )
+    .await;
+    assert_eq!(
+        signal_status,
+        StatusCode::BAD_REQUEST,
+        "late signals to cancelled workflows should be rejected"
+    );
+}
+
+#[tokio::test]
 async fn external_runner_processes_workflows_started_via_management_api() {
     let (database_url, _container) = setup_test_database_url().await;
     let pool = build_test_pool(&database_url);

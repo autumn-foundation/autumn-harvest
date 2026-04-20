@@ -1,9 +1,9 @@
 #[cfg(feature = "db")]
-use diesel::{ExpressionMethods, QueryDsl, SelectableHelper};
+use diesel::{ExpressionMethods, OptionalExtension, QueryDsl, SelectableHelper};
 #[cfg(feature = "db")]
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 
-use crate::error::HarvestResult;
+use crate::error::{HarvestError, HarvestResult};
 #[cfg(feature = "db")]
 use crate::models::{HarvestSignal, NewHarvestSignal};
 use crate::types::ExecutionId;
@@ -22,6 +22,30 @@ pub async fn send_signal(
     payload: serde_json::Value,
 ) -> HarvestResult<()> {
     use crate::schema::harvest_signals;
+    use crate::schema::harvest_workflow_executions;
+
+    let execution = harvest_workflow_executions::table
+        .find(exec_id.as_uuid())
+        .select(crate::models::WorkflowExecution::as_select())
+        .first(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?
+        .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))?;
+
+    match execution.state.as_str() {
+        "RUNNING" => {}
+        "CANCELLED" => {
+            return Err(HarvestError::Cancelled(execution.error.unwrap_or_else(
+                || format!("workflow execution {exec_id} is cancelled"),
+            )));
+        }
+        state => {
+            return Err(HarvestError::Config(format!(
+                "workflow execution {exec_id} is terminal ({state})"
+            )));
+        }
+    }
 
     let row = NewHarvestSignal {
         workflow_exec_id: exec_id.as_uuid(),

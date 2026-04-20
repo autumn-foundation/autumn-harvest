@@ -32,6 +32,17 @@ pub fn empty_shared_state() -> SharedState {
     Arc::new(HashMap::new())
 }
 
+#[cfg(feature = "db")]
+type ActivityCancellationPool =
+    diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>;
+
+#[cfg(feature = "db")]
+#[derive(Clone)]
+struct ActivityCancellationCheck {
+    task_id: uuid::Uuid,
+    pool: ActivityCancellationPool,
+}
+
 // ---------------------------------------------------------------------------
 // WorkflowCommand -- commands emitted during live execution
 // ---------------------------------------------------------------------------
@@ -616,12 +627,14 @@ pub struct ActivityContext {
     heartbeat_tx: Option<tokio::sync::mpsc::Sender<serde_json::Value>>,
     /// Cancellation token -- allows the worker to signal graceful shutdown.
     cancel: tokio_util::sync::CancellationToken,
+    /// Optional durable queue-state cancellation check for worker activities.
+    #[cfg(feature = "db")]
+    cancellation_check: Option<ActivityCancellationCheck>,
 }
 
 impl ActivityContext {
     /// Production constructor -- creates a context with heartbeat channel and
     /// cancellation token.
-    #[allow(dead_code)] // Used by worker dispatch (not yet wired in Phase 2)
     pub(crate) fn new(
         state: SharedState,
         heartbeat_tx: Option<tokio::sync::mpsc::Sender<serde_json::Value>>,
@@ -631,6 +644,25 @@ impl ActivityContext {
             state,
             heartbeat_tx,
             cancel,
+            #[cfg(feature = "db")]
+            cancellation_check: None,
+        }
+    }
+
+    /// Production constructor that also checks durable queue state on heartbeat.
+    #[cfg(feature = "db")]
+    pub(crate) fn new_with_cancellation_check(
+        state: SharedState,
+        heartbeat_tx: Option<tokio::sync::mpsc::Sender<serde_json::Value>>,
+        cancel: tokio_util::sync::CancellationToken,
+        task_id: uuid::Uuid,
+        pool: ActivityCancellationPool,
+    ) -> Self {
+        Self {
+            state,
+            heartbeat_tx,
+            cancel,
+            cancellation_check: Some(ActivityCancellationCheck { task_id, pool }),
         }
     }
 
@@ -660,6 +692,9 @@ impl ActivityContext {
             ));
         }
 
+        #[cfg(feature = "db")]
+        self.check_durable_cancellation().await?;
+
         let payload = serde_json::to_value(details)?;
 
         if let Some(ref tx) = self.heartbeat_tx {
@@ -678,6 +713,51 @@ impl ActivityContext {
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
         self.cancel.is_cancelled()
+    }
+
+    #[cfg(feature = "db")]
+    async fn check_durable_cancellation(&self) -> crate::HarvestResult<()> {
+        use crate::schema::harvest_task_queue::dsl;
+        use diesel::{OptionalExtension, QueryDsl};
+        use diesel_async::RunQueryDsl;
+
+        let Some(check) = &self.cancellation_check else {
+            return Ok(());
+        };
+
+        let mut conn = check
+            .pool
+            .get()
+            .await
+            .map_err(crate::error::database_error)?;
+        let row = dsl::harvest_task_queue
+            .find(check.task_id)
+            .select((dsl::state, dsl::error))
+            .first::<(String, Option<String>)>(&mut conn)
+            .await
+            .optional()
+            .map_err(crate::error::database_error)?;
+
+        match row {
+            Some((state, _)) if state == "RUNNING" => Ok(()),
+            Some((state, Some(error)))
+                if state == "FAILED" && error.contains("workflow cancelled") =>
+            {
+                Err(HarvestError::Cancelled(error))
+            }
+            Some((state, Some(error))) => Err(HarvestError::Cancelled(format!(
+                "activity task {} is no longer running ({state}): {error}",
+                check.task_id
+            ))),
+            Some((state, None)) => Err(HarvestError::Cancelled(format!(
+                "activity task {} is no longer running ({state})",
+                check.task_id
+            ))),
+            None => Err(HarvestError::Cancelled(format!(
+                "activity task {} is no longer present",
+                check.task_id
+            ))),
+        }
     }
 
     /// Constructor for testing -- no heartbeat channel, default cancel token.

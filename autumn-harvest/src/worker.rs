@@ -505,21 +505,25 @@ async fn update_workflow_execution_completed(
 ) -> HarvestResult<()> {
     use crate::schema::harvest_workflow_executions::dsl;
 
-    let updated = diesel::update(dsl::harvest_workflow_executions.find(exec_id.as_uuid()))
-        .set((
-            dsl::state.eq("COMPLETED"),
-            dsl::output.eq(Some(output.clone())),
-            dsl::error.eq(None::<String>),
-            dsl::sticky_worker_id.eq(Some(worker_id.to_string())),
-            dsl::completed_at.eq(Some(chrono::Utc::now())),
-        ))
-        .execute(conn)
-        .await
-        .map_err(crate::error::database_error)?;
+    let updated = diesel::update(
+        dsl::harvest_workflow_executions
+            .find(exec_id.as_uuid())
+            .filter(dsl::state.eq("RUNNING")),
+    )
+    .set((
+        dsl::state.eq("COMPLETED"),
+        dsl::output.eq(Some(output.clone())),
+        dsl::error.eq(None::<String>),
+        dsl::sticky_worker_id.eq(Some(worker_id.to_string())),
+        dsl::completed_at.eq(Some(chrono::Utc::now())),
+    ))
+    .execute(conn)
+    .await
+    .map_err(crate::error::database_error)?;
 
     if updated == 0 {
         return Err(HarvestError::NotFound(format!(
-            "workflow execution {exec_id}"
+            "workflow execution {exec_id} is not running"
         )));
     }
 
@@ -534,21 +538,25 @@ async fn update_workflow_execution_failed(
 ) -> HarvestResult<()> {
     use crate::schema::harvest_workflow_executions::dsl;
 
-    let updated = diesel::update(dsl::harvest_workflow_executions.find(exec_id.as_uuid()))
-        .set((
-            dsl::state.eq("FAILED"),
-            dsl::output.eq(None::<serde_json::Value>),
-            dsl::error.eq(Some(error.to_string())),
-            dsl::sticky_worker_id.eq(Some(worker_id.to_string())),
-            dsl::completed_at.eq(Some(chrono::Utc::now())),
-        ))
-        .execute(conn)
-        .await
-        .map_err(crate::error::database_error)?;
+    let updated = diesel::update(
+        dsl::harvest_workflow_executions
+            .find(exec_id.as_uuid())
+            .filter(dsl::state.eq("RUNNING")),
+    )
+    .set((
+        dsl::state.eq("FAILED"),
+        dsl::output.eq(None::<serde_json::Value>),
+        dsl::error.eq(Some(error.to_string())),
+        dsl::sticky_worker_id.eq(Some(worker_id.to_string())),
+        dsl::completed_at.eq(Some(chrono::Utc::now())),
+    ))
+    .execute(conn)
+    .await
+    .map_err(crate::error::database_error)?;
 
     if updated == 0 {
         return Err(HarvestError::NotFound(format!(
-            "workflow execution {exec_id}"
+            "workflow execution {exec_id} is not running"
         )));
     }
 
@@ -1119,7 +1127,13 @@ async fn process_activity_task(
     let cancel = CancellationToken::new();
     let heartbeat_tx =
         crate::heartbeat::spawn_heartbeat_flusher(task.id, pool.clone(), cancel.clone());
-    let ctx = ActivityContext::new(registry.shared_state(), Some(heartbeat_tx), cancel.clone());
+    let ctx = ActivityContext::new_with_cancellation_check(
+        registry.shared_state(),
+        Some(heartbeat_tx),
+        cancel.clone(),
+        task.id,
+        pool.clone(),
+    );
 
     let activity_result = (activity.handler)(&ctx, task.input.clone()).await;
     cancel.cancel();

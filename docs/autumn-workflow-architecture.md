@@ -6,9 +6,11 @@
 *March 2026*
 
 **Release status note (0.2.0):** DAG scheduling, signals, queries, the
-management API, and dead-letter list/replay endpoints are implemented.
-Workflow cancellation and first-class Saga compensation are the remaining
-0.2.0 work.
+management API, dead-letter list/replay endpoints, and durable workflow
+cancellation are implemented. Cancellation is currently a terminal workflow
+transition with activity heartbeat checks; workflow-level `ctx.cancelled()`
+cleanup remains an architecture target. First-class Saga compensation is the
+remaining 0.2.0 work.
 
 ---
 
@@ -1560,7 +1562,7 @@ The foundation. After this phase, you can define and execute workflows and activ
 - Implement signal storage and delivery
 - Implement query dispatch (cached state on sticky worker, fallback to replay)
 - Implement `ctx.wait_for_signal()` and `ctx.register_query()`
-- Implement workflow cancellation
+- Implement durable workflow cancellation
 
 **Week 16-18: Saga and management API**
 - Implement `Saga` builder with compensation logic

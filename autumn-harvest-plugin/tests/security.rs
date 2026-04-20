@@ -120,6 +120,20 @@ async fn eris_unauthenticated_signal_workflow_is_accessible() {
 }
 
 #[tokio::test]
+async fn eris_unauthenticated_cancel_workflow_is_accessible() {
+    let app = unauthenticated_app();
+    let res = app
+        .oneshot(post_json(
+            "/workflows/00000000-0000-0000-0000-000000000001/cancel",
+            r#"{"reason": "operator request"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_ne!(res.status(), StatusCode::UNAUTHORIZED);
+    assert_ne!(res.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
 async fn eris_unauthenticated_query_workflow_is_accessible() {
     let app = unauthenticated_app();
     let res = app
@@ -207,6 +221,19 @@ async fn eris_require_auth_blocks_signal_workflow() {
     let res = app
         .oneshot(post_json(
             "/workflows/00000000-0000-0000-0000-000000000001/signal/approve",
+            "{}",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn eris_require_auth_blocks_cancel_workflow() {
+    let app = authenticated_app();
+    let res = app
+        .oneshot(post_json(
+            "/workflows/00000000-0000-0000-0000-000000000001/cancel",
             "{}",
         ))
         .await

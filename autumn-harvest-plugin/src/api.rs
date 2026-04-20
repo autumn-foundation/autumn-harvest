@@ -32,7 +32,9 @@ use autumn_harvest::signal;
 use autumn_harvest::store;
 use autumn_harvest::types::ExecutionId;
 use autumn_harvest::worker::HandlerRegistry;
-use autumn_harvest::{StartWorkflowParams, start_or_load_workflow_execution};
+use autumn_harvest::{
+    StartWorkflowParams, cancel_workflow_execution, start_or_load_workflow_execution,
+};
 
 use crate::state::HarvestDbPool;
 
@@ -183,6 +185,16 @@ struct ReplayDeadLetterResponse {
     task_id: String,
 }
 
+#[derive(Debug, Serialize)]
+struct CancelWorkflowResponse {
+    ok: bool,
+    execution_id: String,
+    state: String,
+    reason: String,
+    newly_cancelled: bool,
+    failed_task_count: usize,
+}
+
 #[derive(Debug, Deserialize)]
 struct StartWorkflowRequest {
     workflow_id: Option<String>,
@@ -196,6 +208,11 @@ struct StartWorkflowRequest {
 #[derive(Debug, Deserialize)]
 struct DagTriggerRequest {
     conf: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CancelWorkflowRequest {
+    reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -218,6 +235,7 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .route("/workflows", get(list_workflows))
         .route("/workflows/{id}", get(get_workflow))
         .route("/workflows/{workflow_name}/start", post(start_workflow))
+        .route("/workflows/{id}/cancel", post(cancel_workflow))
         .route(
             "/workflows/{id}/signal/{signal_name}",
             post(signal_workflow),
@@ -327,6 +345,34 @@ async fn start_workflow(
             workflow_name: start.workflow_name,
             workflow_id: start.workflow_id,
             state: start.state,
+        }),
+    ))
+}
+
+async fn cancel_workflow(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id): Path<String>,
+    Json(request): Json<CancelWorkflowRequest>,
+) -> Result<(axum::http::StatusCode, Json<CancelWorkflowResponse>), AutumnError> {
+    let exec_id = parse_execution_id(&id)?;
+    let mut conn = db_conn(&api_state).await?;
+    let reason = request
+        .reason
+        .as_deref()
+        .unwrap_or("workflow cancellation requested");
+    let cancelled = cancel_workflow_execution(&mut conn, exec_id, reason)
+        .await
+        .map_err(map_error)?;
+
+    Ok((
+        axum::http::StatusCode::ACCEPTED,
+        Json(CancelWorkflowResponse {
+            ok: true,
+            execution_id: cancelled.exec_id.to_string(),
+            state: cancelled.state,
+            reason: cancelled.reason,
+            newly_cancelled: cancelled.newly_cancelled,
+            failed_task_count: cancelled.failed_task_count,
         }),
     ))
 }

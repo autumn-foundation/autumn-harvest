@@ -58,6 +58,45 @@ impl StartedWorkflowExecution {
     }
 }
 
+/// Result of a workflow cancellation request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CancelledWorkflowExecution {
+    /// Cancelled workflow execution ID.
+    pub exec_id: ExecutionId,
+    /// Final execution state.
+    pub state: String,
+    /// Stored cancellation reason.
+    pub reason: String,
+    /// `true` when this request performed the terminal transition.
+    pub newly_cancelled: bool,
+    /// Number of pending/running task rows failed by this request.
+    pub failed_task_count: usize,
+}
+
+impl CancelledWorkflowExecution {
+    fn idempotent(exec_id: ExecutionId, execution: WorkflowExecution) -> Self {
+        Self {
+            exec_id,
+            state: execution.state,
+            reason: execution
+                .error
+                .unwrap_or_else(|| "workflow already cancelled".to_string()),
+            newly_cancelled: false,
+            failed_task_count: 0,
+        }
+    }
+
+    fn newly_cancelled(exec_id: ExecutionId, reason: String, failed_task_count: usize) -> Self {
+        Self {
+            exec_id,
+            state: "CANCELLED".to_string(),
+            reason,
+            newly_cancelled: true,
+            failed_task_count,
+        }
+    }
+}
+
 /// Start a workflow execution or load the existing one if the same
 /// `(workflow_name, workflow_id)` has already been published.
 ///
@@ -126,6 +165,103 @@ pub async fn start_or_load_workflow_execution(
                 load_workflow_execution_by_key(conn, request.workflow_name, request.workflow_id)
                     .await?;
             Ok(StartedWorkflowExecution::from_row(execution, false))
+        }
+        .scope_boxed()
+    })
+    .await
+}
+
+/// Cancel a running workflow execution.
+///
+/// Cancellation is a durable terminal transition: this appends a
+/// `WorkflowCancelled` event, marks the execution `CANCELLED`, and fails every
+/// pending or running task associated with the execution. Repeating the same
+/// operation against an already-cancelled execution is idempotent and does not
+/// append another event.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::NotFound`] when the execution does not exist,
+/// [`HarvestError::Config`] when the execution is already terminal for another
+/// reason, and [`HarvestError::Database`] for persistence failures.
+pub async fn cancel_workflow_execution(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    reason: &str,
+) -> HarvestResult<CancelledWorkflowExecution> {
+    let reason = reason.trim();
+    let reason = if reason.is_empty() {
+        "workflow cancellation requested".to_string()
+    } else {
+        reason.to_string()
+    };
+
+    conn.transaction::<CancelledWorkflowExecution, HarvestError, _>(|conn| {
+        async move {
+            let execution = harvest_workflow_executions::table
+                .find(exec_id.as_uuid())
+                .select(WorkflowExecution::as_select())
+                .for_update()
+                .first(conn)
+                .await
+                .optional()
+                .map_err(database_error)?
+                .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))?;
+
+            match execution.state.as_str() {
+                "RUNNING" => {}
+                "CANCELLED" => {
+                    return Ok(CancelledWorkflowExecution::idempotent(exec_id, execution));
+                }
+                state => {
+                    return Err(HarvestError::Config(format!(
+                        "workflow execution {exec_id} is already terminal ({state})"
+                    )));
+                }
+            }
+
+            let history = store::load_history(conn, exec_id).await?;
+            store::append_events(
+                conn,
+                exec_id,
+                &[WorkflowEvent::WorkflowCancelled {
+                    reason: reason.clone(),
+                }],
+                history.next_event_id,
+            )
+            .await?;
+
+            let updated =
+                diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
+                    .filter(harvest_workflow_executions::state.eq("RUNNING"))
+                    .set((
+                        harvest_workflow_executions::state.eq("CANCELLED"),
+                        harvest_workflow_executions::output.eq(None::<serde_json::Value>),
+                        harvest_workflow_executions::error.eq(Some(reason.clone())),
+                        harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+                    ))
+                    .execute(conn)
+                    .await
+                    .map_err(database_error)?;
+
+            if updated == 0 {
+                return Err(HarvestError::Config(format!(
+                    "workflow execution {exec_id} is no longer running"
+                )));
+            }
+
+            let failed_task_count = queue::fail_open_tasks_for_execution(
+                conn,
+                exec_id,
+                &format!("workflow cancelled: {reason}"),
+            )
+            .await?;
+
+            Ok(CancelledWorkflowExecution::newly_cancelled(
+                exec_id,
+                reason,
+                failed_task_count,
+            ))
         }
         .scope_boxed()
     })

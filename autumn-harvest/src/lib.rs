@@ -74,7 +74,8 @@ pub use error::{HarvestError, HarvestResult, TimeoutType};
 pub use event::WorkflowEvent;
 #[cfg(feature = "db")]
 pub use execution::{
-    StartWorkflowParams, StartedWorkflowExecution, start_or_load_workflow_execution,
+    CancelledWorkflowExecution, StartWorkflowParams, StartedWorkflowExecution,
+    cancel_workflow_execution, start_or_load_workflow_execution,
 };
 pub use executor::{WorkflowOutcome, run_workflow};
 pub use info::{ActivityHandlerFn, ActivityInfo, DagInfo, WorkflowHandlerFn, WorkflowInfo};
