@@ -18,6 +18,7 @@ pub mod builder;
 pub mod cache;
 pub mod context;
 pub mod dag;
+pub mod dag_export;
 pub mod error;
 pub mod event;
 #[cfg(feature = "db")]
@@ -70,6 +71,7 @@ pub use builder::{BuiltHarvest, HarvestBuilder, WorkerConfig};
 pub use cache::{CachedWorkflowState, WorkflowCache};
 pub use context::{ActivityContext, WorkflowCommand, WorkflowContext};
 pub use dag::{DagBuildError, DagBuilder, DagDefinition, DagTask, DagTaskRef};
+pub use dag_export::{export_dot, export_mermaid};
 pub use error::{HarvestError, HarvestResult, TimeoutType};
 pub use event::WorkflowEvent;
 #[cfg(feature = "db")]
