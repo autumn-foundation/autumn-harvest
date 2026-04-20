@@ -107,7 +107,7 @@ impl EnqueueParams {
 ///
 /// # Errors
 ///
-/// Returns [`HarvestError::Database`] on insert failure.
+/// Returns [`crate::error::HarvestError::Database`] on insert failure.
 pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> HarvestResult<Uuid> {
     use crate::schema::harvest_task_queue;
 
@@ -147,7 +147,7 @@ pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> Ha
 ///
 /// # Errors
 ///
-/// Returns [`HarvestError::Database`] on query failure.
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
 pub async fn claim_task(
     conn: &mut AsyncPgConnection,
     queues: &[String],
@@ -176,7 +176,7 @@ pub async fn claim_task(
 ///
 /// # Errors
 ///
-/// Returns [`HarvestError::Database`] on update failure.
+/// Returns [`crate::error::HarvestError::Database`] on update failure.
 pub async fn complete_task(
     conn: &mut AsyncPgConnection,
     task_id: Uuid,
@@ -211,7 +211,7 @@ pub async fn complete_task(
 ///
 /// # Errors
 ///
-/// Returns [`HarvestError::Database`] on update failure.
+/// Returns [`crate::error::HarvestError::Database`] on update failure.
 pub async fn fail_task(
     conn: &mut AsyncPgConnection,
     task_id: Uuid,
@@ -246,7 +246,7 @@ pub async fn fail_task(
 ///
 /// # Errors
 ///
-/// Returns [`HarvestError::Database`] on update failure.
+/// Returns [`crate::error::HarvestError::Database`] on update failure.
 pub async fn record_heartbeat(conn: &mut AsyncPgConnection, task_id: Uuid) -> HarvestResult<()> {
     use crate::schema::harvest_task_queue::dsl;
 
@@ -273,7 +273,7 @@ pub async fn record_heartbeat(conn: &mut AsyncPgConnection, task_id: Uuid) -> Ha
 ///
 /// # Errors
 ///
-/// Returns [`HarvestError::Database`] on update failure.
+/// Returns [`crate::error::HarvestError::Database`] on update failure.
 pub async fn requeue_for_retry(
     conn: &mut AsyncPgConnection,
     task_id: Uuid,
@@ -287,7 +287,7 @@ pub async fn requeue_for_retry(
 ///
 /// # Errors
 ///
-/// Returns [`HarvestError::Database`] on update failure.
+/// Returns [`crate::error::HarvestError::Database`] on update failure.
 pub async fn reschedule_task(
     conn: &mut AsyncPgConnection,
     task_id: Uuid,
@@ -329,7 +329,7 @@ pub async fn reschedule_task(
 ///
 /// # Errors
 ///
-/// Returns [`HarvestError::Database`] on update failure.
+/// Returns [`crate::error::HarvestError::Database`] on update failure.
 pub async fn park_workflow_task(conn: &mut AsyncPgConnection, task_id: Uuid) -> HarvestResult<()> {
     use crate::schema::harvest_task_queue::dsl;
 
@@ -366,7 +366,7 @@ pub async fn park_workflow_task(conn: &mut AsyncPgConnection, task_id: Uuid) -> 
 ///
 /// # Errors
 ///
-/// Returns [`HarvestError::Database`] on update failure.
+/// Returns [`crate::error::HarvestError::Database`] on update failure.
 pub async fn wake_workflow_task(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,

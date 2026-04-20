@@ -1,4 +1,4 @@
-//! `HarvestPlugin` — the [`Plugin`](autumn_web::Plugin) implementation that wires
+//! `HarvestPlugin` — the [`Plugin`] implementation that wires
 //! the Harvest workflow engine into an Autumn [`AppBuilder`].
 
 use std::any::Any;

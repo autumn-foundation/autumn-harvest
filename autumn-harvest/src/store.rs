@@ -74,13 +74,13 @@ pub fn events_to_insert_rows_from(
 /// Append events to a workflow's history in a single INSERT.
 ///
 /// Returns the number of events inserted. Fails with a unique constraint
-/// violation (wrapped as [`HarvestError::Database`]) if `start_id` conflicts --
+/// violation (wrapped as [`crate::error::HarvestError::Database`]) if `start_id` conflicts --
 /// this indicates a concurrency conflict where two workers tried to advance
 /// the same workflow simultaneously.
 ///
 /// # Errors
 ///
-/// Returns [`HarvestError::Database`] if the INSERT fails (e.g. unique
+/// Returns [`crate::error::HarvestError::Database`] if the INSERT fails (e.g. unique
 /// constraint violation on `(workflow_exec_id, event_id)` or connection error).
 pub async fn append_events(
     conn: &mut AsyncPgConnection,
@@ -110,8 +110,8 @@ pub async fn append_events(
 ///
 /// # Errors
 ///
-/// Returns [`HarvestError::Database`] on connection or query errors, or
-/// [`HarvestError::Serialization`] if a stored JSON value can't be deserialized
+/// Returns [`crate::error::HarvestError::Database`] on connection or query errors, or
+/// [`crate::error::HarvestError::Serialization`] if a stored JSON value can't be deserialized
 /// into `WorkflowEvent`.
 pub async fn load_history(
     conn: &mut AsyncPgConnection,
