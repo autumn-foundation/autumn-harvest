@@ -24,7 +24,8 @@ pub fn compute_retry_delay(
         secs
     };
 
-    Duration::from_secs_f64(clamped_secs.min(max_interval.as_secs_f64()))
+    let delay = Duration::try_from_secs_f64(clamped_secs).unwrap_or(Duration::MAX);
+    delay.min(max_interval)
 }
 
 /// How an activity failure is retried.
