@@ -262,3 +262,19 @@ mod tests {
         assert_eq!(d, Duration::from_secs(120));
     }
 }
+
+    #[test]
+    fn compute_retry_delay_attempt_zero() {
+        let d = compute_retry_delay(Duration::from_secs(1), 2.0, Duration::from_secs(300), 0);
+        assert_eq!(d, Duration::from_secs(1));
+    }
+
+
+    #[test]
+    fn compute_retry_delay_negative_nan() {
+        let d = compute_retry_delay(Duration::from_secs(1), f64::NAN, Duration::from_secs(300), 2);
+        assert_eq!(d, Duration::from_secs(0));
+
+        let d2 = compute_retry_delay(Duration::from_secs(1), -1.0, Duration::from_secs(300), 2);
+        assert_eq!(d2, Duration::from_secs(0));
+    }
