@@ -5,19 +5,23 @@ use serde_json::Value;
 
 use crate::error::{HarvestError, HarvestResult};
 
+/// A thread-safe, sync function that returns a JSON-serializable query result.
 pub type QueryHandler = Arc<dyn Fn() -> Value + Send + Sync>;
 
+/// Holds all registered query handlers for a running workflow.
 #[derive(Default)]
 pub struct QueryRegistry {
     handlers: HashMap<String, QueryHandler>,
 }
 
 impl QueryRegistry {
+    /// Creates a new, empty query registry.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Registers a query handler under the given name.
     pub fn register(&mut self, name: &str, handler: QueryHandler) {
         self.handlers.insert(name.to_string(), handler);
     }

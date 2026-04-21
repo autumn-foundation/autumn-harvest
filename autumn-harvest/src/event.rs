@@ -19,83 +19,133 @@ use crate::types::{ActivityExecId, ExecutionId, TimerId, WorkerId};
 #[serde(tag = "type", content = "data")]
 pub enum WorkflowEvent {
     // ── Lifecycle ──────────────────────────────────────────────────
+    /// A new workflow execution has started.
     WorkflowStarted {
+        /// The JSON payload used to start the workflow.
         input: serde_json::Value,
+        /// Time when the workflow was initiated.
         timestamp: DateTime<Utc>,
     },
+    /// The workflow ran to completion without an error.
     WorkflowCompleted {
+        /// The JSON result returned by the workflow function.
         output: serde_json::Value,
     },
+    /// The workflow panicked or returned a non-recoverable error.
     WorkflowFailed {
+        /// String representation of the failure.
         error: String,
     },
+    /// The workflow was intentionally cancelled (e.g., via API or parent workflow).
     WorkflowCancelled {
+        /// The reason given for cancellation.
         reason: String,
     },
 
     // ── Activities ────────────────────────────────────────────────
+    /// An activity was requested by the workflow.
     ActivityScheduled {
+        /// Unique ID for this specific activity attempt.
         activity_id: ActivityExecId,
+        /// The name of the registered activity handler.
         name: String,
+        /// JSON input for the activity.
         input: serde_json::Value,
+        /// Target worker queue.
         queue: String,
     },
+    /// A worker picked up the activity and began executing it.
     ActivityStarted {
+        /// Unique ID for this specific activity attempt.
         activity_id: ActivityExecId,
+        /// The worker instance running the activity.
         worker_id: WorkerId,
     },
+    /// The activity finished executing successfully.
     ActivityCompleted {
+        /// Unique ID for this specific activity attempt.
         activity_id: ActivityExecId,
+        /// The JSON result returned by the activity.
         output: serde_json::Value,
     },
+    /// The activity returned an error or panicked.
     ActivityFailed {
+        /// Unique ID for this specific activity attempt.
         activity_id: ActivityExecId,
+        /// String representation of the failure.
         error: String,
+        /// How many times the activity has failed so far.
         attempt: u32,
     },
+    /// The activity exceeded its allocated `start_to_close` or `heartbeat` timeout.
     ActivityTimedOut {
+        /// Unique ID for this specific activity attempt.
         activity_id: ActivityExecId,
+        /// Which timeout triggered the failure.
         timeout_type: TimeoutType,
     },
+    /// The activity successfully sent a heartbeat.
     ActivityHeartbeat {
+        /// Unique ID for this specific activity attempt.
         activity_id: ActivityExecId,
+        /// JSON payload attached to the heartbeat, used to resume progress after failures.
         details: serde_json::Value,
     },
 
     // ── Timers ────────────────────────────────────────────────────
+    /// The workflow requested a durable sleep/timer.
     TimerStarted {
+        /// The ID used to wake the workflow later.
         timer_id: TimerId,
         /// Duration in seconds (Duration is not JSON-serializable natively).
         duration_secs: u64,
     },
+    /// The requested timer elapsed and the workflow can wake up.
     TimerFired {
+        /// The ID that just finished waiting.
         timer_id: TimerId,
     },
 
     // ── Signals ───────────────────────────────────────────────────
+    /// An external signal arrived while the workflow was waiting.
     SignalReceived {
+        /// Name of the signal channel.
         signal_name: String,
+        /// JSON payload delivered by the signal.
         payload: serde_json::Value,
     },
 
     // ── Child workflows ───────────────────────────────────────────
+    /// A sub-workflow was scheduled by a parent workflow.
     ChildWorkflowStarted {
+        /// The ID of the spawned execution.
         child_id: ExecutionId,
+        /// The target child workflow handler.
         workflow_name: String,
+        /// The input passed to the child workflow.
         input: serde_json::Value,
     },
+    /// The spawned sub-workflow completed successfully.
     ChildWorkflowCompleted {
+        /// The ID of the spawned execution.
         child_id: ExecutionId,
+        /// Result of the completed workflow.
         output: serde_json::Value,
     },
+    /// The spawned sub-workflow encountered a fatal error.
     ChildWorkflowFailed {
+        /// The ID of the spawned execution.
         child_id: ExecutionId,
+        /// The reason the child failed.
         error: String,
     },
 
     // ── Markers ───────────────────────────────────────────────────
+    /// An explicit version change or side-effect marker was recorded.
     MarkerRecorded {
+        /// The name of the recorded side effect (e.g. version block name).
         name: String,
+        /// Arbitrary data recorded with the marker.
         details: serde_json::Value,
     },
 }

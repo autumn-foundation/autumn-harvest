@@ -20,11 +20,13 @@ use uuid::Uuid;
 pub struct WorkflowId(String);
 
 impl WorkflowId {
+    /// Creates a new `WorkflowId` from a string-like value.
     #[must_use]
     pub fn new(id: impl Into<String>) -> Self {
         Self(id.into())
     }
 
+    /// Returns the underlying string slice.
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
@@ -44,16 +46,19 @@ impl fmt::Display for WorkflowId {
 pub struct ExecutionId(Uuid);
 
 impl ExecutionId {
+    /// Creates a new, random `ExecutionId` using a v4 UUID.
     #[must_use]
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
 
+    /// Wraps an existing `Uuid` into an `ExecutionId`.
     #[must_use]
     pub const fn from_uuid(id: Uuid) -> Self {
         Self(id)
     }
 
+    /// Returns the underlying `Uuid` for database storage or serialization.
     #[must_use]
     pub const fn as_uuid(&self) -> Uuid {
         self.0
@@ -84,11 +89,13 @@ impl FromStr for ExecutionId {
 pub struct ActivityExecId(Uuid);
 
 impl ActivityExecId {
+    /// Creates a new, random `ActivityExecId` using a v4 UUID.
     #[must_use]
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
 
+    /// Returns the underlying `Uuid`.
     #[must_use]
     pub const fn as_uuid(&self) -> Uuid {
         self.0
@@ -119,11 +126,13 @@ impl FromStr for ActivityExecId {
 pub struct TimerId(String);
 
 impl TimerId {
+    /// Creates a new `TimerId` from a string-like value.
     #[must_use]
     pub fn new(id: impl Into<String>) -> Self {
         Self(id.into())
     }
 
+    /// Returns the underlying string slice.
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
@@ -141,11 +150,13 @@ impl fmt::Display for TimerId {
 pub struct WorkerId(String);
 
 impl WorkerId {
+    /// Creates a new `WorkerId` from a string-like value.
     #[must_use]
     pub fn new(id: impl Into<String>) -> Self {
         Self(id.into())
     }
 
+    /// Returns the underlying string slice.
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0

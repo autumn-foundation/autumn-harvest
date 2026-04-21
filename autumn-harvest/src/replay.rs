@@ -19,16 +19,32 @@ use crate::event::WorkflowEvent;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HistoryMatch {
     /// History contains a completed result for this command.
-    Matched { output: Value },
+    Matched {
+        /// The JSON result value returned by the matched event.
+        output: Value,
+    },
     /// History contains a failure for this command.
-    Failed { error: String, attempt: u32 },
+    Failed {
+        /// String representation of the failure.
+        error: String,
+        /// Attempt number for the failed action.
+        attempt: u32,
+    },
     /// History contains a timeout for this command.
-    TimedOut { timeout_type: TimeoutType },
+    TimedOut {
+        /// The type of timeout that occurred.
+        timeout_type: TimeoutType,
+    },
     /// Cursor is past the end of history — this is a new command.
     NoMatch,
     /// The command does not match what was recorded at this position,
     /// indicating non-determinism in the workflow code.
-    Diverged { expected: String, actual: String },
+    Diverged {
+        /// What the history matcher expected to find based on recorded events.
+        expected: String,
+        /// What the workflow actually requested.
+        actual: String,
+    },
 }
 
 /// Walks through recorded workflow events during replay, matching

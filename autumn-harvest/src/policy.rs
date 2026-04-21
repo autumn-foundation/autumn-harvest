@@ -95,8 +95,11 @@ impl Default for RetryPolicy {
 /// Status of a completed DAG task, used by trigger rules.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskStatus {
+    /// The task executed and returned success.
     Succeeded,
+    /// The task returned an error or exhausted its retries.
     Failed,
+    /// The task was skipped (e.g., due to a trigger rule evaluating to false).
     Skipped,
 }
 
@@ -121,6 +124,9 @@ pub enum TriggerRule {
 }
 
 impl TriggerRule {
+    /// Evaluates the trigger rule against a list of upstream task statuses.
+    ///
+    /// Returns `true` if the downstream task should be executed, `false` otherwise.
     #[must_use]
     pub fn should_run(&self, upstream_statuses: &[TaskStatus]) -> bool {
         match self {
