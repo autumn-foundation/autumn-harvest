@@ -580,26 +580,28 @@ async fn execute_dag_task(
         };
         cancel.cancel();
 
-        match result {
-            Ok(_) => return TaskStatus::Succeeded,
-            Err(error) => {
-                if let Some(policy) = retry_policy.as_ref() {
-                    if policy
-                        .non_retryable_errors
-                        .iter()
-                        .any(|non_retryable| non_retryable == &error)
-                    {
-                        return TaskStatus::Failed;
-                    }
-                    if let Some(delay) = next_retry_delay(policy, attempt) {
-                        attempt = attempt.saturating_add(1);
-                        tokio::time::sleep(delay).await;
-                        continue;
-                    }
-                }
-                return TaskStatus::Failed;
-            }
+        let Err(error) = result else {
+            return TaskStatus::Succeeded;
+        };
+
+        let Some(policy) = retry_policy.as_ref() else {
+            return TaskStatus::Failed;
+        };
+
+        if policy
+            .non_retryable_errors
+            .iter()
+            .any(|non_retryable| non_retryable == &error)
+        {
+            return TaskStatus::Failed;
         }
+
+        let Some(delay) = next_retry_delay(policy, attempt) else {
+            return TaskStatus::Failed;
+        };
+
+        attempt = attempt.saturating_add(1);
+        tokio::time::sleep(delay).await;
     }
 }
 

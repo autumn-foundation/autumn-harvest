@@ -726,11 +726,12 @@ impl ActivityContext {
 
         let payload = serde_json::to_value(details)?;
 
-        if let Some(ref tx) = self.heartbeat_tx {
-            tx.send(payload).await.map_err(|_| {
-                HarvestError::Cancelled("activity cancelled: heartbeat channel closed".into())
-            })?;
-        }
+        let Some(ref tx) = self.heartbeat_tx else {
+            return Ok(());
+        };
+        tx.send(payload).await.map_err(|_| {
+            HarvestError::Cancelled("activity cancelled: heartbeat channel closed".into())
+        })?;
 
         Ok(())
     }
