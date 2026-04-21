@@ -33,6 +33,7 @@ pub mod prelude;
 pub mod query;
 pub mod replay;
 pub mod saga;
+pub mod simulator;
 pub mod types;
 
 #[cfg(feature = "db")]
@@ -94,6 +95,7 @@ pub use scheduler::{
     DagCatalog, RegisteredDag, SchedulerMonitor, SchedulerRuntime, compile_dag_catalog,
     register_schedules, tick_once, trigger_dag,
 };
+pub use simulator::{SimulatorResult, WorkflowSimulator};
 pub use types::{ActivityExecId, ExecutionId, TimerId, WorkerId, WorkflowId};
 
 #[cfg(feature = "db")]
