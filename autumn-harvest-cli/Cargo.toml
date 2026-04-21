@@ -1,0 +1,27 @@
+[package]
+name = "autumn-harvest-cli"
+description = "CLI client for the autumn-harvest management API"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage = "https://github.com/madmax983/autumn-harvest"
+readme = "../README.md"
+keywords = ["workflow", "durable", "cli", "orchestration", "autumn"]
+categories = ["command-line-utilities", "asynchronous"]
+
+[dependencies]
+clap = { version = "4.5", features = ["derive", "env"] }
+percent-encoding = "2"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[[bin]]
+name = "harvest"
+path = "src/main.rs"
+
+[lints]
+workspace = true

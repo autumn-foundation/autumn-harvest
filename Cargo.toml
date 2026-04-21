@@ -1,5 +1,10 @@
 [workspace]
-members = ["autumn-harvest", "autumn-harvest-plugin", "autumn-harvest-macros"]
+members = [
+    "autumn-harvest",
+    "autumn-harvest-plugin",
+    "autumn-harvest-macros",
+    "autumn-harvest-cli",
+]
 resolver = "3"
 
 [workspace.package]

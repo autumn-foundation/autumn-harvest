@@ -92,10 +92,39 @@ async fn main() {
 | [`autumn-harvest`](autumn-harvest/) | Core engine — types, executor, replay, queue, worker runtime |
 | [`autumn-harvest-plugin`](autumn-harvest-plugin/) | `HarvestPlugin` — wires the engine into an Autumn `AppBuilder`, mounts the management API, owns the runtime lifecycle |
 | [`autumn-harvest-macros`](autumn-harvest-macros/) | `#[workflow]`, `#[activity]`, `#[dag]`, `workflows![]`, `activities![]` proc macros |
+| [`autumn-harvest-cli`](autumn-harvest-cli/) | `harvest` CLI: thin operator client for the management API |
 
 Use `autumn-harvest-plugin` if you're building an Autumn app. Use the bare
 `autumn-harvest` crate if you want to embed the engine in another framework or
 a non-web context.
+
+## CLI
+
+The `harvest` binary is a thin HTTP client for the optional management API. It
+does not talk to Postgres directly, so workflow queries, DAG triggers, auth, and
+runtime-owned behavior stay behind the same API surface your service exposes.
+
+```bash
+cargo run -p autumn-harvest-cli -- health
+cargo run -p autumn-harvest-cli -- workflow list --limit 25
+cargo run -p autumn-harvest-cli -- workflow get <execution-id>
+cargo run -p autumn-harvest-cli -- workflow start approval_workflow --input-json '{"request_id":"42"}'
+cargo run -p autumn-harvest-cli -- workflow signal <execution-id> approved --payload-json '{"approved":true}'
+cargo run -p autumn-harvest-cli -- workflow query <execution-id> status
+cargo run -p autumn-harvest-cli -- workflow cancel <execution-id> --reason "operator request"
+cargo run -p autumn-harvest-cli -- dag list
+cargo run -p autumn-harvest-cli -- dag trigger daily_pipeline --conf-json '{"date":"2026-04-21"}'
+cargo run -p autumn-harvest-cli -- dag pause daily_pipeline
+cargo run -p autumn-harvest-cli -- dlq list --limit 25
+cargo run -p autumn-harvest-cli -- dlq replay <dead-letter-id>
+```
+
+Configure the API mount with `--base-url` or `HARVEST_URL` (default:
+`http://localhost:3000/api/harvest`). Pass `--token` or `HARVEST_TOKEN` to send
+a bearer token. Successful responses are printed as pretty JSON by default; use
+`--output json` for compact script-friendly output. JSON request payloads accept
+inline `--*-json` values or `--*-file PATH`; use `-` as the file path to read
+from stdin.
 
 ## Requirements
 
