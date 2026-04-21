@@ -118,10 +118,10 @@ pub fn task_duration(s: &str) -> Option<std::time::Duration> {
             let num: u64 = current_num.parse().ok()?;
             current_num.clear();
             match ch {
-                's' => total_secs += num,
-                'm' => total_secs += num * 60,
-                'h' => total_secs += num * 3600,
-                'd' => total_secs += num * 86400,
+                's' => total_secs = total_secs.checked_add(num)?,
+                'm' => total_secs = total_secs.checked_add(num.checked_mul(60)?)?,
+                'h' => total_secs = total_secs.checked_add(num.checked_mul(3600)?)?,
+                'd' => total_secs = total_secs.checked_add(num.checked_mul(86400)?)?,
                 _ => return None,
             }
         } else if ch != ' ' {
@@ -172,5 +172,13 @@ mod tests {
         assert_eq!(task_duration(""), None);
         assert_eq!(task_duration("5"), None);
         assert_eq!(task_duration("5x"), None);
+    }
+
+    #[test]
+    fn task_duration_rejects_overflow() {
+        assert_eq!(task_duration("18446744073709551615d"), None); // u64::MAX
+        assert_eq!(task_duration("18446744073709551615h"), None); // u64::MAX
+        assert_eq!(task_duration("18446744073709551615m"), None); // u64::MAX
+        assert_eq!(task_duration("18446744073709551614s 2s"), None); // Add overflow
     }
 }
