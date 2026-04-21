@@ -6,13 +6,14 @@ use std::time::Duration;
 use autumn_harvest::builder::WorkerConfig;
 use autumn_harvest::dag::DagBuilder;
 use autumn_harvest::info::{ActivityInfo, DagInfo, WorkflowInfo};
-use autumn_harvest::models::{DagRun, HarvestSchedule, WorkflowExecution};
+use autumn_harvest::models::{DagRun, HarvestSchedule, TaskQueueItem, WorkflowExecution};
 use autumn_harvest::policy::Schedule;
 use autumn_harvest::scheduler::{
     DagCatalog, SchedulerMonitor, compile_dag_catalog, register_schedules, tick_once,
 };
 use autumn_harvest::schema::{
-    harvest_dag_runs, harvest_schedules, harvest_task_queue, harvest_workflow_executions,
+    harvest_dag_runs, harvest_dead_letters, harvest_schedules, harvest_task_queue,
+    harvest_workflow_executions,
 };
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{ActivityContext, WorkflowContext};
@@ -262,6 +263,29 @@ async fn count_workflow_tasks_from_url(database_url: &str, exec_id: &str) -> i64
         .get_result(&mut conn)
         .await
         .expect("failed to count workflow tasks")
+}
+
+async fn load_task_from_url(database_url: &str, task_id: uuid::Uuid) -> TaskQueueItem {
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("failed to connect fresh Postgres client for task query");
+    harvest_task_queue::table
+        .find(task_id)
+        .select(TaskQueueItem::as_select())
+        .first(&mut conn)
+        .await
+        .expect("failed to load replayed task")
+}
+
+async fn count_dead_letters_from_url(database_url: &str) -> i64 {
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("failed to connect fresh Postgres client for dead-letter count");
+    harvest_dead_letters::table
+        .count()
+        .get_result(&mut conn)
+        .await
+        .expect("failed to count dead letters")
 }
 
 async fn load_schedule_from_url(database_url: &str, dag_name: &str) -> HarvestSchedule {
@@ -586,6 +610,92 @@ async fn harvest_api_duplicate_start_reuses_existing_execution() {
 }
 
 #[tokio::test]
+async fn harvest_api_cancels_workflows_and_rejects_late_signals() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let registry = approval_registry();
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
+    api_state.install(HarvestApiRuntime::new(
+        Arc::clone(&registry),
+        Arc::new(HashMap::new()),
+        Some("test-worker".to_string()),
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+    ));
+    let app = harvest_api_router(api_state).with_state(test_app_state(pool));
+
+    let (start_status, start_json) = post_json(
+        &app,
+        "/workflows/approval_workflow/start",
+        json!({
+            "workflow_id": "approval-cancelled",
+            "input": { "request_id": "cancelled" },
+        }),
+    )
+    .await;
+    assert_eq!(start_status, StatusCode::CREATED);
+    let exec_id = start_json["execution_id"]
+        .as_str()
+        .expect("start response should include execution_id")
+        .to_string();
+
+    let cancel_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/workflows/{exec_id}/cancel"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "reason": "operator changed their mind" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .expect("cancel request failed");
+    let cancel_status = cancel_response.status();
+    assert_eq!(cancel_status, StatusCode::ACCEPTED);
+    let cancel_json = read_json_response(cancel_response).await;
+    assert_eq!(cancel_json["ok"], true);
+    assert_eq!(cancel_json["execution_id"], exec_id);
+    assert_eq!(cancel_json["state"], "CANCELLED");
+    assert_eq!(cancel_json["reason"], "operator changed their mind");
+    assert_eq!(cancel_json["newly_cancelled"], true);
+    assert_eq!(cancel_json["failed_task_count"], 1);
+
+    let (details_status, details_json) = get_json(&app, format!("/workflows/{exec_id}")).await;
+    assert_eq!(details_status, StatusCode::OK);
+    assert_eq!(details_json["execution"]["state"], "CANCELLED");
+    assert_eq!(
+        details_json["execution"]["error"],
+        "operator changed their mind"
+    );
+    let history = details_json["history"]
+        .as_array()
+        .expect("workflow history must be an array");
+    assert!(
+        history.iter().any(|event| {
+            event["type"] == "WorkflowCancelled"
+                && event["data"]["reason"] == "operator changed their mind"
+        }),
+        "history should include the cancellation event"
+    );
+
+    let (signal_status, _signal_json) = post_json(
+        &app,
+        format!("/workflows/{exec_id}/signal/approved"),
+        json!({ "approved": true }),
+    )
+    .await;
+    assert_eq!(
+        signal_status,
+        StatusCode::BAD_REQUEST,
+        "late signals to cancelled workflows should be rejected"
+    );
+}
+
+#[tokio::test]
 async fn external_runner_processes_workflows_started_via_management_api() {
     let (database_url, _container) = setup_test_database_url().await;
     let pool = build_test_pool(&database_url);
@@ -767,6 +877,75 @@ async fn harvest_api_signal_does_not_wake_timer_waits_early() {
     );
 
     shutdown_test_worker(&worker, worker_task).await;
+}
+
+#[tokio::test]
+async fn harvest_api_lists_and_replays_dead_letters() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
+    let app = harvest_api_router(api_state).with_state(test_app_state(pool));
+
+    let original_task_id = uuid::Uuid::new_v4();
+    let dlq_id = {
+        let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+            .await
+            .expect("failed to connect for dead-letter setup");
+        autumn_harvest::dlq::dead_letter(
+            &mut conn,
+            &autumn_harvest::dlq::NewDeadLetterEntry {
+                original_task_id,
+                queue_name: "critical".to_string(),
+                task_type: "ACTIVITY".to_string(),
+                workflow_exec_id: None,
+                activity_name: Some("send_receipt".to_string()),
+                input: json!({ "order_id": 42 }),
+                error: "smtp is in the coffin".to_string(),
+                attempts: 3,
+            },
+        )
+        .await
+        .expect("dead-letter setup should insert row")
+    };
+
+    let (list_status, list_json) = get_json(&app, "/dead-letters").await;
+    assert_eq!(list_status, StatusCode::OK);
+    let listed = list_json
+        .as_array()
+        .expect("dead-letter list response must be an array");
+    assert!(
+        listed.iter().any(|row| {
+            row["id"] == dlq_id.to_string()
+                && row["original_task_id"] == original_task_id.to_string()
+                && row["queue_name"] == "critical"
+                && row["task_type"] == "ACTIVITY"
+                && row["activity_name"] == "send_receipt"
+                && row["attempts"] == 3
+        }),
+        "inserted dead-letter row should be listed"
+    );
+
+    let (replay_status, replay_json) =
+        post_json(&app, format!("/dead-letters/{dlq_id}/replay"), json!({})).await;
+    assert_eq!(replay_status, StatusCode::ACCEPTED);
+    assert_eq!(replay_json["ok"], true);
+    assert_eq!(replay_json["dead_letter_id"], dlq_id.to_string());
+    let replayed_task_id = replay_json["task_id"]
+        .as_str()
+        .expect("replay response should include task_id")
+        .parse::<uuid::Uuid>()
+        .expect("task_id should be a uuid");
+
+    let replayed = load_task_from_url(&database_url, replayed_task_id).await;
+    assert_eq!(replayed.queue_name, "critical");
+    assert_eq!(replayed.task_type, "activity");
+    assert_eq!(replayed.activity_name.as_deref(), Some("send_receipt"));
+    assert_eq!(replayed.input, json!({ "order_id": 42 }));
+    assert_eq!(replayed.state, "PENDING");
+    assert_eq!(replayed.attempt, 0);
+    assert_eq!(replayed.max_attempts, 3);
+    assert_eq!(count_dead_letters_from_url(&database_url).await, 0);
 }
 
 #[tokio::test]

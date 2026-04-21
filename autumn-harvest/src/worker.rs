@@ -497,6 +497,54 @@ async fn load_workflow_execution(
         .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))
 }
 
+fn terminal_execution_transition_error(
+    exec_id: ExecutionId,
+    state: &str,
+    error: Option<&str>,
+) -> HarvestError {
+    match state {
+        "CANCELLED" => HarvestError::Cancelled(error.map_or_else(
+            || format!("workflow execution {exec_id} is cancelled"),
+            ToOwned::to_owned,
+        )),
+        "RUNNING" => HarvestError::Config(format!(
+            "workflow execution {exec_id} did not transition from RUNNING"
+        )),
+        state => HarvestError::Config(format!(
+            "workflow execution {exec_id} is already terminal ({state})"
+        )),
+    }
+}
+
+async fn workflow_execution_transition_error(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> HarvestResult<HarvestError> {
+    use crate::schema::harvest_workflow_executions::dsl;
+
+    dsl::harvest_workflow_executions
+        .find(exec_id.as_uuid())
+        .select((dsl::state, dsl::error))
+        .first::<(String, Option<String>)>(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?
+        .map_or_else(
+            || {
+                Ok(HarvestError::NotFound(format!(
+                    "workflow execution {exec_id}"
+                )))
+            },
+            |(state, error)| {
+                Ok(terminal_execution_transition_error(
+                    exec_id,
+                    &state,
+                    error.as_deref(),
+                ))
+            },
+        )
+}
+
 async fn update_workflow_execution_completed(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
@@ -505,22 +553,24 @@ async fn update_workflow_execution_completed(
 ) -> HarvestResult<()> {
     use crate::schema::harvest_workflow_executions::dsl;
 
-    let updated = diesel::update(dsl::harvest_workflow_executions.find(exec_id.as_uuid()))
-        .set((
-            dsl::state.eq("COMPLETED"),
-            dsl::output.eq(Some(output.clone())),
-            dsl::error.eq(None::<String>),
-            dsl::sticky_worker_id.eq(Some(worker_id.to_string())),
-            dsl::completed_at.eq(Some(chrono::Utc::now())),
-        ))
-        .execute(conn)
-        .await
-        .map_err(crate::error::database_error)?;
+    let updated = diesel::update(
+        dsl::harvest_workflow_executions
+            .find(exec_id.as_uuid())
+            .filter(dsl::state.eq("RUNNING")),
+    )
+    .set((
+        dsl::state.eq("COMPLETED"),
+        dsl::output.eq(Some(output.clone())),
+        dsl::error.eq(None::<String>),
+        dsl::sticky_worker_id.eq(Some(worker_id.to_string())),
+        dsl::completed_at.eq(Some(chrono::Utc::now())),
+    ))
+    .execute(conn)
+    .await
+    .map_err(crate::error::database_error)?;
 
     if updated == 0 {
-        return Err(HarvestError::NotFound(format!(
-            "workflow execution {exec_id}"
-        )));
+        return Err(workflow_execution_transition_error(conn, exec_id).await?);
     }
 
     Ok(())
@@ -534,22 +584,24 @@ async fn update_workflow_execution_failed(
 ) -> HarvestResult<()> {
     use crate::schema::harvest_workflow_executions::dsl;
 
-    let updated = diesel::update(dsl::harvest_workflow_executions.find(exec_id.as_uuid()))
-        .set((
-            dsl::state.eq("FAILED"),
-            dsl::output.eq(None::<serde_json::Value>),
-            dsl::error.eq(Some(error.to_string())),
-            dsl::sticky_worker_id.eq(Some(worker_id.to_string())),
-            dsl::completed_at.eq(Some(chrono::Utc::now())),
-        ))
-        .execute(conn)
-        .await
-        .map_err(crate::error::database_error)?;
+    let updated = diesel::update(
+        dsl::harvest_workflow_executions
+            .find(exec_id.as_uuid())
+            .filter(dsl::state.eq("RUNNING")),
+    )
+    .set((
+        dsl::state.eq("FAILED"),
+        dsl::output.eq(None::<serde_json::Value>),
+        dsl::error.eq(Some(error.to_string())),
+        dsl::sticky_worker_id.eq(Some(worker_id.to_string())),
+        dsl::completed_at.eq(Some(chrono::Utc::now())),
+    ))
+    .execute(conn)
+    .await
+    .map_err(crate::error::database_error)?;
 
     if updated == 0 {
-        return Err(HarvestError::NotFound(format!(
-            "workflow execution {exec_id}"
-        )));
+        return Err(workflow_execution_transition_error(conn, exec_id).await?);
     }
 
     Ok(())
@@ -1119,7 +1171,13 @@ async fn process_activity_task(
     let cancel = CancellationToken::new();
     let heartbeat_tx =
         crate::heartbeat::spawn_heartbeat_flusher(task.id, pool.clone(), cancel.clone());
-    let ctx = ActivityContext::new(registry.shared_state(), Some(heartbeat_tx), cancel.clone());
+    let ctx = ActivityContext::new_with_cancellation_check(
+        registry.shared_state(),
+        Some(heartbeat_tx),
+        cancel.clone(),
+        task.id,
+        pool.clone(),
+    );
 
     let activity_result = (activity.handler)(&ctx, task.input.clone()).await;
     cancel.cancel();
@@ -1734,6 +1792,27 @@ mod tests {
         };
         let err = cfg.validate().unwrap_err();
         assert!(err.to_string().contains("queue"));
+    }
+
+    #[test]
+    fn terminal_execution_transition_error_reports_cancelled_state() {
+        let exec_id = ExecutionId::new();
+        let error =
+            terminal_execution_transition_error(exec_id, "CANCELLED", Some("operator stop"));
+
+        assert!(
+            matches!(error, HarvestError::Cancelled(message) if message.contains("operator stop"))
+        );
+    }
+
+    #[test]
+    fn terminal_execution_transition_error_reports_conflicting_terminal_state() {
+        let exec_id = ExecutionId::new();
+        let error = terminal_execution_transition_error(exec_id, "COMPLETED", None);
+
+        assert!(
+            matches!(error, HarvestError::Config(message) if message.contains("already terminal"))
+        );
     }
 
     #[test]

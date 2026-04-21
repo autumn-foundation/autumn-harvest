@@ -242,6 +242,38 @@ pub async fn fail_task(
     Ok(())
 }
 
+/// Mark all pending or running tasks for a workflow execution as failed.
+///
+/// This is used by workflow cancellation to drain both queued and currently
+/// claimed work. Late-running workers may still finish their local future, but
+/// their completion writes will fail because the queue row is no longer open.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`](crate::error::HarvestError::Database) on
+/// update failure.
+pub async fn fail_open_tasks_for_execution(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    error: &str,
+) -> HarvestResult<usize> {
+    use crate::schema::harvest_task_queue::dsl;
+
+    diesel::update(
+        dsl::harvest_task_queue
+            .filter(dsl::workflow_exec_id.eq(Some(exec_id.as_uuid())))
+            .filter(dsl::state.eq_any(["PENDING", "RUNNING"])),
+    )
+    .set((
+        dsl::state.eq("FAILED"),
+        dsl::error.eq(Some(error.to_string())),
+        dsl::completed_at.eq(Some(Utc::now())),
+    ))
+    .execute(conn)
+    .await
+    .map_err(crate::error::database_error)
+}
+
 /// Update the `last_heartbeat_at` timestamp for a running task.
 ///
 /// # Errors

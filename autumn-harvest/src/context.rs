@@ -9,6 +9,8 @@
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+#[cfg(feature = "db")]
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -30,6 +32,40 @@ pub type SharedState = Arc<SharedStateMap>;
 #[must_use]
 pub fn empty_shared_state() -> SharedState {
     Arc::new(HashMap::new())
+}
+
+#[cfg(feature = "db")]
+type ActivityCancellationPool =
+    diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>;
+
+#[cfg(feature = "db")]
+const DURABLE_CANCELLATION_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
+#[cfg(feature = "db")]
+struct ActivityCancellationCheck {
+    task_id: uuid::Uuid,
+    pool: ActivityCancellationPool,
+    last_checked_at: Mutex<Option<Instant>>,
+}
+
+#[cfg(feature = "db")]
+fn should_check_durable_cancellation(
+    last_checked_at: &Mutex<Option<Instant>>,
+    now: Instant,
+) -> bool {
+    let mut last_checked_at = last_checked_at
+        .lock()
+        .expect("activity cancellation check lock poisoned");
+
+    if last_checked_at.is_some_and(|last| {
+        now.checked_duration_since(last)
+            .is_some_and(|elapsed| elapsed < DURABLE_CANCELLATION_CHECK_INTERVAL)
+    }) {
+        return false;
+    }
+
+    *last_checked_at = Some(now);
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -616,12 +652,14 @@ pub struct ActivityContext {
     heartbeat_tx: Option<tokio::sync::mpsc::Sender<serde_json::Value>>,
     /// Cancellation token -- allows the worker to signal graceful shutdown.
     cancel: tokio_util::sync::CancellationToken,
+    /// Optional durable queue-state cancellation check for worker activities.
+    #[cfg(feature = "db")]
+    cancellation_check: Option<ActivityCancellationCheck>,
 }
 
 impl ActivityContext {
     /// Production constructor -- creates a context with heartbeat channel and
     /// cancellation token.
-    #[allow(dead_code)] // Used by worker dispatch (not yet wired in Phase 2)
     pub(crate) fn new(
         state: SharedState,
         heartbeat_tx: Option<tokio::sync::mpsc::Sender<serde_json::Value>>,
@@ -631,6 +669,29 @@ impl ActivityContext {
             state,
             heartbeat_tx,
             cancel,
+            #[cfg(feature = "db")]
+            cancellation_check: None,
+        }
+    }
+
+    /// Production constructor that also checks durable queue state on heartbeat.
+    #[cfg(feature = "db")]
+    pub(crate) fn new_with_cancellation_check(
+        state: SharedState,
+        heartbeat_tx: Option<tokio::sync::mpsc::Sender<serde_json::Value>>,
+        cancel: tokio_util::sync::CancellationToken,
+        task_id: uuid::Uuid,
+        pool: ActivityCancellationPool,
+    ) -> Self {
+        Self {
+            state,
+            heartbeat_tx,
+            cancel,
+            cancellation_check: Some(ActivityCancellationCheck {
+                task_id,
+                pool,
+                last_checked_at: Mutex::new(None),
+            }),
         }
     }
 
@@ -660,6 +721,9 @@ impl ActivityContext {
             ));
         }
 
+        #[cfg(feature = "db")]
+        self.check_durable_cancellation().await?;
+
         let payload = serde_json::to_value(details)?;
 
         if let Some(ref tx) = self.heartbeat_tx {
@@ -678,6 +742,55 @@ impl ActivityContext {
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
         self.cancel.is_cancelled()
+    }
+
+    #[cfg(feature = "db")]
+    async fn check_durable_cancellation(&self) -> crate::HarvestResult<()> {
+        use crate::schema::harvest_task_queue::dsl;
+        use diesel::{OptionalExtension, QueryDsl};
+        use diesel_async::RunQueryDsl;
+
+        let Some(check) = &self.cancellation_check else {
+            return Ok(());
+        };
+
+        if !should_check_durable_cancellation(&check.last_checked_at, Instant::now()) {
+            return Ok(());
+        }
+
+        let mut conn = check
+            .pool
+            .get()
+            .await
+            .map_err(crate::error::database_error)?;
+        let row = dsl::harvest_task_queue
+            .find(check.task_id)
+            .select((dsl::state, dsl::error))
+            .first::<(String, Option<String>)>(&mut conn)
+            .await
+            .optional()
+            .map_err(crate::error::database_error)?;
+
+        match row {
+            Some((state, _)) if state == "RUNNING" => Ok(()),
+            Some((state, Some(error)))
+                if state == "FAILED" && error.contains("workflow cancelled") =>
+            {
+                Err(HarvestError::Cancelled(error))
+            }
+            Some((state, Some(error))) => Err(HarvestError::Cancelled(format!(
+                "activity task {} is no longer running ({state}): {error}",
+                check.task_id
+            ))),
+            Some((state, None)) => Err(HarvestError::Cancelled(format!(
+                "activity task {} is no longer running ({state})",
+                check.task_id
+            ))),
+            None => Err(HarvestError::Cancelled(format!(
+                "activity task {} is no longer present",
+                check.task_id
+            ))),
+        }
     }
 
     /// Constructor for testing -- no heartbeat channel, default cancel token.
@@ -752,6 +865,23 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(matches!(err, HarvestError::Cancelled(_)));
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn durable_cancellation_check_is_rate_limited() {
+        let last_checked_at = Mutex::new(None);
+        let start = std::time::Instant::now();
+
+        assert!(should_check_durable_cancellation(&last_checked_at, start));
+        assert!(!should_check_durable_cancellation(
+            &last_checked_at,
+            start + std::time::Duration::from_millis(999)
+        ));
+        assert!(should_check_durable_cancellation(
+            &last_checked_at,
+            start + std::time::Duration::from_secs(1)
+        ));
     }
 
     #[tokio::test]

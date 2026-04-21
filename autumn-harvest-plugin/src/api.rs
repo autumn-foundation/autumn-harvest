@@ -21,8 +21,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use autumn_harvest::context::WorkflowContext;
+use autumn_harvest::dlq;
 use autumn_harvest::error::{HarvestError, HarvestResult, database_error};
-use autumn_harvest::models::{DagRun, HarvestSchedule, WorkflowExecution};
+use autumn_harvest::models::{DagRun, DeadLetter, HarvestSchedule, WorkflowExecution};
 use autumn_harvest::scheduler::{
     DagCatalog, RegisteredDag, SchedulerMonitor, SchedulerSnapshot, trigger_dag,
 };
@@ -31,7 +32,9 @@ use autumn_harvest::signal;
 use autumn_harvest::store;
 use autumn_harvest::types::ExecutionId;
 use autumn_harvest::worker::HandlerRegistry;
-use autumn_harvest::{StartWorkflowParams, start_or_load_workflow_execution};
+use autumn_harvest::{
+    StartWorkflowParams, cancel_workflow_execution, start_or_load_workflow_execution,
+};
 
 use crate::state::HarvestDbPool;
 
@@ -175,6 +178,23 @@ struct HarvestHealth {
     scheduler: SchedulerSnapshot,
 }
 
+#[derive(Debug, Serialize)]
+struct ReplayDeadLetterResponse {
+    ok: bool,
+    dead_letter_id: String,
+    task_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CancelWorkflowResponse {
+    ok: bool,
+    execution_id: String,
+    state: String,
+    reason: String,
+    newly_cancelled: bool,
+    failed_task_count: usize,
+}
+
 #[derive(Debug, Deserialize)]
 struct StartWorkflowRequest {
     workflow_id: Option<String>,
@@ -191,6 +211,11 @@ struct DagTriggerRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct CancelWorkflowRequest {
+    reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct DagPauseRequest {
     paused: bool,
 }
@@ -200,11 +225,17 @@ struct WorkflowListQuery {
     limit: Option<i64>,
 }
 
+#[derive(Debug, Deserialize)]
+struct DeadLetterListQuery {
+    limit: Option<i64>,
+}
+
 pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
     Router::new()
         .route("/workflows", get(list_workflows))
         .route("/workflows/{id}", get(get_workflow))
         .route("/workflows/{workflow_name}/start", post(start_workflow))
+        .route("/workflows/{id}/cancel", post(cancel_workflow))
         .route(
             "/workflows/{id}/signal/{signal_name}",
             post(signal_workflow),
@@ -214,6 +245,8 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .route("/dags/{dag_name}/runs", get(list_dag_runs))
         .route("/dags/{dag_name}/trigger", post(trigger_dag_run))
         .route("/dags/{dag_name}", patch(patch_dag))
+        .route("/dead-letters", get(list_dead_letters))
+        .route("/dead-letters/{id}/replay", post(replay_dead_letter))
         .route("/health", get(health))
         .layer(Extension(api_state))
 }
@@ -312,6 +345,34 @@ async fn start_workflow(
             workflow_name: start.workflow_name,
             workflow_id: start.workflow_id,
             state: start.state,
+        }),
+    ))
+}
+
+async fn cancel_workflow(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id): Path<String>,
+    Json(request): Json<CancelWorkflowRequest>,
+) -> Result<(axum::http::StatusCode, Json<CancelWorkflowResponse>), AutumnError> {
+    let exec_id = parse_execution_id(&id)?;
+    let mut conn = db_conn(&api_state).await?;
+    let reason = request
+        .reason
+        .as_deref()
+        .unwrap_or("workflow cancellation requested");
+    let cancelled = cancel_workflow_execution(&mut conn, exec_id, reason)
+        .await
+        .map_err(map_error)?;
+
+    Ok((
+        axum::http::StatusCode::ACCEPTED,
+        Json(CancelWorkflowResponse {
+            ok: true,
+            execution_id: cancelled.exec_id.to_string(),
+            state: cancelled.state,
+            reason: cancelled.reason,
+            newly_cancelled: cancelled.newly_cancelled,
+            failed_task_count: cancelled.failed_task_count,
         }),
     ))
 }
@@ -473,6 +534,38 @@ async fn patch_dag(
     Ok(Json(schedule))
 }
 
+async fn list_dead_letters(
+    Extension(api_state): Extension<HarvestApiState>,
+    Query(query): Query<DeadLetterListQuery>,
+) -> Result<Json<Vec<DeadLetter>>, AutumnError> {
+    let mut conn = db_conn(&api_state).await?;
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    let dead_letters = dlq::list_dead_letters(&mut conn, limit)
+        .await
+        .map_err(map_error)?;
+    Ok(Json(dead_letters))
+}
+
+async fn replay_dead_letter(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id): Path<String>,
+) -> Result<(axum::http::StatusCode, Json<ReplayDeadLetterResponse>), AutumnError> {
+    let dead_letter_id = parse_uuid(&id, "dead-letter id")?;
+    let mut conn = db_conn(&api_state).await?;
+    let task_id = dlq::replay_dead_letter(&mut conn, dead_letter_id)
+        .await
+        .map_err(map_error)?;
+
+    Ok((
+        axum::http::StatusCode::ACCEPTED,
+        Json(ReplayDeadLetterResponse {
+            ok: true,
+            dead_letter_id: dead_letter_id.to_string(),
+            task_id: task_id.to_string(),
+        }),
+    ))
+}
+
 async fn health(
     Extension(api_state): Extension<HarvestApiState>,
 ) -> Result<Json<HarvestHealth>, AutumnError> {
@@ -532,6 +625,11 @@ async fn db_conn(
 fn parse_execution_id(raw: &str) -> Result<ExecutionId, AutumnError> {
     raw.parse::<ExecutionId>()
         .map_err(|_| AutumnError::bad_request_msg(format!("invalid execution id '{raw}'")))
+}
+
+fn parse_uuid(raw: &str, label: &str) -> Result<uuid::Uuid, AutumnError> {
+    raw.parse::<uuid::Uuid>()
+        .map_err(|_| AutumnError::bad_request_msg(format!("invalid {label} '{raw}'")))
 }
 
 fn map_error(error: HarvestError) -> AutumnError {

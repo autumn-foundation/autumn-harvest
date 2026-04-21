@@ -31,6 +31,7 @@ pub mod pool;
 pub mod prelude;
 pub mod query;
 pub mod replay;
+pub mod saga;
 pub mod types;
 
 #[cfg(feature = "db")]
@@ -76,7 +77,8 @@ pub use error::{HarvestError, HarvestResult, TimeoutType};
 pub use event::WorkflowEvent;
 #[cfg(feature = "db")]
 pub use execution::{
-    StartWorkflowParams, StartedWorkflowExecution, start_or_load_workflow_execution,
+    CancelledWorkflowExecution, StartWorkflowParams, StartedWorkflowExecution,
+    cancel_workflow_execution, start_or_load_workflow_execution,
 };
 pub use executor::{WorkflowOutcome, run_workflow};
 pub use info::{ActivityHandlerFn, ActivityInfo, DagInfo, WorkflowHandlerFn, WorkflowInfo};
@@ -84,6 +86,7 @@ pub use policy::{RetryPolicy, Schedule, TaskStatus, TriggerRule};
 pub use pool::{HarvestPoolConfig, compute_pool_sizes};
 pub use query::QueryRegistry;
 pub use replay::{HistoryMatch, HistoryMatcher};
+pub use saga::Saga;
 #[cfg(feature = "db")]
 pub use scheduler::{
     DagCatalog, RegisteredDag, SchedulerMonitor, SchedulerRuntime, compile_dag_catalog,
