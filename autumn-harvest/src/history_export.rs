@@ -57,8 +57,7 @@ pub fn export_mermaid_sequence(events: &[WorkflowEvent]) -> Result<String, std::
                 writeln!(
                     out,
                     "    Note right of WF: Activity Started (ID: {activity_id}) on {worker_id}"
-                )
-                ?;
+                )?;
             }
             WorkflowEvent::ActivityCompleted { activity_id, .. } => {
                 // Note: since we lack the activity name here, we'll draw it back to WF generally
@@ -66,8 +65,7 @@ pub fn export_mermaid_sequence(events: &[WorkflowEvent]) -> Result<String, std::
                 writeln!(
                     out,
                     "    Note right of WF: Activity Completed (ID: {activity_id})"
-                )
-                ?;
+                )?;
             }
             WorkflowEvent::ActivityFailed {
                 activity_id,
@@ -78,8 +76,7 @@ pub fn export_mermaid_sequence(events: &[WorkflowEvent]) -> Result<String, std::
                 writeln!(
                     out,
                     "    Note right of WF: Activity Failed (ID: {activity_id}, Attempt: {attempt}): {safe_error}"
-                )
-                ?;
+                )?;
             }
             WorkflowEvent::ActivityTimedOut {
                 activity_id,
@@ -88,15 +85,13 @@ pub fn export_mermaid_sequence(events: &[WorkflowEvent]) -> Result<String, std::
                 writeln!(
                     out,
                     "    Note right of WF: Activity Timed Out (ID: {activity_id}, Type: {timeout_type:?})"
-                )
-                ?;
+                )?;
             }
             WorkflowEvent::ActivityHeartbeat { activity_id, .. } => {
                 writeln!(
                     out,
                     "    Note right of WF: Activity Heartbeat (ID: {activity_id})"
-                )
-                ?;
+                )?;
             }
             WorkflowEvent::TimerStarted {
                 timer_id,
@@ -109,8 +104,7 @@ pub fn export_mermaid_sequence(events: &[WorkflowEvent]) -> Result<String, std::
                 writeln!(
                     out,
                     "    WF->>+{participant}: Start Timer {timer_id} ({duration_secs}s)"
-                )
-                ?;
+                )?;
             }
             WorkflowEvent::TimerFired { timer_id } => {
                 let participant = "Timer";
@@ -124,8 +118,7 @@ pub fn export_mermaid_sequence(events: &[WorkflowEvent]) -> Result<String, std::
                 writeln!(
                     out,
                     "    {participant}->>WF: Signal Received: {signal_name}"
-                )
-                ?;
+                )?;
             }
             WorkflowEvent::ChildWorkflowStarted {
                 child_id,
@@ -137,8 +130,7 @@ pub fn export_mermaid_sequence(events: &[WorkflowEvent]) -> Result<String, std::
                     writeln!(
                         out,
                         "    participant {participant} as Child: {workflow_name}"
-                    )
-                    ?;
+                    )?;
                 }
                 writeln!(out, "    WF->>+{participant}: Start Child (ID: {child_id})")?;
             }
@@ -146,16 +138,14 @@ pub fn export_mermaid_sequence(events: &[WorkflowEvent]) -> Result<String, std::
                 writeln!(
                     out,
                     "    Note right of WF: Child Workflow Completed (ID: {child_id})"
-                )
-                ?;
+                )?;
             }
             WorkflowEvent::ChildWorkflowFailed { child_id, error } => {
                 let safe_error = error.replace('\n', " ").replace('"', "'");
                 writeln!(
                     out,
                     "    Note right of WF: Child Workflow Failed (ID: {child_id}): {safe_error}"
-                )
-                ?;
+                )?;
             }
             WorkflowEvent::MarkerRecorded { name, .. } => {
                 writeln!(out, "    Note over WF: Marker: {name}")?;

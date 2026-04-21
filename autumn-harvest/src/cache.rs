@@ -156,7 +156,12 @@ mod tests {
         cache.insert(id, make_state(10));
         let removed = cache.remove(&id);
         assert!(removed.is_some());
-        assert_eq!(removed.expect("removed entry should not be None").replay_position, 10);
+        assert_eq!(
+            removed
+                .expect("removed entry should not be None")
+                .replay_position,
+            10
+        );
         assert!(cache.is_empty());
     }
 
