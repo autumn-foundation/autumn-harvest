@@ -534,11 +534,10 @@ async fn execute_dag_run(
         let tasks = level.iter().map(|task_index| {
             // Avoid an unnecessary heap allocation of `DagTask` per task when `&DagTask` works.
             let task = &dag.definition.tasks()[*task_index];
-            let upstream_statuses = task
-                .upstreams
-                .iter()
-                .map(|upstream| statuses[*upstream].clone())
-                .collect::<Vec<_>>();
+            let mut upstream_statuses = Vec::with_capacity(task.upstreams.len());
+            for upstream in &task.upstreams {
+                upstream_statuses.push(statuses[*upstream].clone());
+            }
             let registry = Arc::clone(&registry);
             let task_input = run_input.clone();
             async move { execute_dag_task(&registry, task, &upstream_statuses, &task_input).await }
