@@ -27,39 +27,55 @@ use crate::worker::{DbPool, HandlerRegistry};
 
 const DEFAULT_SCHEDULER_TICK_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Represents a fully registered and compiled DAG definition.
 #[derive(Debug, Clone)]
 pub struct RegisteredDag {
+    /// The name of the DAG.
     pub name: String,
+    /// The Rust module path where the DAG is defined.
     pub module: String,
+    /// Optional schedule for automatic execution.
     pub schedule: Option<Schedule>,
+    /// Whether to run missed executions sequentially if the scheduler was down.
     pub catchup: bool,
+    /// Maximum number of concurrent executions for this DAG.
     pub max_active_runs: u32,
+    /// The compiled task and dependency definition.
     pub definition: crate::dag::DagDefinition,
 }
 
 impl RegisteredDag {
+    /// Returns the number of tasks in this DAG.
     #[must_use]
     pub fn task_count(&self) -> usize {
         self.definition.tasks().len()
     }
 }
 
+/// A collection of registered DAGs mapped by name.
 pub type DagCatalog = HashMap<String, RegisteredDag>;
 
+/// A point-in-time diagnostic snapshot of the scheduler's state.
 #[derive(Debug, Clone, Serialize)]
 pub struct SchedulerSnapshot {
+    /// True if the scheduler loop is currently running.
     pub running: bool,
+    /// Number of DAGs registered with the scheduler.
     pub dag_count: usize,
+    /// Interval in milliseconds between scheduler ticks.
     pub tick_interval_ms: u64,
+    /// UTC timestamp of the last executed tick.
     pub last_tick_at: Option<DateTime<Utc>>,
 }
 
+/// Provides diagnostic visibility into a running scheduler.
 #[derive(Debug, Clone)]
 pub struct SchedulerMonitor {
     inner: Arc<Mutex<SchedulerSnapshot>>,
 }
 
 impl SchedulerMonitor {
+    /// Creates a new monitor initialized for the given number of DAGs.
     #[must_use]
     pub fn new(dag_count: usize) -> Self {
         Self {
@@ -75,6 +91,7 @@ impl SchedulerMonitor {
         }
     }
 
+    /// Creates a dummy offline monitor for contexts where the scheduler isn't running.
     #[must_use]
     pub fn offline() -> Self {
         Self {
@@ -117,6 +134,7 @@ impl SchedulerMonitor {
     }
 }
 
+/// The background runtime that drives DAG scheduling.
 pub struct SchedulerRuntime {
     shutdown: CancellationToken,
     handle: JoinHandle<()>,
@@ -124,6 +142,9 @@ pub struct SchedulerRuntime {
 }
 
 impl SchedulerRuntime {
+    /// Spawns the scheduler loop on a new Tokio task.
+    ///
+    /// It wakes up at a fixed interval to evaluate schedules and trigger runs.
     #[must_use]
     pub fn spawn(pool: DbPool, registry: Arc<HandlerRegistry>, dags: Arc<DagCatalog>) -> Self {
         let shutdown = CancellationToken::new();
@@ -165,11 +186,13 @@ impl SchedulerRuntime {
         }
     }
 
+    /// Returns a diagnostic monitor for the scheduler.
     #[must_use]
     pub fn monitor(&self) -> SchedulerMonitor {
         self.monitor.clone()
     }
 
+    /// Requests that the background scheduler loop shut down gracefully.
     pub fn shutdown(&self) {
         self.shutdown.cancel();
     }

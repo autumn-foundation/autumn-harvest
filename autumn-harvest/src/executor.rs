@@ -22,12 +22,21 @@ use crate::types::ExecutionId;
 #[derive(Debug)]
 pub enum WorkflowOutcome {
     /// The workflow ran to completion and returned a value.
-    Completed { output: Value },
+    Completed {
+        /// The final result serialized as JSON.
+        output: Value,
+    },
     /// The workflow function returned an error.
-    Failed { error: String },
+    Failed {
+        /// The string description of the error encountered.
+        error: String,
+    },
     /// The workflow suspended awaiting activity results or timer firings.
     /// The accumulated commands describe what the worker needs to schedule.
-    Suspended { commands: Vec<WorkflowCommand> },
+    Suspended {
+        /// A list of commands representing the side effects (e.g. activities) requested.
+        commands: Vec<WorkflowCommand>,
+    },
 }
 
 /// Default timeout for detecting suspension -- if the workflow hasn't completed
