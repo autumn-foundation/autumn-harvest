@@ -527,7 +527,8 @@ async fn execute_dag_run(
     dag: RegisteredDag,
     run: DagRun,
 ) -> HarvestResult<()> {
-    let run_input = run.conf.clone().unwrap_or(Value::Null);
+    // Bolt: Use Arc to avoid deep cloning the JSON Value for every task in the DAG
+    let run_input = Arc::new(run.conf.unwrap_or(Value::Null));
     let mut statuses = vec![TaskStatus::Skipped; dag.definition.tasks().len()];
 
     for level in dag.definition.execution_levels() {
@@ -539,7 +540,7 @@ async fn execute_dag_run(
                 upstream_statuses.push(statuses[*upstream].clone());
             }
             let registry = Arc::clone(&registry);
-            let task_input = run_input.clone();
+            let task_input = Arc::clone(&run_input);
             async move { execute_dag_task(&registry, task, &upstream_statuses, &task_input).await }
         });
         let results = futures::future::join_all(tasks).await;
