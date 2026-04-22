@@ -156,4 +156,31 @@ mod tests {
         assert_eq!(r?, 42);
         Ok(())
     }
+    #[test]
+    fn harvest_error_saga_compensation_failed() {
+        let e = HarvestError::SagaCompensationFailed {
+            original: "network timeout".into(),
+            compensation_errors: vec!["db locked".into(), "disk full".into()],
+        };
+        assert!(e.to_string().contains("network timeout"));
+        assert!(e.to_string().contains("db locked"));
+        assert!(e.to_string().contains("disk full"));
+    }
+
+    #[test]
+    fn timeout_type_display_is_correct() {
+        assert_eq!(TimeoutType::StartToClose.to_string(), "StartToClose");
+        assert_eq!(TimeoutType::ScheduleToStart.to_string(), "ScheduleToStart");
+        assert_eq!(TimeoutType::ScheduleToClose.to_string(), "ScheduleToClose");
+        assert_eq!(TimeoutType::Heartbeat.to_string(), "Heartbeat");
+    }
+
+    #[test]
+    fn database_error_conversion() {
+        let err = database_error("connection refused");
+        match err {
+            HarvestError::Database(msg) => assert_eq!(msg, "connection refused"),
+            _ => panic!("Expected Database error"),
+        }
+    }
 }

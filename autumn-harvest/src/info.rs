@@ -190,4 +190,42 @@ mod tests {
         assert_eq!(definition.tasks()[0].queue.as_deref(), Some("etl-workers"));
         assert_eq!(definition.tasks()[1].trigger_rule, TriggerRule::AllSuccess);
     }
+    #[test]
+    fn info_debug_formats_correctly() {
+        let workflow_info = WorkflowInfo {
+            name: "test_wf",
+            module: "test_mod",
+            handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+        };
+        let debug_str = format!("{workflow_info:?}");
+        assert!(debug_str.contains("WorkflowInfo"));
+        assert!(debug_str.contains("test_wf"));
+
+        let activity_info = ActivityInfo {
+            name: "test_act",
+            module: "test_mod",
+            default_retry_policy: None,
+            default_start_to_close: None,
+            default_heartbeat_timeout: None,
+            default_schedule_to_start: None,
+            default_queue: None,
+            handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+        };
+        let debug_str = format!("{activity_info:?}");
+        assert!(debug_str.contains("ActivityInfo"));
+        assert!(debug_str.contains("test_act"));
+
+        let dag_info = DagInfo {
+            name: "test_dag",
+            module: "test_mod",
+            schedule: None,
+            catchup: false,
+            max_active_runs: 1,
+            default_queue: None,
+            builder: |_| {},
+        };
+        let debug_str = format!("{dag_info:?}");
+        assert!(debug_str.contains("DagInfo"));
+        assert!(debug_str.contains("test_dag"));
+    }
 }

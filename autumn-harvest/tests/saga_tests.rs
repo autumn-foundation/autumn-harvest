@@ -285,3 +285,44 @@ async fn saga_reports_compensation_failures_with_original_error_and_keeps_unwind
     );
     assert_eq!(saga.pending_compensation_count(), 0);
 }
+
+#[tokio::test]
+async fn saga_compensate_all_reports_failures_when_compensations_fail() {
+    let ctx = test_context();
+    let mut saga = Saga::new(&ctx);
+
+    saga.step(
+        || async move { Ok::<_, HarvestError>("step1") },
+        |_| async move { Err::<(), _>(workflow_failed("comp_fail_1")) },
+    )
+    .await
+    .expect("step should succeed");
+
+    saga.step(
+        || async move { Ok::<_, HarvestError>("step2") },
+        |_| async move { Err::<(), _>(workflow_failed("comp_fail_2")) },
+    )
+    .await
+    .expect("step should succeed");
+
+    let error = saga.compensate_all().await.expect_err("should fail");
+    let HarvestError::SagaCompensationFailed {
+        original,
+        compensation_errors,
+    } = error
+    else {
+        panic!("expected SagaCompensationFailed, got {error:?}");
+    };
+
+    assert_eq!(original, "manual compensation requested");
+    assert_eq!(compensation_errors.len(), 2);
+    assert!(compensation_errors[0].contains("comp_fail_2"));
+    assert!(compensation_errors[1].contains("comp_fail_1"));
+}
+
+#[tokio::test]
+async fn saga_context_returns_provided_context() {
+    let ctx = test_context();
+    let saga = Saga::new(&ctx);
+    assert_eq!(saga.context().version("test", 1, 1), 1);
+}
