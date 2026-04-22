@@ -182,25 +182,28 @@ fn find_pending_scheduled_activity(
         })
         .collect::<HashSet<_>>();
 
-    let pending = history
-        .iter()
-        .filter_map(|event| match event {
-            WorkflowEvent::ActivityScheduled {
-                activity_id, name, ..
-            } if name == activity_name && !terminal_ids.contains(activity_id) => Some(*activity_id),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-
-    match pending.as_slice() {
-        [activity_id] => Ok(*activity_id),
-        [] => Err(HarvestError::NotFound(format!(
-            "no pending scheduled activity '{activity_name}' in workflow history"
-        ))),
-        _ => Err(HarvestError::NonDeterministic(format!(
-            "multiple pending scheduled activities named '{activity_name}' found in history"
-        ))),
+    let mut pending = None;
+    for event in history {
+        if let WorkflowEvent::ActivityScheduled {
+            activity_id, name, ..
+        } = event
+        {
+            if name == activity_name && !terminal_ids.contains(activity_id) {
+                if pending.is_some() {
+                    return Err(HarvestError::NonDeterministic(format!(
+                        "multiple pending scheduled activities named '{activity_name}' found in history"
+                    )));
+                }
+                pending = Some(*activity_id);
+            }
+        }
     }
+
+    pending.ok_or_else(|| {
+        HarvestError::NotFound(format!(
+            "no pending scheduled activity '{activity_name}' in workflow history"
+        ))
+    })
 }
 
 async fn load_workflow_execution(
