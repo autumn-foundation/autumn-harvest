@@ -1,3 +1,5 @@
+#![cfg(feature = "db")]
+
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::store::events_to_insert_rows_from;
 use autumn_harvest::types::ExecutionId;
