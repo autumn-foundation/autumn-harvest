@@ -9,6 +9,15 @@
 //! the blanket `From<E: Error> for AutumnError` impl automatically.
 
 /// The kind of timeout that fired.
+///
+/// ## Examples
+///
+/// ```rust
+/// use autumn_harvest::error::TimeoutType;
+///
+/// let timeout = TimeoutType::StartToClose;
+/// assert_eq!(timeout.to_string(), "StartToClose");
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TimeoutType {
     /// Worker claimed the task but didn't finish in time.
@@ -33,6 +42,15 @@ impl std::fmt::Display for TimeoutType {
 }
 
 /// Errors produced by the autumn-harvest workflow engine.
+///
+/// ## Examples
+///
+/// ```rust
+/// use autumn_harvest::error::HarvestError;
+///
+/// let error = HarvestError::NotFound("workflow-123".into());
+/// assert!(error.to_string().contains("workflow execution not found"));
+/// ```
 #[derive(Debug, thiserror::Error)]
 pub enum HarvestError {
     #[error("activity failed: {name} (attempt {attempt}): {source}")]
@@ -88,6 +106,18 @@ pub type HarvestResult<T> = Result<T, HarvestError>;
 /// Wrap any displayable error into [`HarvestError::Database`].
 ///
 /// Use with `.map_err(database_error)` to reduce boilerplate on diesel calls.
+///
+/// ## Examples
+///
+/// ```rust
+/// use autumn_harvest::error::{HarvestError, database_error};
+///
+/// let err = database_error("connection failed");
+/// match err {
+///     HarvestError::Database(msg) => assert_eq!(msg, "connection failed"),
+///     _ => panic!("Expected Database error"),
+/// }
+/// ```
 pub fn database_error(e: impl std::fmt::Display) -> HarvestError {
     HarvestError::Database(e.to_string())
 }
