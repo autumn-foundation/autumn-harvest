@@ -2,46 +2,50 @@ use crate::dag::DagDefinition;
 use std::fmt::Write;
 
 /// Exports the DAG definition to a Mermaid.js flowchart.
-#[must_use]
-pub fn export_mermaid(dag: &DagDefinition) -> String {
+///
+/// # Errors
+/// Returns `std::fmt::Error` if string formatting fails.
+pub fn export_mermaid(dag: &DagDefinition) -> Result<String, std::fmt::Error> {
     let mut out = String::new();
-    writeln!(out, "graph TD").unwrap();
+    writeln!(out, "graph TD")?;
 
     let tasks = dag.tasks();
 
     for (i, task) in tasks.iter().enumerate() {
-        writeln!(out, "    t{i}[\"{}\"]", task.activity_name).unwrap();
+        writeln!(out, "    t{i}[\"{}\"]", task.activity_name)?;
     }
 
     for (i, task) in tasks.iter().enumerate() {
         for &upstream in &task.upstreams {
-            writeln!(out, "    t{upstream} --> t{i}").unwrap();
+            writeln!(out, "    t{upstream} --> t{i}")?;
         }
     }
 
-    out
+    Ok(out)
 }
 
 /// Exports the DAG definition to Graphviz DOT format.
-#[must_use]
-pub fn export_dot(dag: &DagDefinition) -> String {
+///
+/// # Errors
+/// Returns `std::fmt::Error` if string formatting fails.
+pub fn export_dot(dag: &DagDefinition) -> Result<String, std::fmt::Error> {
     let mut out = String::new();
-    writeln!(out, "digraph DAG {{").unwrap();
+    writeln!(out, "digraph DAG {{")?;
 
     let tasks = dag.tasks();
 
     for (i, task) in tasks.iter().enumerate() {
-        writeln!(out, "    t{i} [label=\"{}\"];", task.activity_name).unwrap();
+        writeln!(out, "    t{i} [label=\"{}\"];", task.activity_name)?;
     }
 
     for (i, task) in tasks.iter().enumerate() {
         for &upstream in &task.upstreams {
-            writeln!(out, "    t{upstream} -> t{i};").unwrap();
+            writeln!(out, "    t{upstream} -> t{i};")?;
         }
     }
 
-    writeln!(out, "}}").unwrap();
-    out
+    writeln!(out, "}}")?;
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -58,10 +62,10 @@ mod tests {
         let builder = DagBuilder::new();
         let dag = builder.build().unwrap();
 
-        let mermaid = export_mermaid(&dag);
+        let mermaid = export_mermaid(&dag).unwrap();
         assert_eq!(mermaid, "graph TD\n");
 
-        let dot = export_dot(&dag);
+        let dot = export_dot(&dag).unwrap();
         assert_eq!(dot, "digraph DAG {\n}\n");
     }
 
@@ -78,7 +82,7 @@ mod tests {
 
         let dag = builder.build().unwrap();
 
-        let mermaid = export_mermaid(&dag);
+        let mermaid = export_mermaid(&dag).unwrap();
         let expected_mermaid = "\
 graph TD
     t0[\"dummy_activity\"]
@@ -92,7 +96,7 @@ graph TD
 ";
         assert_eq!(mermaid, expected_mermaid);
 
-        let dot = export_dot(&dag);
+        let dot = export_dot(&dag).unwrap();
         let expected_dot = "\
 digraph DAG {
     t0 [label=\"dummy_activity\"];
