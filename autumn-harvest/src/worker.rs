@@ -307,9 +307,9 @@ fn extract_single_command<T>(
     commands: &[WorkflowCommand],
     extractor: impl Fn(&WorkflowCommand) -> Option<T>,
 ) -> Option<T> {
-    let mut iter = commands.iter().filter(|cmd| {
-        !matches!(cmd, WorkflowCommand::RecordMarker { .. })
-    });
+    let mut iter = commands
+        .iter()
+        .filter(|cmd| !matches!(cmd, WorkflowCommand::RecordMarker { .. }));
 
     let first_cmd = iter.next()?;
 
