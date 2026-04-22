@@ -41,6 +41,15 @@ impl WorkflowCache {
     /// # Panics
     ///
     /// Panics if `max_size` is zero.
+    ///
+    /// ## Examples
+    ///
+    /// ```rust
+    /// use autumn_harvest::cache::WorkflowCache;
+    ///
+    /// let cache = WorkflowCache::new(10);
+    /// assert_eq!(cache.len(), 0);
+    /// ```
     #[must_use]
     pub fn new(max_size: usize) -> Self {
         let cap = NonZeroUsize::new(max_size).expect("cache max_size must be > 0");
@@ -52,6 +61,17 @@ impl WorkflowCache {
     /// Insert or update a cached workflow state.
     ///
     /// If the cache is full, the least-recently-used entry is evicted.
+    ///
+    /// ## Examples
+    ///
+    /// ```rust
+    /// use uuid::Uuid;
+    /// use autumn_harvest::cache::{WorkflowCache, CachedWorkflowState};
+    ///
+    /// let mut cache = WorkflowCache::new(10);
+    /// let state = CachedWorkflowState { replay_position: 1, next_activity_seq: 1, next_timer_seq: 1 };
+    /// cache.insert(Uuid::new_v4(), state);
+    /// ```
     pub fn insert(&mut self, exec_id: Uuid, state: CachedWorkflowState) {
         self.inner.put(exec_id, state);
     }
@@ -59,23 +79,62 @@ impl WorkflowCache {
     /// Look up a cached workflow state, marking it as recently used.
     ///
     /// Returns `None` if the execution ID is not in the cache.
+    ///
+    /// ## Examples
+    ///
+    /// ```rust
+    /// use uuid::Uuid;
+    /// use autumn_harvest::cache::WorkflowCache;
+    ///
+    /// let mut cache = WorkflowCache::new(10);
+    /// assert!(cache.get(&Uuid::new_v4()).is_none());
+    /// ```
     #[must_use]
     pub fn get(&mut self, exec_id: &Uuid) -> Option<&CachedWorkflowState> {
         self.inner.get(exec_id)
     }
 
     /// Remove a cached workflow state, returning it if present.
+    ///
+    /// ## Examples
+    ///
+    /// ```rust
+    /// use uuid::Uuid;
+    /// use autumn_harvest::cache::WorkflowCache;
+    ///
+    /// let mut cache = WorkflowCache::new(10);
+    /// let id = Uuid::new_v4();
+    /// assert!(cache.remove(&id).is_none());
+    /// ```
     pub fn remove(&mut self, exec_id: &Uuid) -> Option<CachedWorkflowState> {
         self.inner.pop(exec_id)
     }
 
     /// Returns the number of entries currently in the cache.
+    ///
+    /// ## Examples
+    ///
+    /// ```rust
+    /// use autumn_harvest::cache::WorkflowCache;
+    ///
+    /// let cache = WorkflowCache::new(10);
+    /// assert_eq!(cache.len(), 0);
+    /// ```
     #[must_use]
     pub fn len(&self) -> usize {
         self.inner.len()
     }
 
     /// Returns `true` if the cache contains no entries.
+    ///
+    /// ## Examples
+    ///
+    /// ```rust
+    /// use autumn_harvest::cache::WorkflowCache;
+    ///
+    /// let cache = WorkflowCache::new(10);
+    /// assert!(cache.is_empty());
+    /// ```
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
