@@ -60,7 +60,8 @@ pub fn events_to_insert_rows_from(
         .enumerate()
         .map(|(i, event)| {
             #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-            let event_id = start_id + i as i32;
+            let i_i32 = i as i32;
+            let event_id = start_id.checked_add(i_i32).expect("Event ID overflow");
             NewHarvestEvent {
                 workflow_exec_id: exec_id.as_uuid(),
                 event_id,
