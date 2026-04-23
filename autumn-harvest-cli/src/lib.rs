@@ -156,6 +156,8 @@ enum Commands {
         #[command(subcommand)]
         command: DeadLetterCommand,
     },
+    /// Open the TUI dashboard to monitor workflows.
+    Tui,
 }
 
 #[derive(Debug, Subcommand)]
@@ -293,6 +295,7 @@ impl Cli {
             Commands::Workflow { command } => workflow_request(command),
             Commands::Dag { command } => dag_request(command),
             Commands::Dlq { command } => Ok(dead_letter_request(command)),
+            Commands::Tui => unreachable!("Tui command handles its own requests"),
         }
     }
 }
@@ -323,6 +326,8 @@ impl ApiRequest {
     }
 }
 
+pub mod tui;
+
 /// Run the CLI, print successful response data to stdout, and return errors.
 ///
 /// # Errors
@@ -330,6 +335,10 @@ impl ApiRequest {
 /// Returns an error if request construction, HTTP transport, response parsing,
 /// or response formatting fails.
 pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
+    if matches!(cli.command, Commands::Tui) {
+        return tui::run_tui(&cli).await;
+    }
+
     let output = cli.output;
     let response = execute(&cli).await?;
     let rendered = format_output(&response, output)?;
