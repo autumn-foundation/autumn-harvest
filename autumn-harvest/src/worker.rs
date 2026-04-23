@@ -307,62 +307,60 @@ fn extract_single_command<T>(
     commands: &[WorkflowCommand],
     extractor: impl Fn(&WorkflowCommand) -> Option<T>,
 ) -> Option<T> {
-    let mut result = None;
+    let mut iter = commands
+        .iter()
+        .filter(|cmd| !matches!(cmd, WorkflowCommand::RecordMarker { .. }));
 
-    for cmd in commands {
-        if matches!(cmd, WorkflowCommand::RecordMarker { .. }) {
-            continue;
-        }
+    let first_cmd = iter.next()?;
 
-        let val = extractor(cmd)?;
-        if result.is_some() {
-            return None;
-        }
-        result = Some(val);
+    // Original behavior: return None if there's more than one non-marker command.
+    if iter.next().is_some() {
+        return None;
     }
 
-    result
+    // Original behavior: extractor(cmd)? means we return None if the extractor yields None.
+    extractor(first_cmd)
 }
 
 fn extract_single_schedule_activity(
     commands: &[WorkflowCommand],
 ) -> Option<ScheduledActivityCommand> {
     extract_single_command(commands, |cmd| {
-        if let WorkflowCommand::ScheduleActivity {
+        let WorkflowCommand::ScheduleActivity {
             activity_id,
             name,
             input,
             queue,
             ..
         } = cmd
-        {
-            Some(ScheduledActivityCommand {
-                activity_id: *activity_id,
-                name: name.clone(),
-                input: input.clone(),
-                queue: queue.clone(),
-            })
-        } else {
-            None
-        }
+        else {
+            return None;
+        };
+
+        Some(ScheduledActivityCommand {
+            activity_id: *activity_id,
+            name: name.clone(),
+            input: input.clone(),
+            queue: queue.clone(),
+        })
     })
 }
 
 fn extract_single_started_timer(commands: &[WorkflowCommand]) -> Option<StartedTimerCommand> {
     extract_single_command(commands, |cmd| {
-        if let WorkflowCommand::StartTimer {
+        let WorkflowCommand::StartTimer {
             timer_id,
             duration_secs,
             ..
         } = cmd
-        {
-            Some(StartedTimerCommand {
-                timer_id: timer_id.clone(),
-                duration_secs: *duration_secs,
-            })
-        } else {
-            None
-        }
+        else {
+            return None;
+        };
+
+        Some(StartedTimerCommand {
+            timer_id: timer_id.clone(),
+            duration_secs: *duration_secs,
+        })
     })
 }
 
@@ -370,21 +368,21 @@ fn extract_single_started_child_workflow(
     commands: &[WorkflowCommand],
 ) -> Option<StartedChildWorkflowCommand> {
     extract_single_command(commands, |cmd| {
-        if let WorkflowCommand::StartChildWorkflow {
+        let WorkflowCommand::StartChildWorkflow {
             child_id,
             workflow_name,
             input,
             ..
         } = cmd
-        {
-            Some(StartedChildWorkflowCommand {
-                child_id: *child_id,
-                workflow_name: workflow_name.clone(),
-                input: input.clone(),
-            })
-        } else {
-            None
-        }
+        else {
+            return None;
+        };
+
+        Some(StartedChildWorkflowCommand {
+            child_id: *child_id,
+            workflow_name: workflow_name.clone(),
+            input: input.clone(),
+        })
     })
 }
 
