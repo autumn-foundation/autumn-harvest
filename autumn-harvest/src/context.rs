@@ -447,9 +447,9 @@ impl WorkflowContext {
                 task_name: name.to_string(),
             }),
 
-            HistoryMatch::Diverged { expected, actual } => Err(HarvestError::NonDeterministic(format!(
-                "activity mismatch: expected {expected}, got {actual}"
-            ))),
+            HistoryMatch::Diverged { expected, actual } => Err(HarvestError::NonDeterministic(
+                format!("activity mismatch: expected {expected}, got {actual}"),
+            )),
 
             HistoryMatch::NoMatch => {
                 // Live execution: emit a ScheduleActivity command and suspend
@@ -571,9 +571,9 @@ impl WorkflowContext {
                 timeout_type,
                 task_name: format!("child-workflow:{workflow_name}"),
             }),
-            HistoryMatch::Diverged { expected, actual } => Err(HarvestError::NonDeterministic(format!(
-                "child workflow mismatch: expected {expected}, got {actual}"
-            ))),
+            HistoryMatch::Diverged { expected, actual } => Err(HarvestError::NonDeterministic(
+                format!("child workflow mismatch: expected {expected}, got {actual}"),
+            )),
             HistoryMatch::NoMatch => {
                 let (tx, rx) = oneshot::channel();
                 self.push_command(WorkflowCommand::StartChildWorkflow {
