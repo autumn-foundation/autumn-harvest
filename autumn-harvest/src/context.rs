@@ -296,6 +296,80 @@ impl WorkflowContext {
         self.state.get(&TypeId::of::<T>())?.downcast_ref::<T>()
     }
 
+    // ── Side effects ──────────────────────────────────────────────────
+
+    /// Execute a quick, deterministic inline side-effect.
+    ///
+    /// This is useful for fast operations that must not be re-evaluated during
+    /// replay, like generating a random number, assigning an ID, or fetching
+    /// from an external system that does not warrant a full activity.
+    ///
+    /// During **live execution**, runs the closure, serializes the result,
+    /// pushes a `RecordMarker` command to history, and returns the result.
+    /// During **replay**, ignores the closure, deserializes the stored result
+    /// from history, and returns it.
+    ///
+    /// # Errors
+    ///
+    /// Returns `HarvestError::NonDeterministic` if history diverged.
+    /// Returns `HarvestError::Serialization` if the payload couldn't be serialized.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    pub fn side_effect<F, T>(&self, id: &str, f: F) -> HarvestResult<T>
+    where
+        F: FnOnce() -> T,
+        T: serde::Serialize + serde::de::DeserializeOwned,
+    {
+        let history_match = self
+            .matcher
+            .lock()
+            .expect("matcher lock poisoned")
+            .match_side_effect(id);
+
+        match history_match {
+            HistoryMatch::Matched { output } => {
+                serde_json::from_value(output).map_err(HarvestError::Serialization)
+            }
+
+            HistoryMatch::Diverged { expected, actual } => Err(HarvestError::NonDeterministic(
+                format!("side effect mismatch: expected {expected}, got {actual}"),
+            )),
+
+            HistoryMatch::Failed { .. } | HistoryMatch::TimedOut { .. } => {
+                Err(HarvestError::NonDeterministic(
+                    "side effect history contains unexpected failure".into(),
+                ))
+            }
+
+            HistoryMatch::NoMatch => {
+                let result = f();
+                let output = serde_json::to_value(&result)?;
+
+                self.push_command(WorkflowCommand::RecordMarker {
+                    name: format!("side_effect:{id}"),
+                    details: output,
+                });
+
+                Ok(result)
+            }
+        }
+    }
+
+    /// Convenience wrapper around `side_effect` for generating a deterministic UUID.
+    ///
+    /// During **live execution**, generates a new UUID.
+    /// During **replay**, yields the same UUID from history.
+    ///
+    /// # Errors
+    ///
+    /// Returns `HarvestError::NonDeterministic` if history diverged.
+    /// Returns `HarvestError::Serialization` if the payload couldn't be serialized.
+    pub fn random_uuid(&self, id: &str) -> HarvestResult<uuid::Uuid> {
+        self.side_effect(id, uuid::Uuid::new_v4)
+    }
+
     // ── Version gate ──────────────────────────────────────────────────
 
     /// Query or record a versioned code path.
@@ -1081,6 +1155,81 @@ mod tests {
         assert!(
             matches!(&cmds[0], WorkflowCommand::RecordMarker { name, .. } if name == "version:billing_v2")
         );
+    }
+
+    #[test]
+    fn context_side_effect_returns_recorded_value() {
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "side_effect:random_num".into(),
+                details: serde_json::json!(42),
+            },
+        ];
+
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let result = ctx.side_effect("random_num", || 99).unwrap();
+        assert_eq!(result, 42);
+
+        // No commands during replay.
+        assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[test]
+    fn context_side_effect_emits_marker_during_live_execution() {
+        let ctx = WorkflowContext::new_test();
+
+        let result = ctx.side_effect("random_num", || 42).unwrap();
+        assert_eq!(result, 42);
+
+        let cmds = ctx.drain_commands();
+        assert_eq!(cmds.len(), 1);
+        match &cmds[0] {
+            WorkflowCommand::RecordMarker { name, details } => {
+                assert_eq!(name, "side_effect:random_num");
+                assert_eq!(details, &serde_json::json!(42));
+            }
+            _ => panic!("Expected RecordMarker command"),
+        }
+    }
+
+    #[test]
+    fn context_random_uuid_returns_recorded_value() {
+        let expected_uuid = uuid::Uuid::new_v4();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "side_effect:txn_id".into(),
+                details: serde_json::json!(expected_uuid),
+            },
+        ];
+
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let result = ctx.random_uuid("txn_id").unwrap();
+        assert_eq!(result, expected_uuid);
+    }
+
+    #[test]
+    fn context_random_uuid_emits_marker_during_live_execution() {
+        let ctx = WorkflowContext::new_test();
+
+        let result = ctx.random_uuid("txn_id").unwrap();
+
+        let cmds = ctx.drain_commands();
+        assert_eq!(cmds.len(), 1);
+        match &cmds[0] {
+            WorkflowCommand::RecordMarker { name, details } => {
+                assert_eq!(name, "side_effect:txn_id");
+                assert_eq!(details, &serde_json::json!(result));
+            }
+            _ => panic!("Expected RecordMarker command"),
+        }
     }
 
     #[tokio::test]

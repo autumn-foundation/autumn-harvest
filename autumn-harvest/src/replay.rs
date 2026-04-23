@@ -537,6 +537,28 @@ impl HistoryMatcher {
     /// - `min_version` if no marker exists (old workflow before versioning)
     /// - `max_version` if past end of history (new code path)
     #[must_use]
+    pub fn match_side_effect(&mut self, side_effect_id: &str) -> HistoryMatch {
+        self.advance_to_next_unconsumed_event();
+        let marker_name = format!("side_effect:{side_effect_id}");
+
+        if !self.is_replaying() {
+            return HistoryMatch::NoMatch;
+        }
+
+        match &self.events[self.cursor] {
+            WorkflowEvent::MarkerRecorded { name, details } if *name == marker_name => {
+                let output = details.clone();
+                self.cursor += 1;
+                self.advance_to_next_unconsumed_event();
+                HistoryMatch::Matched { output }
+            }
+            other => HistoryMatch::Diverged {
+                expected: format!("MarkerRecorded({marker_name})"),
+                actual: other.type_name().to_string(),
+            },
+        }
+    }
+
     pub fn match_version(&mut self, change_id: &str, min_version: u32, max_version: u32) -> u32 {
         self.advance_to_next_unconsumed_event();
         let marker_name = format!("version:{change_id}");
