@@ -79,39 +79,61 @@ fn should_check_durable_cancellation(
 pub enum WorkflowCommand {
     /// Schedule an activity for execution on a task queue.
     ScheduleActivity {
+        /// The unique execution ID of the activity.
         activity_id: ActivityExecId,
+        /// The name of the activity to execute.
         name: String,
+        /// The input payload for the activity.
         input: Value,
+        /// The queue to schedule the activity on.
         queue: String,
         /// The worker sends the result back through this channel.
         result_tx: oneshot::Sender<Result<Value, String>>,
     },
     /// Start a durable timer.
     StartTimer {
+        /// The unique ID of the timer.
         timer_id: TimerId,
+        /// The duration to wait before firing the timer, in seconds.
         duration_secs: u64,
         /// Fires when the timer completes.
         result_tx: oneshot::Sender<()>,
     },
     /// Start a child workflow execution.
     StartChildWorkflow {
+        /// The unique execution ID of the child workflow.
         child_id: ExecutionId,
+        /// The name of the workflow to execute.
         workflow_name: String,
+        /// The input payload for the child workflow.
         input: Value,
         /// The worker sends the terminal child result back through this channel.
         result_tx: oneshot::Sender<Result<Value, String>>,
     },
     /// Record an opaque marker (used by version gates, side-effect-free notes).
-    RecordMarker { name: String, details: Value },
+    RecordMarker {
+        /// The name of the marker.
+        name: String,
+        /// Optional details or payload associated with the marker.
+        details: Value,
+    },
     /// Suspend until a named signal is delivered.
     WaitForSignal {
+        /// The name of the signal to wait for.
         signal_name: String,
+        /// The worker sends the signal payload back through this channel.
         result_tx: oneshot::Sender<Value>,
     },
     /// The workflow function returned `Ok(output)`.
-    Complete { output: Value },
+    Complete {
+        /// The final output payload of the workflow.
+        output: Value,
+    },
     /// The workflow function returned `Err(error)`.
-    Fail { error: String },
+    Fail {
+        /// The string representation of the error that caused the failure.
+        error: String,
+    },
 }
 
 // Manual Debug because oneshot::Sender is not Debug.
