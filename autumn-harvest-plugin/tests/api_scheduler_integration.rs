@@ -15,6 +15,7 @@ use autumn_harvest::schema::{
     harvest_dag_runs, harvest_dead_letters, harvest_schedules, harvest_task_queue,
     harvest_workflow_executions,
 };
+use autumn_harvest::shard::ShardRouter;
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{ActivityContext, WorkflowContext};
 use autumn_harvest_plugin::HarvestDbPool;
@@ -482,6 +483,7 @@ async fn harvest_api_uses_installed_storage_pool_when_app_state_has_no_database(
         Some("test-worker".to_string()),
         vec!["default".to_string()],
         SchedulerMonitor::offline(),
+        ShardRouter::single(),
     ));
 
     let worker = build_test_worker(Arc::clone(&registry));
@@ -566,6 +568,7 @@ async fn harvest_api_duplicate_start_reuses_existing_execution() {
         Some("test-worker".to_string()),
         vec!["default".to_string()],
         SchedulerMonitor::offline(),
+        ShardRouter::single(),
     ));
     let app = harvest_api_router(api_state).with_state(test_app_state(pool));
 
@@ -622,6 +625,7 @@ async fn harvest_api_cancels_workflows_and_rejects_late_signals() {
         Some("test-worker".to_string()),
         vec!["default".to_string()],
         SchedulerMonitor::offline(),
+        ShardRouter::single(),
     ));
     let app = harvest_api_router(api_state).with_state(test_app_state(pool));
 
@@ -790,6 +794,7 @@ async fn harvest_api_signal_does_not_wake_timer_waits_early() {
         Some("test-worker".to_string()),
         vec!["default".to_string()],
         SchedulerMonitor::offline(),
+        ShardRouter::single(),
     ));
 
     let worker = build_test_worker(Arc::clone(&registry));
@@ -973,6 +978,7 @@ async fn harvest_api_lists_and_triggers_manual_dags() {
         Some("scheduler-only".to_string()),
         vec!["default".to_string()],
         SchedulerMonitor::offline(),
+        ShardRouter::single(),
     ));
     let app = harvest_api_router(api_state).with_state(test_app_state(pool.clone()));
 

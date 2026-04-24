@@ -13,6 +13,7 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 use autumn_harvest::error::{HarvestError, HarvestResult, database_error};
+use autumn_harvest::shard::ShardRouter;
 use autumn_harvest::types::ExecutionId;
 use autumn_harvest::{StartWorkflowParams, start_or_load_workflow_execution};
 
@@ -268,14 +269,24 @@ pub(crate) async fn dispatch_workflow_start_request(
             "Harvest workflow publication is missing HarvestDbPool on AppState".into(),
         )
     })?;
-    let mut conn = harvest_pool.get().await.map_err(database_error)?;
+    let router = state
+        .extension::<ShardRouter>()
+        .map(|router| router.as_ref().clone())
+        .unwrap_or_default();
+    let shard = router.pick_for_new_workflow(&request.workflow_name, &request.workflow_id);
+    let exec_id = ExecutionId::new_for_shard(shard);
+    let mut conn = harvest_pool
+        .pool_for(shard)
+        .get()
+        .await
+        .map_err(database_error)?;
 
     let start = start_or_load_workflow_execution(
         &mut conn,
         StartWorkflowParams {
             workflow_name: &request.workflow_name,
             workflow_id: &request.workflow_id,
-            shard_id: 0,
+            exec_id,
             input: request.input.clone(),
             parent_id: None,
             queue_name: &request.queue_name,

@@ -1912,6 +1912,7 @@ mod tests {
             shutdown_timeout: Duration::from_secs(60),
             workflow_cache_size: 500,
             sticky_timeout: Duration::from_secs(3),
+            shard_assignments: vec![crate::types::ShardId::new(0)],
         };
 
         let runtime_cfg: WorkerRuntimeConfig = builder_cfg.into();

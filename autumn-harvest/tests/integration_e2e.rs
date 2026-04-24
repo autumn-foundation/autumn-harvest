@@ -245,7 +245,7 @@ async fn legacy_workflow_uniqueness_schema_can_be_upgraded_for_idempotent_starts
     let request = StartWorkflowParams {
         workflow_name: "upgrade_test",
         workflow_id: "workflow-42",
-        shard_id: 0,
+        exec_id: autumn_harvest::ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0)),
         input: serde_json::json!({ "workflow_id": 42 }),
         parent_id: None,
         queue_name: "default",

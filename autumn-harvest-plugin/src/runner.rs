@@ -9,6 +9,7 @@ use autumn_harvest::context::SharedStateMap;
 use autumn_harvest::scheduler::{
     DagCatalog, SchedulerMonitor, SchedulerRuntime, compile_dag_catalog,
 };
+use autumn_harvest::shard::ShardRouter;
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use autumn_web::AppState;
 use autumn_web::error::AutumnError;
@@ -28,6 +29,7 @@ pub struct HarvestRunnerResources {
     app_state: Option<AppState>,
     app_pool: Option<DbPool>,
     harvest_pool: DbPool,
+    shard_router: Option<ShardRouter>,
 }
 
 impl HarvestRunnerResources {
@@ -38,6 +40,7 @@ impl HarvestRunnerResources {
             app_state: None,
             app_pool: None,
             harvest_pool,
+            shard_router: None,
         }
     }
 
@@ -55,6 +58,16 @@ impl HarvestRunnerResources {
         self.app_pool = Some(app_pool);
         self
     }
+
+    /// Inject the shard router the runtime should use for new-workflow
+    /// placement and read-side routing decisions.
+    ///
+    /// When omitted the runtime defaults to the single-shard router.
+    #[must_use]
+    pub fn with_shard_router(mut self, router: ShardRouter) -> Self {
+        self.shard_router = Some(router);
+        self
+    }
 }
 
 struct PreparedHarvestRuntime {
@@ -62,6 +75,7 @@ struct PreparedHarvestRuntime {
     dag_catalog: Arc<DagCatalog>,
     worker_runtime_config: WorkerRuntimeConfig,
     storage_pool: HarvestDbPool,
+    shard_router: ShardRouter,
 }
 
 impl PreparedHarvestRuntime {
@@ -69,11 +83,13 @@ impl PreparedHarvestRuntime {
         built: BuiltHarvest,
         resources: HarvestRunnerResources,
     ) -> autumn_web::AutumnResult<Self> {
+        let shard_router = resources.shard_router.clone().unwrap_or_default();
         let (registry, dags, worker_config) =
             built.into_worker_parts_with_extra_state(injected_runtime_state(
                 resources.app_state,
                 resources.app_pool,
                 resources.harvest_pool.clone(),
+                shard_router.clone(),
             ));
         let dag_catalog = Arc::new(
             compile_dag_catalog(dags)
@@ -85,6 +101,7 @@ impl PreparedHarvestRuntime {
             dag_catalog,
             worker_runtime_config: WorkerRuntimeConfig::from(worker_config),
             storage_pool: HarvestDbPool::from(resources.harvest_pool),
+            shard_router,
         })
     }
 }
@@ -121,6 +138,7 @@ impl HarvestRunner {
         let dag_catalog = Arc::clone(&prepared.dag_catalog);
         let queues = prepared.worker_runtime_config.queues.clone();
         let harvest_pool = prepared.storage_pool.clone_inner();
+        let shard_router = prepared.shard_router.clone();
 
         if !config.worker_enabled && !config.scheduler_enabled {
             tracing::info!(
@@ -162,8 +180,14 @@ impl HarvestRunner {
         let scheduler_monitor = scheduler
             .as_ref()
             .map_or_else(SchedulerMonitor::offline, SchedulerRuntime::monitor);
-        let api_runtime =
-            HarvestApiRuntime::new(registry, dag_catalog, worker_id, queues, scheduler_monitor);
+        let api_runtime = HarvestApiRuntime::new(
+            registry,
+            dag_catalog,
+            worker_id,
+            queues,
+            scheduler_monitor,
+            shard_router,
+        );
 
         Ok(Self {
             api_runtime,
@@ -217,6 +241,7 @@ pub(crate) fn injected_runtime_state(
     pool_state: Option<AppState>,
     app_pool: Option<DbPool>,
     harvest_pool: DbPool,
+    shard_router: ShardRouter,
 ) -> SharedStateMap {
     let mut state: HashMap<TypeId, Box<dyn Any + Send + Sync>> = HashMap::new();
     if let Some(pool_state) = pool_state {
@@ -234,5 +259,6 @@ pub(crate) fn injected_runtime_state(
         Box::new(harvest_pool.clone()),
     );
     state.insert(TypeId::of::<DbPool>(), Box::new(harvest_pool.clone_inner()));
+    state.insert(TypeId::of::<ShardRouter>(), Box::new(shard_router));
     state
 }
