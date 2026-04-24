@@ -50,7 +50,7 @@ use uuid::Uuid;
 const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260409000000_harvest_initial/up.sql"),
     "\n",
-    include_str!("../migrations/20260424000000_harvest_trace_context/up.sql"),
+    include_str!("../migrations/20260424000001_harvest_trace_context/up.sql"),
 );
 
 /// Start a Postgres container with the harvest schema applied and return
