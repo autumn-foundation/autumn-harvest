@@ -127,6 +127,7 @@ pub struct TaskQueueItem {
     pub sticky_worker_id: Option<String>,
     pub sticky_until: Option<DateTime<Utc>>,
     pub sticky_timeout: Option<chrono::Duration>,
+    pub trace_context: Option<serde_json::Value>,
 }
 
 /// Insert struct for enqueuing a new task.
@@ -149,6 +150,7 @@ pub struct NewTaskQueueItem<'a> {
     pub sticky_worker_id: Option<&'a str>,
     pub sticky_until: Option<DateTime<Utc>>,
     pub sticky_timeout: Option<chrono::Duration>,
+    pub trace_context: Option<serde_json::Value>,
 }
 
 // ── DagRun ────────────────────────────────────────────────────────────────────

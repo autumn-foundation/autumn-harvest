@@ -12,6 +12,7 @@
 use std::time::Duration;
 
 use serde_json::Value;
+use tracing::Instrument;
 
 use crate::context::{SharedState, WorkflowCommand, WorkflowContext, empty_shared_state};
 use crate::event::WorkflowEvent;
@@ -76,23 +77,38 @@ pub async fn run_workflow_with_state(
 ) -> WorkflowOutcome {
     let ctx = WorkflowContext::for_replay_with_state(exec_id, history, state);
 
-    // Run the handler with a timeout. If it completes, we get the result.
-    // If it blocks on a oneshot (suspended), the timeout fires and we drain
-    // the accumulated commands.
-    let timeout_result = tokio::time::timeout(SUSPENSION_TIMEOUT, handler(&ctx, input)).await;
+    // Emit a span around every executor cycle so operators can correlate the
+    // handler invocation with timers, activity dispatches, and log events that
+    // happen inside. Applications bridge `tracing` to OpenTelemetry via
+    // `tracing-opentelemetry` or an equivalent layer — the harvest engine
+    // itself stays backend-agnostic.
+    let span = tracing::info_span!(
+        "harvest.workflow.run",
+        "otel.kind" = "internal",
+        workflow.execution_id = %exec_id,
+    );
 
-    match timeout_result {
-        // Handler completed within the timeout window.
-        Ok(Ok(output)) => WorkflowOutcome::Completed { output },
-        Ok(Err(error)) => WorkflowOutcome::Failed { error },
+    async {
+        // Run the handler with a timeout. If it completes, we get the result.
+        // If it blocks on a oneshot (suspended), the timeout fires and we drain
+        // the accumulated commands.
+        let timeout_result = tokio::time::timeout(SUSPENSION_TIMEOUT, handler(&ctx, input)).await;
 
-        // Timeout elapsed -- the handler is suspended on a oneshot channel.
-        // Drain the commands it emitted before suspending.
-        Err(_elapsed) => {
-            let commands = ctx.drain_commands();
-            WorkflowOutcome::Suspended { commands }
+        match timeout_result {
+            // Handler completed within the timeout window.
+            Ok(Ok(output)) => WorkflowOutcome::Completed { output },
+            Ok(Err(error)) => WorkflowOutcome::Failed { error },
+
+            // Timeout elapsed -- the handler is suspended on a oneshot channel.
+            // Drain the commands it emitted before suspending.
+            Err(_elapsed) => {
+                let commands = ctx.drain_commands();
+                WorkflowOutcome::Suspended { commands }
+            }
         }
     }
+    .instrument(span)
+    .await
 }
 
 // ---------------------------------------------------------------------------

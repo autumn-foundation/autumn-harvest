@@ -18,6 +18,10 @@ pub use crate::scheduler::{
     DagCatalog, RegisteredDag, SchedulerMonitor, SchedulerRuntime, compile_dag_catalog,
     register_schedules, tick_once, trigger_dag,
 };
+pub use crate::telemetry::{
+    ActivityStatus, MetricsRecorder, NoOpMetrics, NoOpPropagator, TelemetryConfig,
+    TraceContextCarrier, TraceContextPropagator, WorkflowStatus,
+};
 pub use crate::types::{ActivityExecId, ExecutionId, TimerId, WorkerId, WorkflowId};
 
 // Re-export macros from autumn-harvest-macros.

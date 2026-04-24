@@ -16,6 +16,7 @@ use uuid::Uuid;
 
 use crate::error::HarvestResult;
 use crate::models::{NewTaskQueueItem, TaskQueueItem};
+use crate::telemetry::TraceContextCarrier;
 use crate::types::ExecutionId;
 
 // ---------------------------------------------------------------------------
@@ -81,6 +82,9 @@ pub struct EnqueueParams {
     /// [`wake_workflow_task()`] can refresh `sticky_until` to the same value
     /// on each transition back to PENDING without needing external config.
     pub sticky_timeout: Option<StdDuration>,
+    /// W3C tracecontext carrier propagated across the queue boundary so the
+    /// worker can resume the enqueuing process's trace.
+    pub trace_context: Option<TraceContextCarrier>,
 }
 
 impl EnqueueParams {
@@ -108,6 +112,7 @@ impl EnqueueParams {
             retry_policy: None,
             sticky_worker_id: None,
             sticky_timeout: None,
+            trace_context: None,
         }
     }
 
@@ -118,6 +123,14 @@ impl EnqueueParams {
     pub fn with_sticky(mut self, worker_id: impl Into<String>, timeout: StdDuration) -> Self {
         self.sticky_worker_id = Some(worker_id.into());
         self.sticky_timeout = Some(timeout);
+        self
+    }
+
+    /// Attach a trace context carrier so the worker can resume the trace
+    /// started by whoever enqueued this task.
+    #[must_use]
+    pub fn with_trace_context(mut self, carrier: TraceContextCarrier) -> Self {
+        self.trace_context = Some(carrier);
         self
     }
 }
@@ -169,6 +182,10 @@ pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> Ha
         sticky_worker_id: None,
         sticky_until: None,
         sticky_timeout: None,
+        trace_context: params
+            .trace_context
+            .as_ref()
+            .and_then(TraceContextCarrier::to_json),
     };
 
     diesel::insert_into(harvest_task_queue::table)
@@ -349,6 +366,43 @@ pub async fn fail_open_tasks_for_execution(
     .execute(conn)
     .await
     .map_err(crate::error::database_error)
+}
+
+/// Count pending tasks per queue for observability / metrics.
+///
+/// Returns one row per queue name (unseen queues are omitted). Only tasks in
+/// state `PENDING` that are already eligible (`scheduled_at <= NOW()`) are
+/// counted — this matches the slice that [`claim_task`] competes over.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub async fn queue_depths(
+    conn: &mut AsyncPgConnection,
+    queues: &[String],
+) -> HarvestResult<Vec<(String, i64)>> {
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        queue_name: String,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        depth: i64,
+    }
+
+    let rows: Vec<Row> = diesel::sql_query(
+        "SELECT queue_name, COUNT(*)::BIGINT AS depth \
+         FROM harvest_task_queue \
+         WHERE queue_name = ANY($1) \
+           AND state = 'PENDING' \
+           AND scheduled_at <= NOW() \
+         GROUP BY queue_name",
+    )
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
+    .load(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+
+    Ok(rows.into_iter().map(|r| (r.queue_name, r.depth)).collect())
 }
 
 /// Update the `last_heartbeat_at` timestamp for a running task.
@@ -681,6 +735,16 @@ mod tests {
         assert!(params.start_to_close.is_none());
         assert!(params.schedule_to_start.is_none());
         assert!(params.retry_policy.is_none());
+        assert!(params.trace_context.is_none());
+    }
+
+    #[test]
+    fn enqueue_params_with_trace_context_attaches_carrier() {
+        let carrier = TraceContextCarrier::from_traceparent("00-abcd-ef01-01");
+        let params = EnqueueParams::new("billing", TaskType::Workflow, serde_json::json!(null))
+            .with_trace_context(carrier.clone());
+
+        assert_eq!(params.trace_context, Some(carrier));
     }
 
     #[test]

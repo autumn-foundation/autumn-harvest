@@ -35,6 +35,7 @@ use crate::queue::{self, TaskType};
 use crate::schema::{harvest_timers, harvest_workflow_executions};
 use crate::signal;
 use crate::store;
+use crate::telemetry::{ActivityStatus, TraceContextCarrier, WorkflowStatus};
 use crate::types::{ActivityExecId, ExecutionId, TimerId, WorkerId};
 
 /// Type alias for the deadpool-managed async Diesel connection pool.
@@ -122,6 +123,9 @@ pub struct HandlerRegistry {
     pub activities: HashMap<String, ActivityInfo>,
     /// Shared typed state visible to workflow and activity handlers.
     state: SharedState,
+    /// Telemetry bundle (trace-context propagator + metrics recorder) applied
+    /// around every dispatch.
+    telemetry: Arc<crate::telemetry::TelemetryConfig>,
 }
 
 impl HandlerRegistry {
@@ -138,6 +142,27 @@ impl HandlerRegistry {
         activities: Vec<ActivityInfo>,
         state: SharedState,
     ) -> Self {
+        Self::with_state_and_telemetry(
+            workflows,
+            activities,
+            state,
+            Arc::new(crate::telemetry::TelemetryConfig::default()),
+        )
+    }
+
+    /// Create a new registry with shared typed state and a telemetry bundle.
+    ///
+    /// Used by [`crate::builder::BuiltHarvest::into_worker_parts`] so worker
+    /// instrumentation inherits whatever the application configured. Callers
+    /// that do not care about telemetry should prefer [`Self::with_state`],
+    /// which installs safe no-op defaults.
+    #[must_use]
+    pub fn with_state_and_telemetry(
+        workflows: Vec<WorkflowInfo>,
+        activities: Vec<ActivityInfo>,
+        state: SharedState,
+        telemetry: Arc<crate::telemetry::TelemetryConfig>,
+    ) -> Self {
         let workflows = workflows
             .into_iter()
             .map(|w| (w.name.to_string(), w))
@@ -150,6 +175,7 @@ impl HandlerRegistry {
             workflows,
             activities,
             state,
+            telemetry,
         }
     }
 
@@ -164,6 +190,12 @@ impl HandlerRegistry {
     pub fn state<T: Any + Send + Sync>(&self) -> Option<&T> {
         self.state.get(&TypeId::of::<T>())?.downcast_ref::<T>()
     }
+
+    /// Access the telemetry bundle shared across worker dispatches.
+    #[must_use]
+    pub const fn telemetry(&self) -> &Arc<crate::telemetry::TelemetryConfig> {
+        &self.telemetry
+    }
 }
 
 impl std::fmt::Debug for HandlerRegistry {
@@ -172,6 +204,7 @@ impl std::fmt::Debug for HandlerRegistry {
             .field("workflows", &self.workflows.keys().collect::<Vec<_>>())
             .field("activities", &self.activities.keys().collect::<Vec<_>>())
             .field("state_count", &self.state.len())
+            .field("telemetry", &self.telemetry)
             .finish()
     }
 }
@@ -748,6 +781,10 @@ async fn persist_scheduled_activity(
     );
     params.workflow_exec_id = Some(exec_id.as_uuid());
     params.activity_name = Some(scheduled.name.clone());
+    // Snapshot the current trace context so the downstream activity worker
+    // can continue the same trace. `capture` returns `None` when telemetry is
+    // unconfigured, leaving the queue row's `trace_context` NULL.
+    params.trace_context = registry.telemetry().capture_trace_context();
 
     if let Some(retry_policy) = activity.default_retry_policy.clone() {
         params.max_attempts = i32::try_from(retry_policy.max_attempts).map_err(|_| {
@@ -802,9 +839,21 @@ async fn persist_started_timer(
     timer: &StartedTimerCommand,
     sticky: Option<queue::StickyHint<'_>>,
 ) -> HarvestResult<()> {
+    use tracing::Instrument;
+
     let marker_events = marker_events_from_commands(commands);
     let fire_delay = chrono_duration_from_secs(timer.duration_secs, "timer duration")?;
     let fires_at = chrono::Utc::now() + fire_delay;
+    // Emit a short-lived span so operators can see timer placements in a
+    // distributed trace next to the activities and workflow suspensions that
+    // produced them.
+    let span = tracing::info_span!(
+        "harvest.timer.start",
+        "otel.kind" = "internal",
+        timer.id = %timer.timer_id,
+        timer.duration_secs = timer.duration_secs,
+        workflow.execution_id = %exec_id,
+    );
     let timer_started = WorkflowEvent::TimerStarted {
         timer_id: timer.timer_id.clone(),
         duration_secs: timer.duration_secs,
@@ -834,6 +883,7 @@ async fn persist_started_timer(
         }
         .scope_boxed()
     })
+    .instrument(span)
     .await
 }
 
@@ -887,6 +937,7 @@ async fn persist_started_child_workflow(
     let mut params =
         queue::EnqueueParams::new(queue_name.clone(), TaskType::Workflow, child.input.clone());
     params.workflow_exec_id = Some(child.child_id.as_uuid());
+    params.trace_context = registry.telemetry().capture_trace_context();
 
     conn.transaction::<(), HarvestError, _>(|conn| {
         async move {
@@ -1200,6 +1251,7 @@ async fn observe_task_cancellation(pool: &DbPool, task_id: uuid::Uuid) {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn process_activity_task(
     pool: &DbPool,
     conn: &mut AsyncPgConnection,
@@ -1239,45 +1291,89 @@ async fn process_activity_task(
     let cancel = CancellationToken::new();
     let heartbeat_tx =
         crate::heartbeat::spawn_heartbeat_flusher(task.id, pool.clone(), cancel.clone());
+    let trace_carrier = task
+        .trace_context
+        .as_ref()
+        .and_then(TraceContextCarrier::from_json);
     let ctx = ActivityContext::new_with_cancellation_check(
         registry.shared_state(),
         Some(heartbeat_tx),
         cancel.clone(),
         task.id,
         pool.clone(),
+    )
+    .with_trace_context(trace_carrier.clone());
+
+    let telemetry = registry.telemetry().clone();
+    // Reinstate the parent trace context (if any) so the activity span becomes
+    // a child of whichever span enqueued this task, stitching the trace across
+    // the Postgres queue boundary.
+    let _parent_guard = trace_carrier
+        .as_ref()
+        .map(|carrier| telemetry.install_trace_context(carrier));
+    let span = tracing::info_span!(
+        "harvest.activity.run",
+        "otel.kind" = "consumer",
+        activity.name = %activity_name,
+        activity.queue = %task.queue_name,
+        activity.attempt = task.attempt,
+        workflow.execution_id = %exec_id,
+        task.id = %task.id,
+        service.name = %telemetry.service_name,
     );
+    let started_at = std::time::Instant::now();
 
     let mut activity_future = (activity.handler)(&ctx, task.input.clone());
     let cancellation_observer = observe_task_cancellation(pool, task.id);
     tokio::pin!(cancellation_observer);
 
-    let activity_result = tokio::select! {
-        biased;
-        result = &mut activity_future => result,
-        () = &mut cancellation_observer => {
-            cancel.cancel();
-            tracing::info!(
-                task_id = %task.id,
-                activity = %activity_name,
-                grace_period_ms = %cancellation_grace_period.as_millis(),
-                "workflow cancellation detected for running activity; awaiting cooperative unwind"
-            );
-            tokio::time::timeout(cancellation_grace_period, &mut activity_future)
-                .await
-                .unwrap_or_else(|_| {
-                    tracing::warn!(
+    let activity_result = {
+        use tracing::Instrument;
+        async {
+            tokio::select! {
+                biased;
+                result = &mut activity_future => result,
+                () = &mut cancellation_observer => {
+                    cancel.cancel();
+                    tracing::info!(
                         task_id = %task.id,
                         activity = %activity_name,
                         grace_period_ms = %cancellation_grace_period.as_millis(),
-                        "activity ignored cancellation; hard-aborting handler"
+                        "workflow cancellation detected for running activity; awaiting cooperative unwind"
                     );
-                    Err(format!(
-                        "workflow cancelled: activity '{activity_name}' exceeded {}ms cancellation grace period",
-                        cancellation_grace_period.as_millis()
-                    ))
-                })
+                    tokio::time::timeout(cancellation_grace_period, &mut activity_future)
+                        .await
+                        .unwrap_or_else(|_| {
+                            tracing::warn!(
+                                task_id = %task.id,
+                                activity = %activity_name,
+                                grace_period_ms = %cancellation_grace_period.as_millis(),
+                                "activity ignored cancellation; hard-aborting handler"
+                            );
+                            Err(format!(
+                                "workflow cancelled: activity '{activity_name}' exceeded {}ms cancellation grace period",
+                                cancellation_grace_period.as_millis()
+                            ))
+                        })
+                }
+            }
         }
+        .instrument(span)
+        .await
     };
+
+    let duration_secs = started_at.elapsed().as_secs_f64();
+    let status = if activity_result.is_ok() {
+        ActivityStatus::Completed
+    } else {
+        ActivityStatus::Failed
+    };
+    telemetry.metrics.record_activity_completed(
+        activity_name,
+        &task.queue_name,
+        duration_secs,
+        status,
+    );
     cancel.cancel();
     drop(activity_future);
 
@@ -1377,6 +1473,14 @@ async fn handle_suspended_workflow(
             sticky,
         )
         .await;
+        if result.is_ok() {
+            #[allow(clippy::cast_precision_loss)]
+            let duration_secs = timer.duration_secs as f64;
+            registry
+                .telemetry()
+                .metrics
+                .record_timer_started(duration_secs);
+        }
         return fail_execution_on_error(
             conn,
             context.persistence.task,
@@ -1592,6 +1696,23 @@ async fn process_workflow_task(
         return Err(HarvestError::Config(error));
     };
 
+    let telemetry = registry.telemetry().clone();
+    let trace_carrier = task
+        .trace_context
+        .as_ref()
+        .and_then(TraceContextCarrier::from_json);
+    // Reinstate the producer's trace context so the executor's
+    // `harvest.workflow.run` span becomes a child of the span that enqueued
+    // this task — this is what stitches the trace across the queue boundary.
+    let _parent_guard = trace_carrier
+        .as_ref()
+        .map(|carrier| telemetry.install_trace_context(carrier));
+
+    telemetry
+        .metrics
+        .record_workflow_started(&prepared.execution.workflow_name, &task.queue_name);
+    let started_at = std::time::Instant::now();
+
     let outcome = run_workflow_with_state(
         prepared.exec_id,
         prepared.history_events,
@@ -1600,6 +1721,18 @@ async fn process_workflow_task(
         registry.shared_state(),
     )
     .await;
+
+    let status = match &outcome {
+        WorkflowOutcome::Completed { .. } => WorkflowStatus::Completed,
+        WorkflowOutcome::Failed { .. } => WorkflowStatus::Failed,
+        WorkflowOutcome::Suspended { .. } => WorkflowStatus::Suspended,
+    };
+    telemetry.metrics.record_workflow_completed(
+        &prepared.execution.workflow_name,
+        &task.queue_name,
+        started_at.elapsed().as_secs_f64(),
+        status,
+    );
 
     persist_workflow_outcome(
         conn,
@@ -1655,6 +1788,68 @@ async fn process_task(
             .await
         }
     }
+}
+
+/// Periodically sample per-queue pending-task counts and forward them to the
+/// configured [`MetricsRecorder`](crate::telemetry::MetricsRecorder).
+///
+/// The sampler skips work entirely when the recorder is the default no-op
+/// implementation, so unconfigured deployments pay no DB cost. It queries a
+/// single `GROUP BY queue_name` aggregate per tick — cheap enough to run at
+/// the same cadence as the poll interval.
+///
+/// Stops when the cancellation token fires. Queues with zero pending rows are
+/// also reported (as depth 0) so gauges reset cleanly after drains.
+fn spawn_queue_depth_sampler(
+    pool: DbPool,
+    cancel: CancellationToken,
+    telemetry: Arc<crate::telemetry::TelemetryConfig>,
+    queues: Vec<String>,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                () = cancel.cancelled() => break,
+                () = tokio::time::sleep(interval) => {}
+            }
+
+            let mut conn = match pool.get().await {
+                Ok(conn) => conn,
+                Err(error) => {
+                    tracing::debug!(
+                        error = %error,
+                        "queue depth sampler could not acquire DB connection"
+                    );
+                    continue;
+                }
+            };
+
+            match queue::queue_depths(&mut conn, &queues).await {
+                Ok(depths) => {
+                    let mut observed: HashSet<&str> = HashSet::new();
+                    for (queue_name, depth) in &depths {
+                        observed.insert(queue_name.as_str());
+                        telemetry
+                            .metrics
+                            .record_queue_depth(queue_name, u64::try_from(*depth).unwrap_or(0));
+                    }
+                    for queue_name in &queues {
+                        if !observed.contains(queue_name.as_str()) {
+                            telemetry.metrics.record_queue_depth(queue_name, 0);
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::debug!(error = %error, "queue depth sample failed");
+                }
+            }
+
+            if cancel.is_cancelled() {
+                break;
+            }
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1743,6 +1938,13 @@ impl Worker {
             queues = ?self.config.queues,
             "worker starting"
         );
+        let queue_depth_sampler = spawn_queue_depth_sampler(
+            pool.clone(),
+            self.shutdown.clone(),
+            self.registry.telemetry().clone(),
+            self.config.queues.clone(),
+            self.config.poll_interval,
+        );
         let timeout_checker = crate::timeout::spawn_timeout_checker(
             pool.clone(),
             self.shutdown.clone(),
@@ -1788,6 +1990,13 @@ impl Worker {
                 worker_id = %self.config.worker_id,
                 error = %error,
                 "timeout checker task failed during shutdown"
+            );
+        }
+        if let Err(error) = queue_depth_sampler.await {
+            tracing::warn!(
+                worker_id = %self.config.worker_id,
+                error = %error,
+                "queue depth sampler failed during shutdown"
             );
         }
         tracing::info!(worker_id = %self.config.worker_id, "worker stopped");
