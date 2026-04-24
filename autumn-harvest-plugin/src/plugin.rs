@@ -18,6 +18,7 @@ use crate::api::{HarvestApiState, harvest_api_router};
 use crate::config::{HarvestMode, HarvestRuntimeConfig};
 use crate::outbox::spawn_workflow_start_outbox_relay;
 use crate::runner::{HarvestRunner, HarvestRunnerResources};
+use crate::ui::harvest_ui_router;
 use autumn_harvest::builder::{HarvestBuilder, WorkerConfig};
 use autumn_harvest::info::{ActivityInfo, DagInfo, WorkflowInfo};
 use autumn_harvest::shard::ShardRouter;
@@ -200,7 +201,8 @@ impl Plugin for HarvestPlugin {
             });
 
         if let Some(path) = api_path {
-            let mut router = harvest_api_router(api_state);
+            let ui_router = harvest_ui_router(api_state.clone());
+            let mut router = harvest_api_router(api_state).nest("/ui", ui_router);
             if let Some(mw) = api_middleware {
                 router = mw(router);
             }
