@@ -98,9 +98,9 @@ pub use scheduler::{
     DagCatalog, RegisteredDag, SchedulerMonitor, SchedulerRuntime, compile_dag_catalog,
     register_schedules, tick_once, trigger_dag,
 };
+pub use shard::ShardRouter;
 #[cfg(feature = "db")]
 pub use shard::ShardedDbPool;
-pub use shard::ShardRouter;
 pub use simulator::{SimulatorResult, WorkflowSimulator};
 pub use types::{ActivityExecId, ExecutionId, ShardId, TimerId, WorkerId, WorkflowId};
 

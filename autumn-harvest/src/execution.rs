@@ -23,17 +23,40 @@ use crate::store;
 use crate::types::ExecutionId;
 
 /// Parameters for starting a workflow execution.
+///
+/// `exec_id` is the workflow's routing key: its UUID carries the target
+/// [`crate::types::ShardId`] in its first two bytes (see
+/// [`ExecutionId::new_for_shard`]). In multi-shard deployments the caller
+/// picks the shard via [`crate::ShardRouter`] and mints the id with
+/// [`ExecutionId::new_for_shard`] before calling this helper. Single-shard
+/// deployments can pass `ExecutionId::new_for_shard(ShardId::new(0))` or, for
+/// tests and non-production code, the sentinel-producing `ExecutionId::new()`.
 #[derive(Debug, Clone)]
 pub struct StartWorkflowParams<'a> {
     pub workflow_name: &'a str,
     pub workflow_id: &'a str,
-    pub shard_id: i32,
+    pub exec_id: ExecutionId,
     pub input: serde_json::Value,
     pub parent_id: Option<Uuid>,
     pub queue_name: &'a str,
     pub execution_timeout: Option<chrono::Duration>,
     pub memo: Option<serde_json::Value>,
     pub search_attrs: Option<serde_json::Value>,
+}
+
+impl StartWorkflowParams<'_> {
+    /// Shard derived from the encoded `exec_id`, used to populate the row's
+    /// `shard_id` column. Returns `0` when the caller passed an unencoded id
+    /// (tests / legacy call sites), matching the pre-sharding default.
+    #[must_use]
+    pub fn shard_id(&self) -> i32 {
+        let shard = self.exec_id.shard();
+        if shard.is_unencoded() {
+            0
+        } else {
+            shard.as_i32()
+        }
+    }
 }
 
 /// Result of an idempotent workflow start attempt.
@@ -112,13 +135,14 @@ pub async fn start_or_load_workflow_execution(
     conn: &mut AsyncPgConnection,
     request: StartWorkflowParams<'_>,
 ) -> HarvestResult<StartedWorkflowExecution> {
-    let exec_id = ExecutionId::new();
+    let exec_id = request.exec_id;
+    let shard_id_value = request.shard_id();
     let row = NewWorkflowExecution {
         id: exec_id.as_uuid(),
         workflow_name: request.workflow_name,
         workflow_id: request.workflow_id,
         run_id: Uuid::new_v4(),
-        shard_id: request.shard_id,
+        shard_id: shard_id_value,
         input: request.input.clone(),
         parent_id: request.parent_id,
         queue_name: request.queue_name,

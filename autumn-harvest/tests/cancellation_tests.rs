@@ -90,7 +90,7 @@ async fn start_test_workflow(conn: &mut AsyncPgConnection) -> autumn_harvest::Ex
         StartWorkflowParams {
             workflow_name: "cancel_me",
             workflow_id: "cancel-me-001",
-            shard_id: 0,
+            exec_id: autumn_harvest::ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0)),
             input: serde_json::json!({ "request_id": "cancel-me-001" }),
             parent_id: None,
             queue_name: "default",
@@ -410,7 +410,7 @@ async fn running_activity_heartbeat_observes_workflow_cancellation() {
         StartWorkflowParams {
             workflow_name: "heartbeat_workflow",
             workflow_id: "heartbeat-cancel-001",
-            shard_id: 0,
+            exec_id: autumn_harvest::ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0)),
             input: serde_json::json!({ "request_id": "heartbeat-cancel-001" }),
             parent_id: None,
             queue_name: "default",

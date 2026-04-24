@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use crate::context::SharedStateMap;
 use crate::info::{ActivityInfo, DagInfo, WorkflowInfo};
+use crate::types::ShardId;
 
 /// Fluent builder for configuring the autumn-harvest engine.
 ///
@@ -218,6 +219,14 @@ pub struct WorkerConfig {
     pub workflow_cache_size: usize,
     /// How long to offer sticky tasks to the sticky worker before fallback.
     pub sticky_timeout: Duration,
+    /// Shards this worker is responsible for polling.
+    ///
+    /// Defaults to `[ShardId::new(0)]`, matching the single-shard deployment
+    /// shape. Multi-shard operators typically run one worker process per
+    /// shard with `shard_assignments = vec![that_shard]`, but the field is
+    /// a `Vec` so future per-process multi-shard workers can list all shards
+    /// they should poll without changing the config surface.
+    pub shard_assignments: Vec<ShardId>,
 }
 
 impl Default for WorkerConfig {
@@ -230,6 +239,7 @@ impl Default for WorkerConfig {
             shutdown_timeout: Duration::from_secs(30),
             workflow_cache_size: 1000,
             sticky_timeout: Duration::from_secs(5),
+            shard_assignments: vec![ShardId::new(0)],
         }
     }
 }
@@ -256,6 +266,21 @@ impl WorkerConfig {
     #[must_use]
     pub fn with_notification_database_url(mut self, database_url: impl Into<String>) -> Self {
         self.notification_database_url = Some(database_url.into());
+        self
+    }
+
+    /// Assign which shards this worker is responsible for.
+    ///
+    /// Empty assignments default back to `[ShardId::new(0)]` to preserve the
+    /// single-shard behaviour.
+    #[must_use]
+    pub fn with_shard_assignments(mut self, shards: impl IntoIterator<Item = ShardId>) -> Self {
+        let shards: Vec<ShardId> = shards.into_iter().collect();
+        self.shard_assignments = if shards.is_empty() {
+            vec![ShardId::new(0)]
+        } else {
+            shards
+        };
         self
     }
 }
