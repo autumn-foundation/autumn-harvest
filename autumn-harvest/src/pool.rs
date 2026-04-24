@@ -214,3 +214,6 @@ mod tests {
         assert!(worker >= 1);
     }
 }
+
+#[cfg(test)]
+mod pool_proptest;
