@@ -28,6 +28,7 @@ use autumn_harvest::scheduler::{
     DagCatalog, RegisteredDag, SchedulerMonitor, SchedulerSnapshot, trigger_dag,
 };
 use autumn_harvest::schema::{harvest_dag_runs, harvest_schedules, harvest_workflow_executions};
+use autumn_harvest::shard::ShardRouter;
 use autumn_harvest::signal;
 use autumn_harvest::store;
 use autumn_harvest::types::ExecutionId;
@@ -45,6 +46,7 @@ pub struct HarvestApiRuntime {
     worker_id: Option<String>,
     queues: Vec<String>,
     scheduler: SchedulerMonitor,
+    router: ShardRouter,
 }
 
 impl HarvestApiRuntime {
@@ -57,6 +59,7 @@ impl HarvestApiRuntime {
         worker_id: Option<String>,
         queues: Vec<String>,
         scheduler: SchedulerMonitor,
+        router: ShardRouter,
     ) -> Self {
         Self {
             registry,
@@ -64,7 +67,14 @@ impl HarvestApiRuntime {
             worker_id,
             queues,
             scheduler,
+            router,
         }
+    }
+
+    /// Shard router used to pick a destination for new workflows.
+    #[must_use]
+    pub const fn router(&self) -> &ShardRouter {
+        &self.router
     }
 }
 
@@ -273,7 +283,7 @@ async fn get_workflow(
     Path(id): Path<String>,
 ) -> Result<Json<WorkflowDetailsResponse>, AutumnError> {
     let exec_id = parse_execution_id(&id)?;
-    let mut conn = db_conn(&api_state).await?;
+    let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
     let execution = load_execution(&mut conn, exec_id)
         .await
         .map_err(map_error)?;
@@ -305,22 +315,27 @@ async fn start_workflow(
         )));
     }
 
-    let mut conn = db_conn(&api_state).await?;
     let workflow_id = request
         .workflow_id
-        .unwrap_or_else(|| ExecutionId::new().to_string());
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let queue_name = request
         .queue
         .or_else(|| runtime.queues.as_slice().first().cloned())
         .unwrap_or_else(|| "default".to_string());
     let input = request.input.unwrap_or(Value::Null);
 
+    let shard = runtime
+        .router
+        .pick_for_new_workflow(&workflow_name, &workflow_id);
+    let exec_id = ExecutionId::new_for_shard(shard);
+    let mut conn = db_conn_for_shard(&api_state, shard).await?;
+
     let start = start_or_load_workflow_execution(
         &mut conn,
         StartWorkflowParams {
             workflow_name: &workflow_name,
             workflow_id: &workflow_id,
-            shard_id: 0,
+            exec_id,
             input,
             parent_id: None,
             queue_name: &queue_name,
@@ -355,7 +370,7 @@ async fn cancel_workflow(
     Json(request): Json<CancelWorkflowRequest>,
 ) -> Result<(axum::http::StatusCode, Json<CancelWorkflowResponse>), AutumnError> {
     let exec_id = parse_execution_id(&id)?;
-    let mut conn = db_conn(&api_state).await?;
+    let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
     let reason = request
         .reason
         .as_deref()
@@ -383,7 +398,7 @@ async fn signal_workflow(
     Json(payload): Json<Value>,
 ) -> Result<(axum::http::StatusCode, Json<BasicAck>), AutumnError> {
     let exec_id = parse_execution_id(&id)?;
-    let mut conn = db_conn(&api_state).await?;
+    let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
     load_execution(&mut conn, exec_id)
         .await
         .map_err(map_error)?;
@@ -403,7 +418,7 @@ async fn query_workflow(
 ) -> Result<Json<Value>, AutumnError> {
     let runtime = api_state.runtime().map_err(map_error)?;
     let exec_id = parse_execution_id(&id)?;
-    let mut conn = db_conn(&api_state).await?;
+    let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
     let execution = load_execution(&mut conn, exec_id)
         .await
         .map_err(map_error)?;
@@ -604,18 +619,40 @@ async fn load_execution(
         .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))
 }
 
-async fn db_conn(
-    api_state: &HarvestApiState,
-) -> Result<
-    deadpool::managed::Object<
-        diesel_async::pooled_connection::AsyncDieselConnectionManager<
-            diesel_async::AsyncPgConnection,
-        >,
-    >,
-    AutumnError,
-> {
+type PoolConn = deadpool::managed::Object<
+    diesel_async::pooled_connection::AsyncDieselConnectionManager<diesel_async::AsyncPgConnection>,
+>;
+
+async fn db_conn(api_state: &HarvestApiState) -> Result<PoolConn, AutumnError> {
     let pool = api_state.storage_pool().map_err(map_error)?;
     let conn = pool
+        .default_pool()
+        .get()
+        .await
+        .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
+    Ok(conn)
+}
+
+async fn db_conn_for_execution(
+    api_state: &HarvestApiState,
+    exec_id: ExecutionId,
+) -> Result<PoolConn, AutumnError> {
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    let conn = pool
+        .pool_for_execution(exec_id)
+        .get()
+        .await
+        .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
+    Ok(conn)
+}
+
+async fn db_conn_for_shard(
+    api_state: &HarvestApiState,
+    shard: autumn_harvest::types::ShardId,
+) -> Result<PoolConn, AutumnError> {
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    let conn = pool
+        .pool_for(shard)
         .get()
         .await
         .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;

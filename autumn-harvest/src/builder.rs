@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use crate::context::SharedStateMap;
 use crate::info::{ActivityInfo, DagInfo, WorkflowInfo};
+use crate::types::ShardId;
 
 /// Fluent builder for configuring the autumn-harvest engine.
 ///
@@ -224,6 +225,14 @@ pub struct WorkerConfig {
     /// or call [`ActivityContext::heartbeat`], but an uncooperative handler must
     /// not block a worker slot indefinitely.
     pub cancellation_grace_period: Duration,
+    /// Shards this worker is responsible for polling.
+    ///
+    /// Defaults to `[ShardId::new(0)]`, matching the single-shard deployment
+    /// shape. Multi-shard operators typically run one worker process per
+    /// shard with `shard_assignments = vec![that_shard]`, but the field is
+    /// a `Vec` so future per-process multi-shard workers can list all shards
+    /// they should poll without changing the config surface.
+    pub shard_assignments: Vec<ShardId>,
 }
 
 impl Default for WorkerConfig {
@@ -237,6 +246,7 @@ impl Default for WorkerConfig {
             workflow_cache_size: 1000,
             sticky_timeout: Duration::from_secs(5),
             cancellation_grace_period: Duration::from_secs(5),
+            shard_assignments: vec![ShardId::new(0)],
         }
     }
 }
@@ -276,6 +286,21 @@ impl WorkerConfig {
     #[must_use]
     pub const fn with_cancellation_grace_period(mut self, grace_period: Duration) -> Self {
         self.cancellation_grace_period = grace_period;
+        self
+    }
+
+    /// Assign which shards this worker is responsible for.
+    ///
+    /// Empty assignments default back to `[ShardId::new(0)]` to preserve the
+    /// single-shard behaviour.
+    #[must_use]
+    pub fn with_shard_assignments(mut self, shards: impl IntoIterator<Item = ShardId>) -> Self {
+        let shards: Vec<ShardId> = shards.into_iter().collect();
+        self.shard_assignments = if shards.is_empty() {
+            vec![ShardId::new(0)]
+        } else {
+            shards
+        };
         self
     }
 }

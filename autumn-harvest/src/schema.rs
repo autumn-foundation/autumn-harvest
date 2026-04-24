@@ -65,6 +65,9 @@ diesel::table! {
         retry_policy -> Nullable<Jsonb>,
         output -> Nullable<Jsonb>,
         error -> Nullable<Text>,
+        sticky_worker_id -> Nullable<Text>,
+        sticky_until -> Nullable<Timestamptz>,
+        sticky_timeout -> Nullable<Interval>,
     }
 }
 
