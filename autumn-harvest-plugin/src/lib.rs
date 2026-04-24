@@ -7,6 +7,7 @@ pub mod plugin;
 pub mod prelude;
 pub mod runner;
 pub mod state;
+pub mod ui;
 
 pub use api::{HarvestApiRuntime, HarvestApiState, harvest_api_router};
 pub use config::{HarvestDatabaseConfig, HarvestMode, HarvestOutboxConfig, HarvestRuntimeConfig};
@@ -17,3 +18,4 @@ pub use outbox::{
 pub use plugin::HarvestPlugin;
 pub use runner::{HarvestRunner, HarvestRunnerResources};
 pub use state::{AppDbPool, HarvestDbPool};
+pub use ui::harvest_ui_router;

@@ -605,7 +605,7 @@ async fn health(
     }))
 }
 
-async fn load_execution(
+pub(crate) async fn load_execution(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
 ) -> HarvestResult<WorkflowExecution> {
@@ -619,11 +619,11 @@ async fn load_execution(
         .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))
 }
 
-type PoolConn = deadpool::managed::Object<
+pub(crate) type PoolConn = deadpool::managed::Object<
     diesel_async::pooled_connection::AsyncDieselConnectionManager<diesel_async::AsyncPgConnection>,
 >;
 
-async fn db_conn(api_state: &HarvestApiState) -> Result<PoolConn, AutumnError> {
+pub(crate) async fn db_conn(api_state: &HarvestApiState) -> Result<PoolConn, AutumnError> {
     let pool = api_state.storage_pool().map_err(map_error)?;
     let conn = pool
         .default_pool()
@@ -633,7 +633,7 @@ async fn db_conn(api_state: &HarvestApiState) -> Result<PoolConn, AutumnError> {
     Ok(conn)
 }
 
-async fn db_conn_for_execution(
+pub(crate) async fn db_conn_for_execution(
     api_state: &HarvestApiState,
     exec_id: ExecutionId,
 ) -> Result<PoolConn, AutumnError> {
@@ -659,7 +659,7 @@ async fn db_conn_for_shard(
     Ok(conn)
 }
 
-fn parse_execution_id(raw: &str) -> Result<ExecutionId, AutumnError> {
+pub(crate) fn parse_execution_id(raw: &str) -> Result<ExecutionId, AutumnError> {
     raw.parse::<ExecutionId>()
         .map_err(|_| AutumnError::bad_request_msg(format!("invalid execution id '{raw}'")))
 }
@@ -669,7 +669,7 @@ fn parse_uuid(raw: &str, label: &str) -> Result<uuid::Uuid, AutumnError> {
         .map_err(|_| AutumnError::bad_request_msg(format!("invalid {label} '{raw}'")))
 }
 
-fn map_error(error: HarvestError) -> AutumnError {
+pub(crate) fn map_error(error: HarvestError) -> AutumnError {
     match error {
         HarvestError::NotFound(message) => AutumnError::not_found_msg(message),
         HarvestError::Config(message)
