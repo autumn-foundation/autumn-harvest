@@ -434,56 +434,50 @@ impl WorkflowContext {
             .match_activity(name);
 
         match history_match {
-            HistoryMatch::Matched { output } => return Ok(output),
+            HistoryMatch::Matched { output } => Ok(output),
 
-            HistoryMatch::Failed { error, attempt } => {
-                return Err(HarvestError::ActivityFailed {
-                    name: name.to_string(),
-                    attempt,
-                    source: error.into(),
-                });
-            }
-
-            HistoryMatch::TimedOut { timeout_type } => {
-                return Err(HarvestError::Timeout {
-                    timeout_type,
-                    task_name: name.to_string(),
-                });
-            }
-
-            HistoryMatch::Diverged { expected, actual } => {
-                return Err(HarvestError::NonDeterministic(format!(
-                    "activity mismatch: expected {expected}, got {actual}"
-                )));
-            }
-
-            HistoryMatch::NoMatch => {}
-        }
-
-        // Live execution: emit a ScheduleActivity command and suspend
-        // until the worker sends the result through the oneshot channel.
-        let activity_id = self.next_activity_id();
-        let (tx, rx) = oneshot::channel();
-
-        self.push_command(WorkflowCommand::ScheduleActivity {
-            activity_id,
-            name: name.to_string(),
-            input,
-            queue: queue.to_string(),
-            result_tx: tx,
-        });
-
-        // Suspend the coroutine until the worker resolves this activity.
-        match rx.await {
-            Ok(Ok(output)) => Ok(output),
-            Ok(Err(error)) => Err(HarvestError::ActivityFailed {
+            HistoryMatch::Failed { error, attempt } => Err(HarvestError::ActivityFailed {
                 name: name.to_string(),
-                attempt: 1,
+                attempt,
                 source: error.into(),
             }),
-            Err(_) => Err(HarvestError::Cancelled(format!(
-                "activity '{name}' cancelled: result channel dropped"
-            ))),
+
+            HistoryMatch::TimedOut { timeout_type } => Err(HarvestError::Timeout {
+                timeout_type,
+                task_name: name.to_string(),
+            }),
+
+            HistoryMatch::Diverged { expected, actual } => Err(HarvestError::NonDeterministic(
+                format!("activity mismatch: expected {expected}, got {actual}"),
+            )),
+
+            HistoryMatch::NoMatch => {
+                // Live execution: emit a ScheduleActivity command and suspend
+                // until the worker sends the result through the oneshot channel.
+                let activity_id = self.next_activity_id();
+                let (tx, rx) = oneshot::channel();
+
+                self.push_command(WorkflowCommand::ScheduleActivity {
+                    activity_id,
+                    name: name.to_string(),
+                    input,
+                    queue: queue.to_string(),
+                    result_tx: tx,
+                });
+
+                // Suspend the coroutine until the worker resolves this activity.
+                match rx.await {
+                    Ok(Ok(output)) => Ok(output),
+                    Ok(Err(error)) => Err(HarvestError::ActivityFailed {
+                        name: name.to_string(),
+                        attempt: 1,
+                        source: error.into(),
+                    }),
+                    Err(_) => Err(HarvestError::Cancelled(format!(
+                        "activity '{name}' cancelled: result channel dropped"
+                    ))),
+                }
+            }
         }
     }
 
@@ -567,46 +561,40 @@ impl WorkflowContext {
             .match_child_workflow(workflow_name, &input);
 
         match history_match {
-            HistoryMatch::Matched { output } => return Ok(output),
-            HistoryMatch::Failed { error, attempt } => {
-                return Err(HarvestError::ActivityFailed {
-                    name: format!("child-workflow:{workflow_name}"),
-                    attempt,
-                    source: error.into(),
-                });
-            }
-            HistoryMatch::TimedOut { timeout_type } => {
-                return Err(HarvestError::Timeout {
-                    timeout_type,
-                    task_name: format!("child-workflow:{workflow_name}"),
-                });
-            }
-            HistoryMatch::Diverged { expected, actual } => {
-                return Err(HarvestError::NonDeterministic(format!(
-                    "child workflow mismatch: expected {expected}, got {actual}"
-                )));
-            }
-            HistoryMatch::NoMatch => {}
-        }
-
-        let (tx, rx) = oneshot::channel();
-        self.push_command(WorkflowCommand::StartChildWorkflow {
-            child_id: ExecutionId::new(),
-            workflow_name: workflow_name.to_string(),
-            input,
-            result_tx: tx,
-        });
-
-        match rx.await {
-            Ok(Ok(output)) => Ok(output),
-            Ok(Err(error)) => Err(HarvestError::ActivityFailed {
+            HistoryMatch::Matched { output } => Ok(output),
+            HistoryMatch::Failed { error, attempt } => Err(HarvestError::ActivityFailed {
                 name: format!("child-workflow:{workflow_name}"),
-                attempt: 1,
+                attempt,
                 source: error.into(),
             }),
-            Err(_) => Err(HarvestError::Cancelled(format!(
-                "child workflow '{workflow_name}' cancelled: result channel dropped"
-            ))),
+            HistoryMatch::TimedOut { timeout_type } => Err(HarvestError::Timeout {
+                timeout_type,
+                task_name: format!("child-workflow:{workflow_name}"),
+            }),
+            HistoryMatch::Diverged { expected, actual } => Err(HarvestError::NonDeterministic(
+                format!("child workflow mismatch: expected {expected}, got {actual}"),
+            )),
+            HistoryMatch::NoMatch => {
+                let (tx, rx) = oneshot::channel();
+                self.push_command(WorkflowCommand::StartChildWorkflow {
+                    child_id: ExecutionId::new(),
+                    workflow_name: workflow_name.to_string(),
+                    input,
+                    result_tx: tx,
+                });
+
+                match rx.await {
+                    Ok(Ok(output)) => Ok(output),
+                    Ok(Err(error)) => Err(HarvestError::ActivityFailed {
+                        name: format!("child-workflow:{workflow_name}"),
+                        attempt: 1,
+                        source: error.into(),
+                    }),
+                    Err(_) => Err(HarvestError::Cancelled(format!(
+                        "child workflow '{workflow_name}' cancelled: result channel dropped"
+                    ))),
+                }
+            }
         }
     }
 
