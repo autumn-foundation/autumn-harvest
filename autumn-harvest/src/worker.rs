@@ -1866,8 +1866,15 @@ impl Worker {
                 "executing task"
             );
 
-            if let Err(error) =
-                process_task(&pool, registry, task, &worker_id, cancellation_grace_period, sticky_timeout).await
+            if let Err(error) = process_task(
+                &pool,
+                registry,
+                task,
+                &worker_id,
+                cancellation_grace_period,
+                sticky_timeout,
+            )
+            .await
             {
                 tracing::error!(
                     task_id = %task_id,

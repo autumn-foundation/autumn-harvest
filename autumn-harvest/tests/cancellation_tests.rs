@@ -538,6 +538,7 @@ async fn uncooperative_activity_is_hard_aborted_after_grace_period() {
                 shutdown_timeout: Duration::from_secs(2),
                 // Short grace period so the test completes quickly.
                 cancellation_grace_period: Duration::from_millis(500),
+                sticky_timeout: Duration::from_secs(5),
             },
             registry,
         )
@@ -559,7 +560,7 @@ async fn uncooperative_activity_is_hard_aborted_after_grace_period() {
         StartWorkflowParams {
             workflow_name: "uncooperative_workflow",
             workflow_id: "uncooperative-001",
-            shard_id: 0,
+            exec_id: autumn_harvest::ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0)),
             input: serde_json::json!({ "request_id": "uncooperative-001" }),
             parent_id: None,
             queue_name: "default",
