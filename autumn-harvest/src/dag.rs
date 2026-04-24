@@ -25,11 +25,17 @@ struct PendingDagTask {
 /// Immutable task definition produced by [`DagBuilder::build`].
 #[derive(Debug, Clone)]
 pub struct DagTask {
+    /// The name of the activity.
     pub activity_name: String,
+    /// Indices of upstream tasks that must complete before this task.
     pub upstreams: Vec<usize>,
+    /// The trigger rule for this task.
     pub trigger_rule: TriggerRule,
+    /// The retry policy for this task.
     pub retry_policy: Option<RetryPolicy>,
+    /// The start-to-close timeout for this task.
     pub start_to_close: Option<Duration>,
+    /// The optional specific queue to schedule this task on.
     pub queue: Option<String>,
 }
 
@@ -54,11 +60,14 @@ pub struct DagDefinition {
 }
 
 impl DagDefinition {
+    /// Returns the linearised list of all tasks in the DAG.
     #[must_use]
     pub fn tasks(&self) -> &[DagTask] {
         &self.tasks
     }
 
+    /// Returns the DAG execution levels, where each level contains indices
+    /// of tasks that can be executed concurrently.
     #[must_use]
     pub fn execution_levels(&self) -> &[Vec<usize>] {
         &self.execution_levels
@@ -68,6 +77,7 @@ impl DagDefinition {
 /// Error returned when a DAG cannot be compiled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DagBuildError {
+    /// The DAG contains a cyclic dependency, which prevents execution.
     CycleDetected,
 }
 
@@ -91,18 +101,19 @@ pub struct DagTaskRef {
 }
 
 impl DagTaskRef {
+    /// The numerical index of this task within the [`DagBuilder`].
     #[must_use]
     pub const fn index(&self) -> usize {
         self.index
     }
 
-    #[must_use]
     /// Declare that this task depends on `upstream`.
     ///
     /// # Panics
     ///
     /// Panics if `self` and `upstream` were created by different
     /// [`DagBuilder`] instances.
+    #[must_use]
     pub fn upstream(self, upstream: &Self) -> Self {
         assert!(
             Rc::ptr_eq(&self.tasks, &upstream.tasks),
@@ -115,21 +126,25 @@ impl DagTaskRef {
         })
     }
 
+    /// Set a custom trigger rule for this task.
     #[must_use]
     pub fn trigger_rule(self, trigger_rule: TriggerRule) -> Self {
         self.mutate(|task| task.trigger_rule = trigger_rule)
     }
 
+    /// Attach a specific retry policy to this task.
     #[must_use]
     pub fn retry(self, retry_policy: RetryPolicy) -> Self {
         self.mutate(|task| task.retry_policy = Some(retry_policy))
     }
 
+    /// Set a maximum start-to-close timeout duration for this task.
     #[must_use]
     pub fn start_to_close(self, timeout: Duration) -> Self {
         self.mutate(|task| task.start_to_close = Some(timeout))
     }
 
+    /// Assign this task to a specific task queue.
     #[must_use]
     pub fn queue(self, queue: impl Into<String>) -> Self {
         self.mutate(|task| task.queue = Some(queue.into()))
@@ -161,11 +176,29 @@ impl Default for DagBuilder {
 }
 
 impl DagBuilder {
+    /// Create a new, empty DAG builder.
+    ///
+    /// ## Examples
+    ///
+    /// ```rust
+    /// use autumn_harvest::dag::DagBuilder;
+    ///
+    /// let mut builder = DagBuilder::new();
+    /// ```
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Create a new DAG builder that schedules tasks on `queue` by default.
+    ///
+    /// ## Examples
+    ///
+    /// ```rust
+    /// use autumn_harvest::dag::DagBuilder;
+    ///
+    /// let mut builder = DagBuilder::with_default_queue("my-queue");
+    /// ```
     #[must_use]
     pub fn with_default_queue(queue: impl Into<String>) -> Self {
         Self {
@@ -174,6 +207,18 @@ impl DagBuilder {
         }
     }
 
+    /// Add an activity task to the DAG.
+    ///
+    /// ## Examples
+    ///
+    /// ```rust
+    /// use autumn_harvest::dag::DagBuilder;
+    ///
+    /// fn my_activity() {}
+    ///
+    /// let mut builder = DagBuilder::new();
+    /// let task = builder.activity(my_activity);
+    /// ```
     #[must_use]
     pub fn activity<F>(&mut self, activity: F) -> DagTaskRef
     where

@@ -559,6 +559,14 @@ impl HistoryMatcher {
         }
     }
 
+    /// Versioning mechanism for safe workflow code changes.
+    ///
+    /// Checks the recorded history for a version marker. If the marker is present
+    /// in history, returns the recorded version. If not in history (first execution
+    /// or unversioned branch), records `max_version` as a marker and returns it.
+    ///
+    /// This ensures that existing non-deterministic executions continue correctly,
+    /// while new executions start on the new `max_version` path.
     pub fn match_version(&mut self, change_id: &str, min_version: u32, max_version: u32) -> u32 {
         self.advance_to_next_unconsumed_event();
         let marker_name = format!("version:{change_id}");

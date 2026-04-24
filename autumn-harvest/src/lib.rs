@@ -18,6 +18,7 @@ pub mod builder;
 pub mod cache;
 pub mod context;
 pub mod dag;
+/// Export format types for Directed Acyclic Graphs (DAGs) representing workflows.
 pub mod dag_export;
 pub mod error;
 pub mod event;
@@ -30,6 +31,7 @@ pub mod info;
 pub mod policy;
 pub mod pool;
 pub mod prelude;
+/// Types and definitions for querying workflow state and metadata.
 pub mod query;
 pub mod replay;
 pub mod saga;

@@ -53,49 +53,77 @@ impl std::fmt::Display for TimeoutType {
 /// ```
 #[derive(Debug, thiserror::Error)]
 pub enum HarvestError {
+    /// An activity execution failed and exhausted its retries (if any).
     #[error("activity failed: {name} (attempt {attempt}): {source}")]
     ActivityFailed {
+        /// The name of the failed activity.
         name: String,
+        /// The attempt number that failed.
         attempt: u32,
+        /// The underlying error source.
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    /// A workflow execution failed permanently.
     #[error("workflow failed: {name}: {reason}")]
-    WorkflowFailed { name: String, reason: String },
+    WorkflowFailed {
+        /// The name of the failed workflow.
+        name: String,
+        /// The reason string describing the failure.
+        reason: String,
+    },
 
+    /// The engine detected non-deterministic behavior during workflow replay.
     #[error("non-deterministic replay: {0}")]
     NonDeterministic(String),
 
+    /// The workflow was explicitly cancelled.
     #[error("workflow cancelled: {0}")]
     Cancelled(String),
 
+    /// A Saga compensation sequence failed while trying to rollback.
     #[error(
         "saga compensation failed after original error: {original}; compensation errors: {compensation_errors:?}"
     )]
     SagaCompensationFailed {
+        /// The original error that triggered the compensation.
         original: String,
+        /// The list of errors encountered during compensation steps.
         compensation_errors: Vec<String>,
     },
 
+    /// A timeout occurred for a workflow, activity, or execution component.
     #[error("timeout: {timeout_type} for {task_name}")]
     Timeout {
+        /// The specific type of timeout that occurred.
         timeout_type: TimeoutType,
+        /// The name of the task or entity that timed out.
         task_name: String,
     },
 
+    /// A payload could not be serialized or deserialized.
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
 
+    /// A database operation failed.
     #[error("database error: {0}")]
     Database(String),
 
+    /// A task queue reached its maximum capacity.
     #[error("task queue is full (queue: {queue}, depth: {depth})")]
-    QueueFull { queue: String, depth: usize },
+    QueueFull {
+        /// The name of the full task queue.
+        queue: String,
+        /// The current depth/size of the queue.
+        depth: usize,
+    },
 
+    /// The requested workflow execution could not be found.
     #[error("workflow execution not found: {0}")]
     NotFound(String),
 
+    /// Invalid configuration provided to the engine.
     #[error("invalid configuration: {0}")]
     Config(String),
 }
