@@ -389,6 +389,7 @@ async fn running_activity_heartbeat_observes_workflow_cancellation() {
                 max_concurrent_activities: 1,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(1),
+                cancellation_grace_period: Duration::from_secs(1),
             },
             registry,
         )
@@ -442,6 +443,177 @@ async fn running_activity_heartbeat_observes_workflow_cancellation() {
     })
     .await
     .expect("activity heartbeat should observe cancellation");
+
+    worker.shutdown();
+    worker_task.await.expect("worker should stop cleanly");
+}
+
+#[derive(Clone)]
+struct UncooperativeActivityProbe {
+    activity_started: Arc<tokio::sync::Notify>,
+    activity_aborted_early: Arc<AtomicBool>,
+}
+
+fn uncooperative_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    input: Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        ctx.execute_activity_raw("uncooperative_activity", input, "default")
+            .await
+            .map_err(|error| error.to_string())
+    })
+}
+
+fn uncooperative_activity<'a>(
+    ctx: &'a ActivityContext,
+    _input: Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let probe = ctx
+            .state::<UncooperativeActivityProbe>()
+            .expect("probe state must be registered")
+            .clone();
+        probe.activity_started.notify_waiters();
+
+        // Simulate an activity that never heartbeats and never consults
+        // `ctx.is_cancelled()`. We await a long sleep that the worker must
+        // interrupt by dropping the future after the grace period expires.
+        tokio::time::sleep(Duration::from_secs(30)).await;
+
+        // If the worker dropped the future during its long sleep this flag
+        // will remain true. Setting it to false means the grace-period abort
+        // did not actually stop us from running to completion.
+        probe
+            .activity_aborted_early
+            .as_ref()
+            .store(false, Ordering::SeqCst);
+        Ok(serde_json::json!({ "ran_to_completion": true }))
+    })
+}
+
+fn uncooperative_registry(probe: UncooperativeActivityProbe) -> Arc<HandlerRegistry> {
+    let mut state: HashMap<TypeId, Box<dyn Any + Send + Sync>> = HashMap::new();
+    state.insert(TypeId::of::<UncooperativeActivityProbe>(), Box::new(probe));
+
+    Arc::new(HandlerRegistry::with_state(
+        vec![autumn_harvest::info::WorkflowInfo {
+            name: "uncooperative_workflow",
+            module: "cancellation_tests",
+            handler: uncooperative_workflow,
+        }],
+        vec![autumn_harvest::info::ActivityInfo {
+            name: "uncooperative_activity",
+            module: "cancellation_tests",
+            default_retry_policy: None,
+            default_start_to_close: None,
+            default_heartbeat_timeout: None,
+            default_schedule_to_start: None,
+            default_queue: Some("default"),
+            handler: uncooperative_activity,
+        }],
+        Arc::new(state),
+    ))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn uncooperative_activity_is_hard_aborted_after_grace_period() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let probe = UncooperativeActivityProbe {
+        activity_started: Arc::new(tokio::sync::Notify::new()),
+        activity_aborted_early: Arc::new(AtomicBool::new(true)),
+    };
+    let registry = uncooperative_registry(probe.clone());
+    let worker = Arc::new(
+        Worker::new(
+            WorkerRuntimeConfig {
+                worker_id: "uncooperative-worker".to_string(),
+                queues: vec!["default".to_string()],
+                notification_database_url: None,
+                max_concurrent_workflows: 1,
+                max_concurrent_activities: 1,
+                poll_interval: Duration::from_millis(25),
+                shutdown_timeout: Duration::from_secs(2),
+                // Short grace period so the test completes quickly.
+                cancellation_grace_period: Duration::from_millis(500),
+            },
+            registry,
+        )
+        .expect("worker config should be valid"),
+    );
+    let worker_task = {
+        let worker = Arc::clone(&worker);
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            worker.run(&pool).await;
+        })
+    };
+
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect to Postgres container");
+    let exec_id = start_or_load_workflow_execution(
+        &mut conn,
+        StartWorkflowParams {
+            workflow_name: "uncooperative_workflow",
+            workflow_id: "uncooperative-001",
+            shard_id: 0,
+            input: serde_json::json!({ "request_id": "uncooperative-001" }),
+            parent_id: None,
+            queue_name: "default",
+            execution_timeout: None,
+            memo: None,
+            search_attrs: None,
+        },
+    )
+    .await
+    .expect("workflow start should succeed")
+    .exec_id;
+
+    tokio::time::timeout(Duration::from_secs(10), probe.activity_started.notified())
+        .await
+        .expect("activity should start before cancellation");
+
+    cancel_workflow_execution(&mut conn, exec_id, "operator hard-stop")
+        .await
+        .expect("workflow cancellation should succeed");
+
+    // Give the worker time to: observe cancellation (up to ~500ms poll),
+    // cancel the token, elapse the 500ms grace period, then abort the
+    // handler and record the activity failure.
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let tasks = load_tasks(&mut conn, exec_id).await;
+            if tasks
+                .iter()
+                .any(|task| task.task_type == "activity" && task.state == "FAILED")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("activity task should be failed by the worker within the grace window");
+
+    let tasks = load_tasks(&mut conn, exec_id).await;
+    let activity_task = tasks
+        .iter()
+        .find(|task| task.task_type == "activity")
+        .expect("activity task should exist");
+    assert_eq!(activity_task.state, "FAILED");
+    let activity_error = activity_task.error.as_deref().unwrap_or_default();
+    assert!(
+        activity_error.contains("cancellation grace period")
+            || activity_error.contains("workflow cancelled"),
+        "activity error should indicate cancellation, got: {activity_error}"
+    );
+
+    assert!(
+        probe.activity_aborted_early.as_ref().load(Ordering::SeqCst),
+        "uncooperative activity should have been hard-aborted before it ran to completion"
+    );
 
     worker.shutdown();
     worker_task.await.expect("worker should stop cleanly");

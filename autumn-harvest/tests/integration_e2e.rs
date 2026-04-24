@@ -337,6 +337,7 @@ fn build_runtime_worker(
                 max_concurrent_activities,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(1),
+                cancellation_grace_period: Duration::from_secs(1),
             },
             registry,
         )
@@ -734,6 +735,7 @@ async fn worker_completes_workflow_task_and_persists_result() {
                 max_concurrent_activities: 1,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(1),
+                cancellation_grace_period: Duration::from_secs(1),
             },
             registry,
         )
@@ -823,6 +825,7 @@ async fn worker_marks_workflow_failed_when_handler_errors() {
                 max_concurrent_activities: 1,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(1),
+                cancellation_grace_period: Duration::from_secs(1),
             },
             registry,
         )
@@ -934,6 +937,7 @@ async fn worker_completes_workflow_with_activity_round_trip() {
                 max_concurrent_activities: 1,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(1),
+                cancellation_grace_period: Duration::from_secs(1),
             },
             registry,
         )
@@ -1021,6 +1025,7 @@ async fn worker_fails_orphaned_activity_task_without_scheduled_event() {
                 max_concurrent_activities: 1,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(1),
+                cancellation_grace_period: Duration::from_secs(1),
             },
             Arc::new(HandlerRegistry::new(
                 vec![],
@@ -1221,6 +1226,7 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
                 max_concurrent_activities: 1,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(1),
+                cancellation_grace_period: Duration::from_secs(1),
             },
             Arc::new(HandlerRegistry::new(
                 vec![WorkflowInfo {
@@ -1333,6 +1339,7 @@ async fn worker_completes_workflow_with_timer_round_trip() {
                 max_concurrent_activities: 1,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(1),
+                cancellation_grace_period: Duration::from_secs(1),
             },
             Arc::new(HandlerRegistry::new(
                 vec![WorkflowInfo {
