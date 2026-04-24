@@ -38,9 +38,14 @@ pub struct WorkflowCache {
 impl WorkflowCache {
     /// Create a new cache with the given maximum number of entries.
     ///
+    /// If `max_size` is zero, it defaults to a capacity of 1.
+    /// The maximum size is also capped at 1,000,000 entries to prevent OOM
+    /// conditions when large, arbitrary sizes are requested.
+    ///
     /// # Panics
     ///
-    /// Panics if `max_size` is zero.
+    /// Panics if the clamped capacity somehow becomes zero (which should be
+    /// mathematically impossible due to the clamping bounds).
     ///
     /// ## Examples
     ///
@@ -52,7 +57,9 @@ impl WorkflowCache {
     /// ```
     #[must_use]
     pub fn new(max_size: usize) -> Self {
-        let cap = NonZeroUsize::new(max_size).expect("cache max_size must be > 0");
+        // Havoc prevention: Cap max capacity to prevent OOM, and floor at 1 to prevent panic.
+        let safe_size = max_size.clamp(1, 1_000_000);
+        let cap = NonZeroUsize::new(safe_size).expect("clamp ensures size >= 1");
         Self {
             inner: LruCache::new(cap),
         }
@@ -228,6 +235,18 @@ mod tests {
     fn cache_get_missing_returns_none() {
         let mut cache = WorkflowCache::new(5);
         assert!(cache.get(&Uuid::new_v4()).is_none());
+    }
+
+    #[test]
+    fn cache_handles_zero_size_safely() {
+        let cache = WorkflowCache::new(0);
+        assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn cache_handles_max_size_without_oom() {
+        let cache = WorkflowCache::new(usize::MAX);
+        assert_eq!(cache.len(), 0);
     }
 
     #[test]
