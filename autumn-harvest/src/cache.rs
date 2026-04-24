@@ -42,6 +42,11 @@ impl WorkflowCache {
     /// The maximum size is also capped at 1,000,000 entries to prevent OOM
     /// conditions when large, arbitrary sizes are requested.
     ///
+    /// # Panics
+    ///
+    /// Panics if the clamped capacity somehow becomes zero (which should be
+    /// mathematically impossible due to the clamping bounds).
+    ///
     /// ## Examples
     ///
     /// ```rust
