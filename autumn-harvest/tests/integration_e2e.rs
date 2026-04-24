@@ -40,7 +40,18 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use uuid::Uuid;
 
 /// The migration SQL embedded at compile time.
-const INIT_SQL: &str = include_str!("../migrations/20260409000000_harvest_initial/up.sql");
+///
+/// Combines the initial schema with every forward-compatible schema-addition
+/// migration that ships in `migrations/`. The
+/// `20260410010000_harvest_workflow_start_uniqueness` migration is
+/// deliberately excluded because one test (see
+/// `legacy_workflow_uniqueness_schema_can_be_upgraded_for_idempotent_starts`)
+/// applies it on a legacy schema to verify the upgrade path.
+const INIT_SQL: &str = concat!(
+    include_str!("../migrations/20260409000000_harvest_initial/up.sql"),
+    "\n",
+    include_str!("../migrations/20260424000001_harvest_trace_context/up.sql"),
+);
 
 /// Start a Postgres container with the harvest schema applied and return
 /// an `AsyncPgConnection` ready for use.

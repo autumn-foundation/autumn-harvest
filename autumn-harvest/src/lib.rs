@@ -37,6 +37,8 @@ pub mod replay;
 pub mod saga;
 pub mod shard;
 pub mod simulator;
+/// OpenTelemetry integration: trace-context propagation and metrics.
+pub mod telemetry;
 pub mod types;
 
 #[cfg(feature = "db")]
@@ -102,6 +104,10 @@ pub use shard::ShardRouter;
 #[cfg(feature = "db")]
 pub use shard::ShardedDbPool;
 pub use simulator::{SimulatorResult, WorkflowSimulator};
+pub use telemetry::{
+    ActivityStatus, MetricsRecorder, NoOpMetrics, NoOpPropagator, TelemetryConfig,
+    TelemetryConfigBuilder, TraceContextCarrier, TraceContextPropagator, WorkflowStatus,
+};
 pub use types::{ActivityExecId, ExecutionId, ShardId, TimerId, WorkerId, WorkflowId};
 
 #[cfg(feature = "db")]

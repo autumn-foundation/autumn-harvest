@@ -809,6 +809,9 @@ pub struct ActivityContext {
     /// Optional durable queue-state cancellation check for worker activities.
     #[cfg(feature = "db")]
     cancellation_check: Option<ActivityCancellationCheck>,
+    /// W3C tracecontext carrier captured at enqueue, surfaced so activity
+    /// handlers can propagate the trace to downstream services.
+    trace_context: Option<crate::telemetry::TraceContextCarrier>,
 }
 
 impl ActivityContext {
@@ -825,6 +828,7 @@ impl ActivityContext {
             cancel,
             #[cfg(feature = "db")]
             cancellation_check: None,
+            trace_context: None,
         }
     }
 
@@ -846,7 +850,28 @@ impl ActivityContext {
                 pool,
                 last_checked_at: Mutex::new(None),
             }),
+            trace_context: None,
         }
+    }
+
+    /// Attach a trace context carrier captured from the task payload so the
+    /// activity handler can stitch downstream calls into the same trace.
+    #[must_use]
+    pub fn with_trace_context(
+        mut self,
+        carrier: Option<crate::telemetry::TraceContextCarrier>,
+    ) -> Self {
+        self.trace_context = carrier;
+        self
+    }
+
+    /// The W3C trace context that accompanied this activity's enqueue, if any.
+    ///
+    /// Returned by reference so handlers can forward it to outgoing HTTP
+    /// requests without cloning on the hot path.
+    #[must_use]
+    pub const fn trace_context(&self) -> Option<&crate::telemetry::TraceContextCarrier> {
+        self.trace_context.as_ref()
     }
 
     /// Access typed shared state.
@@ -976,6 +1001,19 @@ mod tests {
         let ctx = ActivityContext::new_test();
         let state: Option<&String> = ctx.state::<String>();
         assert!(state.is_none());
+    }
+
+    #[test]
+    fn activity_context_surfaces_attached_trace_context() {
+        let carrier = crate::telemetry::TraceContextCarrier::from_traceparent("00-aaaa-bbbb-01");
+        let ctx = ActivityContext::new_test().with_trace_context(Some(carrier.clone()));
+        assert_eq!(ctx.trace_context(), Some(&carrier));
+    }
+
+    #[test]
+    fn activity_context_trace_context_defaults_to_none() {
+        let ctx = ActivityContext::new_test();
+        assert!(ctx.trace_context().is_none());
     }
 
     #[tokio::test]

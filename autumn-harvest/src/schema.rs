@@ -68,6 +68,7 @@ diesel::table! {
         sticky_worker_id -> Nullable<Text>,
         sticky_until -> Nullable<Timestamptz>,
         sticky_timeout -> Nullable<Interval>,
+        trace_context -> Nullable<Jsonb>,
     }
 }
 

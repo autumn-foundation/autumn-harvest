@@ -41,8 +41,11 @@ use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tower::ServiceExt;
 
-const INIT_SQL: &str =
-    include_str!("../../autumn-harvest/migrations/20260409000000_harvest_initial/up.sql");
+const INIT_SQL: &str = concat!(
+    include_str!("../../autumn-harvest/migrations/20260409000000_harvest_initial/up.sql"),
+    "\n",
+    include_str!("../../autumn-harvest/migrations/20260424000001_harvest_trace_context/up.sql"),
+);
 type HarvestApiApp = axum::Router;
 
 async fn setup_test_database_url() -> (String, ContainerAsync<Postgres>) {
