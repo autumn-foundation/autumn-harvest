@@ -2168,18 +2168,45 @@ async fn enqueue_with_sticky_pin_stores_worker_and_expiry() {
 
     assert_eq!(row.sticky_worker_id.as_deref(), Some("worker-sticky-1"));
     assert!(row.sticky_until.is_some(), "sticky_until should be set");
+    let stored_timeout = row.sticky_timeout.expect("sticky_timeout should be set");
     assert_eq!(
-        row.sticky_timeout,
-        Some(chrono::Duration::seconds(3)),
-        "sticky_timeout interval should be stored on the row",
+        stored_timeout.num_seconds(),
+        3,
+        "sticky_timeout interval should round-trip as 3 seconds (got {stored_timeout})",
     );
+}
+
+async fn insert_named_workflow_execution(
+    conn: &mut AsyncPgConnection,
+    workflow_id: &str,
+) -> ExecutionId {
+    let exec_id = ExecutionId::new();
+    let row = NewWorkflowExecution {
+        id: exec_id.as_uuid(),
+        workflow_name: "e2e_sticky_test",
+        workflow_id,
+        run_id: Uuid::new_v4(),
+        shard_id: 0,
+        input: serde_json::json!({}),
+        parent_id: None,
+        queue_name: "default",
+        execution_timeout: None,
+        memo: None,
+        search_attrs: None,
+    };
+    diesel::insert_into(harvest_workflow_executions::table)
+        .values(&row)
+        .execute(conn)
+        .await
+        .expect("failed to insert sticky test workflow execution");
+    exec_id
 }
 
 #[tokio::test]
 async fn claim_task_prefers_sticky_worker_within_window() {
     let (mut conn, _container) = setup_test_db().await;
-    let exec_pinned = insert_workflow_execution(&mut conn).await;
-    let exec_free = insert_workflow_execution(&mut conn).await;
+    let exec_pinned = insert_named_workflow_execution(&mut conn, "pinned-1").await;
+    let exec_free = insert_named_workflow_execution(&mut conn, "free-1").await;
 
     // Free task is higher priority AND enqueued first so it would ordinarily be
     // claimed ahead of the pinned task by any worker. Sticky routing must
@@ -2318,7 +2345,12 @@ async fn park_workflow_task_with_sticky_hint_pins_to_worker() {
     assert!(row.worker_id.is_none(), "worker ownership cleared on park");
     assert_eq!(row.sticky_worker_id.as_deref(), Some("park-worker"));
     assert!(row.sticky_until.is_some());
-    assert_eq!(row.sticky_timeout, Some(chrono::Duration::seconds(10)));
+    let stored_timeout = row.sticky_timeout.expect("sticky_timeout should be set");
+    assert_eq!(
+        stored_timeout.num_seconds(),
+        10,
+        "sticky_timeout should round-trip as 10 seconds (got {stored_timeout})",
+    );
 }
 
 #[tokio::test]
