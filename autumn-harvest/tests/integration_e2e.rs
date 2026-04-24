@@ -12,7 +12,7 @@ use autumn_harvest::info::{ActivityInfo, WorkflowInfo};
 use autumn_harvest::models::{
     HarvestTimer, NewWorkflowExecution, TaskQueueItem, WorkflowExecution,
 };
-use autumn_harvest::queue::{EnqueueParams, TaskType};
+use autumn_harvest::queue::{EnqueueParams, StickyHint, TaskType};
 use autumn_harvest::schema::{harvest_task_queue, harvest_timers, harvest_workflow_executions};
 use autumn_harvest::store;
 use autumn_harvest::types::{ActivityExecId, ExecutionId};
@@ -337,6 +337,7 @@ fn build_runtime_worker(
                 max_concurrent_activities,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(1),
+                sticky_timeout: Duration::from_secs(5),
             },
             registry,
         )
@@ -734,6 +735,7 @@ async fn worker_completes_workflow_task_and_persists_result() {
                 max_concurrent_activities: 1,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(1),
+                sticky_timeout: Duration::from_secs(5),
             },
             registry,
         )
@@ -823,6 +825,7 @@ async fn worker_marks_workflow_failed_when_handler_errors() {
                 max_concurrent_activities: 1,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(1),
+                sticky_timeout: Duration::from_secs(5),
             },
             registry,
         )
@@ -934,6 +937,7 @@ async fn worker_completes_workflow_with_activity_round_trip() {
                 max_concurrent_activities: 1,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(1),
+                sticky_timeout: Duration::from_secs(5),
             },
             registry,
         )
@@ -1021,6 +1025,7 @@ async fn worker_fails_orphaned_activity_task_without_scheduled_event() {
                 max_concurrent_activities: 1,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(1),
+                sticky_timeout: Duration::from_secs(5),
             },
             Arc::new(HandlerRegistry::new(
                 vec![],
@@ -1134,7 +1139,7 @@ async fn timeout_enforcement_fails_pending_activity_and_wakes_workflow() {
         .expect("workflow task should be claimable");
     assert_eq!(claimed_workflow.id, workflow_task_id);
     assert_eq!(claimed_workflow.state, "RUNNING");
-    queue::park_workflow_task(&mut conn, workflow_task_id)
+    queue::park_workflow_task(&mut conn, workflow_task_id, None)
         .await
         .expect("park workflow task failed");
 
@@ -1221,6 +1226,7 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
                 max_concurrent_activities: 1,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(1),
+                sticky_timeout: Duration::from_secs(5),
             },
             Arc::new(HandlerRegistry::new(
                 vec![WorkflowInfo {
@@ -1333,6 +1339,7 @@ async fn worker_completes_workflow_with_timer_round_trip() {
                 max_concurrent_activities: 1,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(1),
+                sticky_timeout: Duration::from_secs(5),
             },
             Arc::new(HandlerRegistry::new(
                 vec![WorkflowInfo {
@@ -1651,7 +1658,7 @@ async fn wake_workflow_task_emits_notification() {
         .expect("claim should succeed")
         .expect("workflow task should be claimable");
     assert_eq!(claimed.id, task_id);
-    queue::park_workflow_task(&mut conn, task_id)
+    queue::park_workflow_task(&mut conn, task_id, None)
         .await
         .expect("park workflow task should succeed");
 
@@ -2128,4 +2135,284 @@ async fn duplicate_event_id_is_rejected() {
     let result = store::append_events(&mut conn, exec_id, &events, 0).await;
     assert!(result.is_err());
     assert!(matches!(result.unwrap_err(), HarvestError::Database(_)));
+}
+
+// ---------------------------------------------------------------------------
+// Sticky cross-worker routing tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn enqueue_with_sticky_pin_stores_worker_and_expiry() {
+    let (mut conn, _container) = setup_test_db().await;
+    let exec_id = insert_workflow_execution(&mut conn).await;
+
+    let params = EnqueueParams::new(
+        "default",
+        TaskType::Workflow,
+        serde_json::json!({"go": true}),
+    )
+    .with_sticky("worker-sticky-1", Duration::from_secs(3));
+    let mut enqueue = params.clone();
+    enqueue.workflow_exec_id = Some(exec_id.as_uuid());
+
+    let task_id = queue::enqueue(&mut conn, &enqueue)
+        .await
+        .expect("enqueue should succeed");
+
+    let row = harvest_task_queue::table
+        .find(task_id)
+        .select(TaskQueueItem::as_select())
+        .first(&mut conn)
+        .await
+        .expect("row should exist");
+
+    assert_eq!(row.sticky_worker_id.as_deref(), Some("worker-sticky-1"));
+    assert!(row.sticky_until.is_some(), "sticky_until should be set");
+    let stored_timeout = row.sticky_timeout.expect("sticky_timeout should be set");
+    assert_eq!(
+        stored_timeout.num_seconds(),
+        3,
+        "sticky_timeout interval should round-trip as 3 seconds (got {stored_timeout})",
+    );
+}
+
+async fn insert_named_workflow_execution(
+    conn: &mut AsyncPgConnection,
+    workflow_id: &str,
+) -> ExecutionId {
+    let exec_id = ExecutionId::new();
+    let row = NewWorkflowExecution {
+        id: exec_id.as_uuid(),
+        workflow_name: "e2e_sticky_test",
+        workflow_id,
+        run_id: Uuid::new_v4(),
+        shard_id: 0,
+        input: serde_json::json!({}),
+        parent_id: None,
+        queue_name: "default",
+        execution_timeout: None,
+        memo: None,
+        search_attrs: None,
+    };
+    diesel::insert_into(harvest_workflow_executions::table)
+        .values(&row)
+        .execute(conn)
+        .await
+        .expect("failed to insert sticky test workflow execution");
+    exec_id
+}
+
+#[tokio::test]
+async fn claim_task_prefers_sticky_worker_within_window() {
+    let (mut conn, _container) = setup_test_db().await;
+    let exec_pinned = insert_named_workflow_execution(&mut conn, "pinned-1").await;
+    let exec_free = insert_named_workflow_execution(&mut conn, "free-1").await;
+
+    // Free task is higher priority AND enqueued first so it would ordinarily be
+    // claimed ahead of the pinned task by any worker. Sticky routing must
+    // reshuffle the order so the pinned worker sees its pinned row first.
+    let mut free = EnqueueParams::new("default", TaskType::Workflow, serde_json::json!({}));
+    free.priority = 10;
+    free.workflow_exec_id = Some(exec_free.as_uuid());
+    let free_id = queue::enqueue(&mut conn, &free)
+        .await
+        .expect("enqueue free task failed");
+
+    let mut pinned = EnqueueParams::new("default", TaskType::Workflow, serde_json::json!({}))
+        .with_sticky("sticky-worker", Duration::from_secs(30));
+    pinned.priority = 0;
+    pinned.workflow_exec_id = Some(exec_pinned.as_uuid());
+    let pinned_id = queue::enqueue(&mut conn, &pinned)
+        .await
+        .expect("enqueue pinned task failed");
+
+    let queues = vec!["default".to_string()];
+    let claimed = queue::claim_task(&mut conn, &queues, "sticky-worker")
+        .await
+        .expect("claim should succeed")
+        .expect("sticky worker should get its pinned task");
+    assert_eq!(
+        claimed.id, pinned_id,
+        "sticky worker should claim its pinned task ahead of the higher-priority free task",
+    );
+
+    let claimed_other = queue::claim_task(&mut conn, &queues, "other-worker")
+        .await
+        .expect("second claim should succeed")
+        .expect("other worker should pick up the free task");
+    assert_eq!(
+        claimed_other.id, free_id,
+        "other worker should still claim the unpinned free task",
+    );
+}
+
+#[tokio::test]
+async fn claim_task_excludes_other_workers_while_sticky_active() {
+    let (mut conn, _container) = setup_test_db().await;
+    let exec_id = insert_workflow_execution(&mut conn).await;
+
+    let pinned = EnqueueParams::new("default", TaskType::Workflow, serde_json::json!({}))
+        .with_sticky("owner-worker", Duration::from_secs(30));
+    let mut pinned = pinned;
+    pinned.workflow_exec_id = Some(exec_id.as_uuid());
+    queue::enqueue(&mut conn, &pinned)
+        .await
+        .expect("enqueue should succeed");
+
+    let queues = vec!["default".to_string()];
+    // Different worker must not steal a fresh sticky pin.
+    let claimed = queue::claim_task(&mut conn, &queues, "interloper")
+        .await
+        .expect("claim should succeed");
+    assert!(
+        claimed.is_none(),
+        "non-sticky worker should not claim a pinned task while sticky_until is in the future",
+    );
+
+    // The owner can still claim it.
+    let owner_claim = queue::claim_task(&mut conn, &queues, "owner-worker")
+        .await
+        .expect("owner claim should succeed")
+        .expect("owner should be able to claim its pinned task");
+    assert_eq!(
+        owner_claim.sticky_worker_id.as_deref(),
+        Some("owner-worker")
+    );
+}
+
+#[tokio::test]
+async fn claim_task_falls_back_to_any_worker_after_sticky_expires() {
+    let (mut conn, _container) = setup_test_db().await;
+    let exec_id = insert_workflow_execution(&mut conn).await;
+
+    // Pin with a short window so we can observe fallback without sleeping long.
+    // The sleep is generously larger than the window to tolerate DB/host clock
+    // skew inside testcontainers on CI runners.
+    let mut pinned = EnqueueParams::new("default", TaskType::Workflow, serde_json::json!({}))
+        .with_sticky("crashed-worker", Duration::from_millis(100));
+    pinned.workflow_exec_id = Some(exec_id.as_uuid());
+    queue::enqueue(&mut conn, &pinned)
+        .await
+        .expect("enqueue should succeed");
+
+    // Allow the sticky window to elapse comfortably.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    let queues = vec!["default".to_string()];
+    let claimed = queue::claim_task(&mut conn, &queues, "rescue-worker")
+        .await
+        .expect("claim should succeed")
+        .expect("any worker may claim after sticky_until expires");
+    assert_eq!(
+        claimed.worker_id.as_deref(),
+        Some("rescue-worker"),
+        "fallback worker should own the row after expiry",
+    );
+}
+
+#[tokio::test]
+async fn park_workflow_task_with_sticky_hint_pins_to_worker() {
+    let (mut conn, _container) = setup_test_db().await;
+    let exec_id = insert_workflow_execution(&mut conn).await;
+
+    // Seed and claim a workflow task so the row is in RUNNING state.
+    let mut params = EnqueueParams::new("default", TaskType::Workflow, serde_json::json!({}));
+    params.workflow_exec_id = Some(exec_id.as_uuid());
+    let task_id = queue::enqueue(&mut conn, &params)
+        .await
+        .expect("enqueue should succeed");
+    let queues = vec!["default".to_string()];
+    let _claimed = queue::claim_task(&mut conn, &queues, "park-worker")
+        .await
+        .expect("claim should succeed")
+        .expect("row should be claimable");
+
+    queue::park_workflow_task(
+        &mut conn,
+        task_id,
+        Some(StickyHint::new("park-worker", Duration::from_secs(10))),
+    )
+    .await
+    .expect("park with sticky should succeed");
+
+    let row = harvest_task_queue::table
+        .find(task_id)
+        .select(TaskQueueItem::as_select())
+        .first(&mut conn)
+        .await
+        .expect("row should exist");
+    assert_eq!(row.state, "RUNNING", "parked row keeps RUNNING state");
+    assert!(row.worker_id.is_none(), "worker ownership cleared on park");
+    assert_eq!(row.sticky_worker_id.as_deref(), Some("park-worker"));
+    assert!(row.sticky_until.is_some());
+    let stored_timeout = row.sticky_timeout.expect("sticky_timeout should be set");
+    assert_eq!(
+        stored_timeout.num_seconds(),
+        10,
+        "sticky_timeout should round-trip as 10 seconds (got {stored_timeout})",
+    );
+}
+
+#[tokio::test]
+async fn wake_workflow_task_refreshes_sticky_until() {
+    let (mut conn, _container) = setup_test_db().await;
+    let exec_id = insert_workflow_execution(&mut conn).await;
+
+    // Seed, claim, and park a workflow task with a short sticky window.
+    let mut params = EnqueueParams::new("default", TaskType::Workflow, serde_json::json!({}));
+    params.workflow_exec_id = Some(exec_id.as_uuid());
+    let task_id = queue::enqueue(&mut conn, &params)
+        .await
+        .expect("enqueue should succeed");
+    let queues = vec!["default".to_string()];
+    let _claimed = queue::claim_task(&mut conn, &queues, "wake-refresh-worker")
+        .await
+        .expect("claim should succeed");
+    // Use a 5s window so both the park's sticky_until and the wake's refreshed
+    // sticky_until land comfortably in the future even under DB/host clock skew
+    // on CI runners. The test asserts the value was REFRESHED by comparing
+    // before/after timestamps, not by waiting for expiry.
+    queue::park_workflow_task(
+        &mut conn,
+        task_id,
+        Some(StickyHint::new(
+            "wake-refresh-worker",
+            Duration::from_secs(5),
+        )),
+    )
+    .await
+    .expect("park should succeed");
+
+    let parked_until = harvest_task_queue::table
+        .find(task_id)
+        .select(TaskQueueItem::as_select())
+        .first(&mut conn)
+        .await
+        .expect("parked row should exist")
+        .sticky_until
+        .expect("sticky_until should be set at park");
+
+    // Wait long enough that NOW() has moved noticeably (well above typical
+    // sub-millisecond timer resolution) before triggering the refresh.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    queue::wake_workflow_task(&mut conn, exec_id)
+        .await
+        .expect("wake should succeed");
+
+    let row = harvest_task_queue::table
+        .find(task_id)
+        .select(TaskQueueItem::as_select())
+        .first(&mut conn)
+        .await
+        .expect("row should exist");
+
+    assert_eq!(row.state, "PENDING");
+    assert_eq!(row.sticky_worker_id.as_deref(), Some("wake-refresh-worker"));
+    let refreshed_until = row.sticky_until.expect("sticky_until should be refreshed");
+    assert!(
+        refreshed_until > parked_until,
+        "sticky_until should be pushed forward on wake (parked_until={parked_until}, \
+         refreshed_until={refreshed_until})",
+    );
 }
