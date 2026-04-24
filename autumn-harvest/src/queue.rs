@@ -4,8 +4,9 @@
 //! moves a `PENDING` row to `RUNNING` using `FOR UPDATE SKIP LOCKED` --
 //! no two workers will ever claim the same task.
 
+use std::time::Duration as StdDuration;
+
 use chrono::{Duration, Utc};
-use diesel::BoolExpressionMethods;
 use diesel::ExpressionMethods;
 use diesel::OptionalExtension;
 use diesel::QueryDsl;
@@ -70,6 +71,16 @@ pub struct EnqueueParams {
     pub start_to_close: Option<Duration>,
     pub schedule_to_start: Option<Duration>,
     pub retry_policy: Option<serde_json::Value>,
+    /// Pin this task to a specific worker for best-effort cache locality.
+    ///
+    /// When set together with [`Self::sticky_timeout`], the task is offered to
+    /// this worker preferentially for `sticky_timeout` after it becomes
+    /// claimable. Once the window expires, any worker may claim it.
+    pub sticky_worker_id: Option<String>,
+    /// Duration of the sticky preference window. Stored on the row so that
+    /// [`wake_workflow_task()`] can refresh `sticky_until` to the same value
+    /// on each transition back to PENDING without needing external config.
+    pub sticky_timeout: Option<StdDuration>,
 }
 
 impl EnqueueParams {
@@ -95,7 +106,19 @@ impl EnqueueParams {
             start_to_close: None,
             schedule_to_start: None,
             retry_policy: None,
+            sticky_worker_id: None,
+            sticky_timeout: None,
         }
+    }
+
+    /// Pin this task to the given worker for the duration of `timeout`.
+    ///
+    /// Both fields are required together -- passing either alone is a no-op.
+    #[must_use]
+    pub fn with_sticky(mut self, worker_id: impl Into<String>, timeout: StdDuration) -> Self {
+        self.sticky_worker_id = Some(worker_id.into());
+        self.sticky_timeout = Some(timeout);
+        self
     }
 }
 
@@ -113,6 +136,25 @@ pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> Ha
 
     let task_id = Uuid::new_v4();
 
+    // Sticky pin: only valid when both worker_id and timeout are present so the
+    // check constraint `sticky_worker_id IS NULL <=> sticky_until IS NULL` holds.
+    let (sticky_worker_id, sticky_until, sticky_timeout) =
+        match (params.sticky_worker_id.as_deref(), params.sticky_timeout) {
+            (Some(worker), Some(timeout)) => {
+                let chrono_timeout = chrono::Duration::from_std(timeout).map_err(|_| {
+                    crate::error::HarvestError::Config(
+                        "sticky_timeout exceeds chrono duration range".to_string(),
+                    )
+                })?;
+                (
+                    Some(worker),
+                    Some(Utc::now() + chrono_timeout),
+                    Some(chrono_timeout),
+                )
+            }
+            _ => (None, None, None),
+        };
+
     let row = NewTaskQueueItem {
         id: task_id,
         queue_name: &params.queue_name,
@@ -127,6 +169,9 @@ pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> Ha
         start_to_close: params.start_to_close,
         schedule_to_start: params.schedule_to_start,
         retry_policy: params.retry_policy.clone(),
+        sticky_worker_id,
+        sticky_until,
+        sticky_timeout,
     };
 
     diesel::insert_into(harvest_task_queue::table)
@@ -145,6 +190,14 @@ pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> Ha
 /// Uses `FOR UPDATE SKIP LOCKED` so concurrent workers never contend on the
 /// same row. Returns `None` if no eligible task is available.
 ///
+/// # Sticky routing
+///
+/// When a row has `sticky_worker_id` set and `sticky_until > NOW()`, only that
+/// worker may claim it. Once `sticky_until` elapses, any worker becomes
+/// eligible, so a crashed or slow sticky worker never blocks progress.
+/// Within the eligible set, rows pinned to the caller are sorted ahead of
+/// unpinned rows to maximize cache locality.
+///
 /// # Errors
 ///
 /// Returns [`crate::error::HarvestError::Database`] on query failure.
@@ -158,8 +211,19 @@ pub async fn claim_task(
          SET state = 'RUNNING', worker_id = $1, started_at = NOW(), attempt = attempt + 1 \
          WHERE id = ( \
              SELECT id FROM harvest_task_queue \
-             WHERE queue_name = ANY($2) AND state = 'PENDING' AND scheduled_at <= NOW() \
-             ORDER BY priority DESC, scheduled_at ASC \
+             WHERE queue_name = ANY($2) \
+               AND state = 'PENDING' \
+               AND scheduled_at <= NOW() \
+               AND ( \
+                   sticky_worker_id IS NULL \
+                   OR sticky_worker_id = $1 \
+                   OR sticky_until IS NULL \
+                   OR sticky_until <= NOW() \
+               ) \
+             ORDER BY \
+                 (sticky_worker_id = $1 AND sticky_until > NOW()) DESC NULLS LAST, \
+                 priority DESC, \
+                 scheduled_at ASC \
              LIMIT 1 FOR UPDATE SKIP LOCKED \
          ) RETURNING *",
     )
@@ -353,31 +417,136 @@ pub async fn reschedule_task(
     Ok(())
 }
 
+/// Hint for sticky cross-worker routing when parking or enqueueing a task.
+///
+/// When both fields are set, the task is pinned to `worker_id` for `timeout`
+/// so the worker's in-process LRU cache can service follow-up replays without
+/// reloading history from Postgres. A `None` hint leaves the task unpinned.
+#[derive(Debug, Clone, Copy)]
+pub struct StickyHint<'a> {
+    pub worker_id: &'a str,
+    pub timeout: StdDuration,
+}
+
+impl<'a> StickyHint<'a> {
+    /// Create a new sticky hint.
+    #[must_use]
+    pub const fn new(worker_id: &'a str, timeout: StdDuration) -> Self {
+        Self { worker_id, timeout }
+    }
+
+    fn chrono_timeout(self) -> HarvestResult<chrono::Duration> {
+        chrono::Duration::from_std(self.timeout).map_err(|_| {
+            crate::error::HarvestError::Config(
+                "sticky_timeout exceeds chrono duration range".to_string(),
+            )
+        })
+    }
+}
+
+/// Pin a task row to a specific worker for best-effort sticky routing.
+///
+/// Overwrites any existing sticky affinity on the row with the new worker
+/// and a fresh `sticky_until = NOW() + hint.timeout`. Use this after calls
+/// like [`reschedule_task()`] or [`enqueue()`] when the caller wants the
+/// target worker to preferentially claim the task once it becomes due.
+///
+/// Passing `None` clears any existing pin.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on update failure or
+/// [`crate::error::HarvestError::NotFound`] if the row does not exist.
+pub async fn set_task_sticky_affinity(
+    conn: &mut AsyncPgConnection,
+    task_id: Uuid,
+    sticky: Option<StickyHint<'_>>,
+) -> HarvestResult<()> {
+    use crate::schema::harvest_task_queue::dsl;
+
+    let updated = if let Some(hint) = sticky {
+        let timeout = hint.chrono_timeout()?;
+        let sticky_until = Utc::now() + timeout;
+        diesel::update(dsl::harvest_task_queue.find(task_id))
+            .set((
+                dsl::sticky_worker_id.eq(Some(hint.worker_id.to_string())),
+                dsl::sticky_until.eq(Some(sticky_until)),
+                dsl::sticky_timeout.eq(Some(timeout)),
+            ))
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?
+    } else {
+        diesel::update(dsl::harvest_task_queue.find(task_id))
+            .set((
+                dsl::sticky_worker_id.eq(None::<String>),
+                dsl::sticky_until.eq(None::<chrono::DateTime<Utc>>),
+                dsl::sticky_timeout.eq(None::<chrono::Duration>),
+            ))
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?
+    };
+
+    if updated == 0 {
+        return Err(crate::error::HarvestError::NotFound(format!(
+            "task queue item {task_id} does not exist"
+        )));
+    }
+
+    Ok(())
+}
+
 /// Mark a running workflow task as parked while it waits on an external event.
 ///
 /// Parked tasks stay in `RUNNING` state so they remain attached to the same
 /// workflow execution, but their worker ownership and start timestamp are cleared
 /// so wake-up paths can distinguish them from actively executing workflow tasks.
 ///
+/// If `sticky` is supplied, the row is pinned to the given worker for the
+/// configured duration. This lets the next wake-up preferentially land back on
+/// the worker that just produced the park -- the same worker whose in-process
+/// LRU cache holds the workflow state.
+///
 /// # Errors
 ///
 /// Returns [`crate::error::HarvestError::Database`] on update failure.
-pub async fn park_workflow_task(conn: &mut AsyncPgConnection, task_id: Uuid) -> HarvestResult<()> {
+pub async fn park_workflow_task(
+    conn: &mut AsyncPgConnection,
+    task_id: Uuid,
+    sticky: Option<StickyHint<'_>>,
+) -> HarvestResult<()> {
     use crate::schema::harvest_task_queue::dsl;
 
-    let updated = diesel::update(
-        dsl::harvest_task_queue
-            .find(task_id)
-            .filter(dsl::task_type.eq(TaskType::Workflow.as_str()))
-            .filter(dsl::state.eq("RUNNING")),
-    )
-    .set((
-        dsl::worker_id.eq(None::<String>),
-        dsl::started_at.eq(None::<chrono::DateTime<Utc>>),
-    ))
-    .execute(conn)
-    .await
-    .map_err(crate::error::database_error)?;
+    let base_query = dsl::harvest_task_queue
+        .find(task_id)
+        .filter(dsl::task_type.eq(TaskType::Workflow.as_str()))
+        .filter(dsl::state.eq("RUNNING"));
+
+    let updated = if let Some(hint) = sticky {
+        let timeout = hint.chrono_timeout()?;
+        let sticky_until = Utc::now() + timeout;
+        diesel::update(base_query)
+            .set((
+                dsl::worker_id.eq(None::<String>),
+                dsl::started_at.eq(None::<chrono::DateTime<Utc>>),
+                dsl::sticky_worker_id.eq(Some(hint.worker_id.to_string())),
+                dsl::sticky_until.eq(Some(sticky_until)),
+                dsl::sticky_timeout.eq(Some(timeout)),
+            ))
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?
+    } else {
+        diesel::update(base_query)
+            .set((
+                dsl::worker_id.eq(None::<String>),
+                dsl::started_at.eq(None::<chrono::DateTime<Utc>>),
+            ))
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?
+    };
 
     if updated == 0 {
         return Err(crate::error::HarvestError::NotFound(format!(
@@ -396,6 +565,11 @@ pub async fn park_workflow_task(conn: &mut AsyncPgConnection, task_id: Uuid) -> 
 /// rows (e.g. timer-scheduled tasks) are intentionally excluded. If no parked
 /// workflow task exists, this is a no-op.
 ///
+/// If the parked row carries a `sticky_timeout`, `sticky_until` is refreshed
+/// to `NOW() + sticky_timeout` so the pinned worker gets a fresh grace period
+/// each time the task becomes claimable. Rows without a stored timeout keep
+/// their existing `sticky_until` value (which will simply expire if stale).
+///
 /// # Errors
 ///
 /// Returns [`crate::error::HarvestError::Database`] on update failure.
@@ -403,29 +577,45 @@ pub async fn wake_workflow_task(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
 ) -> HarvestResult<()> {
-    use crate::schema::harvest_task_queue::dsl;
+    // Use raw SQL so we can refresh `sticky_until` from the row's own
+    // `sticky_timeout` column atomically in a single UPDATE. Doing this in
+    // two trips (SELECT then UPDATE) would race with other wake paths.
+    let queue_names: Vec<String> = {
+        use diesel::deserialize::QueryableByName;
+        use diesel::sql_types::Text;
 
-    let queue_names = diesel::update(
-        dsl::harvest_task_queue
-            .filter(dsl::workflow_exec_id.eq(Some(exec_id.as_uuid())))
-            .filter(dsl::task_type.eq(TaskType::Workflow.as_str()))
-            .filter(
-                dsl::state
-                    .eq("RUNNING")
-                    .and(dsl::worker_id.is_null())
-                    .and(dsl::started_at.is_null()),
-            ),
-    )
-    .set((
-        dsl::state.eq("PENDING"),
-        dsl::worker_id.eq(None::<String>),
-        dsl::started_at.eq(None::<chrono::DateTime<Utc>>),
-        dsl::scheduled_at.eq(Utc::now() - IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE),
-    ))
-    .returning(dsl::queue_name)
-    .get_results::<String>(conn)
-    .await
-    .map_err(crate::error::database_error)?;
+        #[derive(QueryableByName)]
+        struct QueueNameRow {
+            #[diesel(sql_type = Text)]
+            queue_name: String,
+        }
+
+        let rows: Vec<QueueNameRow> = diesel::sql_query(
+            "UPDATE harvest_task_queue \
+             SET state = 'PENDING', \
+                 worker_id = NULL, \
+                 started_at = NULL, \
+                 scheduled_at = $2, \
+                 sticky_until = CASE \
+                     WHEN sticky_worker_id IS NOT NULL AND sticky_timeout IS NOT NULL \
+                     THEN NOW() + sticky_timeout \
+                     ELSE sticky_until \
+                 END \
+             WHERE workflow_exec_id = $1 \
+               AND task_type = 'workflow' \
+               AND state = 'RUNNING' \
+               AND worker_id IS NULL \
+               AND started_at IS NULL \
+             RETURNING queue_name",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .bind::<diesel::sql_types::Timestamptz, _>(Utc::now() - IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE)
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+        rows.into_iter().map(|r| r.queue_name).collect()
+    };
 
     let mut queue_names = queue_names;
     queue_names.sort();
@@ -485,5 +675,33 @@ mod tests {
         assert_eq!(params.priority, 10);
         assert_eq!(params.max_attempts, 5);
         assert!(params.workflow_exec_id.is_some());
+    }
+
+    #[test]
+    fn enqueue_params_defaults_have_no_sticky_pin() {
+        let params = EnqueueParams::new("default", TaskType::Workflow, serde_json::json!(null));
+        assert!(params.sticky_worker_id.is_none());
+        assert!(params.sticky_timeout.is_none());
+    }
+
+    #[test]
+    fn enqueue_params_with_sticky_sets_both_fields() {
+        let params = EnqueueParams::new("default", TaskType::Workflow, serde_json::json!(null))
+            .with_sticky("worker-42", StdDuration::from_secs(7));
+        assert_eq!(params.sticky_worker_id.as_deref(), Some("worker-42"));
+        assert_eq!(params.sticky_timeout, Some(StdDuration::from_secs(7)));
+    }
+
+    #[test]
+    fn sticky_hint_constructs_with_fields() {
+        let hint = StickyHint::new("w1", StdDuration::from_secs(3));
+        assert_eq!(hint.worker_id, "w1");
+        assert_eq!(hint.timeout, StdDuration::from_secs(3));
+    }
+
+    #[test]
+    fn sticky_hint_rejects_out_of_range_duration() {
+        let hint = StickyHint::new("w1", StdDuration::from_secs(u64::MAX));
+        assert!(hint.chrono_timeout().is_err());
     }
 }

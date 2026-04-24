@@ -66,6 +66,10 @@ pub struct WorkerRuntimeConfig {
     pub poll_interval: Duration,
     /// Maximum time to wait for in-flight tasks during shutdown.
     pub shutdown_timeout: Duration,
+    /// Grace period during which subsequent tasks for a workflow are offered
+    /// preferentially to this worker so its in-process LRU cache stays warm.
+    /// Zero disables sticky routing entirely.
+    pub sticky_timeout: Duration,
 }
 
 impl WorkerRuntimeConfig {
@@ -94,6 +98,7 @@ impl From<WorkerConfig> for WorkerRuntimeConfig {
             max_concurrent_activities: cfg.max_concurrent_activities,
             poll_interval: Duration::from_millis(500),
             shutdown_timeout: cfg.shutdown_timeout,
+            sticky_timeout: cfg.sticky_timeout,
         }
     }
 }
@@ -280,6 +285,21 @@ struct WorkflowTaskPersistence<'a> {
     worker_id: &'a str,
     exec_id: ExecutionId,
     next_event_id: i32,
+    /// Grace window for pinning follow-up tasks to this worker's LRU cache.
+    /// Zero disables sticky routing entirely.
+    sticky_timeout: Duration,
+}
+
+impl<'a> WorkflowTaskPersistence<'a> {
+    /// Build a sticky hint bound to this worker, or `None` when sticky routing
+    /// is disabled (timeout == 0).
+    const fn sticky_hint(&self) -> Option<queue::StickyHint<'a>> {
+        if self.sticky_timeout.is_zero() {
+            None
+        } else {
+            Some(queue::StickyHint::new(self.worker_id, self.sticky_timeout))
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -661,6 +681,7 @@ async fn persist_signal_wait_park(
     exec_id: ExecutionId,
     next_event_id: i32,
     marker_events: &[WorkflowEvent],
+    sticky: Option<queue::StickyHint<'_>>,
 ) -> HarvestResult<()> {
     // Park the workflow task (state=RUNNING, worker cleared) so it is not
     // confused with a timer-waiting task (state=PENDING). This ensures that
@@ -670,7 +691,7 @@ async fn persist_signal_wait_park(
     conn.transaction::<(), HarvestError, _>(|conn| {
         async move {
             store::append_events(conn, exec_id, marker_events, next_event_id).await?;
-            queue::park_workflow_task(conn, task_id).await
+            queue::park_workflow_task(conn, task_id, sticky).await
         }
         .scope_boxed()
     })
@@ -691,6 +712,7 @@ async fn persist_signal_wait_park(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn persist_scheduled_activity(
     conn: &mut AsyncPgConnection,
     registry: &HandlerRegistry,
@@ -699,6 +721,7 @@ async fn persist_scheduled_activity(
     next_event_id: i32,
     commands: &[WorkflowCommand],
     scheduled: &ScheduledActivityCommand,
+    sticky: Option<queue::StickyHint<'_>>,
 ) -> HarvestResult<()> {
     let activity = registry.activities.get(&scheduled.name).ok_or_else(|| {
         HarvestError::Config(format!(
@@ -758,7 +781,7 @@ async fn persist_scheduled_activity(
         async move {
             store::append_events(conn, exec_id, &events, next_event_id).await?;
             queue::enqueue(conn, &params).await?;
-            queue::park_workflow_task(conn, task_id).await?;
+            queue::park_workflow_task(conn, task_id, sticky).await?;
             Ok(())
         }
         .scope_boxed()
@@ -773,6 +796,7 @@ async fn persist_started_timer(
     task_id: uuid::Uuid,
     commands: &[WorkflowCommand],
     timer: &StartedTimerCommand,
+    sticky: Option<queue::StickyHint<'_>>,
 ) -> HarvestResult<()> {
     let marker_events = marker_events_from_commands(commands);
     let fire_delay = chrono_duration_from_secs(timer.duration_secs, "timer duration")?;
@@ -798,13 +822,18 @@ async fn persist_started_timer(
                 .execute(conn)
                 .await
                 .map_err(crate::error::database_error)?;
-            queue::reschedule_task(conn, task_id, fires_at).await
+            queue::reschedule_task(conn, task_id, fires_at).await?;
+            if sticky.is_some() {
+                queue::set_task_sticky_affinity(conn, task_id, sticky).await?;
+            }
+            Ok(())
         }
         .scope_boxed()
     })
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn persist_started_child_workflow(
     conn: &mut AsyncPgConnection,
     registry: &HandlerRegistry,
@@ -813,6 +842,7 @@ async fn persist_started_child_workflow(
     next_event_id: i32,
     commands: &[WorkflowCommand],
     child: &StartedChildWorkflowCommand,
+    sticky: Option<queue::StickyHint<'_>>,
 ) -> HarvestResult<()> {
     if !registry.workflows.contains_key(&child.workflow_name) {
         return Err(HarvestError::Config(format!(
@@ -864,7 +894,7 @@ async fn persist_started_child_workflow(
                 .map_err(crate::error::database_error)?;
             store::append_events(conn, child.child_id, &[child_started_event], 0).await?;
             queue::enqueue(conn, &params).await?;
-            queue::park_workflow_task(conn, task_id).await?;
+            queue::park_workflow_task(conn, task_id, sticky).await?;
             Ok(())
         }
         .scope_boxed()
@@ -1222,6 +1252,8 @@ async fn handle_suspended_workflow(
     context: SuspendedWorkflowContext<'_>,
     commands: &[WorkflowCommand],
 ) -> HarvestResult<()> {
+    let sticky = context.persistence.sticky_hint();
+
     if should_requeue_signal_wait(commands) {
         let marker_events = marker_events_from_commands(commands);
         let result = persist_signal_wait_park(
@@ -1230,6 +1262,7 @@ async fn handle_suspended_workflow(
             context.persistence.exec_id,
             context.persistence.next_event_id,
             &marker_events,
+            sticky,
         )
         .await;
         return fail_execution_on_error(
@@ -1250,6 +1283,7 @@ async fn handle_suspended_workflow(
             context.persistence.next_event_id,
             commands,
             &scheduled,
+            sticky,
         )
         .await;
         return fail_execution_on_error(
@@ -1269,6 +1303,7 @@ async fn handle_suspended_workflow(
             context.persistence.task.id,
             commands,
             &timer,
+            sticky,
         )
         .await;
         return fail_execution_on_error(
@@ -1289,6 +1324,7 @@ async fn handle_suspended_workflow(
             context.persistence.next_event_id,
             commands,
             &child,
+            sticky,
         )
         .await;
         return fail_execution_on_error(
@@ -1473,6 +1509,7 @@ async fn process_workflow_task(
     registry: &HandlerRegistry,
     task: &TaskQueueItem,
     worker_id: &str,
+    sticky_timeout: Duration,
 ) -> HarvestResult<()> {
     let prepared = prepare_workflow_task(conn, task, worker_id).await?;
     let Some(workflow) = registry.workflows.get(&prepared.execution.workflow_name) else {
@@ -1502,6 +1539,7 @@ async fn process_workflow_task(
             worker_id,
             exec_id: prepared.exec_id,
             next_event_id: prepared.next_event_id,
+            sticky_timeout,
         },
         outcome,
     )
@@ -1513,6 +1551,7 @@ async fn process_task(
     registry: Arc<HandlerRegistry>,
     task: TaskQueueItem,
     worker_id: &str,
+    sticky_timeout: Duration,
 ) -> HarvestResult<()> {
     let mut conn = match pool.get().await {
         Ok(conn) => conn,
@@ -1523,7 +1562,14 @@ async fn process_task(
 
     match ClaimedTaskKind::from_db(&task.task_type)? {
         ClaimedTaskKind::Workflow => {
-            process_workflow_task(&mut conn, registry.as_ref(), &task, worker_id).await
+            process_workflow_task(
+                &mut conn,
+                registry.as_ref(),
+                &task,
+                worker_id,
+                sticky_timeout,
+            )
+            .await
         }
         ClaimedTaskKind::Activity => {
             process_activity_task(pool, &mut conn, registry.as_ref(), &task, worker_id).await
@@ -1723,6 +1769,7 @@ impl Worker {
         let task_id = task.id;
         let task_type = task.task_type.clone();
         let worker_id = self.config.worker_id.clone();
+        let sticky_timeout = self.config.sticky_timeout;
 
         tokio::spawn(async move {
             // Acquire semaphore permit — blocks if at concurrency limit.
@@ -1738,7 +1785,9 @@ impl Worker {
                 "executing task"
             );
 
-            if let Err(error) = process_task(&pool, registry, task, &worker_id).await {
+            if let Err(error) =
+                process_task(&pool, registry, task, &worker_id, sticky_timeout).await
+            {
                 tracing::error!(
                     task_id = %task_id,
                     task_type = %task_type,
@@ -1807,6 +1856,7 @@ mod tests {
             max_concurrent_activities: 20,
             poll_interval: Duration::from_millis(100),
             shutdown_timeout: Duration::from_secs(5),
+            sticky_timeout: Duration::from_secs(5),
         }
     }
 

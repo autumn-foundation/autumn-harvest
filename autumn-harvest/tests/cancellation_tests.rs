@@ -389,6 +389,7 @@ async fn running_activity_heartbeat_observes_workflow_cancellation() {
                 max_concurrent_activities: 1,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(1),
+                sticky_timeout: Duration::from_secs(5),
             },
             registry,
         )

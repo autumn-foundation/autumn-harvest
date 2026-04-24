@@ -70,7 +70,18 @@ CREATE TABLE harvest_task_queue (
     schedule_to_start   INTERVAL,
     retry_policy        JSONB,
     output              JSONB,
-    error               TEXT
+    error               TEXT,
+    -- Sticky cross-worker routing: optional affinity to a specific worker that
+    -- already holds workflow state in its LRU cache. `sticky_until` is the
+    -- grace period during which only the pinned worker preferentially claims;
+    -- once elapsed, any worker may claim, so a crashed sticky worker never
+    -- blocks progress. `sticky_timeout` captures the refresh interval so wakes
+    -- can extend the window by a consistent amount.
+    sticky_worker_id    TEXT,
+    sticky_until        TIMESTAMPTZ,
+    sticky_timeout      INTERVAL,
+    CONSTRAINT harvest_tq_sticky_pair_ck
+        CHECK ((sticky_worker_id IS NULL) = (sticky_until IS NULL))
 );
 
 CREATE INDEX idx_harvest_tq_poll ON harvest_task_queue
@@ -80,6 +91,9 @@ CREATE INDEX idx_harvest_tq_running ON harvest_task_queue
     (state, last_heartbeat_at)
     WHERE state = 'RUNNING';
 CREATE INDEX idx_harvest_tq_workflow ON harvest_task_queue (workflow_exec_id);
+CREATE INDEX idx_harvest_tq_sticky_poll ON harvest_task_queue
+    (sticky_worker_id, queue_name, priority DESC, scheduled_at)
+    WHERE state = 'PENDING' AND sticky_worker_id IS NOT NULL;
 
 -- DAG runs
 CREATE TABLE harvest_dag_runs (
