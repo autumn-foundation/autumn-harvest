@@ -1413,6 +1413,7 @@ async fn process_activity_task(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn handle_suspended_workflow(
     conn: &mut AsyncPgConnection,
     registry: &HandlerRegistry,
