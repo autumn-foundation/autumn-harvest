@@ -1845,6 +1845,20 @@ mod tests {
     }
 
     #[test]
+    fn context_cancellation_check_success_cases() {
+        let ctx = WorkflowContext::new_test();
+        assert!(ctx.check_cancellation().is_ok());
+    }
+
+    #[test]
+    fn context_is_cancelled_live_mode() {
+        let ctx = WorkflowContext::new_test();
+        assert!(!ctx.is_cancelled());
+        assert!(ctx.cancellation_reason().is_none());
+        assert!(ctx.check_cancellation().is_ok());
+    }
+
+    #[test]
     fn context_reports_cancellation_from_history() {
         let events = vec![
             WorkflowEvent::WorkflowStarted {

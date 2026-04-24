@@ -260,6 +260,23 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "Event ID overflow")]
+    fn events_to_insert_rows_from_panics_on_event_id_overflow() {
+        let exec_id = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: serde_json::Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::WorkflowCompleted {
+                output: serde_json::Value::Null,
+            },
+        ];
+
+        let _rows = events_to_insert_rows_from(exec_id, &events, i32::MAX);
+    }
+
+    #[test]
     fn history_from_rows_deserializes_events() -> Result<(), serde_json::Error> {
         let exec_id = ExecutionId::new();
         let events = vec![
