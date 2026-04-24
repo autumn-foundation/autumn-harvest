@@ -2258,16 +2258,18 @@ async fn claim_task_falls_back_to_any_worker_after_sticky_expires() {
     let (mut conn, _container) = setup_test_db().await;
     let exec_id = insert_workflow_execution(&mut conn).await;
 
-    // Pin with a 1ms window so we can observe fallback without sleeping long.
+    // Pin with a short window so we can observe fallback without sleeping long.
+    // The sleep is generously larger than the window to tolerate DB/host clock
+    // skew inside testcontainers on CI runners.
     let mut pinned = EnqueueParams::new("default", TaskType::Workflow, serde_json::json!({}))
-        .with_sticky("crashed-worker", Duration::from_millis(1));
+        .with_sticky("crashed-worker", Duration::from_millis(100));
     pinned.workflow_exec_id = Some(exec_id.as_uuid());
     queue::enqueue(&mut conn, &pinned)
         .await
         .expect("enqueue should succeed");
 
-    // Allow the sticky window to elapse.
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Allow the sticky window to elapse comfortably.
+    tokio::time::sleep(Duration::from_millis(800)).await;
 
     let queues = vec!["default".to_string()];
     let claimed = queue::claim_task(&mut conn, &queues, "rescue-worker")
@@ -2334,19 +2336,33 @@ async fn wake_workflow_task_refreshes_sticky_until() {
     let _claimed = queue::claim_task(&mut conn, &queues, "wake-refresh-worker")
         .await
         .expect("claim should succeed");
+    // Use a 5s window so both the park's sticky_until and the wake's refreshed
+    // sticky_until land comfortably in the future even under DB/host clock skew
+    // on CI runners. The test asserts the value was REFRESHED by comparing
+    // before/after timestamps, not by waiting for expiry.
     queue::park_workflow_task(
         &mut conn,
         task_id,
         Some(StickyHint::new(
             "wake-refresh-worker",
-            Duration::from_millis(50),
+            Duration::from_secs(5),
         )),
     )
     .await
     .expect("park should succeed");
 
-    // Simulate a long-running activity: let the original sticky window expire.
-    tokio::time::sleep(Duration::from_millis(120)).await;
+    let parked_until = harvest_task_queue::table
+        .find(task_id)
+        .select(TaskQueueItem::as_select())
+        .first(&mut conn)
+        .await
+        .expect("parked row should exist")
+        .sticky_until
+        .expect("sticky_until should be set at park");
+
+    // Wait long enough that NOW() has moved noticeably (well above typical
+    // sub-millisecond timer resolution) before triggering the refresh.
+    tokio::time::sleep(Duration::from_millis(250)).await;
 
     queue::wake_workflow_task(&mut conn, exec_id)
         .await
@@ -2363,7 +2379,8 @@ async fn wake_workflow_task_refreshes_sticky_until() {
     assert_eq!(row.sticky_worker_id.as_deref(), Some("wake-refresh-worker"));
     let refreshed_until = row.sticky_until.expect("sticky_until should be refreshed");
     assert!(
-        refreshed_until > Utc::now(),
-        "sticky_until should be refreshed into the future on wake (got {refreshed_until})",
+        refreshed_until > parked_until,
+        "sticky_until should be pushed forward on wake (parked_until={parked_until}, \
+         refreshed_until={refreshed_until})",
     );
 }
