@@ -35,6 +35,7 @@ pub mod prelude;
 pub mod query;
 pub mod replay;
 pub mod saga;
+pub mod shard;
 pub mod simulator;
 pub mod types;
 
@@ -97,8 +98,11 @@ pub use scheduler::{
     DagCatalog, RegisteredDag, SchedulerMonitor, SchedulerRuntime, compile_dag_catalog,
     register_schedules, tick_once, trigger_dag,
 };
+#[cfg(feature = "db")]
+pub use shard::ShardedDbPool;
+pub use shard::ShardRouter;
 pub use simulator::{SimulatorResult, WorkflowSimulator};
-pub use types::{ActivityExecId, ExecutionId, TimerId, WorkerId, WorkflowId};
+pub use types::{ActivityExecId, ExecutionId, ShardId, TimerId, WorkerId, WorkflowId};
 
 #[cfg(feature = "db")]
 pub use store::EventHistory;

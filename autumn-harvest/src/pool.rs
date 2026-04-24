@@ -7,6 +7,14 @@
 //! If the sum of requested sizes exceeds the ceiling, both are scaled down
 //! proportionally, with any remainder awarded to the web pool (HTTP latency
 //! is more user-visible than worker throughput).
+//!
+//! ## Sharded deployments
+//!
+//! `worker_pool_size` is applied *per shard*. With `N` shards the process
+//! holds `worker_pool_size * N` total worker connections distributed across
+//! `N` independent Postgres databases. Operators sizing a multi-shard
+//! deployment should account for that multiplication when setting Postgres
+//! `max_connections` on each shard host and the process-wide ceiling.
 
 use crate::error::{HarvestError, HarvestResult};
 
