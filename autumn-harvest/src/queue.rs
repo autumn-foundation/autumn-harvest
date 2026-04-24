@@ -138,22 +138,19 @@ pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> Ha
 
     // Sticky pin: only valid when both worker_id and timeout are present so the
     // check constraint `sticky_worker_id IS NULL <=> sticky_until IS NULL` holds.
-    let (sticky_worker_id, sticky_until, sticky_timeout) =
-        match (params.sticky_worker_id.as_deref(), params.sticky_timeout) {
-            (Some(worker), Some(timeout)) => {
-                let chrono_timeout = chrono::Duration::from_std(timeout).map_err(|_| {
-                    crate::error::HarvestError::Config(
-                        "sticky_timeout exceeds chrono duration range".to_string(),
-                    )
-                })?;
-                (
-                    Some(worker),
-                    Some(Utc::now() + chrono_timeout),
-                    Some(chrono_timeout),
+    // sticky_until is computed below via DB NOW() in a follow-up UPDATE so it
+    // agrees with the clock used by `claim_task` and `wake_workflow_task`.
+    let sticky = match (params.sticky_worker_id.as_deref(), params.sticky_timeout) {
+        (Some(worker), Some(timeout)) => {
+            let chrono_timeout = chrono::Duration::from_std(timeout).map_err(|_| {
+                crate::error::HarvestError::Config(
+                    "sticky_timeout exceeds chrono duration range".to_string(),
                 )
-            }
-            _ => (None, None, None),
-        };
+            })?;
+            Some((worker, chrono_timeout))
+        }
+        _ => None,
+    };
 
     let row = NewTaskQueueItem {
         id: task_id,
@@ -169,9 +166,9 @@ pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> Ha
         start_to_close: params.start_to_close,
         schedule_to_start: params.schedule_to_start,
         retry_policy: params.retry_policy.clone(),
-        sticky_worker_id,
-        sticky_until,
-        sticky_timeout,
+        sticky_worker_id: None,
+        sticky_until: None,
+        sticky_timeout: None,
     };
 
     diesel::insert_into(harvest_task_queue::table)
@@ -179,6 +176,22 @@ pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> Ha
         .execute(conn)
         .await
         .map_err(crate::error::database_error)?;
+
+    if let Some((worker_id, timeout)) = sticky {
+        diesel::sql_query(
+            "UPDATE harvest_task_queue \
+             SET sticky_worker_id = $2, \
+                 sticky_until = NOW() + $3, \
+                 sticky_timeout = $3 \
+             WHERE id = $1",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .bind::<diesel::sql_types::Text, _>(worker_id)
+        .bind::<diesel::sql_types::Interval, _>(timeout)
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    }
 
     crate::notify::notify_task_enqueued(conn, &params.queue_name, task_id).await?;
 
@@ -462,21 +475,26 @@ pub async fn set_task_sticky_affinity(
     task_id: Uuid,
     sticky: Option<StickyHint<'_>>,
 ) -> HarvestResult<()> {
-    use crate::schema::harvest_task_queue::dsl;
-
+    // Use DB NOW() for sticky_until so all rows agree on a single clock with
+    // `claim_task` and `wake_workflow_task`. See `park_workflow_task` for the
+    // rationale.
     let updated = if let Some(hint) = sticky {
         let timeout = hint.chrono_timeout()?;
-        let sticky_until = Utc::now() + timeout;
-        diesel::update(dsl::harvest_task_queue.find(task_id))
-            .set((
-                dsl::sticky_worker_id.eq(Some(hint.worker_id.to_string())),
-                dsl::sticky_until.eq(Some(sticky_until)),
-                dsl::sticky_timeout.eq(Some(timeout)),
-            ))
-            .execute(conn)
-            .await
-            .map_err(crate::error::database_error)?
+        diesel::sql_query(
+            "UPDATE harvest_task_queue \
+             SET sticky_worker_id = $2, \
+                 sticky_until = NOW() + $3, \
+                 sticky_timeout = $3 \
+             WHERE id = $1",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .bind::<diesel::sql_types::Text, _>(hint.worker_id)
+        .bind::<diesel::sql_types::Interval, _>(timeout)
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?
     } else {
+        use crate::schema::harvest_task_queue::dsl;
         diesel::update(dsl::harvest_task_queue.find(task_id))
             .set((
                 dsl::sticky_worker_id.eq(None::<String>),
@@ -516,36 +534,44 @@ pub async fn park_workflow_task(
     task_id: Uuid,
     sticky: Option<StickyHint<'_>>,
 ) -> HarvestResult<()> {
-    use crate::schema::harvest_task_queue::dsl;
-
-    let base_query = dsl::harvest_task_queue
-        .find(task_id)
-        .filter(dsl::task_type.eq(TaskType::Workflow.as_str()))
-        .filter(dsl::state.eq("RUNNING"));
-
+    // Use raw SQL when applying a sticky hint so `sticky_until` is computed
+    // from Postgres `NOW()` -- the same clock used by `wake_workflow_task` and
+    // `claim_task`. Mixing host-clock and DB-clock timestamps on the same row
+    // breaks comparisons under testcontainers / cross-host clock skew.
     let updated = if let Some(hint) = sticky {
         let timeout = hint.chrono_timeout()?;
-        let sticky_until = Utc::now() + timeout;
-        diesel::update(base_query)
-            .set((
-                dsl::worker_id.eq(None::<String>),
-                dsl::started_at.eq(None::<chrono::DateTime<Utc>>),
-                dsl::sticky_worker_id.eq(Some(hint.worker_id.to_string())),
-                dsl::sticky_until.eq(Some(sticky_until)),
-                dsl::sticky_timeout.eq(Some(timeout)),
-            ))
-            .execute(conn)
-            .await
-            .map_err(crate::error::database_error)?
+        diesel::sql_query(
+            "UPDATE harvest_task_queue \
+             SET worker_id = NULL, \
+                 started_at = NULL, \
+                 sticky_worker_id = $2, \
+                 sticky_until = NOW() + $3, \
+                 sticky_timeout = $3 \
+             WHERE id = $1 \
+               AND task_type = 'workflow' \
+               AND state = 'RUNNING'",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .bind::<diesel::sql_types::Text, _>(hint.worker_id)
+        .bind::<diesel::sql_types::Interval, _>(timeout)
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?
     } else {
-        diesel::update(base_query)
-            .set((
-                dsl::worker_id.eq(None::<String>),
-                dsl::started_at.eq(None::<chrono::DateTime<Utc>>),
-            ))
-            .execute(conn)
-            .await
-            .map_err(crate::error::database_error)?
+        use crate::schema::harvest_task_queue::dsl;
+        diesel::update(
+            dsl::harvest_task_queue
+                .find(task_id)
+                .filter(dsl::task_type.eq(TaskType::Workflow.as_str()))
+                .filter(dsl::state.eq("RUNNING")),
+        )
+        .set((
+            dsl::worker_id.eq(None::<String>),
+            dsl::started_at.eq(None::<chrono::DateTime<Utc>>),
+        ))
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?
     };
 
     if updated == 0 {
