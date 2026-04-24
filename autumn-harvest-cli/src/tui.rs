@@ -19,6 +19,11 @@ use serde_json::Value;
 use crate::Cli;
 use crate::CliError;
 
+/// Runs the TUI dashboard.
+///
+/// # Errors
+///
+/// Returns an error if the terminal setup fails, or if rendering encounters an error.
 pub async fn run_tui(cli: &Cli) -> Result<(), CliError> {
     // Setup terminal
     enable_raw_mode().map_err(|e| CliError::ReadJson {
