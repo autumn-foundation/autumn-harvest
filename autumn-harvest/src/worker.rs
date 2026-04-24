@@ -1754,7 +1754,6 @@ impl Worker {
     ///
     /// We wait until all semaphore permits are available again, meaning all
     /// spawned tasks have completed and dropped their permits.
-    #[allow(clippy::cast_possible_truncation)] // concurrency limits are well under u32::MAX
     async fn drain_in_flight(&self) {
         let total_permits =
             self.config.max_concurrent_workflows + self.config.max_concurrent_activities;
@@ -1763,11 +1762,17 @@ impl Worker {
             // Try to acquire ALL permits — when we can, all in-flight tasks are done.
             let _wf = self
                 .workflow_semaphore
-                .acquire_many(self.config.max_concurrent_workflows as u32)
+                .acquire_many(
+                    u32::try_from(self.config.max_concurrent_workflows)
+                        .expect("Concurrency limit overflow"),
+                )
                 .await;
             let _act = self
                 .activity_semaphore
-                .acquire_many(self.config.max_concurrent_activities as u32)
+                .acquire_many(
+                    u32::try_from(self.config.max_concurrent_activities)
+                        .expect("Concurrency limit overflow"),
+                )
                 .await;
         };
 
