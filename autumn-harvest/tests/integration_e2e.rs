@@ -2146,9 +2146,12 @@ async fn enqueue_with_sticky_pin_stores_worker_and_expiry() {
     let (mut conn, _container) = setup_test_db().await;
     let exec_id = insert_workflow_execution(&mut conn).await;
 
-    let params =
-        EnqueueParams::new("default", TaskType::Workflow, serde_json::json!({"go": true}))
-            .with_sticky("worker-sticky-1", Duration::from_secs(3));
+    let params = EnqueueParams::new(
+        "default",
+        TaskType::Workflow,
+        serde_json::json!({"go": true}),
+    )
+    .with_sticky("worker-sticky-1", Duration::from_secs(3));
     let mut enqueue = params.clone();
     enqueue.workflow_exec_id = Some(exec_id.as_uuid());
 
@@ -2244,7 +2247,10 @@ async fn claim_task_excludes_other_workers_while_sticky_active() {
         .await
         .expect("owner claim should succeed")
         .expect("owner should be able to claim its pinned task");
-    assert_eq!(owner_claim.sticky_worker_id.as_deref(), Some("owner-worker"));
+    assert_eq!(
+        owner_claim.sticky_worker_id.as_deref(),
+        Some("owner-worker")
+    );
 }
 
 #[tokio::test]
