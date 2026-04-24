@@ -160,6 +160,32 @@ and read back from history on subsequent invocations. This is the same model as
 Temporal and Cadence; the operational difference is that you only need
 Postgres, not a separate service.
 
+## Sharding
+
+Workflow state can be spread across multiple Postgres databases without
+cross-shard transactions. Each `ExecutionId` carries its `ShardId` in the
+first two bytes of the UUID, so any caller holding an id resolves to the
+owning shard in O(1) — no directory table required. Single-shard deployments
+keep working unchanged; the plugin wires a `ShardRouter::single()` and a
+`ShardedDbPool::single(pool)` by default.
+
+```rust
+use autumn_harvest::{ExecutionId, ShardId, ShardRouter};
+
+let router = ShardRouter::new(
+    vec![ShardId::new(0), ShardId::new(1), ShardId::new(2)], // readable
+    vec![ShardId::new(0), ShardId::new(1), ShardId::new(2)], // writable
+    ShardId::new(0),                                         // default
+);
+let shard = router.pick_for_new_workflow("onboarding", "user-42");
+let exec_id = ExecutionId::new_for_shard(shard);
+assert_eq!(exec_id.shard(), shard);
+```
+
+Adding a shard (new workflows only): provision and migrate the new database,
+add it to `readable_shards`, restart the plugin, then flip it into
+`writable_shards`. In-flight workflows drain on their original shard.
+
 ## License
 
 Dual-licensed under MIT or Apache 2.0 at your option.
