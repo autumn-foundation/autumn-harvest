@@ -19,6 +19,11 @@ use serde_json::Value;
 use crate::Cli;
 use crate::CliError;
 
+/// Starts the interactive terminal user interface.
+///
+/// # Errors
+///
+/// Returns an error if the terminal initialization fails, if the connection to the harvest server fails, or if an I/O error occurs during execution.
 pub async fn run_tui(cli: &Cli) -> Result<(), CliError> {
     // Setup terminal
     enable_raw_mode().map_err(|e| CliError::ReadJson {

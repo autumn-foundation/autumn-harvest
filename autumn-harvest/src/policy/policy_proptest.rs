@@ -9,6 +9,7 @@ proptest! {
         max_secs in prop::num::f64::ANY,
         attempt in prop::num::u32::ANY,
     ) {
+        #[allow(clippy::cast_precision_loss)]
         if initial_secs >= 0.0 && max_secs >= 0.0 && max_secs <= (u64::MAX as f64) && initial_secs <= (u64::MAX as f64) {
             if let Ok(initial) = Duration::try_from_secs_f64(initial_secs) {
                 if let Ok(max_val) = Duration::try_from_secs_f64(max_secs) {
