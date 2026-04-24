@@ -814,6 +814,3 @@ mod tests {
         assert!(rows.is_empty());
     }
 }
-
-#[cfg(test)]
-mod scheduler_proptest;

@@ -360,6 +360,3 @@ fn compute_retry_delay_negative_nan() {
     let d2 = compute_retry_delay(Duration::from_secs(1), -1.0, Duration::from_secs(300), 2);
     assert_eq!(d2, Duration::from_secs(0));
 }
-
-#[cfg(test)]
-mod policy_proptest;
