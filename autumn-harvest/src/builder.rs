@@ -219,6 +219,12 @@ pub struct WorkerConfig {
     pub workflow_cache_size: usize,
     /// How long to offer sticky tasks to the sticky worker before fallback.
     pub sticky_timeout: Duration,
+    /// Grace period for an activity to finish cooperatively after its workflow
+    /// is cancelled before the worker hard-aborts the handler task. Cancellation
+    /// is cooperative -- activities should poll [`ActivityContext::is_cancelled`]
+    /// or call [`ActivityContext::heartbeat`], but an uncooperative handler must
+    /// not block a worker slot indefinitely.
+    pub cancellation_grace_period: Duration,
     /// Shards this worker is responsible for polling.
     ///
     /// Defaults to `[ShardId::new(0)]`, matching the single-shard deployment
@@ -239,6 +245,7 @@ impl Default for WorkerConfig {
             shutdown_timeout: Duration::from_secs(30),
             workflow_cache_size: 1000,
             sticky_timeout: Duration::from_secs(5),
+            cancellation_grace_period: Duration::from_secs(5),
             shard_assignments: vec![ShardId::new(0)],
         }
     }
@@ -266,6 +273,19 @@ impl WorkerConfig {
     #[must_use]
     pub fn with_notification_database_url(mut self, database_url: impl Into<String>) -> Self {
         self.notification_database_url = Some(database_url.into());
+        self
+    }
+
+    /// Override the cancellation grace period.
+    ///
+    /// After a workflow is cancelled, any running activity gets this long to
+    /// notice cooperative cancellation (via [`ActivityContext::is_cancelled`]
+    /// or [`ActivityContext::heartbeat`]) and unwind cleanly. If it is still
+    /// running at the end of the grace period the worker aborts the handler
+    /// task and marks the activity as cancelled.
+    #[must_use]
+    pub const fn with_cancellation_grace_period(mut self, grace_period: Duration) -> Self {
+        self.cancellation_grace_period = grace_period;
         self
     }
 

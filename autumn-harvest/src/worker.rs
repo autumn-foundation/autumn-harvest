@@ -66,6 +66,9 @@ pub struct WorkerRuntimeConfig {
     pub poll_interval: Duration,
     /// Maximum time to wait for in-flight tasks during shutdown.
     pub shutdown_timeout: Duration,
+    /// Grace period for an activity handler to unwind cooperatively after
+    /// its workflow is cancelled before the worker hard-aborts it.
+    pub cancellation_grace_period: Duration,
     /// Grace period during which subsequent tasks for a workflow are offered
     /// preferentially to this worker so its in-process LRU cache stays warm.
     /// Zero disables sticky routing entirely.
@@ -98,6 +101,7 @@ impl From<WorkerConfig> for WorkerRuntimeConfig {
             max_concurrent_activities: cfg.max_concurrent_activities,
             poll_interval: Duration::from_millis(500),
             shutdown_timeout: cfg.shutdown_timeout,
+            cancellation_grace_period: cfg.cancellation_grace_period,
             sticky_timeout: cfg.sticky_timeout,
         }
     }
@@ -1161,12 +1165,48 @@ async fn persist_child_workflow_failure(
     .await
 }
 
+/// Poll the task queue row for `task_id` until its state leaves `RUNNING`,
+/// at which point the caller should treat the activity as cancelled.
+///
+/// Transient DB errors are retried silently; only a state transition (or
+/// row deletion) resolves the future.
+async fn observe_task_cancellation(pool: &DbPool, task_id: uuid::Uuid) {
+    use crate::schema::harvest_task_queue::dsl;
+
+    const POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+    loop {
+        tokio::time::sleep(POLL_INTERVAL).await;
+
+        let Ok(mut conn) = pool.get().await else {
+            continue;
+        };
+
+        let row = dsl::harvest_task_queue
+            .find(task_id)
+            .select(dsl::state)
+            .first::<String>(&mut conn)
+            .await
+            .optional();
+
+        if let Ok(Some(state)) = &row {
+            if state == "RUNNING" {
+                continue;
+            }
+        }
+        if row.is_ok() {
+            return;
+        }
+    }
+}
+
 async fn process_activity_task(
     pool: &DbPool,
     conn: &mut AsyncPgConnection,
     registry: &HandlerRegistry,
     task: &TaskQueueItem,
     worker_id: &str,
+    cancellation_grace_period: Duration,
 ) -> HarvestResult<()> {
     let Some(exec_uuid) = task.workflow_exec_id else {
         return fail_task_only(conn, task.id, "activity task missing workflow_exec_id").await;
@@ -1207,8 +1247,39 @@ async fn process_activity_task(
         pool.clone(),
     );
 
-    let activity_result = (activity.handler)(&ctx, task.input.clone()).await;
+    let mut activity_future = (activity.handler)(&ctx, task.input.clone());
+    let cancellation_observer = observe_task_cancellation(pool, task.id);
+    tokio::pin!(cancellation_observer);
+
+    let activity_result = tokio::select! {
+        biased;
+        result = &mut activity_future => result,
+        () = &mut cancellation_observer => {
+            cancel.cancel();
+            tracing::info!(
+                task_id = %task.id,
+                activity = %activity_name,
+                grace_period_ms = %cancellation_grace_period.as_millis(),
+                "workflow cancellation detected for running activity; awaiting cooperative unwind"
+            );
+            tokio::time::timeout(cancellation_grace_period, &mut activity_future)
+                .await
+                .unwrap_or_else(|_| {
+                    tracing::warn!(
+                        task_id = %task.id,
+                        activity = %activity_name,
+                        grace_period_ms = %cancellation_grace_period.as_millis(),
+                        "activity ignored cancellation; hard-aborting handler"
+                    );
+                    Err(format!(
+                        "workflow cancelled: activity '{activity_name}' exceeded {}ms cancellation grace period",
+                        cancellation_grace_period.as_millis()
+                    ))
+                })
+        }
+    };
     cancel.cancel();
+    drop(activity_future);
 
     let retry_policy_result = configured_retry_policy(task);
     let retry_policy = fail_execution_on_error(conn, task, worker_id, retry_policy_result).await?;
@@ -1551,6 +1622,7 @@ async fn process_task(
     registry: Arc<HandlerRegistry>,
     task: TaskQueueItem,
     worker_id: &str,
+    cancellation_grace_period: Duration,
     sticky_timeout: Duration,
 ) -> HarvestResult<()> {
     let mut conn = match pool.get().await {
@@ -1572,7 +1644,15 @@ async fn process_task(
             .await
         }
         ClaimedTaskKind::Activity => {
-            process_activity_task(pool, &mut conn, registry.as_ref(), &task, worker_id).await
+            process_activity_task(
+                pool,
+                &mut conn,
+                registry.as_ref(),
+                &task,
+                worker_id,
+                cancellation_grace_period,
+            )
+            .await
         }
     }
 }
@@ -1769,6 +1849,7 @@ impl Worker {
         let task_id = task.id;
         let task_type = task.task_type.clone();
         let worker_id = self.config.worker_id.clone();
+        let cancellation_grace_period = self.config.cancellation_grace_period;
         let sticky_timeout = self.config.sticky_timeout;
 
         tokio::spawn(async move {
@@ -1785,8 +1866,15 @@ impl Worker {
                 "executing task"
             );
 
-            if let Err(error) =
-                process_task(&pool, registry, task, &worker_id, sticky_timeout).await
+            if let Err(error) = process_task(
+                &pool,
+                registry,
+                task,
+                &worker_id,
+                cancellation_grace_period,
+                sticky_timeout,
+            )
+            .await
             {
                 tracing::error!(
                     task_id = %task_id,
@@ -1861,6 +1949,7 @@ mod tests {
             max_concurrent_activities: 20,
             poll_interval: Duration::from_millis(100),
             shutdown_timeout: Duration::from_secs(5),
+            cancellation_grace_period: Duration::from_secs(5),
             sticky_timeout: Duration::from_secs(5),
         }
     }
@@ -1912,6 +2001,7 @@ mod tests {
             shutdown_timeout: Duration::from_secs(60),
             workflow_cache_size: 500,
             sticky_timeout: Duration::from_secs(3),
+            cancellation_grace_period: Duration::from_secs(10),
             shard_assignments: vec![crate::types::ShardId::new(0)],
         };
 
@@ -1926,6 +2016,10 @@ mod tests {
         assert_eq!(runtime_cfg.max_concurrent_activities, 15);
         assert_eq!(runtime_cfg.shutdown_timeout, Duration::from_secs(60));
         assert_eq!(runtime_cfg.poll_interval, Duration::from_millis(500));
+        assert_eq!(
+            runtime_cfg.cancellation_grace_period,
+            Duration::from_secs(10)
+        );
         // worker_id should be a valid UUID
         assert!(uuid::Uuid::parse_str(&runtime_cfg.worker_id).is_ok());
     }

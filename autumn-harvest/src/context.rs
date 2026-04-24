@@ -216,6 +216,11 @@ pub struct WorkflowContext {
     state: SharedState,
     /// In-memory query handlers (not persisted to history).
     query_registry: Mutex<QueryRegistry>,
+    /// Cancellation reason captured from a `WorkflowCancelled` event in history,
+    /// if any. When set, `is_cancelled()` returns true and `check_cancellation()`
+    /// yields [`HarvestError::Cancelled`]. Cooperative: the workflow function is
+    /// expected to consult these at strategic points to run cleanup logic.
+    cancellation_reason: Option<String>,
 }
 
 impl WorkflowContext {
@@ -247,6 +252,13 @@ impl WorkflowContext {
             })
             .unwrap_or_else(Utc::now);
 
+        // Capture any terminal cancellation event so workflow code can detect
+        // it via `is_cancelled()` / `check_cancellation()` during replay.
+        let cancellation_reason = events.iter().find_map(|e| match e {
+            WorkflowEvent::WorkflowCancelled { reason } => Some(reason.clone()),
+            _ => None,
+        });
+
         let mut matcher = HistoryMatcher::new(events);
         // Advance past the WorkflowStarted lifecycle event -- it does not
         // correspond to a workflow command.
@@ -260,6 +272,7 @@ impl WorkflowContext {
             activity_seq: Mutex::new(0),
             state,
             query_registry: Mutex::new(QueryRegistry::new()),
+            cancellation_reason,
         }
     }
 
@@ -278,6 +291,7 @@ impl WorkflowContext {
             activity_seq: Mutex::new(0),
             state: empty_shared_state(),
             query_registry: Mutex::new(QueryRegistry::new()),
+            cancellation_reason: None,
         }
     }
 
@@ -316,6 +330,50 @@ impl WorkflowContext {
     #[must_use]
     pub fn state<T: Any + Send + Sync>(&self) -> Option<&T> {
         self.state.get(&TypeId::of::<T>())?.downcast_ref::<T>()
+    }
+
+    // ── Cancellation ──────────────────────────────────────────────────
+
+    /// Returns `true` if a `WorkflowCancelled` event is present in the event
+    /// history backing this context.
+    ///
+    /// Workflows performing long-running loops or multi-step orchestration
+    /// should check this periodically and bail out with cleanup when it
+    /// returns `true`. Activity/timer/signal awaits already surface
+    /// [`HarvestError::Cancelled`] when their result channels are dropped as
+    /// part of the cancellation flow; this accessor is the analogous hook
+    /// for code paths that never suspend.
+    #[must_use]
+    pub const fn is_cancelled(&self) -> bool {
+        self.cancellation_reason.is_some()
+    }
+
+    /// Recorded cancellation reason when [`is_cancelled`](Self::is_cancelled)
+    /// is true.
+    #[must_use]
+    pub fn cancellation_reason(&self) -> Option<&str> {
+        self.cancellation_reason.as_deref()
+    }
+
+    /// Fail fast with [`HarvestError::Cancelled`] when the workflow has been
+    /// cancelled.
+    ///
+    /// Intended for use at the top of long-running workflow sections so that
+    /// cooperative cancellation can short-circuit the remaining work:
+    ///
+    /// ```ignore
+    /// ctx.check_cancellation()?;
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Cancelled`] if a `WorkflowCancelled` event is
+    /// present in the event history.
+    pub fn check_cancellation(&self) -> HarvestResult<()> {
+        if let Some(reason) = self.cancellation_reason.as_deref() {
+            return Err(HarvestError::Cancelled(reason.to_string()));
+        }
+        Ok(())
     }
 
     // ── Side effects ──────────────────────────────────────────────────
@@ -1733,6 +1791,49 @@ mod tests {
             .await
             .expect("signal should replay");
         assert_eq!(payload, serde_json::json!({"ok": true}));
+    }
+
+    #[test]
+    fn context_is_not_cancelled_without_terminal_event() {
+        let events = vec![WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+        }];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+
+        assert!(!ctx.is_cancelled());
+        assert!(ctx.cancellation_reason().is_none());
+        assert!(ctx.check_cancellation().is_ok());
+    }
+
+    #[test]
+    fn context_reports_cancellation_from_history() {
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::WorkflowCancelled {
+                reason: "operator stop".into(),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+
+        assert!(ctx.is_cancelled());
+        assert_eq!(ctx.cancellation_reason(), Some("operator stop"));
+        let err = ctx
+            .check_cancellation()
+            .expect_err("cancelled history should yield Cancelled error");
+        assert!(matches!(err, HarvestError::Cancelled(reason) if reason == "operator stop"));
+    }
+
+    #[test]
+    fn context_live_mode_reports_no_cancellation() {
+        let ctx = WorkflowContext::new_test();
+
+        assert!(!ctx.is_cancelled());
+        assert!(ctx.cancellation_reason().is_none());
+        assert!(ctx.check_cancellation().is_ok());
     }
 
     #[test]
