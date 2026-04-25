@@ -247,8 +247,8 @@ pub struct WorkerConfig {
     pub sticky_timeout: Duration,
     /// Grace period for an activity to finish cooperatively after its workflow
     /// is cancelled before the worker hard-aborts the handler task. Cancellation
-    /// is cooperative -- activities should poll [`ActivityContext::is_cancelled`]
-    /// or call [`ActivityContext::heartbeat`], but an uncooperative handler must
+    /// is cooperative -- activities should poll [`crate::context::ActivityContext::is_cancelled`]
+    /// or call [`crate::context::ActivityContext::heartbeat`], but an uncooperative handler must
     /// not block a worker slot indefinitely.
     pub cancellation_grace_period: Duration,
     /// Shards this worker is responsible for polling.
@@ -305,8 +305,8 @@ impl WorkerConfig {
     /// Override the cancellation grace period.
     ///
     /// After a workflow is cancelled, any running activity gets this long to
-    /// notice cooperative cancellation (via [`ActivityContext::is_cancelled`]
-    /// or [`ActivityContext::heartbeat`]) and unwind cleanly. If it is still
+    /// notice cooperative cancellation (via [`crate::context::ActivityContext::is_cancelled`]
+    /// or [`crate::context::ActivityContext::heartbeat`]) and unwind cleanly. If it is still
     /// running at the end of the grace period the worker aborts the handler
     /// task and marks the activity as cancelled.
     #[must_use]
