@@ -747,10 +747,16 @@ impl WorkflowContext {
     ///
     /// Panics if the internal query registry mutex is poisoned.
     pub fn execute_query(&self, name: &str) -> HarvestResult<Value> {
-        self.query_registry
+        let handler = self
+            .query_registry
             .lock()
             .expect("query_registry lock poisoned")
-            .execute(name)
+            .get(name);
+
+        handler.map_or_else(
+            || Err(HarvestError::NotFound(format!("query handler '{name}'"))),
+            |h| Ok(h()),
+        )
     }
 
     // ── Command drain ─────────────────────────────────────────────────
