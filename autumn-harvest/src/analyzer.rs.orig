@@ -94,17 +94,19 @@ impl AnalyzerRule for ExcessiveRetriesRule {
                     activity_id,
                     attempt,
                     ..
-                } if *attempt > self.threshold => {
-                    let name = activity_names
-                        .get(activity_id)
-                        .map_or("Unknown", |n| n.as_str());
-                    warnings.push(AnalyzerWarning {
-                        rule_name: self.name().to_string(),
-                        message: format!(
-                            "Activity '{}' failed {} times (threshold: {})",
-                            name, attempt, self.threshold
-                        ),
-                    });
+                } => {
+                    if *attempt > self.threshold {
+                        let name = activity_names
+                            .get(activity_id)
+                            .map_or("Unknown", |n| n.as_str());
+                        warnings.push(AnalyzerWarning {
+                            rule_name: self.name().to_string(),
+                            message: format!(
+                                "Activity '{}' failed {} times (threshold: {})",
+                                name, attempt, self.threshold
+                            ),
+                        });
+                    }
                 }
                 _ => {}
             }
