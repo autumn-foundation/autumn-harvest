@@ -20,6 +20,8 @@ pub mod context;
 pub mod dag;
 /// Export format types for Directed Acyclic Graphs (DAGs) representing workflows.
 pub mod dag_export;
+#[cfg(any(test, feature = "testing"))]
+pub mod dag_simulator;
 pub mod error;
 pub mod event;
 #[cfg(feature = "db")]
@@ -80,6 +82,8 @@ pub use cache::{CachedWorkflowState, WorkflowCache};
 pub use context::{ActivityContext, WorkflowCommand, WorkflowContext};
 pub use dag::{DagBuildError, DagBuilder, DagDefinition, DagTask, DagTaskRef};
 pub use dag_export::{export_dot, export_mermaid};
+#[cfg(any(test, feature = "testing"))]
+pub use dag_simulator::{DagSimulator, DagSimulatorResult};
 pub use error::{HarvestError, HarvestResult, TimeoutType};
 pub use event::WorkflowEvent;
 #[cfg(feature = "db")]
