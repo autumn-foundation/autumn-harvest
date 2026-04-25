@@ -1616,56 +1616,54 @@ async fn persist_workflow_outcome(
 ) -> HarvestResult<()> {
     let parent_exec_id = execution.parent_id.map(execution_id_from_uuid);
 
-    match outcome {
-        WorkflowOutcome::Completed { output } => {
-            if let Some(parent_id) = parent_exec_id {
-                persist_child_workflow_completion(
-                    conn,
-                    persistence.task.id,
-                    persistence.exec_id,
-                    persistence.next_event_id,
-                    persistence.worker_id,
-                    parent_id,
-                    output,
-                )
-                .await
-            } else {
-                persist_workflow_completion(
-                    conn,
-                    persistence.task.id,
-                    persistence.exec_id,
-                    persistence.next_event_id,
-                    persistence.worker_id,
-                    output,
-                )
-                .await
-            }
+    match (outcome, parent_exec_id) {
+        (WorkflowOutcome::Completed { output }, Some(parent_id)) => {
+            persist_child_workflow_completion(
+                conn,
+                persistence.task.id,
+                persistence.exec_id,
+                persistence.next_event_id,
+                persistence.worker_id,
+                parent_id,
+                output,
+            )
+            .await
         }
-        WorkflowOutcome::Failed { error } => {
-            if let Some(parent_id) = parent_exec_id {
-                persist_child_workflow_failure(
-                    conn,
-                    persistence.task.id,
-                    persistence.exec_id,
-                    persistence.next_event_id,
-                    persistence.worker_id,
-                    parent_id,
-                    &error,
-                )
-                .await
-            } else {
-                persist_workflow_failure(
-                    conn,
-                    persistence.task.id,
-                    persistence.exec_id,
-                    persistence.next_event_id,
-                    persistence.worker_id,
-                    &error,
-                )
-                .await
-            }
+        (WorkflowOutcome::Completed { output }, None) => {
+            persist_workflow_completion(
+                conn,
+                persistence.task.id,
+                persistence.exec_id,
+                persistence.next_event_id,
+                persistence.worker_id,
+                output,
+            )
+            .await
         }
-        WorkflowOutcome::Suspended { commands } => {
+        (WorkflowOutcome::Failed { error }, Some(parent_id)) => {
+            persist_child_workflow_failure(
+                conn,
+                persistence.task.id,
+                persistence.exec_id,
+                persistence.next_event_id,
+                persistence.worker_id,
+                parent_id,
+                &error,
+            )
+            .await
+        }
+        (WorkflowOutcome::Failed { error }, None) => {
+            persist_workflow_failure(
+                conn,
+                persistence.task.id,
+                persistence.exec_id,
+                persistence.next_event_id,
+                persistence.worker_id,
+                &error,
+            )
+            .await
+        }
+        (WorkflowOutcome::Suspended { commands }, _) => {
             handle_suspended_workflow(
                 conn,
                 registry,
@@ -1759,12 +1757,7 @@ async fn process_task(
     cancellation_grace_period: Duration,
     sticky_timeout: Duration,
 ) -> HarvestResult<()> {
-    let mut conn = match pool.get().await {
-        Ok(conn) => conn,
-        Err(error) => {
-            return Err(crate::error::database_error(error));
-        }
-    };
+    let mut conn = pool.get().await.map_err(crate::error::database_error)?;
 
     match ClaimedTaskKind::from_db(&task.task_type)? {
         ClaimedTaskKind::Workflow => {
