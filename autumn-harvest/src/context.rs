@@ -417,9 +417,9 @@ impl WorkflowContext {
                 format!("side effect mismatch: expected {expected}, got {actual}"),
             )),
 
-            HistoryMatch::Failed { .. } | HistoryMatch::TimedOut { .. } => unreachable!(
-                "match_side_effect only returns Matched, Diverged or NoMatch"
-            ),
+            HistoryMatch::Failed { .. } | HistoryMatch::TimedOut { .. } => {
+                unreachable!("match_side_effect only returns Matched, Diverged or NoMatch")
+            }
 
             HistoryMatch::NoMatch => {
                 let result = f();
@@ -589,9 +589,9 @@ impl WorkflowContext {
                 format!("timer mismatch: expected {expected}, got {actual}"),
             )),
 
-            HistoryMatch::Failed { .. } | HistoryMatch::TimedOut { .. } => unreachable!(
-                "timers do not fail or time out in history matching"
-            ),
+            HistoryMatch::Failed { .. } | HistoryMatch::TimedOut { .. } => {
+                unreachable!("timers do not fail or time out in history matching")
+            }
 
             HistoryMatch::NoMatch => {
                 let (tx, rx) = oneshot::channel();
@@ -644,9 +644,9 @@ impl WorkflowContext {
                 attempt,
                 source: error.into(),
             }),
-            HistoryMatch::TimedOut { .. } => unreachable!(
-                "child workflows do not time out in match_child_workflow"
-            ),
+            HistoryMatch::TimedOut { .. } => {
+                unreachable!("child workflows do not time out in match_child_workflow")
+            }
             HistoryMatch::Diverged { expected, actual } => Err(HarvestError::NonDeterministic(
                 format!("child workflow mismatch: expected {expected}, got {actual}"),
             )),
