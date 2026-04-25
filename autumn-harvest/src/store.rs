@@ -129,11 +129,10 @@ pub async fn load_history(
 
     let next_event_id = rows.last().map_or(0, |r| r.event_id.saturating_add(1));
 
-    let mut events = Vec::with_capacity(rows.len());
-    for row in rows {
-        let event: WorkflowEvent = serde_json::from_value(row.event_data)?;
-        events.push(event);
-    }
+    let events = rows
+        .into_iter()
+        .map(|row| serde_json::from_value(row.event_data))
+        .collect::<Result<Vec<WorkflowEvent>, _>>()?;
 
     Ok(EventHistory {
         exec_id,
