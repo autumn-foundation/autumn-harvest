@@ -76,13 +76,30 @@ impl HistoryMatcher {
         }
     }
 
+    /// Returns `true` if the event at `index` has already been consumed out-of-order.
+    fn is_consumed(&self, index: usize) -> bool {
+        self.consumed_child_terminal_events.contains(&index)
+            || self.consumed_signal_events.contains(&index)
+    }
+
+    fn stash_signal(&mut self, cursor: usize, signal_name: String, payload: Value) {
+        self.consumed_signal_events.insert(cursor);
+        self.pending_signals.push_back((signal_name, payload));
+    }
+
+    /// Prepares for matching by advancing past consumed events and draining early signals.
+    /// Returns `true` if there are still events to replay.
+    fn prepare_match(&mut self) -> bool {
+        self.advance_to_next_unconsumed_event();
+        self.drain_early_signals();
+        self.is_replaying()
+    }
+
     /// Returns `true` if the cursor is still within the recorded history.
     #[must_use]
     pub fn is_replaying(&self) -> bool {
         let mut cursor = self.cursor;
-        while self.consumed_child_terminal_events.contains(&cursor)
-            || self.consumed_signal_events.contains(&cursor)
-        {
+        while self.is_consumed(cursor) {
             cursor += 1;
         }
         cursor < self.events.len()
@@ -106,10 +123,7 @@ impl HistoryMatcher {
     }
 
     fn advance_to_next_unconsumed_event(&mut self) {
-        while (self.consumed_child_terminal_events.contains(&self.cursor)
-            || self.consumed_signal_events.contains(&self.cursor))
-            && self.cursor < self.events.len()
-        {
+        while self.cursor < self.events.len() && self.is_consumed(self.cursor) {
             self.cursor += 1;
         }
     }
@@ -130,9 +144,9 @@ impl HistoryMatcher {
                 payload,
             } = &self.events[self.cursor]
             {
-                self.consumed_signal_events.insert(self.cursor);
-                self.pending_signals
-                    .push_back((signal_name.clone(), payload.clone()));
+                let signal_name = signal_name.clone();
+                let payload = payload.clone();
+                self.stash_signal(self.cursor, signal_name, payload);
                 self.cursor += 1;
                 self.advance_to_next_unconsumed_event();
             } else {
@@ -177,27 +191,23 @@ impl HistoryMatcher {
     /// - [`HistoryMatch::NoMatch`] if past end of history
     /// - [`HistoryMatch::Diverged`] if the event at cursor is not the expected activity
     pub fn match_activity(&mut self, activity_name: &str) -> HistoryMatch {
-        self.advance_to_next_unconsumed_event();
-        // Signals may have been ingested before the activity was scheduled;
-        // buffer them so they can be consumed by a later wait_for_signal call.
-        self.drain_early_signals();
-        if !self.is_replaying() {
+        if !self.prepare_match() {
             return HistoryMatch::NoMatch;
         }
 
         // Expect ActivityScheduled at cursor
-        let scheduled_event = &self.events[self.cursor];
-        let (activity_id, recorded_name) = match scheduled_event {
-            WorkflowEvent::ActivityScheduled {
-                activity_id, name, ..
-            } => (*activity_id, name.as_str()),
-            other => {
-                return HistoryMatch::Diverged {
-                    expected: format!("ActivityScheduled({activity_name})"),
-                    actual: other.type_name().to_string(),
-                };
-            }
+        let WorkflowEvent::ActivityScheduled {
+            activity_id,
+            name: recorded_name,
+            ..
+        } = &self.events[self.cursor]
+        else {
+            return HistoryMatch::Diverged {
+                expected: format!("ActivityScheduled({activity_name})"),
+                actual: self.events[self.cursor].type_name().to_string(),
+            };
         };
+        let activity_id = *activity_id;
 
         // Verify activity name matches
         if recorded_name != activity_name {
@@ -215,9 +225,7 @@ impl HistoryMatcher {
         // Scan forward for Completed or Failed with matching activity_id,
         // skipping Started, Heartbeat, and other intermediate events.
         while scan_cursor < self.events.len() {
-            if self.consumed_child_terminal_events.contains(&scan_cursor)
-                || self.consumed_signal_events.contains(&scan_cursor)
-            {
+            if self.is_consumed(scan_cursor) {
                 scan_cursor += 1;
                 continue;
             }
@@ -285,9 +293,9 @@ impl HistoryMatcher {
                     signal_name,
                     payload,
                 } => {
-                    self.consumed_signal_events.insert(scan_cursor);
-                    self.pending_signals
-                        .push_back((signal_name.clone(), payload.clone()));
+                    let signal_name = signal_name.clone();
+                    let payload = payload.clone();
+                    self.stash_signal(scan_cursor, signal_name, payload);
                     scan_cursor += 1;
                 }
                 // Any other event type is unexpected mid-activity
@@ -305,26 +313,22 @@ impl HistoryMatcher {
     /// Expects `TimerStarted { timer_id }` at cursor, then scans for
     /// `TimerFired` with the same `timer_id`.
     pub fn match_timer(&mut self, timer_id: &str) -> HistoryMatch {
-        self.advance_to_next_unconsumed_event();
-        // Signals may have been ingested before the timer was started;
-        // buffer them so they can be consumed by a later wait_for_signal call.
-        self.drain_early_signals();
-        if !self.is_replaying() {
+        if !self.prepare_match() {
             return HistoryMatch::NoMatch;
         }
 
-        let started_event = &self.events[self.cursor];
-        let recorded_id = match started_event {
-            WorkflowEvent::TimerStarted { timer_id: id, .. } => id.as_str(),
-            other => {
-                return HistoryMatch::Diverged {
-                    expected: format!("TimerStarted({timer_id})"),
-                    actual: other.type_name().to_string(),
-                };
-            }
+        let WorkflowEvent::TimerStarted {
+            timer_id: recorded_id,
+            ..
+        } = &self.events[self.cursor]
+        else {
+            return HistoryMatch::Diverged {
+                expected: format!("TimerStarted({timer_id})"),
+                actual: self.events[self.cursor].type_name().to_string(),
+            };
         };
 
-        if recorded_id != timer_id {
+        if recorded_id.as_str() != timer_id {
             return HistoryMatch::Diverged {
                 expected: format!("TimerStarted({timer_id})"),
                 actual: format!("TimerStarted({recorded_id})"),
@@ -338,9 +342,7 @@ impl HistoryMatcher {
 
         // Scan forward for TimerFired, skipping consumed child terminals and signals.
         while scan_cursor < self.events.len() {
-            if self.consumed_child_terminal_events.contains(&scan_cursor)
-                || self.consumed_signal_events.contains(&scan_cursor)
-            {
+            if self.is_consumed(scan_cursor) {
                 scan_cursor += 1;
                 continue;
             }
@@ -370,9 +372,9 @@ impl HistoryMatcher {
                 payload,
             } = &self.events[scan_cursor]
             {
-                self.consumed_signal_events.insert(scan_cursor);
-                self.pending_signals
-                    .push_back((signal_name.clone(), payload.clone()));
+                let signal_name = signal_name.clone();
+                let payload = payload.clone();
+                self.stash_signal(scan_cursor, signal_name, payload);
                 scan_cursor += 1;
                 continue;
             }
@@ -404,9 +406,7 @@ impl HistoryMatcher {
 
         let mut scan_cursor = self.cursor;
         while scan_cursor < self.events.len() {
-            if self.consumed_child_terminal_events.contains(&scan_cursor)
-                || self.consumed_signal_events.contains(&scan_cursor)
-            {
+            if self.is_consumed(scan_cursor) {
                 scan_cursor += 1;
                 continue;
             }
@@ -427,9 +427,9 @@ impl HistoryMatcher {
                     signal_name: recorded_name,
                     payload,
                 } => {
-                    self.consumed_signal_events.insert(scan_cursor);
-                    self.pending_signals
-                        .push_back((recorded_name.clone(), payload.clone()));
+                    let recorded_name = recorded_name.clone();
+                    let payload = payload.clone();
+                    self.stash_signal(scan_cursor, recorded_name, payload);
                     scan_cursor += 1;
                 }
                 other => {
@@ -450,29 +450,23 @@ impl HistoryMatcher {
     /// a terminal `ChildWorkflowCompleted` or `ChildWorkflowFailed` with the same
     /// `child_id`.
     pub fn match_child_workflow(&mut self, workflow_name: &str, input: &Value) -> HistoryMatch {
-        self.advance_to_next_unconsumed_event();
-        // Signals may have been ingested before the child workflow was started;
-        // buffer them so they can be consumed by a later wait_for_signal call.
-        self.drain_early_signals();
-        if !self.is_replaying() {
+        if !self.prepare_match() {
             return HistoryMatch::NoMatch;
         }
 
         let start_cursor = self.cursor;
-        let started_event = &self.events[self.cursor];
-        let (child_id, recorded_name, recorded_input) = match started_event {
-            WorkflowEvent::ChildWorkflowStarted {
-                child_id,
-                workflow_name,
-                input,
-            } => (*child_id, workflow_name.as_str(), input),
-            other => {
-                return HistoryMatch::Diverged {
-                    expected: format!("ChildWorkflowStarted({workflow_name})"),
-                    actual: other.type_name().to_string(),
-                };
-            }
+        let WorkflowEvent::ChildWorkflowStarted {
+            child_id,
+            workflow_name: recorded_name,
+            input: recorded_input,
+        } = &self.events[self.cursor]
+        else {
+            return HistoryMatch::Diverged {
+                expected: format!("ChildWorkflowStarted({workflow_name})"),
+                actual: self.events[self.cursor].type_name().to_string(),
+            };
         };
+        let child_id = *child_id;
 
         if recorded_name != workflow_name {
             return HistoryMatch::Diverged {
