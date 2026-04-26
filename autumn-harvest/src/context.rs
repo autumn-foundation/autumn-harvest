@@ -1719,6 +1719,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn context_child_workflow_name_mismatch_is_nondeterministic() {
+        let child_id = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "other_workflow".to_string(),
+                input: serde_json::json!({"id": "B-2002"}),
+            },
+        ];
+
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let result = ctx
+            .spawn_child_workflow_raw("process_order", serde_json::json!({"id": "B-2002"}))
+            .await;
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            HarvestError::NonDeterministic(_)
+        ));
+
+        let cmds = ctx.drain_commands();
+        assert!(cmds.is_empty());
+    }
+
+    #[tokio::test]
     async fn context_child_input_mismatch_is_nondeterministic_and_no_live_start() {
         let child_id = ExecutionId::new();
         let events = vec![
@@ -1836,6 +1866,28 @@ mod tests {
         assert_eq!(child, serde_json::json!({"id":"A","ok":true}));
         assert_eq!(activity, serde_json::json!({"sent":true}));
         assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[tokio::test]
+    async fn wait_for_signal_returns_nondeterministic_on_diverged_history() {
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::TimerStarted {
+                timer_id: TimerId::new("timer-1"),
+                duration_secs: 10,
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let result = ctx.wait_for_signal("my-signal").await;
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            HarvestError::NonDeterministic(_)
+        ));
     }
 
     #[tokio::test]
