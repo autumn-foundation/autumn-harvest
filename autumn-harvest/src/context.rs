@@ -418,9 +418,7 @@ impl WorkflowContext {
             )),
 
             HistoryMatch::Failed { .. } | HistoryMatch::TimedOut { .. } => {
-                Err(HarvestError::NonDeterministic(
-                    "side effect history contains unexpected failure".into(),
-                ))
+                unreachable!("match_side_effect only returns Matched, Diverged or NoMatch")
             }
 
             HistoryMatch::NoMatch => {
@@ -592,8 +590,7 @@ impl WorkflowContext {
             )),
 
             HistoryMatch::Failed { .. } | HistoryMatch::TimedOut { .. } => {
-                // Timers don't fail in the traditional sense, but handle gracefully.
-                Ok(())
+                unreachable!("timers do not fail or time out in history matching")
             }
 
             HistoryMatch::NoMatch => {
@@ -647,10 +644,9 @@ impl WorkflowContext {
                 attempt,
                 source: error.into(),
             }),
-            HistoryMatch::TimedOut { timeout_type } => Err(HarvestError::Timeout {
-                timeout_type,
-                task_name: format!("child-workflow:{workflow_name}"),
-            }),
+            HistoryMatch::TimedOut { .. } => {
+                unreachable!("child workflows do not time out in match_child_workflow")
+            }
             HistoryMatch::Diverged { expected, actual } => Err(HarvestError::NonDeterministic(
                 format!("child workflow mismatch: expected {expected}, got {actual}"),
             )),
@@ -1252,6 +1248,33 @@ mod tests {
 
         // No commands during replay.
         assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[test]
+    fn context_side_effect_returns_diverged_error_when_mismatched() {
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: crate::types::ActivityExecId::new(),
+                name: "some_activity".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+        ];
+
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        // Request a side effect but history has ActivityScheduled
+        let result: Result<i32, _> = ctx.side_effect("random_num", || 99);
+
+        assert!(result.is_err());
+        if let Err(HarvestError::NonDeterministic(msg)) = result {
+            assert!(msg.contains("side effect mismatch"));
+        } else {
+            panic!("Expected NonDeterministic error");
+        }
     }
 
     #[test]
