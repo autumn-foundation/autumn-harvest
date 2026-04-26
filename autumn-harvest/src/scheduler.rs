@@ -452,10 +452,10 @@ async fn create_due_runs(conn: &mut AsyncPgConnection, dags: &DagCatalog) -> Har
     Ok(())
 }
 
-async fn activate_queued_runs(
+async fn activate_queued_runs<'a>(
     conn: &mut AsyncPgConnection,
-    dags: &DagCatalog,
-) -> HarvestResult<Vec<(DagRun, RegisteredDag)>> {
+    dags: &'a DagCatalog,
+) -> HarvestResult<Vec<(DagRun, &'a RegisteredDag)>> {
     use crate::schema::harvest_dag_runs::dsl as dag_runs_dsl;
     use crate::schema::harvest_schedules::dsl as schedules_dsl;
 
@@ -514,7 +514,7 @@ async fn activate_queued_runs(
         updated_runs.sort_by_key(|r| r.logical_date);
 
         for updated in updated_runs {
-            runnable.push((updated, dag.clone()));
+            runnable.push((updated, dag));
         }
     }
 
@@ -524,7 +524,7 @@ async fn activate_queued_runs(
 async fn execute_dag_run(
     pool: DbPool,
     registry: Arc<HandlerRegistry>,
-    dag: RegisteredDag,
+    dag: &RegisteredDag,
     run: DagRun,
 ) -> HarvestResult<()> {
     // Bolt: Use Arc to avoid deep cloning the JSON Value for every task in the DAG
