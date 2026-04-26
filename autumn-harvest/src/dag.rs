@@ -283,7 +283,7 @@ impl DagBuilder {
                 }
             }
 
-            execution_levels.push(current_level.clone());
+            execution_levels.push(current_level); // ⚡ Bolt: Removed unnecessary .clone() to avoid allocating a new vector per level.
             ready = next_level;
         }
 
