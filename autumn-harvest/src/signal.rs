@@ -1,3 +1,8 @@
+//! Workflow signal delivery and management.
+//!
+//! Signals provide a way to send asynchronous events or payloads into a running workflow.
+//! This module handles the durable enqueuing of signals into the database, loading pending
+//! signals for a workflow, and marking them as consumed once processed by the workflow context.
 #[cfg(feature = "db")]
 use diesel::{ExpressionMethods, OptionalExtension, QueryDsl, SelectableHelper};
 #[cfg(feature = "db")]
