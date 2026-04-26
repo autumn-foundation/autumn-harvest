@@ -1,7 +1,31 @@
+//! Visualization exporters for DAG definitions.
+//!
+//! Provides utilities to export workflow DAGs (Directed Acyclic Graphs) into human-readable
+//! and tool-compatible diagram formats such as Mermaid.js and Graphviz DOT.
+//! This is useful for debugging, documentation, and visualizing dependencies.
 use crate::dag::DagDefinition;
 use std::fmt::Write;
 
 /// Exports the DAG definition to a Mermaid.js flowchart.
+///
+/// # Examples
+///
+/// ```rust
+/// use autumn_harvest::dag::DagBuilder;
+/// use autumn_harvest::dag_export::export_mermaid;
+///
+/// fn my_activity() {}
+/// fn my_other_activity() {}
+///
+/// let mut builder = DagBuilder::new();
+/// let a = builder.activity(my_activity);
+/// let b = builder.activity(my_other_activity).upstream(&a);
+/// let dag = builder.build().unwrap();
+///
+/// let mermaid = export_mermaid(&dag).unwrap();
+/// assert!(mermaid.contains("graph TD"));
+/// assert!(mermaid.contains("-->"));
+/// ```
 ///
 /// # Errors
 /// Returns `std::fmt::Error` if string formatting fails.
@@ -25,6 +49,25 @@ pub fn export_mermaid(dag: &DagDefinition) -> Result<String, std::fmt::Error> {
 }
 
 /// Exports the DAG definition to Graphviz DOT format.
+///
+/// # Examples
+///
+/// ```rust
+/// use autumn_harvest::dag::DagBuilder;
+/// use autumn_harvest::dag_export::export_dot;
+///
+/// fn my_activity() {}
+/// fn my_other_activity() {}
+///
+/// let mut builder = DagBuilder::new();
+/// let a = builder.activity(my_activity);
+/// let b = builder.activity(my_other_activity).upstream(&a);
+/// let dag = builder.build().unwrap();
+///
+/// let dot = export_dot(&dag).unwrap();
+/// assert!(dot.contains("digraph DAG {"));
+/// assert!(dot.contains("->"));
+/// ```
 ///
 /// # Errors
 /// Returns `std::fmt::Error` if string formatting fails.
