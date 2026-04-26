@@ -43,6 +43,8 @@ pub mod shard;
 pub mod simulator;
 /// OpenTelemetry integration: trace-context propagation and metrics.
 pub mod telemetry;
+#[cfg(any(test, feature = "testing"))]
+pub mod test_generator;
 pub mod types;
 
 #[cfg(feature = "db")]
@@ -118,6 +120,8 @@ pub use telemetry::{
     ActivityStatus, MetricsRecorder, NoOpMetrics, NoOpPropagator, TelemetryConfig,
     TelemetryConfigBuilder, TraceContextCarrier, TraceContextPropagator, WorkflowStatus,
 };
+#[cfg(any(test, feature = "testing"))]
+pub use test_generator::TestHarnessGenerator;
 pub use types::{ActivityExecId, ExecutionId, ShardId, TimerId, WorkerId, WorkflowId};
 
 #[cfg(feature = "db")]
