@@ -31,11 +31,10 @@ pub struct EventHistory {
 ///
 /// This is a convenience wrapper around [`events_to_insert_rows_from`] for
 /// fresh workflow executions where the history starts empty.
-#[must_use]
 pub fn events_to_insert_rows(
     exec_id: ExecutionId,
     events: &[WorkflowEvent],
-) -> Vec<NewHarvestEvent<'_>> {
+) -> Result<Vec<NewHarvestEvent<'_>>, crate::error::HarvestError> {
     events_to_insert_rows_from(exec_id, events, 0)
 }
 
@@ -49,25 +48,26 @@ pub fn events_to_insert_rows(
 ///
 /// Panics if a `WorkflowEvent` variant fails to serialize to JSON. This should
 /// never happen in practice since all variants derive `Serialize`.
-#[must_use]
 pub fn events_to_insert_rows_from(
     exec_id: ExecutionId,
     events: &[WorkflowEvent],
     start_id: i32,
-) -> Vec<NewHarvestEvent<'_>> {
+) -> Result<Vec<NewHarvestEvent<'_>>, crate::error::HarvestError> {
     events
         .iter()
         .enumerate()
         .map(|(i, event)| {
             #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
             let i_i32 = i as i32;
-            let event_id = start_id.checked_add(i_i32).expect("Event ID overflow");
-            NewHarvestEvent {
+            let event_id = start_id.checked_add(i_i32).ok_or_else(|| {
+                crate::error::HarvestError::Database("Event ID overflow".to_string())
+            })?;
+            Ok(NewHarvestEvent {
                 workflow_exec_id: exec_id.as_uuid(),
                 event_id,
                 event_type: event.type_name(),
                 event_data: serde_json::to_value(event).expect("WorkflowEvent must serialize"),
-            }
+            })
         })
         .collect()
 }
@@ -93,7 +93,7 @@ pub async fn append_events(
         return Ok(0);
     }
 
-    let rows = events_to_insert_rows_from(exec_id, events, start_id);
+    let rows = events_to_insert_rows_from(exec_id, events, start_id)?;
 
     diesel::insert_into(harvest_events::table)
         .values(&rows)
@@ -164,7 +164,7 @@ mod tests {
             },
         ];
 
-        let rows = events_to_insert_rows(exec_id, &events);
+        let rows = events_to_insert_rows(exec_id, &events).unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].event_id, 0);
         assert_eq!(rows[1].event_id, 1);
@@ -179,7 +179,7 @@ mod tests {
             output: serde_json::json!({"result": 42}),
         }];
 
-        let rows = events_to_insert_rows(exec_id, &events);
+        let rows = events_to_insert_rows(exec_id, &events).unwrap();
         let data = &rows[0].event_data;
         // serde tagged enum with (tag = "type", content = "data") wraps in "data"
         assert!(
@@ -204,7 +204,7 @@ mod tests {
             },
         ];
 
-        let rows = events_to_insert_rows(exec_id, &events);
+        let rows = events_to_insert_rows(exec_id, &events).unwrap();
         for (row, event) in rows.iter().zip(events.iter()) {
             assert_eq!(
                 row.event_type,
@@ -227,7 +227,7 @@ mod tests {
             },
         ];
 
-        let rows = events_to_insert_rows_from(exec_id, &events, 5);
+        let rows = events_to_insert_rows_from(exec_id, &events, 5).unwrap();
         assert_eq!(rows[0].event_id, 5);
         assert_eq!(rows[1].event_id, 6);
     }
@@ -245,7 +245,7 @@ mod tests {
             },
         ];
 
-        let rows = events_to_insert_rows(exec_id, &events);
+        let rows = events_to_insert_rows(exec_id, &events).unwrap();
         for row in &rows {
             assert_eq!(row.workflow_exec_id, exec_id.as_uuid());
         }
@@ -255,7 +255,7 @@ mod tests {
     fn empty_events_produce_empty_rows() {
         let exec_id = ExecutionId::new();
         let rows = events_to_insert_rows(exec_id, &[]);
-        assert!(rows.is_empty());
+        assert!(rows.unwrap().is_empty());
     }
 
     #[test]
@@ -278,7 +278,7 @@ mod tests {
         ];
 
         // Serialize via the writer path
-        let rows = events_to_insert_rows(exec_id, &events);
+        let rows = events_to_insert_rows(exec_id, &events).unwrap();
         assert_eq!(rows.len(), 3);
 
         // Deserialize each row's event_data back into WorkflowEvent
@@ -339,7 +339,7 @@ mod tests {
             details: serde_json::json!({"step": 3}),
         }];
 
-        let rows = events_to_insert_rows(exec_id, &events);
+        let rows = events_to_insert_rows(exec_id, &events).unwrap();
         let data = &rows[0].event_data;
         // The "type" key comes from serde(tag = "type", content = "data")
         assert_eq!(
