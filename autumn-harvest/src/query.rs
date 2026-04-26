@@ -26,6 +26,12 @@ impl QueryRegistry {
         self.handlers.insert(name.to_string(), handler);
     }
 
+    /// Gets a registered query handler without executing it.
+    #[must_use]
+    pub fn get(&self, name: &str) -> Option<QueryHandler> {
+        self.handlers.get(name).cloned()
+    }
+
     /// Execute a registered query handler.
     ///
     /// # Errors
