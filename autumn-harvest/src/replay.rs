@@ -345,17 +345,13 @@ impl HistoryMatcher {
                 continue;
             }
 
-            if let WorkflowEvent::TimerFired { timer_id: id } = &self.events[scan_cursor] {
-                if id.as_str() == timer_id {
-                    let result = HistoryMatch::Matched {
-                        output: Value::Null,
-                    };
-                    return self.settle_terminal(
-                        scan_cursor,
-                        first_interleaved_child_start,
-                        result,
-                    );
-                }
+            if let WorkflowEvent::TimerFired { timer_id: id } = &self.events[scan_cursor]
+                && id.as_str() == timer_id
+            {
+                let result = HistoryMatch::Matched {
+                    output: Value::Null,
+                };
+                return self.settle_terminal(scan_cursor, first_interleaved_child_start, result);
             }
 
             if matches!(
@@ -396,10 +392,9 @@ impl HistoryMatcher {
             .pending_signals
             .iter()
             .position(|(name, _)| name == signal_name)
+            && let Some((_name, payload)) = self.pending_signals.remove(index)
         {
-            if let Some((_name, payload)) = self.pending_signals.remove(index) {
-                return HistoryMatch::Matched { output: payload };
-            }
+            return HistoryMatch::Matched { output: payload };
         }
 
         self.advance_to_next_unconsumed_event();

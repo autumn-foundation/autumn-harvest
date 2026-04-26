@@ -340,10 +340,10 @@ async fn wait_for_dag_run_state(
     expected_state: &str,
 ) -> DagRun {
     for _ in 0..100 {
-        if let Some(run) = load_latest_dag_run_from_url(database_url, dag_name).await {
-            if run.state == expected_state {
-                return run;
-            }
+        if let Some(run) = load_latest_dag_run_from_url(database_url, dag_name).await
+            && run.state == expected_state
+        {
+            return run;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }

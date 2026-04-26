@@ -229,10 +229,10 @@ impl HarvestRunner {
                 tracing::warn!(error = %error, "harvest scheduler task failed during shutdown");
             }
         }
-        if let Some(worker_handle) = worker_handle {
-            if let Err(error) = worker_handle.await {
-                tracing::warn!(error = %error, "harvest worker task failed during shutdown");
-            }
+        if let Some(worker_handle) = worker_handle
+            && let Err(error) = worker_handle.await
+        {
+            tracing::warn!(error = %error, "harvest worker task failed during shutdown");
         }
     }
 }

@@ -61,11 +61,11 @@ jobs:
         run: cargo test -p autumn-harvest-plugin --test api_scheduler_integration -- --test-threads=1
 
   msrv:
-    name: MSRV (1.86.0)
+    name: MSRV (1.88.0)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.86.0
+      - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
       - name: Check MSRV compiles
         run: cargo check --workspace

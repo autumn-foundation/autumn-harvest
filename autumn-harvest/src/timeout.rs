@@ -187,15 +187,15 @@ fn find_pending_scheduled_activity(
         if let WorkflowEvent::ActivityScheduled {
             activity_id, name, ..
         } = event
+            && name == activity_name
+            && !terminal_ids.contains(activity_id)
         {
-            if name == activity_name && !terminal_ids.contains(activity_id) {
-                if pending.is_some() {
-                    return Err(HarvestError::NonDeterministic(format!(
-                        "multiple pending scheduled activities named '{activity_name}' found in history"
-                    )));
-                }
-                pending = Some(*activity_id);
+            if pending.is_some() {
+                return Err(HarvestError::NonDeterministic(format!(
+                    "multiple pending scheduled activities named '{activity_name}' found in history"
+                )));
             }
+            pending = Some(*activity_id);
         }
     }
 

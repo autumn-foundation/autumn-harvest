@@ -153,10 +153,10 @@ impl SchedulerRuntime {
         let monitor_for_task = monitor.clone();
         let handle = tokio::spawn(async move {
             while !shutdown_for_task.is_cancelled() {
-                if let Ok(mut conn) = pool.get().await {
-                    if let Err(error) = register_schedules(&mut conn, dags.as_ref()).await {
-                        tracing::warn!(error = %error, "failed to register harvest schedules");
-                    }
+                if let Ok(mut conn) = pool.get().await
+                    && let Err(error) = register_schedules(&mut conn, dags.as_ref()).await
+                {
+                    tracing::warn!(error = %error, "failed to register harvest schedules");
                 }
 
                 if let Err(error) = tick_once(
