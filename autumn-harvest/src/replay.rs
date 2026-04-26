@@ -84,8 +84,7 @@ impl HistoryMatcher {
 
     fn stash_signal(&mut self, cursor: usize, signal_name: String, payload: Value) {
         self.consumed_signal_events.insert(cursor);
-        self.pending_signals
-            .push_back((signal_name, payload));
+        self.pending_signals.push_back((signal_name, payload));
     }
 
     /// Prepares for matching by advancing past consumed events and draining early signals.
@@ -95,7 +94,6 @@ impl HistoryMatcher {
         self.drain_early_signals();
         self.is_replaying()
     }
-
 
     /// Returns `true` if the cursor is still within the recorded history.
     #[must_use]
