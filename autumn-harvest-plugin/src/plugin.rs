@@ -311,10 +311,10 @@ async fn stop_harvest_runtime(slot: Arc<Mutex<HarvestRuntimeSlot>>, api_state: H
 
     if let Some(outbox) = runtime.outbox {
         outbox.shutdown.cancel();
-        if let Err(error) = outbox.handle.await {
-            if !error.is_cancelled() {
-                tracing::warn!(error = %error, "harvest outbox relay failed during shutdown");
-            }
+        if let Err(error) = outbox.handle.await
+            && !error.is_cancelled()
+        {
+            tracing::warn!(error = %error, "harvest outbox relay failed during shutdown");
         }
     }
     runtime.runner.stop().await;

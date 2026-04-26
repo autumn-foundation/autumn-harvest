@@ -63,19 +63,19 @@ impl std::fmt::Debug for BuiltHarvest {
 impl BuiltHarvest {
     /// Number of registered workflows.
     #[must_use]
-    pub fn workflow_count(&self) -> usize {
+    pub const fn workflow_count(&self) -> usize {
         self.workflows.len()
     }
 
     /// Number of registered activities.
     #[must_use]
-    pub fn activity_count(&self) -> usize {
+    pub const fn activity_count(&self) -> usize {
         self.activities.len()
     }
 
     /// Number of registered DAGs.
     #[must_use]
-    pub fn dag_count(&self) -> usize {
+    pub const fn dag_count(&self) -> usize {
         self.dags.len()
     }
 
@@ -198,19 +198,19 @@ impl HarvestBuilder {
 
     /// Number of registered workflows (used in tests and diagnostics).
     #[must_use]
-    pub fn workflow_count(&self) -> usize {
+    pub const fn workflow_count(&self) -> usize {
         self.workflows.len()
     }
 
     /// Number of registered activities.
     #[must_use]
-    pub fn activity_count(&self) -> usize {
+    pub const fn activity_count(&self) -> usize {
         self.activities.len()
     }
 
     /// Number of registered DAG definitions.
     #[must_use]
-    pub fn dag_count(&self) -> usize {
+    pub const fn dag_count(&self) -> usize {
         self.dags.len()
     }
 

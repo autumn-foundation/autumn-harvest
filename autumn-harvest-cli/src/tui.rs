@@ -73,10 +73,10 @@ async fn run_app(
             if let Some(token) = &cli.token {
                 req = req.bearer_auth(token);
             }
-            if let Ok(res) = req.send().await {
-                if let Ok(data) = res.json::<Vec<Value>>().await {
-                    workflows = data;
-                }
+            if let Ok(res) = req.send().await
+                && let Ok(data) = res.json::<Vec<Value>>().await
+            {
+                workflows = data;
             }
             last_tick = std::time::Instant::now();
         }
@@ -127,15 +127,13 @@ async fn run_app(
             .checked_sub(last_tick.elapsed())
             .unwrap_or_else(|| Duration::from_secs(0));
 
-        if event::poll(timeout).unwrap_or(false) {
-            if let Event::Key(key) = event::read().unwrap() {
-                if key.code == KeyCode::Char('q')
-                    || (key.modifiers.contains(KeyModifiers::CONTROL)
-                        && key.code == KeyCode::Char('c'))
-                {
-                    return Ok(());
-                }
-            }
+        if event::poll(timeout).unwrap_or(false)
+            && let Event::Key(key) = event::read().unwrap()
+            && (key.code == KeyCode::Char('q')
+                || (key.modifiers.contains(KeyModifiers::CONTROL)
+                    && key.code == KeyCode::Char('c')))
+        {
+            return Ok(());
         }
     }
 }

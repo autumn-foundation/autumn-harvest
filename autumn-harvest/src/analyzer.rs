@@ -141,13 +141,13 @@ impl AnalyzerRule for SuspiciousTimerRule {
         let mut warnings = Vec::new();
 
         for event in history {
-            if let WorkflowEvent::TimerStarted { duration_secs, .. } = event {
-                if *duration_secs == 0 {
-                    warnings.push(AnalyzerWarning {
+            if let WorkflowEvent::TimerStarted { duration_secs, .. } = event
+                && *duration_secs == 0
+            {
+                warnings.push(AnalyzerWarning {
                         rule_name: self.name().to_string(),
                         message: "Suspicious 0-second timer detected. Consider using a side-effect or yield instead.".to_string(),
                     });
-                }
             }
         }
 
