@@ -14,6 +14,8 @@
 pub const MIGRATIONS: diesel_migrations::EmbeddedMigrations =
     diesel_migrations::embed_migrations!();
 
+/// History analyzer and linter.
+pub mod analyzer;
 pub mod builder;
 pub mod cache;
 pub mod context;
@@ -77,6 +79,10 @@ pub mod timeout;
 #[doc(hidden)]
 pub mod worker;
 
+pub use analyzer::{
+    AnalyzerRule, AnalyzerWarning, ExcessiveRetriesRule, HistoryAnalyzer, LargePayloadRule,
+    SuspiciousTimerRule,
+};
 pub use builder::{BuiltHarvest, HarvestBuilder, WorkerConfig};
 pub use cache::{CachedWorkflowState, WorkflowCache};
 pub use context::{ActivityContext, WorkflowCommand, WorkflowContext};
