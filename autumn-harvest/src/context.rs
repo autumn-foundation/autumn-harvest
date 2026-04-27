@@ -835,28 +835,40 @@ impl WorkflowContext {
     ///
     /// Returns [`HarvestError::Cancelled`] if the workflow is cancelled while
     /// it is parked on the continue-as-new command (the worker drops the
-    /// resolution sender during cancellation cleanup).
+    /// resolution sender during cancellation cleanup), or
+    /// [`HarvestError::NonDeterministic`] if replay history does not contain
+    /// the expected `WorkflowContinuedAsNew` event at this position.
     ///
     /// # Panics
     ///
-    /// Panics if the internal commands mutex is poisoned.
+    /// Panics if the internal matcher or commands mutex is poisoned.
     pub async fn continue_as_new(&self, input: Value) -> HarvestResult<()> {
-        // Replay path: a recorded `WorkflowContinuedAsNew` is terminal. The
-        // current execution is sealed and will not run again, so on replay we
-        // just stop forward progress here. Returning `Ok(())` and yielding
-        // control via the suspension future keeps the executor parked until
-        // the worker tears the run down.
-        if self.is_replaying() {
-            // Push the command so the worker still observes the terminal
-            // intent if it inspects drained commands during replay.
-            self.push_command(WorkflowCommand::ContinueAsNew {
-                input: input.clone(),
-            });
-            return park_until_dropped().await;
-        }
+        let history_match = self
+            .matcher
+            .lock()
+            .expect("matcher lock poisoned")
+            .match_continue_as_new(&input);
 
-        self.push_command(WorkflowCommand::ContinueAsNew { input });
-        park_until_dropped().await
+        match history_match {
+            HistoryMatch::Matched { output } => {
+                // Replay still emits the terminal command so the worker can
+                // observe the recorded intent while draining commands.
+                self.push_command(WorkflowCommand::ContinueAsNew { input: output });
+                park_until_dropped().await
+            }
+            HistoryMatch::Diverged { expected, actual } => Err(HarvestError::NonDeterministic(
+                format!("continue_as_new mismatch: expected {expected}, got {actual}"),
+            )),
+            HistoryMatch::Failed { .. } | HistoryMatch::TimedOut { .. } => {
+                Err(HarvestError::NonDeterministic(
+                    "continue_as_new history contains unexpected terminal state".into(),
+                ))
+            }
+            HistoryMatch::NoMatch => {
+                self.push_command(WorkflowCommand::ContinueAsNew { input });
+                park_until_dropped().await
+            }
+        }
     }
 
     /// Register a named query handler for this workflow execution.
@@ -1206,6 +1218,86 @@ mod tests {
             }
             other => panic!("expected ContinueAsNew, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn workflow_context_continue_as_new_replays_recorded_terminal_event() {
+        let payload = serde_json::json!({"cycle": 2});
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::WorkflowContinuedAsNew {
+                new_exec_id: ExecutionId::new(),
+                input: payload.clone(),
+            },
+        ];
+
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let cont = ctx.continue_as_new(payload.clone());
+        tokio::pin!(cont);
+        tokio::select! {
+            _ = &mut cont => panic!("continue_as_new must not resolve"),
+            () = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
+        }
+
+        let drained = ctx.drain_commands();
+        assert_eq!(drained.len(), 1);
+        match &drained[0] {
+            WorkflowCommand::ContinueAsNew { input } => assert_eq!(input, &payload),
+            other => panic!("expected ContinueAsNew, got {other:?}"),
+        }
+        assert!(!ctx.is_replaying());
+    }
+
+    #[tokio::test]
+    async fn workflow_context_continue_as_new_divergence_is_nondeterministic() {
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "send_email".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+        ];
+
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let result = ctx.continue_as_new(serde_json::json!({"cycle": 2})).await;
+
+        assert!(matches!(result, Err(HarvestError::NonDeterministic(_))));
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "replay divergence must not emit a new continue-as-new command"
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_context_continue_as_new_input_mismatch_is_nondeterministic() {
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::WorkflowContinuedAsNew {
+                new_exec_id: ExecutionId::new(),
+                input: serde_json::json!({"cycle": 3}),
+            },
+        ];
+
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let result = ctx.continue_as_new(serde_json::json!({"cycle": 2})).await;
+
+        assert!(matches!(result, Err(HarvestError::NonDeterministic(_))));
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "replay input mismatch must not emit a new continue-as-new command"
+        );
     }
 
     #[test]

@@ -444,6 +444,38 @@ impl HistoryMatcher {
         HistoryMatch::NoMatch
     }
 
+    /// Match a continue-as-new command against history.
+    ///
+    /// Expects `WorkflowContinuedAsNew { input }` at the current cursor.
+    pub fn match_continue_as_new(&mut self, input: &Value) -> HistoryMatch {
+        if !self.prepare_match() {
+            return HistoryMatch::NoMatch;
+        }
+
+        let WorkflowEvent::WorkflowContinuedAsNew {
+            input: recorded_input,
+            ..
+        } = &self.events[self.cursor]
+        else {
+            return HistoryMatch::Diverged {
+                expected: format!("WorkflowContinuedAsNew({input})"),
+                actual: self.events[self.cursor].type_name().to_string(),
+            };
+        };
+
+        if recorded_input != input {
+            return HistoryMatch::Diverged {
+                expected: format!("WorkflowContinuedAsNewInput({input})"),
+                actual: format!("WorkflowContinuedAsNewInput({recorded_input})"),
+            };
+        }
+
+        let output = recorded_input.clone();
+        self.cursor += 1;
+        self.advance_to_next_unconsumed_event();
+        HistoryMatch::Matched { output }
+    }
+
     /// Match a child workflow command against history.
     ///
     /// Expects `ChildWorkflowStarted { workflow_name }` at cursor, then scans for
@@ -585,7 +617,7 @@ impl HistoryMatcher {
 mod tests {
     use super::*;
     use crate::error::TimeoutType;
-    use crate::types::{ActivityExecId, TimerId, WorkerId};
+    use crate::types::{ActivityExecId, ExecutionId, TimerId, WorkerId};
     use chrono::Utc;
 
     /// Helper: build a minimal activity lifecycle (Scheduled -> Completed).
@@ -821,6 +853,47 @@ mod tests {
         let mut matcher = HistoryMatcher::new(events);
         let result = matcher.match_timer("t1");
         assert!(matches!(result, HistoryMatch::Diverged { .. }));
+    }
+
+    #[test]
+    fn matcher_replays_continue_as_new() {
+        let payload = serde_json::json!({"phase": "next"});
+        let events = vec![WorkflowEvent::WorkflowContinuedAsNew {
+            new_exec_id: ExecutionId::new(),
+            input: payload.clone(),
+        }];
+
+        let mut matcher = HistoryMatcher::new(events);
+        let result = matcher.match_continue_as_new(&payload);
+        assert_eq!(result, HistoryMatch::Matched { output: payload });
+        assert_eq!(matcher.position(), 1);
+        assert!(!matcher.is_replaying());
+    }
+
+    #[test]
+    fn matcher_continue_as_new_input_mismatch_diverges() {
+        let events = vec![WorkflowEvent::WorkflowContinuedAsNew {
+            new_exec_id: ExecutionId::new(),
+            input: serde_json::json!({"phase": "next"}),
+        }];
+
+        let mut matcher = HistoryMatcher::new(events);
+        let result = matcher.match_continue_as_new(&serde_json::json!({"phase": "later"}));
+        assert!(matches!(result, HistoryMatch::Diverged { .. }));
+        assert_eq!(matcher.position(), 0);
+    }
+
+    #[test]
+    fn matcher_continue_as_new_wrong_event_diverges() {
+        let events = vec![WorkflowEvent::TimerStarted {
+            timer_id: TimerId::new("t1"),
+            duration_secs: 60,
+        }];
+
+        let mut matcher = HistoryMatcher::new(events);
+        let result = matcher.match_continue_as_new(&serde_json::json!({"phase": "next"}));
+        assert!(matches!(result, HistoryMatch::Diverged { .. }));
+        assert_eq!(matcher.position(), 0);
     }
 
     #[test]
