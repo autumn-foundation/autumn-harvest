@@ -134,6 +134,13 @@ pub enum CliError {
     /// JSON output could not be serialized.
     #[error("failed to serialize response JSON: {0}")]
     SerializeResponse(serde_json::Error),
+
+    /// A `--search-attr` flag was missing the `=` separator.
+    #[error("invalid --search-attr '{value}': expected 'key=value'")]
+    InvalidSearchAttr {
+        /// Original CLI argument value.
+        value: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -167,6 +174,17 @@ enum WorkflowCommand {
         /// Maximum number of rows to return.
         #[arg(long, value_parser = clap::value_parser!(i64).range(1..=200))]
         limit: Option<i64>,
+        /// Filter by workflow execution state. Repeat the flag or pass a
+        /// comma-separated list to match any of several states.
+        #[arg(long, value_delimiter = ',')]
+        state: Vec<String>,
+        /// Filter by registered workflow name (exact match).
+        #[arg(long)]
+        workflow_name: Option<String>,
+        /// Filter by a `search_attrs` key/value pair (`key=value`). Repeat to
+        /// AND multiple predicates together.
+        #[arg(long = "search-attr", value_name = "KEY=VALUE")]
+        search_attr: Vec<String>,
     },
     /// Get one workflow execution and event history.
     Get {
@@ -399,12 +417,20 @@ pub fn format_output(value: &Value, output: OutputFormat) -> Result<String, CliE
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn workflow_request(command: &WorkflowCommand) -> Result<ApiRequest, CliError> {
     match command {
-        WorkflowCommand::List { limit } => Ok(ApiRequest::get(path_with_limit(
-            "/workflows",
-            limit.map(|value| ("limit", value)),
-        ))),
+        WorkflowCommand::List {
+            limit,
+            state,
+            workflow_name,
+            search_attr,
+        } => Ok(ApiRequest::get(build_workflow_list_path(
+            *limit,
+            state,
+            workflow_name.as_deref(),
+            search_attr,
+        )?)),
         WorkflowCommand::Get { execution_id } => Ok(ApiRequest::get(format!(
             "/workflows/{}",
             path_segment(execution_id)
@@ -615,4 +641,55 @@ fn path_with_limit(base: &str, limit: Option<(&str, i64)>) -> String {
         .collect::<Vec<_>>()
         .join("&");
     format!("{base}?{query}")
+}
+
+fn build_workflow_list_path(
+    limit: Option<i64>,
+    states: &[String],
+    workflow_name: Option<&str>,
+    search_attrs: &[String],
+) -> Result<String, CliError> {
+    let mut params: Vec<(&'static str, String)> = Vec::new();
+    if let Some(value) = limit {
+        params.push(("limit", value.to_string()));
+    }
+    if !states.is_empty() {
+        // Use comma-separated values to match the management API's documented
+        // canonical form. The server also accepts repeated `state=` params.
+        params.push(("state", states.join(",")));
+    }
+    if let Some(name) = workflow_name {
+        params.push(("workflow_name", name.to_string()));
+    }
+    for raw in search_attrs {
+        let (key, value) = raw
+            .split_once('=')
+            .ok_or_else(|| CliError::InvalidSearchAttr { value: raw.clone() })?;
+        params.push(("search_attr", format!("{key}:{value}")));
+    }
+
+    if params.is_empty() {
+        return Ok("/workflows".to_string());
+    }
+    let encoded = params
+        .iter()
+        .map(|(key, value)| format!("{key}={}", query_encode(value)))
+        .collect::<Vec<_>>()
+        .join("&");
+    Ok(format!("/workflows?{encoded}"))
+}
+
+fn query_encode(input: &str) -> String {
+    // RFC 3986 query-component encoding. We intentionally leave `:` unencoded
+    // so the management API sees `search_attr=key:value` as a stable shape.
+    let mut out = String::with_capacity(input.len());
+    for byte in input.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~' | b':' | b',') {
+            out.push(byte as char);
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(out, "%{byte:02X}");
+        }
+    }
+    out
 }

@@ -230,9 +230,27 @@ struct DagPauseRequest {
     paused: bool,
 }
 
-#[derive(Debug, Deserialize)]
-struct WorkflowListQuery {
-    limit: Option<i64>,
+/// Workflow execution states that the management API recognises in `state=`
+/// filters. Anything outside this list is rejected with `400 Bad Request`.
+pub(crate) const KNOWN_WORKFLOW_STATES: &[&str] =
+    &["RUNNING", "COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT"];
+
+const DEFAULT_WORKFLOW_LIMIT: i64 = 50;
+const MAX_WORKFLOW_LIMIT: i64 = 200;
+
+#[derive(Debug, Default, Clone)]
+pub(crate) struct WorkflowFilters {
+    pub(crate) limit: i64,
+    pub(crate) states: Vec<String>,
+    pub(crate) workflow_name: Option<String>,
+    pub(crate) search_attrs: Vec<Value>,
+}
+
+impl WorkflowFilters {
+    pub(crate) const fn with_limit(mut self, limit: i64) -> Self {
+        self.limit = limit;
+        self
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -263,11 +281,82 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
 
 async fn list_workflows(
     Extension(api_state): Extension<HarvestApiState>,
-    Query(query): Query<WorkflowListQuery>,
+    Query(pairs): Query<Vec<(String, String)>>,
 ) -> Result<Json<Vec<WorkflowExecution>>, AutumnError> {
-    let limit = query.limit.unwrap_or(50).clamp(1, 200);
-    let workflows = load_workflows_from_shards(&api_state, None, limit).await?;
+    let filters = parse_workflow_filters(&pairs)?;
+    let workflows = load_workflows_from_shards(&api_state, &filters).await?;
     Ok(Json(workflows))
+}
+
+/// Parse the management-API query string into a `WorkflowFilters`.
+///
+/// State values are comma-separated (or repeated `state=`) and validated
+/// against `KNOWN_WORKFLOW_STATES`. `search_attr=` values must be `key:value`
+/// and are repeatable; each entry contributes a separate JSONB containment
+/// predicate so repeats narrow rather than widen.
+pub(crate) fn parse_workflow_filters(
+    pairs: &[(String, String)],
+) -> Result<WorkflowFilters, AutumnError> {
+    let mut limit_raw: Option<i64> = None;
+    let mut filters = WorkflowFilters::default();
+
+    for (key, value) in pairs {
+        match key.as_str() {
+            "limit" => {
+                let parsed = value.parse::<i64>().map_err(|_| {
+                    AutumnError::bad_request_msg(format!("invalid limit '{value}'"))
+                })?;
+                limit_raw = Some(parsed);
+            }
+            "state" => {
+                for raw in value.split(',') {
+                    let trimmed = raw.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    if !KNOWN_WORKFLOW_STATES.contains(&trimmed) {
+                        return Err(AutumnError::bad_request_msg(format!(
+                            "unknown workflow state '{trimmed}'; expected one of {KNOWN_WORKFLOW_STATES:?}"
+                        )));
+                    }
+                    let owned = trimmed.to_string();
+                    if !filters.states.contains(&owned) {
+                        filters.states.push(owned);
+                    }
+                }
+            }
+            "workflow_name" => {
+                let trimmed = value.trim();
+                if !trimmed.is_empty() {
+                    filters.workflow_name = Some(trimmed.to_string());
+                }
+            }
+            "search_attr" => {
+                let (raw_key, raw_val) = value.split_once(':').ok_or_else(|| {
+                    AutumnError::bad_request_msg(format!(
+                        "invalid search_attr '{value}'; expected 'key:value'"
+                    ))
+                })?;
+                let attr_key = raw_key.trim();
+                if attr_key.is_empty() {
+                    return Err(AutumnError::bad_request_msg(format!(
+                        "search_attr '{value}' is missing a key"
+                    )));
+                }
+                let mut object = serde_json::Map::with_capacity(1);
+                object.insert(attr_key.to_string(), Value::String(raw_val.to_string()));
+                filters.search_attrs.push(Value::Object(object));
+            }
+            _ => {
+                // Ignore unknown query parameters so future additions stay non-breaking.
+            }
+        }
+    }
+
+    let limit = limit_raw
+        .unwrap_or(DEFAULT_WORKFLOW_LIMIT)
+        .clamp(1, MAX_WORKFLOW_LIMIT);
+    Ok(filters.with_limit(limit))
 }
 
 async fn get_workflow(
@@ -637,15 +726,26 @@ async fn db_conn_for_dag(
 
 pub(crate) async fn load_workflows(
     conn: &mut AsyncPgConnection,
-    state_filter: Option<&str>,
-    limit: i64,
+    filters: &WorkflowFilters,
 ) -> HarvestResult<Vec<WorkflowExecution>> {
+    use diesel::dsl::sql;
+    use diesel::sql_types::{Bool, Jsonb};
+
     let mut query = harvest_workflow_executions::table
         .into_boxed()
         .order(harvest_workflow_executions::created_at.desc())
-        .limit(limit);
-    if let Some(state) = state_filter {
-        query = query.filter(harvest_workflow_executions::state.eq(state.to_string()));
+        .limit(filters.limit);
+    if !filters.states.is_empty() {
+        query = query.filter(harvest_workflow_executions::state.eq_any(filters.states.clone()));
+    }
+    if let Some(name) = &filters.workflow_name {
+        query = query.filter(harvest_workflow_executions::workflow_name.eq(name.clone()));
+    }
+    // Each search_attr filter contributes its own `search_attrs @> {...}` predicate.
+    // The `@>` operator hits the existing `idx_harvest_we_search` GIN index on
+    // `search_attrs`; ANDing predicates means repeated keys narrow the result set.
+    for predicate in &filters.search_attrs {
+        query = query.filter(sql::<Bool>("search_attrs @> ").bind::<Jsonb, _>(predicate.clone()));
     }
     query
         .select(WorkflowExecution::as_select())
@@ -656,15 +756,14 @@ pub(crate) async fn load_workflows(
 
 pub(crate) async fn load_workflows_from_shards(
     api_state: &HarvestApiState,
-    state_filter: Option<&str>,
-    limit: i64,
+    filters: &WorkflowFilters,
 ) -> Result<Vec<WorkflowExecution>, AutumnError> {
     let pool = api_state.storage_pool().map_err(map_error)?;
     let mut workflows = Vec::new();
 
     for (_shard, shard_pool) in pool.iter_shards() {
         let mut conn = acquire_conn(shard_pool).await?;
-        let mut rows = load_workflows(&mut conn, state_filter, limit)
+        let mut rows = load_workflows(&mut conn, filters)
             .await
             .map_err(map_error)?;
         workflows.append(&mut rows);
@@ -676,7 +775,7 @@ pub(crate) async fn load_workflows_from_shards(
             .cmp(&left.created_at)
             .then_with(|| right.id.cmp(&left.id))
     });
-    workflows.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+    workflows.truncate(usize::try_from(filters.limit).unwrap_or(usize::MAX));
     Ok(workflows)
 }
 
@@ -773,5 +872,102 @@ pub(crate) fn map_error(error: HarvestError) -> AutumnError {
         } => AutumnError::bad_request_msg(message),
         HarvestError::Database(message) => AutumnError::service_unavailable_msg(message),
         other => AutumnError::service_unavailable_msg(other.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pairs(values: &[(&str, &str)]) -> Vec<(String, String)> {
+        values
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn parse_workflow_filters_defaults_to_empty_filters_with_default_limit() {
+        let filters = parse_workflow_filters(&[]).expect("no params should parse");
+        assert_eq!(filters.limit, DEFAULT_WORKFLOW_LIMIT);
+        assert!(filters.states.is_empty());
+        assert!(filters.workflow_name.is_none());
+        assert!(filters.search_attrs.is_empty());
+    }
+
+    #[test]
+    fn parse_workflow_filters_accepts_comma_and_repeated_states() {
+        let filters = parse_workflow_filters(&pairs(&[
+            ("state", "RUNNING,FAILED"),
+            ("state", "TIMED_OUT"),
+        ]))
+        .expect("multi-state should parse");
+        assert_eq!(
+            filters.states,
+            vec![
+                "RUNNING".to_string(),
+                "FAILED".to_string(),
+                "TIMED_OUT".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_workflow_filters_rejects_unknown_state() {
+        let err = parse_workflow_filters(&pairs(&[("state", "BOGUS")]))
+            .expect_err("unknown state must error");
+        assert!(err.to_string().contains("unknown workflow state"));
+    }
+
+    #[test]
+    fn parse_workflow_filters_builds_search_attr_predicates() {
+        let filters = parse_workflow_filters(&pairs(&[
+            ("search_attr", "tenant:acme"),
+            ("search_attr", "customer_id:42"),
+        ]))
+        .expect("search_attr pairs should parse");
+        assert_eq!(filters.search_attrs.len(), 2);
+        assert_eq!(filters.search_attrs[0]["tenant"], "acme");
+        assert_eq!(filters.search_attrs[1]["customer_id"], "42");
+    }
+
+    #[test]
+    fn parse_workflow_filters_rejects_search_attr_without_separator() {
+        let err = parse_workflow_filters(&pairs(&[("search_attr", "tenant")]))
+            .expect_err("missing separator must error");
+        assert!(err.to_string().contains("invalid search_attr"));
+    }
+
+    #[test]
+    fn parse_workflow_filters_rejects_search_attr_with_empty_key() {
+        let err = parse_workflow_filters(&pairs(&[("search_attr", ":acme")]))
+            .expect_err("empty key must error");
+        assert!(err.to_string().contains("missing a key"));
+    }
+
+    #[test]
+    fn parse_workflow_filters_clamps_limit_to_documented_range() {
+        let filters = parse_workflow_filters(&pairs(&[("limit", "9001")]))
+            .expect("oversize limit should clamp");
+        assert_eq!(filters.limit, MAX_WORKFLOW_LIMIT);
+
+        let filters =
+            parse_workflow_filters(&pairs(&[("limit", "0")])).expect("zero limit should clamp");
+        assert_eq!(filters.limit, 1);
+    }
+
+    #[test]
+    fn parse_workflow_filters_rejects_non_numeric_limit() {
+        let err = parse_workflow_filters(&pairs(&[("limit", "abc")]))
+            .expect_err("non-numeric limit must error");
+        assert!(err.to_string().contains("invalid limit"));
+    }
+
+    #[test]
+    fn parse_workflow_filters_ignores_unknown_query_keys() {
+        let filters = parse_workflow_filters(&pairs(&[("ignored", "value")]))
+            .expect("unknown keys should be skipped");
+        assert!(filters.states.is_empty());
+        assert!(filters.workflow_name.is_none());
     }
 }
