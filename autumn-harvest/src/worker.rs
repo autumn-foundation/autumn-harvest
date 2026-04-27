@@ -1631,15 +1631,16 @@ async fn persist_workflow_continue_as_new(
 ) -> HarvestResult<()> {
     use crate::schema::{harvest_signals, harvest_workflow_executions};
 
-    if execution.parent_id.is_some() {
+    if let Some(parent_exec_id) = execution.parent_id.map(execution_id_from_uuid) {
         let error =
             "continue_as_new is not supported in child workflows in this release".to_string();
-        return persist_workflow_failure(
+        return persist_child_workflow_failure(
             conn,
             persistence.task.id,
             persistence.exec_id,
             persistence.next_event_id,
             persistence.worker_id,
+            parent_exec_id,
             &error,
         )
         .await;

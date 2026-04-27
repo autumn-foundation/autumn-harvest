@@ -442,6 +442,24 @@ fn child_round_trip_registry() -> Arc<HandlerRegistry> {
     ))
 }
 
+fn child_continue_as_new_rejection_registry() -> Arc<HandlerRegistry> {
+    Arc::new(HandlerRegistry::new(
+        vec![
+            WorkflowInfo {
+                name: "e2e_test_workflow",
+                module: "integration_e2e",
+                handler: parent_workflow_with_continue_as_new_child,
+            },
+            WorkflowInfo {
+                name: "child_continue_as_new_workflow",
+                module: "integration_e2e",
+                handler: continue_as_new_workflow,
+            },
+        ],
+        vec![],
+    ))
+}
+
 fn echo_workflow<'a>(
     _ctx: &'a WorkflowContext,
     input: serde_json::Value,
@@ -572,6 +590,17 @@ fn child_echo_workflow<'a>(
         Ok(serde_json::json!({
             "child": value,
         }))
+    })
+}
+
+fn parent_workflow_with_continue_as_new_child<'a>(
+    ctx: &'a WorkflowContext,
+    input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        ctx.spawn_child_workflow_raw("child_continue_as_new_workflow", input)
+            .await
+            .map_err(|e| e.to_string())
     })
 }
 
@@ -1552,6 +1581,90 @@ async fn worker_completes_parent_workflow_after_child_workflow_round_trip() {
             WorkflowEvent::WorkflowCompleted { .. },
         ]
     ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn child_continue_as_new_rejection_wakes_parent_with_child_failure() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect to Postgres container");
+
+    let parent_exec_id = insert_workflow_execution(&mut conn).await;
+    let workflow_input = serde_json::json!({"phase": "init"});
+    enqueue_started_workflow_task(&mut conn, parent_exec_id, workflow_input).await;
+
+    let worker = build_runtime_worker(
+        "worker-e2e-child-continue-reject",
+        2,
+        1,
+        child_continue_as_new_rejection_registry(),
+    );
+    let pool = build_test_pool(&database_url);
+    let handle = spawn_test_worker(Arc::clone(&worker), pool);
+
+    let parent_execution = wait_for_execution_state(&database_url, parent_exec_id, "FAILED").await;
+
+    worker.shutdown();
+    handle.await.expect("worker task should join");
+
+    let parent_history = load_history_from_url(&database_url, parent_exec_id).await;
+    assert!(
+        matches!(
+            parent_history.events.as_slice(),
+            [
+                WorkflowEvent::WorkflowStarted { .. },
+                WorkflowEvent::ChildWorkflowStarted { .. },
+                WorkflowEvent::ChildWorkflowFailed { .. },
+                WorkflowEvent::WorkflowFailed { .. },
+            ]
+        ),
+        "parent should observe a terminal child failure instead of staying parked: {:?}",
+        parent_history.events
+    );
+    let child_failure = parent_history
+        .events
+        .iter()
+        .find_map(|event| match event {
+            WorkflowEvent::ChildWorkflowFailed { child_id, error } => {
+                Some((*child_id, error.clone()))
+            }
+            _ => None,
+        })
+        .expect("parent history should include ChildWorkflowFailed");
+    assert!(
+        child_failure
+            .1
+            .contains("continue_as_new is not supported in child workflows"),
+        "parent should receive the rejection reason from the child"
+    );
+
+    let child_execution = load_execution_from_url(&database_url, child_failure.0).await;
+    assert_eq!(child_execution.state, "FAILED");
+    assert_eq!(
+        child_execution.error.as_deref(),
+        Some("continue_as_new is not supported in child workflows in this release"),
+    );
+
+    let child_history = load_history_from_url(&database_url, child_failure.0).await;
+    assert!(
+        matches!(
+            child_history.events.as_slice(),
+            [
+                WorkflowEvent::WorkflowStarted { .. },
+                WorkflowEvent::WorkflowFailed { .. },
+            ]
+        ),
+        "child should fail cleanly after the rejected continue-as-new: {:?}",
+        child_history.events
+    );
+
+    assert!(
+        parent_execution.error.as_deref().is_some_and(
+            |error| error.contains("continue_as_new is not supported in child workflows")
+        ),
+        "parent should fail with the propagated child error",
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

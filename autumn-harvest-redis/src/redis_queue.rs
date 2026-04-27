@@ -428,10 +428,8 @@ impl RedisTaskQueue {
             // to *any* consumer in the group". For PEL recovery, callers use
             // `recover_pending` which re-enqueues idle entries so they become
             // claimable through this same path.
-            let reply: StreamReadReply = conn
-                .xread_options(&[&key], &[">"], &opts)
-                .await
-                .unwrap_or_else(|_| StreamReadReply { keys: vec![] });
+            let reply =
+                propagate_stream_read_result(conn.xread_options(&[&key], &[">"], &opts).await)?;
 
             let entry = reply
                 .keys
@@ -466,6 +464,12 @@ impl RedisTaskQueue {
         }
         Ok(None)
     }
+}
+
+fn propagate_stream_read_result(
+    result: redis::RedisResult<StreamReadReply>,
+) -> RedisAdapterResult<StreamReadReply> {
+    result.map_err(Into::into)
 }
 
 #[async_trait]
@@ -612,6 +616,23 @@ mod tests {
     fn promote_lua_script_compiles() {
         // `Script::new` is the cheapest way to confirm the literal is well-formed.
         let _ = Script::new(PROMOTE_LUA);
+    }
+
+    #[test]
+    fn propagate_stream_read_result_preserves_empty_success() {
+        let reply = propagate_stream_read_result(Ok(StreamReadReply { keys: vec![] }))
+            .expect("empty stream replies should remain successful");
+        assert!(reply.keys.is_empty());
+    }
+
+    #[test]
+    fn propagate_stream_read_result_surfaces_redis_errors() {
+        let err = redis::RedisError::from((redis::ErrorKind::IoError, "xread exploded"));
+        let mapped = propagate_stream_read_result(Err(err));
+        assert!(
+            matches!(mapped, Err(RedisAdapterError::Redis(_))),
+            "xread failures must not be treated as an empty queue",
+        );
     }
 
     // The exact `is_busygroup` path is exercised end-to-end against a real
