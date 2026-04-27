@@ -107,6 +107,7 @@ runtime-owned behavior stay behind the same API surface your service exposes.
 ```bash
 cargo run -p autumn-harvest-cli -- health
 cargo run -p autumn-harvest-cli -- workflow list --limit 25
+cargo run -p autumn-harvest-cli -- workflow list --state RUNNING --search-attr tenant=acme
 cargo run -p autumn-harvest-cli -- workflow get <execution-id>
 cargo run -p autumn-harvest-cli -- workflow start approval_workflow --input-json '{"request_id":"42"}'
 cargo run -p autumn-harvest-cli -- workflow signal <execution-id> approved --payload-json '{"approved":true}'
@@ -125,6 +126,29 @@ a bearer token. Successful responses are printed as pretty JSON by default; use
 `--output json` for compact script-friendly output. JSON request payloads accept
 inline `--*-json` values or `--*-file PATH`; use `-` as the file path to read
 from stdin.
+
+### Filtering the workflow list
+
+`workflow list` (and `GET /workflows`) accept three additional filter knobs on
+top of `limit`:
+
+| CLI flag | Query param | Behavior |
+|---|---|---|
+| `--state RUNNING` (repeatable, also accepts `RUNNING,FAILED`) | `?state=RUNNING,FAILED` (repeatable) | Exact match on the workflow execution state. Allowed values: `RUNNING`, `COMPLETED`, `FAILED`, `CANCELLED`, `TIMED_OUT`. |
+| `--workflow-name onboarding` | `?workflow_name=onboarding` | Exact match on the registered workflow name. |
+| `--search-attr tenant=acme` (repeatable) | `?search_attr=tenant:acme` (repeatable) | JSONB containment predicate on `search_attrs`. Multiple flags AND together; repeating a key narrows. Hits the existing `idx_harvest_we_search` GIN index. |
+
+Invalid values (unknown state, malformed `search_attr` missing the `:`
+separator) return `400 Bad Request` instead of silently matching nothing.
+
+Triage example — find the running onboarding workflows for a single tenant:
+
+```bash
+cargo run -p autumn-harvest-cli -- workflow list \
+    --state RUNNING \
+    --workflow-name onboarding \
+    --search-attr tenant=acme
+```
 
 ## Requirements
 
