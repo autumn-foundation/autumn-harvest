@@ -1,0 +1,618 @@
+//! Command-line client for the autumn-harvest management API.
+
+use std::collections::BTreeMap;
+use std::fs;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+
+use clap::{Parser, Subcommand, ValueEnum};
+use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
+use serde_json::{Map, Value, json};
+use thiserror::Error;
+
+const DEFAULT_BASE_URL: &str = "http://localhost:3000/api/harvest";
+const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'%')
+    .add(b'<')
+    .add(b'>')
+    .add(b'?')
+    .add(b'`')
+    .add(b'{')
+    .add(b'}')
+    .add(b'/');
+
+/// Top-level CLI arguments for the `harvest` binary.
+#[derive(Debug, Parser)]
+#[command(
+    name = "harvest",
+    version,
+    about = "Manage autumn-harvest workflows and DAGs"
+)]
+pub struct Cli {
+    /// Base URL where the Harvest management API is mounted.
+    #[arg(
+        long,
+        global = true,
+        env = "HARVEST_URL",
+        default_value = DEFAULT_BASE_URL
+    )]
+    base_url: String,
+
+    /// Bearer token to send with every request.
+    #[arg(long, global = true, env = "HARVEST_TOKEN", hide_env_values = true)]
+    token: Option<String>,
+
+    /// Output format for successful API responses.
+    #[arg(long, global = true, value_enum, default_value = "pretty-json")]
+    output: OutputFormat,
+
+    #[command(subcommand)]
+    command: Commands,
+}
+
+/// Successful response output format.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum OutputFormat {
+    /// Pretty-printed JSON.
+    PrettyJson,
+    /// Compact JSON for scripts.
+    Json,
+}
+
+/// HTTP method used by a management API request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ApiMethod {
+    /// HTTP GET.
+    Get,
+    /// HTTP PATCH.
+    Patch,
+    /// HTTP POST.
+    Post,
+}
+
+/// Thin request description built from CLI arguments.
+#[derive(Debug, Eq, PartialEq)]
+pub struct ApiRequest {
+    /// HTTP method.
+    pub method: ApiMethod,
+    /// Path relative to the configured Harvest API mount.
+    pub path: String,
+    /// Optional JSON request body.
+    pub body: Option<Value>,
+}
+
+/// CLI failure modes.
+#[derive(Debug, Error)]
+pub enum CliError {
+    /// A supplied JSON string could not be parsed.
+    #[error("invalid JSON for {label}: {source}")]
+    InvalidJson {
+        /// User-facing source label.
+        label: &'static str,
+        /// JSON parser error.
+        source: serde_json::Error,
+    },
+
+    /// A supplied JSON file could not be read.
+    #[error("failed to read {label} from {path}: {source}")]
+    ReadJson {
+        /// User-facing source label.
+        label: &'static str,
+        /// Path displayed to the user.
+        path: String,
+        /// I/O failure.
+        source: std::io::Error,
+    },
+
+    /// Both inline and file JSON sources were supplied for one field.
+    #[error("{label} accepts either inline JSON or a file, not both")]
+    ConflictingJsonSources {
+        /// User-facing source label.
+        label: &'static str,
+    },
+
+    /// HTTP transport failed.
+    #[error("request failed: {0}")]
+    Request(#[from] reqwest::Error),
+
+    /// The Harvest API returned a non-success status.
+    #[error("harvest API returned {status}: {body}")]
+    Http {
+        /// HTTP status code.
+        status: reqwest::StatusCode,
+        /// Response body text.
+        body: String,
+    },
+
+    /// API response JSON could not be parsed.
+    #[error("failed to parse response JSON: {0}")]
+    ParseResponse(serde_json::Error),
+
+    /// JSON output could not be serialized.
+    #[error("failed to serialize response JSON: {0}")]
+    SerializeResponse(serde_json::Error),
+}
+
+#[derive(Debug, Subcommand)]
+enum Commands {
+    /// Check management API health.
+    Health,
+    /// Manage workflow executions.
+    Workflow {
+        #[command(subcommand)]
+        command: WorkflowCommand,
+    },
+    /// Manage DAG schedules and runs.
+    Dag {
+        #[command(subcommand)]
+        command: DagCommand,
+    },
+    /// Manage dead-lettered tasks.
+    #[command(alias = "dead-letter", alias = "dead-letters")]
+    Dlq {
+        #[command(subcommand)]
+        command: DeadLetterCommand,
+    },
+    /// Open the TUI dashboard to monitor workflows.
+    Tui,
+}
+
+#[derive(Debug, Subcommand)]
+enum WorkflowCommand {
+    /// List workflow executions.
+    List {
+        /// Maximum number of rows to return.
+        #[arg(long, value_parser = clap::value_parser!(i64).range(1..=200))]
+        limit: Option<i64>,
+    },
+    /// Get one workflow execution and event history.
+    Get {
+        /// Workflow execution ID.
+        execution_id: String,
+    },
+    /// Start a workflow execution.
+    Start {
+        /// Registered workflow name.
+        workflow_name: String,
+        /// Stable workflow ID for idempotent starts.
+        #[arg(long)]
+        workflow_id: Option<String>,
+        /// Queue to place the initial workflow task on.
+        #[arg(long)]
+        queue: Option<String>,
+        /// Inline JSON workflow input.
+        #[arg(long, conflicts_with = "input_file")]
+        input_json: Option<String>,
+        /// File containing JSON workflow input. Use `-` for stdin.
+        #[arg(long, value_name = "PATH", conflicts_with = "input_json")]
+        input_file: Option<PathBuf>,
+        /// Inline JSON memo.
+        #[arg(long, conflicts_with = "memo_file")]
+        memo_json: Option<String>,
+        /// File containing JSON memo. Use `-` for stdin.
+        #[arg(long, value_name = "PATH", conflicts_with = "memo_json")]
+        memo_file: Option<PathBuf>,
+        /// Inline JSON search attributes.
+        #[arg(long, conflicts_with = "search_attrs_file")]
+        search_attrs_json: Option<String>,
+        /// File containing JSON search attributes. Use `-` for stdin.
+        #[arg(long, value_name = "PATH", conflicts_with = "search_attrs_json")]
+        search_attrs_file: Option<PathBuf>,
+        /// Execution timeout in seconds.
+        #[arg(long)]
+        execution_timeout_secs: Option<i64>,
+    },
+    /// Cancel a workflow execution.
+    Cancel {
+        /// Workflow execution ID.
+        execution_id: String,
+        /// Cancellation reason.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Send a signal to a workflow execution.
+    Signal {
+        /// Workflow execution ID.
+        execution_id: String,
+        /// Registered signal name.
+        signal_name: String,
+        /// Inline JSON signal payload.
+        #[arg(long, conflicts_with = "payload_file")]
+        payload_json: Option<String>,
+        /// File containing JSON signal payload. Use `-` for stdin.
+        #[arg(long, value_name = "PATH", conflicts_with = "payload_json")]
+        payload_file: Option<PathBuf>,
+    },
+    /// Query workflow state.
+    Query {
+        /// Workflow execution ID.
+        execution_id: String,
+        /// Registered query name.
+        query_name: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum DagCommand {
+    /// List DAG schedules.
+    List,
+    /// List runs for a DAG.
+    Runs {
+        /// Registered DAG name.
+        dag_name: String,
+    },
+    /// Trigger a DAG run.
+    Trigger {
+        /// Registered DAG name.
+        dag_name: String,
+        /// Inline JSON DAG run config.
+        #[arg(long, conflicts_with = "conf_file")]
+        conf_json: Option<String>,
+        /// File containing JSON DAG run config. Use `-` for stdin.
+        #[arg(long, value_name = "PATH", conflicts_with = "conf_json")]
+        conf_file: Option<PathBuf>,
+    },
+    /// Pause a DAG schedule.
+    Pause {
+        /// Registered DAG name.
+        dag_name: String,
+    },
+    /// Unpause a DAG schedule.
+    Unpause {
+        /// Registered DAG name.
+        dag_name: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum DeadLetterCommand {
+    /// List dead-lettered tasks.
+    List {
+        /// Maximum number of rows to return.
+        #[arg(long, value_parser = clap::value_parser!(i64).range(1..=200))]
+        limit: Option<i64>,
+    },
+    /// Replay a dead-lettered task.
+    Replay {
+        /// Dead-letter row ID.
+        dead_letter_id: String,
+    },
+}
+
+impl Cli {
+    /// Build the management API request represented by these CLI arguments.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when inline JSON cannot be parsed or JSON file/stdin
+    /// input cannot be read.
+    pub fn api_request(&self) -> Result<ApiRequest, CliError> {
+        match &self.command {
+            Commands::Health => Ok(ApiRequest::get("/health")),
+            Commands::Workflow { command } => workflow_request(command),
+            Commands::Dag { command } => dag_request(command),
+            Commands::Dlq { command } => Ok(dead_letter_request(command)),
+            Commands::Tui => unreachable!("Tui command handles its own requests"),
+        }
+    }
+}
+
+impl ApiRequest {
+    fn get(path: impl Into<String>) -> Self {
+        Self {
+            method: ApiMethod::Get,
+            path: path.into(),
+            body: None,
+        }
+    }
+
+    fn patch(path: impl Into<String>, body: Value) -> Self {
+        Self {
+            method: ApiMethod::Patch,
+            path: path.into(),
+            body: Some(body),
+        }
+    }
+
+    fn post(path: impl Into<String>, body: Option<Value>) -> Self {
+        Self {
+            method: ApiMethod::Post,
+            path: path.into(),
+            body,
+        }
+    }
+}
+
+pub mod tui;
+
+/// Run the CLI, print successful response data to stdout, and return errors.
+///
+/// # Errors
+///
+/// Returns an error if request construction, HTTP transport, response parsing,
+/// or response formatting fails.
+pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
+    if matches!(cli.command, Commands::Tui) {
+        return tui::run_tui(&cli).await;
+    }
+
+    let output = cli.output;
+    let response = execute(&cli).await?;
+    let rendered = format_output(&response, output)?;
+    println!("{rendered}");
+    Ok(())
+}
+
+/// Execute the API request represented by the CLI arguments.
+///
+/// # Errors
+///
+/// Returns an error if request construction fails, the HTTP request fails, the
+/// API returns a non-success status, or the response body is not valid JSON.
+pub async fn execute(cli: &Cli) -> Result<Value, CliError> {
+    let request = cli.api_request()?;
+    let client = reqwest::Client::new();
+    let url = format!("{}{}", cli.base_url.trim_end_matches('/'), request.path);
+    let builder = match request.method {
+        ApiMethod::Get => client.get(url),
+        ApiMethod::Patch => client.patch(url),
+        ApiMethod::Post => client.post(url),
+    };
+    let builder = if let Some(token) = &cli.token {
+        builder.bearer_auth(token)
+    } else {
+        builder
+    };
+    let builder = if let Some(body) = &request.body {
+        builder.json(body)
+    } else {
+        builder
+    };
+
+    let response = builder.send().await?;
+    let status = response.status();
+    let body = response.text().await?;
+    if !status.is_success() {
+        return Err(CliError::Http { status, body });
+    }
+    if body.trim().is_empty() {
+        return Ok(Value::Null);
+    }
+
+    serde_json::from_str(&body).map_err(CliError::ParseResponse)
+}
+
+/// Render a successful response.
+///
+/// # Errors
+///
+/// Returns an error if the JSON value cannot be serialized.
+pub fn format_output(value: &Value, output: OutputFormat) -> Result<String, CliError> {
+    match output {
+        OutputFormat::PrettyJson => {
+            serde_json::to_string_pretty(value).map_err(CliError::SerializeResponse)
+        }
+        OutputFormat::Json => serde_json::to_string(value).map_err(CliError::SerializeResponse),
+    }
+}
+
+fn workflow_request(command: &WorkflowCommand) -> Result<ApiRequest, CliError> {
+    match command {
+        WorkflowCommand::List { limit } => Ok(ApiRequest::get(path_with_limit(
+            "/workflows",
+            limit.map(|value| ("limit", value)),
+        ))),
+        WorkflowCommand::Get { execution_id } => Ok(ApiRequest::get(format!(
+            "/workflows/{}",
+            path_segment(execution_id)
+        ))),
+        WorkflowCommand::Start {
+            workflow_name,
+            workflow_id,
+            queue,
+            input_json,
+            input_file,
+            memo_json,
+            memo_file,
+            search_attrs_json,
+            search_attrs_file,
+            execution_timeout_secs,
+        } => {
+            let mut body = Map::new();
+            insert_string(&mut body, "workflow_id", workflow_id.as_deref());
+            insert_string(&mut body, "queue", queue.as_deref());
+            insert_json(
+                &mut body,
+                "input",
+                parse_json_source(
+                    input_json.as_deref(),
+                    input_file.as_deref(),
+                    "workflow input",
+                )?,
+            );
+            insert_json(
+                &mut body,
+                "memo",
+                parse_json_source(memo_json.as_deref(), memo_file.as_deref(), "memo")?,
+            );
+            insert_json(
+                &mut body,
+                "search_attrs",
+                parse_json_source(
+                    search_attrs_json.as_deref(),
+                    search_attrs_file.as_deref(),
+                    "search attributes",
+                )?,
+            );
+            if let Some(timeout) = execution_timeout_secs {
+                body.insert("execution_timeout_secs".to_string(), json!(timeout));
+            }
+
+            Ok(ApiRequest::post(
+                format!("/workflows/{}/start", path_segment(workflow_name)),
+                Some(Value::Object(body)),
+            ))
+        }
+        WorkflowCommand::Cancel {
+            execution_id,
+            reason,
+        } => {
+            let mut body = Map::new();
+            insert_string(&mut body, "reason", reason.as_deref());
+            Ok(ApiRequest::post(
+                format!("/workflows/{}/cancel", path_segment(execution_id)),
+                Some(Value::Object(body)),
+            ))
+        }
+        WorkflowCommand::Signal {
+            execution_id,
+            signal_name,
+            payload_json,
+            payload_file,
+        } => {
+            let payload = parse_json_source(
+                payload_json.as_deref(),
+                payload_file.as_deref(),
+                "signal payload",
+            )?
+            .unwrap_or_else(|| json!({}));
+            Ok(ApiRequest::post(
+                format!(
+                    "/workflows/{}/signal/{}",
+                    path_segment(execution_id),
+                    path_segment(signal_name)
+                ),
+                Some(payload),
+            ))
+        }
+        WorkflowCommand::Query {
+            execution_id,
+            query_name,
+        } => Ok(ApiRequest::get(format!(
+            "/workflows/{}/query/{}",
+            path_segment(execution_id),
+            path_segment(query_name)
+        ))),
+    }
+}
+
+fn dag_request(command: &DagCommand) -> Result<ApiRequest, CliError> {
+    match command {
+        DagCommand::List => Ok(ApiRequest::get("/dags")),
+        DagCommand::Runs { dag_name } => Ok(ApiRequest::get(format!(
+            "/dags/{}/runs",
+            path_segment(dag_name)
+        ))),
+        DagCommand::Trigger {
+            dag_name,
+            conf_json,
+            conf_file,
+        } => {
+            let mut body = Map::new();
+            insert_json(
+                &mut body,
+                "conf",
+                parse_json_source(conf_json.as_deref(), conf_file.as_deref(), "DAG run config")?,
+            );
+            Ok(ApiRequest::post(
+                format!("/dags/{}/trigger", path_segment(dag_name)),
+                Some(Value::Object(body)),
+            ))
+        }
+        DagCommand::Pause { dag_name } => Ok(ApiRequest::patch(
+            format!("/dags/{}", path_segment(dag_name)),
+            json!({ "paused": true }),
+        )),
+        DagCommand::Unpause { dag_name } => Ok(ApiRequest::patch(
+            format!("/dags/{}", path_segment(dag_name)),
+            json!({ "paused": false }),
+        )),
+    }
+}
+
+fn dead_letter_request(command: &DeadLetterCommand) -> ApiRequest {
+    match command {
+        DeadLetterCommand::List { limit } => ApiRequest::get(path_with_limit(
+            "/dead-letters",
+            limit.map(|value| ("limit", value)),
+        )),
+        DeadLetterCommand::Replay { dead_letter_id } => ApiRequest::post(
+            format!("/dead-letters/{}/replay", path_segment(dead_letter_id)),
+            None,
+        ),
+    }
+}
+
+fn parse_json_source(
+    inline: Option<&str>,
+    file: Option<&Path>,
+    label: &'static str,
+) -> Result<Option<Value>, CliError> {
+    match (inline, file) {
+        (Some(_), Some(_)) => Err(CliError::ConflictingJsonSources { label }),
+        (Some(raw), None) => serde_json::from_str(raw)
+            .map(Some)
+            .map_err(|source| CliError::InvalidJson { label, source }),
+        (None, Some(path)) => {
+            let raw = read_json_file(path, label)?;
+            serde_json::from_str(&raw)
+                .map(Some)
+                .map_err(|source| CliError::InvalidJson { label, source })
+        }
+        (None, None) => Ok(None),
+    }
+}
+
+fn read_json_file(path: &Path, label: &'static str) -> Result<String, CliError> {
+    if path == Path::new("-") {
+        let mut input = String::new();
+        std::io::stdin()
+            .read_to_string(&mut input)
+            .map_err(|source| CliError::ReadJson {
+                label,
+                path: "-".to_string(),
+                source,
+            })?;
+        return Ok(input);
+    }
+
+    fs::read_to_string(path).map_err(|source| CliError::ReadJson {
+        label,
+        path: path.display().to_string(),
+        source,
+    })
+}
+
+fn insert_string(body: &mut Map<String, Value>, key: &str, value: Option<&str>) {
+    if let Some(value) = value {
+        body.insert(key.to_string(), Value::String(value.to_string()));
+    }
+}
+
+fn insert_json(body: &mut Map<String, Value>, key: &str, value: Option<Value>) {
+    if let Some(value) = value {
+        body.insert(key.to_string(), value);
+    }
+}
+
+fn path_segment(raw: &str) -> String {
+    utf8_percent_encode(raw, PATH_SEGMENT_ENCODE_SET).to_string()
+}
+
+fn path_with_limit(base: &str, limit: Option<(&str, i64)>) -> String {
+    let Some((key, value)) = limit else {
+        return base.to_string();
+    };
+
+    let mut query = BTreeMap::new();
+    query.insert(key, value.to_string());
+    let query = query
+        .into_iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join("&");
+    format!("{base}?{query}")
+}

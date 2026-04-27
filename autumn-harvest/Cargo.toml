@@ -24,7 +24,7 @@ db = [
 testing = []
 
 [dependencies]
-autumn-harvest-macros = { version = "0.1.1", path = "../autumn-harvest-macros" }
+autumn-harvest-macros = { version = "0.2.0", path = "../autumn-harvest-macros" }
 tokio = { workspace = true }
 tokio-util = { version = "0.7", features = ["rt"] }
 serde = { workspace = true }
@@ -36,6 +36,7 @@ tracing = { workspace = true }
 futures = { workspace = true }
 lru = "0.16"
 croner = "2.2"
+seahash = "4.1"
 deadpool = { workspace = true, optional = true }
 diesel = { workspace = true, optional = true }
 diesel-async = { workspace = true, optional = true }
@@ -47,6 +48,8 @@ tokio-postgres = { version = "0.7", optional = true }
 tokio = { workspace = true, features = ["test-util"] }
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
+proptest = "1.11.0"
+loom = "0.7.2"
 
 [lints]
 workspace = true

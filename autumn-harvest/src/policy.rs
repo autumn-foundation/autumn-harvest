@@ -16,10 +16,29 @@ pub fn compute_retry_delay(
 ) -> Duration {
     let exp = i32::try_from(attempt.saturating_sub(1)).unwrap_or(i32::MAX);
     let secs = initial.as_secs_f64() * backoff_coefficient.powi(exp);
-    Duration::from_secs_f64(secs.min(max_interval.as_secs_f64()))
+
+    // Protect against negative floats and NaN, which would cause from_secs_f64 to panic
+    let clamped_secs = if secs.is_nan() || secs < 0.0 {
+        0.0
+    } else {
+        secs
+    };
+
+    let delay = Duration::try_from_secs_f64(clamped_secs).unwrap_or(Duration::MAX);
+    delay.min(max_interval)
 }
 
 /// How an activity failure is retried.
+///
+/// ## Examples
+///
+/// ```rust
+/// use std::time::Duration;
+/// use autumn_harvest::policy::RetryPolicy;
+///
+/// let policy = RetryPolicy::exponential(3, Duration::from_secs(1));
+/// assert_eq!(policy.max_attempts, 3);
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetryPolicy {
     /// Maximum number of attempts (including the first). 1 = no retries.
@@ -36,6 +55,16 @@ pub struct RetryPolicy {
 
 impl RetryPolicy {
     /// Exponential backoff: doubles each retry, capped at 5 minutes.
+    ///
+    /// ## Examples
+    ///
+    /// ```rust
+    /// use std::time::Duration;
+    /// use autumn_harvest::policy::RetryPolicy;
+    ///
+    /// let policy = RetryPolicy::exponential(3, Duration::from_secs(1));
+    /// assert_eq!(policy.backoff_coefficient, 2.0);
+    /// ```
     #[must_use]
     #[allow(clippy::missing_const_for_fn)] // vec![] prevents const fn
     pub fn exponential(max_attempts: u32, initial: Duration) -> Self {
@@ -49,6 +78,16 @@ impl RetryPolicy {
     }
 
     /// Fixed delay: same interval every retry.
+    ///
+    /// ## Examples
+    ///
+    /// ```rust
+    /// use std::time::Duration;
+    /// use autumn_harvest::policy::RetryPolicy;
+    ///
+    /// let policy = RetryPolicy::fixed(3, Duration::from_secs(5));
+    /// assert_eq!(policy.backoff_coefficient, 1.0);
+    /// ```
     #[must_use]
     #[allow(clippy::missing_const_for_fn)] // vec![] prevents const fn
     pub fn fixed(max_attempts: u32, interval: Duration) -> Self {
@@ -64,6 +103,17 @@ impl RetryPolicy {
     /// Returns the delay before the given attempt, or `None` if no more retries remain.
     ///
     /// `attempt` is 1-based: 1 = first retry (after the initial failure).
+    ///
+    /// ## Examples
+    ///
+    /// ```rust
+    /// use std::time::Duration;
+    /// use autumn_harvest::policy::RetryPolicy;
+    ///
+    /// let policy = RetryPolicy::exponential(3, Duration::from_secs(1));
+    /// assert_eq!(policy.next_delay(1), Some(Duration::from_secs(1)));
+    /// assert_eq!(policy.next_delay(3), None); // attempt >= max_attempts
+    /// ```
     #[must_use]
     pub fn next_delay(&self, attempt: u32) -> Option<Duration> {
         if attempt >= self.max_attempts {
@@ -85,16 +135,37 @@ impl Default for RetryPolicy {
 }
 
 /// Status of a completed DAG task, used by trigger rules.
+///
+/// ## Examples
+///
+/// ```rust
+/// use autumn_harvest::policy::TaskStatus;
+///
+/// let status = TaskStatus::Succeeded;
+/// assert_eq!(status, TaskStatus::Succeeded);
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskStatus {
+    /// The task executed and returned success.
     Succeeded,
+    /// The task returned an error or exhausted its retries.
     Failed,
+    /// The task was skipped (e.g., due to a trigger rule evaluating to false).
     Skipped,
 }
 
 /// When a DAG task with multiple upstreams should execute.
 ///
 /// All rules vacuously fire when `upstream_statuses` is empty (no dependencies).
+///
+/// ## Examples
+///
+/// ```rust
+/// use autumn_harvest::policy::TriggerRule;
+///
+/// let rule = TriggerRule::AllSuccess;
+/// assert_eq!(rule, TriggerRule::default());
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum TriggerRule {
     /// Run when all upstream tasks succeeded (default).
@@ -113,6 +184,19 @@ pub enum TriggerRule {
 }
 
 impl TriggerRule {
+    /// Evaluates the trigger rule against a list of upstream task statuses.
+    ///
+    /// Returns `true` if the downstream task should be executed, `false` otherwise.
+    ///
+    /// ## Examples
+    ///
+    /// ```rust
+    /// use autumn_harvest::policy::{TriggerRule, TaskStatus};
+    ///
+    /// let rule = TriggerRule::AllSuccess;
+    /// let statuses = vec![TaskStatus::Succeeded, TaskStatus::Succeeded];
+    /// assert!(rule.should_run(&statuses));
+    /// ```
     #[must_use]
     pub fn should_run(&self, upstream_statuses: &[TaskStatus]) -> bool {
         match self {
@@ -132,6 +216,15 @@ impl TriggerRule {
 }
 
 /// DAG/workflow execution schedule.
+///
+/// ## Examples
+///
+/// ```rust
+/// use std::time::Duration;
+/// use autumn_harvest::policy::Schedule;
+///
+/// let sched = Schedule::Interval(Duration::from_secs(60));
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Schedule {
     /// Standard cron expression (e.g., `"0 2 * * *"` for daily at 2 AM).
@@ -246,4 +339,24 @@ mod tests {
         );
         assert_eq!(d, Duration::from_secs(120));
     }
+}
+
+#[test]
+fn compute_retry_delay_attempt_zero() {
+    let d = compute_retry_delay(Duration::from_secs(1), 2.0, Duration::from_secs(300), 0);
+    assert_eq!(d, Duration::from_secs(1));
+}
+
+#[test]
+fn compute_retry_delay_negative_nan() {
+    let d = compute_retry_delay(
+        Duration::from_secs(1),
+        f64::NAN,
+        Duration::from_secs(300),
+        2,
+    );
+    assert_eq!(d, Duration::from_secs(0));
+
+    let d2 = compute_retry_delay(Duration::from_secs(1), -1.0, Duration::from_secs(300), 2);
+    assert_eq!(d2, Duration::from_secs(0));
 }

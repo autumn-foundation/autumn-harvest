@@ -1,4 +1,4 @@
-//! `HarvestPlugin` — the [`Plugin`](autumn_web::Plugin) implementation that wires
+//! `HarvestPlugin` — the [`Plugin`] implementation that wires
 //! the Harvest workflow engine into an Autumn [`AppBuilder`].
 
 use std::any::Any;
@@ -18,8 +18,10 @@ use crate::api::{HarvestApiState, harvest_api_router};
 use crate::config::{HarvestMode, HarvestRuntimeConfig};
 use crate::outbox::spawn_workflow_start_outbox_relay;
 use crate::runner::{HarvestRunner, HarvestRunnerResources};
+use crate::ui::harvest_ui_router;
 use autumn_harvest::builder::{HarvestBuilder, WorkerConfig};
 use autumn_harvest::info::{ActivityInfo, DagInfo, WorkflowInfo};
+use autumn_harvest::shard::ShardRouter;
 use autumn_harvest::worker::DbPool;
 
 const HARVEST_MIGRATIONS: EmbeddedMigrations = autumn_harvest::MIGRATIONS;
@@ -199,7 +201,8 @@ impl Plugin for HarvestPlugin {
             });
 
         if let Some(path) = api_path {
-            let mut router = harvest_api_router(api_state);
+            let ui_router = harvest_ui_router(api_state.clone());
+            let mut router = harvest_api_router(api_state).nest("/ui", ui_router);
             if let Some(mw) = api_middleware {
                 router = mw(router);
             }
@@ -224,6 +227,7 @@ fn start_harvest_runtime(
     let runtime_state = state.clone();
     let app_pool = state.pool().cloned();
     let harvest_pool = resolve_harvest_pool(state, &harvest_config)?;
+    let router = ShardRouter::single();
 
     let (builder, runtime_already_started) = {
         let mut guard = slot.lock().expect("harvest lock poisoned");
@@ -243,8 +247,10 @@ fn start_harvest_runtime(
 
     let built = builder.build();
     state.insert_extension(harvest_config.outbox.clone());
-    let mut runner_resources =
-        HarvestRunnerResources::new(harvest_pool).with_app_state(runtime_state.clone());
+    state.insert_extension(router.clone());
+    let mut runner_resources = HarvestRunnerResources::new(harvest_pool)
+        .with_app_state(runtime_state.clone())
+        .with_shard_router(router);
     if let Some(app_pool) = app_pool.as_ref() {
         runner_resources = runner_resources.with_app_pool(app_pool.clone());
     }
@@ -305,10 +311,10 @@ async fn stop_harvest_runtime(slot: Arc<Mutex<HarvestRuntimeSlot>>, api_state: H
 
     if let Some(outbox) = runtime.outbox {
         outbox.shutdown.cancel();
-        if let Err(error) = outbox.handle.await {
-            if !error.is_cancelled() {
-                tracing::warn!(error = %error, "harvest outbox relay failed during shutdown");
-            }
+        if let Err(error) = outbox.handle.await
+            && !error.is_cancelled()
+        {
+            tracing::warn!(error = %error, "harvest outbox relay failed during shutdown");
         }
     }
     runtime.runner.stop().await;
@@ -500,7 +506,12 @@ mod tests {
     fn injected_runtime_state_contains_app_state() {
         let state = AppState::for_test();
         let harvest_pool = test_pool("postgres://harvest:harvest@localhost:5432/harvest", 4);
-        let injected = injected_runtime_state(Some(state.clone()), None, harvest_pool);
+        let injected = injected_runtime_state(
+            Some(state.clone()),
+            None,
+            harvest_pool,
+            ShardRouter::single(),
+        );
         let stored = injected
             .get(&TypeId::of::<AppState>())
             .and_then(|value| value.downcast_ref::<AppState>())
@@ -545,7 +556,12 @@ mod tests {
         let app_pool = test_pool("postgres://app:app@localhost:5432/app", 3);
         let harvest_pool = test_pool("postgres://harvest:harvest@localhost:5432/harvest", 7);
         let app_state = AppState::for_test().with_pool(app_pool.clone());
-        let injected = injected_runtime_state(Some(app_state), Some(app_pool), harvest_pool);
+        let injected = injected_runtime_state(
+            Some(app_state),
+            Some(app_pool),
+            harvest_pool,
+            ShardRouter::single(),
+        );
 
         let app_db = injected
             .get(&TypeId::of::<AppDbPool>())

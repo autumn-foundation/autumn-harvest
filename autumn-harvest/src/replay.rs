@@ -19,16 +19,32 @@ use crate::event::WorkflowEvent;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HistoryMatch {
     /// History contains a completed result for this command.
-    Matched { output: Value },
+    Matched {
+        /// The JSON result value returned by the matched event.
+        output: Value,
+    },
     /// History contains a failure for this command.
-    Failed { error: String, attempt: u32 },
+    Failed {
+        /// String representation of the failure.
+        error: String,
+        /// Attempt number for the failed action.
+        attempt: u32,
+    },
     /// History contains a timeout for this command.
-    TimedOut { timeout_type: TimeoutType },
+    TimedOut {
+        /// The type of timeout that occurred.
+        timeout_type: TimeoutType,
+    },
     /// Cursor is past the end of history — this is a new command.
     NoMatch,
     /// The command does not match what was recorded at this position,
     /// indicating non-determinism in the workflow code.
-    Diverged { expected: String, actual: String },
+    Diverged {
+        /// What the history matcher expected to find based on recorded events.
+        expected: String,
+        /// What the workflow actually requested.
+        actual: String,
+    },
 }
 
 /// Walks through recorded workflow events during replay, matching
@@ -60,13 +76,30 @@ impl HistoryMatcher {
         }
     }
 
+    /// Returns `true` if the event at `index` has already been consumed out-of-order.
+    fn is_consumed(&self, index: usize) -> bool {
+        self.consumed_child_terminal_events.contains(&index)
+            || self.consumed_signal_events.contains(&index)
+    }
+
+    fn stash_signal(&mut self, cursor: usize, signal_name: String, payload: Value) {
+        self.consumed_signal_events.insert(cursor);
+        self.pending_signals.push_back((signal_name, payload));
+    }
+
+    /// Prepares for matching by advancing past consumed events and draining early signals.
+    /// Returns `true` if there are still events to replay.
+    fn prepare_match(&mut self) -> bool {
+        self.advance_to_next_unconsumed_event();
+        self.drain_early_signals();
+        self.is_replaying()
+    }
+
     /// Returns `true` if the cursor is still within the recorded history.
     #[must_use]
     pub fn is_replaying(&self) -> bool {
         let mut cursor = self.cursor;
-        while self.consumed_child_terminal_events.contains(&cursor)
-            || self.consumed_signal_events.contains(&cursor)
-        {
+        while self.is_consumed(cursor) {
             cursor += 1;
         }
         cursor < self.events.len()
@@ -90,10 +123,7 @@ impl HistoryMatcher {
     }
 
     fn advance_to_next_unconsumed_event(&mut self) {
-        while (self.consumed_child_terminal_events.contains(&self.cursor)
-            || self.consumed_signal_events.contains(&self.cursor))
-            && self.cursor < self.events.len()
-        {
+        while self.cursor < self.events.len() && self.is_consumed(self.cursor) {
             self.cursor += 1;
         }
     }
@@ -114,9 +144,9 @@ impl HistoryMatcher {
                 payload,
             } = &self.events[self.cursor]
             {
-                self.consumed_signal_events.insert(self.cursor);
-                self.pending_signals
-                    .push_back((signal_name.clone(), payload.clone()));
+                let signal_name = signal_name.clone();
+                let payload = payload.clone();
+                self.stash_signal(self.cursor, signal_name, payload);
                 self.cursor += 1;
                 self.advance_to_next_unconsumed_event();
             } else {
@@ -161,27 +191,23 @@ impl HistoryMatcher {
     /// - [`HistoryMatch::NoMatch`] if past end of history
     /// - [`HistoryMatch::Diverged`] if the event at cursor is not the expected activity
     pub fn match_activity(&mut self, activity_name: &str) -> HistoryMatch {
-        self.advance_to_next_unconsumed_event();
-        // Signals may have been ingested before the activity was scheduled;
-        // buffer them so they can be consumed by a later wait_for_signal call.
-        self.drain_early_signals();
-        if !self.is_replaying() {
+        if !self.prepare_match() {
             return HistoryMatch::NoMatch;
         }
 
         // Expect ActivityScheduled at cursor
-        let scheduled_event = &self.events[self.cursor];
-        let (activity_id, recorded_name) = match scheduled_event {
-            WorkflowEvent::ActivityScheduled {
-                activity_id, name, ..
-            } => (*activity_id, name.as_str()),
-            other => {
-                return HistoryMatch::Diverged {
-                    expected: format!("ActivityScheduled({activity_name})"),
-                    actual: other.type_name().to_string(),
-                };
-            }
+        let WorkflowEvent::ActivityScheduled {
+            activity_id,
+            name: recorded_name,
+            ..
+        } = &self.events[self.cursor]
+        else {
+            return HistoryMatch::Diverged {
+                expected: format!("ActivityScheduled({activity_name})"),
+                actual: self.events[self.cursor].type_name().to_string(),
+            };
         };
+        let activity_id = *activity_id;
 
         // Verify activity name matches
         if recorded_name != activity_name {
@@ -199,9 +225,7 @@ impl HistoryMatcher {
         // Scan forward for Completed or Failed with matching activity_id,
         // skipping Started, Heartbeat, and other intermediate events.
         while scan_cursor < self.events.len() {
-            if self.consumed_child_terminal_events.contains(&scan_cursor)
-                || self.consumed_signal_events.contains(&scan_cursor)
-            {
+            if self.is_consumed(scan_cursor) {
                 scan_cursor += 1;
                 continue;
             }
@@ -269,9 +293,9 @@ impl HistoryMatcher {
                     signal_name,
                     payload,
                 } => {
-                    self.consumed_signal_events.insert(scan_cursor);
-                    self.pending_signals
-                        .push_back((signal_name.clone(), payload.clone()));
+                    let signal_name = signal_name.clone();
+                    let payload = payload.clone();
+                    self.stash_signal(scan_cursor, signal_name, payload);
                     scan_cursor += 1;
                 }
                 // Any other event type is unexpected mid-activity
@@ -289,26 +313,22 @@ impl HistoryMatcher {
     /// Expects `TimerStarted { timer_id }` at cursor, then scans for
     /// `TimerFired` with the same `timer_id`.
     pub fn match_timer(&mut self, timer_id: &str) -> HistoryMatch {
-        self.advance_to_next_unconsumed_event();
-        // Signals may have been ingested before the timer was started;
-        // buffer them so they can be consumed by a later wait_for_signal call.
-        self.drain_early_signals();
-        if !self.is_replaying() {
+        if !self.prepare_match() {
             return HistoryMatch::NoMatch;
         }
 
-        let started_event = &self.events[self.cursor];
-        let recorded_id = match started_event {
-            WorkflowEvent::TimerStarted { timer_id: id, .. } => id.as_str(),
-            other => {
-                return HistoryMatch::Diverged {
-                    expected: format!("TimerStarted({timer_id})"),
-                    actual: other.type_name().to_string(),
-                };
-            }
+        let WorkflowEvent::TimerStarted {
+            timer_id: recorded_id,
+            ..
+        } = &self.events[self.cursor]
+        else {
+            return HistoryMatch::Diverged {
+                expected: format!("TimerStarted({timer_id})"),
+                actual: self.events[self.cursor].type_name().to_string(),
+            };
         };
 
-        if recorded_id != timer_id {
+        if recorded_id.as_str() != timer_id {
             return HistoryMatch::Diverged {
                 expected: format!("TimerStarted({timer_id})"),
                 actual: format!("TimerStarted({recorded_id})"),
@@ -322,24 +342,18 @@ impl HistoryMatcher {
 
         // Scan forward for TimerFired, skipping consumed child terminals and signals.
         while scan_cursor < self.events.len() {
-            if self.consumed_child_terminal_events.contains(&scan_cursor)
-                || self.consumed_signal_events.contains(&scan_cursor)
-            {
+            if self.is_consumed(scan_cursor) {
                 scan_cursor += 1;
                 continue;
             }
 
-            if let WorkflowEvent::TimerFired { timer_id: id } = &self.events[scan_cursor] {
-                if id.as_str() == timer_id {
-                    let result = HistoryMatch::Matched {
-                        output: Value::Null,
-                    };
-                    return self.settle_terminal(
-                        scan_cursor,
-                        first_interleaved_child_start,
-                        result,
-                    );
-                }
+            if let WorkflowEvent::TimerFired { timer_id: id } = &self.events[scan_cursor]
+                && id.as_str() == timer_id
+            {
+                let result = HistoryMatch::Matched {
+                    output: Value::Null,
+                };
+                return self.settle_terminal(scan_cursor, first_interleaved_child_start, result);
             }
 
             if matches!(
@@ -358,9 +372,9 @@ impl HistoryMatcher {
                 payload,
             } = &self.events[scan_cursor]
             {
-                self.consumed_signal_events.insert(scan_cursor);
-                self.pending_signals
-                    .push_back((signal_name.clone(), payload.clone()));
+                let signal_name = signal_name.clone();
+                let payload = payload.clone();
+                self.stash_signal(scan_cursor, signal_name, payload);
                 scan_cursor += 1;
                 continue;
             }
@@ -380,10 +394,9 @@ impl HistoryMatcher {
             .pending_signals
             .iter()
             .position(|(name, _)| name == signal_name)
+            && let Some((_name, payload)) = self.pending_signals.remove(index)
         {
-            if let Some((_name, payload)) = self.pending_signals.remove(index) {
-                return HistoryMatch::Matched { output: payload };
-            }
+            return HistoryMatch::Matched { output: payload };
         }
 
         self.advance_to_next_unconsumed_event();
@@ -393,9 +406,7 @@ impl HistoryMatcher {
 
         let mut scan_cursor = self.cursor;
         while scan_cursor < self.events.len() {
-            if self.consumed_child_terminal_events.contains(&scan_cursor)
-                || self.consumed_signal_events.contains(&scan_cursor)
-            {
+            if self.is_consumed(scan_cursor) {
                 scan_cursor += 1;
                 continue;
             }
@@ -416,9 +427,9 @@ impl HistoryMatcher {
                     signal_name: recorded_name,
                     payload,
                 } => {
-                    self.consumed_signal_events.insert(scan_cursor);
-                    self.pending_signals
-                        .push_back((recorded_name.clone(), payload.clone()));
+                    let recorded_name = recorded_name.clone();
+                    let payload = payload.clone();
+                    self.stash_signal(scan_cursor, recorded_name, payload);
                     scan_cursor += 1;
                 }
                 other => {
@@ -433,35 +444,61 @@ impl HistoryMatcher {
         HistoryMatch::NoMatch
     }
 
+    /// Match a continue-as-new command against history.
+    ///
+    /// Expects `WorkflowContinuedAsNew { input }` at the current cursor.
+    pub fn match_continue_as_new(&mut self, input: &Value) -> HistoryMatch {
+        if !self.prepare_match() {
+            return HistoryMatch::NoMatch;
+        }
+
+        let WorkflowEvent::WorkflowContinuedAsNew {
+            input: recorded_input,
+            ..
+        } = &self.events[self.cursor]
+        else {
+            return HistoryMatch::Diverged {
+                expected: format!("WorkflowContinuedAsNew({input})"),
+                actual: self.events[self.cursor].type_name().to_string(),
+            };
+        };
+
+        if recorded_input != input {
+            return HistoryMatch::Diverged {
+                expected: format!("WorkflowContinuedAsNewInput({input})"),
+                actual: format!("WorkflowContinuedAsNewInput({recorded_input})"),
+            };
+        }
+
+        let output = recorded_input.clone();
+        self.cursor += 1;
+        self.advance_to_next_unconsumed_event();
+        HistoryMatch::Matched { output }
+    }
+
     /// Match a child workflow command against history.
     ///
     /// Expects `ChildWorkflowStarted { workflow_name }` at cursor, then scans for
     /// a terminal `ChildWorkflowCompleted` or `ChildWorkflowFailed` with the same
     /// `child_id`.
     pub fn match_child_workflow(&mut self, workflow_name: &str, input: &Value) -> HistoryMatch {
-        self.advance_to_next_unconsumed_event();
-        // Signals may have been ingested before the child workflow was started;
-        // buffer them so they can be consumed by a later wait_for_signal call.
-        self.drain_early_signals();
-        if !self.is_replaying() {
+        if !self.prepare_match() {
             return HistoryMatch::NoMatch;
         }
 
         let start_cursor = self.cursor;
-        let started_event = &self.events[self.cursor];
-        let (child_id, recorded_name, recorded_input) = match started_event {
-            WorkflowEvent::ChildWorkflowStarted {
-                child_id,
-                workflow_name,
-                input,
-            } => (*child_id, workflow_name.as_str(), input),
-            other => {
-                return HistoryMatch::Diverged {
-                    expected: format!("ChildWorkflowStarted({workflow_name})"),
-                    actual: other.type_name().to_string(),
-                };
-            }
+        let WorkflowEvent::ChildWorkflowStarted {
+            child_id,
+            workflow_name: recorded_name,
+            input: recorded_input,
+        } = &self.events[self.cursor]
+        else {
+            return HistoryMatch::Diverged {
+                expected: format!("ChildWorkflowStarted({workflow_name})"),
+                actual: self.events[self.cursor].type_name().to_string(),
+            };
         };
+        let child_id = *child_id;
 
         if recorded_name != workflow_name {
             return HistoryMatch::Diverged {
@@ -521,6 +558,36 @@ impl HistoryMatcher {
     /// - `min_version` if no marker exists (old workflow before versioning)
     /// - `max_version` if past end of history (new code path)
     #[must_use]
+    pub fn match_side_effect(&mut self, side_effect_id: &str) -> HistoryMatch {
+        self.advance_to_next_unconsumed_event();
+        let marker_name = format!("side_effect:{side_effect_id}");
+
+        if !self.is_replaying() {
+            return HistoryMatch::NoMatch;
+        }
+
+        match &self.events[self.cursor] {
+            WorkflowEvent::MarkerRecorded { name, details } if *name == marker_name => {
+                let output = details.clone();
+                self.cursor += 1;
+                self.advance_to_next_unconsumed_event();
+                HistoryMatch::Matched { output }
+            }
+            other => HistoryMatch::Diverged {
+                expected: format!("MarkerRecorded({marker_name})"),
+                actual: other.type_name().to_string(),
+            },
+        }
+    }
+
+    /// Versioning mechanism for safe workflow code changes.
+    ///
+    /// Checks the recorded history for a version marker. If the marker is present
+    /// in history, returns the recorded version. If not in history (first execution
+    /// or unversioned branch), records `max_version` as a marker and returns it.
+    ///
+    /// This ensures that existing non-deterministic executions continue correctly,
+    /// while new executions start on the new `max_version` path.
     pub fn match_version(&mut self, change_id: &str, min_version: u32, max_version: u32) -> u32 {
         self.advance_to_next_unconsumed_event();
         let marker_name = format!("version:{change_id}");
@@ -550,7 +617,7 @@ impl HistoryMatcher {
 mod tests {
     use super::*;
     use crate::error::TimeoutType;
-    use crate::types::{ActivityExecId, TimerId, WorkerId};
+    use crate::types::{ActivityExecId, ExecutionId, TimerId, WorkerId};
     use chrono::Utc;
 
     /// Helper: build a minimal activity lifecycle (Scheduled -> Completed).
@@ -786,6 +853,47 @@ mod tests {
         let mut matcher = HistoryMatcher::new(events);
         let result = matcher.match_timer("t1");
         assert!(matches!(result, HistoryMatch::Diverged { .. }));
+    }
+
+    #[test]
+    fn matcher_replays_continue_as_new() {
+        let payload = serde_json::json!({"phase": "next"});
+        let events = vec![WorkflowEvent::WorkflowContinuedAsNew {
+            new_exec_id: ExecutionId::new(),
+            input: payload.clone(),
+        }];
+
+        let mut matcher = HistoryMatcher::new(events);
+        let result = matcher.match_continue_as_new(&payload);
+        assert_eq!(result, HistoryMatch::Matched { output: payload });
+        assert_eq!(matcher.position(), 1);
+        assert!(!matcher.is_replaying());
+    }
+
+    #[test]
+    fn matcher_continue_as_new_input_mismatch_diverges() {
+        let events = vec![WorkflowEvent::WorkflowContinuedAsNew {
+            new_exec_id: ExecutionId::new(),
+            input: serde_json::json!({"phase": "next"}),
+        }];
+
+        let mut matcher = HistoryMatcher::new(events);
+        let result = matcher.match_continue_as_new(&serde_json::json!({"phase": "later"}));
+        assert!(matches!(result, HistoryMatch::Diverged { .. }));
+        assert_eq!(matcher.position(), 0);
+    }
+
+    #[test]
+    fn matcher_continue_as_new_wrong_event_diverges() {
+        let events = vec![WorkflowEvent::TimerStarted {
+            timer_id: TimerId::new("t1"),
+            duration_secs: 60,
+        }];
+
+        let mut matcher = HistoryMatcher::new(events);
+        let result = matcher.match_continue_as_new(&serde_json::json!({"phase": "next"}));
+        assert!(matches!(result, HistoryMatch::Diverged { .. }));
+        assert_eq!(matcher.position(), 0);
     }
 
     #[test]

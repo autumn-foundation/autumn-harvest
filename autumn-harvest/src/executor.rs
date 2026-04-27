@@ -12,6 +12,7 @@
 use std::time::Duration;
 
 use serde_json::Value;
+use tracing::Instrument;
 
 use crate::context::{SharedState, WorkflowCommand, WorkflowContext, empty_shared_state};
 use crate::event::WorkflowEvent;
@@ -22,12 +23,29 @@ use crate::types::ExecutionId;
 #[derive(Debug)]
 pub enum WorkflowOutcome {
     /// The workflow ran to completion and returned a value.
-    Completed { output: Value },
+    Completed {
+        /// The final result serialized as JSON.
+        output: Value,
+    },
     /// The workflow function returned an error.
-    Failed { error: String },
+    Failed {
+        /// The string description of the error encountered.
+        error: String,
+    },
     /// The workflow suspended awaiting activity results or timer firings.
     /// The accumulated commands describe what the worker needs to schedule.
-    Suspended { commands: Vec<WorkflowCommand> },
+    Suspended {
+        /// A list of commands representing the side effects (e.g. activities) requested.
+        commands: Vec<WorkflowCommand>,
+    },
+    /// The workflow signalled `continue_as_new`. The current execution is
+    /// terminal and the worker should atomically start a fresh execution
+    /// with the same logical `WorkflowId` but a new `ExecutionId`, passing
+    /// `input` as the initial payload.
+    ContinuedAsNew {
+        /// JSON payload to pass to the next iteration of the workflow.
+        input: Value,
+    },
 }
 
 /// Default timeout for detecting suspension -- if the workflow hasn't completed
@@ -67,23 +85,51 @@ pub async fn run_workflow_with_state(
 ) -> WorkflowOutcome {
     let ctx = WorkflowContext::for_replay_with_state(exec_id, history, state);
 
-    // Run the handler with a timeout. If it completes, we get the result.
-    // If it blocks on a oneshot (suspended), the timeout fires and we drain
-    // the accumulated commands.
-    let timeout_result = tokio::time::timeout(SUSPENSION_TIMEOUT, handler(&ctx, input)).await;
+    // Emit a span around every executor cycle so operators can correlate the
+    // handler invocation with timers, activity dispatches, and log events that
+    // happen inside. Applications bridge `tracing` to OpenTelemetry via
+    // `tracing-opentelemetry` or an equivalent layer — the harvest engine
+    // itself stays backend-agnostic.
+    let span = tracing::info_span!(
+        "harvest.workflow.run",
+        "otel.kind" = "internal",
+        workflow.execution_id = %exec_id,
+    );
 
-    match timeout_result {
-        // Handler completed within the timeout window.
-        Ok(Ok(output)) => WorkflowOutcome::Completed { output },
-        Ok(Err(error)) => WorkflowOutcome::Failed { error },
+    async {
+        // Run the handler with a timeout. If it completes, we get the result.
+        // If it blocks on a oneshot (suspended), the timeout fires and we drain
+        // the accumulated commands.
+        let timeout_result = tokio::time::timeout(SUSPENSION_TIMEOUT, handler(&ctx, input)).await;
 
-        // Timeout elapsed -- the handler is suspended on a oneshot channel.
-        // Drain the commands it emitted before suspending.
-        Err(_elapsed) => {
-            let commands = ctx.drain_commands();
-            WorkflowOutcome::Suspended { commands }
+        match timeout_result {
+            // Handler completed within the timeout window.
+            Ok(Ok(output)) => WorkflowOutcome::Completed { output },
+            Ok(Err(error)) => WorkflowOutcome::Failed { error },
+
+            // Timeout elapsed -- the handler is suspended on a oneshot channel.
+            // Drain the commands it emitted before suspending.
+            Err(_elapsed) => {
+                let mut commands = ctx.drain_commands();
+                // ContinueAsNew is terminal: when the workflow body parks on
+                // the dedicated suspension future, the latest command in the
+                // drain is the ContinueAsNew the user requested. Any commands
+                // earlier in the drain (e.g. RecordMarker for `version()` or
+                // `side_effect`) are intentionally discarded — they describe
+                // bookkeeping for an execution that is about to be sealed.
+                if let Some(idx) = commands
+                    .iter()
+                    .rposition(|cmd| matches!(cmd, WorkflowCommand::ContinueAsNew { .. }))
+                    && let WorkflowCommand::ContinueAsNew { input } = commands.swap_remove(idx)
+                {
+                    return WorkflowOutcome::ContinuedAsNew { input };
+                }
+                WorkflowOutcome::Suspended { commands }
+            }
         }
     }
+    .instrument(span)
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -191,6 +237,46 @@ mod tests {
                 );
             }
             other => panic!("expected Suspended, got {other:?}"),
+        }
+    }
+
+    /// A workflow that triggers `continue_as_new` mid-flight.
+    fn continue_as_new_workflow<'a>(
+        ctx: &'a WorkflowContext,
+        input: Value,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            // The future returned by continue_as_new never resolves on its
+            // own; the executor's suspension timeout drains the command and
+            // surfaces it as ContinuedAsNew.
+            let _ = ctx
+                .continue_as_new(serde_json::json!({"prev": input}))
+                .await;
+            unreachable!("continue_as_new must not resolve");
+        })
+    }
+
+    #[tokio::test]
+    async fn executor_returns_continued_as_new_when_command_drained() {
+        let exec_id = ExecutionId::new();
+        let history = vec![WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+        }];
+
+        let outcome = run_workflow(
+            exec_id,
+            history,
+            continue_as_new_workflow,
+            serde_json::json!("v1"),
+        )
+        .await;
+
+        match outcome {
+            WorkflowOutcome::ContinuedAsNew { input } => {
+                assert_eq!(input, serde_json::json!({"prev": "v1"}));
+            }
+            other => panic!("expected ContinuedAsNew, got {other:?}"),
         }
     }
 

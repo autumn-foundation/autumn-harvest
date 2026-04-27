@@ -120,6 +120,20 @@ async fn eris_unauthenticated_signal_workflow_is_accessible() {
 }
 
 #[tokio::test]
+async fn eris_unauthenticated_cancel_workflow_is_accessible() {
+    let app = unauthenticated_app();
+    let res = app
+        .oneshot(post_json(
+            "/workflows/00000000-0000-0000-0000-000000000001/cancel",
+            r#"{"reason": "operator request"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_ne!(res.status(), StatusCode::UNAUTHORIZED);
+    assert_ne!(res.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
 async fn eris_unauthenticated_query_workflow_is_accessible() {
     let app = unauthenticated_app();
     let res = app
@@ -215,6 +229,19 @@ async fn eris_require_auth_blocks_signal_workflow() {
 }
 
 #[tokio::test]
+async fn eris_require_auth_blocks_cancel_workflow() {
+    let app = authenticated_app();
+    let res = app
+        .oneshot(post_json(
+            "/workflows/00000000-0000-0000-0000-000000000001/cancel",
+            "{}",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn eris_require_auth_blocks_query_workflow() {
     let app = authenticated_app();
     let res = app
@@ -255,6 +282,48 @@ async fn eris_require_auth_blocks_patch_dag() {
     let app = authenticated_app();
     let res = app
         .oneshot(patch_json("/dags/my-dag", r#"{"paused": true}"#))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn eris_unauthenticated_list_dead_letters_is_accessible() {
+    let app = unauthenticated_app();
+    let res = app.oneshot(get("/dead-letters")).await.unwrap();
+    assert_ne!(res.status(), StatusCode::UNAUTHORIZED);
+    assert_ne!(res.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn eris_unauthenticated_replay_dead_letter_is_accessible() {
+    let app = unauthenticated_app();
+    let res = app
+        .oneshot(post_json(
+            "/dead-letters/00000000-0000-0000-0000-000000000001/replay",
+            "{}",
+        ))
+        .await
+        .unwrap();
+    assert_ne!(res.status(), StatusCode::UNAUTHORIZED);
+    assert_ne!(res.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn eris_require_auth_blocks_list_dead_letters() {
+    let app = authenticated_app();
+    let res = app.oneshot(get("/dead-letters")).await.unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn eris_require_auth_blocks_replay_dead_letter() {
+    let app = authenticated_app();
+    let res = app
+        .oneshot(post_json(
+            "/dead-letters/00000000-0000-0000-0000-000000000001/replay",
+            "{}",
+        ))
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);

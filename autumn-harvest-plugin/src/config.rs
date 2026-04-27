@@ -276,18 +276,18 @@ fn load_partial_root(path: &Path) -> Result<Option<PartialRoot>, ConfigError> {
 }
 
 fn resolve_profile(env: &dyn Env) -> Option<String> {
-    if let Ok(profile) = env.var("AUTUMN_PROFILE") {
-        if !profile.is_empty() {
-            return Some(profile);
-        }
+    if let Ok(profile) = env.var("AUTUMN_PROFILE")
+        && !profile.is_empty()
+    {
+        return Some(profile);
     }
 
     let args: Vec<String> = std::env::args().collect();
     for (i, arg) in args.iter().enumerate() {
-        if arg == "--profile" {
-            if let Some(profile) = args.get(i + 1) {
-                return Some(profile.clone());
-            }
+        if arg == "--profile"
+            && let Some(profile) = args.get(i + 1)
+        {
+            return Some(profile.clone());
         }
         if let Some(profile) = arg.strip_prefix("--profile=") {
             return Some(profile.to_owned());

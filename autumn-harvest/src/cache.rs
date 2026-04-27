@@ -38,12 +38,28 @@ pub struct WorkflowCache {
 impl WorkflowCache {
     /// Create a new cache with the given maximum number of entries.
     ///
+    /// If `max_size` is zero, it defaults to a capacity of 1.
+    /// The maximum size is also capped at 1,000,000 entries to prevent OOM
+    /// conditions when large, arbitrary sizes are requested.
+    ///
     /// # Panics
     ///
-    /// Panics if `max_size` is zero.
+    /// Panics if the clamped capacity somehow becomes zero (which should be
+    /// mathematically impossible due to the clamping bounds).
+    ///
+    /// ## Examples
+    ///
+    /// ```rust
+    /// use autumn_harvest::cache::WorkflowCache;
+    ///
+    /// let cache = WorkflowCache::new(10);
+    /// assert_eq!(cache.len(), 0);
+    /// ```
     #[must_use]
     pub fn new(max_size: usize) -> Self {
-        let cap = NonZeroUsize::new(max_size).expect("cache max_size must be > 0");
+        // Havoc prevention: Cap max capacity to prevent OOM, and floor at 1 to prevent panic.
+        let safe_size = max_size.clamp(1, 1_000_000);
+        let cap = NonZeroUsize::new(safe_size).expect("clamp ensures size >= 1");
         Self {
             inner: LruCache::new(cap),
         }
@@ -52,6 +68,17 @@ impl WorkflowCache {
     /// Insert or update a cached workflow state.
     ///
     /// If the cache is full, the least-recently-used entry is evicted.
+    ///
+    /// ## Examples
+    ///
+    /// ```rust
+    /// use uuid::Uuid;
+    /// use autumn_harvest::cache::{WorkflowCache, CachedWorkflowState};
+    ///
+    /// let mut cache = WorkflowCache::new(10);
+    /// let state = CachedWorkflowState { replay_position: 1, next_activity_seq: 1, next_timer_seq: 1 };
+    /// cache.insert(Uuid::new_v4(), state);
+    /// ```
     pub fn insert(&mut self, exec_id: Uuid, state: CachedWorkflowState) {
         self.inner.put(exec_id, state);
     }
@@ -59,23 +86,62 @@ impl WorkflowCache {
     /// Look up a cached workflow state, marking it as recently used.
     ///
     /// Returns `None` if the execution ID is not in the cache.
+    ///
+    /// ## Examples
+    ///
+    /// ```rust
+    /// use uuid::Uuid;
+    /// use autumn_harvest::cache::WorkflowCache;
+    ///
+    /// let mut cache = WorkflowCache::new(10);
+    /// assert!(cache.get(&Uuid::new_v4()).is_none());
+    /// ```
     #[must_use]
     pub fn get(&mut self, exec_id: &Uuid) -> Option<&CachedWorkflowState> {
         self.inner.get(exec_id)
     }
 
     /// Remove a cached workflow state, returning it if present.
+    ///
+    /// ## Examples
+    ///
+    /// ```rust
+    /// use uuid::Uuid;
+    /// use autumn_harvest::cache::WorkflowCache;
+    ///
+    /// let mut cache = WorkflowCache::new(10);
+    /// let id = Uuid::new_v4();
+    /// assert!(cache.remove(&id).is_none());
+    /// ```
     pub fn remove(&mut self, exec_id: &Uuid) -> Option<CachedWorkflowState> {
         self.inner.pop(exec_id)
     }
 
     /// Returns the number of entries currently in the cache.
+    ///
+    /// ## Examples
+    ///
+    /// ```rust
+    /// use autumn_harvest::cache::WorkflowCache;
+    ///
+    /// let cache = WorkflowCache::new(10);
+    /// assert_eq!(cache.len(), 0);
+    /// ```
     #[must_use]
     pub fn len(&self) -> usize {
         self.inner.len()
     }
 
     /// Returns `true` if the cache contains no entries.
+    ///
+    /// ## Examples
+    ///
+    /// ```rust
+    /// use autumn_harvest::cache::WorkflowCache;
+    ///
+    /// let cache = WorkflowCache::new(10);
+    /// assert!(cache.is_empty());
+    /// ```
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
@@ -156,7 +222,12 @@ mod tests {
         cache.insert(id, make_state(10));
         let removed = cache.remove(&id);
         assert!(removed.is_some());
-        assert_eq!(removed.unwrap().replay_position, 10);
+        assert_eq!(
+            removed
+                .expect("removed entry should not be None")
+                .replay_position,
+            10
+        );
         assert!(cache.is_empty());
     }
 
@@ -164,6 +235,18 @@ mod tests {
     fn cache_get_missing_returns_none() {
         let mut cache = WorkflowCache::new(5);
         assert!(cache.get(&Uuid::new_v4()).is_none());
+    }
+
+    #[test]
+    fn cache_handles_zero_size_safely() {
+        let cache = WorkflowCache::new(0);
+        assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn cache_handles_max_size_without_oom() {
+        let cache = WorkflowCache::new(usize::MAX);
+        assert_eq!(cache.len(), 0);
     }
 
     #[test]

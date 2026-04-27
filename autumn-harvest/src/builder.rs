@@ -1,10 +1,13 @@
 //! Fluent API for registering workflows, activities, and configuring the worker.
 
 use std::any::{Any, TypeId};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::context::SharedStateMap;
 use crate::info::{ActivityInfo, DagInfo, WorkflowInfo};
+use crate::telemetry::TelemetryConfig;
+use crate::types::ShardId;
 
 /// Fluent builder for configuring the autumn-harvest engine.
 ///
@@ -18,6 +21,7 @@ pub struct HarvestBuilder {
     dags: Vec<DagInfo>,
     worker_config: WorkerConfig,
     state: SharedStateMap,
+    telemetry: Option<TelemetryConfig>,
 }
 
 impl std::fmt::Debug for HarvestBuilder {
@@ -28,6 +32,7 @@ impl std::fmt::Debug for HarvestBuilder {
             .field("dag_count", &self.dags.len())
             .field("worker_config", &self.worker_config)
             .field("state_count", &self.state.len())
+            .field("telemetry_configured", &self.telemetry.is_some())
             .finish()
     }
 }
@@ -39,6 +44,7 @@ pub struct BuiltHarvest {
     dags: Vec<DagInfo>,
     worker_config: WorkerConfig,
     state: SharedStateMap,
+    telemetry: Arc<TelemetryConfig>,
 }
 
 impl std::fmt::Debug for BuiltHarvest {
@@ -49,6 +55,7 @@ impl std::fmt::Debug for BuiltHarvest {
             .field("dag_count", &self.dags.len())
             .field("worker_config", &self.worker_config)
             .field("state_count", &self.state.len())
+            .field("telemetry", &self.telemetry)
             .finish()
     }
 }
@@ -56,19 +63,19 @@ impl std::fmt::Debug for BuiltHarvest {
 impl BuiltHarvest {
     /// Number of registered workflows.
     #[must_use]
-    pub fn workflow_count(&self) -> usize {
+    pub const fn workflow_count(&self) -> usize {
         self.workflows.len()
     }
 
     /// Number of registered activities.
     #[must_use]
-    pub fn activity_count(&self) -> usize {
+    pub const fn activity_count(&self) -> usize {
         self.activities.len()
     }
 
     /// Number of registered DAGs.
     #[must_use]
-    pub fn dag_count(&self) -> usize {
+    pub const fn dag_count(&self) -> usize {
         self.dags.len()
     }
 
@@ -90,15 +97,22 @@ impl BuiltHarvest {
         &self.dags
     }
 
+    /// Telemetry configuration (spans propagator + metrics recorder).
+    #[must_use]
+    pub const fn telemetry(&self) -> &Arc<TelemetryConfig> {
+        &self.telemetry
+    }
+
     /// Convert the built harvest registration into worker-ready parts.
     #[cfg(feature = "db")]
     #[must_use]
     pub fn into_worker_parts(self) -> (crate::worker::HandlerRegistry, Vec<DagInfo>, WorkerConfig) {
         (
-            crate::worker::HandlerRegistry::with_state(
+            crate::worker::HandlerRegistry::with_state_and_telemetry(
                 self.workflows,
                 self.activities,
-                std::sync::Arc::new(self.state),
+                Arc::new(self.state),
+                self.telemetry,
             ),
             self.dags,
             self.worker_config,
@@ -115,10 +129,11 @@ impl BuiltHarvest {
     ) -> (crate::worker::HandlerRegistry, Vec<DagInfo>, WorkerConfig) {
         self.state.extend(extra_state);
         (
-            crate::worker::HandlerRegistry::with_state(
+            crate::worker::HandlerRegistry::with_state_and_telemetry(
                 self.workflows,
                 self.activities,
-                std::sync::Arc::new(self.state),
+                Arc::new(self.state),
+                self.telemetry,
             ),
             self.dags,
             self.worker_config,
@@ -170,21 +185,32 @@ impl HarvestBuilder {
         self
     }
 
+    /// Install a [`TelemetryConfig`] so the worker captures trace context at
+    /// enqueue, reinstates it on claim, and emits workflow / activity / timer
+    /// metrics through the supplied recorder.
+    ///
+    /// When unset, the runtime uses safe no-op defaults — telemetry is opt-in.
+    #[must_use]
+    pub fn telemetry(mut self, telemetry: TelemetryConfig) -> Self {
+        self.telemetry = Some(telemetry);
+        self
+    }
+
     /// Number of registered workflows (used in tests and diagnostics).
     #[must_use]
-    pub fn workflow_count(&self) -> usize {
+    pub const fn workflow_count(&self) -> usize {
         self.workflows.len()
     }
 
     /// Number of registered activities.
     #[must_use]
-    pub fn activity_count(&self) -> usize {
+    pub const fn activity_count(&self) -> usize {
         self.activities.len()
     }
 
     /// Number of registered DAG definitions.
     #[must_use]
-    pub fn dag_count(&self) -> usize {
+    pub const fn dag_count(&self) -> usize {
         self.dags.len()
     }
 
@@ -197,6 +223,7 @@ impl HarvestBuilder {
             dags: self.dags,
             worker_config: self.worker_config,
             state: self.state,
+            telemetry: Arc::new(self.telemetry.unwrap_or_default()),
         }
     }
 }
@@ -218,6 +245,20 @@ pub struct WorkerConfig {
     pub workflow_cache_size: usize,
     /// How long to offer sticky tasks to the sticky worker before fallback.
     pub sticky_timeout: Duration,
+    /// Grace period for an activity to finish cooperatively after its workflow
+    /// is cancelled before the worker hard-aborts the handler task. Cancellation
+    /// is cooperative -- activities should poll [`crate::context::ActivityContext::is_cancelled`]
+    /// or call [`crate::context::ActivityContext::heartbeat`], but an uncooperative handler must
+    /// not block a worker slot indefinitely.
+    pub cancellation_grace_period: Duration,
+    /// Shards this worker is responsible for polling.
+    ///
+    /// Defaults to `[ShardId::new(0)]`, matching the single-shard deployment
+    /// shape. Multi-shard operators typically run one worker process per
+    /// shard with `shard_assignments = vec![that_shard]`, but the field is
+    /// a `Vec` so future per-process multi-shard workers can list all shards
+    /// they should poll without changing the config surface.
+    pub shard_assignments: Vec<ShardId>,
 }
 
 impl Default for WorkerConfig {
@@ -230,6 +271,8 @@ impl Default for WorkerConfig {
             shutdown_timeout: Duration::from_secs(30),
             workflow_cache_size: 1000,
             sticky_timeout: Duration::from_secs(5),
+            cancellation_grace_period: Duration::from_secs(5),
+            shard_assignments: vec![ShardId::new(0)],
         }
     }
 }
@@ -256,6 +299,34 @@ impl WorkerConfig {
     #[must_use]
     pub fn with_notification_database_url(mut self, database_url: impl Into<String>) -> Self {
         self.notification_database_url = Some(database_url.into());
+        self
+    }
+
+    /// Override the cancellation grace period.
+    ///
+    /// After a workflow is cancelled, any running activity gets this long to
+    /// notice cooperative cancellation (via [`crate::context::ActivityContext::is_cancelled`]
+    /// or [`crate::context::ActivityContext::heartbeat`]) and unwind cleanly. If it is still
+    /// running at the end of the grace period the worker aborts the handler
+    /// task and marks the activity as cancelled.
+    #[must_use]
+    pub const fn with_cancellation_grace_period(mut self, grace_period: Duration) -> Self {
+        self.cancellation_grace_period = grace_period;
+        self
+    }
+
+    /// Assign which shards this worker is responsible for.
+    ///
+    /// Empty assignments default back to `[ShardId::new(0)]` to preserve the
+    /// single-shard behaviour.
+    #[must_use]
+    pub fn with_shard_assignments(mut self, shards: impl IntoIterator<Item = ShardId>) -> Self {
+        let shards: Vec<ShardId> = shards.into_iter().collect();
+        self.shard_assignments = if shards.is_empty() {
+            vec![ShardId::new(0)]
+        } else {
+            shards
+        };
         self
     }
 }
@@ -339,6 +410,43 @@ mod tests {
         assert_eq!(built.dag_count(), 0);
         assert_eq!(built.state::<String>(), Some(&String::from("hello")));
         assert!(built.state::<u64>().is_none());
+    }
+
+    #[test]
+    fn harvest_builder_build_defaults_telemetry_to_noop() {
+        let built = HarvestBuilder::new().build();
+        // Default is a safe no-op: capturing yields nothing.
+        assert!(built.telemetry().capture_trace_context().is_none());
+    }
+
+    #[test]
+    fn harvest_builder_telemetry_override_is_propagated() {
+        use crate::telemetry::{TelemetryConfig, TraceContextCarrier, TraceContextPropagator};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct StubProp {
+            captured: AtomicUsize,
+        }
+        impl TraceContextPropagator for StubProp {
+            fn capture(&self) -> Option<TraceContextCarrier> {
+                self.captured.fetch_add(1, Ordering::SeqCst);
+                Some(TraceContextCarrier::from_traceparent("00-f00-b44-01"))
+            }
+            fn install(&self, _carrier: &TraceContextCarrier) -> Box<dyn Any + Send> {
+                Box::new(())
+            }
+        }
+
+        let prop = std::sync::Arc::new(StubProp::default());
+        let built = HarvestBuilder::new()
+            .telemetry(TelemetryConfig::builder().propagator(prop.clone()).build())
+            .build();
+
+        assert_eq!(prop.captured.load(Ordering::SeqCst), 0);
+        let carrier = built.telemetry().capture_trace_context().unwrap();
+        assert_eq!(carrier.traceparent.as_deref(), Some("00-f00-b44-01"));
+        assert_eq!(prop.captured.load(Ordering::SeqCst), 1);
     }
 
     #[cfg(feature = "db")]

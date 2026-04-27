@@ -124,6 +124,10 @@ pub struct TaskQueueItem {
     pub retry_policy: Option<serde_json::Value>,
     pub output: Option<serde_json::Value>,
     pub error: Option<String>,
+    pub sticky_worker_id: Option<String>,
+    pub sticky_until: Option<DateTime<Utc>>,
+    pub sticky_timeout: Option<chrono::Duration>,
+    pub trace_context: Option<serde_json::Value>,
 }
 
 /// Insert struct for enqueuing a new task.
@@ -143,6 +147,10 @@ pub struct NewTaskQueueItem<'a> {
     pub start_to_close: Option<chrono::Duration>,
     pub schedule_to_start: Option<chrono::Duration>,
     pub retry_policy: Option<serde_json::Value>,
+    pub sticky_worker_id: Option<&'a str>,
+    pub sticky_until: Option<DateTime<Utc>>,
+    pub sticky_timeout: Option<chrono::Duration>,
+    pub trace_context: Option<serde_json::Value>,
 }
 
 // ── DagRun ────────────────────────────────────────────────────────────────────

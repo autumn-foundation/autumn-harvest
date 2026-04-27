@@ -12,7 +12,7 @@ use autumn_harvest::info::{ActivityInfo, WorkflowInfo};
 use autumn_harvest::models::{
     HarvestTimer, NewWorkflowExecution, TaskQueueItem, WorkflowExecution,
 };
-use autumn_harvest::queue::{EnqueueParams, TaskType};
+use autumn_harvest::queue::{EnqueueParams, StickyHint, TaskType};
 use autumn_harvest::schema::{harvest_task_queue, harvest_timers, harvest_workflow_executions};
 use autumn_harvest::store;
 use autumn_harvest::types::{ActivityExecId, ExecutionId};
@@ -40,7 +40,30 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use uuid::Uuid;
 
 /// The migration SQL embedded at compile time.
-const INIT_SQL: &str = include_str!("../migrations/20260409000000_harvest_initial/up.sql");
+///
+/// Combines the initial schema with every forward-compatible schema-addition
+/// migration that ships in `migrations/`. The
+/// `20260410010000_harvest_workflow_start_uniqueness` migration is
+/// deliberately excluded because one test (see
+/// `legacy_workflow_uniqueness_schema_can_be_upgraded_for_idempotent_starts`)
+/// applies it on a legacy schema to verify the upgrade path.
+const INIT_SQL: &str = concat!(
+    include_str!("../migrations/20260409000000_harvest_initial/up.sql"),
+    "\n",
+    include_str!("../migrations/20260424000001_harvest_trace_context/up.sql"),
+    "\n",
+    include_str!("../migrations/20260427000000_harvest_continue_as_new/up.sql"),
+);
+
+/// The minimal "legacy" migration set used by the upgrade-path regression
+/// test. Excludes both the workflow-start uniqueness upgrade *and* the
+/// continue-as-new migration so the test can drive the database through the
+/// historical upgrade sequence: legacy -> uniqueness fix -> continue-as-new.
+const LEGACY_INIT_SQL: &str = concat!(
+    include_str!("../migrations/20260409000000_harvest_initial/up.sql"),
+    "\n",
+    include_str!("../migrations/20260424000001_harvest_trace_context/up.sql"),
+);
 
 /// Start a Postgres container with the harvest schema applied and return
 /// an `AsyncPgConnection` ready for use.
@@ -233,7 +256,12 @@ async fn legacy_workflow_uniqueness_schema_can_be_upgraded_for_idempotent_starts
     let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
         .await
         .expect("failed to connect to Postgres container");
-    let legacy_init_sql = INIT_SQL.replacen(
+    // Build a "legacy" schema: the original initial migration whose
+    // uniqueness key was `(workflow_id, run_id)` rather than the modern
+    // `(workflow_name, workflow_id)`. The continue-as-new migration is
+    // deliberately *not* applied yet so this test exercises the historical
+    // upgrade path one step at a time.
+    let legacy_init_sql = LEGACY_INIT_SQL.replacen(
         "UNIQUE (workflow_name, workflow_id)",
         "UNIQUE (workflow_id, run_id)",
         1,
@@ -245,7 +273,7 @@ async fn legacy_workflow_uniqueness_schema_can_be_upgraded_for_idempotent_starts
     let request = StartWorkflowParams {
         workflow_name: "upgrade_test",
         workflow_id: "workflow-42",
-        shard_id: 0,
+        exec_id: autumn_harvest::ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0)),
         input: serde_json::json!({ "workflow_id": 42 }),
         parent_id: None,
         queue_name: "default",
@@ -254,12 +282,16 @@ async fn legacy_workflow_uniqueness_schema_can_be_upgraded_for_idempotent_starts
         search_attrs: None,
     };
 
-    let legacy_error = start_or_load_workflow_execution(&mut conn, request.clone())
+    // On the legacy schema there is no `(workflow_name, workflow_id)`
+    // uniqueness anywhere, so the first start succeeds — but the schema
+    // alone does not yet enforce idempotency. The point of the upgrade
+    // migration is to add that enforcement.
+    let initial_start = start_or_load_workflow_execution(&mut conn, request.clone())
         .await
-        .expect_err("legacy schema should reject the new ON CONFLICT target");
+        .expect("first start should succeed even on legacy schema");
     assert!(
-        matches!(legacy_error, HarvestError::Database(_)),
-        "legacy schema should fail with a database error, got {legacy_error:?}",
+        initial_start.created,
+        "first start should create a workflow execution row on the legacy schema",
     );
 
     let upgrade_path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -274,24 +306,45 @@ async fn legacy_workflow_uniqueness_schema_can_be_upgraded_for_idempotent_starts
         .await
         .expect("failed to apply harvest upgrade migration");
 
-    let first = start_or_load_workflow_execution(&mut conn, request.clone())
+    // After the start-uniqueness upgrade, repeated starts must collapse onto
+    // the originally-created row.
+    let after_uniqueness = start_or_load_workflow_execution(&mut conn, request.clone())
         .await
-        .expect("upgrade migration should restore workflow start");
-    let second = start_or_load_workflow_execution(&mut conn, request)
-        .await
-        .expect("upgrade migration should restore idempotent workflow start");
-
+        .expect("post-upgrade start should reuse the legacy row idempotently");
     assert!(
-        first.created,
-        "first start should create a workflow execution"
-    );
-    assert!(
-        !second.created,
-        "second start should reuse the existing workflow execution",
+        !after_uniqueness.created,
+        "post-upgrade start should not create a second row",
     );
     assert_eq!(
-        first.exec_id, second.exec_id,
-        "idempotent starts should point at the same execution after the upgrade migration",
+        initial_start.exec_id, after_uniqueness.exec_id,
+        "post-upgrade start should resolve to the same execution as the legacy start",
+    );
+
+    // Apply the continue-as-new migration on top to make sure the partial
+    // unique index it installs is compatible with the upgraded schema and
+    // continues to enforce idempotent starts.
+    let continue_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("migrations/20260427000000_harvest_continue_as_new/up.sql");
+    let continue_sql = std::fs::read_to_string(&continue_path).unwrap_or_else(|error| {
+        panic!(
+            "failed to read continue-as-new migration at {}: {error}",
+            continue_path.display()
+        )
+    });
+    conn.batch_execute(&continue_sql)
+        .await
+        .expect("failed to apply continue-as-new migration");
+
+    let after_continue_as_new = start_or_load_workflow_execution(&mut conn, request)
+        .await
+        .expect("start should remain idempotent after the continue-as-new migration");
+    assert!(
+        !after_continue_as_new.created,
+        "continue-as-new migration should not break idempotent starts",
+    );
+    assert_eq!(
+        initial_start.exec_id, after_continue_as_new.exec_id,
+        "idempotent starts should still resolve to the same execution after continue-as-new",
     );
 }
 
@@ -337,6 +390,8 @@ fn build_runtime_worker(
                 max_concurrent_activities,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(1),
+                cancellation_grace_period: Duration::from_secs(1),
+                sticky_timeout: Duration::from_secs(5),
             },
             registry,
         )
@@ -381,6 +436,24 @@ fn child_round_trip_registry() -> Arc<HandlerRegistry> {
                 name: "child_echo_workflow",
                 module: "integration_e2e",
                 handler: child_echo_workflow,
+            },
+        ],
+        vec![],
+    ))
+}
+
+fn child_continue_as_new_rejection_registry() -> Arc<HandlerRegistry> {
+    Arc::new(HandlerRegistry::new(
+        vec![
+            WorkflowInfo {
+                name: "e2e_test_workflow",
+                module: "integration_e2e",
+                handler: parent_workflow_with_continue_as_new_child,
+            },
+            WorkflowInfo {
+                name: "child_continue_as_new_workflow",
+                module: "integration_e2e",
+                handler: continue_as_new_workflow,
             },
         ],
         vec![],
@@ -517,6 +590,40 @@ fn child_echo_workflow<'a>(
         Ok(serde_json::json!({
             "child": value,
         }))
+    })
+}
+
+fn parent_workflow_with_continue_as_new_child<'a>(
+    ctx: &'a WorkflowContext,
+    input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        ctx.spawn_child_workflow_raw("child_continue_as_new_workflow", input)
+            .await
+            .map_err(|e| e.to_string())
+    })
+}
+
+/// First-generation handler used by the continue-as-new e2e test: it
+/// branches on the input. When invoked with `{"phase": "init"}` it requests
+/// continue-as-new with `{"phase": "next"}`. When invoked with the
+/// post-continuation payload it returns it directly.
+fn continue_as_new_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let phase = input
+            .get("phase")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        if phase == "init" {
+            let _ = ctx
+                .continue_as_new(serde_json::json!({"phase": "next", "ran_init": true}))
+                .await;
+            unreachable!("continue_as_new must not resolve");
+        }
+        Ok(input)
     })
 }
 
@@ -734,6 +841,8 @@ async fn worker_completes_workflow_task_and_persists_result() {
                 max_concurrent_activities: 1,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(1),
+                cancellation_grace_period: Duration::from_secs(1),
+                sticky_timeout: Duration::from_secs(5),
             },
             registry,
         )
@@ -823,6 +932,8 @@ async fn worker_marks_workflow_failed_when_handler_errors() {
                 max_concurrent_activities: 1,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(1),
+                cancellation_grace_period: Duration::from_secs(1),
+                sticky_timeout: Duration::from_secs(5),
             },
             registry,
         )
@@ -934,6 +1045,8 @@ async fn worker_completes_workflow_with_activity_round_trip() {
                 max_concurrent_activities: 1,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(1),
+                cancellation_grace_period: Duration::from_secs(1),
+                sticky_timeout: Duration::from_secs(5),
             },
             registry,
         )
@@ -1021,6 +1134,8 @@ async fn worker_fails_orphaned_activity_task_without_scheduled_event() {
                 max_concurrent_activities: 1,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(1),
+                cancellation_grace_period: Duration::from_secs(1),
+                sticky_timeout: Duration::from_secs(5),
             },
             Arc::new(HandlerRegistry::new(
                 vec![],
@@ -1134,7 +1249,7 @@ async fn timeout_enforcement_fails_pending_activity_and_wakes_workflow() {
         .expect("workflow task should be claimable");
     assert_eq!(claimed_workflow.id, workflow_task_id);
     assert_eq!(claimed_workflow.state, "RUNNING");
-    queue::park_workflow_task(&mut conn, workflow_task_id)
+    queue::park_workflow_task(&mut conn, workflow_task_id, None)
         .await
         .expect("park workflow task failed");
 
@@ -1221,6 +1336,8 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
                 max_concurrent_activities: 1,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(1),
+                cancellation_grace_period: Duration::from_secs(1),
+                sticky_timeout: Duration::from_secs(5),
             },
             Arc::new(HandlerRegistry::new(
                 vec![WorkflowInfo {
@@ -1333,6 +1450,8 @@ async fn worker_completes_workflow_with_timer_round_trip() {
                 max_concurrent_activities: 1,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(1),
+                cancellation_grace_period: Duration::from_secs(1),
+                sticky_timeout: Duration::from_secs(5),
             },
             Arc::new(HandlerRegistry::new(
                 vec![WorkflowInfo {
@@ -1462,6 +1581,90 @@ async fn worker_completes_parent_workflow_after_child_workflow_round_trip() {
             WorkflowEvent::WorkflowCompleted { .. },
         ]
     ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn child_continue_as_new_rejection_wakes_parent_with_child_failure() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect to Postgres container");
+
+    let parent_exec_id = insert_workflow_execution(&mut conn).await;
+    let workflow_input = serde_json::json!({"phase": "init"});
+    enqueue_started_workflow_task(&mut conn, parent_exec_id, workflow_input).await;
+
+    let worker = build_runtime_worker(
+        "worker-e2e-child-continue-reject",
+        2,
+        1,
+        child_continue_as_new_rejection_registry(),
+    );
+    let pool = build_test_pool(&database_url);
+    let handle = spawn_test_worker(Arc::clone(&worker), pool);
+
+    let parent_execution = wait_for_execution_state(&database_url, parent_exec_id, "FAILED").await;
+
+    worker.shutdown();
+    handle.await.expect("worker task should join");
+
+    let parent_history = load_history_from_url(&database_url, parent_exec_id).await;
+    assert!(
+        matches!(
+            parent_history.events.as_slice(),
+            [
+                WorkflowEvent::WorkflowStarted { .. },
+                WorkflowEvent::ChildWorkflowStarted { .. },
+                WorkflowEvent::ChildWorkflowFailed { .. },
+                WorkflowEvent::WorkflowFailed { .. },
+            ]
+        ),
+        "parent should observe a terminal child failure instead of staying parked: {:?}",
+        parent_history.events
+    );
+    let child_failure = parent_history
+        .events
+        .iter()
+        .find_map(|event| match event {
+            WorkflowEvent::ChildWorkflowFailed { child_id, error } => {
+                Some((*child_id, error.clone()))
+            }
+            _ => None,
+        })
+        .expect("parent history should include ChildWorkflowFailed");
+    assert!(
+        child_failure
+            .1
+            .contains("continue_as_new is not supported in child workflows"),
+        "parent should receive the rejection reason from the child"
+    );
+
+    let child_execution = load_execution_from_url(&database_url, child_failure.0).await;
+    assert_eq!(child_execution.state, "FAILED");
+    assert_eq!(
+        child_execution.error.as_deref(),
+        Some("continue_as_new is not supported in child workflows in this release"),
+    );
+
+    let child_history = load_history_from_url(&database_url, child_failure.0).await;
+    assert!(
+        matches!(
+            child_history.events.as_slice(),
+            [
+                WorkflowEvent::WorkflowStarted { .. },
+                WorkflowEvent::WorkflowFailed { .. },
+            ]
+        ),
+        "child should fail cleanly after the rejected continue-as-new: {:?}",
+        child_history.events
+    );
+
+    assert!(
+        parent_execution.error.as_deref().is_some_and(
+            |error| error.contains("continue_as_new is not supported in child workflows")
+        ),
+        "parent should fail with the propagated child error",
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1651,7 +1854,7 @@ async fn wake_workflow_task_emits_notification() {
         .expect("claim should succeed")
         .expect("workflow task should be claimable");
     assert_eq!(claimed.id, task_id);
-    queue::park_workflow_task(&mut conn, task_id)
+    queue::park_workflow_task(&mut conn, task_id, None)
         .await
         .expect("park workflow task should succeed");
 
@@ -2128,4 +2331,526 @@ async fn duplicate_event_id_is_rejected() {
     let result = store::append_events(&mut conn, exec_id, &events, 0).await;
     assert!(result.is_err());
     assert!(matches!(result.unwrap_err(), HarvestError::Database(_)));
+}
+
+// ---------------------------------------------------------------------------
+// Sticky cross-worker routing tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn enqueue_with_sticky_pin_stores_worker_and_expiry() {
+    let (mut conn, _container) = setup_test_db().await;
+    let exec_id = insert_workflow_execution(&mut conn).await;
+
+    let params = EnqueueParams::new(
+        "default",
+        TaskType::Workflow,
+        serde_json::json!({"go": true}),
+    )
+    .with_sticky("worker-sticky-1", Duration::from_secs(3));
+    let mut enqueue = params.clone();
+    enqueue.workflow_exec_id = Some(exec_id.as_uuid());
+
+    let task_id = queue::enqueue(&mut conn, &enqueue)
+        .await
+        .expect("enqueue should succeed");
+
+    let row = harvest_task_queue::table
+        .find(task_id)
+        .select(TaskQueueItem::as_select())
+        .first(&mut conn)
+        .await
+        .expect("row should exist");
+
+    assert_eq!(row.sticky_worker_id.as_deref(), Some("worker-sticky-1"));
+    assert!(row.sticky_until.is_some(), "sticky_until should be set");
+    let stored_timeout = row.sticky_timeout.expect("sticky_timeout should be set");
+    assert_eq!(
+        stored_timeout.num_seconds(),
+        3,
+        "sticky_timeout interval should round-trip as 3 seconds (got {stored_timeout})",
+    );
+}
+
+async fn insert_named_workflow_execution(
+    conn: &mut AsyncPgConnection,
+    workflow_id: &str,
+) -> ExecutionId {
+    let exec_id = ExecutionId::new();
+    let row = NewWorkflowExecution {
+        id: exec_id.as_uuid(),
+        workflow_name: "e2e_sticky_test",
+        workflow_id,
+        run_id: Uuid::new_v4(),
+        shard_id: 0,
+        input: serde_json::json!({}),
+        parent_id: None,
+        queue_name: "default",
+        execution_timeout: None,
+        memo: None,
+        search_attrs: None,
+    };
+    diesel::insert_into(harvest_workflow_executions::table)
+        .values(&row)
+        .execute(conn)
+        .await
+        .expect("failed to insert sticky test workflow execution");
+    exec_id
+}
+
+#[tokio::test]
+async fn claim_task_prefers_sticky_worker_within_window() {
+    let (mut conn, _container) = setup_test_db().await;
+    let exec_pinned = insert_named_workflow_execution(&mut conn, "pinned-1").await;
+    let exec_free = insert_named_workflow_execution(&mut conn, "free-1").await;
+
+    // Free task is higher priority AND enqueued first so it would ordinarily be
+    // claimed ahead of the pinned task by any worker. Sticky routing must
+    // reshuffle the order so the pinned worker sees its pinned row first.
+    let mut free = EnqueueParams::new("default", TaskType::Workflow, serde_json::json!({}));
+    free.priority = 10;
+    free.workflow_exec_id = Some(exec_free.as_uuid());
+    let free_id = queue::enqueue(&mut conn, &free)
+        .await
+        .expect("enqueue free task failed");
+
+    let mut pinned = EnqueueParams::new("default", TaskType::Workflow, serde_json::json!({}))
+        .with_sticky("sticky-worker", Duration::from_secs(30));
+    pinned.priority = 0;
+    pinned.workflow_exec_id = Some(exec_pinned.as_uuid());
+    let pinned_id = queue::enqueue(&mut conn, &pinned)
+        .await
+        .expect("enqueue pinned task failed");
+
+    let queues = vec!["default".to_string()];
+    let claimed = queue::claim_task(&mut conn, &queues, "sticky-worker")
+        .await
+        .expect("claim should succeed")
+        .expect("sticky worker should get its pinned task");
+    assert_eq!(
+        claimed.id, pinned_id,
+        "sticky worker should claim its pinned task ahead of the higher-priority free task",
+    );
+
+    let claimed_other = queue::claim_task(&mut conn, &queues, "other-worker")
+        .await
+        .expect("second claim should succeed")
+        .expect("other worker should pick up the free task");
+    assert_eq!(
+        claimed_other.id, free_id,
+        "other worker should still claim the unpinned free task",
+    );
+}
+
+#[tokio::test]
+async fn claim_task_excludes_other_workers_while_sticky_active() {
+    let (mut conn, _container) = setup_test_db().await;
+    let exec_id = insert_workflow_execution(&mut conn).await;
+
+    let pinned = EnqueueParams::new("default", TaskType::Workflow, serde_json::json!({}))
+        .with_sticky("owner-worker", Duration::from_secs(30));
+    let mut pinned = pinned;
+    pinned.workflow_exec_id = Some(exec_id.as_uuid());
+    queue::enqueue(&mut conn, &pinned)
+        .await
+        .expect("enqueue should succeed");
+
+    let queues = vec!["default".to_string()];
+    // Different worker must not steal a fresh sticky pin.
+    let claimed = queue::claim_task(&mut conn, &queues, "interloper")
+        .await
+        .expect("claim should succeed");
+    assert!(
+        claimed.is_none(),
+        "non-sticky worker should not claim a pinned task while sticky_until is in the future",
+    );
+
+    // The owner can still claim it.
+    let owner_claim = queue::claim_task(&mut conn, &queues, "owner-worker")
+        .await
+        .expect("owner claim should succeed")
+        .expect("owner should be able to claim its pinned task");
+    assert_eq!(
+        owner_claim.sticky_worker_id.as_deref(),
+        Some("owner-worker")
+    );
+}
+
+#[tokio::test]
+async fn claim_task_falls_back_to_any_worker_after_sticky_expires() {
+    let (mut conn, _container) = setup_test_db().await;
+    let exec_id = insert_workflow_execution(&mut conn).await;
+
+    // Pin with a short window so we can observe fallback without sleeping long.
+    // The sleep is generously larger than the window to tolerate DB/host clock
+    // skew inside testcontainers on CI runners.
+    let mut pinned = EnqueueParams::new("default", TaskType::Workflow, serde_json::json!({}))
+        .with_sticky("crashed-worker", Duration::from_millis(100));
+    pinned.workflow_exec_id = Some(exec_id.as_uuid());
+    queue::enqueue(&mut conn, &pinned)
+        .await
+        .expect("enqueue should succeed");
+
+    // Allow the sticky window to elapse comfortably.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    let queues = vec!["default".to_string()];
+    let claimed = queue::claim_task(&mut conn, &queues, "rescue-worker")
+        .await
+        .expect("claim should succeed")
+        .expect("any worker may claim after sticky_until expires");
+    assert_eq!(
+        claimed.worker_id.as_deref(),
+        Some("rescue-worker"),
+        "fallback worker should own the row after expiry",
+    );
+}
+
+#[tokio::test]
+async fn claim_task_treats_expired_sticky_rows_like_unpinned_rows() {
+    let (mut conn, _container) = setup_test_db().await;
+    let exec_expired = insert_named_workflow_execution(&mut conn, "expired-sticky-1").await;
+    let exec_free = insert_named_workflow_execution(&mut conn, "free-after-expiry-1").await;
+
+    let mut expired = EnqueueParams::new("default", TaskType::Workflow, serde_json::json!({}))
+        .with_sticky("offline-worker", Duration::from_secs(30));
+    expired.priority = 0;
+    expired.workflow_exec_id = Some(exec_expired.as_uuid());
+    let expired_id = queue::enqueue(&mut conn, &expired)
+        .await
+        .expect("enqueue expired-sticky task failed");
+
+    diesel::sql_query(
+        "UPDATE harvest_task_queue \
+         SET sticky_until = NOW() - INTERVAL '1 second' \
+         WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(expired_id)
+    .execute(&mut conn)
+    .await
+    .expect("failed to expire sticky window");
+
+    let mut free = EnqueueParams::new("default", TaskType::Workflow, serde_json::json!({}));
+    free.priority = 10;
+    free.workflow_exec_id = Some(exec_free.as_uuid());
+    let free_id = queue::enqueue(&mut conn, &free)
+        .await
+        .expect("enqueue free task failed");
+
+    let queues = vec!["default".to_string()];
+    let claimed = queue::claim_task(&mut conn, &queues, "rescue-worker")
+        .await
+        .expect("claim should succeed")
+        .expect("one of the eligible tasks should be claimed");
+    assert_eq!(
+        claimed.id, free_id,
+        "expired sticky rows should compete with unpinned rows by priority instead of jumping ahead",
+    );
+}
+
+#[tokio::test]
+async fn park_workflow_task_with_sticky_hint_pins_to_worker() {
+    let (mut conn, _container) = setup_test_db().await;
+    let exec_id = insert_workflow_execution(&mut conn).await;
+
+    // Seed and claim a workflow task so the row is in RUNNING state.
+    let mut params = EnqueueParams::new("default", TaskType::Workflow, serde_json::json!({}));
+    params.workflow_exec_id = Some(exec_id.as_uuid());
+    let task_id = queue::enqueue(&mut conn, &params)
+        .await
+        .expect("enqueue should succeed");
+    let queues = vec!["default".to_string()];
+    let _claimed = queue::claim_task(&mut conn, &queues, "park-worker")
+        .await
+        .expect("claim should succeed")
+        .expect("row should be claimable");
+
+    queue::park_workflow_task(
+        &mut conn,
+        task_id,
+        Some(StickyHint::new("park-worker", Duration::from_secs(10))),
+    )
+    .await
+    .expect("park with sticky should succeed");
+
+    let row = harvest_task_queue::table
+        .find(task_id)
+        .select(TaskQueueItem::as_select())
+        .first(&mut conn)
+        .await
+        .expect("row should exist");
+    assert_eq!(row.state, "RUNNING", "parked row keeps RUNNING state");
+    assert!(row.worker_id.is_none(), "worker ownership cleared on park");
+    assert_eq!(row.sticky_worker_id.as_deref(), Some("park-worker"));
+    assert!(row.sticky_until.is_some());
+    let stored_timeout = row.sticky_timeout.expect("sticky_timeout should be set");
+    assert_eq!(
+        stored_timeout.num_seconds(),
+        10,
+        "sticky_timeout should round-trip as 10 seconds (got {stored_timeout})",
+    );
+}
+
+#[tokio::test]
+async fn wake_workflow_task_refreshes_sticky_until() {
+    let (mut conn, _container) = setup_test_db().await;
+    let exec_id = insert_workflow_execution(&mut conn).await;
+
+    // Seed, claim, and park a workflow task with a short sticky window.
+    let mut params = EnqueueParams::new("default", TaskType::Workflow, serde_json::json!({}));
+    params.workflow_exec_id = Some(exec_id.as_uuid());
+    let task_id = queue::enqueue(&mut conn, &params)
+        .await
+        .expect("enqueue should succeed");
+    let queues = vec!["default".to_string()];
+    let _claimed = queue::claim_task(&mut conn, &queues, "wake-refresh-worker")
+        .await
+        .expect("claim should succeed");
+    // Use a 5s window so both the park's sticky_until and the wake's refreshed
+    // sticky_until land comfortably in the future even under DB/host clock skew
+    // on CI runners. The test asserts the value was REFRESHED by comparing
+    // before/after timestamps, not by waiting for expiry.
+    queue::park_workflow_task(
+        &mut conn,
+        task_id,
+        Some(StickyHint::new(
+            "wake-refresh-worker",
+            Duration::from_secs(5),
+        )),
+    )
+    .await
+    .expect("park should succeed");
+
+    let parked_until = harvest_task_queue::table
+        .find(task_id)
+        .select(TaskQueueItem::as_select())
+        .first(&mut conn)
+        .await
+        .expect("parked row should exist")
+        .sticky_until
+        .expect("sticky_until should be set at park");
+
+    // Wait long enough that NOW() has moved noticeably (well above typical
+    // sub-millisecond timer resolution) before triggering the refresh.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    queue::wake_workflow_task(&mut conn, exec_id)
+        .await
+        .expect("wake should succeed");
+
+    let row = harvest_task_queue::table
+        .find(task_id)
+        .select(TaskQueueItem::as_select())
+        .first(&mut conn)
+        .await
+        .expect("row should exist");
+
+    assert_eq!(row.state, "PENDING");
+    assert_eq!(row.sticky_worker_id.as_deref(), Some("wake-refresh-worker"));
+    let refreshed_until = row.sticky_until.expect("sticky_until should be refreshed");
+    assert!(
+        refreshed_until > parked_until,
+        "sticky_until should be pushed forward on wake (parked_until={parked_until}, \
+         refreshed_until={refreshed_until})",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_continues_as_new_with_fresh_history_and_same_workflow_id() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect to Postgres container");
+
+    let original_exec_id = insert_workflow_execution(&mut conn).await;
+    let initial_input = serde_json::json!({"phase": "init"});
+    enqueue_started_workflow_task(&mut conn, original_exec_id, initial_input.clone()).await;
+
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![WorkflowInfo {
+            name: "e2e_test_workflow",
+            module: "integration_e2e",
+            handler: continue_as_new_workflow,
+        }],
+        vec![],
+    ));
+    let worker = build_runtime_worker("worker-e2e-continue-as-new", 2, 1, registry);
+    let pool = build_test_pool(&database_url);
+    let handle = spawn_test_worker(Arc::clone(&worker), pool);
+
+    // The original run is sealed by the worker as soon as it drains the
+    // continue-as-new command. We wait for that terminal transition before
+    // asserting on the chain.
+    let sealed_execution =
+        wait_for_execution_state(&database_url, original_exec_id, "CONTINUED_AS_NEW").await;
+
+    // The successor run is identified by the WorkflowContinuedAsNew event
+    // appended to the original run's history. Walking the history is the
+    // public contract operators rely on; loading a fresh row by joining on
+    // the parent_id chain would not work because continue-as-new
+    // intentionally does NOT set parent_id (parent_id is reserved for child
+    // workflows).
+    let original_history = load_history_from_url(&database_url, original_exec_id).await;
+    let new_exec_id = original_history
+        .events
+        .iter()
+        .find_map(|event| match event {
+            WorkflowEvent::WorkflowContinuedAsNew { new_exec_id, .. } => Some(*new_exec_id),
+            _ => None,
+        })
+        .expect("original history should contain a WorkflowContinuedAsNew event");
+
+    assert_ne!(
+        new_exec_id, original_exec_id,
+        "continue-as-new must mint a fresh ExecutionId"
+    );
+
+    // The new run completes on its second execution by returning the
+    // post-continuation payload it was started with.
+    let completed = wait_for_execution_state(&database_url, new_exec_id, "COMPLETED").await;
+
+    worker.shutdown();
+    handle.await.expect("worker task should join");
+
+    assert_eq!(
+        sealed_execution.state, "CONTINUED_AS_NEW",
+        "original run should be sealed in the continue-as-new terminal state"
+    );
+    assert_eq!(
+        sealed_execution.workflow_id, completed.workflow_id,
+        "logical workflow_id must be preserved across the continue-as-new transition"
+    );
+    assert_eq!(
+        sealed_execution.workflow_name, completed.workflow_name,
+        "workflow_name must be preserved across the continue-as-new transition"
+    );
+    assert_eq!(
+        completed.output,
+        Some(serde_json::json!({"phase": "next", "ran_init": true})),
+        "the new run should observe the input passed to continue_as_new"
+    );
+
+    // The successor run starts with an empty history apart from
+    // WorkflowStarted plus its own terminal completion event — this is the
+    // whole point of continue-as-new, bounding history growth.
+    let new_history = load_history_from_url(&database_url, new_exec_id).await;
+    assert!(
+        matches!(
+            new_history.events.as_slice(),
+            [
+                WorkflowEvent::WorkflowStarted { .. },
+                WorkflowEvent::WorkflowCompleted { .. },
+            ]
+        ),
+        "new run history should be bounded; got {:?}",
+        new_history
+            .events
+            .iter()
+            .map(WorkflowEvent::type_name)
+            .collect::<Vec<_>>(),
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn continue_as_new_down_migration_rewrites_historical_runs_for_rollback() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect to Postgres container");
+
+    let original_exec_id = insert_workflow_execution(&mut conn).await;
+    let initial_input = serde_json::json!({"phase": "init"});
+    enqueue_started_workflow_task(&mut conn, original_exec_id, initial_input.clone()).await;
+
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![WorkflowInfo {
+            name: "e2e_test_workflow",
+            module: "integration_e2e",
+            handler: continue_as_new_workflow,
+        }],
+        vec![],
+    ));
+    let worker = build_runtime_worker("worker-e2e-continue-down", 2, 1, registry);
+    let pool = build_test_pool(&database_url);
+    let handle = spawn_test_worker(Arc::clone(&worker), pool);
+
+    let _sealed_execution =
+        wait_for_execution_state(&database_url, original_exec_id, "CONTINUED_AS_NEW").await;
+    let original_history = load_history_from_url(&database_url, original_exec_id).await;
+    let successor_exec_id = original_history
+        .events
+        .iter()
+        .find_map(|event| match event {
+            WorkflowEvent::WorkflowContinuedAsNew { new_exec_id, .. } => Some(*new_exec_id),
+            _ => None,
+        })
+        .expect("original history should contain a WorkflowContinuedAsNew event");
+    let _completed = wait_for_execution_state(&database_url, successor_exec_id, "COMPLETED").await;
+
+    worker.shutdown();
+    handle.await.expect("worker task should join");
+
+    let down_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("migrations/20260427000000_harvest_continue_as_new/down.sql");
+    let down_sql = std::fs::read_to_string(&down_path).unwrap_or_else(|error| {
+        panic!(
+            "failed to read continue-as-new down migration at {}: {error}",
+            down_path.display()
+        )
+    });
+    conn.batch_execute(&down_sql).await.expect(
+        "continue-as-new down migration should succeed after continue-as-new has been used",
+    );
+
+    let executions = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_name.eq("e2e_test_workflow"))
+        .order(harvest_workflow_executions::started_at.asc())
+        .select(WorkflowExecution::as_select())
+        .load(&mut conn)
+        .await
+        .expect("failed to reload workflow executions after down migration");
+    assert_eq!(
+        executions.len(),
+        2,
+        "rollback should preserve both runs while making them compatible with the pre-continue schema",
+    );
+    assert!(
+        executions
+            .iter()
+            .all(|execution| execution.state != "CONTINUED_AS_NEW"),
+        "down migration must eliminate CONTINUED_AS_NEW before restoring the old state check",
+    );
+
+    let original_row = executions
+        .iter()
+        .find(|execution| execution.id == original_exec_id.as_uuid())
+        .expect("original execution should still exist after rollback rewrite");
+    assert_eq!(
+        original_row.state, "COMPLETED",
+        "sealed historical runs should be rewritten to an old-schema terminal state",
+    );
+    assert!(
+        original_row
+            .workflow_id
+            .starts_with("e2e-wf-001::continued-as-new:"),
+        "sealed historical runs should get a synthetic workflow_id during rollback",
+    );
+
+    let successor_row = executions
+        .iter()
+        .find(|execution| execution.id == successor_exec_id.as_uuid())
+        .expect("successor execution should still exist after rollback rewrite");
+    assert_eq!(
+        successor_row.workflow_id, "e2e-wf-001",
+        "the latest run should retain the original logical workflow_id",
+    );
+
+    let rows_on_original_key = executions
+        .iter()
+        .filter(|execution| execution.workflow_id == "e2e-wf-001")
+        .count();
+    assert_eq!(
+        rows_on_original_key, 1,
+        "rollback should leave exactly one row on the original logical key before restoring uniqueness",
+    );
 }

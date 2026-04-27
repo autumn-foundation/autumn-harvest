@@ -115,6 +115,25 @@ Both types are `fn` (not `Box<dyn Fn>`). The macro generates a closure body cast
 
 Single-param workflows/activities: input is passed as a single JSON value and deserialized directly. Multi-param: input is expected to be a JSON array `[arg1, arg2, ...]`, indexed by position.
 
+### Sharding
+
+Harvest can spread workflow state across N independent Postgres databases. A single workflow's event log, task queue rows, timers, signals, and DLQ entries all live on the same shard, so per-workflow ACID guarantees are preserved without cross-shard transactions. Cross-shard rebalancing of existing workflows is out of scope.
+
+Key mechanics:
+
+- **Shard identity is embedded in `ExecutionId`.** `ExecutionId::new_for_shard(ShardId)` writes the shard number into the UUID's first two bytes; `ExecutionId::shard()` reads it back. Any caller holding an `ExecutionId` can route to the owning shard in O(1) with no directory lookup. `ExecutionId::new()` emits the `ShardId::UNENCODED` sentinel (`0xFFFF`) which `ShardRouter` resolves to the configured default shard — that keeps tests and replay harnesses working and gives a safe fallback for pre-sharding rows.
+- **`ShardRouter` picks the initial shard for a new workflow** using `seahash` rendezvous hashing over `readable_shards`. The hash is stable across process restarts so outbox retries are idempotent even when `writable_shards` is being widened or narrowed; picks outside `writable_shards` are re-hashed on the writable subset.
+- **`ShardedDbPool` is a `BTreeMap<ShardId, DbPool>`** with `pool_for(ShardId)`, `pool_for_execution(ExecutionId)`, `iter_shards()`, and a `single(pool)` helper. Single-shard deployments use the `single` shape — it's semantically identical to the pre-sharding runtime and requires no config change.
+- **Backward compatibility.** Existing deployments see zero behavior change. The plugin wires a `ShardRouter::single()` and `ShardedDbPool::single(existing_pool)` by default; the `shard_id` column on `harvest_workflow_executions` is retained for observability and is derived from `exec_id.shard()`.
+
+Operational "add a shard" procedure (new workflows only):
+
+1. Provision a new Postgres database and run `diesel migration run` against it.
+2. Add the new shard to `readable_shards` and keep `writable_shards` pointing at the existing shards. Restart the plugin — the router can now resolve ids that encode the new shard, even though nothing writes there yet.
+3. Add the new shard to `writable_shards`. New workflows begin landing on it via rendezvous hash. In-flight workflows on the old shards continue to drain through their own worker tasks.
+
+Current implementation scope: `ExecutionId`/`ShardId` encoding, `ShardRouter`, `ShardedDbPool`, shard-aware start/read paths in the plugin, and `WorkerConfig.shard_assignments`. Per-shard worker poll loops, per-shard scheduler tick loops with DAG→shard pinning, and cross-shard observability remain as follow-up work.
+
 ---
 
 ## Module Guide
@@ -142,6 +161,7 @@ Single-param workflows/activities: input is passed as a single JSON value and de
 | `cache.rs` | 2 | LRU workflow state cache: bounded capacity, access-order eviction |
 | `dlq.rs` | 2 | Dead letter queue: `DeadLetterEntry` builder, move-to-DLQ on retry exhaustion |
 | `pool.rs` | 2 | Separate DB pool config: web pool + worker pool with shared ceiling, minimum guarantees |
+| `telemetry.rs` | 4 | OpenTelemetry surface: `TraceContextCarrier`, `TraceContextPropagator`, `MetricsRecorder`, `TelemetryConfig` — no-op by default, opt-in via `HarvestBuilder::telemetry` |
 | `migrations/` | 1 | SQL -- run with `diesel migration run` |
 
 ### Macro Modules (`autumn-harvest-macros`)
@@ -312,4 +332,5 @@ Worker pool and web pool are independently sized but share a total connection ce
 - **Cancellation semantics**: explicit workflow/activity cancellation and propagation
 - **Saga primitives**: compensations and failure orchestration
 - **Cross-worker routing**: sticky execution affinity and shard-aware placement
+- **Sharding follow-up**: per-shard worker poll loops, per-shard scheduler tick loops with DAG→shard pinning, and multi-shard observability (the core `ShardId`/`ShardRouter`/`ShardedDbPool` primitives and the shard-aware write/read paths in the plugin are already in place).
 - **Operational surface**: richer metrics, observability, and dashboard/UI work

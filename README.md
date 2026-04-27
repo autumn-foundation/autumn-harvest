@@ -14,9 +14,9 @@ single-Postgres operational footprint.
 
 Most Rust async work is fire-and-forget. autumn-harvest is for the work that
 *can't* be: long-running orchestrations that survive process restarts, retries
-with exactly-once semantics, multi-step business processes with rollback, and
-scheduled DAGs. If you've reached for Temporal, Cadence, or Inngest from a Rust
-service, this is the same shape with one fewer service to operate.
+with durable history, signal-driven waits, queryable state, and scheduled DAGs.
+If you've reached for Temporal, Cadence, or Inngest from a Rust service, this is
+the same shape with one fewer service to operate.
 
 ## Quick example
 
@@ -72,15 +72,16 @@ async fn main() {
   with configurable `start_to_close`, `heartbeat_timeout`, and `retry` policies.
 - **Signals & queries.** Send a signal into a running workflow, query its
   state, or block on a timer.
-- **Child workflows.** Compose orchestrations from smaller workflows; parent
-  failures cascade or compensate per your design.
+- **Child workflows.** Compose orchestrations from smaller workflows and model
+  recovery paths in normal workflow code.
 - **DAG scheduling.** Declare DAGs of activities with trigger rules and
   cron/interval schedules; built-in scheduler dispatches them.
 - **Management API.** Optional HTTP surface for inspecting executions, sending
-  signals, querying state, and triggering DAG runs.
+  signals, querying state, triggering DAG runs, and managing dead letters.
 - **SKIP LOCKED task queue + LISTEN/NOTIFY** for low-latency dispatch without
   polling backoff.
-- **Dead letter queue** for tasks that exhaust their retry policy.
+- **Dead letter queue** for tasks that exhaust their retry policy, with
+  management endpoints to inspect and replay entries.
 - **Separate worker/web connection pools** with a shared ceiling so worker
   bursts can't starve HTTP request handling.
 
@@ -91,10 +92,39 @@ async fn main() {
 | [`autumn-harvest`](autumn-harvest/) | Core engine — types, executor, replay, queue, worker runtime |
 | [`autumn-harvest-plugin`](autumn-harvest-plugin/) | `HarvestPlugin` — wires the engine into an Autumn `AppBuilder`, mounts the management API, owns the runtime lifecycle |
 | [`autumn-harvest-macros`](autumn-harvest-macros/) | `#[workflow]`, `#[activity]`, `#[dag]`, `workflows![]`, `activities![]` proc macros |
+| [`autumn-harvest-cli`](autumn-harvest-cli/) | `harvest` CLI: thin operator client for the management API |
 
 Use `autumn-harvest-plugin` if you're building an Autumn app. Use the bare
 `autumn-harvest` crate if you want to embed the engine in another framework or
 a non-web context.
+
+## CLI
+
+The `harvest` binary is a thin HTTP client for the optional management API. It
+does not talk to Postgres directly, so workflow queries, DAG triggers, auth, and
+runtime-owned behavior stay behind the same API surface your service exposes.
+
+```bash
+cargo run -p autumn-harvest-cli -- health
+cargo run -p autumn-harvest-cli -- workflow list --limit 25
+cargo run -p autumn-harvest-cli -- workflow get <execution-id>
+cargo run -p autumn-harvest-cli -- workflow start approval_workflow --input-json '{"request_id":"42"}'
+cargo run -p autumn-harvest-cli -- workflow signal <execution-id> approved --payload-json '{"approved":true}'
+cargo run -p autumn-harvest-cli -- workflow query <execution-id> status
+cargo run -p autumn-harvest-cli -- workflow cancel <execution-id> --reason "operator request"
+cargo run -p autumn-harvest-cli -- dag list
+cargo run -p autumn-harvest-cli -- dag trigger daily_pipeline --conf-json '{"date":"2026-04-21"}'
+cargo run -p autumn-harvest-cli -- dag pause daily_pipeline
+cargo run -p autumn-harvest-cli -- dlq list --limit 25
+cargo run -p autumn-harvest-cli -- dlq replay <dead-letter-id>
+```
+
+Configure the API mount with `--base-url` or `HARVEST_URL` (default:
+`http://localhost:3000/api/harvest`). Pass `--token` or `HARVEST_TOKEN` to send
+a bearer token. Successful responses are printed as pretty JSON by default; use
+`--output json` for compact script-friendly output. JSON request payloads accept
+inline `--*-json` values or `--*-file PATH`; use `-` as the file path to read
+from stdin.
 
 ## Requirements
 
@@ -106,9 +136,12 @@ a non-web context.
 
 ## Status
 
-Phase 3 (DAG scheduling, signals, queries, management API) is implemented and
-exercised by integration tests. Phase 4 (cancellation/saga semantics, sticky
-cross-worker routing, richer observability, dashboard UI) is the next focus.
+Version 0.2.0 wraps the Phase 3 surface: DAG scheduling, `#[dag]`, trigger
+rules, signal delivery, `ctx.wait_for_signal`, query registration/dispatch, the
+management API, and dead-letter list/replay endpoints are implemented and
+covered by integration tests. Durable workflow cancellation is implemented with
+management API support and activity heartbeat cancellation checks. First-class
+Saga compensation is implemented through the `Saga` builder.
 
 API stability: pre-1.0. Breaking changes happen in minor versions per Cargo's
 0.x semver convention. Each release notes the migration where applicable.
@@ -126,6 +159,32 @@ fire, signal arrival, version branch) is recorded as an event the first time
 and read back from history on subsequent invocations. This is the same model as
 Temporal and Cadence; the operational difference is that you only need
 Postgres, not a separate service.
+
+## Sharding
+
+Workflow state can be spread across multiple Postgres databases without
+cross-shard transactions. Each `ExecutionId` carries its `ShardId` in the
+first two bytes of the UUID, so any caller holding an id resolves to the
+owning shard in O(1) — no directory table required. Single-shard deployments
+keep working unchanged; the plugin wires a `ShardRouter::single()` and a
+`ShardedDbPool::single(pool)` by default.
+
+```rust
+use autumn_harvest::{ExecutionId, ShardId, ShardRouter};
+
+let router = ShardRouter::new(
+    vec![ShardId::new(0), ShardId::new(1), ShardId::new(2)], // readable
+    vec![ShardId::new(0), ShardId::new(1), ShardId::new(2)], // writable
+    ShardId::new(0),                                         // default
+);
+let shard = router.pick_for_new_workflow("onboarding", "user-42");
+let exec_id = ExecutionId::new_for_shard(shard);
+assert_eq!(exec_id.shard(), shard);
+```
+
+Adding a shard (new workflows only): provision and migrate the new database,
+add it to `readable_shards`, restart the plugin, then flip it into
+`writable_shards`. In-flight workflows drain on their original shard.
 
 ## License
 

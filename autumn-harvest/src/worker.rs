@@ -35,6 +35,7 @@ use crate::queue::{self, TaskType};
 use crate::schema::{harvest_timers, harvest_workflow_executions};
 use crate::signal;
 use crate::store;
+use crate::telemetry::{ActivityStatus, TraceContextCarrier, WorkflowStatus};
 use crate::types::{ActivityExecId, ExecutionId, TimerId, WorkerId};
 
 /// Type alias for the deadpool-managed async Diesel connection pool.
@@ -66,6 +67,13 @@ pub struct WorkerRuntimeConfig {
     pub poll_interval: Duration,
     /// Maximum time to wait for in-flight tasks during shutdown.
     pub shutdown_timeout: Duration,
+    /// Grace period for an activity handler to unwind cooperatively after
+    /// its workflow is cancelled before the worker hard-aborts it.
+    pub cancellation_grace_period: Duration,
+    /// Grace period during which subsequent tasks for a workflow are offered
+    /// preferentially to this worker so its in-process LRU cache stays warm.
+    /// Zero disables sticky routing entirely.
+    pub sticky_timeout: Duration,
 }
 
 impl WorkerRuntimeConfig {
@@ -94,6 +102,8 @@ impl From<WorkerConfig> for WorkerRuntimeConfig {
             max_concurrent_activities: cfg.max_concurrent_activities,
             poll_interval: Duration::from_millis(500),
             shutdown_timeout: cfg.shutdown_timeout,
+            cancellation_grace_period: cfg.cancellation_grace_period,
+            sticky_timeout: cfg.sticky_timeout,
         }
     }
 }
@@ -113,6 +123,9 @@ pub struct HandlerRegistry {
     pub activities: HashMap<String, ActivityInfo>,
     /// Shared typed state visible to workflow and activity handlers.
     state: SharedState,
+    /// Telemetry bundle (trace-context propagator + metrics recorder) applied
+    /// around every dispatch.
+    telemetry: Arc<crate::telemetry::TelemetryConfig>,
 }
 
 impl HandlerRegistry {
@@ -129,6 +142,27 @@ impl HandlerRegistry {
         activities: Vec<ActivityInfo>,
         state: SharedState,
     ) -> Self {
+        Self::with_state_and_telemetry(
+            workflows,
+            activities,
+            state,
+            Arc::new(crate::telemetry::TelemetryConfig::default()),
+        )
+    }
+
+    /// Create a new registry with shared typed state and a telemetry bundle.
+    ///
+    /// Used by [`crate::builder::BuiltHarvest::into_worker_parts`] so worker
+    /// instrumentation inherits whatever the application configured. Callers
+    /// that do not care about telemetry should prefer [`Self::with_state`],
+    /// which installs safe no-op defaults.
+    #[must_use]
+    pub fn with_state_and_telemetry(
+        workflows: Vec<WorkflowInfo>,
+        activities: Vec<ActivityInfo>,
+        state: SharedState,
+        telemetry: Arc<crate::telemetry::TelemetryConfig>,
+    ) -> Self {
         let workflows = workflows
             .into_iter()
             .map(|w| (w.name.to_string(), w))
@@ -141,6 +175,7 @@ impl HandlerRegistry {
             workflows,
             activities,
             state,
+            telemetry,
         }
     }
 
@@ -155,6 +190,12 @@ impl HandlerRegistry {
     pub fn state<T: Any + Send + Sync>(&self) -> Option<&T> {
         self.state.get(&TypeId::of::<T>())?.downcast_ref::<T>()
     }
+
+    /// Access the telemetry bundle shared across worker dispatches.
+    #[must_use]
+    pub const fn telemetry(&self) -> &Arc<crate::telemetry::TelemetryConfig> {
+        &self.telemetry
+    }
 }
 
 impl std::fmt::Debug for HandlerRegistry {
@@ -163,6 +204,7 @@ impl std::fmt::Debug for HandlerRegistry {
             .field("workflows", &self.workflows.keys().collect::<Vec<_>>())
             .field("activities", &self.activities.keys().collect::<Vec<_>>())
             .field("state_count", &self.state.len())
+            .field("telemetry", &self.telemetry)
             .finish()
     }
 }
@@ -200,6 +242,7 @@ const fn workflow_command_name(command: &WorkflowCommand) -> &'static str {
         WorkflowCommand::WaitForSignal { .. } => "WaitForSignal",
         WorkflowCommand::Complete { .. } => "Complete",
         WorkflowCommand::Fail { .. } => "Fail",
+        WorkflowCommand::ContinueAsNew { .. } => "ContinueAsNew",
     }
 }
 
@@ -280,6 +323,21 @@ struct WorkflowTaskPersistence<'a> {
     worker_id: &'a str,
     exec_id: ExecutionId,
     next_event_id: i32,
+    /// Grace window for pinning follow-up tasks to this worker's LRU cache.
+    /// Zero disables sticky routing entirely.
+    sticky_timeout: Duration,
+}
+
+impl<'a> WorkflowTaskPersistence<'a> {
+    /// Build a sticky hint bound to this worker, or `None` when sticky routing
+    /// is disabled (timeout == 0).
+    const fn sticky_hint(&self) -> Option<queue::StickyHint<'a>> {
+        if self.sticky_timeout.is_zero() {
+            None
+        } else {
+            Some(queue::StickyHint::new(self.worker_id, self.sticky_timeout))
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -303,95 +361,87 @@ fn marker_events_from_commands(commands: &[WorkflowCommand]) -> Vec<WorkflowEven
         .collect()
 }
 
+fn extract_single_command<T>(
+    commands: &[WorkflowCommand],
+    extractor: impl Fn(&WorkflowCommand) -> Option<T>,
+) -> Option<T> {
+    let mut iter = commands
+        .iter()
+        .filter(|cmd| !matches!(cmd, WorkflowCommand::RecordMarker { .. }));
+
+    let first_cmd = iter.next()?;
+
+    // Original behavior: return None if there's more than one non-marker command.
+    if iter.next().is_some() {
+        return None;
+    }
+
+    // Original behavior: extractor(cmd)? means we return None if the extractor yields None.
+    extractor(first_cmd)
+}
+
 fn extract_single_schedule_activity(
     commands: &[WorkflowCommand],
 ) -> Option<ScheduledActivityCommand> {
-    let mut scheduled = None;
+    extract_single_command(commands, |cmd| {
+        let WorkflowCommand::ScheduleActivity {
+            activity_id,
+            name,
+            input,
+            queue,
+            ..
+        } = cmd
+        else {
+            return None;
+        };
 
-    for cmd in commands {
-        match cmd {
-            WorkflowCommand::RecordMarker { .. } => {}
-            WorkflowCommand::ScheduleActivity {
-                activity_id,
-                name,
-                input,
-                queue,
-                ..
-            } => {
-                if scheduled.is_some() {
-                    return None;
-                }
-
-                scheduled = Some(ScheduledActivityCommand {
-                    activity_id: *activity_id,
-                    name: name.clone(),
-                    input: input.clone(),
-                    queue: queue.clone(),
-                });
-            }
-            _ => return None,
-        }
-    }
-
-    scheduled
+        Some(ScheduledActivityCommand {
+            activity_id: *activity_id,
+            name: name.clone(),
+            input: input.clone(),
+            queue: queue.clone(),
+        })
+    })
 }
 
 fn extract_single_started_timer(commands: &[WorkflowCommand]) -> Option<StartedTimerCommand> {
-    let mut timer = None;
+    extract_single_command(commands, |cmd| {
+        let WorkflowCommand::StartTimer {
+            timer_id,
+            duration_secs,
+            ..
+        } = cmd
+        else {
+            return None;
+        };
 
-    for cmd in commands {
-        match cmd {
-            WorkflowCommand::RecordMarker { .. } => {}
-            WorkflowCommand::StartTimer {
-                timer_id,
-                duration_secs,
-                ..
-            } => {
-                if timer.is_some() {
-                    return None;
-                }
-
-                timer = Some(StartedTimerCommand {
-                    timer_id: timer_id.clone(),
-                    duration_secs: *duration_secs,
-                });
-            }
-            _ => return None,
-        }
-    }
-
-    timer
+        Some(StartedTimerCommand {
+            timer_id: timer_id.clone(),
+            duration_secs: *duration_secs,
+        })
+    })
 }
 
 fn extract_single_started_child_workflow(
     commands: &[WorkflowCommand],
 ) -> Option<StartedChildWorkflowCommand> {
-    let mut child = None;
+    extract_single_command(commands, |cmd| {
+        let WorkflowCommand::StartChildWorkflow {
+            child_id,
+            workflow_name,
+            input,
+            ..
+        } = cmd
+        else {
+            return None;
+        };
 
-    for cmd in commands {
-        match cmd {
-            WorkflowCommand::RecordMarker { .. } => {}
-            WorkflowCommand::StartChildWorkflow {
-                child_id,
-                workflow_name,
-                input,
-                ..
-            } => {
-                if child.is_some() {
-                    return None;
-                }
-
-                child = Some(StartedChildWorkflowCommand {
-                    child_id: *child_id,
-                    workflow_name: workflow_name.clone(),
-                    input: input.clone(),
-                });
-            }
-            _ => return None,
-        }
-    }
-
-    child
+        Some(StartedChildWorkflowCommand {
+            child_id: *child_id,
+            workflow_name: workflow_name.clone(),
+            input: input.clone(),
+        })
+    })
 }
 
 fn chrono_duration_from_std(
@@ -465,25 +515,28 @@ fn find_pending_scheduled_activity(
         })
         .collect::<HashSet<_>>();
 
-    let pending = history
-        .iter()
-        .filter_map(|event| match event {
-            WorkflowEvent::ActivityScheduled {
-                activity_id, name, ..
-            } if name == activity_name && !terminal_ids.contains(activity_id) => Some(*activity_id),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-
-    match pending.as_slice() {
-        [activity_id] => Ok(*activity_id),
-        [] => Err(HarvestError::NotFound(format!(
-            "no pending scheduled activity '{activity_name}' in workflow history"
-        ))),
-        _ => Err(HarvestError::NonDeterministic(format!(
-            "multiple pending scheduled activities named '{activity_name}' found in history"
-        ))),
+    let mut pending = None;
+    for event in history {
+        if let WorkflowEvent::ActivityScheduled {
+            activity_id, name, ..
+        } = event
+            && name == activity_name
+            && !terminal_ids.contains(activity_id)
+        {
+            if pending.is_some() {
+                return Err(HarvestError::NonDeterministic(format!(
+                    "multiple pending scheduled activities named '{activity_name}' found in history"
+                )));
+            }
+            pending = Some(*activity_id);
+        }
     }
+
+    pending.ok_or_else(|| {
+        HarvestError::NotFound(format!(
+            "no pending scheduled activity '{activity_name}' in workflow history"
+        ))
+    })
 }
 
 async fn load_workflow_execution(
@@ -500,6 +553,54 @@ async fn load_workflow_execution(
         .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))
 }
 
+fn terminal_execution_transition_error(
+    exec_id: ExecutionId,
+    state: &str,
+    error: Option<&str>,
+) -> HarvestError {
+    match state {
+        "CANCELLED" => HarvestError::Cancelled(error.map_or_else(
+            || format!("workflow execution {exec_id} is cancelled"),
+            ToOwned::to_owned,
+        )),
+        "RUNNING" => HarvestError::Config(format!(
+            "workflow execution {exec_id} did not transition from RUNNING"
+        )),
+        state => HarvestError::Config(format!(
+            "workflow execution {exec_id} is already terminal ({state})"
+        )),
+    }
+}
+
+async fn workflow_execution_transition_error(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> HarvestResult<HarvestError> {
+    use crate::schema::harvest_workflow_executions::dsl;
+
+    dsl::harvest_workflow_executions
+        .find(exec_id.as_uuid())
+        .select((dsl::state, dsl::error))
+        .first::<(String, Option<String>)>(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?
+        .map_or_else(
+            || {
+                Ok(HarvestError::NotFound(format!(
+                    "workflow execution {exec_id}"
+                )))
+            },
+            |(state, error)| {
+                Ok(terminal_execution_transition_error(
+                    exec_id,
+                    &state,
+                    error.as_deref(),
+                ))
+            },
+        )
+}
+
 async fn update_workflow_execution_completed(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
@@ -508,22 +609,24 @@ async fn update_workflow_execution_completed(
 ) -> HarvestResult<()> {
     use crate::schema::harvest_workflow_executions::dsl;
 
-    let updated = diesel::update(dsl::harvest_workflow_executions.find(exec_id.as_uuid()))
-        .set((
-            dsl::state.eq("COMPLETED"),
-            dsl::output.eq(Some(output.clone())),
-            dsl::error.eq(None::<String>),
-            dsl::sticky_worker_id.eq(Some(worker_id.to_string())),
-            dsl::completed_at.eq(Some(chrono::Utc::now())),
-        ))
-        .execute(conn)
-        .await
-        .map_err(crate::error::database_error)?;
+    let updated = diesel::update(
+        dsl::harvest_workflow_executions
+            .find(exec_id.as_uuid())
+            .filter(dsl::state.eq("RUNNING")),
+    )
+    .set((
+        dsl::state.eq("COMPLETED"),
+        dsl::output.eq(Some(output.clone())),
+        dsl::error.eq(None::<String>),
+        dsl::sticky_worker_id.eq(Some(worker_id.to_string())),
+        dsl::completed_at.eq(Some(chrono::Utc::now())),
+    ))
+    .execute(conn)
+    .await
+    .map_err(crate::error::database_error)?;
 
     if updated == 0 {
-        return Err(HarvestError::NotFound(format!(
-            "workflow execution {exec_id}"
-        )));
+        return Err(workflow_execution_transition_error(conn, exec_id).await?);
     }
 
     Ok(())
@@ -537,22 +640,24 @@ async fn update_workflow_execution_failed(
 ) -> HarvestResult<()> {
     use crate::schema::harvest_workflow_executions::dsl;
 
-    let updated = diesel::update(dsl::harvest_workflow_executions.find(exec_id.as_uuid()))
-        .set((
-            dsl::state.eq("FAILED"),
-            dsl::output.eq(None::<serde_json::Value>),
-            dsl::error.eq(Some(error.to_string())),
-            dsl::sticky_worker_id.eq(Some(worker_id.to_string())),
-            dsl::completed_at.eq(Some(chrono::Utc::now())),
-        ))
-        .execute(conn)
-        .await
-        .map_err(crate::error::database_error)?;
+    let updated = diesel::update(
+        dsl::harvest_workflow_executions
+            .find(exec_id.as_uuid())
+            .filter(dsl::state.eq("RUNNING")),
+    )
+    .set((
+        dsl::state.eq("FAILED"),
+        dsl::output.eq(None::<serde_json::Value>),
+        dsl::error.eq(Some(error.to_string())),
+        dsl::sticky_worker_id.eq(Some(worker_id.to_string())),
+        dsl::completed_at.eq(Some(chrono::Utc::now())),
+    ))
+    .execute(conn)
+    .await
+    .map_err(crate::error::database_error)?;
 
     if updated == 0 {
-        return Err(HarvestError::NotFound(format!(
-            "workflow execution {exec_id}"
-        )));
+        return Err(workflow_execution_transition_error(conn, exec_id).await?);
     }
 
     Ok(())
@@ -614,6 +719,7 @@ async fn persist_signal_wait_park(
     exec_id: ExecutionId,
     next_event_id: i32,
     marker_events: &[WorkflowEvent],
+    sticky: Option<queue::StickyHint<'_>>,
 ) -> HarvestResult<()> {
     // Park the workflow task (state=RUNNING, worker cleared) so it is not
     // confused with a timer-waiting task (state=PENDING). This ensures that
@@ -623,7 +729,7 @@ async fn persist_signal_wait_park(
     conn.transaction::<(), HarvestError, _>(|conn| {
         async move {
             store::append_events(conn, exec_id, marker_events, next_event_id).await?;
-            queue::park_workflow_task(conn, task_id).await
+            queue::park_workflow_task(conn, task_id, sticky).await
         }
         .scope_boxed()
     })
@@ -644,6 +750,7 @@ async fn persist_signal_wait_park(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn persist_scheduled_activity(
     conn: &mut AsyncPgConnection,
     registry: &HandlerRegistry,
@@ -652,6 +759,7 @@ async fn persist_scheduled_activity(
     next_event_id: i32,
     commands: &[WorkflowCommand],
     scheduled: &ScheduledActivityCommand,
+    sticky: Option<queue::StickyHint<'_>>,
 ) -> HarvestResult<()> {
     let activity = registry.activities.get(&scheduled.name).ok_or_else(|| {
         HarvestError::Config(format!(
@@ -674,6 +782,10 @@ async fn persist_scheduled_activity(
     );
     params.workflow_exec_id = Some(exec_id.as_uuid());
     params.activity_name = Some(scheduled.name.clone());
+    // Snapshot the current trace context so the downstream activity worker
+    // can continue the same trace. `capture` returns `None` when telemetry is
+    // unconfigured, leaving the queue row's `trace_context` NULL.
+    params.trace_context = registry.telemetry().capture_trace_context();
 
     if let Some(retry_policy) = activity.default_retry_policy.clone() {
         params.max_attempts = i32::try_from(retry_policy.max_attempts).map_err(|_| {
@@ -711,7 +823,7 @@ async fn persist_scheduled_activity(
         async move {
             store::append_events(conn, exec_id, &events, next_event_id).await?;
             queue::enqueue(conn, &params).await?;
-            queue::park_workflow_task(conn, task_id).await?;
+            queue::park_workflow_task(conn, task_id, sticky).await?;
             Ok(())
         }
         .scope_boxed()
@@ -726,10 +838,23 @@ async fn persist_started_timer(
     task_id: uuid::Uuid,
     commands: &[WorkflowCommand],
     timer: &StartedTimerCommand,
+    sticky: Option<queue::StickyHint<'_>>,
 ) -> HarvestResult<()> {
+    use tracing::Instrument;
+
     let marker_events = marker_events_from_commands(commands);
     let fire_delay = chrono_duration_from_secs(timer.duration_secs, "timer duration")?;
     let fires_at = chrono::Utc::now() + fire_delay;
+    // Emit a short-lived span so operators can see timer placements in a
+    // distributed trace next to the activities and workflow suspensions that
+    // produced them.
+    let span = tracing::info_span!(
+        "harvest.timer.start",
+        "otel.kind" = "internal",
+        timer.id = %timer.timer_id,
+        timer.duration_secs = timer.duration_secs,
+        workflow.execution_id = %exec_id,
+    );
     let timer_started = WorkflowEvent::TimerStarted {
         timer_id: timer.timer_id.clone(),
         duration_secs: timer.duration_secs,
@@ -751,13 +876,19 @@ async fn persist_started_timer(
                 .execute(conn)
                 .await
                 .map_err(crate::error::database_error)?;
-            queue::reschedule_task(conn, task_id, fires_at).await
+            queue::reschedule_task(conn, task_id, fires_at).await?;
+            if sticky.is_some() {
+                queue::set_task_sticky_affinity(conn, task_id, sticky).await?;
+            }
+            Ok(())
         }
         .scope_boxed()
     })
+    .instrument(span)
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn persist_started_child_workflow(
     conn: &mut AsyncPgConnection,
     registry: &HandlerRegistry,
@@ -766,6 +897,7 @@ async fn persist_started_child_workflow(
     next_event_id: i32,
     commands: &[WorkflowCommand],
     child: &StartedChildWorkflowCommand,
+    sticky: Option<queue::StickyHint<'_>>,
 ) -> HarvestResult<()> {
     if !registry.workflows.contains_key(&child.workflow_name) {
         return Err(HarvestError::Config(format!(
@@ -806,6 +938,7 @@ async fn persist_started_child_workflow(
     let mut params =
         queue::EnqueueParams::new(queue_name.clone(), TaskType::Workflow, child.input.clone());
     params.workflow_exec_id = Some(child.child_id.as_uuid());
+    params.trace_context = registry.telemetry().capture_trace_context();
 
     conn.transaction::<(), HarvestError, _>(|conn| {
         async move {
@@ -817,7 +950,7 @@ async fn persist_started_child_workflow(
                 .map_err(crate::error::database_error)?;
             store::append_events(conn, child.child_id, &[child_started_event], 0).await?;
             queue::enqueue(conn, &params).await?;
-            queue::park_workflow_task(conn, task_id).await?;
+            queue::park_workflow_task(conn, task_id, sticky).await?;
             Ok(())
         }
         .scope_boxed()
@@ -835,16 +968,18 @@ async fn ingest_pending_signals(
         return Ok(());
     }
 
-    let mut signal_events = Vec::with_capacity(pending_signals.len());
-    let mut signal_ids = Vec::with_capacity(pending_signals.len());
-
-    for signal in pending_signals {
-        signal_ids.push(signal.id);
-        signal_events.push(WorkflowEvent::SignalReceived {
-            signal_name: signal.signal_name,
-            payload: signal.payload,
-        });
-    }
+    let (signal_ids, signal_events): (Vec<_>, Vec<_>) = pending_signals
+        .into_iter()
+        .map(|signal| {
+            (
+                signal.id,
+                WorkflowEvent::SignalReceived {
+                    signal_name: signal.signal_name,
+                    payload: signal.payload,
+                },
+            )
+        })
+        .unzip();
 
     conn.transaction::<(), HarvestError, _>(|conn| {
         async move {
@@ -882,15 +1017,17 @@ async fn ingest_fired_timers(
         return Ok(());
     }
 
-    let mut timer_events = Vec::with_capacity(due_timers.len());
-    let mut timer_row_ids = Vec::with_capacity(due_timers.len());
-
-    for timer in due_timers {
-        timer_row_ids.push(timer.id);
-        timer_events.push(WorkflowEvent::TimerFired {
-            timer_id: TimerId::new(timer.timer_id),
-        });
-    }
+    let (timer_row_ids, timer_events): (Vec<_>, Vec<_>) = due_timers
+        .into_iter()
+        .map(|timer| {
+            (
+                timer.id,
+                WorkflowEvent::TimerFired {
+                    timer_id: TimerId::new(timer.timer_id),
+                },
+            )
+        })
+        .unzip();
 
     conn.transaction::<(), HarvestError, _>(|conn| {
         async move {
@@ -1084,12 +1221,49 @@ async fn persist_child_workflow_failure(
     .await
 }
 
+/// Poll the task queue row for `task_id` until its state leaves `RUNNING`,
+/// at which point the caller should treat the activity as cancelled.
+///
+/// Transient DB errors are retried silently; only a state transition (or
+/// row deletion) resolves the future.
+async fn observe_task_cancellation(pool: &DbPool, task_id: uuid::Uuid) {
+    use crate::schema::harvest_task_queue::dsl;
+
+    const POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+    loop {
+        tokio::time::sleep(POLL_INTERVAL).await;
+
+        let Ok(mut conn) = pool.get().await else {
+            continue;
+        };
+
+        let row = dsl::harvest_task_queue
+            .find(task_id)
+            .select(dsl::state)
+            .first::<String>(&mut conn)
+            .await
+            .optional();
+
+        if let Ok(Some(state)) = &row
+            && state == "RUNNING"
+        {
+            continue;
+        }
+        if row.is_ok() {
+            return;
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
 async fn process_activity_task(
     pool: &DbPool,
     conn: &mut AsyncPgConnection,
     registry: &HandlerRegistry,
     task: &TaskQueueItem,
     worker_id: &str,
+    cancellation_grace_period: Duration,
 ) -> HarvestResult<()> {
     let Some(exec_uuid) = task.workflow_exec_id else {
         return fail_task_only(conn, task.id, "activity task missing workflow_exec_id").await;
@@ -1105,48 +1279,111 @@ async fn process_activity_task(
         return Err(HarvestError::Config(error));
     };
 
-    let history = match store::load_history(conn, exec_id).await {
-        Ok(history) => history,
-        Err(error) => {
-            fail_task_and_execution(conn, task, worker_id, &error.to_string()).await?;
-            return Err(error);
-        }
-    };
+    let history_result = store::load_history(conn, exec_id).await;
+    let history = fail_execution_on_error(conn, task, worker_id, history_result).await?;
 
-    let activity_id = match find_pending_scheduled_activity(&history.events, activity_name) {
-        Ok(activity_id) => activity_id,
-        Err(error) => {
-            fail_task_and_execution(conn, task, worker_id, &error.to_string()).await?;
-            return Err(error);
-        }
-    };
+    let activity_id_result = find_pending_scheduled_activity(&history.events, activity_name);
+    let activity_id = fail_execution_on_error(conn, task, worker_id, activity_id_result).await?;
 
     let started_event = WorkflowEvent::ActivityStarted {
         activity_id,
         worker_id: WorkerId::new(worker_id),
     };
-    if let Err(error) =
-        store::append_events(conn, exec_id, &[started_event], history.next_event_id).await
-    {
-        fail_task_and_execution(conn, task, worker_id, &error.to_string()).await?;
-        return Err(error);
-    }
+    let append_result =
+        store::append_events(conn, exec_id, &[started_event], history.next_event_id).await;
+    fail_execution_on_error(conn, task, worker_id, append_result).await?;
 
     let cancel = CancellationToken::new();
     let heartbeat_tx =
         crate::heartbeat::spawn_heartbeat_flusher(task.id, pool.clone(), cancel.clone());
-    let ctx = ActivityContext::new(registry.shared_state(), Some(heartbeat_tx), cancel.clone());
+    let trace_carrier = task
+        .trace_context
+        .as_ref()
+        .and_then(TraceContextCarrier::from_json);
+    let ctx = ActivityContext::new_with_cancellation_check(
+        registry.shared_state(),
+        Some(heartbeat_tx),
+        cancel.clone(),
+        task.id,
+        pool.clone(),
+    )
+    .with_trace_context(trace_carrier.clone());
 
-    let activity_result = (activity.handler)(&ctx, task.input.clone()).await;
-    cancel.cancel();
+    let telemetry = registry.telemetry().clone();
+    // Reinstate the parent trace context (if any) so the activity span becomes
+    // a child of whichever span enqueued this task, stitching the trace across
+    // the Postgres queue boundary.
+    let _parent_guard = trace_carrier
+        .as_ref()
+        .map(|carrier| telemetry.install_trace_context(carrier));
+    let span = tracing::info_span!(
+        "harvest.activity.run",
+        "otel.kind" = "consumer",
+        activity.name = %activity_name,
+        activity.queue = %task.queue_name,
+        activity.attempt = task.attempt,
+        workflow.execution_id = %exec_id,
+        task.id = %task.id,
+        service.name = %telemetry.service_name,
+    );
+    let started_at = std::time::Instant::now();
 
-    let retry_policy = match configured_retry_policy(task) {
-        Ok(retry_policy) => retry_policy,
-        Err(error) => {
-            fail_task_and_execution(conn, task, worker_id, &error.to_string()).await?;
-            return Err(error);
+    let mut activity_future = (activity.handler)(&ctx, task.input.clone());
+    let cancellation_observer = observe_task_cancellation(pool, task.id);
+    tokio::pin!(cancellation_observer);
+
+    let activity_result = {
+        use tracing::Instrument;
+        async {
+            tokio::select! {
+                biased;
+                result = &mut activity_future => result,
+                () = &mut cancellation_observer => {
+                    cancel.cancel();
+                    tracing::info!(
+                        task_id = %task.id,
+                        activity = %activity_name,
+                        grace_period_ms = %cancellation_grace_period.as_millis(),
+                        "workflow cancellation detected for running activity; awaiting cooperative unwind"
+                    );
+                    tokio::time::timeout(cancellation_grace_period, &mut activity_future)
+                        .await
+                        .unwrap_or_else(|_| {
+                            tracing::warn!(
+                                task_id = %task.id,
+                                activity = %activity_name,
+                                grace_period_ms = %cancellation_grace_period.as_millis(),
+                                "activity ignored cancellation; hard-aborting handler"
+                            );
+                            Err(format!(
+                                "workflow cancelled: activity '{activity_name}' exceeded {}ms cancellation grace period",
+                                cancellation_grace_period.as_millis()
+                            ))
+                        })
+                }
+            }
         }
+        .instrument(span)
+        .await
     };
+
+    let duration_secs = started_at.elapsed().as_secs_f64();
+    let status = if activity_result.is_ok() {
+        ActivityStatus::Completed
+    } else {
+        ActivityStatus::Failed
+    };
+    telemetry.metrics.record_activity_completed(
+        activity_name,
+        &task.queue_name,
+        duration_secs,
+        status,
+    );
+    cancel.cancel();
+    drop(activity_future);
+
+    let retry_policy_result = configured_retry_policy(task);
+    let retry_policy = fail_execution_on_error(conn, task, worker_id, retry_policy_result).await?;
 
     match activity_result {
         Ok(output) => {
@@ -1161,14 +1398,8 @@ async fn process_activity_task(
             .await
         }
         Err(error) => {
-            let delay = match next_retry_delay(task, &error, retry_policy.as_ref()) {
-                Ok(delay) => delay,
-                Err(delay_error) => {
-                    fail_task_and_execution(conn, task, worker_id, &delay_error.to_string())
-                        .await?;
-                    return Err(delay_error);
-                }
-            };
+            let delay_result = next_retry_delay(task, &error, retry_policy.as_ref());
+            let delay = fail_execution_on_error(conn, task, worker_id, delay_result).await?;
 
             if let Some(delay) = delay {
                 return queue::requeue_for_retry(conn, task.id, delay).await;
@@ -1187,12 +1418,15 @@ async fn process_activity_task(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn handle_suspended_workflow(
     conn: &mut AsyncPgConnection,
     registry: &HandlerRegistry,
     context: SuspendedWorkflowContext<'_>,
     commands: &[WorkflowCommand],
 ) -> HarvestResult<()> {
+    let sticky = context.persistence.sticky_hint();
+
     if should_requeue_signal_wait(commands) {
         let marker_events = marker_events_from_commands(commands);
         let result = persist_signal_wait_park(
@@ -1201,9 +1435,10 @@ async fn handle_suspended_workflow(
             context.persistence.exec_id,
             context.persistence.next_event_id,
             &marker_events,
+            sticky,
         )
         .await;
-        return settle_suspended_result(
+        return fail_execution_on_error(
             conn,
             context.persistence.task,
             context.persistence.worker_id,
@@ -1221,9 +1456,10 @@ async fn handle_suspended_workflow(
             context.persistence.next_event_id,
             commands,
             &scheduled,
+            sticky,
         )
         .await;
-        return settle_suspended_result(
+        return fail_execution_on_error(
             conn,
             context.persistence.task,
             context.persistence.worker_id,
@@ -1240,9 +1476,18 @@ async fn handle_suspended_workflow(
             context.persistence.task.id,
             commands,
             &timer,
+            sticky,
         )
         .await;
-        return settle_suspended_result(
+        if result.is_ok() {
+            #[allow(clippy::cast_precision_loss)]
+            let duration_secs = timer.duration_secs as f64;
+            registry
+                .telemetry()
+                .metrics
+                .record_timer_started(duration_secs);
+        }
+        return fail_execution_on_error(
             conn,
             context.persistence.task,
             context.persistence.worker_id,
@@ -1260,9 +1505,10 @@ async fn handle_suspended_workflow(
             context.persistence.next_event_id,
             commands,
             &child,
+            sticky,
         )
         .await;
-        return settle_suspended_result(
+        return fail_execution_on_error(
             conn,
             context.persistence.task,
             context.persistence.worker_id,
@@ -1272,7 +1518,7 @@ async fn handle_suspended_workflow(
     }
 
     let error = suspended_workflow_error(commands);
-    persist_workflow_failure(
+    let result = persist_workflow_failure(
         conn,
         context.persistence.task.id,
         context.persistence.exec_id,
@@ -1280,10 +1526,18 @@ async fn handle_suspended_workflow(
         context.persistence.worker_id,
         &error,
     )
+    .await;
+
+    fail_execution_on_error(
+        conn,
+        context.persistence.task,
+        context.persistence.worker_id,
+        result,
+    )
     .await
 }
 
-async fn settle_suspended_result<T>(
+async fn fail_execution_on_error<T>(
     conn: &mut AsyncPgConnection,
     task: &TaskQueueItem,
     worker_id: &str,
@@ -1318,41 +1572,22 @@ async fn load_workflow_replay_state(
     worker_id: &str,
     exec_id: ExecutionId,
 ) -> HarvestResult<store::EventHistory> {
-    let initial_history = match store::load_history(conn, exec_id).await {
-        Ok(history) => history,
-        Err(error) => {
-            fail_task_and_execution(conn, task, worker_id, &error.to_string()).await?;
-            return Err(error);
-        }
-    };
+    let history_result = store::load_history(conn, exec_id).await;
+    let initial_history = fail_execution_on_error(conn, task, worker_id, history_result).await?;
 
-    if let Err(error) = ingest_fired_timers(conn, exec_id, initial_history.next_event_id).await {
-        fail_task_and_execution(conn, task, worker_id, &error.to_string()).await?;
-        return Err(error);
-    }
+    let timers_result = ingest_fired_timers(conn, exec_id, initial_history.next_event_id).await;
+    fail_execution_on_error(conn, task, worker_id, timers_result).await?;
 
-    let history_after_timers = match store::load_history(conn, exec_id).await {
-        Ok(history) => history,
-        Err(error) => {
-            fail_task_and_execution(conn, task, worker_id, &error.to_string()).await?;
-            return Err(error);
-        }
-    };
+    let history_after_timers_result = store::load_history(conn, exec_id).await;
+    let history_after_timers =
+        fail_execution_on_error(conn, task, worker_id, history_after_timers_result).await?;
 
-    if let Err(error) =
-        ingest_pending_signals(conn, exec_id, history_after_timers.next_event_id).await
-    {
-        fail_task_and_execution(conn, task, worker_id, &error.to_string()).await?;
-        return Err(error);
-    }
+    let signals_result =
+        ingest_pending_signals(conn, exec_id, history_after_timers.next_event_id).await;
+    fail_execution_on_error(conn, task, worker_id, signals_result).await?;
 
-    match store::load_history(conn, exec_id).await {
-        Ok(history) => Ok(history),
-        Err(error) => {
-            fail_task_and_execution(conn, task, worker_id, &error.to_string()).await?;
-            Err(error)
-        }
-    }
+    let final_history_result = store::load_history(conn, exec_id).await;
+    fail_execution_on_error(conn, task, worker_id, final_history_result).await
 }
 
 async fn prepare_workflow_task(
@@ -1377,6 +1612,131 @@ async fn prepare_workflow_task(
     })
 }
 
+/// Atomically seal the current execution as `CONTINUED_AS_NEW` and start a
+/// fresh execution with the same logical `WorkflowId`, a new `ExecutionId`,
+/// and an empty event history. Pending unconsumed signals on the old
+/// execution are reassigned to the new one so that signals delivered during
+/// the transition window are not lost.
+///
+/// Continue-as-new is intentionally restricted to root workflows. Allowing it
+/// from a child workflow would require either reparenting the new run (which
+/// changes the spawn-time logical identity its parent recorded) or orphaning
+/// the parent's `ChildWorkflow*` waiter, neither of which has a sound default
+/// in Phase 1. Callers from a child workflow get an explicit failure instead.
+async fn persist_workflow_continue_as_new(
+    conn: &mut AsyncPgConnection,
+    persistence: WorkflowTaskPersistence<'_>,
+    execution: &WorkflowExecution,
+    input: serde_json::Value,
+) -> HarvestResult<()> {
+    use crate::schema::{harvest_signals, harvest_workflow_executions};
+
+    if let Some(parent_exec_id) = execution.parent_id.map(execution_id_from_uuid) {
+        let error =
+            "continue_as_new is not supported in child workflows in this release".to_string();
+        return persist_child_workflow_failure(
+            conn,
+            persistence.task.id,
+            persistence.exec_id,
+            persistence.next_event_id,
+            persistence.worker_id,
+            parent_exec_id,
+            &error,
+        )
+        .await;
+    }
+
+    // The new execution stays on the same shard so all of its event log,
+    // queue rows, timers, and signals continue to live in the same Postgres
+    // database as its predecessor.
+    let new_exec_id = ExecutionId::new_for_shard(persistence.exec_id.shard());
+    let task_id = persistence.task.id;
+    let exec_id = persistence.exec_id;
+    let next_event_id = persistence.next_event_id;
+    let worker_id = persistence.worker_id;
+    let started_event = WorkflowEvent::WorkflowStarted {
+        input: input.clone(),
+        timestamp: chrono::Utc::now(),
+    };
+    let continued_event = WorkflowEvent::WorkflowContinuedAsNew {
+        new_exec_id,
+        input: input.clone(),
+    };
+    let new_row = NewWorkflowExecution {
+        id: new_exec_id.as_uuid(),
+        workflow_name: &execution.workflow_name,
+        workflow_id: &execution.workflow_id,
+        run_id: uuid::Uuid::new_v4(),
+        shard_id: execution.shard_id,
+        input: input.clone(),
+        parent_id: None,
+        queue_name: &execution.queue_name,
+        execution_timeout: execution.execution_timeout,
+        memo: execution.memo.clone(),
+        search_attrs: execution.search_attrs.clone(),
+    };
+    let mut enqueue =
+        queue::EnqueueParams::new(execution.queue_name.clone(), TaskType::Workflow, input);
+    enqueue.workflow_exec_id = Some(new_exec_id.as_uuid());
+
+    conn.transaction::<(), HarvestError, _>(|conn| {
+        async move {
+            // Append the terminal continued-as-new marker to the old run.
+            store::append_events(conn, exec_id, &[continued_event], next_event_id).await?;
+
+            // Seal the old execution. The CHECK constraint allows this state
+            // value as of the continue-as-new migration; the partial unique
+            // index on (workflow_name, workflow_id) excludes CONTINUED_AS_NEW
+            // so the new row below can reuse the same logical identity.
+            let updated =
+                diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
+                    .filter(harvest_workflow_executions::state.eq("RUNNING"))
+                    .set((
+                        harvest_workflow_executions::state.eq("CONTINUED_AS_NEW"),
+                        harvest_workflow_executions::output.eq(None::<serde_json::Value>),
+                        harvest_workflow_executions::error.eq(None::<String>),
+                        harvest_workflow_executions::sticky_worker_id
+                            .eq(Some(worker_id.to_string())),
+                        harvest_workflow_executions::completed_at.eq(Some(chrono::Utc::now())),
+                    ))
+                    .execute(conn)
+                    .await
+                    .map_err(crate::error::database_error)?;
+            if updated == 0 {
+                return Err(workflow_execution_transition_error(conn, exec_id).await?);
+            }
+
+            diesel::insert_into(harvest_workflow_executions::table)
+                .values(&new_row)
+                .execute(conn)
+                .await
+                .map_err(crate::error::database_error)?;
+
+            store::append_events(conn, new_exec_id, &[started_event], 0).await?;
+
+            // Reassign unconsumed signals to the new execution so signals
+            // delivered while the workflow body was running do not disappear
+            // through the transition. Consumed signals stay on the old run
+            // for audit purposes.
+            diesel::update(
+                harvest_signals::table
+                    .filter(harvest_signals::workflow_exec_id.eq(exec_id.as_uuid()))
+                    .filter(harvest_signals::consumed.eq(false)),
+            )
+            .set(harvest_signals::workflow_exec_id.eq(new_exec_id.as_uuid()))
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+
+            queue::enqueue(conn, &enqueue).await?;
+            queue::complete_task(conn, task_id, serde_json::Value::Null).await?;
+            Ok(())
+        }
+        .scope_boxed()
+    })
+    .await
+}
+
 async fn persist_workflow_outcome(
     conn: &mut AsyncPgConnection,
     registry: &HandlerRegistry,
@@ -1384,56 +1744,56 @@ async fn persist_workflow_outcome(
     persistence: WorkflowTaskPersistence<'_>,
     outcome: WorkflowOutcome,
 ) -> HarvestResult<()> {
-    match outcome {
-        WorkflowOutcome::Completed { output } => {
-            if let Some(parent_uuid) = execution.parent_id {
-                persist_child_workflow_completion(
-                    conn,
-                    persistence.task.id,
-                    persistence.exec_id,
-                    persistence.next_event_id,
-                    persistence.worker_id,
-                    execution_id_from_uuid(parent_uuid),
-                    output,
-                )
-                .await
-            } else {
-                persist_workflow_completion(
-                    conn,
-                    persistence.task.id,
-                    persistence.exec_id,
-                    persistence.next_event_id,
-                    persistence.worker_id,
-                    output,
-                )
-                .await
-            }
+    let parent_exec_id = execution.parent_id.map(execution_id_from_uuid);
+
+    match (outcome, parent_exec_id) {
+        (WorkflowOutcome::Completed { output }, Some(parent_id)) => {
+            persist_child_workflow_completion(
+                conn,
+                persistence.task.id,
+                persistence.exec_id,
+                persistence.next_event_id,
+                persistence.worker_id,
+                parent_id,
+                output,
+            )
+            .await
         }
-        WorkflowOutcome::Failed { error } => {
-            if let Some(parent_uuid) = execution.parent_id {
-                persist_child_workflow_failure(
-                    conn,
-                    persistence.task.id,
-                    persistence.exec_id,
-                    persistence.next_event_id,
-                    persistence.worker_id,
-                    execution_id_from_uuid(parent_uuid),
-                    &error,
-                )
-                .await
-            } else {
-                persist_workflow_failure(
-                    conn,
-                    persistence.task.id,
-                    persistence.exec_id,
-                    persistence.next_event_id,
-                    persistence.worker_id,
-                    &error,
-                )
-                .await
-            }
+        (WorkflowOutcome::Completed { output }, None) => {
+            persist_workflow_completion(
+                conn,
+                persistence.task.id,
+                persistence.exec_id,
+                persistence.next_event_id,
+                persistence.worker_id,
+                output,
+            )
+            .await
         }
-        WorkflowOutcome::Suspended { commands } => {
+        (WorkflowOutcome::Failed { error }, Some(parent_id)) => {
+            persist_child_workflow_failure(
+                conn,
+                persistence.task.id,
+                persistence.exec_id,
+                persistence.next_event_id,
+                persistence.worker_id,
+                parent_id,
+                &error,
+            )
+            .await
+        }
+        (WorkflowOutcome::Failed { error }, None) => {
+            persist_workflow_failure(
+                conn,
+                persistence.task.id,
+                persistence.exec_id,
+                persistence.next_event_id,
+                persistence.worker_id,
+                &error,
+            )
+            .await
+        }
+        (WorkflowOutcome::Suspended { commands }, _) => {
             handle_suspended_workflow(
                 conn,
                 registry,
@@ -1445,6 +1805,11 @@ async fn persist_workflow_outcome(
             )
             .await
         }
+        (WorkflowOutcome::ContinuedAsNew { input }, _) => {
+            let result =
+                persist_workflow_continue_as_new(conn, persistence, execution, input).await;
+            fail_execution_on_error(conn, persistence.task, persistence.worker_id, result).await
+        }
     }
 }
 
@@ -1453,6 +1818,7 @@ async fn process_workflow_task(
     registry: &HandlerRegistry,
     task: &TaskQueueItem,
     worker_id: &str,
+    sticky_timeout: Duration,
 ) -> HarvestResult<()> {
     let prepared = prepare_workflow_task(conn, task, worker_id).await?;
     let Some(workflow) = registry.workflows.get(&prepared.execution.workflow_name) else {
@@ -1464,6 +1830,23 @@ async fn process_workflow_task(
         return Err(HarvestError::Config(error));
     };
 
+    let telemetry = registry.telemetry().clone();
+    let trace_carrier = task
+        .trace_context
+        .as_ref()
+        .and_then(TraceContextCarrier::from_json);
+    // Reinstate the producer's trace context so the executor's
+    // `harvest.workflow.run` span becomes a child of the span that enqueued
+    // this task — this is what stitches the trace across the queue boundary.
+    let _parent_guard = trace_carrier
+        .as_ref()
+        .map(|carrier| telemetry.install_trace_context(carrier));
+
+    telemetry
+        .metrics
+        .record_workflow_started(&prepared.execution.workflow_name, &task.queue_name);
+    let started_at = std::time::Instant::now();
+
     let outcome = run_workflow_with_state(
         prepared.exec_id,
         prepared.history_events,
@@ -1472,6 +1855,19 @@ async fn process_workflow_task(
         registry.shared_state(),
     )
     .await;
+
+    let status = match &outcome {
+        WorkflowOutcome::Completed { .. } => WorkflowStatus::Completed,
+        WorkflowOutcome::Failed { .. } => WorkflowStatus::Failed,
+        WorkflowOutcome::Suspended { .. } => WorkflowStatus::Suspended,
+        WorkflowOutcome::ContinuedAsNew { .. } => WorkflowStatus::ContinuedAsNew,
+    };
+    telemetry.metrics.record_workflow_completed(
+        &prepared.execution.workflow_name,
+        &task.queue_name,
+        started_at.elapsed().as_secs_f64(),
+        status,
+    );
 
     persist_workflow_outcome(
         conn,
@@ -1482,6 +1878,7 @@ async fn process_workflow_task(
             worker_id,
             exec_id: prepared.exec_id,
             next_event_id: prepared.next_event_id,
+            sticky_timeout,
         },
         outcome,
     )
@@ -1493,22 +1890,96 @@ async fn process_task(
     registry: Arc<HandlerRegistry>,
     task: TaskQueueItem,
     worker_id: &str,
+    cancellation_grace_period: Duration,
+    sticky_timeout: Duration,
 ) -> HarvestResult<()> {
-    let mut conn = match pool.get().await {
-        Ok(conn) => conn,
-        Err(error) => {
-            return Err(crate::error::database_error(error));
-        }
-    };
+    let mut conn = pool.get().await.map_err(crate::error::database_error)?;
 
     match ClaimedTaskKind::from_db(&task.task_type)? {
         ClaimedTaskKind::Workflow => {
-            process_workflow_task(&mut conn, registry.as_ref(), &task, worker_id).await
+            process_workflow_task(
+                &mut conn,
+                registry.as_ref(),
+                &task,
+                worker_id,
+                sticky_timeout,
+            )
+            .await
         }
         ClaimedTaskKind::Activity => {
-            process_activity_task(pool, &mut conn, registry.as_ref(), &task, worker_id).await
+            process_activity_task(
+                pool,
+                &mut conn,
+                registry.as_ref(),
+                &task,
+                worker_id,
+                cancellation_grace_period,
+            )
+            .await
         }
     }
+}
+
+/// Periodically sample per-queue pending-task counts and forward them to the
+/// configured [`MetricsRecorder`](crate::telemetry::MetricsRecorder).
+///
+/// The sampler skips work entirely when the recorder is the default no-op
+/// implementation, so unconfigured deployments pay no DB cost. It queries a
+/// single `GROUP BY queue_name` aggregate per tick — cheap enough to run at
+/// the same cadence as the poll interval.
+///
+/// Stops when the cancellation token fires. Queues with zero pending rows are
+/// also reported (as depth 0) so gauges reset cleanly after drains.
+fn spawn_queue_depth_sampler(
+    pool: DbPool,
+    cancel: CancellationToken,
+    telemetry: Arc<crate::telemetry::TelemetryConfig>,
+    queues: Vec<String>,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                () = cancel.cancelled() => break,
+                () = tokio::time::sleep(interval) => {}
+            }
+
+            let mut conn = match pool.get().await {
+                Ok(conn) => conn,
+                Err(error) => {
+                    tracing::debug!(
+                        error = %error,
+                        "queue depth sampler could not acquire DB connection"
+                    );
+                    continue;
+                }
+            };
+
+            match queue::queue_depths(&mut conn, &queues).await {
+                Ok(depths) => {
+                    let mut observed: HashSet<&str> = HashSet::new();
+                    for (queue_name, depth) in &depths {
+                        observed.insert(queue_name.as_str());
+                        telemetry
+                            .metrics
+                            .record_queue_depth(queue_name, u64::try_from(*depth).unwrap_or(0));
+                    }
+                    for queue_name in &queues {
+                        if !observed.contains(queue_name.as_str()) {
+                            telemetry.metrics.record_queue_depth(queue_name, 0);
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::debug!(error = %error, "queue depth sample failed");
+                }
+            }
+
+            if cancel.is_cancelled() {
+                break;
+            }
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1597,6 +2068,13 @@ impl Worker {
             queues = ?self.config.queues,
             "worker starting"
         );
+        let queue_depth_sampler = spawn_queue_depth_sampler(
+            pool.clone(),
+            self.shutdown.clone(),
+            self.registry.telemetry().clone(),
+            self.config.queues.clone(),
+            self.config.poll_interval,
+        );
         let timeout_checker = crate::timeout::spawn_timeout_checker(
             pool.clone(),
             self.shutdown.clone(),
@@ -1642,6 +2120,13 @@ impl Worker {
                 worker_id = %self.config.worker_id,
                 error = %error,
                 "timeout checker task failed during shutdown"
+            );
+        }
+        if let Err(error) = queue_depth_sampler.await {
+            tracing::warn!(
+                worker_id = %self.config.worker_id,
+                error = %error,
+                "queue depth sampler failed during shutdown"
             );
         }
         tracing::info!(worker_id = %self.config.worker_id, "worker stopped");
@@ -1703,6 +2188,8 @@ impl Worker {
         let task_id = task.id;
         let task_type = task.task_type.clone();
         let worker_id = self.config.worker_id.clone();
+        let cancellation_grace_period = self.config.cancellation_grace_period;
+        let sticky_timeout = self.config.sticky_timeout;
 
         tokio::spawn(async move {
             // Acquire semaphore permit — blocks if at concurrency limit.
@@ -1718,7 +2205,16 @@ impl Worker {
                 "executing task"
             );
 
-            if let Err(error) = process_task(&pool, registry, task, &worker_id).await {
+            if let Err(error) = process_task(
+                &pool,
+                registry,
+                task,
+                &worker_id,
+                cancellation_grace_period,
+                sticky_timeout,
+            )
+            .await
+            {
                 tracing::error!(
                     task_id = %task_id,
                     task_type = %task_type,
@@ -1734,7 +2230,6 @@ impl Worker {
     ///
     /// We wait until all semaphore permits are available again, meaning all
     /// spawned tasks have completed and dropped their permits.
-    #[allow(clippy::cast_possible_truncation)] // concurrency limits are well under u32::MAX
     async fn drain_in_flight(&self) {
         let total_permits =
             self.config.max_concurrent_workflows + self.config.max_concurrent_activities;
@@ -1743,11 +2238,17 @@ impl Worker {
             // Try to acquire ALL permits — when we can, all in-flight tasks are done.
             let _wf = self
                 .workflow_semaphore
-                .acquire_many(self.config.max_concurrent_workflows as u32)
+                .acquire_many(
+                    u32::try_from(self.config.max_concurrent_workflows)
+                        .expect("Concurrency limit overflow"),
+                )
                 .await;
             let _act = self
                 .activity_semaphore
-                .acquire_many(self.config.max_concurrent_activities as u32)
+                .acquire_many(
+                    u32::try_from(self.config.max_concurrent_activities)
+                        .expect("Concurrency limit overflow"),
+                )
                 .await;
         };
 
@@ -1787,6 +2288,8 @@ mod tests {
             max_concurrent_activities: 20,
             poll_interval: Duration::from_millis(100),
             shutdown_timeout: Duration::from_secs(5),
+            cancellation_grace_period: Duration::from_secs(5),
+            sticky_timeout: Duration::from_secs(5),
         }
     }
 
@@ -1807,6 +2310,27 @@ mod tests {
     }
 
     #[test]
+    fn terminal_execution_transition_error_reports_cancelled_state() {
+        let exec_id = ExecutionId::new();
+        let error =
+            terminal_execution_transition_error(exec_id, "CANCELLED", Some("operator stop"));
+
+        assert!(
+            matches!(error, HarvestError::Cancelled(message) if message.contains("operator stop"))
+        );
+    }
+
+    #[test]
+    fn terminal_execution_transition_error_reports_conflicting_terminal_state() {
+        let exec_id = ExecutionId::new();
+        let error = terminal_execution_transition_error(exec_id, "COMPLETED", None);
+
+        assert!(
+            matches!(error, HarvestError::Config(message) if message.contains("already terminal"))
+        );
+    }
+
+    #[test]
     fn worker_config_from_builder() {
         let builder_cfg = WorkerConfig {
             queues: vec!["email".to_string(), "billing".to_string()],
@@ -1816,6 +2340,8 @@ mod tests {
             shutdown_timeout: Duration::from_secs(60),
             workflow_cache_size: 500,
             sticky_timeout: Duration::from_secs(3),
+            cancellation_grace_period: Duration::from_secs(10),
+            shard_assignments: vec![crate::types::ShardId::new(0)],
         };
 
         let runtime_cfg: WorkerRuntimeConfig = builder_cfg.into();
@@ -1829,6 +2355,10 @@ mod tests {
         assert_eq!(runtime_cfg.max_concurrent_activities, 15);
         assert_eq!(runtime_cfg.shutdown_timeout, Duration::from_secs(60));
         assert_eq!(runtime_cfg.poll_interval, Duration::from_millis(500));
+        assert_eq!(
+            runtime_cfg.cancellation_grace_period,
+            Duration::from_secs(10)
+        );
         // worker_id should be a valid UUID
         assert!(uuid::Uuid::parse_str(&runtime_cfg.worker_id).is_ok());
     }

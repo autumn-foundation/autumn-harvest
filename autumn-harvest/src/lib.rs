@@ -14,22 +14,37 @@
 pub const MIGRATIONS: diesel_migrations::EmbeddedMigrations =
     diesel_migrations::embed_migrations!();
 
+/// History analyzer and linter.
+pub mod analyzer;
 pub mod builder;
 pub mod cache;
 pub mod context;
 pub mod dag;
+/// Export format types for Directed Acyclic Graphs (DAGs) representing workflows.
+pub mod dag_export;
+#[cfg(any(test, feature = "testing"))]
+pub mod dag_simulator;
 pub mod error;
 pub mod event;
 #[cfg(feature = "db")]
 #[doc(hidden)]
 pub mod execution;
 pub mod executor;
+pub mod history_export;
 pub mod info;
 pub mod policy;
 pub mod pool;
 pub mod prelude;
+/// Types and definitions for querying workflow state and metadata.
 pub mod query;
 pub mod replay;
+pub mod saga;
+pub mod shard;
+pub mod simulator;
+/// OpenTelemetry integration: trace-context propagation and metrics.
+pub mod telemetry;
+#[cfg(any(test, feature = "testing"))]
+pub mod test_generator;
 pub mod types;
 
 #[cfg(feature = "db")]
@@ -66,28 +81,48 @@ pub mod timeout;
 #[doc(hidden)]
 pub mod worker;
 
+pub use analyzer::{
+    AnalyzerRule, AnalyzerWarning, ExcessiveRetriesRule, HistoryAnalyzer, LargePayloadRule,
+    SuspiciousTimerRule,
+};
 pub use builder::{BuiltHarvest, HarvestBuilder, WorkerConfig};
 pub use cache::{CachedWorkflowState, WorkflowCache};
 pub use context::{ActivityContext, WorkflowCommand, WorkflowContext};
 pub use dag::{DagBuildError, DagBuilder, DagDefinition, DagTask, DagTaskRef};
+pub use dag_export::{export_dot, export_mermaid};
+#[cfg(any(test, feature = "testing"))]
+pub use dag_simulator::{DagSimulator, DagSimulatorResult};
 pub use error::{HarvestError, HarvestResult, TimeoutType};
 pub use event::WorkflowEvent;
 #[cfg(feature = "db")]
 pub use execution::{
-    StartWorkflowParams, StartedWorkflowExecution, start_or_load_workflow_execution,
+    CancelledWorkflowExecution, StartWorkflowParams, StartedWorkflowExecution,
+    cancel_workflow_execution, start_or_load_workflow_execution,
 };
 pub use executor::{WorkflowOutcome, run_workflow};
+pub use history_export::export_mermaid_sequence;
 pub use info::{ActivityHandlerFn, ActivityInfo, DagInfo, WorkflowHandlerFn, WorkflowInfo};
 pub use policy::{RetryPolicy, Schedule, TaskStatus, TriggerRule};
 pub use pool::{HarvestPoolConfig, compute_pool_sizes};
 pub use query::QueryRegistry;
 pub use replay::{HistoryMatch, HistoryMatcher};
+pub use saga::Saga;
 #[cfg(feature = "db")]
 pub use scheduler::{
     DagCatalog, RegisteredDag, SchedulerMonitor, SchedulerRuntime, compile_dag_catalog,
     register_schedules, tick_once, trigger_dag,
 };
-pub use types::{ActivityExecId, ExecutionId, TimerId, WorkerId, WorkflowId};
+pub use shard::ShardRouter;
+#[cfg(feature = "db")]
+pub use shard::ShardedDbPool;
+pub use simulator::{SimulatorResult, WorkflowSimulator};
+pub use telemetry::{
+    ActivityStatus, MetricsRecorder, NoOpMetrics, NoOpPropagator, TelemetryConfig,
+    TelemetryConfigBuilder, TraceContextCarrier, TraceContextPropagator, WorkflowStatus,
+};
+#[cfg(any(test, feature = "testing"))]
+pub use test_generator::TestHarnessGenerator;
+pub use types::{ActivityExecId, ExecutionId, ShardId, TimerId, WorkerId, WorkflowId};
 
 #[cfg(feature = "db")]
 pub use store::EventHistory;
@@ -111,10 +146,10 @@ pub fn task_duration(s: &str) -> Option<std::time::Duration> {
             let num: u64 = current_num.parse().ok()?;
             current_num.clear();
             match ch {
-                's' => total_secs += num,
-                'm' => total_secs += num * 60,
-                'h' => total_secs += num * 3600,
-                'd' => total_secs += num * 86400,
+                's' => total_secs = total_secs.checked_add(num)?,
+                'm' => total_secs = total_secs.checked_add(num.checked_mul(60)?)?,
+                'h' => total_secs = total_secs.checked_add(num.checked_mul(3600)?)?,
+                'd' => total_secs = total_secs.checked_add(num.checked_mul(86400)?)?,
                 _ => return None,
             }
         } else if ch != ' ' {
@@ -165,5 +200,13 @@ mod tests {
         assert_eq!(task_duration(""), None);
         assert_eq!(task_duration("5"), None);
         assert_eq!(task_duration("5x"), None);
+    }
+
+    #[test]
+    fn task_duration_rejects_overflow() {
+        assert_eq!(task_duration("18446744073709551615d"), None); // u64::MAX
+        assert_eq!(task_duration("18446744073709551615h"), None); // u64::MAX
+        assert_eq!(task_duration("18446744073709551615m"), None); // u64::MAX
+        assert_eq!(task_duration("18446744073709551614s 2s"), None); // Add overflow
     }
 }

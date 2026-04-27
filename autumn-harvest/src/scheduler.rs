@@ -27,39 +27,55 @@ use crate::worker::{DbPool, HandlerRegistry};
 
 const DEFAULT_SCHEDULER_TICK_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Represents a fully registered and compiled DAG definition.
 #[derive(Debug, Clone)]
 pub struct RegisteredDag {
+    /// The name of the DAG.
     pub name: String,
+    /// The Rust module path where the DAG is defined.
     pub module: String,
+    /// Optional schedule for automatic execution.
     pub schedule: Option<Schedule>,
+    /// Whether to run missed executions sequentially if the scheduler was down.
     pub catchup: bool,
+    /// Maximum number of concurrent executions for this DAG.
     pub max_active_runs: u32,
+    /// The compiled task and dependency definition.
     pub definition: crate::dag::DagDefinition,
 }
 
 impl RegisteredDag {
+    /// Returns the number of tasks in this DAG.
     #[must_use]
     pub fn task_count(&self) -> usize {
         self.definition.tasks().len()
     }
 }
 
+/// A collection of registered DAGs mapped by name.
 pub type DagCatalog = HashMap<String, RegisteredDag>;
 
+/// A point-in-time diagnostic snapshot of the scheduler's state.
 #[derive(Debug, Clone, Serialize)]
 pub struct SchedulerSnapshot {
+    /// True if the scheduler loop is currently running.
     pub running: bool,
+    /// Number of DAGs registered with the scheduler.
     pub dag_count: usize,
+    /// Interval in milliseconds between scheduler ticks.
     pub tick_interval_ms: u64,
+    /// UTC timestamp of the last executed tick.
     pub last_tick_at: Option<DateTime<Utc>>,
 }
 
+/// Provides diagnostic visibility into a running scheduler.
 #[derive(Debug, Clone)]
 pub struct SchedulerMonitor {
     inner: Arc<Mutex<SchedulerSnapshot>>,
 }
 
 impl SchedulerMonitor {
+    /// Creates a new monitor initialized for the given number of DAGs.
     #[must_use]
     pub fn new(dag_count: usize) -> Self {
         Self {
@@ -75,6 +91,7 @@ impl SchedulerMonitor {
         }
     }
 
+    /// Creates a dummy offline monitor for contexts where the scheduler isn't running.
     #[must_use]
     pub fn offline() -> Self {
         Self {
@@ -117,6 +134,7 @@ impl SchedulerMonitor {
     }
 }
 
+/// The background runtime that drives DAG scheduling.
 pub struct SchedulerRuntime {
     shutdown: CancellationToken,
     handle: JoinHandle<()>,
@@ -124,6 +142,9 @@ pub struct SchedulerRuntime {
 }
 
 impl SchedulerRuntime {
+    /// Spawns the scheduler loop on a new Tokio task.
+    ///
+    /// It wakes up at a fixed interval to evaluate schedules and trigger runs.
     #[must_use]
     pub fn spawn(pool: DbPool, registry: Arc<HandlerRegistry>, dags: Arc<DagCatalog>) -> Self {
         let shutdown = CancellationToken::new();
@@ -132,10 +153,10 @@ impl SchedulerRuntime {
         let monitor_for_task = monitor.clone();
         let handle = tokio::spawn(async move {
             while !shutdown_for_task.is_cancelled() {
-                if let Ok(mut conn) = pool.get().await {
-                    if let Err(error) = register_schedules(&mut conn, dags.as_ref()).await {
-                        tracing::warn!(error = %error, "failed to register harvest schedules");
-                    }
+                if let Ok(mut conn) = pool.get().await
+                    && let Err(error) = register_schedules(&mut conn, dags.as_ref()).await
+                {
+                    tracing::warn!(error = %error, "failed to register harvest schedules");
                 }
 
                 if let Err(error) = tick_once(
@@ -165,11 +186,13 @@ impl SchedulerRuntime {
         }
     }
 
+    /// Returns a diagnostic monitor for the scheduler.
     #[must_use]
     pub fn monitor(&self) -> SchedulerMonitor {
         self.monitor.clone()
     }
 
+    /// Requests that the background scheduler loop shut down gracefully.
     pub fn shutdown(&self) {
         self.shutdown.cancel();
     }
@@ -429,10 +452,10 @@ async fn create_due_runs(conn: &mut AsyncPgConnection, dags: &DagCatalog) -> Har
     Ok(())
 }
 
-async fn activate_queued_runs(
+async fn activate_queued_runs<'a>(
     conn: &mut AsyncPgConnection,
-    dags: &DagCatalog,
-) -> HarvestResult<Vec<(DagRun, RegisteredDag)>> {
+    dags: &'a DagCatalog,
+) -> HarvestResult<Vec<(DagRun, &'a RegisteredDag)>> {
     use crate::schema::harvest_dag_runs::dsl as dag_runs_dsl;
     use crate::schema::harvest_schedules::dsl as schedules_dsl;
 
@@ -442,7 +465,7 @@ async fn activate_queued_runs(
         .load(conn)
         .await
         .map_err(crate::error::database_error)?;
-    let mut runnable = Vec::new();
+    let mut runnable = Vec::with_capacity(schedules.len());
 
     for schedule in schedules {
         let Some(dag) = dags.get(&schedule.dag_name) else {
@@ -491,7 +514,7 @@ async fn activate_queued_runs(
         updated_runs.sort_by_key(|r| r.logical_date);
 
         for updated in updated_runs {
-            runnable.push((updated, dag.clone()));
+            runnable.push((updated, dag));
         }
     }
 
@@ -501,23 +524,25 @@ async fn activate_queued_runs(
 async fn execute_dag_run(
     pool: DbPool,
     registry: Arc<HandlerRegistry>,
-    dag: RegisteredDag,
+    dag: &RegisteredDag,
     run: DagRun,
 ) -> HarvestResult<()> {
-    let run_input = run.conf.clone().unwrap_or(Value::Null);
+    // Bolt: Use Arc to avoid deep cloning the JSON Value for every task in the DAG
+    let run_input = Arc::new(run.conf.unwrap_or(Value::Null));
     let mut statuses = vec![TaskStatus::Skipped; dag.definition.tasks().len()];
 
     for level in dag.definition.execution_levels() {
         let tasks = level.iter().map(|task_index| {
-            let task = dag.definition.tasks()[*task_index].clone();
-            let upstream_statuses = task
+            // Avoid an unnecessary heap allocation of `DagTask` per task when `&DagTask` works.
+            let task = &dag.definition.tasks()[*task_index];
+            let upstream_statuses: Vec<_> = task
                 .upstreams
                 .iter()
                 .map(|upstream| statuses[*upstream].clone())
-                .collect::<Vec<_>>();
+                .collect();
             let registry = Arc::clone(&registry);
-            let task_input = run_input.clone();
-            async move { execute_dag_task(&registry, &task, &upstream_statuses, &task_input).await }
+            let task_input = Arc::clone(&run_input);
+            async move { execute_dag_task(&registry, task, &upstream_statuses, &task_input).await }
         });
         let results = futures::future::join_all(tasks).await;
         for (task_index, result) in level.iter().zip(results) {
@@ -579,26 +604,28 @@ async fn execute_dag_task(
         };
         cancel.cancel();
 
-        match result {
-            Ok(_) => return TaskStatus::Succeeded,
-            Err(error) => {
-                if let Some(policy) = retry_policy.as_ref() {
-                    if policy
-                        .non_retryable_errors
-                        .iter()
-                        .any(|non_retryable| non_retryable == &error)
-                    {
-                        return TaskStatus::Failed;
-                    }
-                    if let Some(delay) = next_retry_delay(policy, attempt) {
-                        attempt = attempt.saturating_add(1);
-                        tokio::time::sleep(delay).await;
-                        continue;
-                    }
-                }
-                return TaskStatus::Failed;
-            }
+        let Err(error) = result else {
+            return TaskStatus::Succeeded;
+        };
+
+        let Some(policy) = retry_policy.as_ref() else {
+            return TaskStatus::Failed;
+        };
+
+        if policy
+            .non_retryable_errors
+            .iter()
+            .any(|non_retryable| non_retryable == &error)
+        {
+            return TaskStatus::Failed;
         }
+
+        let Some(delay) = next_retry_delay(policy, attempt) else {
+            return TaskStatus::Failed;
+        };
+
+        attempt = attempt.saturating_add(1);
+        tokio::time::sleep(delay).await;
     }
 }
 
@@ -703,7 +730,7 @@ fn due_run_plan(
         return (vec![first_due], next_run_after(schedule, now));
     }
 
-    let mut created = Vec::new();
+    let mut created = Vec::with_capacity(1);
     let mut cursor = first_due;
 
     loop {

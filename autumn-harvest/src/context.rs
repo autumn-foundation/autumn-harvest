@@ -9,6 +9,8 @@
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+#[cfg(feature = "db")]
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -32,6 +34,40 @@ pub fn empty_shared_state() -> SharedState {
     Arc::new(HashMap::new())
 }
 
+#[cfg(feature = "db")]
+type ActivityCancellationPool =
+    diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>;
+
+#[cfg(feature = "db")]
+const DURABLE_CANCELLATION_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
+#[cfg(feature = "db")]
+struct ActivityCancellationCheck {
+    task_id: uuid::Uuid,
+    pool: ActivityCancellationPool,
+    last_checked_at: Mutex<Option<Instant>>,
+}
+
+#[cfg(feature = "db")]
+fn should_check_durable_cancellation(
+    last_checked_at: &Mutex<Option<Instant>>,
+    now: Instant,
+) -> bool {
+    let mut last_checked_at = last_checked_at
+        .lock()
+        .expect("activity cancellation check lock poisoned");
+
+    if last_checked_at.is_some_and(|last| {
+        now.checked_duration_since(last)
+            .is_some_and(|elapsed| elapsed < DURABLE_CANCELLATION_CHECK_INTERVAL)
+    }) {
+        return false;
+    }
+
+    *last_checked_at = Some(now);
+    true
+}
+
 // ---------------------------------------------------------------------------
 // WorkflowCommand -- commands emitted during live execution
 // ---------------------------------------------------------------------------
@@ -43,39 +79,73 @@ pub fn empty_shared_state() -> SharedState {
 pub enum WorkflowCommand {
     /// Schedule an activity for execution on a task queue.
     ScheduleActivity {
+        /// The unique execution ID of the activity.
         activity_id: ActivityExecId,
+        /// The name of the activity to execute.
         name: String,
+        /// The input payload for the activity.
         input: Value,
+        /// The queue to schedule the activity on.
         queue: String,
         /// The worker sends the result back through this channel.
         result_tx: oneshot::Sender<Result<Value, String>>,
     },
     /// Start a durable timer.
     StartTimer {
+        /// The unique ID of the timer.
         timer_id: TimerId,
+        /// The duration to wait before firing the timer, in seconds.
         duration_secs: u64,
         /// Fires when the timer completes.
         result_tx: oneshot::Sender<()>,
     },
     /// Start a child workflow execution.
     StartChildWorkflow {
+        /// The unique execution ID of the child workflow.
         child_id: ExecutionId,
+        /// The name of the workflow to execute.
         workflow_name: String,
+        /// The input payload for the child workflow.
         input: Value,
         /// The worker sends the terminal child result back through this channel.
         result_tx: oneshot::Sender<Result<Value, String>>,
     },
     /// Record an opaque marker (used by version gates, side-effect-free notes).
-    RecordMarker { name: String, details: Value },
+    RecordMarker {
+        /// The name of the marker.
+        name: String,
+        /// Optional details or payload associated with the marker.
+        details: Value,
+    },
     /// Suspend until a named signal is delivered.
     WaitForSignal {
+        /// The name of the signal to wait for.
         signal_name: String,
+        /// The worker sends the signal payload back through this channel.
         result_tx: oneshot::Sender<Value>,
     },
     /// The workflow function returned `Ok(output)`.
-    Complete { output: Value },
+    Complete {
+        /// The final output payload of the workflow.
+        output: Value,
+    },
     /// The workflow function returned `Err(error)`.
-    Fail { error: String },
+    Fail {
+        /// The string representation of the error that caused the failure.
+        error: String,
+    },
+    /// Atomically end the current execution and start a fresh one with the
+    /// same `WorkflowId` (logical identity) but a new `ExecutionId` and a
+    /// fresh event history.
+    ///
+    /// The accompanying future returned by
+    /// [`WorkflowContext::continue_as_new`] never resolves: the worker drains
+    /// this command after the executor's suspension timeout and treats it as
+    /// terminal regardless of whether the workflow function later returns.
+    ContinueAsNew {
+        /// Input passed to the next iteration of the workflow.
+        input: Value,
+    },
 }
 
 // Manual Debug because oneshot::Sender is not Debug.
@@ -124,8 +194,21 @@ impl std::fmt::Debug for WorkflowCommand {
                 f.debug_struct("Complete").field("output", output).finish()
             }
             Self::Fail { error } => f.debug_struct("Fail").field("error", error).finish(),
+            Self::ContinueAsNew { input } => f
+                .debug_struct("ContinueAsNew")
+                .field("input", input)
+                .finish(),
         }
     }
+}
+
+/// Suspend forever — used by terminal commands like `continue_as_new` whose
+/// resolution is performed by the worker after draining the command rather
+/// than by completing a oneshot. The executor's suspension timeout will fire
+/// long before this future could resolve naturally.
+async fn park_until_dropped() -> HarvestResult<()> {
+    std::future::pending::<()>().await;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -158,6 +241,11 @@ pub struct WorkflowContext {
     state: SharedState,
     /// In-memory query handlers (not persisted to history).
     query_registry: Mutex<QueryRegistry>,
+    /// Cancellation reason captured from a `WorkflowCancelled` event in history,
+    /// if any. When set, `is_cancelled()` returns true and `check_cancellation()`
+    /// yields [`HarvestError::Cancelled`]. Cooperative: the workflow function is
+    /// expected to consult these at strategic points to run cleanup logic.
+    cancellation_reason: Option<String>,
 }
 
 impl WorkflowContext {
@@ -189,6 +277,13 @@ impl WorkflowContext {
             })
             .unwrap_or_else(Utc::now);
 
+        // Capture any terminal cancellation event so workflow code can detect
+        // it via `is_cancelled()` / `check_cancellation()` during replay.
+        let cancellation_reason = events.iter().find_map(|e| match e {
+            WorkflowEvent::WorkflowCancelled { reason } => Some(reason.clone()),
+            _ => None,
+        });
+
         let mut matcher = HistoryMatcher::new(events);
         // Advance past the WorkflowStarted lifecycle event -- it does not
         // correspond to a workflow command.
@@ -202,6 +297,7 @@ impl WorkflowContext {
             activity_seq: Mutex::new(0),
             state,
             query_registry: Mutex::new(QueryRegistry::new()),
+            cancellation_reason,
         }
     }
 
@@ -220,6 +316,7 @@ impl WorkflowContext {
             activity_seq: Mutex::new(0),
             state: empty_shared_state(),
             query_registry: Mutex::new(QueryRegistry::new()),
+            cancellation_reason: None,
         }
     }
 
@@ -252,12 +349,202 @@ impl WorkflowContext {
             .is_replaying()
     }
 
-    /// Access typed shared state (e.g., email clients, config).
+    /// Access typed shared state (e.g., email clients, config) injected via the builder.
     ///
-    /// Returns `None` if the state type was not registered with the builder.
+    /// Because workflows must be deterministic and pure, they often need to access
+    /// configuration, HTTP clients, or external service handles that were injected
+    /// at application startup.
+    ///
+    /// Returns `None` if the state type was not registered.
+    ///
+    /// ## Examples
+    ///
+    /// ```rust
+    /// use autumn_harvest::builder::HarvestBuilder;
+    /// use autumn_harvest::context::WorkflowContext;
+    ///
+    /// struct AppConfig {
+    ///     api_key: String,
+    /// }
+    ///
+    /// // During application startup:
+    /// let _harvest = HarvestBuilder::default()
+    ///     .state(AppConfig { api_key: "secret-123".to_string() })
+    ///     .build();
+    ///
+    /// // Inside a workflow function:
+    /// # let ctx = WorkflowContext::for_replay_with_state(
+    /// #    autumn_harvest::types::ExecutionId::new(),
+    /// #    vec![],
+    /// #    std::sync::Arc::new(std::collections::HashMap::from([(
+    /// #        std::any::TypeId::of::<AppConfig>(),
+    /// #        Box::new(AppConfig { api_key: "secret-123".to_string() }) as Box<dyn std::any::Any + Send + Sync>
+    /// #    )]))
+    /// # );
+    /// if let Some(config) = ctx.state::<AppConfig>() {
+    ///     assert_eq!(config.api_key, "secret-123");
+    /// }
+    /// ```
     #[must_use]
     pub fn state<T: Any + Send + Sync>(&self) -> Option<&T> {
         self.state.get(&TypeId::of::<T>())?.downcast_ref::<T>()
+    }
+
+    // ── Cancellation ──────────────────────────────────────────────────
+
+    /// Returns `true` if a `WorkflowCancelled` event is present in the event
+    /// history backing this context.
+    ///
+    /// Workflows performing long-running loops or multi-step orchestration
+    /// should check this periodically and bail out with cleanup when it
+    /// returns `true`. Activity/timer/signal awaits already surface
+    /// [`HarvestError::Cancelled`] when their result channels are dropped as
+    /// part of the cancellation flow; this accessor is the analogous hook
+    /// for code paths that never suspend.
+    #[must_use]
+    pub const fn is_cancelled(&self) -> bool {
+        self.cancellation_reason.is_some()
+    }
+
+    /// Recorded cancellation reason when [`is_cancelled`](Self::is_cancelled)
+    /// is true.
+    #[must_use]
+    pub fn cancellation_reason(&self) -> Option<&str> {
+        self.cancellation_reason.as_deref()
+    }
+
+    /// Fail fast with [`HarvestError::Cancelled`] when the workflow has been
+    /// cancelled.
+    ///
+    /// Intended for use at the top of long-running workflow sections so that
+    /// cooperative cancellation can short-circuit the remaining work:
+    ///
+    /// ```ignore
+    /// ctx.check_cancellation()?;
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Cancelled`] if a `WorkflowCancelled` event is
+    /// present in the event history.
+    pub fn check_cancellation(&self) -> HarvestResult<()> {
+        if let Some(reason) = self.cancellation_reason.as_deref() {
+            return Err(HarvestError::Cancelled(reason.to_string()));
+        }
+        Ok(())
+    }
+
+    // ── Side effects ──────────────────────────────────────────────────
+
+    /// Execute a quick, deterministic inline side-effect.
+    ///
+    /// Workflows must be completely deterministic. Operations like generating random
+    /// numbers, reading the current time, or creating UUIDs will cause the workflow
+    /// to behave differently during replay. `side_effect` solves this by recording
+    /// the result of the closure during live execution and reusing that exact result
+    /// during future replays.
+    ///
+    /// Use this for fast, non-failing operations that don't warrant the overhead
+    /// of a full activity.
+    ///
+    /// During **live execution**, runs the closure, serializes the result,
+    /// pushes a `RecordMarker` command to history, and returns the result.
+    /// During **replay**, ignores the closure, deserializes the stored result
+    /// from history, and returns it.
+    ///
+    /// ## Examples
+    ///
+    /// ```rust
+    /// use autumn_harvest::context::WorkflowContext;
+    ///
+    /// # fn example(ctx: &WorkflowContext) -> autumn_harvest::HarvestResult<()> {
+    /// // Read the current system time once and freeze it in history.
+    /// // On replay, the time read is skipped and the history value is returned.
+    /// let current_time: u64 = ctx.side_effect("get-time", || {
+    ///     std::time::SystemTime::now()
+    ///         .duration_since(std::time::UNIX_EPOCH)
+    ///         .unwrap()
+    ///         .as_secs()
+    /// })?;
+    ///
+    /// println!("The time is frozen at: {}", current_time);
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns `HarvestError::NonDeterministic` if history diverged.
+    /// Returns `HarvestError::Serialization` if the payload couldn't be serialized.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    pub fn side_effect<F, T>(&self, id: &str, f: F) -> HarvestResult<T>
+    where
+        F: FnOnce() -> T,
+        T: serde::Serialize + serde::de::DeserializeOwned,
+    {
+        let history_match = self
+            .matcher
+            .lock()
+            .expect("matcher lock poisoned")
+            .match_side_effect(id);
+
+        match history_match {
+            HistoryMatch::Matched { output } => {
+                serde_json::from_value(output).map_err(HarvestError::Serialization)
+            }
+
+            HistoryMatch::Diverged { expected, actual } => Err(HarvestError::NonDeterministic(
+                format!("side effect mismatch: expected {expected}, got {actual}"),
+            )),
+
+            HistoryMatch::Failed { .. } | HistoryMatch::TimedOut { .. } => {
+                unreachable!("match_side_effect only returns Matched, Diverged or NoMatch")
+            }
+
+            HistoryMatch::NoMatch => {
+                let result = f();
+                let output = serde_json::to_value(&result)?;
+
+                self.push_command(WorkflowCommand::RecordMarker {
+                    name: format!("side_effect:{id}"),
+                    details: output,
+                });
+
+                Ok(result)
+            }
+        }
+    }
+
+    /// Convenience wrapper around `side_effect` for generating a deterministic UUID.
+    ///
+    /// Because standard UUID generation is non-deterministic, calling `Uuid::new_v4()`
+    /// directly inside a workflow will cause replay failures. This helper wraps the
+    /// generation in a side effect so the UUID is frozen in history.
+    ///
+    /// During **live execution**, generates a new UUID.
+    /// During **replay**, yields the same UUID from history.
+    ///
+    /// ## Examples
+    ///
+    /// ```rust
+    /// use autumn_harvest::context::WorkflowContext;
+    ///
+    /// # fn example(ctx: &WorkflowContext) -> autumn_harvest::HarvestResult<()> {
+    /// // Safe to use inside a workflow!
+    /// let idempotency_key = ctx.random_uuid("stripe-key")?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns `HarvestError::NonDeterministic` if history diverged.
+    /// Returns `HarvestError::Serialization` if the payload couldn't be serialized.
+    pub fn random_uuid(&self, id: &str) -> HarvestResult<uuid::Uuid> {
+        self.side_effect(id, uuid::Uuid::new_v4)
     }
 
     // ── Version gate ──────────────────────────────────────────────────
@@ -402,8 +689,7 @@ impl WorkflowContext {
             )),
 
             HistoryMatch::Failed { .. } | HistoryMatch::TimedOut { .. } => {
-                // Timers don't fail in the traditional sense, but handle gracefully.
-                Ok(())
+                unreachable!("timers do not fail or time out in history matching")
             }
 
             HistoryMatch::NoMatch => {
@@ -457,10 +743,9 @@ impl WorkflowContext {
                 attempt,
                 source: error.into(),
             }),
-            HistoryMatch::TimedOut { timeout_type } => Err(HarvestError::Timeout {
-                timeout_type,
-                task_name: format!("child-workflow:{workflow_name}"),
-            }),
+            HistoryMatch::TimedOut { .. } => {
+                unreachable!("child workflows do not time out in match_child_workflow")
+            }
             HistoryMatch::Diverged { expected, actual } => Err(HarvestError::NonDeterministic(
                 format!("child workflow mismatch: expected {expected}, got {actual}"),
             )),
@@ -529,9 +814,89 @@ impl WorkflowContext {
         }
     }
 
+    // ── Continue-as-new ───────────────────────────────────────────────
+
+    /// Atomically end the current execution and start a fresh one with the
+    /// same `WorkflowId` (logical identity) but a new `ExecutionId` and an
+    /// empty event history. The new run begins with the supplied `input`.
+    ///
+    /// Used by long-lived orchestrations (recurring billing cycles, polling
+    /// loops, `IoT` device monitors) to bound event-history growth and keep
+    /// replay times constant.
+    ///
+    /// The returned future never resolves on its own — calling
+    /// `ctx.continue_as_new(input).await?` is effectively a "tail call" to a
+    /// new execution. The worker drains the emitted command after the
+    /// executor's suspension window elapses and performs the transition in a
+    /// single transaction. Any code after the await is therefore unreachable
+    /// in practice.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Cancelled`] if the workflow is cancelled while
+    /// it is parked on the continue-as-new command (the worker drops the
+    /// resolution sender during cancellation cleanup), or
+    /// [`HarvestError::NonDeterministic`] if replay history does not contain
+    /// the expected `WorkflowContinuedAsNew` event at this position.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    pub async fn continue_as_new(&self, input: Value) -> HarvestResult<()> {
+        let history_match = self
+            .matcher
+            .lock()
+            .expect("matcher lock poisoned")
+            .match_continue_as_new(&input);
+
+        match history_match {
+            HistoryMatch::Matched { output } => {
+                // Replay still emits the terminal command so the worker can
+                // observe the recorded intent while draining commands.
+                self.push_command(WorkflowCommand::ContinueAsNew { input: output });
+                park_until_dropped().await
+            }
+            HistoryMatch::Diverged { expected, actual } => Err(HarvestError::NonDeterministic(
+                format!("continue_as_new mismatch: expected {expected}, got {actual}"),
+            )),
+            HistoryMatch::Failed { .. } | HistoryMatch::TimedOut { .. } => {
+                Err(HarvestError::NonDeterministic(
+                    "continue_as_new history contains unexpected terminal state".into(),
+                ))
+            }
+            HistoryMatch::NoMatch => {
+                self.push_command(WorkflowCommand::ContinueAsNew { input });
+                park_until_dropped().await
+            }
+        }
+    }
+
     /// Register a named query handler for this workflow execution.
     ///
-    /// Query handlers are in-memory only and do not emit workflow commands.
+    /// Queries allow external clients (via the management API) to inspect the
+    /// internal state of a running workflow. Handlers run in-memory and are
+    /// never recorded in the event history. Because queries execute synchronously
+    /// without awaiting I/O, they must be fast and side-effect free.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use std::sync::{Arc, Mutex};
+    /// use autumn_harvest::context::WorkflowContext;
+    ///
+    /// # fn example(ctx: &WorkflowContext) {
+    /// let items_processed = Arc::new(Mutex::new(0));
+    ///
+    /// // Register a query that returns the current counter value
+    /// let query_state = items_processed.clone();
+    /// ctx.register_query("items_processed", move || {
+    ///     serde_json::json!(*query_state.lock().unwrap())
+    /// });
+    ///
+    /// // ... later in the workflow ...
+    /// *items_processed.lock().unwrap() += 1;
+    /// # }
+    /// ```
     ///
     /// # Panics
     ///
@@ -548,6 +913,24 @@ impl WorkflowContext {
 
     /// Execute a previously registered query by name.
     ///
+    /// This is typically called by the worker infrastructure when servicing an
+    /// external API request. User workflow code rarely needs to call this directly.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use autumn_harvest::context::WorkflowContext;
+    ///
+    /// # fn example(ctx: &WorkflowContext) -> autumn_harvest::HarvestResult<()> {
+    /// ctx.register_query("status", || serde_json::json!("running"));
+    ///
+    /// // The framework internally dispatches queries like this:
+    /// let result = ctx.execute_query("status")?;
+    /// assert_eq!(result, "running");
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
     /// # Errors
     ///
     /// Returns [`HarvestError::NotFound`] if no query handler is registered under
@@ -557,10 +940,16 @@ impl WorkflowContext {
     ///
     /// Panics if the internal query registry mutex is poisoned.
     pub fn execute_query(&self, name: &str) -> HarvestResult<Value> {
-        self.query_registry
+        let handler = self
+            .query_registry
             .lock()
             .expect("query_registry lock poisoned")
-            .execute(name)
+            .get(name);
+
+        handler.map_or_else(
+            || Err(HarvestError::NotFound(format!("query handler '{name}'"))),
+            |h| Ok(h()),
+        )
     }
 
     // ── Command drain ─────────────────────────────────────────────────
@@ -616,12 +1005,17 @@ pub struct ActivityContext {
     heartbeat_tx: Option<tokio::sync::mpsc::Sender<serde_json::Value>>,
     /// Cancellation token -- allows the worker to signal graceful shutdown.
     cancel: tokio_util::sync::CancellationToken,
+    /// Optional durable queue-state cancellation check for worker activities.
+    #[cfg(feature = "db")]
+    cancellation_check: Option<ActivityCancellationCheck>,
+    /// W3C tracecontext carrier captured at enqueue, surfaced so activity
+    /// handlers can propagate the trace to downstream services.
+    trace_context: Option<crate::telemetry::TraceContextCarrier>,
 }
 
 impl ActivityContext {
     /// Production constructor -- creates a context with heartbeat channel and
     /// cancellation token.
-    #[allow(dead_code)] // Used by worker dispatch (not yet wired in Phase 2)
     pub(crate) fn new(
         state: SharedState,
         heartbeat_tx: Option<tokio::sync::mpsc::Sender<serde_json::Value>>,
@@ -631,7 +1025,52 @@ impl ActivityContext {
             state,
             heartbeat_tx,
             cancel,
+            #[cfg(feature = "db")]
+            cancellation_check: None,
+            trace_context: None,
         }
+    }
+
+    /// Production constructor that also checks durable queue state on heartbeat.
+    #[cfg(feature = "db")]
+    pub(crate) fn new_with_cancellation_check(
+        state: SharedState,
+        heartbeat_tx: Option<tokio::sync::mpsc::Sender<serde_json::Value>>,
+        cancel: tokio_util::sync::CancellationToken,
+        task_id: uuid::Uuid,
+        pool: ActivityCancellationPool,
+    ) -> Self {
+        Self {
+            state,
+            heartbeat_tx,
+            cancel,
+            cancellation_check: Some(ActivityCancellationCheck {
+                task_id,
+                pool,
+                last_checked_at: Mutex::new(None),
+            }),
+            trace_context: None,
+        }
+    }
+
+    /// Attach a trace context carrier captured from the task payload so the
+    /// activity handler can stitch downstream calls into the same trace.
+    #[must_use]
+    pub fn with_trace_context(
+        mut self,
+        carrier: Option<crate::telemetry::TraceContextCarrier>,
+    ) -> Self {
+        self.trace_context = carrier;
+        self
+    }
+
+    /// The W3C trace context that accompanied this activity's enqueue, if any.
+    ///
+    /// Returned by reference so handlers can forward it to outgoing HTTP
+    /// requests without cloning on the hot path.
+    #[must_use]
+    pub const fn trace_context(&self) -> Option<&crate::telemetry::TraceContextCarrier> {
+        self.trace_context.as_ref()
     }
 
     /// Access typed shared state.
@@ -660,13 +1099,17 @@ impl ActivityContext {
             ));
         }
 
+        #[cfg(feature = "db")]
+        self.check_durable_cancellation().await?;
+
         let payload = serde_json::to_value(details)?;
 
-        if let Some(ref tx) = self.heartbeat_tx {
-            tx.send(payload).await.map_err(|_| {
-                HarvestError::Cancelled("activity cancelled: heartbeat channel closed".into())
-            })?;
-        }
+        let Some(ref tx) = self.heartbeat_tx else {
+            return Ok(());
+        };
+        tx.send(payload).await.map_err(|_| {
+            HarvestError::Cancelled("activity cancelled: heartbeat channel closed".into())
+        })?;
 
         Ok(())
     }
@@ -678,6 +1121,55 @@ impl ActivityContext {
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
         self.cancel.is_cancelled()
+    }
+
+    #[cfg(feature = "db")]
+    async fn check_durable_cancellation(&self) -> crate::HarvestResult<()> {
+        use crate::schema::harvest_task_queue::dsl;
+        use diesel::{OptionalExtension, QueryDsl};
+        use diesel_async::RunQueryDsl;
+
+        let Some(check) = &self.cancellation_check else {
+            return Ok(());
+        };
+
+        if !should_check_durable_cancellation(&check.last_checked_at, Instant::now()) {
+            return Ok(());
+        }
+
+        let mut conn = check
+            .pool
+            .get()
+            .await
+            .map_err(crate::error::database_error)?;
+        let row = dsl::harvest_task_queue
+            .find(check.task_id)
+            .select((dsl::state, dsl::error))
+            .first::<(String, Option<String>)>(&mut conn)
+            .await
+            .optional()
+            .map_err(crate::error::database_error)?;
+
+        match row {
+            Some((state, _)) if state == "RUNNING" => Ok(()),
+            Some((state, Some(error)))
+                if state == "FAILED" && error.contains("workflow cancelled") =>
+            {
+                Err(HarvestError::Cancelled(error))
+            }
+            Some((state, Some(error))) => Err(HarvestError::Cancelled(format!(
+                "activity task {} is no longer running ({state}): {error}",
+                check.task_id
+            ))),
+            Some((state, None)) => Err(HarvestError::Cancelled(format!(
+                "activity task {} is no longer running ({state})",
+                check.task_id
+            ))),
+            None => Err(HarvestError::Cancelled(format!(
+                "activity task {} is no longer present",
+                check.task_id
+            ))),
+        }
     }
 
     /// Constructor for testing -- no heartbeat channel, default cancel token.
@@ -703,11 +1195,129 @@ mod tests {
     use crate::types::ActivityExecId;
     use chrono::Utc;
 
+    #[tokio::test]
+    async fn workflow_context_continue_as_new_pushes_terminal_command() {
+        let ctx = WorkflowContext::new_test();
+        let payload = serde_json::json!({"cycle": 2});
+
+        // The future never resolves, so race it against a short sleep and
+        // assert the command was queued — drain and inspect after the await
+        // is dropped.
+        let cont = ctx.continue_as_new(payload.clone());
+        tokio::pin!(cont);
+        tokio::select! {
+            _ = &mut cont => panic!("continue_as_new must not resolve"),
+            () = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
+        }
+
+        let drained = ctx.drain_commands();
+        assert_eq!(drained.len(), 1);
+        match &drained[0] {
+            WorkflowCommand::ContinueAsNew { input } => {
+                assert_eq!(input, &payload);
+            }
+            other => panic!("expected ContinueAsNew, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn workflow_context_continue_as_new_replays_recorded_terminal_event() {
+        let payload = serde_json::json!({"cycle": 2});
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::WorkflowContinuedAsNew {
+                new_exec_id: ExecutionId::new(),
+                input: payload.clone(),
+            },
+        ];
+
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let cont = ctx.continue_as_new(payload.clone());
+        tokio::pin!(cont);
+        tokio::select! {
+            _ = &mut cont => panic!("continue_as_new must not resolve"),
+            () = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
+        }
+
+        let drained = ctx.drain_commands();
+        assert_eq!(drained.len(), 1);
+        match &drained[0] {
+            WorkflowCommand::ContinueAsNew { input } => assert_eq!(input, &payload),
+            other => panic!("expected ContinueAsNew, got {other:?}"),
+        }
+        assert!(!ctx.is_replaying());
+    }
+
+    #[tokio::test]
+    async fn workflow_context_continue_as_new_divergence_is_nondeterministic() {
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "send_email".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+        ];
+
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let result = ctx.continue_as_new(serde_json::json!({"cycle": 2})).await;
+
+        assert!(matches!(result, Err(HarvestError::NonDeterministic(_))));
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "replay divergence must not emit a new continue-as-new command"
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_context_continue_as_new_input_mismatch_is_nondeterministic() {
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::WorkflowContinuedAsNew {
+                new_exec_id: ExecutionId::new(),
+                input: serde_json::json!({"cycle": 3}),
+            },
+        ];
+
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let result = ctx.continue_as_new(serde_json::json!({"cycle": 2})).await;
+
+        assert!(matches!(result, Err(HarvestError::NonDeterministic(_))));
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "replay input mismatch must not emit a new continue-as-new command"
+        );
+    }
+
     #[test]
     fn activity_context_state_returns_none_when_not_registered() {
         let ctx = ActivityContext::new_test();
         let state: Option<&String> = ctx.state::<String>();
         assert!(state.is_none());
+    }
+
+    #[test]
+    fn activity_context_surfaces_attached_trace_context() {
+        let carrier = crate::telemetry::TraceContextCarrier::from_traceparent("00-aaaa-bbbb-01");
+        let ctx = ActivityContext::new_test().with_trace_context(Some(carrier.clone()));
+        assert_eq!(ctx.trace_context(), Some(&carrier));
+    }
+
+    #[test]
+    fn activity_context_trace_context_defaults_to_none() {
+        let ctx = ActivityContext::new_test();
+        assert!(ctx.trace_context().is_none());
     }
 
     #[tokio::test]
@@ -752,6 +1362,23 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(matches!(err, HarvestError::Cancelled(_)));
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn durable_cancellation_check_is_rate_limited() {
+        let last_checked_at = Mutex::new(None);
+        let start = std::time::Instant::now();
+
+        assert!(should_check_durable_cancellation(&last_checked_at, start));
+        assert!(!should_check_durable_cancellation(
+            &last_checked_at,
+            start + std::time::Duration::from_millis(999)
+        ));
+        assert!(should_check_durable_cancellation(
+            &last_checked_at,
+            start + std::time::Duration::from_secs(1)
+        ));
     }
 
     #[tokio::test]
@@ -926,6 +1553,33 @@ mod tests {
     }
 
     #[test]
+    fn context_side_effect_returns_diverged_error_when_mismatched() {
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: crate::types::ActivityExecId::new(),
+                name: "some_activity".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+        ];
+
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        // Request a side effect but history has ActivityScheduled
+        let result: Result<i32, _> = ctx.side_effect("random_num", || 99);
+
+        assert!(result.is_err());
+        if let Err(HarvestError::NonDeterministic(msg)) = result {
+            assert!(msg.contains("side effect mismatch"));
+        } else {
+            panic!("Expected NonDeterministic error");
+        }
+    }
+
+    #[test]
     fn context_version_emits_marker_during_live_execution() {
         let ctx = WorkflowContext::new_test();
 
@@ -938,6 +1592,81 @@ mod tests {
         assert!(
             matches!(&cmds[0], WorkflowCommand::RecordMarker { name, .. } if name == "version:billing_v2")
         );
+    }
+
+    #[test]
+    fn context_side_effect_returns_recorded_value() {
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "side_effect:random_num".into(),
+                details: serde_json::json!(42),
+            },
+        ];
+
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let result = ctx.side_effect("random_num", || 99).unwrap();
+        assert_eq!(result, 42);
+
+        // No commands during replay.
+        assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[test]
+    fn context_side_effect_emits_marker_during_live_execution() {
+        let ctx = WorkflowContext::new_test();
+
+        let result = ctx.side_effect("random_num", || 42).unwrap();
+        assert_eq!(result, 42);
+
+        let cmds = ctx.drain_commands();
+        assert_eq!(cmds.len(), 1);
+        match &cmds[0] {
+            WorkflowCommand::RecordMarker { name, details } => {
+                assert_eq!(name, "side_effect:random_num");
+                assert_eq!(details, &serde_json::json!(42));
+            }
+            _ => panic!("Expected RecordMarker command"),
+        }
+    }
+
+    #[test]
+    fn context_random_uuid_returns_recorded_value() {
+        let expected_uuid = uuid::Uuid::new_v4();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "side_effect:txn_id".into(),
+                details: serde_json::json!(expected_uuid),
+            },
+        ];
+
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let result = ctx.random_uuid("txn_id").unwrap();
+        assert_eq!(result, expected_uuid);
+    }
+
+    #[test]
+    fn context_random_uuid_emits_marker_during_live_execution() {
+        let ctx = WorkflowContext::new_test();
+
+        let result = ctx.random_uuid("txn_id").unwrap();
+
+        let cmds = ctx.drain_commands();
+        assert_eq!(cmds.len(), 1);
+        match &cmds[0] {
+            WorkflowCommand::RecordMarker { name, details } => {
+                assert_eq!(name, "side_effect:txn_id");
+                assert_eq!(details, &serde_json::json!(result));
+            }
+            _ => panic!("Expected RecordMarker command"),
+        }
     }
 
     #[tokio::test]
@@ -1292,6 +2021,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn context_child_workflow_name_mismatch_is_nondeterministic() {
+        let child_id = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "other_workflow".to_string(),
+                input: serde_json::json!({"id": "B-2002"}),
+            },
+        ];
+
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let result = ctx
+            .spawn_child_workflow_raw("process_order", serde_json::json!({"id": "B-2002"}))
+            .await;
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            HarvestError::NonDeterministic(_)
+        ));
+
+        let cmds = ctx.drain_commands();
+        assert!(cmds.is_empty());
+    }
+
+    #[tokio::test]
     async fn context_child_input_mismatch_is_nondeterministic_and_no_live_start() {
         let child_id = ExecutionId::new();
         let events = vec![
@@ -1412,6 +2171,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wait_for_signal_returns_nondeterministic_on_diverged_history() {
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::TimerStarted {
+                timer_id: TimerId::new("timer-1"),
+                duration_secs: 10,
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let result = ctx.wait_for_signal("my-signal").await;
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            HarvestError::NonDeterministic(_)
+        ));
+    }
+
+    #[tokio::test]
     async fn wait_for_signal_replays_recorded_signal() {
         let exec_id = ExecutionId::new();
         let history = vec![
@@ -1431,6 +2212,49 @@ mod tests {
             .await
             .expect("signal should replay");
         assert_eq!(payload, serde_json::json!({"ok": true}));
+    }
+
+    #[test]
+    fn context_is_not_cancelled_without_terminal_event() {
+        let events = vec![WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+        }];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+
+        assert!(!ctx.is_cancelled());
+        assert!(ctx.cancellation_reason().is_none());
+        assert!(ctx.check_cancellation().is_ok());
+    }
+
+    #[test]
+    fn context_reports_cancellation_from_history() {
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::WorkflowCancelled {
+                reason: "operator stop".into(),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+
+        assert!(ctx.is_cancelled());
+        assert_eq!(ctx.cancellation_reason(), Some("operator stop"));
+        let err = ctx
+            .check_cancellation()
+            .expect_err("cancelled history should yield Cancelled error");
+        assert!(matches!(err, HarvestError::Cancelled(reason) if reason == "operator stop"));
+    }
+
+    #[test]
+    fn context_live_mode_reports_no_cancellation() {
+        let ctx = WorkflowContext::new_test();
+
+        assert!(!ctx.is_cancelled());
+        assert!(ctx.cancellation_reason().is_none());
+        assert!(ctx.check_cancellation().is_ok());
     }
 
     #[test]

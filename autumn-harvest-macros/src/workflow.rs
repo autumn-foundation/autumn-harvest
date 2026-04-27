@@ -31,10 +31,10 @@ pub fn workflow_macro(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let param_names: Vec<_> = params
         .iter()
         .filter_map(|arg| {
-            if let syn::FnArg::Typed(pat) = arg {
-                if let syn::Pat::Ident(ident) = pat.pat.as_ref() {
-                    return Some(&ident.ident);
-                }
+            if let syn::FnArg::Typed(pat) = arg
+                && let syn::Pat::Ident(ident) = pat.pat.as_ref()
+            {
+                return Some(&ident.ident);
             }
             None
         })
