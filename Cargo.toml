@@ -4,6 +4,7 @@ members = [
     "autumn-harvest-plugin",
     "autumn-harvest-macros",
     "autumn-harvest-cli",
+    "autumn-harvest-redis",
 ]
 resolver = "3"
 
@@ -37,9 +38,12 @@ syn = { version = "2", features = ["full"] }
 quote = "1"
 proc-macro2 = "1"
 
+# Redis
+redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager", "streams", "script"] }
+
 # Dev / test
 testcontainers = "0.27"
-testcontainers-modules = { version = "0.15", features = ["postgres"] }
+testcontainers-modules = { version = "0.15", features = ["postgres", "redis"] }
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
