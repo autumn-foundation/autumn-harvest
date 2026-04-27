@@ -9,46 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Continue-as-new support for long-running workflows, including rollback-safe
-  schema changes for reused workflow IDs.
-- Workflow sharding across multiple Postgres databases with shard-aware routing
-  in the engine, plugin API, and UI.
-- `autumn-harvest-redis`, a Redis Streams task queue adapter that keeps durable
-  workflow history in Postgres while moving hot task claiming off the database.
-- A management CLI and dashboard UI for workflow inspection, signals, queries,
-  dead letters, DAG operations, and operator visibility.
-- Workflow simulation, history analysis, and generated replay test harnesses for
-  local debugging and regression reproduction.
-- OpenTelemetry propagation, Mermaid/DOT DAG exporters, and first-class Saga
-  compensation helpers.
+- Add harvest management cli (#29)([597dcfc](https://github.com/madmax983/autumn-harvest/commit/597dcfca7406dd5554223a843589a31d6cd2647c))
+- Add Mermaid.js workflow history exporter (#25)([7226560](https://github.com/madmax983/autumn-harvest/commit/72265609750ef9b02b18f6b9cb49b2d31ddcee91))
 
 ### Fixed
 
-- Replay determinism for `continue_as_new`, including input validation against
-  recorded history during replay.
-- Parent wake-up behavior when a child workflow rejects `continue_as_new` in
-  this release.
-- Sticky queue fairness so expired sticky tasks no longer outrank ordinary
-  unpinned work.
-- Redis queue claim/depth error handling so operational failures surface as
-  errors instead of looking like an empty queue.
-- Overflow, panic, and deadlock bugs in event indexing, retry delay math, cache
-  sizing, task duration parsing, and query execution.
-- Cross-shard list and detail reads in the plugin API and dashboard so
-  workflows, DAG runs, and dead letters on non-default shards remain visible.
+- Redis depth handling([76335e6](https://github.com/madmax983/autumn-harvest/commit/76335e65f96643faf3e08c635dc3a7ad5fe2277f))
+- Replay determinism([d0a14d7](https://github.com/madmax983/autumn-harvest/commit/d0a14d7eede408bcf4449f1ad68ce04013c47b91))
+- Redit and continue-as-new([fd1c024](https://github.com/madmax983/autumn-harvest/commit/fd1c0242a42985e6a8cfc4a1d19b40daf091e88e))
+- Prevent silent integer truncation in concurrency limits and event indexing (#45)([68d5225](https://github.com/madmax983/autumn-harvest/commit/68d5225d6d5e97850ba975188d971e86a4bd5ce3))
+- Resolve broken intra-doc links for HarvestError (#19)([cd77f63](https://github.com/madmax983/autumn-harvest/commit/cd77f6365848bcd7c9861564ffc53b2c0bf69f08))
 
 ### Documentation
 
-- Refresh README and architecture docs for the Phase 3 / `0.2.0` surface.
-- Add design/spec coverage for sharding, sticky routing, continue-as-new,
-  dashboard UI, Redis queueing, cancellation semantics, and Saga primitives.
+- Skills([be33d2e](https://github.com/madmax983/autumn-harvest/commit/be33d2ebcde3c6eeb29540baf2e728ae175bd565))
+- Add module-level documentation and executable doc tests for query, dag_export, schema, and signal. (#69)([859bb21](https://github.com/madmax983/autumn-harvest/commit/859bb2101fcbc7f6efbc0b486adb05b6b171e1c4))
+- Add Vantage spec for Continue-As-New (#60)([d884143](https://github.com/madmax983/autumn-harvest/commit/d884143fe78da00cf627b11a72ea07445d8b077e))
+- Add Vantage specification for Saga Primitives (#18)([0cc01fe](https://github.com/madmax983/autumn-harvest/commit/0cc01fed2dea12ed2ce076ae230a1fd5d0ee3cf4))
+- Update CHANGELOG.md for v0.1.1([0dc1ff1](https://github.com/madmax983/autumn-harvest/commit/0dc1ff1e8973c2076bc95c591a0a3883cbc1966c))
 
 ### Testing
 
-- Expand integration and regression coverage for signals, replay divergence,
-  continue-as-new, child workflow failure propagation, Redis adapter behavior,
-  and sharded API/UI reads.
+- **saga:** Add comprehensive unit tests for Saga compensation logic (#44)([72d5760](https://github.com/madmax983/autumn-harvest/commit/72d5760b1217909d79342ac9a5242bc3a672b57d))
+- Improve test coverage for Error, Info, and Saga modules (#40)([48f5a37](https://github.com/madmax983/autumn-harvest/commit/48f5a377dd024b65c2782447fca4407ad3577e2a))
 
+### Miscellaneous
+
+- Relase work([7e61ec0](https://github.com/madmax983/autumn-harvest/commit/7e61ec038ee985e93186a72c0cad28d53d8b7ddc))
+- Clippy([51b9b6e](https://github.com/madmax983/autumn-harvest/commit/51b9b6ec3626e5804eca98f138ac907f58554fdb))
+- PR feedback([6f40114](https://github.com/madmax983/autumn-harvest/commit/6f40114d7ac6109a0a277d98cce469ca8dfefc8f))
+- Cleanup([2c59de4](https://github.com/madmax983/autumn-harvest/commit/2c59de42684a19c036e1360584bfc53522eaa4e7))
 ## [0.1.1] - 2026-04-19
 
 ### Documentation
