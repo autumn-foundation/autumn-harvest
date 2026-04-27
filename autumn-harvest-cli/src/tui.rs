@@ -63,7 +63,7 @@ async fn run_app(
     url: &str,
     cli: &Cli,
 ) -> Result<(), CliError> {
-    let tick_rate = Duration::from_millis(1000);
+    let tick_rate = Duration::from_secs(1);
     let mut last_tick = std::time::Instant::now();
     let mut workflows: Vec<Value> = Vec::new();
 

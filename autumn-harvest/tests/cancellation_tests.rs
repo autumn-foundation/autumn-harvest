@@ -30,7 +30,13 @@ use testcontainers::ContainerAsync;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
-const INIT_SQL: &str = include_str!("../migrations/20260409000000_harvest_initial/up.sql");
+const INIT_SQL: &str = concat!(
+    include_str!("../migrations/20260409000000_harvest_initial/up.sql"),
+    "\n",
+    include_str!("../migrations/20260424000001_harvest_trace_context/up.sql"),
+    "\n",
+    include_str!("../migrations/20260427000000_harvest_continue_as_new/up.sql"),
+);
 
 async fn setup_test_db() -> (AsyncPgConnection, ContainerAsync<Postgres>) {
     let container = Postgres::default()

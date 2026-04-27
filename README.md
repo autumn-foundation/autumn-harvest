@@ -128,7 +128,7 @@ from stdin.
 
 ## Requirements
 
-- Rust 1.86.0 or newer (MSRV)
+- Rust 1.88.0 or newer (MSRV)
 - Postgres 12+
 - The `db` feature is enabled by default and pulls Diesel + diesel-async; build
   with `--no-default-features` for pure compile-checks on systems without

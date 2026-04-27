@@ -16,8 +16,13 @@ use uuid::Uuid;
 
 const OUTBOX_INIT_SQL: &str =
     include_str!("../migrations/20260409010000_harvest_workflow_outbox/up.sql");
-const HARVEST_INIT_SQL: &str =
-    include_str!("../../autumn-harvest/migrations/20260409000000_harvest_initial/up.sql");
+const HARVEST_INIT_SQL: &str = concat!(
+    include_str!("../../autumn-harvest/migrations/20260409000000_harvest_initial/up.sql"),
+    "\n",
+    include_str!("../../autumn-harvest/migrations/20260424000001_harvest_trace_context/up.sql"),
+    "\n",
+    include_str!("../../autumn-harvest/migrations/20260427000000_harvest_continue_as_new/up.sql"),
+);
 
 #[derive(Debug, QueryableByName)]
 struct CountRow {

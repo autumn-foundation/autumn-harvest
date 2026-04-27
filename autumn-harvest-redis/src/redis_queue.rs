@@ -445,7 +445,7 @@ impl RedisTaskQueue {
                 .get("payload")
                 .and_then(|v| match v {
                     redis::Value::BulkString(bytes) => {
-                        std::str::from_utf8(&bytes).ok().map(ToString::to_string)
+                        std::str::from_utf8(bytes).ok().map(ToString::to_string)
                     }
                     redis::Value::SimpleString(s) => Some(s.clone()),
                     _ => None,

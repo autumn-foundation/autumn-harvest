@@ -76,9 +76,10 @@ async fn try_start_redis() -> Option<RedisFixture> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn enqueue_and_claim_round_trips_a_task() {
-    let Some(RedisFixture { queue, .. }) = try_start_redis().await else {
+    let Some(fixture) = try_start_redis().await else {
         return;
     };
+    let queue = &fixture.queue;
     let q = "default".to_string();
 
     let task_id = queue
@@ -111,9 +112,10 @@ async fn enqueue_and_claim_round_trips_a_task() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn delayed_task_is_invisible_until_due() {
-    let Some(RedisFixture { queue, .. }) = try_start_redis().await else {
+    let Some(fixture) = try_start_redis().await else {
         return;
     };
+    let queue = &fixture.queue;
     let q = "delayed".to_string();
 
     let mut params = EnqueueParams::new(&q, TaskType::Workflow, serde_json::json!(null));
@@ -143,9 +145,10 @@ async fn delayed_task_is_invisible_until_due() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn requeue_for_retry_keeps_task_id_and_advances_attempt() {
-    let Some(RedisFixture { queue, .. }) = try_start_redis().await else {
+    let Some(fixture) = try_start_redis().await else {
         return;
     };
+    let queue = &fixture.queue;
     let q = "retry".to_string();
 
     let task_id = queue
@@ -189,9 +192,10 @@ async fn requeue_for_retry_keeps_task_id_and_advances_attempt() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn recover_pending_reclaims_idle_entries() {
-    let Some(RedisFixture { queue, .. }) = try_start_redis().await else {
+    let Some(fixture) = try_start_redis().await else {
         return;
     };
+    let queue = &fixture.queue;
     let q = "recover".to_string();
 
     queue
@@ -243,9 +247,10 @@ async fn recover_pending_reclaims_idle_entries() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn fail_pushes_to_dlq_when_enabled() {
-    let Some(RedisFixture { queue, .. }) = try_start_redis().await else {
+    let Some(fixture) = try_start_redis().await else {
         return;
     };
+    let queue = &fixture.queue;
     let q = "deadletter".to_string();
 
     queue
@@ -274,9 +279,10 @@ async fn fail_pushes_to_dlq_when_enabled() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn claim_load_balances_across_consumers() {
-    let Some(RedisFixture { queue, .. }) = try_start_redis().await else {
+    let Some(fixture) = try_start_redis().await else {
         return;
     };
+    let queue = &fixture.queue;
     let q = "balanced".to_string();
 
     for i in 0..4 {
