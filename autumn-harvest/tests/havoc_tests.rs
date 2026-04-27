@@ -1,9 +1,9 @@
-use autumn_harvest::{
-    event::WorkflowEvent, policy::RetryPolicy, store::events_to_insert_rows_from,
-    types::ExecutionId,
-};
+use autumn_harvest::{event::WorkflowEvent, policy::RetryPolicy, types::ExecutionId};
+#[cfg(feature = "db")]
+use autumn_harvest::store::events_to_insert_rows_from;
 use std::time::Duration;
 
+#[cfg(feature = "db")]
 #[test]
 fn test_havoc_event_id_overflow() {
     let exec_id = ExecutionId::new();
