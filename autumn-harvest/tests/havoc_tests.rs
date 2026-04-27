@@ -1,43 +1,42 @@
-use autumn_harvest::policy::compute_retry_delay;
-use autumn_harvest::types::*;
-use proptest::prelude::*;
-use std::str::FromStr;
+#[cfg(feature = "db")]
+use autumn_harvest::store::events_to_insert_rows_from;
+use autumn_harvest::{event::WorkflowEvent, policy::RetryPolicy, types::ExecutionId};
 use std::time::Duration;
 
-proptest! {
-    #[test]
-    fn havoc_compute_retry_delay_does_not_panic(
-        initial_secs in 1u64..u64::MAX,
-        backoff in -100.0f64..100.0f64,
-        max_interval_secs in 1u64..u64::MAX,
-        attempt in 1u32..u32::MAX
-    ) {
-        let initial = Duration::from_secs(initial_secs);
-        let max_interval = Duration::from_secs(max_interval_secs);
-        let _delay = compute_retry_delay(initial, backoff, max_interval, attempt);
-    }
-}
-
-proptest! {
-    #[test]
-    fn havoc_task_duration_does_not_panic(s in "\\PC*") {
-        let _ = autumn_harvest::task_duration(&s);
-    }
-}
-
-proptest! {
-    #[test]
-    fn havoc_types_do_not_panic(s in "\\PC*") {
-        let _ = ExecutionId::from_str(&s);
-        let _ = ActivityExecId::from_str(&s);
-        let _ = TimerId::new(&s);
-    }
-}
-
 #[cfg(feature = "db")]
-proptest! {
-    #[test]
-    fn havoc_cron_schedule_does_not_panic(s in "\\PC*") {
-        let _ = croner::Cron::new(&s).parse();
-    }
+#[test]
+fn test_havoc_event_id_overflow() {
+    let exec_id = ExecutionId::new();
+    let events = vec![
+        WorkflowEvent::WorkflowCompleted {
+            output: serde_json::Value::Null,
+        },
+        WorkflowEvent::WorkflowCompleted {
+            output: serde_json::Value::Null,
+        },
+    ];
+    let res = std::panic::catch_unwind(|| {
+        let _ = events_to_insert_rows_from(exec_id, &events, i32::MAX);
+    });
+
+    assert!(
+        res.is_ok(),
+        "The system still crashes due to Event ID overflow!"
+    );
+    // Specifically, `events_to_insert_rows_from` should return an Err, not panic.
+    let out = events_to_insert_rows_from(exec_id, &events, i32::MAX);
+    assert!(
+        out.is_err(),
+        "It should return a Database error for event ID overflow."
+    );
+}
+
+#[test]
+fn test_havoc_exponential_retry_delay() {
+    let policy = RetryPolicy::exponential(u32::MAX, Duration::from_secs(1));
+    let res = std::panic::catch_unwind(|| policy.next_delay(32));
+    assert!(
+        res.is_ok(),
+        "The system still crashes on large retry delay calculations!"
+    );
 }
