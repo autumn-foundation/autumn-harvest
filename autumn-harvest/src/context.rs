@@ -349,9 +349,42 @@ impl WorkflowContext {
             .is_replaying()
     }
 
-    /// Access typed shared state (e.g., email clients, config).
+    /// Access typed shared state (e.g., email clients, config) injected via the builder.
     ///
-    /// Returns `None` if the state type was not registered with the builder.
+    /// Because workflows must be deterministic and pure, they often need to access
+    /// configuration, HTTP clients, or external service handles that were injected
+    /// at application startup.
+    ///
+    /// Returns `None` if the state type was not registered.
+    ///
+    /// ## Examples
+    ///
+    /// ```rust
+    /// use autumn_harvest::builder::HarvestBuilder;
+    /// use autumn_harvest::context::WorkflowContext;
+    ///
+    /// struct AppConfig {
+    ///     api_key: String,
+    /// }
+    ///
+    /// // During application startup:
+    /// let _harvest = HarvestBuilder::default()
+    ///     .state(AppConfig { api_key: "secret-123".to_string() })
+    ///     .build();
+    ///
+    /// // Inside a workflow function:
+    /// # let ctx = WorkflowContext::for_replay_with_state(
+    /// #    autumn_harvest::types::ExecutionId::new(),
+    /// #    vec![],
+    /// #    std::sync::Arc::new(std::collections::HashMap::from([(
+    /// #        std::any::TypeId::of::<AppConfig>(),
+    /// #        Box::new(AppConfig { api_key: "secret-123".to_string() }) as Box<dyn std::any::Any + Send + Sync>
+    /// #    )]))
+    /// # );
+    /// if let Some(config) = ctx.state::<AppConfig>() {
+    ///     assert_eq!(config.api_key, "secret-123");
+    /// }
+    /// ```
     #[must_use]
     pub fn state<T: Any + Send + Sync>(&self) -> Option<&T> {
         self.state.get(&TypeId::of::<T>())?.downcast_ref::<T>()
@@ -405,14 +438,39 @@ impl WorkflowContext {
 
     /// Execute a quick, deterministic inline side-effect.
     ///
-    /// This is useful for fast operations that must not be re-evaluated during
-    /// replay, like generating a random number, assigning an ID, or fetching
-    /// from an external system that does not warrant a full activity.
+    /// Workflows must be completely deterministic. Operations like generating random
+    /// numbers, reading the current time, or creating UUIDs will cause the workflow
+    /// to behave differently during replay. `side_effect` solves this by recording
+    /// the result of the closure during live execution and reusing that exact result
+    /// during future replays.
+    ///
+    /// Use this for fast, non-failing operations that don't warrant the overhead
+    /// of a full activity.
     ///
     /// During **live execution**, runs the closure, serializes the result,
     /// pushes a `RecordMarker` command to history, and returns the result.
     /// During **replay**, ignores the closure, deserializes the stored result
     /// from history, and returns it.
+    ///
+    /// ## Examples
+    ///
+    /// ```rust
+    /// use autumn_harvest::context::WorkflowContext;
+    ///
+    /// # fn example(ctx: &WorkflowContext) -> autumn_harvest::HarvestResult<()> {
+    /// // Read the current system time once and freeze it in history.
+    /// // On replay, the time read is skipped and the history value is returned.
+    /// let current_time: u64 = ctx.side_effect("get-time", || {
+    ///     std::time::SystemTime::now()
+    ///         .duration_since(std::time::UNIX_EPOCH)
+    ///         .unwrap()
+    ///         .as_secs()
+    /// })?;
+    ///
+    /// println!("The time is frozen at: {}", current_time);
+    /// # Ok(())
+    /// # }
+    /// ```
     ///
     /// # Errors
     ///
@@ -462,8 +520,24 @@ impl WorkflowContext {
 
     /// Convenience wrapper around `side_effect` for generating a deterministic UUID.
     ///
+    /// Because standard UUID generation is non-deterministic, calling `Uuid::new_v4()`
+    /// directly inside a workflow will cause replay failures. This helper wraps the
+    /// generation in a side effect so the UUID is frozen in history.
+    ///
     /// During **live execution**, generates a new UUID.
     /// During **replay**, yields the same UUID from history.
+    ///
+    /// ## Examples
+    ///
+    /// ```rust
+    /// use autumn_harvest::context::WorkflowContext;
+    ///
+    /// # fn example(ctx: &WorkflowContext) -> autumn_harvest::HarvestResult<()> {
+    /// // Safe to use inside a workflow!
+    /// let idempotency_key = ctx.random_uuid("stripe-key")?;
+    /// # Ok(())
+    /// # }
+    /// ```
     ///
     /// # Errors
     ///
@@ -787,7 +861,30 @@ impl WorkflowContext {
 
     /// Register a named query handler for this workflow execution.
     ///
-    /// Query handlers are in-memory only and do not emit workflow commands.
+    /// Queries allow external clients (via the management API) to inspect the
+    /// internal state of a running workflow. Handlers run in-memory and are
+    /// never recorded in the event history. Because queries execute synchronously
+    /// without awaiting I/O, they must be fast and side-effect free.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use std::sync::{Arc, Mutex};
+    /// use autumn_harvest::context::WorkflowContext;
+    ///
+    /// # fn example(ctx: &WorkflowContext) {
+    /// let items_processed = Arc::new(Mutex::new(0));
+    ///
+    /// // Register a query that returns the current counter value
+    /// let query_state = items_processed.clone();
+    /// ctx.register_query("items_processed", move || {
+    ///     serde_json::json!(*query_state.lock().unwrap())
+    /// });
+    ///
+    /// // ... later in the workflow ...
+    /// *items_processed.lock().unwrap() += 1;
+    /// # }
+    /// ```
     ///
     /// # Panics
     ///
@@ -803,6 +900,24 @@ impl WorkflowContext {
     }
 
     /// Execute a previously registered query by name.
+    ///
+    /// This is typically called by the worker infrastructure when servicing an
+    /// external API request. User workflow code rarely needs to call this directly.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use autumn_harvest::context::WorkflowContext;
+    ///
+    /// # fn example(ctx: &WorkflowContext) -> autumn_harvest::HarvestResult<()> {
+    /// ctx.register_query("status", || serde_json::json!("running"));
+    ///
+    /// // The framework internally dispatches queries like this:
+    /// let result = ctx.execute_query("status")?;
+    /// assert_eq!(result, "running");
+    /// # Ok(())
+    /// # }
+    /// ```
     ///
     /// # Errors
     ///
