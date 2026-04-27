@@ -150,6 +150,12 @@ pub fn export_mermaid_sequence(events: &[WorkflowEvent]) -> Result<String, std::
             WorkflowEvent::MarkerRecorded { name, .. } => {
                 writeln!(out, "    Note over WF: Marker: {name}")?;
             }
+            WorkflowEvent::WorkflowContinuedAsNew { new_exec_id, .. } => {
+                writeln!(
+                    out,
+                    "    Note over WF: Continued As New (next: {new_exec_id})"
+                )?;
+            }
         }
     }
 

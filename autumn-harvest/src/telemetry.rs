@@ -153,6 +153,9 @@ pub enum WorkflowStatus {
     /// Handler suspended awaiting activity results or timer firings; this run
     /// of the executor did not complete the workflow.
     Suspended,
+    /// Handler signalled `continue_as_new`: the current run is sealed and a
+    /// fresh execution with the same `WorkflowId` is started in its place.
+    ContinuedAsNew,
 }
 
 impl WorkflowStatus {
@@ -163,6 +166,7 @@ impl WorkflowStatus {
             Self::Completed => "completed",
             Self::Failed => "failed",
             Self::Suspended => "suspended",
+            Self::ContinuedAsNew => "continued_as_new",
         }
     }
 }
@@ -402,6 +406,7 @@ mod tests {
         assert_eq!(WorkflowStatus::Completed.as_str(), "completed");
         assert_eq!(WorkflowStatus::Failed.as_str(), "failed");
         assert_eq!(WorkflowStatus::Suspended.as_str(), "suspended");
+        assert_eq!(WorkflowStatus::ContinuedAsNew.as_str(), "continued_as_new");
         assert_eq!(ActivityStatus::Completed.as_str(), "completed");
         assert_eq!(ActivityStatus::Failed.as_str(), "failed");
     }

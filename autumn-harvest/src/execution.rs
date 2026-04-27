@@ -162,13 +162,15 @@ pub async fn start_or_load_workflow_execution(
         let enqueue = enqueue.clone();
         let request = request.clone();
         async move {
+            // `on_conflict_do_nothing()` (no explicit target) lets Postgres
+            // arbitrate against the partial unique index installed by the
+            // continue-as-new migration, which only enforces uniqueness on
+            // rows whose state is not `CONTINUED_AS_NEW`. A previously sealed
+            // continue-as-new chain therefore does not block reusing the same
+            // (workflow_name, workflow_id).
             let inserted = diesel::insert_into(harvest_workflow_executions::table)
                 .values(&row)
-                .on_conflict((
-                    harvest_workflow_executions::workflow_name,
-                    harvest_workflow_executions::workflow_id,
-                ))
-                .do_nothing()
+                .on_conflict_do_nothing()
                 .returning(WorkflowExecution::as_returning())
                 .get_result(conn)
                 .await
@@ -297,9 +299,15 @@ async fn load_workflow_execution_by_key(
     workflow_name: &str,
     workflow_id: &str,
 ) -> HarvestResult<WorkflowExecution> {
+    // After continue-as-new, several rows may share the same
+    // (workflow_name, workflow_id): every sealed run carries
+    // state='CONTINUED_AS_NEW' and only one row remains active. Filtering on
+    // state mirrors the partial unique index and returns the row that callers
+    // expect to keep operating against.
     harvest_workflow_executions::table
         .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
         .filter(harvest_workflow_executions::workflow_id.eq(workflow_id))
+        .filter(harvest_workflow_executions::state.ne("CONTINUED_AS_NEW"))
         .select(WorkflowExecution::as_select())
         .first(conn)
         .await

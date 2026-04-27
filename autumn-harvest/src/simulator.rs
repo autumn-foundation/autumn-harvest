@@ -112,6 +112,20 @@ impl WorkflowSimulator {
                         history,
                     };
                 }
+                WorkflowOutcome::ContinuedAsNew { input: cont_input } => {
+                    // Sim-stop: simulate the seal-and-restart by recording the
+                    // terminal marker and feeding the new input back into the
+                    // top of the loop. The simulator runs in-process, so this
+                    // is a tail call rather than a fresh queue task.
+                    history.push(WorkflowEvent::WorkflowContinuedAsNew {
+                        new_exec_id: ExecutionId::new(),
+                        input: cont_input.clone(),
+                    });
+                    return SimulatorResult {
+                        final_output: Ok(cont_input),
+                        history,
+                    };
+                }
                 WorkflowOutcome::Suspended { commands } => {
                     let mut advanced = false;
 

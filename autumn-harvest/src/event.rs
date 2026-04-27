@@ -148,6 +148,17 @@ pub enum WorkflowEvent {
         /// Arbitrary data recorded with the marker.
         details: serde_json::Value,
     },
+
+    // ── Continue-as-new ───────────────────────────────────────────
+    /// The workflow signalled `continue_as_new`. This is the terminal event
+    /// for the current execution; a fresh execution sharing the same logical
+    /// `WorkflowId` is started in its place with the recorded `input`.
+    WorkflowContinuedAsNew {
+        /// The execution ID of the freshly started run that succeeds this one.
+        new_exec_id: ExecutionId,
+        /// The JSON payload passed to the next iteration of the workflow.
+        input: serde_json::Value,
+    },
 }
 
 impl WorkflowEvent {
@@ -173,6 +184,7 @@ impl WorkflowEvent {
             Self::ChildWorkflowCompleted { .. } => "ChildWorkflowCompleted",
             Self::ChildWorkflowFailed { .. } => "ChildWorkflowFailed",
             Self::MarkerRecorded { .. } => "MarkerRecorded",
+            Self::WorkflowContinuedAsNew { .. } => "WorkflowContinuedAsNew",
         }
     }
 }
@@ -287,10 +299,14 @@ mod tests {
                 name: "m".into(),
                 details: serde_json::Value::Null,
             },
+            WorkflowEvent::WorkflowContinuedAsNew {
+                new_exec_id: ExecutionId::new(),
+                input: serde_json::Value::Null,
+            },
         ];
 
-        assert_eq!(events.len(), 17);
+        assert_eq!(events.len(), 18);
         let names: HashSet<_> = events.iter().map(WorkflowEvent::type_name).collect();
-        assert_eq!(names.len(), 17, "duplicate type names detected");
+        assert_eq!(names.len(), 18, "duplicate type names detected");
     }
 }

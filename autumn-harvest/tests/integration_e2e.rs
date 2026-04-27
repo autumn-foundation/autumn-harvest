@@ -51,6 +51,18 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260409000000_harvest_initial/up.sql"),
     "\n",
     include_str!("../migrations/20260424000001_harvest_trace_context/up.sql"),
+    "\n",
+    include_str!("../migrations/20260427000000_harvest_continue_as_new/up.sql"),
+);
+
+/// The minimal "legacy" migration set used by the upgrade-path regression
+/// test. Excludes both the workflow-start uniqueness upgrade *and* the
+/// continue-as-new migration so the test can drive the database through the
+/// historical upgrade sequence: legacy -> uniqueness fix -> continue-as-new.
+const LEGACY_INIT_SQL: &str = concat!(
+    include_str!("../migrations/20260409000000_harvest_initial/up.sql"),
+    "\n",
+    include_str!("../migrations/20260424000001_harvest_trace_context/up.sql"),
 );
 
 /// Start a Postgres container with the harvest schema applied and return
@@ -244,7 +256,12 @@ async fn legacy_workflow_uniqueness_schema_can_be_upgraded_for_idempotent_starts
     let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
         .await
         .expect("failed to connect to Postgres container");
-    let legacy_init_sql = INIT_SQL.replacen(
+    // Build a "legacy" schema: the original initial migration whose
+    // uniqueness key was `(workflow_id, run_id)` rather than the modern
+    // `(workflow_name, workflow_id)`. The continue-as-new migration is
+    // deliberately *not* applied yet so this test exercises the historical
+    // upgrade path one step at a time.
+    let legacy_init_sql = LEGACY_INIT_SQL.replacen(
         "UNIQUE (workflow_name, workflow_id)",
         "UNIQUE (workflow_id, run_id)",
         1,
@@ -265,12 +282,16 @@ async fn legacy_workflow_uniqueness_schema_can_be_upgraded_for_idempotent_starts
         search_attrs: None,
     };
 
-    let legacy_error = start_or_load_workflow_execution(&mut conn, request.clone())
+    // On the legacy schema there is no `(workflow_name, workflow_id)`
+    // uniqueness anywhere, so the first start succeeds — but the schema
+    // alone does not yet enforce idempotency. The point of the upgrade
+    // migration is to add that enforcement.
+    let initial_start = start_or_load_workflow_execution(&mut conn, request.clone())
         .await
-        .expect_err("legacy schema should reject the new ON CONFLICT target");
+        .expect("first start should succeed even on legacy schema");
     assert!(
-        matches!(legacy_error, HarvestError::Database(_)),
-        "legacy schema should fail with a database error, got {legacy_error:?}",
+        initial_start.created,
+        "first start should create a workflow execution row on the legacy schema",
     );
 
     let upgrade_path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -285,24 +306,45 @@ async fn legacy_workflow_uniqueness_schema_can_be_upgraded_for_idempotent_starts
         .await
         .expect("failed to apply harvest upgrade migration");
 
-    let first = start_or_load_workflow_execution(&mut conn, request.clone())
+    // After the start-uniqueness upgrade, repeated starts must collapse onto
+    // the originally-created row.
+    let after_uniqueness = start_or_load_workflow_execution(&mut conn, request.clone())
         .await
-        .expect("upgrade migration should restore workflow start");
-    let second = start_or_load_workflow_execution(&mut conn, request)
-        .await
-        .expect("upgrade migration should restore idempotent workflow start");
-
+        .expect("post-upgrade start should reuse the legacy row idempotently");
     assert!(
-        first.created,
-        "first start should create a workflow execution"
-    );
-    assert!(
-        !second.created,
-        "second start should reuse the existing workflow execution",
+        !after_uniqueness.created,
+        "post-upgrade start should not create a second row",
     );
     assert_eq!(
-        first.exec_id, second.exec_id,
-        "idempotent starts should point at the same execution after the upgrade migration",
+        initial_start.exec_id, after_uniqueness.exec_id,
+        "post-upgrade start should resolve to the same execution as the legacy start",
+    );
+
+    // Apply the continue-as-new migration on top to make sure the partial
+    // unique index it installs is compatible with the upgraded schema and
+    // continues to enforce idempotent starts.
+    let continue_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("migrations/20260427000000_harvest_continue_as_new/up.sql");
+    let continue_sql = std::fs::read_to_string(&continue_path).unwrap_or_else(|error| {
+        panic!(
+            "failed to read continue-as-new migration at {}: {error}",
+            continue_path.display()
+        )
+    });
+    conn.batch_execute(&continue_sql)
+        .await
+        .expect("failed to apply continue-as-new migration");
+
+    let after_continue_as_new = start_or_load_workflow_execution(&mut conn, request)
+        .await
+        .expect("start should remain idempotent after the continue-as-new migration");
+    assert!(
+        !after_continue_as_new.created,
+        "continue-as-new migration should not break idempotent starts",
+    );
+    assert_eq!(
+        initial_start.exec_id, after_continue_as_new.exec_id,
+        "idempotent starts should still resolve to the same execution after continue-as-new",
     );
 }
 
@@ -530,6 +572,29 @@ fn child_echo_workflow<'a>(
         Ok(serde_json::json!({
             "child": value,
         }))
+    })
+}
+
+/// First-generation handler used by the continue-as-new e2e test: it
+/// branches on the input. When invoked with `{"phase": "init"}` it requests
+/// continue-as-new with `{"phase": "next"}`. When invoked with the
+/// post-continuation payload it returns it directly.
+fn continue_as_new_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let phase = input
+            .get("phase")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        if phase == "init" {
+            let _ = ctx
+                .continue_as_new(serde_json::json!({"phase": "next", "ran_init": true}))
+                .await;
+            unreachable!("continue_as_new must not resolve");
+        }
+        Ok(input)
     })
 }
 
@@ -2432,5 +2497,101 @@ async fn wake_workflow_task_refreshes_sticky_until() {
         refreshed_until > parked_until,
         "sticky_until should be pushed forward on wake (parked_until={parked_until}, \
          refreshed_until={refreshed_until})",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_continues_as_new_with_fresh_history_and_same_workflow_id() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect to Postgres container");
+
+    let original_exec_id = insert_workflow_execution(&mut conn).await;
+    let initial_input = serde_json::json!({"phase": "init"});
+    enqueue_started_workflow_task(&mut conn, original_exec_id, initial_input.clone()).await;
+
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![WorkflowInfo {
+            name: "e2e_test_workflow",
+            module: "integration_e2e",
+            handler: continue_as_new_workflow,
+        }],
+        vec![],
+    ));
+    let worker = build_runtime_worker("worker-e2e-continue-as-new", 2, 1, registry);
+    let pool = build_test_pool(&database_url);
+    let handle = spawn_test_worker(Arc::clone(&worker), pool);
+
+    // The original run is sealed by the worker as soon as it drains the
+    // continue-as-new command. We wait for that terminal transition before
+    // asserting on the chain.
+    let sealed_execution =
+        wait_for_execution_state(&database_url, original_exec_id, "CONTINUED_AS_NEW").await;
+
+    // The successor run is identified by the WorkflowContinuedAsNew event
+    // appended to the original run's history. Walking the history is the
+    // public contract operators rely on; loading a fresh row by joining on
+    // the parent_id chain would not work because continue-as-new
+    // intentionally does NOT set parent_id (parent_id is reserved for child
+    // workflows).
+    let original_history = load_history_from_url(&database_url, original_exec_id).await;
+    let new_exec_id = original_history
+        .events
+        .iter()
+        .find_map(|event| match event {
+            WorkflowEvent::WorkflowContinuedAsNew { new_exec_id, .. } => Some(*new_exec_id),
+            _ => None,
+        })
+        .expect("original history should contain a WorkflowContinuedAsNew event");
+
+    assert_ne!(
+        new_exec_id, original_exec_id,
+        "continue-as-new must mint a fresh ExecutionId"
+    );
+
+    // The new run completes on its second execution by returning the
+    // post-continuation payload it was started with.
+    let completed = wait_for_execution_state(&database_url, new_exec_id, "COMPLETED").await;
+
+    worker.shutdown();
+    handle.await.expect("worker task should join");
+
+    assert_eq!(
+        sealed_execution.state, "CONTINUED_AS_NEW",
+        "original run should be sealed in the continue-as-new terminal state"
+    );
+    assert_eq!(
+        sealed_execution.workflow_id, completed.workflow_id,
+        "logical workflow_id must be preserved across the continue-as-new transition"
+    );
+    assert_eq!(
+        sealed_execution.workflow_name, completed.workflow_name,
+        "workflow_name must be preserved across the continue-as-new transition"
+    );
+    assert_eq!(
+        completed.output,
+        Some(serde_json::json!({"phase": "next", "ran_init": true})),
+        "the new run should observe the input passed to continue_as_new"
+    );
+
+    // The successor run starts with an empty history apart from
+    // WorkflowStarted plus its own terminal completion event — this is the
+    // whole point of continue-as-new, bounding history growth.
+    let new_history = load_history_from_url(&database_url, new_exec_id).await;
+    assert!(
+        matches!(
+            new_history.events.as_slice(),
+            [
+                WorkflowEvent::WorkflowStarted { .. },
+                WorkflowEvent::WorkflowCompleted { .. },
+            ]
+        ),
+        "new run history should be bounded; got {:?}",
+        new_history
+            .events
+            .iter()
+            .map(WorkflowEvent::type_name)
+            .collect::<Vec<_>>(),
     );
 }
