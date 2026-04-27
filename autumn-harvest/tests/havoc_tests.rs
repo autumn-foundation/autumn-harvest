@@ -1,6 +1,6 @@
-use autumn_harvest::{event::WorkflowEvent, policy::RetryPolicy, types::ExecutionId};
 #[cfg(feature = "db")]
 use autumn_harvest::store::events_to_insert_rows_from;
+use autumn_harvest::{event::WorkflowEvent, policy::RetryPolicy, types::ExecutionId};
 use std::time::Duration;
 
 #[cfg(feature = "db")]
