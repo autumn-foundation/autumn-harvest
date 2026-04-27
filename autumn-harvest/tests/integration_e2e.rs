@@ -2394,6 +2394,48 @@ async fn claim_task_falls_back_to_any_worker_after_sticky_expires() {
 }
 
 #[tokio::test]
+async fn claim_task_treats_expired_sticky_rows_like_unpinned_rows() {
+    let (mut conn, _container) = setup_test_db().await;
+    let exec_expired = insert_named_workflow_execution(&mut conn, "expired-sticky-1").await;
+    let exec_free = insert_named_workflow_execution(&mut conn, "free-after-expiry-1").await;
+
+    let mut expired = EnqueueParams::new("default", TaskType::Workflow, serde_json::json!({}))
+        .with_sticky("offline-worker", Duration::from_secs(30));
+    expired.priority = 0;
+    expired.workflow_exec_id = Some(exec_expired.as_uuid());
+    let expired_id = queue::enqueue(&mut conn, &expired)
+        .await
+        .expect("enqueue expired-sticky task failed");
+
+    diesel::sql_query(
+        "UPDATE harvest_task_queue \
+         SET sticky_until = NOW() - INTERVAL '1 second' \
+         WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(expired_id)
+    .execute(&mut conn)
+    .await
+    .expect("failed to expire sticky window");
+
+    let mut free = EnqueueParams::new("default", TaskType::Workflow, serde_json::json!({}));
+    free.priority = 10;
+    free.workflow_exec_id = Some(exec_free.as_uuid());
+    let free_id = queue::enqueue(&mut conn, &free)
+        .await
+        .expect("enqueue free task failed");
+
+    let queues = vec!["default".to_string()];
+    let claimed = queue::claim_task(&mut conn, &queues, "rescue-worker")
+        .await
+        .expect("claim should succeed")
+        .expect("one of the eligible tasks should be claimed");
+    assert_eq!(
+        claimed.id, free_id,
+        "expired sticky rows should compete with unpinned rows by priority instead of jumping ahead",
+    );
+}
+
+#[tokio::test]
 async fn park_workflow_task_with_sticky_hint_pins_to_worker() {
     let (mut conn, _container) = setup_test_db().await;
     let exec_id = insert_workflow_execution(&mut conn).await;
@@ -2593,5 +2635,109 @@ async fn worker_continues_as_new_with_fresh_history_and_same_workflow_id() {
             .iter()
             .map(WorkflowEvent::type_name)
             .collect::<Vec<_>>(),
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn continue_as_new_down_migration_rewrites_historical_runs_for_rollback() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect to Postgres container");
+
+    let original_exec_id = insert_workflow_execution(&mut conn).await;
+    let initial_input = serde_json::json!({"phase": "init"});
+    enqueue_started_workflow_task(&mut conn, original_exec_id, initial_input.clone()).await;
+
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![WorkflowInfo {
+            name: "e2e_test_workflow",
+            module: "integration_e2e",
+            handler: continue_as_new_workflow,
+        }],
+        vec![],
+    ));
+    let worker = build_runtime_worker("worker-e2e-continue-down", 2, 1, registry);
+    let pool = build_test_pool(&database_url);
+    let handle = spawn_test_worker(Arc::clone(&worker), pool);
+
+    let _sealed_execution =
+        wait_for_execution_state(&database_url, original_exec_id, "CONTINUED_AS_NEW").await;
+    let original_history = load_history_from_url(&database_url, original_exec_id).await;
+    let successor_exec_id = original_history
+        .events
+        .iter()
+        .find_map(|event| match event {
+            WorkflowEvent::WorkflowContinuedAsNew { new_exec_id, .. } => Some(*new_exec_id),
+            _ => None,
+        })
+        .expect("original history should contain a WorkflowContinuedAsNew event");
+    let _completed = wait_for_execution_state(&database_url, successor_exec_id, "COMPLETED").await;
+
+    worker.shutdown();
+    handle.await.expect("worker task should join");
+
+    let down_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("migrations/20260427000000_harvest_continue_as_new/down.sql");
+    let down_sql = std::fs::read_to_string(&down_path).unwrap_or_else(|error| {
+        panic!(
+            "failed to read continue-as-new down migration at {}: {error}",
+            down_path.display()
+        )
+    });
+    conn.batch_execute(&down_sql).await.expect(
+        "continue-as-new down migration should succeed after continue-as-new has been used",
+    );
+
+    let executions = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_name.eq("e2e_test_workflow"))
+        .order(harvest_workflow_executions::started_at.asc())
+        .select(WorkflowExecution::as_select())
+        .load(&mut conn)
+        .await
+        .expect("failed to reload workflow executions after down migration");
+    assert_eq!(
+        executions.len(),
+        2,
+        "rollback should preserve both runs while making them compatible with the pre-continue schema",
+    );
+    assert!(
+        executions
+            .iter()
+            .all(|execution| execution.state != "CONTINUED_AS_NEW"),
+        "down migration must eliminate CONTINUED_AS_NEW before restoring the old state check",
+    );
+
+    let original_row = executions
+        .iter()
+        .find(|execution| execution.id == original_exec_id.as_uuid())
+        .expect("original execution should still exist after rollback rewrite");
+    assert_eq!(
+        original_row.state, "COMPLETED",
+        "sealed historical runs should be rewritten to an old-schema terminal state",
+    );
+    assert!(
+        original_row
+            .workflow_id
+            .starts_with("e2e-wf-001::continued-as-new:"),
+        "sealed historical runs should get a synthetic workflow_id during rollback",
+    );
+
+    let successor_row = executions
+        .iter()
+        .find(|execution| execution.id == successor_exec_id.as_uuid())
+        .expect("successor execution should still exist after rollback rewrite");
+    assert_eq!(
+        successor_row.workflow_id, "e2e-wf-001",
+        "the latest run should retain the original logical workflow_id",
+    );
+
+    let rows_on_original_key = executions
+        .iter()
+        .filter(|execution| execution.workflow_id == "e2e-wf-001")
+        .count();
+    assert_eq!(
+        rows_on_original_key, 1,
+        "rollback should leave exactly one row on the original logical key before restoring uniqueness",
     );
 }

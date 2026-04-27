@@ -251,7 +251,10 @@ pub async fn claim_task(
                    OR sticky_until <= NOW() \
                ) \
              ORDER BY \
-                 (sticky_worker_id = $1 AND sticky_until > NOW()) DESC NULLS LAST, \
+                 CASE \
+                     WHEN sticky_worker_id = $1 AND sticky_until > NOW() THEN 1 \
+                     ELSE 0 \
+                 END DESC, \
                  priority DESC, \
                  scheduled_at ASC \
              LIMIT 1 FOR UPDATE SKIP LOCKED \
