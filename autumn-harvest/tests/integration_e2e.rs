@@ -51,6 +51,8 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260409000000_harvest_initial/up.sql"),
     "\n",
     include_str!("../migrations/20260424000001_harvest_trace_context/up.sql"),
+    "\n",
+    include_str!("../migrations/20260427000000_harvest_continue_as_new/up.sql"),
 );
 
 /// Start a Postgres container with the harvest schema applied and return
@@ -530,6 +532,29 @@ fn child_echo_workflow<'a>(
         Ok(serde_json::json!({
             "child": value,
         }))
+    })
+}
+
+/// First-generation handler used by the continue-as-new e2e test: it
+/// branches on the input. When invoked with `{"phase": "init"}` it requests
+/// continue-as-new with `{"phase": "next"}`. When invoked with the
+/// post-continuation payload it returns it directly.
+fn continue_as_new_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let phase = input
+            .get("phase")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        if phase == "init" {
+            let _ = ctx
+                .continue_as_new(serde_json::json!({"phase": "next", "ran_init": true}))
+                .await;
+            unreachable!("continue_as_new must not resolve");
+        }
+        Ok(input)
     })
 }
 
@@ -2432,5 +2457,101 @@ async fn wake_workflow_task_refreshes_sticky_until() {
         refreshed_until > parked_until,
         "sticky_until should be pushed forward on wake (parked_until={parked_until}, \
          refreshed_until={refreshed_until})",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_continues_as_new_with_fresh_history_and_same_workflow_id() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect to Postgres container");
+
+    let original_exec_id = insert_workflow_execution(&mut conn).await;
+    let initial_input = serde_json::json!({"phase": "init"});
+    enqueue_started_workflow_task(&mut conn, original_exec_id, initial_input.clone()).await;
+
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![WorkflowInfo {
+            name: "e2e_test_workflow",
+            module: "integration_e2e",
+            handler: continue_as_new_workflow,
+        }],
+        vec![],
+    ));
+    let worker = build_runtime_worker("worker-e2e-continue-as-new", 2, 1, registry);
+    let pool = build_test_pool(&database_url);
+    let handle = spawn_test_worker(Arc::clone(&worker), pool);
+
+    // The original run is sealed by the worker as soon as it drains the
+    // continue-as-new command. We wait for that terminal transition before
+    // asserting on the chain.
+    let sealed_execution =
+        wait_for_execution_state(&database_url, original_exec_id, "CONTINUED_AS_NEW").await;
+
+    // The successor run is identified by the WorkflowContinuedAsNew event
+    // appended to the original run's history. Walking the history is the
+    // public contract operators rely on; loading a fresh row by joining on
+    // the parent_id chain would not work because continue-as-new
+    // intentionally does NOT set parent_id (parent_id is reserved for child
+    // workflows).
+    let original_history = load_history_from_url(&database_url, original_exec_id).await;
+    let new_exec_id = original_history
+        .events
+        .iter()
+        .find_map(|event| match event {
+            WorkflowEvent::WorkflowContinuedAsNew { new_exec_id, .. } => Some(*new_exec_id),
+            _ => None,
+        })
+        .expect("original history should contain a WorkflowContinuedAsNew event");
+
+    assert_ne!(
+        new_exec_id, original_exec_id,
+        "continue-as-new must mint a fresh ExecutionId"
+    );
+
+    // The new run completes on its second execution by returning the
+    // post-continuation payload it was started with.
+    let completed = wait_for_execution_state(&database_url, new_exec_id, "COMPLETED").await;
+
+    worker.shutdown();
+    handle.await.expect("worker task should join");
+
+    assert_eq!(
+        sealed_execution.state, "CONTINUED_AS_NEW",
+        "original run should be sealed in the continue-as-new terminal state"
+    );
+    assert_eq!(
+        sealed_execution.workflow_id, completed.workflow_id,
+        "logical workflow_id must be preserved across the continue-as-new transition"
+    );
+    assert_eq!(
+        sealed_execution.workflow_name, completed.workflow_name,
+        "workflow_name must be preserved across the continue-as-new transition"
+    );
+    assert_eq!(
+        completed.output,
+        Some(serde_json::json!({"phase": "next", "ran_init": true})),
+        "the new run should observe the input passed to continue_as_new"
+    );
+
+    // The successor run starts with an empty history apart from
+    // WorkflowStarted plus its own terminal completion event — this is the
+    // whole point of continue-as-new, bounding history growth.
+    let new_history = load_history_from_url(&database_url, new_exec_id).await;
+    assert!(
+        matches!(
+            new_history.events.as_slice(),
+            [
+                WorkflowEvent::WorkflowStarted { .. },
+                WorkflowEvent::WorkflowCompleted { .. },
+            ]
+        ),
+        "new run history should be bounded; got {:?}",
+        new_history
+            .events
+            .iter()
+            .map(WorkflowEvent::type_name)
+            .collect::<Vec<_>>(),
     );
 }

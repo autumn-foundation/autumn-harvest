@@ -38,6 +38,14 @@ pub enum WorkflowOutcome {
         /// A list of commands representing the side effects (e.g. activities) requested.
         commands: Vec<WorkflowCommand>,
     },
+    /// The workflow signalled `continue_as_new`. The current execution is
+    /// terminal and the worker should atomically start a fresh execution
+    /// with the same logical `WorkflowId` but a new `ExecutionId`, passing
+    /// `input` as the initial payload.
+    ContinuedAsNew {
+        /// JSON payload to pass to the next iteration of the workflow.
+        input: Value,
+    },
 }
 
 /// Default timeout for detecting suspension -- if the workflow hasn't completed
@@ -102,7 +110,20 @@ pub async fn run_workflow_with_state(
             // Timeout elapsed -- the handler is suspended on a oneshot channel.
             // Drain the commands it emitted before suspending.
             Err(_elapsed) => {
-                let commands = ctx.drain_commands();
+                let mut commands = ctx.drain_commands();
+                // ContinueAsNew is terminal: when the workflow body parks on
+                // the dedicated suspension future, the latest command in the
+                // drain is the ContinueAsNew the user requested. Any commands
+                // earlier in the drain (e.g. RecordMarker for `version()` or
+                // `side_effect`) are intentionally discarded — they describe
+                // bookkeeping for an execution that is about to be sealed.
+                if let Some(idx) = commands
+                    .iter()
+                    .rposition(|cmd| matches!(cmd, WorkflowCommand::ContinueAsNew { .. }))
+                    && let WorkflowCommand::ContinueAsNew { input } = commands.swap_remove(idx)
+                {
+                    return WorkflowOutcome::ContinuedAsNew { input };
+                }
                 WorkflowOutcome::Suspended { commands }
             }
         }
@@ -216,6 +237,46 @@ mod tests {
                 );
             }
             other => panic!("expected Suspended, got {other:?}"),
+        }
+    }
+
+    /// A workflow that triggers `continue_as_new` mid-flight.
+    fn continue_as_new_workflow<'a>(
+        ctx: &'a WorkflowContext,
+        input: Value,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            // The future returned by continue_as_new never resolves on its
+            // own; the executor's suspension timeout drains the command and
+            // surfaces it as ContinuedAsNew.
+            let _ = ctx
+                .continue_as_new(serde_json::json!({"prev": input}))
+                .await;
+            unreachable!("continue_as_new must not resolve");
+        })
+    }
+
+    #[tokio::test]
+    async fn executor_returns_continued_as_new_when_command_drained() {
+        let exec_id = ExecutionId::new();
+        let history = vec![WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+        }];
+
+        let outcome = run_workflow(
+            exec_id,
+            history,
+            continue_as_new_workflow,
+            serde_json::json!("v1"),
+        )
+        .await;
+
+        match outcome {
+            WorkflowOutcome::ContinuedAsNew { input } => {
+                assert_eq!(input, serde_json::json!({"prev": "v1"}));
+            }
+            other => panic!("expected ContinuedAsNew, got {other:?}"),
         }
     }
 

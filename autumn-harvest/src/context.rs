@@ -134,6 +134,18 @@ pub enum WorkflowCommand {
         /// The string representation of the error that caused the failure.
         error: String,
     },
+    /// Atomically end the current execution and start a fresh one with the
+    /// same `WorkflowId` (logical identity) but a new `ExecutionId` and a
+    /// fresh event history.
+    ///
+    /// The accompanying future returned by
+    /// [`WorkflowContext::continue_as_new`] never resolves: the worker drains
+    /// this command after the executor's suspension timeout and treats it as
+    /// terminal regardless of whether the workflow function later returns.
+    ContinueAsNew {
+        /// Input passed to the next iteration of the workflow.
+        input: Value,
+    },
 }
 
 // Manual Debug because oneshot::Sender is not Debug.
@@ -182,8 +194,21 @@ impl std::fmt::Debug for WorkflowCommand {
                 f.debug_struct("Complete").field("output", output).finish()
             }
             Self::Fail { error } => f.debug_struct("Fail").field("error", error).finish(),
+            Self::ContinueAsNew { input } => f
+                .debug_struct("ContinueAsNew")
+                .field("input", input)
+                .finish(),
         }
     }
+}
+
+/// Suspend forever — used by terminal commands like `continue_as_new` whose
+/// resolution is performed by the worker after draining the command rather
+/// than by completing a oneshot. The executor's suspension timeout will fire
+/// long before this future could resolve naturally.
+async fn park_until_dropped() -> HarvestResult<()> {
+    std::future::pending::<()>().await;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -715,6 +740,51 @@ impl WorkflowContext {
         }
     }
 
+    // ── Continue-as-new ───────────────────────────────────────────────
+
+    /// Atomically end the current execution and start a fresh one with the
+    /// same `WorkflowId` (logical identity) but a new `ExecutionId` and an
+    /// empty event history. The new run begins with the supplied `input`.
+    ///
+    /// Used by long-lived orchestrations (recurring billing cycles, polling
+    /// loops, `IoT` device monitors) to bound event-history growth and keep
+    /// replay times constant.
+    ///
+    /// The returned future never resolves on its own — calling
+    /// `ctx.continue_as_new(input).await?` is effectively a "tail call" to a
+    /// new execution. The worker drains the emitted command after the
+    /// executor's suspension window elapses and performs the transition in a
+    /// single transaction. Any code after the await is therefore unreachable
+    /// in practice.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Cancelled`] if the workflow is cancelled while
+    /// it is parked on the continue-as-new command (the worker drops the
+    /// resolution sender during cancellation cleanup).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal commands mutex is poisoned.
+    pub async fn continue_as_new(&self, input: Value) -> HarvestResult<()> {
+        // Replay path: a recorded `WorkflowContinuedAsNew` is terminal. The
+        // current execution is sealed and will not run again, so on replay we
+        // just stop forward progress here. Returning `Ok(())` and yielding
+        // control via the suspension future keeps the executor parked until
+        // the worker tears the run down.
+        if self.is_replaying() {
+            // Push the command so the worker still observes the terminal
+            // intent if it inspects drained commands during replay.
+            self.push_command(WorkflowCommand::ContinueAsNew {
+                input: input.clone(),
+            });
+            return park_until_dropped().await;
+        }
+
+        self.push_command(WorkflowCommand::ContinueAsNew { input });
+        park_until_dropped().await
+    }
+
     /// Register a named query handler for this workflow execution.
     ///
     /// Query handlers are in-memory only and do not emit workflow commands.
@@ -997,6 +1067,31 @@ mod tests {
     use crate::error::TimeoutType;
     use crate::types::ActivityExecId;
     use chrono::Utc;
+
+    #[tokio::test]
+    async fn workflow_context_continue_as_new_pushes_terminal_command() {
+        let ctx = WorkflowContext::new_test();
+        let payload = serde_json::json!({"cycle": 2});
+
+        // The future never resolves, so race it against a short sleep and
+        // assert the command was queued — drain and inspect after the await
+        // is dropped.
+        let cont = ctx.continue_as_new(payload.clone());
+        tokio::pin!(cont);
+        tokio::select! {
+            _ = &mut cont => panic!("continue_as_new must not resolve"),
+            () = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
+        }
+
+        let drained = ctx.drain_commands();
+        assert_eq!(drained.len(), 1);
+        match &drained[0] {
+            WorkflowCommand::ContinueAsNew { input } => {
+                assert_eq!(input, &payload);
+            }
+            other => panic!("expected ContinueAsNew, got {other:?}"),
+        }
+    }
 
     #[test]
     fn activity_context_state_returns_none_when_not_registered() {

@@ -242,6 +242,7 @@ const fn workflow_command_name(command: &WorkflowCommand) -> &'static str {
         WorkflowCommand::WaitForSignal { .. } => "WaitForSignal",
         WorkflowCommand::Complete { .. } => "Complete",
         WorkflowCommand::Fail { .. } => "Fail",
+        WorkflowCommand::ContinueAsNew { .. } => "ContinueAsNew",
     }
 }
 
@@ -1611,6 +1612,130 @@ async fn prepare_workflow_task(
     })
 }
 
+/// Atomically seal the current execution as `CONTINUED_AS_NEW` and start a
+/// fresh execution with the same logical `WorkflowId`, a new `ExecutionId`,
+/// and an empty event history. Pending unconsumed signals on the old
+/// execution are reassigned to the new one so that signals delivered during
+/// the transition window are not lost.
+///
+/// Continue-as-new is intentionally restricted to root workflows. Allowing it
+/// from a child workflow would require either reparenting the new run (which
+/// changes the spawn-time logical identity its parent recorded) or orphaning
+/// the parent's `ChildWorkflow*` waiter, neither of which has a sound default
+/// in Phase 1. Callers from a child workflow get an explicit failure instead.
+async fn persist_workflow_continue_as_new(
+    conn: &mut AsyncPgConnection,
+    persistence: WorkflowTaskPersistence<'_>,
+    execution: &WorkflowExecution,
+    input: serde_json::Value,
+) -> HarvestResult<()> {
+    use crate::schema::{harvest_signals, harvest_workflow_executions};
+
+    if execution.parent_id.is_some() {
+        let error =
+            "continue_as_new is not supported in child workflows in this release".to_string();
+        return persist_workflow_failure(
+            conn,
+            persistence.task.id,
+            persistence.exec_id,
+            persistence.next_event_id,
+            persistence.worker_id,
+            &error,
+        )
+        .await;
+    }
+
+    // The new execution stays on the same shard so all of its event log,
+    // queue rows, timers, and signals continue to live in the same Postgres
+    // database as its predecessor.
+    let new_exec_id = ExecutionId::new_for_shard(persistence.exec_id.shard());
+    let task_id = persistence.task.id;
+    let exec_id = persistence.exec_id;
+    let next_event_id = persistence.next_event_id;
+    let worker_id = persistence.worker_id;
+    let started_event = WorkflowEvent::WorkflowStarted {
+        input: input.clone(),
+        timestamp: chrono::Utc::now(),
+    };
+    let continued_event = WorkflowEvent::WorkflowContinuedAsNew {
+        new_exec_id,
+        input: input.clone(),
+    };
+    let new_row = NewWorkflowExecution {
+        id: new_exec_id.as_uuid(),
+        workflow_name: &execution.workflow_name,
+        workflow_id: &execution.workflow_id,
+        run_id: uuid::Uuid::new_v4(),
+        shard_id: execution.shard_id,
+        input: input.clone(),
+        parent_id: None,
+        queue_name: &execution.queue_name,
+        execution_timeout: execution.execution_timeout,
+        memo: execution.memo.clone(),
+        search_attrs: execution.search_attrs.clone(),
+    };
+    let mut enqueue =
+        queue::EnqueueParams::new(execution.queue_name.clone(), TaskType::Workflow, input);
+    enqueue.workflow_exec_id = Some(new_exec_id.as_uuid());
+
+    conn.transaction::<(), HarvestError, _>(|conn| {
+        async move {
+            // Append the terminal continued-as-new marker to the old run.
+            store::append_events(conn, exec_id, &[continued_event], next_event_id).await?;
+
+            // Seal the old execution. The CHECK constraint allows this state
+            // value as of the continue-as-new migration; the partial unique
+            // index on (workflow_name, workflow_id) excludes CONTINUED_AS_NEW
+            // so the new row below can reuse the same logical identity.
+            let updated =
+                diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
+                    .filter(harvest_workflow_executions::state.eq("RUNNING"))
+                    .set((
+                        harvest_workflow_executions::state.eq("CONTINUED_AS_NEW"),
+                        harvest_workflow_executions::output.eq(None::<serde_json::Value>),
+                        harvest_workflow_executions::error.eq(None::<String>),
+                        harvest_workflow_executions::sticky_worker_id
+                            .eq(Some(worker_id.to_string())),
+                        harvest_workflow_executions::completed_at.eq(Some(chrono::Utc::now())),
+                    ))
+                    .execute(conn)
+                    .await
+                    .map_err(crate::error::database_error)?;
+            if updated == 0 {
+                return Err(workflow_execution_transition_error(conn, exec_id).await?);
+            }
+
+            diesel::insert_into(harvest_workflow_executions::table)
+                .values(&new_row)
+                .execute(conn)
+                .await
+                .map_err(crate::error::database_error)?;
+
+            store::append_events(conn, new_exec_id, &[started_event], 0).await?;
+
+            // Reassign unconsumed signals to the new execution so signals
+            // delivered while the workflow body was running do not disappear
+            // through the transition. Consumed signals stay on the old run
+            // for audit purposes.
+            diesel::update(
+                harvest_signals::table
+                    .filter(harvest_signals::workflow_exec_id.eq(exec_id.as_uuid()))
+                    .filter(harvest_signals::consumed.eq(false)),
+            )
+            .set(harvest_signals::workflow_exec_id.eq(new_exec_id.as_uuid()))
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+
+            queue::enqueue(conn, &enqueue).await?;
+            queue::complete_task(conn, task_id, serde_json::Value::Null).await?;
+            Ok(())
+        }
+        .scope_boxed()
+    })
+    .await
+}
+
 async fn persist_workflow_outcome(
     conn: &mut AsyncPgConnection,
     registry: &HandlerRegistry,
@@ -1679,6 +1804,11 @@ async fn persist_workflow_outcome(
             )
             .await
         }
+        (WorkflowOutcome::ContinuedAsNew { input }, _) => {
+            let result =
+                persist_workflow_continue_as_new(conn, persistence, execution, input).await;
+            fail_execution_on_error(conn, persistence.task, persistence.worker_id, result).await
+        }
     }
 }
 
@@ -1729,6 +1859,7 @@ async fn process_workflow_task(
         WorkflowOutcome::Completed { .. } => WorkflowStatus::Completed,
         WorkflowOutcome::Failed { .. } => WorkflowStatus::Failed,
         WorkflowOutcome::Suspended { .. } => WorkflowStatus::Suspended,
+        WorkflowOutcome::ContinuedAsNew { .. } => WorkflowStatus::ContinuedAsNew,
     };
     telemetry.metrics.record_workflow_completed(
         &prepared.execution.workflow_name,
