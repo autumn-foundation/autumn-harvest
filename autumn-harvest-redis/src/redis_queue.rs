@@ -401,9 +401,9 @@ impl RedisTaskQueue {
     async fn queue_depth_one(&self, queue_name: &str) -> RedisAdapterResult<i64> {
         let mut conn = self.conn.clone();
         let key = self.stream_key(queue_name);
-        let stream_len: i64 = conn.xlen(&key).await.unwrap_or(0);
+        let stream_len: i64 = propagate_redis_result(conn.xlen(&key).await)?;
         let zset = self.zset_key(queue_name);
-        let zset_len: i64 = conn.zcard(&zset).await.unwrap_or(0);
+        let zset_len: i64 = propagate_redis_result(conn.zcard(&zset).await)?;
         Ok(stream_len + zset_len)
     }
 
@@ -428,8 +428,8 @@ impl RedisTaskQueue {
             // to *any* consumer in the group". For PEL recovery, callers use
             // `recover_pending` which re-enqueues idle entries so they become
             // claimable through this same path.
-            let reply =
-                propagate_stream_read_result(conn.xread_options(&[&key], &[">"], &opts).await)?;
+            let reply: StreamReadReply =
+                propagate_redis_result(conn.xread_options(&[&key], &[">"], &opts).await)?;
 
             let entry = reply
                 .keys
@@ -445,7 +445,7 @@ impl RedisTaskQueue {
                 .get("payload")
                 .and_then(|v| match v {
                     redis::Value::BulkString(bytes) => {
-                        std::str::from_utf8(bytes).ok().map(ToString::to_string)
+                        std::str::from_utf8(&bytes).ok().map(ToString::to_string)
                     }
                     redis::Value::SimpleString(s) => Some(s.clone()),
                     _ => None,
@@ -466,9 +466,7 @@ impl RedisTaskQueue {
     }
 }
 
-fn propagate_stream_read_result(
-    result: redis::RedisResult<StreamReadReply>,
-) -> RedisAdapterResult<StreamReadReply> {
+fn propagate_redis_result<T>(result: redis::RedisResult<T>) -> RedisAdapterResult<T> {
     result.map_err(Into::into)
 }
 
@@ -619,19 +617,26 @@ mod tests {
     }
 
     #[test]
-    fn propagate_stream_read_result_preserves_empty_success() {
-        let reply = propagate_stream_read_result(Ok(StreamReadReply { keys: vec![] }))
+    fn propagate_redis_result_preserves_empty_stream_success() {
+        let reply = propagate_redis_result(Ok(StreamReadReply { keys: vec![] }))
             .expect("empty stream replies should remain successful");
         assert!(reply.keys.is_empty());
     }
 
     #[test]
-    fn propagate_stream_read_result_surfaces_redis_errors() {
+    fn propagate_redis_result_preserves_integer_success() {
+        let depth =
+            propagate_redis_result::<i64>(Ok(7)).expect("integer replies should pass through");
+        assert_eq!(depth, 7);
+    }
+
+    #[test]
+    fn propagate_redis_result_surfaces_redis_errors() {
         let err = redis::RedisError::from((redis::ErrorKind::IoError, "xread exploded"));
-        let mapped = propagate_stream_read_result(Err(err));
+        let mapped = propagate_redis_result::<i64>(Err(err));
         assert!(
             matches!(mapped, Err(RedisAdapterError::Redis(_))),
-            "xread failures must not be treated as an empty queue",
+            "redis command failures must not be treated as empty depth or an empty queue",
         );
     }
 

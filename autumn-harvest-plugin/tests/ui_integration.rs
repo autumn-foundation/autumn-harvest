@@ -1,6 +1,6 @@
 //! Integration tests for the Vantage dashboard UI.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use autumn_harvest::builder::WorkerConfig;
@@ -8,7 +8,10 @@ use autumn_harvest::info::WorkflowInfo;
 use autumn_harvest::scheduler::SchedulerMonitor;
 use autumn_harvest::schema::harvest_workflow_executions;
 use autumn_harvest::shard::ShardRouter;
+use autumn_harvest::shard::ShardedDbPool;
+use autumn_harvest::types::{ExecutionId, ShardId};
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
+use autumn_harvest::{StartWorkflowParams, start_or_load_workflow_execution};
 use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{HarvestApiRuntime, HarvestApiState};
 use autumn_harvest_plugin::ui::harvest_ui_router;
@@ -17,6 +20,7 @@ use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use diesel::QueryDsl;
+use diesel_async::SimpleAsyncConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 use serde_json::{Value, json};
@@ -50,12 +54,63 @@ async fn setup_test_database_url() -> (String, ContainerAsync<Postgres>) {
     (url, container)
 }
 
+async fn setup_sharded_test_database_urls() -> ((String, String), ContainerAsync<Postgres>) {
+    let container = Postgres::default()
+        .start()
+        .await
+        .expect("failed to start Postgres container");
+    let host = container
+        .get_host()
+        .await
+        .expect("failed to get container host");
+    let port = container
+        .get_host_port_ipv4(5432)
+        .await
+        .expect("failed to get container port");
+    let admin_url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+    let shard0_db = format!("harvest_ui_shard_{}", uuid::Uuid::new_v4().simple());
+    let shard1_db = format!("harvest_ui_shard_{}", uuid::Uuid::new_v4().simple());
+
+    let mut admin_conn = <AsyncPgConnection as AsyncConnection>::establish(&admin_url)
+        .await
+        .expect("failed to connect to admin database");
+    diesel::sql_query(format!("CREATE DATABASE {shard0_db}"))
+        .execute(&mut admin_conn)
+        .await
+        .expect("failed to create shard 0 database");
+    diesel::sql_query(format!("CREATE DATABASE {shard1_db}"))
+        .execute(&mut admin_conn)
+        .await
+        .expect("failed to create shard 1 database");
+
+    let shard0_url = format!("postgres://postgres:postgres@{host}:{port}/{shard0_db}");
+    let shard1_url = format!("postgres://postgres:postgres@{host}:{port}/{shard1_db}");
+
+    for shard_url in [&shard0_url, &shard1_url] {
+        let mut conn = <AsyncPgConnection as AsyncConnection>::establish(shard_url)
+            .await
+            .expect("failed to connect to shard database");
+        conn.batch_execute(INIT_SQL)
+            .await
+            .expect("failed to apply harvest migrations to shard database");
+    }
+
+    ((shard0_url, shard1_url), container)
+}
+
 fn build_test_pool(database_url: &str) -> DbPool {
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(database_url);
     deadpool::managed::Pool::builder(manager)
         .max_size(4)
         .build()
         .expect("failed to build test pool")
+}
+
+fn build_two_shard_pool(shard0_url: &str, shard1_url: &str) -> HarvestDbPool {
+    let mut pools = BTreeMap::new();
+    pools.insert(ShardId::new(0), build_test_pool(shard0_url));
+    pools.insert(ShardId::new(1), build_test_pool(shard1_url));
+    HarvestDbPool::sharded(ShardedDbPool::from_map(pools, ShardId::new(0)))
 }
 
 fn test_app_state_without_database() -> AppState {
@@ -107,6 +162,35 @@ async fn fetch_html(app: &axum::Router, uri: &str) -> (StatusCode, String) {
         .await
         .expect("failed to read response body");
     (status, String::from_utf8_lossy(&bytes).to_string())
+}
+
+async fn insert_workflow_on_url(
+    database_url: &str,
+    shard: ShardId,
+    workflow_name: &str,
+    workflow_id: &str,
+) -> ExecutionId {
+    let exec_id = ExecutionId::new_for_shard(shard);
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("failed to connect fresh Postgres client for workflow insert");
+    start_or_load_workflow_execution(
+        &mut conn,
+        StartWorkflowParams {
+            workflow_name,
+            workflow_id,
+            exec_id,
+            input: json!({ "workflow_id": workflow_id, "shard": shard.as_i32() }),
+            parent_id: None,
+            queue_name: "default",
+            execution_timeout: None,
+            memo: None,
+            search_attrs: None,
+        },
+    )
+    .await
+    .expect("workflow insert should succeed");
+    exec_id
 }
 
 async fn start_workflow_and_wait(
@@ -257,7 +341,7 @@ async fn ui_lists_workflows_and_renders_detail_page() {
         "detail history should include completion event"
     );
     // Input payload is pretty-printed and HTML-escaped
-    assert!(detail_html.contains("\"hello\""));
+    assert!(detail_html.contains("&quot;hello&quot;"));
     assert!(!detail_html.contains("<script"));
 
     let (status, _body) = fetch_html(&ui_app, "/workflows/not-a-uuid").await;
@@ -269,4 +353,40 @@ async fn ui_lists_workflows_and_renders_detail_page() {
 
     worker.shutdown();
     worker_task.await.expect("worker should exit cleanly");
+}
+
+#[tokio::test]
+async fn ui_lists_workflows_across_shards() {
+    let ((shard0_url, shard1_url), _container) = setup_sharded_test_database_urls().await;
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(build_two_shard_pool(&shard0_url, &shard1_url));
+    api_state.install(HarvestApiRuntime::new(
+        echo_registry(),
+        Arc::new(HashMap::new()),
+        Some("ui-test-worker".to_string()),
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        ShardRouter::new(
+            vec![ShardId::new(0), ShardId::new(1)],
+            vec![ShardId::new(0), ShardId::new(1)],
+            ShardId::new(0),
+        ),
+    ));
+
+    let exec_on_zero =
+        insert_workflow_on_url(&shard0_url, ShardId::new(0), "workflow_on_zero", "ui-zero").await;
+    let exec_on_one =
+        insert_workflow_on_url(&shard1_url, ShardId::new(1), "workflow_on_one", "ui-one").await;
+
+    let ui_app = harvest_ui_router(api_state).with_state(test_app_state_without_database());
+    let (status, list_html) = fetch_html(&ui_app, "/workflows").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        list_html.contains("workflow_on_zero") && list_html.contains(&exec_on_zero.to_string()),
+        "workflow from shard 0 should appear in the UI list"
+    );
+    assert!(
+        list_html.contains("workflow_on_one") && list_html.contains(&exec_on_one.to_string()),
+        "workflow from shard 1 should appear in the UI list"
+    );
 }

@@ -16,20 +16,15 @@ use axum::extract::{Path, Query};
 use axum::response::Html;
 use axum::routing::get;
 use chrono::{DateTime, Utc};
-use diesel::ExpressionMethods;
-use diesel::QueryDsl;
-use diesel::SelectableHelper;
-use diesel_async::RunQueryDsl;
 use serde::Deserialize;
 use serde_json::Value;
 
-use autumn_harvest::error::{HarvestError, HarvestResult, database_error};
+use autumn_harvest::error::{HarvestError, HarvestResult};
 use autumn_harvest::models::WorkflowExecution;
-use autumn_harvest::schema::harvest_workflow_executions;
 use autumn_harvest::store;
 
 use crate::api::{
-    HarvestApiState, PoolConn, db_conn, db_conn_for_execution, load_execution, map_error,
+    HarvestApiState, db_conn_for_execution, load_execution, load_workflows_from_shards, map_error,
     parse_execution_id,
 };
 
@@ -128,11 +123,17 @@ async fn list_workflows_ui(
         .filter(|value| !value.is_empty())
         .map(str::to_string);
 
-    let mut conn = db_conn(&api_state).await?;
-    let workflows = load_workflow_page(&mut conn, state_filter.as_deref(), limit, offset)
-        .await
-        .map_err(map_error)?;
-    let has_next = i64::try_from(workflows.len()).unwrap_or(i64::MAX) == limit;
+    let fetch_limit = offset.saturating_add(limit).saturating_add(1);
+    let workflows =
+        load_workflows_from_shards(&api_state, state_filter.as_deref(), fetch_limit).await?;
+    let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
+    let offset_usize = usize::try_from(offset).unwrap_or(usize::MAX);
+    let has_next = workflows.len() > offset_usize.saturating_add(limit_usize);
+    let workflows = workflows
+        .into_iter()
+        .skip(offset_usize)
+        .take(limit_usize)
+        .collect::<Vec<_>>();
 
     Ok(Html(render_workflow_list(
         &workflows,
@@ -163,27 +164,6 @@ async fn workflow_detail_ui(
         .map_err(map_error)?;
 
     Ok(Html(render_workflow_detail(&execution, &events)))
-}
-
-async fn load_workflow_page(
-    conn: &mut PoolConn,
-    state_filter: Option<&str>,
-    limit: i64,
-    offset: i64,
-) -> HarvestResult<Vec<WorkflowExecution>> {
-    let mut query = harvest_workflow_executions::table
-        .into_boxed()
-        .order(harvest_workflow_executions::created_at.desc())
-        .limit(limit)
-        .offset(offset);
-    if let Some(state) = state_filter {
-        query = query.filter(harvest_workflow_executions::state.eq(state.to_string()));
-    }
-    query
-        .select(WorkflowExecution::as_select())
-        .load(conn)
-        .await
-        .map_err(database_error)
 }
 
 fn render_workflow_list(

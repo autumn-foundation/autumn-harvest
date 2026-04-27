@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -6,7 +6,9 @@ use std::time::Duration;
 use autumn_harvest::builder::WorkerConfig;
 use autumn_harvest::dag::DagBuilder;
 use autumn_harvest::info::{ActivityInfo, DagInfo, WorkflowInfo};
-use autumn_harvest::models::{DagRun, HarvestSchedule, TaskQueueItem, WorkflowExecution};
+use autumn_harvest::models::{
+    DagRun, HarvestSchedule, NewDagRun, TaskQueueItem, WorkflowExecution,
+};
 use autumn_harvest::policy::Schedule;
 use autumn_harvest::scheduler::{
     DagCatalog, SchedulerMonitor, compile_dag_catalog, register_schedules, tick_once,
@@ -15,9 +17,12 @@ use autumn_harvest::schema::{
     harvest_dag_runs, harvest_dead_letters, harvest_schedules, harvest_task_queue,
     harvest_workflow_executions,
 };
-use autumn_harvest::shard::ShardRouter;
+use autumn_harvest::shard::{ShardRouter, ShardedDbPool};
+use autumn_harvest::types::{ExecutionId, ShardId};
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
-use autumn_harvest::{ActivityContext, WorkflowContext};
+use autumn_harvest::{
+    ActivityContext, StartWorkflowParams, WorkflowContext, start_or_load_workflow_execution,
+};
 use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{HarvestApiRuntime, HarvestApiState, harvest_api_router};
 use autumn_harvest_plugin::{
@@ -34,6 +39,7 @@ use diesel::SelectableHelper;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
+use diesel_async::SimpleAsyncConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use serde_json::{Value, json};
 use testcontainers::ContainerAsync;
@@ -68,12 +74,72 @@ async fn setup_test_database_url() -> (String, ContainerAsync<Postgres>) {
     (database_url, container)
 }
 
+async fn setup_sharded_test_database_urls() -> ((String, String), ContainerAsync<Postgres>) {
+    let container = Postgres::default()
+        .start()
+        .await
+        .expect("failed to start Postgres container");
+
+    let host = container
+        .get_host()
+        .await
+        .expect("failed to get container host");
+    let port = container
+        .get_host_port_ipv4(5432)
+        .await
+        .expect("failed to get container port");
+    let admin_url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+    let shard0_db = format!("harvest_shard_{}", uuid::Uuid::new_v4().simple());
+    let shard1_db = format!("harvest_shard_{}", uuid::Uuid::new_v4().simple());
+
+    let mut admin_conn = <AsyncPgConnection as AsyncConnection>::establish(&admin_url)
+        .await
+        .expect("failed to connect to admin database");
+    diesel::sql_query(format!("CREATE DATABASE {shard0_db}"))
+        .execute(&mut admin_conn)
+        .await
+        .expect("failed to create shard 0 database");
+    diesel::sql_query(format!("CREATE DATABASE {shard1_db}"))
+        .execute(&mut admin_conn)
+        .await
+        .expect("failed to create shard 1 database");
+
+    let shard0_url = format!("postgres://postgres:postgres@{host}:{port}/{shard0_db}");
+    let shard1_url = format!("postgres://postgres:postgres@{host}:{port}/{shard1_db}");
+
+    for shard_url in [&shard0_url, &shard1_url] {
+        let mut conn = <AsyncPgConnection as AsyncConnection>::establish(shard_url)
+            .await
+            .expect("failed to connect to shard database");
+        conn.batch_execute(INIT_SQL)
+            .await
+            .expect("failed to apply harvest migrations to shard database");
+    }
+
+    ((shard0_url, shard1_url), container)
+}
+
 fn build_test_pool(database_url: &str) -> DbPool {
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(database_url);
     deadpool::managed::Pool::builder(manager)
         .max_size(4)
         .build()
         .expect("failed to build test pool")
+}
+
+fn two_shard_router() -> ShardRouter {
+    ShardRouter::new(
+        vec![ShardId::new(0), ShardId::new(1)],
+        vec![ShardId::new(0), ShardId::new(1)],
+        ShardId::new(0),
+    )
+}
+
+fn build_two_shard_pool(shard0_url: &str, shard1_url: &str) -> HarvestDbPool {
+    let mut pools = BTreeMap::new();
+    pools.insert(ShardId::new(0), build_test_pool(shard0_url));
+    pools.insert(ShardId::new(1), build_test_pool(shard1_url));
+    HarvestDbPool::sharded(ShardedDbPool::from_map(pools, ShardId::new(0)))
 }
 
 fn test_app_state(pool: DbPool) -> AppState {
@@ -142,6 +208,29 @@ async fn post_json(
         )
         .await
         .expect("POST request failed");
+    let status = response.status();
+    let json = read_json_response(response).await;
+    (status, json)
+}
+
+async fn patch_json(
+    app: &HarvestApiApp,
+    uri: impl Into<String>,
+    payload: Value,
+) -> (StatusCode, Value) {
+    let uri = uri.into();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(&uri)
+                .header("content-type", "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .expect("PATCH request failed");
     let status = response.status();
     let json = read_json_response(response).await;
     (status, json)
@@ -219,6 +308,86 @@ async fn register_test_schedules(database_url: &str, dag_catalog: &DagCatalog, r
         .expect("failed to register dag schedules");
 }
 
+async fn insert_workflow_on_url(
+    database_url: &str,
+    shard: ShardId,
+    workflow_name: &str,
+    workflow_id: &str,
+) -> ExecutionId {
+    let exec_id = ExecutionId::new_for_shard(shard);
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("failed to connect fresh Postgres client for workflow insert");
+    start_or_load_workflow_execution(
+        &mut conn,
+        StartWorkflowParams {
+            workflow_name,
+            workflow_id,
+            exec_id,
+            input: json!({ "workflow_id": workflow_id, "shard": shard.as_i32() }),
+            parent_id: None,
+            queue_name: "default",
+            execution_timeout: None,
+            memo: None,
+            search_attrs: None,
+        },
+    )
+    .await
+    .expect("workflow insert should succeed");
+    exec_id
+}
+
+async fn insert_dead_letter_on_url(
+    database_url: &str,
+    queue_name: &str,
+    activity_name: &str,
+) -> uuid::Uuid {
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("failed to connect fresh Postgres client for dead-letter insert");
+    autumn_harvest::dlq::dead_letter(
+        &mut conn,
+        &autumn_harvest::dlq::NewDeadLetterEntry {
+            original_task_id: uuid::Uuid::new_v4(),
+            queue_name: queue_name.to_string(),
+            task_type: "ACTIVITY".to_string(),
+            workflow_exec_id: None,
+            activity_name: Some(activity_name.to_string()),
+            input: json!({ "queue": queue_name }),
+            error: format!("{activity_name} failed"),
+            attempts: 3,
+        },
+    )
+    .await
+    .expect("dead-letter insert should succeed")
+}
+
+fn leak_string(value: String) -> &'static str {
+    Box::leak(value.into_boxed_str())
+}
+
+fn manual_pipeline_info_named(name: &'static str) -> DagInfo {
+    DagInfo {
+        name,
+        module: "tests",
+        schedule: Some(Schedule::Manual),
+        catchup: false,
+        max_active_runs: 1,
+        default_queue: Some("default"),
+        builder: build_manual_pipeline_dag,
+    }
+}
+
+fn find_dag_name_for_shard(router: &ShardRouter, prefix: &str, target: ShardId) -> &'static str {
+    for attempt in 0..4096 {
+        let candidate = format!("{prefix}_{attempt}");
+        if router.pick_for_dag(&candidate) == target {
+            return leak_string(candidate);
+        }
+    }
+    panic!("failed to find dag name mapping to shard {target}");
+}
+
 async fn load_execution_from_url(database_url: &str, exec_id: &str) -> WorkflowExecution {
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
         .await
@@ -290,6 +459,18 @@ async fn count_dead_letters_from_url(database_url: &str) -> i64 {
         .get_result(&mut conn)
         .await
         .expect("failed to count dead letters")
+}
+
+async fn count_dag_runs_from_url(database_url: &str, dag_name: &str) -> i64 {
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("failed to connect fresh Postgres client for dag-run count");
+    harvest_dag_runs::table
+        .filter(harvest_dag_runs::dag_name.eq(dag_name))
+        .count()
+        .get_result(&mut conn)
+        .await
+        .expect("failed to count dag runs")
 }
 
 async fn load_schedule_from_url(database_url: &str, dag_name: &str) -> HarvestSchedule {
@@ -957,6 +1138,90 @@ async fn harvest_api_lists_and_replays_dead_letters() {
 }
 
 #[tokio::test]
+async fn harvest_api_lists_workflows_and_dead_letters_across_shards() {
+    let ((shard0_url, shard1_url), _container) = setup_sharded_test_database_urls().await;
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(build_two_shard_pool(&shard0_url, &shard1_url));
+    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+
+    let exec_on_zero = insert_workflow_on_url(
+        &shard0_url,
+        ShardId::new(0),
+        "workflow_on_zero",
+        "workflow-zero",
+    )
+    .await;
+    let exec_on_one = insert_workflow_on_url(
+        &shard1_url,
+        ShardId::new(1),
+        "workflow_on_one",
+        "workflow-one",
+    )
+    .await;
+    let dead_letter_on_zero =
+        insert_dead_letter_on_url(&shard0_url, "zero-queue", "zero_task").await;
+    let dead_letter_on_one = insert_dead_letter_on_url(&shard1_url, "one-queue", "one_task").await;
+
+    let (workflow_status, workflow_json) = get_json(&app, "/workflows?limit=10").await;
+    assert_eq!(workflow_status, StatusCode::OK);
+    let workflows = workflow_json
+        .as_array()
+        .expect("workflow list response must be an array");
+    assert!(
+        workflows
+            .iter()
+            .any(|row| row["id"] == exec_on_zero.to_string()
+                && row["workflow_name"] == "workflow_on_zero"),
+        "workflow from shard 0 should be listed"
+    );
+    assert!(
+        workflows
+            .iter()
+            .any(|row| row["id"] == exec_on_one.to_string()
+                && row["workflow_name"] == "workflow_on_one"),
+        "workflow from shard 1 should be listed"
+    );
+
+    let (dead_letter_status, dead_letter_json) = get_json(&app, "/dead-letters?limit=10").await;
+    assert_eq!(dead_letter_status, StatusCode::OK);
+    let dead_letters = dead_letter_json
+        .as_array()
+        .expect("dead-letter list response must be an array");
+    assert!(
+        dead_letters
+            .iter()
+            .any(|row| row["id"] == dead_letter_on_zero.to_string()
+                && row["queue_name"] == "zero-queue"),
+        "dead letter from shard 0 should be listed"
+    );
+    assert!(
+        dead_letters
+            .iter()
+            .any(|row| row["id"] == dead_letter_on_one.to_string()
+                && row["queue_name"] == "one-queue"),
+        "dead letter from shard 1 should be listed"
+    );
+
+    let (replay_status, replay_json) = post_json(
+        &app,
+        format!("/dead-letters/{dead_letter_on_one}/replay"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(replay_status, StatusCode::ACCEPTED);
+    let replayed_task_id = replay_json["task_id"]
+        .as_str()
+        .expect("replay response should include task_id")
+        .parse::<uuid::Uuid>()
+        .expect("task_id should be a uuid");
+    let replayed = load_task_from_url(&shard1_url, replayed_task_id).await;
+    assert_eq!(replayed.queue_name, "one-queue");
+    assert_eq!(replayed.activity_name.as_deref(), Some("one_task"));
+    assert_eq!(count_dead_letters_from_url(&shard0_url).await, 1);
+    assert_eq!(count_dead_letters_from_url(&shard1_url).await, 0);
+}
+
+#[tokio::test]
 async fn harvest_api_lists_and_triggers_manual_dags() {
     let (database_url, _container) = setup_test_database_url().await;
     let pool = build_test_pool(&database_url);
@@ -1020,6 +1285,142 @@ async fn harvest_api_lists_and_triggers_manual_dags() {
 
     let recorded = log.lock().expect("log mutex poisoned").clone();
     assert_eq!(recorded, vec!["extract", "transform", "notify"]);
+}
+
+#[tokio::test]
+async fn harvest_api_routes_dag_reads_and_mutations_to_owned_shard() {
+    let ((shard0_url, shard1_url), _container) = setup_sharded_test_database_urls().await;
+    let router = two_shard_router();
+    let dag_on_zero = find_dag_name_for_shard(&router, "manual_zero", ShardId::new(0));
+    let dag_on_one = find_dag_name_for_shard(&router, "manual_one", ShardId::new(1));
+
+    let dag_catalog = Arc::new(
+        compile_dag_catalog(vec![
+            manual_pipeline_info_named(dag_on_zero),
+            manual_pipeline_info_named(dag_on_one),
+        ])
+        .expect("sharded manual dags should compile"),
+    );
+    let log = Arc::new(Mutex::new(Vec::<String>::new()));
+    let registry = recording_registry(Arc::clone(&log), &["extract", "transform", "notify"]);
+
+    let shard0_catalog = compile_dag_catalog(vec![manual_pipeline_info_named(dag_on_zero)])
+        .expect("shard 0 dag should compile");
+    let shard1_catalog = compile_dag_catalog(vec![manual_pipeline_info_named(dag_on_one)])
+        .expect("shard 1 dag should compile");
+    register_test_schedules(
+        &shard0_url,
+        &shard0_catalog,
+        "failed to register shard 0 schedules",
+    )
+    .await;
+    register_test_schedules(
+        &shard1_url,
+        &shard1_catalog,
+        "failed to register shard 1 schedules",
+    )
+    .await;
+
+    let seeded_run_id = {
+        let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&shard1_url)
+            .await
+            .expect("failed to connect to shard 1 for dag-run seed");
+        let now = chrono::Utc::now();
+        let seeded_run_id = uuid::Uuid::new_v4();
+        diesel::insert_into(harvest_dag_runs::table)
+            .values(&NewDagRun {
+                id: seeded_run_id,
+                dag_name: dag_on_one,
+                workflow_exec_id: None,
+                logical_date: now,
+                data_interval_start: now,
+                data_interval_end: now,
+                conf: Some(json!({ "seeded": true })),
+            })
+            .execute(&mut conn)
+            .await
+            .expect("failed to seed shard 1 dag run");
+        seeded_run_id
+    };
+
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(build_two_shard_pool(&shard0_url, &shard1_url));
+    api_state.install(HarvestApiRuntime::new(
+        Arc::clone(&registry),
+        Arc::clone(&dag_catalog),
+        Some("scheduler-sharded".to_string()),
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        router,
+    ));
+    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+
+    let (dags_status, dags_json) = get_json(&app, "/dags").await;
+    assert_eq!(dags_status, StatusCode::OK);
+    let dags = dags_json
+        .as_array()
+        .expect("dags response must be an array");
+    assert!(
+        dags.iter().any(|dag| dag["name"] == dag_on_zero),
+        "dag from shard 0 should be listed"
+    );
+    assert!(
+        dags.iter().any(|dag| dag["name"] == dag_on_one),
+        "dag from shard 1 should be listed"
+    );
+
+    let (runs_status, runs_json) = get_json(&app, format!("/dags/{dag_on_one}/runs")).await;
+    assert_eq!(runs_status, StatusCode::OK);
+    assert!(
+        runs_json
+            .as_array()
+            .expect("dag runs response must be an array")
+            .iter()
+            .any(|row| row["id"] == seeded_run_id.to_string()),
+        "dag runs must come from the dag's owning shard"
+    );
+
+    let (patch_status, patch_json) = patch_json(
+        &app,
+        format!("/dags/{dag_on_one}"),
+        json!({ "paused": true }),
+    )
+    .await;
+    assert_eq!(patch_status, StatusCode::OK);
+    assert_eq!(patch_json["dag_name"], dag_on_one);
+    assert_eq!(patch_json["is_paused"], true);
+    assert!(
+        load_schedule_from_url(&shard1_url, dag_on_one)
+            .await
+            .is_paused,
+        "pause updates must hit the dag's owning shard"
+    );
+    assert!(
+        !load_schedule_from_url(&shard0_url, dag_on_zero)
+            .await
+            .is_paused,
+        "patching a shard 1 dag must not mutate shard 0 schedules"
+    );
+
+    let before_trigger_count = count_dag_runs_from_url(&shard1_url, dag_on_one).await;
+    let (trigger_status, _trigger_json) = post_json(
+        &app,
+        format!("/dags/{dag_on_one}/trigger"),
+        json!({ "conf": { "manual": true } }),
+    )
+    .await;
+    assert_eq!(trigger_status, StatusCode::CREATED);
+    assert_eq!(
+        count_dag_runs_from_url(&shard1_url, dag_on_one).await,
+        before_trigger_count + 1,
+        "triggered runs must be inserted on the dag's owning shard"
+    );
+    assert!(
+        load_latest_dag_run_from_url(&shard0_url, dag_on_one)
+            .await
+            .is_none(),
+        "trigger must not create runs on the default shard for a shard 1 dag"
+    );
 }
 
 #[tokio::test]

@@ -31,8 +31,8 @@ use autumn_harvest::schema::{harvest_dag_runs, harvest_schedules, harvest_workfl
 use autumn_harvest::shard::ShardRouter;
 use autumn_harvest::signal;
 use autumn_harvest::store;
-use autumn_harvest::types::ExecutionId;
-use autumn_harvest::worker::HandlerRegistry;
+use autumn_harvest::types::{ExecutionId, ShardId};
+use autumn_harvest::worker::{DbPool, HandlerRegistry};
 use autumn_harvest::{
     StartWorkflowParams, cancel_workflow_execution, start_or_load_workflow_execution,
 };
@@ -265,16 +265,8 @@ async fn list_workflows(
     Extension(api_state): Extension<HarvestApiState>,
     Query(query): Query<WorkflowListQuery>,
 ) -> Result<Json<Vec<WorkflowExecution>>, AutumnError> {
-    let mut conn = db_conn(&api_state).await?;
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
-    let workflows = harvest_workflow_executions::table
-        .order(harvest_workflow_executions::created_at.desc())
-        .limit(limit)
-        .select(WorkflowExecution::as_select())
-        .load(&mut conn)
-        .await
-        .map_err(database_error)
-        .map_err(map_error)?;
+    let workflows = load_workflows_from_shards(&api_state, None, limit).await?;
     Ok(Json(workflows))
 }
 
@@ -454,14 +446,7 @@ async fn list_dags(
     Extension(api_state): Extension<HarvestApiState>,
 ) -> Result<Json<Vec<DagSummary>>, AutumnError> {
     let runtime = api_state.runtime().map_err(map_error)?;
-    let mut conn = db_conn(&api_state).await?;
-    let schedules = harvest_schedules::table
-        .order(harvest_schedules::dag_name.asc())
-        .select(HarvestSchedule::as_select())
-        .load(&mut conn)
-        .await
-        .map_err(database_error)
-        .map_err(map_error)?;
+    let schedules = load_schedules_from_shards(&api_state).await?;
 
     let dags = schedules
         .into_iter()
@@ -486,7 +471,7 @@ async fn list_dag_runs(
     Extension(api_state): Extension<HarvestApiState>,
     Path(dag_name): Path<String>,
 ) -> Result<Json<Vec<DagRun>>, AutumnError> {
-    let mut conn = db_conn(&api_state).await?;
+    let mut conn = db_conn_for_dag(&api_state, &dag_name).await?;
     let runs = harvest_dag_runs::table
         .filter(harvest_dag_runs::dag_name.eq(&dag_name))
         .order(harvest_dag_runs::created_at.desc())
@@ -505,8 +490,9 @@ async fn trigger_dag_run(
 ) -> Result<(axum::http::StatusCode, Json<DagRun>), AutumnError> {
     let runtime = api_state.runtime().map_err(map_error)?;
     let pool = api_state.storage_pool().map_err(map_error)?;
+    let shard = runtime.router.pick_for_dag(&dag_name);
     let run = trigger_dag(
-        pool.clone_inner(),
+        pool.pool_for(shard).clone(),
         Arc::clone(&runtime.registry),
         Arc::clone(&runtime.dags),
         &dag_name,
@@ -525,7 +511,7 @@ async fn patch_dag(
 ) -> Result<Json<HarvestSchedule>, AutumnError> {
     use autumn_harvest::schema::harvest_schedules::dsl;
 
-    let mut conn = db_conn(&api_state).await?;
+    let mut conn = db_conn_for_dag(&api_state, &dag_name).await?;
     let updated = diesel::update(dsl::harvest_schedules.filter(dsl::dag_name.eq(&dag_name)))
         .set((
             dsl::is_paused.eq(request.paused),
@@ -553,11 +539,8 @@ async fn list_dead_letters(
     Extension(api_state): Extension<HarvestApiState>,
     Query(query): Query<DeadLetterListQuery>,
 ) -> Result<Json<Vec<DeadLetter>>, AutumnError> {
-    let mut conn = db_conn(&api_state).await?;
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
-    let dead_letters = dlq::list_dead_letters(&mut conn, limit)
-        .await
-        .map_err(map_error)?;
+    let dead_letters = load_dead_letters_from_shards(&api_state, limit).await?;
     Ok(Json(dead_letters))
 }
 
@@ -566,10 +549,7 @@ async fn replay_dead_letter(
     Path(id): Path<String>,
 ) -> Result<(axum::http::StatusCode, Json<ReplayDeadLetterResponse>), AutumnError> {
     let dead_letter_id = parse_uuid(&id, "dead-letter id")?;
-    let mut conn = db_conn(&api_state).await?;
-    let task_id = dlq::replay_dead_letter(&mut conn, dead_letter_id)
-        .await
-        .map_err(map_error)?;
+    let task_id = replay_dead_letter_from_shards(&api_state, dead_letter_id).await?;
 
     Ok((
         axum::http::StatusCode::ACCEPTED,
@@ -623,14 +603,12 @@ pub(crate) type PoolConn = deadpool::managed::Object<
     diesel_async::pooled_connection::AsyncDieselConnectionManager<diesel_async::AsyncPgConnection>,
 >;
 
-pub(crate) async fn db_conn(api_state: &HarvestApiState) -> Result<PoolConn, AutumnError> {
-    let pool = api_state.storage_pool().map_err(map_error)?;
-    let conn = pool
-        .default_pool()
-        .get()
-        .await
-        .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
-    Ok(conn)
+fn map_pool_error(error: impl ToString) -> AutumnError {
+    AutumnError::service_unavailable_msg(error.to_string())
+}
+
+async fn acquire_conn(pool: &DbPool) -> Result<PoolConn, AutumnError> {
+    pool.get().await.map_err(map_pool_error)
 }
 
 pub(crate) async fn db_conn_for_execution(
@@ -638,25 +616,139 @@ pub(crate) async fn db_conn_for_execution(
     exec_id: ExecutionId,
 ) -> Result<PoolConn, AutumnError> {
     let pool = api_state.storage_pool().map_err(map_error)?;
-    let conn = pool
-        .pool_for_execution(exec_id)
-        .get()
-        .await
-        .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
-    Ok(conn)
+    acquire_conn(pool.pool_for_execution(exec_id)).await
 }
 
 async fn db_conn_for_shard(
     api_state: &HarvestApiState,
-    shard: autumn_harvest::types::ShardId,
+    shard: ShardId,
 ) -> Result<PoolConn, AutumnError> {
     let pool = api_state.storage_pool().map_err(map_error)?;
-    let conn = pool
-        .pool_for(shard)
-        .get()
+    acquire_conn(pool.pool_for(shard)).await
+}
+
+async fn db_conn_for_dag(
+    api_state: &HarvestApiState,
+    dag_name: &str,
+) -> Result<PoolConn, AutumnError> {
+    let runtime = api_state.runtime().map_err(map_error)?;
+    db_conn_for_shard(api_state, runtime.router.pick_for_dag(dag_name)).await
+}
+
+pub(crate) async fn load_workflows(
+    conn: &mut AsyncPgConnection,
+    state_filter: Option<&str>,
+    limit: i64,
+) -> HarvestResult<Vec<WorkflowExecution>> {
+    let mut query = harvest_workflow_executions::table
+        .into_boxed()
+        .order(harvest_workflow_executions::created_at.desc())
+        .limit(limit);
+    if let Some(state) = state_filter {
+        query = query.filter(harvest_workflow_executions::state.eq(state.to_string()));
+    }
+    query
+        .select(WorkflowExecution::as_select())
+        .load(conn)
         .await
-        .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
-    Ok(conn)
+        .map_err(database_error)
+}
+
+pub(crate) async fn load_workflows_from_shards(
+    api_state: &HarvestApiState,
+    state_filter: Option<&str>,
+    limit: i64,
+) -> Result<Vec<WorkflowExecution>, AutumnError> {
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    let mut workflows = Vec::new();
+
+    for (_shard, shard_pool) in pool.iter_shards() {
+        let mut conn = acquire_conn(shard_pool).await?;
+        let mut rows = load_workflows(&mut conn, state_filter, limit)
+            .await
+            .map_err(map_error)?;
+        workflows.append(&mut rows);
+    }
+
+    workflows.sort_by(|left, right| {
+        right
+            .created_at
+            .cmp(&left.created_at)
+            .then_with(|| right.id.cmp(&left.id))
+    });
+    workflows.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+    Ok(workflows)
+}
+
+async fn load_schedules_from_shards(
+    api_state: &HarvestApiState,
+) -> Result<Vec<HarvestSchedule>, AutumnError> {
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    let mut schedules = Vec::new();
+
+    for (_shard, shard_pool) in pool.iter_shards() {
+        let mut conn = acquire_conn(shard_pool).await?;
+        let mut rows = harvest_schedules::table
+            .order(harvest_schedules::dag_name.asc())
+            .select(HarvestSchedule::as_select())
+            .load(&mut conn)
+            .await
+            .map_err(database_error)
+            .map_err(map_error)?;
+        schedules.append(&mut rows);
+    }
+
+    schedules.sort_by(|left, right| {
+        left.dag_name
+            .cmp(&right.dag_name)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    Ok(schedules)
+}
+
+async fn load_dead_letters_from_shards(
+    api_state: &HarvestApiState,
+    limit: i64,
+) -> Result<Vec<DeadLetter>, AutumnError> {
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    let mut dead_letters = Vec::new();
+
+    for (_shard, shard_pool) in pool.iter_shards() {
+        let mut conn = acquire_conn(shard_pool).await?;
+        let mut rows = dlq::list_dead_letters(&mut conn, limit)
+            .await
+            .map_err(map_error)?;
+        dead_letters.append(&mut rows);
+    }
+
+    dead_letters.sort_by(|left, right| {
+        right
+            .failed_at
+            .cmp(&left.failed_at)
+            .then_with(|| right.id.cmp(&left.id))
+    });
+    dead_letters.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+    Ok(dead_letters)
+}
+
+async fn replay_dead_letter_from_shards(
+    api_state: &HarvestApiState,
+    dead_letter_id: uuid::Uuid,
+) -> Result<uuid::Uuid, AutumnError> {
+    let pool = api_state.storage_pool().map_err(map_error)?;
+
+    for (_shard, shard_pool) in pool.iter_shards() {
+        let mut conn = acquire_conn(shard_pool).await?;
+        match dlq::replay_dead_letter(&mut conn, dead_letter_id).await {
+            Ok(task_id) => return Ok(task_id),
+            Err(HarvestError::NotFound(_)) => continue,
+            Err(error) => return Err(map_error(error)),
+        }
+    }
+
+    Err(AutumnError::not_found_msg(format!(
+        "dead-letter {dead_letter_id}"
+    )))
 }
 
 pub(crate) fn parse_execution_id(raw: &str) -> Result<ExecutionId, AutumnError> {
