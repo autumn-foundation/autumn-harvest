@@ -603,12 +603,12 @@ pub(crate) type PoolConn = deadpool::managed::Object<
     diesel_async::pooled_connection::AsyncDieselConnectionManager<diesel_async::AsyncPgConnection>,
 >;
 
-fn map_pool_error(error: impl ToString) -> AutumnError {
+fn map_pool_error(error: &impl ToString) -> AutumnError {
     AutumnError::service_unavailable_msg(error.to_string())
 }
 
 async fn acquire_conn(pool: &DbPool) -> Result<PoolConn, AutumnError> {
-    pool.get().await.map_err(map_pool_error)
+    pool.get().await.map_err(|error| map_pool_error(&error))
 }
 
 pub(crate) async fn db_conn_for_execution(
@@ -741,7 +741,7 @@ async fn replay_dead_letter_from_shards(
         let mut conn = acquire_conn(shard_pool).await?;
         match dlq::replay_dead_letter(&mut conn, dead_letter_id).await {
             Ok(task_id) => return Ok(task_id),
-            Err(HarvestError::NotFound(_)) => continue,
+            Err(HarvestError::NotFound(_)) => {}
             Err(error) => return Err(map_error(error)),
         }
     }

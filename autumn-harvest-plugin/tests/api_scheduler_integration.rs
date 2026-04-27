@@ -388,6 +388,174 @@ fn find_dag_name_for_shard(router: &ShardRouter, prefix: &str, target: ShardId) 
     panic!("failed to find dag name mapping to shard {target}");
 }
 
+fn sharded_manual_dag_names(router: &ShardRouter) -> (&'static str, &'static str) {
+    (
+        find_dag_name_for_shard(router, "manual_zero", ShardId::new(0)),
+        find_dag_name_for_shard(router, "manual_one", ShardId::new(1)),
+    )
+}
+
+fn sharded_manual_dag_catalog(
+    dag_on_zero: &'static str,
+    dag_on_one: &'static str,
+) -> Arc<DagCatalog> {
+    Arc::new(
+        compile_dag_catalog(vec![
+            manual_pipeline_info_named(dag_on_zero),
+            manual_pipeline_info_named(dag_on_one),
+        ])
+        .expect("sharded manual dags should compile"),
+    )
+}
+
+async fn register_sharded_manual_dag_schedules(
+    shard0_url: &str,
+    shard1_url: &str,
+    dag_on_zero: &'static str,
+    dag_on_one: &'static str,
+) {
+    let shard0_catalog = compile_dag_catalog(vec![manual_pipeline_info_named(dag_on_zero)])
+        .expect("shard 0 dag should compile");
+    let shard1_catalog = compile_dag_catalog(vec![manual_pipeline_info_named(dag_on_one)])
+        .expect("shard 1 dag should compile");
+    register_test_schedules(
+        shard0_url,
+        &shard0_catalog,
+        "failed to register shard 0 schedules",
+    )
+    .await;
+    register_test_schedules(
+        shard1_url,
+        &shard1_catalog,
+        "failed to register shard 1 schedules",
+    )
+    .await;
+}
+
+async fn seed_dag_run_on_url(database_url: &str, dag_name: &str) -> uuid::Uuid {
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("failed to connect to shard for dag-run seed");
+    let now = chrono::Utc::now();
+    let seeded_run_id = uuid::Uuid::new_v4();
+    diesel::insert_into(harvest_dag_runs::table)
+        .values(&NewDagRun {
+            id: seeded_run_id,
+            dag_name,
+            workflow_exec_id: None,
+            logical_date: now,
+            data_interval_start: now,
+            data_interval_end: now,
+            conf: Some(json!({ "seeded": true })),
+        })
+        .execute(&mut conn)
+        .await
+        .expect("failed to seed dag run");
+    seeded_run_id
+}
+
+fn build_sharded_dag_api_app(
+    shard0_url: &str,
+    shard1_url: &str,
+    dag_catalog: Arc<DagCatalog>,
+    registry: Arc<HandlerRegistry>,
+    router: ShardRouter,
+) -> HarvestApiApp {
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(build_two_shard_pool(shard0_url, shard1_url));
+    api_state.install(HarvestApiRuntime::new(
+        registry,
+        dag_catalog,
+        Some("scheduler-sharded".to_string()),
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        router,
+    ));
+    harvest_api_router(api_state).with_state(test_app_state_without_database())
+}
+
+async fn assert_sharded_dag_list_and_runs(
+    app: &HarvestApiApp,
+    dag_on_zero: &str,
+    dag_on_one: &str,
+    seeded_run_id: uuid::Uuid,
+) {
+    let (dags_status, dags_json) = get_json(app, "/dags").await;
+    assert_eq!(dags_status, StatusCode::OK);
+    let dags = dags_json
+        .as_array()
+        .expect("dags response must be an array");
+    assert!(
+        dags.iter().any(|dag| dag["name"] == dag_on_zero),
+        "dag from shard 0 should be listed"
+    );
+    assert!(
+        dags.iter().any(|dag| dag["name"] == dag_on_one),
+        "dag from shard 1 should be listed"
+    );
+
+    let (runs_status, runs_json) = get_json(app, format!("/dags/{dag_on_one}/runs")).await;
+    assert_eq!(runs_status, StatusCode::OK);
+    assert!(
+        runs_json
+            .as_array()
+            .expect("dag runs response must be an array")
+            .iter()
+            .any(|row| row["id"] == seeded_run_id.to_string()),
+        "dag runs must come from the dag's owning shard"
+    );
+}
+
+async fn assert_sharded_dag_patch_and_trigger(
+    app: &HarvestApiApp,
+    shard0_url: &str,
+    shard1_url: &str,
+    dag_on_zero: &str,
+    dag_on_one: &str,
+) {
+    let (patch_status, patch_json) = patch_json(
+        app,
+        format!("/dags/{dag_on_one}"),
+        json!({ "paused": true }),
+    )
+    .await;
+    assert_eq!(patch_status, StatusCode::OK);
+    assert_eq!(patch_json["dag_name"], dag_on_one);
+    assert_eq!(patch_json["is_paused"], true);
+    assert!(
+        load_schedule_from_url(shard1_url, dag_on_one)
+            .await
+            .is_paused,
+        "pause updates must hit the dag's owning shard"
+    );
+    assert!(
+        !load_schedule_from_url(shard0_url, dag_on_zero)
+            .await
+            .is_paused,
+        "patching a shard 1 dag must not mutate shard 0 schedules"
+    );
+
+    let before_trigger_count = count_dag_runs_from_url(shard1_url, dag_on_one).await;
+    let (trigger_status, _trigger_json) = post_json(
+        app,
+        format!("/dags/{dag_on_one}/trigger"),
+        json!({ "conf": { "manual": true } }),
+    )
+    .await;
+    assert_eq!(trigger_status, StatusCode::CREATED);
+    assert_eq!(
+        count_dag_runs_from_url(shard1_url, dag_on_one).await,
+        before_trigger_count + 1,
+        "triggered runs must be inserted on the dag's owning shard"
+    );
+    assert!(
+        load_latest_dag_run_from_url(shard0_url, dag_on_one)
+            .await
+            .is_none(),
+        "trigger must not create runs on the default shard for a shard 1 dag"
+    );
+}
+
 async fn load_execution_from_url(database_url: &str, exec_id: &str) -> WorkflowExecution {
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
         .await
@@ -1291,136 +1459,26 @@ async fn harvest_api_lists_and_triggers_manual_dags() {
 async fn harvest_api_routes_dag_reads_and_mutations_to_owned_shard() {
     let ((shard0_url, shard1_url), _container) = setup_sharded_test_database_urls().await;
     let router = two_shard_router();
-    let dag_on_zero = find_dag_name_for_shard(&router, "manual_zero", ShardId::new(0));
-    let dag_on_one = find_dag_name_for_shard(&router, "manual_one", ShardId::new(1));
-
-    let dag_catalog = Arc::new(
-        compile_dag_catalog(vec![
-            manual_pipeline_info_named(dag_on_zero),
-            manual_pipeline_info_named(dag_on_one),
-        ])
-        .expect("sharded manual dags should compile"),
+    let (dag_on_zero, dag_on_one) = sharded_manual_dag_names(&router);
+    let dag_catalog = sharded_manual_dag_catalog(dag_on_zero, dag_on_one);
+    let registry = recording_registry(
+        Arc::new(Mutex::new(Vec::<String>::new())),
+        &["extract", "transform", "notify"],
     );
-    let log = Arc::new(Mutex::new(Vec::<String>::new()));
-    let registry = recording_registry(Arc::clone(&log), &["extract", "transform", "notify"]);
 
-    let shard0_catalog = compile_dag_catalog(vec![manual_pipeline_info_named(dag_on_zero)])
-        .expect("shard 0 dag should compile");
-    let shard1_catalog = compile_dag_catalog(vec![manual_pipeline_info_named(dag_on_one)])
-        .expect("shard 1 dag should compile");
-    register_test_schedules(
+    register_sharded_manual_dag_schedules(&shard0_url, &shard1_url, dag_on_zero, dag_on_one).await;
+    let seeded_run_id = seed_dag_run_on_url(&shard1_url, dag_on_one).await;
+    let app = build_sharded_dag_api_app(
         &shard0_url,
-        &shard0_catalog,
-        "failed to register shard 0 schedules",
-    )
-    .await;
-    register_test_schedules(
         &shard1_url,
-        &shard1_catalog,
-        "failed to register shard 1 schedules",
-    )
-    .await;
-
-    let seeded_run_id = {
-        let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&shard1_url)
-            .await
-            .expect("failed to connect to shard 1 for dag-run seed");
-        let now = chrono::Utc::now();
-        let seeded_run_id = uuid::Uuid::new_v4();
-        diesel::insert_into(harvest_dag_runs::table)
-            .values(&NewDagRun {
-                id: seeded_run_id,
-                dag_name: dag_on_one,
-                workflow_exec_id: None,
-                logical_date: now,
-                data_interval_start: now,
-                data_interval_end: now,
-                conf: Some(json!({ "seeded": true })),
-            })
-            .execute(&mut conn)
-            .await
-            .expect("failed to seed shard 1 dag run");
-        seeded_run_id
-    };
-
-    let api_state = HarvestApiState::new();
-    api_state.install_storage_pool(build_two_shard_pool(&shard0_url, &shard1_url));
-    api_state.install(HarvestApiRuntime::new(
-        Arc::clone(&registry),
         Arc::clone(&dag_catalog),
-        Some("scheduler-sharded".to_string()),
-        vec!["default".to_string()],
-        SchedulerMonitor::offline(),
+        registry,
         router,
-    ));
-    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
-
-    let (dags_status, dags_json) = get_json(&app, "/dags").await;
-    assert_eq!(dags_status, StatusCode::OK);
-    let dags = dags_json
-        .as_array()
-        .expect("dags response must be an array");
-    assert!(
-        dags.iter().any(|dag| dag["name"] == dag_on_zero),
-        "dag from shard 0 should be listed"
-    );
-    assert!(
-        dags.iter().any(|dag| dag["name"] == dag_on_one),
-        "dag from shard 1 should be listed"
     );
 
-    let (runs_status, runs_json) = get_json(&app, format!("/dags/{dag_on_one}/runs")).await;
-    assert_eq!(runs_status, StatusCode::OK);
-    assert!(
-        runs_json
-            .as_array()
-            .expect("dag runs response must be an array")
-            .iter()
-            .any(|row| row["id"] == seeded_run_id.to_string()),
-        "dag runs must come from the dag's owning shard"
-    );
-
-    let (patch_status, patch_json) = patch_json(
-        &app,
-        format!("/dags/{dag_on_one}"),
-        json!({ "paused": true }),
-    )
-    .await;
-    assert_eq!(patch_status, StatusCode::OK);
-    assert_eq!(patch_json["dag_name"], dag_on_one);
-    assert_eq!(patch_json["is_paused"], true);
-    assert!(
-        load_schedule_from_url(&shard1_url, dag_on_one)
-            .await
-            .is_paused,
-        "pause updates must hit the dag's owning shard"
-    );
-    assert!(
-        !load_schedule_from_url(&shard0_url, dag_on_zero)
-            .await
-            .is_paused,
-        "patching a shard 1 dag must not mutate shard 0 schedules"
-    );
-
-    let before_trigger_count = count_dag_runs_from_url(&shard1_url, dag_on_one).await;
-    let (trigger_status, _trigger_json) = post_json(
-        &app,
-        format!("/dags/{dag_on_one}/trigger"),
-        json!({ "conf": { "manual": true } }),
-    )
-    .await;
-    assert_eq!(trigger_status, StatusCode::CREATED);
-    assert_eq!(
-        count_dag_runs_from_url(&shard1_url, dag_on_one).await,
-        before_trigger_count + 1,
-        "triggered runs must be inserted on the dag's owning shard"
-    );
-    assert!(
-        load_latest_dag_run_from_url(&shard0_url, dag_on_one)
-            .await
-            .is_none(),
-        "trigger must not create runs on the default shard for a shard 1 dag"
-    );
+    assert_sharded_dag_list_and_runs(&app, dag_on_zero, dag_on_one, seeded_run_id).await;
+    assert_sharded_dag_patch_and_trigger(&app, &shard0_url, &shard1_url, dag_on_zero, dag_on_one)
+        .await;
 }
 
 #[tokio::test]
