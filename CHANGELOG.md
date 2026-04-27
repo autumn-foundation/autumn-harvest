@@ -5,6 +5,50 @@ All notable changes to autumn-harvest will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-04-27
+
+### Added
+
+- Continue-as-new support for long-running workflows, including rollback-safe
+  schema changes for reused workflow IDs.
+- Workflow sharding across multiple Postgres databases with shard-aware routing
+  in the engine, plugin API, and UI.
+- `autumn-harvest-redis`, a Redis Streams task queue adapter that keeps durable
+  workflow history in Postgres while moving hot task claiming off the database.
+- A management CLI and dashboard UI for workflow inspection, signals, queries,
+  dead letters, DAG operations, and operator visibility.
+- Workflow simulation, history analysis, and generated replay test harnesses for
+  local debugging and regression reproduction.
+- OpenTelemetry propagation, Mermaid/DOT DAG exporters, and first-class Saga
+  compensation helpers.
+
+### Fixed
+
+- Replay determinism for `continue_as_new`, including input validation against
+  recorded history during replay.
+- Parent wake-up behavior when a child workflow rejects `continue_as_new` in
+  this release.
+- Sticky queue fairness so expired sticky tasks no longer outrank ordinary
+  unpinned work.
+- Redis queue claim/depth error handling so operational failures surface as
+  errors instead of looking like an empty queue.
+- Overflow, panic, and deadlock bugs in event indexing, retry delay math, cache
+  sizing, task duration parsing, and query execution.
+- Cross-shard list and detail reads in the plugin API and dashboard so
+  workflows, DAG runs, and dead letters on non-default shards remain visible.
+
+### Documentation
+
+- Refresh README and architecture docs for the Phase 3 / `0.2.0` surface.
+- Add design/spec coverage for sharding, sticky routing, continue-as-new,
+  dashboard UI, Redis queueing, cancellation semantics, and Saga primitives.
+
+### Testing
+
+- Expand integration and regression coverage for signals, replay divergence,
+  continue-as-new, child workflow failure propagation, Redis adapter behavior,
+  and sharded API/UI reads.
+
 ## [0.1.1] - 2026-04-19
 
 ### Documentation
