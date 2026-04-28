@@ -259,6 +259,9 @@ async fn ui_root_redirects_to_workflows() {
         Some("ui-test-worker".to_string()),
         vec!["default".to_string()],
         SchedulerMonitor::offline(),
+        autumn_harvest::RetentionConfig::default(),
+        None,
+        None,
         ShardRouter::single(),
     ));
 
@@ -291,6 +294,9 @@ async fn ui_lists_workflows_and_renders_detail_page() {
         Some("ui-test-worker".to_string()),
         vec!["default".to_string()],
         SchedulerMonitor::offline(),
+        autumn_harvest::RetentionConfig::default(),
+        None,
+        None,
         ShardRouter::single(),
     ));
 
@@ -368,6 +374,9 @@ async fn ui_lists_workflows_across_shards() {
         Some("ui-test-worker".to_string()),
         vec!["default".to_string()],
         SchedulerMonitor::offline(),
+        autumn_harvest::RetentionConfig::default(),
+        None,
+        None,
         ShardRouter::new(
             vec![ShardId::new(0), ShardId::new(1)],
             vec![ShardId::new(0), ShardId::new(1)],

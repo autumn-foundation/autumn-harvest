@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use crate::context::SharedStateMap;
 use crate::info::{ActivityInfo, DagInfo, WorkflowInfo};
+use crate::retention::RetentionConfig;
 use crate::telemetry::TelemetryConfig;
 use crate::types::ShardId;
 
@@ -22,6 +23,7 @@ pub struct HarvestBuilder {
     worker_config: WorkerConfig,
     state: SharedStateMap,
     telemetry: Option<TelemetryConfig>,
+    retention: RetentionConfig,
 }
 
 impl std::fmt::Debug for HarvestBuilder {
@@ -45,6 +47,7 @@ pub struct BuiltHarvest {
     worker_config: WorkerConfig,
     state: SharedStateMap,
     telemetry: Arc<TelemetryConfig>,
+    retention: RetentionConfig,
 }
 
 impl std::fmt::Debug for BuiltHarvest {
@@ -56,8 +59,17 @@ impl std::fmt::Debug for BuiltHarvest {
             .field("worker_config", &self.worker_config)
             .field("state_count", &self.state.len())
             .field("telemetry", &self.telemetry)
+            .field("retention", &self.retention)
             .finish()
     }
+}
+
+/// Builder-time configuration errors.
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
+pub enum HarvestBuilderError {
+    /// Retention configuration validation failed.
+    #[error("invalid retention configuration: {0}")]
+    InvalidRetention(String),
 }
 
 impl BuiltHarvest {
@@ -101,6 +113,12 @@ impl BuiltHarvest {
     #[must_use]
     pub const fn telemetry(&self) -> &Arc<TelemetryConfig> {
         &self.telemetry
+    }
+
+    /// Retention janitor configuration.
+    #[must_use]
+    pub const fn retention(&self) -> &RetentionConfig {
+        &self.retention
     }
 
     /// Convert the built harvest registration into worker-ready parts.
@@ -196,6 +214,13 @@ impl HarvestBuilder {
         self
     }
 
+    /// Configure retention janitor behavior for completed workflow history.
+    #[must_use]
+    pub fn retention(mut self, retention: RetentionConfig) -> Self {
+        self.retention = retention;
+        self
+    }
+
     /// Number of registered workflows (used in tests and diagnostics).
     #[must_use]
     pub const fn workflow_count(&self) -> usize {
@@ -215,16 +240,35 @@ impl HarvestBuilder {
     }
 
     /// Finalize the builder into a reusable harvest registration set.
+    ///
+    /// # Panics
+    ///
+    /// Panics when retention settings are invalid. Prefer [`Self::try_build`]
+    /// if you want startup errors instead.
     #[must_use]
     pub fn build(self) -> BuiltHarvest {
-        BuiltHarvest {
+        self.try_build()
+            .expect("HarvestBuilder::build failed validation")
+    }
+
+    /// Finalize the builder into a reusable harvest registration set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestBuilderError`] when retention settings are invalid.
+    pub fn try_build(self) -> Result<BuiltHarvest, HarvestBuilderError> {
+        self.retention
+            .validate()
+            .map_err(HarvestBuilderError::InvalidRetention)?;
+        Ok(BuiltHarvest {
             workflows: self.workflows,
             activities: self.activities,
             dags: self.dags,
             worker_config: self.worker_config,
             state: self.state,
             telemetry: Arc::new(self.telemetry.unwrap_or_default()),
-        }
+            retention: self.retention,
+        })
     }
 }
 

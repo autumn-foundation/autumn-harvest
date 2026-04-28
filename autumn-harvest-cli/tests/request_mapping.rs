@@ -245,3 +245,20 @@ fn path_segments_are_percent_encoded() {
         "/workflows/tenant%2Fworkflow%20with%20spaces/start"
     );
 }
+
+#[test]
+fn retention_commands_match_management_routes() {
+    let status = Cli::try_parse_from(["harvest", "retention", "status"])
+        .expect("retention status args should parse");
+    let status_request = status.api_request().expect("status request should build");
+    assert_eq!(status_request.method, ApiMethod::Get);
+    assert_eq!(status_request.path, "/admin/retention");
+    assert_eq!(status_request.body, None);
+
+    let run_now = Cli::try_parse_from(["harvest", "retention", "run-now"])
+        .expect("retention run-now args should parse");
+    let run_now_request = run_now.api_request().expect("run-now request should build");
+    assert_eq!(run_now_request.method, ApiMethod::Post);
+    assert_eq!(run_now_request.path, "/admin/retention/run-now");
+    assert_eq!(run_now_request.body, None);
+}

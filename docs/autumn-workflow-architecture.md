@@ -888,27 +888,15 @@ CREATE TABLE harvest_events_p1 PARTITION OF harvest_events FOR VALUES WITH (MODU
 
 The `harvest_task_queue` table is also partitioned by `queue_name` using list partitioning, enabling queue-specific vacuum and index tuning.
 
-### 8.3 History Archival
+### 8.3 History Retention
 
-Completed workflow histories should be archived to prevent unbounded table growth. A background janitor task (running on the scheduler tick) moves completed workflows older than `history_retention` (default: 30 days) to `harvest_archived_events` (or deletes them if `archive = false`).
+Harvest ships an opt-in retention janitor for completed workflow histories. Operators configure `RetentionConfig` on `HarvestBuilder`; default behavior is disabled (`max_age = None`), so upgrading does not delete any rows until explicitly enabled.
 
-```sql
--- Archive old completed events
-INSERT INTO harvest_archived_events
-SELECT * FROM harvest_events
-WHERE workflow_exec_id IN (
-    SELECT id FROM harvest_workflow_executions
-    WHERE state IN ('COMPLETED', 'FAILED', 'CANCELLED')
-      AND completed_at < NOW() - INTERVAL '30 days'
-);
+When enabled, each tick selects terminal workflow executions older than `max_age` and deletes the parent row from `harvest_workflow_executions`; child rows in `harvest_events`, `harvest_task_queue`, `harvest_timers`, `harvest_signals`, and `harvest_dead_letters` are removed by existing `ON DELETE CASCADE` foreign keys.
 
-DELETE FROM harvest_events
-WHERE workflow_exec_id IN (
-    SELECT id FROM harvest_workflow_executions
-    WHERE state IN ('COMPLETED', 'FAILED', 'CANCELLED')
-      AND completed_at < NOW() - INTERVAL '30 days'
-);
-```
+In-flight workflows are never eligible because retention only targets terminal states with `completed_at` older than the configured window.
+
+The management API exposes retention introspection and control via `GET /admin/retention` and `POST /admin/retention/run-now`.
 
 ---
 
@@ -1310,11 +1298,9 @@ Activities that need their own connections use `ctx.db()` which draws from the s
 
 For long-running deployments, the event history table will be the largest table. Harvest provides three retention strategies:
 
-**Time-based deletion** (default): Completed workflow histories older than `history_retention` are deleted.
+**Time-based deletion** (implemented): Configure `RetentionConfig { max_age, tick_interval, batch_size, dry_run }` on `HarvestBuilder` to prune terminal workflow history older than a fixed age.
 
-**Archival to cold storage:** Completed histories are serialized to JSONL and written to a configurable storage backend (local filesystem, S3 via optional feature flag) before deletion.
-
-**Infinite retention:** No cleanup. Suitable for compliance-heavy workloads. Requires partitioning and pg_partman for automated partition management.
+**Infinite retention** (default): Leave `max_age = None` to keep append-only history forever.
 
 ---
 
@@ -1350,9 +1336,7 @@ default_retry_policy.backoff_coefficient = 2.0
 default_retry_policy.max_interval = "5m"
 
 # History management
-history_retention = "30d"
-archive_enabled = false
-archive_path = "./harvest-archive"
+# configured via `HarvestBuilder::retention(RetentionConfig { ... })`
 
 # Management API
 api_enabled = true

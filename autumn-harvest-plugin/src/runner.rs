@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use autumn_harvest::BuiltHarvest;
 use autumn_harvest::context::SharedStateMap;
+use autumn_harvest::retention::{RetentionConfig, RetentionRuntime};
 use autumn_harvest::scheduler::{
     DagCatalog, SchedulerMonitor, SchedulerRuntime, compile_dag_catalog,
 };
@@ -76,6 +77,7 @@ struct PreparedHarvestRuntime {
     worker_runtime_config: WorkerRuntimeConfig,
     storage_pool: HarvestDbPool,
     shard_router: ShardRouter,
+    retention_config: RetentionConfig,
 }
 
 impl PreparedHarvestRuntime {
@@ -84,6 +86,7 @@ impl PreparedHarvestRuntime {
         resources: HarvestRunnerResources,
     ) -> autumn_web::AutumnResult<Self> {
         let shard_router = resources.shard_router.clone().unwrap_or_default();
+        let retention_config = built.retention().clone();
         let (registry, dags, worker_config) =
             built.into_worker_parts_with_extra_state(injected_runtime_state(
                 resources.app_state,
@@ -102,6 +105,7 @@ impl PreparedHarvestRuntime {
             worker_runtime_config: WorkerRuntimeConfig::from(worker_config),
             storage_pool: HarvestDbPool::from(resources.harvest_pool),
             shard_router,
+            retention_config,
         })
     }
 }
@@ -117,6 +121,7 @@ pub struct HarvestRunner {
     worker: Option<Arc<Worker>>,
     worker_handle: Option<JoinHandle<()>>,
     scheduler: Option<SchedulerRuntime>,
+    retention: Option<RetentionRuntime>,
 }
 
 impl HarvestRunner {
@@ -180,12 +185,22 @@ impl HarvestRunner {
         let scheduler_monitor = scheduler
             .as_ref()
             .map_or_else(SchedulerMonitor::offline, SchedulerRuntime::monitor);
+        let retention = RetentionRuntime::spawn(
+            prepared.storage_pool.sharded_pool().clone(),
+            prepared.retention_config.clone(),
+            Arc::clone(&registry.telemetry().metrics),
+        );
+        let retention_monitor = retention.as_ref().map(RetentionRuntime::monitor);
+        let retention_trigger = retention.as_ref().map(RetentionRuntime::trigger_sender);
         let api_runtime = HarvestApiRuntime::new(
             registry,
             dag_catalog,
             worker_id,
             queues,
             scheduler_monitor,
+            prepared.retention_config,
+            retention_monitor,
+            retention_trigger,
             shard_router,
         );
 
@@ -195,6 +210,7 @@ impl HarvestRunner {
             worker,
             worker_handle,
             scheduler,
+            retention,
         })
     }
 
@@ -218,6 +234,7 @@ impl HarvestRunner {
             worker,
             worker_handle,
             scheduler,
+            retention,
         } = self;
 
         if let Some(worker) = worker {
@@ -227,6 +244,12 @@ impl HarvestRunner {
             scheduler.shutdown();
             if let Err(error) = scheduler.join().await {
                 tracing::warn!(error = %error, "harvest scheduler task failed during shutdown");
+            }
+        }
+        if let Some(retention) = retention {
+            retention.shutdown();
+            if let Err(error) = retention.join().await {
+                tracing::warn!(error = %error, "harvest retention task failed during shutdown");
             }
         }
         if let Some(worker_handle) = worker_handle
