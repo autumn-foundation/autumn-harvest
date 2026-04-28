@@ -24,6 +24,7 @@ use autumn_harvest::context::WorkflowContext;
 use autumn_harvest::dlq;
 use autumn_harvest::error::{HarvestError, HarvestResult, database_error};
 use autumn_harvest::models::{DagRun, DeadLetter, HarvestSchedule, WorkflowExecution};
+use autumn_harvest::retention::{RetentionConfig, RetentionMonitor, RetentionStatus};
 use autumn_harvest::scheduler::{
     DagCatalog, RegisteredDag, SchedulerMonitor, SchedulerSnapshot, trigger_dag,
 };
@@ -46,6 +47,9 @@ pub struct HarvestApiRuntime {
     worker_id: Option<String>,
     queues: Vec<String>,
     scheduler: SchedulerMonitor,
+    retention_config: RetentionConfig,
+    retention: Option<RetentionMonitor>,
+    retention_trigger: Option<tokio::sync::mpsc::UnboundedSender<()>>,
     router: ShardRouter,
 }
 
@@ -59,6 +63,9 @@ impl HarvestApiRuntime {
         worker_id: Option<String>,
         queues: Vec<String>,
         scheduler: SchedulerMonitor,
+        retention_config: RetentionConfig,
+        retention: Option<RetentionMonitor>,
+        retention_trigger: Option<tokio::sync::mpsc::UnboundedSender<()>>,
         router: ShardRouter,
     ) -> Self {
         Self {
@@ -67,6 +74,9 @@ impl HarvestApiRuntime {
             worker_id,
             queues,
             scheduler,
+            retention_config,
+            retention,
+            retention_trigger,
             router,
         }
     }
@@ -276,6 +286,8 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .route("/dead-letters", get(list_dead_letters))
         .route("/dead-letters/{id}/replay", post(replay_dead_letter))
         .route("/health", get(health))
+        .route("/admin/retention", get(retention_status))
+        .route("/admin/retention/run-now", post(retention_run_now))
         .layer(Extension(api_state))
 }
 
@@ -648,6 +660,30 @@ async fn replay_dead_letter(
             task_id: task_id.to_string(),
         }),
     ))
+}
+
+async fn retention_status(
+    Extension(api_state): Extension<HarvestApiState>,
+) -> Result<Json<RetentionStatus>, AutumnError> {
+    let runtime = api_state.runtime().map_err(map_error)?;
+    let status = runtime.retention.as_ref().map_or_else(
+        || RetentionStatus {
+            config: runtime.retention_config.clone(),
+            per_shard: Vec::new(),
+        },
+        RetentionMonitor::snapshot,
+    );
+    Ok(Json(status))
+}
+
+async fn retention_run_now(
+    Extension(api_state): Extension<HarvestApiState>,
+) -> Result<Json<BasicAck>, AutumnError> {
+    let runtime = api_state.runtime().map_err(map_error)?;
+    if let Some(trigger) = &runtime.retention_trigger {
+        let _ = trigger.send(());
+    }
+    Ok(Json(BasicAck { ok: true }))
 }
 
 async fn health(

@@ -38,6 +38,7 @@ pub mod prelude;
 /// Types and definitions for querying workflow state and metadata.
 pub mod query;
 pub mod replay;
+pub mod retention;
 pub mod saga;
 pub mod shard;
 pub mod simulator;
@@ -106,6 +107,9 @@ pub use policy::{RetryPolicy, Schedule, TaskStatus, TriggerRule};
 pub use pool::{HarvestPoolConfig, compute_pool_sizes};
 pub use query::QueryRegistry;
 pub use replay::{HistoryMatch, HistoryMatcher};
+pub use retention::RetentionConfig;
+#[cfg(feature = "db")]
+pub use retention::{RetentionMonitor, RetentionRuntime, RetentionStatus, RetentionTickResult};
 pub use saga::Saga;
 #[cfg(feature = "db")]
 pub use scheduler::{

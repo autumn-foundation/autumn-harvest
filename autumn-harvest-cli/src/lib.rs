@@ -163,6 +163,11 @@ enum Commands {
         #[command(subcommand)]
         command: DeadLetterCommand,
     },
+    /// Retention janitor operations.
+    Retention {
+        #[command(subcommand)]
+        command: RetentionCommand,
+    },
     /// Open the TUI dashboard to monitor workflows.
     Tui,
 }
@@ -286,6 +291,14 @@ enum DagCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum RetentionCommand {
+    /// Show retention config and last tick results.
+    Status,
+    /// Trigger a retention tick immediately.
+    RunNow,
+}
+
+#[derive(Debug, Subcommand)]
 enum DeadLetterCommand {
     /// List dead-lettered tasks.
     List {
@@ -313,6 +326,7 @@ impl Cli {
             Commands::Workflow { command } => workflow_request(command),
             Commands::Dag { command } => dag_request(command),
             Commands::Dlq { command } => Ok(dead_letter_request(command)),
+            Commands::Retention { command } => Ok(retention_request(command)),
             Commands::Tui => unreachable!("Tui command handles its own requests"),
         }
     }
@@ -556,6 +570,13 @@ fn dag_request(command: &DagCommand) -> Result<ApiRequest, CliError> {
             format!("/dags/{}", path_segment(dag_name)),
             json!({ "paused": false }),
         )),
+    }
+}
+
+fn retention_request(command: &RetentionCommand) -> ApiRequest {
+    match command {
+        RetentionCommand::Status => ApiRequest::get("/admin/retention"),
+        RetentionCommand::RunNow => ApiRequest::post("/admin/retention/run-now", None),
     }
 }
 
