@@ -185,7 +185,7 @@ impl RetentionRuntime {
         let monitor_task = monitor.clone();
         let (trigger_tx, mut trigger_rx) = mpsc::unbounded_channel();
         let handle = tokio::spawn(async move {
-            let mut scan_cursors: HashMap<ShardId, ShardScanState> = HashMap::new();
+            let mut scan_cursors: HashMap<ShardId, Option<RetentionScanCursor>> = HashMap::new();
             loop {
                 tokio::select! {
                     () = shutdown_task.cancelled() => break,
@@ -204,7 +204,7 @@ impl RetentionRuntime {
                     let pool = pool.clone();
                     let config = config.clone();
                     let metrics = Arc::clone(&metrics);
-                    let cursor = scan_cursors.get(&shard).and_then(|state| state.cursor);
+                    let cursor = scan_cursors.get(&shard).copied().flatten();
                     async move {
                         let started = Instant::now();
                         let tick = run_shard_tick(
@@ -229,17 +229,7 @@ impl RetentionRuntime {
                     };
                     match tick {
                         Ok(ok) => {
-                            let state = scan_cursors.entry(shard).or_default();
-                            state.cursor = ok.next_cursor;
-                            if ok.had_skipped_candidate {
-                                state.ticks_with_skips = state.ticks_with_skips.saturating_add(1);
-                                if state.ticks_with_skips >= CURSOR_REVISIT_INTERVAL_TICKS {
-                                    state.cursor = None;
-                                    state.ticks_with_skips = 0;
-                                }
-                            } else {
-                                state.ticks_with_skips = 0;
-                            }
+                            scan_cursors.insert(shard, ok.next_cursor);
                             result.candidate_count = ok.candidate_count;
                             result.deleted_count = ok.deleted_count;
                             result.oldest_age_secs_skipped = ok.oldest_age_secs_skipped;
@@ -261,7 +251,7 @@ impl RetentionRuntime {
                         }
                         Err(error) => {
                             result.last_error = Some(error.to_string());
-                            scan_cursors.remove(&shard);
+                            scan_cursors.insert(shard, None);
                             tracing::warn!(shard = %shard, error = %error, "harvest retention tick failed");
                         }
                     }
@@ -308,7 +298,6 @@ struct ShardTickOutcome {
     deleted_count: usize,
     oldest_age_secs_skipped: Option<u64>,
     next_cursor: Option<RetentionScanCursor>,
-    had_skipped_candidate: bool,
 }
 
 #[cfg(feature = "db")]
@@ -329,16 +318,6 @@ struct CandidateExecution {
 struct RetentionScanCursor {
     completed_at: DateTime<Utc>,
     id: uuid::Uuid,
-}
-
-#[cfg(feature = "db")]
-const CURSOR_REVISIT_INTERVAL_TICKS: u32 = 10;
-
-#[cfg(feature = "db")]
-#[derive(Debug, Default, Clone, Copy)]
-struct ShardScanState {
-    cursor: Option<RetentionScanCursor>,
-    ticks_with_skips: u32,
 }
 
 #[cfg(feature = "db")]
@@ -409,7 +388,6 @@ async fn run_shard_tick(
                     .signed_duration_since(completed_at)
                     .num_seconds()
                     .max(0) as u64;
-                outcome.had_skipped_candidate = true;
                 outcome.oldest_age_secs_skipped = Some(
                     outcome
                         .oldest_age_secs_skipped
@@ -425,6 +403,22 @@ async fn run_shard_tick(
 
             conn.transaction::<_, HarvestError, _>(|conn| {
                 Box::pin(async move {
+                    diesel::update(
+                        harvest_workflow_executions::table
+                            .filter(harvest_workflow_executions::parent_id.eq(Some(candidate.id)))
+                            .filter(harvest_workflow_executions::state.eq_any([
+                                "COMPLETED",
+                                "FAILED",
+                                "CANCELLED",
+                                "TIMED_OUT",
+                                "CONTINUED_AS_NEW",
+                            ])),
+                    )
+                    .set(harvest_workflow_executions::parent_id.eq::<Option<uuid::Uuid>>(None))
+                    .execute(conn)
+                    .await
+                    .map_err(database_error)?;
+
                     diesel::delete(
                         harvest_dead_letters::table
                             .filter(harvest_dead_letters::workflow_exec_id.eq(Some(candidate.id))),
@@ -461,7 +455,8 @@ async fn should_skip_candidate(
     let active_parent_ref_count = diesel::sql_query(
         "SELECT COUNT(*) AS count
          FROM harvest_workflow_executions
-         WHERE parent_id = $1",
+         WHERE parent_id = $1
+           AND state NOT IN ('COMPLETED','FAILED','CANCELLED','TIMED_OUT','CONTINUED_AS_NEW')",
     )
     .bind::<SqlUuid, _>(candidate.id)
     .get_result::<CountRow>(conn)
