@@ -256,12 +256,20 @@ impl WorkflowContext {
     /// The `events` slice must begin with `WorkflowStarted` (the timestamp
     /// is extracted for deterministic `now()`). The matcher is initialized
     /// with the cursor past the `WorkflowStarted` event.
+    ///
+    /// This method is primarily used internally by the framework when hydrating
+    /// a workflow from the database, but is also highly useful for writing
+    /// replay unit tests.
     #[must_use]
     pub fn for_replay(exec_id: ExecutionId, events: Vec<WorkflowEvent>) -> Self {
         Self::for_replay_with_state(exec_id, events, empty_shared_state())
     }
 
     /// Create a replay context with shared application state.
+    ///
+    /// Similar to [`Self::for_replay`], but allows injecting typed shared state
+    /// into the context. This is required if the workflow handler uses
+    /// `ctx.state::<T>()`.
     #[must_use]
     pub fn for_replay_with_state(
         exec_id: ExecutionId,
@@ -338,6 +346,23 @@ impl WorkflowContext {
     /// Returns `true` if the context is currently replaying recorded history
     /// (i.e. the matcher cursor has not yet reached the end).
     ///
+    /// During replay, operations should not have external side effects (like sending
+    /// an email or writing to a file), because the workflow code runs multiple times
+    /// as it recovers state. You can check this flag to skip logging or local
+    /// non-deterministic side-effects during recovery.
+    ///
+    /// ## Examples
+    ///
+    /// ```rust
+    /// use autumn_harvest::context::WorkflowContext;
+    ///
+    /// # fn example(ctx: &WorkflowContext) {
+    /// if !ctx.is_replaying() {
+    ///     println!("Executing step 1 live!");
+    /// }
+    /// # }
+    /// ```
+    ///
     /// # Panics
     ///
     /// Panics if the internal matcher mutex is poisoned.
@@ -408,6 +433,9 @@ impl WorkflowContext {
 
     /// Recorded cancellation reason when [`is_cancelled`](Self::is_cancelled)
     /// is true.
+    ///
+    /// If you implement a custom cancellation cleanup routine, you can use this
+    /// to read the original message or reason that initiated the abort.
     #[must_use]
     pub fn cancellation_reason(&self) -> Option<&str> {
         self.cancellation_reason.as_deref()
@@ -419,8 +447,23 @@ impl WorkflowContext {
     /// Intended for use at the top of long-running workflow sections so that
     /// cooperative cancellation can short-circuit the remaining work:
     ///
-    /// ```ignore
-    /// ctx.check_cancellation()?;
+    /// Since long-running loops don't automatically yield to the runtime like
+    /// awaits on activities do, this provides a fast path to bail out of
+    /// compute-heavy or tightly looped workflows when cancellation is requested.
+    ///
+    /// ## Examples
+    ///
+    /// ```rust
+    /// use autumn_harvest::context::WorkflowContext;
+    /// use autumn_harvest::HarvestResult;
+    ///
+    /// # fn example(ctx: &WorkflowContext) -> HarvestResult<()> {
+    /// for item in 0..1000 {
+    ///     ctx.check_cancellation()?; // Returns Err if cancelled
+    ///     // Process item...
+    /// }
+    /// # Ok(())
+    /// # }
     /// ```
     ///
     /// # Errors
@@ -957,6 +1000,11 @@ impl WorkflowContext {
     /// Drain all accumulated commands. Called by the worker after the
     /// workflow coroutine suspends or completes.
     ///
+    /// This is an internal framework method. After the workflow coroutine suspends
+    /// (by awaiting a timer, activity, etc.), the worker uses this to harvest all
+    /// the side-effect commands that were requested, so it can persist them to
+    /// the database.
+    ///
     /// # Panics
     ///
     /// Panics if the internal commands mutex is poisoned.
@@ -1074,6 +1122,22 @@ impl ActivityContext {
     }
 
     /// Access typed shared state.
+    ///
+    /// Returns `None` if the state type was not registered on the builder.
+    ///
+    /// ## Examples
+    ///
+    /// ```rust
+    /// use autumn_harvest::context::ActivityContext;
+    ///
+    /// struct DatabaseConnection;
+    ///
+    /// # fn example(ctx: &ActivityContext) {
+    /// if let Some(db) = ctx.state::<DatabaseConnection>() {
+    ///     // Execute query...
+    /// }
+    /// # }
+    /// ```
     #[must_use]
     pub fn state<T: Any + Send + Sync>(&self) -> Option<&T> {
         self.state.get(&TypeId::of::<T>())?.downcast_ref::<T>()
@@ -1085,6 +1149,23 @@ impl ActivityContext {
     /// heartbeat loop, which batches writes to the database. Always check the
     /// return value -- an `Err(Cancelled)` means the workflow was cancelled and
     /// the activity should wind down promptly.
+    ///
+    /// ## Examples
+    ///
+    /// ```rust
+    /// use autumn_harvest::context::ActivityContext;
+    /// use autumn_harvest::HarvestResult;
+    ///
+    /// # async fn download_file(ctx: &ActivityContext) -> HarvestResult<()> {
+    /// for chunk in 0..100 {
+    ///     // Downloading...
+    ///
+    ///     // Heartbeat with the current progress
+    ///     ctx.heartbeat(serde_json::json!({"progress": chunk})).await?;
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
     ///
     /// # Errors
     ///
@@ -1173,6 +1254,24 @@ impl ActivityContext {
     }
 
     /// Constructor for testing -- no heartbeat channel, default cancel token.
+    ///
+    /// This method allows you to instantiate an `ActivityContext` in isolation
+    /// for unit testing activity handlers without needing to spin up the entire
+    /// workflow engine.
+    ///
+    /// ## Examples
+    ///
+    /// ```rust
+    /// use autumn_harvest::context::ActivityContext;
+    ///
+    /// # async fn my_activity(ctx: ActivityContext) -> autumn_harvest::HarvestResult<()> { Ok(()) }
+    ///
+    /// # async fn test_run() {
+    /// let ctx = ActivityContext::new_test();
+    /// let result = my_activity(ctx).await;
+    /// assert!(result.is_ok());
+    /// # }
+    /// ```
     #[cfg(any(test, feature = "testing"))]
     #[must_use]
     pub fn new_test() -> Self {

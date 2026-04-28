@@ -14,6 +14,25 @@ use crate::types::ShardId;
 /// In a full Autumn app, this is consumed by `HarvestPlugin` from the
 /// `autumn-harvest-plugin` crate. In tests or standalone use, call
 /// `.build()` directly.
+///
+/// ## Examples
+///
+/// ```rust
+/// use autumn_harvest::builder::{HarvestBuilder, WorkerConfig};
+///
+/// struct DatabasePool;
+///
+/// let built = HarvestBuilder::new()
+///     .workflows(vec![]) // usually from workflows![]
+///     .activities(vec![]) // usually from activities![]
+///     .dags(vec![]) // usually from dags![]
+///     .worker(WorkerConfig::new())
+///     .state(DatabasePool)
+///     .build();
+///
+/// assert_eq!(built.workflow_count(), 0);
+/// assert!(built.state::<DatabasePool>().is_some());
+/// ```
 #[derive(Default)]
 pub struct HarvestBuilder {
     workflows: Vec<WorkflowInfo>,
@@ -143,12 +162,18 @@ impl BuiltHarvest {
 
 impl HarvestBuilder {
     /// Create a new empty builder.
+    ///
+    /// This starts the fluent configuration chain for registering definitions
+    /// and options before finalizing them into a [`BuiltHarvest`] or worker.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Register workflow definitions (output of `workflows![]` macro).
+    ///
+    /// The runtime uses these definitions to route executions to the correct
+    /// handler functions.
     #[must_use]
     pub fn workflows(mut self, workflows: Vec<WorkflowInfo>) -> Self {
         self.workflows.extend(workflows);
@@ -156,6 +181,8 @@ impl HarvestBuilder {
     }
 
     /// Register activity definitions (output of `activities![]` macro).
+    ///
+    /// The runtime maps activity tasks to these definitions for execution.
     #[must_use]
     pub fn activities(mut self, activities: Vec<ActivityInfo>) -> Self {
         self.activities.extend(activities);
@@ -163,6 +190,8 @@ impl HarvestBuilder {
     }
 
     /// Register DAG definitions (output of `dags![]` macro).
+    ///
+    /// DAGs define graphs of steps that run according to a schedule.
     #[must_use]
     pub fn dags(mut self, dags: Vec<DagInfo>) -> Self {
         self.dags.extend(dags);
@@ -170,6 +199,8 @@ impl HarvestBuilder {
     }
 
     /// Configure the worker (concurrency, queues, timeouts).
+    ///
+    /// See [`WorkerConfig`] for details on adjusting poll behavior.
     #[must_use]
     pub fn worker(mut self, config: WorkerConfig) -> Self {
         self.worker_config = config;
@@ -177,6 +208,10 @@ impl HarvestBuilder {
     }
 
     /// Register typed shared state visible to workflow and activity handlers.
+    ///
+    /// State injected here can be retrieved in your handlers by calling
+    /// `ctx.state::<T>()`. It is useful for sharing database connection pools,
+    /// email clients, or configuration structs across tasks.
     ///
     /// Registering the same type more than once replaces the previous value.
     #[must_use]
@@ -215,6 +250,8 @@ impl HarvestBuilder {
     }
 
     /// Finalize the builder into a reusable harvest registration set.
+    ///
+    /// Produces a [`BuiltHarvest`] which contains all registered parts.
     #[must_use]
     pub fn build(self) -> BuiltHarvest {
         BuiltHarvest {
