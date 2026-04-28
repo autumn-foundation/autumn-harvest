@@ -210,3 +210,4 @@ mod tests {
         assert_eq!(task_duration("18446744073709551614s 2s"), None); // Add overflow
     }
 }
+pub mod test_havoc;
