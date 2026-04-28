@@ -1,11 +1,9 @@
 --- autumn-harvest/src/query.rs
 +++ autumn-harvest/src/query.rs
-@@ -8,7 +8,7 @@
+@@ -8,7 +8,6 @@
 
  use serde_json::Value;
 
--use crate::error::{HarvestError, HarvestResult};
-+use crate::error::HarvestResult;
-
+-
  /// A thread-safe, sync function that returns a JSON-serializable query result.
  pub type QueryHandler = Arc<dyn Fn() -> Value + Send + Sync>;

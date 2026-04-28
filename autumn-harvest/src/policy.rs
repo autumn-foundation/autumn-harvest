@@ -144,7 +144,7 @@ impl Default for RetryPolicy {
 /// let status = TaskStatus::Succeeded;
 /// assert_eq!(status, TaskStatus::Succeeded);
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskStatus {
     /// The task executed and returned success.
     Succeeded,
