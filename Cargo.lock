@@ -224,6 +224,7 @@ dependencies = [
  "diesel",
  "diesel-async",
  "diesel_migrations",
+ "maud",
  "scoped-futures",
  "serde",
  "serde_json",
