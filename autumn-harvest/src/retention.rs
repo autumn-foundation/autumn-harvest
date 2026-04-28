@@ -40,15 +40,6 @@ const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const DEFAULT_BATCH_SIZE: usize = 1_000;
 const MIN_MAX_AGE: Duration = Duration::from_secs(1);
 const MAX_MAX_AGE: Duration = Duration::from_secs(60 * 60 * 24 * 365 * 10);
-#[cfg(feature = "db")]
-const TERMINAL_STATES: [&str; 5] = [
-    "COMPLETED",
-    "FAILED",
-    "CANCELLED",
-    "TIMED_OUT",
-    "CONTINUED_AS_NEW",
-];
-
 #[derive(Debug, Clone, Serialize)]
 pub struct RetentionConfig {
     pub max_age_secs: Option<u64>,
@@ -351,18 +342,17 @@ async fn run_shard_tick(
         let candidates = diesel::sql_query(
             "SELECT id, workflow_name, workflow_id, completed_at
              FROM harvest_workflow_executions
-             WHERE state = ANY($1)
+             WHERE state IN ('COMPLETED','FAILED','CANCELLED','TIMED_OUT','CONTINUED_AS_NEW')
                AND completed_at IS NOT NULL
-               AND completed_at < $2
+               AND completed_at < $1
                AND (
-                   $3 IS NULL
-                   OR completed_at > $3
-                   OR (completed_at = $3 AND id > $4)
+                   $2 IS NULL
+                   OR completed_at > $2
+                   OR (completed_at = $2 AND id > $3)
                )
              ORDER BY completed_at ASC, id ASC
-             LIMIT $5",
+             LIMIT $4",
         )
-        .bind::<diesel::sql_types::Array<Text>, _>(TERMINAL_STATES.to_vec())
         .bind::<Timestamptz, _>(cutoff)
         .bind::<Nullable<Timestamptz>, _>(cursor.map(|it| it.completed_at))
         .bind::<Nullable<SqlUuid>, _>(cursor.map(|it| it.id))
