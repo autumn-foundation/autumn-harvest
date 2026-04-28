@@ -337,6 +337,7 @@ async fn run_shard_tick(
     let mut cursor = start_cursor;
     let mut wrapped = false;
     let mut remaining = config.batch_size;
+    let mut saw_skipped_candidate = false;
 
     while remaining > 0 {
         let candidates = diesel::sql_query(
@@ -388,6 +389,7 @@ async fn run_shard_tick(
                     .signed_duration_since(completed_at)
                     .num_seconds()
                     .max(0) as u64;
+                saw_skipped_candidate = true;
                 outcome.oldest_age_secs_skipped = Some(
                     outcome
                         .oldest_age_secs_skipped
@@ -424,6 +426,10 @@ async fn run_shard_tick(
             .await?;
             outcome.deleted_count += 1;
         }
+    }
+
+    if saw_skipped_candidate {
+        outcome.next_cursor = None;
     }
 
     tracing::debug!(shard = %shard, candidates = outcome.candidate_count, deleted = outcome.deleted_count, "retention shard tick");
