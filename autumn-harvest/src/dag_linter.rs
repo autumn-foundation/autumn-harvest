@@ -21,7 +21,11 @@ pub trait DagRule: Send + Sync {
     fn name(&self) -> &'static str;
 
     /// Analyze the given DAG definition and return any warnings.
-    fn analyze(&self, dag: &DagDefinition) -> Vec<DagWarning>;
+    fn analyze(
+        &self,
+        dag: &DagDefinition,
+        activities: &std::collections::HashMap<String, crate::info::ActivityInfo>,
+    ) -> Vec<DagWarning>;
 }
 
 /// The main entry point for statically analyzing DAG definitions.
@@ -45,10 +49,14 @@ impl DagLinter {
 
     /// Analyze the DAG definition using all registered rules.
     #[must_use]
-    pub fn analyze(&self, dag: &DagDefinition) -> Vec<DagWarning> {
+    pub fn analyze(
+        &self,
+        dag: &DagDefinition,
+        activities: &std::collections::HashMap<String, crate::info::ActivityInfo>,
+    ) -> Vec<DagWarning> {
         self.rules
             .iter()
-            .flat_map(|rule| rule.analyze(dag))
+            .flat_map(|rule| rule.analyze(dag, activities))
             .collect()
     }
 }
@@ -86,11 +94,19 @@ impl DagRule for MissingRetryPolicyRule {
         "MissingRetryPolicy"
     }
 
-    fn analyze(&self, dag: &DagDefinition) -> Vec<DagWarning> {
+    fn analyze(
+        &self,
+        dag: &DagDefinition,
+        activities: &std::collections::HashMap<String, crate::info::ActivityInfo>,
+    ) -> Vec<DagWarning> {
         let mut warnings = Vec::new();
 
         for task in dag.tasks() {
-            if task.retry_policy.is_none() {
+            let has_retry = task.retry_policy.is_some()
+                || activities
+                    .get(&task.activity_name)
+                    .is_some_and(|info| info.default_retry_policy.is_some());
+            if !has_retry {
                 warnings.push(DagWarning {
                     rule_name: self.name().to_string(),
                     message: format!(
@@ -130,11 +146,19 @@ impl DagRule for MissingTimeoutRule {
         "MissingTimeout"
     }
 
-    fn analyze(&self, dag: &DagDefinition) -> Vec<DagWarning> {
+    fn analyze(
+        &self,
+        dag: &DagDefinition,
+        activities: &std::collections::HashMap<String, crate::info::ActivityInfo>,
+    ) -> Vec<DagWarning> {
         let mut warnings = Vec::new();
 
         for task in dag.tasks() {
-            if task.start_to_close.is_none() {
+            let has_timeout = task.start_to_close.is_some()
+                || activities
+                    .get(&task.activity_name)
+                    .is_some_and(|info| info.default_start_to_close.is_some());
+            if !has_timeout {
                 warnings.push(DagWarning {
                     rule_name: self.name().to_string(),
                     message: format!(
@@ -169,7 +193,11 @@ impl DagRule for ExcessiveParallelismRule {
         "ExcessiveParallelism"
     }
 
-    fn analyze(&self, dag: &DagDefinition) -> Vec<DagWarning> {
+    fn analyze(
+        &self,
+        dag: &DagDefinition,
+        _activities: &std::collections::HashMap<String, crate::info::ActivityInfo>,
+    ) -> Vec<DagWarning> {
         let mut warnings = Vec::new();
 
         for (level_idx, level) in dag.execution_levels().iter().enumerate() {
@@ -194,6 +222,7 @@ impl DagRule for ExcessiveParallelismRule {
 mod tests {
     use super::*;
     use crate::dag::DagBuilder;
+    use crate::info::ActivityInfo;
     use crate::policy::RetryPolicy;
     use std::time::Duration;
 
@@ -208,7 +237,7 @@ mod tests {
             .retry(RetryPolicy::exponential(3, Duration::from_secs(1)));
         let dag = builder.build().unwrap();
 
-        let warnings = rule.analyze(&dag);
+        let warnings = rule.analyze(&dag, &std::collections::HashMap::new());
         assert_eq!(warnings.len(), 1);
         assert_eq!(warnings[0].rule_name, "MissingRetryPolicy");
         assert!(warnings[0].message.contains("has no retry policy"));
@@ -225,7 +254,7 @@ mod tests {
             .start_to_close(Duration::from_secs(300));
         let dag = builder.build().unwrap();
 
-        let warnings = rule.analyze(&dag);
+        let warnings = rule.analyze(&dag, &std::collections::HashMap::new());
         assert_eq!(warnings.len(), 1);
         assert_eq!(warnings[0].rule_name, "MissingTimeout");
         assert!(
@@ -247,7 +276,7 @@ mod tests {
         // All tasks are level 0 (3 concurrent, threshold 2)
         let dag = builder.build().unwrap();
 
-        let warnings = rule.analyze(&dag);
+        let warnings = rule.analyze(&dag, &std::collections::HashMap::new());
         assert_eq!(warnings.len(), 1);
         assert_eq!(warnings[0].rule_name, "ExcessiveParallelism");
         assert!(warnings[0].message.contains("3 concurrent tasks"));
@@ -265,10 +294,50 @@ mod tests {
         let _t2 = builder.activity(|| Ok::<(), ()>(()));
         let dag = builder.build().unwrap();
 
-        let warnings = linter.analyze(&dag);
+        let warnings = linter.analyze(&dag, &std::collections::HashMap::new());
         // t1 & t2 missing retry (2)
         // t1 & t2 missing timeout (2)
         // level 0 has 2 tasks, threshold 1 (1)
         assert_eq!(warnings.len(), 5);
+    }
+
+    fn my_test_activity() {}
+
+    fn dummy_handler(
+        _ctx: &crate::context::ActivityContext,
+        _val: serde_json::Value,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + '_>,
+    > {
+        Box::pin(async { Ok(serde_json::Value::Null) })
+    }
+
+    #[test]
+    fn dag_linter_respects_activity_defaults() {
+        let linter = DagLinter::new()
+            .with_rule(MissingRetryPolicyRule::new())
+            .with_rule(MissingTimeoutRule::new());
+
+        let mut builder = DagBuilder::new();
+        let _t1 = builder.activity(my_test_activity); // Has no explicit config, but we will provide default
+        let dag = builder.build().unwrap();
+
+        let mut activities = std::collections::HashMap::new();
+        activities.insert(
+            "my_test_activity".to_string(),
+            ActivityInfo {
+                name: "my_test_activity",
+                module: "test",
+                default_retry_policy: Some(RetryPolicy::exponential(3, Duration::from_secs(1))),
+                default_start_to_close: Some(Duration::from_secs(300)),
+                default_heartbeat_timeout: None,
+                default_schedule_to_start: None,
+                default_queue: None,
+                handler: dummy_handler,
+            },
+        );
+
+        let warnings = linter.analyze(&dag, &activities);
+        assert_eq!(warnings.len(), 0);
     }
 }
