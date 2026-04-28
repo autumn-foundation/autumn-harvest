@@ -26,7 +26,7 @@ use crate::types::ShardId;
 ///     .workflows(vec![]) // usually from workflows![]
 ///     .activities(vec![]) // usually from activities![]
 ///     .dags(vec![]) // usually from dags![]
-///     .worker(WorkerConfig::new())
+///     .worker(WorkerConfig::default())
 ///     .state(DatabasePool)
 ///     .build();
 ///
