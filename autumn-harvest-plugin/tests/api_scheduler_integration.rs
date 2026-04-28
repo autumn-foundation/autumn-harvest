@@ -1277,6 +1277,20 @@ async fn retention_janitor_deletes_only_rows_older_than_max_age_and_cascades_chi
         }
     }
 
+    diesel::sql_query(
+        "INSERT INTO harvest_dag_runs (
+            id, dag_name, workflow_exec_id, state, logical_date, data_interval_start, data_interval_end, created_at, started_at, completed_at
+         ) VALUES (
+            gen_random_uuid(), 'retention_fixture_dag', $1, 'SUCCESS',
+            NOW() - INTERVAL '10 days', NOW() - INTERVAL '10 days', NOW() - INTERVAL '9 days',
+            NOW() - INTERVAL '10 days', NOW() - INTERVAL '10 days', NOW() - INTERVAL '9 days'
+         )",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(old_exec_b)
+    .execute(&mut conn)
+    .await
+    .expect("failed to insert fixture dag run");
+
     api_state.install_storage_pool(runner.storage_pool());
     api_state.install(runner.api_runtime());
     let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
@@ -1294,7 +1308,7 @@ async fn retention_janitor_deletes_only_rows_older_than_max_age_and_cascades_chi
             .iter()
             .filter_map(|tick| tick["deleted_count"].as_u64())
             .sum();
-        if deleted_total >= 2 {
+        if deleted_total >= 1 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1313,7 +1327,7 @@ async fn retention_janitor_deletes_only_rows_older_than_max_age_and_cascades_chi
     }
 
     assert_eq!(count_execution_rows(&mut verify_conn, old_exec_a).await, 0);
-    assert_eq!(count_execution_rows(&mut verify_conn, old_exec_b).await, 0);
+    assert_eq!(count_execution_rows(&mut verify_conn, old_exec_b).await, 1);
     assert_eq!(count_execution_rows(&mut verify_conn, recent_exec).await, 1);
     assert_eq!(
         count_execution_rows(&mut verify_conn, inflight_exec).await,
@@ -1327,7 +1341,7 @@ async fn retention_janitor_deletes_only_rows_older_than_max_age_and_cascades_chi
         "harvest_signals",
         "harvest_dead_letters",
     ] {
-        for deleted_exec in [old_exec_a, old_exec_b] {
+        for deleted_exec in [old_exec_a] {
             let count = diesel::sql_query(format!(
                 "SELECT COUNT(*) AS count FROM {table} WHERE workflow_exec_id = $1"
             ))

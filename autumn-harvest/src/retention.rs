@@ -461,14 +461,13 @@ async fn should_skip_candidate(
         return Ok(true);
     }
 
-    let inflight_dag_run_count = harvest_dag_runs::table
+    let dag_run_ref_count = harvest_dag_runs::table
         .filter(harvest_dag_runs::workflow_exec_id.eq(Some(candidate.id)))
-        .filter(harvest_dag_runs::state.eq_any(["QUEUED", "RUNNING"]))
         .count()
         .get_result::<i64>(conn)
         .await
         .map_err(database_error)?;
-    if inflight_dag_run_count > 0 {
+    if dag_run_ref_count > 0 {
         return Ok(true);
     }
 
