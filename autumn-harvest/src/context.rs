@@ -2269,4 +2269,21 @@ mod tests {
             "queries must not emit events"
         );
     }
+
+    #[test]
+    fn context_check_cancellation_returns_error_when_cancelled() {
+        let mut ctx = WorkflowContext::new_test();
+        ctx.cancellation_reason = Some("user request".to_string());
+        let result = ctx.check_cancellation();
+        match result {
+            Err(HarvestError::Cancelled(reason)) => assert_eq!(reason, "user request"),
+            _ => panic!("Expected Cancelled error"),
+        }
+    }
+
+    #[test]
+    fn context_check_cancellation_returns_ok_when_not_cancelled() {
+        let ctx = WorkflowContext::new_test();
+        assert!(ctx.check_cancellation().is_ok());
+    }
 }
