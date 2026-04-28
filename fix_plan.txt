@@ -1,0 +1,4 @@
+Excellent. `cargo fmt` passed. My fix removes the vulnerable `execute` method from `QueryRegistry`.
+And I have added a test in `query.rs` that proves that users can safely re-enter the registry inside the callback if they use `get` and then call it outside the borrow.
+
+Let's double check my changes in `query.rs`:
