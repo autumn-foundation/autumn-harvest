@@ -1,22 +1,36 @@
 //! Time-based retention janitor for completed workflow history.
 
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(feature = "db")]
+use std::time::Instant;
 
 use chrono::{DateTime, Utc};
+#[cfg(feature = "db")]
 use diesel::prelude::*;
+#[cfg(feature = "db")]
 use diesel::sql_types::{BigInt, Nullable, Text, Timestamptz, Uuid as SqlUuid};
+#[cfg(feature = "db")]
 use diesel_async::{AsyncConnection, RunQueryDsl};
+#[cfg(feature = "db")]
 use futures::future::join_all;
 use serde::Serialize;
+#[cfg(feature = "db")]
 use tokio::sync::mpsc;
+#[cfg(feature = "db")]
 use tokio::task::JoinHandle;
+#[cfg(feature = "db")]
 use tokio_util::sync::CancellationToken;
 
+#[cfg(feature = "db")]
 use crate::error::{HarvestError, HarvestResult, database_error};
+#[cfg(feature = "db")]
 use crate::schema::harvest_workflow_executions;
+#[cfg(feature = "db")]
 use crate::schema::{harvest_dag_runs, harvest_signals, harvest_task_queue, harvest_timers};
+#[cfg(feature = "db")]
 use crate::shard::ShardedDbPool;
+#[cfg(feature = "db")]
 use crate::telemetry::MetricsRecorder;
 use crate::types::ShardId;
 
@@ -24,6 +38,7 @@ const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const DEFAULT_BATCH_SIZE: usize = 1_000;
 const MIN_MAX_AGE: Duration = Duration::from_secs(1);
 const MAX_MAX_AGE: Duration = Duration::from_secs(60 * 60 * 24 * 365 * 10);
+#[cfg(feature = "db")]
 const TERMINAL_STATES: [&str; 5] = [
     "COMPLETED",
     "FAILED",
@@ -139,6 +154,7 @@ impl RetentionMonitor {
             .clone()
     }
 
+    #[cfg(feature = "db")]
     fn update(&self, shard: ShardId, result: RetentionTickResult) {
         let mut guard = self.inner.lock().expect("retention monitor lock poisoned");
         if let Some(existing) = guard
@@ -151,6 +167,7 @@ impl RetentionMonitor {
     }
 }
 
+#[cfg(feature = "db")]
 pub struct RetentionRuntime {
     shutdown: CancellationToken,
     trigger_tx: mpsc::UnboundedSender<()>,
@@ -158,6 +175,7 @@ pub struct RetentionRuntime {
     monitor: RetentionMonitor,
 }
 
+#[cfg(feature = "db")]
 impl RetentionRuntime {
     #[must_use]
     pub fn spawn(
@@ -270,6 +288,7 @@ impl RetentionRuntime {
     }
 }
 
+#[cfg(feature = "db")]
 #[derive(Debug, Default)]
 struct ShardTickOutcome {
     candidate_count: usize,
@@ -277,6 +296,7 @@ struct ShardTickOutcome {
     oldest_age_secs_skipped: Option<u64>,
 }
 
+#[cfg(feature = "db")]
 #[derive(Debug, QueryableByName)]
 struct CandidateExecution {
     #[diesel(sql_type = SqlUuid)]
@@ -289,6 +309,7 @@ struct CandidateExecution {
     completed_at: Option<DateTime<Utc>>,
 }
 
+#[cfg(feature = "db")]
 async fn run_shard_tick(
     pool: crate::worker::DbPool,
     shard: ShardId,
@@ -359,6 +380,7 @@ async fn run_shard_tick(
     Ok(outcome)
 }
 
+#[cfg(feature = "db")]
 async fn should_skip_candidate(
     conn: &mut diesel_async::AsyncPgConnection,
     candidate: &CandidateExecution,
@@ -367,8 +389,7 @@ async fn should_skip_candidate(
     let active_parent_ref_count = diesel::sql_query(
         "SELECT COUNT(*) AS count
          FROM harvest_workflow_executions
-         WHERE parent_id = $1
-           AND state NOT IN ('COMPLETED','FAILED','CANCELLED','TIMED_OUT','CONTINUED_AS_NEW')",
+         WHERE parent_id = $1",
     )
     .bind::<SqlUuid, _>(candidate.id)
     .get_result::<CountRow>(conn)
@@ -448,6 +469,7 @@ async fn should_skip_candidate(
     Ok(chain_link_count > 0)
 }
 
+#[cfg(feature = "db")]
 #[derive(QueryableByName)]
 struct CountRow {
     #[diesel(sql_type = BigInt)]
