@@ -323,67 +323,93 @@ async fn run_shard_tick(
         .get()
         .await
         .map_err(|error| HarvestError::Database(error.to_string()))?;
-    let candidates = diesel::sql_query(
-        "SELECT id, workflow_name, workflow_id, completed_at
-         FROM harvest_workflow_executions
-         WHERE state = ANY($1)
-           AND completed_at IS NOT NULL
-           AND completed_at < $2
-         ORDER BY completed_at ASC
-         LIMIT $3",
-    )
-    .bind::<diesel::sql_types::Array<Text>, _>(TERMINAL_STATES.to_vec())
-    .bind::<Timestamptz, _>(cutoff)
-    .bind::<BigInt, _>(config.batch_size as i64)
-    .load::<CandidateExecution>(&mut conn)
-    .await
-    .map_err(database_error)?;
-
     let mut outcome = ShardTickOutcome {
-        candidate_count: candidates.len(),
         ..ShardTickOutcome::default()
     };
+    let mut cursor_completed_at: Option<DateTime<Utc>> = None;
+    let mut cursor_id: Option<uuid::Uuid> = None;
 
-    for candidate in candidates {
-        if should_skip_candidate(&mut conn, &candidate, cutoff).await? {
-            if let Some(completed_at) = candidate.completed_at {
-                let age = (Utc::now() - completed_at).num_seconds().max(0) as u64;
-                outcome.oldest_age_secs_skipped = Some(
-                    outcome
-                        .oldest_age_secs_skipped
-                        .map_or(age, |existing| existing.max(age)),
-                );
+    loop {
+        let candidates = diesel::sql_query(
+            "SELECT id, workflow_name, workflow_id, completed_at
+             FROM harvest_workflow_executions
+             WHERE state = ANY($1)
+               AND completed_at IS NOT NULL
+               AND completed_at < $2
+               AND (
+                   $3 IS NULL
+                   OR completed_at > $3
+                   OR (completed_at = $3 AND id > $4)
+               )
+             ORDER BY completed_at ASC, id ASC
+             LIMIT $5",
+        )
+        .bind::<diesel::sql_types::Array<Text>, _>(TERMINAL_STATES.to_vec())
+        .bind::<Timestamptz, _>(cutoff)
+        .bind::<Nullable<Timestamptz>, _>(cursor_completed_at)
+        .bind::<Nullable<SqlUuid>, _>(cursor_id)
+        .bind::<BigInt, _>(config.batch_size as i64)
+        .load::<CandidateExecution>(&mut conn)
+        .await
+        .map_err(database_error)?;
+
+        if candidates.is_empty() {
+            break;
+        }
+
+        outcome.candidate_count += candidates.len();
+
+        for candidate in candidates {
+            cursor_completed_at = candidate.completed_at;
+            cursor_id = Some(candidate.id);
+
+            if outcome.deleted_count >= config.batch_size {
+                break;
             }
-            continue;
-        }
 
-        if config.dry_run {
-            outcome.deleted_count += 1;
-            continue;
-        }
+            if should_skip_candidate(&mut conn, &candidate, cutoff).await? {
+                if let Some(completed_at) = candidate.completed_at {
+                    let age = (Utc::now() - completed_at).num_seconds().max(0) as u64;
+                    outcome.oldest_age_secs_skipped = Some(
+                        outcome
+                            .oldest_age_secs_skipped
+                            .map_or(age, |existing| existing.max(age)),
+                    );
+                }
+                continue;
+            }
 
-        conn.transaction::<_, HarvestError, _>(|conn| {
-            Box::pin(async move {
-                diesel::delete(
-                    harvest_dead_letters::table
-                        .filter(harvest_dead_letters::workflow_exec_id.eq(Some(candidate.id))),
-                )
-                .execute(conn)
-                .await
-                .map_err(database_error)?;
+            if config.dry_run {
+                outcome.deleted_count += 1;
+                continue;
+            }
 
-                diesel::delete(
-                    harvest_workflow_executions::table
-                        .filter(harvest_workflow_executions::id.eq(candidate.id)),
-                )
-                .execute(conn)
-                .await
-                .map_err(database_error)?;
-                Ok(())
+            conn.transaction::<_, HarvestError, _>(|conn| {
+                Box::pin(async move {
+                    diesel::delete(
+                        harvest_dead_letters::table
+                            .filter(harvest_dead_letters::workflow_exec_id.eq(Some(candidate.id))),
+                    )
+                    .execute(conn)
+                    .await
+                    .map_err(database_error)?;
+
+                    diesel::delete(
+                        harvest_workflow_executions::table
+                            .filter(harvest_workflow_executions::id.eq(candidate.id)),
+                    )
+                    .execute(conn)
+                    .await
+                    .map_err(database_error)?;
+                    Ok(())
+                })
             })
-        })
-        .await?;
-        outcome.deleted_count += 1;
+            .await?;
+            outcome.deleted_count += 1;
+        }
+        if outcome.deleted_count >= config.batch_size {
+            break;
+        }
     }
 
     tracing::debug!(shard = %shard, candidates = outcome.candidate_count, deleted = outcome.deleted_count, "retention shard tick");
