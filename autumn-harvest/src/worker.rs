@@ -2240,14 +2240,14 @@ impl Worker {
                 .workflow_semaphore
                 .acquire_many(
                     u32::try_from(self.config.max_concurrent_workflows)
-                        .expect("Concurrency limit overflow"),
+                        .unwrap_or(u32::MAX),
                 )
                 .await;
             let _act = self
                 .activity_semaphore
                 .acquire_many(
                     u32::try_from(self.config.max_concurrent_activities)
-                        .expect("Concurrency limit overflow"),
+                        .unwrap_or(u32::MAX),
                 )
                 .await;
         };

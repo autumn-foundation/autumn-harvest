@@ -58,7 +58,7 @@ pub fn events_to_insert_rows_from(
         .enumerate()
         .map(|(i, event)| {
             #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-            let i_i32 = i as i32;
+            let i_i32 = i32::try_from(i).map_err(|_| crate::error::HarvestError::Database("Event array too large".to_string()))?;
             let event_id = start_id.checked_add(i_i32).ok_or_else(|| {
                 crate::error::HarvestError::Database("Event ID overflow".to_string())
             })?;
