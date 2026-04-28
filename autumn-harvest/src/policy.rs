@@ -184,7 +184,7 @@ pub enum TriggerRule {
 }
 
 impl TriggerRule {
-    /// Evaluates the trigger rule against a list of upstream task statuses.
+    /// Evaluates the trigger rule against a list (or iterator) of upstream task statuses.
     ///
     /// Returns `true` if the downstream task should be executed, `false` otherwise.
     ///
@@ -198,17 +198,24 @@ impl TriggerRule {
     /// assert!(rule.should_run(&statuses));
     /// ```
     #[must_use]
-    pub fn should_run(&self, upstream_statuses: &[TaskStatus]) -> bool {
+    pub fn should_run<'a>(
+        &self,
+        upstream_statuses: impl IntoIterator<Item = &'a TaskStatus>,
+    ) -> bool {
         match self {
             Self::AllSuccess => upstream_statuses
-                .iter()
+                .into_iter()
                 .all(|s| *s == TaskStatus::Succeeded),
             Self::AllDone => true,
-            Self::OneSuccess => upstream_statuses.contains(&TaskStatus::Succeeded),
-            Self::OneFailed => upstream_statuses.contains(&TaskStatus::Failed),
+            Self::OneSuccess => upstream_statuses
+                .into_iter()
+                .any(|s| *s == TaskStatus::Succeeded),
+            Self::OneFailed => upstream_statuses
+                .into_iter()
+                .any(|s| *s == TaskStatus::Failed),
             Self::AllFailed => {
-                !upstream_statuses.is_empty()
-                    && upstream_statuses.iter().all(|s| *s == TaskStatus::Failed)
+                let mut iter = upstream_statuses.into_iter().peekable();
+                iter.peek().is_some() && iter.all(|s| *s == TaskStatus::Failed)
             }
             Self::Manual => false,
         }

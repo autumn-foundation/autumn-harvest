@@ -535,14 +535,18 @@ async fn execute_dag_run(
         let tasks = level.iter().map(|task_index| {
             // Avoid an unnecessary heap allocation of `DagTask` per task when `&DagTask` works.
             let task = &dag.definition.tasks()[*task_index];
-            let upstream_statuses: Vec<_> = task
-                .upstreams
-                .iter()
-                .map(|upstream| statuses[*upstream])
-                .collect();
             let registry = Arc::clone(&registry);
             let task_input = Arc::clone(&run_input);
-            async move { execute_dag_task(&registry, task, &upstream_statuses, &task_input).await }
+
+            // ⚡ Bolt: Remove an intermediate `.collect::<Vec<_>>()` when fetching upstream
+            // statuses by passing an Iterator into `execute_dag_task`. This avoids an
+            // unnecessary heap allocation per DAG task inside this loop.
+            let statuses_ref = &statuses;
+            let upstream_statuses = task
+                .upstreams
+                .iter()
+                .map(move |upstream| &statuses_ref[*upstream]);
+            async move { execute_dag_task(&registry, task, upstream_statuses, &task_input).await }
         });
         let results = futures::future::join_all(tasks).await;
         for (task_index, result) in level.iter().zip(results) {
@@ -571,10 +575,10 @@ async fn execute_dag_run(
     Ok(())
 }
 
-async fn execute_dag_task(
+async fn execute_dag_task<'a>(
     registry: &HandlerRegistry,
     task: &crate::dag::DagTask,
-    upstream_statuses: &[TaskStatus],
+    upstream_statuses: impl IntoIterator<Item = &'a TaskStatus>,
     conf: &Value,
 ) -> TaskStatus {
     if !task.trigger_rule.should_run(upstream_statuses) {
