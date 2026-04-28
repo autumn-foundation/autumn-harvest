@@ -237,6 +237,17 @@ pub trait MetricsRecorder: Send + Sync {
     fn record_queue_depth(&self, queue_name: &str, depth: u64) {
         let _ = (queue_name, depth);
     }
+
+    /// Results of one retention-janitor tick on a shard.
+    fn record_retention_tick(
+        &self,
+        shard: u16,
+        candidate_count: u64,
+        deleted_count: u64,
+        duration_secs: f64,
+    ) {
+        let _ = (shard, candidate_count, deleted_count, duration_secs);
+    }
 }
 
 /// Default metrics recorder that discards every sample.
