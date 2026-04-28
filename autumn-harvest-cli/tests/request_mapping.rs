@@ -70,6 +70,65 @@ fn workflow_list_and_query_use_get_requests() {
 }
 
 #[test]
+fn workflow_list_filters_map_to_query_string() {
+    let list = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "list",
+        "--state",
+        "RUNNING",
+        "--workflow-name",
+        "onboarding",
+        "--search-attr",
+        "tenant=acme",
+        "--search-attr",
+        "customer_id=42",
+    ])
+    .expect("filtered list args should parse");
+    let request = list.api_request().expect("list request should build");
+
+    assert_eq!(request.method, ApiMethod::Get);
+    assert_eq!(
+        request.path,
+        "/workflows?state=RUNNING&workflow_name=onboarding\
+         &search_attr=tenant:acme&search_attr=customer_id:42"
+    );
+    assert_eq!(request.body, None);
+}
+
+#[test]
+fn workflow_list_supports_repeated_and_comma_states() {
+    let list = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "list",
+        "--state",
+        "RUNNING,FAILED",
+        "--state",
+        "TIMED_OUT",
+    ])
+    .expect("multi-state list args should parse");
+    let request = list.api_request().expect("list request should build");
+
+    assert_eq!(request.path, "/workflows?state=RUNNING,FAILED,TIMED_OUT");
+}
+
+#[test]
+fn workflow_list_rejects_search_attr_without_equals() {
+    let list = Cli::try_parse_from(["harvest", "workflow", "list", "--search-attr", "tenant"])
+        .expect("malformed search-attr args should still parse at clap level");
+
+    let err = list
+        .api_request()
+        .expect_err("malformed search-attr should fail to map");
+    let message = err.to_string();
+    assert!(
+        message.contains("invalid --search-attr"),
+        "unexpected error: {message}"
+    );
+}
+
+#[test]
 fn workflow_signal_and_cancel_use_post_bodies() {
     let signal = Cli::try_parse_from([
         "harvest",

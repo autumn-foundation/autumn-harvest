@@ -24,14 +24,14 @@ use autumn_harvest::models::WorkflowExecution;
 use autumn_harvest::store;
 
 use crate::api::{
-    HarvestApiState, db_conn_for_execution, load_execution, load_workflows_from_shards, map_error,
-    parse_execution_id,
+    HarvestApiState, KNOWN_WORKFLOW_STATES, WorkflowFilters, db_conn_for_execution, load_execution,
+    load_workflows_from_shards, map_error, parse_execution_id,
 };
 
 const DEFAULT_PAGE_SIZE: i64 = 25;
 const MAX_PAGE_SIZE: i64 = 200;
 
-const KNOWN_STATES: &[&str] = &["RUNNING", "COMPLETED", "FAILED", "CANCELLED"];
+const KNOWN_STATES: &[&str] = KNOWN_WORKFLOW_STATES;
 
 const STYLE: &str = r#"
 *,*::before,*::after{box-sizing:border-box}
@@ -90,6 +90,12 @@ pub(crate) struct WorkflowListParams {
     limit: Option<i64>,
     #[serde(default)]
     state: Option<String>,
+    #[serde(default)]
+    workflow_name: Option<String>,
+    #[serde(default)]
+    search_attr_key: Option<String>,
+    #[serde(default)]
+    search_attr_value: Option<String>,
 }
 
 /// Build the Vantage dashboard router.
@@ -123,9 +129,43 @@ async fn list_workflows_ui(
         .filter(|value| !value.is_empty())
         .map(str::to_string);
 
+    let workflow_name_filter = params
+        .workflow_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+
+    let search_attr_key = params
+        .search_attr_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let search_attr_value = params
+        .search_attr_value
+        .as_deref()
+        .map(str::to_string)
+        .unwrap_or_default();
+    // Only enforce the search_attr predicate when the user supplied a key.
+    // The value may legitimately be the empty string.
+    let search_attr_pair = search_attr_key
+        .as_ref()
+        .map(|key| (key.clone(), search_attr_value.clone()));
+
     let fetch_limit = offset.saturating_add(limit).saturating_add(1);
-    let workflows =
-        load_workflows_from_shards(&api_state, state_filter.as_deref(), fetch_limit).await?;
+    let mut filters = WorkflowFilters::default().with_limit(fetch_limit);
+    if let Some(state) = state_filter.as_deref() {
+        filters.states.push(state.to_string());
+    }
+    filters.workflow_name.clone_from(&workflow_name_filter);
+    if let Some((key, value)) = search_attr_pair.clone() {
+        let mut object = serde_json::Map::with_capacity(1);
+        object.insert(key, Value::String(value));
+        filters.search_attrs.push(Value::Object(object));
+    }
+
+    let workflows = load_workflows_from_shards(&api_state, &filters).await?;
     let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
     let offset_usize = usize::try_from(offset).unwrap_or(usize::MAX);
     let has_next = workflows.len() > offset_usize.saturating_add(limit_usize);
@@ -141,6 +181,8 @@ async fn list_workflows_ui(
         limit,
         has_next,
         state_filter.as_deref(),
+        workflow_name_filter.as_deref(),
+        search_attr_pair.as_ref(),
     ))
 }
 
@@ -172,10 +214,12 @@ fn render_workflow_list(
     limit: i64,
     has_next: bool,
     state_filter: Option<&str>,
+    workflow_name_filter: Option<&str>,
+    search_attr_filter: Option<&(String, String)>,
 ) -> Markup {
     let body = html! {
         h2 { "Workflows" }
-        (render_filters(state_filter, limit))
+        (render_filters(state_filter, workflow_name_filter, search_attr_filter, limit))
 
         @if workflows.is_empty() {
             div.card.empty { "No workflows match this filter." }
@@ -209,13 +253,22 @@ fn render_workflow_list(
             }
         }
 
-        (render_pagination(page, limit, has_next, state_filter))
+        (render_pagination(page, limit, has_next, state_filter, workflow_name_filter, search_attr_filter))
     };
 
     layout("Workflows · Vantage", &body)
 }
 
-fn render_filters(state_filter: Option<&str>, limit: i64) -> Markup {
+fn render_filters(
+    state_filter: Option<&str>,
+    workflow_name_filter: Option<&str>,
+    search_attr_filter: Option<&(String, String)>,
+    limit: i64,
+) -> Markup {
+    let (attr_key, attr_value) =
+        search_attr_filter.map_or(("", ""), |(k, v)| (k.as_str(), v.as_str()));
+    let workflow_name_value = workflow_name_filter.unwrap_or("");
+
     html! {
         form.filters method="get" action="workflows" {
             label {
@@ -233,6 +286,18 @@ fn render_filters(state_filter: Option<&str>, limit: i64) -> Markup {
                 }
             }
             label {
+                "Workflow name"
+                input type="text" name="workflow_name" value=(workflow_name_value) placeholder="e.g. onboarding";
+            }
+            label {
+                "Search attr key"
+                input type="text" name="search_attr_key" value=(attr_key) placeholder="e.g. tenant";
+            }
+            label {
+                "Search attr value"
+                input type="text" name="search_attr_value" value=(attr_value) placeholder="e.g. acme";
+            }
+            label {
                 "Per page"
                 input type="number" name="limit" min="1" max=(MAX_PAGE_SIZE) value=(limit);
             }
@@ -242,8 +307,20 @@ fn render_filters(state_filter: Option<&str>, limit: i64) -> Markup {
     }
 }
 
-fn render_pagination(page: i64, limit: i64, has_next: bool, state_filter: Option<&str>) -> Markup {
-    let base_query = build_query_string(limit, state_filter);
+fn render_pagination(
+    page: i64,
+    limit: i64,
+    has_next: bool,
+    state_filter: Option<&str>,
+    workflow_name_filter: Option<&str>,
+    search_attr_filter: Option<&(String, String)>,
+) -> Markup {
+    let base_query = build_query_string(
+        limit,
+        state_filter,
+        workflow_name_filter,
+        search_attr_filter,
+    );
 
     html! {
         div.pagination {
@@ -268,7 +345,12 @@ fn render_pagination(page: i64, limit: i64, has_next: bool, state_filter: Option
     }
 }
 
-fn build_query_string(limit: i64, state_filter: Option<&str>) -> String {
+fn build_query_string(
+    limit: i64,
+    state_filter: Option<&str>,
+    workflow_name_filter: Option<&str>,
+    search_attr_filter: Option<&(String, String)>,
+) -> String {
     let mut out = String::new();
     if limit != DEFAULT_PAGE_SIZE {
         let _ = write!(out, "&limit={limit}");
@@ -276,15 +358,22 @@ fn build_query_string(limit: i64, state_filter: Option<&str>) -> String {
     if let Some(state) = state_filter {
         let _ = write!(out, "&state={}", url_encode(state));
     }
+    if let Some(name) = workflow_name_filter {
+        let _ = write!(out, "&workflow_name={}", url_encode(name));
+    }
+    if let Some((key, value)) = search_attr_filter {
+        let _ = write!(out, "&search_attr_key={}", url_encode(key));
+        let _ = write!(out, "&search_attr_value={}", url_encode(value));
+    }
     out
 }
 
 fn render_workflow_detail(execution: &WorkflowExecution, events: &[Value]) -> Markup {
     let title = format!("{} · Vantage", execution.workflow_name);
+    let detail_badge_class = format!("badge {}", badge_class(&execution.state));
     let body = html! {
         div.detail-row { a.back href="../workflows" { (PreEscaped("&larr;")) " Back to workflows" } }
 
-        @let detail_badge_class = format!("badge {}", badge_class(&execution.state));
         h2 {
             (execution.workflow_name) " "
             span class=(detail_badge_class) { (execution.state) }
@@ -488,15 +577,28 @@ mod tests {
 
     #[test]
     fn build_query_string_omits_default_limit() {
-        assert_eq!(build_query_string(DEFAULT_PAGE_SIZE, None), "");
-        assert_eq!(build_query_string(10, None), "&limit=10");
+        assert_eq!(build_query_string(DEFAULT_PAGE_SIZE, None, None, None), "");
+        assert_eq!(build_query_string(10, None, None, None), "&limit=10");
         assert_eq!(
-            build_query_string(DEFAULT_PAGE_SIZE, Some("FAILED")),
+            build_query_string(DEFAULT_PAGE_SIZE, Some("FAILED"), None, None),
             "&state=FAILED"
         );
         assert_eq!(
-            build_query_string(50, Some("with space")),
+            build_query_string(50, Some("with space"), None, None),
             "&limit=50&state=with%20space"
+        );
+    }
+
+    #[test]
+    fn build_query_string_includes_workflow_name_and_search_attrs() {
+        assert_eq!(
+            build_query_string(DEFAULT_PAGE_SIZE, None, Some("onboarding"), None),
+            "&workflow_name=onboarding"
+        );
+        let pair = ("tenant".to_string(), "acme".to_string());
+        assert_eq!(
+            build_query_string(DEFAULT_PAGE_SIZE, None, None, Some(&pair)),
+            "&search_attr_key=tenant&search_attr_value=acme"
         );
     }
 
