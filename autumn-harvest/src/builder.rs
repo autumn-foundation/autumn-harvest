@@ -110,8 +110,8 @@ pub enum HarvestBuilderError {
 
     /// An activity declares a `concurrency_key` but no `max_concurrent` cap.
     /// Without a cap the key is written to the queue row but the saturation
-    /// predicate (`HAVING COUNT(*) >= NULL`) never fires, silently bypassing
-    /// the intended shared budget.
+    /// predicate (`(SELECT COUNT(*) ...) < NULL`) is always null/unknown,
+    /// silently bypassing the intended shared budget.
     #[error(
         "activity '{activity}' sets concurrency_key = \"{key}\" but has no max_concurrent; \
          either add max_concurrent or remove the concurrency_key"
@@ -123,9 +123,9 @@ pub enum HarvestBuilderError {
         key: String,
     },
 
-    /// An activity declares `max_concurrent = 0`, which makes every enqueued
-    /// task permanently unclaimable: the saturation predicate
-    /// (`HAVING COUNT(*) >= 0`) is always true, deferring all tasks indefinitely.
+    /// An activity declares `max_concurrent = 0`, which makes the saturation
+    /// check `(SELECT COUNT(*) ...) < 0` always false, permanently deferring
+    /// every task for this activity.
     #[error(
         "activity '{activity}' has max_concurrent = 0; use max_concurrent >= 1 \
          or omit max_concurrent entirely to disable the cap"
@@ -390,18 +390,24 @@ fn validate_concurrency_keys(
             });
         }
 
-        let (Some(key), Some(cap)) = (activity.concurrency_key, activity.max_concurrent) else {
+        // Activities with max_concurrent but no explicit concurrency_key use the
+        // activity name as the effective key at runtime (persist_scheduled_activity
+        // defaults it). Include them in the cross-activity cap consistency check.
+        let Some(cap) = activity.max_concurrent else {
             continue;
         };
-        let entry = seen.entry(key).or_insert_with(|| ConcurrencyKeyEntry {
-            first_cap: cap,
-            contributors: Vec::new(),
-        });
+        let effective_key: &str = activity.concurrency_key.unwrap_or(activity.name);
+        let entry = seen
+            .entry(effective_key)
+            .or_insert_with(|| ConcurrencyKeyEntry {
+                first_cap: cap,
+                contributors: Vec::new(),
+            });
         entry.contributors.push((activity.name.to_string(), cap));
 
         if entry.first_cap != cap {
             return Err(HarvestBuilderError::ConcurrencyKeyMismatch {
-                key: key.to_string(),
+                key: effective_key.to_string(),
                 activities: entry.contributors.clone(),
             });
         }
@@ -729,7 +735,7 @@ mod tests {
     #[test]
     fn builder_rejects_concurrency_key_without_cap() {
         // concurrency_key set but max_concurrent omitted — the cap predicate
-        // would silently never fire (HAVING COUNT(*) >= NULL is always unknown).
+        // would silently never fire (NULL cap bypasses the saturation check).
         let result = HarvestBuilder::new()
             .activities(vec![make_activity("act_a", None, Some("stripe"))])
             .try_build();
@@ -744,9 +750,40 @@ mod tests {
     }
 
     #[test]
+    fn builder_rejects_implicit_key_cap_mismatch_with_explicit_key() {
+        // act_a uses max_concurrent=5 with no key (implicit key = "act_a").
+        // act_b explicitly declares key="act_a" with a different cap.
+        // Both would resolve to the same effective key at runtime, so caps must agree.
+        let result = HarvestBuilder::new()
+            .activities(vec![
+                make_activity("act_a", Some(5), None),
+                make_activity("act_b", Some(10), Some("act_a")),
+            ])
+            .try_build();
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, HarvestBuilderError::ConcurrencyKeyMismatch { ref key, .. } if key == "act_a"),
+            "expected ConcurrencyKeyMismatch for key 'act_a', got: {err}"
+        );
+    }
+
+    #[test]
+    fn builder_accepts_implicit_key_matching_explicit_key_same_cap() {
+        // act_a: implicit key = "act_a", cap = 5
+        // act_b: explicit key = "act_a", cap = 5 → same effective key and same cap → ok
+        let result = HarvestBuilder::new()
+            .activities(vec![
+                make_activity("act_a", Some(5), None),
+                make_activity("act_b", Some(5), Some("act_a")),
+            ])
+            .try_build();
+        assert!(result.is_ok());
+    }
+
+    #[test]
     fn builder_rejects_zero_concurrency_cap() {
-        // max_concurrent = 0 makes HAVING COUNT(*) >= 0 always true,
-        // permanently deferring every task for this activity.
+        // max_concurrent = 0 makes the COUNT check always fail (0 running < 0 is
+        // never true), permanently deferring every task for this activity.
         let result = HarvestBuilder::new()
             .activities(vec![make_activity("act_a", Some(0), Some("stripe"))])
             .try_build();

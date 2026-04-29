@@ -17,9 +17,16 @@ ALTER TABLE harvest_task_queue
     ADD COLUMN IF NOT EXISTS concurrency_cap INT4;
 
 -- Partial index on RUNNING rows with a concurrency key so the saturation
--- check subquery in claim_task() uses an index scan instead of a seq scan.
+-- check scalar subquery in claim_task() uses an index scan instead of a seq scan.
 -- Rows with NULL concurrency_key are excluded (zero index overhead for the
 -- no-cap path).
+--
+-- NOTE: for zero-downtime rollout against a live database, build this index
+-- with CONCURRENTLY outside a transaction before running this migration:
+--   CREATE INDEX CONCURRENTLY IF NOT EXISTS harvest_task_queue_concurrency_key_running
+--       ON harvest_task_queue (concurrency_key)
+--       WHERE state = 'RUNNING' AND concurrency_key IS NOT NULL;
+-- The IF NOT EXISTS clause makes this CREATE INDEX a no-op if that was done first.
 CREATE INDEX IF NOT EXISTS harvest_task_queue_concurrency_key_running
     ON harvest_task_queue (concurrency_key)
     WHERE state = 'RUNNING' AND concurrency_key IS NOT NULL;

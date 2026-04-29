@@ -273,7 +273,7 @@ pub async fn claim_task(
     // not actually claim, keeping throughput high under contention.
     //
     // The partial index harvest_task_queue_concurrency_key_running makes the
-    // inner re-check SELECT fast: it only scans RUNNING rows with a non-NULL key.
+    // scalar subquery fast: it only scans RUNNING rows with a non-NULL key.
     let result: Vec<TaskQueueItem> = diesel::sql_query(
         "WITH candidate AS ( \
              SELECT id, concurrency_key, concurrency_cap \
@@ -289,12 +289,12 @@ pub async fn claim_task(
                ) \
                AND ( \
                    concurrency_key IS NULL \
-                   OR NOT EXISTS ( \
-                       SELECT 1 FROM harvest_task_queue inner_q \
+                   OR concurrency_cap IS NULL \
+                   OR ( \
+                       SELECT COUNT(*) FROM harvest_task_queue inner_q \
                        WHERE inner_q.concurrency_key = harvest_task_queue.concurrency_key \
                          AND inner_q.state = 'RUNNING' \
-                       HAVING COUNT(*) >= harvest_task_queue.concurrency_cap \
-                   ) \
+                   ) < harvest_task_queue.concurrency_cap \
                ) \
              ORDER BY \
                  CASE \
@@ -313,11 +313,13 @@ pub async fn claim_task(
                candidate.concurrency_key IS NULL \
                OR ( \
                    pg_try_advisory_xact_lock(hashtext(candidate.concurrency_key)::bigint) \
-                   AND NOT EXISTS ( \
-                       SELECT 1 FROM harvest_task_queue recheck \
-                       WHERE recheck.concurrency_key = candidate.concurrency_key \
-                         AND recheck.state = 'RUNNING' \
-                       HAVING COUNT(*) >= candidate.concurrency_cap \
+                   AND ( \
+                       candidate.concurrency_cap IS NULL \
+                       OR ( \
+                           SELECT COUNT(*) FROM harvest_task_queue recheck \
+                           WHERE recheck.concurrency_key = candidate.concurrency_key \
+                             AND recheck.state = 'RUNNING' \
+                       ) < candidate.concurrency_cap \
                    ) \
                ) \
            ) \
