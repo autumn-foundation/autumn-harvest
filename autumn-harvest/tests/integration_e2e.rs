@@ -54,6 +54,8 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260424000001_harvest_trace_context/up.sql"),
     "\n",
     include_str!("../migrations/20260427000000_harvest_continue_as_new/up.sql"),
+    "\n",
+    include_str!("../migrations/20260429000000_harvest_concurrency_key/up.sql"),
 );
 
 /// The minimal "legacy" migration set used by the upgrade-path regression
@@ -1034,6 +1036,8 @@ async fn worker_completes_workflow_with_activity_round_trip() {
             default_heartbeat_timeout: None,
             default_schedule_to_start: None,
             default_queue: Some("default"),
+            max_concurrent: None,
+            concurrency_key: None,
             handler: send_email_activity,
         }],
     ));
@@ -1149,6 +1153,8 @@ async fn worker_fails_orphaned_activity_task_without_scheduled_event() {
                     default_heartbeat_timeout: None,
                     default_schedule_to_start: None,
                     default_queue: Some("default"),
+                    max_concurrent: None,
+                    concurrency_key: None,
                     handler: send_email_activity,
                 }],
             )),
@@ -1355,6 +1361,8 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
                     default_heartbeat_timeout: None,
                     default_schedule_to_start: None,
                     default_queue: Some("default"),
+                    max_concurrent: None,
+                    concurrency_key: None,
                     handler: slow_activity,
                 }],
             )),
@@ -1713,6 +1721,8 @@ async fn worker_builder_state_is_visible_to_workflow_and_activity() {
             default_heartbeat_timeout: None,
             default_schedule_to_start: None,
             default_queue: Some("default"),
+            max_concurrent: None,
+            concurrency_key: None,
             handler: stateful_activity,
         }])
         .state(String::from("haunted"))
@@ -2289,6 +2299,8 @@ async fn worker_handles_early_ingested_signal_before_activity() {
             default_heartbeat_timeout: None,
             default_schedule_to_start: None,
             default_queue: Some("default"),
+            max_concurrent: None,
+            concurrency_key: None,
             handler: send_email_activity,
         }],
     ));
@@ -3320,4 +3332,261 @@ async fn reuse_policy_terminate_if_running_retry_after_partial_failure_is_idempo
     assert!(second.created, "retry must mint a fresh execution");
     assert_eq!(second.exec_id, second_id);
     assert_ne!(second.exec_id, first.exec_id);
+}
+
+// ---------------------------------------------------------------------------
+// Concurrency-cap integration tests (issue #88)
+// ---------------------------------------------------------------------------
+
+/// (a) Baseline: a `max_concurrent = 2` cap is enforced cluster-wide.
+///
+/// Six activity tasks are enqueued with the same concurrency key and cap.
+/// Only 2 should be claimable at once. After completing one in-flight task, a
+/// third slot opens and one more can be claimed.
+#[tokio::test]
+async fn concurrency_cap_limits_concurrent_claims_cluster_wide() {
+    let (mut conn, _container) = setup_test_db().await;
+    let queues = vec!["default".to_string()];
+
+    for i in 0..6_u32 {
+        let mut params = EnqueueParams::new(
+            "default",
+            TaskType::Activity,
+            serde_json::json!({ "i": i }),
+        );
+        params.activity_name = Some("capped_activity".into());
+        params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+        params.concurrency_key = Some("capped_activity".to_string());
+        params.max_concurrent = Some(2);
+        queue::enqueue(&mut conn, &params)
+            .await
+            .expect("enqueue failed");
+    }
+
+    let t1 = queue::claim_task(&mut conn, &queues, "worker-cc-1")
+        .await
+        .expect("claim 1 query failed");
+    let t2 = queue::claim_task(&mut conn, &queues, "worker-cc-1")
+        .await
+        .expect("claim 2 query failed");
+    assert!(t1.is_some(), "first claim should succeed");
+    assert!(t2.is_some(), "second claim should succeed");
+
+    // Cap is now saturated — third claim must be deferred.
+    let t3 = queue::claim_task(&mut conn, &queues, "worker-cc-1")
+        .await
+        .expect("claim 3 query failed");
+    assert!(
+        t3.is_none(),
+        "third claim must be deferred while cap is saturated"
+    );
+
+    // Complete one in-flight task to free a slot.
+    queue::complete_task(
+        &mut conn,
+        t1.unwrap().id,
+        serde_json::json!(null),
+    )
+    .await
+    .expect("complete_task failed");
+
+    // Now a slot is free; one more task should be claimable.
+    let t4 = queue::claim_task(&mut conn, &queues, "worker-cc-1")
+        .await
+        .expect("claim after complete query failed");
+    assert!(
+        t4.is_some(),
+        "claim should succeed after one in-flight task completes"
+    );
+}
+
+/// (b) Shared-key: two distinct activities sharing `concurrency_key = "stripe"`
+/// and `max_concurrent = 3` consume from a single shared budget — not two
+/// independent budgets of 3 each.
+#[tokio::test]
+async fn concurrency_cap_shared_key_budget_is_not_doubled() {
+    let (mut conn, _container) = setup_test_db().await;
+    let queues = vec!["default".to_string()];
+
+    // 3 tasks for activity A
+    for i in 0..3_u32 {
+        let mut params = EnqueueParams::new(
+            "default",
+            TaskType::Activity,
+            serde_json::json!({ "act": "charge", "i": i }),
+        );
+        params.activity_name = Some("charge_stripe".into());
+        params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+        params.concurrency_key = Some("stripe".to_string());
+        params.max_concurrent = Some(3);
+        queue::enqueue(&mut conn, &params)
+            .await
+            .expect("enqueue charge_stripe failed");
+    }
+
+    // 3 tasks for activity B, same key and cap
+    for i in 0..3_u32 {
+        let mut params = EnqueueParams::new(
+            "default",
+            TaskType::Activity,
+            serde_json::json!({ "act": "refund", "i": i }),
+        );
+        params.activity_name = Some("refund_stripe".into());
+        params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+        params.concurrency_key = Some("stripe".to_string());
+        params.max_concurrent = Some(3);
+        queue::enqueue(&mut conn, &params)
+            .await
+            .expect("enqueue refund_stripe failed");
+    }
+
+    // Attempt to claim all 6; the shared budget of 3 should cap the total.
+    let mut claimed = 0usize;
+    for _ in 0..6 {
+        if queue::claim_task(&mut conn, &queues, "worker-sk-1")
+            .await
+            .expect("claim query failed")
+            .is_some()
+        {
+            claimed += 1;
+        }
+    }
+    assert_eq!(
+        claimed, 3,
+        "shared 'stripe' budget of 3 must cap the combined in-flight count to 3, not 6"
+    );
+}
+
+/// (c) Failure path: in-flight tasks that fail transition out of RUNNING,
+/// freeing their slots so that pending peers can be claimed. The queue must
+/// not wedge when the saturating tasks all fail.
+#[tokio::test]
+async fn concurrency_cap_failure_frees_slot_and_does_not_wedge_queue() {
+    let (mut conn, _container) = setup_test_db().await;
+    let queues = vec!["default".to_string()];
+
+    for i in 0..4_u32 {
+        let mut params = EnqueueParams::new(
+            "default",
+            TaskType::Activity,
+            serde_json::json!({ "i": i }),
+        );
+        params.activity_name = Some("fragile_activity".into());
+        params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+        params.concurrency_key = Some("fragile".to_string());
+        params.max_concurrent = Some(2);
+        queue::enqueue(&mut conn, &params)
+            .await
+            .expect("enqueue failed");
+    }
+
+    // Claim 2 (saturating the cap).
+    let t1 = queue::claim_task(&mut conn, &queues, "worker-fp-1")
+        .await
+        .expect("claim 1 query failed")
+        .expect("first task should be claimable");
+    let t2 = queue::claim_task(&mut conn, &queues, "worker-fp-1")
+        .await
+        .expect("claim 2 query failed")
+        .expect("second task should be claimable");
+
+    // Cap is now saturated.
+    let t3 = queue::claim_task(&mut conn, &queues, "worker-fp-1")
+        .await
+        .expect("claim 3 query failed");
+    assert!(t3.is_none(), "cap must be saturated after 2 claims");
+
+    // Fail both in-flight tasks — this transitions them out of RUNNING.
+    queue::fail_task(&mut conn, t1.id, "intentional test failure")
+        .await
+        .expect("fail t1 failed");
+    queue::fail_task(&mut conn, t2.id, "intentional test failure")
+        .await
+        .expect("fail t2 failed");
+
+    // The queue must not be wedged; the remaining pending tasks must be claimable.
+    let t4 = queue::claim_task(&mut conn, &queues, "worker-fp-1")
+        .await
+        .expect("claim after fail query failed");
+    let t5 = queue::claim_task(&mut conn, &queues, "worker-fp-1")
+        .await
+        .expect("claim 5 query failed");
+    assert!(
+        t4.is_some(),
+        "pending task must be claimable after in-flight tasks fail"
+    );
+    assert!(
+        t5.is_some(),
+        "second pending task must also be claimable after in-flight tasks fail"
+    );
+}
+
+/// (d) Backward compatibility: activities without a `concurrency_key` (NULL in
+/// the queue row) are completely unaffected by a saturated key — they can be
+/// claimed freely even when another key is at its cap.
+#[tokio::test]
+async fn concurrency_cap_null_key_tasks_are_unaffected_by_saturated_key() {
+    let (mut conn, _container) = setup_test_db().await;
+    let queues = vec!["default".to_string()];
+
+    // Saturate a key with 2 RUNNING tasks (cap = 2).
+    for i in 0..2_u32 {
+        let mut params = EnqueueParams::new(
+            "default",
+            TaskType::Activity,
+            serde_json::json!({ "i": i }),
+        );
+        params.activity_name = Some("capped_activity".into());
+        params.scheduled_at = Utc::now() - chrono::Duration::seconds(2);
+        params.concurrency_key = Some("saturated_key".to_string());
+        params.max_concurrent = Some(2);
+        queue::enqueue(&mut conn, &params)
+            .await
+            .expect("enqueue capped task failed");
+        // Immediately claim each to put it in RUNNING state.
+        queue::claim_task(&mut conn, &queues, "worker-bc-1")
+            .await
+            .expect("claim capped task failed");
+    }
+
+    // Verify the key is saturated (third claim returns None).
+    let saturated_check = queue::claim_task(&mut conn, &queues, "worker-bc-1")
+        .await
+        .expect("saturation check query failed");
+    assert!(
+        saturated_check.is_none(),
+        "key must be saturated before backward-compat check"
+    );
+
+    // Enqueue 3 tasks with NO concurrency key (null — the pre-#88 baseline).
+    for i in 0..3_u32 {
+        let mut params = EnqueueParams::new(
+            "default",
+            TaskType::Activity,
+            serde_json::json!({ "i": i }),
+        );
+        params.activity_name = Some("uncapped_activity".into());
+        params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+        // concurrency_key left as None (default) — backward-compat path.
+        queue::enqueue(&mut conn, &params)
+            .await
+            .expect("enqueue uncapped task failed");
+    }
+
+    // All 3 uncapped tasks must be claimable even though the saturated key
+    // is at its cap — the NULL check-path must not be constrained by other keys.
+    let mut claimed = 0usize;
+    for _ in 0..3 {
+        if queue::claim_task(&mut conn, &queues, "worker-bc-1")
+            .await
+            .expect("uncapped claim query failed")
+            .is_some()
+        {
+            claimed += 1;
+        }
+    }
+    assert_eq!(
+        claimed, 3,
+        "uncapped tasks must not be blocked by a saturated concurrency key"
+    );
 }
