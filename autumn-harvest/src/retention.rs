@@ -403,7 +403,8 @@ async fn run_shard_tick(
                 let age = Utc::now()
                     .signed_duration_since(completed_at)
                     .num_seconds()
-                    .max(0) as u64;
+                    .max(0)
+                    .cast_unsigned();
                 outcome.oldest_age_secs_skipped = Some(
                     outcome
                         .oldest_age_secs_skipped
