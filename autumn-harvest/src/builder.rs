@@ -107,6 +107,21 @@ pub enum HarvestBuilderError {
         /// Each `(activity_name, max_concurrent)` pair with a conflicting value.
         activities: Vec<(String, u32)>,
     },
+
+    /// An activity declares a `concurrency_key` but no `max_concurrent` cap.
+    /// Without a cap the key is written to the queue row but the saturation
+    /// predicate (`HAVING COUNT(*) >= NULL`) never fires, silently bypassing
+    /// the intended shared budget.
+    #[error(
+        "activity '{activity}' sets concurrency_key = \"{key}\" but has no max_concurrent; \
+         either add max_concurrent or remove the concurrency_key"
+    )]
+    ConcurrencyKeyWithoutCap {
+        /// The activity name.
+        activity: String,
+        /// The orphaned concurrency key.
+        key: String,
+    },
 }
 
 impl BuiltHarvest {
@@ -347,6 +362,14 @@ fn validate_concurrency_keys(
     let mut seen: HashMap<&str, ConcurrencyKeyEntry> = HashMap::new();
 
     for activity in activities {
+        // concurrency_key without max_concurrent silently bypasses the cap — reject it.
+        if let (Some(key), None) = (activity.concurrency_key, activity.max_concurrent) {
+            return Err(HarvestBuilderError::ConcurrencyKeyWithoutCap {
+                activity: activity.name.to_string(),
+                key: key.to_string(),
+            });
+        }
+
         let (Some(key), Some(cap)) = (activity.concurrency_key, activity.max_concurrent) else {
             continue;
         };
@@ -677,5 +700,22 @@ mod tests {
             ])
             .try_build();
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn builder_rejects_concurrency_key_without_cap() {
+        // concurrency_key set but max_concurrent omitted — the cap predicate
+        // would silently never fire (HAVING COUNT(*) >= NULL is always unknown).
+        let result = HarvestBuilder::new()
+            .activities(vec![make_activity("act_a", None, Some("stripe"))])
+            .try_build();
+        let err = result.unwrap_err();
+        assert!(matches!(
+            err,
+            HarvestBuilderError::ConcurrencyKeyWithoutCap { ref activity, ref key }
+                if activity == "act_a" && key == "stripe"
+        ));
+        assert!(err.to_string().contains("act_a"));
+        assert!(err.to_string().contains("stripe"));
     }
 }

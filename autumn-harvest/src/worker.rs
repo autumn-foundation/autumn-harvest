@@ -2463,6 +2463,8 @@ mod tests {
             default_heartbeat_timeout: None,
             default_schedule_to_start: None,
             default_queue: None,
+            max_concurrent: None,
+            concurrency_key: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
         };
 

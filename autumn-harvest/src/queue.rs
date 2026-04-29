@@ -253,17 +253,22 @@ pub async fn claim_task(
     queues: &[String],
     worker_id: &str,
 ) -> HarvestResult<Option<TaskQueueItem>> {
-    // The concurrency-cap predicate is a correlated subquery that checks how
+    // The concurrency-cap predicate is a correlated subquery that counts how
     // many tasks with the same concurrency_key are currently RUNNING. When
-    // the count >= concurrency_cap the row is skipped (NOT EXISTS returns
-    // false), deferring it for the next poll cycle.
+    // the count >= concurrency_cap the row is skipped (NOT EXISTS is false),
+    // deferring it to the next poll cycle.
     //
-    // Tasks with NULL concurrency_key take the short-circuit branch
-    // (concurrency_key IS NULL) and incur zero subquery overhead — backward
-    // compatibility is preserved byte-for-byte on the hot path.
+    // Race-condition protection: pg_try_advisory_xact_lock serializes claim
+    // attempts for a given key across concurrent workers. Without it, two
+    // workers that both observe N < cap in the same window could each claim a
+    // task and momentarily exceed the cap. The advisory lock is transaction-
+    // scoped (auto-released on commit/rollback), so the serialization window
+    // is only as wide as the claim transaction itself — typically sub-ms.
+    // Different keys use independent lock slots; uncapped (NULL-key) tasks are
+    // completely unaffected (short-circuit branch).
     //
     // The partial index harvest_task_queue_concurrency_key_running makes the
-    // inner SELECT fast: it only scans RUNNING rows that have a non-NULL key.
+    // inner SELECT fast: it only scans RUNNING rows with a non-NULL key.
     let result: Vec<TaskQueueItem> = diesel::sql_query(
         "UPDATE harvest_task_queue \
          SET state = 'RUNNING', worker_id = $1, started_at = NOW(), attempt = attempt + 1 \
@@ -280,11 +285,14 @@ pub async fn claim_task(
                ) \
                AND ( \
                    concurrency_key IS NULL \
-                   OR NOT EXISTS ( \
-                       SELECT 1 FROM harvest_task_queue inner_q \
-                       WHERE inner_q.concurrency_key = harvest_task_queue.concurrency_key \
-                         AND inner_q.state = 'RUNNING' \
-                       HAVING COUNT(*) >= harvest_task_queue.concurrency_cap \
+                   OR ( \
+                       pg_try_advisory_xact_lock(hashtext(concurrency_key)::bigint) \
+                       AND NOT EXISTS ( \
+                           SELECT 1 FROM harvest_task_queue inner_q \
+                           WHERE inner_q.concurrency_key = harvest_task_queue.concurrency_key \
+                             AND inner_q.state = 'RUNNING' \
+                           HAVING COUNT(*) >= harvest_task_queue.concurrency_cap \
+                       ) \
                    ) \
                ) \
              ORDER BY \
