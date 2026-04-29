@@ -110,7 +110,7 @@ pub async fn notify_tasks_enqueued(
     let payload = serde_json::to_string(&NotifyPayload { task_id })
         .map_err(|e| HarvestError::Database(format!("failed to serialize notify payload: {e}")))?;
 
-    diesel::sql_query("SELECT pg_notify(unnest($1), $2)")
+    diesel::sql_query("SELECT pg_notify(channel, $2) FROM unnest($1) AS channel")
         .bind::<diesel::sql_types::Array<Text>, _>(channels)
         .bind::<Text, _>(&payload)
         .execute(conn)
