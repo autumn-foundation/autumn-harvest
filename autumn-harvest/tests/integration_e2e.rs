@@ -2925,7 +2925,10 @@ async fn reuse_policy_allow_duplicate_running_returns_existing() {
         .await
         .expect("AllowDuplicate on RUNNING should return existing");
     assert!(!second.created);
-    assert_eq!(second.exec_id, first.exec_id, "must return the first exec_id");
+    assert_eq!(
+        second.exec_id, first.exec_id,
+        "must return the first exec_id"
+    );
     assert_eq!(second.state, "RUNNING");
 }
 
