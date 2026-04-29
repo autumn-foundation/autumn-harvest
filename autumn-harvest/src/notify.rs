@@ -92,6 +92,34 @@ pub async fn notify_task_enqueued(
     Ok(())
 }
 
+/// Send a `NOTIFY` on the appropriate channels for multiple queues in a single roundtrip.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] if the `NOTIFY` SQL fails.
+pub async fn notify_tasks_enqueued(
+    conn: &mut AsyncPgConnection,
+    queue_names: &[String],
+    task_id: Uuid,
+) -> HarvestResult<()> {
+    if queue_names.is_empty() {
+        return Ok(());
+    }
+
+    let channels: Vec<String> = queue_names.iter().map(|q| queue_channel(q)).collect();
+    let payload = serde_json::to_string(&NotifyPayload { task_id })
+        .map_err(|e| HarvestError::Database(format!("failed to serialize notify payload: {e}")))?;
+
+    diesel::sql_query("SELECT pg_notify(channel, $2) FROM unnest($1) AS channel")
+        .bind::<diesel::sql_types::Array<Text>, _>(channels)
+        .bind::<Text, _>(&payload)
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // QueueListener (using tokio-postgres)
 // ---------------------------------------------------------------------------

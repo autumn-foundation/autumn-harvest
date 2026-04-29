@@ -704,9 +704,7 @@ pub async fn wake_workflow_task(
     queue_names.sort();
     queue_names.dedup();
 
-    for queue_name in queue_names {
-        crate::notify::notify_task_enqueued(conn, &queue_name, Uuid::nil()).await?;
-    }
+    crate::notify::notify_tasks_enqueued(conn, &queue_names, Uuid::nil()).await?;
 
     Ok(())
 }
