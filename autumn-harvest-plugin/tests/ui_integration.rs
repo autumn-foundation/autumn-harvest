@@ -188,6 +188,7 @@ async fn insert_workflow_on_url(
             execution_timeout: None,
             memo: None,
             search_attrs: None,
+            reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
         },
     )
     .await

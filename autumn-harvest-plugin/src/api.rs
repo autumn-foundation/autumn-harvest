@@ -32,7 +32,7 @@ use autumn_harvest::schema::{harvest_dag_runs, harvest_schedules, harvest_workfl
 use autumn_harvest::shard::ShardRouter;
 use autumn_harvest::signal;
 use autumn_harvest::store;
-use autumn_harvest::types::{ExecutionId, ShardId};
+use autumn_harvest::types::{ExecutionId, ShardId, WorkflowIdReusePolicy};
 use autumn_harvest::worker::{DbPool, HandlerRegistry};
 use autumn_harvest::{
     StartWorkflowParams, cancel_workflow_execution, start_or_load_workflow_execution,
@@ -244,6 +244,17 @@ struct StartWorkflowRequest {
     memo: Option<Value>,
     search_attrs: Option<Value>,
     execution_timeout_secs: Option<i64>,
+    /// How to handle a duplicate `(workflow_name, workflow_id)` collision.
+    /// Omitted or `null` → `AllowDuplicate` (preserves existing wire behaviour).
+    /// An unknown string value returns `400 Bad Request`.
+    reuse_policy: Option<WorkflowIdReusePolicy>,
+}
+
+/// Response body for a 409 Conflict returned by `RejectDuplicate` policy.
+#[derive(Debug, Serialize)]
+struct AlreadyExistsResponse {
+    existing_execution_id: String,
+    existing_state: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -421,14 +432,20 @@ async fn start_workflow(
     Extension(api_state): Extension<HarvestApiState>,
     Path(workflow_name): Path<String>,
     Json(request): Json<StartWorkflowRequest>,
-) -> Result<(axum::http::StatusCode, Json<StartWorkflowResponse>), AutumnError> {
-    let runtime = api_state.runtime().map_err(map_error)?;
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+
+    let runtime = match api_state.runtime() {
+        Ok(r) => r,
+        Err(e) => return map_error(e).into_response(),
+    };
     if !runtime.registry.workflows.contains_key(&workflow_name) {
-        return Err(AutumnError::not_found_msg(format!(
-            "workflow '{workflow_name}'"
-        )));
+        return AutumnError::not_found_msg(format!("workflow '{workflow_name}'")).into_response();
     }
 
+    let reuse_policy = request
+        .reuse_policy
+        .unwrap_or(WorkflowIdReusePolicy::AllowDuplicate);
     let workflow_id = request
         .workflow_id
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
@@ -442,9 +459,12 @@ async fn start_workflow(
         .router
         .pick_for_new_workflow(&workflow_name, &workflow_id);
     let exec_id = ExecutionId::new_for_shard(shard);
-    let mut conn = db_conn_for_shard(&api_state, shard).await?;
+    let mut conn = match db_conn_for_shard(&api_state, shard).await {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
 
-    let start = start_or_load_workflow_execution(
+    let result = start_or_load_workflow_execution(
         &mut conn,
         StartWorkflowParams {
             workflow_name: &workflow_name,
@@ -458,24 +478,39 @@ async fn start_workflow(
                 .map(chrono::Duration::seconds),
             memo: request.memo.clone(),
             search_attrs: request.search_attrs.clone(),
+            reuse_policy,
         },
     )
-    .await
-    .map_err(map_error)?;
+    .await;
 
-    Ok((
-        if start.created {
-            axum::http::StatusCode::CREATED
-        } else {
-            axum::http::StatusCode::OK
-        },
-        Json(StartWorkflowResponse {
-            execution_id: start.exec_id.to_string(),
-            workflow_name: start.workflow_name,
-            workflow_id: start.workflow_id,
-            state: start.state,
-        }),
-    ))
+    match result {
+        Err(HarvestError::AlreadyExists {
+            existing_exec_id,
+            existing_state,
+        }) => (
+            axum::http::StatusCode::CONFLICT,
+            Json(AlreadyExistsResponse {
+                existing_execution_id: existing_exec_id.to_string(),
+                existing_state,
+            }),
+        )
+            .into_response(),
+        Err(e) => map_error(e).into_response(),
+        Ok(start) => (
+            if start.created {
+                axum::http::StatusCode::CREATED
+            } else {
+                axum::http::StatusCode::OK
+            },
+            Json(StartWorkflowResponse {
+                execution_id: start.exec_id.to_string(),
+                workflow_name: start.workflow_name,
+                workflow_id: start.workflow_id,
+                state: start.state,
+            }),
+        )
+            .into_response(),
+    }
 }
 
 async fn cancel_workflow(
@@ -934,6 +969,12 @@ pub(crate) fn map_error(error: HarvestError) -> AutumnError {
             name: _,
             reason: message,
         } => AutumnError::bad_request_msg(message),
+        HarvestError::AlreadyExists {
+            existing_exec_id,
+            existing_state,
+        } => AutumnError::bad_request_msg(format!(
+            "workflow execution already exists: {existing_exec_id} (state: {existing_state})"
+        )),
         HarvestError::Database(message) => AutumnError::service_unavailable_msg(message),
         other => AutumnError::service_unavailable_msg(other.to_string()),
     }

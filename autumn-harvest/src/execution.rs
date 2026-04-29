@@ -20,7 +20,7 @@ use crate::models::{NewWorkflowExecution, WorkflowExecution};
 use crate::queue::{self, EnqueueParams, TaskType};
 use crate::schema::harvest_workflow_executions;
 use crate::store;
-use crate::types::ExecutionId;
+use crate::types::{ExecutionId, WorkflowIdReusePolicy};
 
 /// Parameters for starting a workflow execution.
 ///
@@ -42,6 +42,9 @@ pub struct StartWorkflowParams<'a> {
     pub execution_timeout: Option<chrono::Duration>,
     pub memo: Option<serde_json::Value>,
     pub search_attrs: Option<serde_json::Value>,
+    /// How to handle a duplicate `(workflow_name, workflow_id)` collision.
+    /// Defaults to [`WorkflowIdReusePolicy::AllowDuplicate`].
+    pub reuse_policy: WorkflowIdReusePolicy,
 }
 
 impl StartWorkflowParams<'_> {
@@ -120,23 +123,52 @@ impl CancelledWorkflowExecution {
     }
 }
 
-/// Start a workflow execution or load the existing one if the same
-/// `(workflow_name, workflow_id)` has already been published.
+/// Start a workflow execution or load the existing one, applying the caller's
+/// [`WorkflowIdReusePolicy`] when a duplicate `(workflow_name, workflow_id)`
+/// collision occurs.
 ///
-/// New starts insert the execution row, append `WorkflowStarted`, and enqueue
-/// the initial workflow task in one transaction. Duplicate starts return the
-/// previously-created execution without appending extra events or queue work.
+/// ## Policy behaviour
+///
+/// | Prior state | `AllowDuplicate` | `RejectDuplicate` | `AllowDuplicateFailedOnly` | `TerminateIfRunning` |
+/// |-------------|------------------|-------------------|---------------------------|----------------------|
+/// | none | create | create | create | create |
+/// | RUNNING | return existing | `Err(AlreadyExists)` | return existing | cancel + start fresh |
+/// | COMPLETED | return existing | `Err(AlreadyExists)` | return existing | start fresh |
+/// | FAILED | return existing | `Err(AlreadyExists)` | start fresh | start fresh |
+/// | CANCELLED | return existing | `Err(AlreadyExists)` | start fresh | start fresh |
+///
+/// For `TerminateIfRunning` + RUNNING the cancel is performed in a separate
+/// transaction (Transaction 1) before the start transaction (Transaction 2). A
+/// failure between the two leaves the prior workflow CANCELLED with no new run
+/// started; the caller can retry with the same policy to get a fresh run.
 ///
 /// # Errors
 ///
-/// Returns [`HarvestError::Database`] for insert/query failures and propagates
-/// queue/event-store failures from the new-start transaction.
+/// - [`HarvestError::AlreadyExists`] when `RejectDuplicate` rejects.
+/// - [`HarvestError::Database`] for insert/query failures.
+/// - Propagates queue/event-store failures from the start transaction.
 pub async fn start_or_load_workflow_execution(
     conn: &mut AsyncPgConnection,
     request: StartWorkflowParams<'_>,
 ) -> HarvestResult<StartedWorkflowExecution> {
     let exec_id = request.exec_id;
     let shard_id_value = request.shard_id();
+
+    // For TerminateIfRunning: if there is an existing RUNNING execution, cancel
+    // it (Transaction 1) before the start transaction below (Transaction 2). A
+    // crash between the two leaves the prior workflow CANCELLED with no new run;
+    // retrying with the same policy starts fresh on the next attempt because the
+    // CANCELLED row is treated as "start fresh" by TerminateIfRunning.
+    if request.reuse_policy == WorkflowIdReusePolicy::TerminateIfRunning
+        && let Some(existing) =
+            try_load_by_key(conn, request.workflow_name, request.workflow_id).await?
+        && existing.state == "RUNNING"
+    {
+        let existing_exec_id = ExecutionId::from_uuid(existing.id);
+        cancel_workflow_execution(conn, existing_exec_id, "terminated to start new execution")
+            .await?;
+    }
+
     let row = NewWorkflowExecution {
         id: exec_id.as_uuid(),
         workflow_name: request.workflow_name,
@@ -187,14 +219,135 @@ pub async fn start_or_load_workflow_execution(
                 return Ok(StartedWorkflowExecution::from_row(execution, true));
             }
 
-            let execution =
-                load_workflow_execution_by_key(conn, request.workflow_name, request.workflow_id)
-                    .await?;
-            Ok(StartedWorkflowExecution::from_row(execution, false))
+            // INSERT was a no-op: a prior execution exists. Lock the row to
+            // prevent concurrent state changes while we decide what to do.
+            let existing = load_workflow_execution_by_key_for_update(
+                conn,
+                request.workflow_name,
+                request.workflow_id,
+            )
+            .await?;
+
+            match request.reuse_policy {
+                WorkflowIdReusePolicy::AllowDuplicate => {
+                    Ok(StartedWorkflowExecution::from_row(existing, false))
+                }
+
+                WorkflowIdReusePolicy::RejectDuplicate => {
+                    Err(HarvestError::AlreadyExists {
+                        existing_exec_id: ExecutionId::from_uuid(existing.id),
+                        existing_state: existing.state,
+                    })
+                }
+
+                WorkflowIdReusePolicy::AllowDuplicateFailedOnly => {
+                    match existing.state.as_str() {
+                        "RUNNING" | "COMPLETED" => {
+                            Ok(StartedWorkflowExecution::from_row(existing, false))
+                        }
+                        _ => {
+                            // FAILED or CANCELLED: replace with a fresh execution.
+                            replace_execution(conn, existing, &row, &enqueue, exec_id, &request)
+                                .await
+                        }
+                    }
+                }
+
+                WorkflowIdReusePolicy::TerminateIfRunning => {
+                    // The pre-check above cancelled any RUNNING prior execution
+                    // (Transaction 1). By the time we reach this point the prior
+                    // execution's state is CANCELLED, FAILED, COMPLETED, or —
+                    // under extreme concurrency — still RUNNING. All cases start
+                    // fresh; for the still-RUNNING race we inline the cancel here
+                    // so the new start is not silently blocked.
+                    if existing.state == "RUNNING" {
+                        inline_cancel(conn, ExecutionId::from_uuid(existing.id)).await?;
+                    }
+                    replace_execution(conn, existing, &row, &enqueue, exec_id, &request).await
+                }
+            }
         }
         .scope_boxed()
     })
     .await
+}
+
+/// Transition `existing` to `CONTINUED_AS_NEW` (releasing the partial unique
+/// index slot) then insert `new_row` as a fresh execution with its own
+/// `WorkflowStarted` event and task queue entry.
+async fn replace_execution(
+    conn: &mut AsyncPgConnection,
+    existing: WorkflowExecution,
+    new_row: &NewWorkflowExecution<'_>,
+    enqueue: &EnqueueParams,
+    new_exec_id: ExecutionId,
+    request: &StartWorkflowParams<'_>,
+) -> HarvestResult<StartedWorkflowExecution> {
+    // Seal the prior execution row as CONTINUED_AS_NEW. This removes it from
+    // the partial unique index scope (WHERE state != 'CONTINUED_AS_NEW'),
+    // allowing the new row to be inserted without violating the constraint.
+    diesel::update(harvest_workflow_executions::table.find(existing.id))
+        .set((
+            harvest_workflow_executions::state.eq("CONTINUED_AS_NEW"),
+            harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+        ))
+        .execute(conn)
+        .await
+        .map_err(database_error)?;
+
+    let new_execution = diesel::insert_into(harvest_workflow_executions::table)
+        .values(new_row)
+        .returning(WorkflowExecution::as_returning())
+        .get_result(conn)
+        .await
+        .map_err(database_error)?;
+
+    let started_event = WorkflowEvent::WorkflowStarted {
+        input: request.input.clone(),
+        timestamp: Utc::now(),
+    };
+    store::append_events(conn, new_exec_id, &[started_event], 0).await?;
+    queue::enqueue(conn, enqueue).await?;
+
+    Ok(StartedWorkflowExecution::from_row(new_execution, true))
+}
+
+/// Inline cancellation for the `TerminateIfRunning` race condition where a
+/// RUNNING row appears inside the start transaction despite the pre-check.
+/// Appends a `WorkflowCancelled` event, transitions to CANCELLED, and fails
+/// open tasks — all within the caller's transaction.
+async fn inline_cancel(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> HarvestResult<()> {
+    let reason = "terminated to start new execution";
+    let history = store::load_history(conn, exec_id).await?;
+    store::append_events(
+        conn,
+        exec_id,
+        &[WorkflowEvent::WorkflowCancelled {
+            reason: reason.to_string(),
+        }],
+        history.next_event_id,
+    )
+    .await?;
+    diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
+        .filter(harvest_workflow_executions::state.eq("RUNNING"))
+        .set((
+            harvest_workflow_executions::state.eq("CANCELLED"),
+            harvest_workflow_executions::error.eq(Some(reason)),
+            harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+        ))
+        .execute(conn)
+        .await
+        .map_err(database_error)?;
+    queue::fail_open_tasks_for_execution(
+        conn,
+        exec_id,
+        &format!("workflow cancelled: {reason}"),
+    )
+    .await?;
+    Ok(())
 }
 
 /// Cancel a running workflow execution.
@@ -294,21 +447,37 @@ pub async fn cancel_workflow_execution(
     .await
 }
 
-async fn load_workflow_execution_by_key(
+/// Non-locking lookup used for the `TerminateIfRunning` pre-check outside any
+/// transaction. Returns `None` if no active execution exists.
+async fn try_load_by_key(
     conn: &mut AsyncPgConnection,
     workflow_name: &str,
     workflow_id: &str,
-) -> HarvestResult<WorkflowExecution> {
-    // After continue-as-new, several rows may share the same
-    // (workflow_name, workflow_id): every sealed run carries
-    // state='CONTINUED_AS_NEW' and only one row remains active. Filtering on
-    // state mirrors the partial unique index and returns the row that callers
-    // expect to keep operating against.
+) -> HarvestResult<Option<WorkflowExecution>> {
     harvest_workflow_executions::table
         .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
         .filter(harvest_workflow_executions::workflow_id.eq(workflow_id))
         .filter(harvest_workflow_executions::state.ne("CONTINUED_AS_NEW"))
         .select(WorkflowExecution::as_select())
+        .first(conn)
+        .await
+        .optional()
+        .map_err(database_error)
+}
+
+/// Locking lookup used inside the start transaction when a policy decision may
+/// modify or replace the existing row.
+async fn load_workflow_execution_by_key_for_update(
+    conn: &mut AsyncPgConnection,
+    workflow_name: &str,
+    workflow_id: &str,
+) -> HarvestResult<WorkflowExecution> {
+    harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
+        .filter(harvest_workflow_executions::workflow_id.eq(workflow_id))
+        .filter(harvest_workflow_executions::state.ne("CONTINUED_AS_NEW"))
+        .select(WorkflowExecution::as_select())
+        .for_update()
         .first(conn)
         .await
         .optional()

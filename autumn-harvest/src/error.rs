@@ -8,6 +8,8 @@
 //! — it's an HTTP response wrapper. `HarvestError` converts to `AutumnError` via
 //! the blanket `From<E: Error> for AutumnError` impl automatically.
 
+use crate::types::ExecutionId;
+
 /// The kind of timeout that fired.
 ///
 /// ## Examples
@@ -126,6 +128,21 @@ pub enum HarvestError {
     /// Invalid configuration provided to the engine.
     #[error("invalid configuration: {0}")]
     Config(String),
+
+    /// A workflow execution with the same `(workflow_name, workflow_id)` already
+    /// exists and the caller's reuse policy does not permit reuse.
+    ///
+    /// Returned by `start_or_load_workflow_execution` when the policy is
+    /// `WorkflowIdReusePolicy::RejectDuplicate`.
+    #[error(
+        "workflow execution already exists: {existing_exec_id} (state: {existing_state})"
+    )]
+    AlreadyExists {
+        /// The execution ID of the conflicting prior run.
+        existing_exec_id: ExecutionId,
+        /// The state of the conflicting prior run (e.g. `"RUNNING"`, `"COMPLETED"`).
+        existing_state: String,
+    },
 }
 
 /// Standard result type for internal harvest engine operations.

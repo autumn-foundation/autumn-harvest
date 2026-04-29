@@ -133,6 +133,61 @@ a bearer token. Successful responses are printed as pretty JSON by default; use
 inline `--*-json` values or `--*-file PATH`; use `-` as the file path to read
 from stdin.
 
+### Controlling duplicate workflow starts
+
+By default, starting a workflow with a `(workflow_name, workflow_id)` pair that already exists returns the existing execution. This "allow duplicate" behaviour is correct for upstream services that retry a start whose response was lost. It is **not** correct when you need at-most-one, retry-after-failure, or terminate-and-replace semantics.
+
+Pass `reuse_policy` in the HTTP body (or `--reuse-policy` on the CLI) to override the default:
+
+| Value | Behaviour |
+|---|---|
+| `allow_duplicate` (default) | Return the existing execution unconditionally. |
+| `reject_duplicate` | Return **409 Conflict** with `existing_execution_id` and `existing_state` in the body. Use for at-most-one semantics. |
+| `allow_duplicate_failed_only` | Start fresh if the prior execution is FAILED or CANCELLED; return the existing execution if RUNNING or COMPLETED. Use for retry-after-failure. |
+| `terminate_if_running` | Cancel a RUNNING prior execution and start a fresh run; start fresh unconditionally for any terminal prior state. |
+
+An unknown `reuse_policy` value returns `400 Bad Request` with the offending value echoed in the error body; it does not silently fall back to the default.
+
+**Retry-after-failure**: pass `reuse_policy: "allow_duplicate_failed_only"` so an upstream retry against a failed run gets a fresh execution while a successful or in-progress run is not superseded. Pass `reuse_policy: "reject_duplicate"` for strict at-most-one semantics.
+
+```bash
+# Retry-after-failure: start fresh only if the prior run failed or was cancelled
+cargo run -p autumn-harvest-cli -- workflow start billing_workflow \
+    --workflow-id "order-42" \
+    --reuse-policy allow_duplicate_failed_only \
+    --input-json '{"order_id": 42}'
+
+# At-most-one: reject a second start with 409 while the workflow is still running
+cargo run -p autumn-harvest-cli -- workflow start billing_workflow \
+    --workflow-id "order-42" \
+    --reuse-policy reject_duplicate
+
+# Terminate-and-replace: cancel a stuck run and immediately start fresh
+cargo run -p autumn-harvest-cli -- workflow start billing_workflow \
+    --workflow-id "order-42" \
+    --reuse-policy terminate_if_running
+```
+
+Via the HTTP API directly:
+
+```json
+POST /api/harvest/workflows/billing_workflow/start
+{
+  "workflow_id": "order-42",
+  "reuse_policy": "allow_duplicate_failed_only",
+  "input": {"order_id": 42}
+}
+```
+
+A 409 response body looks like:
+
+```json
+{
+  "existing_execution_id": "01234567-...",
+  "existing_state": "RUNNING"
+}
+```
+
 ### Filtering the workflow list
 
 `workflow list` (and `GET /workflows`) accept three additional filter knobs on
