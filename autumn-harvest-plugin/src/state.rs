@@ -13,6 +13,19 @@ use autumn_harvest::worker::DbPool;
 pub struct AppDbPool(DbPool);
 
 impl AppDbPool {
+    /// Clones the underlying database pool for use in a new task.
+    ///
+    /// Why does this exist? `AppDbPool` itself wraps the underlying pool so that it can be distinctly
+    /// typed from the `HarvestDbPool` in Axum state. When you need to actually execute a query, this method
+    /// unspools the raw inner pool so you can grab a connection.
+    ///
+    /// ## Examples
+    /// ```
+    /// # async fn get_conn(app_pool: &autumn_harvest_plugin::state::AppDbPool) {
+    /// let raw_pool = app_pool.clone_inner();
+    /// let conn = raw_pool.get().await.unwrap();
+    /// # }
+    /// ```
     #[must_use]
     pub fn clone_inner(&self) -> DbPool {
         self.0.clone()

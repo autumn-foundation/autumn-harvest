@@ -1,11 +1,14 @@
 //! Autumn plugin crate for autumn-harvest.
 
 pub mod api;
+/// Configuration types for the Harvest runtime plugin.
 pub mod config;
+/// Outbox relay for reliable workflow publication.
 pub mod outbox;
 pub mod plugin;
 pub mod prelude;
 pub mod runner;
+/// Shared state containers and connection pools for Harvest.
 pub mod state;
 pub mod ui;
 

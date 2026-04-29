@@ -3,36 +3,124 @@ use std::path::{Path, PathBuf};
 use autumn_web::config::{ConfigError, DatabaseConfig, Env, OsEnv};
 use serde::Deserialize;
 
+/// Specifies the topological mode Harvest should run in within the application.
+///
+/// Why does this exist? Harvest is designed to scale with your architecture. You might start with it
+/// embedded directly inside your web process. Later, you might extract the data tier, and eventually
+/// move Harvest entirely into a standalone worker fleet. This enum orchestrates that transition.
+///
+/// ## Examples
+/// ```
+/// use autumn_harvest_plugin::config::HarvestMode;
+///
+/// let mode = HarvestMode::Embedded;
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum HarvestMode {
+    /// Embedded mode where Harvest runs in the same process and database as the application.
     #[default]
     Embedded,
+    /// Split mode where Harvest runs in the same process but uses a separate database.
     Split,
+    /// External mode where Harvest assumes it is running in an external worker process.
     External,
 }
 
+/// Configuration for the database connection used specifically by Harvest components.
+///
+/// Why does this exist? By default, Harvest hitchhikes on your application's database pool. But in
+/// `Split` or `External` topologies, Harvest demands its own dedicated Postgres connection URL so it
+/// doesn't devour the connection bandwidth meant for your user-facing traffic.
+///
+/// ## Examples
+/// ```
+/// use autumn_harvest_plugin::config::HarvestDatabaseConfig;
+///
+/// let config = HarvestDatabaseConfig {
+///     url: Some("postgres://harvest:secret@localhost/db".to_string()),
+/// };
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct HarvestDatabaseConfig {
+    /// The database connection URL (e.g., `postgres://user:pass@localhost:5432/db`).
     pub url: Option<String>,
 }
 
+/// Configuration for the outbox relay that publishes workflow starts.
+///
+/// Why does this exist? We need a bulletproof way to ensure workflows are triggered exactly once when a
+/// user action occurs. The outbox pattern commits the workflow start intent into the application database
+/// transactionally. This config tunes how aggressively the background relay sweeps that outbox table and
+/// punts those intents into the Harvest engine.
+///
+/// ## Examples
+/// ```
+/// use autumn_harvest_plugin::config::HarvestOutboxConfig;
+///
+/// let outbox = HarvestOutboxConfig {
+///     enabled: true,
+///     batch_size: 100,
+///     poll_interval_ms: 500,
+///     claim_ttl_ms: 30000,
+///     base_retry_delay_ms: 1000,
+///     max_retry_delay_ms: 60000,
+/// };
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HarvestOutboxConfig {
+    /// Whether the outbox relay is enabled.
     pub enabled: bool,
+    /// The maximum number of outbox records to claim and process per batch.
     pub batch_size: i64,
+    /// The delay in milliseconds between polling the outbox for new records.
     pub poll_interval_ms: u64,
+    /// The time-to-live in milliseconds for a claimed outbox record before another worker can take it.
     pub claim_ttl_ms: u64,
+    /// The base delay in milliseconds to wait before retrying a failed outbox record.
     pub base_retry_delay_ms: u64,
+    /// The maximum delay in milliseconds to wait before retrying a failed outbox record.
     pub max_retry_delay_ms: u64,
 }
 
+/// The master blueprint for the Harvest runtime plugin.
+///
+/// Why does this exist? This struct gathers every dial and switch needed to boot the Harvest engine.
+/// It merges values from `autumn.toml`, environment variables, and defaults, delivering a single unified
+/// source of truth to the plugin system so the engine can ignite smoothly.
+///
+/// ## Examples
+/// ```
+/// use autumn_harvest_plugin::config::{HarvestRuntimeConfig, HarvestMode, HarvestDatabaseConfig, HarvestOutboxConfig};
+///
+/// let outbox = HarvestOutboxConfig {
+///     enabled: false,
+///     batch_size: 10,
+///     poll_interval_ms: 1000,
+///     claim_ttl_ms: 5000,
+///     base_retry_delay_ms: 100,
+///     max_retry_delay_ms: 1000,
+/// };
+///
+/// let config = HarvestRuntimeConfig {
+///     mode: HarvestMode::Embedded,
+///     worker_enabled: true,
+///     scheduler_enabled: true,
+///     database: HarvestDatabaseConfig::default(),
+///     outbox,
+/// };
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HarvestRuntimeConfig {
+    /// The operating mode for Harvest (e.g., Embedded, Split, External).
     pub mode: HarvestMode,
+    /// Whether to start the background worker to execute workflows and activities.
     pub worker_enabled: bool,
+    /// Whether to start the scheduler monitor to manage DAG runs.
     pub scheduler_enabled: bool,
+    /// Database settings specific to Harvest.
     pub database: HarvestDatabaseConfig,
+    /// Settings for the outbox relay.
     pub outbox: HarvestOutboxConfig,
 }
 

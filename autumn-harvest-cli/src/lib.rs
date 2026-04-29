@@ -344,6 +344,7 @@ impl ApiRequest {
     }
 }
 
+/// The TUI module for the interactive terminal dashboard.
 pub mod tui;
 
 /// Run the CLI, print successful response data to stdout, and return errors.

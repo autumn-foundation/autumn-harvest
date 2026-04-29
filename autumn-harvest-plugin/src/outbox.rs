@@ -1,3 +1,9 @@
+//! Outbox relay for reliable workflow publication from the application database.
+//!
+//! The outbox allows the application to atomically commit business state changes and
+//! workflow starts in a single database transaction. A background task then drains
+//! these records and forwards them to the Harvest storage tier.
+
 use std::time::Duration;
 
 use autumn_web::AppState;
@@ -21,32 +27,75 @@ use crate::config::HarvestOutboxConfig;
 use crate::state::HarvestDbPool;
 
 diesel::table! {
+    /// Schema mapping for the `harvest_workflow_outbox` table.
     harvest_workflow_outbox (id) {
+        /// Primary key
         id -> BigInt,
+        /// Name of the workflow to start
         workflow_name -> Text,
+        /// Unique business ID for the workflow execution
         workflow_id -> Text,
+        /// Target queue for the workflow
         queue_name -> Text,
+        /// Input arguments serialized as JSON
         input -> Jsonb,
+        /// Optional memo attached to the workflow
         memo -> Nullable<Jsonb>,
+        /// Optional search attributes for the workflow
         search_attrs -> Nullable<Jsonb>,
+        /// Number of times delivery has been attempted
         delivery_attempts -> BigInt,
+        /// Error message from the last failed delivery attempt
         last_error -> Nullable<Text>,
+        /// Harvest execution ID once successfully delivered
         delivered_execution_id -> Nullable<Text>,
+        /// Timestamp when the record was successfully delivered
         delivered_at -> Nullable<Timestamp>,
+        /// Next time this record is eligible for delivery attempt
         next_attempt_at -> Timestamp,
+        /// Time when the record was claimed for processing
         claimed_at -> Nullable<Timestamp>,
+        /// Identifier of the worker that claimed the record
         claimed_by -> Nullable<Text>,
+        /// Time when the outbox record was created
         created_at -> Timestamp,
     }
 }
 
+/// The sealed envelope for a workflow destined for the Harvest engine.
+///
+/// Why does this exist? When you ask to start a workflow through the outbox, that intent needs to be serialized
+/// into a Postgres JSONB column alongside your application's state changes. This struct defines the exact schema
+/// of that request, guaranteeing that when the background relay picks it up, it has everything it needs—like
+/// the workflow name, execution ID, and input payload—to correctly fire it off.
+///
+/// ## Examples
+/// ```
+/// use serde_json::json;
+/// use autumn_harvest_plugin::outbox::WorkflowStartRequest;
+///
+/// let request = WorkflowStartRequest {
+///     workflow_name: "onboarding".to_string(),
+///     workflow_id: "user_42".to_string(),
+///     queue_name: "default".to_string(),
+///     input: json!({"user_id": 42}),
+///     memo: None,
+///     search_attrs: Some(json!({"tenant": "acme"})),
+/// };
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkflowStartRequest {
+    /// Name of the workflow.
     pub workflow_name: String,
+    /// Business-provided ID for the workflow.
     pub workflow_id: String,
+    /// Queue the workflow should execute on.
     pub queue_name: String,
+    /// Workflow input arguments.
     pub input: Value,
+    /// Optional memo data.
     pub memo: Option<Value>,
+    /// Optional search attributes.
     pub search_attrs: Option<Value>,
 }
 

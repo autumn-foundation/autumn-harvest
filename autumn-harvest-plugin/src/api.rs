@@ -39,6 +39,30 @@ use autumn_harvest::{
 
 use crate::state::HarvestDbPool;
 
+/// The beating heart of the Harvest management API, frozen in time.
+///
+/// Why does this exist? When an operator asks the management API to trigger a DAG or signal a workflow,
+/// the HTTP layer needs access to the deeply nested workflow engines and catalogs. This struct acts as a
+/// read-only snapshot of that complex internal state, safely ferrying it across the async task boundaries to
+/// the Axum route handlers.
+///
+/// ## Examples
+/// ```
+/// use std::sync::Arc;
+/// use autumn_harvest::worker::HandlerRegistry;
+/// use autumn_harvest::scheduler::{DagCatalog, SchedulerMonitor};
+/// use autumn_harvest::shard::ShardRouter;
+/// use autumn_harvest_plugin::api::HarvestApiRuntime;
+///
+/// let runtime = HarvestApiRuntime::new(
+///     Arc::new(HandlerRegistry::default()),
+///     Arc::new(DagCatalog::default()),
+///     Some("worker-1".to_string()),
+///     vec!["default".to_string()],
+///     SchedulerMonitor::new(),
+///     ShardRouter::default()
+/// );
+/// ```
 #[derive(Clone)]
 pub struct HarvestApiRuntime {
     registry: Arc<HandlerRegistry>,
@@ -78,6 +102,23 @@ impl HarvestApiRuntime {
     }
 }
 
+/// The vessel carrying the Harvest API's consciousness across the HTTP layer.
+///
+/// Why does this exist? Axum requires state to be `Clone` and thread-safe. Since the Harvest runtime and
+/// database connection pools take time to spin up and might be initialized after the web server starts,
+/// this state object wraps them in `Arc<Mutex<Option<T>>>`. This allows the application to wire up the routes
+/// early, and dynamically inject the pulsing runtime engine later once it's ready.
+///
+/// ## Examples
+/// ```
+/// use autumn_harvest_plugin::api::HarvestApiState;
+///
+/// // Create a hollow vessel ready for the Axum router.
+/// let api_state = HarvestApiState::new();
+///
+/// // Later in the application lifecycle, install the runtime...
+/// // api_state.install(runtime);
+/// ```
 #[derive(Clone, Default)]
 pub struct HarvestApiState {
     runtime: Arc<Mutex<Option<HarvestApiRuntime>>>,
@@ -85,6 +126,16 @@ pub struct HarvestApiState {
 }
 
 impl HarvestApiState {
+    /// Summons a new, hollow API state vessel.
+    ///
+    /// The state begins empty (no runtime or pool attached) so it can be passed into the router immediately.
+    /// You must call [`HarvestApiState::install`] and [`HarvestApiState::install_storage_pool`] later to give it life.
+    ///
+    /// ## Examples
+    /// ```
+    /// use autumn_harvest_plugin::api::HarvestApiState;
+    /// let empty_state = HarvestApiState::new();
+    /// ```
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -258,6 +309,21 @@ struct DeadLetterListQuery {
     limit: Option<i64>,
 }
 
+/// Weaves the web of HTTP routes for the Harvest management API.
+///
+/// Why does this exist? Operators need a window into the black box of running workflows.
+/// This router binds all the necessary endpoints (listing workflows, sending signals, replaying dead letters)
+/// into a cohesive Axum sub-router. It uses the provided `api_state` to peer into the active runtime.
+///
+/// ## Examples
+/// ```
+/// use axum::Router;
+/// use autumn_web::AppState;
+/// use autumn_harvest_plugin::api::{HarvestApiState, harvest_api_router};
+///
+/// let state = HarvestApiState::new();
+/// let router: Router<AppState> = harvest_api_router(state);
+/// ```
 pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
     Router::new()
         .route("/workflows", get(list_workflows))
