@@ -185,11 +185,19 @@ impl HarvestRunner {
         let scheduler_monitor = scheduler
             .as_ref()
             .map_or_else(SchedulerMonitor::offline, SchedulerRuntime::monitor);
-        let retention = RetentionRuntime::spawn(
-            prepared.storage_pool.sharded_pool().clone(),
-            prepared.retention_config.clone(),
-            Arc::clone(&registry.telemetry().metrics),
-        );
+        let retention = if config.scheduler_enabled {
+            RetentionRuntime::spawn(
+                prepared.storage_pool.sharded_pool().clone(),
+                prepared.retention_config.clone(),
+                Arc::clone(&registry.telemetry().metrics),
+            )
+        } else {
+            tracing::info!(
+                mode = ?config.mode,
+                "harvest retention janitor not started on this runtime (scheduler ownership disabled)"
+            );
+            None
+        };
         let retention_monitor = retention.as_ref().map(RetentionRuntime::monitor);
         let retention_trigger = retention.as_ref().map(RetentionRuntime::trigger_sender);
         let api_runtime = HarvestApiRuntime::new(
