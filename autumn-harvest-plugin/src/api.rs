@@ -49,7 +49,7 @@ pub struct HarvestApiRuntime {
     scheduler: SchedulerMonitor,
     retention_config: RetentionConfig,
     retention: Option<RetentionMonitor>,
-    retention_trigger: Option<tokio::sync::mpsc::UnboundedSender<()>>,
+    retention_trigger: Option<tokio::sync::mpsc::Sender<()>>,
     router: ShardRouter,
 }
 
@@ -65,7 +65,7 @@ impl HarvestApiRuntime {
         scheduler: SchedulerMonitor,
         retention_config: RetentionConfig,
         retention: Option<RetentionMonitor>,
-        retention_trigger: Option<tokio::sync::mpsc::UnboundedSender<()>>,
+        retention_trigger: Option<tokio::sync::mpsc::Sender<()>>,
         router: ShardRouter,
     ) -> Self {
         Self {
@@ -681,7 +681,7 @@ async fn retention_run_now(
 ) -> Result<Json<BasicAck>, AutumnError> {
     let runtime = api_state.runtime().map_err(map_error)?;
     if let Some(trigger) = &runtime.retention_trigger {
-        let _ = trigger.send(());
+        let _ = trigger.try_send(());
     }
     Ok(Json(BasicAck { ok: true }))
 }

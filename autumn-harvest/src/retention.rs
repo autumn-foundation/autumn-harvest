@@ -163,7 +163,7 @@ impl RetentionMonitor {
 #[cfg(feature = "db")]
 pub struct RetentionRuntime {
     shutdown: CancellationToken,
-    trigger_tx: mpsc::UnboundedSender<()>,
+    trigger_tx: mpsc::Sender<()>,
     handle: JoinHandle<()>,
     monitor: RetentionMonitor,
 }
@@ -183,7 +183,7 @@ impl RetentionRuntime {
         let shutdown = CancellationToken::new();
         let shutdown_task = shutdown.clone();
         let monitor_task = monitor.clone();
-        let (trigger_tx, mut trigger_rx) = mpsc::unbounded_channel();
+        let (trigger_tx, mut trigger_rx) = mpsc::channel(1);
         let handle = tokio::spawn(async move {
             let mut scan_cursors: HashMap<ShardId, Option<RetentionScanCursor>> = HashMap::new();
             loop {
@@ -274,11 +274,11 @@ impl RetentionRuntime {
     }
 
     pub fn run_now(&self) {
-        let _ = self.trigger_tx.send(());
+        let _ = self.trigger_tx.try_send(());
     }
 
     #[must_use]
-    pub fn trigger_sender(&self) -> mpsc::UnboundedSender<()> {
+    pub fn trigger_sender(&self) -> mpsc::Sender<()> {
         self.trigger_tx.clone()
     }
 
