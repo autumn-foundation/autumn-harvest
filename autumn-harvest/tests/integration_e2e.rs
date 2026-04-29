@@ -3291,8 +3291,8 @@ async fn reuse_policy_terminate_if_running_cancelled_starts_fresh() {
     assert_ne!(second.exec_id, first.exec_id);
 }
 
-/// TerminateIfRunning is idempotent: if the prior run is CANCELLED (e.g. from
-/// a previous TerminateIfRunning that crashed between the two transactions),
+/// `TerminateIfRunning` is idempotent: if the prior run is CANCELLED (e.g. from
+/// a previous `TerminateIfRunning` that crashed between the two transactions),
 /// the retry starts fresh without requiring manual intervention.
 #[tokio::test]
 async fn reuse_policy_terminate_if_running_retry_after_partial_failure_is_idempotent() {
