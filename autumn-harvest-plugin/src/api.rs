@@ -41,15 +41,40 @@ use autumn_harvest::{
 use crate::state::HarvestDbPool;
 
 #[derive(Clone)]
+pub struct HarvestRetentionRuntime {
+    config: RetentionConfig,
+    monitor: Option<RetentionMonitor>,
+    trigger: Option<tokio::sync::mpsc::Sender<()>>,
+}
+
+impl HarvestRetentionRuntime {
+    #[must_use]
+    pub const fn new(
+        config: RetentionConfig,
+        monitor: Option<RetentionMonitor>,
+        trigger: Option<tokio::sync::mpsc::Sender<()>>,
+    ) -> Self {
+        Self {
+            config,
+            monitor,
+            trigger,
+        }
+    }
+
+    #[must_use]
+    pub const fn disabled(config: RetentionConfig) -> Self {
+        Self::new(config, None, None)
+    }
+}
+
+#[derive(Clone)]
 pub struct HarvestApiRuntime {
     registry: Arc<HandlerRegistry>,
     dags: Arc<DagCatalog>,
     worker_id: Option<String>,
     queues: Vec<String>,
     scheduler: SchedulerMonitor,
-    retention_config: RetentionConfig,
-    retention: Option<RetentionMonitor>,
-    retention_trigger: Option<tokio::sync::mpsc::Sender<()>>,
+    retention: HarvestRetentionRuntime,
     router: ShardRouter,
 }
 
@@ -63,9 +88,7 @@ impl HarvestApiRuntime {
         worker_id: Option<String>,
         queues: Vec<String>,
         scheduler: SchedulerMonitor,
-        retention_config: RetentionConfig,
-        retention: Option<RetentionMonitor>,
-        retention_trigger: Option<tokio::sync::mpsc::Sender<()>>,
+        retention: HarvestRetentionRuntime,
         router: ShardRouter,
     ) -> Self {
         Self {
@@ -74,9 +97,7 @@ impl HarvestApiRuntime {
             worker_id,
             queues,
             scheduler,
-            retention_config,
             retention,
-            retention_trigger,
             router,
         }
     }
@@ -666,9 +687,9 @@ async fn retention_status(
     Extension(api_state): Extension<HarvestApiState>,
 ) -> Result<Json<RetentionStatus>, AutumnError> {
     let runtime = api_state.runtime().map_err(map_error)?;
-    let status = runtime.retention.as_ref().map_or_else(
+    let status = runtime.retention.monitor.as_ref().map_or_else(
         || RetentionStatus {
-            config: runtime.retention_config.clone(),
+            config: runtime.retention.config.clone(),
             per_shard: Vec::new(),
         },
         RetentionMonitor::snapshot,
@@ -680,7 +701,7 @@ async fn retention_run_now(
     Extension(api_state): Extension<HarvestApiState>,
 ) -> Result<Json<BasicAck>, AutumnError> {
     let runtime = api_state.runtime().map_err(map_error)?;
-    let trigger = runtime.retention_trigger.as_ref().ok_or_else(|| {
+    let trigger = runtime.retention.trigger.as_ref().ok_or_else(|| {
         AutumnError::service_unavailable_msg(
             "retention run-now unavailable: no local retention runtime owner",
         )

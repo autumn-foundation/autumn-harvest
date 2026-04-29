@@ -16,7 +16,7 @@ use autumn_web::AppState;
 use autumn_web::error::AutumnError;
 use tokio::task::JoinHandle;
 
-use crate::api::HarvestApiRuntime;
+use crate::api::{HarvestApiRuntime, HarvestRetentionRuntime};
 use crate::config::HarvestRuntimeConfig;
 use crate::state::{AppDbPool, HarvestDbPool};
 
@@ -206,9 +206,11 @@ impl HarvestRunner {
             worker_id,
             queues,
             scheduler_monitor,
-            prepared.retention_config,
-            retention_monitor,
-            retention_trigger,
+            HarvestRetentionRuntime::new(
+                prepared.retention_config,
+                retention_monitor,
+                retention_trigger,
+            ),
             shard_router,
         );
 

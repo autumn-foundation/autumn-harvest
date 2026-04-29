@@ -25,7 +25,9 @@ use autumn_harvest::{
     start_or_load_workflow_execution,
 };
 use autumn_harvest_plugin::HarvestDbPool;
-use autumn_harvest_plugin::api::{HarvestApiRuntime, HarvestApiState, harvest_api_router};
+use autumn_harvest_plugin::api::{
+    HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
+};
 use autumn_harvest_plugin::{
     HarvestMode, HarvestRunner, HarvestRunnerResources, HarvestRuntimeConfig,
 };
@@ -478,9 +480,7 @@ fn build_sharded_dag_api_app(
         Some("scheduler-sharded".to_string()),
         vec!["default".to_string()],
         SchedulerMonitor::offline(),
-        autumn_harvest::RetentionConfig::default(),
-        None,
-        None,
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         router,
     ));
     harvest_api_router(api_state).with_state(test_app_state_without_database())
@@ -712,6 +712,194 @@ async fn wait_for_dag_run_state(
     panic!("dag {dag_name} did not reach state {expected_state}");
 }
 
+async fn insert_retention_fixture_execution(
+    conn: &mut AsyncPgConnection,
+    exec_id: uuid::Uuid,
+    workflow_id: &str,
+    state: &str,
+    completed_at_expr: &str,
+) {
+    diesel::sql_query(format!(
+        "INSERT INTO harvest_workflow_executions (
+            id, workflow_name, workflow_id, run_id, shard_id, state, input, queue_name, started_at, completed_at, created_at
+        ) VALUES (
+            $1, 'retention_fixture', '{workflow_id}', gen_random_uuid(), 0, '{state}', '{{}}'::jsonb, 'default',
+            NOW() - INTERVAL '11 days', {completed_at_expr}, NOW() - INTERVAL '11 days'
+        )"
+    ))
+    .bind::<diesel::sql_types::Uuid, _>(exec_id)
+    .execute(conn)
+    .await
+    .expect("failed to insert fixture workflow execution");
+
+    if state == "RUNNING" {
+        return;
+    }
+
+    diesel::sql_query(
+        "INSERT INTO harvest_events (workflow_exec_id, event_id, event_type, event_data, timestamp)
+         VALUES ($1, 0, 'WorkflowCompleted', '{}'::jsonb, NOW() - INTERVAL '10 days')",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id)
+    .execute(conn)
+    .await
+    .expect("failed to insert fixture event");
+
+    diesel::sql_query(
+        "INSERT INTO harvest_task_queue (
+            id, queue_name, task_type, workflow_exec_id, input, state, priority, max_attempts, scheduled_at
+         ) VALUES (
+            gen_random_uuid(), 'default', 'workflow', $1, '{}'::jsonb, 'COMPLETED', 0, 1, NOW() - INTERVAL '10 days'
+         )",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id)
+    .execute(conn)
+    .await
+    .expect("failed to insert fixture task");
+
+    diesel::sql_query(
+        "INSERT INTO harvest_timers (workflow_exec_id, timer_id, fires_at, fired)
+         VALUES ($1, 'fixture-timer', NOW() - INTERVAL '10 days', TRUE)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id)
+    .execute(conn)
+    .await
+    .expect("failed to insert fixture timer");
+
+    diesel::sql_query(
+        "INSERT INTO harvest_signals (workflow_exec_id, signal_name, payload, consumed)
+         VALUES ($1, 'fixture-signal', '{}'::jsonb, TRUE)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id)
+    .execute(conn)
+    .await
+    .expect("failed to insert fixture signal");
+
+    diesel::sql_query(
+        "INSERT INTO harvest_dead_letters (
+            id, original_task_id, queue_name, task_type, workflow_exec_id, input, error, attempts, failed_at
+         ) VALUES (
+            gen_random_uuid(), gen_random_uuid(), 'default', 'workflow', $1, '{}'::jsonb, 'fixture', 1, NOW() - INTERVAL '10 days'
+         )",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id)
+    .execute(conn)
+    .await
+    .expect("failed to insert fixture dead letter");
+}
+
+async fn seed_retention_fixtures(
+    conn: &mut AsyncPgConnection,
+    old_exec_a: uuid::Uuid,
+    old_exec_b: uuid::Uuid,
+    recent_exec: uuid::Uuid,
+    inflight_exec: uuid::Uuid,
+) {
+    for (exec_id, workflow_id, state, completed_at_expr) in [
+        (
+            old_exec_a,
+            "retention-old-a",
+            "COMPLETED",
+            "NOW() - INTERVAL '10 days'",
+        ),
+        (
+            old_exec_b,
+            "retention-old-b",
+            "FAILED",
+            "NOW() - INTERVAL '9 days'",
+        ),
+        (
+            recent_exec,
+            "retention-recent",
+            "COMPLETED",
+            "NOW() - INTERVAL '2 days'",
+        ),
+        (inflight_exec, "retention-inflight", "RUNNING", "NULL"),
+    ] {
+        insert_retention_fixture_execution(conn, exec_id, workflow_id, state, completed_at_expr)
+            .await;
+    }
+
+    diesel::sql_query(
+        "INSERT INTO harvest_dag_runs (
+            id, dag_name, workflow_exec_id, state, logical_date, data_interval_start, data_interval_end, created_at, started_at, completed_at
+         ) VALUES (
+            gen_random_uuid(), 'retention_fixture_dag', $1, 'SUCCESS',
+            NOW() - INTERVAL '10 days', NOW() - INTERVAL '10 days', NOW() - INTERVAL '9 days',
+            NOW() - INTERVAL '10 days', NOW() - INTERVAL '10 days', NOW() - INTERVAL '9 days'
+         )",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(old_exec_b)
+    .execute(conn)
+    .await
+    .expect("failed to insert fixture dag run");
+}
+
+async fn trigger_retention_and_wait(app: &HarvestApiApp) {
+    let (run_now_status, run_now_json) =
+        post_json(app, "/admin/retention/run-now", json!({})).await;
+    assert_eq!(run_now_status, StatusCode::OK);
+    assert_eq!(run_now_json["ok"], true);
+
+    for _ in 0..40 {
+        let (_status, status_json) = get_json(app, "/admin/retention").await;
+        let deleted_total: u64 = status_json["per_shard"]
+            .as_array()
+            .unwrap_or(&Vec::new())
+            .iter()
+            .filter_map(|tick| tick["deleted_count"].as_u64())
+            .sum();
+        if deleted_total >= 1 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn count_execution_rows(conn: &mut AsyncPgConnection, exec_id: uuid::Uuid) -> i64 {
+    diesel::sql_query("SELECT COUNT(*) AS count FROM harvest_workflow_executions WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(exec_id)
+        .get_result::<CountByName>(conn)
+        .await
+        .expect("count query should succeed")
+        .count
+}
+
+async fn count_child_rows(conn: &mut AsyncPgConnection, table: &str, exec_id: uuid::Uuid) -> i64 {
+    diesel::sql_query(format!(
+        "SELECT COUNT(*) AS count FROM {table} WHERE workflow_exec_id = $1"
+    ))
+    .bind::<diesel::sql_types::Uuid, _>(exec_id)
+    .get_result::<CountByName>(conn)
+    .await
+    .expect("child count query should succeed")
+    .count
+}
+
+async fn assert_retention_cleanup_state(
+    conn: &mut AsyncPgConnection,
+    old_exec_a: uuid::Uuid,
+    old_exec_b: uuid::Uuid,
+    recent_exec: uuid::Uuid,
+    inflight_exec: uuid::Uuid,
+) {
+    assert_eq!(count_execution_rows(conn, old_exec_a).await, 0);
+    assert_eq!(count_execution_rows(conn, old_exec_b).await, 1);
+    assert_eq!(count_execution_rows(conn, recent_exec).await, 1);
+    assert_eq!(count_execution_rows(conn, inflight_exec).await, 1);
+
+    for table in [
+        "harvest_events",
+        "harvest_task_queue",
+        "harvest_timers",
+        "harvest_signals",
+        "harvest_dead_letters",
+    ] {
+        let count = count_child_rows(conn, table, old_exec_a).await;
+        assert_eq!(count, 0, "cascade should clear {table} for {old_exec_a}");
+    }
+}
+
 fn approval_workflow<'a>(
     ctx: &'a WorkflowContext,
     input: Value,
@@ -847,9 +1035,7 @@ async fn harvest_api_uses_installed_storage_pool_when_app_state_has_no_database(
         Some("test-worker".to_string()),
         vec!["default".to_string()],
         SchedulerMonitor::offline(),
-        autumn_harvest::RetentionConfig::default(),
-        None,
-        None,
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::single(),
     ));
 
@@ -935,9 +1121,7 @@ async fn harvest_api_duplicate_start_reuses_existing_execution() {
         Some("test-worker".to_string()),
         vec!["default".to_string()],
         SchedulerMonitor::offline(),
-        autumn_harvest::RetentionConfig::default(),
-        None,
-        None,
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::single(),
     ));
     let app = harvest_api_router(api_state).with_state(test_app_state(pool));
@@ -995,9 +1179,7 @@ async fn harvest_api_cancels_workflows_and_rejects_late_signals() {
         Some("test-worker".to_string()),
         vec!["default".to_string()],
         SchedulerMonitor::offline(),
-        autumn_harvest::RetentionConfig::default(),
-        None,
-        None,
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::single(),
     ));
     let app = harvest_api_router(api_state).with_state(test_app_state(pool));
@@ -1189,170 +1371,32 @@ async fn retention_janitor_deletes_only_rows_older_than_max_age_and_cascades_chi
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
         .await
         .expect("failed to connect for retention fixture");
-    for (exec_id, workflow_id, state, completed_at_expr) in [
-        (
-            old_exec_a,
-            "retention-old-a",
-            "COMPLETED",
-            "NOW() - INTERVAL '10 days'",
-        ),
-        (
-            old_exec_b,
-            "retention-old-b",
-            "FAILED",
-            "NOW() - INTERVAL '9 days'",
-        ),
-        (
-            recent_exec,
-            "retention-recent",
-            "COMPLETED",
-            "NOW() - INTERVAL '2 days'",
-        ),
-        (inflight_exec, "retention-inflight", "RUNNING", "NULL"),
-    ] {
-        diesel::sql_query(format!(
-            "INSERT INTO harvest_workflow_executions (
-                id, workflow_name, workflow_id, run_id, shard_id, state, input, queue_name, started_at, completed_at, created_at
-            ) VALUES (
-                $1, 'retention_fixture', '{workflow_id}', gen_random_uuid(), 0, '{state}', '{{}}'::jsonb, 'default',
-                NOW() - INTERVAL '11 days', {completed_at_expr}, NOW() - INTERVAL '11 days'
-            )"
-        ))
-        .bind::<diesel::sql_types::Uuid, _>(exec_id)
-        .execute(&mut conn)
-        .await
-        .expect("failed to insert fixture workflow execution");
-
-        if state != "RUNNING" {
-            diesel::sql_query(
-                "INSERT INTO harvest_events (workflow_exec_id, event_id, event_type, event_data, timestamp)
-                 VALUES ($1, 0, 'WorkflowCompleted', '{}'::jsonb, NOW() - INTERVAL '10 days')",
-            )
-            .bind::<diesel::sql_types::Uuid, _>(exec_id)
-            .execute(&mut conn)
-            .await
-            .expect("failed to insert fixture event");
-
-            diesel::sql_query(
-                "INSERT INTO harvest_task_queue (
-                    id, queue_name, task_type, workflow_exec_id, input, state, priority, max_attempts, scheduled_at
-                 ) VALUES (
-                    gen_random_uuid(), 'default', 'workflow', $1, '{}'::jsonb, 'COMPLETED', 0, 1, NOW() - INTERVAL '10 days'
-                 )",
-            )
-            .bind::<diesel::sql_types::Uuid, _>(exec_id)
-            .execute(&mut conn)
-            .await
-            .expect("failed to insert fixture task");
-
-            diesel::sql_query(
-                "INSERT INTO harvest_timers (workflow_exec_id, timer_id, fires_at, fired)
-                 VALUES ($1, 'fixture-timer', NOW() - INTERVAL '10 days', TRUE)",
-            )
-            .bind::<diesel::sql_types::Uuid, _>(exec_id)
-            .execute(&mut conn)
-            .await
-            .expect("failed to insert fixture timer");
-
-            diesel::sql_query(
-                "INSERT INTO harvest_signals (workflow_exec_id, signal_name, payload, consumed)
-                 VALUES ($1, 'fixture-signal', '{}'::jsonb, TRUE)",
-            )
-            .bind::<diesel::sql_types::Uuid, _>(exec_id)
-            .execute(&mut conn)
-            .await
-            .expect("failed to insert fixture signal");
-
-            diesel::sql_query(
-                "INSERT INTO harvest_dead_letters (
-                    id, original_task_id, queue_name, task_type, workflow_exec_id, input, error, attempts, failed_at
-                 ) VALUES (
-                    gen_random_uuid(), gen_random_uuid(), 'default', 'workflow', $1, '{}'::jsonb, 'fixture', 1, NOW() - INTERVAL '10 days'
-                 )",
-            )
-            .bind::<diesel::sql_types::Uuid, _>(exec_id)
-            .execute(&mut conn)
-            .await
-            .expect("failed to insert fixture dead letter");
-        }
-    }
-
-    diesel::sql_query(
-        "INSERT INTO harvest_dag_runs (
-            id, dag_name, workflow_exec_id, state, logical_date, data_interval_start, data_interval_end, created_at, started_at, completed_at
-         ) VALUES (
-            gen_random_uuid(), 'retention_fixture_dag', $1, 'SUCCESS',
-            NOW() - INTERVAL '10 days', NOW() - INTERVAL '10 days', NOW() - INTERVAL '9 days',
-            NOW() - INTERVAL '10 days', NOW() - INTERVAL '10 days', NOW() - INTERVAL '9 days'
-         )",
+    seed_retention_fixtures(
+        &mut conn,
+        old_exec_a,
+        old_exec_b,
+        recent_exec,
+        inflight_exec,
     )
-    .bind::<diesel::sql_types::Uuid, _>(old_exec_b)
-    .execute(&mut conn)
-    .await
-    .expect("failed to insert fixture dag run");
+    .await;
 
     api_state.install_storage_pool(runner.storage_pool());
     api_state.install(runner.api_runtime());
     let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
 
-    let (run_now_status, run_now_json) =
-        post_json(&app, "/admin/retention/run-now", json!({})).await;
-    assert_eq!(run_now_status, StatusCode::OK);
-    assert_eq!(run_now_json["ok"], true);
-
-    for _ in 0..40 {
-        let (_status, status_json) = get_json(&app, "/admin/retention").await;
-        let deleted_total: u64 = status_json["per_shard"]
-            .as_array()
-            .unwrap_or(&Vec::new())
-            .iter()
-            .filter_map(|tick| tick["deleted_count"].as_u64())
-            .sum();
-        if deleted_total >= 1 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    trigger_retention_and_wait(&app).await;
 
     let mut verify_conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
         .await
         .expect("failed to reconnect for verification");
-    async fn count_execution_rows(conn: &mut AsyncPgConnection, exec_id: uuid::Uuid) -> i64 {
-        diesel::sql_query("SELECT COUNT(*) AS count FROM harvest_workflow_executions WHERE id = $1")
-            .bind::<diesel::sql_types::Uuid, _>(exec_id)
-            .get_result::<CountByName>(conn)
-            .await
-            .expect("count query should succeed")
-            .count
-    }
-
-    assert_eq!(count_execution_rows(&mut verify_conn, old_exec_a).await, 0);
-    assert_eq!(count_execution_rows(&mut verify_conn, old_exec_b).await, 1);
-    assert_eq!(count_execution_rows(&mut verify_conn, recent_exec).await, 1);
-    assert_eq!(
-        count_execution_rows(&mut verify_conn, inflight_exec).await,
-        1
-    );
-
-    for table in [
-        "harvest_events",
-        "harvest_task_queue",
-        "harvest_timers",
-        "harvest_signals",
-        "harvest_dead_letters",
-    ] {
-        for deleted_exec in [old_exec_a] {
-            let count = diesel::sql_query(format!(
-                "SELECT COUNT(*) AS count FROM {table} WHERE workflow_exec_id = $1"
-            ))
-            .bind::<diesel::sql_types::Uuid, _>(deleted_exec)
-            .get_result::<CountByName>(&mut verify_conn)
-            .await
-            .expect("child count query should succeed")
-            .count;
-            assert_eq!(count, 0, "cascade should clear {table} for {deleted_exec}");
-        }
-    }
+    assert_retention_cleanup_state(
+        &mut verify_conn,
+        old_exec_a,
+        old_exec_b,
+        recent_exec,
+        inflight_exec,
+    )
+    .await;
 
     runner.stop().await;
 }
@@ -1370,9 +1414,7 @@ async fn harvest_api_signal_does_not_wake_timer_waits_early() {
         Some("test-worker".to_string()),
         vec!["default".to_string()],
         SchedulerMonitor::offline(),
-        autumn_harvest::RetentionConfig::default(),
-        None,
-        None,
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::single(),
     ));
 
@@ -1641,9 +1683,7 @@ async fn harvest_api_lists_and_triggers_manual_dags() {
         Some("scheduler-only".to_string()),
         vec!["default".to_string()],
         SchedulerMonitor::offline(),
-        autumn_harvest::RetentionConfig::default(),
-        None,
-        None,
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::single(),
     ));
     let app = harvest_api_router(api_state).with_state(test_app_state(pool.clone()));
