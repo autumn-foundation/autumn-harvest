@@ -921,8 +921,7 @@ mod tests {
 
     #[test]
     fn enqueue_params_concurrency_fields_set_manually() {
-        let mut params =
-            EnqueueParams::new("default", TaskType::Activity, serde_json::json!(null));
+        let mut params = EnqueueParams::new("default", TaskType::Activity, serde_json::json!(null));
         params.concurrency_key = Some("stripe".to_string());
         params.max_concurrent = Some(5);
         assert_eq!(params.concurrency_key.as_deref(), Some("stripe"));

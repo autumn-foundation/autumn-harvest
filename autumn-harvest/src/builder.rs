@@ -649,7 +649,11 @@ mod tests {
         assert!(config.queues.is_empty());
     }
 
-    fn make_activity(name: &'static str, max_concurrent: Option<u32>, key: Option<&'static str>) -> ActivityInfo {
+    fn make_activity(
+        name: &'static str,
+        max_concurrent: Option<u32>,
+        key: Option<&'static str>,
+    ) -> ActivityInfo {
         ActivityInfo {
             name,
             module: "test",

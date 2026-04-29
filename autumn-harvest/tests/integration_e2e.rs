@@ -3349,11 +3349,8 @@ async fn concurrency_cap_limits_concurrent_claims_cluster_wide() {
     let queues = vec!["default".to_string()];
 
     for i in 0..6_u32 {
-        let mut params = EnqueueParams::new(
-            "default",
-            TaskType::Activity,
-            serde_json::json!({ "i": i }),
-        );
+        let mut params =
+            EnqueueParams::new("default", TaskType::Activity, serde_json::json!({ "i": i }));
         params.activity_name = Some("capped_activity".into());
         params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
         params.concurrency_key = Some("capped_activity".to_string());
@@ -3382,13 +3379,9 @@ async fn concurrency_cap_limits_concurrent_claims_cluster_wide() {
     );
 
     // Complete one in-flight task to free a slot.
-    queue::complete_task(
-        &mut conn,
-        t1.unwrap().id,
-        serde_json::json!(null),
-    )
-    .await
-    .expect("complete_task failed");
+    queue::complete_task(&mut conn, t1.unwrap().id, serde_json::json!(null))
+        .await
+        .expect("complete_task failed");
 
     // Now a slot is free; one more task should be claimable.
     let t4 = queue::claim_task(&mut conn, &queues, "worker-cc-1")
@@ -3466,11 +3459,8 @@ async fn concurrency_cap_failure_frees_slot_and_does_not_wedge_queue() {
     let queues = vec!["default".to_string()];
 
     for i in 0..4_u32 {
-        let mut params = EnqueueParams::new(
-            "default",
-            TaskType::Activity,
-            serde_json::json!({ "i": i }),
-        );
+        let mut params =
+            EnqueueParams::new("default", TaskType::Activity, serde_json::json!({ "i": i }));
         params.activity_name = Some("fragile_activity".into());
         params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
         params.concurrency_key = Some("fragile".to_string());
@@ -3531,11 +3521,8 @@ async fn concurrency_cap_null_key_tasks_are_unaffected_by_saturated_key() {
 
     // Saturate a key with 2 RUNNING tasks (cap = 2).
     for i in 0..2_u32 {
-        let mut params = EnqueueParams::new(
-            "default",
-            TaskType::Activity,
-            serde_json::json!({ "i": i }),
-        );
+        let mut params =
+            EnqueueParams::new("default", TaskType::Activity, serde_json::json!({ "i": i }));
         params.activity_name = Some("capped_activity".into());
         params.scheduled_at = Utc::now() - chrono::Duration::seconds(2);
         params.concurrency_key = Some("saturated_key".to_string());
@@ -3560,11 +3547,8 @@ async fn concurrency_cap_null_key_tasks_are_unaffected_by_saturated_key() {
 
     // Enqueue 3 tasks with NO concurrency key (null — the pre-#88 baseline).
     for i in 0..3_u32 {
-        let mut params = EnqueueParams::new(
-            "default",
-            TaskType::Activity,
-            serde_json::json!({ "i": i }),
-        );
+        let mut params =
+            EnqueueParams::new("default", TaskType::Activity, serde_json::json!({ "i": i }));
         params.activity_name = Some("uncapped_activity".into());
         params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
         // concurrency_key left as None (default) — backward-compat path.

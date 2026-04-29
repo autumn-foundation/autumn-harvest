@@ -24,6 +24,7 @@ use autumn_harvest::context::WorkflowContext;
 use autumn_harvest::dlq;
 use autumn_harvest::error::{HarvestError, HarvestResult, database_error};
 use autumn_harvest::models::{DagRun, DeadLetter, HarvestSchedule, WorkflowExecution};
+use autumn_harvest::queue::{self, ConcurrencyKeyStats};
 use autumn_harvest::retention::{RetentionConfig, RetentionMonitor, RetentionStatus};
 use autumn_harvest::scheduler::{
     DagCatalog, RegisteredDag, SchedulerMonitor, SchedulerSnapshot, trigger_dag,
@@ -34,7 +35,6 @@ use autumn_harvest::signal;
 use autumn_harvest::store;
 use autumn_harvest::types::{ExecutionId, ShardId, WorkflowIdReusePolicy};
 use autumn_harvest::worker::{DbPool, HandlerRegistry};
-use autumn_harvest::queue::{self, ConcurrencyKeyStats};
 use autumn_harvest::{
     StartWorkflowParams, cancel_workflow_execution, start_or_load_workflow_execution,
 };
@@ -768,14 +768,14 @@ async fn concurrency_status(
             .await
             .map_err(map_error)?;
         for stat in stats {
-            let entry = merged.entry(stat.key.clone()).or_insert_with(|| {
-                ConcurrencyKeyStats {
+            let entry = merged
+                .entry(stat.key.clone())
+                .or_insert_with(|| ConcurrencyKeyStats {
                     key: stat.key.clone(),
                     max_concurrent: stat.max_concurrent,
                     in_flight: 0,
                     pending: 0,
-                }
-            });
+                });
             entry.in_flight += stat.in_flight;
             entry.pending += stat.pending;
         }

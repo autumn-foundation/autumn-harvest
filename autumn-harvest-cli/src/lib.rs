@@ -388,7 +388,6 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
         return tui::run_tui(&cli).await;
     }
 
-
     let output = cli.output;
     let response = execute(&cli).await?;
     let rendered = format_output(&response, output)?;
