@@ -13,7 +13,7 @@ use autumn_harvest::types::{ExecutionId, ShardId};
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{StartWorkflowParams, start_or_load_workflow_execution};
 use autumn_harvest_plugin::HarvestDbPool;
-use autumn_harvest_plugin::api::{HarvestApiRuntime, HarvestApiState};
+use autumn_harvest_plugin::api::{HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime};
 use autumn_harvest_plugin::ui::harvest_ui_router;
 use autumn_web::AppState;
 use autumn_web::reexports::axum;
@@ -259,6 +259,7 @@ async fn ui_root_redirects_to_workflows() {
         Some("ui-test-worker".to_string()),
         vec!["default".to_string()],
         SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::single(),
     ));
 
@@ -291,6 +292,7 @@ async fn ui_lists_workflows_and_renders_detail_page() {
         Some("ui-test-worker".to_string()),
         vec!["default".to_string()],
         SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::single(),
     ));
 
@@ -368,6 +370,7 @@ async fn ui_lists_workflows_across_shards() {
         Some("ui-test-worker".to_string()),
         vec!["default".to_string()],
         SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::new(
             vec![ShardId::new(0), ShardId::new(1)],
             vec![ShardId::new(0), ShardId::new(1)],

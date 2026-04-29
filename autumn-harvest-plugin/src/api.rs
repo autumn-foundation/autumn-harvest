@@ -24,6 +24,7 @@ use autumn_harvest::context::WorkflowContext;
 use autumn_harvest::dlq;
 use autumn_harvest::error::{HarvestError, HarvestResult, database_error};
 use autumn_harvest::models::{DagRun, DeadLetter, HarvestSchedule, WorkflowExecution};
+use autumn_harvest::retention::{RetentionConfig, RetentionMonitor, RetentionStatus};
 use autumn_harvest::scheduler::{
     DagCatalog, RegisteredDag, SchedulerMonitor, SchedulerSnapshot, trigger_dag,
 };
@@ -40,12 +41,40 @@ use autumn_harvest::{
 use crate::state::HarvestDbPool;
 
 #[derive(Clone)]
+pub struct HarvestRetentionRuntime {
+    config: RetentionConfig,
+    monitor: Option<RetentionMonitor>,
+    trigger: Option<tokio::sync::mpsc::Sender<()>>,
+}
+
+impl HarvestRetentionRuntime {
+    #[must_use]
+    pub const fn new(
+        config: RetentionConfig,
+        monitor: Option<RetentionMonitor>,
+        trigger: Option<tokio::sync::mpsc::Sender<()>>,
+    ) -> Self {
+        Self {
+            config,
+            monitor,
+            trigger,
+        }
+    }
+
+    #[must_use]
+    pub const fn disabled(config: RetentionConfig) -> Self {
+        Self::new(config, None, None)
+    }
+}
+
+#[derive(Clone)]
 pub struct HarvestApiRuntime {
     registry: Arc<HandlerRegistry>,
     dags: Arc<DagCatalog>,
     worker_id: Option<String>,
     queues: Vec<String>,
     scheduler: SchedulerMonitor,
+    retention: HarvestRetentionRuntime,
     router: ShardRouter,
 }
 
@@ -59,6 +88,7 @@ impl HarvestApiRuntime {
         worker_id: Option<String>,
         queues: Vec<String>,
         scheduler: SchedulerMonitor,
+        retention: HarvestRetentionRuntime,
         router: ShardRouter,
     ) -> Self {
         Self {
@@ -67,6 +97,7 @@ impl HarvestApiRuntime {
             worker_id,
             queues,
             scheduler,
+            retention,
             router,
         }
     }
@@ -276,6 +307,8 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .route("/dead-letters", get(list_dead_letters))
         .route("/dead-letters/{id}/replay", post(replay_dead_letter))
         .route("/health", get(health))
+        .route("/admin/retention", get(retention_status))
+        .route("/admin/retention/run-now", post(retention_run_now))
         .layer(Extension(api_state))
 }
 
@@ -648,6 +681,37 @@ async fn replay_dead_letter(
             task_id: task_id.to_string(),
         }),
     ))
+}
+
+async fn retention_status(
+    Extension(api_state): Extension<HarvestApiState>,
+) -> Result<Json<RetentionStatus>, AutumnError> {
+    let runtime = api_state.runtime().map_err(map_error)?;
+    let status = runtime.retention.monitor.as_ref().map_or_else(
+        || RetentionStatus {
+            config: runtime.retention.config.clone(),
+            per_shard: Vec::new(),
+        },
+        RetentionMonitor::snapshot,
+    );
+    Ok(Json(status))
+}
+
+async fn retention_run_now(
+    Extension(api_state): Extension<HarvestApiState>,
+) -> Result<Json<BasicAck>, AutumnError> {
+    let runtime = api_state.runtime().map_err(map_error)?;
+    let trigger = runtime.retention.trigger.as_ref().ok_or_else(|| {
+        AutumnError::service_unavailable_msg(
+            "retention run-now unavailable: no local retention runtime owner",
+        )
+    })?;
+    trigger.try_send(()).map_err(|error| {
+        AutumnError::service_unavailable_msg(format!(
+            "retention run-now unavailable: failed to enqueue trigger ({error})"
+        ))
+    })?;
+    Ok(Json(BasicAck { ok: true }))
 }
 
 async fn health(

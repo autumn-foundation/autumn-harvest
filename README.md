@@ -82,6 +82,10 @@ async fn main() {
   polling backoff.
 - **Dead letter queue** for tasks that exhaust their retry policy, with
   management endpoints to inspect and replay entries.
+- **Retention janitor** (opt-in) to prune completed workflow histories older
+  than a configured max age, with status and run-now controls on the admin API.
+  Running workflows are unaffected because only terminal-state executions with
+  `completed_at` older than the retention window are eligible.
 - **Separate worker/web connection pools** with a shared ceiling so worker
   bursts can't starve HTTP request handling.
 
@@ -118,6 +122,8 @@ cargo run -p autumn-harvest-cli -- dag trigger daily_pipeline --conf-json '{"dat
 cargo run -p autumn-harvest-cli -- dag pause daily_pipeline
 cargo run -p autumn-harvest-cli -- dlq list --limit 25
 cargo run -p autumn-harvest-cli -- dlq replay <dead-letter-id>
+cargo run -p autumn-harvest-cli -- retention status
+cargo run -p autumn-harvest-cli -- retention run-now
 ```
 
 Configure the API mount with `--base-url` or `HARVEST_URL` (default:

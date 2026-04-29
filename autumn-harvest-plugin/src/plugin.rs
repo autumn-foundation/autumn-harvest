@@ -245,7 +245,9 @@ fn start_harvest_runtime(
         ));
     };
 
-    let built = builder.build();
+    let built = builder
+        .try_build()
+        .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
     state.insert_extension(harvest_config.outbox.clone());
     state.insert_extension(router.clone());
     let mut runner_resources = HarvestRunnerResources::new(harvest_pool)
