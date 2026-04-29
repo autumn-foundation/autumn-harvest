@@ -128,6 +128,10 @@ pub struct TaskQueueItem {
     pub sticky_until: Option<DateTime<Utc>>,
     pub sticky_timeout: Option<chrono::Duration>,
     pub trace_context: Option<serde_json::Value>,
+    /// Cluster-wide concurrency group key. NULL = no cap enforced.
+    pub concurrency_key: Option<String>,
+    /// Maximum concurrent RUNNING tasks allowed for this concurrency_key.
+    pub concurrency_cap: Option<i32>,
 }
 
 /// Insert struct for enqueuing a new task.
@@ -151,6 +155,8 @@ pub struct NewTaskQueueItem<'a> {
     pub sticky_until: Option<DateTime<Utc>>,
     pub sticky_timeout: Option<chrono::Duration>,
     pub trace_context: Option<serde_json::Value>,
+    pub concurrency_key: Option<&'a str>,
+    pub concurrency_cap: Option<i32>,
 }
 
 // ── DagRun ────────────────────────────────────────────────────────────────────

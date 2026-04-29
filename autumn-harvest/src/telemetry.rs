@@ -248,6 +248,24 @@ pub trait MetricsRecorder: Send + Sync {
     ) {
         let _ = (shard, candidate_count, deleted_count, duration_secs);
     }
+
+    /// Current number of RUNNING tasks for a concurrency group key.
+    ///
+    /// Emitted by the concurrency sampler on every sample interval. The value
+    /// is a gauge — operators should alert when it approaches `max_concurrent`.
+    fn record_concurrency_key_in_flight(&self, key: &str, in_flight: u64) {
+        let _ = (key, in_flight);
+    }
+
+    /// Number of PENDING tasks for a key that are being held back because the
+    /// cap is currently saturated (`in_flight >= max_concurrent`).
+    ///
+    /// Emitted alongside each `record_concurrency_key_in_flight` call when
+    /// there are deferred tasks waiting for a slot. Operators should monitor
+    /// this alongside queue depth to detect saturation-induced backlog.
+    fn record_concurrency_key_deferred(&self, key: &str, deferred: u64) {
+        let _ = (key, deferred);
+    }
 }
 
 /// Default metrics recorder that discards every sample.

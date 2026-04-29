@@ -168,6 +168,11 @@ enum Commands {
         #[command(subcommand)]
         command: RetentionCommand,
     },
+    /// Inspect cluster-wide per-activity concurrency caps.
+    Concurrency {
+        #[command(subcommand)]
+        command: ConcurrencyCommand,
+    },
     /// Open the TUI dashboard to monitor workflows.
     Tui,
 }
@@ -304,6 +309,12 @@ enum RetentionCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum ConcurrencyCommand {
+    /// Show per-key concurrency stats: cap, in-flight, and pending counts.
+    Status,
+}
+
+#[derive(Debug, Subcommand)]
 enum DeadLetterCommand {
     /// List dead-lettered tasks.
     List {
@@ -332,6 +343,7 @@ impl Cli {
             Commands::Dag { command } => dag_request(command),
             Commands::Dlq { command } => Ok(dead_letter_request(command)),
             Commands::Retention { command } => Ok(retention_request(command)),
+            Commands::Concurrency { command } => Ok(concurrency_request(command)),
             Commands::Tui => unreachable!("Tui command handles its own requests"),
         }
     }
@@ -375,6 +387,7 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
     if matches!(cli.command, Commands::Tui) {
         return tui::run_tui(&cli).await;
     }
+
 
     let output = cli.output;
     let response = execute(&cli).await?;
@@ -584,6 +597,12 @@ fn retention_request(command: &RetentionCommand) -> ApiRequest {
     match command {
         RetentionCommand::Status => ApiRequest::get("/admin/retention"),
         RetentionCommand::RunNow => ApiRequest::post("/admin/retention/run-now", None),
+    }
+}
+
+fn concurrency_request(command: &ConcurrencyCommand) -> ApiRequest {
+    match command {
+        ConcurrencyCommand::Status => ApiRequest::get("/admin/concurrency"),
     }
 }
 

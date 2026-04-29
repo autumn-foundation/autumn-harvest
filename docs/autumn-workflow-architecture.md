@@ -163,6 +163,39 @@ async fn send_bulk_email(ctx: &ActivityContext, batch: Vec<EmailRequest>) -> Aut
 }
 ```
 
+#### Per-activity concurrency caps
+
+Workflows commonly integrate with rate-limited downstream services (Stripe,
+OpenAI, SendGrid, etc.). Without a cap the cluster can fan out many parallel
+calls, hitting 429s or connection pool limits.
+
+Declare `max_concurrent = N` on the activity to enforce a cluster-wide cap:
+
+```rust
+// At most 5 Stripe calls in flight at any instant across the whole cluster.
+#[activity(start_to_close = "30s", max_concurrent = 5)]
+async fn charge_stripe(ctx: &ActivityContext, amount_cents: u64) -> HarvestResult<String> {
+    // …
+}
+```
+
+When multiple activities share a single rate-limited dependency, give them the
+same `concurrency_key` so the budget is shared rather than doubled:
+
+```rust
+#[activity(start_to_close = "30s", max_concurrent = 5, concurrency_key = "stripe")]
+async fn charge_stripe(ctx: &ActivityContext, amount_cents: u64) -> HarvestResult<String> { /* … */ }
+
+#[activity(start_to_close = "10s", max_concurrent = 5, concurrency_key = "stripe")]
+async fn refund_stripe(ctx: &ActivityContext, charge_id: String) -> HarvestResult<()> { /* … */ }
+```
+
+`HarvestBuilder::build()` fails fast with
+`HarvestBuilderError::ConcurrencyKeyMismatch` if activities sharing a key
+disagree on `max_concurrent`. The cap is enforced by the Postgres claim query
+without any extra table, background task, or dedicated worker process; tasks
+whose key is saturated are simply not claimed until a slot becomes free.
+
 ### 4.2 Defining Workflows (Durable Execution)
 
 Workflows are deterministic orchestration functions. They call activities, set timers, wait for signals, and maintain durable state through event sourcing. This is the Temporal-style model.

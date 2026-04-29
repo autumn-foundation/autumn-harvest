@@ -809,6 +809,10 @@ async fn persist_scheduled_activity(
             "schedule_to_start timeout",
         )?);
     }
+    if let Some(key) = activity.concurrency_key {
+        params.concurrency_key = Some(key.to_string());
+        params.max_concurrent = activity.max_concurrent;
+    }
 
     let activity_events = vec![WorkflowEvent::ActivityScheduled {
         activity_id: scheduled.activity_id,
@@ -1982,6 +1986,72 @@ fn spawn_queue_depth_sampler(
     })
 }
 
+/// Periodically sample per-concurrency-key stats and emit metrics/traces.
+///
+/// Runs on the same cadence as the queue-depth sampler. For each key that is
+/// currently active (RUNNING or PENDING tasks), it emits:
+///  - `record_concurrency_key_in_flight` with the current RUNNING count
+///  - A `DEBUG` trace if any tasks are pending while the cap is saturated
+fn spawn_concurrency_sampler(
+    pool: DbPool,
+    cancel: CancellationToken,
+    telemetry: Arc<crate::telemetry::TelemetryConfig>,
+    queues: Vec<String>,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                () = cancel.cancelled() => break,
+                () = tokio::time::sleep(interval) => {}
+            }
+
+            let mut conn = match pool.get().await {
+                Ok(conn) => conn,
+                Err(error) => {
+                    tracing::debug!(
+                        error = %error,
+                        "concurrency sampler could not acquire DB connection"
+                    );
+                    continue;
+                }
+            };
+
+            match queue::concurrency_key_stats(&mut conn, &queues).await {
+                Ok(stats) => {
+                    for stat in &stats {
+                        telemetry.metrics.record_concurrency_key_in_flight(
+                            &stat.key,
+                            u64::try_from(stat.in_flight).unwrap_or(0),
+                        );
+                        let saturated = stat.in_flight >= i64::from(stat.max_concurrent);
+                        if saturated && stat.pending > 0 {
+                            tracing::debug!(
+                                concurrency_key = %stat.key,
+                                in_flight = stat.in_flight,
+                                max_concurrent = stat.max_concurrent,
+                                deferred = stat.pending,
+                                "concurrency cap saturated; pending tasks deferred until a slot frees"
+                            );
+                            telemetry.metrics.record_concurrency_key_deferred(
+                                &stat.key,
+                                u64::try_from(stat.pending).unwrap_or(0),
+                            );
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::debug!(error = %error, "concurrency key stats sample failed");
+                }
+            }
+
+            if cancel.is_cancelled() {
+                break;
+            }
+        }
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Worker
 // ---------------------------------------------------------------------------
@@ -2075,6 +2145,13 @@ impl Worker {
             self.config.queues.clone(),
             self.config.poll_interval,
         );
+        let concurrency_sampler = spawn_concurrency_sampler(
+            pool.clone(),
+            self.shutdown.clone(),
+            self.registry.telemetry().clone(),
+            self.config.queues.clone(),
+            self.config.poll_interval,
+        );
         let timeout_checker = crate::timeout::spawn_timeout_checker(
             pool.clone(),
             self.shutdown.clone(),
@@ -2127,6 +2204,13 @@ impl Worker {
                 worker_id = %self.config.worker_id,
                 error = %error,
                 "queue depth sampler failed during shutdown"
+            );
+        }
+        if let Err(error) = concurrency_sampler.await {
+            tracing::warn!(
+                worker_id = %self.config.worker_id,
+                error = %error,
+                "concurrency sampler failed during shutdown"
             );
         }
         tracing::info!(worker_id = %self.config.worker_id, "worker stopped");

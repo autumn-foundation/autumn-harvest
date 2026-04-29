@@ -86,10 +86,27 @@ impl std::fmt::Debug for BuiltHarvest {
 
 /// Builder-time configuration errors.
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum HarvestBuilderError {
     /// Retention configuration validation failed.
     #[error("invalid retention configuration: {0}")]
     InvalidRetention(String),
+
+    /// Two activities sharing a `concurrency_key` declare different
+    /// `max_concurrent` values. There is no silent precedence rule — the
+    /// operator must pick one value and apply it consistently.
+    ///
+    /// `activities` lists each `(activity_name, max_concurrent)` pair that
+    /// contributed to the conflict.
+    #[error(
+        "concurrency_key '{key}' has conflicting max_concurrent values across activities: {activities:?}"
+    )]
+    ConcurrencyKeyMismatch {
+        /// The shared concurrency key.
+        key: String,
+        /// Each `(activity_name, max_concurrent)` pair with a conflicting value.
+        activities: Vec<(String, u32)>,
+    },
 }
 
 impl BuiltHarvest {
@@ -291,11 +308,16 @@ impl HarvestBuilder {
     ///
     /// # Errors
     ///
-    /// Returns [`HarvestBuilderError`] when retention settings are invalid.
+    /// Returns [`HarvestBuilderError`] when retention settings are invalid or
+    /// when activities sharing a `concurrency_key` declare different
+    /// `max_concurrent` values.
     pub fn try_build(self) -> Result<BuiltHarvest, HarvestBuilderError> {
         self.retention
             .validate()
             .map_err(HarvestBuilderError::InvalidRetention)?;
+
+        validate_concurrency_keys(&self.activities)?;
+
         Ok(BuiltHarvest {
             workflows: self.workflows,
             activities: self.activities,
@@ -306,6 +328,43 @@ impl HarvestBuilder {
             retention: self.retention,
         })
     }
+}
+
+/// Entry in the concurrency-key deduplication map.
+struct ConcurrencyKeyEntry {
+    first_cap: u32,
+    contributors: Vec<(String, u32)>,
+}
+
+/// Verify that all activities sharing a `concurrency_key` agree on
+/// `max_concurrent`. Fails fast with [`HarvestBuilderError::ConcurrencyKeyMismatch`]
+/// if any disagreement is found.
+fn validate_concurrency_keys(
+    activities: &[crate::info::ActivityInfo],
+) -> Result<(), HarvestBuilderError> {
+    use std::collections::HashMap;
+
+    let mut seen: HashMap<&str, ConcurrencyKeyEntry> = HashMap::new();
+
+    for activity in activities {
+        let (Some(key), Some(cap)) = (activity.concurrency_key, activity.max_concurrent) else {
+            continue;
+        };
+        let entry = seen.entry(key).or_insert_with(|| ConcurrencyKeyEntry {
+            first_cap: cap,
+            contributors: Vec::new(),
+        });
+        entry.contributors.push((activity.name.to_string(), cap));
+
+        if entry.first_cap != cap {
+            return Err(HarvestBuilderError::ConcurrencyKeyMismatch {
+                key: key.to_string(),
+                activities: entry.contributors.clone(),
+            });
+        }
+    }
+
+    Ok(())
 }
 
 /// Worker concurrency and queue configuration.
@@ -542,6 +601,8 @@ mod tests {
                 default_heartbeat_timeout: None,
                 default_schedule_to_start: None,
                 default_queue: None,
+                max_concurrent: None,
+                concurrency_key: None,
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             }])
             .state(String::from("haunted"))
@@ -563,5 +624,58 @@ mod tests {
     fn worker_config_with_empty_iterator_clears_queues() {
         let config = WorkerConfig::default().with_queues(Vec::<&str>::new());
         assert!(config.queues.is_empty());
+    }
+
+    fn make_activity(name: &'static str, max_concurrent: Option<u32>, key: Option<&'static str>) -> ActivityInfo {
+        ActivityInfo {
+            name,
+            module: "test",
+            default_retry_policy: None,
+            default_start_to_close: None,
+            default_heartbeat_timeout: None,
+            default_schedule_to_start: None,
+            default_queue: None,
+            max_concurrent,
+            concurrency_key: key,
+            handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+        }
+    }
+
+    #[test]
+    fn builder_accepts_matching_concurrency_key_caps() {
+        let result = HarvestBuilder::new()
+            .activities(vec![
+                make_activity("act_a", Some(5), Some("stripe")),
+                make_activity("act_b", Some(5), Some("stripe")),
+            ])
+            .try_build();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn builder_rejects_mismatched_concurrency_key_caps() {
+        let result = HarvestBuilder::new()
+            .activities(vec![
+                make_activity("act_a", Some(5), Some("stripe")),
+                make_activity("act_b", Some(10), Some("stripe")),
+            ])
+            .try_build();
+        let err = result.unwrap_err();
+        assert!(matches!(
+            err,
+            HarvestBuilderError::ConcurrencyKeyMismatch { ref key, .. } if key == "stripe"
+        ));
+        assert!(err.to_string().contains("stripe"));
+    }
+
+    #[test]
+    fn builder_accepts_activities_without_concurrency_key() {
+        let result = HarvestBuilder::new()
+            .activities(vec![
+                make_activity("act_a", None, None),
+                make_activity("act_b", Some(3), Some("sendgrid")),
+            ])
+            .try_build();
+        assert!(result.is_ok());
     }
 }

@@ -85,6 +85,15 @@ pub struct EnqueueParams {
     /// W3C tracecontext carrier propagated across the queue boundary so the
     /// worker can resume the enqueuing process's trace.
     pub trace_context: Option<TraceContextCarrier>,
+    /// Cluster-wide concurrency group key. When set together with
+    /// [`Self::max_concurrent`], the claim query enforces that at most
+    /// `max_concurrent` tasks with this key are `RUNNING` at any instant.
+    /// `None` = no per-key cap; only the worker-level semaphore applies.
+    pub concurrency_key: Option<String>,
+    /// Maximum number of concurrent RUNNING tasks for the `concurrency_key`.
+    /// Stored on each row so the claim query can enforce the cap without
+    /// application-layer input per poll.
+    pub max_concurrent: Option<u32>,
 }
 
 impl EnqueueParams {
@@ -113,6 +122,8 @@ impl EnqueueParams {
             sticky_worker_id: None,
             sticky_timeout: None,
             trace_context: None,
+            concurrency_key: None,
+            max_concurrent: None,
         }
     }
 
@@ -165,6 +176,10 @@ pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> Ha
         _ => None,
     };
 
+    let concurrency_cap = params
+        .max_concurrent
+        .map(|n| i32::try_from(n).unwrap_or(i32::MAX));
+
     let row = NewTaskQueueItem {
         id: task_id,
         queue_name: &params.queue_name,
@@ -186,6 +201,8 @@ pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> Ha
             .trace_context
             .as_ref()
             .and_then(TraceContextCarrier::to_json),
+        concurrency_key: params.concurrency_key.as_deref(),
+        concurrency_cap,
     };
 
     diesel::insert_into(harvest_task_queue::table)
@@ -236,6 +253,17 @@ pub async fn claim_task(
     queues: &[String],
     worker_id: &str,
 ) -> HarvestResult<Option<TaskQueueItem>> {
+    // The concurrency-cap predicate is a correlated subquery that checks how
+    // many tasks with the same concurrency_key are currently RUNNING. When
+    // the count >= concurrency_cap the row is skipped (NOT EXISTS returns
+    // false), deferring it for the next poll cycle.
+    //
+    // Tasks with NULL concurrency_key take the short-circuit branch
+    // (concurrency_key IS NULL) and incur zero subquery overhead — backward
+    // compatibility is preserved byte-for-byte on the hot path.
+    //
+    // The partial index harvest_task_queue_concurrency_key_running makes the
+    // inner SELECT fast: it only scans RUNNING rows that have a non-NULL key.
     let result: Vec<TaskQueueItem> = diesel::sql_query(
         "UPDATE harvest_task_queue \
          SET state = 'RUNNING', worker_id = $1, started_at = NOW(), attempt = attempt + 1 \
@@ -249,6 +277,15 @@ pub async fn claim_task(
                    OR sticky_worker_id = $1 \
                    OR sticky_until IS NULL \
                    OR sticky_until <= NOW() \
+               ) \
+               AND ( \
+                   concurrency_key IS NULL \
+                   OR NOT EXISTS ( \
+                       SELECT 1 FROM harvest_task_queue inner_q \
+                       WHERE inner_q.concurrency_key = harvest_task_queue.concurrency_key \
+                         AND inner_q.state = 'RUNNING' \
+                       HAVING COUNT(*) >= harvest_task_queue.concurrency_cap \
+                   ) \
                ) \
              ORDER BY \
                  CASE \
@@ -267,6 +304,77 @@ pub async fn claim_task(
     .map_err(crate::error::database_error)?;
 
     Ok(result.into_iter().next())
+}
+
+// ---------------------------------------------------------------------------
+// Concurrency-key stats
+// ---------------------------------------------------------------------------
+
+/// Live stats for a single concurrency group key.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ConcurrencyKeyStats {
+    /// The concurrency group key.
+    pub key: String,
+    /// Declared maximum concurrent tasks for this key.
+    pub max_concurrent: i32,
+    /// Number of tasks currently in `RUNNING` state for this key.
+    pub in_flight: i64,
+    /// Number of tasks in `PENDING` state for this key (may be deferred by
+    /// the cap if `in_flight >= max_concurrent`).
+    pub pending: i64,
+}
+
+/// Return live concurrency stats for all keys visible in the given queues.
+///
+/// Only rows where `concurrency_key IS NOT NULL` contribute. Results are
+/// aggregated per key across all matching queues on this shard.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub async fn concurrency_key_stats(
+    conn: &mut AsyncPgConnection,
+    queues: &[String],
+) -> HarvestResult<Vec<ConcurrencyKeyStats>> {
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        key: String,
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        max_concurrent: i32,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        in_flight: i64,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        pending: i64,
+    }
+
+    let rows: Vec<Row> = diesel::sql_query(
+        "SELECT \
+             concurrency_key AS key, \
+             MAX(concurrency_cap)::INT4 AS max_concurrent, \
+             COUNT(*) FILTER (WHERE state = 'RUNNING') AS in_flight, \
+             COUNT(*) FILTER (WHERE state = 'PENDING') AS pending \
+         FROM harvest_task_queue \
+         WHERE concurrency_key IS NOT NULL \
+           AND concurrency_cap IS NOT NULL \
+           AND queue_name = ANY($1) \
+           AND state IN ('RUNNING', 'PENDING') \
+         GROUP BY concurrency_key",
+    )
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
+    .load(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| ConcurrencyKeyStats {
+            key: r.key,
+            max_concurrent: r.max_concurrent,
+            in_flight: r.in_flight,
+            pending: r.pending,
+        })
+        .collect())
 }
 
 /// Mark a task as completed with the given output.
@@ -794,5 +902,22 @@ mod tests {
     fn sticky_hint_rejects_out_of_range_duration() {
         let hint = StickyHint::new("w1", StdDuration::from_secs(u64::MAX));
         assert!(hint.chrono_timeout().is_err());
+    }
+
+    #[test]
+    fn enqueue_params_concurrency_fields_default_to_none() {
+        let params = EnqueueParams::new("default", TaskType::Activity, serde_json::json!(null));
+        assert!(params.concurrency_key.is_none());
+        assert!(params.max_concurrent.is_none());
+    }
+
+    #[test]
+    fn enqueue_params_concurrency_fields_set_manually() {
+        let mut params =
+            EnqueueParams::new("default", TaskType::Activity, serde_json::json!(null));
+        params.concurrency_key = Some("stripe".to_string());
+        params.max_concurrent = Some(5);
+        assert_eq!(params.concurrency_key.as_deref(), Some("stripe"));
+        assert_eq!(params.max_concurrent, Some(5));
     }
 }

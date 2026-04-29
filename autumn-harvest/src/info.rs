@@ -57,6 +57,13 @@ pub struct ActivityInfo {
     pub default_schedule_to_start: Option<Duration>,
     /// Default task queue name (`None` = `"default"`).
     pub default_queue: Option<&'static str>,
+    /// Cluster-wide concurrency cap. `None` = no cap (only the worker-level
+    /// `max_concurrent_activities` semaphore applies).
+    pub max_concurrent: Option<u32>,
+    /// Concurrency group key. Multiple activities sharing a key share the
+    /// `max_concurrent` budget. Defaults to the activity's own name when
+    /// `max_concurrent` is set and `concurrency_key` is not specified.
+    pub concurrency_key: Option<&'static str>,
     /// Type-erased dispatch function.
     pub handler: ActivityHandlerFn,
 }
@@ -114,6 +121,8 @@ impl std::fmt::Debug for ActivityInfo {
             .field("default_heartbeat_timeout", &self.default_heartbeat_timeout)
             .field("default_schedule_to_start", &self.default_schedule_to_start)
             .field("default_queue", &self.default_queue)
+            .field("max_concurrent", &self.max_concurrent)
+            .field("concurrency_key", &self.concurrency_key)
             .field("handler", &"<fn>")
             .finish()
     }
@@ -158,10 +167,32 @@ mod tests {
             default_heartbeat_timeout: None,
             default_schedule_to_start: None,
             default_queue: None,
+            max_concurrent: None,
+            concurrency_key: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
         };
         assert!(info.default_retry_policy.is_none());
         assert_eq!(info.default_queue, None);
+        assert!(info.max_concurrent.is_none());
+        assert!(info.concurrency_key.is_none());
+    }
+
+    #[test]
+    fn activity_info_concurrency_fields() {
+        let info = ActivityInfo {
+            name: "send_email",
+            module: "my_app::activities",
+            default_retry_policy: None,
+            default_start_to_close: None,
+            default_heartbeat_timeout: None,
+            default_schedule_to_start: None,
+            default_queue: None,
+            max_concurrent: Some(5),
+            concurrency_key: Some("email"),
+            handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+        };
+        assert_eq!(info.max_concurrent, Some(5));
+        assert_eq!(info.concurrency_key, Some("email"));
     }
 
     #[test]
@@ -209,6 +240,8 @@ mod tests {
             default_heartbeat_timeout: None,
             default_schedule_to_start: None,
             default_queue: None,
+            max_concurrent: None,
+            concurrency_key: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
         };
         let debug_str = format!("{activity_info:?}");
