@@ -680,9 +680,16 @@ async fn retention_run_now(
     Extension(api_state): Extension<HarvestApiState>,
 ) -> Result<Json<BasicAck>, AutumnError> {
     let runtime = api_state.runtime().map_err(map_error)?;
-    if let Some(trigger) = &runtime.retention_trigger {
-        let _ = trigger.try_send(());
-    }
+    let trigger = runtime.retention_trigger.as_ref().ok_or_else(|| {
+        AutumnError::service_unavailable_msg(
+            "retention run-now unavailable: no local retention runtime owner",
+        )
+    })?;
+    trigger.try_send(()).map_err(|error| {
+        AutumnError::service_unavailable_msg(format!(
+            "retention run-now unavailable: failed to enqueue trigger ({error})"
+        ))
+    })?;
     Ok(Json(BasicAck { ok: true }))
 }
 
