@@ -246,8 +246,9 @@ struct StartWorkflowRequest {
     execution_timeout_secs: Option<i64>,
     /// How to handle a duplicate `(workflow_name, workflow_id)` collision.
     /// Omitted or `null` → `AllowDuplicate` (preserves existing wire behaviour).
-    /// An unknown string value returns `400 Bad Request`.
-    reuse_policy: Option<WorkflowIdReusePolicy>,
+    /// An unknown string value returns `400 Bad Request` with the offending value
+    /// echoed in the response body.
+    reuse_policy: Option<String>,
 }
 
 /// Response body for a 409 Conflict returned by `RejectDuplicate` policy.
@@ -443,9 +444,10 @@ async fn start_workflow(
         return AutumnError::not_found_msg(format!("workflow '{workflow_name}'")).into_response();
     }
 
-    let reuse_policy = request
-        .reuse_policy
-        .unwrap_or(WorkflowIdReusePolicy::AllowDuplicate);
+    let reuse_policy = match parse_reuse_policy(request.reuse_policy.as_deref()) {
+        Ok(p) => p,
+        Err(e) => return e.into_response(),
+    };
     let workflow_id = request
         .workflow_id
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
@@ -949,6 +951,19 @@ async fn replay_dead_letter_from_shards(
     )))
 }
 
+fn parse_reuse_policy(raw: Option<&str>) -> Result<WorkflowIdReusePolicy, AutumnError> {
+    match raw {
+        None | Some("" | "allow_duplicate") => Ok(WorkflowIdReusePolicy::AllowDuplicate),
+        Some("reject_duplicate") => Ok(WorkflowIdReusePolicy::RejectDuplicate),
+        Some("allow_duplicate_failed_only") => Ok(WorkflowIdReusePolicy::AllowDuplicateFailedOnly),
+        Some("terminate_if_running") => Ok(WorkflowIdReusePolicy::TerminateIfRunning),
+        Some(other) => Err(AutumnError::bad_request_msg(format!(
+            "unknown reuse_policy '{other}'; expected one of: allow_duplicate, reject_duplicate, \
+             allow_duplicate_failed_only, terminate_if_running"
+        ))),
+    }
+}
+
 pub(crate) fn parse_execution_id(raw: &str) -> Result<ExecutionId, AutumnError> {
     raw.parse::<ExecutionId>()
         .map_err(|_| AutumnError::bad_request_msg(format!("invalid execution id '{raw}'")))
@@ -1074,5 +1089,62 @@ mod tests {
             .expect("unknown keys should be skipped");
         assert!(filters.states.is_empty());
         assert!(filters.workflow_name.is_none());
+    }
+
+    #[test]
+    fn parse_reuse_policy_none_defaults_to_allow_duplicate() {
+        assert_eq!(
+            parse_reuse_policy(None).unwrap(),
+            WorkflowIdReusePolicy::AllowDuplicate
+        );
+    }
+
+    #[test]
+    fn parse_reuse_policy_empty_string_defaults_to_allow_duplicate() {
+        assert_eq!(
+            parse_reuse_policy(Some("")).unwrap(),
+            WorkflowIdReusePolicy::AllowDuplicate
+        );
+    }
+
+    #[test]
+    fn parse_reuse_policy_accepts_all_known_values() {
+        use WorkflowIdReusePolicy::*;
+        let cases = [
+            ("allow_duplicate", AllowDuplicate),
+            ("reject_duplicate", RejectDuplicate),
+            ("allow_duplicate_failed_only", AllowDuplicateFailedOnly),
+            ("terminate_if_running", TerminateIfRunning),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                parse_reuse_policy(Some(input)).unwrap(),
+                expected,
+                "failed for '{input}'"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_reuse_policy_unknown_value_returns_400_error() {
+        let err = parse_reuse_policy(Some("bogus_policy")).expect_err("unknown value must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("bogus_policy"),
+            "offending value must be echoed in error: {msg}"
+        );
+        assert!(
+            msg.contains("unknown reuse_policy"),
+            "error must mention unknown reuse_policy: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_reuse_policy_unknown_value_is_not_silent_fallback() {
+        // Ensure "allow_DUPLICATE" (wrong case) is rejected, not silently coerced.
+        assert!(
+            parse_reuse_policy(Some("allow_DUPLICATE")).is_err(),
+            "wrong case must not silently fall back"
+        );
     }
 }
