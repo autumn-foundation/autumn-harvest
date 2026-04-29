@@ -54,6 +54,7 @@ impl std::fmt::Debug for HarvestBuilder {
             .field("worker_config", &self.worker_config)
             .field("state_count", &self.state.len())
             .field("telemetry_configured", &self.telemetry.is_some())
+            .field("retention", &self.retention)
             .finish()
     }
 }
@@ -251,7 +252,7 @@ impl HarvestBuilder {
 
     /// Configure retention janitor behavior for completed workflow history.
     #[must_use]
-    pub fn retention(mut self, retention: RetentionConfig) -> Self {
+    pub const fn retention(mut self, retention: RetentionConfig) -> Self {
         self.retention = retention;
         self
     }

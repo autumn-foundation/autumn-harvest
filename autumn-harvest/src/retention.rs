@@ -78,6 +78,10 @@ impl RetentionConfig {
         Duration::from_secs(self.tick_interval_secs)
     }
 
+    /// # Errors
+    ///
+    /// Returns an error string if `tick_interval_secs` is 0, `batch_size` is 0,
+    /// or `max_age` is outside the allowed range.
     pub fn validate(&self) -> Result<(), String> {
         if self.tick_interval_secs == 0 {
             return Err("tick_interval must be >= 1s".to_string());
@@ -85,14 +89,14 @@ impl RetentionConfig {
         if self.batch_size == 0 {
             return Err("batch_size must be >= 1".to_string());
         }
-        if let Some(max_age) = self.max_age() {
-            if !(MIN_MAX_AGE..=MAX_MAX_AGE).contains(&max_age) {
-                return Err(format!(
-                    "max_age must be between {}s and {}s",
-                    MIN_MAX_AGE.as_secs(),
-                    MAX_MAX_AGE.as_secs()
-                ));
-            }
+        if let Some(max_age) = self.max_age()
+            && !(MIN_MAX_AGE..=MAX_MAX_AGE).contains(&max_age)
+        {
+            return Err(format!(
+                "max_age must be between {}s and {}s",
+                MIN_MAX_AGE.as_secs(),
+                MAX_MAX_AGE.as_secs()
+            ));
         }
         Ok(())
     }
@@ -139,6 +143,9 @@ impl RetentionMonitor {
         }
     }
 
+    /// # Panics
+    ///
+    /// Panics if the internal mutex has been poisoned.
     #[must_use]
     pub fn snapshot(&self) -> RetentionStatus {
         self.inner
@@ -170,6 +177,10 @@ pub struct RetentionRuntime {
 
 #[cfg(feature = "db")]
 impl RetentionRuntime {
+    /// # Panics
+    ///
+    /// Panics inside the spawned task if the enabled config is missing `max_age`
+    /// (which cannot happen when `config.enabled()` is `true`).
     #[must_use]
     pub fn spawn(
         pools: ShardedDbPool,
@@ -189,8 +200,8 @@ impl RetentionRuntime {
             loop {
                 tokio::select! {
                     () = shutdown_task.cancelled() => break,
-                    _ = tokio::time::sleep(config.tick_interval()) => {},
-                    Some(_) = trigger_rx.recv() => {
+                    () = tokio::time::sleep(config.tick_interval()) => {},
+                    Some(()) = trigger_rx.recv() => {
                         while trigger_rx.try_recv().is_ok() {}
                     }
                 }
@@ -242,6 +253,7 @@ impl RetentionRuntime {
                                 dry_run = config.dry_run,
                                 "harvest retention tick completed"
                             );
+                            #[allow(clippy::cast_precision_loss)]
                             metrics.record_retention_tick(
                                 u16::try_from(shard.as_i32()).unwrap_or(0),
                                 ok.candidate_count as u64,
@@ -286,6 +298,10 @@ impl RetentionRuntime {
         self.shutdown.cancel();
     }
 
+    /// # Errors
+    ///
+    /// Returns a [`tokio::task::JoinError`] if the spawned retention task panicked
+    /// or was aborted.
     pub async fn join(self) -> Result<(), tokio::task::JoinError> {
         self.handle.await
     }
@@ -356,7 +372,7 @@ async fn run_shard_tick(
         .bind::<Timestamptz, _>(cutoff)
         .bind::<Nullable<Timestamptz>, _>(cursor.map(|it| it.completed_at))
         .bind::<Nullable<SqlUuid>, _>(cursor.map(|it| it.id))
-        .bind::<BigInt, _>(remaining as i64)
+        .bind::<BigInt, _>(i64::try_from(remaining).unwrap_or(i64::MAX))
         .load::<CandidateExecution>(&mut conn)
         .await
         .map_err(database_error)?;
@@ -401,49 +417,57 @@ async fn run_shard_tick(
                 continue;
             }
 
-            conn.transaction::<_, HarvestError, _>(|conn| {
-                Box::pin(async move {
-                    diesel::update(
-                        harvest_workflow_executions::table
-                            .filter(harvest_workflow_executions::parent_id.eq(Some(candidate.id)))
-                            .filter(harvest_workflow_executions::state.eq_any([
-                                "COMPLETED",
-                                "FAILED",
-                                "CANCELLED",
-                                "TIMED_OUT",
-                                "CONTINUED_AS_NEW",
-                            ])),
-                    )
-                    .set(harvest_workflow_executions::parent_id.eq::<Option<uuid::Uuid>>(None))
-                    .execute(conn)
-                    .await
-                    .map_err(database_error)?;
-
-                    diesel::delete(
-                        harvest_dead_letters::table
-                            .filter(harvest_dead_letters::workflow_exec_id.eq(Some(candidate.id))),
-                    )
-                    .execute(conn)
-                    .await
-                    .map_err(database_error)?;
-
-                    diesel::delete(
-                        harvest_workflow_executions::table
-                            .filter(harvest_workflow_executions::id.eq(candidate.id)),
-                    )
-                    .execute(conn)
-                    .await
-                    .map_err(database_error)?;
-                    Ok(())
-                })
-            })
-            .await?;
+            delete_candidate_execution(&mut conn, candidate.id).await?;
             outcome.deleted_count += 1;
         }
     }
 
     tracing::debug!(shard = %shard, candidates = outcome.candidate_count, deleted = outcome.deleted_count, "retention shard tick");
     Ok(outcome)
+}
+
+#[cfg(feature = "db")]
+async fn delete_candidate_execution(
+    conn: &mut diesel_async::AsyncPgConnection,
+    candidate_id: uuid::Uuid,
+) -> HarvestResult<()> {
+    conn.transaction::<_, HarvestError, _>(|conn| {
+        Box::pin(async move {
+            diesel::update(
+                harvest_workflow_executions::table
+                    .filter(harvest_workflow_executions::parent_id.eq(Some(candidate_id)))
+                    .filter(harvest_workflow_executions::state.eq_any([
+                        "COMPLETED",
+                        "FAILED",
+                        "CANCELLED",
+                        "TIMED_OUT",
+                        "CONTINUED_AS_NEW",
+                    ])),
+            )
+            .set(harvest_workflow_executions::parent_id.eq::<Option<uuid::Uuid>>(None))
+            .execute(conn)
+            .await
+            .map_err(database_error)?;
+
+            diesel::delete(
+                harvest_dead_letters::table
+                    .filter(harvest_dead_letters::workflow_exec_id.eq(Some(candidate_id))),
+            )
+            .execute(conn)
+            .await
+            .map_err(database_error)?;
+
+            diesel::delete(
+                harvest_workflow_executions::table
+                    .filter(harvest_workflow_executions::id.eq(candidate_id)),
+            )
+            .execute(conn)
+            .await
+            .map_err(database_error)?;
+            Ok(())
+        })
+    })
+    .await
 }
 
 #[cfg(feature = "db")]
