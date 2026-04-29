@@ -134,9 +134,7 @@ pub enum HarvestError {
     ///
     /// Returned by `start_or_load_workflow_execution` when the policy is
     /// `WorkflowIdReusePolicy::RejectDuplicate`.
-    #[error(
-        "workflow execution already exists: {existing_exec_id} (state: {existing_state})"
-    )]
+    #[error("workflow execution already exists: {existing_exec_id} (state: {existing_state})")]
     AlreadyExists {
         /// The execution ID of the conflicting prior run.
         existing_exec_id: ExecutionId,

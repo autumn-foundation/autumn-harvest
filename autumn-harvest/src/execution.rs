@@ -165,8 +165,15 @@ pub async fn start_or_load_workflow_execution(
         && existing.state == "RUNNING"
     {
         let existing_exec_id = ExecutionId::from_uuid(existing.id);
-        cancel_workflow_execution(conn, existing_exec_id, "terminated to start new execution")
-            .await?;
+        // Ignore Config errors: the execution may have transitioned to a terminal
+        // state between the pre-check and the cancel lock. In that race the prior
+        // run is already done, so we just continue to the start transaction below.
+        match cancel_workflow_execution(conn, existing_exec_id, "terminated to start new execution")
+            .await
+        {
+            Ok(_) | Err(HarvestError::Config(_)) => {}
+            Err(e) => return Err(e),
+        }
     }
 
     let row = NewWorkflowExecution {
@@ -233,22 +240,22 @@ pub async fn start_or_load_workflow_execution(
                     Ok(StartedWorkflowExecution::from_row(existing, false))
                 }
 
-                WorkflowIdReusePolicy::RejectDuplicate => {
-                    Err(HarvestError::AlreadyExists {
-                        existing_exec_id: ExecutionId::from_uuid(existing.id),
-                        existing_state: existing.state,
-                    })
-                }
+                WorkflowIdReusePolicy::RejectDuplicate => Err(HarvestError::AlreadyExists {
+                    existing_exec_id: ExecutionId::from_uuid(existing.id),
+                    existing_state: existing.state,
+                }),
 
                 WorkflowIdReusePolicy::AllowDuplicateFailedOnly => {
                     match existing.state.as_str() {
-                        "RUNNING" | "COMPLETED" => {
-                            Ok(StartedWorkflowExecution::from_row(existing, false))
-                        }
-                        _ => {
-                            // FAILED or CANCELLED: replace with a fresh execution.
+                        "FAILED" | "CANCELLED" => {
+                            // Only these two explicitly abnormal states start fresh.
                             replace_execution(conn, existing, &row, &enqueue, exec_id, &request)
                                 .await
+                        }
+                        _ => {
+                            // RUNNING, COMPLETED, TIMED_OUT, or any other state:
+                            // return the existing execution unchanged.
+                            Ok(StartedWorkflowExecution::from_row(existing, false))
                         }
                     }
                 }
@@ -316,10 +323,7 @@ async fn replace_execution(
 /// RUNNING row appears inside the start transaction despite the pre-check.
 /// Appends a `WorkflowCancelled` event, transitions to CANCELLED, and fails
 /// open tasks — all within the caller's transaction.
-async fn inline_cancel(
-    conn: &mut AsyncPgConnection,
-    exec_id: ExecutionId,
-) -> HarvestResult<()> {
+async fn inline_cancel(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> HarvestResult<()> {
     let reason = "terminated to start new execution";
     let history = store::load_history(conn, exec_id).await?;
     store::append_events(
@@ -341,12 +345,8 @@ async fn inline_cancel(
         .execute(conn)
         .await
         .map_err(database_error)?;
-    queue::fail_open_tasks_for_execution(
-        conn,
-        exec_id,
-        &format!("workflow cancelled: {reason}"),
-    )
-    .await?;
+    queue::fail_open_tasks_for_execution(conn, exec_id, &format!("workflow cancelled: {reason}"))
+        .await?;
     Ok(())
 }
 
