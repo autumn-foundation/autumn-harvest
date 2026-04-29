@@ -249,6 +249,16 @@ pub struct WorkflowContext {
 }
 
 impl WorkflowContext {
+    // ── Internal Helpers ──────────────────────────────────────────────────
+
+    fn match_history<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut HistoryMatcher) -> R,
+    {
+        let mut matcher = self.matcher.lock().expect("matcher lock poisoned");
+        f(&mut matcher)
+    }
+
     // ── Constructors ──────────────────────────────────────────────────
 
     /// Create a context for replaying a workflow from its event history.
@@ -528,11 +538,7 @@ impl WorkflowContext {
         F: FnOnce() -> T,
         T: serde::Serialize + serde::de::DeserializeOwned,
     {
-        let history_match = self
-            .matcher
-            .lock()
-            .expect("matcher lock poisoned")
-            .match_side_effect(id);
+        let history_match = self.match_history(|m| m.match_side_effect(id));
 
         match history_match {
             HistoryMatch::Matched { output } => {
@@ -604,11 +610,7 @@ impl WorkflowContext {
     ///
     /// Panics if the internal matcher or commands mutex is poisoned.
     pub fn version(&self, change_id: &str, min: u32, max: u32) -> u32 {
-        let version = self
-            .matcher
-            .lock()
-            .expect("matcher lock poisoned")
-            .match_version(change_id, min, max);
+        let version = self.match_history(|m| m.match_version(change_id, min, max));
 
         // During live execution (matcher returned max_version and is past
         // history), emit a marker so future replays see this version.
@@ -647,11 +649,7 @@ impl WorkflowContext {
         queue: &str,
     ) -> HarvestResult<Value> {
         // Step 1: Match against history (lock is dropped before any .await).
-        let history_match = self
-            .matcher
-            .lock()
-            .expect("matcher lock poisoned")
-            .match_activity(name);
+        let history_match = self.match_history(|m| m.match_activity(name));
 
         match history_match {
             HistoryMatch::Matched { output } => Ok(output),
@@ -718,11 +716,7 @@ impl WorkflowContext {
     ///
     /// Panics if the internal matcher or commands mutex is poisoned.
     pub async fn timer(&self, timer_id: &str, duration_secs: u64) -> HarvestResult<()> {
-        let history_match = self
-            .matcher
-            .lock()
-            .expect("matcher lock poisoned")
-            .match_timer(timer_id);
+        let history_match = self.match_history(|m| m.match_timer(timer_id));
 
         match history_match {
             HistoryMatch::Matched { .. } => Ok(()),
@@ -773,11 +767,7 @@ impl WorkflowContext {
         workflow_name: &str,
         input: Value,
     ) -> HarvestResult<Value> {
-        let history_match = self
-            .matcher
-            .lock()
-            .expect("matcher lock poisoned")
-            .match_child_workflow(workflow_name, &input);
+        let history_match = self.match_history(|m| m.match_child_workflow(workflow_name, &input));
 
         match history_match {
             HistoryMatch::Matched { output } => Ok(output),
@@ -828,11 +818,7 @@ impl WorkflowContext {
     ///
     /// Panics if the internal replay matcher mutex is poisoned.
     pub async fn wait_for_signal(&self, signal_name: &str) -> HarvestResult<Value> {
-        let history_match = self
-            .matcher
-            .lock()
-            .expect("matcher lock poisoned")
-            .match_signal(signal_name);
+        let history_match = self.match_history(|m| m.match_signal(signal_name));
 
         match history_match {
             HistoryMatch::Matched { output } => Ok(output),
@@ -886,11 +872,7 @@ impl WorkflowContext {
     ///
     /// Panics if the internal matcher or commands mutex is poisoned.
     pub async fn continue_as_new(&self, input: Value) -> HarvestResult<()> {
-        let history_match = self
-            .matcher
-            .lock()
-            .expect("matcher lock poisoned")
-            .match_continue_as_new(&input);
+        let history_match = self.match_history(|m| m.match_continue_as_new(&input));
 
         match history_match {
             HistoryMatch::Matched { output } => {
