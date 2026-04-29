@@ -22,6 +22,7 @@ pub mod context;
 pub mod dag;
 /// Export format types for Directed Acyclic Graphs (DAGs) representing workflows.
 pub mod dag_export;
+pub mod dag_linter;
 #[cfg(any(test, feature = "testing"))]
 pub mod dag_simulator;
 pub mod error;
@@ -91,6 +92,10 @@ pub use cache::{CachedWorkflowState, WorkflowCache};
 pub use context::{ActivityContext, WorkflowCommand, WorkflowContext};
 pub use dag::{DagBuildError, DagBuilder, DagDefinition, DagTask, DagTaskRef};
 pub use dag_export::{export_dot, export_mermaid};
+pub use dag_linter::{
+    DagLinter, DagRule, DagWarning, ExcessiveParallelismRule, MissingRetryPolicyRule,
+    MissingTimeoutRule,
+};
 #[cfg(any(test, feature = "testing"))]
 pub use dag_simulator::{DagSimulator, DagSimulatorResult};
 pub use error::{HarvestError, HarvestResult, TimeoutType};

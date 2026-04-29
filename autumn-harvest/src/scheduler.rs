@@ -538,7 +538,7 @@ async fn execute_dag_run(
             let upstream_statuses: Vec<_> = task
                 .upstreams
                 .iter()
-                .map(|upstream| statuses[*upstream].clone())
+                .map(|upstream| statuses[*upstream])
                 .collect();
             let registry = Arc::clone(&registry);
             let task_input = Arc::clone(&run_input);

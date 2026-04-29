@@ -28,6 +28,7 @@ diesel_migrations = { workspace = true }
 deadpool = { workspace = true }
 scoped-futures = "0.1"
 tower = "0.5"
+maud = { version = "0.27", features = ["axum"] }
 
 [dev-dependencies]
 tower = "0.5"
