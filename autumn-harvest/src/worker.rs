@@ -809,8 +809,14 @@ async fn persist_scheduled_activity(
             "schedule_to_start timeout",
         )?);
     }
-    if let Some(key) = activity.concurrency_key {
-        params.concurrency_key = Some(key.to_string());
+    // When max_concurrent is set but concurrency_key is omitted, default the
+    // key to the activity name so the per-activity cap is enforced correctly.
+    let effective_key = activity
+        .concurrency_key
+        .map(ToString::to_string)
+        .or_else(|| activity.max_concurrent.map(|_| activity.name.to_string()));
+    if let Some(key) = effective_key {
+        params.concurrency_key = Some(key);
         params.max_concurrent = activity.max_concurrent;
     }
 

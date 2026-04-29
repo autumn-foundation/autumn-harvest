@@ -122,6 +122,18 @@ pub enum HarvestBuilderError {
         /// The orphaned concurrency key.
         key: String,
     },
+
+    /// An activity declares `max_concurrent = 0`, which makes every enqueued
+    /// task permanently unclaimable: the saturation predicate
+    /// (`HAVING COUNT(*) >= 0`) is always true, deferring all tasks indefinitely.
+    #[error(
+        "activity '{activity}' has max_concurrent = 0; use max_concurrent >= 1 \
+         or omit max_concurrent entirely to disable the cap"
+    )]
+    ZeroConcurrencyCap {
+        /// The activity name.
+        activity: String,
+    },
 }
 
 impl BuiltHarvest {
@@ -362,6 +374,14 @@ fn validate_concurrency_keys(
     let mut seen: HashMap<&str, ConcurrencyKeyEntry> = HashMap::new();
 
     for activity in activities {
+        // max_concurrent = 0 makes the cap predicate always-true, permanently
+        // deferring every task for that activity. Reject at build time.
+        if activity.max_concurrent == Some(0) {
+            return Err(HarvestBuilderError::ZeroConcurrencyCap {
+                activity: activity.name.to_string(),
+            });
+        }
+
         // concurrency_key without max_concurrent silently bypasses the cap — reject it.
         if let (Some(key), None) = (activity.concurrency_key, activity.max_concurrent) {
             return Err(HarvestBuilderError::ConcurrencyKeyWithoutCap {
@@ -721,5 +741,21 @@ mod tests {
         ));
         assert!(err.to_string().contains("act_a"));
         assert!(err.to_string().contains("stripe"));
+    }
+
+    #[test]
+    fn builder_rejects_zero_concurrency_cap() {
+        // max_concurrent = 0 makes HAVING COUNT(*) >= 0 always true,
+        // permanently deferring every task for this activity.
+        let result = HarvestBuilder::new()
+            .activities(vec![make_activity("act_a", Some(0), Some("stripe"))])
+            .try_build();
+        let err = result.unwrap_err();
+        assert!(matches!(
+            err,
+            HarvestBuilderError::ZeroConcurrencyCap { ref activity }
+                if activity == "act_a"
+        ));
+        assert!(err.to_string().contains("act_a"));
     }
 }

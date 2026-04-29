@@ -253,27 +253,31 @@ pub async fn claim_task(
     queues: &[String],
     worker_id: &str,
 ) -> HarvestResult<Option<TaskQueueItem>> {
-    // The concurrency-cap predicate is a correlated subquery that counts how
-    // many tasks with the same concurrency_key are currently RUNNING. When
-    // the count >= concurrency_cap the row is skipped (NOT EXISTS is false),
-    // deferring it to the next poll cycle.
+    // Two-phase claim using a CTE to avoid holding advisory locks during
+    // broad WHERE filtering.
     //
-    // Race-condition protection: pg_try_advisory_xact_lock serializes claim
-    // attempts for a given key across concurrent workers. Without it, two
-    // workers that both observe N < cap in the same window could each claim a
-    // task and momentarily exceed the cap. The advisory lock is transaction-
-    // scoped (auto-released on commit/rollback), so the serialization window
-    // is only as wide as the claim transaction itself — typically sub-ms.
-    // Different keys use independent lock slots; uncapped (NULL-key) tasks are
-    // completely unaffected (short-circuit branch).
+    // Phase 1 (CTE): select the best PENDING candidate using the cap check
+    // alone (no advisory lock). FOR UPDATE SKIP LOCKED prevents two workers
+    // from picking the same row.
+    //
+    // Phase 2 (UPDATE): for capped keys, acquire pg_try_advisory_xact_lock
+    // only for the single selected candidate and re-verify the cap. This
+    // closes the race window where two workers could both pass the cap check
+    // in the same poll cycle before either commits. If the advisory lock fails
+    // (another worker holds it) or the re-check shows the cap is now
+    // saturated, the UPDATE matches 0 rows and the transaction commits with no
+    // change; the PENDING row is immediately available for the next poll.
+    //
+    // Acquiring the lock only for the final candidate (not during broad
+    // filtering) means a worker never transiently holds locks for keys it will
+    // not actually claim, keeping throughput high under contention.
     //
     // The partial index harvest_task_queue_concurrency_key_running makes the
-    // inner SELECT fast: it only scans RUNNING rows with a non-NULL key.
+    // inner re-check SELECT fast: it only scans RUNNING rows with a non-NULL key.
     let result: Vec<TaskQueueItem> = diesel::sql_query(
-        "UPDATE harvest_task_queue \
-         SET state = 'RUNNING', worker_id = $1, started_at = NOW(), attempt = attempt + 1 \
-         WHERE id = ( \
-             SELECT id FROM harvest_task_queue \
+        "WITH candidate AS ( \
+             SELECT id, concurrency_key, concurrency_cap \
+             FROM harvest_task_queue \
              WHERE queue_name = ANY($2) \
                AND state = 'PENDING' \
                AND scheduled_at <= NOW() \
@@ -285,14 +289,11 @@ pub async fn claim_task(
                ) \
                AND ( \
                    concurrency_key IS NULL \
-                   OR ( \
-                       pg_try_advisory_xact_lock(hashtext(concurrency_key)::bigint) \
-                       AND NOT EXISTS ( \
-                           SELECT 1 FROM harvest_task_queue inner_q \
-                           WHERE inner_q.concurrency_key = harvest_task_queue.concurrency_key \
-                             AND inner_q.state = 'RUNNING' \
-                           HAVING COUNT(*) >= harvest_task_queue.concurrency_cap \
-                       ) \
+                   OR NOT EXISTS ( \
+                       SELECT 1 FROM harvest_task_queue inner_q \
+                       WHERE inner_q.concurrency_key = harvest_task_queue.concurrency_key \
+                         AND inner_q.state = 'RUNNING' \
+                       HAVING COUNT(*) >= harvest_task_queue.concurrency_cap \
                    ) \
                ) \
              ORDER BY \
@@ -303,7 +304,24 @@ pub async fn claim_task(
                  priority DESC, \
                  scheduled_at ASC \
              LIMIT 1 FOR UPDATE SKIP LOCKED \
-         ) RETURNING *",
+         ) \
+         UPDATE harvest_task_queue \
+         SET state = 'RUNNING', worker_id = $1, started_at = NOW(), attempt = attempt + 1 \
+         FROM candidate \
+         WHERE harvest_task_queue.id = candidate.id \
+           AND ( \
+               candidate.concurrency_key IS NULL \
+               OR ( \
+                   pg_try_advisory_xact_lock(hashtext(candidate.concurrency_key)::bigint) \
+                   AND NOT EXISTS ( \
+                       SELECT 1 FROM harvest_task_queue recheck \
+                       WHERE recheck.concurrency_key = candidate.concurrency_key \
+                         AND recheck.state = 'RUNNING' \
+                       HAVING COUNT(*) >= candidate.concurrency_cap \
+                   ) \
+               ) \
+           ) \
+         RETURNING harvest_task_queue.*",
     )
     .bind::<diesel::sql_types::Text, _>(worker_id)
     .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
