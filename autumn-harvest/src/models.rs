@@ -130,7 +130,7 @@ pub struct TaskQueueItem {
     pub trace_context: Option<serde_json::Value>,
     /// Cluster-wide concurrency group key. NULL = no cap enforced.
     pub concurrency_key: Option<String>,
-    /// Maximum concurrent RUNNING tasks allowed for this concurrency_key.
+    /// Maximum concurrent RUNNING tasks allowed for this `concurrency_key`.
     pub concurrency_cap: Option<i32>,
 }
 
