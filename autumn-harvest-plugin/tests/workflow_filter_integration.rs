@@ -149,6 +149,7 @@ async fn seed_workflow(
             execution_timeout: None,
             memo: None,
             search_attrs,
+            reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
         },
     )
     .await

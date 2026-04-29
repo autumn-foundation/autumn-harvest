@@ -436,6 +436,55 @@ impl fmt::Display for WorkerId {
     }
 }
 
+/// Controls how a duplicate `(workflow_name, workflow_id)` start is handled.
+///
+/// The policy is a *caller* concern chosen at request time. It has no effect
+/// on the first start of a given `workflow_id`; it only changes behaviour when
+/// a prior execution already exists for the same `(workflow_name, workflow_id)`
+/// pair.
+///
+/// ## Examples
+///
+/// ```rust
+/// use autumn_harvest::types::WorkflowIdReusePolicy;
+///
+/// // AllowDuplicate is the default
+/// let policy = WorkflowIdReusePolicy::default();
+/// assert_eq!(policy, WorkflowIdReusePolicy::AllowDuplicate);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowIdReusePolicy {
+    /// Return the existing execution unconditionally. This is the default.
+    ///
+    /// Correct for upstream retries when the caller does not know whether the
+    /// previous start succeeded — they get the same `exec_id` back and move on.
+    #[default]
+    AllowDuplicate,
+
+    /// Return [`crate::error::HarvestError::AlreadyExists`] for any prior
+    /// execution, including terminal ones.
+    ///
+    /// Use for at-most-one semantics: the second request is explicitly rejected
+    /// so the caller can decide what to do.
+    RejectDuplicate,
+
+    /// Start a fresh run if the prior execution is FAILED or CANCELLED; return
+    /// the existing execution unchanged if it is RUNNING or COMPLETED.
+    ///
+    /// Use for retry-after-failure semantics: a successful or in-progress run
+    /// is not superseded, but a failed one is automatically replaced.
+    AllowDuplicateFailedOnly,
+
+    /// Cancel a RUNNING prior execution and start a fresh run; start a fresh
+    /// run unconditionally if the prior execution is already terminal.
+    ///
+    /// The cancel and the new start are two separate transactions. A failure
+    /// between them leaves the prior workflow CANCELLED with no new run started;
+    /// retrying with the same policy starts a fresh run on the next attempt.
+    TerminateIfRunning,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

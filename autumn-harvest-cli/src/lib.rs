@@ -227,6 +227,11 @@ enum WorkflowCommand {
         /// Execution timeout in seconds.
         #[arg(long)]
         execution_timeout_secs: Option<i64>,
+        /// How to handle a duplicate `(workflow_name, workflow_id)` start.
+        /// One of: `allow_duplicate` (default), `reject_duplicate`,
+        /// `allow_duplicate_failed_only`, `terminate_if_running`.
+        #[arg(long, value_name = "POLICY")]
+        reuse_policy: Option<String>,
     },
     /// Cancel a workflow execution.
     Cancel {
@@ -460,6 +465,7 @@ fn workflow_request(command: &WorkflowCommand) -> Result<ApiRequest, CliError> {
             search_attrs_json,
             search_attrs_file,
             execution_timeout_secs,
+            reuse_policy,
         } => {
             let mut body = Map::new();
             insert_string(&mut body, "workflow_id", workflow_id.as_deref());
@@ -490,6 +496,7 @@ fn workflow_request(command: &WorkflowCommand) -> Result<ApiRequest, CliError> {
             if let Some(timeout) = execution_timeout_secs {
                 body.insert("execution_timeout_secs".to_string(), json!(timeout));
             }
+            insert_string(&mut body, "reuse_policy", reuse_policy.as_deref());
 
             Ok(ApiRequest::post(
                 format!("/workflows/{}/start", path_segment(workflow_name)),
@@ -713,4 +720,98 @@ fn query_encode(input: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod reuse_policy_tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Cli {
+        Cli::try_parse_from(std::iter::once("harvest").chain(args.iter().copied()))
+            .expect("CLI should parse successfully")
+    }
+
+    fn start_request(args: &[&str]) -> ApiRequest {
+        parse(args)
+            .api_request()
+            .expect("request mapping should succeed")
+    }
+
+    #[test]
+    fn start_omitting_reuse_policy_sends_no_field() {
+        let req = start_request(&["workflow", "start", "my_wf"]);
+        let body = req.body.as_ref().expect("start should have a body");
+        assert!(
+            body.get("reuse_policy").is_none(),
+            "omitting --reuse-policy must not send the field"
+        );
+    }
+
+    #[test]
+    fn start_allow_duplicate_sends_correct_value() {
+        let req = start_request(&[
+            "workflow",
+            "start",
+            "my_wf",
+            "--reuse-policy",
+            "allow_duplicate",
+        ]);
+        let body = req.body.as_ref().unwrap();
+        assert_eq!(body["reuse_policy"], "allow_duplicate");
+    }
+
+    #[test]
+    fn start_reject_duplicate_sends_correct_value() {
+        let req = start_request(&[
+            "workflow",
+            "start",
+            "my_wf",
+            "--reuse-policy",
+            "reject_duplicate",
+        ]);
+        let body = req.body.as_ref().unwrap();
+        assert_eq!(body["reuse_policy"], "reject_duplicate");
+    }
+
+    #[test]
+    fn start_allow_duplicate_failed_only_sends_correct_value() {
+        let req = start_request(&[
+            "workflow",
+            "start",
+            "my_wf",
+            "--reuse-policy",
+            "allow_duplicate_failed_only",
+        ]);
+        let body = req.body.as_ref().unwrap();
+        assert_eq!(body["reuse_policy"], "allow_duplicate_failed_only");
+    }
+
+    #[test]
+    fn start_terminate_if_running_sends_correct_value() {
+        let req = start_request(&[
+            "workflow",
+            "start",
+            "my_wf",
+            "--reuse-policy",
+            "terminate_if_running",
+        ]);
+        let body = req.body.as_ref().unwrap();
+        assert_eq!(body["reuse_policy"], "terminate_if_running");
+    }
+
+    #[test]
+    fn start_preserves_other_fields_alongside_reuse_policy() {
+        let req = start_request(&[
+            "workflow",
+            "start",
+            "my_wf",
+            "--workflow-id",
+            "wf-123",
+            "--reuse-policy",
+            "reject_duplicate",
+        ]);
+        let body = req.body.as_ref().unwrap();
+        assert_eq!(body["workflow_id"], "wf-123");
+        assert_eq!(body["reuse_policy"], "reject_duplicate");
+    }
 }

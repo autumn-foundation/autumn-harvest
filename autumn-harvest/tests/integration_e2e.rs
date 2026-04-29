@@ -19,7 +19,8 @@ use autumn_harvest::types::{ActivityExecId, ExecutionId};
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{
     ActivityContext, HarvestBuilder, HarvestError, StartWorkflowParams, TimeoutType, WorkerConfig,
-    WorkflowContext, queue, start_or_load_workflow_execution, timeout,
+    WorkflowContext, WorkflowIdReusePolicy, cancel_workflow_execution, queue,
+    start_or_load_workflow_execution, timeout,
 };
 
 use chrono::Utc;
@@ -280,6 +281,7 @@ async fn legacy_workflow_uniqueness_schema_can_be_upgraded_for_idempotent_starts
         execution_timeout: None,
         memo: None,
         search_attrs: None,
+        reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
     };
 
     // On the legacy schema there is no `(workflow_name, workflow_id)`
@@ -2853,4 +2855,469 @@ async fn continue_as_new_down_migration_rewrites_historical_runs_for_rollback() 
         rows_on_original_key, 1,
         "rollback should leave exactly one row on the original logical key before restoring uniqueness",
     );
+}
+
+// ── WorkflowIdReusePolicy integration matrix ─────────────────────────────────
+//
+// 4 policies × 5 prior states (none, RUNNING, COMPLETED, FAILED, CANCELLED)
+// = 20 cells, each asserting: (a) which exec_id the second start observes,
+// (b) whether a new exec_id was minted, (c) the error variant when applicable.
+
+/// Helpers for the reuse-policy matrix tests.
+mod reuse_policy_helpers {
+    use super::*;
+
+    pub fn base_params(
+        workflow_id: &'static str,
+        exec_id: ExecutionId,
+    ) -> StartWorkflowParams<'static> {
+        StartWorkflowParams {
+            workflow_name: "reuse_policy_wf",
+            workflow_id,
+            exec_id,
+            input: serde_json::json!({}),
+            parent_id: None,
+            queue_name: "default",
+            execution_timeout: None,
+            memo: None,
+            search_attrs: None,
+            reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
+        }
+    }
+
+    /// Force a workflow row into a terminal state by direct UPDATE.
+    pub async fn force_state(conn: &mut AsyncPgConnection, exec_id: ExecutionId, state: &str) {
+        diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
+            .set(harvest_workflow_executions::state.eq(state))
+            .execute(conn)
+            .await
+            .expect("force_state UPDATE failed");
+    }
+}
+
+#[tokio::test]
+async fn reuse_policy_allow_duplicate_no_prior_creates() {
+    let (mut conn, _container) = setup_test_db().await;
+    let exec_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    let mut params = reuse_policy_helpers::base_params("rp-allow-none", exec_id);
+    params.reuse_policy = WorkflowIdReusePolicy::AllowDuplicate;
+    let result = start_or_load_workflow_execution(&mut conn, params)
+        .await
+        .expect("AllowDuplicate with no prior should succeed");
+    assert!(result.created, "should create when no prior exists");
+    assert_eq!(result.exec_id, exec_id);
+}
+
+#[tokio::test]
+async fn reuse_policy_allow_duplicate_running_returns_existing() {
+    let (mut conn, _container) = setup_test_db().await;
+    let first_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    let mut params = reuse_policy_helpers::base_params("rp-allow-run", first_id);
+    params.reuse_policy = WorkflowIdReusePolicy::AllowDuplicate;
+    let first = start_or_load_workflow_execution(&mut conn, params.clone())
+        .await
+        .expect("first start should succeed");
+    assert!(first.created);
+
+    let second_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    params.exec_id = second_id;
+    let second = start_or_load_workflow_execution(&mut conn, params)
+        .await
+        .expect("AllowDuplicate on RUNNING should return existing");
+    assert!(!second.created);
+    assert_eq!(
+        second.exec_id, first.exec_id,
+        "must return the first exec_id"
+    );
+    assert_eq!(second.state, "RUNNING");
+}
+
+#[tokio::test]
+async fn reuse_policy_allow_duplicate_completed_returns_existing() {
+    let (mut conn, _container) = setup_test_db().await;
+    let first_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    let mut params = reuse_policy_helpers::base_params("rp-allow-cmp", first_id);
+    params.reuse_policy = WorkflowIdReusePolicy::AllowDuplicate;
+    let first = start_or_load_workflow_execution(&mut conn, params.clone())
+        .await
+        .expect("first start should succeed");
+    reuse_policy_helpers::force_state(&mut conn, first.exec_id, "COMPLETED").await;
+
+    params.exec_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    let second = start_or_load_workflow_execution(&mut conn, params)
+        .await
+        .expect("AllowDuplicate on COMPLETED should return existing");
+    assert!(!second.created);
+    assert_eq!(second.exec_id, first.exec_id);
+}
+
+#[tokio::test]
+async fn reuse_policy_allow_duplicate_failed_returns_existing() {
+    let (mut conn, _container) = setup_test_db().await;
+    let first_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    let mut params = reuse_policy_helpers::base_params("rp-allow-fail", first_id);
+    params.reuse_policy = WorkflowIdReusePolicy::AllowDuplicate;
+    let first = start_or_load_workflow_execution(&mut conn, params.clone())
+        .await
+        .expect("first start should succeed");
+    reuse_policy_helpers::force_state(&mut conn, first.exec_id, "FAILED").await;
+
+    params.exec_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    let second = start_or_load_workflow_execution(&mut conn, params)
+        .await
+        .expect("AllowDuplicate on FAILED should return existing");
+    assert!(!second.created);
+    assert_eq!(second.exec_id, first.exec_id);
+}
+
+#[tokio::test]
+async fn reuse_policy_allow_duplicate_cancelled_returns_existing() {
+    let (mut conn, _container) = setup_test_db().await;
+    let first_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    let mut params = reuse_policy_helpers::base_params("rp-allow-can", first_id);
+    params.reuse_policy = WorkflowIdReusePolicy::AllowDuplicate;
+    let first = start_or_load_workflow_execution(&mut conn, params.clone())
+        .await
+        .expect("first start should succeed");
+    cancel_workflow_execution(&mut conn, first.exec_id, "test cancel")
+        .await
+        .expect("cancel should succeed");
+
+    params.exec_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    let second = start_or_load_workflow_execution(&mut conn, params)
+        .await
+        .expect("AllowDuplicate on CANCELLED should return existing");
+    assert!(!second.created);
+    assert_eq!(second.exec_id, first.exec_id);
+    assert_eq!(second.state, "CANCELLED");
+}
+
+#[tokio::test]
+async fn reuse_policy_reject_duplicate_no_prior_creates() {
+    let (mut conn, _container) = setup_test_db().await;
+    let exec_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    let mut params = reuse_policy_helpers::base_params("rp-reject-none", exec_id);
+    params.reuse_policy = WorkflowIdReusePolicy::RejectDuplicate;
+    let result = start_or_load_workflow_execution(&mut conn, params)
+        .await
+        .expect("RejectDuplicate with no prior should succeed");
+    assert!(result.created);
+}
+
+#[tokio::test]
+async fn reuse_policy_reject_duplicate_running_errors() {
+    let (mut conn, _container) = setup_test_db().await;
+    let first_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    let mut params = reuse_policy_helpers::base_params("rp-reject-run", first_id);
+    params.reuse_policy = WorkflowIdReusePolicy::RejectDuplicate;
+    let first = start_or_load_workflow_execution(&mut conn, params.clone())
+        .await
+        .expect("first start should succeed");
+
+    params.exec_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    let err = start_or_load_workflow_execution(&mut conn, params)
+        .await
+        .expect_err("RejectDuplicate on RUNNING must error");
+    match err {
+        HarvestError::AlreadyExists {
+            existing_exec_id,
+            existing_state,
+        } => {
+            assert_eq!(existing_exec_id, first.exec_id);
+            assert_eq!(existing_state, "RUNNING");
+        }
+        other => panic!("expected AlreadyExists, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn reuse_policy_reject_duplicate_completed_errors() {
+    let (mut conn, _container) = setup_test_db().await;
+    let first_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    let mut params = reuse_policy_helpers::base_params("rp-reject-cmp", first_id);
+    params.reuse_policy = WorkflowIdReusePolicy::RejectDuplicate;
+    let first = start_or_load_workflow_execution(&mut conn, params.clone())
+        .await
+        .expect("first start should succeed");
+    reuse_policy_helpers::force_state(&mut conn, first.exec_id, "COMPLETED").await;
+
+    params.exec_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    let err = start_or_load_workflow_execution(&mut conn, params)
+        .await
+        .expect_err("RejectDuplicate on COMPLETED must error");
+    assert!(matches!(err, HarvestError::AlreadyExists { .. }));
+}
+
+#[tokio::test]
+async fn reuse_policy_reject_duplicate_failed_errors() {
+    let (mut conn, _container) = setup_test_db().await;
+    let first_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    let mut params = reuse_policy_helpers::base_params("rp-reject-fail", first_id);
+    params.reuse_policy = WorkflowIdReusePolicy::RejectDuplicate;
+    let first = start_or_load_workflow_execution(&mut conn, params.clone())
+        .await
+        .expect("first start should succeed");
+    reuse_policy_helpers::force_state(&mut conn, first.exec_id, "FAILED").await;
+
+    params.exec_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    let err = start_or_load_workflow_execution(&mut conn, params)
+        .await
+        .expect_err("RejectDuplicate on FAILED must error");
+    assert!(matches!(err, HarvestError::AlreadyExists { .. }));
+}
+
+#[tokio::test]
+async fn reuse_policy_reject_duplicate_cancelled_errors() {
+    let (mut conn, _container) = setup_test_db().await;
+    let first_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    let mut params = reuse_policy_helpers::base_params("rp-reject-can", first_id);
+    params.reuse_policy = WorkflowIdReusePolicy::RejectDuplicate;
+    let first = start_or_load_workflow_execution(&mut conn, params.clone())
+        .await
+        .expect("first start should succeed");
+    cancel_workflow_execution(&mut conn, first.exec_id, "test cancel")
+        .await
+        .expect("cancel should succeed");
+
+    params.exec_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    let err = start_or_load_workflow_execution(&mut conn, params)
+        .await
+        .expect_err("RejectDuplicate on CANCELLED must error");
+    assert!(matches!(err, HarvestError::AlreadyExists { .. }));
+}
+
+#[tokio::test]
+async fn reuse_policy_allow_failed_only_no_prior_creates() {
+    let (mut conn, _container) = setup_test_db().await;
+    let exec_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    let mut params = reuse_policy_helpers::base_params("rp-afo-none", exec_id);
+    params.reuse_policy = WorkflowIdReusePolicy::AllowDuplicateFailedOnly;
+    let result = start_or_load_workflow_execution(&mut conn, params)
+        .await
+        .expect("AllowDuplicateFailedOnly with no prior should create");
+    assert!(result.created);
+}
+
+#[tokio::test]
+async fn reuse_policy_allow_failed_only_running_returns_existing() {
+    let (mut conn, _container) = setup_test_db().await;
+    let first_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    let mut params = reuse_policy_helpers::base_params("rp-afo-run", first_id);
+    params.reuse_policy = WorkflowIdReusePolicy::AllowDuplicateFailedOnly;
+    let first = start_or_load_workflow_execution(&mut conn, params.clone())
+        .await
+        .expect("first start should succeed");
+
+    params.exec_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    let second = start_or_load_workflow_execution(&mut conn, params)
+        .await
+        .expect("AllowDuplicateFailedOnly on RUNNING should return existing");
+    assert!(!second.created);
+    assert_eq!(second.exec_id, first.exec_id);
+}
+
+#[tokio::test]
+async fn reuse_policy_allow_failed_only_completed_returns_existing() {
+    let (mut conn, _container) = setup_test_db().await;
+    let first_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    let mut params = reuse_policy_helpers::base_params("rp-afo-cmp", first_id);
+    params.reuse_policy = WorkflowIdReusePolicy::AllowDuplicateFailedOnly;
+    let first = start_or_load_workflow_execution(&mut conn, params.clone())
+        .await
+        .expect("first start should succeed");
+    reuse_policy_helpers::force_state(&mut conn, first.exec_id, "COMPLETED").await;
+
+    params.exec_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    let second = start_or_load_workflow_execution(&mut conn, params)
+        .await
+        .expect("AllowDuplicateFailedOnly on COMPLETED should return existing");
+    assert!(!second.created);
+    assert_eq!(second.exec_id, first.exec_id);
+}
+
+#[tokio::test]
+async fn reuse_policy_allow_failed_only_failed_starts_fresh() {
+    let (mut conn, _container) = setup_test_db().await;
+    let first_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    let mut params = reuse_policy_helpers::base_params("rp-afo-fail", first_id);
+    params.reuse_policy = WorkflowIdReusePolicy::AllowDuplicateFailedOnly;
+    let first = start_or_load_workflow_execution(&mut conn, params.clone())
+        .await
+        .expect("first start should succeed");
+    reuse_policy_helpers::force_state(&mut conn, first.exec_id, "FAILED").await;
+
+    let second_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    params.exec_id = second_id;
+    let second = start_or_load_workflow_execution(&mut conn, params)
+        .await
+        .expect("AllowDuplicateFailedOnly on FAILED should start fresh");
+    assert!(second.created, "must mint a new execution");
+    assert_eq!(second.exec_id, second_id, "must use the new exec_id");
+    assert_ne!(second.exec_id, first.exec_id);
+}
+
+#[tokio::test]
+async fn reuse_policy_allow_failed_only_cancelled_starts_fresh() {
+    let (mut conn, _container) = setup_test_db().await;
+    let first_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    let mut params = reuse_policy_helpers::base_params("rp-afo-can", first_id);
+    params.reuse_policy = WorkflowIdReusePolicy::AllowDuplicateFailedOnly;
+    let first = start_or_load_workflow_execution(&mut conn, params.clone())
+        .await
+        .expect("first start should succeed");
+    cancel_workflow_execution(&mut conn, first.exec_id, "test cancel")
+        .await
+        .expect("cancel should succeed");
+
+    let second_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    params.exec_id = second_id;
+    let second = start_or_load_workflow_execution(&mut conn, params)
+        .await
+        .expect("AllowDuplicateFailedOnly on CANCELLED should start fresh");
+    assert!(second.created, "must mint a new execution");
+    assert_eq!(second.exec_id, second_id);
+    assert_ne!(second.exec_id, first.exec_id);
+}
+
+#[tokio::test]
+async fn reuse_policy_terminate_if_running_no_prior_creates() {
+    let (mut conn, _container) = setup_test_db().await;
+    let exec_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    let mut params = reuse_policy_helpers::base_params("rp-tir-none", exec_id);
+    params.reuse_policy = WorkflowIdReusePolicy::TerminateIfRunning;
+    let result = start_or_load_workflow_execution(&mut conn, params)
+        .await
+        .expect("TerminateIfRunning with no prior should create");
+    assert!(result.created);
+    assert_eq!(result.exec_id, exec_id);
+}
+
+#[tokio::test]
+async fn reuse_policy_terminate_if_running_running_cancels_and_starts_fresh() {
+    let (mut conn, _container) = setup_test_db().await;
+    let first_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    let mut params = reuse_policy_helpers::base_params("rp-tir-run", first_id);
+    params.reuse_policy = WorkflowIdReusePolicy::TerminateIfRunning;
+    let first = start_or_load_workflow_execution(&mut conn, params.clone())
+        .await
+        .expect("first start should succeed");
+    assert_eq!(first.state, "RUNNING");
+
+    let second_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    params.exec_id = second_id;
+    let second = start_or_load_workflow_execution(&mut conn, params)
+        .await
+        .expect("TerminateIfRunning on RUNNING should cancel and start fresh");
+    assert!(second.created, "must mint a new execution");
+    assert_eq!(second.exec_id, second_id);
+    assert_ne!(second.exec_id, first.exec_id);
+    assert_eq!(second.state, "RUNNING");
+
+    // Verify prior run was cancelled
+    let prior = harvest_workflow_executions::table
+        .find(first.exec_id.as_uuid())
+        .select(WorkflowExecution::as_select())
+        .first(&mut conn)
+        .await
+        .expect("prior execution row must still exist");
+    assert_eq!(
+        prior.state, "CONTINUED_AS_NEW",
+        "prior run should be sealed as CONTINUED_AS_NEW"
+    );
+}
+
+#[tokio::test]
+async fn reuse_policy_terminate_if_running_completed_starts_fresh() {
+    let (mut conn, _container) = setup_test_db().await;
+    let first_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    let mut params = reuse_policy_helpers::base_params("rp-tir-cmp", first_id);
+    params.reuse_policy = WorkflowIdReusePolicy::TerminateIfRunning;
+    let first = start_or_load_workflow_execution(&mut conn, params.clone())
+        .await
+        .expect("first start should succeed");
+    reuse_policy_helpers::force_state(&mut conn, first.exec_id, "COMPLETED").await;
+
+    let second_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    params.exec_id = second_id;
+    let second = start_or_load_workflow_execution(&mut conn, params)
+        .await
+        .expect("TerminateIfRunning on COMPLETED should start fresh");
+    assert!(second.created, "must mint a new execution");
+    assert_eq!(second.exec_id, second_id);
+    assert_ne!(second.exec_id, first.exec_id);
+}
+
+#[tokio::test]
+async fn reuse_policy_terminate_if_running_failed_starts_fresh() {
+    let (mut conn, _container) = setup_test_db().await;
+    let first_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    let mut params = reuse_policy_helpers::base_params("rp-tir-fail", first_id);
+    params.reuse_policy = WorkflowIdReusePolicy::TerminateIfRunning;
+    let first = start_or_load_workflow_execution(&mut conn, params.clone())
+        .await
+        .expect("first start should succeed");
+    reuse_policy_helpers::force_state(&mut conn, first.exec_id, "FAILED").await;
+
+    let second_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    params.exec_id = second_id;
+    let second = start_or_load_workflow_execution(&mut conn, params)
+        .await
+        .expect("TerminateIfRunning on FAILED should start fresh");
+    assert!(second.created, "must mint a new execution");
+    assert_eq!(second.exec_id, second_id);
+    assert_ne!(second.exec_id, first.exec_id);
+}
+
+#[tokio::test]
+async fn reuse_policy_terminate_if_running_cancelled_starts_fresh() {
+    let (mut conn, _container) = setup_test_db().await;
+    let first_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    let mut params = reuse_policy_helpers::base_params("rp-tir-can", first_id);
+    params.reuse_policy = WorkflowIdReusePolicy::TerminateIfRunning;
+    let first = start_or_load_workflow_execution(&mut conn, params.clone())
+        .await
+        .expect("first start should succeed");
+    cancel_workflow_execution(&mut conn, first.exec_id, "test cancel")
+        .await
+        .expect("cancel should succeed");
+
+    let second_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    params.exec_id = second_id;
+    let second = start_or_load_workflow_execution(&mut conn, params)
+        .await
+        .expect("TerminateIfRunning on CANCELLED should start fresh");
+    assert!(second.created, "must mint a new execution");
+    assert_eq!(second.exec_id, second_id);
+    assert_ne!(second.exec_id, first.exec_id);
+}
+
+/// `TerminateIfRunning` is idempotent: if the prior run is CANCELLED (e.g. from
+/// a previous `TerminateIfRunning` that crashed between the two transactions),
+/// the retry starts fresh without requiring manual intervention.
+#[tokio::test]
+async fn reuse_policy_terminate_if_running_retry_after_partial_failure_is_idempotent() {
+    let (mut conn, _container) = setup_test_db().await;
+    let first_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    let mut params = reuse_policy_helpers::base_params("rp-tir-retry", first_id);
+
+    // Simulate transaction 1 completing (cancel) but transaction 2 failing
+    // by manually cancelling the first run and then not starting a new one.
+    params.reuse_policy = WorkflowIdReusePolicy::AllowDuplicate;
+    let first = start_or_load_workflow_execution(&mut conn, params.clone())
+        .await
+        .expect("initial start should succeed");
+    cancel_workflow_execution(&mut conn, first.exec_id, "simulated T1 complete")
+        .await
+        .expect("cancel should succeed");
+
+    // Now retry with TerminateIfRunning. Prior run is CANCELLED → start fresh.
+    let second_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    params.exec_id = second_id;
+    params.reuse_policy = WorkflowIdReusePolicy::TerminateIfRunning;
+    let second = start_or_load_workflow_execution(&mut conn, params)
+        .await
+        .expect("retry with TerminateIfRunning on CANCELLED should start fresh");
+    assert!(second.created, "retry must mint a fresh execution");
+    assert_eq!(second.exec_id, second_id);
+    assert_ne!(second.exec_id, first.exec_id);
 }
