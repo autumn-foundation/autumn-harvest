@@ -782,7 +782,9 @@ async fn tick_one_workflow_schedule(
 
     for scheduled_for in &run_dates {
         let workflow_id = scheduled_workflow_id(wf_name, *scheduled_for);
-        let exec_id = ExecutionId::new_for_shard(crate::types::ShardId::new(0));
+        // ExecutionId::new() encodes ShardId::UNENCODED, which the ShardRouter
+        // resolves to the configured default shard — correct for all deployments.
+        let exec_id = ExecutionId::new();
         let input = schedule
             .workflow_input
             .clone()

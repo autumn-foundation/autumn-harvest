@@ -958,6 +958,9 @@ fn parse_schedule_expr(expr: &str) -> Result<autumn_harvest::policy::Schedule, S
             .trim()
             .parse()
             .map_err(|_| format!("invalid interval seconds '{secs_str}'"))?;
+        if secs == 0 {
+            return Err("interval must be at least 1 second".to_string());
+        }
         Schedule::Interval(std::time::Duration::from_secs(secs))
     } else if trimmed == "manual" {
         Schedule::Manual
