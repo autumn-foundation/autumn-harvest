@@ -707,7 +707,7 @@ async fn tick_workflow_schedules(
         .map_err(crate::error::database_error)?;
 
     for schedule in due {
-        let Some(ref wf_name) = schedule.workflow_name.clone() else {
+        let Some(ref wf_name) = schedule.workflow_name else {
             continue;
         };
         let Some(logical_date) = schedule.next_run_at else {
