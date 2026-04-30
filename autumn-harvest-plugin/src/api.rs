@@ -23,6 +23,7 @@ use serde_json::Value;
 use autumn_harvest::context::WorkflowContext;
 use autumn_harvest::dlq;
 use autumn_harvest::error::{HarvestError, HarvestResult, database_error};
+use autumn_harvest::external_task;
 use autumn_harvest::models::{DagRun, DeadLetter, HarvestSchedule, WorkflowExecution};
 use autumn_harvest::policy::WorkflowSchedule;
 use autumn_harvest::queue::{self, ConcurrencyKeyStats};
@@ -34,7 +35,7 @@ use autumn_harvest::schema::{harvest_dag_runs, harvest_schedules, harvest_workfl
 use autumn_harvest::shard::ShardRouter;
 use autumn_harvest::signal;
 use autumn_harvest::store;
-use autumn_harvest::types::{ExecutionId, ShardId, WorkflowIdReusePolicy};
+use autumn_harvest::types::{ExecutionId, ExternalActivityToken, ShardId, WorkflowIdReusePolicy};
 use autumn_harvest::worker::{DbPool, HandlerRegistry};
 use autumn_harvest::{
     StartWorkflowParams, cancel_workflow_execution, start_or_load_workflow_execution,
@@ -392,6 +393,19 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .route("/admin/schedules/{id}/pause", post(pause_schedule))
         .route("/admin/schedules/{id}/resume", post(resume_schedule))
         .route("/admin/schedules/{id}", delete(delete_schedule))
+        // External activity completion (issue #92): async task-token API.
+        .route(
+            "/activities/external/{token}/complete",
+            post(complete_external_activity),
+        )
+        .route(
+            "/activities/external/{token}/fail",
+            post(fail_external_activity),
+        )
+        .route(
+            "/activities/external/{token}/heartbeat",
+            post(heartbeat_external_activity),
+        )
         .layer(Extension(api_state))
 }
 
@@ -1351,6 +1365,151 @@ pub(crate) fn map_error(error: HarvestError) -> AutumnError {
         HarvestError::Database(message) => AutumnError::service_unavailable_msg(message),
         other => AutumnError::service_unavailable_msg(other.to_string()),
     }
+}
+
+// ── External activity completion (issue #92) ──────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct CompleteExternalActivityRequest {
+    output: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FailExternalActivityRequest {
+    error: String,
+    #[serde(default)]
+    retryable: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct HeartbeatExternalActivityRequest {
+    /// How many seconds to extend the schedule-to-close deadline from now.
+    /// Defaults to the original `schedule_to_close_secs` if omitted.
+    extend_by_secs: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct ExternalActivityAck {
+    ok: bool,
+    newly_resolved: bool,
+}
+
+async fn complete_external_activity(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(token_str): Path<String>,
+    Json(request): Json<CompleteExternalActivityRequest>,
+) -> Result<Json<ExternalActivityAck>, AutumnError> {
+    let token = parse_external_token(&token_str)?;
+    let output = request.output.unwrap_or(Value::Null);
+
+    let newly_resolved = resolve_external_on_shards(
+        &api_state,
+        token,
+        |conn, tok| {
+            let out = output.clone();
+            Box::pin(async move { external_task::complete_externally(conn, tok, out).await })
+        },
+    )
+    .await?;
+
+    Ok(Json(ExternalActivityAck {
+        ok: true,
+        newly_resolved,
+    }))
+}
+
+async fn fail_external_activity(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(token_str): Path<String>,
+    Json(request): Json<FailExternalActivityRequest>,
+) -> Result<Json<ExternalActivityAck>, AutumnError> {
+    let token = parse_external_token(&token_str)?;
+
+    let newly_resolved = resolve_external_on_shards(
+        &api_state,
+        token,
+        |conn, tok| {
+            let err = request.error.clone();
+            let retryable = request.retryable;
+            Box::pin(async move {
+                external_task::fail_externally(conn, tok, err, retryable).await
+            })
+        },
+    )
+    .await?;
+
+    Ok(Json(ExternalActivityAck {
+        ok: true,
+        newly_resolved,
+    }))
+}
+
+async fn heartbeat_external_activity(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(token_str): Path<String>,
+    Json(request): Json<HeartbeatExternalActivityRequest>,
+) -> Result<Json<BasicAck>, AutumnError> {
+    let token = parse_external_token(&token_str)?;
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    let extend_by = request.extend_by_secs.unwrap_or(300);
+
+    for (_shard, shard_pool) in pool.iter_shards() {
+        let mut conn = acquire_conn(shard_pool).await?;
+        if external_task::find_by_token(&mut conn, token)
+            .await
+            .map_err(map_error)?
+            .is_some()
+        {
+            external_task::extend_deadline(&mut conn, token, extend_by)
+                .await
+                .map_err(map_error)?;
+            return Ok(Json(BasicAck { ok: true }));
+        }
+    }
+
+    Err(AutumnError::not_found_msg(format!(
+        "external task token {token_str}"
+    )))
+}
+
+fn parse_external_token(raw: &str) -> Result<ExternalActivityToken, AutumnError> {
+    raw.parse::<ExternalActivityToken>()
+        .map_err(|_| AutumnError::bad_request_msg(format!("invalid external task token '{raw}'")))
+}
+
+/// Scan all shards for the external task identified by `token`, then invoke
+/// `action` on the shard that owns it.  Returns `true` if the state transition
+/// happened, `false` if the token was already in a terminal state (idempotent).
+async fn resolve_external_on_shards<F>(
+    api_state: &HarvestApiState,
+    token: ExternalActivityToken,
+    action: F,
+) -> Result<bool, AutumnError>
+where
+    F: for<'c> Fn(
+        &'c mut diesel_async::AsyncPgConnection,
+        ExternalActivityToken,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = HarvestResult<bool>> + Send + 'c>,
+    >,
+{
+    let pool = api_state.storage_pool().map_err(map_error)?;
+
+    for (_shard, shard_pool) in pool.iter_shards() {
+        let mut conn = acquire_conn(shard_pool).await?;
+        if external_task::find_by_token(&mut conn, token)
+            .await
+            .map_err(map_error)?
+            .is_some()
+        {
+            let result = action(&mut conn, token).await.map_err(map_error)?;
+            return Ok(result);
+        }
+    }
+
+    Err(AutumnError::not_found_msg(format!(
+        "external task token {token}"
+    )))
 }
 
 #[cfg(test)]

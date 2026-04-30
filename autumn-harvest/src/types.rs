@@ -315,6 +315,12 @@ impl ActivityExecId {
     pub const fn as_uuid(&self) -> Uuid {
         self.0
     }
+
+    /// Wraps an existing `Uuid` as an `ActivityExecId`.
+    #[must_use]
+    pub const fn from_uuid(id: Uuid) -> Self {
+        Self(id)
+    }
 }
 
 impl Default for ActivityExecId {
@@ -371,6 +377,12 @@ impl ExternalActivityToken {
     #[must_use]
     pub const fn as_uuid(&self) -> Uuid {
         self.0
+    }
+
+    /// Wraps an existing `Uuid` as an `ExternalActivityToken`.
+    #[must_use]
+    pub const fn from_uuid(id: Uuid) -> Self {
+        Self(id)
     }
 }
 

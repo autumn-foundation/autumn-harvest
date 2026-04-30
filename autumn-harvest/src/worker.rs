@@ -33,10 +33,11 @@ use crate::models::{
 use crate::policy::RetryPolicy;
 use crate::queue::{self, TaskType};
 use crate::schema::{harvest_timers, harvest_workflow_executions};
+use crate::external_task;
 use crate::signal;
 use crate::store;
 use crate::telemetry::{ActivityStatus, TraceContextCarrier, WorkflowStatus};
-use crate::types::{ActivityExecId, ExecutionId, TimerId, WorkerId};
+use crate::types::{ActivityExecId, ExecutionId, ExternalActivityToken, TimerId, WorkerId};
 
 /// Type alias for the deadpool-managed async Diesel connection pool.
 pub type DbPool = deadpool::managed::Pool<
@@ -236,6 +237,7 @@ fn execution_id_from_uuid(id: uuid::Uuid) -> ExecutionId {
 const fn workflow_command_name(command: &WorkflowCommand) -> &'static str {
     match command {
         WorkflowCommand::ScheduleActivity { .. } => "ScheduleActivity",
+        WorkflowCommand::ScheduleExternalActivity { .. } => "ScheduleExternalActivity",
         WorkflowCommand::StartTimer { .. } => "StartTimer",
         WorkflowCommand::StartChildWorkflow { .. } => "StartChildWorkflow",
         WorkflowCommand::RecordMarker { .. } => "RecordMarker",
@@ -307,6 +309,16 @@ struct StartedChildWorkflowCommand {
     child_id: ExecutionId,
     workflow_name: String,
     input: serde_json::Value,
+}
+
+#[derive(Debug, Clone)]
+struct ScheduledExternalActivityCommand {
+    activity_id: ActivityExecId,
+    token: ExternalActivityToken,
+    name: String,
+    input: serde_json::Value,
+    queue: String,
+    schedule_to_close_secs: u64,
 }
 
 #[derive(Debug)]
@@ -440,6 +452,34 @@ fn extract_single_started_child_workflow(
             child_id: *child_id,
             workflow_name: workflow_name.clone(),
             input: input.clone(),
+        })
+    })
+}
+
+fn extract_single_schedule_external_activity(
+    commands: &[WorkflowCommand],
+) -> Option<ScheduledExternalActivityCommand> {
+    extract_single_command(commands, |cmd| {
+        let WorkflowCommand::ScheduleExternalActivity {
+            activity_id,
+            token,
+            name,
+            input,
+            queue,
+            schedule_to_close_secs,
+            ..
+        } = cmd
+        else {
+            return None;
+        };
+
+        Some(ScheduledExternalActivityCommand {
+            activity_id: *activity_id,
+            token: *token,
+            name: name.clone(),
+            input: input.clone(),
+            queue: queue.clone(),
+            schedule_to_close_secs: *schedule_to_close_secs,
         })
     })
 }
@@ -1428,6 +1468,48 @@ async fn process_activity_task(
     }
 }
 
+async fn persist_scheduled_external_activity(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    next_event_id: i32,
+    task_id: uuid::Uuid,
+    commands: &[WorkflowCommand],
+    scheduled: &ScheduledExternalActivityCommand,
+    sticky: Option<queue::StickyHint<'_>>,
+) -> HarvestResult<()> {
+    let marker_events = marker_events_from_commands(commands);
+    let awaiting_event = WorkflowEvent::ActivityAwaitingExternal {
+        activity_id: scheduled.activity_id,
+        token: scheduled.token,
+        name: scheduled.name.clone(),
+        input: scheduled.input.clone(),
+        queue: scheduled.queue.clone(),
+        schedule_to_close_secs: scheduled.schedule_to_close_secs,
+    };
+    let mut events = marker_events;
+    events.push(awaiting_event);
+
+    conn.transaction::<(), HarvestError, _>(|conn| {
+        async move {
+            store::append_events(conn, exec_id, &events, next_event_id).await?;
+            external_task::record_external_task(
+                conn,
+                exec_id,
+                scheduled.token,
+                scheduled.activity_id,
+                &scheduled.name,
+                &scheduled.queue,
+                scheduled.schedule_to_close_secs,
+            )
+            .await?;
+            queue::park_workflow_task(conn, task_id, sticky).await?;
+            Ok(())
+        }
+        .scope_boxed()
+    })
+    .await
+}
+
 #[allow(clippy::too_many_lines)]
 async fn handle_suspended_workflow(
     conn: &mut AsyncPgConnection,
@@ -1515,6 +1597,26 @@ async fn handle_suspended_workflow(
             context.persistence.next_event_id,
             commands,
             &child,
+            sticky,
+        )
+        .await;
+        return fail_execution_on_error(
+            conn,
+            context.persistence.task,
+            context.persistence.worker_id,
+            result,
+        )
+        .await;
+    }
+
+    if let Some(scheduled) = extract_single_schedule_external_activity(commands) {
+        let result = persist_scheduled_external_activity(
+            conn,
+            context.persistence.exec_id,
+            context.persistence.next_event_id,
+            context.persistence.task.id,
+            commands,
+            &scheduled,
             sticky,
         )
         .await;

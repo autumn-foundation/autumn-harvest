@@ -611,3 +611,103 @@ async fn context_execute_activity_external_detects_non_determinism() {
     );
     assert!(ctx.drain_commands().is_empty());
 }
+
+#[tokio::test]
+async fn context_double_complete_is_idempotent_replay() {
+    // Simulates the "double-complete" scenario at the replay layer:
+    // if ActivityCompletedExternally is already in history, a second call to
+    // execute_activity_external returns the same recorded output without
+    // suspending or emitting new commands.
+    let activity_id = ActivityExecId::new();
+    let token = ExternalActivityToken::new();
+    let output = serde_json::json!({"approved": true});
+
+    let events = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+        },
+        WorkflowEvent::ActivityAwaitingExternal {
+            activity_id,
+            token,
+            name: "approve_expense".into(),
+            input: Value::Null,
+            queue: "approvals".into(),
+            schedule_to_close_secs: 86400,
+        },
+        WorkflowEvent::ActivityCompletedExternally {
+            activity_id,
+            token,
+            output: output.clone(),
+        },
+    ];
+
+    let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+
+    // First call — replays from history.
+    let result1 = ctx
+        .execute_activity_external("approve_expense", Value::Null, "approvals", 86400)
+        .await;
+    assert!(result1.is_ok(), "first call must succeed: {result1:?}");
+    assert_eq!(result1.unwrap(), output);
+
+    // No live commands emitted during a pure replay.
+    assert!(ctx.drain_commands().is_empty());
+}
+
+#[tokio::test]
+async fn context_post_restart_while_awaiting_with_deadline_extensions() {
+    // After a process restart, the workflow is re-run from scratch.  History
+    // contains ActivityAwaitingExternal + two deadline extensions but no
+    // terminal event.  The context must:
+    //   (a) return AwaitingExternalCompletion (not a terminal result), and
+    //   (b) re-emit ScheduleExternalActivity with the SAME token and activity_id.
+    let activity_id = ActivityExecId::new();
+    let token = ExternalActivityToken::new();
+
+    let events = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+        },
+        WorkflowEvent::ActivityAwaitingExternal {
+            activity_id,
+            token,
+            name: "approve_expense".into(),
+            input: Value::Null,
+            queue: "approvals".into(),
+            schedule_to_close_secs: 86400,
+        },
+        WorkflowEvent::ActivityExternalDeadlineExtended { activity_id, token },
+        WorkflowEvent::ActivityExternalDeadlineExtended { activity_id, token },
+    ];
+
+    let ctx = Arc::new(WorkflowContext::for_replay(ExecutionId::new(), events));
+    let ctx2 = Arc::clone(&ctx);
+
+    let handle = tokio::spawn(async move {
+        ctx2.execute_activity_external("approve_expense", Value::Null, "approvals", 86400)
+            .await
+    });
+
+    tokio::task::yield_now().await;
+
+    let cmds = ctx.drain_commands();
+    assert_eq!(cmds.len(), 1, "must re-emit exactly one command");
+
+    let WorkflowCommand::ScheduleExternalActivity {
+        token: emitted_token,
+        activity_id: emitted_id,
+        name,
+        ..
+    } = &cmds[0]
+    else {
+        panic!("expected ScheduleExternalActivity, got {:?}", cmds[0]);
+    };
+
+    assert_eq!(*emitted_token, token, "token must be preserved across restart");
+    assert_eq!(*emitted_id, activity_id, "activity_id must be preserved");
+    assert_eq!(name, "approve_expense");
+
+    handle.abort();
+}

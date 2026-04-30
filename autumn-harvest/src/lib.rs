@@ -32,6 +32,8 @@ pub mod event;
 #[doc(hidden)]
 pub mod execution;
 pub mod executor;
+#[cfg(feature = "db")]
+pub mod external_task;
 pub mod history_export;
 pub mod info;
 pub mod policy;

@@ -102,6 +102,34 @@ pub async fn append_events(
         .map_err(crate::error::database_error)
 }
 
+/// Append a single event to a workflow's history without loading the full log.
+///
+/// Queries the current maximum `event_id` and inserts one position past it.
+/// Use this from management-API paths (external completion, heartbeat) where
+/// loading the full history would be wasteful.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] if the query or insert fails.
+pub async fn append_single_event(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    event: WorkflowEvent,
+) -> HarvestResult<()> {
+    use diesel::dsl::max;
+
+    let max_id: Option<i32> = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
+        .select(max(harvest_events::event_id))
+        .first(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    let next_id = max_id.map_or(0, |id| id.saturating_add(1));
+    append_events(conn, exec_id, &[event], next_id).await?;
+    Ok(())
+}
+
 /// Load the full event history for a workflow execution, ordered by `event_id`.
 ///
 /// Deserializes each row's `event_data` JSON back into [`WorkflowEvent`].
