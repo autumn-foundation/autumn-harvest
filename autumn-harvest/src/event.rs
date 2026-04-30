@@ -282,7 +282,7 @@ mod tests {
 
     #[test]
     fn all_type_names_are_unique() {
-        use crate::types::{ActivityExecId, ExecutionId, ExternalActivityToken, TimerId, WorkerId};
+        use crate::types::{ActivityExecId, ExecutionId, TimerId, WorkerId};
         use std::collections::HashSet;
 
         let events = vec![
