@@ -422,6 +422,7 @@ async fn upsert_schedule(
             timezone: "UTC",
             catchup: dag.catchup,
             max_active_runs: i32::try_from(dag.max_active_runs).unwrap_or(i32::MAX),
+            is_paused: false,
             workflow_name: None,
             workflow_input: None,
         };
@@ -477,6 +478,9 @@ async fn upsert_workflow_schedule(
         timezone: "UTC",
         catchup: ws.catchup,
         max_active_runs: i32::try_from(ws.max_active_runs).unwrap_or(i32::MAX),
+        // is_paused is set on initial insert only; subsequent upserts preserve the
+        // current value so that pause/resume state is not accidentally overwritten.
+        is_paused: ws.paused,
         workflow_name: Some(&ws.workflow_name),
         workflow_input: Some(ws.input.clone()),
     };
@@ -1015,6 +1019,26 @@ async fn insert_dag_run(
         .first(db)
         .await
         .map_err(crate::error::database_error)
+}
+
+/// Validate a [`Schedule`] at creation time.
+///
+/// Returns `Err` if the schedule is a `Cron` variant whose expression cannot be
+/// parsed by `croner`. `Interval` and `Manual` schedules are always valid.
+///
+/// # Errors
+///
+/// Returns a human-readable error string if the cron expression is syntactically
+/// invalid.
+pub fn validate_schedule(schedule: &Schedule) -> Result<(), String> {
+    if let Schedule::Cron(expr) = schedule {
+        Cron::new(expr)
+            .parse()
+            .map(|_| ())
+            .map_err(|e| format!("invalid cron expression '{expr}': {e}"))
+    } else {
+        Ok(())
+    }
 }
 
 fn schedule_expr(schedule: Option<&Schedule>) -> Option<String> {

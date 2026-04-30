@@ -121,7 +121,7 @@ pub use saga::Saga;
 #[cfg(feature = "db")]
 pub use scheduler::{
     DagCatalog, RegisteredDag, SchedulerMonitor, SchedulerRuntime, compile_dag_catalog,
-    register_schedules, register_workflow_schedules, tick_once, trigger_dag,
+    register_schedules, register_workflow_schedules, tick_once, trigger_dag, validate_schedule,
 };
 pub use shard::ShardRouter;
 #[cfg(feature = "db")]

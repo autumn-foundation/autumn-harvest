@@ -232,6 +232,7 @@ pub struct NewHarvestSchedule<'a> {
     pub timezone: &'a str,
     pub catchup: bool,
     pub max_active_runs: i32,
+    pub is_paused: bool,
     /// Set for workflow-only schedules, None for DAG schedules.
     pub workflow_name: Option<&'a str>,
     pub workflow_input: Option<serde_json::Value>,

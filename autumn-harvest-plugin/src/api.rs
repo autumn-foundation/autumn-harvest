@@ -942,25 +942,27 @@ async fn delete_schedule(
 }
 
 fn parse_schedule_expr(expr: &str) -> Result<autumn_harvest::policy::Schedule, String> {
+    use autumn_harvest::policy::Schedule;
+
     let trimmed = expr.trim();
-    if let Some(cron) = trimmed.strip_prefix("cron:") {
-        Ok(autumn_harvest::policy::Schedule::Cron(
-            cron.trim().to_string(),
-        ))
+    let schedule = if let Some(cron) = trimmed.strip_prefix("cron:") {
+        Schedule::Cron(cron.trim().to_string())
     } else if let Some(secs_str) = trimmed.strip_prefix("interval:") {
         let secs: u64 = secs_str
             .trim()
             .parse()
             .map_err(|_| format!("invalid interval seconds '{secs_str}'"))?;
-        Ok(autumn_harvest::policy::Schedule::Interval(
-            std::time::Duration::from_secs(secs),
-        ))
+        Schedule::Interval(std::time::Duration::from_secs(secs))
     } else if trimmed == "manual" {
-        Ok(autumn_harvest::policy::Schedule::Manual)
+        Schedule::Manual
     } else {
         // Treat a bare expression as a cron string for convenience.
-        Ok(autumn_harvest::policy::Schedule::Cron(trimmed.to_string()))
-    }
+        Schedule::Cron(trimmed.to_string())
+    };
+    // Validate cron expressions eagerly so callers receive a 400 rather than
+    // silently persisting an expression that will never fire.
+    autumn_harvest::validate_schedule(&schedule)?;
+    Ok(schedule)
 }
 
 async fn list_dead_letters(
