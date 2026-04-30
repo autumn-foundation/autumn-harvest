@@ -21,8 +21,8 @@ use crate::context::ActivityContext;
 use crate::error::{HarvestError, HarvestResult};
 use crate::info::DagInfo;
 use crate::models::{DagRun, HarvestSchedule, NewDagRun, NewHarvestSchedule};
-use crate::policy::{RetryPolicy, Schedule, TaskStatus};
-use crate::schema::{harvest_dag_runs, harvest_schedules};
+use crate::policy::{RetryPolicy, Schedule, TaskStatus, WorkflowSchedule};
+use crate::schema::{harvest_dag_runs, harvest_schedules, harvest_workflow_executions};
 use crate::worker::{DbPool, HandlerRegistry};
 
 const DEFAULT_SCHEDULER_TICK_INTERVAL: Duration = Duration::from_secs(1);
@@ -134,7 +134,7 @@ impl SchedulerMonitor {
     }
 }
 
-/// The background runtime that drives DAG scheduling.
+/// The background runtime that drives DAG and workflow scheduling.
 pub struct SchedulerRuntime {
     shutdown: CancellationToken,
     handle: JoinHandle<()>,
@@ -146,23 +146,37 @@ impl SchedulerRuntime {
     ///
     /// It wakes up at a fixed interval to evaluate schedules and trigger runs.
     #[must_use]
-    pub fn spawn(pool: DbPool, registry: Arc<HandlerRegistry>, dags: Arc<DagCatalog>) -> Self {
+    pub fn spawn(
+        pool: DbPool,
+        registry: Arc<HandlerRegistry>,
+        dags: Arc<DagCatalog>,
+        workflow_schedules: Arc<Vec<WorkflowSchedule>>,
+    ) -> Self {
         let shutdown = CancellationToken::new();
         let shutdown_for_task = shutdown.clone();
-        let monitor = SchedulerMonitor::new(dags.len());
+        let total = dags.len() + workflow_schedules.len();
+        let monitor = SchedulerMonitor::new(total);
         let monitor_for_task = monitor.clone();
         let handle = tokio::spawn(async move {
             while !shutdown_for_task.is_cancelled() {
-                if let Ok(mut conn) = pool.get().await
-                    && let Err(error) = register_schedules(&mut conn, dags.as_ref()).await
-                {
-                    tracing::warn!(error = %error, "failed to register harvest schedules");
+                if let Ok(mut conn) = pool.get().await {
+                    if let Err(error) =
+                        register_schedules(&mut conn, dags.as_ref()).await
+                    {
+                        tracing::warn!(error = %error, "failed to register harvest DAG schedules");
+                    }
+                    if let Err(error) =
+                        register_workflow_schedules(&mut conn, workflow_schedules.as_ref()).await
+                    {
+                        tracing::warn!(error = %error, "failed to register harvest workflow schedules");
+                    }
                 }
 
                 if let Err(error) = tick_once(
                     pool.clone(),
                     Arc::clone(&registry),
                     Arc::clone(&dags),
+                    Arc::clone(&workflow_schedules),
                     monitor_for_task.clone(),
                 )
                 .await
@@ -176,7 +190,8 @@ impl SchedulerRuntime {
                 }
             }
 
-            monitor_for_task.mark_stopped(dags.len());
+            let total = dags.len() + workflow_schedules.len();
+            monitor_for_task.mark_stopped(total);
         });
 
         Self {
@@ -260,8 +275,24 @@ pub async fn register_schedules(
     Ok(())
 }
 
-/// Run one scheduler tick: create due runs, activate queued runs, and execute
-/// any runs that became runnable.
+/// Upsert the durable schedule rows for the provided workflow schedules.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] if the schedule rows cannot be read or
+/// written.
+pub async fn register_workflow_schedules(
+    conn: &mut AsyncPgConnection,
+    schedules: &[WorkflowSchedule],
+) -> HarvestResult<()> {
+    for ws in schedules {
+        upsert_workflow_schedule(conn, ws).await?;
+    }
+    Ok(())
+}
+
+/// Run one scheduler tick: create due DAG runs, activate queued runs, execute
+/// runnable DAG runs, and dispatch due workflow-schedule runs.
 ///
 /// # Errors
 ///
@@ -271,9 +302,11 @@ pub async fn tick_once(
     pool: DbPool,
     registry: Arc<HandlerRegistry>,
     dags: Arc<DagCatalog>,
+    workflow_schedules: Arc<Vec<WorkflowSchedule>>,
     monitor: SchedulerMonitor,
 ) -> HarvestResult<()> {
-    monitor.mark_tick(dags.len());
+    let total = dags.len() + workflow_schedules.len();
+    monitor.mark_tick(total);
 
     let mut conn = pool
         .get()
@@ -281,6 +314,16 @@ pub async fn tick_once(
         .map_err(|error| HarvestError::Database(error.to_string()))?;
     create_due_runs(&mut conn, dags.as_ref()).await?;
     let runnable = activate_queued_runs(&mut conn, dags.as_ref()).await?;
+
+    // Dispatch due workflow-schedule runs directly via start_or_load_workflow_execution.
+    if !workflow_schedules.is_empty() {
+        let metrics = Arc::clone(&registry.telemetry().metrics);
+        if let Err(error) =
+            tick_workflow_schedules(&mut conn, workflow_schedules.as_ref(), &metrics).await
+        {
+            tracing::warn!(error = %error, "harvest workflow-schedule tick error");
+        }
+    }
     drop(conn);
 
     for (run, dag) in runnable {
@@ -316,7 +359,14 @@ pub async fn trigger_dag(
     drop(db);
 
     tokio::spawn(async move {
-        let _ = tick_once(pool, registry, dags, monitor).await;
+        let _ = tick_once(
+            pool,
+            registry,
+            dags,
+            Arc::new(Vec::new()), // no workflow schedules needed for a DAG trigger kick
+            monitor,
+        )
+        .await;
     });
 
     Ok(run)
@@ -369,11 +419,13 @@ async fn upsert_schedule(
     } else {
         let row = NewHarvestSchedule {
             id: uuid::Uuid::new_v4(),
-            dag_name: &dag.name,
+            dag_name: Some(&dag.name),
             schedule_expr: expr.as_deref(),
             timezone: "UTC",
             catchup: dag.catchup,
             max_active_runs: i32::try_from(dag.max_active_runs).unwrap_or(i32::MAX),
+            workflow_name: None,
+            workflow_input: None,
         };
         diesel::insert_into(harvest_schedules::table)
             .values(&row)
@@ -403,10 +455,102 @@ async fn upsert_schedule(
     }
 }
 
+/// Upsert a `harvest_schedules` row for a [`WorkflowSchedule`].
+async fn upsert_workflow_schedule(
+    conn: &mut AsyncPgConnection,
+    ws: &WorkflowSchedule,
+) -> HarvestResult<HarvestSchedule> {
+    use crate::schema::harvest_schedules::dsl;
+
+    let existing = dsl::harvest_schedules
+        .filter(dsl::workflow_name.eq(&ws.workflow_name))
+        .select(HarvestSchedule::as_select())
+        .first(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?;
+    let now = Utc::now();
+    let expr = schedule_expr(Some(&ws.schedule));
+
+    if let Some(existing) = existing {
+        let schedule_changed = existing.schedule_expr != expr;
+        let next_run_at = if schedule_changed {
+            next_run_after(Some(&ws.schedule), now)
+        } else {
+            existing
+                .next_run_at
+                .or_else(|| next_run_after(Some(&ws.schedule), now))
+        };
+        diesel::update(dsl::harvest_schedules.find(existing.id))
+            .set((
+                dsl::schedule_expr.eq(expr),
+                dsl::timezone.eq("UTC"),
+                dsl::catchup.eq(ws.catchup),
+                dsl::max_active_runs
+                    .eq(i32::try_from(ws.max_active_runs).unwrap_or(i32::MAX)),
+                dsl::workflow_input.eq(Some(ws.input.clone())),
+                dsl::updated_at.eq(now),
+                dsl::next_run_at.eq(next_run_at),
+            ))
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+
+        dsl::harvest_schedules
+            .find(existing.id)
+            .select(HarvestSchedule::as_select())
+            .first(conn)
+            .await
+            .map_err(crate::error::database_error)
+    } else {
+        let row = NewHarvestSchedule {
+            id: uuid::Uuid::new_v4(),
+            dag_name: None,
+            schedule_expr: expr.as_deref(),
+            timezone: "UTC",
+            catchup: ws.catchup,
+            max_active_runs: i32::try_from(ws.max_active_runs).unwrap_or(i32::MAX),
+            workflow_name: Some(&ws.workflow_name),
+            workflow_input: Some(ws.input.clone()),
+        };
+        diesel::insert_into(harvest_schedules::table)
+            .values(&row)
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+
+        let inserted = dsl::harvest_schedules
+            .filter(dsl::workflow_name.eq(&ws.workflow_name))
+            .select(HarvestSchedule::as_select())
+            .first(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+
+        // Set initial is_paused and next_run_at.
+        let initial_next_run = next_run_after(Some(&ws.schedule), now);
+        diesel::update(dsl::harvest_schedules.find(inserted.id))
+            .set((
+                dsl::is_paused.eq(ws.paused),
+                dsl::next_run_at.eq(initial_next_run),
+            ))
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+
+        dsl::harvest_schedules
+            .find(inserted.id)
+            .select(HarvestSchedule::as_select())
+            .first(conn)
+            .await
+            .map_err(crate::error::database_error)
+    }
+}
+
 async fn create_due_runs(conn: &mut AsyncPgConnection, dags: &DagCatalog) -> HarvestResult<()> {
     use crate::schema::harvest_schedules::dsl;
 
     let schedules = dsl::harvest_schedules
+        .filter(dsl::dag_name.is_not_null()) // DAG-only rows
         .filter(dsl::is_paused.eq(false))
         .filter(dsl::next_run_at.is_not_null())
         .filter(dsl::next_run_at.le(Utc::now()))
@@ -417,7 +561,10 @@ async fn create_due_runs(conn: &mut AsyncPgConnection, dags: &DagCatalog) -> Har
         .map_err(crate::error::database_error)?;
 
     for schedule in schedules {
-        let Some(dag) = dags.get(&schedule.dag_name) else {
+        let Some(dag_name) = &schedule.dag_name else {
+            continue;
+        };
+        let Some(dag) = dags.get(dag_name) else {
             continue;
         };
         let Some(logical_date) = schedule.next_run_at else {
@@ -428,7 +575,7 @@ async fn create_due_runs(conn: &mut AsyncPgConnection, dags: &DagCatalog) -> Har
             due_run_plan(dag.schedule.as_ref(), logical_date, now, dag.catchup);
 
         if !created.is_empty() {
-            let rows = create_new_dag_runs(&schedule.dag_name, &created);
+            let rows = create_new_dag_runs(dag_name, &created);
             diesel::insert_into(harvest_dag_runs::table)
                 .values(&rows)
                 .on_conflict((harvest_dag_runs::dag_name, harvest_dag_runs::logical_date))
@@ -460,6 +607,7 @@ async fn activate_queued_runs<'a>(
     use crate::schema::harvest_schedules::dsl as schedules_dsl;
 
     let schedules = schedules_dsl::harvest_schedules
+        .filter(schedules_dsl::dag_name.is_not_null()) // DAG-only rows
         .filter(schedules_dsl::is_paused.eq(false))
         .select(HarvestSchedule::as_select())
         .load(conn)
@@ -468,11 +616,14 @@ async fn activate_queued_runs<'a>(
     let mut runnable = Vec::with_capacity(schedules.len());
 
     for schedule in schedules {
-        let Some(dag) = dags.get(&schedule.dag_name) else {
+        let Some(dag_name) = &schedule.dag_name else {
+            continue;
+        };
+        let Some(dag) = dags.get(dag_name) else {
             continue;
         };
         let running_count = dag_runs_dsl::harvest_dag_runs
-            .filter(dag_runs_dsl::dag_name.eq(&schedule.dag_name))
+            .filter(dag_runs_dsl::dag_name.eq(dag_name))
             .filter(dag_runs_dsl::state.eq("RUNNING"))
             .count()
             .get_result::<i64>(conn)
@@ -484,7 +635,7 @@ async fn activate_queued_runs<'a>(
         }
 
         let queued = dag_runs_dsl::harvest_dag_runs
-            .filter(dag_runs_dsl::dag_name.eq(&schedule.dag_name))
+            .filter(dag_runs_dsl::dag_name.eq(dag_name))
             .filter(dag_runs_dsl::state.eq("QUEUED"))
             .order(dag_runs_dsl::logical_date.asc())
             .limit(available)
@@ -519,6 +670,147 @@ async fn activate_queued_runs<'a>(
     }
 
     Ok(runnable)
+}
+
+/// Derive a deterministic, idempotent `workflow_id` for a scheduled run.
+///
+/// The id is stable across retries: if the scheduler ticks twice before
+/// updating `last_run_at`, `start_or_load_workflow_execution` returns the
+/// existing execution rather than starting a duplicate.
+fn scheduled_workflow_id(workflow_name: &str, scheduled_for: DateTime<Utc>) -> String {
+    format!("sched:{}:{}", workflow_name, scheduled_for.timestamp())
+}
+
+/// Process due workflow-schedule rows and dispatch workflow starts.
+async fn tick_workflow_schedules(
+    conn: &mut AsyncPgConnection,
+    workflow_schedules: &[WorkflowSchedule],
+    metrics: &Arc<dyn crate::telemetry::MetricsRecorder>,
+) -> HarvestResult<()> {
+    use crate::schema::harvest_schedules::dsl;
+
+    let now = Utc::now();
+
+    let due: Vec<HarvestSchedule> = dsl::harvest_schedules
+        .filter(dsl::workflow_name.is_not_null())
+        .filter(dsl::is_paused.eq(false))
+        .filter(dsl::next_run_at.is_not_null())
+        .filter(dsl::next_run_at.le(now))
+        .order(dsl::next_run_at.asc())
+        .select(HarvestSchedule::as_select())
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    for schedule in due {
+        let Some(ref wf_name) = schedule.workflow_name.clone() else {
+            continue;
+        };
+        let Some(ws) = workflow_schedules.iter().find(|s| &s.workflow_name == wf_name) else {
+            continue;
+        };
+        let Some(logical_date) = schedule.next_run_at else {
+            continue;
+        };
+        tick_one_workflow_schedule(conn, wf_name, ws, &schedule, logical_date, now, metrics)
+            .await?;
+    }
+
+    Ok(())
+}
+
+async fn tick_one_workflow_schedule(
+    conn: &mut AsyncPgConnection,
+    wf_name: &str,
+    ws: &WorkflowSchedule,
+    schedule: &HarvestSchedule,
+    logical_date: DateTime<Utc>,
+    now: DateTime<Utc>,
+    metrics: &Arc<dyn crate::telemetry::MetricsRecorder>,
+) -> HarvestResult<()> {
+    use crate::execution::StartWorkflowParams;
+    use crate::schema::harvest_schedules::dsl;
+    use crate::types::{ExecutionId, WorkflowIdReusePolicy};
+
+    let running: i64 = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_name.eq(wf_name))
+        .filter(harvest_workflow_executions::state.eq("RUNNING"))
+        .count()
+        .get_result(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    if running >= i64::from(schedule.max_active_runs) {
+        tracing::info!(
+            workflow_name = %wf_name,
+            running,
+            max_active_runs = schedule.max_active_runs,
+            "harvest workflow schedule skipped: max_active_runs reached"
+        );
+        metrics.record_schedule_skipped("workflow", wf_name, "max_active_runs_reached");
+        let next = next_run_after(Some(&ws.schedule), now);
+        diesel::update(dsl::harvest_schedules.find(schedule.id))
+            .set((dsl::next_run_at.eq(next), dsl::updated_at.eq(now)))
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+        return Ok(());
+    }
+
+    let (run_dates, next_run_at) = due_run_plan(Some(&ws.schedule), logical_date, now, ws.catchup);
+
+    for scheduled_for in &run_dates {
+        let workflow_id = scheduled_workflow_id(wf_name, *scheduled_for);
+        let exec_id = ExecutionId::new_for_shard(crate::types::ShardId::new(0));
+        let input = schedule.workflow_input.clone().unwrap_or(serde_json::Value::Null);
+        tracing::info!(
+            workflow_name = %wf_name, workflow_id = %workflow_id,
+            scheduled_for = %scheduled_for, "harvest: dispatching scheduled workflow run"
+        );
+        match crate::execution::start_or_load_workflow_execution(
+            conn,
+            StartWorkflowParams {
+                workflow_name: wf_name,
+                workflow_id: &workflow_id,
+                exec_id,
+                input,
+                parent_id: None,
+                queue_name: "default",
+                execution_timeout: None,
+                memo: None,
+                search_attrs: None,
+                reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
+            },
+        )
+        .await
+        {
+            Ok(started) => {
+                metrics.record_schedule_run("workflow", wf_name);
+                tracing::info!(
+                    workflow_name = %wf_name, execution_id = %started.exec_id,
+                    created = started.created, "harvest: scheduled workflow run dispatched"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error, workflow_name = %wf_name, workflow_id = %workflow_id,
+                    "harvest: failed to start scheduled workflow run"
+                );
+            }
+        }
+    }
+
+    diesel::update(dsl::harvest_schedules.find(schedule.id))
+        .set((
+            dsl::last_run_at.eq(run_dates.last().copied()),
+            dsl::next_run_at.eq(next_run_at),
+            dsl::updated_at.eq(now),
+        ))
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    Ok(())
 }
 
 async fn execute_dag_run(

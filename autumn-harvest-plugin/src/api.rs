@@ -10,7 +10,7 @@ use axum::Extension;
 use axum::Json;
 use axum::Router;
 use axum::extract::{Path, Query};
-use axum::routing::{get, patch, post};
+use axum::routing::{delete, get, patch, post};
 use diesel::ExpressionMethods;
 use diesel::OptionalExtension;
 use diesel::QueryDsl;
@@ -26,6 +26,7 @@ use autumn_harvest::error::{HarvestError, HarvestResult, database_error};
 use autumn_harvest::models::{DagRun, DeadLetter, HarvestSchedule, WorkflowExecution};
 use autumn_harvest::queue::{self, ConcurrencyKeyStats};
 use autumn_harvest::retention::{RetentionConfig, RetentionMonitor, RetentionStatus};
+use autumn_harvest::policy::WorkflowSchedule;
 use autumn_harvest::scheduler::{
     DagCatalog, RegisteredDag, SchedulerMonitor, SchedulerSnapshot, trigger_dag,
 };
@@ -72,6 +73,7 @@ impl HarvestRetentionRuntime {
 pub struct HarvestApiRuntime {
     registry: Arc<HandlerRegistry>,
     dags: Arc<DagCatalog>,
+    workflow_schedules: Arc<Vec<WorkflowSchedule>>,
     worker_id: Option<String>,
     queues: Vec<String>,
     scheduler: SchedulerMonitor,
@@ -83,9 +85,11 @@ impl HarvestApiRuntime {
     /// Build an API runtime snapshot from the available Harvest registrations
     /// and any locally owned worker/scheduler state.
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub const fn new(
         registry: Arc<HandlerRegistry>,
         dags: Arc<DagCatalog>,
+        workflow_schedules: Arc<Vec<WorkflowSchedule>>,
         worker_id: Option<String>,
         queues: Vec<String>,
         scheduler: SchedulerMonitor,
@@ -95,6 +99,7 @@ impl HarvestApiRuntime {
         Self {
             registry,
             dags,
+            workflow_schedules,
             worker_id,
             queues,
             scheduler,
@@ -107,6 +112,17 @@ impl HarvestApiRuntime {
     #[must_use]
     pub const fn router(&self) -> &ShardRouter {
         &self.router
+    }
+
+    /// In-process workflow schedule registrations known to this runtime.
+    ///
+    /// Returns the schedules that were registered via
+    /// [`HarvestBuilder::workflow_schedule`] at startup. Schedules added
+    /// dynamically via the management API are stored only in the database and
+    /// will not appear here.
+    #[must_use]
+    pub fn workflow_schedules(&self) -> &[WorkflowSchedule] {
+        &self.workflow_schedules
     }
 }
 
@@ -274,6 +290,47 @@ struct DagPauseRequest {
     paused: bool,
 }
 
+/// Kind tag on a schedule entry returned by `GET /admin/schedules`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum ScheduleKind {
+    Dag,
+    Workflow,
+}
+
+/// A single schedule entry in the `GET /admin/schedules` list.
+#[derive(Debug, Serialize)]
+struct ScheduleEntry {
+    id: uuid::Uuid,
+    kind: ScheduleKind,
+    name: String,
+    schedule_expr: Option<String>,
+    is_paused: bool,
+    next_run_at: Option<chrono::DateTime<chrono::Utc>>,
+    last_run_at: Option<chrono::DateTime<chrono::Utc>>,
+    max_active_runs: i32,
+    catchup: bool,
+}
+
+/// Request body for `POST /admin/schedules/workflow`.
+#[derive(Debug, Deserialize)]
+struct CreateWorkflowScheduleRequest {
+    workflow_name: String,
+    schedule_expr: String,
+    #[serde(default)]
+    input: serde_json::Value,
+    #[serde(default)]
+    catchup: bool,
+    #[serde(default = "default_max_active_runs")]
+    max_active_runs: u32,
+    #[serde(default)]
+    paused: bool,
+}
+
+const fn default_max_active_runs() -> u32 {
+    1
+}
+
 /// Workflow execution states that the management API recognises in `state=`
 /// filters. Anything outside this list is rejected with `400 Bad Request`.
 pub(crate) const KNOWN_WORKFLOW_STATES: &[&str] =
@@ -323,6 +380,12 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .route("/admin/retention", get(retention_status))
         .route("/admin/retention/run-now", post(retention_run_now))
         .route("/admin/concurrency", get(concurrency_status))
+        // Schedule management (issue #91): unified list + workflow-schedule CRUD.
+        .route("/admin/schedules", get(list_schedules))
+        .route("/admin/schedules/workflow", post(create_workflow_schedule))
+        .route("/admin/schedules/{id}/pause", post(pause_schedule))
+        .route("/admin/schedules/{id}/resume", post(resume_schedule))
+        .route("/admin/schedules/{id}", delete(delete_schedule))
         .layer(Extension(api_state))
 }
 
@@ -611,17 +674,20 @@ async fn list_dags(
 
     let dags = schedules
         .into_iter()
-        .map(|schedule| DagSummary {
-            name: schedule.dag_name.clone(),
-            schedule_expr: schedule.schedule_expr.clone(),
-            is_paused: schedule.is_paused,
-            next_run_at: schedule.next_run_at,
-            max_active_runs: schedule.max_active_runs,
-            catchup: schedule.catchup,
-            task_count: runtime
-                .dags
-                .get(&schedule.dag_name)
-                .map_or(0, RegisteredDag::task_count),
+        .filter_map(|schedule| {
+            let dag_name = schedule.dag_name.clone()?; // skip workflow-only rows
+            Some(DagSummary {
+                name: dag_name.clone(),
+                schedule_expr: schedule.schedule_expr.clone(),
+                is_paused: schedule.is_paused,
+                next_run_at: schedule.next_run_at,
+                max_active_runs: schedule.max_active_runs,
+                catchup: schedule.catchup,
+                task_count: runtime
+                    .dags
+                    .get(&dag_name)
+                    .map_or(0, RegisteredDag::task_count),
+            })
         })
         .collect();
 
@@ -694,6 +760,203 @@ async fn patch_dag(
         .map_err(database_error)
         .map_err(map_error)?;
     Ok(Json(schedule))
+}
+
+async fn list_schedules(
+    Extension(api_state): Extension<HarvestApiState>,
+) -> Result<Json<Vec<ScheduleEntry>>, AutumnError> {
+    let schedules = load_schedules_from_shards(&api_state).await?;
+    let entries = schedules
+        .into_iter()
+        .map(|s| {
+            let (kind, name) = if let Some(ref dag_name) = s.dag_name {
+                (ScheduleKind::Dag, dag_name.clone())
+            } else if let Some(ref wf_name) = s.workflow_name {
+                (ScheduleKind::Workflow, wf_name.clone())
+            } else {
+                // Should not occur given the CHECK constraint, but handle gracefully.
+                (ScheduleKind::Dag, String::new())
+            };
+            ScheduleEntry {
+                id: s.id,
+                kind,
+                name,
+                schedule_expr: s.schedule_expr,
+                is_paused: s.is_paused,
+                next_run_at: s.next_run_at,
+                last_run_at: s.last_run_at,
+                max_active_runs: s.max_active_runs,
+                catchup: s.catchup,
+            }
+        })
+        .collect();
+    Ok(Json(entries))
+}
+
+async fn create_workflow_schedule(
+    Extension(api_state): Extension<HarvestApiState>,
+    Json(request): Json<CreateWorkflowScheduleRequest>,
+) -> Result<(axum::http::StatusCode, Json<ScheduleEntry>), AutumnError> {
+    use autumn_harvest::schema::harvest_schedules::dsl;
+
+    let runtime = api_state.runtime().map_err(map_error)?;
+
+    // Validate: workflow_name must be registered.
+    if !runtime
+        .registry
+        .workflows
+        .contains_key(&request.workflow_name)
+    {
+        let registered: Vec<&str> = runtime.registry.workflows.keys().map(String::as_str).collect();
+        return Err(AutumnError::not_found_msg(format!(
+            "workflow '{}' is not registered; registered: {:?}",
+            request.workflow_name, registered
+        )));
+    }
+
+    // Parse the schedule expression.
+    let schedule = parse_schedule_expr(&request.schedule_expr).map_err(|e| {
+        AutumnError::bad_request_msg(format!("invalid schedule_expr: {e}"))
+    })?;
+
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    // For a single-shard deployment or a workflow-name-keyed schedule, use shard 0.
+    let mut conn = acquire_conn(pool.pool_for(autumn_harvest::types::ShardId::new(0))).await?;
+
+    // Upsert the schedule row.
+    let ws = WorkflowSchedule {
+        workflow_name: request.workflow_name.clone(),
+        schedule,
+        input: request.input.clone(),
+        catchup: request.catchup,
+        max_active_runs: request.max_active_runs,
+        paused: request.paused,
+    };
+    autumn_harvest::register_workflow_schedules(&mut conn, std::slice::from_ref(&ws))
+        .await
+        .map_err(map_error)?;
+
+    // Read back the upserted row to return it.
+    let row: autumn_harvest::models::HarvestSchedule = dsl::harvest_schedules
+        .filter(dsl::workflow_name.eq(&request.workflow_name))
+        .select(autumn_harvest::models::HarvestSchedule::as_select())
+        .first(&mut conn)
+        .await
+        .map_err(database_error)
+        .map_err(map_error)?;
+
+    let entry = ScheduleEntry {
+        id: row.id,
+        kind: ScheduleKind::Workflow,
+        name: request.workflow_name.clone(),
+        schedule_expr: row.schedule_expr,
+        is_paused: row.is_paused,
+        next_run_at: row.next_run_at,
+        last_run_at: row.last_run_at,
+        max_active_runs: row.max_active_runs,
+        catchup: row.catchup,
+    };
+
+    Ok((axum::http::StatusCode::CREATED, Json(entry)))
+}
+
+async fn pause_schedule(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<BasicAck>, AutumnError> {
+    set_schedule_paused(&api_state, &id, true).await
+}
+
+async fn resume_schedule(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<BasicAck>, AutumnError> {
+    set_schedule_paused(&api_state, &id, false).await
+}
+
+async fn set_schedule_paused(
+    api_state: &HarvestApiState,
+    id_str: &str,
+    paused: bool,
+) -> Result<Json<BasicAck>, AutumnError> {
+    use autumn_harvest::schema::harvest_schedules::dsl;
+
+    let id = parse_uuid(id_str, "schedule id")?;
+    let pool = api_state.storage_pool().map_err(map_error)?;
+
+    let mut updated_count = 0usize;
+    for (_shard, shard_pool) in pool.iter_shards() {
+        let mut conn = acquire_conn(shard_pool).await?;
+        let n = diesel::update(dsl::harvest_schedules.find(id))
+            .set((
+                dsl::is_paused.eq(paused),
+                dsl::updated_at.eq(chrono::Utc::now()),
+            ))
+            .execute(&mut conn)
+            .await
+            .map_err(database_error)
+            .map_err(map_error)?;
+        updated_count += n;
+        if updated_count > 0 {
+            break;
+        }
+    }
+
+    if updated_count == 0 {
+        return Err(AutumnError::not_found_msg(format!("schedule {id}")));
+    }
+    Ok(Json(BasicAck { ok: true }))
+}
+
+async fn delete_schedule(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<BasicAck>, AutumnError> {
+    use autumn_harvest::schema::harvest_schedules::dsl;
+
+    let id = parse_uuid(&id, "schedule id")?;
+    let pool = api_state.storage_pool().map_err(map_error)?;
+
+    let mut deleted_count = 0usize;
+    for (_shard, shard_pool) in pool.iter_shards() {
+        let mut conn = acquire_conn(shard_pool).await?;
+        let n = diesel::delete(dsl::harvest_schedules.find(id))
+            .execute(&mut conn)
+            .await
+            .map_err(database_error)
+            .map_err(map_error)?;
+        deleted_count += n;
+        if deleted_count > 0 {
+            break;
+        }
+    }
+
+    if deleted_count == 0 {
+        return Err(AutumnError::not_found_msg(format!("schedule {id}")));
+    }
+    Ok(Json(BasicAck { ok: true }))
+}
+
+fn parse_schedule_expr(
+    expr: &str,
+) -> Result<autumn_harvest::policy::Schedule, String> {
+    let trimmed = expr.trim();
+    if let Some(cron) = trimmed.strip_prefix("cron:") {
+        Ok(autumn_harvest::policy::Schedule::Cron(cron.trim().to_string()))
+    } else if let Some(secs_str) = trimmed.strip_prefix("interval:") {
+        let secs: u64 = secs_str
+            .trim()
+            .parse()
+            .map_err(|_| format!("invalid interval seconds '{secs_str}'"))?;
+        Ok(autumn_harvest::policy::Schedule::Interval(
+            std::time::Duration::from_secs(secs),
+        ))
+    } else if trimmed == "manual" {
+        Ok(autumn_harvest::policy::Schedule::Manual)
+    } else {
+        // Treat a bare expression as a cron string for convenience.
+        Ok(autumn_harvest::policy::Schedule::Cron(trimmed.to_string()))
+    }
 }
 
 async fn list_dead_letters(
@@ -937,9 +1200,9 @@ async fn load_schedules_from_shards(
     }
 
     schedules.sort_by(|left, right| {
-        left.dag_name
-            .cmp(&right.dag_name)
-            .then_with(|| left.id.cmp(&right.id))
+        let left_name = left.dag_name.as_deref().or(left.workflow_name.as_deref()).unwrap_or("");
+        let right_name = right.dag_name.as_deref().or(right.workflow_name.as_deref()).unwrap_or("");
+        left_name.cmp(right_name).then_with(|| left.id.cmp(&right.id))
     });
     Ok(schedules)
 }

@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use crate::context::SharedStateMap;
 use crate::info::{ActivityInfo, DagInfo, WorkflowInfo};
+use crate::policy::WorkflowSchedule;
 use crate::retention::RetentionConfig;
 use crate::telemetry::TelemetryConfig;
 use crate::types::ShardId;
@@ -39,6 +40,7 @@ pub struct HarvestBuilder {
     workflows: Vec<WorkflowInfo>,
     activities: Vec<ActivityInfo>,
     dags: Vec<DagInfo>,
+    workflow_schedules: Vec<WorkflowSchedule>,
     worker_config: WorkerConfig,
     state: SharedStateMap,
     telemetry: Option<TelemetryConfig>,
@@ -51,6 +53,7 @@ impl std::fmt::Debug for HarvestBuilder {
             .field("workflow_count", &self.workflows.len())
             .field("activity_count", &self.activities.len())
             .field("dag_count", &self.dags.len())
+            .field("workflow_schedule_count", &self.workflow_schedules.len())
             .field("worker_config", &self.worker_config)
             .field("state_count", &self.state.len())
             .field("telemetry_configured", &self.telemetry.is_some())
@@ -64,6 +67,7 @@ pub struct BuiltHarvest {
     workflows: Vec<WorkflowInfo>,
     activities: Vec<ActivityInfo>,
     dags: Vec<DagInfo>,
+    workflow_schedules: Vec<WorkflowSchedule>,
     worker_config: WorkerConfig,
     state: SharedStateMap,
     telemetry: Arc<TelemetryConfig>,
@@ -76,6 +80,7 @@ impl std::fmt::Debug for BuiltHarvest {
             .field("workflow_count", &self.workflows.len())
             .field("activity_count", &self.activities.len())
             .field("dag_count", &self.dags.len())
+            .field("workflow_schedule_count", &self.workflow_schedules.len())
             .field("worker_config", &self.worker_config)
             .field("state_count", &self.state.len())
             .field("telemetry", &self.telemetry)
@@ -134,6 +139,23 @@ pub enum HarvestBuilderError {
         /// The activity name.
         activity: String,
     },
+
+    /// A [`WorkflowSchedule`] names a workflow that was not registered via
+    /// `workflows![]`. The schedule is rejected at build time so the operator
+    /// sees a clear error rather than silent no-ops at scheduler tick time.
+    ///
+    /// `workflow_name` is the name that was not found. `registered` lists every
+    /// workflow name that was actually registered on this builder.
+    #[error(
+        "workflow_schedule references unknown workflow '{workflow_name}'; \
+         registered workflows: {registered:?}"
+    )]
+    UnknownWorkflowSchedule {
+        /// The unrecognised workflow name in the schedule.
+        workflow_name: String,
+        /// All workflow names currently registered on the builder.
+        registered: Vec<String>,
+    },
 }
 
 impl BuiltHarvest {
@@ -153,6 +175,18 @@ impl BuiltHarvest {
     #[must_use]
     pub const fn dag_count(&self) -> usize {
         self.dags.len()
+    }
+
+    /// Number of registered workflow schedules.
+    #[must_use]
+    pub const fn workflow_schedule_count(&self) -> usize {
+        self.workflow_schedules.len()
+    }
+
+    /// Registered workflow schedules.
+    #[must_use]
+    pub fn workflow_schedules(&self) -> &[WorkflowSchedule] {
+        &self.workflow_schedules
     }
 
     /// Access typed shared state registered on the builder.
@@ -188,7 +222,14 @@ impl BuiltHarvest {
     /// Convert the built harvest registration into worker-ready parts.
     #[cfg(feature = "db")]
     #[must_use]
-    pub fn into_worker_parts(self) -> (crate::worker::HandlerRegistry, Vec<DagInfo>, WorkerConfig) {
+    pub fn into_worker_parts(
+        self,
+    ) -> (
+        crate::worker::HandlerRegistry,
+        Vec<DagInfo>,
+        Vec<WorkflowSchedule>,
+        WorkerConfig,
+    ) {
         (
             crate::worker::HandlerRegistry::with_state_and_telemetry(
                 self.workflows,
@@ -197,6 +238,7 @@ impl BuiltHarvest {
                 self.telemetry,
             ),
             self.dags,
+            self.workflow_schedules,
             self.worker_config,
         )
     }
@@ -208,7 +250,12 @@ impl BuiltHarvest {
     pub fn into_worker_parts_with_extra_state(
         mut self,
         extra_state: SharedStateMap,
-    ) -> (crate::worker::HandlerRegistry, Vec<DagInfo>, WorkerConfig) {
+    ) -> (
+        crate::worker::HandlerRegistry,
+        Vec<DagInfo>,
+        Vec<WorkflowSchedule>,
+        WorkerConfig,
+    ) {
         self.state.extend(extra_state);
         (
             crate::worker::HandlerRegistry::with_state_and_telemetry(
@@ -218,6 +265,7 @@ impl BuiltHarvest {
                 self.telemetry,
             ),
             self.dags,
+            self.workflow_schedules,
             self.worker_config,
         )
     }
@@ -258,6 +306,33 @@ impl HarvestBuilder {
     #[must_use]
     pub fn dags(mut self, dags: Vec<DagInfo>) -> Self {
         self.dags.extend(dags);
+        self
+    }
+
+    /// Register a per-workflow cron/interval schedule.
+    ///
+    /// The referenced `workflow_name` must appear in a prior (or subsequent)
+    /// `.workflows(workflows![...])` call. [`Self::try_build`] validates this
+    /// and returns [`HarvestBuilderError::UnknownWorkflowSchedule`] if the
+    /// workflow is missing.
+    ///
+    /// ## Examples
+    ///
+    /// ```rust
+    /// use autumn_harvest::builder::{HarvestBuilder, HarvestBuilderError};
+    /// use autumn_harvest::policy::{Schedule, WorkflowSchedule};
+    ///
+    /// // Referencing an unregistered workflow name is caught at try_build time.
+    /// let result = HarvestBuilder::new()
+    ///     .workflow_schedule(
+    ///         WorkflowSchedule::new("daily_billing_report", Schedule::Cron("0 3 * * *".to_string()))
+    ///     )
+    ///     .try_build();
+    /// assert!(matches!(result, Err(HarvestBuilderError::UnknownWorkflowSchedule { .. })));
+    /// ```
+    #[must_use]
+    pub fn workflow_schedule(mut self, schedule: WorkflowSchedule) -> Self {
+        self.workflow_schedules.push(schedule);
         self
     }
 
@@ -319,6 +394,12 @@ impl HarvestBuilder {
         self.dags.len()
     }
 
+    /// Number of registered workflow schedules.
+    #[must_use]
+    pub const fn workflow_schedule_count(&self) -> usize {
+        self.workflow_schedules.len()
+    }
+
     /// Finalize the builder into a reusable harvest registration set.
     ///
     /// # Panics
@@ -335,26 +416,52 @@ impl HarvestBuilder {
     ///
     /// # Errors
     ///
-    /// Returns [`HarvestBuilderError`] when retention settings are invalid or
+    /// Returns [`HarvestBuilderError`] when retention settings are invalid,
     /// when activities sharing a `concurrency_key` declare different
-    /// `max_concurrent` values.
+    /// `max_concurrent` values, or when a [`WorkflowSchedule`] references a
+    /// workflow name not registered on this builder.
     pub fn try_build(self) -> Result<BuiltHarvest, HarvestBuilderError> {
         self.retention
             .validate()
             .map_err(HarvestBuilderError::InvalidRetention)?;
 
         validate_concurrency_keys(&self.activities)?;
+        validate_workflow_schedules(&self.workflow_schedules, &self.workflows)?;
 
         Ok(BuiltHarvest {
             workflows: self.workflows,
             activities: self.activities,
             dags: self.dags,
+            workflow_schedules: self.workflow_schedules,
             worker_config: self.worker_config,
             state: self.state,
             telemetry: Arc::new(self.telemetry.unwrap_or_default()),
             retention: self.retention,
         })
     }
+}
+
+/// Verify that every [`WorkflowSchedule`] references a workflow name that is
+/// actually registered on the builder. Fails fast with
+/// [`HarvestBuilderError::UnknownWorkflowSchedule`] on the first mismatch.
+fn validate_workflow_schedules(
+    schedules: &[WorkflowSchedule],
+    workflows: &[crate::info::WorkflowInfo],
+) -> Result<(), HarvestBuilderError> {
+    if schedules.is_empty() {
+        return Ok(());
+    }
+    let registered: Vec<String> = workflows.iter().map(|w| w.name.to_string()).collect();
+    if let Some(schedule) = schedules
+        .iter()
+        .find(|s| !registered.contains(&s.workflow_name))
+    {
+        return Err(HarvestBuilderError::UnknownWorkflowSchedule {
+            workflow_name: schedule.workflow_name.clone(),
+            registered,
+        });
+    }
+    Ok(())
 }
 
 /// Entry in the concurrency-key deduplication map.

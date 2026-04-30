@@ -102,7 +102,7 @@ diesel::table! {
 
     harvest_schedules (id) {
         id -> Uuid,
-        dag_name -> Text,
+        dag_name -> Nullable<Text>,
         schedule_expr -> Nullable<Text>,
         timezone -> Text,
         catchup -> Bool,
@@ -112,6 +112,8 @@ diesel::table! {
         next_run_at -> Nullable<Timestamptz>,
         created_at -> Timestamptz,
         updated_at -> Timestamptz,
+        workflow_name -> Nullable<Text>,
+        workflow_input -> Nullable<Jsonb>,
     }
 }
 

@@ -71,6 +71,8 @@ pub enum ApiMethod {
     Patch,
     /// HTTP POST.
     Post,
+    /// HTTP DELETE.
+    Delete,
 }
 
 /// Thin request description built from CLI arguments.
@@ -156,6 +158,12 @@ enum Commands {
     Dag {
         #[command(subcommand)]
         command: DagCommand,
+    },
+    /// Manage workflow and DAG schedules (issue #91).
+    #[command(alias = "schedules")]
+    Schedule {
+        #[command(subcommand)]
+        command: ScheduleCommand,
     },
     /// Manage dead-lettered tasks.
     #[command(alias = "dead-letter", alias = "dead-letters")]
@@ -301,6 +309,51 @@ enum DagCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum ScheduleCommand {
+    /// List all schedules (DAG and workflow), tagged with kind.
+    List,
+    /// Create or update a workflow schedule.
+    CreateWorkflow {
+        /// Registered workflow name to schedule.
+        #[arg(long)]
+        name: String,
+        /// Cron expression (e.g. `"0 3 * * *"`) or `"interval:<secs>"`.
+        #[arg(long)]
+        cron: String,
+        /// Inline JSON input passed to each scheduled run.
+        #[arg(long, value_name = "JSON", conflicts_with = "input_file")]
+        input_json: Option<String>,
+        /// File containing JSON input. Use `-` for stdin.
+        #[arg(long, value_name = "PATH", conflicts_with = "input_json")]
+        input_file: Option<PathBuf>,
+        /// Maximum concurrent in-flight runs (default: 1).
+        #[arg(long, default_value_t = 1)]
+        max_active_runs: u32,
+        /// Backfill missed runs when the scheduler was down.
+        #[arg(long)]
+        catchup: bool,
+        /// Create the schedule in a paused state.
+        #[arg(long)]
+        paused: bool,
+    },
+    /// Pause a schedule (works for both DAG and workflow schedules).
+    Pause {
+        /// Schedule row ID (UUID).
+        id: String,
+    },
+    /// Resume a paused schedule.
+    Resume {
+        /// Schedule row ID (UUID).
+        id: String,
+    },
+    /// Delete a schedule.
+    Delete {
+        /// Schedule row ID (UUID).
+        id: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum RetentionCommand {
     /// Show retention config and last tick results.
     Status,
@@ -341,6 +394,7 @@ impl Cli {
             Commands::Health => Ok(ApiRequest::get("/health")),
             Commands::Workflow { command } => workflow_request(command),
             Commands::Dag { command } => dag_request(command),
+            Commands::Schedule { command } => schedule_request(command),
             Commands::Dlq { command } => Ok(dead_letter_request(command)),
             Commands::Retention { command } => Ok(retention_request(command)),
             Commands::Concurrency { command } => Ok(concurrency_request(command)),
@@ -409,6 +463,7 @@ pub async fn execute(cli: &Cli) -> Result<Value, CliError> {
         ApiMethod::Get => client.get(url),
         ApiMethod::Patch => client.patch(url),
         ApiMethod::Post => client.post(url),
+        ApiMethod::Delete => client.delete(url),
     };
     let builder = if let Some(token) = &cli.token {
         builder.bearer_auth(token)
@@ -589,6 +644,57 @@ fn dag_request(command: &DagCommand) -> Result<ApiRequest, CliError> {
             format!("/dags/{}", path_segment(dag_name)),
             json!({ "paused": false }),
         )),
+    }
+}
+
+fn schedule_request(command: &ScheduleCommand) -> Result<ApiRequest, CliError> {
+    match command {
+        ScheduleCommand::List => Ok(ApiRequest::get("/admin/schedules")),
+        ScheduleCommand::CreateWorkflow {
+            name,
+            cron,
+            input_json,
+            input_file,
+            max_active_runs,
+            catchup,
+            paused,
+        } => {
+            let mut body = Map::new();
+            body.insert("workflow_name".to_string(), Value::String(name.clone()));
+            body.insert("schedule_expr".to_string(), Value::String(cron.clone()));
+            body.insert("max_active_runs".to_string(), json!(max_active_runs));
+            body.insert("catchup".to_string(), json!(catchup));
+            body.insert("paused".to_string(), json!(paused));
+            if let Some(input) =
+                parse_json_source(input_json.as_deref(), input_file.as_deref(), "input")?
+            {
+                body.insert("input".to_string(), input);
+            }
+            Ok(ApiRequest::post(
+                "/admin/schedules/workflow",
+                Some(Value::Object(body)),
+            ))
+        }
+        ScheduleCommand::Pause { id } => Ok(ApiRequest::post(
+            format!("/admin/schedules/{}/pause", path_segment(id)),
+            None,
+        )),
+        ScheduleCommand::Resume { id } => Ok(ApiRequest::post(
+            format!("/admin/schedules/{}/resume", path_segment(id)),
+            None,
+        )),
+        ScheduleCommand::Delete { id } => {
+            // DELETE — use a dedicated ApiMethod variant or reuse Post with a
+            // special path. Since ApiMethod only has Get/Patch/Post and adding
+            // Delete would require more changes, we'll represent it as a Post
+            // to a /delete path.
+            // Actually, let's add Delete to ApiMethod.
+            Ok(ApiRequest {
+                method: ApiMethod::Delete,
+                path: format!("/admin/schedules/{}", path_segment(id)),
+                body: None,
+            })
+        }
     }
 }
 

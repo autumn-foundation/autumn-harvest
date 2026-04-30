@@ -110,7 +110,7 @@ pub use execution::{
 pub use executor::{WorkflowOutcome, run_workflow};
 pub use history_export::export_mermaid_sequence;
 pub use info::{ActivityHandlerFn, ActivityInfo, DagInfo, WorkflowHandlerFn, WorkflowInfo};
-pub use policy::{RetryPolicy, Schedule, TaskStatus, TriggerRule};
+pub use policy::{RetryPolicy, Schedule, TaskStatus, TriggerRule, WorkflowSchedule};
 pub use pool::{HarvestPoolConfig, compute_pool_sizes};
 pub use query::QueryRegistry;
 pub use replay::{HistoryMatch, HistoryMatcher};
@@ -121,7 +121,7 @@ pub use saga::Saga;
 #[cfg(feature = "db")]
 pub use scheduler::{
     DagCatalog, RegisteredDag, SchedulerMonitor, SchedulerRuntime, compile_dag_catalog,
-    register_schedules, tick_once, trigger_dag,
+    register_schedules, register_workflow_schedules, tick_once, trigger_dag,
 };
 pub use shard::ShardRouter;
 #[cfg(feature = "db")]

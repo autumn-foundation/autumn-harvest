@@ -196,7 +196,7 @@ pub struct NewDagRun<'a> {
 
 // ── Schedule ──────────────────────────────────────────────────────────────────
 
-/// A DAG schedule configuration.
+/// A DAG or workflow schedule configuration.
 #[derive(
     Debug, Clone, Queryable, Selectable, Identifiable, serde::Serialize, serde::Deserialize,
 )]
@@ -204,7 +204,8 @@ pub struct NewDagRun<'a> {
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct HarvestSchedule {
     pub id: Uuid,
-    pub dag_name: String,
+    /// Set for DAG schedules, NULL for workflow-only schedules.
+    pub dag_name: Option<String>,
     pub schedule_expr: Option<String>,
     pub timezone: String,
     pub catchup: bool,
@@ -214,18 +215,26 @@ pub struct HarvestSchedule {
     pub next_run_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Set for workflow-only schedules, NULL for DAG schedules.
+    pub workflow_name: Option<String>,
+    /// Input JSON passed to each scheduled workflow run.
+    pub workflow_input: Option<serde_json::Value>,
 }
 
-/// Insert struct for registering a new DAG schedule.
+/// Insert struct for registering a new schedule (DAG or workflow).
 #[derive(Debug, Insertable, serde::Serialize, serde::Deserialize)]
 #[diesel(table_name = harvest_schedules)]
 pub struct NewHarvestSchedule<'a> {
     pub id: Uuid,
-    pub dag_name: &'a str,
+    /// Set for DAG schedules, None for workflow-only schedules.
+    pub dag_name: Option<&'a str>,
     pub schedule_expr: Option<&'a str>,
     pub timezone: &'a str,
     pub catchup: bool,
     pub max_active_runs: i32,
+    /// Set for workflow-only schedules, None for DAG schedules.
+    pub workflow_name: Option<&'a str>,
+    pub workflow_input: Option<serde_json::Value>,
 }
 
 // ── Signal ────────────────────────────────────────────────────────────────────
