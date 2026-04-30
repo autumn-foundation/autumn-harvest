@@ -743,7 +743,7 @@ async fn tick_workflow_schedules(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn tick_one_workflow_schedule(
     conn: &mut AsyncPgConnection,
     wf_name: &str,
@@ -803,8 +803,6 @@ async fn tick_one_workflow_schedule(
             break;
         }
         let workflow_id = scheduled_workflow_id(wf_name, *scheduled_for);
-        // ExecutionId::new() encodes ShardId::UNENCODED, which the ShardRouter
-        // resolves to the configured default shard — correct for all deployments.
         let exec_id = ExecutionId::new();
         let input = schedule
             .workflow_input
@@ -826,14 +824,8 @@ async fn tick_one_workflow_schedule(
                 execution_timeout: None,
                 memo: None,
                 search_attrs: None,
+                // TODO(#87): switch to RejectDuplicate once #87 lands.
                 reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
-                // TODO(#87): switch to WorkflowIdReusePolicy::RejectDuplicate (or a
-                // user-specified policy) once issue #87 lands and the reuse-policy
-                // surface is wired through the scheduling path.  Until then,
-                // AllowDuplicate matches the existing DAG-schedule behaviour: each
-                // cron firing always starts a new execution, even if a previous one
-                // with the same deterministic workflow_id still exists.  Operators
-                // relying on at-most-one semantics should set max_active_runs = 1.
             },
         )
         .await
@@ -859,12 +851,8 @@ async fn tick_one_workflow_schedule(
         }
     }
 
-    // When the catchup loop broke early, use the first undispatched slot as
-    // next_run_at so remaining catchup slots are retried on the next tick
-    // rather than silently dropped. Fall back to the post-plan next slot when
-    // all slots were dispatched. last_run_at advances only to the last slot
-    // that was actually started; if nothing was dispatched, keep the existing
-    // value to avoid regressing the cursor.
+    // Deferred catchup slots become next_run_at so the next tick retries them.
+    // last_run_at only advances to the last slot actually started.
     let effective_last_run_at = last_dispatched_at.or(schedule.last_run_at);
     let effective_next_run_at = deferred_next_run_at.or(next_run_after_plan);
     diesel::update(dsl::harvest_schedules.find(schedule.id))
