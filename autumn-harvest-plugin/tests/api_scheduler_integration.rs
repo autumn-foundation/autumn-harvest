@@ -482,6 +482,7 @@ fn build_sharded_dag_api_app(
     api_state.install(HarvestApiRuntime::new(
         registry,
         dag_catalog,
+        Arc::new(Vec::new()),
         Some("scheduler-sharded".to_string()),
         vec!["default".to_string()],
         SchedulerMonitor::offline(),
@@ -1037,6 +1038,7 @@ async fn harvest_api_uses_installed_storage_pool_when_app_state_has_no_database(
     api_state.install(HarvestApiRuntime::new(
         Arc::clone(&registry),
         Arc::new(HashMap::new()),
+        Arc::new(Vec::new()),
         Some("test-worker".to_string()),
         vec!["default".to_string()],
         SchedulerMonitor::offline(),
@@ -1123,6 +1125,7 @@ async fn harvest_api_duplicate_start_reuses_existing_execution() {
     api_state.install(HarvestApiRuntime::new(
         Arc::clone(&registry),
         Arc::new(HashMap::new()),
+        Arc::new(Vec::new()),
         Some("test-worker".to_string()),
         vec!["default".to_string()],
         SchedulerMonitor::offline(),
@@ -1181,6 +1184,7 @@ async fn harvest_api_cancels_workflows_and_rejects_late_signals() {
     api_state.install(HarvestApiRuntime::new(
         Arc::clone(&registry),
         Arc::new(HashMap::new()),
+        Arc::new(Vec::new()),
         Some("test-worker".to_string()),
         vec!["default".to_string()],
         SchedulerMonitor::offline(),
@@ -1416,6 +1420,7 @@ async fn harvest_api_signal_does_not_wake_timer_waits_early() {
     api_state.install(HarvestApiRuntime::new(
         Arc::clone(&registry),
         Arc::new(HashMap::new()),
+        Arc::new(Vec::new()),
         Some("test-worker".to_string()),
         vec!["default".to_string()],
         SchedulerMonitor::offline(),
@@ -1685,6 +1690,7 @@ async fn harvest_api_lists_and_triggers_manual_dags() {
     api_state.install(HarvestApiRuntime::new(
         Arc::clone(&registry),
         Arc::clone(&dag_catalog),
+        Arc::new(Vec::new()),
         Some("scheduler-only".to_string()),
         vec!["default".to_string()],
         SchedulerMonitor::offline(),
@@ -1819,6 +1825,7 @@ async fn scheduler_tick_creates_and_executes_due_interval_runs() {
         pool.clone(),
         Arc::clone(&registry),
         Arc::clone(&dag_catalog),
+        Arc::new(Vec::new()),
         SchedulerMonitor::offline(),
     )
     .await

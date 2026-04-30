@@ -425,6 +425,7 @@ async fn upsert_schedule(
             is_paused: false,
             workflow_name: None,
             workflow_input: None,
+            queue_name: None,
         };
         diesel::insert_into(harvest_schedules::table)
             .values(&row)
@@ -483,6 +484,7 @@ async fn upsert_workflow_schedule(
         is_paused: ws.paused,
         workflow_name: Some(&ws.workflow_name),
         workflow_input: Some(ws.input.clone()),
+        queue_name: Some(ws.queue_name.as_str()),
     };
     diesel::insert_into(harvest_schedules::table)
         .values(&row)
@@ -517,6 +519,7 @@ async fn upsert_workflow_schedule(
             dsl::catchup.eq(ws.catchup),
             dsl::max_active_runs.eq(i32::try_from(ws.max_active_runs).unwrap_or(i32::MAX)),
             dsl::workflow_input.eq(Some(ws.input.clone())),
+            dsl::queue_name.eq(Some(ws.queue_name.as_str())),
             dsl::updated_at.eq(now),
             dsl::next_run_at.eq(next_run_at),
         ))
@@ -775,6 +778,7 @@ async fn tick_one_workflow_schedule(
     }
 
     let (run_dates, next_run_at) = due_run_plan(parsed_schedule, logical_date, now, catchup);
+    let dispatch_queue = schedule.queue_name.as_deref().unwrap_or("default");
 
     for scheduled_for in &run_dates {
         let workflow_id = scheduled_workflow_id(wf_name, *scheduled_for);
@@ -795,7 +799,7 @@ async fn tick_one_workflow_schedule(
                 exec_id,
                 input,
                 parent_id: None,
-                queue_name: "default",
+                queue_name: dispatch_queue,
                 execution_timeout: None,
                 memo: None,
                 search_attrs: None,
@@ -819,10 +823,13 @@ async fn tick_one_workflow_schedule(
                 );
             }
             Err(error) => {
+                // Propagate the error so last_run_at is not advanced — the next
+                // tick will retry the same firing rather than silently dropping it.
                 tracing::warn!(
                     error = %error, workflow_name = %wf_name, workflow_id = %workflow_id,
                     "harvest: failed to start scheduled workflow run"
                 );
+                return Err(error);
             }
         }
     }

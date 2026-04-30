@@ -279,13 +279,15 @@ pub struct WorkflowSchedule {
     pub max_active_runs: u32,
     /// Initial paused state. Defaults to `false`.
     pub paused: bool,
+    /// Task queue name for dispatched runs. Defaults to `"default"`.
+    pub queue_name: String,
 }
 
 impl WorkflowSchedule {
     /// Create a new workflow schedule with sensible defaults.
     ///
     /// Defaults: `input = null`, `catchup = false`, `max_active_runs = 1`,
-    /// `paused = false`.
+    /// `paused = false`, `queue_name = "default"`.
     #[must_use]
     pub fn new(workflow_name: impl Into<String>, schedule: Schedule) -> Self {
         Self {
@@ -295,6 +297,7 @@ impl WorkflowSchedule {
             catchup: false,
             max_active_runs: 1,
             paused: false,
+            queue_name: "default".to_string(),
         }
     }
 

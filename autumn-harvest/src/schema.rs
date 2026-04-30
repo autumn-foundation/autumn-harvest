@@ -114,6 +114,7 @@ diesel::table! {
         updated_at -> Timestamptz,
         workflow_name -> Nullable<Text>,
         workflow_input -> Nullable<Jsonb>,
+        queue_name -> Nullable<Text>,
     }
 }
 

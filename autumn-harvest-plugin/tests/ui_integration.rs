@@ -259,6 +259,7 @@ async fn ui_root_redirects_to_workflows() {
     api_state.install(HarvestApiRuntime::new(
         Arc::clone(&registry),
         Arc::new(HashMap::new()),
+        Arc::new(Vec::new()),
         Some("ui-test-worker".to_string()),
         vec!["default".to_string()],
         SchedulerMonitor::offline(),
@@ -292,6 +293,7 @@ async fn ui_lists_workflows_and_renders_detail_page() {
     api_state.install(HarvestApiRuntime::new(
         Arc::clone(&registry),
         Arc::new(HashMap::new()),
+        Arc::new(Vec::new()),
         Some("ui-test-worker".to_string()),
         vec!["default".to_string()],
         SchedulerMonitor::offline(),
@@ -370,6 +372,7 @@ async fn ui_lists_workflows_across_shards() {
     api_state.install(HarvestApiRuntime::new(
         echo_registry(),
         Arc::new(HashMap::new()),
+        Arc::new(Vec::new()),
         Some("ui-test-worker".to_string()),
         vec!["default".to_string()],
         SchedulerMonitor::offline(),

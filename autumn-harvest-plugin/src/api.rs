@@ -325,6 +325,12 @@ struct CreateWorkflowScheduleRequest {
     max_active_runs: u32,
     #[serde(default)]
     paused: bool,
+    #[serde(default = "default_queue_name")]
+    queue_name: String,
+}
+
+fn default_queue_name() -> String {
+    "default".to_string()
 }
 
 const fn default_max_active_runs() -> u32 {
@@ -824,8 +830,7 @@ async fn create_workflow_schedule(
         .map_err(|e| AutumnError::bad_request_msg(format!("invalid schedule_expr: {e}")))?;
 
     let pool = api_state.storage_pool().map_err(map_error)?;
-    // For a single-shard deployment or a workflow-name-keyed schedule, use shard 0.
-    let mut conn = acquire_conn(pool.pool_for(autumn_harvest::types::ShardId::new(0))).await?;
+    let mut conn = acquire_conn(pool.pool_for(runtime.router().default_shard())).await?;
 
     // Upsert the schedule row.
     let ws = WorkflowSchedule {
@@ -835,6 +840,7 @@ async fn create_workflow_schedule(
         catchup: request.catchup,
         max_active_runs: request.max_active_runs,
         paused: request.paused,
+        queue_name: request.queue_name.clone(),
     };
     autumn_harvest::register_workflow_schedules(&mut conn, std::slice::from_ref(&ws))
         .await

@@ -219,6 +219,8 @@ pub struct HarvestSchedule {
     pub workflow_name: Option<String>,
     /// Input JSON passed to each scheduled workflow run.
     pub workflow_input: Option<serde_json::Value>,
+    /// Task queue for workflow dispatches. NULL for DAG schedule rows.
+    pub queue_name: Option<String>,
 }
 
 /// Insert struct for registering a new schedule (DAG or workflow).
@@ -236,6 +238,8 @@ pub struct NewHarvestSchedule<'a> {
     /// Set for workflow-only schedules, None for DAG schedules.
     pub workflow_name: Option<&'a str>,
     pub workflow_input: Option<serde_json::Value>,
+    /// Task queue for workflow dispatches. None for DAG schedule rows.
+    pub queue_name: Option<&'a str>,
 }
 
 // ── Signal ────────────────────────────────────────────────────────────────────

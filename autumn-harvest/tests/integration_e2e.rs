@@ -3921,7 +3921,7 @@ async fn workflow_schedule_dag_only_deployment_unaffected() {
 
     // There are no workflow-schedule rows; the workflow_schedules list is empty.
     let empty_workflow_schedules: Arc<Vec<WorkflowSchedule>> = Arc::new(Vec::new());
-    let empty_dags: Arc<autumn_harvest::DagCatalog> = Arc::new(Default::default());
+    let empty_dags: Arc<autumn_harvest::DagCatalog> = Arc::new(DagCatalog::default());
     let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
 
     // Run several ticks against an otherwise-empty database.

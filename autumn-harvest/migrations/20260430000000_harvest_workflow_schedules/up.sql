@@ -27,3 +27,6 @@ ALTER TABLE harvest_schedules
 -- (which have workflow_name = NULL) are unaffected.
 ALTER TABLE harvest_schedules
     ADD CONSTRAINT harvest_schedules_workflow_name_unique UNIQUE (workflow_name);
+
+-- Queue name for workflow-only schedules (NULL for DAG rows).
+ALTER TABLE harvest_schedules ADD COLUMN queue_name TEXT;
