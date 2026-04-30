@@ -88,7 +88,7 @@ pub use analyzer::{
     AnalyzerRule, AnalyzerWarning, ExcessiveRetriesRule, HistoryAnalyzer, LargePayloadRule,
     SuspiciousTimerRule,
 };
-pub use builder::{BuiltHarvest, HarvestBuilder, WorkerConfig};
+pub use builder::{BuiltHarvest, HarvestBuilder, HarvestBuilderError, WorkerConfig};
 pub use cache::{CachedWorkflowState, WorkflowCache};
 pub use context::{ActivityContext, WorkflowCommand, WorkflowContext};
 pub use dag::{DagBuildError, DagBuilder, DagDefinition, DagTask, DagTaskRef};
@@ -139,6 +139,9 @@ pub use types::{
 
 #[cfg(feature = "db")]
 pub use store::EventHistory;
+
+#[cfg(feature = "db")]
+pub use queue::ConcurrencyKeyStats;
 
 // Allow macro-generated code to use ::autumn_harvest::serde_json
 pub use serde_json;

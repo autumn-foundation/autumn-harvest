@@ -24,6 +24,7 @@ use autumn_harvest::context::WorkflowContext;
 use autumn_harvest::dlq;
 use autumn_harvest::error::{HarvestError, HarvestResult, database_error};
 use autumn_harvest::models::{DagRun, DeadLetter, HarvestSchedule, WorkflowExecution};
+use autumn_harvest::queue::{self, ConcurrencyKeyStats};
 use autumn_harvest::retention::{RetentionConfig, RetentionMonitor, RetentionStatus};
 use autumn_harvest::scheduler::{
     DagCatalog, RegisteredDag, SchedulerMonitor, SchedulerSnapshot, trigger_dag,
@@ -321,6 +322,7 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .route("/health", get(health))
         .route("/admin/retention", get(retention_status))
         .route("/admin/retention/run-now", post(retention_run_now))
+        .route("/admin/concurrency", get(concurrency_status))
         .layer(Extension(api_state))
 }
 
@@ -749,6 +751,42 @@ async fn retention_run_now(
         ))
     })?;
     Ok(Json(BasicAck { ok: true }))
+}
+
+async fn concurrency_status(
+    Extension(api_state): Extension<HarvestApiState>,
+) -> Result<Json<Vec<ConcurrencyKeyStats>>, AutumnError> {
+    let runtime = api_state.runtime().map_err(map_error)?;
+    let pool = api_state.storage_pool().map_err(map_error)?;
+
+    let mut merged: std::collections::HashMap<String, ConcurrencyKeyStats> =
+        std::collections::HashMap::new();
+
+    for (_shard, shard_pool) in pool.iter_shards() {
+        let mut conn = acquire_conn(shard_pool).await?;
+        let stats = queue::concurrency_key_stats(&mut conn, &runtime.queues)
+            .await
+            .map_err(map_error)?;
+        for stat in stats {
+            let entry = merged
+                .entry(stat.key.clone())
+                .or_insert_with(|| ConcurrencyKeyStats {
+                    key: stat.key.clone(),
+                    max_concurrent: stat.max_concurrent,
+                    in_flight: 0,
+                    pending: 0,
+                });
+            // Take the highest cap seen across shards, matching what
+            // concurrency_key_stats() does within a shard (MAX(concurrency_cap)).
+            entry.max_concurrent = entry.max_concurrent.max(stat.max_concurrent);
+            entry.in_flight += stat.in_flight;
+            entry.pending += stat.pending;
+        }
+    }
+
+    let mut result: Vec<ConcurrencyKeyStats> = merged.into_values().collect();
+    result.sort_by(|a, b| a.key.cmp(&b.key));
+    Ok(Json(result))
 }
 
 async fn health(

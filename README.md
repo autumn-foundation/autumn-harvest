@@ -70,6 +70,10 @@ async fn main() {
   up at the same state.
 - **Activities with retries.** Side effects live in `#[activity]` functions
   with configurable `start_to_close`, `heartbeat_timeout`, and `retry` policies.
+- **Per-activity concurrency caps.** Declare `max_concurrent = N` on an
+  activity to enforce a cluster-wide cap without spinning up dedicated worker
+  processes. Activities sharing a rate-limited dependency can share a budget
+  via `concurrency_key = "stripe"`.
 - **Signals & queries.** Send a signal into a running workflow, query its
   state, or block on a timer.
 - **Child workflows.** Compose orchestrations from smaller workflows and model
@@ -124,6 +128,7 @@ cargo run -p autumn-harvest-cli -- dlq list --limit 25
 cargo run -p autumn-harvest-cli -- dlq replay <dead-letter-id>
 cargo run -p autumn-harvest-cli -- retention status
 cargo run -p autumn-harvest-cli -- retention run-now
+cargo run -p autumn-harvest-cli -- concurrency status
 ```
 
 Configure the API mount with `--base-url` or `HARVEST_URL` (default:
@@ -186,6 +191,70 @@ A 409 response body looks like:
   "existing_execution_id": "01234567-...",
   "existing_state": "RUNNING"
 }
+```
+
+### Capping concurrency for rate-limited downstream dependencies
+
+Workflows commonly integrate with rate-limited APIs (Stripe, OpenAI, SendGrid,
+Twilio, S3 multipart, internal microservices with a `max_connections` cap).
+Without a concurrency cap the cluster may fan out dozens of simultaneous calls,
+triggering 429s or downstream timeouts.
+
+The old workaround — a dedicated task queue with a single worker process set to
+`max_concurrent_activities = N` — is operationally expensive and fragile
+(autoscalers or accidental second instances break the invariant).
+
+Instead, declare `max_concurrent = N` directly on the activity:
+
+```rust
+// At most 5 concurrent Stripe calls across the whole cluster.
+#[activity(start_to_close = "30s", max_concurrent = 5)]
+async fn charge_stripe(ctx: &ActivityContext, amount_cents: u64) -> HarvestResult<String> {
+    // … Stripe SDK call
+}
+```
+
+When multiple activities all touch the same rate-limited API, share the budget
+with `concurrency_key`:
+
+```rust
+// "stripe" budget: combined in-flight count of both activities never exceeds 5.
+#[activity(start_to_close = "30s", max_concurrent = 5, concurrency_key = "stripe")]
+async fn charge_stripe(ctx: &ActivityContext, amount_cents: u64) -> HarvestResult<String> {
+    // …
+}
+
+#[activity(start_to_close = "10s", max_concurrent = 5, concurrency_key = "stripe")]
+async fn refund_stripe(ctx: &ActivityContext, charge_id: String) -> HarvestResult<()> {
+    // …
+}
+```
+
+Activities sharing a `concurrency_key` must declare the **same** `max_concurrent`
+value. Disagreeing values are caught at `HarvestBuilder::build()` time:
+
+```
+HarvestBuilderError::ConcurrencyKeyMismatch { key: "stripe", activities: [...] }
+```
+
+The cap is enforced cluster-wide via a `WHERE NOT EXISTS` predicate on the
+`harvest_task_queue` claim query. A task whose key is saturated is skipped and
+re-evaluated on the next poll — no dedicated worker process, no extra table, no
+background coordinator. The partial index
+`harvest_task_queue_concurrency_key_running` makes the saturation check O(log n)
+on RUNNING rows with a non-NULL key; activities without a cap pay zero overhead.
+
+Inspect live stats with the CLI:
+
+```bash
+harvest concurrency status
+# [{ "key": "stripe", "max_concurrent": 5, "in_flight": 3, "pending": 12 }, …]
+```
+
+Or via the management API directly:
+
+```bash
+GET /api/harvest/admin/concurrency
 ```
 
 ### Filtering the workflow list

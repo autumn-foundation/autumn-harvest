@@ -74,6 +74,8 @@ diesel::table! {
         sticky_until -> Nullable<Timestamptz>,
         sticky_timeout -> Nullable<Interval>,
         trace_context -> Nullable<Jsonb>,
+        concurrency_key -> Nullable<Text>,
+        concurrency_cap -> Nullable<Int4>,
     }
 }
 

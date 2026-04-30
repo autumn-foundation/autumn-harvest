@@ -36,6 +36,8 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260424000001_harvest_trace_context/up.sql"),
     "\n",
     include_str!("../migrations/20260427000000_harvest_continue_as_new/up.sql"),
+    "\n",
+    include_str!("../migrations/20260429000000_harvest_concurrency_key/up.sql"),
 );
 
 async fn setup_test_db() -> (AsyncPgConnection, ContainerAsync<Postgres>) {
@@ -194,6 +196,8 @@ fn heartbeat_registry(probe: HeartbeatCancellationProbe) -> Arc<HandlerRegistry>
             default_heartbeat_timeout: None,
             default_schedule_to_start: None,
             default_queue: Some("default"),
+            max_concurrent: None,
+            concurrency_key: None,
             handler: heartbeat_activity,
         }],
         Arc::new(state),
@@ -519,6 +523,8 @@ fn uncooperative_registry(probe: UncooperativeActivityProbe) -> Arc<HandlerRegis
             default_heartbeat_timeout: None,
             default_schedule_to_start: None,
             default_queue: Some("default"),
+            max_concurrent: None,
+            concurrency_key: None,
             handler: uncooperative_activity,
         }],
         Arc::new(state),
