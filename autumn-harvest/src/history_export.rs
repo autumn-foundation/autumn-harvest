@@ -292,4 +292,62 @@ mod tests {
         assert!(diagram.contains("WF->>+Activity_download_file: Schedule (ID: "));
         assert!(diagram.contains("Note over WF: Workflow Completed"));
     }
+
+    #[test]
+    #[should_panic(expected = "internal error: entered unreachable code")]
+    fn test_handle_workflow_event_unreachable_panics() {
+        let mut exporter = MermaidExporter::new();
+        // WorkflowCompleted is not an unreachable arm, but ActivityScheduled is (for workflow event handler)
+        let event = WorkflowEvent::ActivityScheduled {
+            activity_id: ActivityExecId::new(),
+            name: "test".to_string(),
+            input: serde_json::json!({}),
+            queue: "default".to_string(),
+        };
+        let _ = exporter.handle_workflow_event(&event);
+    }
+
+    #[test]
+    #[should_panic(expected = "internal error: entered unreachable code")]
+    fn test_handle_activity_event_unreachable_panics() {
+        let mut exporter = MermaidExporter::new();
+        let event = WorkflowEvent::WorkflowStarted {
+            input: serde_json::json!({}),
+            timestamp: Utc::now(),
+        };
+        let _ = exporter.handle_activity_event(&event);
+    }
+
+    #[test]
+    #[should_panic(expected = "internal error: entered unreachable code")]
+    fn test_handle_timer_event_unreachable_panics() {
+        let mut exporter = MermaidExporter::new();
+        let event = WorkflowEvent::WorkflowStarted {
+            input: serde_json::json!({}),
+            timestamp: Utc::now(),
+        };
+        let _ = exporter.handle_timer_event(&event);
+    }
+
+    #[test]
+    #[should_panic(expected = "internal error: entered unreachable code")]
+    fn test_handle_child_workflow_event_unreachable_panics() {
+        let mut exporter = MermaidExporter::new();
+        let event = WorkflowEvent::WorkflowStarted {
+            input: serde_json::json!({}),
+            timestamp: Utc::now(),
+        };
+        let _ = exporter.handle_child_workflow_event(&event);
+    }
+
+    #[test]
+    #[should_panic(expected = "internal error: entered unreachable code")]
+    fn test_handle_misc_event_unreachable_panics() {
+        let mut exporter = MermaidExporter::new();
+        let event = WorkflowEvent::WorkflowStarted {
+            input: serde_json::json!({}),
+            timestamp: Utc::now(),
+        };
+        let _ = exporter.handle_misc_event(&event);
+    }
 }
