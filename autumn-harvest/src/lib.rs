@@ -19,6 +19,7 @@ pub mod analyzer;
 pub mod builder;
 pub mod cache;
 pub mod context;
+pub mod critical_path;
 pub mod dag;
 /// Export format types for Directed Acyclic Graphs (DAGs) representing workflows.
 pub mod dag_export;
@@ -91,6 +92,7 @@ pub use analyzer::{
 pub use builder::{BuiltHarvest, HarvestBuilder, HarvestBuilderError, WorkerConfig};
 pub use cache::{CachedWorkflowState, WorkflowCache};
 pub use context::{ActivityContext, WorkflowCommand, WorkflowContext};
+pub use critical_path::{CriticalPathAnalyzer, CriticalPathResult};
 pub use dag::{DagBuildError, DagBuilder, DagDefinition, DagTask, DagTaskRef};
 pub use dag_export::{export_dot, export_mermaid};
 pub use dag_linter::{
