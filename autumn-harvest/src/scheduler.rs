@@ -783,12 +783,18 @@ async fn tick_one_workflow_schedule(
         return Ok(());
     }
 
-    let (run_dates, next_run_at) = due_run_plan(parsed_schedule, logical_date, now, catchup);
+    let (run_dates, next_run_after_plan) =
+        due_run_plan(parsed_schedule, logical_date, now, catchup);
     let dispatch_queue = schedule.queue_name.as_deref().unwrap_or("default");
 
     let mut dispatched: u32 = 0;
+    let mut last_dispatched_at: Option<DateTime<Utc>> = None;
+    // Set to the first slot we could not dispatch due to max_active_runs; if Some,
+    // it becomes next_run_at so catchup slots are not silently dropped.
+    let mut deferred_next_run_at: Option<DateTime<Utc>> = None;
     for scheduled_for in &run_dates {
         if running + i64::from(dispatched) >= i64::from(schedule.max_active_runs) {
+            deferred_next_run_at = Some(*scheduled_for);
             tracing::info!(
                 workflow_name = %wf_name,
                 max_active_runs = schedule.max_active_runs,
@@ -834,6 +840,7 @@ async fn tick_one_workflow_schedule(
         {
             Ok(started) => {
                 dispatched += 1;
+                last_dispatched_at = Some(*scheduled_for);
                 metrics.record_schedule_run("workflow", wf_name);
                 tracing::info!(
                     workflow_name = %wf_name, execution_id = %started.exec_id,
@@ -852,10 +859,18 @@ async fn tick_one_workflow_schedule(
         }
     }
 
+    // When the catchup loop broke early, use the first undispatched slot as
+    // next_run_at so remaining catchup slots are retried on the next tick
+    // rather than silently dropped. Fall back to the post-plan next slot when
+    // all slots were dispatched. last_run_at advances only to the last slot
+    // that was actually started; if nothing was dispatched, keep the existing
+    // value to avoid regressing the cursor.
+    let effective_last_run_at = last_dispatched_at.or(schedule.last_run_at);
+    let effective_next_run_at = deferred_next_run_at.or(next_run_after_plan);
     diesel::update(dsl::harvest_schedules.find(schedule.id))
         .set((
-            dsl::last_run_at.eq(run_dates.last().copied()),
-            dsl::next_run_at.eq(next_run_at),
+            dsl::last_run_at.eq(effective_last_run_at),
+            dsl::next_run_at.eq(effective_next_run_at),
             dsl::updated_at.eq(now),
         ))
         .execute(conn)
