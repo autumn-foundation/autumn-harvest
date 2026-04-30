@@ -424,6 +424,16 @@ impl HistoryMatcher {
                     self.stash_signal(scan_cursor, signal_name, payload);
                     scan_cursor += 1;
                 }
+                // A second ActivityAwaitingExternal for the same activity can
+                // appear when a workflow is woken by a signal while still
+                // awaiting external completion: the worker re-runs
+                // persist_scheduled_external_activity, but record_external_task
+                // is idempotent (ON CONFLICT DO NOTHING).  Skip the duplicate.
+                WorkflowEvent::ActivityAwaitingExternal {
+                    activity_id: id, ..
+                } if *id == activity_id => {
+                    scan_cursor += 1;
+                }
                 _ => break,
             }
         }
