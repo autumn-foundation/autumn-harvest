@@ -346,6 +346,7 @@ pub struct ExternalTask {
     pub queue: String,
     pub state: String,
     pub schedule_to_close_at: DateTime<Utc>,
+    pub schedule_to_close_secs: i64,
     pub created_at: DateTime<Utc>,
 }
 
@@ -359,4 +360,5 @@ pub struct NewExternalTask<'a> {
     pub name: &'a str,
     pub queue: &'a str,
     pub schedule_to_close_at: DateTime<Utc>,
+    pub schedule_to_close_secs: i64,
 }

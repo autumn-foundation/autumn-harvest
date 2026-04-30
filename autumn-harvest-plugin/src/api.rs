@@ -1448,15 +1448,10 @@ async fn heartbeat_external_activity(
             .await
             .map_err(map_error)?
         {
-            // Default to the original configured duration (schedule_to_close_at
-            // - created_at) so that omitting extend_by_secs resets the deadline
-            // to the same window as the initial schedule rather than a fixed 300s.
-            let original_secs = u64::try_from(
-                (task.schedule_to_close_at - task.created_at)
-                    .num_seconds()
-                    .max(1),
-            )
-            .unwrap_or(1);
+            // Default to the original configured duration so that omitting
+            // extend_by_secs resets the deadline by the same fixed window every
+            // time, regardless of how many heartbeats have already fired.
+            let original_secs = u64::try_from(task.schedule_to_close_secs).unwrap_or(1);
             let extend_by = request.extend_by_secs.unwrap_or(original_secs);
             external_task::extend_deadline(&mut conn, token, extend_by)
                 .await

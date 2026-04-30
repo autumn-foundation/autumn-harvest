@@ -45,6 +45,7 @@ pub async fn record_external_task(
         name,
         queue,
         schedule_to_close_at,
+        schedule_to_close_secs: i64::try_from(schedule_to_close_secs).unwrap_or(i64::MAX),
     };
 
     diesel::insert_into(harvest_external_tasks::table)

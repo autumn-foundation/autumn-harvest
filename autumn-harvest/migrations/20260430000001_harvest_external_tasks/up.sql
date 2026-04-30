@@ -8,16 +8,17 @@
 -- State machine: PENDING → COMPLETED | FAILED | TIMED_OUT
 
 CREATE TABLE harvest_external_tasks (
-    id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    token                UUID NOT NULL,
-    workflow_exec_id     UUID NOT NULL REFERENCES harvest_workflow_executions(id) ON DELETE CASCADE,
-    activity_id          UUID NOT NULL,
-    name                 TEXT NOT NULL,
-    queue                TEXT NOT NULL,
-    state                TEXT NOT NULL DEFAULT 'PENDING'
-                             CHECK (state IN ('PENDING', 'COMPLETED', 'FAILED', 'TIMED_OUT')),
-    schedule_to_close_at TIMESTAMPTZ NOT NULL,
-    created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    id                    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    token                 UUID NOT NULL,
+    workflow_exec_id      UUID NOT NULL REFERENCES harvest_workflow_executions(id) ON DELETE CASCADE,
+    activity_id           UUID NOT NULL,
+    name                  TEXT NOT NULL,
+    queue                 TEXT NOT NULL,
+    state                 TEXT NOT NULL DEFAULT 'PENDING'
+                              CHECK (state IN ('PENDING', 'COMPLETED', 'FAILED', 'TIMED_OUT')),
+    schedule_to_close_at  TIMESTAMPTZ NOT NULL,
+    schedule_to_close_secs BIGINT NOT NULL,
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 -- Primary access pattern: management API resolves token → exec_id in O(log n)

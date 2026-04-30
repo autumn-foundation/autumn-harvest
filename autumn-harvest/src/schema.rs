@@ -172,6 +172,7 @@ diesel::table! {
         queue -> Text,
         state -> Text,
         schedule_to_close_at -> Timestamptz,
+        schedule_to_close_secs -> Int8,
         created_at -> Timestamptz,
     }
 }
