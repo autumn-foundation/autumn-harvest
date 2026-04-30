@@ -314,11 +314,11 @@ pub async fn tick_once(
     let runnable = activate_queued_runs(&mut conn, dags.as_ref()).await?;
 
     // Dispatch due workflow-schedule runs directly via start_or_load_workflow_execution.
-    if !workflow_schedules.is_empty() {
+    // Always check the DB — API-created schedules are DB-only and won't appear in the
+    // in-memory workflow_schedules list.
+    {
         let metrics = Arc::clone(&registry.telemetry().metrics);
-        if let Err(error) =
-            tick_workflow_schedules(&mut conn, workflow_schedules.as_ref(), &metrics).await
-        {
+        if let Err(error) = tick_workflow_schedules(&mut conn, &metrics).await {
             tracing::warn!(error = %error, "harvest workflow-schedule tick error");
         }
     }
@@ -454,93 +454,78 @@ async fn upsert_schedule(
 }
 
 /// Upsert a `harvest_schedules` row for a [`WorkflowSchedule`].
+///
+/// The insert uses `ON CONFLICT (workflow_name) DO NOTHING` so that concurrent
+/// scheduler instances or API requests cannot produce duplicate rows even without
+/// a serialisable transaction. A subsequent `UPDATE` then refreshes all mutable
+/// fields, preserving `is_paused` (managed independently via pause/resume).
 async fn upsert_workflow_schedule(
     conn: &mut AsyncPgConnection,
     ws: &WorkflowSchedule,
 ) -> HarvestResult<HarvestSchedule> {
     use crate::schema::harvest_schedules::dsl;
 
-    let existing = dsl::harvest_schedules
+    let now = Utc::now();
+    let expr = schedule_expr(Some(&ws.schedule));
+
+    // Attempt an atomic insert. The UNIQUE constraint on workflow_name means a
+    // concurrent writer will hit DO NOTHING rather than inserting a duplicate.
+    let row = NewHarvestSchedule {
+        id: uuid::Uuid::new_v4(),
+        dag_name: None,
+        schedule_expr: expr.as_deref(),
+        timezone: "UTC",
+        catchup: ws.catchup,
+        max_active_runs: i32::try_from(ws.max_active_runs).unwrap_or(i32::MAX),
+        workflow_name: Some(&ws.workflow_name),
+        workflow_input: Some(ws.input.clone()),
+    };
+    diesel::insert_into(harvest_schedules::table)
+        .values(&row)
+        .on_conflict(dsl::workflow_name)
+        .do_nothing()
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    // Read back whichever row now exists (just-inserted or pre-existing).
+    let existing: HarvestSchedule = dsl::harvest_schedules
         .filter(dsl::workflow_name.eq(&ws.workflow_name))
         .select(HarvestSchedule::as_select())
         .first(conn)
         .await
-        .optional()
         .map_err(crate::error::database_error)?;
-    let now = Utc::now();
-    let expr = schedule_expr(Some(&ws.schedule));
 
-    if let Some(existing) = existing {
-        let schedule_changed = existing.schedule_expr != expr;
-        let next_run_at = if schedule_changed {
-            next_run_after(Some(&ws.schedule), now)
-        } else {
-            existing
-                .next_run_at
-                .or_else(|| next_run_after(Some(&ws.schedule), now))
-        };
-        diesel::update(dsl::harvest_schedules.find(existing.id))
-            .set((
-                dsl::schedule_expr.eq(expr),
-                dsl::timezone.eq("UTC"),
-                dsl::catchup.eq(ws.catchup),
-                dsl::max_active_runs.eq(i32::try_from(ws.max_active_runs).unwrap_or(i32::MAX)),
-                dsl::workflow_input.eq(Some(ws.input.clone())),
-                dsl::updated_at.eq(now),
-                dsl::next_run_at.eq(next_run_at),
-            ))
-            .execute(conn)
-            .await
-            .map_err(crate::error::database_error)?;
-
-        dsl::harvest_schedules
-            .find(existing.id)
-            .select(HarvestSchedule::as_select())
-            .first(conn)
-            .await
-            .map_err(crate::error::database_error)
+    // Recalculate next_run_at: reset on schedule-expression change, preserve otherwise.
+    let schedule_changed = existing.schedule_expr != expr;
+    let next_run_at = if schedule_changed {
+        next_run_after(Some(&ws.schedule), now)
     } else {
-        let row = NewHarvestSchedule {
-            id: uuid::Uuid::new_v4(),
-            dag_name: None,
-            schedule_expr: expr.as_deref(),
-            timezone: "UTC",
-            catchup: ws.catchup,
-            max_active_runs: i32::try_from(ws.max_active_runs).unwrap_or(i32::MAX),
-            workflow_name: Some(&ws.workflow_name),
-            workflow_input: Some(ws.input.clone()),
-        };
-        diesel::insert_into(harvest_schedules::table)
-            .values(&row)
-            .execute(conn)
-            .await
-            .map_err(crate::error::database_error)?;
+        existing
+            .next_run_at
+            .or_else(|| next_run_after(Some(&ws.schedule), now))
+    };
+    // is_paused is deliberately excluded — it is managed via pause/resume, not here.
+    diesel::update(dsl::harvest_schedules.find(existing.id))
+        .set((
+            dsl::schedule_expr.eq(expr),
+            dsl::timezone.eq("UTC"),
+            dsl::catchup.eq(ws.catchup),
+            dsl::max_active_runs.eq(i32::try_from(ws.max_active_runs).unwrap_or(i32::MAX)),
+            dsl::workflow_input.eq(Some(ws.input.clone())),
+            dsl::updated_at.eq(now),
+            dsl::next_run_at.eq(next_run_at),
+        ))
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
 
-        let inserted = dsl::harvest_schedules
-            .filter(dsl::workflow_name.eq(&ws.workflow_name))
-            .select(HarvestSchedule::as_select())
-            .first(conn)
-            .await
-            .map_err(crate::error::database_error)?;
-
-        // Set initial is_paused and next_run_at.
-        let initial_next_run = next_run_after(Some(&ws.schedule), now);
-        diesel::update(dsl::harvest_schedules.find(inserted.id))
-            .set((
-                dsl::is_paused.eq(ws.paused),
-                dsl::next_run_at.eq(initial_next_run),
-            ))
-            .execute(conn)
-            .await
-            .map_err(crate::error::database_error)?;
-
-        dsl::harvest_schedules
-            .find(inserted.id)
-            .select(HarvestSchedule::as_select())
-            .first(conn)
-            .await
-            .map_err(crate::error::database_error)
-    }
+    dsl::harvest_schedules
+        .find(existing.id)
+        .select(HarvestSchedule::as_select())
+        .first(conn)
+        .await
+        .map_err(crate::error::database_error)
 }
 
 async fn create_due_runs(conn: &mut AsyncPgConnection, dags: &DagCatalog) -> HarvestResult<()> {
@@ -679,9 +664,24 @@ fn scheduled_workflow_id(workflow_name: &str, scheduled_for: DateTime<Utc>) -> S
 }
 
 /// Process due workflow-schedule rows and dispatch workflow starts.
+/// Parse a stored `schedule_expr` string back into a [`Schedule`] variant.
+///
+/// The format written by [`schedule_expr`] is `"cron:<expr>"`, `"interval:<secs>"`,
+/// or `"manual"`. Unrecognised strings return `None` and the row is treated as
+/// `Schedule::Manual` (no automatic `next_run_at`).
+fn parse_schedule_from_expr(expr: &str) -> Option<Schedule> {
+    expr.strip_prefix("cron:").map_or_else(
+        || {
+            expr.strip_prefix("interval:")
+                .and_then(|s| s.parse::<u64>().ok())
+                .map(|secs| Schedule::Interval(Duration::from_secs(secs)))
+        },
+        |cron| Some(Schedule::Cron(cron.to_string())),
+    )
+}
+
 async fn tick_workflow_schedules(
     conn: &mut AsyncPgConnection,
-    workflow_schedules: &[WorkflowSchedule],
     metrics: &Arc<dyn crate::telemetry::MetricsRecorder>,
 ) -> HarvestResult<()> {
     use crate::schema::harvest_schedules::dsl;
@@ -703,26 +703,39 @@ async fn tick_workflow_schedules(
         let Some(ref wf_name) = schedule.workflow_name.clone() else {
             continue;
         };
-        let Some(ws) = workflow_schedules
-            .iter()
-            .find(|s| &s.workflow_name == wf_name)
-        else {
-            continue;
-        };
         let Some(logical_date) = schedule.next_run_at else {
             continue;
         };
-        tick_one_workflow_schedule(conn, wf_name, ws, &schedule, logical_date, now, metrics)
-            .await?;
+        // Parse the schedule expression stored in the DB row. This covers both
+        // in-process registered schedules and schedules created via the API
+        // (which are DB-only and do not appear in the in-memory list).
+        let parsed_schedule = schedule
+            .schedule_expr
+            .as_deref()
+            .and_then(parse_schedule_from_expr);
+        let catchup = schedule.catchup;
+        tick_one_workflow_schedule(
+            conn,
+            wf_name,
+            catchup,
+            parsed_schedule.as_ref(),
+            &schedule,
+            logical_date,
+            now,
+            metrics,
+        )
+        .await?;
     }
 
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn tick_one_workflow_schedule(
     conn: &mut AsyncPgConnection,
     wf_name: &str,
-    ws: &WorkflowSchedule,
+    catchup: bool,
+    parsed_schedule: Option<&Schedule>,
     schedule: &HarvestSchedule,
     logical_date: DateTime<Utc>,
     now: DateTime<Utc>,
@@ -748,7 +761,7 @@ async fn tick_one_workflow_schedule(
             "harvest workflow schedule skipped: max_active_runs reached"
         );
         metrics.record_schedule_skipped("workflow", wf_name, "max_active_runs_reached");
-        let next = next_run_after(Some(&ws.schedule), now);
+        let next = next_run_after(parsed_schedule, now);
         diesel::update(dsl::harvest_schedules.find(schedule.id))
             .set((dsl::next_run_at.eq(next), dsl::updated_at.eq(now)))
             .execute(conn)
@@ -757,7 +770,7 @@ async fn tick_one_workflow_schedule(
         return Ok(());
     }
 
-    let (run_dates, next_run_at) = due_run_plan(Some(&ws.schedule), logical_date, now, ws.catchup);
+    let (run_dates, next_run_at) = due_run_plan(parsed_schedule, logical_date, now, catchup);
 
     for scheduled_for in &run_dates {
         let workflow_id = scheduled_workflow_id(wf_name, *scheduled_for);

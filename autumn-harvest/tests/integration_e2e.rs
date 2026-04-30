@@ -18,10 +18,10 @@ use autumn_harvest::store;
 use autumn_harvest::types::{ActivityExecId, ExecutionId};
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{
-    ActivityContext, HarvestBuilder, HarvestError, Schedule, SchedulerMonitor, SchedulerRuntime,
-    StartWorkflowParams, TimeoutType, WorkerConfig, WorkflowContext, WorkflowIdReusePolicy,
-    WorkflowSchedule, cancel_workflow_execution, queue, register_workflow_schedules,
-    start_or_load_workflow_execution, tick_once, timeout,
+    ActivityContext, DagCatalog, HarvestBuilder, HarvestError, Schedule, SchedulerMonitor,
+    SchedulerRuntime, StartWorkflowParams, TimeoutType, WorkerConfig, WorkflowContext,
+    WorkflowIdReusePolicy, WorkflowSchedule, cancel_workflow_execution, queue,
+    register_workflow_schedules, start_or_load_workflow_execution, tick_once, timeout,
 };
 
 use chrono::Utc;
@@ -3624,7 +3624,7 @@ fn instant_workflow<'a>(
     Box::pin(async move { Ok(serde_json::Value::Null) })
 }
 
-/// Slow workflow handler that sleeps for 30 s — used to saturate max_active_runs.
+/// Slow workflow handler that sleeps for 30 s — used to saturate `max_active_runs`.
 fn slow_workflow<'a>(
     _ctx: &'a WorkflowContext,
     _input: serde_json::Value,
@@ -3636,7 +3636,7 @@ fn slow_workflow<'a>(
 }
 
 /// (a) Baseline: a `*/2 * * * * *` schedule dispatches >=3 executions in a
-/// 10-second window and each execution carries the deterministic workflow_id
+/// 10-second window and each execution carries the deterministic `workflow_id`
 /// `sched:{name}:{ts}`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn workflow_schedule_baseline_dispatches_multiple_runs() {
@@ -3659,7 +3659,7 @@ async fn workflow_schedule_baseline_dispatches_multiple_runs() {
     let ws = WorkflowSchedule::new(wf_name, Schedule::Cron("*/2 * * * * *".to_string()));
     {
         let mut conn = pool.get().await.expect("pool get failed");
-        register_workflow_schedules(&mut conn, &[ws.clone()])
+        register_workflow_schedules(&mut conn, std::slice::from_ref(&ws))
             .await
             .expect("register_workflow_schedules failed");
     }
@@ -3669,7 +3669,7 @@ async fn workflow_schedule_baseline_dispatches_multiple_runs() {
     let scheduler = SchedulerRuntime::spawn(
         pool.clone(),
         Arc::clone(&registry),
-        Arc::new(Default::default()),
+        Arc::new(DagCatalog::default()),
         Arc::clone(&workflow_schedules),
     );
     let worker = Arc::new(
@@ -3750,7 +3750,7 @@ async fn workflow_schedule_max_active_runs_enforced() {
         .with_max_active_runs(1);
     {
         let mut conn = pool.get().await.expect("pool get failed");
-        register_workflow_schedules(&mut conn, &[ws.clone()])
+        register_workflow_schedules(&mut conn, std::slice::from_ref(&ws))
             .await
             .expect("register_workflow_schedules failed");
     }
@@ -3759,7 +3759,7 @@ async fn workflow_schedule_max_active_runs_enforced() {
     let scheduler = SchedulerRuntime::spawn(
         pool.clone(),
         Arc::clone(&registry),
-        Arc::new(Default::default()),
+        Arc::new(DagCatalog::default()),
         Arc::clone(&workflow_schedules),
     );
     let worker = Arc::new(
@@ -3828,7 +3828,7 @@ async fn workflow_schedule_pause_and_resume() {
         .with_paused(true);
     {
         let mut conn = pool.get().await.expect("pool get failed");
-        register_workflow_schedules(&mut conn, &[ws.clone()])
+        register_workflow_schedules(&mut conn, std::slice::from_ref(&ws))
             .await
             .expect("register_workflow_schedules failed");
     }
@@ -3837,7 +3837,7 @@ async fn workflow_schedule_pause_and_resume() {
     let scheduler = SchedulerRuntime::spawn(
         pool.clone(),
         Arc::clone(&registry),
-        Arc::new(Default::default()),
+        Arc::new(DagCatalog::default()),
         Arc::clone(&workflow_schedules),
     );
     let worker = Arc::new(

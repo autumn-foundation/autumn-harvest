@@ -21,7 +21,9 @@ ALTER TABLE harvest_schedules
 ALTER TABLE harvest_schedules
     VALIDATE CONSTRAINT harvest_schedules_kind_check;
 
--- Index for efficient scheduler tick queries on workflow schedules.
-CREATE INDEX idx_harvest_schedules_workflow_name
-    ON harvest_schedules (workflow_name)
-    WHERE workflow_name IS NOT NULL;
+-- Unique constraint on workflow_name so that concurrent upserts via
+-- ON CONFLICT (workflow_name) DO NOTHING cannot produce duplicate rows.
+-- NULLs are always distinct in PostgreSQL UNIQUE constraints, so DAG rows
+-- (which have workflow_name = NULL) are unaffected.
+ALTER TABLE harvest_schedules
+    ADD CONSTRAINT harvest_schedules_workflow_name_unique UNIQUE (workflow_name);
