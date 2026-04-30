@@ -66,6 +66,12 @@ impl MermaidExporter {
                 WorkflowEvent::SignalReceived { .. } | WorkflowEvent::MarkerRecorded { .. } => {
                     self.handle_misc_event(event)?;
                 }
+                WorkflowEvent::ActivityAwaitingExternal { .. }
+                | WorkflowEvent::ActivityCompletedExternally { .. }
+                | WorkflowEvent::ActivityFailedExternally { .. }
+                | WorkflowEvent::ActivityExternalDeadlineExtended { .. } => {
+                    self.handle_external_activity_event(event)?;
+                }
             }
         }
         Ok(())
@@ -247,6 +253,45 @@ impl MermaidExporter {
             }
             WorkflowEvent::MarkerRecorded { name, .. } => {
                 writeln!(self.out, "    Note over WF: Marker: {name}")?;
+            }
+            _ => unreachable!(),
+        }
+        Ok(())
+    }
+
+    fn handle_external_activity_event(
+        &mut self,
+        event: &WorkflowEvent,
+    ) -> Result<(), std::fmt::Error> {
+        let participant = "ExternalSystem";
+        if self.participants.insert(participant.to_string()) {
+            writeln!(self.out, "    participant {participant} as External System")?;
+        }
+        match event {
+            WorkflowEvent::ActivityAwaitingExternal { name, token, .. } => {
+                writeln!(
+                    self.out,
+                    "    WF->>{participant}: Awaiting External: {name} (token: {token})"
+                )?;
+            }
+            WorkflowEvent::ActivityCompletedExternally { token, .. } => {
+                writeln!(
+                    self.out,
+                    "    {participant}->>WF: Completed Externally (token: {token})"
+                )?;
+            }
+            WorkflowEvent::ActivityFailedExternally { token, error, .. } => {
+                let safe_error = error.replace('\n', " ").replace('"', "'");
+                writeln!(
+                    self.out,
+                    "    {participant}->>WF: Failed Externally (token: {token}): {safe_error}"
+                )?;
+            }
+            WorkflowEvent::ActivityExternalDeadlineExtended { token, .. } => {
+                writeln!(
+                    self.out,
+                    "    Note right of WF: Deadline Extended (token: {token})"
+                )?;
             }
             _ => unreachable!(),
         }

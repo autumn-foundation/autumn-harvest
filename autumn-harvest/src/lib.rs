@@ -135,7 +135,8 @@ pub use telemetry::{
 #[cfg(any(test, feature = "testing"))]
 pub use test_generator::TestHarnessGenerator;
 pub use types::{
-    ActivityExecId, ExecutionId, ShardId, TimerId, WorkerId, WorkflowId, WorkflowIdReusePolicy,
+    ActivityExecId, ExecutionId, ExternalActivityToken, ShardId, TimerId, WorkerId, WorkflowId,
+    WorkflowIdReusePolicy,
 };
 
 #[cfg(feature = "db")]

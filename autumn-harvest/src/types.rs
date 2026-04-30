@@ -336,6 +336,63 @@ impl FromStr for ActivityExecId {
     }
 }
 
+/// Opaque single-use token that uniquely identifies a pending external activity.
+///
+/// The token is embedded in the `ActivityAwaitingExternal` event when a workflow
+/// calls `execute_activity_external`, and is round-tripped by external systems
+/// through the management API to deliver a result (`/complete`, `/fail`) or extend
+/// the deadline (`/heartbeat`).
+///
+/// ## Examples
+///
+/// ```rust
+/// use autumn_harvest::types::ExternalActivityToken;
+///
+/// let token = ExternalActivityToken::new();
+/// assert!(!token.as_uuid().is_nil());
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ExternalActivityToken(Uuid);
+
+impl ExternalActivityToken {
+    /// Create a fresh, random token.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+
+    /// The nil token (all-zero UUID), useful as a sentinel in tests.
+    #[must_use]
+    pub const fn nil() -> Self {
+        Self(Uuid::nil())
+    }
+
+    /// The underlying UUID.
+    #[must_use]
+    pub const fn as_uuid(&self) -> Uuid {
+        self.0
+    }
+}
+
+impl Default for ExternalActivityToken {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for ExternalActivityToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl FromStr for ExternalActivityToken {
+    type Err = uuid::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Uuid::parse_str(s).map(Self)
+    }
+}
+
 /// Durable timer handle within a workflow.
 ///
 /// ## Examples
