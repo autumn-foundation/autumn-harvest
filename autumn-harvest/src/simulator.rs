@@ -37,7 +37,7 @@ pub struct WorkflowSimulator {
     state: SharedState,
     activity_mocks: HashMap<String, ActivityMockFn>,
     child_workflow_mocks: HashMap<String, ActivityMockFn>,
-    signals_to_send: HashMap<String, Value>,
+    signals_to_send: HashMap<String, std::collections::VecDeque<Value>>,
 }
 
 impl WorkflowSimulator {
@@ -87,7 +87,10 @@ impl WorkflowSimulator {
     /// Register a signal to send when requested by `wait_for_signal`.
     #[must_use]
     pub fn send_signal(mut self, name: &str, payload: Value) -> Self {
-        self.signals_to_send.insert(name.to_string(), payload);
+        self.signals_to_send
+            .entry(name.to_string())
+            .or_default()
+            .push_back(payload);
         self
     }
 
@@ -239,7 +242,11 @@ impl WorkflowSimulator {
                                 advanced = true;
                             }
                             WorkflowCommand::WaitForSignal { signal_name, .. } => {
-                                if let Some(payload) = self.signals_to_send.remove(&signal_name) {
+                                if let Some(payload) = self
+                                    .signals_to_send
+                                    .get_mut(&signal_name)
+                                    .and_then(std::collections::VecDeque::pop_front)
+                                {
                                     history.push(WorkflowEvent::SignalReceived {
                                         signal_name: signal_name.clone(),
                                         payload: payload.clone(),
@@ -341,5 +348,34 @@ mod tests {
             final_output,
             serde_json::json!({ "final": { "child": "signal_data" } })
         );
+    }
+    fn dummy_workflow_with_multiple_signals(
+        ctx: &crate::context::WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + '_>> {
+        Box::pin(async move {
+            let s1 = ctx
+                .wait_for_signal("test_signal")
+                .await
+                .map_err(|e| e.to_string())?;
+            let s2 = ctx
+                .wait_for_signal("test_signal")
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(serde_json::json!([s1, s2]))
+        })
+    }
+
+    #[tokio::test]
+    async fn test_simulator_multiple_signals() {
+        let sim = WorkflowSimulator::new(dummy_workflow_with_multiple_signals)
+            .send_signal("test_signal", serde_json::json!("sig1"))
+            .send_signal("test_signal", serde_json::json!("sig2"));
+
+        let res = sim.run(serde_json::json!("init")).await;
+        let final_output = res
+            .final_output
+            .expect("workflow should complete successfully");
+        assert_eq!(final_output, serde_json::json!(["sig1", "sig2"]));
     }
 }
