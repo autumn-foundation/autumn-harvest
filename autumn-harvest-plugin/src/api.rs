@@ -922,6 +922,7 @@ async fn delete_schedule(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
 ) -> Result<Json<BasicAck>, AutumnError> {
+    use autumn_harvest::models::HarvestSchedule;
     use autumn_harvest::schema::harvest_schedules::dsl;
 
     let id = parse_uuid(&id, "schedule id")?;
@@ -930,6 +931,23 @@ async fn delete_schedule(
     let mut deleted_count = 0usize;
     for (_shard, shard_pool) in pool.iter_shards() {
         let mut conn = acquire_conn(shard_pool).await?;
+        let row: Option<HarvestSchedule> = dsl::harvest_schedules
+            .find(id)
+            .select(HarvestSchedule::as_select())
+            .first(&mut conn)
+            .await
+            .optional()
+            .map_err(database_error)
+            .map_err(map_error)?;
+        let Some(row) = row else {
+            continue;
+        };
+        if row.dag_name.is_some() {
+            return Err(AutumnError::bad_request_msg(format!(
+                "schedule {id} is managed by the DAG catalog and cannot be deleted via API; \
+                 remove the DAG definition to stop scheduling"
+            )));
+        }
         let n = diesel::delete(dsl::harvest_schedules.find(id))
             .execute(&mut conn)
             .await
