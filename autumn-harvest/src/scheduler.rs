@@ -160,9 +160,7 @@ impl SchedulerRuntime {
         let handle = tokio::spawn(async move {
             while !shutdown_for_task.is_cancelled() {
                 if let Ok(mut conn) = pool.get().await {
-                    if let Err(error) =
-                        register_schedules(&mut conn, dags.as_ref()).await
-                    {
+                    if let Err(error) = register_schedules(&mut conn, dags.as_ref()).await {
                         tracing::warn!(error = %error, "failed to register harvest DAG schedules");
                     }
                     if let Err(error) =
@@ -486,8 +484,7 @@ async fn upsert_workflow_schedule(
                 dsl::schedule_expr.eq(expr),
                 dsl::timezone.eq("UTC"),
                 dsl::catchup.eq(ws.catchup),
-                dsl::max_active_runs
-                    .eq(i32::try_from(ws.max_active_runs).unwrap_or(i32::MAX)),
+                dsl::max_active_runs.eq(i32::try_from(ws.max_active_runs).unwrap_or(i32::MAX)),
                 dsl::workflow_input.eq(Some(ws.input.clone())),
                 dsl::updated_at.eq(now),
                 dsl::next_run_at.eq(next_run_at),
@@ -706,7 +703,10 @@ async fn tick_workflow_schedules(
         let Some(ref wf_name) = schedule.workflow_name.clone() else {
             continue;
         };
-        let Some(ws) = workflow_schedules.iter().find(|s| &s.workflow_name == wf_name) else {
+        let Some(ws) = workflow_schedules
+            .iter()
+            .find(|s| &s.workflow_name == wf_name)
+        else {
             continue;
         };
         let Some(logical_date) = schedule.next_run_at else {
@@ -762,7 +762,10 @@ async fn tick_one_workflow_schedule(
     for scheduled_for in &run_dates {
         let workflow_id = scheduled_workflow_id(wf_name, *scheduled_for);
         let exec_id = ExecutionId::new_for_shard(crate::types::ShardId::new(0));
-        let input = schedule.workflow_input.clone().unwrap_or(serde_json::Value::Null);
+        let input = schedule
+            .workflow_input
+            .clone()
+            .unwrap_or(serde_json::Value::Null);
         tracing::info!(
             workflow_name = %wf_name, workflow_id = %workflow_id,
             scheduled_for = %scheduled_for, "harvest: dispatching scheduled workflow run"

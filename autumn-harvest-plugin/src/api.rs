@@ -24,9 +24,9 @@ use autumn_harvest::context::WorkflowContext;
 use autumn_harvest::dlq;
 use autumn_harvest::error::{HarvestError, HarvestResult, database_error};
 use autumn_harvest::models::{DagRun, DeadLetter, HarvestSchedule, WorkflowExecution};
+use autumn_harvest::policy::WorkflowSchedule;
 use autumn_harvest::queue::{self, ConcurrencyKeyStats};
 use autumn_harvest::retention::{RetentionConfig, RetentionMonitor, RetentionStatus};
-use autumn_harvest::policy::WorkflowSchedule;
 use autumn_harvest::scheduler::{
     DagCatalog, RegisteredDag, SchedulerMonitor, SchedulerSnapshot, trigger_dag,
 };
@@ -807,7 +807,12 @@ async fn create_workflow_schedule(
         .workflows
         .contains_key(&request.workflow_name)
     {
-        let registered: Vec<&str> = runtime.registry.workflows.keys().map(String::as_str).collect();
+        let registered: Vec<&str> = runtime
+            .registry
+            .workflows
+            .keys()
+            .map(String::as_str)
+            .collect();
         return Err(AutumnError::not_found_msg(format!(
             "workflow '{}' is not registered; registered: {:?}",
             request.workflow_name, registered
@@ -815,9 +820,8 @@ async fn create_workflow_schedule(
     }
 
     // Parse the schedule expression.
-    let schedule = parse_schedule_expr(&request.schedule_expr).map_err(|e| {
-        AutumnError::bad_request_msg(format!("invalid schedule_expr: {e}"))
-    })?;
+    let schedule = parse_schedule_expr(&request.schedule_expr)
+        .map_err(|e| AutumnError::bad_request_msg(format!("invalid schedule_expr: {e}")))?;
 
     let pool = api_state.storage_pool().map_err(map_error)?;
     // For a single-shard deployment or a workflow-name-keyed schedule, use shard 0.
@@ -937,12 +941,12 @@ async fn delete_schedule(
     Ok(Json(BasicAck { ok: true }))
 }
 
-fn parse_schedule_expr(
-    expr: &str,
-) -> Result<autumn_harvest::policy::Schedule, String> {
+fn parse_schedule_expr(expr: &str) -> Result<autumn_harvest::policy::Schedule, String> {
     let trimmed = expr.trim();
     if let Some(cron) = trimmed.strip_prefix("cron:") {
-        Ok(autumn_harvest::policy::Schedule::Cron(cron.trim().to_string()))
+        Ok(autumn_harvest::policy::Schedule::Cron(
+            cron.trim().to_string(),
+        ))
     } else if let Some(secs_str) = trimmed.strip_prefix("interval:") {
         let secs: u64 = secs_str
             .trim()
@@ -1200,9 +1204,19 @@ async fn load_schedules_from_shards(
     }
 
     schedules.sort_by(|left, right| {
-        let left_name = left.dag_name.as_deref().or(left.workflow_name.as_deref()).unwrap_or("");
-        let right_name = right.dag_name.as_deref().or(right.workflow_name.as_deref()).unwrap_or("");
-        left_name.cmp(right_name).then_with(|| left.id.cmp(&right.id))
+        let left_name = left
+            .dag_name
+            .as_deref()
+            .or(left.workflow_name.as_deref())
+            .unwrap_or("");
+        let right_name = right
+            .dag_name
+            .as_deref()
+            .or(right.workflow_name.as_deref())
+            .unwrap_or("");
+        left_name
+            .cmp(right_name)
+            .then_with(|| left.id.cmp(&right.id))
     });
     Ok(schedules)
 }

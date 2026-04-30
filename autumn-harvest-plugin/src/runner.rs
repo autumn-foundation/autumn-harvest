@@ -178,19 +178,18 @@ impl HarvestRunner {
                 worker.run(&pool).await;
             })
         });
-        let scheduler =
-            if config.scheduler_enabled
-                && (!dag_catalog.is_empty() || !workflow_schedules.is_empty())
-            {
-                Some(SchedulerRuntime::spawn(
-                    harvest_pool,
-                    Arc::clone(&registry),
-                    Arc::clone(&dag_catalog),
-                    Arc::clone(&workflow_schedules),
-                ))
-            } else {
-                None
-            };
+        let scheduler = if config.scheduler_enabled
+            && (!dag_catalog.is_empty() || !workflow_schedules.is_empty())
+        {
+            Some(SchedulerRuntime::spawn(
+                harvest_pool,
+                Arc::clone(&registry),
+                Arc::clone(&dag_catalog),
+                Arc::clone(&workflow_schedules),
+            ))
+        } else {
+            None
+        };
         let scheduler_monitor = scheduler
             .as_ref()
             .map_or_else(SchedulerMonitor::offline, SchedulerRuntime::monitor);

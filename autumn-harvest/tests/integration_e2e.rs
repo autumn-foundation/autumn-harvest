@@ -3656,10 +3656,7 @@ async fn workflow_schedule_baseline_dispatches_multiple_runs() {
     let pool = build_test_pool(&database_url);
 
     // Register the schedule row before starting the scheduler.
-    let ws = WorkflowSchedule::new(
-        wf_name,
-        Schedule::Cron("*/2 * * * * *".to_string()),
-    );
+    let ws = WorkflowSchedule::new(wf_name, Schedule::Cron("*/2 * * * * *".to_string()));
     {
         let mut conn = pool.get().await.expect("pool get failed");
         register_workflow_schedules(&mut conn, &[ws.clone()])
@@ -3749,11 +3746,8 @@ async fn workflow_schedule_max_active_runs_enforced() {
     ));
     let pool = build_test_pool(&database_url);
 
-    let ws = WorkflowSchedule::new(
-        wf_name,
-        Schedule::Cron("*/2 * * * * *".to_string()),
-    )
-    .with_max_active_runs(1);
+    let ws = WorkflowSchedule::new(wf_name, Schedule::Cron("*/2 * * * * *".to_string()))
+        .with_max_active_runs(1);
     {
         let mut conn = pool.get().await.expect("pool get failed");
         register_workflow_schedules(&mut conn, &[ws.clone()])
@@ -3830,11 +3824,8 @@ async fn workflow_schedule_pause_and_resume() {
     let pool = build_test_pool(&database_url);
 
     // Register the schedule paused so no runs fire initially.
-    let ws = WorkflowSchedule::new(
-        wf_name,
-        Schedule::Cron("*/2 * * * * *".to_string()),
-    )
-    .with_paused(true);
+    let ws = WorkflowSchedule::new(wf_name, Schedule::Cron("*/2 * * * * *".to_string()))
+        .with_paused(true);
     {
         let mut conn = pool.get().await.expect("pool get failed");
         register_workflow_schedules(&mut conn, &[ws.clone()])
@@ -3882,18 +3873,15 @@ async fn workflow_schedule_pause_and_resume() {
     // will pick it up on the next tick.
     {
         let mut conn = pool.get().await.expect("pool get failed");
-        diesel::update(
-            sched_dsl::harvest_schedules
-                .filter(sched_dsl::workflow_name.eq(wf_name)),
-        )
-        .set((
-            sched_dsl::is_paused.eq(false),
-            sched_dsl::next_run_at.eq(Utc::now() - chrono::Duration::seconds(1)),
-            sched_dsl::updated_at.eq(Utc::now()),
-        ))
-        .execute(&mut conn)
-        .await
-        .expect("resume update failed");
+        diesel::update(sched_dsl::harvest_schedules.filter(sched_dsl::workflow_name.eq(wf_name)))
+            .set((
+                sched_dsl::is_paused.eq(false),
+                sched_dsl::next_run_at.eq(Utc::now() - chrono::Duration::seconds(1)),
+                sched_dsl::updated_at.eq(Utc::now()),
+            ))
+            .execute(&mut conn)
+            .await
+            .expect("resume update failed");
     }
 
     // After resuming, wait up to 6 seconds for at least 1 execution.
@@ -3932,8 +3920,7 @@ async fn workflow_schedule_dag_only_deployment_unaffected() {
     let pool = build_test_pool(&database_url);
 
     // There are no workflow-schedule rows; the workflow_schedules list is empty.
-    let empty_workflow_schedules: Arc<Vec<WorkflowSchedule>> =
-        Arc::new(Vec::new());
+    let empty_workflow_schedules: Arc<Vec<WorkflowSchedule>> = Arc::new(Vec::new());
     let empty_dags: Arc<autumn_harvest::DagCatalog> = Arc::new(Default::default());
     let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
 
