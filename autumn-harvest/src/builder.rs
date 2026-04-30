@@ -156,6 +156,17 @@ pub enum HarvestBuilderError {
         /// All workflow names currently registered on the builder.
         registered: Vec<String>,
     },
+
+    /// A [`WorkflowSchedule`] contains an invalid schedule value (malformed cron
+    /// expression, zero-length interval, etc.). Caught at build time so the
+    /// operator sees a clear error rather than silently-inert or wedging schedules.
+    #[error("workflow_schedule for '{workflow_name}' has an invalid schedule: {reason}")]
+    InvalidWorkflowSchedule {
+        /// The workflow name whose schedule is invalid.
+        workflow_name: String,
+        /// Human-readable reason the schedule was rejected.
+        reason: String,
+    },
 }
 
 impl BuiltHarvest {
@@ -452,14 +463,28 @@ fn validate_workflow_schedules(
         return Ok(());
     }
     let registered: Vec<String> = workflows.iter().map(|w| w.name.to_string()).collect();
-    if let Some(schedule) = schedules
-        .iter()
-        .find(|s| !registered.contains(&s.workflow_name))
-    {
-        return Err(HarvestBuilderError::UnknownWorkflowSchedule {
-            workflow_name: schedule.workflow_name.clone(),
-            registered,
-        });
+    for schedule in schedules {
+        if !registered.contains(&schedule.workflow_name) {
+            return Err(HarvestBuilderError::UnknownWorkflowSchedule {
+                workflow_name: schedule.workflow_name.clone(),
+                registered,
+            });
+        }
+        // Reject zero-length intervals (would cause infinite loops in due_run_plan
+        // with catchup=true) and invalid cron expressions (would silently never fire).
+        if let crate::policy::Schedule::Interval(dur) = &schedule.schedule {
+            if dur.is_zero() {
+                return Err(HarvestBuilderError::InvalidWorkflowSchedule {
+                    workflow_name: schedule.workflow_name.clone(),
+                    reason: "interval must be at least 1 second".to_string(),
+                });
+            }
+        } else if let Err(reason) = crate::scheduler::validate_schedule(&schedule.schedule) {
+            return Err(HarvestBuilderError::InvalidWorkflowSchedule {
+                workflow_name: schedule.workflow_name.clone(),
+                reason,
+            });
+        }
     }
     Ok(())
 }
