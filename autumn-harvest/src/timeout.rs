@@ -378,11 +378,22 @@ pub async fn enforce_external_task_timeouts(conn: &mut AsyncPgConnection) -> Har
         let result = conn
             .transaction::<(), HarvestError, _>(|conn| {
                 async move {
-                    diesel::update(harvest_external_tasks::table.find(task_id))
-                        .set(harvest_external_tasks::state.eq("TIMED_OUT"))
-                        .execute(conn)
-                        .await
-                        .map_err(crate::error::database_error)?;
+                    // Guard against races: only transition if still PENDING.
+                    // If complete/fail landed between our scan and this update,
+                    // their state wins and we skip the timeout event entirely.
+                    let rows = diesel::update(
+                        harvest_external_tasks::table
+                            .find(task_id)
+                            .filter(harvest_external_tasks::state.eq("PENDING")),
+                    )
+                    .set(harvest_external_tasks::state.eq("TIMED_OUT"))
+                    .execute(conn)
+                    .await
+                    .map_err(crate::error::database_error)?;
+
+                    if rows == 0 {
+                        return Ok(());
+                    }
 
                     store::append_single_event(conn, exec_id, timeout_event).await?;
                     queue::wake_workflow_task(conn, exec_id).await

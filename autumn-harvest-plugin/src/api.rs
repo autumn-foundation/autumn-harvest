@@ -1441,15 +1441,20 @@ async fn heartbeat_external_activity(
 ) -> Result<Json<BasicAck>, AutumnError> {
     let token = parse_external_token(&token_str)?;
     let pool = api_state.storage_pool().map_err(map_error)?;
-    let extend_by = request.extend_by_secs.unwrap_or(300);
 
     for (_shard, shard_pool) in pool.iter_shards() {
         let mut conn = acquire_conn(shard_pool).await?;
-        if external_task::find_by_token(&mut conn, token)
+        if let Some(task) = external_task::find_by_token(&mut conn, token)
             .await
             .map_err(map_error)?
-            .is_some()
         {
+            // Default to the original configured duration (schedule_to_close_at
+            // - created_at) so that omitting extend_by_secs resets the deadline
+            // to the same window as the initial schedule rather than a fixed 300s.
+            let original_secs = (task.schedule_to_close_at - task.created_at)
+                .num_seconds()
+                .max(1) as u64;
+            let extend_by = request.extend_by_secs.unwrap_or(original_secs);
             external_task::extend_deadline(&mut conn, token, extend_by)
                 .await
                 .map_err(map_error)?;
