@@ -776,6 +776,9 @@ async fn concurrency_status(
                     in_flight: 0,
                     pending: 0,
                 });
+            // Take the highest cap seen across shards, matching what
+            // concurrency_key_stats() does within a shard (MAX(concurrency_cap)).
+            entry.max_concurrent = entry.max_concurrent.max(stat.max_concurrent);
             entry.in_flight += stat.in_flight;
             entry.pending += stat.pending;
         }
