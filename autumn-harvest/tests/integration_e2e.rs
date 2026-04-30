@@ -62,10 +62,16 @@ const INIT_SQL: &str = concat!(
 /// test. Excludes both the workflow-start uniqueness upgrade *and* the
 /// continue-as-new migration so the test can drive the database through the
 /// historical upgrade sequence: legacy -> uniqueness fix -> continue-as-new.
+///
+/// The concurrency_key migration is included because `enqueue` (called by
+/// `start_or_load_workflow_execution`) writes the `concurrency_key` and
+/// `concurrency_cap` columns that it added; without them the INSERT fails.
 const LEGACY_INIT_SQL: &str = concat!(
     include_str!("../migrations/20260409000000_harvest_initial/up.sql"),
     "\n",
     include_str!("../migrations/20260424000001_harvest_trace_context/up.sql"),
+    "\n",
+    include_str!("../migrations/20260429000000_harvest_concurrency_key/up.sql"),
 );
 
 /// Start a Postgres container with the harvest schema applied and return
