@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use autumn_harvest::BuiltHarvest;
 use autumn_harvest::context::SharedStateMap;
+use autumn_harvest::policy::WorkflowSchedule;
 use autumn_harvest::retention::{RetentionConfig, RetentionRuntime};
 use autumn_harvest::scheduler::{
     DagCatalog, SchedulerMonitor, SchedulerRuntime, compile_dag_catalog,
@@ -74,6 +75,7 @@ impl HarvestRunnerResources {
 struct PreparedHarvestRuntime {
     registry: Arc<HandlerRegistry>,
     dag_catalog: Arc<DagCatalog>,
+    workflow_schedules: Arc<Vec<WorkflowSchedule>>,
     worker_runtime_config: WorkerRuntimeConfig,
     storage_pool: HarvestDbPool,
     shard_router: ShardRouter,
@@ -87,7 +89,8 @@ impl PreparedHarvestRuntime {
     ) -> autumn_web::AutumnResult<Self> {
         let shard_router = resources.shard_router.clone().unwrap_or_default();
         let retention_config = built.retention().clone();
-        let (registry, dags, worker_config) =
+        let workflow_schedules = Arc::new(built.workflow_schedules().to_vec());
+        let (registry, dags, _ws, worker_config) =
             built.into_worker_parts_with_extra_state(injected_runtime_state(
                 resources.app_state,
                 resources.app_pool,
@@ -102,6 +105,7 @@ impl PreparedHarvestRuntime {
         Ok(Self {
             registry: Arc::new(registry),
             dag_catalog,
+            workflow_schedules,
             worker_runtime_config: WorkerRuntimeConfig::from(worker_config),
             storage_pool: HarvestDbPool::from(resources.harvest_pool),
             shard_router,
@@ -141,6 +145,7 @@ impl HarvestRunner {
         let prepared = PreparedHarvestRuntime::build(built, resources)?;
         let registry = Arc::clone(&prepared.registry);
         let dag_catalog = Arc::clone(&prepared.dag_catalog);
+        let workflow_schedules = Arc::clone(&prepared.workflow_schedules);
         let queues = prepared.worker_runtime_config.queues.clone();
         let harvest_pool = prepared.storage_pool.clone_inner();
         let shard_router = prepared.shard_router.clone();
@@ -173,11 +178,12 @@ impl HarvestRunner {
                 worker.run(&pool).await;
             })
         });
-        let scheduler = if config.scheduler_enabled && !dag_catalog.is_empty() {
+        let scheduler = if config.scheduler_enabled {
             Some(SchedulerRuntime::spawn(
                 harvest_pool,
                 Arc::clone(&registry),
                 Arc::clone(&dag_catalog),
+                Arc::clone(&workflow_schedules),
             ))
         } else {
             None
@@ -203,6 +209,7 @@ impl HarvestRunner {
         let api_runtime = HarvestApiRuntime::new(
             registry,
             dag_catalog,
+            workflow_schedules,
             worker_id,
             queues,
             scheduler_monitor,

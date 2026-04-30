@@ -1046,6 +1046,7 @@ pub struct ActivityContext {
 impl ActivityContext {
     /// Production constructor -- creates a context with heartbeat channel and
     /// cancellation token.
+    #[cfg_attr(not(feature = "db"), allow(dead_code))]
     pub(crate) fn new(
         state: SharedState,
         heartbeat_tx: Option<tokio::sync::mpsc::Sender<serde_json::Value>>,

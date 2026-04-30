@@ -78,6 +78,11 @@ async fn main() {
   state, or block on a timer.
 - **Child workflows.** Compose orchestrations from smaller workflows and model
   recovery paths in normal workflow code.
+- **Workflow cron schedules.** Register any workflow on a cron/interval
+  expression with one builder call — no DAG wrapper required. Choose
+  `WorkflowSchedule` when you want "run this workflow on a schedule";
+  choose `DagBuilder` when you need dependency-graph fan-out and trigger
+  rules between tasks.
 - **DAG scheduling.** Declare DAGs of activities with trigger rules and
   cron/interval schedules; built-in scheduler dispatches them.
 - **Management API.** Optional HTTP surface for inspecting executions, sending
@@ -278,6 +283,64 @@ cargo run -p autumn-harvest-cli -- workflow list \
     --state RUNNING \
     --workflow-name onboarding \
     --search-attr tenant=acme
+```
+
+### Scheduling workflows on a cron
+
+Use `WorkflowSchedule` when you want to fire a single workflow on a cron or
+interval expression. Use `DagBuilder` when you need dependency-graph fan-out,
+trigger rules, or multi-step pipelines between tasks.
+
+```rust
+use autumn_harvest::policy::{Schedule, WorkflowSchedule};
+
+// Register a daily billing run at 03:00 UTC with at-most-1 concurrent run.
+let sched = WorkflowSchedule::new(
+    "daily_billing_report",
+    Schedule::Cron("0 3 * * *".to_string()),
+)
+.with_input(serde_json::json!({"region": "us-east"}))
+.with_max_active_runs(1);
+
+// Wire it into the builder alongside your workflow registration.
+let app = autumn_web::app()
+    .workflows(workflows![daily_billing_report])
+    .workflow_schedule(sched)
+    .worker(WorkerConfig::default());
+```
+
+The scheduler tick derives a deterministic `workflow_id` of
+`sched:{name}:{unix_ts}` so retries after a crashed tick are idempotent.
+`max_active_runs = 1` (the default) means: if the previous run is still
+`RUNNING` when the next cron fires, skip that firing rather than stack runs.
+Set `catchup = true` to replay missed firings after a scheduler downtime window.
+
+Manage schedules via the CLI:
+
+```bash
+# Create a workflow schedule via API
+cargo run -p autumn-harvest-cli -- schedule create-workflow \
+    --name daily_billing_report \
+    --cron "0 3 * * *" \
+    --max-active-runs 1
+
+# List all schedules (both DAG and workflow kinds)
+cargo run -p autumn-harvest-cli -- schedule list
+
+# Pause / resume / delete by ID
+cargo run -p autumn-harvest-cli -- schedule pause  <id>
+cargo run -p autumn-harvest-cli -- schedule resume <id>
+cargo run -p autumn-harvest-cli -- schedule delete <id>
+```
+
+Or via the HTTP API:
+
+```bash
+POST /api/harvest/admin/schedules/workflow
+GET  /api/harvest/admin/schedules
+POST /api/harvest/admin/schedules/{id}/pause
+POST /api/harvest/admin/schedules/{id}/resume
+DELETE /api/harvest/admin/schedules/{id}
 ```
 
 ## Requirements

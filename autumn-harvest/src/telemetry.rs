@@ -266,6 +266,25 @@ pub trait MetricsRecorder: Send + Sync {
     fn record_concurrency_key_deferred(&self, key: &str, deferred: u64) {
         let _ = (key, deferred);
     }
+
+    /// A scheduled run was dispatched (either a DAG run or a workflow start).
+    ///
+    /// `kind` is `"dag"` or `"workflow"`. `name` is the DAG or workflow name.
+    /// Maps to the metric `harvest_schedule_runs_total{kind, name}`.
+    fn record_schedule_run(&self, kind: &str, name: &str) {
+        let _ = (kind, name);
+    }
+
+    /// A scheduled run was skipped without dispatching.
+    ///
+    /// `kind` is `"dag"` or `"workflow"`. `name` is the DAG or workflow name.
+    /// `reason` is one of `"paused"`, `"max_active_runs_reached"`, or
+    /// `"catchup_disabled"`.
+    ///
+    /// Maps to the metric `harvest_schedule_skipped_total{kind, name, reason}`.
+    fn record_schedule_skipped(&self, kind: &str, name: &str, reason: &str) {
+        let _ = (kind, name, reason);
+    }
 }
 
 /// Default metrics recorder that discards every sample.

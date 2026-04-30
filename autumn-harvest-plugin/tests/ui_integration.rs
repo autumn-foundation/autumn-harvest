@@ -38,6 +38,10 @@ const INIT_SQL: &str = concat!(
     include_str!("../../autumn-harvest/migrations/20260427000000_harvest_continue_as_new/up.sql"),
     "\n",
     include_str!("../../autumn-harvest/migrations/20260429000000_harvest_concurrency_key/up.sql"),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260430000000_harvest_workflow_schedules/up.sql"
+    ),
 );
 
 async fn setup_test_database_url() -> (String, ContainerAsync<Postgres>) {
@@ -259,6 +263,7 @@ async fn ui_root_redirects_to_workflows() {
     api_state.install(HarvestApiRuntime::new(
         Arc::clone(&registry),
         Arc::new(HashMap::new()),
+        Arc::new(Vec::new()),
         Some("ui-test-worker".to_string()),
         vec!["default".to_string()],
         SchedulerMonitor::offline(),
@@ -292,6 +297,7 @@ async fn ui_lists_workflows_and_renders_detail_page() {
     api_state.install(HarvestApiRuntime::new(
         Arc::clone(&registry),
         Arc::new(HashMap::new()),
+        Arc::new(Vec::new()),
         Some("ui-test-worker".to_string()),
         vec!["default".to_string()],
         SchedulerMonitor::offline(),
@@ -370,6 +376,7 @@ async fn ui_lists_workflows_across_shards() {
     api_state.install(HarvestApiRuntime::new(
         echo_registry(),
         Arc::new(HashMap::new()),
+        Arc::new(Vec::new()),
         Some("ui-test-worker".to_string()),
         vec!["default".to_string()],
         SchedulerMonitor::offline(),
