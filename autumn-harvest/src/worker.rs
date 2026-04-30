@@ -1479,18 +1479,39 @@ async fn persist_scheduled_external_activity(
 ) -> HarvestResult<()> {
     // If the token is already registered the awaiting event was already
     // appended by a prior run.  A workflow woken by a signal while still
-    // waiting for external completion will re-emit ScheduleExternalActivity —
-    // persist any marker events from this run then re-park without duplicating
-    // the awaiting event.
+    // waiting for external completion will re-emit ScheduleExternalActivity.
+    // Use a fast non-locking check first; if the row exists, enter a
+    // transaction that locks it to close the race with complete/fail_externally:
+    // the management API holds FOR UPDATE on the external task row while it
+    // appends the terminal event and calls wake_workflow_task.  Because the
+    // workflow task is still RUNNING at that point, the wake is a no-op.  By
+    // waiting for the same lock here we read the post-commit state and re-wake
+    // the workflow ourselves if the task is already terminal, preventing an
+    // indefinite park despite terminal history being present.
     if external_task::find_by_token(conn, scheduled.token)
         .await?
         .is_some()
     {
-        let marker_events = marker_events_from_commands(commands);
-        if !marker_events.is_empty() {
-            store::append_events(conn, exec_id, &marker_events, next_event_id).await?;
-        }
-        return queue::park_workflow_task(conn, task_id, sticky).await;
+        let token = scheduled.token;
+        conn.transaction::<(), HarvestError, _>(|conn| {
+            async move {
+                let locked = external_task::find_by_token_locked(conn, token).await?;
+
+                let marker_events = marker_events_from_commands(commands);
+                if !marker_events.is_empty() {
+                    store::append_events(conn, exec_id, &marker_events, next_event_id).await?;
+                }
+
+                if locked.is_some_and(|t| t.state != "PENDING") {
+                    queue::wake_workflow_task(conn, exec_id).await
+                } else {
+                    queue::park_workflow_task(conn, task_id, sticky).await
+                }
+            }
+            .scope_boxed()
+        })
+        .await?;
+        return Ok(());
     }
 
     let marker_events = marker_events_from_commands(commands);

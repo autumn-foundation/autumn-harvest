@@ -79,6 +79,31 @@ pub async fn find_by_token(
         .map_err(database_error)
 }
 
+/// Look up an external task by its opaque token, acquiring a row-level lock.
+///
+/// Like [`find_by_token`] but uses `FOR UPDATE`, serializing the caller
+/// against concurrent writers (complete/fail) that also lock this row.
+/// Must be called inside a transaction.
+///
+/// Returns `None` when the token is unknown (wrong shard, already deleted, etc.).
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] if the query fails.
+pub async fn find_by_token_locked(
+    conn: &mut AsyncPgConnection,
+    token: ExternalActivityToken,
+) -> HarvestResult<Option<ExternalTask>> {
+    harvest_external_tasks::table
+        .filter(harvest_external_tasks::token.eq(token.as_uuid()))
+        .for_update()
+        .select(ExternalTask::as_select())
+        .first(conn)
+        .await
+        .optional()
+        .map_err(database_error)
+}
+
 /// Mark an external activity as successfully completed.
 ///
 /// Appends `ActivityCompletedExternally` to the event history and wakes the
