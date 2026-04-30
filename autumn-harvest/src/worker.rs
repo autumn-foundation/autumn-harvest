@@ -1480,11 +1480,16 @@ async fn persist_scheduled_external_activity(
     // If the token is already registered the awaiting event was already
     // appended by a prior run.  A workflow woken by a signal while still
     // waiting for external completion will re-emit ScheduleExternalActivity —
-    // just re-park without duplicating the event.
+    // persist any marker events from this run then re-park without duplicating
+    // the awaiting event.
     if external_task::find_by_token(conn, scheduled.token)
         .await?
         .is_some()
     {
+        let marker_events = marker_events_from_commands(commands);
+        if !marker_events.is_empty() {
+            store::append_events(conn, exec_id, &marker_events, next_event_id).await?;
+        }
         return queue::park_workflow_task(conn, task_id, sticky).await;
     }
 

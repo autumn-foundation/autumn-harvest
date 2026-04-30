@@ -378,13 +378,16 @@ pub async fn enforce_external_task_timeouts(conn: &mut AsyncPgConnection) -> Har
         let result = conn
             .transaction::<(), HarvestError, _>(|conn| {
                 async move {
-                    // Guard against races: only transition if still PENDING.
-                    // If complete/fail landed between our scan and this update,
-                    // their state wins and we skip the timeout event entirely.
+                    // Guard against two races:
+                    // 1. complete/fail landed after our scan → state != PENDING
+                    // 2. heartbeat extended the deadline after our scan →
+                    //    schedule_to_close_at is now in the future
+                    // Either way, 0 rows updated means we skip the timeout event.
                     let rows = diesel::update(
                         harvest_external_tasks::table
                             .find(task_id)
-                            .filter(harvest_external_tasks::state.eq("PENDING")),
+                            .filter(harvest_external_tasks::state.eq("PENDING"))
+                            .filter(harvest_external_tasks::schedule_to_close_at.lt(Utc::now())),
                     )
                     .set(harvest_external_tasks::state.eq("TIMED_OUT"))
                     .execute(conn)
