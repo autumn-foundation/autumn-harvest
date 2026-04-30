@@ -354,9 +354,7 @@ async fn enforce_workflow_timeout(
 /// # Errors
 ///
 /// Returns the first database or persistence error encountered.
-pub async fn enforce_external_task_timeouts(
-    conn: &mut AsyncPgConnection,
-) -> HarvestResult<usize> {
+pub async fn enforce_external_task_timeouts(conn: &mut AsyncPgConnection) -> HarvestResult<usize> {
     let expired: Vec<ExternalTask> = harvest_external_tasks::table
         .filter(harvest_external_tasks::state.eq("PENDING"))
         .filter(harvest_external_tasks::schedule_to_close_at.lt(Utc::now()))
