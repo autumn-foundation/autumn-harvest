@@ -1073,18 +1073,8 @@ async fn fail_task_and_execution(
     };
 
     let exec_id = execution_id_from_uuid(exec_uuid);
-    match store::load_history(conn, exec_id).await {
-        Ok(history) => {
-            persist_workflow_failure(
-                conn,
-                task.id,
-                exec_id,
-                history.next_event_id,
-                worker_id,
-                error,
-            )
-            .await
-        }
+    let history = match store::load_history(conn, exec_id).await {
+        Ok(h) => h,
         Err(history_error) => {
             tracing::warn!(
                 task_id = %task.id,
@@ -1093,9 +1083,19 @@ async fn fail_task_and_execution(
                 "failed to load workflow history while persisting task failure; updating rows without event append"
             );
             update_workflow_execution_failed(conn, exec_id, worker_id, error).await?;
-            queue::fail_task(conn, task.id, error).await
+            return queue::fail_task(conn, task.id, error).await;
         }
-    }
+    };
+
+    persist_workflow_failure(
+        conn,
+        task.id,
+        exec_id,
+        history.next_event_id,
+        worker_id,
+        error,
+    )
+    .await
 }
 
 async fn finalize_activity_completion(
@@ -1553,13 +1553,12 @@ async fn fail_execution_on_error<T>(
     worker_id: &str,
     result: HarvestResult<T>,
 ) -> HarvestResult<T> {
-    match result {
-        Ok(value) => Ok(value),
-        Err(error) => {
-            fail_task_and_execution(conn, task, worker_id, &error.to_string()).await?;
-            Err(error)
-        }
-    }
+    let error = match result {
+        Ok(val) => return Ok(val),
+        Err(e) => e,
+    };
+    fail_task_and_execution(conn, task, worker_id, &error.to_string()).await?;
+    Err(error)
 }
 
 async fn load_task_execution(
@@ -1567,13 +1566,12 @@ async fn load_task_execution(
     task: &TaskQueueItem,
     exec_id: ExecutionId,
 ) -> HarvestResult<WorkflowExecution> {
-    match load_workflow_execution(conn, exec_id).await {
-        Ok(execution) => Ok(execution),
-        Err(error) => {
-            fail_task_only(conn, task.id, &error.to_string()).await?;
-            Err(error)
-        }
-    }
+    let error = match load_workflow_execution(conn, exec_id).await {
+        Ok(val) => return Ok(val),
+        Err(e) => e,
+    };
+    fail_task_only(conn, task.id, &error.to_string()).await?;
+    Err(error)
 }
 
 async fn load_workflow_replay_state(
