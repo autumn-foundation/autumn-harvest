@@ -1042,6 +1042,7 @@ async fn insert_dag_run(
 pub fn validate_schedule(schedule: &Schedule) -> Result<(), String> {
     if let Schedule::Cron(expr) = schedule {
         Cron::new(expr)
+            .with_seconds_optional()
             .parse()
             .map(|_| ())
             .map_err(|e| format!("invalid cron expression '{expr}': {e}"))
@@ -1062,6 +1063,7 @@ fn schedule_expr(schedule: Option<&Schedule>) -> Option<String> {
 fn next_run_after(schedule: Option<&Schedule>, reference: DateTime<Utc>) -> Option<DateTime<Utc>> {
     match schedule {
         Some(Schedule::Cron(expr)) => Cron::new(expr)
+            .with_seconds_optional()
             .parse()
             .ok()
             .and_then(|cron| cron.find_next_occurrence(&reference, false).ok()),
