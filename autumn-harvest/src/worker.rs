@@ -26,6 +26,7 @@ use crate::context::{ActivityContext, SharedState, WorkflowCommand, empty_shared
 use crate::error::{HarvestError, HarvestResult};
 use crate::event::WorkflowEvent;
 use crate::executor::{WorkflowOutcome, run_workflow_with_state};
+use crate::external_task;
 use crate::info::{ActivityInfo, WorkflowInfo};
 use crate::models::{
     HarvestTimer, NewHarvestTimer, NewWorkflowExecution, TaskQueueItem, WorkflowExecution,
@@ -33,7 +34,6 @@ use crate::models::{
 use crate::policy::RetryPolicy;
 use crate::queue::{self, TaskType};
 use crate::schema::{harvest_timers, harvest_workflow_executions};
-use crate::external_task;
 use crate::signal;
 use crate::store;
 use crate::telemetry::{ActivityStatus, TraceContextCarrier, WorkflowStatus};

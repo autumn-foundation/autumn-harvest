@@ -40,7 +40,10 @@ fn activity_awaiting_external_round_trips_serde() {
     };
     let json = serde_json::to_string(&event).expect("serialize");
     let back: WorkflowEvent = serde_json::from_str(&json).expect("deserialize");
-    assert!(matches!(back, WorkflowEvent::ActivityAwaitingExternal { .. }));
+    assert!(matches!(
+        back,
+        WorkflowEvent::ActivityAwaitingExternal { .. }
+    ));
 }
 
 #[test]
@@ -54,7 +57,10 @@ fn activity_completed_externally_round_trips_serde() {
     };
     let json = serde_json::to_string(&event).expect("serialize");
     let back: WorkflowEvent = serde_json::from_str(&json).expect("deserialize");
-    assert!(matches!(back, WorkflowEvent::ActivityCompletedExternally { .. }));
+    assert!(matches!(
+        back,
+        WorkflowEvent::ActivityCompletedExternally { .. }
+    ));
 }
 
 #[test]
@@ -69,7 +75,10 @@ fn activity_failed_externally_round_trips_serde() {
     };
     let json = serde_json::to_string(&event).expect("serialize");
     let back: WorkflowEvent = serde_json::from_str(&json).expect("deserialize");
-    assert!(matches!(back, WorkflowEvent::ActivityFailedExternally { .. }));
+    assert!(matches!(
+        back,
+        WorkflowEvent::ActivityFailedExternally { .. }
+    ));
 }
 
 #[test]
@@ -276,7 +285,10 @@ fn matcher_diverges_on_wrong_name_for_external_activity() {
     let result = matcher.match_external_activity("different_activity");
 
     assert!(
-        matches!(result, autumn_harvest::replay::HistoryMatch::Diverged { .. }),
+        matches!(
+            result,
+            autumn_harvest::replay::HistoryMatch::Diverged { .. }
+        ),
         "expected Diverged, got {result:?}"
     );
 }
@@ -404,9 +416,7 @@ async fn context_execute_activity_external_resolves_via_oneshot() {
     let WorkflowCommand::ScheduleExternalActivity { result_tx, .. } = cmds.remove(0) else {
         panic!("expected ScheduleExternalActivity");
     };
-    result_tx
-        .send(Ok(expected2))
-        .expect("send should succeed");
+    result_tx.send(Ok(expected2)).expect("send should succeed");
 
     let result = handle.await.expect("no panic");
     assert!(result.is_ok());
@@ -484,7 +494,10 @@ async fn context_replays_failed_external_activity() {
         .await;
 
     assert!(result.is_err());
-    assert!(matches!(result.unwrap_err(), HarvestError::ActivityFailed { .. }));
+    assert!(matches!(
+        result.unwrap_err(),
+        HarvestError::ActivityFailed { .. }
+    ));
 }
 
 #[tokio::test]
@@ -569,7 +582,10 @@ async fn context_awaiting_external_re_emits_same_token_idempotently() {
     };
     // Crucially, the token and activity_id must match what's already in history.
     assert_eq!(*emitted_token, token, "token must be reused from history");
-    assert_eq!(*emitted_id, activity_id, "activity_id must be reused from history");
+    assert_eq!(
+        *emitted_id, activity_id,
+        "activity_id must be reused from history"
+    );
 
     handle.abort();
 }
@@ -705,7 +721,10 @@ async fn context_post_restart_while_awaiting_with_deadline_extensions() {
         panic!("expected ScheduleExternalActivity, got {:?}", cmds[0]);
     };
 
-    assert_eq!(*emitted_token, token, "token must be preserved across restart");
+    assert_eq!(
+        *emitted_token, token,
+        "token must be preserved across restart"
+    );
     assert_eq!(*emitted_id, activity_id, "activity_id must be preserved");
     assert_eq!(name, "approve_expense");
 

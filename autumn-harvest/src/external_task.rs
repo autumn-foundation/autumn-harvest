@@ -201,9 +201,7 @@ pub async fn extend_deadline(
             let activity_id = ActivityExecId::from_uuid(task.activity_id);
 
             let new_deadline = Utc::now()
-                + chrono::Duration::seconds(
-                    i64::try_from(extend_by_secs).unwrap_or(i64::MAX),
-                );
+                + chrono::Duration::seconds(i64::try_from(extend_by_secs).unwrap_or(i64::MAX));
 
             diesel::update(harvest_external_tasks::table.find(task.id))
                 .set(harvest_external_tasks::schedule_to_close_at.eq(new_deadline))
@@ -211,10 +209,7 @@ pub async fn extend_deadline(
                 .await
                 .map_err(database_error)?;
 
-            let event = WorkflowEvent::ActivityExternalDeadlineExtended {
-                activity_id,
-                token,
-            };
+            let event = WorkflowEvent::ActivityExternalDeadlineExtended { activity_id, token };
             store::append_single_event(conn, exec_id, event).await?;
 
             Ok(())

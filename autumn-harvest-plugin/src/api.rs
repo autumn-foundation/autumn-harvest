@@ -1402,14 +1402,10 @@ async fn complete_external_activity(
     let token = parse_external_token(&token_str)?;
     let output = request.output.unwrap_or(Value::Null);
 
-    let newly_resolved = resolve_external_on_shards(
-        &api_state,
-        token,
-        |conn, tok| {
-            let out = output.clone();
-            Box::pin(async move { external_task::complete_externally(conn, tok, out).await })
-        },
-    )
+    let newly_resolved = resolve_external_on_shards(&api_state, token, |conn, tok| {
+        let out = output.clone();
+        Box::pin(async move { external_task::complete_externally(conn, tok, out).await })
+    })
     .await?;
 
     Ok(Json(ExternalActivityAck {
@@ -1425,17 +1421,11 @@ async fn fail_external_activity(
 ) -> Result<Json<ExternalActivityAck>, AutumnError> {
     let token = parse_external_token(&token_str)?;
 
-    let newly_resolved = resolve_external_on_shards(
-        &api_state,
-        token,
-        |conn, tok| {
-            let err = request.error.clone();
-            let retryable = request.retryable;
-            Box::pin(async move {
-                external_task::fail_externally(conn, tok, err, retryable).await
-            })
-        },
-    )
+    let newly_resolved = resolve_external_on_shards(&api_state, token, |conn, tok| {
+        let err = request.error.clone();
+        let retryable = request.retryable;
+        Box::pin(async move { external_task::fail_externally(conn, tok, err, retryable).await })
+    })
     .await?;
 
     Ok(Json(ExternalActivityAck {

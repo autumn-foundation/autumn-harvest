@@ -108,7 +108,9 @@ pub async fn notify_approver(
     println!("[notify_approver]   GET /harvest/workflows/<EXEC_ID>");
     println!("[notify_approver] Then call:");
     println!("[notify_approver]   POST /harvest/activities/external/<TOKEN>/complete");
-    println!("[notify_approver]        {{\"output\": {{\"approved\": true, \"approver\": \"alice\", \"comment\": null}}}}");
+    println!(
+        "[notify_approver]        {{\"output\": {{\"approved\": true, \"approver\": \"alice\", \"comment\": null}}}}"
+    );
     Ok("notification_sent".to_string())
 }
 
@@ -118,9 +120,7 @@ fn main() {
     println!("Key curl commands after starting the server:");
     println!();
     println!("# Start a workflow");
-    println!(
-        r#"curl -X POST http://localhost:8080/harvest/workflows/expense_approval/start \"#
-    );
+    println!(r#"curl -X POST http://localhost:8080/harvest/workflows/expense_approval/start \"#);
     println!(r#"     -H 'Content-Type: application/json' \"#);
     println!(r#"     -d '{{"input": ["exp-001", 49900]}}'"#);
     println!();
@@ -140,9 +140,7 @@ fn main() {
     println!(r#"     -d '{{"error": "expense exceeds budget", "retryable": false}}'"#);
     println!();
     println!("# Extend the deadline by 3 more days");
-    println!(
-        "curl -X POST http://localhost:8080/harvest/activities/external/<TOKEN>/heartbeat \\"
-    );
+    println!("curl -X POST http://localhost:8080/harvest/activities/external/<TOKEN>/heartbeat \\");
     println!("     -H 'Content-Type: application/json' \\");
     println!(r#"     -d '{{"extend_by_secs": 259200}}'"#);
 }
