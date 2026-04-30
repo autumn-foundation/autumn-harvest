@@ -651,6 +651,62 @@ Level 3: [send_slack_notification]           ← waits for level 2
 
 Cycle detection happens at compile time (via the `#[dag]` macro). If the dependency graph contains a cycle, the macro emits a compile error.
 
+### 6.5 Per-Workflow Cron Schedules
+
+For the common case of "run this one workflow on a schedule," wrapping a single
+workflow in a DAG is unnecessary overhead. The scheduler tick has a parallel
+branch that processes `harvest_schedules` rows where `workflow_name IS NOT NULL`,
+dispatching each due run directly via `start_or_load_workflow_execution`.
+
+**Decision tree:**
+
+| You want… | Use… |
+|---|---|
+| One workflow, one cron string, one JSON input | `WorkflowSchedule` |
+| Fan-out across multiple activities with trigger rules and `AllSuccess` / `OneFailed` dependencies | `DagBuilder` |
+| Multi-step pipeline where step N waits for step N−1 | `DagBuilder` |
+| Dynamic input that changes per run | `DagBuilder` with a trigger via API |
+
+**Registration:**
+
+```rust
+use autumn_harvest::policy::{Schedule, WorkflowSchedule};
+
+let sched = WorkflowSchedule::new(
+    "daily_billing_report",           // must match a workflows![] registration
+    Schedule::Cron("0 3 * * *".to_string()),
+)
+.with_input(serde_json::json!({"region": "us-east"}))
+.with_max_active_runs(1)    // skip the next firing if the previous run is still RUNNING
+.with_catchup(false);       // drop missed firings instead of replaying them
+
+let app = autumn_web::app()
+    .workflows(workflows![daily_billing_report])
+    .workflow_schedule(sched)
+    .worker(WorkerConfig::default());
+```
+
+**Schema shape:** `harvest_schedules` uses a single-table design where exactly
+one of `dag_name` or `workflow_name` is set per row, enforced by a CHECK
+constraint. The scheduler's `create_due_runs` and `activate_queued_runs`
+helpers filter to `dag_name IS NOT NULL`; the `tick_workflow_schedules` branch
+filters to `workflow_name IS NOT NULL`. Existing DAG-only deployments see no
+behavioral change.
+
+**`workflow_id` derivation:** each scheduled dispatch uses
+`sched:{workflow_name}:{unix_seconds_of_logical_date}` as the `workflow_id`.
+This makes retries after a crashed tick idempotent under the current
+`AllowDuplicate` reuse policy. When issue #87 lands and
+`WorkflowIdReusePolicy::RejectDuplicate` is available, the scheduler will
+switch to it so a double-tick cannot start two executions for the same logical
+date.
+
+**`max_active_runs`:** enforced via a `COUNT(*)` query on
+`harvest_workflow_executions` filtered by `workflow_name = ? AND state = 'RUNNING'`.
+If the running count equals or exceeds the cap, the tick updates `next_run_at`
+and increments the `harvest_schedule_skipped_total{reason="max_active_runs_reached"}`
+metric without starting a new execution.
+
 ---
 
 ## 7. Worker Model
@@ -848,10 +904,16 @@ CREATE TABLE harvest_dag_runs (
 
 CREATE INDEX idx_harvest_dr_schedule ON harvest_dag_runs (dag_name, state, logical_date);
 
--- Schedules (registered DAG timetables)
+-- Schedules (registered DAG timetables and per-workflow cron schedules)
+--
+-- Single-table design: exactly one of dag_name or workflow_name is set per row.
+-- Enforced by a NOT VALID CHECK constraint applied online-safely after the
+-- 20260430000000_harvest_workflow_schedules migration.
 CREATE TABLE harvest_schedules (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    dag_name        TEXT NOT NULL UNIQUE,
+    dag_name        TEXT UNIQUE,            -- NULL for workflow-kind rows
+    workflow_name   TEXT,                   -- NULL for dag-kind rows
+    workflow_input  JSONB,                  -- per-firing input for workflow-kind rows
     schedule_expr   TEXT,                   -- cron expression or 'manual'
     timezone        TEXT NOT NULL DEFAULT 'UTC',
     catchup         BOOLEAN NOT NULL DEFAULT FALSE,
@@ -860,7 +922,11 @@ CREATE TABLE harvest_schedules (
     last_run_at     TIMESTAMPTZ,
     next_run_at     TIMESTAMPTZ,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT harvest_schedules_kind_check CHECK (
+        (dag_name IS NOT NULL AND workflow_name IS NULL) OR
+        (dag_name IS NULL    AND workflow_name IS NOT NULL)
+    )
 );
 
 -- Signals (pending signals for running workflows)

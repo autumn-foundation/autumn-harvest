@@ -764,7 +764,7 @@ mod tests {
             .state(String::from("haunted"))
             .build();
 
-        let (registry, _dags, worker_config) = built.into_worker_parts();
+        let (registry, _dags, _workflow_schedules, worker_config) = built.into_worker_parts();
 
         assert_eq!(registry.state::<String>(), Some(&String::from("haunted")));
         assert!(worker_config.queues.contains(&"default".to_string()));

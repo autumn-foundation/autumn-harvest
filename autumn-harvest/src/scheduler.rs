@@ -780,6 +780,13 @@ async fn tick_one_workflow_schedule(
                 memo: None,
                 search_attrs: None,
                 reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
+                // TODO(#87): switch to WorkflowIdReusePolicy::RejectDuplicate (or a
+                // user-specified policy) once issue #87 lands and the reuse-policy
+                // surface is wired through the scheduling path.  Until then,
+                // AllowDuplicate matches the existing DAG-schedule behaviour: each
+                // cron firing always starts a new execution, even if a previous one
+                // with the same deterministic workflow_id still exists.  Operators
+                // relying on at-most-one semantics should set max_active_runs = 1.
             },
         )
         .await

@@ -18,9 +18,10 @@ use autumn_harvest::store;
 use autumn_harvest::types::{ActivityExecId, ExecutionId};
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{
-    ActivityContext, HarvestBuilder, HarvestError, StartWorkflowParams, TimeoutType, WorkerConfig,
-    WorkflowContext, WorkflowIdReusePolicy, cancel_workflow_execution, queue,
-    start_or_load_workflow_execution, timeout,
+    ActivityContext, HarvestBuilder, HarvestError, Schedule, SchedulerMonitor, SchedulerRuntime,
+    StartWorkflowParams, TimeoutType, WorkerConfig, WorkflowContext, WorkflowIdReusePolicy,
+    WorkflowSchedule, cancel_workflow_execution, queue, register_workflow_schedules,
+    start_or_load_workflow_execution, tick_once, timeout,
 };
 
 use chrono::Utc;
@@ -56,6 +57,8 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260427000000_harvest_continue_as_new/up.sql"),
     "\n",
     include_str!("../migrations/20260429000000_harvest_concurrency_key/up.sql"),
+    "\n",
+    include_str!("../migrations/20260430000000_harvest_workflow_schedules/up.sql"),
 );
 
 /// The minimal "legacy" migration set used by the upgrade-path regression
@@ -1734,7 +1737,7 @@ async fn worker_builder_state_is_visible_to_workflow_and_activity() {
         .state(String::from("haunted"))
         .worker(WorkerConfig::default())
         .build();
-    let (registry, _dags, worker_config) = built.into_worker_parts();
+    let (registry, _dags, _workflow_schedules, worker_config) = built.into_worker_parts();
     let mut runtime_config: WorkerRuntimeConfig = worker_config.into();
     runtime_config.worker_id = "worker-e2e-builder-state".to_string();
     runtime_config.poll_interval = Duration::from_millis(25);
@@ -3578,5 +3581,425 @@ async fn concurrency_cap_null_key_tasks_are_unaffected_by_saturated_key() {
     assert_eq!(
         claimed, 3,
         "uncapped tasks must not be blocked by a saturated concurrency key"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #91: per-workflow cron schedule integration tests
+// ---------------------------------------------------------------------------
+
+/// Helper: count executions for a given workflow name in any non-terminal or
+/// completed state.
+async fn count_executions_for_workflow(database_url: &str, workflow_name: &str) -> i64 {
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(database_url)
+        .await
+        .expect("failed to connect for execution count query");
+    harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
+        .count()
+        .get_result::<i64>(&mut conn)
+        .await
+        .expect("count query failed")
+}
+
+/// Helper: count executions in RUNNING state for a given workflow name.
+async fn count_running_executions(database_url: &str, workflow_name: &str) -> i64 {
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(database_url)
+        .await
+        .expect("failed to connect for running-count query");
+    harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
+        .filter(harvest_workflow_executions::state.eq("RUNNING"))
+        .count()
+        .get_result::<i64>(&mut conn)
+        .await
+        .expect("running count query failed")
+}
+
+/// Instant-return workflow handler used for schedule baseline tests.
+fn instant_workflow<'a>(
+    _ctx: &'a WorkflowContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move { Ok(serde_json::Value::Null) })
+}
+
+/// Slow workflow handler that sleeps for 30 s — used to saturate max_active_runs.
+fn slow_workflow<'a>(
+    _ctx: &'a WorkflowContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        Ok(serde_json::Value::Null)
+    })
+}
+
+/// (a) Baseline: a `*/2 * * * * *` schedule dispatches >=3 executions in a
+/// 10-second window and each execution carries the deterministic workflow_id
+/// `sched:{name}:{ts}`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn workflow_schedule_baseline_dispatches_multiple_runs() {
+    use autumn_harvest::schema::harvest_workflow_executions::dsl as exec_dsl;
+
+    let (database_url, _container) = setup_test_database_url().await;
+
+    let wf_name = "scheduled_instant_workflow";
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![WorkflowInfo {
+            name: wf_name,
+            module: "integration_e2e",
+            handler: instant_workflow,
+        }],
+        vec![],
+    ));
+    let pool = build_test_pool(&database_url);
+
+    // Register the schedule row before starting the scheduler.
+    let ws = WorkflowSchedule::new(
+        wf_name,
+        Schedule::Cron("*/2 * * * * *".to_string()),
+    );
+    {
+        let mut conn = pool.get().await.expect("pool get failed");
+        register_workflow_schedules(&mut conn, &[ws.clone()])
+            .await
+            .expect("register_workflow_schedules failed");
+    }
+
+    // Start scheduler + worker.
+    let workflow_schedules = Arc::new(vec![ws]);
+    let scheduler = SchedulerRuntime::spawn(
+        pool.clone(),
+        Arc::clone(&registry),
+        Arc::new(Default::default()),
+        Arc::clone(&workflow_schedules),
+    );
+    let worker = Arc::new(
+        Worker::new(
+            WorkerRuntimeConfig {
+                worker_id: "worker-sched-baseline".to_string(),
+                queues: vec!["default".to_string()],
+                notification_database_url: None,
+                max_concurrent_workflows: 4,
+                max_concurrent_activities: 4,
+                poll_interval: Duration::from_millis(100),
+                shutdown_timeout: Duration::from_secs(2),
+                cancellation_grace_period: Duration::from_secs(1),
+                sticky_timeout: Duration::from_secs(5),
+            },
+            Arc::clone(&registry),
+        )
+        .expect("worker should build"),
+    );
+    let worker_pool = pool.clone();
+    let worker_ref = Arc::clone(&worker);
+    let worker_handle = tokio::spawn(async move { worker_ref.run(&worker_pool).await });
+
+    // Wait up to 10 seconds for at least 3 executions to appear.
+    let dispatched = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let n = count_executions_for_workflow(&database_url, wf_name).await;
+            if n >= 3 {
+                break n;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("should observe >=3 scheduled dispatches within 10 seconds");
+
+    assert!(dispatched >= 3, "expected >=3 executions, got {dispatched}");
+
+    // Verify that execution workflow_ids follow the deterministic `sched:{name}:{ts}` pattern.
+    let mut conn = pool.get().await.expect("pool get failed");
+    let workflow_ids: Vec<String> = exec_dsl::harvest_workflow_executions
+        .filter(exec_dsl::workflow_name.eq(wf_name))
+        .select(exec_dsl::workflow_id)
+        .load(&mut conn)
+        .await
+        .expect("load workflow_ids failed");
+    for id in &workflow_ids {
+        assert!(
+            id.starts_with(&format!("sched:{wf_name}:")),
+            "workflow_id '{id}' does not match expected sched: prefix"
+        );
+    }
+
+    scheduler.shutdown();
+    worker.shutdown();
+    let _ = scheduler.join().await;
+    let _ = worker_handle.await;
+}
+
+/// (b) `max_active_runs = 1` with a slow handler: the second cron firing must
+/// be skipped — the in-flight run count must never exceed 1.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn workflow_schedule_max_active_runs_enforced() {
+    let (database_url, _container) = setup_test_database_url().await;
+
+    let wf_name = "scheduled_slow_workflow";
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![WorkflowInfo {
+            name: wf_name,
+            module: "integration_e2e",
+            handler: slow_workflow,
+        }],
+        vec![],
+    ));
+    let pool = build_test_pool(&database_url);
+
+    let ws = WorkflowSchedule::new(
+        wf_name,
+        Schedule::Cron("*/2 * * * * *".to_string()),
+    )
+    .with_max_active_runs(1);
+    {
+        let mut conn = pool.get().await.expect("pool get failed");
+        register_workflow_schedules(&mut conn, &[ws.clone()])
+            .await
+            .expect("register_workflow_schedules failed");
+    }
+
+    let workflow_schedules = Arc::new(vec![ws]);
+    let scheduler = SchedulerRuntime::spawn(
+        pool.clone(),
+        Arc::clone(&registry),
+        Arc::new(Default::default()),
+        Arc::clone(&workflow_schedules),
+    );
+    let worker = Arc::new(
+        Worker::new(
+            WorkerRuntimeConfig {
+                worker_id: "worker-sched-maxruns".to_string(),
+                queues: vec!["default".to_string()],
+                notification_database_url: None,
+                max_concurrent_workflows: 4,
+                max_concurrent_activities: 4,
+                poll_interval: Duration::from_millis(100),
+                shutdown_timeout: Duration::from_secs(2),
+                cancellation_grace_period: Duration::from_secs(1),
+                sticky_timeout: Duration::from_secs(5),
+            },
+            Arc::clone(&registry),
+        )
+        .expect("worker should build"),
+    );
+    let worker_pool = pool.clone();
+    let worker_ref = Arc::clone(&worker);
+    let worker_handle = tokio::spawn(async move { worker_ref.run(&worker_pool).await });
+
+    // Let at least one execution start, then observe multiple ticks.
+    // After the first dispatch, subsequent ticks must skip because the slow
+    // workflow is RUNNING. Allow 8 seconds so we see 3–4 ticks at 2s cadence.
+    tokio::time::sleep(Duration::from_secs(8)).await;
+
+    // At most 1 RUNNING execution at any point in time.
+    let running = count_running_executions(&database_url, wf_name).await;
+    assert!(
+        running <= 1,
+        "expected at most 1 running execution, found {running}"
+    );
+
+    // At least 1 execution was dispatched (the first tick).
+    let total = count_executions_for_workflow(&database_url, wf_name).await;
+    assert!(total >= 1, "expected at least 1 execution, got {total}");
+
+    scheduler.shutdown();
+    worker.shutdown();
+    let _ = scheduler.join().await;
+    let _ = worker_handle.await;
+}
+
+/// (c) Pause / resume: no dispatches after pause; dispatches resume after unpause.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn workflow_schedule_pause_and_resume() {
+    use autumn_harvest::schema::harvest_schedules::dsl as sched_dsl;
+
+    let (database_url, _container) = setup_test_database_url().await;
+
+    let wf_name = "scheduled_pause_resume_workflow";
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![WorkflowInfo {
+            name: wf_name,
+            module: "integration_e2e",
+            handler: instant_workflow,
+        }],
+        vec![],
+    ));
+    let pool = build_test_pool(&database_url);
+
+    // Register the schedule paused so no runs fire initially.
+    let ws = WorkflowSchedule::new(
+        wf_name,
+        Schedule::Cron("*/2 * * * * *".to_string()),
+    )
+    .with_paused(true);
+    {
+        let mut conn = pool.get().await.expect("pool get failed");
+        register_workflow_schedules(&mut conn, &[ws.clone()])
+            .await
+            .expect("register_workflow_schedules failed");
+    }
+
+    let workflow_schedules = Arc::new(vec![ws]);
+    let scheduler = SchedulerRuntime::spawn(
+        pool.clone(),
+        Arc::clone(&registry),
+        Arc::new(Default::default()),
+        Arc::clone(&workflow_schedules),
+    );
+    let worker = Arc::new(
+        Worker::new(
+            WorkerRuntimeConfig {
+                worker_id: "worker-sched-pause".to_string(),
+                queues: vec!["default".to_string()],
+                notification_database_url: None,
+                max_concurrent_workflows: 4,
+                max_concurrent_activities: 4,
+                poll_interval: Duration::from_millis(100),
+                shutdown_timeout: Duration::from_secs(2),
+                cancellation_grace_period: Duration::from_secs(1),
+                sticky_timeout: Duration::from_secs(5),
+            },
+            Arc::clone(&registry),
+        )
+        .expect("worker should build"),
+    );
+    let worker_pool = pool.clone();
+    let worker_ref = Arc::clone(&worker);
+    let worker_handle = tokio::spawn(async move { worker_ref.run(&worker_pool).await });
+
+    // Let 3 ticks pass — schedule is paused so no executions should start.
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    let count_while_paused = count_executions_for_workflow(&database_url, wf_name).await;
+    assert_eq!(
+        count_while_paused, 0,
+        "no executions should fire while schedule is paused"
+    );
+
+    // Resume: flip is_paused to false and update next_run_at so the scheduler
+    // will pick it up on the next tick.
+    {
+        let mut conn = pool.get().await.expect("pool get failed");
+        diesel::update(
+            sched_dsl::harvest_schedules
+                .filter(sched_dsl::workflow_name.eq(wf_name)),
+        )
+        .set((
+            sched_dsl::is_paused.eq(false),
+            sched_dsl::next_run_at.eq(Utc::now() - chrono::Duration::seconds(1)),
+            sched_dsl::updated_at.eq(Utc::now()),
+        ))
+        .execute(&mut conn)
+        .await
+        .expect("resume update failed");
+    }
+
+    // After resuming, wait up to 6 seconds for at least 1 execution.
+    let dispatched = tokio::time::timeout(Duration::from_secs(6), async {
+        loop {
+            let n = count_executions_for_workflow(&database_url, wf_name).await;
+            if n >= 1 {
+                break n;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("should observe executions after resume within 6 seconds");
+
+    assert!(
+        dispatched >= 1,
+        "expected >=1 execution after resume, got {dispatched}"
+    );
+
+    scheduler.shutdown();
+    worker.shutdown();
+    let _ = scheduler.join().await;
+    let _ = worker_handle.await;
+}
+
+/// (d) Backward compatibility: a deployment with only DAG schedules in the
+/// `harvest_schedules` table sees no interaction from the workflow-schedule
+/// tick branch. This verifies the `workflow_name IS NOT NULL` filter keeps
+/// DAG-only rows untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workflow_schedule_dag_only_deployment_unaffected() {
+    use autumn_harvest::schema::harvest_schedules::dsl as sched_dsl;
+
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+
+    // There are no workflow-schedule rows; the workflow_schedules list is empty.
+    let empty_workflow_schedules: Arc<Vec<WorkflowSchedule>> =
+        Arc::new(Vec::new());
+    let empty_dags: Arc<autumn_harvest::DagCatalog> = Arc::new(Default::default());
+    let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+
+    // Run several ticks against an otherwise-empty database.
+    for _ in 0..3 {
+        tick_once(
+            pool.clone(),
+            Arc::clone(&registry),
+            Arc::clone(&empty_dags),
+            Arc::clone(&empty_workflow_schedules),
+            SchedulerMonitor::offline(),
+        )
+        .await
+        .expect("tick_once must not error on an empty workflow-schedule list");
+    }
+
+    // No schedule rows should have been inserted.
+    let mut conn = pool.get().await.expect("pool get failed");
+    let schedule_count: i64 = sched_dsl::harvest_schedules
+        .count()
+        .get_result(&mut conn)
+        .await
+        .expect("count query failed");
+    assert_eq!(
+        schedule_count, 0,
+        "no schedule rows should exist when workflow_schedules is empty"
+    );
+
+    // No workflow executions should have been started.
+    let exec_count: i64 = harvest_workflow_executions::table
+        .count()
+        .get_result(&mut conn)
+        .await
+        .expect("execution count query failed");
+    assert_eq!(
+        exec_count, 0,
+        "no workflow executions should have been started"
+    );
+}
+
+/// (e) Builder validation: scheduling an unregistered workflow name fails at
+/// `build()` with `HarvestBuilderError::UnknownWorkflowSchedule`.
+#[test]
+fn workflow_schedule_builder_rejects_unregistered_workflow() {
+    let ws = WorkflowSchedule::new(
+        "nonexistent_workflow",
+        Schedule::Cron("0 * * * *".to_string()),
+    );
+
+    let result = HarvestBuilder::new()
+        .workflows(vec![WorkflowInfo {
+            name: "some_other_workflow",
+            module: "integration_e2e",
+            handler: echo_workflow,
+        }])
+        .workflow_schedule(ws)
+        .worker(WorkerConfig::default())
+        .try_build();
+
+    assert!(
+        matches!(
+            result,
+            Err(autumn_harvest::HarvestBuilderError::UnknownWorkflowSchedule {
+                ref workflow_name, ..
+            }) if workflow_name == "nonexistent_workflow"
+        ),
+        "expected UnknownWorkflowSchedule error, got: {result:?}"
     );
 }
