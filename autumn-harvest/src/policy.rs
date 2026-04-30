@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+use croner::Cron;
 use serde::{Deserialize, Serialize};
 
 /// Compute the next retry delay using exponential backoff.
@@ -327,6 +328,28 @@ impl WorkflowSchedule {
     pub const fn with_paused(mut self, paused: bool) -> Self {
         self.paused = paused;
         self
+    }
+}
+
+/// Validate a [`Schedule`] value, returning an error string if it is invalid.
+///
+/// For [`Schedule::Cron`] expressions this parses the expression using
+/// `croner` (5-field or 6-field with seconds). For other variants the schedule
+/// is always valid.
+///
+/// # Errors
+///
+/// Returns a human-readable error string if the cron expression is
+/// syntactically invalid.
+pub fn validate_schedule(schedule: &Schedule) -> Result<(), String> {
+    if let Schedule::Cron(expr) = schedule {
+        Cron::new(expr)
+            .with_seconds_optional()
+            .parse()
+            .map(|_| ())
+            .map_err(|e| format!("invalid cron expression '{expr}': {e}"))
+    } else {
+        Ok(())
     }
 }
 

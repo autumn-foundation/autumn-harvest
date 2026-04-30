@@ -1035,21 +1035,9 @@ async fn insert_dag_run(
 /// Returns `Err` if the schedule is a `Cron` variant whose expression cannot be
 /// parsed by `croner`. `Interval` and `Manual` schedules are always valid.
 ///
-/// # Errors
-///
-/// Returns a human-readable error string if the cron expression is syntactically
-/// invalid.
-pub fn validate_schedule(schedule: &Schedule) -> Result<(), String> {
-    if let Schedule::Cron(expr) = schedule {
-        Cron::new(expr)
-            .with_seconds_optional()
-            .parse()
-            .map(|_| ())
-            .map_err(|e| format!("invalid cron expression '{expr}': {e}"))
-    } else {
-        Ok(())
-    }
-}
+// Re-exported so callers can reach it via the `scheduler` module path, which
+// is where it lived before being moved to `policy` for feature-gate reasons.
+pub use crate::policy::validate_schedule;
 
 fn schedule_expr(schedule: Option<&Schedule>) -> Option<String> {
     match schedule {

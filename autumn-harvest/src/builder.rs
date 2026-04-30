@@ -479,7 +479,7 @@ fn validate_workflow_schedules(
                     reason: "interval must be at least 1 second".to_string(),
                 });
             }
-        } else if let Err(reason) = crate::scheduler::validate_schedule(&schedule.schedule) {
+        } else if let Err(reason) = crate::policy::validate_schedule(&schedule.schedule) {
             return Err(HarvestBuilderError::InvalidWorkflowSchedule {
                 workflow_name: schedule.workflow_name.clone(),
                 reason,
