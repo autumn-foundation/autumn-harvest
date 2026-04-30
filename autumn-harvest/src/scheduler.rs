@@ -721,7 +721,7 @@ async fn tick_workflow_schedules(
             .as_deref()
             .and_then(parse_schedule_from_expr);
         let catchup = schedule.catchup;
-        tick_one_workflow_schedule(
+        if let Err(error) = tick_one_workflow_schedule(
             conn,
             wf_name,
             catchup,
@@ -731,7 +731,13 @@ async fn tick_workflow_schedules(
             now,
             metrics,
         )
-        .await?;
+        .await
+        {
+            tracing::warn!(
+                error = %error, workflow_name = %wf_name,
+                "harvest: workflow schedule tick failed; continuing to next schedule"
+            );
+        }
     }
 
     Ok(())
@@ -780,7 +786,16 @@ async fn tick_one_workflow_schedule(
     let (run_dates, next_run_at) = due_run_plan(parsed_schedule, logical_date, now, catchup);
     let dispatch_queue = schedule.queue_name.as_deref().unwrap_or("default");
 
+    let mut dispatched: u32 = 0;
     for scheduled_for in &run_dates {
+        if running + i64::from(dispatched) >= i64::from(schedule.max_active_runs) {
+            tracing::info!(
+                workflow_name = %wf_name,
+                max_active_runs = schedule.max_active_runs,
+                "harvest workflow schedule: max_active_runs reached during catchup; deferring remaining"
+            );
+            break;
+        }
         let workflow_id = scheduled_workflow_id(wf_name, *scheduled_for);
         // ExecutionId::new() encodes ShardId::UNENCODED, which the ShardRouter
         // resolves to the configured default shard — correct for all deployments.
@@ -818,6 +833,7 @@ async fn tick_one_workflow_schedule(
         .await
         {
             Ok(started) => {
+                dispatched += 1;
                 metrics.record_schedule_run("workflow", wf_name);
                 tracing::info!(
                     workflow_name = %wf_name, execution_id = %started.exec_id,

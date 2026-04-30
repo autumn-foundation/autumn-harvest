@@ -178,9 +178,7 @@ impl HarvestRunner {
                 worker.run(&pool).await;
             })
         });
-        let scheduler = if config.scheduler_enabled
-            && (!dag_catalog.is_empty() || !workflow_schedules.is_empty())
-        {
+        let scheduler = if config.scheduler_enabled {
             Some(SchedulerRuntime::spawn(
                 harvest_pool,
                 Arc::clone(&registry),
