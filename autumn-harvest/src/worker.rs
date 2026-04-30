@@ -1497,12 +1497,22 @@ async fn persist_scheduled_external_activity(
             async move {
                 let locked = external_task::find_by_token_locked(conn, token).await?;
 
+                // Recompute the event offset inside the transaction: external
+                // completion may have appended a terminal event between replay
+                // start (when next_event_id was sampled) and here.  Using
+                // append_single_event serialises each append against concurrent
+                // writers via the per-execution FOR UPDATE it acquires.
                 let marker_events = marker_events_from_commands(commands);
-                if !marker_events.is_empty() {
-                    store::append_events(conn, exec_id, &marker_events, next_event_id).await?;
+                for event in marker_events {
+                    store::append_single_event(conn, exec_id, event).await?;
                 }
 
                 if locked.is_some_and(|t| t.state != "PENDING") {
+                    // The task is still RUNNING (owned by this worker), so
+                    // wake_workflow_task (which only moves parked rows) is a
+                    // no-op.  Park first to clear worker ownership, then wake
+                    // so the next available worker picks up the terminal event.
+                    queue::park_workflow_task(conn, task_id, sticky).await?;
                     queue::wake_workflow_task(conn, exec_id).await
                 } else {
                     queue::park_workflow_task(conn, task_id, sticky).await
