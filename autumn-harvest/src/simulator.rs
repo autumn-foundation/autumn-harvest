@@ -98,7 +98,7 @@ impl WorkflowSimulator {
     /// Panics if the workflow deadlocks (e.g., suspends without emitting any
     /// progressable commands like mocked activities, child workflows, or awaited signals).
     #[allow(clippy::too_many_lines)]
-    pub async fn run(self, input: Value) -> SimulatorResult {
+    pub async fn run(mut self, input: Value) -> SimulatorResult {
         let exec_id = ExecutionId::new();
         let mut history = vec![WorkflowEvent::WorkflowStarted {
             input: input.clone(),
@@ -239,7 +239,7 @@ impl WorkflowSimulator {
                                 advanced = true;
                             }
                             WorkflowCommand::WaitForSignal { signal_name, .. } => {
-                                if let Some(payload) = self.signals_to_send.get(&signal_name) {
+                                if let Some(payload) = self.signals_to_send.remove(&signal_name) {
                                     history.push(WorkflowEvent::SignalReceived {
                                         signal_name: signal_name.clone(),
                                         payload: payload.clone(),
