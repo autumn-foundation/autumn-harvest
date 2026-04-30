@@ -2236,17 +2236,22 @@ impl Worker {
 
         let drain = async {
             // Try to acquire ALL permits — when we can, all in-flight tasks are done.
-            let max_permits = (1 << 31) - 1;
-            let wf_permits = u32::try_from(self.config.max_concurrent_workflows)
-                .unwrap_or(u32::MAX)
-                .min(max_permits);
-
-            let act_permits = u32::try_from(self.config.max_concurrent_activities)
-                .unwrap_or(u32::MAX)
-                .min(max_permits);
-
-            let _wf = self.workflow_semaphore.acquire_many(wf_permits).await;
-            let _act = self.activity_semaphore.acquire_many(act_permits).await;
+            let _wf = self
+                .workflow_semaphore
+                .acquire_many(
+                    u32::try_from(self.config.max_concurrent_workflows)
+                        .unwrap_or(u32::MAX)
+                        .min((1 << 31) - 1),
+                )
+                .await;
+            let _act = self
+                .activity_semaphore
+                .acquire_many(
+                    u32::try_from(self.config.max_concurrent_activities)
+                        .unwrap_or(u32::MAX)
+                        .min((1 << 31) - 1),
+                )
+                .await;
         };
 
         if tokio::time::timeout(self.config.shutdown_timeout, drain)
