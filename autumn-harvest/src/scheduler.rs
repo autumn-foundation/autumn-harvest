@@ -774,7 +774,15 @@ async fn tick_one_workflow_schedule(
             "harvest workflow schedule skipped: max_active_runs reached"
         );
         metrics.record_schedule_skipped("workflow", wf_name, "max_active_runs_reached");
-        let next = next_run_after(parsed_schedule, now);
+        // For catchup schedules keep next_run_at at logical_date so the
+        // overdue slot is retried on the next tick once a run slot opens.
+        // For non-catchup schedules advance past overdue slots to the next
+        // future firing so the scheduler doesn't spin on an old timestamp.
+        let next = if catchup {
+            Some(logical_date)
+        } else {
+            next_run_after(parsed_schedule, now)
+        };
         diesel::update(dsl::harvest_schedules.find(schedule.id))
             .set((dsl::next_run_at.eq(next), dsl::updated_at.eq(now)))
             .execute(conn)

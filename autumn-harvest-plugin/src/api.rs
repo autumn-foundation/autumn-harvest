@@ -948,6 +948,20 @@ async fn delete_schedule(
                  remove the DAG definition to stop scheduling"
             )));
         }
+        if let Some(ref wf_name) = row.workflow_name {
+            let runtime = api_state.runtime().map_err(map_error)?;
+            let is_code_managed = runtime
+                .workflow_schedules()
+                .iter()
+                .any(|ws| ws.workflow_name == *wf_name);
+            if is_code_managed {
+                return Err(AutumnError::bad_request_msg(format!(
+                    "schedule {id} is managed by the in-process workflow schedule catalog \
+                     and cannot be deleted via API; it will be re-created on the next \
+                     scheduler tick"
+                )));
+            }
+        }
         let n = diesel::delete(dsl::harvest_schedules.find(id))
             .execute(&mut conn)
             .await
