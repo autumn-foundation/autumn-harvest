@@ -149,14 +149,15 @@ Current implementation scope: `ExecutionId`/`ShardId` encoding, `ShardRouter`, `
 | `info.rs` | 1 | `WorkflowInfo`, `ActivityInfo`, `WorkflowHandlerFn`, `ActivityHandlerFn` type aliases |
 | `builder.rs` | 1 | `HarvestBuilder` (fluent), `WorkerConfig` (queues, concurrency, timeouts) |
 | `prelude.rs` | 1 | Core glob re-export surface including macros |
-| `schema.rs` | 1 | Diesel `table!` macros -- 8 tables |
-| `models.rs` | 1 | `Queryable`/`Selectable` read structs and `Insertable` `New*` write structs for all 8 tables |
+| `schema.rs` | 1 | Diesel `table!` macros -- 9 tables |
+| `models.rs` | 1 | `Queryable`/`Selectable` read structs and `Insertable` `New*` write structs for all 9 tables |
 | `store.rs` | 2 | Event store: `append_events`, `load_history`, `events_to_rows` with sequential event IDs |
 | `replay.rs` | 2 | Deterministic replay engine: `HistoryMatcher` walks event history, detects non-determinism |
 | `executor.rs` | 2 | Workflow executor: `run_workflow` drives replay + live execution, handles suspension |
 | `queue.rs` | 2 | Postgres task queue: `enqueue`, `claim` (FOR UPDATE SKIP LOCKED), `complete`, `fail` |
 | `notify.rs` | 2 | LISTEN/NOTIFY wrapper: `Listener` (async stream), `Notifier` (pg_notify), channel naming |
 | `worker.rs` | 2 | Worker runtime: poll loop, semaphore-bounded concurrent dispatch, graceful shutdown |
+| `workers.rs` | 4 | Worker fleet registry: `register_worker`, `heartbeat_worker`, `transition_status`, `list_workers`, `get_worker`, `fleet_health`, `spawn_worker_heartbeat` |
 | `heartbeat.rs` | 2 | Batched heartbeat flusher: debounced channel receiver, bulk DB update |
 | `timeout.rs` | 2 | Timeout enforcement scanner: start-to-close, schedule-to-start, heartbeat timeout queries |
 | `cache.rs` | 2 | LRU workflow state cache: bounded capacity, access-order eviction |
@@ -308,6 +309,7 @@ The `testing` feature in `autumn-harvest/Cargo.toml` gates `WorkflowContext::new
 | `harvest_signals` | `Uuid` | Pending signals queued for delivery |
 | `harvest_timers` | `Uuid` | Durable timers registered by workflows |
 | `harvest_dead_letters` | `Uuid` | Tasks that exhausted all retry attempts |
+| `harvest_workers` | `Text` | Live worker process registrations and heartbeat state |
 
 `harvest_workflow_executions` is the hub — six tables join back to it via `workflow_exec_id`.
 
@@ -367,6 +369,7 @@ Worker pool and web pool are independently sized but share a total connection ce
 
 ## Phase 4 Scope (next)
 
+- **Worker fleet observability** (implemented, issue #100): `harvest_workers` table, per-worker heartbeat upsert, `Active → Draining → Stopped` lifecycle, `GET /workers`, `GET /workers/{id}`, `GET /workers/health` management routes, cross-shard aggregation via `iter_shards()`.
 - **Cancellation semantics**: explicit workflow/activity cancellation and propagation
 - **Saga primitives**: compensations and failure orchestration
 - **Cross-worker routing**: sticky execution affinity and shard-aware placement

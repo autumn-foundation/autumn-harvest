@@ -17,9 +17,11 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use uuid::Uuid;
+
 use crate::error::{HarvestError, HarvestResult};
 use crate::models::{HarvestWorker, NewHarvestWorker};
-use crate::schema::harvest_workers;
+use crate::schema::{harvest_task_queue, harvest_workers};
 use crate::worker::DbPool;
 
 // ---------------------------------------------------------------------------
@@ -314,7 +316,11 @@ pub async fn list_workers(
         .into_iter()
         .map(|w| {
             let health = WorkerHealth::classify(w.last_heartbeat_at, stale_threshold);
-            WorkerRow { worker: w, health }
+            WorkerRow {
+                worker: w,
+                health,
+                active_task_ids: vec![],
+            }
         })
         .collect();
 
@@ -360,9 +366,23 @@ pub async fn get_worker(
         .optional()
         .map_err(crate::error::database_error)?;
 
-    Ok(row.map(|w| {
-        let health = WorkerHealth::classify(w.last_heartbeat_at, stale_threshold);
-        WorkerRow { worker: w, health }
+    let Some(w) = row else {
+        return Ok(None);
+    };
+
+    let active_task_ids = harvest_task_queue::table
+        .filter(harvest_task_queue::worker_id.eq(Some(worker_id)))
+        .filter(harvest_task_queue::state.eq("RUNNING"))
+        .select(harvest_task_queue::id)
+        .load::<Uuid>(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    let health = WorkerHealth::classify(w.last_heartbeat_at, stale_threshold);
+    Ok(Some(WorkerRow {
+        worker: w,
+        health,
+        active_task_ids,
     }))
 }
 
@@ -431,6 +451,9 @@ pub struct WorkerRow {
     #[serde(flatten)]
     pub worker: HarvestWorker,
     pub health: WorkerHealth,
+    /// IDs of task-queue items currently claimed by this worker (`state = RUNNING`).
+    /// Populated only by `get_worker`; the list endpoint returns an empty vec.
+    pub active_task_ids: Vec<Uuid>,
 }
 
 /// Aggregated fleet health roll-up.
@@ -672,6 +695,49 @@ mod tests {
         let f = parse_worker_filters(&pairs(&[("unknown_param", "value")])).unwrap();
         assert!(f.queue.is_none());
         assert!(f.status.is_none());
+    }
+
+    // -- WorkerRow active_task_ids --
+
+    fn make_test_worker_row(active_task_ids: Vec<uuid::Uuid>) -> WorkerRow {
+        WorkerRow {
+            worker: HarvestWorker {
+                worker_id: "test-worker".to_string(),
+                started_at: Utc::now(),
+                last_heartbeat_at: Utc::now(),
+                queues: serde_json::json!(["default"]),
+                shard_assignments: serde_json::json!([0]),
+                max_concurrency: 10,
+                in_flight_count: 0,
+                host: "localhost".to_string(),
+                version: None,
+                status: "Active".to_string(),
+            },
+            health: WorkerHealth::Healthy,
+            active_task_ids,
+        }
+    }
+
+    #[test]
+    fn worker_row_active_task_ids_serializes_empty() {
+        let row = make_test_worker_row(vec![]);
+        let json = serde_json::to_value(&row).unwrap();
+        let ids = json["active_task_ids"]
+            .as_array()
+            .expect("active_task_ids should be array");
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn worker_row_active_task_ids_serializes_uuids() {
+        let tid = uuid::Uuid::new_v4();
+        let row = make_test_worker_row(vec![tid]);
+        let json = serde_json::to_value(&row).unwrap();
+        let ids = json["active_task_ids"]
+            .as_array()
+            .expect("active_task_ids should be array");
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0].as_str().unwrap(), tid.to_string());
     }
 
     // -- compute_in_flight --
