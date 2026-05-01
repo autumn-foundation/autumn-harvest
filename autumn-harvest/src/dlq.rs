@@ -110,6 +110,24 @@ fn dead_letter_task_type(dead_letter_id: Uuid, task_type: &str) -> HarvestResult
 ///
 /// Mirrors [`NewDeadLetter`] but owns its strings, making it easier to
 /// construct from runtime data without lifetime gymnastics.
+///
+/// ## Examples
+///
+/// ```rust
+/// use uuid::Uuid;
+/// use autumn_harvest::dlq::NewDeadLetterEntry;
+///
+/// let entry = NewDeadLetterEntry {
+///     original_task_id: Uuid::new_v4(),
+///     queue_name: "default".to_string(),
+///     task_type: "ACTIVITY".to_string(),
+///     workflow_exec_id: Some(Uuid::new_v4()),
+///     activity_name: Some("send_email".to_string()),
+///     input: serde_json::json!({"to": "user@example.com"}),
+///     error: "connection refused".to_string(),
+///     attempts: 3,
+/// };
+/// ```
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct NewDeadLetterEntry {
     pub original_task_id: Uuid,
