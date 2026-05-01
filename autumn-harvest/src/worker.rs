@@ -2529,9 +2529,20 @@ impl Worker {
             .iter()
             .map(|s| s.as_i32())
             .collect();
+        let max_concurrency = i32::try_from(
+            self.config.max_concurrent_workflows + self.config.max_concurrent_activities,
+        )
+        .unwrap_or(i32::MAX);
         let heartbeat_handle = crate::workers::spawn_worker_heartbeat(
             pool.clone(),
-            self.config.worker_id.clone(),
+            crate::workers::WorkerRegistration {
+                worker_id: self.config.worker_id.clone(),
+                queues: self.config.queues.clone(),
+                shard_assignments: shard_ids,
+                max_concurrency,
+                host: crate::workers::local_hostname(),
+                version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            },
             Arc::clone(&self.workflow_semaphore),
             self.config.max_concurrent_workflows,
             Arc::clone(&self.activity_semaphore),
@@ -2539,7 +2550,6 @@ impl Worker {
             self.config.worker_heartbeat_interval,
             self.shutdown.clone(),
         );
-        let _ = shard_ids; // used during registration only
 
         while !self.shutdown.is_cancelled() {
             if self.poll_once(pool).await {

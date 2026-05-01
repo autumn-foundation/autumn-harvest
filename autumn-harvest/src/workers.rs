@@ -20,6 +20,22 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::error::{HarvestError, HarvestResult};
+
+// ---------------------------------------------------------------------------
+// WorkerRegistration
+// ---------------------------------------------------------------------------
+
+/// Static fields that identify a worker process, used for initial registration
+/// and heartbeat self-healing.
+#[derive(Debug, Clone)]
+pub struct WorkerRegistration {
+    pub worker_id: String,
+    pub queues: Vec<String>,
+    pub shard_assignments: Vec<i32>,
+    pub max_concurrency: i32,
+    pub host: String,
+    pub version: Option<String>,
+}
 use crate::models::{HarvestWorker, NewHarvestWorker};
 use crate::schema::{harvest_task_queue, harvest_workers};
 use crate::worker::DbPool;
@@ -251,6 +267,10 @@ pub async fn register_worker(
 
 /// Upsert `last_heartbeat_at` and `in_flight_count` for a worker.
 ///
+/// Returns the number of rows updated (1 if the worker row exists, 0 if it is
+/// missing). Callers that receive 0 should re-register the worker to self-heal
+/// after a failed startup registration.
+///
 /// # Errors
 ///
 /// Returns [`HarvestError`] on database failure.
@@ -258,8 +278,8 @@ pub async fn heartbeat_worker(
     conn: &mut AsyncPgConnection,
     worker_id: &str,
     in_flight_count: i32,
-) -> HarvestResult<()> {
-    diesel::update(harvest_workers::table.find(worker_id))
+) -> HarvestResult<usize> {
+    let affected = diesel::update(harvest_workers::table.find(worker_id))
         .set((
             harvest_workers::last_heartbeat_at.eq(Utc::now()),
             harvest_workers::in_flight_count.eq(in_flight_count),
@@ -267,7 +287,7 @@ pub async fn heartbeat_worker(
         .execute(conn)
         .await
         .map_err(crate::error::database_error)?;
-    Ok(())
+    Ok(affected)
 }
 
 /// Transition a worker's lifecycle status.
@@ -288,43 +308,12 @@ pub async fn transition_status(
     Ok(())
 }
 
-/// Query the fleet table with optional filters.
+/// Apply queue, shard, health, and limit filters to an already-loaded worker list.
 ///
-/// # Errors
-///
-/// Returns [`HarvestError`] on database failure.
-pub async fn list_workers(
-    conn: &mut AsyncPgConnection,
-    filters: &WorkerFilters,
-    stale_threshold: Duration,
-) -> HarvestResult<Vec<WorkerRow>> {
-    let mut query = harvest_workers::table
-        .select(HarvestWorker::as_select())
-        .into_boxed();
-
-    if let Some(ref status) = filters.status {
-        query = query.filter(harvest_workers::status.eq(status));
-    }
-
-    let rows: Vec<HarvestWorker> = query
-        .limit(filters.limit)
-        .load(conn)
-        .await
-        .map_err(crate::error::database_error)?;
-
-    let mut results: Vec<WorkerRow> = rows
-        .into_iter()
-        .map(|w| {
-            let health = WorkerHealth::classify(w.last_heartbeat_at, stale_threshold);
-            WorkerRow {
-                worker: w,
-                health,
-                active_task_ids: vec![],
-            }
-        })
-        .collect();
-
-    // Apply post-query filters that need in-process evaluation.
+/// The limit is intentionally applied **after** the in-process `retain` passes so
+/// that a SQL-level page size cannot silently exclude matching rows that appear
+/// beyond the first N rows of the unfiltered table.
+fn apply_worker_filters(mut results: Vec<WorkerRow>, filters: &WorkerFilters) -> Vec<WorkerRow> {
     if let Some(ref queue) = filters.queue {
         results.retain(|r| {
             r.worker
@@ -344,8 +333,50 @@ pub async fn list_workers(
     if let Some(health_filter) = filters.health {
         results.retain(|r| r.health == health_filter);
     }
+    results.truncate(usize::try_from(filters.limit).unwrap_or(usize::MAX));
+    results
+}
 
-    Ok(results)
+/// Query the fleet table with optional filters.
+///
+/// The SQL query applies only the `status` filter (an indexed column). Queue,
+/// shard, health, and limit filters are applied in-process after loading so
+/// that the limit is never evaluated before the JSONB/derived-field filters.
+///
+/// # Errors
+///
+/// Returns [`HarvestError`] on database failure.
+pub async fn list_workers(
+    conn: &mut AsyncPgConnection,
+    filters: &WorkerFilters,
+    stale_threshold: Duration,
+) -> HarvestResult<Vec<WorkerRow>> {
+    let mut query = harvest_workers::table
+        .select(HarvestWorker::as_select())
+        .into_boxed();
+
+    if let Some(ref status) = filters.status {
+        query = query.filter(harvest_workers::status.eq(status));
+    }
+
+    let rows: Vec<HarvestWorker> = query
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    let results: Vec<WorkerRow> = rows
+        .into_iter()
+        .map(|w| {
+            let health = WorkerHealth::classify(w.last_heartbeat_at, stale_threshold);
+            WorkerRow {
+                worker: w,
+                health,
+                active_task_ids: vec![],
+            }
+        })
+        .collect();
+
+    Ok(apply_worker_filters(results, filters))
 }
 
 /// Get a single worker detail row.
@@ -473,12 +504,14 @@ pub struct FleetHealth {
 /// Spawn a background task that upserts worker heartbeats on a regular interval.
 ///
 /// The task reads the current `in_flight_count` from the semaphores, then
-/// writes it to the database. It stops when `cancel` is triggered.
+/// writes it to the database. If the worker row is missing (0 rows updated —
+/// e.g. because startup registration failed transiently), the task re-registers
+/// the worker automatically. It stops when `cancel` is triggered.
 #[must_use]
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_worker_heartbeat(
     pool: DbPool,
-    worker_id: String,
+    registration: WorkerRegistration,
     wf_semaphore: Arc<Semaphore>,
     wf_max: usize,
     act_semaphore: Arc<Semaphore>,
@@ -497,17 +530,43 @@ pub fn spawn_worker_heartbeat(
 
             match pool.get().await {
                 Ok(mut conn) => {
-                    if let Err(error) = heartbeat_worker(&mut conn, &worker_id, in_flight).await {
-                        tracing::warn!(
-                            worker_id = %worker_id,
-                            error = %error,
-                            "worker heartbeat write failed"
-                        );
+                    match heartbeat_worker(&mut conn, &registration.worker_id, in_flight).await {
+                        Ok(0) => {
+                            tracing::info!(
+                                worker_id = %registration.worker_id,
+                                "worker row missing; re-registering"
+                            );
+                            if let Err(error) = register_worker(
+                                &mut conn,
+                                &registration.worker_id,
+                                &registration.queues,
+                                &registration.shard_assignments,
+                                registration.max_concurrency,
+                                &registration.host,
+                                registration.version.as_deref(),
+                            )
+                            .await
+                            {
+                                tracing::warn!(
+                                    worker_id = %registration.worker_id,
+                                    error = %error,
+                                    "worker re-registration failed"
+                                );
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            tracing::warn!(
+                                worker_id = %registration.worker_id,
+                                error = %error,
+                                "worker heartbeat write failed"
+                            );
+                        }
                     }
                 }
                 Err(error) => {
                     tracing::warn!(
-                        worker_id = %worker_id,
+                        worker_id = %registration.worker_id,
                         error = %error,
                         "worker heartbeat failed to get pool connection"
                     );
@@ -695,6 +754,89 @@ mod tests {
         let f = parse_worker_filters(&pairs(&[("unknown_param", "value")])).unwrap();
         assert!(f.queue.is_none());
         assert!(f.status.is_none());
+    }
+
+    // -- WorkerRegistration --
+
+    #[test]
+    fn worker_registration_captures_all_fields() {
+        let reg = WorkerRegistration {
+            worker_id: "w1".to_string(),
+            queues: vec!["default".to_string()],
+            shard_assignments: vec![0],
+            max_concurrency: 10,
+            host: "localhost".to_string(),
+            version: Some("0.2.0".to_string()),
+        };
+        assert_eq!(reg.worker_id, "w1");
+        assert_eq!(reg.queues, vec!["default"]);
+        assert_eq!(reg.max_concurrency, 10);
+        assert_eq!(reg.version.as_deref(), Some("0.2.0"));
+    }
+
+    // -- apply_worker_filters (limit is applied after queue/shard/health filtering) --
+
+    fn make_queue_row(worker_id: &str, queue: &str) -> WorkerRow {
+        WorkerRow {
+            worker: HarvestWorker {
+                worker_id: worker_id.to_string(),
+                started_at: Utc::now(),
+                last_heartbeat_at: Utc::now(),
+                queues: serde_json::json!([queue]),
+                shard_assignments: serde_json::json!([0]),
+                max_concurrency: 10,
+                in_flight_count: 0,
+                host: "localhost".to_string(),
+                version: None,
+                status: "Active".to_string(),
+            },
+            health: WorkerHealth::Healthy,
+            active_task_ids: vec![],
+        }
+    }
+
+    #[test]
+    fn apply_filters_limit_is_applied_after_queue_filter() {
+        // 3 rows total; only 1 matches "email-workers". With limit=2 applied
+        // BEFORE filtering, the email-workers row might be outside the window.
+        // apply_worker_filters must truncate AFTER retaining.
+        let rows = vec![
+            make_queue_row("w-default-1", "default"),
+            make_queue_row("w-default-2", "default"),
+            make_queue_row("w-email", "email-workers"),
+        ];
+        let mut filters = WorkerFilters::new();
+        filters.queue = Some("email-workers".to_string());
+        filters.limit = 2;
+        let result = apply_worker_filters(rows, &filters);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].worker.worker_id, "w-email");
+    }
+
+    #[test]
+    fn apply_filters_limit_truncates_matched_results() {
+        let rows = vec![
+            make_queue_row("w1", "email-workers"),
+            make_queue_row("w2", "email-workers"),
+            make_queue_row("w3", "email-workers"),
+        ];
+        let mut filters = WorkerFilters::new();
+        filters.queue = Some("email-workers".to_string());
+        filters.limit = 2;
+        let result = apply_worker_filters(rows, &filters);
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn apply_filters_no_match_returns_empty() {
+        let rows = vec![
+            make_queue_row("w1", "default"),
+            make_queue_row("w2", "default"),
+        ];
+        let mut filters = WorkerFilters::new();
+        filters.queue = Some("email-workers".to_string());
+        let result = apply_worker_filters(rows, &filters);
+        assert!(result.is_empty());
     }
 
     // -- WorkerRow active_task_ids --
