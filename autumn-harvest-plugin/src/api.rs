@@ -1729,11 +1729,13 @@ async fn list_workers_handler(
     let pool = api_state.storage_pool().map_err(map_error)?;
     let mut results: Vec<WorkerRow> = Vec::new();
 
-    // Query each shard without a per-shard limit so that the global sort +
-    // truncate below sees every matching worker. Per-shard limiting would
-    // silently drop valid workers on large shards before the merge.
+    // Use i64::MAX as the per-shard limit so apply_worker_filters performs no
+    // truncation inside list_workers. Any MAX_LIMIT cap would silently drop
+    // workers on a large shard before the global sort+truncate below, producing
+    // incomplete results for fleets with more than MAX_LIMIT matching workers on
+    // a single shard.
     let per_shard_filters = WorkerFilters {
-        limit: WorkerFilters::MAX_LIMIT,
+        limit: i64::MAX,
         ..filters.clone()
     };
     for (_shard, shard_pool) in pool.iter_shards() {
