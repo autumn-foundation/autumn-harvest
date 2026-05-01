@@ -434,6 +434,7 @@ mod tests {
             default_queue: None,
             max_concurrent: None,
             concurrency_key: None,
+            is_local: false,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
         }
     }
