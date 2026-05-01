@@ -83,6 +83,10 @@ mod tests {
         assert_eq!(wf.name, "greeting");
         assert_eq!(act.name, "send_greeting");
         // The default worker listens on "default", matching execute_activity_raw's queue arg.
-        assert!(WorkerConfig::default().queues.contains(&"default".to_string()));
+        assert!(
+            WorkerConfig::default()
+                .queues
+                .contains(&"default".to_string())
+        );
     }
 }
