@@ -46,6 +46,7 @@ pub struct ApprovalDecision {
 /// Suspends until a manager approves or rejects the expense via the
 /// management API.  Automatically times out after 7 days.
 #[workflow]
+#[allow(clippy::missing_errors_doc)]
 pub async fn expense_approval(
     ctx: &WorkflowContext,
     expense_id: String,
@@ -93,6 +94,7 @@ pub async fn expense_approval(
 /// notification that includes the task token so the approver UI can call the
 /// management API to complete the activity.
 #[activity(start_to_close = "30s", queue = "default")]
+#[allow(clippy::missing_errors_doc, clippy::unused_async)]
 pub async fn notify_approver(
     _ctx: &ActivityContext,
     expense_id: String,
@@ -120,8 +122,8 @@ fn main() {
     println!("Key curl commands after starting the server:");
     println!();
     println!("# Start a workflow");
-    println!(r#"curl -X POST http://localhost:8080/harvest/workflows/expense_approval/start \"#);
-    println!(r#"     -H 'Content-Type: application/json' \"#);
+    println!(r"curl -X POST http://localhost:8080/harvest/workflows/expense_approval/start \");
+    println!(r"     -H 'Content-Type: application/json' \");
     println!(r#"     -d '{{"input": ["exp-001", 49900]}}'"#);
     println!();
     println!("# (Retrieve EXEC_ID and TOKEN from the event history)");

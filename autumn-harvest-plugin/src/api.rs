@@ -118,7 +118,7 @@ impl HarvestApiRuntime {
     /// In-process workflow schedule registrations known to this runtime.
     ///
     /// Returns the schedules that were registered via
-    /// [`HarvestBuilder::workflow_schedule`] at startup. Schedules added
+    /// [`autumn_harvest::builder::HarvestBuilder::workflow_schedule`] at startup. Schedules added
     /// dynamically via the management API are stored only in the database and
     /// will not appear here.
     #[must_use]
