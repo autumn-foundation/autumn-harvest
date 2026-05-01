@@ -697,7 +697,7 @@ fn two_gate_workflow<'a>(
     })
 }
 
-/// History with two version markers: gate_alpha=2, gate_beta=4.
+/// History with two version markers: `gate_alpha=2`, `gate_beta=4`.
 fn two_gate_history() -> (ExecutionId, Vec<WorkflowEvent>) {
     let exec_id = ExecutionId::new();
     let events = vec![

@@ -98,6 +98,19 @@ impl HistoryMatcher {
         self.pending_signals.push_back((signal_name, payload));
     }
 
+    /// Format the `actual` field for a [`HistoryMatch::Diverged`] result.
+    ///
+    /// When the unexpected event is a `MarkerRecorded` its name is included so
+    /// the replayer's `classify_kind` can recognise `"MarkerRecorded(version:…)"`
+    /// and return [`crate::testing::NonDeterminismKind::VersionMarkerMismatch`]
+    /// instead of the generic command-level mismatch kind.
+    fn actual_event_name(event: &WorkflowEvent) -> String {
+        match event {
+            WorkflowEvent::MarkerRecorded { name, .. } => format!("MarkerRecorded({name})"),
+            other => other.type_name().to_string(),
+        }
+    }
+
     /// Prepares for matching by advancing past consumed events and draining early signals.
     /// Returns `true` if there are still events to replay.
     fn prepare_match(&mut self) -> bool {
@@ -242,18 +255,9 @@ impl HistoryMatcher {
             ..
         } = &self.events[self.cursor]
         else {
-            // Include the marker name in the `actual` field so the replayer can
-            // classify a stale version-gate marker as `VersionMarkerMismatch`
-            // rather than the generic `ActivityScheduleMismatch`.
-            let actual = match &self.events[self.cursor] {
-                WorkflowEvent::MarkerRecorded { name, .. } => {
-                    format!("MarkerRecorded({name})")
-                }
-                other => other.type_name().to_string(),
-            };
             return HistoryMatch::Diverged {
                 expected: format!("ActivityScheduled({activity_name})"),
-                actual,
+                actual: Self::actual_event_name(&self.events[self.cursor]),
             };
         };
         let activity_id = *activity_id;
@@ -391,18 +395,10 @@ impl HistoryMatcher {
                 }
                 Ok(*activity_id)
             }
-            other => {
-                let actual = match other {
-                    WorkflowEvent::MarkerRecorded { name, .. } => {
-                        format!("MarkerRecorded({name})")
-                    }
-                    e => e.type_name().to_string(),
-                };
-                Err(HistoryMatch::Diverged {
-                    expected: format!("ActivityScheduled({activity_name})"),
-                    actual,
-                })
-            }
+            other => Err(HistoryMatch::Diverged {
+                expected: format!("ActivityScheduled({activity_name})"),
+                actual: Self::actual_event_name(other),
+            }),
         };
         let activity_id = match result {
             Ok(id) => id,
@@ -516,7 +512,7 @@ impl HistoryMatcher {
         else {
             return HistoryMatch::Diverged {
                 expected: format!("ActivityAwaitingExternal({activity_name})"),
-                actual: self.events[self.cursor].type_name().to_string(),
+                actual: Self::actual_event_name(&self.events[self.cursor]),
             };
         };
 
@@ -627,7 +623,7 @@ impl HistoryMatcher {
         else {
             return HistoryMatch::Diverged {
                 expected: format!("TimerStarted({timer_id})"),
-                actual: self.events[self.cursor].type_name().to_string(),
+                actual: Self::actual_event_name(&self.events[self.cursor]),
             };
         };
 
@@ -738,7 +734,7 @@ impl HistoryMatcher {
                 other => {
                     return HistoryMatch::Diverged {
                         expected: format!("SignalReceived({signal_name})"),
-                        actual: other.type_name().to_string(),
+                        actual: Self::actual_event_name(other),
                     };
                 }
             }
@@ -762,7 +758,7 @@ impl HistoryMatcher {
         else {
             return HistoryMatch::Diverged {
                 expected: format!("WorkflowContinuedAsNew({input})"),
-                actual: self.events[self.cursor].type_name().to_string(),
+                actual: Self::actual_event_name(&self.events[self.cursor]),
             };
         };
 
@@ -798,7 +794,7 @@ impl HistoryMatcher {
         else {
             return HistoryMatch::Diverged {
                 expected: format!("ChildWorkflowStarted({workflow_name})"),
-                actual: self.events[self.cursor].type_name().to_string(),
+                actual: Self::actual_event_name(&self.events[self.cursor]),
             };
         };
         let child_id = *child_id;
@@ -878,7 +874,7 @@ impl HistoryMatcher {
             }
             other => HistoryMatch::Diverged {
                 expected: format!("MarkerRecorded({marker_name})"),
-                actual: other.type_name().to_string(),
+                actual: Self::actual_event_name(other),
             },
         }
     }
@@ -911,7 +907,7 @@ impl HistoryMatcher {
         else {
             return HistoryMatch::Diverged {
                 expected: format!("LocalActivityScheduled({activity_name})"),
-                actual: self.events[self.cursor].type_name().to_string(),
+                actual: Self::actual_event_name(&self.events[self.cursor]),
             };
         };
         let activity_id = *activity_id;
@@ -1016,7 +1012,7 @@ impl HistoryMatcher {
             }
             other => Err(HistoryMatch::Diverged {
                 expected: format!("LocalActivityScheduled({activity_name})"),
-                actual: other.type_name().to_string(),
+                actual: Self::actual_event_name(other),
             }),
         };
         let activity_id = match result {
