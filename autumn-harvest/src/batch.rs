@@ -206,18 +206,6 @@ mod db {
             ));
         }
 
-        if let Some(key) = request.idempotency_key.as_deref()
-            && let Some(existing) = harvest_batch_jobs::table
-                .filter(harvest_batch_jobs::idempotency_key.eq(key))
-                .select(BatchJob::as_select())
-                .first::<BatchJob>(conn)
-                .await
-                .optional()
-                .map_err(database_error)?
-        {
-            return Ok(existing.id);
-        }
-
         let id = Uuid::new_v4();
         let filter_value = serde_json::to_value(&request.filter).map_err(HarvestError::from)?;
         let new_row = NewBatchJob {
@@ -230,12 +218,30 @@ mod db {
             idempotency_key: request.idempotency_key.as_deref(),
             created_by: request.created_by.as_deref(),
         };
-        diesel::insert_into(harvest_batch_jobs::table)
+        match diesel::insert_into(harvest_batch_jobs::table)
             .values(&new_row)
-            .execute(conn)
+            .returning(harvest_batch_jobs::id)
+            .get_result::<Uuid>(conn)
             .await
-            .map_err(database_error)?;
-        Ok(id)
+        {
+            Ok(inserted_id) => Ok(inserted_id),
+            Err(diesel::result::Error::DatabaseError(
+                diesel::result::DatabaseErrorKind::UniqueViolation,
+                _,
+            )) => {
+                // A concurrent submission with the same idempotency_key raced
+                // ahead of our insert. Return the id of the row that won.
+                harvest_batch_jobs::table
+                    .filter(harvest_batch_jobs::idempotency_key.eq(
+                        request.idempotency_key.as_deref().unwrap_or(""),
+                    ))
+                    .select(harvest_batch_jobs::id)
+                    .first::<Uuid>(conn)
+                    .await
+                    .map_err(database_error)
+            }
+            Err(e) => Err(database_error(e)),
+        }
     }
 
     /// Filters accepted by the management list endpoint.
@@ -607,20 +613,16 @@ mod db {
             mark_running(&mut owning_conn, job.id, total).await?;
         }
 
-        // Already-processed prefix from a prior tick survives a crash:
-        // skip the first `completed + failed` targets and resume the cursor.
-        let already_done = usize::try_from((job.completed + job.failed).max(0)).unwrap_or(0);
-        let pending = all_targets
-            .into_iter()
-            .skip(already_done)
-            .collect::<Vec<_>>();
-
         let signal_name = job.signal_name.clone();
         let signal_payload = job.signal_payload.clone();
         let concurrency = usize::try_from(config.concurrency.max(1)).unwrap_or(1);
 
         // Dispatch in chunks of `concurrency` to bound in-flight ops.
-        for chunk in pending.chunks(concurrency) {
+        // The SQL filter already excludes already-processed targets (e.g. only
+        // RUNNING workflows appear for Cancel, so cancelled ones are invisible).
+        // No offset skip is needed; accumulated counters from prior ticks are
+        // preserved in `completed`/`failed` and are additive across ticks.
+        for chunk in all_targets.chunks(concurrency) {
             let mut tasks: FuturesUnordered<_> = FuturesUnordered::new();
             for target in chunk.iter().copied() {
                 let pool_for_target = pool.pool_for_execution(target).clone();
