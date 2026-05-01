@@ -680,7 +680,11 @@ fn chrono_duration_from_secs(seconds: u64, field_name: &str) -> HarvestResult<ch
     let seconds = i64::try_from(seconds).map_err(|_| {
         HarvestError::Config(format!("activity {field_name} exceeds i64 seconds range"))
     })?;
-    Ok(chrono::Duration::seconds(seconds))
+    chrono::Duration::try_seconds(seconds).ok_or_else(|| {
+        HarvestError::Config(format!(
+            "activity {field_name} exceeds chrono::Duration bounds"
+        ))
+    })
 }
 
 fn next_retry_delay(
@@ -3073,5 +3077,18 @@ mod tests {
             details: serde_json::json!(2),
         }];
         assert!(!should_requeue_signal_wait(&commands));
+    }
+
+    #[test]
+    fn havoc_chrono_duration_panic() {
+        let max_safe_secs = i64::MAX as u64;
+        let result = chrono_duration_from_secs(max_safe_secs, "timeout");
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds chrono::Duration bounds")
+        );
     }
 }
