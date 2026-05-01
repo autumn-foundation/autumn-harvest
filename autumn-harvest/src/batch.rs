@@ -308,7 +308,7 @@ mod db {
     }
 
     /// Lease window after which an in-progress batch is considered abandoned
-    /// and another worker may claim it. `record_progress` and `mark_running`
+    /// and another worker may claim it. `record_progress` and `try_claim_job`
     /// both refresh `updated_at`, so a healthy worker keeps the lease alive.
     pub const BATCH_JOB_LEASE_SECS: i64 = 60;
 
@@ -320,13 +320,19 @@ mod db {
     /// two concurrent runtimes cannot both claim the same row: a `Pending`
     /// row matches once and transitions to `Running`; a `Running` row only
     /// matches when its `updated_at` is older than the lease window (the
-    /// previous owner is presumed dead). The returning `id` short-circuits
-    /// further work when no claim was made.
-    pub async fn try_claim_job(conn: &mut AsyncPgConnection, job_id: Uuid) -> HarvestResult<bool> {
+    /// previous owner is presumed dead). When transitioning from `Pending`
+    /// the `total` is persisted atomically with the status change, so the
+    /// claim is the single durable write that begins a job.
+    pub async fn try_claim_job(
+        conn: &mut AsyncPgConnection,
+        job_id: Uuid,
+        total: i64,
+    ) -> HarvestResult<bool> {
         let lease_threshold = Utc::now() - chrono::Duration::seconds(BATCH_JOB_LEASE_SECS);
         let claimed: Option<Uuid> = diesel::sql_query(
             "UPDATE harvest_batch_jobs \
              SET status = 'Running', \
+                 total = CASE WHEN status = 'Pending' THEN $3 ELSE total END, \
                  started_at = COALESCE(started_at, now()), \
                  updated_at = now() \
              WHERE id = $1 \
@@ -336,6 +342,7 @@ mod db {
         )
         .bind::<diesel::sql_types::Uuid, _>(job_id)
         .bind::<diesel::sql_types::Timestamptz, _>(lease_threshold)
+        .bind::<diesel::sql_types::BigInt, _>(total)
         .get_result::<ClaimedId>(conn)
         .await
         .optional()
@@ -646,25 +653,22 @@ mod db {
             all_targets.append(&mut targets);
         }
 
-        // Mark the row Running and record total. record_progress runs on the
-        // owning shard (where the job row lives).
+        // Atomic lease claim with total: a Pending row transitions to Running
+        // and persists `total` in one write; a Running row with an expired
+        // lease is reclaimed without touching `total`. If another worker
+        // owns the lease, skip silently. record_progress runs on the owning
+        // shard (where the job row lives).
         let mut owning_conn = owning_shard_pool
             .get()
             .await
             .map_err(|e| HarvestError::Database(e.to_string()))?;
-        // Atomic lease claim: prevents two parallel runtimes from racing on
-        // the same job. If another worker owns it, skip silently.
-        if !try_claim_job(&mut owning_conn, job.id).await? {
+        let total = i64::try_from(all_targets.len()).unwrap_or(i64::MAX);
+        if !try_claim_job(&mut owning_conn, job.id, total).await? {
             tracing::debug!(
                 job_id = %job.id,
                 "batch job is owned by another worker; skipping"
             );
             return Ok(());
-        }
-        // Skip already-running rows: total already recorded.
-        let total = i64::try_from(all_targets.len()).unwrap_or(i64::MAX);
-        if job.status == BatchJobStatus::Pending.as_str() {
-            mark_running(&mut owning_conn, job.id, total).await?;
         }
 
         // Stable UUID sort; Signal targets stay RUNNING so we offset-skip the already-counted prefix.
