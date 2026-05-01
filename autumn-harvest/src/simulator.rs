@@ -152,119 +152,7 @@ impl WorkflowSimulator {
                     };
                 }
                 WorkflowOutcome::Suspended { commands } => {
-                    let mut advanced = false;
-
-                    for cmd in commands {
-                        match cmd {
-                            WorkflowCommand::ScheduleActivity {
-                                activity_id,
-                                name,
-                                input: activity_input,
-                                queue,
-                                ..
-                            } => {
-                                history.push(WorkflowEvent::ActivityScheduled {
-                                    activity_id,
-                                    name: name.clone(),
-                                    input: activity_input.clone(),
-                                    queue,
-                                });
-                                history.push(WorkflowEvent::ActivityStarted {
-                                    activity_id,
-                                    worker_id: WorkerId::new("sim-worker"),
-                                });
-
-                                let mock_res = self
-                                    .activity_mocks
-                                    .get(&name)
-                                    .map_or(Ok(Value::Null), |mock| mock(activity_input));
-
-                                match mock_res {
-                                    Ok(out) => {
-                                        history.push(WorkflowEvent::ActivityCompleted {
-                                            activity_id,
-                                            output: out,
-                                        });
-                                    }
-                                    Err(err) => {
-                                        history.push(WorkflowEvent::ActivityFailed {
-                                            activity_id,
-                                            error: err,
-                                            attempt: 1,
-                                        });
-                                    }
-                                }
-                                advanced = true;
-                            }
-                            WorkflowCommand::StartTimer {
-                                timer_id,
-                                duration_secs,
-                                ..
-                            } => {
-                                history.push(WorkflowEvent::TimerStarted {
-                                    timer_id: timer_id.clone(),
-                                    duration_secs,
-                                });
-                                history.push(WorkflowEvent::TimerFired { timer_id });
-                                advanced = true;
-                            }
-                            WorkflowCommand::StartChildWorkflow {
-                                child_id,
-                                workflow_name,
-                                input,
-                                ..
-                            } => {
-                                history.push(WorkflowEvent::ChildWorkflowStarted {
-                                    child_id,
-                                    workflow_name: workflow_name.clone(),
-                                    input: input.clone(),
-                                });
-
-                                let mock_res = self
-                                    .child_workflow_mocks
-                                    .get(&workflow_name)
-                                    .map_or(Ok(Value::Null), |mock| mock(input));
-
-                                match mock_res {
-                                    Ok(out) => {
-                                        history.push(WorkflowEvent::ChildWorkflowCompleted {
-                                            child_id,
-                                            output: out,
-                                        });
-                                    }
-                                    Err(err) => {
-                                        history.push(WorkflowEvent::ChildWorkflowFailed {
-                                            child_id,
-                                            error: err,
-                                        });
-                                    }
-                                }
-                                advanced = true;
-                            }
-                            WorkflowCommand::WaitForSignal { signal_name, .. } => {
-                                if let Some(payload) = self
-                                    .signals_to_send
-                                    .get_mut(&signal_name)
-                                    .and_then(std::collections::VecDeque::pop_front)
-                                {
-                                    history.push(WorkflowEvent::SignalReceived {
-                                        signal_name: signal_name.clone(),
-                                        payload: payload.clone(),
-                                    });
-                                    advanced = true;
-                                }
-                            }
-                            WorkflowCommand::RecordMarker { name, details } => {
-                                history.push(WorkflowEvent::MarkerRecorded { name, details });
-                                advanced = true;
-                            }
-                            _ => {
-                                // Commands like WaitForSignal, StartChildWorkflow are not yet fully supported.
-                                // Complete and Fail are handled on the next loop iteration.
-                            }
-                        }
-                    }
-
+                    let advanced = self.process_simulator_commands(commands, &mut history);
                     assert!(
                         advanced,
                         "Simulator deadlock: workflow suspended but no progressable commands were emitted (e.g. waiting on unmocked signal)."
@@ -272,6 +160,127 @@ impl WorkflowSimulator {
                 }
             }
         }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn process_simulator_commands(
+        &mut self,
+        commands: Vec<WorkflowCommand>,
+        history: &mut Vec<WorkflowEvent>,
+    ) -> bool {
+        let mut advanced = false;
+
+        for cmd in commands {
+            match cmd {
+                WorkflowCommand::ScheduleActivity {
+                    activity_id,
+                    name,
+                    input: activity_input,
+                    queue,
+                    ..
+                } => {
+                    history.push(WorkflowEvent::ActivityScheduled {
+                        activity_id,
+                        name: name.clone(),
+                        input: activity_input.clone(),
+                        queue,
+                    });
+                    history.push(WorkflowEvent::ActivityStarted {
+                        activity_id,
+                        worker_id: WorkerId::new("sim-worker"),
+                    });
+
+                    let mock_res = self
+                        .activity_mocks
+                        .get(&name)
+                        .map_or(Ok(Value::Null), |mock| mock(activity_input));
+
+                    match mock_res {
+                        Ok(out) => {
+                            history.push(WorkflowEvent::ActivityCompleted {
+                                activity_id,
+                                output: out,
+                            });
+                        }
+                        Err(err) => {
+                            history.push(WorkflowEvent::ActivityFailed {
+                                activity_id,
+                                error: err,
+                                attempt: 1,
+                            });
+                        }
+                    }
+                    advanced = true;
+                }
+                WorkflowCommand::StartTimer {
+                    timer_id,
+                    duration_secs,
+                    ..
+                } => {
+                    history.push(WorkflowEvent::TimerStarted {
+                        timer_id: timer_id.clone(),
+                        duration_secs,
+                    });
+                    history.push(WorkflowEvent::TimerFired { timer_id });
+                    advanced = true;
+                }
+                WorkflowCommand::StartChildWorkflow {
+                    child_id,
+                    workflow_name,
+                    input,
+                    ..
+                } => {
+                    history.push(WorkflowEvent::ChildWorkflowStarted {
+                        child_id,
+                        workflow_name: workflow_name.clone(),
+                        input: input.clone(),
+                    });
+
+                    let mock_res = self
+                        .child_workflow_mocks
+                        .get(&workflow_name)
+                        .map_or(Ok(Value::Null), |mock| mock(input));
+
+                    match mock_res {
+                        Ok(out) => {
+                            history.push(WorkflowEvent::ChildWorkflowCompleted {
+                                child_id,
+                                output: out,
+                            });
+                        }
+                        Err(err) => {
+                            history.push(WorkflowEvent::ChildWorkflowFailed {
+                                child_id,
+                                error: err,
+                            });
+                        }
+                    }
+                    advanced = true;
+                }
+                WorkflowCommand::WaitForSignal { signal_name, .. } => {
+                    if let Some(payload) = self
+                        .signals_to_send
+                        .get_mut(&signal_name)
+                        .and_then(std::collections::VecDeque::pop_front)
+                    {
+                        history.push(WorkflowEvent::SignalReceived {
+                            signal_name: signal_name.clone(),
+                            payload: payload.clone(),
+                        });
+                        advanced = true;
+                    }
+                }
+                WorkflowCommand::RecordMarker { name, details } => {
+                    history.push(WorkflowEvent::MarkerRecorded { name, details });
+                    advanced = true;
+                }
+                _ => {
+                    // Commands like WaitForSignal, StartChildWorkflow are not yet fully supported.
+                    // Complete and Fail are handled on the next loop iteration.
+                }
+            }
+        }
+        advanced
     }
 }
 
