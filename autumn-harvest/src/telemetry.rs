@@ -158,7 +158,7 @@ impl TraceContextCarrier {
     #[must_use]
     pub fn into_replay_context(self) -> Self {
         Self {
-            link_traceparent: self.traceparent,
+            link_traceparent: self.traceparent.or(self.link_traceparent),
             traceparent: None,
             tracestate: None,
             is_replay: true,
@@ -609,6 +609,26 @@ mod tests {
             Some("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"),
         );
         assert!(decoded.traceparent.is_none());
+    }
+
+    #[test]
+    fn into_replay_context_on_already_replay_carrier_preserves_link() {
+        // If into_replay_context() is called defensively on a carrier that is
+        // already in replay form (traceparent=None, link_traceparent=Some),
+        // the existing link must not be erased.
+        let original = TraceContextCarrier::from_traceparent(
+            "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+        );
+        let replay = original.into_replay_context();
+        // Call again — should be idempotent, link must survive.
+        let replay2 = replay.into_replay_context();
+        assert!(replay2.traceparent.is_none());
+        assert!(replay2.is_replay);
+        assert_eq!(
+            replay2.link_traceparent.as_deref(),
+            Some("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"),
+            "double-converting a replay carrier must not erase the original link"
+        );
     }
 
     #[test]
