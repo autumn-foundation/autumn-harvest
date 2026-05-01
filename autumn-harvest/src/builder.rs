@@ -183,6 +183,10 @@ pub enum HarvestBuilderError {
         /// Human-readable reason the schedule was rejected.
         reason: String,
     },
+
+    /// A [`WorkerConfig`] field has an invalid value.
+    #[error("invalid worker configuration: {0}")]
+    InvalidWorkerConfig(String),
 }
 
 impl BuiltHarvest {
@@ -451,6 +455,12 @@ impl HarvestBuilder {
         self.retention
             .validate()
             .map_err(HarvestBuilderError::InvalidRetention)?;
+
+        if self.worker_config.worker_heartbeat_interval.is_zero() {
+            return Err(HarvestBuilderError::InvalidWorkerConfig(
+                "worker_heartbeat_interval must be greater than zero".to_string(),
+            ));
+        }
 
         validate_concurrency_keys(&self.activities)?;
         validate_workflow_schedules(&self.workflow_schedules, &self.workflows)?;
@@ -748,6 +758,25 @@ mod tests {
     fn harvest_builder_collects_workflows() {
         let builder = HarvestBuilder::new().workflows(vec![fake_workflow_info()]);
         assert_eq!(builder.workflow_count(), 1);
+    }
+
+    #[test]
+    fn worker_heartbeat_interval_defaults_to_5s() {
+        assert_eq!(
+            WorkerConfig::default().worker_heartbeat_interval,
+            Duration::from_secs(5)
+        );
+    }
+
+    #[test]
+    fn worker_heartbeat_interval_zero_is_rejected() {
+        let result = HarvestBuilder::new()
+            .worker(WorkerConfig::default().with_worker_heartbeat_interval(Duration::ZERO))
+            .try_build();
+        assert!(
+            matches!(result, Err(HarvestBuilderError::InvalidWorkerConfig(_))),
+            "expected InvalidWorkerConfig but got {result:?}"
+        );
     }
 
     #[test]

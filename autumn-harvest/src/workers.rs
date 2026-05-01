@@ -99,10 +99,13 @@ impl WorkerHealth {
     /// `stale_threshold` (typically `2 × heartbeat_interval`).
     #[must_use]
     pub fn classify(last_heartbeat_at: DateTime<Utc>, stale_threshold: Duration) -> Self {
+        // Negative durations arise from clock skew (worker host slightly ahead of
+        // the API host). Treat them as zero elapsed time so a freshly-heartbeating
+        // worker is never misclassified as stale.
         let elapsed = Utc::now()
             .signed_duration_since(last_heartbeat_at)
             .to_std()
-            .unwrap_or(Duration::MAX);
+            .unwrap_or(Duration::ZERO);
         if elapsed > stale_threshold {
             Self::Stale
         } else {
@@ -672,6 +675,18 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn worker_health_healthy_when_timestamp_is_in_future() {
+        // Clock skew: last_heartbeat_at is slightly ahead of "now".
+        // Should be treated as zero elapsed time (Healthy), not Duration::MAX (Stale).
+        let threshold = Duration::from_secs(10);
+        let future = Utc::now() + chrono::Duration::seconds(2);
+        assert_eq!(
+            WorkerHealth::classify(future, threshold),
+            WorkerHealth::Healthy
+        );
     }
 
     #[test]
