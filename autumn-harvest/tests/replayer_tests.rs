@@ -12,7 +12,7 @@ use std::pin::Pin;
 
 use autumn_harvest::context::WorkflowContext;
 use autumn_harvest::event::WorkflowEvent;
-use autumn_harvest::testing::{NonDeterminismKind, ReplayStatus, WorkflowReplayer};
+use autumn_harvest::testing::{HistorySnapshot, NonDeterminismKind, ReplayStatus, WorkflowReplayer};
 use autumn_harvest::types::{ActivityExecId, ExecutionId, TimerId};
 use chrono::Utc;
 use serde_json::Value;
@@ -186,6 +186,19 @@ fn build_replayer() -> WorkflowReplayer {
         .register_fn("timer_first_workflow", timer_first_workflow)
 }
 
+/// Build a snapshot from a (exec_id, events) pair with a given workflow name.
+fn make_snapshot(
+    name: &str,
+    exec_id: ExecutionId,
+    events: Vec<WorkflowEvent>,
+) -> HistorySnapshot {
+    HistorySnapshot {
+        workflow_name: name.to_string(),
+        execution_id: exec_id,
+        events,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // (a) Unchanged workflow against its own history → ReplaySucceeded
 // ---------------------------------------------------------------------------
@@ -196,7 +209,7 @@ async fn replay_unchanged_workflow_succeeds() {
     let replayer = build_replayer();
 
     let report = replayer
-        .replay_from_events("canonical_workflow", exec_id, events)
+        .replay_from_snapshot(make_snapshot("canonical_workflow", exec_id, events))
         .await;
 
     assert!(
@@ -216,7 +229,7 @@ async fn replay_reordered_activities_detects_non_determinism() {
     let replayer = build_replayer();
 
     let report = replayer
-        .replay_from_events("reordered_workflow", exec_id, events)
+        .replay_from_snapshot(make_snapshot("reordered_workflow", exec_id, events))
         .await;
 
     match &report.status {
@@ -243,7 +256,7 @@ async fn replay_version_fenced_workflow_succeeds() {
     let replayer = build_replayer();
 
     let report = replayer
-        .replay_from_events("versioned_workflow_fenced", exec_id, events)
+        .replay_from_snapshot(make_snapshot("versioned_workflow_fenced", exec_id, events))
         .await;
 
     assert!(
@@ -262,7 +275,7 @@ async fn replay_version_unfenced_detects_non_determinism() {
     let replayer = build_replayer();
 
     let report = replayer
-        .replay_from_events("versioned_workflow_unfenced", exec_id, events)
+        .replay_from_snapshot(make_snapshot("versioned_workflow_unfenced", exec_id, events))
         .await;
 
     assert!(
@@ -284,7 +297,7 @@ async fn report_display_is_useful_on_failure() {
     let replayer = build_replayer();
 
     let report = replayer
-        .replay_from_events("reordered_workflow", exec_id, events)
+        .replay_from_snapshot(make_snapshot("reordered_workflow", exec_id, events))
         .await;
 
     let display = format!("{report}");
@@ -363,7 +376,7 @@ async fn replay_unknown_workflow_surfaces_as_failed() {
     let replayer = build_replayer();
 
     let report = replayer
-        .replay_from_events("unknown_workflow", exec_id, events)
+        .replay_from_snapshot(make_snapshot("unknown_workflow", exec_id, events))
         .await;
 
     match &report.status {
@@ -388,7 +401,7 @@ async fn report_fields_are_populated() {
     let replayer = build_replayer();
 
     let report = replayer
-        .replay_from_events("canonical_workflow", exec_id, events)
+        .replay_from_snapshot(make_snapshot("canonical_workflow", exec_id, events))
         .await;
 
     assert_eq!(report.execution_id, exec_id, "execution_id must match");
@@ -427,7 +440,7 @@ async fn replay_activity_history_for_timer_workflow_detects_timer_mismatch() {
 
     let replayer = build_replayer();
     let report = replayer
-        .replay_from_events("timer_first_workflow", exec_id, events)
+        .replay_from_snapshot(make_snapshot("timer_first_workflow", exec_id, events))
         .await;
 
     assert!(
@@ -453,7 +466,7 @@ async fn non_determinism_report_includes_expected_actual() {
     let replayer = build_replayer();
 
     let report = replayer
-        .replay_from_events("reordered_workflow", exec_id, events)
+        .replay_from_snapshot(make_snapshot("reordered_workflow", exec_id, events))
         .await;
 
     match &report.status {
@@ -468,18 +481,80 @@ async fn non_determinism_report_includes_expected_actual() {
 }
 
 // ---------------------------------------------------------------------------
+// Activity input mismatch is detected (strict replay mode)
+// ---------------------------------------------------------------------------
+
+/// Workflow that calls step_one with a NON-NULL input that won't match history.
+fn changed_input_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        // History records step_one with input=null but this code now passes 42.
+        ctx.execute_activity_raw("step_one", serde_json::json!(42), "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(Value::Null)
+    })
+}
+
+#[tokio::test]
+async fn replay_activity_with_changed_input_detects_non_determinism() {
+    // Build a history where step_one was called with input=null.
+    let exec_id = ExecutionId::new();
+    let id1 = ActivityExecId::new();
+    let events = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: id1,
+            name: "step_one".into(),
+            input: Value::Null, // recorded input was null
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: id1,
+            output: serde_json::json!("ok"),
+        },
+    ];
+
+    // Replay with a workflow that passes 42 — strict mode should catch the mismatch.
+    let replayer = WorkflowReplayer::new().register_fn("changed", changed_input_workflow);
+    let report = replayer
+        .replay_from_snapshot(HistorySnapshot {
+            workflow_name: "changed".to_string(),
+            execution_id: exec_id,
+            events,
+        })
+        .await;
+
+    assert!(
+        matches!(
+            report.status,
+            ReplayStatus::NonDeterminismDetected {
+                kind: NonDeterminismKind::ActivityScheduleMismatch,
+                ..
+            }
+        ),
+        "changed input must produce ActivityScheduleMismatch, got: {:?}",
+        report.status
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Replayer is usable as a static helper in CI (one-liner pattern)
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn one_liner_ci_pattern_compiles_and_runs() {
-    let (exec_id, events) = canonical_history();
+    let (_exec_id, events) = canonical_history();
 
-    // This is the pattern shown in README docs:
-    // Build replayer, replay, assert.
+    // This is the pattern shown in README docs — single handler, bare events list.
     let report = WorkflowReplayer::new()
         .register_fn("canonical_workflow", canonical_workflow)
-        .replay_from_events("canonical_workflow", exec_id, events)
+        .replay_from_events(events)
         .await;
 
     assert!(

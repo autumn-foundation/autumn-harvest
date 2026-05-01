@@ -14,7 +14,6 @@ use autumn_harvest::context::WorkflowContext;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::testing::WorkflowReplayer;
 use autumn_harvest::types::{ActivityExecId, ExecutionId};
-use chrono::Utc;
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use serde_json::Value;
 
@@ -71,10 +70,8 @@ fn bench_replay_10k(c: &mut Criterion) {
     c.bench_function("replay_10k_events", |b| {
         b.iter_batched(
             || build_history(5_000), // 5_000 activities = 10_001 events
-            |(exec_id, events)| {
-                rt.block_on(
-                    replayer.replay_from_events("sequential", exec_id, events),
-                )
+            |(_exec_id, events)| {
+                rt.block_on(replayer.replay_from_events(events))
             },
             BatchSize::SmallInput,
         );
@@ -88,10 +85,8 @@ fn bench_replay_1k(c: &mut Criterion) {
     c.bench_function("replay_1k_events", |b| {
         b.iter_batched(
             || build_history(500), // 500 activities = 1_001 events
-            |(exec_id, events)| {
-                rt.block_on(
-                    replayer.replay_from_events("sequential", exec_id, events),
-                )
+            |(_exec_id, events)| {
+                rt.block_on(replayer.replay_from_events(events))
             },
             BatchSize::SmallInput,
         );

@@ -313,6 +313,10 @@ pub struct WorkflowContext {
     /// yields [`HarvestError::Cancelled`]. Cooperative: the workflow function is
     /// expected to consult these at strategic points to run cleanup logic.
     cancellation_reason: Option<String>,
+    /// When `true`, activity and local-activity dispatch compares the input
+    /// payload against what was recorded in history, in addition to the name.
+    /// Set by the `WorkflowReplayer` to detect non-deterministic input changes.
+    strict_replay: bool,
 }
 
 impl WorkflowContext {
@@ -383,7 +387,24 @@ impl WorkflowContext {
             state,
             query_registry: Mutex::new(QueryRegistry::new()),
             cancellation_reason,
+            strict_replay: false,
         }
+    }
+
+    /// Create a strict replay context that also verifies activity input payloads.
+    ///
+    /// Identical to [`for_replay`](Self::for_replay) except that
+    /// `execute_activity_raw` and `execute_local_activity_raw` additionally
+    /// compare the input value against the recorded `ActivityScheduled` event,
+    /// returning [`HarvestError::NonDeterministic`] on any mismatch.
+    ///
+    /// Used by [`WorkflowReplayer`](crate::testing::WorkflowReplayer) to catch
+    /// non-deterministic changes to activity inputs before deployment.
+    #[must_use]
+    pub fn for_replay_strict(exec_id: ExecutionId, events: Vec<WorkflowEvent>) -> Self {
+        let mut ctx = Self::for_replay(exec_id, events);
+        ctx.strict_replay = true;
+        ctx
     }
 
     /// Test constructor -- creates a context in live (non-replay) mode with
@@ -402,6 +423,7 @@ impl WorkflowContext {
             state: empty_shared_state(),
             query_registry: Mutex::new(QueryRegistry::new()),
             cancellation_reason: None,
+            strict_replay: false,
         }
     }
 
@@ -718,7 +740,11 @@ impl WorkflowContext {
         queue: &str,
     ) -> HarvestResult<Value> {
         // Step 1: Match against history (lock is dropped before any .await).
-        let history_match = self.match_history(|m| m.match_activity(name));
+        let history_match = if self.strict_replay {
+            self.match_history(|m| m.match_activity_strict(name, &input))
+        } else {
+            self.match_history(|m| m.match_activity(name))
+        };
 
         match history_match {
             HistoryMatch::Matched { output } => Ok(output),
@@ -804,7 +830,11 @@ impl WorkflowContext {
         retry_policy: Option<crate::policy::RetryPolicy>,
         start_to_close_secs: Option<u64>,
     ) -> HarvestResult<Value> {
-        let history_match = self.match_history(|m| m.match_local_activity(name));
+        let history_match = if self.strict_replay {
+            self.match_history(|m| m.match_local_activity_strict(name, &input))
+        } else {
+            self.match_history(|m| m.match_local_activity(name))
+        };
 
         match history_match {
             HistoryMatch::Matched { output } => Ok(output),

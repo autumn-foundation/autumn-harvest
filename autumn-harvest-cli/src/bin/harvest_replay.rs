@@ -124,9 +124,7 @@ async fn run_json_replay(replayer: &WorkflowReplayer, args: &Args) -> Result<(),
         let mut snapshot: HistorySnapshot = serde_json::from_str(&json)
             .map_err(|e| format!("failed to parse history JSON: {e}"))?;
         snapshot.workflow_name = name.clone();
-        replayer
-            .replay_from_events(&snapshot.workflow_name, snapshot.execution_id, snapshot.events)
-            .await
+        replayer.replay_from_snapshot(snapshot).await
     } else {
         replayer
             .replay_from_json(&json)

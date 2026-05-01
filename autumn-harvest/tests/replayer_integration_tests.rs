@@ -1,0 +1,280 @@
+#![cfg(all(feature = "db", feature = "testing"))]
+
+//! Real-Postgres integration tests for [`WorkflowReplayer::replay_from_db`].
+//!
+//! Spins up a throwaway Postgres container per test (via testcontainers),
+//! inserts a workflow execution row and its event history directly, then
+//! replays using `replay_from_db` and asserts the outcome.
+//!
+//! Run with:
+//!   cargo test -p autumn-harvest --features testing --test replayer_integration_tests
+
+use std::future::Future;
+use std::pin::Pin;
+
+use autumn_harvest::context::WorkflowContext;
+use autumn_harvest::event::WorkflowEvent;
+use autumn_harvest::models::NewWorkflowExecution;
+use autumn_harvest::schema::harvest_workflow_executions;
+use autumn_harvest::store;
+use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
+use autumn_harvest::types::{ActivityExecId, ExecutionId, TimerId};
+use chrono::Utc;
+use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use serde_json::Value;
+use testcontainers::ContainerAsync;
+use testcontainers_modules::postgres::Postgres;
+use testcontainers_modules::testcontainers::runners::AsyncRunner;
+use uuid::Uuid;
+
+// ---------------------------------------------------------------------------
+// Migration SQL (same set as integration_e2e.rs)
+// ---------------------------------------------------------------------------
+
+const INIT_SQL: &str = concat!(
+    include_str!("../migrations/20260409000000_harvest_initial/up.sql"),
+    "\n",
+    include_str!("../migrations/20260424000001_harvest_trace_context/up.sql"),
+    "\n",
+    include_str!("../migrations/20260427000000_harvest_continue_as_new/up.sql"),
+    "\n",
+    include_str!("../migrations/20260429000000_harvest_concurrency_key/up.sql"),
+    "\n",
+    include_str!("../migrations/20260430000000_harvest_workflow_schedules/up.sql"),
+    "\n",
+    include_str!("../migrations/20260430000001_harvest_external_tasks/up.sql"),
+);
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+async fn setup_test_db() -> (AsyncPgConnection, ContainerAsync<Postgres>) {
+    let container = Postgres::default()
+        .with_init_sql(INIT_SQL.to_string().into_bytes())
+        .start()
+        .await
+        .expect("failed to start Postgres container");
+
+    let host = container
+        .get_host()
+        .await
+        .expect("failed to get container host");
+    let port = container
+        .get_host_port_ipv4(5432)
+        .await
+        .expect("failed to get container port");
+    let database_url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+
+    let conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect to Postgres container");
+
+    (conn, container)
+}
+
+/// Insert a minimal workflow execution row so `replay_from_db` can look up the name.
+async fn insert_execution(conn: &mut AsyncPgConnection, exec_id: ExecutionId, name: &str) {
+    let row = NewWorkflowExecution {
+        id: exec_id.as_uuid(),
+        workflow_name: name,
+        workflow_id: "test-wf",
+        run_id: Uuid::new_v4(),
+        shard_id: 0,
+        input: Value::Null,
+        parent_id: None,
+        queue_name: "default",
+        execution_timeout: None,
+        memo: None,
+        search_attrs: None,
+    };
+    diesel::insert_into(harvest_workflow_executions::table)
+        .values(&row)
+        .execute(conn)
+        .await
+        .expect("failed to insert workflow execution");
+}
+
+// ---------------------------------------------------------------------------
+// Workflow handler functions
+// ---------------------------------------------------------------------------
+
+fn canonical_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        ctx.execute_activity_raw("step_one", Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        ctx.execute_activity_raw("step_two", Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        ctx.timer("cooldown", 60)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(Value::Null)
+    })
+}
+
+fn reordered_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        // Activities in reverse order — diverges from canonical history.
+        ctx.execute_activity_raw("step_two", Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        ctx.execute_activity_raw("step_one", Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        ctx.timer("cooldown", 60)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(Value::Null)
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Build a canonical event history and persist it to the DB.
+// ---------------------------------------------------------------------------
+
+async fn persist_canonical_history(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> Vec<WorkflowEvent> {
+    let id1 = ActivityExecId::new();
+    let id2 = ActivityExecId::new();
+    let timer_id = TimerId::new("cooldown");
+
+    let events = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: id1,
+            name: "step_one".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: id1,
+            output: Value::Null,
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: id2,
+            name: "step_two".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: id2,
+            output: Value::Null,
+        },
+        WorkflowEvent::TimerStarted {
+            timer_id: timer_id.clone(),
+            duration_secs: 60,
+        },
+        WorkflowEvent::TimerFired { timer_id },
+    ];
+
+    store::append_events(conn, exec_id, &events, 0)
+        .await
+        .expect("failed to append events");
+
+    events
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+/// (a) Unchanged workflow replays its own real DB history → ReplaySucceeded.
+#[tokio::test]
+async fn replay_from_db_unchanged_workflow_succeeds() {
+    let (mut conn, _container) = setup_test_db().await;
+    let exec_id = ExecutionId::new();
+
+    insert_execution(&mut conn, exec_id, "canonical_workflow").await;
+    persist_canonical_history(&mut conn, exec_id).await;
+
+    let replayer = WorkflowReplayer::new().register_fn("canonical_workflow", canonical_workflow);
+
+    let report = replayer
+        .replay_from_db(&mut conn, exec_id)
+        .await
+        .expect("replay_from_db must not return a DB error");
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "unchanged workflow against real DB history must succeed: {report}"
+    );
+    assert!(
+        report.events_replayed > 0,
+        "events_replayed must be > 0 when DB history exists"
+    );
+}
+
+/// (b) Reordered activities against real DB history → NonDeterminismDetected.
+#[tokio::test]
+async fn replay_from_db_detects_non_determinism() {
+    let (mut conn, _container) = setup_test_db().await;
+    let exec_id = ExecutionId::new();
+
+    insert_execution(&mut conn, exec_id, "reordered_workflow").await;
+    persist_canonical_history(&mut conn, exec_id).await;
+
+    // Register the reordered handler under the name stored in the DB row.
+    let replayer = WorkflowReplayer::new().register_fn("reordered_workflow", reordered_workflow);
+
+    let report = replayer
+        .replay_from_db(&mut conn, exec_id)
+        .await
+        .expect("replay_from_db must not return a DB error");
+
+    assert!(
+        matches!(report.status, ReplayStatus::NonDeterminismDetected { .. }),
+        "reordered workflow against real DB history must detect non-determinism: {report}"
+    );
+}
+
+/// (c) `replay_from_db` fails gracefully when the execution ID doesn't exist.
+#[tokio::test]
+async fn replay_from_db_unknown_exec_id_returns_error() {
+    let (mut conn, _container) = setup_test_db().await;
+    let unknown_exec_id = ExecutionId::new();
+
+    let replayer = WorkflowReplayer::new().register_fn("canonical_workflow", canonical_workflow);
+
+    let result = replayer.replay_from_db(&mut conn, unknown_exec_id).await;
+
+    assert!(
+        result.is_err(),
+        "replay_from_db on a nonexistent exec_id must return Err"
+    );
+}
+
+/// (d) Correct handler registered but with mismatched DB workflow name → WorkflowFailed.
+#[tokio::test]
+async fn replay_from_db_unregistered_handler_surfaces_as_workflow_failed() {
+    let (mut conn, _container) = setup_test_db().await;
+    let exec_id = ExecutionId::new();
+
+    // DB row says "other_workflow" but the replayer only knows "canonical_workflow".
+    insert_execution(&mut conn, exec_id, "other_workflow").await;
+    persist_canonical_history(&mut conn, exec_id).await;
+
+    let replayer = WorkflowReplayer::new().register_fn("canonical_workflow", canonical_workflow);
+
+    let report = replayer
+        .replay_from_db(&mut conn, exec_id)
+        .await
+        .expect("replay_from_db must not return a DB error on lookup failure");
+
+    assert!(
+        matches!(report.status, ReplayStatus::WorkflowFailed { .. }),
+        "unregistered handler name must surface as WorkflowFailed: {report}"
+    );
+}

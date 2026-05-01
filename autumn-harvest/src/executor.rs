@@ -75,6 +75,49 @@ pub async fn run_workflow(
     run_workflow_with_state(exec_id, history, handler, input, empty_shared_state()).await
 }
 
+/// Like [`run_workflow`] but runs in strict replay mode.
+///
+/// Uses [`WorkflowContext::for_replay_strict`] so that activity and local-activity
+/// dispatch additionally compare input payloads against the recorded history,
+/// returning a non-determinism error on any mismatch.  This is used by
+/// [`WorkflowReplayer`](crate::testing::WorkflowReplayer) to catch
+/// input-changing code changes before deployment.
+pub async fn run_workflow_strict(
+    exec_id: ExecutionId,
+    history: Vec<WorkflowEvent>,
+    handler: WorkflowHandlerFn,
+    input: Value,
+) -> WorkflowOutcome {
+    let ctx = WorkflowContext::for_replay_strict(exec_id, history);
+
+    let span = tracing::info_span!(
+        "harvest.workflow.run_strict",
+        "otel.kind" = "internal",
+        workflow.execution_id = %exec_id,
+    );
+
+    async {
+        let timeout_result = tokio::time::timeout(SUSPENSION_TIMEOUT, handler(&ctx, input)).await;
+        match timeout_result {
+            Ok(Ok(output)) => WorkflowOutcome::Completed { output },
+            Ok(Err(error)) => WorkflowOutcome::Failed { error },
+            Err(_elapsed) => {
+                let mut commands = ctx.drain_commands();
+                if let Some(idx) = commands
+                    .iter()
+                    .rposition(|cmd| matches!(cmd, WorkflowCommand::ContinueAsNew { .. }))
+                    && let WorkflowCommand::ContinueAsNew { input } = commands.swap_remove(idx)
+                {
+                    return WorkflowOutcome::ContinuedAsNew { input };
+                }
+                WorkflowOutcome::Suspended { commands }
+            }
+        }
+    }
+    .instrument(span)
+    .await
+}
+
 /// Run a workflow function through replay and live execution with shared state.
 pub async fn run_workflow_with_state(
     exec_id: ExecutionId,

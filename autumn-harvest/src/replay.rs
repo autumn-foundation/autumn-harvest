@@ -319,6 +319,131 @@ impl HistoryMatcher {
         HistoryMatch::NoMatch
     }
 
+    /// Like [`match_activity`](Self::match_activity) but also verifies the input payload.
+    ///
+    /// Used by the [`WorkflowReplayer`](crate::testing::WorkflowReplayer) to detect
+    /// non-determinism caused by changing an activity's input arguments across deployments.
+    #[allow(clippy::too_many_lines)]
+    pub fn match_activity_strict(&mut self, activity_name: &str, input: &Value) -> HistoryMatch {
+        if !self.prepare_match() {
+            return HistoryMatch::NoMatch;
+        }
+
+        // Extract fields as owned values so the immutable borrow ends before cursor mutation.
+        let result = match &self.events[self.cursor] {
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: recorded_name,
+                input: recorded_input,
+                ..
+            } => {
+                if recorded_name != activity_name {
+                    return HistoryMatch::Diverged {
+                        expected: format!("ActivityScheduled({activity_name})"),
+                        actual: format!("ActivityScheduled({recorded_name})"),
+                    };
+                }
+                if recorded_input != input {
+                    return HistoryMatch::Diverged {
+                        expected: format!(
+                            "ActivityScheduled({activity_name}, input={recorded_input})"
+                        ),
+                        actual: format!(
+                            "ActivityScheduled({activity_name}, input={input})"
+                        ),
+                    };
+                }
+                Ok(*activity_id)
+            }
+            other => Err(HistoryMatch::Diverged {
+                expected: format!("ActivityScheduled({activity_name})"),
+                actual: other.type_name().to_string(),
+            }),
+        };
+        let activity_id = match result {
+            Ok(id) => id,
+            Err(diverged) => return diverged,
+        };
+
+        self.cursor += 1;
+        let mut scan_cursor = self.cursor;
+        let mut first_interleaved_child_start = None;
+
+        while scan_cursor < self.events.len() {
+            if self.is_consumed(scan_cursor) {
+                scan_cursor += 1;
+                continue;
+            }
+            match &self.events[scan_cursor] {
+                WorkflowEvent::ActivityCompleted {
+                    activity_id: id,
+                    output,
+                } if *id == activity_id => {
+                    let result = HistoryMatch::Matched {
+                        output: output.clone(),
+                    };
+                    return self.settle_terminal(
+                        scan_cursor,
+                        first_interleaved_child_start,
+                        result,
+                    );
+                }
+                WorkflowEvent::ActivityFailed {
+                    activity_id: id,
+                    error,
+                    attempt,
+                } if *id == activity_id => {
+                    let result = HistoryMatch::Failed {
+                        error: error.clone(),
+                        attempt: *attempt,
+                    };
+                    return self.settle_terminal(
+                        scan_cursor,
+                        first_interleaved_child_start,
+                        result,
+                    );
+                }
+                WorkflowEvent::ActivityTimedOut {
+                    activity_id: id,
+                    timeout_type,
+                } if *id == activity_id => {
+                    let result = HistoryMatch::TimedOut {
+                        timeout_type: timeout_type.clone(),
+                    };
+                    return self.settle_terminal(
+                        scan_cursor,
+                        first_interleaved_child_start,
+                        result,
+                    );
+                }
+                WorkflowEvent::ActivityHeartbeat {
+                    activity_id: id, ..
+                }
+                | WorkflowEvent::ActivityStarted {
+                    activity_id: id, ..
+                } if *id == activity_id => {
+                    scan_cursor += 1;
+                }
+                WorkflowEvent::ChildWorkflowStarted { .. } => {
+                    first_interleaved_child_start.get_or_insert(scan_cursor);
+                    scan_cursor += 1;
+                }
+                WorkflowEvent::SignalReceived {
+                    signal_name,
+                    payload,
+                } => {
+                    let signal_name = signal_name.clone();
+                    let payload = payload.clone();
+                    self.stash_signal(scan_cursor, signal_name, payload);
+                    scan_cursor += 1;
+                }
+                _ => break,
+            }
+        }
+
+        HistoryMatch::NoMatch
+    }
+
     /// Match an `execute_activity_external` command against history.
     ///
     /// Expects `ActivityAwaitingExternal { name }` at the current cursor, then
@@ -808,6 +933,104 @@ impl HistoryMatcher {
         }
 
         // LocalActivityScheduled found but no terminal event yet — incomplete history.
+        HistoryMatch::NoMatch
+    }
+
+    /// Like [`match_local_activity`](Self::match_local_activity) but also verifies the input payload.
+    ///
+    /// Used by the [`WorkflowReplayer`](crate::testing::WorkflowReplayer) in strict replay mode.
+    pub fn match_local_activity_strict(
+        &mut self,
+        activity_name: &str,
+        input: &Value,
+    ) -> HistoryMatch {
+        if !self.prepare_match() {
+            return HistoryMatch::NoMatch;
+        }
+
+        let result = match &self.events[self.cursor] {
+            WorkflowEvent::LocalActivityScheduled {
+                activity_id,
+                name: recorded_name,
+                input: recorded_input,
+            } => {
+                if recorded_name != activity_name {
+                    return HistoryMatch::Diverged {
+                        expected: format!("LocalActivityScheduled({activity_name})"),
+                        actual: format!("LocalActivityScheduled({recorded_name})"),
+                    };
+                }
+                if recorded_input != input {
+                    return HistoryMatch::Diverged {
+                        expected: format!(
+                            "LocalActivityScheduled({activity_name}, input={recorded_input})"
+                        ),
+                        actual: format!(
+                            "LocalActivityScheduled({activity_name}, input={input})"
+                        ),
+                    };
+                }
+                Ok(*activity_id)
+            }
+            other => Err(HistoryMatch::Diverged {
+                expected: format!("LocalActivityScheduled({activity_name})"),
+                actual: other.type_name().to_string(),
+            }),
+        };
+        let activity_id = match result {
+            Ok(id) => id,
+            Err(diverged) => return diverged,
+        };
+
+        self.cursor += 1;
+        let mut scan_cursor = self.cursor;
+        let mut last_failure: Option<HistoryMatch> = None;
+
+        while scan_cursor < self.events.len() {
+            if self.is_consumed(scan_cursor) {
+                scan_cursor += 1;
+                continue;
+            }
+            match &self.events[scan_cursor] {
+                WorkflowEvent::LocalActivityCompleted {
+                    activity_id: id,
+                    output,
+                } if *id == activity_id => {
+                    let output = output.clone();
+                    self.cursor = scan_cursor + 1;
+                    self.advance_to_next_unconsumed_event();
+                    return HistoryMatch::Matched { output };
+                }
+                WorkflowEvent::LocalActivityFailed {
+                    activity_id: id,
+                    error,
+                    attempt,
+                } if *id == activity_id => {
+                    last_failure = Some(HistoryMatch::Failed {
+                        error: error.clone(),
+                        attempt: *attempt,
+                    });
+                    scan_cursor += 1;
+                }
+                WorkflowEvent::SignalReceived {
+                    signal_name,
+                    payload,
+                } => {
+                    let signal_name = signal_name.clone();
+                    let payload = payload.clone();
+                    self.stash_signal(scan_cursor, signal_name, payload);
+                    scan_cursor += 1;
+                }
+                _ => break,
+            }
+        }
+
+        if let Some(failure) = last_failure {
+            self.cursor = scan_cursor;
+            self.advance_to_next_unconsumed_event();
+            return failure;
+        }
+
         HistoryMatch::NoMatch
     }
 

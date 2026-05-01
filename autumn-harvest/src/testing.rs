@@ -19,7 +19,6 @@
 //!
 //! ```rust,no_run
 //! # use autumn_harvest::testing::{WorkflowReplayer, ReplayStatus};
-//! # use autumn_harvest::types::ExecutionId;
 //! # use autumn_harvest::event::WorkflowEvent;
 //! # use autumn_harvest::context::WorkflowContext;
 //! # use serde_json::Value;
@@ -28,11 +27,10 @@
 //! #   -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>>
 //! # { Box::pin(async move { Ok(input) }) }
 //! # async fn example() {
-//! # let exec_id = ExecutionId::new();
 //! # let history: Vec<WorkflowEvent> = vec![];
 //! let report = WorkflowReplayer::new()
 //!     .register_fn("my_workflow", my_workflow)
-//!     .replay_from_events("my_workflow", exec_id, history)
+//!     .replay_from_events(history)
 //!     .await;
 //!
 //! assert!(
@@ -47,7 +45,7 @@ use std::collections::HashMap;
 use serde_json::Value;
 
 use crate::event::WorkflowEvent;
-use crate::executor::{WorkflowOutcome, run_workflow};
+use crate::executor::{WorkflowOutcome, run_workflow_strict};
 use crate::info::{WorkflowHandlerFn, WorkflowInfo};
 use crate::types::ExecutionId;
 
@@ -275,33 +273,110 @@ impl WorkflowReplayer {
         self
     }
 
-    /// Replay a recorded history against the named workflow handler.
+    /// Replay a recorded [`HistorySnapshot`] against the handler registered
+    /// for `snapshot.workflow_name`.
     ///
-    /// Returns a [`ReplayReport`] regardless of outcome.  If `workflow_name`
-    /// is not registered, the report contains
+    /// This is the primary routing method used internally by
+    /// [`replay_from_json`](Self::replay_from_json) and
+    /// [`replay_from_db`](Self::replay_from_db).  Prefer those for most use
+    /// cases; call `replay_from_snapshot` directly when you need to override
+    /// the workflow name after constructing the snapshot (e.g. the
+    /// `--workflow` flag in `harvest-replay`).
+    ///
+    /// Returns a [`ReplayReport`] regardless of outcome.  If
+    /// `snapshot.workflow_name` is not registered, the report contains
     /// `ReplayStatus::WorkflowFailed` with a descriptive error.
-    pub async fn replay_from_events(
-        &self,
-        workflow_name: &str,
-        exec_id: ExecutionId,
-        events: Vec<WorkflowEvent>,
-    ) -> ReplayReport {
-        let Some(&handler) = self.handlers.get(workflow_name) else {
+    pub async fn replay_from_snapshot(&self, snapshot: HistorySnapshot) -> ReplayReport {
+        let Some(&handler) = self.handlers.get(&snapshot.workflow_name) else {
             return ReplayReport {
-                execution_id: exec_id,
+                execution_id: snapshot.execution_id,
                 events_replayed: 0,
                 status: ReplayStatus::WorkflowFailed {
-                    error: format!("workflow '{workflow_name}' not registered in this replayer"),
+                    error: format!(
+                        "workflow '{}' not registered in this replayer",
+                        snapshot.workflow_name
+                    ),
                     event_index: 0,
                 },
                 mismatched_command_summary: None,
             };
         };
 
+        let exec_id = snapshot.execution_id;
+        let total_events = snapshot.events.len();
+        let input = extract_input(&snapshot.events);
+
+        let outcome = run_workflow_strict(exec_id, snapshot.events.clone(), handler, input).await;
+        outcome_to_report(exec_id, total_events, &snapshot.events, outcome)
+    }
+
+    /// Replay a raw event list against the **single** registered handler.
+    ///
+    /// This is the most concise API when the replayer has exactly one handler:
+    ///
+    /// ```rust,no_run
+    /// # use autumn_harvest::testing::{WorkflowReplayer, ReplayStatus};
+    /// # use autumn_harvest::event::WorkflowEvent;
+    /// # use autumn_harvest::context::WorkflowContext;
+    /// # use serde_json::Value;
+    /// # use std::pin::Pin;
+    /// # fn my_workflow<'a>(ctx: &'a WorkflowContext, input: Value)
+    /// #   -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>>
+    /// # { Box::pin(async move { Ok(input) }) }
+    /// # async fn example() {
+    /// # let history: Vec<WorkflowEvent> = vec![];
+    /// let report = WorkflowReplayer::new()
+    ///     .register_fn("my_workflow", my_workflow)
+    ///     .replay_from_events(history)
+    ///     .await;
+    ///
+    /// assert!(
+    ///     matches!(report.status, ReplayStatus::ReplaySucceeded),
+    ///     "replay regression detected:\n{report}"
+    /// );
+    /// # }
+    /// ```
+    ///
+    /// Returns `ReplayStatus::WorkflowFailed` when zero or more than one
+    /// handler is registered — use [`replay_from_snapshot`](Self::replay_from_snapshot)
+    /// or [`replay_from_json`](Self::replay_from_json) to route to a named
+    /// handler when multiple are registered.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal `HashMap::iter().next().unwrap()` is reached on
+    /// an empty map — this is unreachable because the empty-map case returns
+    /// early with `WorkflowFailed` before that line.
+    pub async fn replay_from_events(&self, events: Vec<WorkflowEvent>) -> ReplayReport {
+        if self.handlers.len() != 1 {
+            let exec_id = ExecutionId::new();
+            let error = if self.handlers.is_empty() {
+                "no workflow handlers registered; call register_fn() before replay_from_events()"
+                    .to_string()
+            } else {
+                format!(
+                    "replay_from_events() requires exactly one registered handler, but {} are \
+                     registered; use replay_from_snapshot() or replay_from_json() to route by name",
+                    self.handlers.len()
+                )
+            };
+            return ReplayReport {
+                execution_id: exec_id,
+                events_replayed: 0,
+                status: ReplayStatus::WorkflowFailed {
+                    error,
+                    event_index: 0,
+                },
+                mismatched_command_summary: None,
+            };
+        }
+
+        let (_, &handler) = self.handlers.iter().next().unwrap();
+        let exec_id = ExecutionId::new();
         let total_events = events.len();
         let input = extract_input(&events);
 
-        let outcome = run_workflow(exec_id, events.clone(), handler, input).await;
+        let outcome = run_workflow_strict(exec_id, events.clone(), handler, input).await;
         outcome_to_report(exec_id, total_events, &events, outcome)
     }
 
@@ -319,9 +394,7 @@ impl WorkflowReplayer {
         json: &str,
     ) -> Result<ReplayReport, serde_json::Error> {
         let snapshot: HistorySnapshot = serde_json::from_str(json)?;
-        Ok(self
-            .replay_from_events(&snapshot.workflow_name, snapshot.execution_id, snapshot.events)
-            .await)
+        Ok(self.replay_from_snapshot(snapshot).await)
     }
 
     /// Replay a workflow execution directly from the Postgres event store.
@@ -348,9 +421,12 @@ impl WorkflowReplayer {
         // Load workflow name from executions table.
         let workflow_name = load_workflow_name(conn, exec_id).await?;
 
-        Ok(self
-            .replay_from_events(&workflow_name, exec_id, history.events)
-            .await)
+        let snapshot = HistorySnapshot {
+            workflow_name,
+            execution_id: exec_id,
+            events: history.events,
+        };
+        Ok(self.replay_from_snapshot(snapshot).await)
     }
 }
 
@@ -557,21 +633,20 @@ mod tests {
 
     #[tokio::test]
     async fn simple_replay_succeeds() {
-        let exec_id = ExecutionId::new();
         let events = vec![WorkflowEvent::WorkflowStarted {
             input: serde_json::json!("hi"),
             timestamp: Utc::now(),
         }];
         let replayer = WorkflowReplayer::new().register_fn("simple", simple_workflow);
-        let report = replayer.replay_from_events("simple", exec_id, events).await;
+        let report = replayer.replay_from_events(events).await;
         assert!(matches!(report.status, ReplayStatus::ReplaySucceeded));
     }
 
     #[tokio::test]
     async fn activity_replay_succeeds() {
-        let (exec_id, events) = activity_events();
+        let (_exec_id, events) = activity_events();
         let replayer = WorkflowReplayer::new().register_fn("activity", activity_workflow);
-        let report = replayer.replay_from_events("activity", exec_id, events).await;
+        let report = replayer.replay_from_events(events).await;
         assert!(matches!(report.status, ReplayStatus::ReplaySucceeded));
     }
 
@@ -589,9 +664,9 @@ mod tests {
             })
         }
 
-        let (exec_id, events) = activity_events();
+        let (_exec_id, events) = activity_events();
         let replayer = WorkflowReplayer::new().register_fn("wrong", wrong_activity);
-        let report = replayer.replay_from_events("wrong", exec_id, events).await;
+        let report = replayer.replay_from_events(events).await;
         assert!(matches!(
             report.status,
             ReplayStatus::NonDeterminismDetected {
