@@ -25,6 +25,69 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
+// Span attribute name constants
+// Defined by docs/adr/0001-otel-trace-contract.md
+// ---------------------------------------------------------------------------
+
+/// OpenTelemetry span attribute: the logical workflow name (e.g. `"onboarding"`).
+pub const ATTR_WORKFLOW_ID: &str = "harvest.workflow.id";
+
+/// OpenTelemetry span attribute: the unique execution UUID.
+pub const ATTR_EXECUTION_ID: &str = "harvest.execution.id";
+
+/// OpenTelemetry span attribute: the shard number that owns this execution.
+pub const ATTR_SHARD_ID: &str = "harvest.shard.id";
+
+/// OpenTelemetry span attribute: the activity function name (e.g. `"send_email"`).
+pub const ATTR_ACTIVITY_NAME: &str = "harvest.activity.name";
+
+/// OpenTelemetry span attribute: the 1-based attempt number for this activity invocation.
+pub const ATTR_ATTEMPT: &str = "harvest.attempt";
+
+/// OpenTelemetry span attribute: the task queue name the work item was pulled from.
+pub const ATTR_QUEUE: &str = "harvest.queue";
+
+/// OpenTelemetry span attribute for replay-mode spans.
+///
+/// Set to `true` when the span is emitted during deterministic replay rather
+/// than live execution. Consumers must treat such spans as reconstructed
+/// history, not live causality.
+pub const ATTR_REPLAY: &str = "harvest.replay";
+
+// ---------------------------------------------------------------------------
+// Metric name constants
+// Defined by docs/adr/0001-otel-trace-contract.md — OpenTelemetry semantic
+// naming: `harvest.<noun>.<instrument>` in dot-notation.
+// ---------------------------------------------------------------------------
+
+/// Counter: incremented once when a worker starts executing a workflow task.
+pub const METRIC_WORKFLOW_STARTED: &str = "harvest.workflow.started";
+
+/// Histogram: wall-clock seconds a workflow executor cycle took.
+pub const METRIC_WORKFLOW_DURATION: &str = "harvest.workflow.duration";
+
+/// Histogram: wall-clock seconds an activity invocation took (success or failure).
+pub const METRIC_ACTIVITY_DURATION: &str = "harvest.activity.duration";
+
+/// Counter: incremented when a durable timer is persisted.
+pub const METRIC_TIMER_STARTED: &str = "harvest.timer.started";
+
+/// Gauge: current number of pending (unclaimed) tasks in a queue.
+pub const METRIC_QUEUE_DEPTH: &str = "harvest.queue.depth";
+
+/// Gauge: current number of entries in the dead letter queue.
+pub const METRIC_DLQ_ENTRIES: &str = "harvest.dlq.entries";
+
+/// Counter: incremented each time a scheduled run is dispatched.
+pub const METRIC_SCHEDULE_RUNS: &str = "harvest.schedule.runs";
+
+/// Counter: incremented each time a scheduled run is skipped.
+pub const METRIC_SCHEDULE_SKIPPED: &str = "harvest.schedule.skipped";
+
+/// Counter: number of rows deleted by the retention janitor in one tick.
+pub const METRIC_RETENTION_DELETED: &str = "harvest.retention.deleted";
+
+// ---------------------------------------------------------------------------
 // TraceContextCarrier
 // ---------------------------------------------------------------------------
 
@@ -35,16 +98,41 @@ use serde::{Deserialize, Serialize};
 /// `traceparent` (required to join a trace) and `tracestate` (optional
 /// vendor-specific extensions). Storing them as JSONB keeps the schema
 /// flexible if the spec gains additional headers.
+///
+/// The two extra fields (`is_replay`, `link_traceparent`) implement the replay
+/// semantics defined in `docs/adr/0001-otel-trace-contract.md`: replay spans
+/// must NOT inherit the original trace as a parent (it may have long expired),
+/// but they SHOULD carry the original `traceparent` as an OpenTelemetry span
+/// *link* so operators can navigate from a replay span to the original trace
+/// in their APM tool.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TraceContextCarrier {
-    /// The W3C `traceparent` header, e.g.
-    /// `00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01`.
+    /// The W3C `traceparent` header for the *parent* span.
+    ///
+    /// During replay this field is `None` — the replay span roots itself and
+    /// links to [`link_traceparent`] instead.
+    ///
+    /// [`link_traceparent`]: TraceContextCarrier::link_traceparent
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub traceparent: Option<String>,
 
     /// The optional W3C `tracestate` header.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tracestate: Option<String>,
+
+    /// When `true`, the worker must emit the span with attribute
+    /// `harvest.replay = true` and must NOT restore `traceparent` as the
+    /// parent context. Instead, it should create a new root span and attach a
+    /// span *link* pointing at [`link_traceparent`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_replay: bool,
+
+    /// The original `traceparent` preserved for use as a span *link*.
+    ///
+    /// Only populated when `is_replay == true`. Enables APM navigation from a
+    /// replay-emitted span back to the original (possibly expired) trace root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_traceparent: Option<String>,
 }
 
 impl TraceContextCarrier {
@@ -54,13 +142,36 @@ impl TraceContextCarrier {
         Self {
             traceparent: Some(traceparent.into()),
             tracestate: None,
+            is_replay: false,
+            link_traceparent: None,
         }
     }
 
-    /// Returns `true` when neither `traceparent` nor `tracestate` is set.
+    /// Convert this carrier into a replay carrier.
+    ///
+    /// Per the OpenTelemetry trace contract ADR (`docs/adr/0001-otel-trace-contract.md`):
+    /// - `traceparent` is cleared so the replay span becomes a new root.
+    /// - `link_traceparent` is set to the original `traceparent` so the worker
+    ///   can attach a span *link* for APM navigation.
+    /// - `is_replay` is set to `true` so workers know to emit
+    ///   `harvest.replay = true` and skip parent context installation.
+    #[must_use]
+    pub fn into_replay_context(self) -> Self {
+        Self {
+            link_traceparent: self.traceparent.or(self.link_traceparent),
+            traceparent: None,
+            tracestate: None,
+            is_replay: true,
+        }
+    }
+
+    /// Returns `true` when no context fields are set (ignoring the replay flag).
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.traceparent.is_none() && self.tracestate.is_none()
+        self.traceparent.is_none()
+            && self.tracestate.is_none()
+            && self.link_traceparent.is_none()
+            && !self.is_replay
     }
 
     /// Serialise to a JSONB-compatible [`serde_json::Value`] suitable for
@@ -409,6 +520,117 @@ impl TelemetryConfigBuilder {
 mod tests {
     use super::*;
 
+    // -----------------------------------------------------------------------
+    // RED-phase tests: these assert the spec-mandated constants and
+    // replay-aware carrier shape defined in docs/adr/0001-otel-trace-contract.md
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn span_attribute_constants_have_correct_names() {
+        // The OTel trace contract ADR mandates these exact attribute keys.
+        assert_eq!(ATTR_WORKFLOW_ID, "harvest.workflow.id");
+        assert_eq!(ATTR_EXECUTION_ID, "harvest.execution.id");
+        assert_eq!(ATTR_SHARD_ID, "harvest.shard.id");
+        assert_eq!(ATTR_ACTIVITY_NAME, "harvest.activity.name");
+        assert_eq!(ATTR_ATTEMPT, "harvest.attempt");
+        assert_eq!(ATTR_QUEUE, "harvest.queue");
+        assert_eq!(ATTR_REPLAY, "harvest.replay");
+    }
+
+    #[test]
+    fn metric_name_constants_have_correct_names() {
+        // OTel semantic naming: instrument.noun (dot-separated).
+        assert_eq!(METRIC_WORKFLOW_STARTED, "harvest.workflow.started");
+        assert_eq!(METRIC_WORKFLOW_DURATION, "harvest.workflow.duration");
+        assert_eq!(METRIC_ACTIVITY_DURATION, "harvest.activity.duration");
+        assert_eq!(METRIC_TIMER_STARTED, "harvest.timer.started");
+        assert_eq!(METRIC_QUEUE_DEPTH, "harvest.queue.depth");
+        assert_eq!(METRIC_DLQ_ENTRIES, "harvest.dlq.entries");
+        assert_eq!(METRIC_SCHEDULE_RUNS, "harvest.schedule.runs");
+        assert_eq!(METRIC_SCHEDULE_SKIPPED, "harvest.schedule.skipped");
+        assert_eq!(METRIC_RETENTION_DELETED, "harvest.retention.deleted");
+    }
+
+    #[test]
+    fn replay_carrier_strips_traceparent_and_preserves_link() {
+        // Per spec: replay spans MUST NOT be parented to the original
+        // (potentially expired) trace — they link to it instead.
+        let original = TraceContextCarrier::from_traceparent(
+            "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+        );
+        let replay = original.into_replay_context();
+        assert!(
+            replay.traceparent.is_none(),
+            "replay carrier must not carry original traceparent as parent"
+        );
+        assert_eq!(
+            replay.link_traceparent.as_deref(),
+            Some("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"),
+            "replay carrier must preserve original as a span link"
+        );
+        assert!(
+            replay.is_replay,
+            "replay carrier must be flagged harvest.replay = true"
+        );
+    }
+
+    #[test]
+    fn non_replay_carrier_has_is_replay_false_and_no_link() {
+        let carrier = TraceContextCarrier::from_traceparent("00-abcd-ef01-01");
+        assert!(!carrier.is_replay);
+        assert!(carrier.link_traceparent.is_none());
+    }
+
+    #[test]
+    fn replay_carrier_from_empty_original_has_no_link() {
+        let empty = TraceContextCarrier::default();
+        let replay = empty.into_replay_context();
+        assert!(replay.traceparent.is_none());
+        assert!(
+            replay.link_traceparent.is_none(),
+            "no link when original had no traceparent"
+        );
+        assert!(replay.is_replay);
+    }
+
+    #[test]
+    fn replay_carrier_roundtrips_through_json() {
+        let original = TraceContextCarrier::from_traceparent(
+            "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+        );
+        let replay = original.into_replay_context();
+        // A replay carrier must still serialise / deserialise so it can
+        // travel on harvest_task_queue.trace_context.
+        let json = replay.to_json().expect("replay carrier serialises");
+        let decoded = TraceContextCarrier::from_json(&json).expect("valid JSON roundtrips");
+        assert!(decoded.is_replay);
+        assert_eq!(
+            decoded.link_traceparent.as_deref(),
+            Some("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"),
+        );
+        assert!(decoded.traceparent.is_none());
+    }
+
+    #[test]
+    fn into_replay_context_on_already_replay_carrier_preserves_link() {
+        // If into_replay_context() is called defensively on a carrier that is
+        // already in replay form (traceparent=None, link_traceparent=Some),
+        // the existing link must not be erased.
+        let original = TraceContextCarrier::from_traceparent(
+            "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+        );
+        let replay = original.into_replay_context();
+        // Call again — should be idempotent, link must survive.
+        let replay2 = replay.into_replay_context();
+        assert!(replay2.traceparent.is_none());
+        assert!(replay2.is_replay);
+        assert_eq!(
+            replay2.link_traceparent.as_deref(),
+            Some("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"),
+            "double-converting a replay carrier must not erase the original link"
+        );
+    }
+
     #[test]
     fn carrier_roundtrips_through_json() {
         let carrier = TraceContextCarrier {
@@ -416,6 +638,7 @@ mod tests {
                 "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01".to_string(),
             ),
             tracestate: Some("vendor=abc".to_string()),
+            ..Default::default()
         };
 
         let json = carrier.to_json().expect("non-empty carrier serialises");
