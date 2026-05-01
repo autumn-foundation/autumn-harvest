@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::schema::{
     harvest_dag_runs, harvest_dead_letters, harvest_events, harvest_external_tasks,
-    harvest_schedules, harvest_signals, harvest_task_queue, harvest_timers,
+    harvest_schedules, harvest_signals, harvest_task_queue, harvest_timers, harvest_workers,
     harvest_workflow_executions,
 };
 
@@ -361,4 +361,43 @@ pub struct NewExternalTask<'a> {
     pub queue: &'a str,
     pub schedule_to_close_at: DateTime<Utc>,
     pub schedule_to_close_secs: i64,
+}
+
+// ── HarvestWorker ─────────────────────────────────────────────────────────────
+
+/// A live or recently-stopped worker process registered in the fleet table.
+#[derive(
+    Debug, Clone, Queryable, Selectable, Identifiable, serde::Serialize, serde::Deserialize,
+)]
+#[diesel(table_name = harvest_workers)]
+#[diesel(primary_key(worker_id))]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct HarvestWorker {
+    pub worker_id: String,
+    pub started_at: DateTime<Utc>,
+    pub last_heartbeat_at: DateTime<Utc>,
+    /// JSON array of queue names polled by this worker.
+    pub queues: serde_json::Value,
+    /// JSON array of `ShardId` integers assigned to this worker.
+    pub shard_assignments: serde_json::Value,
+    /// `max_concurrent_workflows + max_concurrent_activities`.
+    pub max_concurrency: i32,
+    /// Currently executing tasks (refreshed on every heartbeat).
+    pub in_flight_count: i32,
+    pub host: String,
+    pub version: Option<String>,
+    /// Lifecycle status: `Active`, `Draining`, or `Stopped`.
+    pub status: String,
+}
+
+/// Insert struct for registering a new worker process.
+#[derive(Debug, Insertable)]
+#[diesel(table_name = harvest_workers)]
+pub struct NewHarvestWorker<'a> {
+    pub worker_id: &'a str,
+    pub queues: serde_json::Value,
+    pub shard_assignments: serde_json::Value,
+    pub max_concurrency: i32,
+    pub host: &'a str,
+    pub version: Option<&'a str>,
 }

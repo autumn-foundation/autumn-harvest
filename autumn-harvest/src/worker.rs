@@ -79,6 +79,12 @@ pub struct WorkerRuntimeConfig {
     /// not complete within this window it is treated as a failure and retried
     /// (or the workflow fails if retries are exhausted).
     pub max_local_activity_start_to_close: Duration,
+    /// Shard IDs this worker polls. Recorded in `harvest_workers` for fleet
+    /// observability. Defaults to `[0]` for single-shard deployments.
+    pub shard_assignments: Vec<crate::types::ShardId>,
+    /// Heartbeat interval for worker liveness records in `harvest_workers`.
+    /// Defaults to 5 seconds. Stale threshold is `2 × heartbeat_interval`.
+    pub worker_heartbeat_interval: Duration,
 }
 
 impl WorkerRuntimeConfig {
@@ -110,6 +116,8 @@ impl From<WorkerConfig> for WorkerRuntimeConfig {
             cancellation_grace_period: cfg.cancellation_grace_period,
             sticky_timeout: cfg.sticky_timeout,
             max_local_activity_start_to_close: cfg.max_local_activity_start_to_close,
+            shard_assignments: cfg.shard_assignments,
+            worker_heartbeat_interval: Duration::from_secs(5),
         }
     }
 }
@@ -2479,6 +2487,7 @@ impl Worker {
     ///
     /// This lets callers separate listener startup from task polling when they
     /// need tighter control over startup sequencing.
+    #[allow(clippy::too_many_lines)]
     pub async fn run_with_listener(
         &self,
         pool: &DbPool,
@@ -2489,6 +2498,10 @@ impl Worker {
             queues = ?self.config.queues,
             "worker starting"
         );
+
+        // Register this worker in the fleet table.
+        self.register_in_fleet(pool).await;
+
         let queue_depth_sampler = spawn_queue_depth_sampler(
             pool.clone(),
             self.shutdown.clone(),
@@ -2508,6 +2521,25 @@ impl Worker {
             self.shutdown.clone(),
             self.config.poll_interval,
         );
+
+        // Spawn the heartbeat background task.
+        let shard_ids: Vec<i32> = self
+            .config
+            .shard_assignments
+            .iter()
+            .map(|s| s.as_i32())
+            .collect();
+        let heartbeat_handle = crate::workers::spawn_worker_heartbeat(
+            pool.clone(),
+            self.config.worker_id.clone(),
+            Arc::clone(&self.workflow_semaphore),
+            self.config.max_concurrent_workflows,
+            Arc::clone(&self.activity_semaphore),
+            self.config.max_concurrent_activities,
+            self.config.worker_heartbeat_interval,
+            self.shutdown.clone(),
+        );
+        let _ = shard_ids; // used during registration only
 
         while !self.shutdown.is_cancelled() {
             if self.poll_once(pool).await {
@@ -2541,8 +2573,24 @@ impl Worker {
 
         tracing::info!(worker_id = %self.config.worker_id, "shutdown signal received");
 
+        // Transition to Draining before waiting for in-flight tasks.
+        self.transition_fleet_status(pool, crate::workers::WorkerStatus::Draining)
+            .await;
+
         tracing::info!(worker_id = %self.config.worker_id, "draining in-flight tasks");
         self.drain_in_flight().await;
+
+        // All tasks complete — mark Stopped.
+        self.transition_fleet_status(pool, crate::workers::WorkerStatus::Stopped)
+            .await;
+
+        if let Err(error) = heartbeat_handle.await {
+            tracing::warn!(
+                worker_id = %self.config.worker_id,
+                error = %error,
+                "worker heartbeat task failed during shutdown"
+            );
+        }
         if let Err(error) = timeout_checker.await {
             tracing::warn!(
                 worker_id = %self.config.worker_id,
@@ -2565,6 +2613,84 @@ impl Worker {
             );
         }
         tracing::info!(worker_id = %self.config.worker_id, "worker stopped");
+    }
+
+    /// Register or re-register this worker in the fleet table.
+    async fn register_in_fleet(&self, pool: &DbPool) {
+        let shard_ids: Vec<i32> = self
+            .config
+            .shard_assignments
+            .iter()
+            .map(|s| s.as_i32())
+            .collect();
+        let max_concurrency = i32::try_from(
+            self.config.max_concurrent_workflows + self.config.max_concurrent_activities,
+        )
+        .unwrap_or(i32::MAX);
+        let host = crate::workers::local_hostname();
+        let version = env!("CARGO_PKG_VERSION");
+
+        match pool.get().await {
+            Ok(mut conn) => {
+                if let Err(error) = crate::workers::register_worker(
+                    &mut conn,
+                    &self.config.worker_id,
+                    &self.config.queues,
+                    &shard_ids,
+                    max_concurrency,
+                    &host,
+                    Some(version),
+                )
+                .await
+                {
+                    tracing::warn!(
+                        worker_id = %self.config.worker_id,
+                        error = %error,
+                        "failed to register worker in fleet table; continuing without fleet registration"
+                    );
+                } else {
+                    tracing::info!(
+                        worker_id = %self.config.worker_id,
+                        host = %host,
+                        max_concurrency,
+                        "worker registered in fleet"
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    worker_id = %self.config.worker_id,
+                    error = %error,
+                    "failed to get pool connection for fleet registration"
+                );
+            }
+        }
+    }
+
+    /// Transition this worker's status in the fleet table.
+    async fn transition_fleet_status(&self, pool: &DbPool, status: crate::workers::WorkerStatus) {
+        match pool.get().await {
+            Ok(mut conn) => {
+                if let Err(error) =
+                    crate::workers::transition_status(&mut conn, &self.config.worker_id, status)
+                        .await
+                {
+                    tracing::warn!(
+                        worker_id = %self.config.worker_id,
+                        ?status,
+                        error = %error,
+                        "failed to update worker fleet status"
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    worker_id = %self.config.worker_id,
+                    error = %error,
+                    "failed to get pool connection for fleet status update"
+                );
+            }
+        }
     }
 
     /// Execute a single poll iteration.
@@ -2730,6 +2856,8 @@ mod tests {
             cancellation_grace_period: Duration::from_secs(5),
             sticky_timeout: Duration::from_secs(5),
             max_local_activity_start_to_close: Duration::from_secs(60),
+            shard_assignments: vec![crate::types::ShardId::new(0)],
+            worker_heartbeat_interval: Duration::from_secs(5),
         }
     }
 

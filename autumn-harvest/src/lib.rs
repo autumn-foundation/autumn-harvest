@@ -85,6 +85,8 @@ pub mod timeout;
 #[cfg(feature = "db")]
 #[doc(hidden)]
 pub mod worker;
+#[cfg(feature = "db")]
+pub mod workers;
 
 pub use analyzer::{
     AnalyzerRule, AnalyzerWarning, ExcessiveRetriesRule, HistoryAnalyzer, LargePayloadRule,

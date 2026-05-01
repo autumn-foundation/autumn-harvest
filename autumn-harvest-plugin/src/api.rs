@@ -37,6 +37,10 @@ use autumn_harvest::signal;
 use autumn_harvest::store;
 use autumn_harvest::types::{ExecutionId, ExternalActivityToken, ShardId, WorkflowIdReusePolicy};
 use autumn_harvest::worker::{DbPool, HandlerRegistry};
+use autumn_harvest::workers::{
+    FleetHealth, WorkerFilters, WorkerRow, fleet_health, get_worker, list_workers,
+    parse_worker_filters,
+};
 use autumn_harvest::{
     StartWorkflowParams, cancel_workflow_execution, start_or_load_workflow_execution,
 };
@@ -414,6 +418,12 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             "/activities/external/{token}/heartbeat",
             post(heartbeat_external_activity),
         )
+        // Worker fleet observability (issue #100).
+        // /workers/health must be registered before /workers/{worker_id} so axum
+        // does not treat the literal "health" segment as a worker_id capture.
+        .route("/workers/health", get(workers_health))
+        .route("/workers", get(list_workers_handler))
+        .route("/workers/{worker_id}", get(get_worker_handler))
         .layer(Extension(api_state))
 }
 
@@ -1672,9 +1682,95 @@ where
     )))
 }
 
+// ---------------------------------------------------------------------------
+// Worker fleet observability (issue #100)
+// ---------------------------------------------------------------------------
+
+/// Workers that have not sent a heartbeat within this window are classified
+/// as stale. Equals `2 × default heartbeat_interval (5s)`.
+const WORKER_STALE_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(10);
+
+async fn list_workers_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+    Query(pairs): Query<Vec<(String, String)>>,
+) -> Result<Json<Vec<WorkerRow>>, AutumnError> {
+    let filters = parse_worker_filters_api(&pairs)?;
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    let mut results: Vec<WorkerRow> = Vec::new();
+
+    for (_shard, shard_pool) in pool.iter_shards() {
+        let mut conn = acquire_conn(shard_pool).await?;
+        let mut rows = list_workers(&mut conn, &filters, WORKER_STALE_THRESHOLD)
+            .await
+            .map_err(map_error)?;
+        results.append(&mut rows);
+    }
+
+    // Sort by worker_id for deterministic output across shards.
+    results.sort_by(|a, b| a.worker.worker_id.cmp(&b.worker.worker_id));
+    results.truncate(usize::try_from(filters.limit).unwrap_or(usize::MAX));
+    Ok(Json(results))
+}
+
+async fn get_worker_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(worker_id): Path<String>,
+) -> Result<Json<WorkerRow>, AutumnError> {
+    let pool = api_state.storage_pool().map_err(map_error)?;
+
+    for (_shard, shard_pool) in pool.iter_shards() {
+        let mut conn = acquire_conn(shard_pool).await?;
+        if let Some(row) = get_worker(&mut conn, &worker_id, WORKER_STALE_THRESHOLD)
+            .await
+            .map_err(map_error)?
+        {
+            return Ok(Json(row));
+        }
+    }
+
+    Err(AutumnError::not_found_msg(format!("worker '{worker_id}'")))
+}
+
+async fn workers_health(
+    Extension(api_state): Extension<HarvestApiState>,
+) -> Result<Json<FleetHealth>, AutumnError> {
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    let mut combined = FleetHealth {
+        healthy: 0,
+        stale: 0,
+        draining: 0,
+        by_queue: std::collections::HashMap::new(),
+        by_shard: std::collections::HashMap::new(),
+    };
+
+    for (_shard, shard_pool) in pool.iter_shards() {
+        let mut conn = acquire_conn(shard_pool).await?;
+        let shard_health = fleet_health(&mut conn, WORKER_STALE_THRESHOLD)
+            .await
+            .map_err(map_error)?;
+        combined.healthy += shard_health.healthy;
+        combined.stale += shard_health.stale;
+        combined.draining += shard_health.draining;
+        for (queue, count) in shard_health.by_queue {
+            *combined.by_queue.entry(queue).or_default() += count;
+        }
+        for (shard, count) in shard_health.by_shard {
+            *combined.by_shard.entry(shard).or_default() += count;
+        }
+    }
+
+    Ok(Json(combined))
+}
+
+/// Parse worker query-string parameters, mapping errors to `400 Bad Request`.
+fn parse_worker_filters_api(pairs: &[(String, String)]) -> Result<WorkerFilters, AutumnError> {
+    parse_worker_filters(pairs).map_err(AutumnError::bad_request_msg)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use autumn_harvest::workers::WorkerHealth;
 
     fn pairs(values: &[(&str, &str)]) -> Vec<(String, String)> {
         values
@@ -1854,5 +1950,73 @@ mod tests {
             parse_reuse_policy(Some("allow_DUPLICATE")).is_err(),
             "wrong case must not silently fall back"
         );
+    }
+
+    // -- Worker filter parsing via API wrapper --
+
+    #[test]
+    fn parse_worker_filters_api_defaults_when_no_params() {
+        let f = parse_worker_filters_api(&[]).expect("empty params should succeed");
+        assert_eq!(f.limit, WorkerFilters::DEFAULT_LIMIT);
+        assert!(f.queue.is_none());
+        assert!(f.shard_id.is_none());
+        assert!(f.status.is_none());
+        assert!(f.health.is_none());
+    }
+
+    #[test]
+    fn parse_worker_filters_api_accepts_queue_filter() {
+        let f = parse_worker_filters_api(&pairs(&[("queue", "email-workers")])).unwrap();
+        assert_eq!(f.queue.as_deref(), Some("email-workers"));
+    }
+
+    #[test]
+    fn parse_worker_filters_api_accepts_all_status_values() {
+        for status in ["Active", "Draining", "Stopped"] {
+            let f = parse_worker_filters_api(&pairs(&[("status", status)])).unwrap();
+            assert_eq!(f.status.as_deref(), Some(status), "failed for {status}");
+        }
+    }
+
+    #[test]
+    fn parse_worker_filters_api_rejects_unknown_status_with_400() {
+        let err = parse_worker_filters_api(&pairs(&[("status", "zombie")])).unwrap_err();
+        assert!(err.to_string().contains("unknown status"), "error: {err}");
+    }
+
+    #[test]
+    fn parse_worker_filters_api_accepts_health_healthy_and_stale() {
+        let f = parse_worker_filters_api(&pairs(&[("health", "healthy")])).unwrap();
+        assert_eq!(f.health, Some(WorkerHealth::Healthy));
+
+        let f = parse_worker_filters_api(&pairs(&[("health", "stale")])).unwrap();
+        assert_eq!(f.health, Some(WorkerHealth::Stale));
+    }
+
+    #[test]
+    fn parse_worker_filters_api_rejects_unknown_health_with_400() {
+        let err = parse_worker_filters_api(&pairs(&[("health", "unknown")])).unwrap_err();
+        assert!(err.to_string().contains("unknown health"), "error: {err}");
+    }
+
+    #[test]
+    fn parse_worker_filters_api_accepts_shard_id() {
+        let f = parse_worker_filters_api(&pairs(&[("shard_id", "2")])).unwrap();
+        assert_eq!(f.shard_id, Some(2));
+    }
+
+    #[test]
+    fn parse_worker_filters_api_rejects_non_integer_shard_id() {
+        let err = parse_worker_filters_api(&pairs(&[("shard_id", "bad")])).unwrap_err();
+        assert!(err.to_string().contains("invalid shard_id"), "error: {err}");
+    }
+
+    #[test]
+    fn parse_worker_filters_api_clamps_limit() {
+        let f = parse_worker_filters_api(&pairs(&[("limit", "99999")])).unwrap();
+        assert_eq!(f.limit, WorkerFilters::MAX_LIMIT);
+
+        let f = parse_worker_filters_api(&pairs(&[("limit", "0")])).unwrap();
+        assert_eq!(f.limit, 1);
     }
 }
