@@ -247,6 +247,90 @@ fn path_segments_are_percent_encoded() {
 }
 
 #[test]
+fn dlq_bulk_replay_maps_to_management_route() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "dlq",
+        "bulk-replay",
+        "--activity-name",
+        "send_email",
+        "--dry-run",
+    ])
+    .expect("bulk-replay args should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(request.method, ApiMethod::Post);
+    assert_eq!(request.path, "/dead-letters/replay");
+    assert_eq!(
+        request.body,
+        Some(json!({
+            "activity_name": "send_email",
+            "dry_run": true
+        }))
+    );
+}
+
+#[test]
+fn dlq_bulk_discard_maps_to_management_route() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "dlq",
+        "bulk-discard",
+        "--activity-name",
+        "send_email",
+        "--failed-after",
+        "2026-04-27T12:30:00Z",
+    ])
+    .expect("bulk-discard args should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(request.method, ApiMethod::Post);
+    assert_eq!(request.path, "/dead-letters/discard");
+    assert_eq!(
+        request.body,
+        Some(json!({
+            "activity_name": "send_email",
+            "failed_after": "2026-04-27T12:30:00Z"
+        }))
+    );
+}
+
+#[test]
+fn dlq_bulk_replay_with_all_filters_maps_correctly() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "dlq",
+        "bulk-replay",
+        "--activity-name",
+        "charge_card",
+        "--workflow-name",
+        "billing",
+        "--failed-after",
+        "2026-04-27T12:30:00Z",
+        "--failed-before",
+        "2026-04-27T14:30:00Z",
+        "--limit",
+        "500",
+        "--dry-run",
+    ])
+    .expect("bulk-replay with all filters should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(request.method, ApiMethod::Post);
+    assert_eq!(request.path, "/dead-letters/replay");
+    let body = request.body.expect("should have body");
+    assert_eq!(body["activity_name"], "charge_card");
+    assert_eq!(body["workflow_name"], "billing");
+    assert_eq!(body["failed_after"], "2026-04-27T12:30:00Z");
+    assert_eq!(body["failed_before"], "2026-04-27T14:30:00Z");
+    assert_eq!(body["limit"], 500);
+    assert_eq!(body["dry_run"], true);
+}
+
+#[test]
 fn retention_commands_match_management_routes() {
     let status = Cli::try_parse_from(["harvest", "retention", "status"])
         .expect("retention status args should parse");
