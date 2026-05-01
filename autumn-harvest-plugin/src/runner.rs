@@ -5,17 +5,19 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use autumn_harvest::BuiltHarvest;
+use autumn_harvest::batch::{BatchExecutorConfig, run_executor_once};
 use autumn_harvest::context::SharedStateMap;
 use autumn_harvest::policy::WorkflowSchedule;
 use autumn_harvest::retention::{RetentionConfig, RetentionRuntime};
 use autumn_harvest::scheduler::{
     DagCatalog, SchedulerMonitor, SchedulerRuntime, compile_dag_catalog,
 };
-use autumn_harvest::shard::ShardRouter;
+use autumn_harvest::shard::{ShardRouter, ShardedDbPool};
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use autumn_web::AppState;
 use autumn_web::error::AutumnError;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use crate::api::{HarvestApiRuntime, HarvestRetentionRuntime};
 use crate::config::HarvestRuntimeConfig;
@@ -126,6 +128,51 @@ pub struct HarvestRunner {
     worker_handle: Option<JoinHandle<()>>,
     scheduler: Option<SchedulerRuntime>,
     retention: Option<RetentionRuntime>,
+    batch: Option<BatchRuntime>,
+}
+
+/// Background batch-operations executor handle (issue #102).
+struct BatchRuntime {
+    cancel: CancellationToken,
+    handle: JoinHandle<()>,
+}
+
+impl BatchRuntime {
+    /// Spawn a tick loop that drives every open batch job to terminal status.
+    ///
+    /// The loop sleeps `tick_interval` between scans; each tick walks every
+    /// shard and dispatches per-target actions with bounded concurrency. The
+    /// loop exits cleanly when the cancellation token fires.
+    fn spawn(
+        pool: ShardedDbPool,
+        executor_config: BatchExecutorConfig,
+        tick_interval: std::time::Duration,
+    ) -> Self {
+        let cancel = CancellationToken::new();
+        let cancel_for_task = cancel.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                if cancel_for_task.is_cancelled() {
+                    return;
+                }
+                if let Err(error) = run_executor_once(&pool, &executor_config).await {
+                    tracing::warn!(%error, "batch executor tick failed");
+                }
+                tokio::select! {
+                    () = cancel_for_task.cancelled() => return,
+                    () = tokio::time::sleep(tick_interval) => {}
+                }
+            }
+        });
+        Self { cancel, handle }
+    }
+
+    async fn shutdown(self) {
+        self.cancel.cancel();
+        if let Err(error) = self.handle.await {
+            tracing::warn!(error = %error, "harvest batch executor task failed during shutdown");
+        }
+    }
 }
 
 impl HarvestRunner {
@@ -206,6 +253,21 @@ impl HarvestRunner {
         };
         let retention_monitor = retention.as_ref().map(RetentionRuntime::monitor);
         let retention_trigger = retention.as_ref().map(RetentionRuntime::trigger_sender);
+        // Batch operations executor (issue #102): drive open `harvest_batch_jobs`
+        // rows to completion in the background. Only the worker-owning
+        // process spawns it so we don't run multiple competing executors
+        // against the same job rows.
+        let batch = if config.worker_enabled {
+            Some(BatchRuntime::spawn(
+                prepared.storage_pool.sharded_pool().clone(),
+                BatchExecutorConfig {
+                    concurrency: config.batch.concurrency,
+                },
+                std::time::Duration::from_millis(config.batch.tick_interval_ms),
+            ))
+        } else {
+            None
+        };
         let api_runtime = HarvestApiRuntime::new(
             registry,
             dag_catalog,
@@ -228,6 +290,7 @@ impl HarvestRunner {
             worker_handle,
             scheduler,
             retention,
+            batch,
         })
     }
 
@@ -252,6 +315,7 @@ impl HarvestRunner {
             worker_handle,
             scheduler,
             retention,
+            batch,
         } = self;
 
         if let Some(worker) = worker {
@@ -268,6 +332,9 @@ impl HarvestRunner {
             if let Err(error) = retention.join().await {
                 tracing::warn!(error = %error, "harvest retention task failed during shutdown");
             }
+        }
+        if let Some(batch) = batch {
+            batch.shutdown().await;
         }
         if let Some(worker_handle) = worker_handle
             && let Err(error) = worker_handle.await

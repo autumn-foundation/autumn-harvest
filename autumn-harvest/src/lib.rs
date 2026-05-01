@@ -16,6 +16,8 @@ pub const MIGRATIONS: diesel_migrations::EmbeddedMigrations =
 
 /// History analyzer and linter.
 pub mod analyzer;
+/// Batch operations for fleet-wide workflow cancel/terminate/signal (issue #102).
+pub mod batch;
 pub mod builder;
 pub mod cache;
 pub mod context;

@@ -27,6 +27,18 @@ pub struct HarvestOutboxConfig {
     pub max_retry_delay_ms: u64,
 }
 
+/// Tunables for the batch-operations executor (issue #102).
+///
+/// `concurrency` caps the number of in-flight per-target operations so a
+/// 10k-target batch can't monopolise the connection pool. `tick_interval_ms`
+/// is how often the background loop wakes up to scan for new open jobs;
+/// the same loop drains in-progress jobs synchronously within a tick.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HarvestBatchConfig {
+    pub concurrency: u32,
+    pub tick_interval_ms: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HarvestRuntimeConfig {
     pub mode: HarvestMode,
@@ -34,6 +46,7 @@ pub struct HarvestRuntimeConfig {
     pub scheduler_enabled: bool,
     pub database: HarvestDatabaseConfig,
     pub outbox: HarvestOutboxConfig,
+    pub batch: HarvestBatchConfig,
 }
 
 impl HarvestRuntimeConfig {
@@ -104,6 +117,12 @@ impl HarvestRuntimeConfig {
         if let Some(max_retry_delay_ms) = partial.outbox.max_retry_delay_ms {
             self.outbox.max_retry_delay_ms = max_retry_delay_ms;
         }
+        if let Some(concurrency) = partial.batch.concurrency {
+            self.batch.concurrency = concurrency;
+        }
+        if let Some(tick_interval_ms) = partial.batch.tick_interval_ms {
+            self.batch.tick_interval_ms = tick_interval_ms;
+        }
     }
 
     fn apply_env_overrides(&mut self, env: &dyn Env) -> Result<(), ConfigError> {
@@ -151,6 +170,14 @@ impl HarvestRuntimeConfig {
             )?;
         }
 
+        if let Ok(concurrency) = env.var("AUTUMN_HARVEST_BATCH__CONCURRENCY") {
+            self.batch.concurrency = parse_u32("AUTUMN_HARVEST_BATCH__CONCURRENCY", &concurrency)?;
+        }
+        if let Ok(tick_interval_ms) = env.var("AUTUMN_HARVEST_BATCH__TICK_INTERVAL_MS") {
+            self.batch.tick_interval_ms =
+                parse_u64("AUTUMN_HARVEST_BATCH__TICK_INTERVAL_MS", &tick_interval_ms)?;
+        }
+
         Ok(())
     }
 
@@ -196,6 +223,17 @@ impl HarvestRuntimeConfig {
             ));
         }
 
+        if self.batch.concurrency < 1 {
+            return Err(ConfigError::Validation(
+                "harvest.batch.concurrency must be at least 1".to_owned(),
+            ));
+        }
+        if self.batch.tick_interval_ms < 1 {
+            return Err(ConfigError::Validation(
+                "harvest.batch.tick_interval_ms must be at least 1".to_owned(),
+            ));
+        }
+
         Ok(())
     }
 }
@@ -208,6 +246,7 @@ impl Default for HarvestRuntimeConfig {
             scheduler_enabled: true,
             database: HarvestDatabaseConfig::default(),
             outbox: HarvestOutboxConfig::default(),
+            batch: HarvestBatchConfig::default(),
         }
     }
 }
@@ -221,6 +260,16 @@ impl Default for HarvestOutboxConfig {
             claim_ttl_ms: 30_000,
             base_retry_delay_ms: 1_000,
             max_retry_delay_ms: 60_000,
+        }
+    }
+}
+
+impl Default for HarvestBatchConfig {
+    fn default() -> Self {
+        Self {
+            // Matches the issue's default: cap fan-out at 32 in-flight ops.
+            concurrency: 32,
+            tick_interval_ms: 500,
         }
     }
 }
@@ -240,6 +289,8 @@ struct PartialHarvestRuntimeConfig {
     database: PartialHarvestDatabaseConfig,
     #[serde(default)]
     outbox: PartialHarvestOutboxConfig,
+    #[serde(default)]
+    batch: PartialHarvestBatchConfig,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -255,6 +306,12 @@ struct PartialHarvestOutboxConfig {
     claim_ttl_ms: Option<u64>,
     base_retry_delay_ms: Option<u64>,
     max_retry_delay_ms: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PartialHarvestBatchConfig {
+    concurrency: Option<u32>,
+    tick_interval_ms: Option<u64>,
 }
 
 fn find_config_file_named(filename: &str, env: &dyn Env) -> PathBuf {
@@ -331,6 +388,12 @@ fn parse_i64(key: &str, value: &str) -> Result<i64, ConfigError> {
 fn parse_u64(key: &str, value: &str) -> Result<u64, ConfigError> {
     value
         .parse::<u64>()
+        .map_err(|_| ConfigError::Validation(format!("invalid integer for {key}: {value:?}")))
+}
+
+fn parse_u32(key: &str, value: &str) -> Result<u32, ConfigError> {
+    value
+        .parse::<u32>()
         .map_err(|_| ConfigError::Validation(format!("invalid integer for {key}: {value:?}")))
 }
 

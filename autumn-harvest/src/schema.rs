@@ -194,6 +194,29 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    use diesel::sql_types::*;
+
+    harvest_batch_jobs (id) {
+        id -> Uuid,
+        action -> Text,
+        filter -> Jsonb,
+        signal_name -> Nullable<Text>,
+        signal_payload -> Nullable<Jsonb>,
+        status -> Text,
+        total -> Int8,
+        completed -> Int8,
+        failed -> Int8,
+        errors -> Jsonb,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+        started_at -> Nullable<Timestamptz>,
+        completed_at -> Nullable<Timestamptz>,
+        idempotency_key -> Nullable<Text>,
+        created_by -> Nullable<Text>,
+    }
+}
+
 diesel::joinable!(harvest_events -> harvest_workflow_executions (workflow_exec_id));
 diesel::joinable!(harvest_task_queue -> harvest_workflow_executions (workflow_exec_id));
 diesel::joinable!(harvest_dag_runs -> harvest_workflow_executions (workflow_exec_id));
@@ -212,4 +235,5 @@ diesel::allow_tables_to_appear_in_same_query!(
     harvest_dead_letters,
     harvest_external_tasks,
     harvest_workers,
+    harvest_batch_jobs,
 );
