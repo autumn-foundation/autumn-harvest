@@ -568,7 +568,10 @@ mod tests {
             Some("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"),
             "replay carrier must preserve original as a span link"
         );
-        assert!(replay.is_replay, "replay carrier must be flagged harvest.replay = true");
+        assert!(
+            replay.is_replay,
+            "replay carrier must be flagged harvest.replay = true"
+        );
     }
 
     #[test]
@@ -583,7 +586,10 @@ mod tests {
         let empty = TraceContextCarrier::default();
         let replay = empty.into_replay_context();
         assert!(replay.traceparent.is_none());
-        assert!(replay.link_traceparent.is_none(), "no link when original had no traceparent");
+        assert!(
+            replay.link_traceparent.is_none(),
+            "no link when original had no traceparent"
+        );
         assert!(replay.is_replay);
     }
 
