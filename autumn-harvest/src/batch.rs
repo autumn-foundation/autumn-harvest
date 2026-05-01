@@ -232,9 +232,10 @@ mod db {
                 // A concurrent submission with the same idempotency_key raced
                 // ahead of our insert. Return the id of the row that won.
                 harvest_batch_jobs::table
-                    .filter(harvest_batch_jobs::idempotency_key.eq(
-                        request.idempotency_key.as_deref().unwrap_or(""),
-                    ))
+                    .filter(
+                        harvest_batch_jobs::idempotency_key
+                            .eq(request.idempotency_key.as_deref().unwrap_or("")),
+                    )
                     .select(harvest_batch_jobs::id)
                     .first::<Uuid>(conn)
                     .await
@@ -559,6 +560,7 @@ mod db {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn process_job(
         pool: &ShardedDbPool,
         owning_shard_pool: &DbPool,
@@ -613,16 +615,21 @@ mod db {
             mark_running(&mut owning_conn, job.id, total).await?;
         }
 
+        // Stable UUID sort; Signal targets stay RUNNING so we offset-skip the already-counted prefix.
+        all_targets.sort_unstable_by_key(ExecutionId::as_uuid);
+        let skip = if action == BatchAction::Signal {
+            usize::try_from((job.completed + job.failed).max(0)).unwrap_or(0)
+        } else {
+            0
+        };
+        let targets_to_dispatch: Vec<_> = all_targets.into_iter().skip(skip).collect();
+
         let signal_name = job.signal_name.clone();
         let signal_payload = job.signal_payload.clone();
         let concurrency = usize::try_from(config.concurrency.max(1)).unwrap_or(1);
 
         // Dispatch in chunks of `concurrency` to bound in-flight ops.
-        // The SQL filter already excludes already-processed targets (e.g. only
-        // RUNNING workflows appear for Cancel, so cancelled ones are invisible).
-        // No offset skip is needed; accumulated counters from prior ticks are
-        // preserved in `completed`/`failed` and are additive across ticks.
-        for chunk in all_targets.chunks(concurrency) {
+        for chunk in targets_to_dispatch.chunks(concurrency) {
             let mut tasks: FuturesUnordered<_> = FuturesUnordered::new();
             for target in chunk.iter().copied() {
                 let pool_for_target = pool.pool_for_execution(target).clone();
