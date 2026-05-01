@@ -295,6 +295,7 @@ fn recording_activity_info(name: &'static str) -> ActivityInfo {
         default_queue: Some("default"),
         max_concurrent: None,
         concurrency_key: None,
+        is_local: false,
         handler: record_activity,
     }
 }
@@ -1790,6 +1791,7 @@ async fn scheduler_tick_creates_and_executes_due_interval_runs() {
             default_queue: Some("default"),
             max_concurrent: None,
             concurrency_key: None,
+            is_local: false,
             handler: record_activity,
         }],
         Arc::new(state),

@@ -72,6 +72,11 @@ impl MermaidExporter {
                 | WorkflowEvent::ActivityExternalDeadlineExtended { .. } => {
                     self.handle_external_activity_event(event)?;
                 }
+                WorkflowEvent::LocalActivityScheduled { .. }
+                | WorkflowEvent::LocalActivityCompleted { .. }
+                | WorkflowEvent::LocalActivityFailed { .. } => {
+                    self.handle_local_activity_event(event)?;
+                }
             }
         }
         Ok(())
@@ -253,6 +258,41 @@ impl MermaidExporter {
             }
             WorkflowEvent::MarkerRecorded { name, .. } => {
                 writeln!(self.out, "    Note over WF: Marker: {name}")?;
+            }
+            _ => unreachable!(),
+        }
+        Ok(())
+    }
+
+    fn handle_local_activity_event(
+        &mut self,
+        event: &WorkflowEvent,
+    ) -> Result<(), std::fmt::Error> {
+        match event {
+            WorkflowEvent::LocalActivityScheduled {
+                name, activity_id, ..
+            } => {
+                writeln!(
+                    self.out,
+                    "    Note right of WF: Local Activity Scheduled: {name} (ID: {activity_id})"
+                )?;
+            }
+            WorkflowEvent::LocalActivityCompleted { activity_id, .. } => {
+                writeln!(
+                    self.out,
+                    "    Note right of WF: Local Activity Completed (ID: {activity_id})"
+                )?;
+            }
+            WorkflowEvent::LocalActivityFailed {
+                activity_id,
+                error,
+                attempt,
+            } => {
+                let safe_error = error.replace('\n', " ").replace('"', "'");
+                writeln!(
+                    self.out,
+                    "    Note right of WF: Local Activity Failed (ID: {activity_id}, Attempt: {attempt}): {safe_error}"
+                )?;
             }
             _ => unreachable!(),
         }

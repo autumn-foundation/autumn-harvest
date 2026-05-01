@@ -407,6 +407,7 @@ fn build_runtime_worker(
                 shutdown_timeout: Duration::from_secs(1),
                 cancellation_grace_period: Duration::from_secs(1),
                 sticky_timeout: Duration::from_secs(5),
+                max_local_activity_start_to_close: Duration::from_secs(60),
             },
             registry,
         )
@@ -858,6 +859,7 @@ async fn worker_completes_workflow_task_and_persists_result() {
                 shutdown_timeout: Duration::from_secs(1),
                 cancellation_grace_period: Duration::from_secs(1),
                 sticky_timeout: Duration::from_secs(5),
+                max_local_activity_start_to_close: Duration::from_secs(60),
             },
             registry,
         )
@@ -949,6 +951,7 @@ async fn worker_marks_workflow_failed_when_handler_errors() {
                 shutdown_timeout: Duration::from_secs(1),
                 cancellation_grace_period: Duration::from_secs(1),
                 sticky_timeout: Duration::from_secs(5),
+                max_local_activity_start_to_close: Duration::from_secs(60),
             },
             registry,
         )
@@ -1049,6 +1052,7 @@ async fn worker_completes_workflow_with_activity_round_trip() {
             default_queue: Some("default"),
             max_concurrent: None,
             concurrency_key: None,
+            is_local: false,
             handler: send_email_activity,
         }],
     ));
@@ -1064,6 +1068,7 @@ async fn worker_completes_workflow_with_activity_round_trip() {
                 shutdown_timeout: Duration::from_secs(1),
                 cancellation_grace_period: Duration::from_secs(1),
                 sticky_timeout: Duration::from_secs(5),
+                max_local_activity_start_to_close: Duration::from_secs(60),
             },
             registry,
         )
@@ -1153,6 +1158,7 @@ async fn worker_fails_orphaned_activity_task_without_scheduled_event() {
                 shutdown_timeout: Duration::from_secs(1),
                 cancellation_grace_period: Duration::from_secs(1),
                 sticky_timeout: Duration::from_secs(5),
+                max_local_activity_start_to_close: Duration::from_secs(60),
             },
             Arc::new(HandlerRegistry::new(
                 vec![],
@@ -1166,6 +1172,7 @@ async fn worker_fails_orphaned_activity_task_without_scheduled_event() {
                     default_queue: Some("default"),
                     max_concurrent: None,
                     concurrency_key: None,
+                    is_local: false,
                     handler: send_email_activity,
                 }],
             )),
@@ -1316,6 +1323,7 @@ async fn timeout_enforcement_fails_pending_activity_and_wakes_workflow() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
 async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
     let (database_url, _container) = setup_test_database_url().await;
     let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
@@ -1357,6 +1365,7 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
                 shutdown_timeout: Duration::from_secs(1),
                 cancellation_grace_period: Duration::from_secs(1),
                 sticky_timeout: Duration::from_secs(5),
+                max_local_activity_start_to_close: Duration::from_secs(60),
             },
             Arc::new(HandlerRegistry::new(
                 vec![WorkflowInfo {
@@ -1374,6 +1383,7 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
                     default_queue: Some("default"),
                     max_concurrent: None,
                     concurrency_key: None,
+                    is_local: false,
                     handler: slow_activity,
                 }],
             )),
@@ -1473,6 +1483,7 @@ async fn worker_completes_workflow_with_timer_round_trip() {
                 shutdown_timeout: Duration::from_secs(1),
                 cancellation_grace_period: Duration::from_secs(1),
                 sticky_timeout: Duration::from_secs(5),
+                max_local_activity_start_to_close: Duration::from_secs(60),
             },
             Arc::new(HandlerRegistry::new(
                 vec![WorkflowInfo {
@@ -1734,6 +1745,7 @@ async fn worker_builder_state_is_visible_to_workflow_and_activity() {
             default_queue: Some("default"),
             max_concurrent: None,
             concurrency_key: None,
+            is_local: false,
             handler: stateful_activity,
         }])
         .state(String::from("haunted"))
@@ -2312,6 +2324,7 @@ async fn worker_handles_early_ingested_signal_before_activity() {
             default_queue: Some("default"),
             max_concurrent: None,
             concurrency_key: None,
+            is_local: false,
             handler: send_email_activity,
         }],
     ));
@@ -3686,6 +3699,7 @@ async fn workflow_schedule_baseline_dispatches_multiple_runs() {
                 shutdown_timeout: Duration::from_secs(2),
                 cancellation_grace_period: Duration::from_secs(1),
                 sticky_timeout: Duration::from_secs(5),
+                max_local_activity_start_to_close: Duration::from_secs(60),
             },
             Arc::clone(&registry),
         )
@@ -3776,6 +3790,7 @@ async fn workflow_schedule_max_active_runs_enforced() {
                 shutdown_timeout: Duration::from_secs(2),
                 cancellation_grace_period: Duration::from_secs(1),
                 sticky_timeout: Duration::from_secs(5),
+                max_local_activity_start_to_close: Duration::from_secs(60),
             },
             Arc::clone(&registry),
         )
@@ -3854,6 +3869,7 @@ async fn workflow_schedule_pause_and_resume() {
                 shutdown_timeout: Duration::from_secs(2),
                 cancellation_grace_period: Duration::from_secs(1),
                 sticky_timeout: Duration::from_secs(5),
+                max_local_activity_start_to_close: Duration::from_secs(60),
             },
             Arc::clone(&registry),
         )

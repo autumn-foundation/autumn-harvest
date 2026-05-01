@@ -75,6 +75,10 @@ pub struct WorkerRuntimeConfig {
     /// preferentially to this worker so its in-process LRU cache stays warm.
     /// Zero disables sticky routing entirely.
     pub sticky_timeout: Duration,
+    /// Hard cap applied to each local activity attempt. If the activity does
+    /// not complete within this window it is treated as a failure and retried
+    /// (or the workflow fails if retries are exhausted).
+    pub max_local_activity_start_to_close: Duration,
 }
 
 impl WorkerRuntimeConfig {
@@ -105,6 +109,7 @@ impl From<WorkerConfig> for WorkerRuntimeConfig {
             shutdown_timeout: cfg.shutdown_timeout,
             cancellation_grace_period: cfg.cancellation_grace_period,
             sticky_timeout: cfg.sticky_timeout,
+            max_local_activity_start_to_close: cfg.max_local_activity_start_to_close,
         }
     }
 }
@@ -245,6 +250,7 @@ const fn workflow_command_name(command: &WorkflowCommand) -> &'static str {
         WorkflowCommand::Complete { .. } => "Complete",
         WorkflowCommand::Fail { .. } => "Fail",
         WorkflowCommand::ContinueAsNew { .. } => "ContinueAsNew",
+        WorkflowCommand::RunLocalActivity { .. } => "RunLocalActivity",
     }
 }
 
@@ -482,6 +488,161 @@ fn extract_single_schedule_external_activity(
             schedule_to_close_secs: *schedule_to_close_secs,
         })
     })
+}
+
+// ── Local activity support ──────────────────────────────────────────────────
+
+struct LocalActivityRun {
+    activity_id: crate::types::ActivityExecId,
+    name: String,
+    input: serde_json::Value,
+    start_to_close_secs: Option<u64>,
+    retry_policy: Option<crate::policy::RetryPolicy>,
+}
+
+/// Extract a `RunLocalActivity` command from an owned command list.
+///
+/// Marker (`RecordMarker`) events are also extracted and returned so the
+/// caller can append them to the event log before the local-activity events.
+/// The `result_tx` inside the command is dropped immediately — the workflow
+/// coroutine was already dropped when the 100 ms suspension timeout fired, so
+/// nobody is listening on the receiving end.
+fn extract_run_local_activity(
+    commands: Vec<WorkflowCommand>,
+) -> (Vec<WorkflowEvent>, LocalActivityRun) {
+    let mut markers = Vec::new();
+    let mut local_run = None;
+    for cmd in commands {
+        match cmd {
+            WorkflowCommand::RecordMarker { name, details } => {
+                markers.push(WorkflowEvent::MarkerRecorded { name, details });
+            }
+            WorkflowCommand::RunLocalActivity {
+                activity_id,
+                name,
+                input,
+                start_to_close_secs,
+                retry_policy,
+                result_tx,
+            } => {
+                drop(result_tx); // coroutine already dropped; close the channel
+                local_run = Some(LocalActivityRun {
+                    activity_id,
+                    name,
+                    input,
+                    start_to_close_secs,
+                    retry_policy,
+                });
+            }
+            _ => {} // unexpected alongside RunLocalActivity; ignore
+        }
+    }
+    (
+        markers,
+        local_run.expect("called only after confirming RunLocalActivity is present"),
+    )
+}
+
+/// Run a local activity inline, appending durability events to `harvest_events`.
+///
+/// Retries the handler up to `max_attempts` times (per the retry policy),
+/// sleeping the computed backoff between attempts. Each attempt appends a
+/// `LocalActivityFailed` event; on success a `LocalActivityCompleted` event is
+/// appended. Returns all newly-appended events so the caller can extend its
+/// in-memory replay history and avoid a DB round-trip.
+async fn run_local_activity_inline(
+    conn: &mut AsyncPgConnection,
+    registry: &HandlerRegistry,
+    exec_id: ExecutionId,
+    marker_events: Vec<WorkflowEvent>,
+    run: LocalActivityRun,
+    max_start_to_close: Duration,
+    next_event_id: &mut i32,
+) -> HarvestResult<Vec<WorkflowEvent>> {
+    let activity = registry.activities.get(&run.name).ok_or_else(|| {
+        HarvestError::Config(format!("no activity handler registered for '{}'", run.name))
+    })?;
+
+    let per_attempt_timeout = run
+        .start_to_close_secs
+        .map_or(max_start_to_close, Duration::from_secs)
+        .min(max_start_to_close);
+
+    let max_attempts = run.retry_policy.as_ref().map_or(1, |p| p.max_attempts);
+
+    let scheduled_event = WorkflowEvent::LocalActivityScheduled {
+        activity_id: run.activity_id,
+        name: run.name.clone(),
+        input: run.input.clone(),
+    };
+
+    // Append marker events + scheduled event in a single call.
+    let mut prefix_events = marker_events;
+    prefix_events.push(scheduled_event);
+    store::append_events(conn, exec_id, &prefix_events, *next_event_id).await?;
+    *next_event_id += i32::try_from(prefix_events.len())
+        .map_err(|_| HarvestError::Config("event count overflow".into()))?;
+
+    let mut all_new_events = prefix_events;
+    let ctx = ActivityContext::new(registry.shared_state(), None, CancellationToken::new());
+    let handler = activity.handler;
+
+    for attempt in 1..=max_attempts {
+        let result = tokio::time::timeout(per_attempt_timeout, (handler)(&ctx, run.input.clone()))
+            .await
+            .unwrap_or_else(|_| {
+                Err(format!(
+                    "local activity '{}' timed out after {:?}",
+                    run.name, per_attempt_timeout
+                ))
+            });
+
+        match result {
+            Ok(output) => {
+                let completed_event = WorkflowEvent::LocalActivityCompleted {
+                    activity_id: run.activity_id,
+                    output,
+                };
+                store::append_events(
+                    conn,
+                    exec_id,
+                    std::slice::from_ref(&completed_event),
+                    *next_event_id,
+                )
+                .await?;
+                *next_event_id += 1;
+                all_new_events.push(completed_event);
+                return Ok(all_new_events);
+            }
+            Err(error) => {
+                let failed_event = WorkflowEvent::LocalActivityFailed {
+                    activity_id: run.activity_id,
+                    error: error.clone(),
+                    attempt,
+                };
+                store::append_events(
+                    conn,
+                    exec_id,
+                    std::slice::from_ref(&failed_event),
+                    *next_event_id,
+                )
+                .await?;
+                *next_event_id += 1;
+                all_new_events.push(failed_event);
+
+                if attempt < max_attempts
+                    && let Some(delay) = run
+                        .retry_policy
+                        .as_ref()
+                        .and_then(|p| p.next_delay(attempt))
+                {
+                    tokio::time::sleep(delay).await;
+                }
+            }
+        }
+    }
+
+    Ok(all_new_events)
 }
 
 fn chrono_duration_from_std(
@@ -1976,6 +2137,7 @@ async fn process_workflow_task(
     task: &TaskQueueItem,
     worker_id: &str,
     sticky_timeout: Duration,
+    max_local_activity_start_to_close: Duration,
 ) -> HarvestResult<()> {
     let prepared = prepare_workflow_task(conn, task, worker_id).await?;
     let Some(workflow) = registry.workflows.get(&prepared.execution.workflow_name) else {
@@ -2004,14 +2166,48 @@ async fn process_workflow_task(
         .record_workflow_started(&prepared.execution.workflow_name, &task.queue_name);
     let started_at = std::time::Instant::now();
 
-    let outcome = run_workflow_with_state(
-        prepared.exec_id,
-        prepared.history_events,
-        workflow.handler,
-        task.input.clone(),
-        registry.shared_state(),
-    )
-    .await;
+    // Drive the workflow in a loop so that local activities can be executed
+    // inline without parking the task. Each iteration runs the workflow until
+    // it suspends; if it suspends on a RunLocalActivity command the handler
+    // is executed here, its events are appended to history, and the workflow
+    // is re-run with the extended history. Any other suspension (regular
+    // activity, timer, signal wait, …) breaks out of the loop.
+    let mut history_events = prepared.history_events;
+    let mut next_event_id = prepared.next_event_id;
+
+    let outcome = loop {
+        let run_outcome = run_workflow_with_state(
+            prepared.exec_id,
+            history_events.clone(),
+            workflow.handler,
+            task.input.clone(),
+            registry.shared_state(),
+        )
+        .await;
+
+        match run_outcome {
+            WorkflowOutcome::Suspended { commands }
+                if commands
+                    .iter()
+                    .any(|c| matches!(c, WorkflowCommand::RunLocalActivity { .. })) =>
+            {
+                let (markers, local_run) = extract_run_local_activity(commands);
+                let new_events = run_local_activity_inline(
+                    conn,
+                    registry,
+                    prepared.exec_id,
+                    markers,
+                    local_run,
+                    max_local_activity_start_to_close,
+                    &mut next_event_id,
+                )
+                .await?;
+                history_events.extend(new_events);
+                // Loop: re-run the workflow with the extended history.
+            }
+            other => break other,
+        }
+    };
 
     let status = match &outcome {
         WorkflowOutcome::Completed { .. } => WorkflowStatus::Completed,
@@ -2034,7 +2230,7 @@ async fn process_workflow_task(
             task,
             worker_id,
             exec_id: prepared.exec_id,
-            next_event_id: prepared.next_event_id,
+            next_event_id,
             sticky_timeout,
         },
         outcome,
@@ -2049,6 +2245,7 @@ async fn process_task(
     worker_id: &str,
     cancellation_grace_period: Duration,
     sticky_timeout: Duration,
+    max_local_activity_start_to_close: Duration,
 ) -> HarvestResult<()> {
     let mut conn = pool.get().await.map_err(crate::error::database_error)?;
 
@@ -2060,6 +2257,7 @@ async fn process_task(
                 &task,
                 worker_id,
                 sticky_timeout,
+                max_local_activity_start_to_close,
             )
             .await
         }
@@ -2427,6 +2625,7 @@ impl Worker {
         let worker_id = self.config.worker_id.clone();
         let cancellation_grace_period = self.config.cancellation_grace_period;
         let sticky_timeout = self.config.sticky_timeout;
+        let max_local_activity_start_to_close = self.config.max_local_activity_start_to_close;
 
         tokio::spawn(async move {
             // Acquire semaphore permit — blocks if at concurrency limit.
@@ -2449,6 +2648,7 @@ impl Worker {
                 &worker_id,
                 cancellation_grace_period,
                 sticky_timeout,
+                max_local_activity_start_to_close,
             )
             .await
             {
@@ -2529,6 +2729,7 @@ mod tests {
             shutdown_timeout: Duration::from_secs(5),
             cancellation_grace_period: Duration::from_secs(5),
             sticky_timeout: Duration::from_secs(5),
+            max_local_activity_start_to_close: Duration::from_secs(60),
         }
     }
 
@@ -2581,6 +2782,7 @@ mod tests {
             sticky_timeout: Duration::from_secs(3),
             cancellation_grace_period: Duration::from_secs(10),
             shard_assignments: vec![crate::types::ShardId::new(0)],
+            max_local_activity_start_to_close: Duration::from_secs(60),
         };
 
         let runtime_cfg: WorkerRuntimeConfig = builder_cfg.into();
@@ -2620,6 +2822,7 @@ mod tests {
             default_queue: None,
             max_concurrent: None,
             concurrency_key: None,
+            is_local: false,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
         };
 

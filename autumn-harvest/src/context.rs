@@ -165,6 +165,28 @@ pub enum WorkflowCommand {
         /// Input passed to the next iteration of the workflow.
         input: Value,
     },
+    /// Run a local activity inline on the workflow worker (never enqueued).
+    ///
+    /// The worker resolves this command by running the named handler directly
+    /// in the workflow dispatch loop, recording `LocalActivityScheduled`,
+    /// zero or more `LocalActivityFailed` (per retry attempt), and finally
+    /// `LocalActivityCompleted` or a terminal `LocalActivityFailed` in
+    /// `harvest_events`. No row is ever written to `harvest_task_queue`.
+    RunLocalActivity {
+        /// The unique execution ID for this local activity invocation.
+        activity_id: ActivityExecId,
+        /// The name of the registered activity handler (looked up by the worker).
+        name: String,
+        /// JSON input for the handler.
+        input: Value,
+        /// Optional start-to-close timeout in seconds. `None` defers to the
+        /// worker's `max_local_activity_start_to_close` cap.
+        start_to_close_secs: Option<u64>,
+        /// Optional retry policy. `None` = no retries (fail immediately).
+        retry_policy: Option<crate::policy::RetryPolicy>,
+        /// The worker sends the final result (success or exhausted retries) here.
+        result_tx: oneshot::Sender<Result<Value, String>>,
+    },
 }
 
 // Manual Debug because oneshot::Sender is not Debug.
@@ -232,6 +254,17 @@ impl std::fmt::Debug for WorkflowCommand {
                 .debug_struct("ContinueAsNew")
                 .field("input", input)
                 .finish(),
+            Self::RunLocalActivity {
+                activity_id,
+                name,
+                start_to_close_secs,
+                ..
+            } => f
+                .debug_struct("RunLocalActivity")
+                .field("activity_id", activity_id)
+                .field("name", name)
+                .field("start_to_close_secs", start_to_close_secs)
+                .finish_non_exhaustive(),
         }
     }
 }
@@ -733,6 +766,90 @@ impl WorkflowContext {
                     }),
                     Err(_) => Err(HarvestError::Cancelled(format!(
                         "activity '{name}' cancelled: result channel dropped"
+                    ))),
+                }
+            }
+        }
+    }
+
+    // ── Local activity dispatch ───────────────────────────────────────
+
+    /// Execute a *local* activity inline on the workflow worker — never enqueued.
+    ///
+    /// During **replay**, returns the recorded outcome from `harvest_events`
+    /// without running the handler body.
+    ///
+    /// During **live execution**, emits a [`WorkflowCommand::RunLocalActivity`]
+    /// command and suspends the coroutine until the worker runs the handler
+    /// inline and resolves the result channel.
+    ///
+    /// Local activities respect only `start_to_close`. They do not support
+    /// heartbeats, `schedule_to_start`, or a named task queue (they always
+    /// run on the same worker task driving the workflow).
+    ///
+    /// # Errors
+    ///
+    /// - [`HarvestError::NonDeterministic`] if history at this position does
+    ///   not match `name`.
+    /// - [`HarvestError::ActivityFailed`] if recorded history shows exhausted retries.
+    /// - [`HarvestError::Cancelled`] if the result channel was dropped.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    pub async fn execute_local_activity_raw(
+        &self,
+        name: &str,
+        input: Value,
+        retry_policy: Option<crate::policy::RetryPolicy>,
+        start_to_close_secs: Option<u64>,
+    ) -> HarvestResult<Value> {
+        let history_match = self.match_history(|m| m.match_local_activity(name));
+
+        match history_match {
+            HistoryMatch::Matched { output } => Ok(output),
+
+            HistoryMatch::Failed { error, attempt } => Err(HarvestError::ActivityFailed {
+                name: name.to_string(),
+                attempt,
+                source: error.into(),
+            }),
+
+            HistoryMatch::TimedOut { timeout_type } => Err(HarvestError::Timeout {
+                timeout_type,
+                task_name: name.to_string(),
+            }),
+
+            HistoryMatch::Diverged { expected, actual } => Err(HarvestError::NonDeterministic(
+                format!("local activity mismatch: expected {expected}, got {actual}"),
+            )),
+
+            HistoryMatch::AwaitingExternalCompletion { .. } => {
+                unreachable!("match_local_activity never returns AwaitingExternalCompletion")
+            }
+
+            HistoryMatch::NoMatch => {
+                let activity_id = self.next_activity_id();
+                let (tx, rx) = oneshot::channel();
+
+                self.push_command(WorkflowCommand::RunLocalActivity {
+                    activity_id,
+                    name: name.to_string(),
+                    input,
+                    start_to_close_secs,
+                    retry_policy,
+                    result_tx: tx,
+                });
+
+                match rx.await {
+                    Ok(Ok(output)) => Ok(output),
+                    Ok(Err(error)) => Err(HarvestError::ActivityFailed {
+                        name: name.to_string(),
+                        attempt: 1,
+                        source: error.into(),
+                    }),
+                    Err(_) => Err(HarvestError::Cancelled(format!(
+                        "local activity '{name}' cancelled: result channel dropped"
                     ))),
                 }
             }
@@ -2523,5 +2640,109 @@ mod tests {
     fn context_check_cancellation_returns_ok_when_not_cancelled() {
         let ctx = WorkflowContext::new_test();
         assert!(ctx.check_cancellation().is_ok());
+    }
+
+    // ── Local activity tests ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn execute_local_activity_emits_run_local_command_during_live_execution() {
+        let ctx = WorkflowContext::new_test();
+
+        // Race the future against a short sleep — it should suspend (not complete)
+        // because no history provides a result.
+        let fut = ctx.execute_local_activity_raw("format_data", Value::Null, None, None);
+        tokio::pin!(fut);
+        tokio::select! {
+            _ = &mut fut => panic!("should suspend, not complete"),
+            () = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
+        }
+
+        let commands = ctx.drain_commands();
+        assert_eq!(commands.len(), 1);
+        match &commands[0] {
+            WorkflowCommand::RunLocalActivity { name, .. } => {
+                assert_eq!(name, "format_data");
+            }
+            other => panic!("expected RunLocalActivity, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_local_activity_returns_history_result_during_replay() {
+        let id = ActivityExecId::new();
+        let expected = serde_json::json!({"formatted": "hello"});
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+            },
+            WorkflowEvent::LocalActivityScheduled {
+                activity_id: id,
+                name: "format_data".into(),
+                input: Value::Null,
+            },
+            WorkflowEvent::LocalActivityCompleted {
+                activity_id: id,
+                output: expected.clone(),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(crate::types::ExecutionId::new(), events);
+        let result = ctx
+            .execute_local_activity_raw("format_data", Value::Null, None, None)
+            .await
+            .expect("replay should succeed");
+        assert_eq!(result, expected);
+        assert!(!ctx.is_replaying());
+    }
+
+    #[tokio::test]
+    async fn execute_local_activity_returns_error_for_exhausted_retries_in_history() {
+        let id = ActivityExecId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+            },
+            WorkflowEvent::LocalActivityScheduled {
+                activity_id: id,
+                name: "format_data".into(),
+                input: Value::Null,
+            },
+            WorkflowEvent::LocalActivityFailed {
+                activity_id: id,
+                error: "always fails".into(),
+                attempt: 1,
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(crate::types::ExecutionId::new(), events);
+        let result = ctx
+            .execute_local_activity_raw("format_data", Value::Null, None, None)
+            .await;
+        assert!(
+            matches!(result, Err(HarvestError::ActivityFailed { attempt: 1, .. })),
+            "expected ActivityFailed, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_local_activity_divergence_is_nondeterministic() {
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "other_activity".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(crate::types::ExecutionId::new(), events);
+        let result = ctx
+            .execute_local_activity_raw("format_data", Value::Null, None, None)
+            .await;
+        assert!(matches!(result, Err(HarvestError::NonDeterministic(_))));
     }
 }

@@ -157,6 +157,22 @@ pub enum HarvestBuilderError {
         registered: Vec<String>,
     },
 
+    /// A local activity declares a `start_to_close` that exceeds the worker's
+    /// `max_local_activity_start_to_close` cap. Local activities run inline on
+    /// the workflow worker and must not block it indefinitely.
+    #[error(
+        "local activity '{activity}' start_to_close ({actual:?}) exceeds the worker cap \
+         ({cap:?}); lower start_to_close or raise WorkerConfig::max_local_activity_start_to_close"
+    )]
+    LocalActivityStartToCloseExceedsCap {
+        /// The local activity name.
+        activity: String,
+        /// The declared `start_to_close` on the activity.
+        actual: Duration,
+        /// The configured worker cap.
+        cap: Duration,
+    },
+
     /// A [`WorkflowSchedule`] contains an invalid schedule value (malformed cron
     /// expression, zero-length interval, etc.). Caught at build time so the
     /// operator sees a clear error rather than silently-inert or wedging schedules.
@@ -438,6 +454,10 @@ impl HarvestBuilder {
 
         validate_concurrency_keys(&self.activities)?;
         validate_workflow_schedules(&self.workflow_schedules, &self.workflows)?;
+        validate_local_activity_timeouts(
+            &self.activities,
+            self.worker_config.max_local_activity_start_to_close,
+        )?;
 
         Ok(BuiltHarvest {
             workflows: self.workflows,
@@ -548,6 +568,27 @@ fn validate_concurrency_keys(
     Ok(())
 }
 
+/// Reject local activities whose `default_start_to_close` exceeds the worker
+/// cap. Failing early gives operators a clear error instead of a runtime surprise.
+fn validate_local_activity_timeouts(
+    activities: &[crate::info::ActivityInfo],
+    cap: Duration,
+) -> Result<(), HarvestBuilderError> {
+    for activity in activities {
+        if !activity.is_local {
+            continue;
+        }
+        if activity.default_start_to_close.is_some_and(|stc| stc > cap) {
+            return Err(HarvestBuilderError::LocalActivityStartToCloseExceedsCap {
+                activity: activity.name.to_string(),
+                actual: activity.default_start_to_close.unwrap(),
+                cap,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Worker concurrency and queue configuration.
 #[derive(Debug, Clone)]
 pub struct WorkerConfig {
@@ -579,6 +620,13 @@ pub struct WorkerConfig {
     /// a `Vec` so future per-process multi-shard workers can list all shards
     /// they should poll without changing the config surface.
     pub shard_assignments: Vec<ShardId>,
+    /// Hard cap on `start_to_close` for local activities.
+    ///
+    /// Local activities run inline on the workflow worker task. An unbounded
+    /// timeout would block the worker indefinitely. Defaults to **60 seconds**.
+    /// Any local activity registered with `start_to_close > cap` is rejected
+    /// at builder `try_build()` time.
+    pub max_local_activity_start_to_close: Duration,
 }
 
 impl Default for WorkerConfig {
@@ -593,6 +641,7 @@ impl Default for WorkerConfig {
             sticky_timeout: Duration::from_secs(5),
             cancellation_grace_period: Duration::from_secs(5),
             shard_assignments: vec![ShardId::new(0)],
+            max_local_activity_start_to_close: Duration::from_secs(60),
         }
     }
 }
@@ -784,6 +833,7 @@ mod tests {
                 default_queue: None,
                 max_concurrent: None,
                 concurrency_key: None,
+                is_local: false,
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             }])
             .state(String::from("haunted"))
@@ -822,6 +872,23 @@ mod tests {
             default_queue: None,
             max_concurrent,
             concurrency_key: key,
+            is_local: false,
+            handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+        }
+    }
+
+    fn make_local_activity(name: &'static str, start_to_close: Option<Duration>) -> ActivityInfo {
+        ActivityInfo {
+            name,
+            module: "test",
+            default_retry_policy: None,
+            default_start_to_close: start_to_close,
+            default_heartbeat_timeout: None,
+            default_schedule_to_start: None,
+            default_queue: None,
+            max_concurrent: None,
+            concurrency_key: None,
+            is_local: true,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
         }
     }
@@ -926,5 +993,114 @@ mod tests {
                 if activity == "act_a"
         ));
         assert!(err.to_string().contains("act_a"));
+    }
+
+    // ── Local activity cap tests ──────────────────────────────────────────
+
+    #[test]
+    fn worker_config_max_local_activity_start_to_close_defaults_to_60s() {
+        let config = WorkerConfig::default();
+        assert_eq!(
+            config.max_local_activity_start_to_close,
+            Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn builder_accepts_local_activity_within_cap() {
+        let result = HarvestBuilder::new()
+            .activities(vec![make_local_activity(
+                "compute_hash",
+                Some(Duration::from_secs(30)),
+            )])
+            .try_build();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn builder_accepts_local_activity_with_no_start_to_close() {
+        let result = HarvestBuilder::new()
+            .activities(vec![make_local_activity("compute_hash", None)])
+            .try_build();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn builder_rejects_local_activity_exceeding_cap() {
+        let result = HarvestBuilder::new()
+            .activities(vec![make_local_activity(
+                "slow_local",
+                Some(Duration::from_secs(120)),
+            )])
+            .try_build();
+        let err = result.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                HarvestBuilderError::LocalActivityStartToCloseExceedsCap {
+                    ref activity, ..
+                } if activity == "slow_local"
+            ),
+            "expected LocalActivityStartToCloseExceedsCap, got {err}"
+        );
+        assert!(err.to_string().contains("slow_local"));
+    }
+
+    #[test]
+    fn builder_rejects_local_activity_exactly_at_cap_boundary_when_exceeded() {
+        // Exactly 60s is fine; 61s should fail.
+        let at_cap = HarvestBuilder::new()
+            .activities(vec![make_local_activity(
+                "edge_case",
+                Some(Duration::from_secs(60)),
+            )])
+            .try_build();
+        assert!(at_cap.is_ok());
+
+        let over_cap = HarvestBuilder::new()
+            .activities(vec![make_local_activity(
+                "edge_case",
+                Some(Duration::from_secs(61)),
+            )])
+            .try_build();
+        assert!(over_cap.is_err());
+    }
+
+    #[test]
+    fn builder_accepts_custom_cap_that_fits_activity() {
+        let worker = WorkerConfig {
+            max_local_activity_start_to_close: Duration::from_secs(120),
+            ..WorkerConfig::default()
+        };
+        let result = HarvestBuilder::new()
+            .activities(vec![make_local_activity(
+                "slow_local",
+                Some(Duration::from_secs(90)),
+            )])
+            .worker(worker)
+            .try_build();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn regular_activity_is_not_subject_to_local_cap() {
+        // A regular activity with start_to_close > 60s should not be rejected
+        // by the local activity cap validator.
+        let result = HarvestBuilder::new()
+            .activities(vec![ActivityInfo {
+                name: "long_running",
+                module: "test",
+                default_retry_policy: None,
+                default_start_to_close: Some(Duration::from_secs(300)),
+                default_heartbeat_timeout: None,
+                default_schedule_to_start: None,
+                default_queue: None,
+                max_concurrent: None,
+                concurrency_key: None,
+                is_local: false,
+                handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            }])
+            .try_build();
+        assert!(result.is_ok());
     }
 }

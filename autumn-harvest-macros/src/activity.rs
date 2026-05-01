@@ -12,6 +12,7 @@ struct ActivityAttrs {
     queue: Option<String>,
     max_concurrent: Option<u32>,
     concurrency_key: Option<String>,
+    local: bool,
 }
 
 fn parse_attrs(attr: TokenStream) -> syn::Result<ActivityAttrs> {
@@ -23,6 +24,7 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<ActivityAttrs> {
         queue: None,
         max_concurrent: None,
         concurrency_key: None,
+        local: false,
     };
 
     syn::meta::parser(|meta| {
@@ -60,8 +62,12 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<ActivityAttrs> {
             let value: LitStr = meta.value()?.parse()?;
             result.concurrency_key = Some(value.value());
             Ok(())
+        } else if meta.path.is_ident("local") {
+            let value: syn::LitBool = meta.value()?.parse()?;
+            result.local = value.value();
+            Ok(())
         } else {
-            Err(meta.error("unsupported attribute: expected retry, start_to_close, heartbeat_timeout, schedule_to_start, queue, max_concurrent, or concurrency_key"))
+            Err(meta.error("unsupported attribute: expected retry, start_to_close, heartbeat_timeout, schedule_to_start, queue, max_concurrent, concurrency_key, or local"))
         }
     })
     .parse2(attr)?;
@@ -97,6 +103,35 @@ pub fn activity_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             "#[activity] functions must be async",
         )
         .to_compile_error();
+    }
+
+    // Local activities may only use start_to_close. Emit a clear compile error
+    // for any unsupported option to prevent silent misconfiguration.
+    if attrs.local {
+        if attrs.heartbeat_timeout.is_some() {
+            return syn::Error::new_spanned(
+                input_fn.sig.fn_token,
+                "local activities do not support heartbeat_timeout; \
+                 use a regular activity if you need heartbeating",
+            )
+            .to_compile_error();
+        }
+        if attrs.schedule_to_start.is_some() {
+            return syn::Error::new_spanned(
+                input_fn.sig.fn_token,
+                "local activities do not support schedule_to_start; \
+                 local activities always run inline on the workflow worker",
+            )
+            .to_compile_error();
+        }
+        if attrs.queue.is_some() {
+            return syn::Error::new_spanned(
+                input_fn.sig.fn_token,
+                "local activities do not support queue; \
+                 local activities always run on the worker executing the workflow",
+            )
+            .to_compile_error();
+        }
     }
 
     let fn_name = &input_fn.sig.ident;
@@ -207,6 +242,8 @@ pub fn activity_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
+    let is_local = attrs.local;
+
     quote! {
         #input_fn
 
@@ -222,6 +259,7 @@ pub fn activity_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 default_queue: #queue_expr,
                 max_concurrent: #max_concurrent_expr,
                 concurrency_key: #concurrency_key_expr,
+                is_local: #is_local,
                 handler: |ctx, input| {
                     ::std::boxed::Box::pin(async move {
                         #dispatch

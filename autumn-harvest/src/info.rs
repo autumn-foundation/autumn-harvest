@@ -64,6 +64,10 @@ pub struct ActivityInfo {
     /// `max_concurrent` budget. Defaults to the activity's own name when
     /// `max_concurrent` is set and `concurrency_key` is not specified.
     pub concurrency_key: Option<&'static str>,
+    /// When `true`, the worker runs this activity inline on the workflow task
+    /// (never enqueued). Local activities must not set `heartbeat_timeout`,
+    /// `schedule_to_start`, or `queue` — the macro enforces this at compile time.
+    pub is_local: bool,
     /// Type-erased dispatch function.
     pub handler: ActivityHandlerFn,
 }
@@ -123,6 +127,7 @@ impl std::fmt::Debug for ActivityInfo {
             .field("default_queue", &self.default_queue)
             .field("max_concurrent", &self.max_concurrent)
             .field("concurrency_key", &self.concurrency_key)
+            .field("is_local", &self.is_local)
             .field("handler", &"<fn>")
             .finish()
     }
@@ -169,12 +174,44 @@ mod tests {
             default_queue: None,
             max_concurrent: None,
             concurrency_key: None,
+            is_local: false,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
         };
         assert!(info.default_retry_policy.is_none());
         assert_eq!(info.default_queue, None);
         assert!(info.max_concurrent.is_none());
         assert!(info.concurrency_key.is_none());
+        assert!(!info.is_local);
+    }
+
+    #[test]
+    fn activity_info_is_local_true() {
+        let info = ActivityInfo {
+            name: "compute_hash",
+            module: "my_app::activities",
+            default_retry_policy: None,
+            default_start_to_close: Some(std::time::Duration::from_secs(10)),
+            default_heartbeat_timeout: None,
+            default_schedule_to_start: None,
+            default_queue: None,
+            max_concurrent: None,
+            concurrency_key: None,
+            is_local: true,
+            handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+        };
+        assert!(info.is_local);
+        assert!(
+            info.default_heartbeat_timeout.is_none(),
+            "local activities must not have heartbeat_timeout"
+        );
+        assert!(
+            info.default_schedule_to_start.is_none(),
+            "local activities must not have schedule_to_start"
+        );
+        assert!(
+            info.default_queue.is_none(),
+            "local activities must not have a queue"
+        );
     }
 
     #[test]
@@ -189,6 +226,7 @@ mod tests {
             default_queue: None,
             max_concurrent: Some(5),
             concurrency_key: Some("email"),
+            is_local: false,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
         };
         assert_eq!(info.max_concurrent, Some(5));
@@ -242,6 +280,7 @@ mod tests {
             default_queue: None,
             max_concurrent: None,
             concurrency_key: None,
+            is_local: false,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
         };
         let debug_str = format!("{activity_info:?}");
