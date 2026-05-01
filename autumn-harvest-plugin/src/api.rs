@@ -382,6 +382,14 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .route("/dags/{dag_name}/trigger", post(trigger_dag_run))
         .route("/dags/{dag_name}", patch(patch_dag))
         .route("/dead-letters", get(list_dead_letters))
+        .route(
+            "/dead-letters/replay",
+            post(bulk_replay_dead_letters_handler),
+        )
+        .route(
+            "/dead-letters/discard",
+            post(bulk_discard_dead_letters_handler),
+        )
         .route("/dead-letters/{id}/replay", post(replay_dead_letter))
         .route("/health", get(health))
         .route("/admin/retention", get(retention_status))
@@ -1046,6 +1054,165 @@ async fn replay_dead_letter(
     ))
 }
 
+async fn bulk_replay_dead_letters_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+    Json(filter): Json<dlq::BulkDlqFilter>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+
+    if filter.is_empty() {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "bulk filter must specify at least one criterion: \
+                          activity_name, workflow_name, failed_after, or failed_before"
+            })),
+        )
+            .into_response();
+    }
+
+    match bulk_replay_from_shards(&api_state, &filter).await {
+        Ok(result) => {
+            let status = if result.acted_on == 0 && !result.failures.is_empty() {
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            } else {
+                axum::http::StatusCode::OK
+            };
+            (status, Json(result)).into_response()
+        }
+        Err(e) => map_error(e).into_response(),
+    }
+}
+
+async fn bulk_discard_dead_letters_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+    Json(filter): Json<dlq::BulkDlqFilter>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+
+    if filter.is_empty() {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "bulk filter must specify at least one criterion: \
+                          activity_name, workflow_name, failed_after, or failed_before"
+            })),
+        )
+            .into_response();
+    }
+
+    match bulk_discard_from_shards(&api_state, &filter).await {
+        Ok(result) => {
+            let status = if result.acted_on == 0 && !result.failures.is_empty() {
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            } else {
+                axum::http::StatusCode::OK
+            };
+            (status, Json(result)).into_response()
+        }
+        Err(e) => map_error(e).into_response(),
+    }
+}
+
+async fn bulk_replay_from_shards(
+    api_state: &HarvestApiState,
+    filter: &dlq::BulkDlqFilter,
+) -> Result<dlq::BulkDlqResult, HarvestError> {
+    let pool = api_state.storage_pool()?;
+    let mut total = dlq::BulkDlqResult {
+        matched: 0,
+        acted_on: 0,
+        skipped: 0,
+        ids: Vec::new(),
+        dry_run: filter.dry_run,
+        failures: Vec::new(),
+    };
+
+    // Enforce the limit as a global cap across all shards, not per-shard.
+    // effective_limit() is guaranteed to be in [1, 1000] so both try_from
+    // conversions below are infallible in practice.
+    let mut remaining: u32 =
+        u32::try_from(filter.effective_limit()).unwrap_or(dlq::DEFAULT_BULK_LIMIT);
+
+    for (_shard, shard_pool) in pool.iter_shards() {
+        let mut conn = shard_pool
+            .get()
+            .await
+            .map_err(|e| HarvestError::Database(e.to_string()))?;
+
+        if remaining == 0 {
+            // Budget exhausted: count-only so matched reflects all shards.
+            let shard_matched = dlq::count_bulk_filter_matches(&mut conn, filter)
+                .await
+                .map(|n| usize::try_from(n).unwrap_or(0))?;
+            total.matched += shard_matched;
+            continue;
+        }
+
+        let mut shard_filter = filter.clone();
+        shard_filter.limit = Some(remaining);
+        let shard_result = dlq::bulk_replay_dead_letters(&mut conn, &shard_filter).await?;
+        // Rows consumed = acted + skipped + failed (or preview ids in dry-run).
+        let consumed = shard_result.ids.len() + shard_result.skipped + shard_result.failures.len();
+        remaining = remaining.saturating_sub(u32::try_from(consumed).unwrap_or(remaining));
+        total.matched += shard_result.matched;
+        total.acted_on += shard_result.acted_on;
+        total.skipped += shard_result.skipped;
+        total.ids.extend(shard_result.ids);
+        total.failures.extend(shard_result.failures);
+    }
+
+    Ok(total)
+}
+
+async fn bulk_discard_from_shards(
+    api_state: &HarvestApiState,
+    filter: &dlq::BulkDlqFilter,
+) -> Result<dlq::BulkDlqResult, HarvestError> {
+    let pool = api_state.storage_pool()?;
+    let mut total = dlq::BulkDlqResult {
+        matched: 0,
+        acted_on: 0,
+        skipped: 0,
+        ids: Vec::new(),
+        dry_run: filter.dry_run,
+        failures: Vec::new(),
+    };
+
+    // Enforce the limit as a global cap across all shards, not per-shard.
+    let mut remaining: u32 =
+        u32::try_from(filter.effective_limit()).unwrap_or(dlq::DEFAULT_BULK_LIMIT);
+
+    for (_shard, shard_pool) in pool.iter_shards() {
+        let mut conn = shard_pool
+            .get()
+            .await
+            .map_err(|e| HarvestError::Database(e.to_string()))?;
+
+        if remaining == 0 {
+            // Budget exhausted: count-only so matched reflects all shards.
+            let shard_matched = dlq::count_bulk_filter_matches(&mut conn, filter)
+                .await
+                .map(|n| usize::try_from(n).unwrap_or(0))?;
+            total.matched += shard_matched;
+            continue;
+        }
+
+        let mut shard_filter = filter.clone();
+        shard_filter.limit = Some(remaining);
+        let shard_result = dlq::bulk_discard_dead_letters(&mut conn, &shard_filter).await?;
+        let consumed = shard_result.ids.len() + shard_result.skipped + shard_result.failures.len();
+        remaining = remaining.saturating_sub(u32::try_from(consumed).unwrap_or(remaining));
+        total.matched += shard_result.matched;
+        total.acted_on += shard_result.acted_on;
+        total.skipped += shard_result.skipped;
+        total.ids.extend(shard_result.ids);
+        total.failures.extend(shard_result.failures);
+    }
+
+    Ok(total)
+}
+
 async fn retention_status(
     Extension(api_state): Extension<HarvestApiState>,
 ) -> Result<Json<RetentionStatus>, AutumnError> {
@@ -1514,6 +1681,37 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect()
+    }
+
+    #[test]
+    fn bulk_dlq_filter_is_empty_when_only_limit_set() {
+        let filter: autumn_harvest::dlq::BulkDlqFilter =
+            serde_json::from_str(r#"{"limit": 100}"#).unwrap();
+        assert!(
+            filter.is_empty(),
+            "filter with only limit should be considered empty"
+        );
+    }
+
+    #[test]
+    fn bulk_dlq_filter_is_not_empty_when_activity_name_set() {
+        let filter: autumn_harvest::dlq::BulkDlqFilter =
+            serde_json::from_str(r#"{"activity_name": "send_email"}"#).unwrap();
+        assert!(!filter.is_empty());
+    }
+
+    #[test]
+    fn bulk_dlq_filter_effective_limit_defaults_to_100() {
+        let filter: autumn_harvest::dlq::BulkDlqFilter =
+            serde_json::from_str(r#"{"activity_name": "foo"}"#).unwrap();
+        assert_eq!(filter.effective_limit(), 100);
+    }
+
+    #[test]
+    fn bulk_dlq_filter_effective_limit_hard_capped_at_1000() {
+        let filter: autumn_harvest::dlq::BulkDlqFilter =
+            serde_json::from_str(r#"{"activity_name": "foo", "limit": 9999}"#).unwrap();
+        assert_eq!(filter.effective_limit(), 1000);
     }
 
     #[test]

@@ -375,10 +375,58 @@ enum DeadLetterCommand {
         #[arg(long, value_parser = clap::value_parser!(i64).range(1..=200))]
         limit: Option<i64>,
     },
-    /// Replay a dead-lettered task.
+    /// Replay a single dead-lettered task by ID.
     Replay {
         /// Dead-letter row ID.
         dead_letter_id: String,
+    },
+    /// Bulk-replay dead-lettered tasks matching a filter.
+    ///
+    /// At least one filter criterion must be provided. Use --dry-run to preview
+    /// matching rows without performing any writes.
+    BulkReplay {
+        /// Exact match on activity name.
+        #[arg(long)]
+        activity_name: Option<String>,
+        /// Exact match on workflow name.
+        #[arg(long)]
+        workflow_name: Option<String>,
+        /// Inclusive lower bound on `failed_at` (RFC 3339, e.g. `2026-04-27T12:30:00Z`).
+        #[arg(long)]
+        failed_after: Option<String>,
+        /// Exclusive upper bound on `failed_at` (RFC 3339).
+        #[arg(long)]
+        failed_before: Option<String>,
+        /// Maximum rows to act on per call (default 100, max 1000).
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=1000))]
+        limit: Option<u32>,
+        /// Preview matching rows without performing any writes.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Bulk-discard dead-lettered tasks matching a filter (delete without replay).
+    ///
+    /// At least one filter criterion must be provided. Use --dry-run to preview
+    /// matching rows without performing any deletes.
+    BulkDiscard {
+        /// Exact match on activity name.
+        #[arg(long)]
+        activity_name: Option<String>,
+        /// Exact match on workflow name.
+        #[arg(long)]
+        workflow_name: Option<String>,
+        /// Inclusive lower bound on `failed_at` (RFC 3339, e.g. `2026-04-27T12:30:00Z`).
+        #[arg(long)]
+        failed_after: Option<String>,
+        /// Exclusive upper bound on `failed_at` (RFC 3339).
+        #[arg(long)]
+        failed_before: Option<String>,
+        /// Maximum rows to act on per call (default 100, max 1000).
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=1000))]
+        limit: Option<u32>,
+        /// Preview matching rows without performing any deletes.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -721,7 +769,65 @@ fn dead_letter_request(command: &DeadLetterCommand) -> ApiRequest {
             format!("/dead-letters/{}/replay", path_segment(dead_letter_id)),
             None,
         ),
+        DeadLetterCommand::BulkReplay {
+            activity_name,
+            workflow_name,
+            failed_after,
+            failed_before,
+            limit,
+            dry_run,
+        } => ApiRequest::post(
+            "/dead-letters/replay",
+            Some(build_bulk_dlq_body(
+                activity_name.as_deref(),
+                workflow_name.as_deref(),
+                failed_after.as_deref(),
+                failed_before.as_deref(),
+                *limit,
+                *dry_run,
+            )),
+        ),
+        DeadLetterCommand::BulkDiscard {
+            activity_name,
+            workflow_name,
+            failed_after,
+            failed_before,
+            limit,
+            dry_run,
+        } => ApiRequest::post(
+            "/dead-letters/discard",
+            Some(build_bulk_dlq_body(
+                activity_name.as_deref(),
+                workflow_name.as_deref(),
+                failed_after.as_deref(),
+                failed_before.as_deref(),
+                *limit,
+                *dry_run,
+            )),
+        ),
     }
+}
+
+fn build_bulk_dlq_body(
+    activity_name: Option<&str>,
+    workflow_name: Option<&str>,
+    failed_after: Option<&str>,
+    failed_before: Option<&str>,
+    limit: Option<u32>,
+    dry_run: bool,
+) -> Value {
+    let mut body = Map::new();
+    insert_string(&mut body, "activity_name", activity_name);
+    insert_string(&mut body, "workflow_name", workflow_name);
+    insert_string(&mut body, "failed_after", failed_after);
+    insert_string(&mut body, "failed_before", failed_before);
+    if let Some(l) = limit {
+        body.insert("limit".to_string(), json!(l));
+    }
+    if dry_run {
+        body.insert("dry_run".to_string(), json!(true));
+    }
+    Value::Object(body)
 }
 
 fn parse_json_source(
