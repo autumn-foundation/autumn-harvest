@@ -357,13 +357,19 @@ mod db {
         id: Uuid,
     }
 
-    /// Bump completed/failed counters and append per-target errors atomically.
+    /// Bump completed/failed counters, append per-target errors, and record
+    /// the dispatched execution ids atomically.
+    ///
+    /// The dispatched ids are the durable exclusion set used on resume to
+    /// skip already-processed targets regardless of their current workflow
+    /// state.
     pub async fn record_progress(
         conn: &mut AsyncPgConnection,
         id: Uuid,
         delta_completed: i64,
         delta_failed: i64,
         new_errors: &[BatchTargetError],
+        dispatched_ids: &[Uuid],
     ) -> HarvestResult<()> {
         use diesel::dsl::sql;
         use diesel::sql_types::Jsonb;
@@ -386,6 +392,24 @@ mod db {
                 .set(
                     harvest_batch_jobs::errors
                         .eq(sql::<Jsonb>("errors || ").bind::<Jsonb, _>(errors_value)),
+                )
+                .execute(conn)
+                .await
+                .map_err(database_error)?;
+        }
+
+        if !dispatched_ids.is_empty() {
+            let ids_value = serde_json::to_value(
+                dispatched_ids
+                    .iter()
+                    .map(Uuid::to_string)
+                    .collect::<Vec<_>>(),
+            )
+            .map_err(HarvestError::from)?;
+            diesel::update(harvest_batch_jobs::table.find(id))
+                .set(
+                    harvest_batch_jobs::processed_ids
+                        .eq(sql::<Jsonb>("processed_ids || ").bind::<Jsonb, _>(ids_value)),
                 )
                 .execute(conn)
                 .await
@@ -671,14 +695,23 @@ mod db {
             return Ok(());
         }
 
-        // Stable UUID sort; Signal targets stay RUNNING so we offset-skip the already-counted prefix.
-        all_targets.sort_unstable_by_key(ExecutionId::as_uuid);
-        let skip = if action == BatchAction::Signal {
-            usize::try_from((job.completed + job.failed).max(0)).unwrap_or(0)
-        } else {
-            0
-        };
-        let targets_to_dispatch: Vec<_> = all_targets.into_iter().skip(skip).collect();
+        // Build the durable exclusion set from prior ticks. Resume-by-identity:
+        // a target whose UUID is already in `processed_ids` was dispatched on
+        // a previous tick (success or failure was already counted), so skip it
+        // regardless of its current workflow state. This is the correct fix
+        // for Signal — signaled workflows stay RUNNING and would otherwise be
+        // re-dispatched, and an offset-based cursor is unsafe when the RUNNING
+        // set drains naturally during a recovery window.
+        let processed: std::collections::HashSet<Uuid> =
+            serde_json::from_value::<Vec<String>>(job.processed_ids.clone())
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|s| Uuid::parse_str(&s).ok())
+                .collect();
+        let targets_to_dispatch: Vec<_> = all_targets
+            .into_iter()
+            .filter(|t| !processed.contains(&t.as_uuid()))
+            .collect();
 
         let signal_name = job.signal_name.clone();
         let signal_payload = job.signal_payload.clone();
@@ -710,7 +743,9 @@ mod db {
             let mut completed_delta = 0i64;
             let mut failed_delta = 0i64;
             let mut new_errors: Vec<BatchTargetError> = Vec::new();
+            let mut dispatched_ids: Vec<Uuid> = Vec::with_capacity(chunk.len());
             while let Some((target, outcome)) = tasks.next().await {
+                dispatched_ids.push(target.as_uuid());
                 match outcome {
                     Ok(()) => completed_delta += 1,
                     Err(reason) => {
@@ -728,6 +763,7 @@ mod db {
                 completed_delta,
                 failed_delta,
                 &new_errors,
+                &dispatched_ids,
             )
             .await?;
         }

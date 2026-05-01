@@ -427,6 +427,7 @@ pub struct BatchJob {
     pub completed_at: Option<DateTime<Utc>>,
     pub idempotency_key: Option<String>,
     pub created_by: Option<String>,
+    pub processed_ids: serde_json::Value,
 }
 
 /// Insert struct for submitting a new batch job.

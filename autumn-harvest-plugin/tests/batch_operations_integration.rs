@@ -53,6 +53,10 @@ const INIT_SQL: &str = concat!(
     include_str!("../../autumn-harvest/migrations/20260430000001_harvest_external_tasks/up.sql"),
     "\n",
     include_str!("../../autumn-harvest/migrations/20260501010000_harvest_batch_jobs/up.sql"),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260501020000_harvest_batch_processed_ids/up.sql"
+    ),
 );
 
 type HarvestApiApp = axum::Router;
@@ -470,15 +474,26 @@ async fn batch_resumes_from_partial_progress_cursor() {
             .unwrap();
     }
     let job_uuid: uuid::Uuid = job_id.parse().unwrap();
-    // Backdate updated_at past the lease window so the surviving worker can
-    // claim the abandoned row (simulating a worker that crashed long ago).
+    // Record the 8 already-cancelled exec ids in `processed_ids` so the next
+    // tick excludes them by identity (not by counter offset). Backdate
+    // updated_at past the lease window so the surviving worker can claim the
+    // abandoned row (simulating a worker that crashed long ago).
+    let processed_json = serde_json::to_value(
+        ids.iter()
+            .take(8)
+            .map(|id| id.as_uuid().to_string())
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
     diesel::sql_query(
         "UPDATE harvest_batch_jobs \
          SET status='Running', total=20, completed=8, \
+             processed_ids = $2, \
              updated_at = now() - INTERVAL '5 minutes' \
          WHERE id=$1",
     )
     .bind::<diesel::sql_types::Uuid, _>(job_uuid)
+    .bind::<diesel::sql_types::Jsonb, _>(processed_json)
     .execute(&mut conn)
     .await
     .unwrap();
@@ -677,4 +692,103 @@ async fn batch_executor_lease_prevents_double_dispatch() {
         "completed must equal total; double-dispatch would inflate this"
     );
     assert_eq!(body["failed"], 0);
+}
+
+// Issue #102 Signal-resume correctness: Signal targets stay RUNNING after
+// dispatch, so the resume cursor cannot be a counter offset over a re-queried
+// list. If workflows that were already signaled naturally complete during the
+// recovery window, the new RUNNING set shrinks and an offset cursor would
+// silently skip workflows that were never signaled. This test seeds that
+// exact race: it backs the executor row with `processed_ids = first 4 UUIDs`
+// (those were "signaled and later naturally completed"), then deletes those 4
+// rows from the workflow table (so they no longer match the RUNNING filter),
+// and confirms the resume tick dispatches the remaining 6 by identity.
+#[tokio::test]
+async fn batch_signal_resume_excludes_processed_ids_not_offset() {
+    use autumn_harvest::schema::harvest_signals;
+
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+
+    let ids = seed_workflows(&url, "onboarding", 10).await;
+
+    let (_, body) = post_json(
+        &app,
+        "/batch-operations",
+        json!({
+            "action": "Signal",
+            "filter": { "workflow_name": "onboarding" },
+            "signal_name": "switch_to_fallback"
+        }),
+    )
+    .await;
+    let job_id = body["batch_job_id"].as_str().unwrap().to_string();
+    let job_uuid: uuid::Uuid = job_id.parse().unwrap();
+
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&url)
+        .await
+        .unwrap();
+
+    // Simulate "signaled before crash, naturally completed during recovery":
+    // mark the first 4 rows COMPLETED so they leave the RUNNING filter.
+    for exec_id in ids.iter().take(4) {
+        diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
+            .set(harvest_workflow_executions::state.eq("COMPLETED"))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+    }
+
+    // Persist those 4 ids as already-processed and bump completed=4.
+    let processed_json = serde_json::to_value(
+        ids.iter()
+            .take(4)
+            .map(|id| id.as_uuid().to_string())
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    diesel::sql_query(
+        "UPDATE harvest_batch_jobs \
+         SET status='Running', total=10, completed=4, \
+             processed_ids = $2, \
+             updated_at = now() - INTERVAL '5 minutes' \
+         WHERE id=$1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(job_uuid)
+    .bind::<diesel::sql_types::Jsonb, _>(processed_json)
+    .execute(&mut conn)
+    .await
+    .unwrap();
+
+    let sharded_pool = HarvestDbPool::from(pool.clone());
+    run_executor_once(sharded_pool.sharded_pool(), &BatchExecutorConfig::default())
+        .await
+        .unwrap();
+
+    // The remaining 6 RUNNING workflows must each have received a signal,
+    // and total/completed must reflect identity-based exclusion: 4 from the
+    // prior tick + 6 dispatched here = 10. An offset cursor would have
+    // skipped 4 workflows from the now-shrunken list of 6 and dispatched 2.
+    let (_, body) = get_json(&app, &format!("/batch-operations/{job_id}")).await;
+    assert_eq!(body["status"], "Completed", "after resume tick: {body}");
+    assert_eq!(body["total"], 10);
+    assert_eq!(
+        body["completed"], 10,
+        "completed must equal total; signal-resume by identity"
+    );
+
+    // Verify each of the 6 surviving workflows actually received a signal.
+    for exec_id in ids.iter().skip(4) {
+        let signal_count: i64 = harvest_signals::table
+            .filter(harvest_signals::workflow_exec_id.eq(exec_id.as_uuid()))
+            .count()
+            .get_result(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            signal_count, 1,
+            "exec {exec_id} must have exactly one signal queued"
+        );
+    }
 }

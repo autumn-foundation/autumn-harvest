@@ -214,6 +214,7 @@ diesel::table! {
         completed_at -> Nullable<Timestamptz>,
         idempotency_key -> Nullable<Text>,
         created_by -> Nullable<Text>,
+        processed_ids -> Jsonb,
     }
 }
 
