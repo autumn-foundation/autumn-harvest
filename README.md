@@ -20,6 +20,8 @@ the same shape with one fewer service to operate.
 
 ## Quick example
 
+Try it end-to-end: `cargo run -p quickstart` (see [`examples/quickstart/`](examples/quickstart/)).
+
 ```rust
 use autumn_harvest::prelude::*;
 
