@@ -116,6 +116,25 @@ impl HistoryMatcher {
         cursor < self.events.len()
     }
 
+    /// Returns `true` if there are unconsumed events that are not terminal
+    /// lifecycle events (`WorkflowCompleted`, `WorkflowFailed`,
+    /// `WorkflowCancelled`).
+    ///
+    /// Used by [`WorkflowContext::history_has_unconsumed_events`] to avoid
+    /// false non-determinism reports when replaying full histories that include
+    /// a terminal event appended after workflow completion.
+    #[must_use]
+    pub fn has_non_lifecycle_unconsumed(&self) -> bool {
+        let mut cursor = self.cursor;
+        while cursor < self.events.len() {
+            if !self.is_consumed(cursor) && !self.events[cursor].is_terminal_lifecycle() {
+                return true;
+            }
+            cursor += 1;
+        }
+        false
+    }
+
     /// Current cursor position in the event list.
     #[must_use]
     pub const fn position(&self) -> usize {

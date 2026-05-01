@@ -420,12 +420,16 @@ impl WorkflowContext {
         ctx
     }
 
-    /// Returns `true` if there are still unconsumed recorded history events.
+    /// Returns `true` if there are unconsumed recorded history events that are
+    /// not terminal lifecycle events (`WorkflowCompleted`, `WorkflowFailed`,
+    /// `WorkflowCancelled`).
     ///
-    /// Used by `run_workflow_strict` to detect early-completion non-determinism
-    /// (i.e. the workflow returned before consuming the full event history).
+    /// Used by `run_workflow_strict` to detect early-completion non-determinism.
+    /// Terminal lifecycle events are excluded because they are appended by the
+    /// executor after the workflow returns and are never consumed by workflow
+    /// commands.
     pub fn history_has_unconsumed_events(&self) -> bool {
-        self.match_history(|m| m.is_replaying())
+        self.match_history(|m| m.has_non_lifecycle_unconsumed())
     }
 
     /// Test constructor -- creates a context in live (non-replay) mode with

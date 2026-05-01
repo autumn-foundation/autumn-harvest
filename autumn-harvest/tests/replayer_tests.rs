@@ -593,3 +593,128 @@ async fn replay_early_completion_detects_non_determinism() {
         "early-return workflow must produce EarlyCompletion non-determinism, got: {report}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Suspended-during-replay detection
+// ---------------------------------------------------------------------------
+
+/// Workflow that issues a new activity not in the recorded history.
+fn extra_step_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        ctx.execute_activity_raw("step_one", Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        ctx.execute_activity_raw("step_two", Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        // NEW step not in the canonical 2-activity history → suspends.
+        ctx.execute_activity_raw("step_three_new", Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(Value::Null)
+    })
+}
+
+/// A workflow that adds a new command beyond recorded history suspends during
+/// strict replay → `NonDeterminismDetected` (not `ReplaySucceeded`).
+#[tokio::test]
+async fn replay_new_command_beyond_history_detects_non_determinism() {
+    // Build a 2-activity history (step_one, step_two only — no step_three).
+    let exec_id = ExecutionId::new();
+    let id1 = autumn_harvest::types::ActivityExecId::new();
+    let id2 = autumn_harvest::types::ActivityExecId::new();
+    let events = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: id1,
+            name: "step_one".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: id1,
+            output: Value::Null,
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: id2,
+            name: "step_two".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: id2,
+            output: Value::Null,
+        },
+    ];
+
+    let report = WorkflowReplayer::new()
+        .register_fn("extra_step_workflow", extra_step_workflow)
+        .replay_from_snapshot(make_snapshot("extra_step_workflow", exec_id, events))
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::NonDeterminismDetected { .. }),
+        "workflow adding a new command beyond history must be non-deterministic: {report}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Terminal lifecycle events ignored by early-completion check
+// ---------------------------------------------------------------------------
+
+fn single_step_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        ctx.execute_activity_raw("step_one", Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(Value::Null)
+    })
+}
+
+/// Histories loaded from a completed execution include `WorkflowCompleted` as
+/// the last event. An unchanged workflow should still report `ReplaySucceeded`.
+#[tokio::test]
+async fn replay_history_with_workflow_completed_tail_succeeds() {
+    let exec_id = ExecutionId::new();
+    let id1 = autumn_harvest::types::ActivityExecId::new();
+    let events = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: id1,
+            name: "step_one".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: id1,
+            output: Value::Null,
+        },
+        // Terminal lifecycle event — the executor appends this after the
+        // workflow returns. It must not be treated as "unconsumed history".
+        WorkflowEvent::WorkflowCompleted {
+            output: Value::Null,
+        },
+    ];
+
+    let report = WorkflowReplayer::new()
+        .register_fn("single_step_workflow", single_step_workflow)
+        .replay_from_snapshot(make_snapshot("single_step_workflow", exec_id, events))
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "history with WorkflowCompleted tail must not trigger early-completion: {report}"
+    );
+}

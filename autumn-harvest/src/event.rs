@@ -276,6 +276,19 @@ impl WorkflowEvent {
             Self::ActivityExternalDeadlineExtended { .. } => "ActivityExternalDeadlineExtended",
         }
     }
+
+    /// Returns `true` for terminal lifecycle events that are appended by the
+    /// executor after a workflow finishes and are never consumed by workflow
+    /// commands during replay.
+    #[must_use]
+    pub const fn is_terminal_lifecycle(&self) -> bool {
+        matches!(
+            self,
+            Self::WorkflowCompleted { .. }
+                | Self::WorkflowFailed { .. }
+                | Self::WorkflowCancelled { .. }
+        )
+    }
 }
 
 #[cfg(test)]

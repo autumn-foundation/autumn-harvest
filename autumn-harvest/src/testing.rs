@@ -530,13 +530,32 @@ fn outcome_to_report(
     outcome: WorkflowOutcome,
 ) -> ReplayReport {
     match outcome {
-        WorkflowOutcome::Completed { .. }
-        | WorkflowOutcome::Suspended { .. }
-        | WorkflowOutcome::ContinuedAsNew { .. } => ReplayReport {
+        WorkflowOutcome::Completed { .. } | WorkflowOutcome::ContinuedAsNew { .. } => {
+            ReplayReport {
+                execution_id: exec_id,
+                events_replayed: total_events,
+                status: ReplayStatus::ReplaySucceeded,
+                mismatched_command_summary: None,
+            }
+        }
+
+        // Suspension during strict replay means the workflow tried to issue a
+        // new command with no matching history event (the oneshot is never
+        // resolved in replay mode, so the 100 ms timeout fires).
+        WorkflowOutcome::Suspended { .. } => ReplayReport {
             execution_id: exec_id,
             events_replayed: total_events,
-            status: ReplayStatus::ReplaySucceeded,
-            mismatched_command_summary: None,
+            status: ReplayStatus::NonDeterminismDetected {
+                kind: NonDeterminismKind::Unknown,
+                expected: "<workflow to complete replay>".to_string(),
+                actual: "<workflow suspended — issued new command with no matching history event>"
+                    .to_string(),
+                event_index: total_events,
+            },
+            mismatched_command_summary: Some(
+                "workflow suspended during replay (new command beyond recorded history)"
+                    .to_string(),
+            ),
         },
 
         WorkflowOutcome::Failed { error } => try_parse_non_determinism(&error, exec_id, events)
