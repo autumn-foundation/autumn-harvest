@@ -360,6 +360,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn all_type_names_are_unique() {
         use crate::types::{ActivityExecId, ExecutionId, TimerId, WorkerId};
         use std::collections::HashSet;

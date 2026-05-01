@@ -198,6 +198,7 @@ fn heartbeat_registry(probe: HeartbeatCancellationProbe) -> Arc<HandlerRegistry>
             default_queue: Some("default"),
             max_concurrent: None,
             concurrency_key: None,
+            is_local: false,
             handler: heartbeat_activity,
         }],
         Arc::new(state),
@@ -402,6 +403,7 @@ async fn running_activity_heartbeat_observes_workflow_cancellation() {
                 shutdown_timeout: Duration::from_secs(1),
                 cancellation_grace_period: Duration::from_secs(1),
                 sticky_timeout: Duration::from_secs(5),
+                max_local_activity_start_to_close: Duration::from_secs(60),
             },
             registry,
         )
@@ -525,6 +527,7 @@ fn uncooperative_registry(probe: UncooperativeActivityProbe) -> Arc<HandlerRegis
             default_queue: Some("default"),
             max_concurrent: None,
             concurrency_key: None,
+            is_local: false,
             handler: uncooperative_activity,
         }],
         Arc::new(state),
@@ -553,6 +556,7 @@ async fn uncooperative_activity_is_hard_aborted_after_grace_period() {
                 // Short grace period so the test completes quickly.
                 cancellation_grace_period: Duration::from_millis(500),
                 sticky_timeout: Duration::from_secs(5),
+                max_local_activity_start_to_close: Duration::from_secs(60),
             },
             registry,
         )
