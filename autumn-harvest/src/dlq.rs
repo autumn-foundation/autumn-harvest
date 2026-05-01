@@ -18,7 +18,7 @@ use crate::error::{HarvestError, HarvestResult};
 use crate::models::{DeadLetter, NewDeadLetter};
 use crate::queue::{EnqueueParams, TaskType};
 
-const DEFAULT_BULK_LIMIT: u32 = 100;
+pub const DEFAULT_BULK_LIMIT: u32 = 100;
 const MAX_BULK_LIMIT: u32 = 1000;
 
 /// Filter for bulk DLQ operations.
@@ -56,10 +56,15 @@ impl BulkDlqFilter {
     }
 
     /// Effective row limit: uses the provided value clamped to [1, 1000],
-    /// defaulting to 100 when not set.
+    /// defaulting to 100 when not set. Zero is treated as 1 so callers never
+    /// get a silent no-op from `LIMIT 0`.
     #[must_use]
     pub fn effective_limit(&self) -> i64 {
-        i64::from(self.limit.unwrap_or(DEFAULT_BULK_LIMIT).min(MAX_BULK_LIMIT))
+        i64::from(
+            self.limit
+                .unwrap_or(DEFAULT_BULK_LIMIT)
+                .clamp(1, MAX_BULK_LIMIT),
+        )
     }
 }
 
@@ -567,6 +572,15 @@ mod tests {
             ..BulkDlqFilter::default()
         };
         assert_eq!(filter.effective_limit(), 250);
+    }
+
+    #[test]
+    fn bulk_filter_effective_limit_floors_at_1_for_zero() {
+        let filter = BulkDlqFilter {
+            limit: Some(0),
+            ..BulkDlqFilter::default()
+        };
+        assert_eq!(filter.effective_limit(), 1);
     }
 
     #[test]
