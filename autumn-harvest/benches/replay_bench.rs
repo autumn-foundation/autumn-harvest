@@ -14,6 +14,7 @@ use autumn_harvest::context::WorkflowContext;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::testing::WorkflowReplayer;
 use autumn_harvest::types::{ActivityExecId, ExecutionId};
+use chrono::Utc;
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use serde_json::Value;
 

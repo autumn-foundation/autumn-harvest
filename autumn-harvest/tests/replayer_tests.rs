@@ -552,3 +552,44 @@ async fn one_liner_ci_pattern_compiles_and_runs() {
         "one-liner pattern must succeed: {report}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Early-completion detection
+// ---------------------------------------------------------------------------
+
+/// Workflow that only executes `step_one`, ignoring the rest of the history.
+fn early_return_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        ctx.execute_activity_raw("step_one", Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        // Returns before consuming step_two or the timer — early completion.
+        Ok(Value::Null)
+    })
+}
+
+/// A workflow that returns early leaves unconsumed history events → `NonDeterminismDetected`
+/// with `EarlyCompletion` kind.
+#[tokio::test]
+async fn replay_early_completion_detects_non_determinism() {
+    let (exec_id, events) = canonical_history();
+
+    let report = WorkflowReplayer::new()
+        .register_fn("early_return_workflow", early_return_workflow)
+        .replay_from_snapshot(make_snapshot("early_return_workflow", exec_id, events))
+        .await;
+
+    assert!(
+        matches!(
+            report.status,
+            ReplayStatus::NonDeterminismDetected {
+                kind: NonDeterminismKind::EarlyCompletion,
+                ..
+            }
+        ),
+        "early-return workflow must produce EarlyCompletion non-determinism, got: {report}"
+    );
+}

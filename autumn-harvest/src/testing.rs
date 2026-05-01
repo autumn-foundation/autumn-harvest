@@ -77,6 +77,8 @@ pub enum NonDeterminismKind {
     ExternalActivityMismatch,
     /// A continue-as-new input differed from history.
     ContinueAsNewMismatch,
+    /// The workflow returned before consuming all recorded history events.
+    EarlyCompletion,
     /// The divergence could not be classified into a known category.
     Unknown,
 }
@@ -92,6 +94,7 @@ impl std::fmt::Display for NonDeterminismKind {
             Self::SideEffectMismatch => write!(f, "SideEffectMismatch"),
             Self::ExternalActivityMismatch => write!(f, "ExternalActivityMismatch"),
             Self::ContinueAsNewMismatch => write!(f, "ContinueAsNewMismatch"),
+            Self::EarlyCompletion => write!(f, "EarlyCompletion"),
             Self::Unknown => write!(f, "Unknown"),
         }
     }
@@ -604,6 +607,7 @@ fn classify_kind(kind_str: &str) -> NonDeterminismKind {
         "side effect" => NonDeterminismKind::SideEffectMismatch,
         "external activity" => NonDeterminismKind::ExternalActivityMismatch,
         s if s.contains("continue") => NonDeterminismKind::ContinueAsNewMismatch,
+        "early completion" => NonDeterminismKind::EarlyCompletion,
         _ => NonDeterminismKind::Unknown,
     }
 }

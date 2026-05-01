@@ -100,7 +100,17 @@ pub async fn run_workflow_strict(
     async {
         let timeout_result = tokio::time::timeout(SUSPENSION_TIMEOUT, handler(&ctx, input)).await;
         match timeout_result {
-            Ok(Ok(output)) => WorkflowOutcome::Completed { output },
+            Ok(Ok(output)) => {
+                if ctx.history_has_unconsumed_events() {
+                    WorkflowOutcome::Failed {
+                        error: "non-deterministic replay: early completion mismatch: \
+                                expected <end of history>, got <workflow returned early>"
+                            .to_string(),
+                    }
+                } else {
+                    WorkflowOutcome::Completed { output }
+                }
+            }
             Ok(Err(error)) => WorkflowOutcome::Failed { error },
             Err(_elapsed) => {
                 let mut commands = ctx.drain_commands();

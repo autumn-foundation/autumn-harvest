@@ -420,6 +420,14 @@ impl WorkflowContext {
         ctx
     }
 
+    /// Returns `true` if there are still unconsumed recorded history events.
+    ///
+    /// Used by `run_workflow_strict` to detect early-completion non-determinism
+    /// (i.e. the workflow returned before consuming the full event history).
+    pub fn history_has_unconsumed_events(&self) -> bool {
+        self.match_history(|m| m.is_replaying())
+    }
+
     /// Test constructor -- creates a context in live (non-replay) mode with
     /// empty state and a fresh execution ID.
     #[cfg(any(test, feature = "testing"))]
