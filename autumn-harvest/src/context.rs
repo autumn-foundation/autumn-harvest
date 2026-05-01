@@ -1269,6 +1269,13 @@ impl WorkflowContext {
                 ))
             }
             HistoryMatch::NoMatch => {
+                if self.strict_replay {
+                    return Err(HarvestError::NonDeterministic(
+                        "early completion mismatch: expected <end of history>, \
+                         got ContinueAsNew"
+                            .to_string(),
+                    ));
+                }
                 self.push_command(WorkflowCommand::ContinueAsNew { input });
                 park_until_dropped().await
             }
