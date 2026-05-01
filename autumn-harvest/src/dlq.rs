@@ -248,6 +248,44 @@ pub async fn replay_dead_letter(
 // Bulk operations
 // ---------------------------------------------------------------------------
 
+/// Count dead-letter rows matching `filter` without applying a row limit.
+///
+/// Used to populate `BulkDlqResult::matched` so callers can detect when the
+/// limit clips the result set.
+async fn count_dead_letters_for_bulk(
+    conn: &mut AsyncPgConnection,
+    filter: &BulkDlqFilter,
+) -> HarvestResult<i64> {
+    use crate::schema::harvest_dead_letters::dsl;
+    use diesel::dsl::sql;
+    use diesel::sql_types::{Bool, Text};
+
+    let mut query = dsl::harvest_dead_letters.into_boxed();
+
+    if let Some(ref name) = filter.activity_name {
+        query = query.filter(dsl::activity_name.eq(name.clone()));
+    }
+    if let Some(ref wf_name) = filter.workflow_name {
+        query = query.filter(
+            sql::<Bool>("workflow_exec_id IN (SELECT id FROM harvest_workflow_executions WHERE workflow_name = ")
+                .bind::<Text, _>(wf_name.clone())
+                .sql(")"),
+        );
+    }
+    if let Some(after) = filter.failed_after {
+        query = query.filter(dsl::failed_at.ge(after));
+    }
+    if let Some(before) = filter.failed_before {
+        query = query.filter(dsl::failed_at.lt(before));
+    }
+
+    query
+        .count()
+        .get_result(conn)
+        .await
+        .map_err(crate::error::database_error)
+}
+
 /// Query dead-letter rows matching `filter`, ordered oldest-first, up to
 /// `filter.effective_limit()` rows.
 async fn query_dead_letters_for_bulk(
@@ -301,8 +339,8 @@ pub async fn bulk_replay_dead_letters(
     conn: &mut AsyncPgConnection,
     filter: &BulkDlqFilter,
 ) -> HarvestResult<BulkDlqResult> {
+    let matched = usize::try_from(count_dead_letters_for_bulk(conn, filter).await?).unwrap_or(0);
     let rows = query_dead_letters_for_bulk(conn, filter).await?;
-    let matched = rows.len();
     let preview_ids: Vec<String> = rows.iter().map(|r| r.id.to_string()).collect();
 
     if filter.dry_run {
@@ -365,8 +403,8 @@ pub async fn bulk_discard_dead_letters(
 ) -> HarvestResult<BulkDlqResult> {
     use crate::schema::harvest_dead_letters::dsl;
 
+    let matched = usize::try_from(count_dead_letters_for_bulk(conn, filter).await?).unwrap_or(0);
     let rows = query_dead_letters_for_bulk(conn, filter).await?;
-    let matched = rows.len();
     let preview_ids: Vec<String> = rows.iter().map(|r| r.id.to_string()).collect();
 
     if filter.dry_run {

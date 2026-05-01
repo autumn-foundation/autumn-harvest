@@ -131,6 +131,9 @@ cargo run -p autumn-harvest-cli -- dag trigger daily_pipeline --conf-json '{"dat
 cargo run -p autumn-harvest-cli -- dag pause daily_pipeline
 cargo run -p autumn-harvest-cli -- dlq list --limit 25
 cargo run -p autumn-harvest-cli -- dlq replay <dead-letter-id>
+cargo run -p autumn-harvest-cli -- dlq bulk-replay --activity-name send_email --dry-run
+cargo run -p autumn-harvest-cli -- dlq bulk-replay --activity-name send_email
+cargo run -p autumn-harvest-cli -- dlq bulk-discard --activity-name send_email --failed-before 2026-04-27T00:00:00Z
 cargo run -p autumn-harvest-cli -- retention status
 cargo run -p autumn-harvest-cli -- retention run-now
 cargo run -p autumn-harvest-cli -- concurrency status
@@ -284,6 +287,55 @@ cargo run -p autumn-harvest-cli -- workflow list \
     --workflow-name onboarding \
     --search-attr tenant=acme
 ```
+
+### Post-incident DLQ drain
+
+After an infrastructure incident (database blip, downstream 503, misconfigured retry policy), many activities end up in the dead-letter queue. Rather than replaying them one-by-one with `dlq replay <id>`, use the bulk endpoints to drain the queue by activity or time window.
+
+**Always dry-run first** to see what will be acted on before committing:
+
+```bash
+# Preview — no writes, returns matched count and IDs
+curl -s -X POST https://api.example.com/api/harvest/dead-letters/replay \
+  -H 'Content-Type: application/json' \
+  -d '{"activity_name":"send_email","failed_after":"2026-04-27T12:00:00Z","dry_run":true}' | jq .
+```
+
+The response reports `matched` (total rows satisfying the filter, before any limit clip), `acted_on`, and any per-row `failures`. When `matched` exceeds `acted_on` after a non-dry run, the limit clipped the result — call again until `matched == 0`.
+
+```bash
+# Real replay: re-enqueue all matching dead-letter entries
+curl -s -X POST https://api.example.com/api/harvest/dead-letters/replay \
+  -H 'Content-Type: application/json' \
+  -d '{"activity_name":"send_email","failed_after":"2026-04-27T12:00:00Z"}' | jq .
+
+# Discard (delete without re-enqueueing) — use when the work is no longer needed
+curl -s -X POST https://api.example.com/api/harvest/dead-letters/discard \
+  -H 'Content-Type: application/json' \
+  -d '{"activity_name":"charge_card","failed_before":"2026-04-27T00:00:00Z"}' | jq .
+```
+
+Or via the CLI:
+
+```bash
+# Dry run first
+cargo run -p autumn-harvest-cli -- dlq bulk-replay \
+    --activity-name send_email \
+    --failed-after 2026-04-27T12:00:00Z \
+    --dry-run
+
+# Commit the replay
+cargo run -p autumn-harvest-cli -- dlq bulk-replay \
+    --activity-name send_email \
+    --failed-after 2026-04-27T12:00:00Z
+
+# Discard stale failures
+cargo run -p autumn-harvest-cli -- dlq bulk-discard \
+    --activity-name charge_card \
+    --failed-before 2026-04-27T00:00:00Z
+```
+
+At least one of `--activity-name`, `--workflow-name`, `--failed-after`, or `--failed-before` is required. A filter with only `--limit` or `--dry-run` is rejected with `400 Bad Request`. The default batch size is 100 rows; pass `--limit N` (max 1000) to replay more per call.
 
 ### Scheduling workflows on a cron
 
