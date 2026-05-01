@@ -670,6 +670,13 @@ impl WorkflowContext {
             }
 
             HistoryMatch::NoMatch => {
+                if self.strict_replay {
+                    return Err(HarvestError::NonDeterministic(format!(
+                        "early completion mismatch: expected <end of history>, \
+                         got SideEffectRecorded({id})"
+                    )));
+                }
+
                 let result = f();
                 let output = serde_json::to_value(&result)?;
 

@@ -107,6 +107,14 @@ pub async fn run_workflow_strict(
                                 expected <end of history>, got <workflow returned early>"
                             .to_string(),
                     }
+                } else if !ctx.drain_commands().is_empty() {
+                    // New commands emitted after history was fully consumed (e.g. a
+                    // newly-added version() or side_effect() call on an old history).
+                    WorkflowOutcome::Failed {
+                        error: "non-deterministic replay: new commands emitted beyond \
+                                recorded history"
+                            .to_string(),
+                    }
                 } else {
                     WorkflowOutcome::Completed { output }
                 }
