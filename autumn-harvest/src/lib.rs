@@ -28,6 +28,9 @@ pub mod dag_export;
 pub mod dag_linter;
 #[cfg(any(test, feature = "testing"))]
 pub mod dag_simulator;
+/// Replay test harness for verifying workflow determinism pre-deploy.
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 pub mod diagnostic;
 pub mod error;
 pub mod event;
@@ -142,6 +145,10 @@ pub use telemetry::{
 };
 #[cfg(any(test, feature = "testing"))]
 pub use test_generator::TestHarnessGenerator;
+#[cfg(any(test, feature = "testing"))]
+pub use testing::{
+    HistorySnapshot, NonDeterminismKind, ReplayReport, ReplayStatus, WorkflowReplayer,
+};
 pub use types::{
     ActivityExecId, ExecutionId, ExternalActivityToken, ShardId, TimerId, WorkerId, WorkflowId,
     WorkflowIdReusePolicy,

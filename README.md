@@ -489,6 +489,87 @@ Adding a shard (new workflows only): provision and migrate the new database,
 add it to `readable_shards`, restart the plugin, then flip it into
 `writable_shards`. In-flight workflows drain on their original shard.
 
+## Testing workflow code changes with the replayer
+
+Before deploying any edit to a `#[workflow]` function, verify it is
+replay-safe against recorded production histories using `WorkflowReplayer`
+(available when the `testing` feature is enabled).
+
+### CI pattern
+
+```toml
+# Cargo.toml — in your app's dev-dependencies
+autumn-harvest = { version = "0.2", features = ["testing"] }
+```
+
+```rust
+// tests/replay_regression.rs
+use autumn_harvest::testing::{HistorySnapshot, ReplayStatus, WorkflowReplayer};
+
+#[tokio::test]
+async fn onboarding_is_replay_safe() {
+    // Load a fixture exported from production or a previous run.
+    let json = std::fs::read_to_string("fixtures/onboarding_history.json").unwrap();
+
+    let report = WorkflowReplayer::new()
+        .register_fn("onboarding", onboarding_handler)  // your #[workflow] fn
+        .replay_from_json(&json)
+        .await
+        .expect("fixture must parse");
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "replay regression:\n{report}"
+    );
+}
+```
+
+### Exporting a history fixture
+
+Serialise a `HistorySnapshot` to JSON and check it in as a test fixture:
+
+```rust
+use autumn_harvest::testing::HistorySnapshot;
+
+let snapshot = HistorySnapshot {
+    workflow_name: "onboarding".to_string(),
+    execution_id: exec_id,
+    events,  // Vec<WorkflowEvent> loaded from harvest_events
+};
+let json = serde_json::to_string_pretty(&snapshot).unwrap();
+std::fs::write("fixtures/onboarding_history.json", json).unwrap();
+```
+
+### CLI validator
+
+```sh
+cargo run --bin harvest-replay -- \
+  --workflow onboarding \
+  --history-source json \
+  --json-path ./fixtures/onboarding_history.json
+```
+
+Exit code 0 = `ReplaySucceeded`. Exit code 1 = non-determinism or workflow
+failure. Extend `harvest-replay/src/bin/harvest_replay.rs` with your own
+workflow handlers so the binary can replay against live code.
+
+### What the replayer detects
+
+| Kind | Trigger |
+|---|---|
+| `ActivityScheduleMismatch` | Activity name changed or order swapped |
+| `LocalActivityScheduleMismatch` | Local activity name changed |
+| `TimerMismatch` | Timer inserted / removed / reordered |
+| `SignalMismatch` | Signal wait inserted where history has a non-signal event |
+| `ChildWorkflowMismatch` | Child workflow name or input changed |
+| `SideEffectMismatch` | `ctx.side_effect` ID changed |
+| `ContinueAsNewMismatch` | `continue_as_new` input changed |
+
+Changes that are safe without a `ctx.version()` fence: none of the above.
+Use `ctx.version("change_id", 1, 2)` and guard the new code path behind the
+returned version number; old histories replay with version 1 and skip the new
+path.
+
 ## License
 
 Dual-licensed under MIT or Apache 2.0 at your option.
