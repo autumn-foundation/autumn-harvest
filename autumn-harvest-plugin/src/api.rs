@@ -1135,15 +1135,22 @@ async fn bulk_replay_from_shards(
         u32::try_from(filter.effective_limit()).unwrap_or(dlq::DEFAULT_BULK_LIMIT);
 
     for (_shard, shard_pool) in pool.iter_shards() {
-        if remaining == 0 {
-            break;
-        }
-        let mut shard_filter = filter.clone();
-        shard_filter.limit = Some(remaining);
         let mut conn = shard_pool
             .get()
             .await
             .map_err(|e| HarvestError::Database(e.to_string()))?;
+
+        if remaining == 0 {
+            // Budget exhausted: count-only so matched reflects all shards.
+            let shard_matched = dlq::count_bulk_filter_matches(&mut conn, filter)
+                .await
+                .map(|n| usize::try_from(n).unwrap_or(0))?;
+            total.matched += shard_matched;
+            continue;
+        }
+
+        let mut shard_filter = filter.clone();
+        shard_filter.limit = Some(remaining);
         let shard_result = dlq::bulk_replay_dead_letters(&mut conn, &shard_filter).await?;
         // Rows consumed = acted + skipped + failed (or preview ids in dry-run).
         let consumed = shard_result.ids.len() + shard_result.skipped + shard_result.failures.len();
@@ -1177,15 +1184,22 @@ async fn bulk_discard_from_shards(
         u32::try_from(filter.effective_limit()).unwrap_or(dlq::DEFAULT_BULK_LIMIT);
 
     for (_shard, shard_pool) in pool.iter_shards() {
-        if remaining == 0 {
-            break;
-        }
-        let mut shard_filter = filter.clone();
-        shard_filter.limit = Some(remaining);
         let mut conn = shard_pool
             .get()
             .await
             .map_err(|e| HarvestError::Database(e.to_string()))?;
+
+        if remaining == 0 {
+            // Budget exhausted: count-only so matched reflects all shards.
+            let shard_matched = dlq::count_bulk_filter_matches(&mut conn, filter)
+                .await
+                .map(|n| usize::try_from(n).unwrap_or(0))?;
+            total.matched += shard_matched;
+            continue;
+        }
+
+        let mut shard_filter = filter.clone();
+        shard_filter.limit = Some(remaining);
         let shard_result = dlq::bulk_discard_dead_letters(&mut conn, &shard_filter).await?;
         let consumed = shard_result.ids.len() + shard_result.skipped + shard_result.failures.len();
         remaining = remaining.saturating_sub(u32::try_from(consumed).unwrap_or(remaining));

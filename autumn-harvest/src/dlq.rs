@@ -255,9 +255,15 @@ pub async fn replay_dead_letter(
 
 /// Count dead-letter rows matching `filter` without applying a row limit.
 ///
-/// Used to populate `BulkDlqResult::matched` so callers can detect when the
-/// limit clips the result set.
-async fn count_dead_letters_for_bulk(
+/// Used both internally (to populate `BulkDlqResult::matched`) and by the
+/// API fan-out layer to count matches on shards where the global limit is
+/// already exhausted, so that `matched` in the aggregated response always
+/// reflects the true pre-limit total across all shards.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] on query failure.
+pub async fn count_bulk_filter_matches(
     conn: &mut AsyncPgConnection,
     filter: &BulkDlqFilter,
 ) -> HarvestResult<i64> {
@@ -344,7 +350,7 @@ pub async fn bulk_replay_dead_letters(
     conn: &mut AsyncPgConnection,
     filter: &BulkDlqFilter,
 ) -> HarvestResult<BulkDlqResult> {
-    let matched = usize::try_from(count_dead_letters_for_bulk(conn, filter).await?).unwrap_or(0);
+    let matched = usize::try_from(count_bulk_filter_matches(conn, filter).await?).unwrap_or(0);
     let rows = query_dead_letters_for_bulk(conn, filter).await?;
     let preview_ids: Vec<String> = rows.iter().map(|r| r.id.to_string()).collect();
 
@@ -408,7 +414,7 @@ pub async fn bulk_discard_dead_letters(
 ) -> HarvestResult<BulkDlqResult> {
     use crate::schema::harvest_dead_letters::dsl;
 
-    let matched = usize::try_from(count_dead_letters_for_bulk(conn, filter).await?).unwrap_or(0);
+    let matched = usize::try_from(count_bulk_filter_matches(conn, filter).await?).unwrap_or(0);
     let rows = query_dead_letters_for_bulk(conn, filter).await?;
     let preview_ids: Vec<String> = rows.iter().map(|r| r.id.to_string()).collect();
 
