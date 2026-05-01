@@ -98,7 +98,8 @@ pub async fn run_workflow_strict(
     );
 
     async {
-        let timeout_result = tokio::time::timeout(SUSPENSION_TIMEOUT, handler(&ctx, input)).await;
+        let timeout_result =
+            tokio::time::timeout(SUSPENSION_TIMEOUT, handler(&ctx, input)).await;
         match timeout_result {
             Ok(Ok(output)) => {
                 if ctx.history_has_unconsumed_events() {
