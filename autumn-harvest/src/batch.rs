@@ -409,7 +409,7 @@ mod db {
         }
     }
 
-    use crate::execution::cancel_workflow_execution;
+    use crate::execution::{cancel_workflow_execution, terminate_workflow_execution};
     use crate::models::WorkflowExecution;
     use crate::schema::harvest_workflow_executions;
     use crate::shard::ShardedDbPool;
@@ -441,8 +441,15 @@ mod db {
     /// single shard. Mirrors `load_workflows` in the plugin's API module but
     /// returns just the IDs the executor needs to act on, and intentionally
     /// drops the per-call limit so a 10k batch can drain over multiple ticks.
+    ///
+    /// `action` is consulted only to pick the default state filter when the
+    /// caller didn't supply one: Cancel/Signal default to `RUNNING` (terminal
+    /// rows are no-ops); Terminate defaults to "every non-CANCELLED state"
+    /// because its whole purpose is to bring stuck-non-running rows to a
+    /// clean terminal state.
     async fn resolve_targets_on_shard(
         conn: &mut AsyncPgConnection,
+        action: BatchAction,
         filter: &BatchFilter,
     ) -> HarvestResult<Vec<ExecutionId>> {
         use diesel::dsl::sql;
@@ -450,9 +457,14 @@ mod db {
 
         let mut query = harvest_workflow_executions::table.into_boxed();
         if filter.states.is_empty() {
-            // Default to live executions only — terminal states are no-ops
-            // for cancel/signal and would just inflate the failed counter.
-            query = query.filter(harvest_workflow_executions::state.eq("RUNNING"));
+            match action {
+                BatchAction::Terminate => {
+                    query = query.filter(harvest_workflow_executions::state.ne("CANCELLED"));
+                }
+                BatchAction::Cancel | BatchAction::Signal => {
+                    query = query.filter(harvest_workflow_executions::state.eq("RUNNING"));
+                }
+            }
         } else {
             query = query.filter(harvest_workflow_executions::state.eq_any(filter.states.clone()));
         }
@@ -491,7 +503,11 @@ mod db {
                     .map_err(|e| e.to_string())
             }
             BatchAction::Terminate => {
-                cancel_workflow_execution(conn, target, "batch terminate requested")
+                // Hard finalize: accepts any non-cancelled state (including
+                // FAILED / TIMED_OUT) and force-writes CANCELLED. Cancel
+                // would error on those — Terminate is the operator escape
+                // hatch.
+                terminate_workflow_execution(conn, target, "batch terminate requested")
                     .await
                     .map(|_| ())
                     .map_err(|e| e.to_string())
@@ -575,7 +591,7 @@ mod db {
                 .get()
                 .await
                 .map_err(|e| HarvestError::Database(e.to_string()))?;
-            let mut targets = resolve_targets_on_shard(&mut conn, &filter).await?;
+            let mut targets = resolve_targets_on_shard(&mut conn, action, &filter).await?;
             all_targets.append(&mut targets);
         }
 

@@ -111,7 +111,7 @@ pub use event::WorkflowEvent;
 #[cfg(feature = "db")]
 pub use execution::{
     CancelledWorkflowExecution, StartWorkflowParams, StartedWorkflowExecution,
-    cancel_workflow_execution, start_or_load_workflow_execution,
+    cancel_workflow_execution, start_or_load_workflow_execution, terminate_workflow_execution,
 };
 pub use executor::{WorkflowOutcome, run_workflow};
 pub use history_export::export_mermaid_sequence;

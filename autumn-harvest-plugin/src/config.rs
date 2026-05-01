@@ -120,6 +120,9 @@ impl HarvestRuntimeConfig {
         if let Some(concurrency) = partial.batch.concurrency {
             self.batch.concurrency = concurrency;
         }
+        if let Some(concurrency) = partial.batch.batch_concurrency {
+            self.batch.concurrency = concurrency;
+        }
         if let Some(tick_interval_ms) = partial.batch.tick_interval_ms {
             self.batch.tick_interval_ms = tick_interval_ms;
         }
@@ -170,8 +173,15 @@ impl HarvestRuntimeConfig {
             )?;
         }
 
+        // Issue #102 calls the knob `batch_concurrency`; we accept either
+        // spelling so operators can use whichever matches their habits and
+        // the AC name resolves verbatim.
         if let Ok(concurrency) = env.var("AUTUMN_HARVEST_BATCH__CONCURRENCY") {
             self.batch.concurrency = parse_u32("AUTUMN_HARVEST_BATCH__CONCURRENCY", &concurrency)?;
+        }
+        if let Ok(concurrency) = env.var("AUTUMN_HARVEST_BATCH__BATCH_CONCURRENCY") {
+            self.batch.concurrency =
+                parse_u32("AUTUMN_HARVEST_BATCH__BATCH_CONCURRENCY", &concurrency)?;
         }
         if let Ok(tick_interval_ms) = env.var("AUTUMN_HARVEST_BATCH__TICK_INTERVAL_MS") {
             self.batch.tick_interval_ms =
@@ -311,6 +321,10 @@ struct PartialHarvestOutboxConfig {
 #[derive(Debug, Default, Deserialize)]
 struct PartialHarvestBatchConfig {
     concurrency: Option<u32>,
+    /// Issue #102 spells the field `batch_concurrency`. Either key sets the
+    /// same field; if both are present, `batch_concurrency` wins because it
+    /// is the issue's canonical name.
+    batch_concurrency: Option<u32>,
     tick_interval_ms: Option<u64>,
 }
 

@@ -1,9 +1,8 @@
 //! Integration tests for the batch operations API (issue #102).
 //!
-//! Covers the durable wiring: submit → list → get → executor drains. Uses a
-//! small synthetic fleet (50 workflows) instead of the issue's 1k target so
-//! the test stays under a CI-tractable runtime; the codepath under test is
-//! identical at any cardinality.
+//! Covers the durable wiring end to end: submit → list → get → executor
+//! drains, mid-batch crash resume, Terminate-on-non-running, and the issue's
+//! 1k-workflow / 30s success metric.
 
 #![allow(clippy::similar_names, clippy::redundant_clone)]
 
@@ -386,15 +385,16 @@ async fn batch_per_target_failures_dont_abort_run() {
     assert_eq!(errors.len(), 1);
 }
 
-// 60-second guard: in CI, the executor must drain 50 workflows well within
-// this. If the rate-limiter regresses it'll be the first thing to time out.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn batch_drains_within_time_budget() {
+// Issue #102 success metric: 1k-workflow batch-cancel drains within 30 seconds
+// at default concurrency on a laptop-class Postgres. The 60s outer timeout is
+// the CI escape hatch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn batch_drains_thousand_workflows_within_time_budget() {
     let (url, _container) = setup_database().await;
     let pool = build_pool(&url);
     let app = build_app(&pool);
 
-    seed_workflows(&url, "onboarding", 50).await;
+    seed_workflows(&url, "onboarding", 1000).await;
     let (_, body) = post_json(
         &app,
         "/batch-operations",
@@ -418,9 +418,209 @@ async fn batch_drains_within_time_budget() {
     let elapsed = started.elapsed();
     assert!(
         elapsed < Duration::from_secs(30),
-        "50-workflow batch should drain in under 30s, took {elapsed:?}"
+        "1k-workflow batch should drain in under 30s, took {elapsed:?}"
     );
 
     let (_, body) = get_json(&app, &format!("/batch-operations/{job_id}")).await;
     assert_eq!(body["status"], "Completed");
+    assert_eq!(body["total"], 1000);
+    assert_eq!(body["completed"], 1000);
+    assert_eq!(body["failed"], 0);
+}
+
+// Issue #102: "A job survives plugin restart and resumes from
+// `completed + failed` cursor."
+//
+// Direct-process-kill is awkward in a single test process, so this simulates
+// the post-crash state: the executor wrote `Running, completed=K` against the
+// row and cancelled K of the matched workflows before the host went away. A
+// fresh executor tick should pick up the remaining N-K and end the job at
+// `total=N, completed=N, failed=0`.
+#[tokio::test]
+async fn batch_resumes_from_partial_progress_cursor() {
+    use autumn_harvest::cancel_workflow_execution;
+
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+
+    let ids = seed_workflows(&url, "onboarding", 20).await;
+
+    // Submit the batch through the API so the row is shaped exactly as the
+    // production path produces it.
+    let (_, body) = post_json(
+        &app,
+        "/batch-operations",
+        json!({
+            "action": "Cancel",
+            "filter": { "workflow_name": "onboarding" }
+        }),
+    )
+    .await;
+    let job_id = body["batch_job_id"].as_str().unwrap().to_string();
+
+    // Simulate a crash mid-tick: 8 of the 20 targets already cancelled and
+    // the row already in Running with the partial counters in place.
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&url)
+        .await
+        .unwrap();
+    for exec_id in ids.iter().take(8).copied() {
+        cancel_workflow_execution(&mut conn, exec_id, "simulated mid-batch progress")
+            .await
+            .unwrap();
+    }
+    let job_uuid: uuid::Uuid = job_id.parse().unwrap();
+    diesel::sql_query(
+        "UPDATE harvest_batch_jobs SET status='Running', total=20, completed=8 WHERE id=$1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(job_uuid)
+    .execute(&mut conn)
+    .await
+    .unwrap();
+
+    // Fresh tick from the surviving plugin process.
+    let sharded_pool = HarvestDbPool::from(pool.clone());
+    run_executor_once(sharded_pool.sharded_pool(), &BatchExecutorConfig::default())
+        .await
+        .unwrap();
+
+    // Job ends terminal with the full count, not double-counted.
+    let (_, body) = get_json(&app, &format!("/batch-operations/{job_id}")).await;
+    assert_eq!(body["status"], "Completed", "after resume tick: {body}");
+    assert_eq!(body["total"], 20);
+    assert_eq!(body["completed"], 20);
+    assert_eq!(body["failed"], 0);
+
+    // And every workflow ended up CANCELLED.
+    let states: Vec<String> = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_name.eq("onboarding"))
+        .select(harvest_workflow_executions::state)
+        .load(&mut conn)
+        .await
+        .unwrap();
+    assert!(
+        states.iter().all(|s| s == "CANCELLED"),
+        "every workflow must be CANCELLED after resume, got {states:?}"
+    );
+}
+
+// Issue #102 distinguishes Cancel from Terminate: Terminate is a hard
+// finalize that operates on workflows Cancel rejects (FAILED, TIMED_OUT, ...).
+#[tokio::test]
+async fn batch_terminate_finalizes_non_running_workflows() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+
+    let ids = seed_workflows(&url, "onboarding", 4).await;
+
+    // Two workflows in non-RUNNING states that Cancel cannot touch.
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&url)
+        .await
+        .unwrap();
+    diesel::update(harvest_workflow_executions::table.find(ids[1].as_uuid()))
+        .set(harvest_workflow_executions::state.eq("FAILED"))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    diesel::update(harvest_workflow_executions::table.find(ids[2].as_uuid()))
+        .set(harvest_workflow_executions::state.eq("TIMED_OUT"))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    // Terminate without an explicit state filter — the executor's default for
+    // Terminate widens to "every non-CANCELLED state".
+    let (_, body) = post_json(
+        &app,
+        "/batch-operations",
+        json!({
+            "action": "Terminate",
+            "filter": { "workflow_name": "onboarding" }
+        }),
+    )
+    .await;
+    let job_id = body["batch_job_id"].as_str().unwrap().to_string();
+
+    let sharded_pool = HarvestDbPool::from(pool);
+    run_executor_once(sharded_pool.sharded_pool(), &BatchExecutorConfig::default())
+        .await
+        .unwrap();
+
+    let (_, body) = get_json(&app, &format!("/batch-operations/{job_id}")).await;
+    assert_eq!(body["status"], "Completed");
+    assert_eq!(body["total"], 4);
+    // All four — including FAILED and TIMED_OUT — must be force-finalized.
+    assert_eq!(
+        body["completed"], 4,
+        "Terminate must accept any non-cancelled state: {body}"
+    );
+    assert_eq!(body["failed"], 0);
+
+    let states: Vec<String> = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_name.eq("onboarding"))
+        .select(harvest_workflow_executions::state)
+        .load(&mut conn)
+        .await
+        .unwrap();
+    assert!(
+        states.iter().all(|s| s == "CANCELLED"),
+        "Terminate must coerce every match to CANCELLED, got {states:?}"
+    );
+}
+
+// Issue #102 success metric: "p99 task-queue claim latency for unrelated
+// workflows must not regress by more than 10% during a 10k-target batch run."
+// This is a scaled-down smoke test: while a 200-target batch tick is in
+// flight, an unrelated GET /workflows must complete within a tight bound.
+// Detects accidental table-locking or pool-exhaustion regressions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn batch_does_not_block_unrelated_workflow_reads() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+
+    seed_workflows(&url, "onboarding", 200).await;
+    seed_workflows(&url, "billing", 5).await; // distinct, not in batch filter
+
+    let (_, body) = post_json(
+        &app,
+        "/batch-operations",
+        json!({
+            "action": "Cancel",
+            "filter": { "workflow_name": "onboarding" }
+        }),
+    )
+    .await;
+    let _job_id = body["batch_job_id"].as_str().unwrap().to_string();
+
+    let sharded_pool = HarvestDbPool::from(pool);
+    let executor_pool = sharded_pool.clone();
+    let executor = tokio::spawn(async move {
+        run_executor_once(
+            executor_pool.sharded_pool(),
+            &BatchExecutorConfig::default(),
+        )
+        .await
+    });
+
+    // Probe an unrelated read while the batch is draining. The probe must
+    // complete in well under 5s — the executor holds no long-lived locks
+    // and uses bounded fan-out, so per-call latency should be DB-roundtrip
+    // bounded.
+    let probe_started = std::time::Instant::now();
+    let (status, body) = get_json(&app, "/workflows?workflow_name=billing").await;
+    let probe_elapsed = probe_started.elapsed();
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body.as_array().expect("array").len(),
+        5,
+        "unrelated billing workflows must remain visible during a batch run"
+    );
+    assert!(
+        probe_elapsed < Duration::from_secs(5),
+        "unrelated GET /workflows must not be blocked by the batch executor; took {probe_elapsed:?}"
+    );
+
+    executor.await.unwrap().unwrap();
 }
