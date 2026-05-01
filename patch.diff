@@ -1,0 +1,11 @@
+<<<<<<< SEARCH
+        f.debug_struct("HandlerRegistry")
+            .field("workflows", &self.workflows.keys().collect::<Vec<_>>())
+            .field("activities", &self.activities.keys().collect::<Vec<_>>())
+            .field("state_count", &self.state.len())
+=======
+        f.debug_struct("HandlerRegistry")
+            .field("workflows", &self.workflows.keys())
+            .field("activities", &self.activities.keys())
+            .field("state_count", &self.state.len())
+>>>>>>> REPLACE
