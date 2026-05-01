@@ -603,6 +603,7 @@ mod tests {
                 url: Some("postgres://harvest:harvest@localhost:5432/harvest".to_owned()),
             },
             outbox: HarvestOutboxConfig::default(),
+            batch: crate::config::HarvestBatchConfig::default(),
         };
 
         let harvest_pool = resolve_harvest_pool(&state, &config)
