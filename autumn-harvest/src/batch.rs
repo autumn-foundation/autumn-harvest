@@ -307,6 +307,49 @@ mod db {
         Ok(())
     }
 
+    /// Lease window after which an in-progress batch is considered abandoned
+    /// and another worker may claim it. `record_progress` and `mark_running`
+    /// both refresh `updated_at`, so a healthy worker keeps the lease alive.
+    pub const BATCH_JOB_LEASE_SECS: i64 = 60;
+
+    /// Atomically claim a batch job for exclusive processing by this worker.
+    ///
+    /// Returns `true` when this caller acquired the claim and may proceed,
+    /// `false` when another worker already owns it (skip silently). Uses a
+    /// single conditional UPDATE with `PostgreSQL`'s row-level write lock so
+    /// two concurrent runtimes cannot both claim the same row: a `Pending`
+    /// row matches once and transitions to `Running`; a `Running` row only
+    /// matches when its `updated_at` is older than the lease window (the
+    /// previous owner is presumed dead). The returning `id` short-circuits
+    /// further work when no claim was made.
+    pub async fn try_claim_job(conn: &mut AsyncPgConnection, job_id: Uuid) -> HarvestResult<bool> {
+        let lease_threshold = Utc::now() - chrono::Duration::seconds(BATCH_JOB_LEASE_SECS);
+        let claimed: Option<Uuid> = diesel::sql_query(
+            "UPDATE harvest_batch_jobs \
+             SET status = 'Running', \
+                 started_at = COALESCE(started_at, now()), \
+                 updated_at = now() \
+             WHERE id = $1 \
+               AND (status = 'Pending' \
+                    OR (status = 'Running' AND updated_at < $2)) \
+             RETURNING id",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(job_id)
+        .bind::<diesel::sql_types::Timestamptz, _>(lease_threshold)
+        .get_result::<ClaimedId>(conn)
+        .await
+        .optional()
+        .map_err(database_error)?
+        .map(|c| c.id);
+        Ok(claimed.is_some())
+    }
+
+    #[derive(diesel::QueryableByName)]
+    struct ClaimedId {
+        #[diesel(sql_type = diesel::sql_types::Uuid)]
+        id: Uuid,
+    }
+
     /// Bump completed/failed counters and append per-target errors atomically.
     pub async fn record_progress(
         conn: &mut AsyncPgConnection,
@@ -609,6 +652,15 @@ mod db {
             .get()
             .await
             .map_err(|e| HarvestError::Database(e.to_string()))?;
+        // Atomic lease claim: prevents two parallel runtimes from racing on
+        // the same job. If another worker owns it, skip silently.
+        if !try_claim_job(&mut owning_conn, job.id).await? {
+            tracing::debug!(
+                job_id = %job.id,
+                "batch job is owned by another worker; skipping"
+            );
+            return Ok(());
+        }
         // Skip already-running rows: total already recorded.
         let total = i64::try_from(all_targets.len()).unwrap_or(i64::MAX);
         if job.status == BatchJobStatus::Pending.as_str() {

@@ -513,6 +513,7 @@ pub async fn terminate_workflow_execution(
             diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
                 .set((
                     harvest_workflow_executions::state.eq("CANCELLED"),
+                    harvest_workflow_executions::output.eq(None::<serde_json::Value>),
                     harvest_workflow_executions::error.eq(Some(reason.clone())),
                     harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
                 ))

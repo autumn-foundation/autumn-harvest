@@ -470,8 +470,13 @@ async fn batch_resumes_from_partial_progress_cursor() {
             .unwrap();
     }
     let job_uuid: uuid::Uuid = job_id.parse().unwrap();
+    // Backdate updated_at past the lease window so the surviving worker can
+    // claim the abandoned row (simulating a worker that crashed long ago).
     diesel::sql_query(
-        "UPDATE harvest_batch_jobs SET status='Running', total=20, completed=8 WHERE id=$1",
+        "UPDATE harvest_batch_jobs \
+         SET status='Running', total=20, completed=8, \
+             updated_at = now() - INTERVAL '5 minutes' \
+         WHERE id=$1",
     )
     .bind::<diesel::sql_types::Uuid, _>(job_uuid)
     .execute(&mut conn)
@@ -623,4 +628,53 @@ async fn batch_does_not_block_unrelated_workflow_reads() {
     );
 
     executor.await.unwrap().unwrap();
+}
+
+// Two executor ticks running in parallel must not both claim the same job.
+// The lease-based claim guarantees exactly-once dispatch per target across
+// concurrent worker processes (issue #102, P1 review feedback).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn batch_executor_lease_prevents_double_dispatch() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+
+    let _ids = seed_workflows(&url, "onboarding", 30).await;
+
+    let (_, body) = post_json(
+        &app,
+        "/batch-operations",
+        json!({
+            "action": "Cancel",
+            "filter": { "workflow_name": "onboarding" }
+        }),
+    )
+    .await;
+    let job_id = body["batch_job_id"].as_str().unwrap().to_string();
+
+    // Race two executor ticks on the same shard pool. With the atomic lease
+    // claim, exactly one tick processes the job; the other no-ops silently.
+    let sharded_pool = HarvestDbPool::from(pool.clone());
+    let pool_a = sharded_pool.sharded_pool().clone();
+    let pool_b = sharded_pool.sharded_pool().clone();
+    let tick_a =
+        tokio::spawn(
+            async move { run_executor_once(&pool_a, &BatchExecutorConfig::default()).await },
+        );
+    let tick_b =
+        tokio::spawn(
+            async move { run_executor_once(&pool_b, &BatchExecutorConfig::default()).await },
+        );
+    tick_a.await.unwrap().unwrap();
+    tick_b.await.unwrap().unwrap();
+
+    // The job ends terminal with completed == total (no double-counting).
+    let (_, body) = get_json(&app, &format!("/batch-operations/{job_id}")).await;
+    assert_eq!(body["status"], "Completed", "after racing ticks: {body}");
+    assert_eq!(body["total"], 30);
+    assert_eq!(
+        body["completed"], 30,
+        "completed must equal total; double-dispatch would inflate this"
+    );
+    assert_eq!(body["failed"], 0);
 }
