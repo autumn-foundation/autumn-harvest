@@ -362,7 +362,9 @@ mod db {
     ///
     /// The dispatched ids are the durable exclusion set used on resume to
     /// skip already-processed targets regardless of their current workflow
-    /// state.
+    /// state. All four column updates land in a single SQL UPDATE so a crash
+    /// cannot persist counters without the matching `processed_ids` append —
+    /// otherwise a resumed tick would re-dispatch already-counted targets.
     pub async fn record_progress(
         conn: &mut AsyncPgConnection,
         id: Uuid,
@@ -374,47 +376,39 @@ mod db {
         use diesel::dsl::sql;
         use diesel::sql_types::Jsonb;
 
-        diesel::update(harvest_batch_jobs::table.find(id))
-            .set((
-                harvest_batch_jobs::completed.eq(harvest_batch_jobs::completed + delta_completed),
-                harvest_batch_jobs::failed.eq(harvest_batch_jobs::failed + delta_failed),
-                harvest_batch_jobs::updated_at.eq(Utc::now()),
-            ))
-            .execute(conn)
-            .await
-            .map_err(database_error)?;
-
-        if !new_errors.is_empty() {
-            let errors_value = serde_json::to_value(new_errors).map_err(HarvestError::from)?;
-            // Append the new errors to the existing JSON array via `||`. The
-            // column defaults to '[]' so this always concatenates.
-            diesel::update(harvest_batch_jobs::table.find(id))
-                .set(
-                    harvest_batch_jobs::errors
-                        .eq(sql::<Jsonb>("errors || ").bind::<Jsonb, _>(errors_value)),
-                )
-                .execute(conn)
-                .await
-                .map_err(database_error)?;
-        }
-
-        if !dispatched_ids.is_empty() {
-            let ids_value = serde_json::to_value(
+        let errors_value = if new_errors.is_empty() {
+            Value::Array(Vec::new())
+        } else {
+            serde_json::to_value(new_errors).map_err(HarvestError::from)?
+        };
+        let ids_value = if dispatched_ids.is_empty() {
+            Value::Array(Vec::new())
+        } else {
+            serde_json::to_value(
                 dispatched_ids
                     .iter()
                     .map(Uuid::to_string)
                     .collect::<Vec<_>>(),
             )
-            .map_err(HarvestError::from)?;
-            diesel::update(harvest_batch_jobs::table.find(id))
-                .set(
-                    harvest_batch_jobs::processed_ids
-                        .eq(sql::<Jsonb>("processed_ids || ").bind::<Jsonb, _>(ids_value)),
-                )
-                .execute(conn)
-                .await
-                .map_err(database_error)?;
-        }
+            .map_err(HarvestError::from)?
+        };
+
+        // Single UPDATE = single transaction = atomic. Appending an empty
+        // JSON array via `||` is a no-op, so it's safe to always include the
+        // errors and processed_ids set clauses regardless of input length.
+        diesel::update(harvest_batch_jobs::table.find(id))
+            .set((
+                harvest_batch_jobs::completed.eq(harvest_batch_jobs::completed + delta_completed),
+                harvest_batch_jobs::failed.eq(harvest_batch_jobs::failed + delta_failed),
+                harvest_batch_jobs::updated_at.eq(Utc::now()),
+                harvest_batch_jobs::errors
+                    .eq(sql::<Jsonb>("errors || ").bind::<Jsonb, _>(errors_value)),
+                harvest_batch_jobs::processed_ids
+                    .eq(sql::<Jsonb>("processed_ids || ").bind::<Jsonb, _>(ids_value)),
+            ))
+            .execute(conn)
+            .await
+            .map_err(database_error)?;
 
         Ok(())
     }
