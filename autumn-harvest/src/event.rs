@@ -12,7 +12,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::error::TimeoutType;
-use crate::types::{ActivityExecId, ExecutionId, TimerId, WorkerId};
+use crate::types::{ActivityExecId, ExecutionId, ExternalActivityToken, TimerId, WorkerId};
 
 /// All possible events in a workflow's history.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -159,6 +159,53 @@ pub enum WorkflowEvent {
         /// The JSON payload passed to the next iteration of the workflow.
         input: serde_json::Value,
     },
+
+    // ── External activity completion (issue #92) ──────────────────────
+    /// An external activity was scheduled and is awaiting completion via the
+    /// management API task-token endpoint. The `token` is a single-use handle
+    /// that external systems round-trip through `/activities/external/{token}/complete`.
+    ActivityAwaitingExternal {
+        /// Unique ID for this specific activity attempt.
+        activity_id: ActivityExecId,
+        /// Opaque token that external systems use to complete or fail the activity.
+        token: ExternalActivityToken,
+        /// The name of the registered activity handler.
+        name: String,
+        /// JSON input for the activity.
+        input: serde_json::Value,
+        /// Target worker queue (informational; external activities don't occupy a slot).
+        queue: String,
+        /// Maximum seconds the external system has to deliver a result.
+        schedule_to_close_secs: u64,
+    },
+    /// An external system delivered a successful result via the management API.
+    ActivityCompletedExternally {
+        /// Unique ID for this specific activity attempt.
+        activity_id: ActivityExecId,
+        /// Token that was used to complete the activity.
+        token: ExternalActivityToken,
+        /// The JSON result returned by the external system.
+        output: serde_json::Value,
+    },
+    /// An external system reported a failure via the management API.
+    ActivityFailedExternally {
+        /// Unique ID for this specific activity attempt.
+        activity_id: ActivityExecId,
+        /// Token that was used to fail the activity.
+        token: ExternalActivityToken,
+        /// String representation of the failure.
+        error: String,
+        /// Whether the failure is retryable per the activity's `RetryPolicy`.
+        retryable: bool,
+    },
+    /// The schedule-to-close deadline for an external activity was extended via
+    /// the management API heartbeat endpoint.
+    ActivityExternalDeadlineExtended {
+        /// Unique ID for this specific activity attempt.
+        activity_id: ActivityExecId,
+        /// Token of the activity whose deadline was extended.
+        token: ExternalActivityToken,
+    },
 }
 
 impl WorkflowEvent {
@@ -185,6 +232,10 @@ impl WorkflowEvent {
             Self::ChildWorkflowFailed { .. } => "ChildWorkflowFailed",
             Self::MarkerRecorded { .. } => "MarkerRecorded",
             Self::WorkflowContinuedAsNew { .. } => "WorkflowContinuedAsNew",
+            Self::ActivityAwaitingExternal { .. } => "ActivityAwaitingExternal",
+            Self::ActivityCompletedExternally { .. } => "ActivityCompletedExternally",
+            Self::ActivityFailedExternally { .. } => "ActivityFailedExternally",
+            Self::ActivityExternalDeadlineExtended { .. } => "ActivityExternalDeadlineExtended",
         }
     }
 }
@@ -303,10 +354,33 @@ mod tests {
                 new_exec_id: ExecutionId::new(),
                 input: serde_json::Value::Null,
             },
+            WorkflowEvent::ActivityAwaitingExternal {
+                activity_id: ActivityExecId::new(),
+                token: crate::types::ExternalActivityToken::new(),
+                name: "x".into(),
+                input: serde_json::Value::Null,
+                queue: "default".into(),
+                schedule_to_close_secs: 0,
+            },
+            WorkflowEvent::ActivityCompletedExternally {
+                activity_id: ActivityExecId::new(),
+                token: crate::types::ExternalActivityToken::new(),
+                output: serde_json::Value::Null,
+            },
+            WorkflowEvent::ActivityFailedExternally {
+                activity_id: ActivityExecId::new(),
+                token: crate::types::ExternalActivityToken::new(),
+                error: "x".into(),
+                retryable: false,
+            },
+            WorkflowEvent::ActivityExternalDeadlineExtended {
+                activity_id: ActivityExecId::new(),
+                token: crate::types::ExternalActivityToken::new(),
+            },
         ];
 
-        assert_eq!(events.len(), 18);
+        assert_eq!(events.len(), 22);
         let names: HashSet<_> = events.iter().map(WorkflowEvent::type_name).collect();
-        assert_eq!(names.len(), 18, "duplicate type names detected");
+        assert_eq!(names.len(), 22, "duplicate type names detected");
     }
 }

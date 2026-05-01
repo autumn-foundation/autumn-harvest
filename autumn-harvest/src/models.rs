@@ -10,8 +10,9 @@ use diesel::prelude::*;
 use uuid::Uuid;
 
 use crate::schema::{
-    harvest_dag_runs, harvest_dead_letters, harvest_events, harvest_schedules, harvest_signals,
-    harvest_task_queue, harvest_timers, harvest_workflow_executions,
+    harvest_dag_runs, harvest_dead_letters, harvest_events, harvest_external_tasks,
+    harvest_schedules, harvest_signals, harvest_task_queue, harvest_timers,
+    harvest_workflow_executions,
 };
 
 // ── WorkflowExecution ─────────────────────────────────────────────────────────
@@ -326,4 +327,38 @@ pub struct NewDeadLetter<'a> {
     pub input: serde_json::Value,
     pub error: &'a str,
     pub attempts: i32,
+}
+
+// ── ExternalTask ──────────────────────────────────────────────────────────────
+
+/// A pending or resolved external activity task, keyed by its opaque token.
+#[derive(
+    Debug, Clone, Queryable, Selectable, Identifiable, serde::Serialize, serde::Deserialize,
+)]
+#[diesel(table_name = harvest_external_tasks)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct ExternalTask {
+    pub id: Uuid,
+    pub token: Uuid,
+    pub workflow_exec_id: Uuid,
+    pub activity_id: Uuid,
+    pub name: String,
+    pub queue: String,
+    pub state: String,
+    pub schedule_to_close_at: DateTime<Utc>,
+    pub schedule_to_close_secs: i64,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Insert struct for registering a new external activity task.
+#[derive(Debug, Insertable)]
+#[diesel(table_name = harvest_external_tasks)]
+pub struct NewExternalTask<'a> {
+    pub token: Uuid,
+    pub workflow_exec_id: Uuid,
+    pub activity_id: Uuid,
+    pub name: &'a str,
+    pub queue: &'a str,
+    pub schedule_to_close_at: DateTime<Utc>,
+    pub schedule_to_close_secs: i64,
 }

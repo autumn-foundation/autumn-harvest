@@ -14,6 +14,7 @@ use std::collections::{HashSet, VecDeque};
 
 use crate::error::TimeoutType;
 use crate::event::WorkflowEvent;
+use crate::types::{ActivityExecId, ExternalActivityToken};
 
 /// Result of matching a workflow command against the event history.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,6 +45,16 @@ pub enum HistoryMatch {
         expected: String,
         /// What the workflow actually requested.
         actual: String,
+    },
+    /// History shows an external activity was scheduled but no terminal event
+    /// (completed/failed/timed-out) exists yet. The workflow should re-emit the
+    /// schedule command with the same token and activity ID (idempotent at the
+    /// worker level) and then suspend until the external completion arrives.
+    AwaitingExternalCompletion {
+        /// The activity execution ID already recorded in history.
+        activity_id: ActivityExecId,
+        /// The token already recorded in history. Must be reused to stay idempotent.
+        token: ExternalActivityToken,
     },
 }
 
@@ -306,6 +317,129 @@ impl HistoryMatcher {
         // We found the Scheduled event but no terminal event — treat as
         // incomplete history (the activity was scheduled but never finished).
         HistoryMatch::NoMatch
+    }
+
+    /// Match an `execute_activity_external` command against history.
+    ///
+    /// Expects `ActivityAwaitingExternal { name }` at the current cursor, then
+    /// scans forward for a terminal event (`ActivityCompletedExternally`,
+    /// `ActivityFailedExternally`, or `ActivityTimedOut`) with the same
+    /// `activity_id`. `ActivityExternalDeadlineExtended` events are skipped.
+    ///
+    /// Returns:
+    /// - [`HistoryMatch::Matched`] when the external system completed the activity
+    /// - [`HistoryMatch::Failed`] when the external system failed the activity
+    /// - [`HistoryMatch::TimedOut`] when the schedule-to-close clock expired
+    /// - [`HistoryMatch::AwaitingExternalCompletion`] when scheduled but no terminal yet
+    /// - [`HistoryMatch::NoMatch`] when past end of history (first-time scheduling)
+    /// - [`HistoryMatch::Diverged`] when history has a different event at this position
+    pub fn match_external_activity(&mut self, activity_name: &str) -> HistoryMatch {
+        if !self.prepare_match() {
+            return HistoryMatch::NoMatch;
+        }
+
+        let WorkflowEvent::ActivityAwaitingExternal {
+            activity_id,
+            token,
+            name: recorded_name,
+            ..
+        } = &self.events[self.cursor]
+        else {
+            return HistoryMatch::Diverged {
+                expected: format!("ActivityAwaitingExternal({activity_name})"),
+                actual: self.events[self.cursor].type_name().to_string(),
+            };
+        };
+
+        if recorded_name != activity_name {
+            return HistoryMatch::Diverged {
+                expected: format!("ActivityAwaitingExternal({activity_name})"),
+                actual: format!("ActivityAwaitingExternal({recorded_name})"),
+            };
+        }
+
+        let activity_id = *activity_id;
+        let token = *token;
+
+        // Advance past the ActivityAwaitingExternal event.
+        self.cursor += 1;
+        let mut scan_cursor = self.cursor;
+
+        while scan_cursor < self.events.len() {
+            if self.is_consumed(scan_cursor) {
+                scan_cursor += 1;
+                continue;
+            }
+
+            match &self.events[scan_cursor] {
+                WorkflowEvent::ActivityCompletedExternally {
+                    activity_id: id,
+                    output,
+                    ..
+                } if *id == activity_id => {
+                    let result = HistoryMatch::Matched {
+                        output: output.clone(),
+                    };
+                    self.cursor = scan_cursor + 1;
+                    self.advance_to_next_unconsumed_event();
+                    return result;
+                }
+                WorkflowEvent::ActivityFailedExternally {
+                    activity_id: id,
+                    error,
+                    ..
+                } if *id == activity_id => {
+                    let result = HistoryMatch::Failed {
+                        error: error.clone(),
+                        attempt: 1,
+                    };
+                    self.cursor = scan_cursor + 1;
+                    self.advance_to_next_unconsumed_event();
+                    return result;
+                }
+                WorkflowEvent::ActivityTimedOut {
+                    activity_id: id,
+                    timeout_type,
+                } if *id == activity_id => {
+                    let result = HistoryMatch::TimedOut {
+                        timeout_type: timeout_type.clone(),
+                    };
+                    self.cursor = scan_cursor + 1;
+                    self.advance_to_next_unconsumed_event();
+                    return result;
+                }
+                // Deadline-extended events are informational; skip them.
+                WorkflowEvent::ActivityExternalDeadlineExtended {
+                    activity_id: id, ..
+                } if *id == activity_id => {
+                    scan_cursor += 1;
+                }
+                // Signals can arrive while an external activity is pending.
+                WorkflowEvent::SignalReceived {
+                    signal_name,
+                    payload,
+                } => {
+                    let signal_name = signal_name.clone();
+                    let payload = payload.clone();
+                    self.stash_signal(scan_cursor, signal_name, payload);
+                    scan_cursor += 1;
+                }
+                // A second ActivityAwaitingExternal for the same activity can
+                // appear when a workflow is woken by a signal while still
+                // awaiting external completion: the worker re-runs
+                // persist_scheduled_external_activity, but record_external_task
+                // is idempotent (ON CONFLICT DO NOTHING).  Skip the duplicate.
+                WorkflowEvent::ActivityAwaitingExternal {
+                    activity_id: id, ..
+                } if *id == activity_id => {
+                    scan_cursor += 1;
+                }
+                _ => break,
+            }
+        }
+
+        // Awaiting event exists in history but no terminal found yet.
+        HistoryMatch::AwaitingExternalCompletion { activity_id, token }
     }
 
     /// Match a timer command against history.

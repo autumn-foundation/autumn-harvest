@@ -20,7 +20,7 @@ use crate::error::{HarvestError, HarvestResult};
 use crate::event::WorkflowEvent;
 use crate::query::QueryRegistry;
 use crate::replay::{HistoryMatch, HistoryMatcher};
-use crate::types::{ActivityExecId, ExecutionId, TimerId};
+use crate::types::{ActivityExecId, ExecutionId, ExternalActivityToken, TimerId};
 
 /// Runtime map of typed shared state registered on the harvest builder.
 pub type SharedStateMap = HashMap<TypeId, Box<dyn Any + Send + Sync>>;
@@ -117,6 +117,25 @@ pub enum WorkflowCommand {
         /// Optional details or payload associated with the marker.
         details: Value,
     },
+    /// Schedule an activity that completes externally via a task token.
+    ScheduleExternalActivity {
+        /// The unique execution ID of the activity.
+        activity_id: ActivityExecId,
+        /// The opaque task token the external system uses to deliver a result.
+        token: ExternalActivityToken,
+        /// The name of the activity to execute.
+        name: String,
+        /// The input payload for the activity.
+        input: Value,
+        /// The queue to schedule the activity on.
+        queue: String,
+        /// Maximum seconds before the activity times out.
+        schedule_to_close_secs: u64,
+        /// The worker sends the result back through this channel if a result
+        /// arrives in the same execution cycle (rare; normally the channel is
+        /// dropped and the workflow is re-run when external completion arrives).
+        result_tx: oneshot::Sender<Result<Value, String>>,
+    },
     /// Suspend until a named signal is delivered.
     WaitForSignal {
         /// The name of the signal to wait for.
@@ -186,6 +205,21 @@ impl std::fmt::Debug for WorkflowCommand {
                 .field("name", name)
                 .field("details", details)
                 .finish(),
+            Self::ScheduleExternalActivity {
+                activity_id,
+                token,
+                name,
+                queue,
+                schedule_to_close_secs,
+                ..
+            } => f
+                .debug_struct("ScheduleExternalActivity")
+                .field("activity_id", activity_id)
+                .field("token", token)
+                .field("name", name)
+                .field("queue", queue)
+                .field("schedule_to_close_secs", schedule_to_close_secs)
+                .finish_non_exhaustive(),
             Self::WaitForSignal { signal_name, .. } => f
                 .debug_struct("WaitForSignal")
                 .field("signal_name", signal_name)
@@ -549,7 +583,9 @@ impl WorkflowContext {
                 format!("side effect mismatch: expected {expected}, got {actual}"),
             )),
 
-            HistoryMatch::Failed { .. } | HistoryMatch::TimedOut { .. } => {
+            HistoryMatch::Failed { .. }
+            | HistoryMatch::TimedOut { .. }
+            | HistoryMatch::AwaitingExternalCompletion { .. } => {
                 unreachable!("match_side_effect only returns Matched, Diverged or NoMatch")
             }
 
@@ -669,6 +705,10 @@ impl WorkflowContext {
                 format!("activity mismatch: expected {expected}, got {actual}"),
             )),
 
+            HistoryMatch::AwaitingExternalCompletion { .. } => {
+                unreachable!("match_activity never returns AwaitingExternalCompletion")
+            }
+
             HistoryMatch::NoMatch => {
                 // Live execution: emit a ScheduleActivity command and suspend
                 // until the worker sends the result through the oneshot channel.
@@ -725,7 +765,9 @@ impl WorkflowContext {
                 format!("timer mismatch: expected {expected}, got {actual}"),
             )),
 
-            HistoryMatch::Failed { .. } | HistoryMatch::TimedOut { .. } => {
+            HistoryMatch::Failed { .. }
+            | HistoryMatch::TimedOut { .. }
+            | HistoryMatch::AwaitingExternalCompletion { .. } => {
                 unreachable!("timers do not fail or time out in history matching")
             }
 
@@ -776,7 +818,7 @@ impl WorkflowContext {
                 attempt,
                 source: error.into(),
             }),
-            HistoryMatch::TimedOut { .. } => {
+            HistoryMatch::TimedOut { .. } | HistoryMatch::AwaitingExternalCompletion { .. } => {
                 unreachable!("child workflows do not time out in match_child_workflow")
             }
             HistoryMatch::Diverged { expected, actual } => Err(HarvestError::NonDeterministic(
@@ -825,7 +867,9 @@ impl WorkflowContext {
             HistoryMatch::Diverged { expected, actual } => Err(HarvestError::NonDeterministic(
                 format!("signal mismatch: expected {expected}, got {actual}"),
             )),
-            HistoryMatch::Failed { .. } | HistoryMatch::TimedOut { .. } => Err(
+            HistoryMatch::Failed { .. }
+            | HistoryMatch::TimedOut { .. }
+            | HistoryMatch::AwaitingExternalCompletion { .. } => Err(
                 HarvestError::NonDeterministic("signal history contains unexpected failure".into()),
             ),
             HistoryMatch::NoMatch => {
@@ -839,6 +883,116 @@ impl WorkflowContext {
                         "signal '{signal_name}' cancelled: result channel dropped"
                     ))
                 })
+            }
+        }
+    }
+
+    // ── External activity completion ───────────────────────────────────
+
+    /// Schedule an activity that completes when an *external* system delivers
+    /// a result via the management API task-token endpoint.
+    ///
+    /// Unlike [`execute_activity_raw`](Self::execute_activity_raw), external
+    /// activities do **not** occupy a worker slot — the workflow suspends until
+    /// an operator or third-party service posts to
+    /// `POST /activities/external/{token}/complete` or `/fail`.
+    ///
+    /// The scheduling step generates a durable, opaque **task token** (UUID)
+    /// embedded in event history. On replay the recorded outcome is returned
+    /// without contacting anything external.
+    ///
+    /// # Errors
+    ///
+    /// - [`HarvestError::NonDeterministic`] if the activity name recorded in
+    ///   history does not match `name`.
+    /// - [`HarvestError::ActivityFailed`] if the recorded history shows a failure.
+    /// - [`HarvestError::Timeout`] if the schedule-to-close deadline expired.
+    /// - [`HarvestError::Cancelled`] if the result channel is dropped.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    pub async fn execute_activity_external(
+        &self,
+        name: &str,
+        input: Value,
+        queue: &str,
+        schedule_to_close_secs: u64,
+    ) -> HarvestResult<Value> {
+        use crate::replay::HistoryMatch;
+
+        let history_match = self.match_history(|m| m.match_external_activity(name));
+
+        match history_match {
+            HistoryMatch::Matched { output } => Ok(output),
+
+            HistoryMatch::Failed { error, attempt } => Err(HarvestError::ActivityFailed {
+                name: name.to_string(),
+                attempt,
+                source: error.into(),
+            }),
+
+            HistoryMatch::TimedOut { timeout_type } => Err(HarvestError::Timeout {
+                timeout_type,
+                task_name: name.to_string(),
+            }),
+
+            HistoryMatch::Diverged { expected, actual } => Err(HarvestError::NonDeterministic(
+                format!("external activity mismatch: expected {expected}, got {actual}"),
+            )),
+
+            HistoryMatch::AwaitingExternalCompletion { activity_id, token } => {
+                // Already recorded — re-emit idempotently so the worker confirms
+                // the lookup-table entry is present, then suspend until the
+                // external completion triggers a re-run.
+                let (tx, rx) = oneshot::channel();
+                self.push_command(WorkflowCommand::ScheduleExternalActivity {
+                    activity_id,
+                    token,
+                    name: name.to_string(),
+                    input,
+                    queue: queue.to_string(),
+                    schedule_to_close_secs,
+                    result_tx: tx,
+                });
+                match rx.await {
+                    Ok(Ok(output)) => Ok(output),
+                    Ok(Err(error)) => Err(HarvestError::ActivityFailed {
+                        name: name.to_string(),
+                        attempt: 1,
+                        source: error.into(),
+                    }),
+                    Err(_) => Err(HarvestError::Cancelled(format!(
+                        "external activity '{name}' cancelled: result channel dropped"
+                    ))),
+                }
+            }
+
+            HistoryMatch::NoMatch => {
+                // First time — generate a fresh token and schedule.
+                let activity_id = self.next_activity_id();
+                let token = ExternalActivityToken::new();
+                let (tx, rx) = oneshot::channel();
+                self.push_command(WorkflowCommand::ScheduleExternalActivity {
+                    activity_id,
+                    token,
+                    name: name.to_string(),
+                    input,
+                    queue: queue.to_string(),
+                    schedule_to_close_secs,
+                    result_tx: tx,
+                });
+                match rx.await {
+                    Ok(Ok(output)) => Ok(output),
+                    Ok(Err(error)) => Err(HarvestError::ActivityFailed {
+                        name: name.to_string(),
+                        attempt: 1,
+                        source: error.into(),
+                    }),
+                    Err(_) => Err(HarvestError::Cancelled(format!(
+                        "external activity '{name}' cancelled: result channel dropped"
+                    ))),
+                }
             }
         }
     }
@@ -884,7 +1038,9 @@ impl WorkflowContext {
             HistoryMatch::Diverged { expected, actual } => Err(HarvestError::NonDeterministic(
                 format!("continue_as_new mismatch: expected {expected}, got {actual}"),
             )),
-            HistoryMatch::Failed { .. } | HistoryMatch::TimedOut { .. } => {
+            HistoryMatch::Failed { .. }
+            | HistoryMatch::TimedOut { .. }
+            | HistoryMatch::AwaitingExternalCompletion { .. } => {
                 Err(HarvestError::NonDeterministic(
                     "continue_as_new history contains unexpected terminal state".into(),
                 ))

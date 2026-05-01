@@ -160,11 +160,29 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    use diesel::sql_types::*;
+
+    harvest_external_tasks (id) {
+        id -> Uuid,
+        token -> Uuid,
+        workflow_exec_id -> Uuid,
+        activity_id -> Uuid,
+        name -> Text,
+        queue -> Text,
+        state -> Text,
+        schedule_to_close_at -> Timestamptz,
+        schedule_to_close_secs -> Int8,
+        created_at -> Timestamptz,
+    }
+}
+
 diesel::joinable!(harvest_events -> harvest_workflow_executions (workflow_exec_id));
 diesel::joinable!(harvest_task_queue -> harvest_workflow_executions (workflow_exec_id));
 diesel::joinable!(harvest_dag_runs -> harvest_workflow_executions (workflow_exec_id));
 diesel::joinable!(harvest_signals -> harvest_workflow_executions (workflow_exec_id));
 diesel::joinable!(harvest_timers -> harvest_workflow_executions (workflow_exec_id));
+diesel::joinable!(harvest_external_tasks -> harvest_workflow_executions (workflow_exec_id));
 
 diesel::allow_tables_to_appear_in_same_query!(
     harvest_workflow_executions,
@@ -175,4 +193,5 @@ diesel::allow_tables_to_appear_in_same_query!(
     harvest_signals,
     harvest_timers,
     harvest_dead_letters,
+    harvest_external_tasks,
 );

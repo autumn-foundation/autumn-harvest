@@ -315,6 +315,12 @@ impl ActivityExecId {
     pub const fn as_uuid(&self) -> Uuid {
         self.0
     }
+
+    /// Wraps an existing `Uuid` as an `ActivityExecId`.
+    #[must_use]
+    pub const fn from_uuid(id: Uuid) -> Self {
+        Self(id)
+    }
 }
 
 impl Default for ActivityExecId {
@@ -330,6 +336,69 @@ impl fmt::Display for ActivityExecId {
 }
 
 impl FromStr for ActivityExecId {
+    type Err = uuid::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Uuid::parse_str(s).map(Self)
+    }
+}
+
+/// Opaque single-use token that uniquely identifies a pending external activity.
+///
+/// The token is embedded in the `ActivityAwaitingExternal` event when a workflow
+/// calls `execute_activity_external`, and is round-tripped by external systems
+/// through the management API to deliver a result (`/complete`, `/fail`) or extend
+/// the deadline (`/heartbeat`).
+///
+/// ## Examples
+///
+/// ```rust
+/// use autumn_harvest::types::ExternalActivityToken;
+///
+/// let token = ExternalActivityToken::new();
+/// assert!(!token.as_uuid().is_nil());
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ExternalActivityToken(Uuid);
+
+impl ExternalActivityToken {
+    /// Create a fresh, random token.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+
+    /// The nil token (all-zero UUID), useful as a sentinel in tests.
+    #[must_use]
+    pub const fn nil() -> Self {
+        Self(Uuid::nil())
+    }
+
+    /// The underlying UUID.
+    #[must_use]
+    pub const fn as_uuid(&self) -> Uuid {
+        self.0
+    }
+
+    /// Wraps an existing `Uuid` as an `ExternalActivityToken`.
+    #[must_use]
+    pub const fn from_uuid(id: Uuid) -> Self {
+        Self(id)
+    }
+}
+
+impl Default for ExternalActivityToken {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for ExternalActivityToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl FromStr for ExternalActivityToken {
     type Err = uuid::Error;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Uuid::parse_str(s).map(Self)

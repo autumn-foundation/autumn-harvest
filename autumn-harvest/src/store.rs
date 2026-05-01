@@ -5,7 +5,9 @@
 //! that two workers can't append conflicting events to the same workflow.
 
 use diesel::ExpressionMethods;
+use diesel::OptionalExtension;
 use diesel::QueryDsl;
+use diesel::SelectableHelper;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 
@@ -100,6 +102,54 @@ pub async fn append_events(
         .execute(conn)
         .await
         .map_err(crate::error::database_error)
+}
+
+/// Append a single event to a workflow's history without loading the full log.
+///
+/// Acquires a row-level lock on the workflow execution before reading
+/// `MAX(event_id)`, serializing concurrent appenders (management API paths,
+/// timeout enforcement) so they never race to allocate the same event ID.
+/// Must be called inside a transaction; the lock is held until the transaction
+/// commits or rolls back.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] if the query or insert fails,
+/// or [`crate::error::HarvestError::NotFound`] if the execution does not exist.
+pub async fn append_single_event(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    event: WorkflowEvent,
+) -> HarvestResult<()> {
+    use crate::models::WorkflowExecution;
+    use crate::schema::harvest_workflow_executions;
+    use diesel::dsl::max;
+
+    // Lock the parent execution row so that concurrent callers serialise their
+    // MAX(event_id) + INSERT pairs — preventing a duplicate-event-id collision
+    // on the UNIQUE(workflow_exec_id, event_id) constraint.
+    harvest_workflow_executions::table
+        .find(exec_id.as_uuid())
+        .for_update()
+        .select(WorkflowExecution::as_select())
+        .first(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?
+        .ok_or_else(|| {
+            crate::error::HarvestError::NotFound(format!("workflow execution {exec_id}"))
+        })?;
+
+    let max_id: Option<i32> = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
+        .select(max(harvest_events::event_id))
+        .first(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    let next_id = max_id.map_or(0, |id| id.saturating_add(1));
+    append_events(conn, exec_id, &[event], next_id).await?;
+    Ok(())
 }
 
 /// Load the full event history for a workflow execution, ordered by `event_id`.

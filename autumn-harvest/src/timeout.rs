@@ -23,7 +23,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::{HarvestError, HarvestResult, TimeoutType};
 use crate::event::WorkflowEvent;
-use crate::models::{TaskQueueItem, WorkflowExecution};
+use crate::models::{ExternalTask, TaskQueueItem, WorkflowExecution};
+use crate::schema::harvest_external_tasks;
+use crate::types::ActivityExecId;
 use crate::{queue, store};
 
 /// The reason a task was identified as timed out.
@@ -337,6 +339,86 @@ async fn enforce_workflow_timeout(
     .await
 }
 
+/// Enforce schedule-to-close timeouts for pending external activity tasks.
+///
+/// Scans `harvest_external_tasks` for rows that are still `PENDING` but whose
+/// `schedule_to_close_at` has elapsed.  For each expired row the function:
+///
+/// 1. Marks the row `TIMED_OUT`.
+/// 2. Appends `ActivityTimedOut { timeout_type: ScheduleToClose }` to the
+///    owning workflow's event history.
+/// 3. Wakes the parked workflow task so it can process the timeout.
+///
+/// Returns the number of external tasks that were timed out.
+///
+/// # Errors
+///
+/// Returns the first database or persistence error encountered.
+pub async fn enforce_external_task_timeouts(conn: &mut AsyncPgConnection) -> HarvestResult<usize> {
+    let expired: Vec<ExternalTask> = harvest_external_tasks::table
+        .filter(harvest_external_tasks::state.eq("PENDING"))
+        .filter(harvest_external_tasks::schedule_to_close_at.lt(Utc::now()))
+        .select(ExternalTask::as_select())
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    let count = expired.len();
+
+    for task in &expired {
+        let exec_id = execution_id_from_uuid(task.workflow_exec_id);
+        let activity_id = ActivityExecId::from_uuid(task.activity_id);
+        let task_id = task.id;
+
+        let timeout_event = WorkflowEvent::ActivityTimedOut {
+            activity_id,
+            timeout_type: TimeoutType::ScheduleToClose,
+        };
+
+        let result = conn
+            .transaction::<(), HarvestError, _>(|conn| {
+                async move {
+                    // Guard against two races:
+                    // 1. complete/fail landed after our scan → state != PENDING
+                    // 2. heartbeat extended the deadline after our scan →
+                    //    schedule_to_close_at is now in the future
+                    // Either way, 0 rows updated means we skip the timeout event.
+                    let rows = diesel::update(
+                        harvest_external_tasks::table
+                            .find(task_id)
+                            .filter(harvest_external_tasks::state.eq("PENDING"))
+                            .filter(harvest_external_tasks::schedule_to_close_at.lt(Utc::now())),
+                    )
+                    .set(harvest_external_tasks::state.eq("TIMED_OUT"))
+                    .execute(conn)
+                    .await
+                    .map_err(crate::error::database_error)?;
+
+                    if rows == 0 {
+                        return Ok(());
+                    }
+
+                    store::append_single_event(conn, exec_id, timeout_event).await?;
+                    queue::wake_workflow_task(conn, exec_id).await
+                }
+                .scope_boxed()
+            })
+            .await;
+
+        if let Err(error) = result {
+            tracing::error!(
+                task_id = %task.id,
+                exec_id = %exec_id,
+                error = %error,
+                "failed to enforce external task schedule-to-close timeout"
+            );
+            return Err(error);
+        }
+    }
+
+    Ok(count)
+}
+
 /// Enforce all currently expired task timeouts against the database state.
 ///
 /// This mutates queue rows and workflow history so timed-out tasks are not
@@ -348,7 +430,7 @@ async fn enforce_workflow_timeout(
 /// Returns the first database or persistence error encountered.
 pub async fn enforce_timeouts_once(conn: &mut AsyncPgConnection) -> HarvestResult<usize> {
     let timed_out = find_timed_out_tasks(conn).await?;
-    let count = timed_out.len();
+    let mut count = timed_out.len();
 
     for (task, reason) in timed_out {
         let result = match (task.task_type.as_str(), task.workflow_exec_id) {
@@ -375,6 +457,7 @@ pub async fn enforce_timeouts_once(conn: &mut AsyncPgConnection) -> HarvestResul
         }
     }
 
+    count += enforce_external_task_timeouts(conn).await?;
     Ok(count)
 }
 

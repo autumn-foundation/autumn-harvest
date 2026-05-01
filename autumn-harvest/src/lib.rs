@@ -32,6 +32,8 @@ pub mod event;
 #[doc(hidden)]
 pub mod execution;
 pub mod executor;
+#[cfg(feature = "db")]
+pub mod external_task;
 pub mod history_export;
 pub mod info;
 pub mod policy;
@@ -135,7 +137,8 @@ pub use telemetry::{
 #[cfg(any(test, feature = "testing"))]
 pub use test_generator::TestHarnessGenerator;
 pub use types::{
-    ActivityExecId, ExecutionId, ShardId, TimerId, WorkerId, WorkflowId, WorkflowIdReusePolicy,
+    ActivityExecId, ExecutionId, ExternalActivityToken, ShardId, TimerId, WorkerId, WorkflowId,
+    WorkflowIdReusePolicy,
 };
 
 #[cfg(feature = "db")]
