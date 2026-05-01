@@ -30,6 +30,7 @@ autumn-harvest/          <- workspace root (this file lives here)
       cache.rs           <- Phase 2: LRU workflow state cache
       dlq.rs             <- Phase 2: dead letter queue
       pool.rs            <- Phase 2: separate pool config with shared ceiling
+      testing.rs         <- Phase 3.5 (testing feature): WorkflowReplayer harness
     migrations/
       20260409000000_harvest_initial/
     tests/
@@ -345,9 +346,45 @@ cargo test -p autumn-harvest --test integration_e2e
 # Replay tests
 cargo test -p autumn-harvest --test replay_tests
 
+# Replayer harness tests (WorkflowReplayer — no DB required)
+cargo test -p autumn-harvest --test replayer_tests --features testing --no-default-features
+
+# Replay throughput benchmark (issue #135 budget: 10k events < 200ms)
+cargo bench -p autumn-harvest --features testing --no-default-features --bench replay_bench
+
 # Macro tests
 cargo test -p autumn-harvest-macros
 ```
+
+### Testing workflow code changes with WorkflowReplayer
+
+`autumn_harvest::testing::WorkflowReplayer` (gated by the `testing` feature) lets
+you assert that a `#[workflow]` function is replay-safe against recorded histories
+before deploying a code change.  This catches non-determinism regressions in CI
+rather than via the DLQ in production.
+
+```rust
+// In your test binary (Cargo.toml: autumn-harvest = { features = ["testing"] })
+let report = WorkflowReplayer::new()
+    .register_fn("onboarding", onboarding_handler)
+    .replay_from_json(&std::fs::read_to_string("fixtures/onboarding_history.json").unwrap())
+    .await
+    .expect("fixture must parse");
+
+assert!(
+    matches!(report.status, ReplayStatus::ReplaySucceeded),
+    "replay regression:\n{report}"
+);
+```
+
+The replayer never executes activities or writes to the database — it runs the
+workflow function in pure replay mode and compares commands against the recorded
+history.  A `ReplayReport` with `ReplaySucceeded` means the workflow code can
+safely resume all in-flight executions that produced that history.
+
+Key types: `WorkflowReplayer`, `ReplayReport`, `ReplayStatus`, `NonDeterminismKind`,
+`HistorySnapshot` (the JSON round-trip format).  See `src/testing.rs` and
+`tests/replayer_tests.rs` for examples.
 
 ---
 

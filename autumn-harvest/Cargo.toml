@@ -48,12 +48,26 @@ tokio-postgres = { version = "0.7", optional = true }
 name = "external_completion_tests"
 required-features = ["testing"]
 
+[[test]]
+name = "replayer_tests"
+required-features = ["testing"]
+
+[[test]]
+name = "replayer_integration_tests"
+required-features = ["testing", "db"]
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
 proptest = "1.11.0"
 loom = "0.7.2"
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+[[bench]]
+name = "replay_bench"
+required-features = ["testing"]
+harness = false
 
 [lints]
 workspace = true

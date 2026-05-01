@@ -75,6 +75,68 @@ pub async fn run_workflow(
     run_workflow_with_state(exec_id, history, handler, input, empty_shared_state()).await
 }
 
+/// Like [`run_workflow`] but runs in strict replay mode.
+///
+/// Uses [`WorkflowContext::for_replay_strict`] so that activity and local-activity
+/// dispatch additionally compare input payloads against the recorded history,
+/// returning a non-determinism error on any mismatch.  This is used by
+/// [`WorkflowReplayer`](crate::testing::WorkflowReplayer) to catch
+/// input-changing code changes before deployment.
+pub async fn run_workflow_strict(
+    exec_id: ExecutionId,
+    history: Vec<WorkflowEvent>,
+    handler: WorkflowHandlerFn,
+    input: Value,
+    state: SharedState,
+) -> WorkflowOutcome {
+    let ctx = WorkflowContext::for_replay_strict_with_state(exec_id, history, state);
+
+    let span = tracing::info_span!(
+        "harvest.workflow.run_strict",
+        "otel.kind" = "internal",
+        workflow.execution_id = %exec_id,
+    );
+
+    async {
+        let timeout_result = tokio::time::timeout(SUSPENSION_TIMEOUT, handler(&ctx, input)).await;
+        match timeout_result {
+            Ok(Ok(output)) => {
+                if ctx.history_has_unconsumed_events() {
+                    WorkflowOutcome::Failed {
+                        error: "non-deterministic replay: early completion mismatch: \
+                                expected <end of history>, got <workflow returned early>"
+                            .to_string(),
+                    }
+                } else if !ctx.drain_commands().is_empty() {
+                    // New commands emitted after history was fully consumed (e.g. a
+                    // newly-added version() or side_effect() call on an old history).
+                    WorkflowOutcome::Failed {
+                        error: "non-deterministic replay: new commands emitted beyond \
+                                recorded history"
+                            .to_string(),
+                    }
+                } else {
+                    WorkflowOutcome::Completed { output }
+                }
+            }
+            Ok(Err(error)) => WorkflowOutcome::Failed { error },
+            Err(_elapsed) => {
+                let mut commands = ctx.drain_commands();
+                if let Some(idx) = commands
+                    .iter()
+                    .rposition(|cmd| matches!(cmd, WorkflowCommand::ContinueAsNew { .. }))
+                    && let WorkflowCommand::ContinueAsNew { input } = commands.swap_remove(idx)
+                {
+                    return WorkflowOutcome::ContinuedAsNew { input };
+                }
+                WorkflowOutcome::Suspended { commands }
+            }
+        }
+    }
+    .instrument(span)
+    .await
+}
+
 /// Run a workflow function through replay and live execution with shared state.
 pub async fn run_workflow_with_state(
     exec_id: ExecutionId,
