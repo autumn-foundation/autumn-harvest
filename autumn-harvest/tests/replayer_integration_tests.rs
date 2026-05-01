@@ -7,7 +7,9 @@
 //! replays using `replay_from_db` and asserts the outcome.
 //!
 //! Run with:
+//! ```text
 //!   cargo test -p autumn-harvest --features testing --test replayer_integration_tests
+//! ```
 
 use std::future::Future;
 use std::pin::Pin;
@@ -187,7 +189,7 @@ async fn persist_canonical_history(
 // Tests
 // ---------------------------------------------------------------------------
 
-/// (a) Unchanged workflow replays its own real DB history → ReplaySucceeded.
+/// (a) Unchanged workflow replays its own real DB history → `ReplaySucceeded`.
 #[tokio::test]
 async fn replay_from_db_unchanged_workflow_succeeds() {
     let (mut conn, _container) = setup_test_db().await;
@@ -213,7 +215,7 @@ async fn replay_from_db_unchanged_workflow_succeeds() {
     );
 }
 
-/// (b) Reordered activities against real DB history → NonDeterminismDetected.
+/// (b) Reordered activities against real DB history → `NonDeterminismDetected`.
 #[tokio::test]
 async fn replay_from_db_detects_non_determinism() {
     let (mut conn, _container) = setup_test_db().await;
@@ -252,7 +254,7 @@ async fn replay_from_db_unknown_exec_id_returns_error() {
     );
 }
 
-/// (d) Correct handler registered but with mismatched DB workflow name → WorkflowFailed.
+/// (d) Correct handler registered but with mismatched DB workflow name → `WorkflowFailed`.
 #[tokio::test]
 async fn replay_from_db_unregistered_handler_surfaces_as_workflow_failed() {
     let (mut conn, _container) = setup_test_db().await;

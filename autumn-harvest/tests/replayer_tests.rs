@@ -62,7 +62,7 @@ fn reordered_workflow<'a>(
     })
 }
 
-/// Workflow that uses ctx.version() to gate a new code path — correctly fenced.
+/// Workflow that uses `ctx.version()` to gate a new code path — correctly fenced.
 fn versioned_workflow_fenced<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -178,7 +178,7 @@ fn build_replayer() -> WorkflowReplayer {
         .register_fn("timer_first_workflow", timer_first_workflow)
 }
 
-/// Build a snapshot from a (exec_id, events) pair with a given workflow name.
+/// Build a snapshot from a `(exec_id, events)` pair with a given workflow name.
 fn make_snapshot(name: &str, exec_id: ExecutionId, events: Vec<WorkflowEvent>) -> HistorySnapshot {
     HistorySnapshot {
         workflow_name: name.to_string(),
@@ -474,7 +474,7 @@ async fn non_determinism_report_includes_expected_actual() {
 // Activity input mismatch is detected (strict replay mode)
 // ---------------------------------------------------------------------------
 
-/// Workflow that calls step_one with a NON-NULL input that won't match history.
+/// Workflow that calls `step_one` with a NON-NULL input that won't match history.
 fn changed_input_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
