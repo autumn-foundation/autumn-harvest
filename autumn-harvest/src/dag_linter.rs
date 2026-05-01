@@ -335,6 +335,7 @@ mod tests {
                 default_queue: None,
                 max_concurrent: None,
                 concurrency_key: None,
+                is_local: false,
                 handler: dummy_handler,
             },
         );

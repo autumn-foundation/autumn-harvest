@@ -160,6 +160,41 @@ pub enum WorkflowEvent {
         input: serde_json::Value,
     },
 
+    // ── Local activities (issue #98) ─────────────────────────────────────
+    /// A local activity was dispatched for inline execution on the workflow
+    /// worker. Unlike regular activities, local activities never write a row to
+    /// `harvest_task_queue`; the worker runs the handler in the same Tokio task
+    /// that drives the workflow loop.
+    LocalActivityScheduled {
+        /// Unique ID for this local activity attempt sequence.
+        activity_id: ActivityExecId,
+        /// The name of the registered activity handler.
+        name: String,
+        /// JSON input for the activity.
+        input: serde_json::Value,
+    },
+    /// A local activity finished executing successfully.
+    LocalActivityCompleted {
+        /// Unique ID matching the corresponding `LocalActivityScheduled`.
+        activity_id: ActivityExecId,
+        /// The JSON result returned by the activity handler.
+        output: serde_json::Value,
+    },
+    /// A local activity attempt returned an error or the handler panicked.
+    ///
+    /// Multiple `LocalActivityFailed` events may appear in sequence (one per
+    /// attempt) before a terminal `LocalActivityCompleted` (retry eventually
+    /// succeeded) or before the retry budget is exhausted (the last
+    /// `LocalActivityFailed` with no following `LocalActivityCompleted`).
+    LocalActivityFailed {
+        /// Unique ID matching the corresponding `LocalActivityScheduled`.
+        activity_id: ActivityExecId,
+        /// String representation of the failure.
+        error: String,
+        /// How many attempts have been made so far (1-based).
+        attempt: u32,
+    },
+
     // ── External activity completion (issue #92) ──────────────────────
     /// An external activity was scheduled and is awaiting completion via the
     /// management API task-token endpoint. The `token` is a single-use handle
@@ -232,6 +267,9 @@ impl WorkflowEvent {
             Self::ChildWorkflowFailed { .. } => "ChildWorkflowFailed",
             Self::MarkerRecorded { .. } => "MarkerRecorded",
             Self::WorkflowContinuedAsNew { .. } => "WorkflowContinuedAsNew",
+            Self::LocalActivityScheduled { .. } => "LocalActivityScheduled",
+            Self::LocalActivityCompleted { .. } => "LocalActivityCompleted",
+            Self::LocalActivityFailed { .. } => "LocalActivityFailed",
             Self::ActivityAwaitingExternal { .. } => "ActivityAwaitingExternal",
             Self::ActivityCompletedExternally { .. } => "ActivityCompletedExternally",
             Self::ActivityFailedExternally { .. } => "ActivityFailedExternally",
@@ -269,6 +307,47 @@ mod tests {
         let json = serde_json::to_string(&event)?;
         let back: WorkflowEvent = serde_json::from_str(&json)?;
         assert!(matches!(back, WorkflowEvent::ActivityScheduled { .. }));
+        Ok(())
+    }
+
+    #[test]
+    fn local_activity_scheduled_round_trips() -> Result<(), serde_json::Error> {
+        let event = WorkflowEvent::LocalActivityScheduled {
+            activity_id: ActivityExecId::new(),
+            name: "format_data".into(),
+            input: serde_json::json!({"x": 1}),
+        };
+        let json = serde_json::to_string(&event)?;
+        let back: WorkflowEvent = serde_json::from_str(&json)?;
+        assert!(matches!(back, WorkflowEvent::LocalActivityScheduled { .. }));
+        Ok(())
+    }
+
+    #[test]
+    fn local_activity_completed_round_trips() -> Result<(), serde_json::Error> {
+        let event = WorkflowEvent::LocalActivityCompleted {
+            activity_id: ActivityExecId::new(),
+            output: serde_json::json!({"result": 42}),
+        };
+        let json = serde_json::to_string(&event)?;
+        let back: WorkflowEvent = serde_json::from_str(&json)?;
+        assert!(matches!(back, WorkflowEvent::LocalActivityCompleted { .. }));
+        Ok(())
+    }
+
+    #[test]
+    fn local_activity_failed_round_trips() -> Result<(), serde_json::Error> {
+        let event = WorkflowEvent::LocalActivityFailed {
+            activity_id: ActivityExecId::new(),
+            error: "db connection refused".into(),
+            attempt: 3,
+        };
+        let json = serde_json::to_string(&event)?;
+        let back: WorkflowEvent = serde_json::from_str(&json)?;
+        assert!(matches!(
+            back,
+            WorkflowEvent::LocalActivityFailed { attempt: 3, .. }
+        ));
         Ok(())
     }
 
@@ -377,10 +456,24 @@ mod tests {
                 activity_id: ActivityExecId::new(),
                 token: crate::types::ExternalActivityToken::new(),
             },
+            WorkflowEvent::LocalActivityScheduled {
+                activity_id: ActivityExecId::new(),
+                name: "format_data".into(),
+                input: serde_json::Value::Null,
+            },
+            WorkflowEvent::LocalActivityCompleted {
+                activity_id: ActivityExecId::new(),
+                output: serde_json::Value::Null,
+            },
+            WorkflowEvent::LocalActivityFailed {
+                activity_id: ActivityExecId::new(),
+                error: "transient".into(),
+                attempt: 1,
+            },
         ];
 
-        assert_eq!(events.len(), 22);
+        assert_eq!(events.len(), 25);
         let names: HashSet<_> = events.iter().map(WorkflowEvent::type_name).collect();
-        assert_eq!(names.len(), 22, "duplicate type names detected");
+        assert_eq!(names.len(), 25, "duplicate type names detected");
     }
 }

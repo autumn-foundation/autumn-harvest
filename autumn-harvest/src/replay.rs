@@ -714,6 +714,103 @@ impl HistoryMatcher {
         }
     }
 
+    /// Match a local activity command against history.
+    ///
+    /// Expects `LocalActivityScheduled { name }` at the current cursor, then
+    /// scans forward for `LocalActivityCompleted` (returns [`HistoryMatch::Matched`])
+    /// or exhausts `LocalActivityFailed` events and returns the last failure
+    /// (returns [`HistoryMatch::Failed`]).
+    ///
+    /// Intermediate `LocalActivityFailed` events (when the handler was retried
+    /// inline) are skipped; only the final outcome is surfaced to the workflow.
+    ///
+    /// Returns:
+    /// - [`HistoryMatch::Matched`] if the activity eventually succeeded
+    /// - [`HistoryMatch::Failed`] if retries were exhausted (last recorded failure)
+    /// - [`HistoryMatch::NoMatch`] if past end of history (first-time execution)
+    /// - [`HistoryMatch::Diverged`] if history has a different event at this position
+    pub fn match_local_activity(&mut self, activity_name: &str) -> HistoryMatch {
+        if !self.prepare_match() {
+            return HistoryMatch::NoMatch;
+        }
+
+        let WorkflowEvent::LocalActivityScheduled {
+            activity_id,
+            name: recorded_name,
+            ..
+        } = &self.events[self.cursor]
+        else {
+            return HistoryMatch::Diverged {
+                expected: format!("LocalActivityScheduled({activity_name})"),
+                actual: self.events[self.cursor].type_name().to_string(),
+            };
+        };
+        let activity_id = *activity_id;
+
+        if recorded_name != activity_name {
+            return HistoryMatch::Diverged {
+                expected: format!("LocalActivityScheduled({activity_name})"),
+                actual: format!("LocalActivityScheduled({recorded_name})"),
+            };
+        }
+
+        // Advance past LocalActivityScheduled
+        self.cursor += 1;
+        let mut scan_cursor = self.cursor;
+        let mut last_failure: Option<HistoryMatch> = None;
+
+        while scan_cursor < self.events.len() {
+            if self.is_consumed(scan_cursor) {
+                scan_cursor += 1;
+                continue;
+            }
+
+            match &self.events[scan_cursor] {
+                WorkflowEvent::LocalActivityCompleted {
+                    activity_id: id,
+                    output,
+                } if *id == activity_id => {
+                    let output = output.clone();
+                    self.cursor = scan_cursor + 1;
+                    self.advance_to_next_unconsumed_event();
+                    return HistoryMatch::Matched { output };
+                }
+                WorkflowEvent::LocalActivityFailed {
+                    activity_id: id,
+                    error,
+                    attempt,
+                } if *id == activity_id => {
+                    last_failure = Some(HistoryMatch::Failed {
+                        error: error.clone(),
+                        attempt: *attempt,
+                    });
+                    scan_cursor += 1;
+                }
+                // Signals can be ingested while a local activity is retrying
+                WorkflowEvent::SignalReceived {
+                    signal_name,
+                    payload,
+                } => {
+                    let signal_name = signal_name.clone();
+                    let payload = payload.clone();
+                    self.stash_signal(scan_cursor, signal_name, payload);
+                    scan_cursor += 1;
+                }
+                _ => break,
+            }
+        }
+
+        if let Some(failure) = last_failure {
+            // Scanned past all retry failures with no completion — this is terminal.
+            self.cursor = scan_cursor;
+            self.advance_to_next_unconsumed_event();
+            return failure;
+        }
+
+        // LocalActivityScheduled found but no terminal event yet — incomplete history.
+        HistoryMatch::NoMatch
+    }
+
     /// Versioning mechanism for safe workflow code changes.
     ///
     /// Checks the recorded history for a version marker. If the marker is present
@@ -1747,6 +1844,212 @@ mod tests {
             },
             "signal buffered during timer scan should be returned by match_signal"
         );
+    }
+
+    // ── Local activity tests ──────────────────────────────────────────────
+
+    #[test]
+    fn matcher_replays_completed_local_activity() {
+        let id = ActivityExecId::new();
+        let output = serde_json::json!({"formatted": "hello"});
+        let events = vec![
+            WorkflowEvent::LocalActivityScheduled {
+                activity_id: id,
+                name: "format_data".into(),
+                input: Value::Null,
+            },
+            WorkflowEvent::LocalActivityCompleted {
+                activity_id: id,
+                output: output.clone(),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        let result = matcher.match_local_activity("format_data");
+        assert_eq!(result, HistoryMatch::Matched { output });
+        assert_eq!(matcher.position(), 2);
+        assert!(!matcher.is_replaying());
+    }
+
+    #[test]
+    fn matcher_replays_failed_local_activity_retries_exhausted() {
+        let id = ActivityExecId::new();
+        let events = vec![
+            WorkflowEvent::LocalActivityScheduled {
+                activity_id: id,
+                name: "format_data".into(),
+                input: Value::Null,
+            },
+            WorkflowEvent::LocalActivityFailed {
+                activity_id: id,
+                error: "transient".into(),
+                attempt: 1,
+            },
+            WorkflowEvent::LocalActivityFailed {
+                activity_id: id,
+                error: "still failing".into(),
+                attempt: 2,
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        let result = matcher.match_local_activity("format_data");
+        assert_eq!(
+            result,
+            HistoryMatch::Failed {
+                error: "still failing".into(),
+                attempt: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn matcher_local_activity_skips_intermediate_failures_and_returns_completion() {
+        let id = ActivityExecId::new();
+        let output = serde_json::json!({"ok": true});
+        let events = vec![
+            WorkflowEvent::LocalActivityScheduled {
+                activity_id: id,
+                name: "format_data".into(),
+                input: Value::Null,
+            },
+            WorkflowEvent::LocalActivityFailed {
+                activity_id: id,
+                error: "transient".into(),
+                attempt: 1,
+            },
+            WorkflowEvent::LocalActivityFailed {
+                activity_id: id,
+                error: "still transient".into(),
+                attempt: 2,
+            },
+            WorkflowEvent::LocalActivityCompleted {
+                activity_id: id,
+                output: output.clone(),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        let result = matcher.match_local_activity("format_data");
+        assert_eq!(result, HistoryMatch::Matched { output });
+        assert_eq!(matcher.position(), 4);
+    }
+
+    #[test]
+    fn matcher_local_activity_no_match_at_end_of_history() {
+        let mut matcher = HistoryMatcher::new(vec![]);
+        let result = matcher.match_local_activity("format_data");
+        assert_eq!(result, HistoryMatch::NoMatch);
+    }
+
+    #[test]
+    fn matcher_local_activity_detects_divergence_wrong_event_type() {
+        let timer_id = TimerId::new("t1");
+        let events = vec![WorkflowEvent::TimerStarted {
+            timer_id,
+            duration_secs: 10,
+        }];
+        let mut matcher = HistoryMatcher::new(events);
+        let result = matcher.match_local_activity("format_data");
+        assert!(matches!(result, HistoryMatch::Diverged { .. }));
+        if let HistoryMatch::Diverged { expected, actual } = result {
+            assert!(expected.contains("format_data"));
+            assert!(actual.contains("TimerStarted"));
+        }
+    }
+
+    #[test]
+    fn matcher_local_activity_detects_divergence_wrong_name() {
+        let id = ActivityExecId::new();
+        let events = vec![WorkflowEvent::LocalActivityScheduled {
+            activity_id: id,
+            name: "other_activity".into(),
+            input: Value::Null,
+        }];
+        let mut matcher = HistoryMatcher::new(events);
+        let result = matcher.match_local_activity("format_data");
+        assert!(matches!(result, HistoryMatch::Diverged { .. }));
+        if let HistoryMatch::Diverged { expected, actual } = result {
+            assert!(expected.contains("format_data"));
+            assert!(actual.contains("other_activity"));
+        }
+    }
+
+    #[test]
+    fn matcher_local_activity_stashes_signals_during_retry_scan() {
+        let id = ActivityExecId::new();
+        let output = serde_json::json!({"ok": true});
+        let events = vec![
+            WorkflowEvent::LocalActivityScheduled {
+                activity_id: id,
+                name: "format_data".into(),
+                input: Value::Null,
+            },
+            WorkflowEvent::LocalActivityFailed {
+                activity_id: id,
+                error: "transient".into(),
+                attempt: 1,
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "abort".into(),
+                payload: serde_json::json!({"reason": "user"}),
+            },
+            WorkflowEvent::LocalActivityCompleted {
+                activity_id: id,
+                output: output.clone(),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        let result = matcher.match_local_activity("format_data");
+        assert_eq!(result, HistoryMatch::Matched { output });
+
+        // Signal buffered during scan must be deliverable later.
+        let signal = matcher.match_signal("abort");
+        assert_eq!(
+            signal,
+            HistoryMatch::Matched {
+                output: serde_json::json!({"reason": "user"})
+            }
+        );
+    }
+
+    #[test]
+    fn matcher_replays_sequential_local_and_regular_activities() {
+        let local_id = ActivityExecId::new();
+        let regular_id = ActivityExecId::new();
+        let local_out = serde_json::json!("formatted");
+        let regular_out = serde_json::json!({"sent": true});
+        let events = vec![
+            WorkflowEvent::LocalActivityScheduled {
+                activity_id: local_id,
+                name: "format_data".into(),
+                input: Value::Null,
+            },
+            WorkflowEvent::LocalActivityCompleted {
+                activity_id: local_id,
+                output: local_out.clone(),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: regular_id,
+                name: "send_email".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id: regular_id,
+                output: regular_out.clone(),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+
+        let r1 = matcher.match_local_activity("format_data");
+        assert_eq!(r1, HistoryMatch::Matched { output: local_out });
+
+        let r2 = matcher.match_activity("send_email");
+        assert_eq!(
+            r2,
+            HistoryMatch::Matched {
+                output: regular_out
+            }
+        );
+        assert!(!matcher.is_replaying());
     }
 
     #[test]

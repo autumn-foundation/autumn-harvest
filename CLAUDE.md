@@ -51,6 +51,7 @@ Two crates in the workspace. `autumn-harvest` is the public library. `autumn-har
 - **Phase 1** (complete): types, error, event, policy, context stubs, models, macros, builder
 - **Phase 2** (complete): event store, replay engine, workflow context, activity context, task queue (SKIP LOCKED), LISTEN/NOTIFY, worker runtime, heartbeating, timeout enforcement, workflow versioning (ctx.version), LRU workflow cache, dead letter queue, separate worker pool with shared ceiling, testcontainers integration tests
 - **Phase 3** (implemented): DAG scheduler/runtime, `DagBuilder`, `#[dag]` macro, trigger rules, signals/queries, management HTTP API, Autumn adapter crate with `HarvestExt` lifecycle integration
+- **Phase 3.5** (implemented): Local activities (`#[activity(local = true)]`, `ctx.execute_local_activity_raw`, `WorkflowCommand::RunLocalActivity`, three new `WorkflowEvent` variants, builder cap validation) — see issue #98
 - **Phase 4** (next): production hardening -- cancellation/saga semantics, sharding, sticky cross-worker routing, observability, metrics, dashboard (autumn-harvest-ui)
 
 ---
@@ -207,10 +208,47 @@ Supported `#[activity]` attribute keys:
 - `schedule_to_start = "5m"`
 - `retry = RetryPolicy::exponential(3, Duration::from_secs(1))` — any expression
 - `queue = "email-workers"` — task queue name
+- `local = true` — run inline on the workflow worker (see Local Activities below)
 
 Duration strings: `"30s"`, `"5m"`, `"1h"`. Parsed via Harvest core's local `task_duration()` helper.
 
 `#[workflow]` takes no attributes in Phase 1.
+
+### Local Activities
+
+Local activities run **inline on the workflow worker task** — they are never enqueued to `harvest_task_queue` and never dispatched to a remote worker. Their results are still recorded durably in `harvest_events` (`LocalActivityScheduled`, `LocalActivityCompleted`, `LocalActivityFailed`) so deterministic replay works identically to regular activities.
+
+```rust
+#[activity(local = true, start_to_close = "5s", retry = RetryPolicy::fixed(3, Duration::from_millis(100)))]
+async fn compute_checksum(ctx: &ActivityContext, data: Vec<u8>) -> Result<String, String> {
+    // pure CPU work — no I/O, no heartbeats
+    Ok(hex::encode(sha256(&data)))
+}
+```
+
+**Decision matrix — local vs regular activity:**
+
+| | Local activity | Regular activity |
+|---|---|---|
+| Execution location | Inline on the workflow worker | Dispatched to task queue / remote worker |
+| Typical duration | < 1 s | Any duration |
+| Hard timeout cap | `WorkerConfig::max_local_activity_start_to_close` (default 60 s) | No cap enforced by Harvest |
+| Heartbeating | **Not supported** | Supported |
+| `schedule_to_start` timeout | **Not supported** | Supported |
+| Custom task queue | **Not supported** | Supported |
+| Retry policy | Supported | Supported |
+| Durability / replay | Full (events appended to history) | Full (events appended to history) |
+
+**Use a local activity when:**
+- The work is in-process (pure computation, fast cache lookups, format conversions, orchestration glue)
+- Latency matters and you want to avoid round-trips through the task queue
+- The operation reliably completes within the 60 s default cap
+
+**Use a regular activity when:**
+- The work involves real I/O (HTTP, DB, filesystem)
+- You need the activity to run on a different worker pool or machine
+- The operation might take more than 60 s or needs heartbeating to signal liveness
+- You want `schedule_to_start` timeout enforcement
 
 ---
 
