@@ -87,8 +87,9 @@ pub async fn run_workflow_strict(
     history: Vec<WorkflowEvent>,
     handler: WorkflowHandlerFn,
     input: Value,
+    state: SharedState,
 ) -> WorkflowOutcome {
-    let ctx = WorkflowContext::for_replay_strict(exec_id, history);
+    let ctx = WorkflowContext::for_replay_strict_with_state(exec_id, history, state);
 
     let span = tracing::info_span!(
         "harvest.workflow.run_strict",

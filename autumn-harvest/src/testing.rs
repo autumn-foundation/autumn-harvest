@@ -40,10 +40,12 @@
 //! # }
 //! ```
 
+use std::any::TypeId;
 use std::collections::HashMap;
 
 use serde_json::Value;
 
+use crate::context::{SharedState, empty_shared_state};
 use crate::event::WorkflowEvent;
 use crate::executor::{WorkflowOutcome, run_workflow_strict};
 use crate::info::{WorkflowHandlerFn, WorkflowInfo};
@@ -231,6 +233,7 @@ pub struct HistorySnapshot {
 /// code issues against what the recorded history expects.
 pub struct WorkflowReplayer {
     handlers: HashMap<String, WorkflowHandlerFn>,
+    state: SharedState,
 }
 
 impl Default for WorkflowReplayer {
@@ -245,7 +248,42 @@ impl WorkflowReplayer {
     pub fn new() -> Self {
         Self {
             handlers: HashMap::new(),
+            state: empty_shared_state(),
         }
+    }
+
+    /// Inject a typed shared-state value available to workflow handlers via
+    /// `ctx.state::<T>()` during replay.
+    ///
+    /// Call this for every state type the workflow accesses, otherwise
+    /// `ctx.state::<T>()` returns `None` and the workflow may return
+    /// `WorkflowFailed` even when the history is fully deterministic.
+    ///
+    /// ```rust,no_run
+    /// # use autumn_harvest::testing::WorkflowReplayer;
+    /// # use autumn_harvest::event::WorkflowEvent;
+    /// struct MyConfig { value: u32 }
+    /// # async fn example() {
+    /// # let history: Vec<WorkflowEvent> = vec![];
+    /// let report = WorkflowReplayer::new()
+    ///     .with_state(MyConfig { value: 42 })
+    ///     // .register_fn(...)
+    ///     .replay_from_events(history)
+    ///     .await;
+    /// # }
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal `Arc` has been cloned before `with_state` is
+    /// called — this is unreachable in normal builder usage where `with_state`
+    /// is always called on a freshly constructed `WorkflowReplayer`.
+    #[must_use]
+    pub fn with_state<T: Send + Sync + 'static>(mut self, value: T) -> Self {
+        std::sync::Arc::get_mut(&mut self.state)
+            .expect("state Arc has no other references during WorkflowReplayer construction")
+            .insert(TypeId::of::<T>(), Box::new(value));
+        self
     }
 
     /// Register a batch of workflows from a `workflows![]` macro call.
@@ -306,7 +344,14 @@ impl WorkflowReplayer {
         let total_events = snapshot.events.len();
         let input = extract_input(&snapshot.events);
 
-        let outcome = run_workflow_strict(exec_id, snapshot.events.clone(), handler, input).await;
+        let outcome = run_workflow_strict(
+            exec_id,
+            snapshot.events.clone(),
+            handler,
+            input,
+            self.state.clone(),
+        )
+        .await;
         outcome_to_report(exec_id, total_events, &snapshot.events, outcome)
     }
 
@@ -376,7 +421,8 @@ impl WorkflowReplayer {
         let total_events = events.len();
         let input = extract_input(&events);
 
-        let outcome = run_workflow_strict(exec_id, events.clone(), handler, input).await;
+        let outcome =
+            run_workflow_strict(exec_id, events.clone(), handler, input, self.state.clone()).await;
         outcome_to_report(exec_id, total_events, &events, outcome)
     }
 

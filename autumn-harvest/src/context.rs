@@ -407,6 +407,19 @@ impl WorkflowContext {
         ctx
     }
 
+    /// Like [`for_replay_strict`](Self::for_replay_strict) but injects shared
+    /// application state, required when the workflow calls `ctx.state::<T>()`.
+    #[must_use]
+    pub fn for_replay_strict_with_state(
+        exec_id: ExecutionId,
+        events: Vec<WorkflowEvent>,
+        state: SharedState,
+    ) -> Self {
+        let mut ctx = Self::for_replay_with_state(exec_id, events, state);
+        ctx.strict_replay = true;
+        ctx
+    }
+
     /// Test constructor -- creates a context in live (non-replay) mode with
     /// empty state and a fresh execution ID.
     #[cfg(any(test, feature = "testing"))]
