@@ -627,6 +627,10 @@ pub struct WorkerConfig {
     /// Any local activity registered with `start_to_close > cap` is rejected
     /// at builder `try_build()` time.
     pub max_local_activity_start_to_close: Duration,
+    /// How often the worker upserts its liveness row in `harvest_workers`.
+    /// Defaults to **5 seconds**. The API classifies a worker as stale after
+    /// `2 × worker_heartbeat_interval` without a heartbeat.
+    pub worker_heartbeat_interval: Duration,
 }
 
 impl Default for WorkerConfig {
@@ -642,6 +646,7 @@ impl Default for WorkerConfig {
             cancellation_grace_period: Duration::from_secs(5),
             shard_assignments: vec![ShardId::new(0)],
             max_local_activity_start_to_close: Duration::from_secs(60),
+            worker_heartbeat_interval: Duration::from_secs(5),
         }
     }
 }
@@ -696,6 +701,16 @@ impl WorkerConfig {
         } else {
             shards
         };
+        self
+    }
+
+    /// Override the worker heartbeat interval (default 5 s).
+    ///
+    /// The management API classifies a worker as stale after
+    /// `2 × worker_heartbeat_interval` without a heartbeat write.
+    #[must_use]
+    pub const fn with_worker_heartbeat_interval(mut self, interval: Duration) -> Self {
+        self.worker_heartbeat_interval = interval;
         self
     }
 }

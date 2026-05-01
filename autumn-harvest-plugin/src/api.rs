@@ -131,16 +131,50 @@ impl HarvestApiRuntime {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct HarvestApiState {
     runtime: Arc<Mutex<Option<HarvestApiRuntime>>>,
     storage_pool: Arc<Mutex<Option<HarvestDbPool>>>,
+    /// `2 × worker_heartbeat_interval`; derived from `WorkerConfig` at startup.
+    worker_stale_threshold: Arc<Mutex<std::time::Duration>>,
+}
+
+impl Default for HarvestApiState {
+    fn default() -> Self {
+        Self {
+            runtime: Arc::default(),
+            storage_pool: Arc::default(),
+            worker_stale_threshold: Arc::new(Mutex::new(std::time::Duration::from_secs(10))),
+        }
+    }
 }
 
 impl HarvestApiState {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Update the worker stale threshold used by `/workers` routes.
+    ///
+    /// Call this during startup with `2 × WorkerConfig::worker_heartbeat_interval`
+    /// so the API correctly reflects the configured heartbeat cadence.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    pub fn set_worker_stale_threshold(&self, threshold: std::time::Duration) {
+        *self
+            .worker_stale_threshold
+            .lock()
+            .expect("harvest api state lock poisoned") = threshold;
+    }
+
+    fn worker_stale_threshold(&self) -> std::time::Duration {
+        *self
+            .worker_stale_threshold
+            .lock()
+            .expect("harvest api state lock poisoned")
     }
 
     /// Install the currently running Harvest runtime snapshot.
@@ -1686,27 +1720,32 @@ where
 // Worker fleet observability (issue #100)
 // ---------------------------------------------------------------------------
 
-/// Workers that have not sent a heartbeat within this window are classified
-/// as stale. Equals `2 × default heartbeat_interval (5s)`.
-const WORKER_STALE_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(10);
-
 async fn list_workers_handler(
     Extension(api_state): Extension<HarvestApiState>,
     Query(pairs): Query<Vec<(String, String)>>,
 ) -> Result<Json<Vec<WorkerRow>>, AutumnError> {
     let filters = parse_worker_filters_api(&pairs)?;
+    let stale_threshold = api_state.worker_stale_threshold();
     let pool = api_state.storage_pool().map_err(map_error)?;
     let mut results: Vec<WorkerRow> = Vec::new();
 
+    // Query each shard without a per-shard limit so that the global sort +
+    // truncate below sees every matching worker. Per-shard limiting would
+    // silently drop valid workers on large shards before the merge.
+    let per_shard_filters = WorkerFilters {
+        limit: WorkerFilters::MAX_LIMIT,
+        ..filters.clone()
+    };
     for (_shard, shard_pool) in pool.iter_shards() {
         let mut conn = acquire_conn(shard_pool).await?;
-        let mut rows = list_workers(&mut conn, &filters, WORKER_STALE_THRESHOLD)
+        let mut rows = list_workers(&mut conn, &per_shard_filters, stale_threshold)
             .await
             .map_err(map_error)?;
         results.append(&mut rows);
     }
 
-    // Sort by worker_id for deterministic output across shards.
+    // Sort by worker_id for deterministic output across shards, then apply the
+    // real limit globally.
     results.sort_by(|a, b| a.worker.worker_id.cmp(&b.worker.worker_id));
     results.truncate(usize::try_from(filters.limit).unwrap_or(usize::MAX));
     Ok(Json(results))
@@ -1716,11 +1755,12 @@ async fn get_worker_handler(
     Extension(api_state): Extension<HarvestApiState>,
     Path(worker_id): Path<String>,
 ) -> Result<Json<WorkerRow>, AutumnError> {
+    let stale_threshold = api_state.worker_stale_threshold();
     let pool = api_state.storage_pool().map_err(map_error)?;
 
     for (_shard, shard_pool) in pool.iter_shards() {
         let mut conn = acquire_conn(shard_pool).await?;
-        if let Some(row) = get_worker(&mut conn, &worker_id, WORKER_STALE_THRESHOLD)
+        if let Some(row) = get_worker(&mut conn, &worker_id, stale_threshold)
             .await
             .map_err(map_error)?
         {
@@ -1734,6 +1774,7 @@ async fn get_worker_handler(
 async fn workers_health(
     Extension(api_state): Extension<HarvestApiState>,
 ) -> Result<Json<FleetHealth>, AutumnError> {
+    let stale_threshold = api_state.worker_stale_threshold();
     let pool = api_state.storage_pool().map_err(map_error)?;
     let mut combined = FleetHealth {
         healthy: 0,
@@ -1745,7 +1786,7 @@ async fn workers_health(
 
     for (_shard, shard_pool) in pool.iter_shards() {
         let mut conn = acquire_conn(shard_pool).await?;
-        let shard_health = fleet_health(&mut conn, WORKER_STALE_THRESHOLD)
+        let shard_health = fleet_health(&mut conn, stale_threshold)
             .await
             .map_err(map_error)?;
         combined.healthy += shard_health.healthy;
@@ -2018,5 +2059,24 @@ mod tests {
 
         let f = parse_worker_filters_api(&pairs(&[("limit", "0")])).unwrap();
         assert_eq!(f.limit, 1);
+    }
+
+    #[test]
+    fn harvest_api_state_stale_threshold_defaults_to_10s() {
+        let state = HarvestApiState::new();
+        assert_eq!(
+            state.worker_stale_threshold(),
+            std::time::Duration::from_secs(10)
+        );
+    }
+
+    #[test]
+    fn harvest_api_state_stale_threshold_can_be_overridden() {
+        let state = HarvestApiState::new();
+        state.set_worker_stale_threshold(std::time::Duration::from_secs(20));
+        assert_eq!(
+            state.worker_stale_threshold(),
+            std::time::Duration::from_secs(20)
+        );
     }
 }

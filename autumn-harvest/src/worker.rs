@@ -117,7 +117,7 @@ impl From<WorkerConfig> for WorkerRuntimeConfig {
             sticky_timeout: cfg.sticky_timeout,
             max_local_activity_start_to_close: cfg.max_local_activity_start_to_close,
             shard_assignments: cfg.shard_assignments,
-            worker_heartbeat_interval: Duration::from_secs(5),
+            worker_heartbeat_interval: cfg.worker_heartbeat_interval,
         }
     }
 }
@@ -2522,7 +2522,10 @@ impl Worker {
             self.config.poll_interval,
         );
 
-        // Spawn the heartbeat background task.
+        // Spawn the heartbeat background task with a dedicated cancel token so
+        // that liveness updates continue during the Draining phase and only stop
+        // after the Stopped transition is written.
+        let heartbeat_cancel = CancellationToken::new();
         let shard_ids: Vec<i32> = self
             .config
             .shard_assignments
@@ -2548,7 +2551,7 @@ impl Worker {
             Arc::clone(&self.activity_semaphore),
             self.config.max_concurrent_activities,
             self.config.worker_heartbeat_interval,
-            self.shutdown.clone(),
+            heartbeat_cancel.clone(),
         );
 
         while !self.shutdown.is_cancelled() {
@@ -2590,9 +2593,10 @@ impl Worker {
         tracing::info!(worker_id = %self.config.worker_id, "draining in-flight tasks");
         self.drain_in_flight().await;
 
-        // All tasks complete — mark Stopped.
+        // All tasks complete — mark Stopped, then stop the heartbeat task.
         self.transition_fleet_status(pool, crate::workers::WorkerStatus::Stopped)
             .await;
+        heartbeat_cancel.cancel();
 
         if let Err(error) = heartbeat_handle.await {
             tracing::warn!(
@@ -2921,6 +2925,7 @@ mod tests {
             cancellation_grace_period: Duration::from_secs(10),
             shard_assignments: vec![crate::types::ShardId::new(0)],
             max_local_activity_start_to_close: Duration::from_secs(60),
+            worker_heartbeat_interval: Duration::from_secs(5),
         };
 
         let runtime_cfg: WorkerRuntimeConfig = builder_cfg.into();
