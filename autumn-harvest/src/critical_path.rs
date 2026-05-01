@@ -100,12 +100,20 @@ impl CriticalPathAnalyzer {
             }
         }
 
-        // Find the node with the maximum total distance
+        // Identify sink nodes (nodes with no downstreams)
+        let mut is_sink = vec![true; tasks.len()];
+        for task in tasks {
+            for &up_idx in &task.upstreams {
+                is_sink[up_idx] = false;
+            }
+        }
+
+        // Find the sink node with the maximum total distance
         let mut max_dist = Duration::ZERO;
         let mut end_node = None;
 
         for (i, &dist) in distances.iter().enumerate() {
-            if dist > max_dist || end_node.is_none() {
+            if is_sink[i] && (dist > max_dist || end_node.is_none()) {
                 max_dist = dist;
                 end_node = Some(i);
             }
