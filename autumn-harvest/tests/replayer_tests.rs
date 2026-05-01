@@ -12,7 +12,9 @@ use std::pin::Pin;
 
 use autumn_harvest::context::WorkflowContext;
 use autumn_harvest::event::WorkflowEvent;
-use autumn_harvest::testing::{HistorySnapshot, NonDeterminismKind, ReplayStatus, WorkflowReplayer};
+use autumn_harvest::testing::{
+    HistorySnapshot, NonDeterminismKind, ReplayStatus, WorkflowReplayer,
+};
 use autumn_harvest::types::{ActivityExecId, ExecutionId, TimerId};
 use chrono::Utc;
 use serde_json::Value;
@@ -35,9 +37,7 @@ fn canonical_workflow<'a>(
             .execute_activity_raw("step_two", Value::Null, "default")
             .await
             .map_err(|e| e.to_string())?;
-        ctx.timer("cooldown", 60)
-            .await
-            .map_err(|e| e.to_string())?;
+        ctx.timer("cooldown", 60).await.map_err(|e| e.to_string())?;
         Ok(serde_json::json!({"first": r1, "second": r2}))
     })
 }
@@ -57,9 +57,7 @@ fn reordered_workflow<'a>(
             .execute_activity_raw("step_one", Value::Null, "default")
             .await
             .map_err(|e| e.to_string())?;
-        ctx.timer("cooldown", 60)
-            .await
-            .map_err(|e| e.to_string())?;
+        ctx.timer("cooldown", 60).await.map_err(|e| e.to_string())?;
         Ok(serde_json::json!({"first": r1, "second": r2}))
     })
 }
@@ -87,9 +85,7 @@ fn versioned_workflow_fenced<'a>(
             .execute_activity_raw("step_two", Value::Null, "default")
             .await
             .map_err(|e| e.to_string())?;
-        ctx.timer("cooldown", 60)
-            .await
-            .map_err(|e| e.to_string())?;
+        ctx.timer("cooldown", 60).await.map_err(|e| e.to_string())?;
         Ok(serde_json::json!({"first": r1, "second": r2}))
     })
 }
@@ -114,9 +110,7 @@ fn versioned_workflow_unfenced<'a>(
             .execute_activity_raw("step_two", Value::Null, "default")
             .await
             .map_err(|e| e.to_string())?;
-        ctx.timer("cooldown", 60)
-            .await
-            .map_err(|e| e.to_string())?;
+        ctx.timer("cooldown", 60).await.map_err(|e| e.to_string())?;
         Ok(serde_json::json!({"first": r1, "second": r2}))
     })
 }
@@ -127,9 +121,7 @@ fn timer_first_workflow<'a>(
     _input: Value,
 ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
     Box::pin(async move {
-        ctx.timer("wait", 30)
-            .await
-            .map_err(|e| e.to_string())?;
+        ctx.timer("wait", 30).await.map_err(|e| e.to_string())?;
         Ok(Value::Null)
     })
 }
@@ -187,11 +179,7 @@ fn build_replayer() -> WorkflowReplayer {
 }
 
 /// Build a snapshot from a (exec_id, events) pair with a given workflow name.
-fn make_snapshot(
-    name: &str,
-    exec_id: ExecutionId,
-    events: Vec<WorkflowEvent>,
-) -> HistorySnapshot {
+fn make_snapshot(name: &str, exec_id: ExecutionId, events: Vec<WorkflowEvent>) -> HistorySnapshot {
     HistorySnapshot {
         workflow_name: name.to_string(),
         execution_id: exec_id,
@@ -216,7 +204,10 @@ async fn replay_unchanged_workflow_succeeds() {
         matches!(report.status, ReplayStatus::ReplaySucceeded),
         "unchanged workflow must succeed replay, got: {report}"
     );
-    assert!(report.events_replayed > 0, "events_replayed must be positive");
+    assert!(
+        report.events_replayed > 0,
+        "events_replayed must be positive"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -240,9 +231,7 @@ async fn replay_reordered_activities_detects_non_determinism() {
                 "reordered activities must produce ActivityScheduleMismatch, got {kind:?}"
             );
         }
-        other => panic!(
-            "expected NonDeterminismDetected, got: {other:?}\nreport: {report}"
-        ),
+        other => panic!("expected NonDeterminismDetected, got: {other:?}\nreport: {report}"),
     }
 }
 
@@ -275,14 +264,15 @@ async fn replay_version_unfenced_detects_non_determinism() {
     let replayer = build_replayer();
 
     let report = replayer
-        .replay_from_snapshot(make_snapshot("versioned_workflow_unfenced", exec_id, events))
+        .replay_from_snapshot(make_snapshot(
+            "versioned_workflow_unfenced",
+            exec_id,
+            events,
+        ))
         .await;
 
     assert!(
-        matches!(
-            report.status,
-            ReplayStatus::NonDeterminismDetected { .. }
-        ),
+        matches!(report.status, ReplayStatus::NonDeterminismDetected { .. }),
         "unfenced new code path must produce NonDeterminismDetected, got: {report}"
     );
 }

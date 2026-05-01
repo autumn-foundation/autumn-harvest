@@ -70,9 +70,7 @@ fn bench_replay_10k(c: &mut Criterion) {
     c.bench_function("replay_10k_events", |b| {
         b.iter_batched(
             || build_history(5_000), // 5_000 activities = 10_001 events
-            |(_exec_id, events)| {
-                rt.block_on(replayer.replay_from_events(events))
-            },
+            |(_exec_id, events)| rt.block_on(replayer.replay_from_events(events)),
             BatchSize::SmallInput,
         );
     });
@@ -85,9 +83,7 @@ fn bench_replay_1k(c: &mut Criterion) {
     c.bench_function("replay_1k_events", |b| {
         b.iter_batched(
             || build_history(500), // 500 activities = 1_001 events
-            |(_exec_id, events)| {
-                rt.block_on(replayer.replay_from_events(events))
-            },
+            |(_exec_id, events)| rt.block_on(replayer.replay_from_events(events)),
             BatchSize::SmallInput,
         );
     });

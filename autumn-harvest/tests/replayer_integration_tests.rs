@@ -110,9 +110,7 @@ fn canonical_workflow<'a>(
         ctx.execute_activity_raw("step_two", Value::Null, "default")
             .await
             .map_err(|e| e.to_string())?;
-        ctx.timer("cooldown", 60)
-            .await
-            .map_err(|e| e.to_string())?;
+        ctx.timer("cooldown", 60).await.map_err(|e| e.to_string())?;
         Ok(Value::Null)
     })
 }
@@ -129,9 +127,7 @@ fn reordered_workflow<'a>(
         ctx.execute_activity_raw("step_one", Value::Null, "default")
             .await
             .map_err(|e| e.to_string())?;
-        ctx.timer("cooldown", 60)
-            .await
-            .map_err(|e| e.to_string())?;
+        ctx.timer("cooldown", 60).await.map_err(|e| e.to_string())?;
         Ok(Value::Null)
     })
 }

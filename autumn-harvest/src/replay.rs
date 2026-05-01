@@ -348,9 +348,7 @@ impl HistoryMatcher {
                         expected: format!(
                             "ActivityScheduled({activity_name}, input={recorded_input})"
                         ),
-                        actual: format!(
-                            "ActivityScheduled({activity_name}, input={input})"
-                        ),
+                        actual: format!("ActivityScheduled({activity_name}, input={input})"),
                     };
                 }
                 Ok(*activity_id)
@@ -965,9 +963,7 @@ impl HistoryMatcher {
                         expected: format!(
                             "LocalActivityScheduled({activity_name}, input={recorded_input})"
                         ),
-                        actual: format!(
-                            "LocalActivityScheduled({activity_name}, input={input})"
-                        ),
+                        actual: format!("LocalActivityScheduled({activity_name}, input={input})"),
                     };
                 }
                 Ok(*activity_id)

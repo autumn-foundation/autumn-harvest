@@ -389,10 +389,7 @@ impl WorkflowReplayer {
     ///
     /// Returns `serde_json::Error` if the input is not valid JSON or cannot
     /// be deserialised as a `HistorySnapshot`.
-    pub async fn replay_from_json(
-        &self,
-        json: &str,
-    ) -> Result<ReplayReport, serde_json::Error> {
+    pub async fn replay_from_json(&self, json: &str) -> Result<ReplayReport, serde_json::Error> {
         let snapshot: HistorySnapshot = serde_json::from_str(json)?;
         Ok(self.replay_from_snapshot(snapshot).await)
     }
@@ -493,8 +490,8 @@ fn outcome_to_report(
             mismatched_command_summary: None,
         },
 
-        WorkflowOutcome::Failed { error } => {
-            try_parse_non_determinism(&error, exec_id, events).unwrap_or(ReplayReport {
+        WorkflowOutcome::Failed { error } => try_parse_non_determinism(&error, exec_id, events)
+            .unwrap_or(ReplayReport {
                 execution_id: exec_id,
                 events_replayed: total_events,
                 status: ReplayStatus::WorkflowFailed {
@@ -502,8 +499,7 @@ fn outcome_to_report(
                     event_index: total_events,
                 },
                 mismatched_command_summary: None,
-            })
-        }
+            }),
     }
 }
 
@@ -678,8 +674,9 @@ mod tests {
 
     #[test]
     fn parse_nd_message_activity() {
-        let (kind, expected, actual) =
-            parse_nd_message("activity mismatch: expected ActivityScheduled(a), got ActivityScheduled(b)");
+        let (kind, expected, actual) = parse_nd_message(
+            "activity mismatch: expected ActivityScheduled(a), got ActivityScheduled(b)",
+        );
         assert_eq!(kind, NonDeterminismKind::ActivityScheduleMismatch);
         assert_eq!(expected, "ActivityScheduled(a)");
         assert_eq!(actual, "ActivityScheduled(b)");
@@ -694,22 +691,39 @@ mod tests {
 
     #[test]
     fn parse_nd_message_unknown_format() {
-        let (kind, expected, _) =
-            parse_nd_message("signal history contains unexpected failure");
+        let (kind, expected, _) = parse_nd_message("signal history contains unexpected failure");
         assert_eq!(kind, NonDeterminismKind::Unknown);
         assert!(!expected.is_empty());
     }
 
     #[test]
     fn classify_kind_covers_all_prefixes() {
-        assert_eq!(classify_kind("activity"), NonDeterminismKind::ActivityScheduleMismatch);
-        assert_eq!(classify_kind("local activity"), NonDeterminismKind::LocalActivityScheduleMismatch);
+        assert_eq!(
+            classify_kind("activity"),
+            NonDeterminismKind::ActivityScheduleMismatch
+        );
+        assert_eq!(
+            classify_kind("local activity"),
+            NonDeterminismKind::LocalActivityScheduleMismatch
+        );
         assert_eq!(classify_kind("timer"), NonDeterminismKind::TimerMismatch);
         assert_eq!(classify_kind("signal"), NonDeterminismKind::SignalMismatch);
-        assert_eq!(classify_kind("child workflow"), NonDeterminismKind::ChildWorkflowMismatch);
-        assert_eq!(classify_kind("side effect"), NonDeterminismKind::SideEffectMismatch);
-        assert_eq!(classify_kind("external activity"), NonDeterminismKind::ExternalActivityMismatch);
-        assert_eq!(classify_kind("continue-as-new"), NonDeterminismKind::ContinueAsNewMismatch);
+        assert_eq!(
+            classify_kind("child workflow"),
+            NonDeterminismKind::ChildWorkflowMismatch
+        );
+        assert_eq!(
+            classify_kind("side effect"),
+            NonDeterminismKind::SideEffectMismatch
+        );
+        assert_eq!(
+            classify_kind("external activity"),
+            NonDeterminismKind::ExternalActivityMismatch
+        );
+        assert_eq!(
+            classify_kind("continue-as-new"),
+            NonDeterminismKind::ContinueAsNewMismatch
+        );
         assert_eq!(classify_kind("something else"), NonDeterminismKind::Unknown);
     }
 

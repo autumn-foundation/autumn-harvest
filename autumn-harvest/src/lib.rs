@@ -28,9 +28,6 @@ pub mod dag_export;
 pub mod dag_linter;
 #[cfg(any(test, feature = "testing"))]
 pub mod dag_simulator;
-/// Replay test harness for verifying workflow determinism pre-deploy.
-#[cfg(any(test, feature = "testing"))]
-pub mod testing;
 pub mod diagnostic;
 pub mod error;
 pub mod event;
@@ -56,6 +53,9 @@ pub mod simulator;
 pub mod telemetry;
 #[cfg(any(test, feature = "testing"))]
 pub mod test_generator;
+/// Replay test harness for verifying workflow determinism pre-deploy.
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 pub mod types;
 
 #[cfg(feature = "db")]
