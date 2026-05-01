@@ -248,6 +248,11 @@ fn start_harvest_runtime(
     let built = builder
         .try_build()
         .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
+
+    // Derive the API stale threshold from the worker heartbeat interval so that
+    // /workers correctly classifies workers under non-default configurations.
+    api_state.set_worker_stale_threshold(built.worker_config().worker_heartbeat_interval * 2);
+
     state.insert_extension(harvest_config.outbox.clone());
     state.insert_extension(router.clone());
     let mut runner_resources = HarvestRunnerResources::new(harvest_pool)

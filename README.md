@@ -395,6 +395,38 @@ POST /api/harvest/admin/schedules/{id}/resume
 DELETE /api/harvest/admin/schedules/{id}
 ```
 
+### Worker Fleet
+
+The management API exposes three routes for observing the live worker fleet. Workers register on startup and heartbeat every 5 s (configurable via `WorkerConfig`). Workers that have not heartbeated within `2 × heartbeat_interval` (default 10 s) are classified as `stale` at query time but are not auto-deleted.
+
+```bash
+# List all workers (supports ?queue=, ?shard_id=, ?status=, ?health= filters)
+GET /api/harvest/workers
+
+# Filter to workers polling a specific queue on a specific shard
+GET /api/harvest/workers?queue=email-workers&shard_id=0
+
+# Single worker detail — includes currently claimed task-queue item IDs
+GET /api/harvest/workers/{worker_id}
+
+# Fleet health roll-up
+GET /api/harvest/workers/health
+# → { "healthy": 4, "stale": 1, "draining": 0, "by_queue": {"default": 5}, "by_shard": {"0": 5} }
+```
+
+Equivalent CLI (thin HTTP client, no direct Postgres access required):
+
+```bash
+cargo run -p autumn-harvest-cli -- worker list
+cargo run -p autumn-harvest-cli -- worker list --queue email-workers --shard-id 0
+cargo run -p autumn-harvest-cli -- worker get <worker-id>
+cargo run -p autumn-harvest-cli -- worker health
+```
+
+Worker lifecycle status values: `Active` (normal operation), `Draining` (received SIGTERM, waiting for in-flight tasks to complete), `Stopped` (shutdown complete). The `health` field in responses is derived at query time: `healthy` or `stale`.
+
+In sharded deployments the API merges results across all shards via `iter_shards()`. The `harvest_workers` table lives on every shard; each worker row is pinned to the shard the worker is polling.
+
 ## Requirements
 
 - Rust 1.88.0 or newer (MSRV)

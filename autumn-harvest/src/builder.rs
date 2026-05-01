@@ -183,6 +183,10 @@ pub enum HarvestBuilderError {
         /// Human-readable reason the schedule was rejected.
         reason: String,
     },
+
+    /// A [`WorkerConfig`] field has an invalid value.
+    #[error("invalid worker configuration: {0}")]
+    InvalidWorkerConfig(String),
 }
 
 impl BuiltHarvest {
@@ -452,6 +456,12 @@ impl HarvestBuilder {
             .validate()
             .map_err(HarvestBuilderError::InvalidRetention)?;
 
+        if self.worker_config.worker_heartbeat_interval.is_zero() {
+            return Err(HarvestBuilderError::InvalidWorkerConfig(
+                "worker_heartbeat_interval must be greater than zero".to_string(),
+            ));
+        }
+
         validate_concurrency_keys(&self.activities)?;
         validate_workflow_schedules(&self.workflow_schedules, &self.workflows)?;
         validate_local_activity_timeouts(
@@ -627,6 +637,10 @@ pub struct WorkerConfig {
     /// Any local activity registered with `start_to_close > cap` is rejected
     /// at builder `try_build()` time.
     pub max_local_activity_start_to_close: Duration,
+    /// How often the worker upserts its liveness row in `harvest_workers`.
+    /// Defaults to **5 seconds**. The API classifies a worker as stale after
+    /// `2 × worker_heartbeat_interval` without a heartbeat.
+    pub worker_heartbeat_interval: Duration,
 }
 
 impl Default for WorkerConfig {
@@ -642,6 +656,7 @@ impl Default for WorkerConfig {
             cancellation_grace_period: Duration::from_secs(5),
             shard_assignments: vec![ShardId::new(0)],
             max_local_activity_start_to_close: Duration::from_secs(60),
+            worker_heartbeat_interval: Duration::from_secs(5),
         }
     }
 }
@@ -698,6 +713,16 @@ impl WorkerConfig {
         };
         self
     }
+
+    /// Override the worker heartbeat interval (default 5 s).
+    ///
+    /// The management API classifies a worker as stale after
+    /// `2 × worker_heartbeat_interval` without a heartbeat write.
+    #[must_use]
+    pub const fn with_worker_heartbeat_interval(mut self, interval: Duration) -> Self {
+        self.worker_heartbeat_interval = interval;
+        self
+    }
 }
 
 #[cfg(test)]
@@ -733,6 +758,25 @@ mod tests {
     fn harvest_builder_collects_workflows() {
         let builder = HarvestBuilder::new().workflows(vec![fake_workflow_info()]);
         assert_eq!(builder.workflow_count(), 1);
+    }
+
+    #[test]
+    fn worker_heartbeat_interval_defaults_to_5s() {
+        assert_eq!(
+            WorkerConfig::default().worker_heartbeat_interval,
+            Duration::from_secs(5)
+        );
+    }
+
+    #[test]
+    fn worker_heartbeat_interval_zero_is_rejected() {
+        let result = HarvestBuilder::new()
+            .worker(WorkerConfig::default().with_worker_heartbeat_interval(Duration::ZERO))
+            .try_build();
+        assert!(
+            matches!(result, Err(HarvestBuilderError::InvalidWorkerConfig(_))),
+            "expected InvalidWorkerConfig but got {result:?}"
+        );
     }
 
     #[test]

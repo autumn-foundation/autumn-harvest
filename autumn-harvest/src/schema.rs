@@ -177,6 +177,23 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    use diesel::sql_types::*;
+
+    harvest_workers (worker_id) {
+        worker_id -> Text,
+        started_at -> Timestamptz,
+        last_heartbeat_at -> Timestamptz,
+        queues -> Jsonb,
+        shard_assignments -> Jsonb,
+        max_concurrency -> Int4,
+        in_flight_count -> Int4,
+        host -> Text,
+        version -> Nullable<Text>,
+        status -> Text,
+    }
+}
+
 diesel::joinable!(harvest_events -> harvest_workflow_executions (workflow_exec_id));
 diesel::joinable!(harvest_task_queue -> harvest_workflow_executions (workflow_exec_id));
 diesel::joinable!(harvest_dag_runs -> harvest_workflow_executions (workflow_exec_id));
@@ -194,4 +211,5 @@ diesel::allow_tables_to_appear_in_same_query!(
     harvest_timers,
     harvest_dead_letters,
     harvest_external_tasks,
+    harvest_workers,
 );

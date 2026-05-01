@@ -408,6 +408,8 @@ fn build_runtime_worker(
                 cancellation_grace_period: Duration::from_secs(1),
                 sticky_timeout: Duration::from_secs(5),
                 max_local_activity_start_to_close: Duration::from_secs(60),
+                shard_assignments: vec![autumn_harvest::types::ShardId::new(0)],
+                worker_heartbeat_interval: Duration::from_secs(5),
             },
             registry,
         )
@@ -860,6 +862,8 @@ async fn worker_completes_workflow_task_and_persists_result() {
                 cancellation_grace_period: Duration::from_secs(1),
                 sticky_timeout: Duration::from_secs(5),
                 max_local_activity_start_to_close: Duration::from_secs(60),
+                shard_assignments: vec![autumn_harvest::types::ShardId::new(0)],
+                worker_heartbeat_interval: Duration::from_secs(5),
             },
             registry,
         )
@@ -952,6 +956,8 @@ async fn worker_marks_workflow_failed_when_handler_errors() {
                 cancellation_grace_period: Duration::from_secs(1),
                 sticky_timeout: Duration::from_secs(5),
                 max_local_activity_start_to_close: Duration::from_secs(60),
+                shard_assignments: vec![autumn_harvest::types::ShardId::new(0)],
+                worker_heartbeat_interval: Duration::from_secs(5),
             },
             registry,
         )
@@ -1069,6 +1075,8 @@ async fn worker_completes_workflow_with_activity_round_trip() {
                 cancellation_grace_period: Duration::from_secs(1),
                 sticky_timeout: Duration::from_secs(5),
                 max_local_activity_start_to_close: Duration::from_secs(60),
+                shard_assignments: vec![autumn_harvest::types::ShardId::new(0)],
+                worker_heartbeat_interval: Duration::from_secs(5),
             },
             registry,
         )
@@ -1159,6 +1167,8 @@ async fn worker_fails_orphaned_activity_task_without_scheduled_event() {
                 cancellation_grace_period: Duration::from_secs(1),
                 sticky_timeout: Duration::from_secs(5),
                 max_local_activity_start_to_close: Duration::from_secs(60),
+                shard_assignments: vec![autumn_harvest::types::ShardId::new(0)],
+                worker_heartbeat_interval: Duration::from_secs(5),
             },
             Arc::new(HandlerRegistry::new(
                 vec![],
@@ -1366,6 +1376,8 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
                 cancellation_grace_period: Duration::from_secs(1),
                 sticky_timeout: Duration::from_secs(5),
                 max_local_activity_start_to_close: Duration::from_secs(60),
+                shard_assignments: vec![autumn_harvest::types::ShardId::new(0)],
+                worker_heartbeat_interval: Duration::from_secs(5),
             },
             Arc::new(HandlerRegistry::new(
                 vec![WorkflowInfo {
@@ -1484,6 +1496,8 @@ async fn worker_completes_workflow_with_timer_round_trip() {
                 cancellation_grace_period: Duration::from_secs(1),
                 sticky_timeout: Duration::from_secs(5),
                 max_local_activity_start_to_close: Duration::from_secs(60),
+                shard_assignments: vec![autumn_harvest::types::ShardId::new(0)],
+                worker_heartbeat_interval: Duration::from_secs(5),
             },
             Arc::new(HandlerRegistry::new(
                 vec![WorkflowInfo {
@@ -3700,6 +3714,8 @@ async fn workflow_schedule_baseline_dispatches_multiple_runs() {
                 cancellation_grace_period: Duration::from_secs(1),
                 sticky_timeout: Duration::from_secs(5),
                 max_local_activity_start_to_close: Duration::from_secs(60),
+                shard_assignments: vec![autumn_harvest::types::ShardId::new(0)],
+                worker_heartbeat_interval: Duration::from_secs(5),
             },
             Arc::clone(&registry),
         )
@@ -3791,6 +3807,8 @@ async fn workflow_schedule_max_active_runs_enforced() {
                 cancellation_grace_period: Duration::from_secs(1),
                 sticky_timeout: Duration::from_secs(5),
                 max_local_activity_start_to_close: Duration::from_secs(60),
+                shard_assignments: vec![autumn_harvest::types::ShardId::new(0)],
+                worker_heartbeat_interval: Duration::from_secs(5),
             },
             Arc::clone(&registry),
         )
@@ -3870,6 +3888,8 @@ async fn workflow_schedule_pause_and_resume() {
                 cancellation_grace_period: Duration::from_secs(1),
                 sticky_timeout: Duration::from_secs(5),
                 max_local_activity_start_to_close: Duration::from_secs(60),
+                shard_assignments: vec![autumn_harvest::types::ShardId::new(0)],
+                worker_heartbeat_interval: Duration::from_secs(5),
             },
             Arc::clone(&registry),
         )
