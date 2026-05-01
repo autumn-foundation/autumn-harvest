@@ -5,6 +5,7 @@ members = [
     "autumn-harvest-macros",
     "autumn-harvest-cli",
     "autumn-harvest-redis",
+    "examples/quickstart",
 ]
 resolver = "3"
 
