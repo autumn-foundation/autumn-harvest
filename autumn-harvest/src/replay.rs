@@ -229,6 +229,7 @@ impl HistoryMatcher {
     /// - [`HistoryMatch::TimedOut`] if a timeout is found
     /// - [`HistoryMatch::NoMatch`] if past end of history
     /// - [`HistoryMatch::Diverged`] if the event at cursor is not the expected activity
+    #[allow(clippy::too_many_lines)]
     pub fn match_activity(&mut self, activity_name: &str) -> HistoryMatch {
         if !self.prepare_match() {
             return HistoryMatch::NoMatch;
@@ -241,9 +242,18 @@ impl HistoryMatcher {
             ..
         } = &self.events[self.cursor]
         else {
+            // Include the marker name in the `actual` field so the replayer can
+            // classify a stale version-gate marker as `VersionMarkerMismatch`
+            // rather than the generic `ActivityScheduleMismatch`.
+            let actual = match &self.events[self.cursor] {
+                WorkflowEvent::MarkerRecorded { name, .. } => {
+                    format!("MarkerRecorded({name})")
+                }
+                other => other.type_name().to_string(),
+            };
             return HistoryMatch::Diverged {
                 expected: format!("ActivityScheduled({activity_name})"),
-                actual: self.events[self.cursor].type_name().to_string(),
+                actual,
             };
         };
         let activity_id = *activity_id;
@@ -381,10 +391,18 @@ impl HistoryMatcher {
                 }
                 Ok(*activity_id)
             }
-            other => Err(HistoryMatch::Diverged {
-                expected: format!("ActivityScheduled({activity_name})"),
-                actual: other.type_name().to_string(),
-            }),
+            other => {
+                let actual = match other {
+                    WorkflowEvent::MarkerRecorded { name, .. } => {
+                        format!("MarkerRecorded({name})")
+                    }
+                    e => e.type_name().to_string(),
+                };
+                Err(HistoryMatch::Diverged {
+                    expected: format!("ActivityScheduled({activity_name})"),
+                    actual,
+                })
+            }
         };
         let activity_id = match result {
             Ok(id) => id,

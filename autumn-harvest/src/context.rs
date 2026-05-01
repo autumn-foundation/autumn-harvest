@@ -733,6 +733,10 @@ impl WorkflowContext {
     ///
     /// Panics if the internal matcher or commands mutex is poisoned.
     pub fn version(&self, change_id: &str, min: u32, max: u32) -> u32 {
+        assert!(
+            min <= max,
+            "version gate '{change_id}': min version {min} must not exceed max version {max}"
+        );
         let version = self.match_history(|m| m.match_version(change_id, min, max));
 
         // During live execution (matcher returned max_version and is past
@@ -2045,6 +2049,16 @@ mod tests {
         } else {
             panic!("Expected NonDeterministic error");
         }
+    }
+
+    // ── Red-phase versioning tests ────────────────────────────────────────
+
+    /// min > max is a programmer error — must panic immediately with a clear message.
+    #[test]
+    #[should_panic(expected = "min version 5 must not exceed max version 2")]
+    fn version_panics_when_min_exceeds_max() {
+        let ctx = WorkflowContext::new_test();
+        ctx.version("my_gate", 5, 2);
     }
 
     #[test]

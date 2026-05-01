@@ -680,6 +680,191 @@ fn single_step_workflow<'a>(
     })
 }
 
+// ---------------------------------------------------------------------------
+// Acceptance criteria: multiple concurrent version changes in a single workflow
+// (spec AC#3: "Must support multiple concurrent version changes")
+// ---------------------------------------------------------------------------
+
+/// Workflow with two sequential version gates that BOTH have recorded markers.
+fn two_gate_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let va = ctx.version("gate_alpha", 1, 3);
+        let vb = ctx.version("gate_beta", 1, 5);
+        Ok(serde_json::json!({"va": va, "vb": vb}))
+    })
+}
+
+/// History with two version markers: gate_alpha=2, gate_beta=4.
+fn two_gate_history() -> (ExecutionId, Vec<WorkflowEvent>) {
+    let exec_id = ExecutionId::new();
+    let events = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+        },
+        WorkflowEvent::MarkerRecorded {
+            name: "version:gate_alpha".into(),
+            details: serde_json::json!(2_u32),
+        },
+        WorkflowEvent::MarkerRecorded {
+            name: "version:gate_beta".into(),
+            details: serde_json::json!(4_u32),
+        },
+    ];
+    (exec_id, events)
+}
+
+/// Both version markers are consumed in order — no non-determinism.
+#[tokio::test]
+async fn replay_two_concurrent_version_gates_succeed() {
+    let (exec_id, events) = two_gate_history();
+    let report = WorkflowReplayer::new()
+        .register_fn("two_gate_workflow", two_gate_workflow)
+        .replay_from_snapshot(make_snapshot("two_gate_workflow", exec_id, events))
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "two concurrent version gates must replay cleanly: {report}"
+    );
+}
+
+/// A version gate interleaved with an activity also replays correctly.
+fn interleaved_gate_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let va = ctx.version("gate_alpha", 1, 3);
+        let r = ctx
+            .execute_activity_raw("step_one", Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        let vb = ctx.version("gate_beta", 1, 5);
+        Ok(serde_json::json!({"va": va, "r": r, "vb": vb}))
+    })
+}
+
+fn interleaved_gate_history() -> (ExecutionId, Vec<WorkflowEvent>) {
+    let exec_id = ExecutionId::new();
+    let aid = ActivityExecId::new();
+    let events = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+        },
+        WorkflowEvent::MarkerRecorded {
+            name: "version:gate_alpha".into(),
+            details: serde_json::json!(2_u32),
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: aid,
+            name: "step_one".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: aid,
+            output: serde_json::json!("done"),
+        },
+        WorkflowEvent::MarkerRecorded {
+            name: "version:gate_beta".into(),
+            details: serde_json::json!(4_u32),
+        },
+    ];
+    (exec_id, events)
+}
+
+#[tokio::test]
+async fn replay_interleaved_version_gate_and_activity_succeed() {
+    let (exec_id, events) = interleaved_gate_history();
+    let report = WorkflowReplayer::new()
+        .register_fn("interleaved_gate_workflow", interleaved_gate_workflow)
+        .replay_from_snapshot(make_snapshot("interleaved_gate_workflow", exec_id, events))
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "interleaved version gate + activity must replay cleanly: {report}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Acceptance criteria: clear warnings for improper use
+// (spec AC#5: "Must provide clear compilation errors or runtime warnings if
+//  versioning is used improperly")
+// ---------------------------------------------------------------------------
+
+/// A workflow that was updated to use `version("gate_new", …)` where history
+/// still records `version("gate_old", …)`.  The unconsumed old marker causes
+/// the next command (an activity) to see a `MarkerRecorded(version:gate_old)`
+/// at the position where it expects `ActivityScheduled(step)`.
+/// The replayer must classify this as `VersionMarkerMismatch`, not a generic
+/// `ActivityScheduleMismatch`, so the error message clearly points to the
+/// version gate as the source of the problem.
+fn renamed_gate_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        // Code was updated: "gate_old" → "gate_new", but history still has gate_old
+        let _v = ctx.version("gate_new", 1, 2);
+        ctx.execute_activity_raw("step", Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(Value::Null)
+    })
+}
+
+fn history_with_old_gate() -> (ExecutionId, Vec<WorkflowEvent>) {
+    let exec_id = ExecutionId::new();
+    let aid = ActivityExecId::new();
+    let events = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+        },
+        WorkflowEvent::MarkerRecorded {
+            name: "version:gate_old".into(),
+            details: serde_json::json!(1_u32),
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: aid,
+            name: "step".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: aid,
+            output: serde_json::json!("done"),
+        },
+    ];
+    (exec_id, events)
+}
+
+#[tokio::test]
+async fn replay_renamed_version_gate_classified_as_version_marker_mismatch() {
+    let (exec_id, events) = history_with_old_gate();
+    let report = WorkflowReplayer::new()
+        .register_fn("renamed_gate_workflow", renamed_gate_workflow)
+        .replay_from_snapshot(make_snapshot("renamed_gate_workflow", exec_id, events))
+        .await;
+
+    match &report.status {
+        ReplayStatus::NonDeterminismDetected { kind, .. } => {
+            assert_eq!(
+                *kind,
+                NonDeterminismKind::VersionMarkerMismatch,
+                "a renamed version gate must produce VersionMarkerMismatch, got {kind:?}\nreport: {report}"
+            );
+        }
+        other => panic!("expected NonDeterminismDetected, got: {other:?}\nreport: {report}"),
+    }
+}
+
 /// Histories loaded from a completed execution include `WorkflowCompleted` as
 /// the last event. An unchanged workflow should still report `ReplaySucceeded`.
 #[tokio::test]

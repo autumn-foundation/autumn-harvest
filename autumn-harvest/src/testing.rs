@@ -79,6 +79,10 @@ pub enum NonDeterminismKind {
     ContinueAsNewMismatch,
     /// The workflow returned before consuming all recorded history events.
     EarlyCompletion,
+    /// A version gate's `change_id` was renamed without migrating the history
+    /// so the old `version:…` marker was left unconsumed and was encountered
+    /// by the next command at that cursor position.
+    VersionMarkerMismatch,
     /// The divergence could not be classified into a known category.
     Unknown,
 }
@@ -95,6 +99,7 @@ impl std::fmt::Display for NonDeterminismKind {
             Self::ExternalActivityMismatch => write!(f, "ExternalActivityMismatch"),
             Self::ContinueAsNewMismatch => write!(f, "ContinueAsNewMismatch"),
             Self::EarlyCompletion => write!(f, "EarlyCompletion"),
+            Self::VersionMarkerMismatch => write!(f, "VersionMarkerMismatch"),
             Self::Unknown => write!(f, "Unknown"),
         }
     }
@@ -609,14 +614,28 @@ fn parse_nd_message(msg: &str) -> (NonDeterminismKind, String, String) {
             .strip_prefix("expected ")
             .unwrap_or(exp_part)
             .to_string();
-        let kind = classify_kind(kind_str);
-        return (kind, expected, actual.to_string());
+        let actual = actual.to_string();
+        let kind = classify_kind(kind_str, &actual);
+        return (kind, expected, actual);
     }
     // Fallback for unusual formats (e.g. "signal history contains unexpected failure")
     (NonDeterminismKind::Unknown, msg.to_string(), String::new())
 }
 
-fn classify_kind(kind_str: &str) -> NonDeterminismKind {
+/// Classify a non-determinism error into a [`NonDeterminismKind`].
+///
+/// `kind_str` is the prefix before `" mismatch:"` in the error message.
+/// `actual` is the event type / name that was actually found at the cursor.
+/// If `actual` names a `version:…` marker the cause is a renamed version gate,
+/// which is always classified as [`NonDeterminismKind::VersionMarkerMismatch`]
+/// regardless of which command kind triggered the mismatch.
+fn classify_kind(kind_str: &str, actual: &str) -> NonDeterminismKind {
+    // A version marker found where another event was expected means the version
+    // gate's change_id was renamed — classify specifically so error messages
+    // point at the version gate rather than the command that first noticed it.
+    if actual.starts_with("MarkerRecorded(version:") {
+        return NonDeterminismKind::VersionMarkerMismatch;
+    }
     match kind_str {
         "activity" => NonDeterminismKind::ActivityScheduleMismatch,
         "local activity" => NonDeterminismKind::LocalActivityScheduleMismatch,
@@ -766,34 +785,59 @@ mod tests {
     }
 
     #[test]
+    fn parse_nd_message_version_marker_mismatch() {
+        // The activity matcher sees a stale version-gate marker and produces this message.
+        let (kind, expected, actual) = parse_nd_message(
+            "activity mismatch: expected ActivityScheduled(step), got MarkerRecorded(version:gate_old)",
+        );
+        assert_eq!(kind, NonDeterminismKind::VersionMarkerMismatch);
+        assert_eq!(expected, "ActivityScheduled(step)");
+        assert_eq!(actual, "MarkerRecorded(version:gate_old)");
+    }
+
+    #[test]
     fn classify_kind_covers_all_prefixes() {
         assert_eq!(
-            classify_kind("activity"),
+            classify_kind("activity", "ActivityScheduled(other)"),
             NonDeterminismKind::ActivityScheduleMismatch
         );
         assert_eq!(
-            classify_kind("local activity"),
+            classify_kind("local activity", "LocalActivityScheduled(other)"),
             NonDeterminismKind::LocalActivityScheduleMismatch
         );
-        assert_eq!(classify_kind("timer"), NonDeterminismKind::TimerMismatch);
-        assert_eq!(classify_kind("signal"), NonDeterminismKind::SignalMismatch);
         assert_eq!(
-            classify_kind("child workflow"),
+            classify_kind("timer", "ActivityScheduled"),
+            NonDeterminismKind::TimerMismatch
+        );
+        assert_eq!(
+            classify_kind("signal", "ActivityScheduled"),
+            NonDeterminismKind::SignalMismatch
+        );
+        assert_eq!(
+            classify_kind("child workflow", "ActivityScheduled"),
             NonDeterminismKind::ChildWorkflowMismatch
         );
         assert_eq!(
-            classify_kind("side effect"),
+            classify_kind("side effect", "ActivityScheduled"),
             NonDeterminismKind::SideEffectMismatch
         );
         assert_eq!(
-            classify_kind("external activity"),
+            classify_kind("external activity", "ActivityScheduled"),
             NonDeterminismKind::ExternalActivityMismatch
         );
         assert_eq!(
-            classify_kind("continue-as-new"),
+            classify_kind("continue-as-new", ""),
             NonDeterminismKind::ContinueAsNewMismatch
         );
-        assert_eq!(classify_kind("something else"), NonDeterminismKind::Unknown);
+        assert_eq!(
+            classify_kind("something else", ""),
+            NonDeterminismKind::Unknown
+        );
+        // Version marker in actual always wins regardless of kind_str
+        assert_eq!(
+            classify_kind("activity", "MarkerRecorded(version:gate_old)"),
+            NonDeterminismKind::VersionMarkerMismatch
+        );
     }
 
     #[test]
