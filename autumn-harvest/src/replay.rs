@@ -118,11 +118,18 @@ impl HistoryMatcher {
 
     /// Returns `true` if there are unconsumed events that are not terminal
     /// lifecycle events (`WorkflowCompleted`, `WorkflowFailed`,
-    /// `WorkflowCancelled`).
+    /// `WorkflowCancelled`), or if there are buffered signals that were never
+    /// delivered via `wait_for_signal`.
     ///
     /// Used by [`WorkflowContext::history_has_unconsumed_events`] to avoid
     /// false non-determinism reports when replaying full histories that include
     /// a terminal event appended after workflow completion.
+    ///
+    /// The pending-signal check is necessary because early `SignalReceived`
+    /// events are moved into `consumed_signal_events` when buffered, so they
+    /// are invisible to the cursor-based check.  If new code removes a
+    /// `wait_for_signal` call, the buffered signal would be silently ignored
+    /// without this additional check.
     #[must_use]
     pub fn has_non_lifecycle_unconsumed(&self) -> bool {
         let mut cursor = self.cursor;
@@ -132,7 +139,9 @@ impl HistoryMatcher {
             }
             cursor += 1;
         }
-        false
+        // Signals buffered early (via drain_early_signals) that were never
+        // consumed by wait_for_signal represent unconsumed history.
+        !self.pending_signals.is_empty()
     }
 
     /// Current cursor position in the event list.
