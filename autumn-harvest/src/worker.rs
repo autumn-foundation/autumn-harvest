@@ -1139,7 +1139,6 @@ async fn persist_all_started_child_workflows(
     registry: &HandlerRegistry,
     task_id: uuid::Uuid,
     parent_execution: &WorkflowExecution,
-    next_event_id: i32,
     commands: &[WorkflowCommand],
     children: &[StartedChildWorkflowCommand],
     sticky: Option<queue::StickyHint<'_>>,
@@ -1184,6 +1183,11 @@ async fn persist_all_started_child_workflows(
                 .collect();
 
             // Append marker events + ChildWorkflowStarted for new children to parent.
+            // Use append_single_event rather than append_events(…, next_event_id) so
+            // that each insert re-reads MAX(event_id) under a parent-row FOR UPDATE
+            // lock.  This serializes against concurrent ChildWorkflowCompleted/Failed
+            // appends from sibling children that complete while this parent task is
+            // still RUNNING, preventing a UNIQUE(workflow_exec_id, event_id) collision.
             let mut parent_events = marker_events;
             for child in &new_children {
                 parent_events.push(WorkflowEvent::ChildWorkflowStarted {
@@ -1192,8 +1196,8 @@ async fn persist_all_started_child_workflows(
                     input: child.input.clone(),
                 });
             }
-            if !parent_events.is_empty() {
-                store::append_events(conn, parent_exec_id, &parent_events, next_event_id).await?;
+            for event in parent_events {
+                store::append_single_event(conn, parent_exec_id, event).await?;
             }
 
             // Insert rows and enqueue tasks for new children.
@@ -1904,7 +1908,6 @@ async fn handle_suspended_workflow(
             registry,
             context.persistence.task.id,
             context.execution,
-            context.persistence.next_event_id,
             commands,
             &children,
             sticky,
