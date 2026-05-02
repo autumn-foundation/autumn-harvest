@@ -419,6 +419,7 @@ mod tests {
 
         /// Subscriber that captures per-span field values as `(field_name, value_string)`.
         #[derive(Clone, Default)]
+        #[allow(clippy::type_complexity)]
         pub struct SpanFields(pub Arc<Mutex<Vec<(String, Vec<(String, String)>)>>>);
 
         impl SpanFields {
