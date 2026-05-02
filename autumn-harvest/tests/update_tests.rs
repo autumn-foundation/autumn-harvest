@@ -1,7 +1,7 @@
 //! Tests for the Update primitive (issue #140).
 //!
-//! Covers: event serde, UpdateId, UpdateRegistry, WorkflowContext
-//! registration/validation/dispatch, and HistoryMatcher update replay.
+//! Covers: event serde, `UpdateId`, `UpdateRegistry`, `WorkflowContext`
+//! registration/validation/dispatch, and `HistoryMatcher` update replay.
 
 #![cfg(feature = "testing")]
 
@@ -306,7 +306,7 @@ async fn execute_admitted_update_replays_completed_result_without_rerunning() {
     let history = make_completed_history(update_id, "approve");
     let ctx = WorkflowContext::for_replay(exec_id, history);
 
-    let mut handler_ran = false;
+    let handler_ran = false;
     ctx.register_update_handler(
         "approve",
         |_: &serde_json::Value| Ok::<(), String>(()),
@@ -373,7 +373,7 @@ fn history_matcher_finds_update_completed() {
         },
     ];
 
-    let mut matcher = HistoryMatcher::new(events);
+    let matcher = HistoryMatcher::new(events);
     let result = matcher.match_update(update_id);
     assert!(
         matches!(result, HistoryMatch::Matched { .. }),
@@ -406,7 +406,7 @@ fn history_matcher_finds_update_failed() {
         },
     ];
 
-    let mut matcher = HistoryMatcher::new(events);
+    let matcher = HistoryMatcher::new(events);
     let result = matcher.match_update(update_id);
     assert!(
         matches!(result, HistoryMatch::Failed { .. }),
@@ -436,7 +436,7 @@ fn history_matcher_returns_no_match_for_admitted_without_completion() {
         // No UpdateCompleted or UpdateFailed
     ];
 
-    let mut matcher = HistoryMatcher::new(events);
+    let matcher = HistoryMatcher::new(events);
     let result = matcher.match_update(update_id);
     assert!(
         matches!(result, HistoryMatch::NoMatch),
@@ -461,7 +461,7 @@ fn history_matcher_returns_no_match_for_unknown_update_id() {
         },
     ];
 
-    let mut matcher = HistoryMatcher::new(events);
+    let matcher = HistoryMatcher::new(events);
     let result = matcher.match_update(unknown_id);
     assert!(
         matches!(result, HistoryMatch::NoMatch),

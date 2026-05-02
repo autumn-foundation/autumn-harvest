@@ -366,7 +366,9 @@ fn workflow_update_admitted_mode_sets_wait_query_param() {
         "10",
     ])
     .expect("workflow update admitted args should parse");
-    let request = cli.api_request().expect("update admitted request should build");
+    let request = cli
+        .api_request()
+        .expect("update admitted request should build");
 
     assert_eq!(request.method, ApiMethod::Post);
     // wait=admitted is in path; timeout_secs is included too
@@ -392,7 +394,9 @@ fn workflow_update_result_maps_to_get() {
         "aaaaaaaa-bbbb-cccc-dddd-000000000002",
     ])
     .expect("workflow update-result args should parse");
-    let request = cli.api_request().expect("update-result request should build");
+    let request = cli
+        .api_request()
+        .expect("update-result request should build");
 
     assert_eq!(request.method, ApiMethod::Get);
     assert_eq!(
