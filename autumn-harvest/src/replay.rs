@@ -14,7 +14,7 @@ use std::collections::{HashSet, VecDeque};
 
 use crate::error::TimeoutType;
 use crate::event::WorkflowEvent;
-use crate::types::{ActivityExecId, ExecutionId, ExternalActivityToken};
+use crate::types::{ActivityExecId, ExecutionId, ExternalActivityToken, UpdateId};
 
 /// Result of matching a workflow command against the event history.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,6 +108,20 @@ impl HistoryMatcher {
         self.pending_signals.push_back((signal_name, payload));
     }
 
+    /// Returns `true` for the three update event variants.
+    ///
+    /// Update events are transparent to the main workflow replay sequence —
+    /// they are skipped during activity/timer/signal/child-workflow matching
+    /// and are consumed by the `match_update` / `drain_admitted_updates` APIs.
+    const fn is_update_event(event: &WorkflowEvent) -> bool {
+        matches!(
+            event,
+            WorkflowEvent::UpdateAdmitted { .. }
+                | WorkflowEvent::UpdateCompleted { .. }
+                | WorkflowEvent::UpdateFailed { .. }
+        )
+    }
+
     /// Format the `actual` field for a [`HistoryMatch::Diverged`] result.
     ///
     /// When the unexpected event is a `MarkerRecorded` its name is included so
@@ -190,8 +204,7 @@ impl HistoryMatcher {
         }
     }
 
-    /// Drain any `SignalReceived` events at the current cursor into
-    /// `pending_signals`.
+    /// Drain any `SignalReceived` and update events at the current cursor.
     ///
     /// Signals can be ingested into history at any point (when the worker
     /// picks up a task), so they may appear before an `ActivityScheduled`,
@@ -199,20 +212,30 @@ impl HistoryMatcher {
     /// workflow code only calls `wait_for_signal` later.  This helper
     /// buffers those early signals so the normal matcher methods do not
     /// mis-report them as non-determinism.
+    ///
+    /// Update events (`UpdateAdmitted`, `UpdateCompleted`, `UpdateFailed`) are
+    /// also transparent to the main workflow replay sequence and are consumed
+    /// here so they don't cause spurious `Diverged` results in `prepare_match`.
     fn drain_early_signals(&mut self) {
         while self.cursor < self.events.len() {
-            if let WorkflowEvent::SignalReceived {
-                signal_name,
-                payload,
-            } = &self.events[self.cursor]
-            {
-                let signal_name = signal_name.clone();
-                let payload = payload.clone();
-                self.stash_signal(self.cursor, signal_name, payload);
-                self.cursor += 1;
-                self.advance_to_next_unconsumed_event();
-            } else {
-                break;
+            match &self.events[self.cursor] {
+                WorkflowEvent::SignalReceived {
+                    signal_name,
+                    payload,
+                } => {
+                    let signal_name = signal_name.clone();
+                    let payload = payload.clone();
+                    self.stash_signal(self.cursor, signal_name, payload);
+                    self.cursor += 1;
+                    self.advance_to_next_unconsumed_event();
+                }
+                ev if Self::is_update_event(ev) => {
+                    // Consume the update event so it doesn't block the cursor.
+                    self.consumed_signal_events.insert(self.cursor);
+                    self.cursor += 1;
+                    self.advance_to_next_unconsumed_event();
+                }
+                _ => break,
             }
         }
     }
@@ -361,6 +384,10 @@ impl HistoryMatcher {
                     self.stash_signal(scan_cursor, signal_name, payload);
                     scan_cursor += 1;
                 }
+                // Update events are transparent to the activity scan.
+                ev if Self::is_update_event(ev) => {
+                    scan_cursor += 1;
+                }
                 // Any other event type is unexpected mid-activity
                 _ => break,
             }
@@ -487,6 +514,9 @@ impl HistoryMatcher {
                     self.stash_signal(scan_cursor, signal_name, payload);
                     scan_cursor += 1;
                 }
+                ev if Self::is_update_event(ev) => {
+                    scan_cursor += 1;
+                }
                 _ => break,
             }
         }
@@ -609,6 +639,10 @@ impl HistoryMatcher {
                 } if *id == activity_id => {
                     scan_cursor += 1;
                 }
+                // Update events are transparent to the external activity scan.
+                ev if Self::is_update_event(ev) => {
+                    scan_cursor += 1;
+                }
                 _ => break,
             }
         }
@@ -688,6 +722,12 @@ impl HistoryMatcher {
                 continue;
             }
 
+            // Update events are transparent to the timer scan.
+            if Self::is_update_event(&self.events[scan_cursor]) {
+                scan_cursor += 1;
+                continue;
+            }
+
             break;
         }
 
@@ -739,6 +779,10 @@ impl HistoryMatcher {
                     let recorded_name = recorded_name.clone();
                     let payload = payload.clone();
                     self.stash_signal(scan_cursor, recorded_name, payload);
+                    scan_cursor += 1;
+                }
+                ev if Self::is_update_event(ev) => {
+                    // Update events are transparent to signal scanning.
                     scan_cursor += 1;
                 }
                 other => {
@@ -975,6 +1019,9 @@ impl HistoryMatcher {
                     self.stash_signal(scan_cursor, signal_name, payload);
                     scan_cursor += 1;
                 }
+                ev if Self::is_update_event(ev) => {
+                    scan_cursor += 1;
+                }
                 _ => break,
             }
         }
@@ -1073,6 +1120,9 @@ impl HistoryMatcher {
                     self.stash_signal(scan_cursor, signal_name, payload);
                     scan_cursor += 1;
                 }
+                ev if Self::is_update_event(ev) => {
+                    scan_cursor += 1;
+                }
                 _ => break,
             }
         }
@@ -1116,6 +1166,87 @@ impl HistoryMatcher {
             // this version gate. Don't advance cursor.
             _ => min_version,
         }
+    }
+
+    // ── Update primitive (issue #140) ─────────────────────────────────────
+
+    /// Look up the recorded result for a specific update by `update_id`.
+    ///
+    /// Unlike the cursor-based activity/timer/signal matching methods, this
+    /// performs a full-history scan keyed by `update_id`. It does **not**
+    /// advance the cursor — update events are managed independently of the
+    /// main workflow replay sequence.
+    ///
+    /// Returns:
+    /// - [`HistoryMatch::Matched`] if `UpdateCompleted` with the given ID is found.
+    /// - [`HistoryMatch::Failed`] if `UpdateFailed` with the given ID is found.
+    /// - [`HistoryMatch::NoMatch`] if only `UpdateAdmitted` exists (in-flight) or
+    ///   if the ID is entirely unknown.
+    #[must_use]
+    pub fn match_update(&self, update_id: UpdateId) -> HistoryMatch {
+        for event in &self.events {
+            match event {
+                WorkflowEvent::UpdateCompleted {
+                    update_id: id,
+                    output,
+                } if *id == update_id => {
+                    return HistoryMatch::Matched {
+                        output: output.clone(),
+                    };
+                }
+                WorkflowEvent::UpdateFailed {
+                    update_id: id,
+                    error,
+                } if *id == update_id => {
+                    return HistoryMatch::Failed {
+                        error: error.clone(),
+                        attempt: 1,
+                    };
+                }
+                _ => {}
+            }
+        }
+        HistoryMatch::NoMatch
+    }
+
+    /// Return all `UpdateAdmitted` events that do not have a paired
+    /// `UpdateCompleted` or `UpdateFailed` event in history.
+    ///
+    /// The worker calls this on restart to discover in-flight updates that
+    /// must be re-dispatched to their registered handlers.
+    ///
+    /// Returns a `Vec` of `(update_id, handler_name, input)` tuples.
+    #[must_use]
+    pub fn drain_admitted_updates(&self) -> Vec<(UpdateId, String, Value)> {
+        // Collect IDs of completed/failed updates.
+        let mut resolved: std::collections::HashSet<UpdateId> = std::collections::HashSet::new();
+        for event in &self.events {
+            match event {
+                WorkflowEvent::UpdateCompleted { update_id, .. }
+                | WorkflowEvent::UpdateFailed { update_id, .. } => {
+                    resolved.insert(*update_id);
+                }
+                _ => {}
+            }
+        }
+
+        // Return admitted updates that are not yet resolved.
+        self.events
+            .iter()
+            .filter_map(|event| {
+                if let WorkflowEvent::UpdateAdmitted {
+                    update_id,
+                    name,
+                    input,
+                    ..
+                } = event
+                    && !resolved.contains(update_id)
+                {
+                    return Some((*update_id, name.clone(), input.clone()));
+                }
+                None
+            })
+            .collect()
     }
 }
 

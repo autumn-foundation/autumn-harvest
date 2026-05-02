@@ -141,6 +141,23 @@ pub enum HarvestError {
         /// The state of the conflicting prior run (e.g. `"RUNNING"`, `"COMPLETED"`).
         existing_state: String,
     },
+
+    /// An update request was rejected by the handler's validator before being
+    /// admitted to the workflow's event history.
+    ///
+    /// No event is written to `harvest_events`. The caller receives the reason
+    /// string and should surface it as a `409 Conflict` or `400 Bad Request`.
+    #[error("update rejected: {reason}")]
+    UpdateRejected {
+        /// Human-readable rejection reason returned by the validator.
+        reason: String,
+    },
+
+    /// No update handler is registered under the given name.
+    ///
+    /// Surfaces as `404 Not Found` at the management API layer.
+    #[error("update handler not found: {0}")]
+    UpdateHandlerNotFound(String),
 }
 
 /// Standard result type for internal harvest engine operations.

@@ -66,6 +66,7 @@ pub mod test_generator;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 pub mod types;
+pub mod update;
 
 #[cfg(feature = "db")]
 #[doc(hidden)]
@@ -159,9 +160,10 @@ pub use testing::{
     HistorySnapshot, NonDeterminismKind, ReplayReport, ReplayStatus, WorkflowReplayer,
 };
 pub use types::{
-    ActivityExecId, ExecutionId, ExternalActivityToken, ShardId, TimerId, WorkerId, WorkflowId,
-    WorkflowIdReusePolicy,
+    ActivityExecId, ExecutionId, ExternalActivityToken, ShardId, TimerId, UpdateId, WorkerId,
+    WorkflowId, WorkflowIdReusePolicy,
 };
+pub use update::UpdateRegistry;
 
 #[cfg(feature = "db")]
 pub use store::EventHistory;
