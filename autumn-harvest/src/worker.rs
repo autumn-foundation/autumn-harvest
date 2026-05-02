@@ -1461,12 +1461,14 @@ async fn wake_parent_for_child_completion(
     child_exec_id: ExecutionId,
     output: serde_json::Value,
 ) -> HarvestResult<()> {
-    let parent_history = store::load_history(conn, parent_exec_id).await?;
+    // Use append_single_event (FOR UPDATE + MAX re-read) so concurrent sibling
+    // child completions serialise around the parent execution row and cannot
+    // collide on (workflow_exec_id, event_id).
     let event = WorkflowEvent::ChildWorkflowCompleted {
         child_id: child_exec_id,
         output,
     };
-    store::append_events(conn, parent_exec_id, &[event], parent_history.next_event_id).await?;
+    store::append_single_event(conn, parent_exec_id, event).await?;
     queue::wake_workflow_task(conn, parent_exec_id).await
 }
 
@@ -1476,12 +1478,11 @@ async fn wake_parent_for_child_failure(
     child_exec_id: ExecutionId,
     error: &str,
 ) -> HarvestResult<()> {
-    let parent_history = store::load_history(conn, parent_exec_id).await?;
     let event = WorkflowEvent::ChildWorkflowFailed {
         child_id: child_exec_id,
         error: error.to_string(),
     };
-    store::append_events(conn, parent_exec_id, &[event], parent_history.next_event_id).await?;
+    store::append_single_event(conn, parent_exec_id, event).await?;
     queue::wake_workflow_task(conn, parent_exec_id).await
 }
 
