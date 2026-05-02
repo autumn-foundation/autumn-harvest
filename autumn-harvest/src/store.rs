@@ -8,8 +8,10 @@ use diesel::ExpressionMethods;
 use diesel::OptionalExtension;
 use diesel::QueryDsl;
 use diesel::SelectableHelper;
+use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
+use scoped_futures::ScopedFutureExt as _;
 
 use crate::error::HarvestResult;
 use crate::event::WorkflowEvent;
@@ -150,6 +152,39 @@ pub async fn append_single_event(
     let next_id = max_id.map_or(0, |id| id.saturating_add(1));
     append_events(conn, exec_id, &[event], next_id).await?;
     Ok(())
+}
+
+/// Durably admit an update into a workflow's event history.
+///
+/// Wraps [`append_single_event`] in a transaction that acquires a row-level
+/// lock on the workflow execution row, ensuring concurrent admission calls
+/// (e.g. management API + timeout scanner) cannot race to claim the same
+/// `event_id`.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::NotFound`] if `exec_id` does not exist.
+/// Returns [`crate::error::HarvestError::Database`] on query or insert failure.
+pub async fn admit_update_event(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    update_id: crate::types::UpdateId,
+    name: String,
+    input: serde_json::Value,
+) -> HarvestResult<()> {
+    conn.transaction::<(), crate::error::HarvestError, _>(|conn| {
+        async move {
+            let event = WorkflowEvent::UpdateAdmitted {
+                update_id,
+                name,
+                input,
+                timestamp: chrono::Utc::now(),
+            };
+            append_single_event(conn, exec_id, event).await
+        }
+        .scope_boxed()
+    })
+    .await
 }
 
 /// Load the full event history for a workflow execution, ordered by `event_id`.

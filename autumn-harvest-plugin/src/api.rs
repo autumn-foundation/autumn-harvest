@@ -2090,21 +2090,17 @@ async fn admit_update(
 
     let update_id = UpdateId::new();
 
-    // Load history to determine the next sequential event_id.
-    let history = match store::load_history(&mut conn, exec_id).await {
-        Ok(h) => h,
-        Err(e) => return map_error(e).into_response(),
-    };
-    let next_event_id = history.next_event_id;
-
-    // Durably append the UpdateAdmitted event.
-    let admitted_event = WorkflowEvent::UpdateAdmitted {
+    // Durably append the UpdateAdmitted event using the serialised helper so
+    // concurrent appenders (workflow executor, other API calls) cannot race to
+    // claim the same event_id.
+    if let Err(e) = store::admit_update_event(
+        &mut conn,
+        exec_id,
         update_id,
-        name: update_name.clone(),
-        input: request.input.clone(),
-        timestamp: chrono::Utc::now(),
-    };
-    if let Err(e) = store::append_events(&mut conn, exec_id, &[admitted_event], next_event_id).await
+        update_name.clone(),
+        request.input,
+    )
+    .await
     {
         return map_error(e).into_response();
     }
