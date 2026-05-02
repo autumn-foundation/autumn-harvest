@@ -257,12 +257,14 @@ async fn wake_parent_for_child_timeout(
     child_exec_id: crate::types::ExecutionId,
     error: &str,
 ) -> HarvestResult<()> {
-    let parent_history = store::load_history(conn, parent_exec_id).await?;
+    // Use append_single_event so concurrent sibling timeout/completion paths
+    // serialise around the parent execution row and cannot collide on the
+    // (workflow_exec_id, event_id) unique constraint.
     let event = WorkflowEvent::ChildWorkflowFailed {
         child_id: child_exec_id,
         error: error.to_string(),
     };
-    store::append_events(conn, parent_exec_id, &[event], parent_history.next_event_id).await?;
+    store::append_single_event(conn, parent_exec_id, event).await?;
     queue::wake_workflow_task(conn, parent_exec_id).await
 }
 

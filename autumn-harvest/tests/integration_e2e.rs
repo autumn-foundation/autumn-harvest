@@ -1713,6 +1713,140 @@ async fn child_continue_as_new_rejection_wakes_parent_with_child_failure() {
     );
 }
 
+// ── Parallel child workflow handler functions ────────────────────────────────
+
+/// Parent that spawns two children concurrently via `tokio::join!` and returns
+/// a merged result.
+fn parent_workflow_parallel_children<'a>(
+    ctx: &'a WorkflowContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let (a, b) = tokio::join!(
+            ctx.spawn_child_workflow_raw("child_alpha", serde_json::json!({"item": "alpha"})),
+            ctx.spawn_child_workflow_raw("child_beta", serde_json::json!({"item": "beta"})),
+        );
+        let a = a.map_err(|e| e.to_string())?;
+        let b = b.map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({"alpha": a, "beta": b}))
+    })
+}
+
+fn child_alpha_workflow<'a>(
+    _ctx: &'a WorkflowContext,
+    input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        Ok(serde_json::json!({"result": input.get("item").and_then(|v| v.as_str()).unwrap_or("?")}))
+    })
+}
+
+fn child_beta_workflow<'a>(
+    _ctx: &'a WorkflowContext,
+    input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        Ok(serde_json::json!({"result": input.get("item").and_then(|v| v.as_str()).unwrap_or("?")}))
+    })
+}
+
+fn parallel_children_registry() -> Arc<HandlerRegistry> {
+    Arc::new(HandlerRegistry::new(
+        vec![
+            WorkflowInfo {
+                name: "e2e_test_workflow",
+                module: "integration_e2e",
+                handler: parent_workflow_parallel_children,
+            },
+            WorkflowInfo {
+                name: "child_alpha",
+                module: "integration_e2e",
+                handler: child_alpha_workflow,
+            },
+            WorkflowInfo {
+                name: "child_beta",
+                module: "integration_e2e",
+                handler: child_beta_workflow,
+            },
+        ],
+        vec![],
+    ))
+}
+
+/// RED test: parent spawns two child workflows in parallel via `tokio::join!`.
+///
+/// Both children must complete and the parent must produce a merged result
+/// containing both outputs.  With the current single-child dispatch the
+/// worker fails because it cannot handle two simultaneous `StartChildWorkflow`
+/// commands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_completes_parent_workflow_with_parallel_child_workflows() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect to Postgres container");
+
+    let parent_exec_id = insert_workflow_execution(&mut conn).await;
+    enqueue_started_workflow_task(&mut conn, parent_exec_id, serde_json::json!({})).await;
+
+    let worker = build_runtime_worker(
+        "worker-e2e-parallel-children",
+        4,
+        2,
+        parallel_children_registry(),
+    );
+    let pool = build_test_pool(&database_url);
+    let handle = spawn_test_worker(Arc::clone(&worker), pool);
+
+    let parent_execution =
+        wait_for_execution_state(&database_url, parent_exec_id, "COMPLETED").await;
+
+    worker.shutdown();
+    handle.await.expect("worker task should join");
+
+    assert_eq!(
+        parent_execution.output,
+        Some(serde_json::json!({
+            "alpha": {"result": "alpha"},
+            "beta":  {"result": "beta"},
+        })),
+        "parent output must contain merged results from both children"
+    );
+
+    let parent_history = load_history_from_url(&database_url, parent_exec_id).await;
+    let child_started_count = parent_history
+        .events
+        .iter()
+        .filter(|e| matches!(e, WorkflowEvent::ChildWorkflowStarted { .. }))
+        .count();
+    let child_completed_count = parent_history
+        .events
+        .iter()
+        .filter(|e| matches!(e, WorkflowEvent::ChildWorkflowCompleted { .. }))
+        .count();
+    assert_eq!(
+        child_started_count, 2,
+        "parent history must record both child starts"
+    );
+    assert_eq!(
+        child_completed_count, 2,
+        "parent history must record both child completions"
+    );
+
+    let child_execs = load_child_executions_from_url(&database_url, parent_exec_id).await;
+    assert_eq!(
+        child_execs.len(),
+        2,
+        "exactly two child executions must be stored with parent_id set"
+    );
+    for child_exec in &child_execs {
+        assert_eq!(
+            child_exec.state, "COMPLETED",
+            "each child execution must be COMPLETED"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn worker_builder_state_is_visible_to_workflow_and_activity() {
     let (database_url, _container) = setup_test_database_url().await;

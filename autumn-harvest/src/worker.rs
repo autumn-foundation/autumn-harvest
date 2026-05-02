@@ -448,26 +448,41 @@ fn extract_single_started_timer(commands: &[WorkflowCommand]) -> Option<StartedT
     })
 }
 
-fn extract_single_started_child_workflow(
+/// Extract all `StartChildWorkflow` commands when every non-marker command is
+/// a child-workflow start.  Returns `Some(children)` (may have length > 1 for
+/// parallel spawns) or `None` if any non-marker command is of a different type.
+fn extract_all_started_child_workflows(
     commands: &[WorkflowCommand],
-) -> Option<StartedChildWorkflowCommand> {
-    extract_single_command(commands, |cmd| {
-        let WorkflowCommand::StartChildWorkflow {
-            child_id,
-            workflow_name,
-            input,
-            ..
-        } = cmd
-        else {
-            return None;
-        };
+) -> Option<Vec<StartedChildWorkflowCommand>> {
+    let non_markers: Vec<&WorkflowCommand> = commands
+        .iter()
+        .filter(|c| !matches!(c, WorkflowCommand::RecordMarker { .. }))
+        .collect();
 
-        Some(StartedChildWorkflowCommand {
-            child_id: *child_id,
-            workflow_name: workflow_name.clone(),
-            input: input.clone(),
+    if non_markers.is_empty() {
+        return None;
+    }
+
+    non_markers
+        .iter()
+        .map(|cmd| {
+            if let WorkflowCommand::StartChildWorkflow {
+                child_id,
+                workflow_name,
+                input,
+                ..
+            } = cmd
+            {
+                Some(StartedChildWorkflowCommand {
+                    child_id: *child_id,
+                    workflow_name: workflow_name.clone(),
+                    input: input.clone(),
+                })
+            } else {
+                None
+            }
         })
-    })
+        .collect()
 }
 
 fn extract_single_schedule_external_activity(
@@ -1112,68 +1127,156 @@ async fn persist_started_timer(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn persist_started_child_workflow(
+/// Atomically create zero or more child workflow executions and park the parent.
+///
+/// Children whose `child_id` already exists in `harvest_workflow_executions` are
+/// silently skipped — this is the idempotent re-park path taken when the parent
+/// wakes after one of several parallel children completes while others are still
+/// running.  Only genuinely new children get rows inserted and tasks enqueued.
+#[allow(clippy::too_many_lines)]
+async fn persist_all_started_child_workflows(
     conn: &mut AsyncPgConnection,
     registry: &HandlerRegistry,
     task_id: uuid::Uuid,
     parent_execution: &WorkflowExecution,
-    next_event_id: i32,
     commands: &[WorkflowCommand],
-    child: &StartedChildWorkflowCommand,
+    children: &[StartedChildWorkflowCommand],
     sticky: Option<queue::StickyHint<'_>>,
 ) -> HarvestResult<()> {
-    if !registry.workflows.contains_key(&child.workflow_name) {
-        return Err(HarvestError::Config(format!(
-            "no workflow handler registered for '{}'",
-            child.workflow_name
-        )));
+    for child in children {
+        if !registry.workflows.contains_key(&child.workflow_name) {
+            return Err(HarvestError::Config(format!(
+                "no workflow handler registered for '{}'",
+                child.workflow_name
+            )));
+        }
     }
 
-    let marker_events = marker_events_from_commands(commands);
     let parent_exec_id = execution_id_from_uuid(parent_execution.id);
-    let child_started_in_parent = WorkflowEvent::ChildWorkflowStarted {
-        child_id: child.child_id,
-        workflow_name: child.workflow_name.clone(),
-        input: child.input.clone(),
-    };
-    let mut parent_events = marker_events;
-    parent_events.push(child_started_in_parent);
-
-    let child_workflow_id = child.child_id.to_string();
     let queue_name = parent_execution.queue_name.clone();
-    let child_row = NewWorkflowExecution {
-        id: child.child_id.as_uuid(),
-        workflow_name: &child.workflow_name,
-        workflow_id: &child_workflow_id,
-        run_id: uuid::Uuid::new_v4(),
-        shard_id: parent_execution.shard_id,
-        input: child.input.clone(),
-        parent_id: Some(parent_exec_id.as_uuid()),
-        queue_name: &queue_name,
-        execution_timeout: None,
-        memo: None,
-        search_attrs: None,
-    };
-    let child_started_event = WorkflowEvent::WorkflowStarted {
-        input: child.input.clone(),
-        timestamp: chrono::Utc::now(),
-    };
-    let mut params =
-        queue::EnqueueParams::new(queue_name.clone(), TaskType::Workflow, child.input.clone());
-    params.workflow_exec_id = Some(child.child_id.as_uuid());
-    params.trace_context = registry.telemetry().capture_trace_context();
+    let children = children.to_vec();
+    // Compute marker events outside the transaction (WorkflowCommand is not Clone).
+    let marker_events = marker_events_from_commands(commands);
+    let trace_ctx = registry.telemetry().capture_trace_context();
+    let shard_id = parent_execution.shard_id;
 
     conn.transaction::<(), HarvestError, _>(|conn| {
+        let children = children.clone();
+        let marker_events = marker_events.clone();
+        let queue_name = queue_name.clone();
         async move {
-            store::append_events(conn, parent_exec_id, &parent_events, next_event_id).await?;
-            diesel::insert_into(harvest_workflow_executions::table)
-                .values(&child_row)
-                .execute(conn)
+            // Determine which children are genuinely new vs. already running.
+            let requested_ids: Vec<uuid::Uuid> =
+                children.iter().map(|c| c.child_id.as_uuid()).collect();
+            let existing_ids: HashSet<uuid::Uuid> = harvest_workflow_executions::table
+                .filter(harvest_workflow_executions::id.eq_any(&requested_ids))
+                .select(harvest_workflow_executions::id)
+                .load::<uuid::Uuid>(conn)
                 .await
-                .map_err(crate::error::database_error)?;
-            store::append_events(conn, child.child_id, &[child_started_event], 0).await?;
-            queue::enqueue(conn, &params).await?;
+                .map_err(crate::error::database_error)?
+                .into_iter()
+                .collect();
+
+            let new_children: Vec<&StartedChildWorkflowCommand> = children
+                .iter()
+                .filter(|c| !existing_ids.contains(&c.child_id.as_uuid()))
+                .collect();
+
+            // Append marker events + ChildWorkflowStarted for new children to parent.
+            // Use append_single_event rather than append_events(…, next_event_id) so
+            // that each insert re-reads MAX(event_id) under a parent-row FOR UPDATE
+            // lock.  This serializes against concurrent ChildWorkflowCompleted/Failed
+            // appends from sibling children that complete while this parent task is
+            // still RUNNING, preventing a UNIQUE(workflow_exec_id, event_id) collision.
+            let mut parent_events = marker_events;
+            for child in &new_children {
+                parent_events.push(WorkflowEvent::ChildWorkflowStarted {
+                    child_id: child.child_id,
+                    workflow_name: child.workflow_name.clone(),
+                    input: child.input.clone(),
+                });
+            }
+            for event in parent_events {
+                store::append_single_event(conn, parent_exec_id, event).await?;
+            }
+
+            // Insert rows and enqueue tasks for new children.
+            for child in &new_children {
+                let child_workflow_id = child.child_id.to_string();
+                let child_row = NewWorkflowExecution {
+                    id: child.child_id.as_uuid(),
+                    workflow_name: &child.workflow_name,
+                    workflow_id: &child_workflow_id,
+                    run_id: uuid::Uuid::new_v4(),
+                    shard_id,
+                    input: child.input.clone(),
+                    parent_id: Some(parent_exec_id.as_uuid()),
+                    queue_name: &queue_name,
+                    execution_timeout: None,
+                    memo: None,
+                    search_attrs: None,
+                };
+                let child_started_event = WorkflowEvent::WorkflowStarted {
+                    input: child.input.clone(),
+                    timestamp: chrono::Utc::now(),
+                };
+                let mut params = queue::EnqueueParams::new(
+                    queue_name.clone(),
+                    TaskType::Workflow,
+                    child.input.clone(),
+                );
+                params.workflow_exec_id = Some(child.child_id.as_uuid());
+                params.trace_context = trace_ctx.clone();
+
+                diesel::insert_into(harvest_workflow_executions::table)
+                    .values(&child_row)
+                    .execute(conn)
+                    .await
+                    .map_err(crate::error::database_error)?;
+                store::append_events(conn, child.child_id, &[child_started_event], 0).await?;
+                queue::enqueue(conn, &params).await?;
+            }
+
+            // Check for already-terminal children only in the re-park path
+            // (new_children is empty).  In the initial park path all children
+            // were just created inside this transaction and are invisible to
+            // other transactions until commit, so they cannot be terminal and
+            // the check would always return false.  Skipping it also avoids a
+            // lock-order inversion: append_single_event (for new ChildWorkflowStarted
+            // events) holds the parent execution row lock, and then acquiring
+            // child execution row locks via FOR UPDATE would be the inverse of
+            // the child-completion order (child exec row → parent exec row via
+            // wake_parent append_single_event).
+            //
+            // In the re-park path there are no append_single_event calls, so
+            // lock order is child exec rows → parent task queue row, which
+            // matches the child-completion path.  A terminal child here means
+            // wake_workflow_task was a no-op while the parent was RUNNING, so
+            // we re-wake after parking.
+            let any_terminal = if new_children.is_empty() {
+                let child_states: Vec<String> = harvest_workflow_executions::table
+                    .filter(harvest_workflow_executions::id.eq_any(&requested_ids))
+                    .for_update()
+                    .select(harvest_workflow_executions::state)
+                    .load::<String>(conn)
+                    .await
+                    .map_err(crate::error::database_error)?;
+                child_states.iter().any(|s| {
+                    matches!(
+                        s.as_str(),
+                        "COMPLETED" | "FAILED" | "TIMED_OUT" | "CANCELLED"
+                    )
+                })
+            } else {
+                false
+            };
+
             queue::park_workflow_task(conn, task_id, sticky).await?;
+
+            if any_terminal {
+                queue::wake_workflow_task(conn, parent_exec_id).await?;
+            }
+
             Ok(())
         }
         .scope_boxed()
@@ -1368,12 +1471,14 @@ async fn wake_parent_for_child_completion(
     child_exec_id: ExecutionId,
     output: serde_json::Value,
 ) -> HarvestResult<()> {
-    let parent_history = store::load_history(conn, parent_exec_id).await?;
+    // Use append_single_event (FOR UPDATE + MAX re-read) so concurrent sibling
+    // child completions serialise around the parent execution row and cannot
+    // collide on (workflow_exec_id, event_id).
     let event = WorkflowEvent::ChildWorkflowCompleted {
         child_id: child_exec_id,
         output,
     };
-    store::append_events(conn, parent_exec_id, &[event], parent_history.next_event_id).await?;
+    store::append_single_event(conn, parent_exec_id, event).await?;
     queue::wake_workflow_task(conn, parent_exec_id).await
 }
 
@@ -1383,12 +1488,11 @@ async fn wake_parent_for_child_failure(
     child_exec_id: ExecutionId,
     error: &str,
 ) -> HarvestResult<()> {
-    let parent_history = store::load_history(conn, parent_exec_id).await?;
     let event = WorkflowEvent::ChildWorkflowFailed {
         child_id: child_exec_id,
         error: error.to_string(),
     };
-    store::append_events(conn, parent_exec_id, &[event], parent_history.next_event_id).await?;
+    store::append_single_event(conn, parent_exec_id, event).await?;
     queue::wake_workflow_task(conn, parent_exec_id).await
 }
 
@@ -1808,15 +1912,14 @@ async fn handle_suspended_workflow(
         .await;
     }
 
-    if let Some(child) = extract_single_started_child_workflow(commands) {
-        let result = persist_started_child_workflow(
+    if let Some(children) = extract_all_started_child_workflows(commands) {
+        let result = persist_all_started_child_workflows(
             conn,
             registry,
             context.persistence.task.id,
             context.execution,
-            context.persistence.next_event_id,
             commands,
-            &child,
+            &children,
             sticky,
         )
         .await;

@@ -14,7 +14,7 @@ use std::collections::{HashSet, VecDeque};
 
 use crate::error::TimeoutType;
 use crate::event::WorkflowEvent;
-use crate::types::{ActivityExecId, ExternalActivityToken};
+use crate::types::{ActivityExecId, ExecutionId, ExternalActivityToken};
 
 /// Result of matching a workflow command against the event history.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,6 +55,16 @@ pub enum HistoryMatch {
         activity_id: ActivityExecId,
         /// The token already recorded in history. Must be reused to stay idempotent.
         token: ExternalActivityToken,
+    },
+    /// History shows a child workflow was started but no terminal event
+    /// (completed/failed) exists yet.  This occurs when the parent wakes after
+    /// one of several parallel children completes while others are still
+    /// running.  The workflow should re-emit a `StartChildWorkflow` command
+    /// carrying the **existing** `child_id` from history (idempotent at the
+    /// worker level) and then suspend until the child's terminal event arrives.
+    ChildInProgress {
+        /// The child execution ID already recorded in history. Must be reused.
+        child_id: ExecutionId,
     },
 }
 
@@ -840,11 +850,15 @@ impl HistoryMatcher {
             }
         }
 
-        self.cursor = start_cursor;
-        HistoryMatch::Diverged {
-            expected: format!("ChildWorkflowTerminal({workflow_name})"),
-            actual: "EndOfHistory".to_string(),
-        }
+        // The start event was found and name+input matched, but the terminal
+        // hasn't arrived yet.  This is the normal state when the parent wakes
+        // after one of several parallel children completes while this child is
+        // still running.  Return ChildInProgress so the caller can re-emit a
+        // StartChildWorkflow command with the existing child_id rather than
+        // treating the incomplete history as a non-determinism error.
+        self.cursor = start_cursor + 1;
+        self.advance_to_next_unconsumed_event();
+        HistoryMatch::ChildInProgress { child_id }
     }
 
     /// Match a version gate against history.
@@ -1472,7 +1486,7 @@ mod tests {
     }
 
     #[test]
-    fn matcher_child_workflow_without_terminal_diverges_and_preserves_cursor() {
+    fn matcher_child_workflow_without_terminal_returns_child_in_progress() {
         let child_id = crate::types::ExecutionId::new();
         let events = vec![WorkflowEvent::ChildWorkflowStarted {
             child_id,
@@ -1482,11 +1496,16 @@ mod tests {
 
         let mut matcher = HistoryMatcher::new(events);
         let result = matcher.match_child_workflow("process_order", &Value::Null);
-        assert!(matches!(result, HistoryMatch::Diverged { .. }));
+        assert!(
+            matches!(result, HistoryMatch::ChildInProgress { child_id: id } if id == child_id),
+            "should be ChildInProgress with the known child_id, got {result:?}"
+        );
+        // Cursor advances past the ChildWorkflowStarted event so subsequent
+        // commands (e.g. other parallel children) can be matched correctly.
         assert_eq!(
             matcher.position(),
-            0,
-            "cursor must not consume started event"
+            1,
+            "cursor must advance past started event"
         );
     }
 

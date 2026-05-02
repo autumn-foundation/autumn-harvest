@@ -903,3 +903,134 @@ async fn replay_history_with_workflow_completed_tail_succeeds() {
         "history with WorkflowCompleted tail must not trigger early-completion: {report}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Child workflow replay tests
+// ---------------------------------------------------------------------------
+
+fn child_spawning_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let result = ctx
+            .spawn_child_workflow_raw("child_processor", serde_json::json!({"item": "A"}))
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({"processed": result}))
+    })
+}
+
+fn renamed_child_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        // Name changed from "child_processor" → triggers non-determinism
+        let result = ctx
+            .spawn_child_workflow_raw("renamed_processor", serde_json::json!({"item": "A"}))
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(result)
+    })
+}
+
+fn changed_input_child_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        // Input changed — triggers non-determinism
+        let result = ctx
+            .spawn_child_workflow_raw("child_processor", serde_json::json!({"item": "CHANGED"}))
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(result)
+    })
+}
+
+fn child_spawning_history() -> (ExecutionId, Vec<WorkflowEvent>) {
+    let exec_id = ExecutionId::new();
+    let child_id = ExecutionId::new();
+    let events = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+        },
+        WorkflowEvent::ChildWorkflowStarted {
+            child_id,
+            workflow_name: "child_processor".into(),
+            input: serde_json::json!({"item": "A"}),
+        },
+        WorkflowEvent::ChildWorkflowCompleted {
+            child_id,
+            output: serde_json::json!({"done": true}),
+        },
+        WorkflowEvent::WorkflowCompleted {
+            output: serde_json::json!({"processed": {"done": true}}),
+        },
+    ];
+    (exec_id, events)
+}
+
+#[tokio::test]
+async fn replayer_succeeds_for_workflow_spawning_a_child() {
+    let (exec_id, events) = child_spawning_history();
+    let report = WorkflowReplayer::new()
+        .register_fn("child_spawning_workflow", child_spawning_workflow)
+        .replay_from_snapshot(make_snapshot("child_spawning_workflow", exec_id, events))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "child spawn workflow must replay successfully: {report}"
+    );
+}
+
+#[tokio::test]
+async fn replayer_detects_changed_child_workflow_name() {
+    let (exec_id, events) = child_spawning_history();
+    let report = WorkflowReplayer::new()
+        .register_fn("renamed_child_workflow", renamed_child_workflow)
+        .replay_from_snapshot(make_snapshot("renamed_child_workflow", exec_id, events))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::NonDeterminismDetected { .. }),
+        "renamed child workflow must trigger non-determinism: {report}"
+    );
+}
+
+#[tokio::test]
+async fn replayer_reports_child_workflow_mismatch_kind() {
+    let (exec_id, events) = child_spawning_history();
+    let report = WorkflowReplayer::new()
+        .register_fn("renamed_child_workflow", renamed_child_workflow)
+        .replay_from_snapshot(make_snapshot("renamed_child_workflow", exec_id, events))
+        .await;
+    match &report.status {
+        ReplayStatus::NonDeterminismDetected { kind, .. } => {
+            assert_eq!(
+                *kind,
+                NonDeterminismKind::ChildWorkflowMismatch,
+                "wrong non-determinism kind: {kind:?}"
+            );
+        }
+        other => panic!("expected NonDeterminismDetected, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn replayer_detects_changed_child_workflow_input() {
+    let (exec_id, events) = child_spawning_history();
+    let report = WorkflowReplayer::new()
+        .register_fn("changed_input_child_workflow", changed_input_child_workflow)
+        .replay_from_snapshot(make_snapshot(
+            "changed_input_child_workflow",
+            exec_id,
+            events,
+        ))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::NonDeterminismDetected { .. }),
+        "changed child input must trigger non-determinism: {report}"
+    );
+}
