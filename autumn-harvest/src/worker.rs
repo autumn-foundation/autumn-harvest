@@ -1237,18 +1237,15 @@ async fn persist_all_started_child_workflows(
                 queue::enqueue(conn, &params).await?;
             }
 
-            // Park the parent. Then lock all pending child rows with
-            // SELECT ... FOR UPDATE and read their states. The lock serializes
-            // against any concurrent update_workflow_execution_completed /
-            // failed / timed_out, which also acquires a row lock before
-            // appending the ChildWorkflowCompleted/Failed event and calling
-            // wake_workflow_task (a no-op while the parent is RUNNING). After
-            // our lock we see the post-update state, so if any child is already
-            // terminal we re-wake the now-PARKED parent, closing the race.
-            // TIMED_OUT and CANCELLED are also terminal states that emit a
-            // ChildWorkflowFailed event to the parent.
-            queue::park_workflow_task(conn, task_id, sticky).await?;
-
+            // Lock all child rows BEFORE parking the parent task.  Child-completion
+            // transactions acquire the child execution row lock first, then lock the
+            // parent task queue row via wake_workflow_task.  Acquiring child locks
+            // here in the same order prevents a lock-order inversion deadlock.
+            //
+            // After acquiring the lock we read each child's state.  If any child
+            // is already terminal (COMPLETED, FAILED, TIMED_OUT, CANCELLED) the
+            // wake_workflow_task call that followed child completion was a no-op
+            // (parent task was still RUNNING), so we must re-wake after parking.
             let child_states: Vec<String> = harvest_workflow_executions::table
                 .filter(harvest_workflow_executions::id.eq_any(&requested_ids))
                 .for_update()
@@ -1263,6 +1260,8 @@ async fn persist_all_started_child_workflows(
                     "COMPLETED" | "FAILED" | "TIMED_OUT" | "CANCELLED"
                 )
             });
+
+            queue::park_workflow_task(conn, task_id, sticky).await?;
 
             if any_terminal {
                 queue::wake_workflow_task(conn, parent_exec_id).await?;
