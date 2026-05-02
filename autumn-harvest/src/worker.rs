@@ -344,6 +344,8 @@ struct PreparedWorkflowTask {
     exec_id: ExecutionId,
     history_events: Vec<WorkflowEvent>,
     next_event_id: i32,
+    timers_fired: bool,
+    signals_delivered: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1331,35 +1333,26 @@ async fn persist_all_started_child_workflows(
 async fn ingest_pending_signals(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
-    workflow_name: &str,
     next_event_id: i32,
-) -> HarvestResult<()> {
+) -> HarvestResult<Vec<String>> {
     let pending_signals = signal::load_pending_signals(conn, exec_id).await?;
     if pending_signals.is_empty() {
-        return Ok(());
+        return Ok(vec![]);
     }
 
-    let (signal_ids, signal_events): (Vec<_>, Vec<_>) = pending_signals
+    let (signal_ids, signals_data): (Vec<_>, Vec<_>) = pending_signals
         .into_iter()
         .map(|signal| {
-            // ADR-0001 §2.6: harvest.signal.deliver — CONSUMER, parent = workflow execute.
-            let _deliver_guard = tracing::info_span!(
-                "harvest.signal.deliver",
-                "otel.kind" = "consumer",
-                { ATTR_WORKFLOW_ID } = workflow_name,
-                { ATTR_EXECUTION_ID } = %exec_id,
-                signal.name = %signal.signal_name,
-            )
-            .entered();
-            (
-                signal.id,
-                WorkflowEvent::SignalReceived {
-                    signal_name: signal.signal_name,
-                    payload: signal.payload,
-                },
-            )
+            let name = signal.signal_name.clone();
+            let event = WorkflowEvent::SignalReceived {
+                signal_name: signal.signal_name,
+                payload: signal.payload,
+            };
+            (signal.id, (name, event))
         })
         .unzip();
+
+    let (signal_names, signal_events): (Vec<_>, Vec<_>) = signals_data.into_iter().unzip();
 
     conn.transaction::<(), HarvestError, _>(|conn| {
         async move {
@@ -1369,14 +1362,16 @@ async fn ingest_pending_signals(
         }
         .scope_boxed()
     })
-    .await
+    .await?;
+
+    Ok(signal_names)
 }
 
 async fn ingest_fired_timers(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
     next_event_id: i32,
-) -> HarvestResult<()> {
+) -> HarvestResult<bool> {
     use crate::schema::harvest_timers::dsl;
     use diesel::dsl::sql;
     use diesel::sql_types::Timestamptz;
@@ -1394,7 +1389,7 @@ async fn ingest_fired_timers(
         .map_err(crate::error::database_error)?;
 
     if due_timers.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
 
     let (timer_row_ids, timer_events): (Vec<_>, Vec<_>) = due_timers
@@ -1409,16 +1404,6 @@ async fn ingest_fired_timers(
         })
         .unzip();
 
-    // ADR-0001 §2.7: harvest.timer.fire — INTERNAL, parent = workflow execute span.
-    // The span is entered and exited synchronously before the await so that
-    // EnteredSpan (!Send) is not held across the async transaction boundary.
-    tracing::info_span!(
-        "harvest.timer.fire",
-        "otel.kind" = "internal",
-        { ATTR_EXECUTION_ID } = %exec_id,
-    )
-    .in_scope(|| {});
-
     conn.transaction::<(), HarvestError, _>(|conn| {
         async move {
             store::append_events(conn, exec_id, &timer_events, next_event_id).await?;
@@ -1431,7 +1416,9 @@ async fn ingest_fired_timers(
         }
         .scope_boxed()
     })
-    .await
+    .await?;
+
+    Ok(true)
 }
 
 async fn fail_task_only(
@@ -2066,29 +2053,27 @@ async fn load_workflow_replay_state(
     task: &TaskQueueItem,
     worker_id: &str,
     exec_id: ExecutionId,
-    workflow_name: &str,
-) -> HarvestResult<store::EventHistory> {
+    _workflow_name: &str,
+) -> HarvestResult<(store::EventHistory, bool, Vec<String>)> {
     let history_result = store::load_history(conn, exec_id).await;
     let initial_history = fail_execution_on_error(conn, task, worker_id, history_result).await?;
 
     let timers_result = ingest_fired_timers(conn, exec_id, initial_history.next_event_id).await;
-    fail_execution_on_error(conn, task, worker_id, timers_result).await?;
+    let timers_fired = fail_execution_on_error(conn, task, worker_id, timers_result).await?;
 
     let history_after_timers_result = store::load_history(conn, exec_id).await;
     let history_after_timers =
         fail_execution_on_error(conn, task, worker_id, history_after_timers_result).await?;
 
-    let signals_result = ingest_pending_signals(
-        conn,
-        exec_id,
-        workflow_name,
-        history_after_timers.next_event_id,
-    )
-    .await;
-    fail_execution_on_error(conn, task, worker_id, signals_result).await?;
+    let signals_result =
+        ingest_pending_signals(conn, exec_id, history_after_timers.next_event_id).await;
+    let signals_delivered =
+        fail_execution_on_error(conn, task, worker_id, signals_result).await?;
 
     let final_history_result = store::load_history(conn, exec_id).await;
-    fail_execution_on_error(conn, task, worker_id, final_history_result).await
+    let final_history =
+        fail_execution_on_error(conn, task, worker_id, final_history_result).await?;
+    Ok((final_history, timers_fired, signals_delivered))
 }
 
 async fn prepare_workflow_task(
@@ -2103,7 +2088,7 @@ async fn prepare_workflow_task(
     };
     let exec_id = execution_id_from_uuid(exec_uuid);
     let execution = load_task_execution(conn, task, exec_id).await?;
-    let history =
+    let (history, timers_fired, signals_delivered) =
         load_workflow_replay_state(conn, task, worker_id, exec_id, &execution.workflow_name)
             .await?;
 
@@ -2112,6 +2097,8 @@ async fn prepare_workflow_task(
         exec_id,
         history_events: history.events,
         next_event_id: history.next_event_id,
+        timers_fired,
+        signals_delivered,
     })
 }
 
@@ -2352,6 +2339,29 @@ async fn process_workflow_task(
         .as_ref()
         .filter(|_| !initial_is_replay)
         .map(|c| telemetry.install_trace_context(c));
+
+    // ADR-0001 §2.6 + §2.7: emit harvest.signal.deliver and harvest.timer.fire
+    // spans here, after the trace context is restored, so they are correlated
+    // with the workflow execution trace rather than being orphaned.
+    // EnteredSpan is !Send; .in_scope() drops it before any subsequent .await.
+    if prepared.timers_fired {
+        tracing::info_span!(
+            "harvest.timer.fire",
+            "otel.kind" = "internal",
+            { ATTR_EXECUTION_ID } = %prepared.exec_id,
+        )
+        .in_scope(|| {});
+    }
+    for signal_name in &prepared.signals_delivered {
+        tracing::info_span!(
+            "harvest.signal.deliver",
+            "otel.kind" = "consumer",
+            { ATTR_WORKFLOW_ID } = prepared.execution.workflow_name.as_str(),
+            { ATTR_EXECUTION_ID } = %prepared.exec_id,
+            signal.name = signal_name.as_str(),
+        )
+        .in_scope(|| {});
+    }
 
     telemetry
         .metrics
