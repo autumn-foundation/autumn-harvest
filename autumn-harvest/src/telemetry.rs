@@ -72,6 +72,9 @@ pub const METRIC_ACTIVITY_DURATION: &str = "harvest.activity.duration";
 /// Counter: incremented when a durable timer is persisted.
 pub const METRIC_TIMER_STARTED: &str = "harvest.timer.started";
 
+/// Histogram: distribution of scheduled timer durations (seconds).
+pub const METRIC_TIMER_DURATION: &str = "harvest.timer.duration";
+
 /// Gauge: current number of pending (unclaimed) tasks in a queue.
 pub const METRIC_QUEUE_DEPTH: &str = "harvest.queue.depth";
 
@@ -86,6 +89,33 @@ pub const METRIC_SCHEDULE_SKIPPED: &str = "harvest.schedule.skipped";
 
 /// Counter: number of rows deleted by the retention janitor in one tick.
 pub const METRIC_RETENTION_DELETED: &str = "harvest.retention.deleted";
+
+// ---------------------------------------------------------------------------
+// Metric label key constants
+// Used by MetricsRecorder implementations to avoid string literals at call
+// sites. These are short Prometheus-compatible names; the forbidden label
+// (ATTR_EXECUTION_ID) deliberately has no entry here so it cannot be
+// accidentally used on a metric.
+// ---------------------------------------------------------------------------
+
+/// Metric label: the workflow name.
+pub const METRIC_LABEL_WORKFLOW: &str = "workflow";
+/// Metric label: the activity name.
+pub const METRIC_LABEL_ACTIVITY: &str = "activity";
+/// Metric label: the task queue name.
+pub const METRIC_LABEL_QUEUE: &str = "queue";
+/// Metric label: terminal outcome status (e.g. `"completed"`, `"failed"`).
+pub const METRIC_LABEL_STATUS: &str = "status";
+/// Metric label: the shard number.
+pub const METRIC_LABEL_SHARD: &str = "shard";
+/// Metric label: schedule kind (`"dag"` or `"workflow"`).
+pub const METRIC_LABEL_KIND: &str = "kind";
+/// Metric label: the schedule or DAG name.
+pub const METRIC_LABEL_NAME: &str = "name";
+/// Metric label: reason a scheduled run was skipped.
+pub const METRIC_LABEL_REASON: &str = "reason";
+/// Metric label: the concurrency group key.
+pub const METRIC_LABEL_KEY: &str = "key";
 
 // ---------------------------------------------------------------------------
 // TraceContextCarrier
@@ -376,6 +406,17 @@ pub trait MetricsRecorder: Send + Sync {
     /// this alongside queue depth to detect saturation-induced backlog.
     fn record_concurrency_key_deferred(&self, key: &str, deferred: u64) {
         let _ = (key, deferred);
+    }
+
+    /// Current number of entries in the dead-letter queue on one shard.
+    ///
+    /// Emitted by a periodic background sampler on the same cadence as
+    /// [`record_queue_depth`](Self::record_queue_depth). `shard` is the
+    /// `ShardId` as a `u16`; single-shard deployments always emit `shard = 0`.
+    ///
+    /// Maps to the gauge `harvest_dlq_entries{shard}`.
+    fn record_dlq_entries(&self, shard: u16, depth: u64) {
+        let _ = (shard, depth);
     }
 
     /// A scheduled run was dispatched (either a DAG run or a workflow start).
@@ -670,6 +711,42 @@ mod tests {
         let carrier = TraceContextCarrier::from_traceparent("00-abcd-ef01-01");
         assert_eq!(carrier.traceparent.as_deref(), Some("00-abcd-ef01-01"));
         assert!(carrier.tracestate.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // RED-phase tests: record_dlq_entries and cardinality enforcement
+    // These tests fail until the implementation is complete.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn dlq_entries_gauge_has_default_noop_impl() {
+        // record_dlq_entries must exist on MetricsRecorder with (shard: u16, depth: u64).
+        // METRIC_DLQ_ENTRIES is the registered constant; this verifies it's
+        // actually wired to a callable method with the right shape.
+        let rec = NoOpMetrics;
+        rec.record_dlq_entries(0, 0);
+        rec.record_dlq_entries(1, 42);
+    }
+
+    #[test]
+    fn all_metric_record_methods_compile_without_execution_id() {
+        // ADR-0001 §7: execution.id is span-only and FORBIDDEN as a metric label.
+        // This test verifies by construction that no record_* method on
+        // MetricsRecorder accepts an ExecutionId argument — the cardinality
+        // guard is enforced at the API surface, not just at call sites.
+        let rec: Arc<dyn MetricsRecorder> = Arc::new(NoOpMetrics);
+        // Each call compiles only if the method signature matches what we expect:
+        // no ExecutionId, no raw UUID params that could smuggle one in.
+        rec.record_workflow_started("onboarding", "default");
+        rec.record_workflow_completed("onboarding", "default", 1.23, WorkflowStatus::Completed);
+        rec.record_activity_completed("send_email", "default", 0.5, ActivityStatus::Completed);
+        rec.record_timer_started(60.0);
+        rec.record_queue_depth("default", 7);
+        rec.record_dlq_entries(0, 3);
+        rec.record_schedule_run("workflow", "daily_digest");
+        rec.record_schedule_skipped("workflow", "daily_digest", "paused");
+        rec.record_retention_tick(0, 100, 50, 0.02);
+        // If any method silently accepted execution.id we'd see it here.
     }
 
     #[test]

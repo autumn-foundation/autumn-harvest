@@ -2369,9 +2369,34 @@ async fn process_workflow_task(
         .in_scope(|| {});
     }
 
-    telemetry
-        .metrics
-        .record_workflow_started(&prepared.execution.workflow_name, &task.queue_name);
+    // Emit workflow.started exactly once per execution.  Two independent
+    // conditions must both hold:
+    //
+    // 1. task.attempt == 1: the task queue has never dispatched this execution
+    //    before (attempt starts at 0 and is incremented to 1 on first claim;
+    //    signal-resume paths increment it again on re-claim).
+    //
+    // 2. No scheduling events in history: guards against counting replayed
+    //    first-dispatch tasks that already committed scheduling work.
+    //    load_workflow_replay_state prepends SignalReceived/TimerFired for
+    //    pending signals and fired timers, so checking raw length alone is
+    //    unreliable for brand-new workflows.
+    let has_scheduling_events = prepared.history_events.iter().any(|e| {
+        matches!(
+            e,
+            WorkflowEvent::ActivityScheduled { .. }
+                | WorkflowEvent::TimerStarted { .. }
+                | WorkflowEvent::ChildWorkflowStarted { .. }
+                | WorkflowEvent::LocalActivityScheduled { .. }
+                | WorkflowEvent::ActivityAwaitingExternal { .. }
+                | WorkflowEvent::MarkerRecorded { .. }
+        )
+    });
+    if task.attempt == 1 && !has_scheduling_events {
+        telemetry
+            .metrics
+            .record_workflow_started(&prepared.execution.workflow_name, &task.queue_name);
+    }
     let started_at = std::time::Instant::now();
 
     // Drive the workflow in a loop so that local activities can be executed
@@ -2648,6 +2673,58 @@ fn spawn_concurrency_sampler(
     })
 }
 
+/// Periodically sample the dead-letter queue entry count and forward it to
+/// the configured [`MetricsRecorder`](crate::telemetry::MetricsRecorder).
+///
+/// Runs on the same cadence as the queue-depth sampler. For sharded
+/// deployments the caller should spawn one instance per shard, passing the
+/// shard-specific pool; single-shard deployments pass their single pool and
+/// `shard_id = 0`.
+///
+/// Stops when the cancellation token fires.
+fn spawn_dlq_depth_sampler(
+    pool: DbPool,
+    cancel: CancellationToken,
+    telemetry: Arc<crate::telemetry::TelemetryConfig>,
+    shard_id: u16,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                () = cancel.cancelled() => break,
+                () = tokio::time::sleep(interval) => {}
+            }
+
+            let mut conn = match pool.get().await {
+                Ok(conn) => conn,
+                Err(error) => {
+                    tracing::debug!(
+                        error = %error,
+                        shard_id,
+                        "dlq depth sampler could not acquire DB connection"
+                    );
+                    continue;
+                }
+            };
+
+            match crate::dlq::dead_letter_count(&mut conn).await {
+                Ok(count) => {
+                    let depth = u64::try_from(count).unwrap_or(0);
+                    telemetry.metrics.record_dlq_entries(shard_id, depth);
+                }
+                Err(error) => {
+                    tracing::debug!(error = %error, "dlq depth sample failed");
+                }
+            }
+
+            if cancel.is_cancelled() {
+                break;
+            }
+        }
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Worker
 // ---------------------------------------------------------------------------
@@ -2753,6 +2830,41 @@ impl Worker {
             self.config.queues.clone(),
             self.config.poll_interval,
         );
+        // DLQ depth gauge — one sampler per shard assignment so every shard
+        // this worker owns is reported.  Single-shard deployments get one
+        // sampler for shard 0; multi-shard workers (rare) get one per entry.
+        let dlq_depth_samplers: Vec<_> = {
+            let assignments = &self.config.shard_assignments;
+            let shards: &[_] = if assignments.is_empty() {
+                // Fallback: if no explicit assignments, sample with shard 0.
+                &[]
+            } else {
+                assignments.as_slice()
+            };
+            let mut handles: Vec<_> = shards
+                .iter()
+                .map(|shard| {
+                    let shard_id = u16::try_from(shard.as_i32()).unwrap_or(0);
+                    spawn_dlq_depth_sampler(
+                        pool.clone(),
+                        self.shutdown.clone(),
+                        self.registry.telemetry().clone(),
+                        shard_id,
+                        self.config.poll_interval,
+                    )
+                })
+                .collect();
+            if handles.is_empty() {
+                handles.push(spawn_dlq_depth_sampler(
+                    pool.clone(),
+                    self.shutdown.clone(),
+                    self.registry.telemetry().clone(),
+                    0u16,
+                    self.config.poll_interval,
+                ));
+            }
+            handles
+        };
         let timeout_checker = crate::timeout::spawn_timeout_checker(
             pool.clone(),
             self.shutdown.clone(),
@@ -2862,6 +2974,15 @@ impl Worker {
                 error = %error,
                 "concurrency sampler failed during shutdown"
             );
+        }
+        for sampler in dlq_depth_samplers {
+            if let Err(error) = sampler.await {
+                tracing::warn!(
+                    worker_id = %self.config.worker_id,
+                    error = %error,
+                    "dlq depth sampler failed during shutdown"
+                );
+            }
         }
         tracing::info!(worker_id = %self.config.worker_id, "worker stopped");
     }

@@ -22,6 +22,7 @@ db = [
     "dep:tokio-postgres",
 ]
 testing = []
+metrics-rs = ["dep:metrics"]
 
 [dependencies]
 autumn-harvest-macros = { version = "0.2.0", path = "../autumn-harvest-macros" }
@@ -43,10 +44,15 @@ diesel-async = { workspace = true, optional = true }
 diesel_migrations = { workspace = true, optional = true }
 scoped-futures = { version = "0.1", optional = true }
 tokio-postgres = { version = "0.7", optional = true }
+metrics = { version = "0.24", optional = true }
 
 [[test]]
 name = "external_completion_tests"
 required-features = ["testing"]
+
+[[bench]]
+name = "metrics_noop"
+harness = false
 
 [[test]]
 name = "replayer_tests"
@@ -62,7 +68,7 @@ testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
 proptest = "1.11.0"
 loom = "0.7.2"
-criterion = { version = "0.5", features = ["async_tokio"] }
+criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [[bench]]
