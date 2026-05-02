@@ -2339,33 +2339,19 @@ async fn process_workflow_task(
         .trace_context
         .as_ref()
         .and_then(TraceContextCarrier::from_json);
-    // Derive is_replay from the event history length: a fresh execution has
-    // exactly one event (WorkflowStarted); any additional events mean this is a
-    // resume cycle and the workflow function will replay past them.
-    let is_replay = prepared.history_events.len() > 1;
 
     // ADR-0001 §3 + §4: for live runs, restore the producer's trace context so
     // the workflow span becomes a child of the span that enqueued this task.
     // For replay runs, do NOT restore — replay spans must be new root spans
     // (the original trace may have long since expired).
+    // is_replay for this guard uses the initial history length (before any
+    // local-activity events are appended) because the guard must be installed
+    // exactly once for the lifetime of the task, before the first await.
+    let initial_is_replay = prepared.history_events.len() > 1;
     let _parent_guard = trace_carrier
         .as_ref()
-        .filter(|_| !is_replay)
+        .filter(|_| !initial_is_replay)
         .map(|c| telemetry.install_trace_context(c));
-
-    // ADR-0001 §2.1: pass span metadata into run_workflow_with_state so the
-    // harvest.workflow.execute span carries the correct workflow.id, shard.id,
-    // queue, replay flag, and link.traceparent on the span that actually exists.
-    let span_meta = WorkflowExecuteSpanMeta {
-        workflow_name: prepared.execution.workflow_name.clone(),
-        shard_id: i64::from(prepared.execution.shard_id),
-        queue_name: task.queue_name.clone(),
-        is_replay,
-        link_traceparent: trace_carrier
-            .as_ref()
-            .filter(|_| is_replay)
-            .and_then(|c| c.link_traceparent.clone().or_else(|| c.traceparent.clone())),
-    };
 
     telemetry
         .metrics
@@ -2382,6 +2368,22 @@ async fn process_workflow_task(
     let mut next_event_id = prepared.next_event_id;
 
     let outcome = loop {
+        // Recompute is_replay each iteration: after local-activity events are
+        // appended the workflow re-runs in replay mode (history_events.len() > 1).
+        // ADR-0001 §2.1: span metadata must reflect the current replay state so
+        // harvest.replay and link.traceparent are accurate on every executor call.
+        let is_replay = history_events.len() > 1;
+        let span_meta = WorkflowExecuteSpanMeta {
+            workflow_name: prepared.execution.workflow_name.clone(),
+            shard_id: i64::from(prepared.execution.shard_id),
+            queue_name: task.queue_name.clone(),
+            is_replay,
+            link_traceparent: trace_carrier
+                .as_ref()
+                .filter(|_| is_replay)
+                .and_then(|c| c.link_traceparent.clone().or_else(|| c.traceparent.clone())),
+        };
+
         let run_outcome = run_workflow_with_state(
             prepared.exec_id,
             history_events.clone(),
