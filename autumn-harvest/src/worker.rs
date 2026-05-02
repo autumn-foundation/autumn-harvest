@@ -2067,8 +2067,7 @@ async fn load_workflow_replay_state(
 
     let signals_result =
         ingest_pending_signals(conn, exec_id, history_after_timers.next_event_id).await;
-    let signals_delivered =
-        fail_execution_on_error(conn, task, worker_id, signals_result).await?;
+    let signals_delivered = fail_execution_on_error(conn, task, worker_id, signals_result).await?;
 
     let final_history_result = store::load_history(conn, exec_id).await;
     let final_history =
