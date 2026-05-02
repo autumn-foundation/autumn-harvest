@@ -1237,29 +1237,39 @@ async fn persist_all_started_child_workflows(
                 queue::enqueue(conn, &params).await?;
             }
 
-            // Lock all child rows BEFORE parking the parent task.  Child-completion
-            // transactions acquire the child execution row lock first, then lock the
-            // parent task queue row via wake_workflow_task.  Acquiring child locks
-            // here in the same order prevents a lock-order inversion deadlock.
+            // Check for already-terminal children only in the re-park path
+            // (new_children is empty).  In the initial park path all children
+            // were just created inside this transaction and are invisible to
+            // other transactions until commit, so they cannot be terminal and
+            // the check would always return false.  Skipping it also avoids a
+            // lock-order inversion: append_single_event (for new ChildWorkflowStarted
+            // events) holds the parent execution row lock, and then acquiring
+            // child execution row locks via FOR UPDATE would be the inverse of
+            // the child-completion order (child exec row → parent exec row via
+            // wake_parent append_single_event).
             //
-            // After acquiring the lock we read each child's state.  If any child
-            // is already terminal (COMPLETED, FAILED, TIMED_OUT, CANCELLED) the
-            // wake_workflow_task call that followed child completion was a no-op
-            // (parent task was still RUNNING), so we must re-wake after parking.
-            let child_states: Vec<String> = harvest_workflow_executions::table
-                .filter(harvest_workflow_executions::id.eq_any(&requested_ids))
-                .for_update()
-                .select(harvest_workflow_executions::state)
-                .load::<String>(conn)
-                .await
-                .map_err(crate::error::database_error)?;
-
-            let any_terminal = child_states.iter().any(|s| {
-                matches!(
-                    s.as_str(),
-                    "COMPLETED" | "FAILED" | "TIMED_OUT" | "CANCELLED"
-                )
-            });
+            // In the re-park path there are no append_single_event calls, so
+            // lock order is child exec rows → parent task queue row, which
+            // matches the child-completion path.  A terminal child here means
+            // wake_workflow_task was a no-op while the parent was RUNNING, so
+            // we re-wake after parking.
+            let any_terminal = if new_children.is_empty() {
+                let child_states: Vec<String> = harvest_workflow_executions::table
+                    .filter(harvest_workflow_executions::id.eq_any(&requested_ids))
+                    .for_update()
+                    .select(harvest_workflow_executions::state)
+                    .load::<String>(conn)
+                    .await
+                    .map_err(crate::error::database_error)?;
+                child_states.iter().any(|s| {
+                    matches!(
+                        s.as_str(),
+                        "COMPLETED" | "FAILED" | "TIMED_OUT" | "CANCELLED"
+                    )
+                })
+            } else {
+                false
+            };
 
             queue::park_workflow_task(conn, task_id, sticky).await?;
 
