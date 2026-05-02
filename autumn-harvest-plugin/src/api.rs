@@ -40,12 +40,15 @@ use autumn_harvest::shard::ShardRouter;
 use autumn_harvest::signal;
 use autumn_harvest::store;
 use autumn_harvest::telemetry::{ATTR_EXECUTION_ID, ATTR_QUEUE, ATTR_SHARD_ID, ATTR_WORKFLOW_ID};
-use autumn_harvest::types::{ExecutionId, ExternalActivityToken, ShardId, WorkflowIdReusePolicy};
+use autumn_harvest::types::{
+    ExecutionId, ExternalActivityToken, ShardId, UpdateId, WorkflowIdReusePolicy,
+};
 use autumn_harvest::worker::{DbPool, HandlerRegistry};
 use autumn_harvest::workers::{
     FleetHealth, WorkerFilters, WorkerRow, fleet_health, get_worker, list_workers,
     parse_worker_filters,
 };
+use autumn_harvest::{HistoryMatch, HistoryMatcher, WorkflowEvent};
 use autumn_harvest::{
     StartWorkflowParams, cancel_workflow_execution, start_or_load_workflow_execution,
 };
@@ -420,6 +423,12 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             post(signal_workflow),
         )
         .route("/workflows/{id}/query/{query_name}", get(query_workflow))
+        // Update primitive (issue #140): synchronous request/response into a running workflow.
+        .route("/workflows/{id}/update/{update_name}", post(admit_update))
+        .route(
+            "/workflows/{id}/update/{update_id}/result",
+            get(get_update_result),
+        )
         .route("/dags", get(list_dags))
         .route("/dags/{dag_name}/runs", get(list_dag_runs))
         .route("/dags/{dag_name}/trigger", post(trigger_dag_run))
@@ -1745,7 +1754,9 @@ fn parse_uuid(raw: &str, label: &str) -> Result<uuid::Uuid, AutumnError> {
 
 pub(crate) fn map_error(error: HarvestError) -> AutumnError {
     match error {
-        HarvestError::NotFound(message) => AutumnError::not_found_msg(message),
+        HarvestError::NotFound(message) | HarvestError::UpdateHandlerNotFound(message) => {
+            AutumnError::not_found_msg(message)
+        }
         HarvestError::Config(message)
         | HarvestError::NonDeterministic(message)
         | HarvestError::Cancelled(message)
@@ -1753,6 +1764,9 @@ pub(crate) fn map_error(error: HarvestError) -> AutumnError {
             name: _,
             reason: message,
         } => AutumnError::bad_request_msg(message),
+        HarvestError::UpdateRejected { reason } => {
+            AutumnError::bad_request_msg(reason).with_status(axum::http::StatusCode::CONFLICT)
+        }
         HarvestError::AlreadyExists {
             existing_exec_id,
             existing_state,
@@ -1994,6 +2008,266 @@ async fn workers_health(
 /// Parse worker query-string parameters, mapping errors to `400 Bad Request`.
 fn parse_worker_filters_api(pairs: &[(String, String)]) -> Result<WorkerFilters, AutumnError> {
     parse_worker_filters(pairs).map_err(AutumnError::bad_request_msg)
+}
+
+// ---------------------------------------------------------------------------
+// Update primitive (issue #140)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct AdmitUpdateRequest {
+    #[serde(default)]
+    input: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct AdmitUpdateQuery {
+    /// Controls how long to wait for a result.
+    /// `"admitted"` — return 202 as soon as the event is durably written.
+    /// `"completed"` (default) — block until the handler returns or the timeout fires.
+    wait: Option<String>,
+    /// Wall-clock timeout in seconds for `wait=completed` mode. Default: 30.
+    timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct UpdateAdmittedResponse {
+    update_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct UpdateCompletedResponse {
+    update_id: String,
+    output: Value,
+}
+
+#[derive(Debug, Serialize)]
+struct UpdateFailedResponse {
+    update_id: String,
+    error: String,
+}
+
+/// `POST /workflows/{id}/update/{update_name}`
+///
+/// Durably appends an `UpdateAdmitted` event for the named handler, wakes the
+/// workflow worker, then either returns immediately (`?wait=admitted`) or polls
+/// for the terminal `UpdateCompleted`/`UpdateFailed` event (`?wait=completed`,
+/// the default) until the configurable timeout fires.
+async fn admit_update(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path((id, update_name)): Path<(String, String)>,
+    Query(query): Query<AdmitUpdateQuery>,
+    Json(request): Json<AdmitUpdateRequest>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+
+    let exec_id = match parse_execution_id(&id) {
+        Ok(id) => id,
+        Err(e) => return e.into_response(),
+    };
+    let mut conn = match db_conn_for_execution(&api_state, exec_id).await {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+
+    // Reject if the workflow is not RUNNING.
+    let execution = match load_execution(&mut conn, exec_id).await {
+        Ok(e) => e,
+        Err(e) => return map_error(e).into_response(),
+    };
+    if execution.state != "RUNNING" {
+        return (
+            axum::http::StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!(
+                    "workflow {} is not RUNNING (state: {})",
+                    exec_id, execution.state
+                )
+            })),
+        )
+            .into_response();
+    }
+
+    let update_id = UpdateId::new();
+
+    // Load history to determine the next sequential event_id.
+    let history = match store::load_history(&mut conn, exec_id).await {
+        Ok(h) => h,
+        Err(e) => return map_error(e).into_response(),
+    };
+    let next_event_id = history.next_event_id;
+
+    // Durably append the UpdateAdmitted event.
+    let admitted_event = WorkflowEvent::UpdateAdmitted {
+        update_id,
+        name: update_name.clone(),
+        input: request.input.clone(),
+        timestamp: chrono::Utc::now(),
+    };
+    if let Err(e) = store::append_events(&mut conn, exec_id, &[admitted_event], next_event_id).await
+    {
+        return map_error(e).into_response();
+    }
+
+    // Wake the workflow worker so it picks up the new admitted update.
+    if let Err(e) = queue::wake_workflow_task(&mut conn, exec_id).await {
+        return map_error(e).into_response();
+    }
+
+    // Return immediately if the caller only wanted durable admission.
+    let wait_mode = query.wait.as_deref().unwrap_or("completed");
+    if wait_mode == "admitted" {
+        return (
+            axum::http::StatusCode::ACCEPTED,
+            Json(UpdateAdmittedResponse {
+                update_id: update_id.to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    let timeout_secs = query.timeout_secs.unwrap_or(30);
+    let pool = match api_state.storage_pool() {
+        Ok(p) => p,
+        Err(e) => return map_error(e).into_response(),
+    };
+    poll_update_result(&pool, exec_id, update_id, timeout_secs).await
+}
+
+/// Poll history until `update_id` resolves to `UpdateCompleted`/`UpdateFailed`
+/// or the wall-clock `timeout_secs` elapses (→ 504 Gateway Timeout).
+async fn poll_update_result(
+    pool: &HarvestDbPool,
+    exec_id: ExecutionId,
+    update_id: UpdateId,
+    timeout_secs: u64,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+
+    let poll_interval = Duration::from_millis(300);
+
+    let poll_result = tokio::time::timeout(Duration::from_secs(timeout_secs), async {
+        loop {
+            let mut c = pool
+                .pool_for_execution(exec_id)
+                .get()
+                .await
+                .map_err(|e| HarvestError::Database(e.to_string()))?;
+            let h = store::load_history(&mut c, exec_id).await?;
+            match HistoryMatcher::new(h.events).match_update(update_id) {
+                HistoryMatch::Matched { output } => {
+                    return Ok::<_, HarvestError>((true, output, String::new()));
+                }
+                HistoryMatch::Failed { error, .. } => {
+                    return Ok((false, Value::Null, error));
+                }
+                _ => {
+                    tokio::time::sleep(poll_interval).await;
+                }
+            }
+        }
+    })
+    .await;
+
+    match poll_result {
+        Ok(Ok((true, output, _))) => (
+            axum::http::StatusCode::OK,
+            Json(UpdateCompletedResponse {
+                update_id: update_id.to_string(),
+                output,
+            }),
+        )
+            .into_response(),
+        Ok(Ok((false, _, error))) => (
+            axum::http::StatusCode::CONFLICT,
+            Json(UpdateFailedResponse {
+                update_id: update_id.to_string(),
+                error,
+            }),
+        )
+            .into_response(),
+        Ok(Err(e)) => map_error(e).into_response(),
+        Err(_timeout) => (
+            axum::http::StatusCode::GATEWAY_TIMEOUT,
+            Json(serde_json::json!({
+                "update_id": update_id.to_string(),
+                "message": format!("update did not complete within {timeout_secs}s"),
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /workflows/{id}/update/{update_id}/result`
+///
+/// Look up the durable result of a previously admitted update by its
+/// `update_id`. Returns:
+/// - `200 OK` with `output` if the handler completed successfully.
+/// - `409 Conflict` with `error` if the handler failed or the update was rejected.
+/// - `202 Accepted` if the update is still in-flight.
+/// - `404 Not Found` if no `UpdateAdmitted` event exists for the given ID.
+async fn get_update_result(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path((id, update_id_str)): Path<(String, String)>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+
+    let exec_id = match parse_execution_id(&id) {
+        Ok(id) => id,
+        Err(e) => return e.into_response(),
+    };
+    let update_id: UpdateId = match update_id_str.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return AutumnError::bad_request_msg(format!("invalid update id '{update_id_str}'"))
+                .into_response();
+        }
+    };
+
+    let mut conn = match db_conn_for_execution(&api_state, exec_id).await {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+
+    let history = match store::load_history(&mut conn, exec_id).await {
+        Ok(h) => h,
+        Err(e) => return map_error(e).into_response(),
+    };
+
+    // Confirm the update was ever admitted.
+    let admitted = history.events.iter().any(
+        |ev| matches!(ev, WorkflowEvent::UpdateAdmitted { update_id: id, .. } if *id == update_id),
+    );
+    if !admitted {
+        return AutumnError::not_found_msg(format!("update {update_id_str}")).into_response();
+    }
+
+    let matcher = HistoryMatcher::new(history.events);
+    match matcher.match_update(update_id) {
+        HistoryMatch::Matched { output } => (
+            axum::http::StatusCode::OK,
+            Json(UpdateCompletedResponse {
+                update_id: update_id.to_string(),
+                output,
+            }),
+        )
+            .into_response(),
+        HistoryMatch::Failed { error, .. } => (
+            axum::http::StatusCode::CONFLICT,
+            Json(UpdateFailedResponse {
+                update_id: update_id.to_string(),
+                error,
+            }),
+        )
+            .into_response(),
+        _ => (
+            axum::http::StatusCode::ACCEPTED,
+            Json(UpdateAdmittedResponse {
+                update_id: update_id.to_string(),
+            }),
+        )
+            .into_response(),
+    }
 }
 
 #[cfg(test)]

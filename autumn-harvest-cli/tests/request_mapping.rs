@@ -331,6 +331,78 @@ fn dlq_bulk_replay_with_all_filters_maps_correctly() {
 }
 
 #[test]
+fn workflow_update_maps_to_post_with_wait_query() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "update",
+        "00000000-0000-0000-0000-000000000001",
+        "approve",
+        "--input-json",
+        r#"{"approved":true}"#,
+    ])
+    .expect("workflow update args should parse");
+    let request = cli.api_request().expect("update request should build");
+
+    assert_eq!(request.method, ApiMethod::Post);
+    assert_eq!(
+        request.path,
+        "/workflows/00000000-0000-0000-0000-000000000001/update/approve?wait=completed"
+    );
+    assert_eq!(request.body, Some(json!({ "input": { "approved": true } })));
+}
+
+#[test]
+fn workflow_update_admitted_mode_sets_wait_query_param() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "update",
+        "00000000-0000-0000-0000-000000000001",
+        "approve",
+        "--wait",
+        "admitted",
+        "--timeout-secs",
+        "10",
+    ])
+    .expect("workflow update admitted args should parse");
+    let request = cli.api_request().expect("update admitted request should build");
+
+    assert_eq!(request.method, ApiMethod::Post);
+    // wait=admitted is in path; timeout_secs is included too
+    assert!(
+        request.path.contains("wait=admitted"),
+        "path must include wait=admitted: {}",
+        request.path
+    );
+    assert!(
+        request.path.contains("timeout_secs=10"),
+        "path must include timeout_secs=10: {}",
+        request.path
+    );
+}
+
+#[test]
+fn workflow_update_result_maps_to_get() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "update-result",
+        "00000000-0000-0000-0000-000000000001",
+        "aaaaaaaa-bbbb-cccc-dddd-000000000002",
+    ])
+    .expect("workflow update-result args should parse");
+    let request = cli.api_request().expect("update-result request should build");
+
+    assert_eq!(request.method, ApiMethod::Get);
+    assert_eq!(
+        request.path,
+        "/workflows/00000000-0000-0000-0000-000000000001/update/aaaaaaaa-bbbb-cccc-dddd-000000000002/result"
+    );
+    assert_eq!(request.body, None);
+}
+
+#[test]
 fn retention_commands_match_management_routes() {
     let status = Cli::try_parse_from(["harvest", "retention", "status"])
         .expect("retention status args should parse");

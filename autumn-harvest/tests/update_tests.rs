@@ -3,7 +3,7 @@
 //! Covers: event serde, UpdateId, UpdateRegistry, WorkflowContext
 //! registration/validation/dispatch, and HistoryMatcher update replay.
 
-#![cfg(any(test, feature = "testing"))]
+#![cfg(feature = "testing")]
 
 use autumn_harvest::context::WorkflowContext;
 use autumn_harvest::event::WorkflowEvent;

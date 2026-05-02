@@ -274,6 +274,34 @@ enum WorkflowCommand {
         /// Registered query name.
         query_name: String,
     },
+    /// Send a synchronous update request to a running workflow.
+    Update {
+        /// Workflow execution ID.
+        execution_id: String,
+        /// Registered update handler name.
+        update_name: String,
+        /// Inline JSON input for the update handler.
+        #[arg(long, conflicts_with = "input_file")]
+        input_json: Option<String>,
+        /// File containing JSON input. Use `-` for stdin.
+        #[arg(long, value_name = "PATH", conflicts_with = "input_json")]
+        input_file: Option<PathBuf>,
+        /// How long to wait for the result.
+        /// `admitted` — return immediately after durable admission (202).
+        /// `completed` — block until the handler returns (default).
+        #[arg(long, value_name = "MODE", default_value = "completed")]
+        wait: String,
+        /// Timeout in seconds when `--wait completed` (default: 30).
+        #[arg(long, value_name = "SECS")]
+        timeout_secs: Option<u64>,
+    },
+    /// Look up the durable result of a previously admitted update.
+    UpdateResult {
+        /// Workflow execution ID.
+        execution_id: String,
+        /// Update ID returned by a prior `harvest workflow update` call.
+        update_id: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -657,6 +685,45 @@ fn workflow_request(command: &WorkflowCommand) -> Result<ApiRequest, CliError> {
             "/workflows/{}/query/{}",
             path_segment(execution_id),
             path_segment(query_name)
+        ))),
+        WorkflowCommand::Update {
+            execution_id,
+            update_name,
+            input_json,
+            input_file,
+            wait,
+            timeout_secs,
+        } => {
+            let input =
+                parse_json_source(input_json.as_deref(), input_file.as_deref(), "update input")?
+                    .unwrap_or(serde_json::Value::Null);
+            let path = timeout_secs.map_or_else(
+                || {
+                    format!(
+                        "/workflows/{}/update/{}?wait={}",
+                        path_segment(execution_id),
+                        path_segment(update_name),
+                        wait,
+                    )
+                },
+                |secs| {
+                    format!(
+                        "/workflows/{}/update/{}?wait={}&timeout_secs={secs}",
+                        path_segment(execution_id),
+                        path_segment(update_name),
+                        wait,
+                    )
+                },
+            );
+            Ok(ApiRequest::post(path, Some(json!({ "input": input }))))
+        }
+        WorkflowCommand::UpdateResult {
+            execution_id,
+            update_id,
+        } => Ok(ApiRequest::get(format!(
+            "/workflows/{}/update/{}/result",
+            path_segment(execution_id),
+            path_segment(update_id),
         ))),
     }
 }
