@@ -22,6 +22,14 @@ the same shape with one fewer service to operate.
 
 Try it end-to-end: `cargo run -p quickstart` (see [`examples/quickstart/`](examples/quickstart/)).
 
+Need a real reference instead of the tiny hello-world path? See:
+
+- [`examples/billing-autumn-web/`](examples/billing-autumn-web/) for a full Autumn web billing
+  integration with app routes, workflow outbox publication, `HarvestPlugin`, saga compensation,
+  child workflows, version gates, signals, timers, deterministic side effects, and scheduled DAGs.
+- [`examples/standalone-runner/`](examples/standalone-runner/) for the out-of-the-box runner path:
+  no Autumn plugin, just `HarvestRunner` plus a manually mounted management API router.
+
 ```rust
 use autumn_harvest::prelude::*;
 
