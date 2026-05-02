@@ -700,7 +700,10 @@ fn task_attempt(task: &TaskQueueItem) -> u32 {
     u32::try_from(task.attempt.max(1)).unwrap_or(1)
 }
 
-fn chrono_duration_from_secs(seconds: u64, field_name: &str) -> HarvestResult<chrono::Duration> {
+pub(crate) fn chrono_duration_from_secs(
+    seconds: u64,
+    field_name: &str,
+) -> HarvestResult<chrono::Duration> {
     let seconds = i64::try_from(seconds).map_err(|_| {
         HarvestError::Config(format!("activity {field_name} exceeds i64 seconds range"))
     })?;

@@ -35,11 +35,10 @@ pub async fn record_external_task(
     queue: &str,
     schedule_to_close_secs: u64,
 ) -> HarvestResult<()> {
-    let dur =
-        chrono::Duration::try_seconds(i64::try_from(schedule_to_close_secs).unwrap_or(i64::MAX))
-            .ok_or_else(|| {
-                crate::error::HarvestError::Database("Duration out of bounds".to_string())
-            })?;
+    let dur = crate::worker::chrono_duration_from_secs(
+        schedule_to_close_secs,
+        "external task schedule to close",
+    )?;
 
     let schedule_to_close_at = Utc::now().checked_add_signed(dur).ok_or_else(|| {
         crate::error::HarvestError::Database("Datetime addition overflow".to_string())
@@ -233,11 +232,10 @@ pub async fn extend_deadline(
             let exec_id = ExecutionId::from_uuid(task.workflow_exec_id);
             let activity_id = ActivityExecId::from_uuid(task.activity_id);
 
-            let dur =
-                chrono::Duration::try_seconds(i64::try_from(extend_by_secs).unwrap_or(i64::MAX))
-                    .ok_or_else(|| {
-                        crate::error::HarvestError::Database("Duration out of bounds".to_string())
-                    })?;
+            let dur = crate::worker::chrono_duration_from_secs(
+                extend_by_secs,
+                "external task extend by",
+            )?;
 
             let new_deadline = Utc::now().checked_add_signed(dur).ok_or_else(|| {
                 crate::error::HarvestError::Database("Datetime addition overflow".to_string())
