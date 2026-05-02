@@ -7,6 +7,10 @@
 pub use crate::builder::{HarvestBuilder, WorkerConfig};
 pub use crate::context::{ActivityContext, WorkflowContext};
 pub use crate::dag::{DagBuildError, DagBuilder, DagDefinition, DagTask, DagTaskRef};
+pub use crate::determinism::{
+    DeterminismFinding, DeterminismRule, DeterminismRuleCategory, DeterminismSeverity,
+    DeterminismSourceLocation, DeterminismSuppression, deterministic_guardrail_catalog,
+};
 pub use crate::error::{HarvestError, HarvestResult, TimeoutType};
 pub use crate::event::WorkflowEvent;
 pub use crate::info::{ActivityInfo, DagInfo, WorkflowInfo};
