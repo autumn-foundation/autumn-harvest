@@ -5,7 +5,7 @@
 //! laptop-class machine for a workflow whose user code is in-memory only."
 //!
 //! Run with:
-//!   cargo bench -p autumn-harvest --features testing --no-default-features --bench replay_bench
+//!   cargo bench -p autumn-harvest --features testing --no-default-features --bench `replay_bench`
 
 use std::future::Future;
 use std::pin::Pin;
@@ -24,7 +24,7 @@ fn sequential_workflow<'a>(
     input: Value,
 ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
     Box::pin(async move {
-        let n: usize = input.as_u64().unwrap_or(0) as usize;
+        let n: usize = usize::try_from(input.as_u64().unwrap_or(0)).unwrap_or(0);
         let mut last = Value::Null;
         for i in 0..n {
             let name = format!("activity_{i}");

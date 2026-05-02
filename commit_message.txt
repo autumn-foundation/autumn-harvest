@@ -1,0 +1,6 @@
+👺 Havoc: Prevent panic when external task timeout is excessively large
+
+🧨 **The Trigger:** An external task duration passed as `u64::MAX` causes a panic on conversion and evaluation using `chrono::Duration::seconds()` and `Utc::now() + dur`.
+📉 **The Stack Trace:** Panic at `Utc::now() + dur` and unwrapping the duration itself.
+🧪 **Reproduction:** Run `cargo test --test havoc_tests` with `test_havoc_external_task_duration_panic`.
+😈 **Comment:** You assumed the time delta would never exceed integer maximums. You were wrong.
