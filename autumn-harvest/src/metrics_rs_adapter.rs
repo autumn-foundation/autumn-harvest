@@ -44,22 +44,12 @@
 use metrics::{counter, gauge, histogram};
 
 use crate::telemetry::{
-    ActivityStatus, METRIC_ACTIVITY_DURATION, METRIC_DLQ_ENTRIES, METRIC_QUEUE_DEPTH,
+    ActivityStatus, METRIC_ACTIVITY_DURATION, METRIC_DLQ_ENTRIES, METRIC_LABEL_ACTIVITY,
+    METRIC_LABEL_KEY, METRIC_LABEL_KIND, METRIC_LABEL_NAME, METRIC_LABEL_QUEUE, METRIC_LABEL_REASON,
+    METRIC_LABEL_SHARD, METRIC_LABEL_STATUS, METRIC_LABEL_WORKFLOW, METRIC_QUEUE_DEPTH,
     METRIC_RETENTION_DELETED, METRIC_SCHEDULE_RUNS, METRIC_SCHEDULE_SKIPPED, METRIC_TIMER_STARTED,
     METRIC_WORKFLOW_DURATION, METRIC_WORKFLOW_STARTED, MetricsRecorder, WorkflowStatus,
 };
-
-// `ATTR_*` constants kept as local string literals to avoid a public
-// dependency on the span attribute names at the metrics call site.
-const LABEL_WORKFLOW: &str = "workflow";
-const LABEL_ACTIVITY: &str = "activity";
-const LABEL_QUEUE: &str = "queue";
-const LABEL_STATUS: &str = "status";
-const LABEL_SHARD: &str = "shard";
-const LABEL_KIND: &str = "kind";
-const LABEL_NAME: &str = "name";
-const LABEL_REASON: &str = "reason";
-const LABEL_KEY: &str = "key";
 
 /// [`MetricsRecorder`] implementation that forwards every sample to the
 /// global [`metrics`] registry.
@@ -73,8 +63,8 @@ impl MetricsRecorder for MetricsRsRecorder {
     fn record_workflow_started(&self, workflow_name: &str, queue: &str) {
         counter!(
             METRIC_WORKFLOW_STARTED,
-            LABEL_WORKFLOW => workflow_name.to_owned(),
-            LABEL_QUEUE => queue.to_owned(),
+            METRIC_LABEL_WORKFLOW => workflow_name.to_owned(),
+            METRIC_LABEL_QUEUE => queue.to_owned(),
         )
         .increment(1);
     }
@@ -88,9 +78,9 @@ impl MetricsRecorder for MetricsRsRecorder {
     ) {
         histogram!(
             METRIC_WORKFLOW_DURATION,
-            LABEL_WORKFLOW => workflow_name.to_owned(),
-            LABEL_QUEUE => queue.to_owned(),
-            LABEL_STATUS => status.as_str(),
+            METRIC_LABEL_WORKFLOW => workflow_name.to_owned(),
+            METRIC_LABEL_QUEUE => queue.to_owned(),
+            METRIC_LABEL_STATUS => status.as_str(),
         )
         .record(duration_secs);
     }
@@ -104,9 +94,9 @@ impl MetricsRecorder for MetricsRsRecorder {
     ) {
         histogram!(
             METRIC_ACTIVITY_DURATION,
-            LABEL_ACTIVITY => activity_name.to_owned(),
-            LABEL_QUEUE => queue.to_owned(),
-            LABEL_STATUS => status.as_str(),
+            METRIC_LABEL_ACTIVITY => activity_name.to_owned(),
+            METRIC_LABEL_QUEUE => queue.to_owned(),
+            METRIC_LABEL_STATUS => status.as_str(),
         )
         .record(duration_secs);
     }
@@ -122,7 +112,7 @@ impl MetricsRecorder for MetricsRsRecorder {
     fn record_queue_depth(&self, queue_name: &str, depth: u64) {
         gauge!(
             METRIC_QUEUE_DEPTH,
-            LABEL_QUEUE => queue_name.to_owned(),
+            METRIC_LABEL_QUEUE => queue_name.to_owned(),
         )
         .set(depth as f64);
     }
@@ -131,7 +121,7 @@ impl MetricsRecorder for MetricsRsRecorder {
     fn record_dlq_entries(&self, shard: u16, depth: u64) {
         gauge!(
             METRIC_DLQ_ENTRIES,
-            LABEL_SHARD => shard.to_string(),
+            METRIC_LABEL_SHARD => shard.to_string(),
         )
         .set(depth as f64);
     }
@@ -139,8 +129,8 @@ impl MetricsRecorder for MetricsRsRecorder {
     fn record_schedule_run(&self, kind: &str, name: &str) {
         counter!(
             METRIC_SCHEDULE_RUNS,
-            LABEL_KIND => kind.to_owned(),
-            LABEL_NAME => name.to_owned(),
+            METRIC_LABEL_KIND => kind.to_owned(),
+            METRIC_LABEL_NAME => name.to_owned(),
         )
         .increment(1);
     }
@@ -148,9 +138,9 @@ impl MetricsRecorder for MetricsRsRecorder {
     fn record_schedule_skipped(&self, kind: &str, name: &str, reason: &str) {
         counter!(
             METRIC_SCHEDULE_SKIPPED,
-            LABEL_KIND => kind.to_owned(),
-            LABEL_NAME => name.to_owned(),
-            LABEL_REASON => reason.to_owned(),
+            METRIC_LABEL_KIND => kind.to_owned(),
+            METRIC_LABEL_NAME => name.to_owned(),
+            METRIC_LABEL_REASON => reason.to_owned(),
         )
         .increment(1);
     }
@@ -164,7 +154,7 @@ impl MetricsRecorder for MetricsRsRecorder {
     ) {
         counter!(
             METRIC_RETENTION_DELETED,
-            LABEL_SHARD => shard.to_string(),
+            METRIC_LABEL_SHARD => shard.to_string(),
         )
         .increment(deleted_count);
     }
@@ -173,7 +163,7 @@ impl MetricsRecorder for MetricsRsRecorder {
     fn record_concurrency_key_in_flight(&self, key: &str, in_flight: u64) {
         gauge!(
             "harvest.concurrency.in_flight",
-            LABEL_KEY => key.to_owned(),
+            METRIC_LABEL_KEY => key.to_owned(),
         )
         .set(in_flight as f64);
     }
@@ -182,7 +172,7 @@ impl MetricsRecorder for MetricsRsRecorder {
     fn record_concurrency_key_deferred(&self, key: &str, deferred: u64) {
         gauge!(
             "harvest.concurrency.deferred",
-            LABEL_KEY => key.to_owned(),
+            METRIC_LABEL_KEY => key.to_owned(),
         )
         .set(deferred as f64);
     }

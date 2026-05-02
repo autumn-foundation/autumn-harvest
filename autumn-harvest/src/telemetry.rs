@@ -88,6 +88,33 @@ pub const METRIC_SCHEDULE_SKIPPED: &str = "harvest.schedule.skipped";
 pub const METRIC_RETENTION_DELETED: &str = "harvest.retention.deleted";
 
 // ---------------------------------------------------------------------------
+// Metric label key constants
+// Used by MetricsRecorder implementations to avoid string literals at call
+// sites. These are short Prometheus-compatible names; the forbidden label
+// (ATTR_EXECUTION_ID) deliberately has no entry here so it cannot be
+// accidentally used on a metric.
+// ---------------------------------------------------------------------------
+
+/// Metric label: the workflow name.
+pub const METRIC_LABEL_WORKFLOW: &str = "workflow";
+/// Metric label: the activity name.
+pub const METRIC_LABEL_ACTIVITY: &str = "activity";
+/// Metric label: the task queue name.
+pub const METRIC_LABEL_QUEUE: &str = "queue";
+/// Metric label: terminal outcome status (e.g. `"completed"`, `"failed"`).
+pub const METRIC_LABEL_STATUS: &str = "status";
+/// Metric label: the shard number.
+pub const METRIC_LABEL_SHARD: &str = "shard";
+/// Metric label: schedule kind (`"dag"` or `"workflow"`).
+pub const METRIC_LABEL_KIND: &str = "kind";
+/// Metric label: the schedule or DAG name.
+pub const METRIC_LABEL_NAME: &str = "name";
+/// Metric label: reason a scheduled run was skipped.
+pub const METRIC_LABEL_REASON: &str = "reason";
+/// Metric label: the concurrency group key.
+pub const METRIC_LABEL_KEY: &str = "key";
+
+// ---------------------------------------------------------------------------
 // TraceContextCarrier
 // ---------------------------------------------------------------------------
 

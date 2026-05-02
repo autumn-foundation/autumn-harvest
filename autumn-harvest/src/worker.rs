@@ -2173,9 +2173,15 @@ async fn process_workflow_task(
         .as_ref()
         .map(|carrier| telemetry.install_trace_context(carrier));
 
-    telemetry
-        .metrics
-        .record_workflow_started(&prepared.execution.workflow_name, &task.queue_name);
+    // Only count on first live invocation — history has exactly one event
+    // (WorkflowStarted) when this is a brand-new execution. Resumed executions
+    // carry additional ActivityScheduled/ActivityCompleted/etc. events and must
+    // not re-increment the counter per ADR-0001 §7 replay semantics.
+    if prepared.history_events.len() == 1 {
+        telemetry
+            .metrics
+            .record_workflow_started(&prepared.execution.workflow_name, &task.queue_name);
+    }
     let started_at = std::time::Instant::now();
 
     // Drive the workflow in a loop so that local activities can be executed
@@ -2578,6 +2584,7 @@ impl Worker {
         let shard_id = self
             .config
             .shard_assignments
+            .as_slice()
             .first()
             .map_or(0u16, |s| u16::try_from(s.as_i32()).unwrap_or(0));
         let dlq_depth_sampler = spawn_dlq_depth_sampler(
