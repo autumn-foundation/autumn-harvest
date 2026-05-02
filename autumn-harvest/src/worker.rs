@@ -15,7 +15,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use diesel::{BoolExpressionMethods, ExpressionMethods, OptionalExtension, QueryDsl, SelectableHelper};
+use diesel::{
+    BoolExpressionMethods, ExpressionMethods, OptionalExtension, QueryDsl, SelectableHelper,
+};
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 use scoped_futures::ScopedFutureExt;
 use tokio::sync::Semaphore;
