@@ -2070,29 +2070,13 @@ async fn admit_update(
         Err(e) => return e.into_response(),
     };
 
-    // Reject if the workflow is not RUNNING.
-    let execution = match load_execution(&mut conn, exec_id).await {
-        Ok(e) => e,
-        Err(e) => return map_error(e).into_response(),
-    };
-    if execution.state != "RUNNING" {
-        return (
-            axum::http::StatusCode::CONFLICT,
-            Json(serde_json::json!({
-                "error": format!(
-                    "workflow {} is not RUNNING (state: {})",
-                    exec_id, execution.state
-                )
-            })),
-        )
-            .into_response();
-    }
-
     let update_id = UpdateId::new();
 
-    // Durably append the UpdateAdmitted event using the serialised helper so
-    // concurrent appenders (workflow executor, other API calls) cannot race to
-    // claim the same event_id.
+    // Durably append the UpdateAdmitted event inside a FOR UPDATE transaction
+    // that also verifies the execution is still RUNNING.  Doing the state check
+    // and the insert under the same row-level lock prevents a TOCTOU race where
+    // the workflow could complete between a separate state read and the insert.
+    // UpdateRejected is returned if the execution is no longer RUNNING.
     if let Err(e) = store::admit_update_event(
         &mut conn,
         exec_id,
@@ -2144,22 +2128,24 @@ async fn poll_update_result(
 
     let poll_result = tokio::time::timeout(Duration::from_secs(timeout_secs), async {
         loop {
-            let mut c = pool
-                .pool_for_execution(exec_id)
-                .get()
-                .await
-                .map_err(|e| HarvestError::Database(e.to_string()))?;
-            let h = store::load_history(&mut c, exec_id).await?;
-            match HistoryMatcher::new(h.events).match_update(update_id) {
-                HistoryMatch::Matched { output } => {
-                    return Ok::<_, HarvestError>((true, output, String::new()));
+            let result = {
+                // Scope the connection so it is returned to the pool before sleeping.
+                let mut c = pool
+                    .pool_for_execution(exec_id)
+                    .get()
+                    .await
+                    .map_err(|e| HarvestError::Database(e.to_string()))?;
+                let h = store::load_history(&mut c, exec_id).await?;
+                // c is dropped here, releasing the connection back to the pool.
+                match HistoryMatcher::new(h.events).match_update(update_id) {
+                    HistoryMatch::Matched { output } => Some(Ok((true, output, String::new()))),
+                    HistoryMatch::Failed { error, .. } => Some(Ok((false, Value::Null, error))),
+                    _ => None,
                 }
-                HistoryMatch::Failed { error, .. } => {
-                    return Ok((false, Value::Null, error));
-                }
-                _ => {
-                    tokio::time::sleep(poll_interval).await;
-                }
+            };
+            match result {
+                Some(v) => return v,
+                None => tokio::time::sleep(poll_interval).await,
             }
         }
     })

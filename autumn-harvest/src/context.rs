@@ -188,6 +188,18 @@ pub enum WorkflowCommand {
         /// The worker sends the final result (success or exhausted retries) here.
         result_tx: oneshot::Sender<Result<Value, String>>,
     },
+    /// Record a terminal result for an admitted update.
+    ///
+    /// Pushed by [`WorkflowContext::execute_admitted_update`] in live mode so
+    /// the worker can durably append `UpdateCompleted` or `UpdateFailed` to the
+    /// event history before persisting any other side effects from the same
+    /// execution cycle.
+    RecordUpdateResult {
+        /// The update whose result is being recorded.
+        update_id: crate::types::UpdateId,
+        /// `Ok(value)` on success; `Err(reason)` when the handler returned an error.
+        result: Result<Value, String>,
+    },
 }
 
 // Manual Debug because oneshot::Sender is not Debug.
@@ -266,6 +278,14 @@ impl std::fmt::Debug for WorkflowCommand {
                 .field("name", name)
                 .field("start_to_close_secs", start_to_close_secs)
                 .finish_non_exhaustive(),
+            Self::RecordUpdateResult { update_id, result } => f
+                .debug_struct("RecordUpdateResult")
+                .field("update_id", update_id)
+                .field(
+                    "result",
+                    &result.as_ref().map(|_| "<output>").map_err(String::as_str),
+                )
+                .finish(),
         }
     }
 }
@@ -1552,10 +1572,19 @@ impl WorkflowContext {
             registry.invoke(name, input)
         };
 
-        match future {
+        let result = match future {
             Some(fut) => fut.await,
             None => Err(format!("update handler '{name}' not found")),
-        }
+        };
+
+        // Durably record the terminal result so the worker can append
+        // UpdateCompleted/UpdateFailed before persisting other side effects.
+        self.push_command(WorkflowCommand::RecordUpdateResult {
+            update_id,
+            result: result.clone(),
+        });
+
+        result
     }
 
     // ── Command drain ─────────────────────────────────────────────────

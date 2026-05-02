@@ -90,7 +90,7 @@ pub async fn run_workflow(
     handler: WorkflowHandlerFn,
     input: Value,
 ) -> WorkflowOutcome {
-    let (outcome, _span) =
+    let (outcome, _pending, _span) =
         run_workflow_with_state(exec_id, history, handler, input, empty_shared_state(), None).await;
     outcome
 }
@@ -161,11 +161,18 @@ pub async fn run_workflow_strict(
 
 /// Run a workflow function through replay and live execution with shared state.
 ///
-/// Returns the outcome paired with a [`tracing::Span`] handle for the
-/// `harvest.workflow.execute` span.  The caller should hold the handle alive
-/// while persisting producer-side side-effects (activity schedules, child
-/// workflow starts) so that those producer spans can be correctly parented to
-/// this executor cycle.  Dropping the handle closes the span.
+/// Returns a triple of `(outcome, pending_commands, span_handle)`:
+/// - `outcome`: the workflow's terminal or suspended state.
+/// - `pending_commands`: commands emitted during a `Completed` or `Failed` run
+///   that the worker must persist before recording the terminal event. This is
+///   non-empty only when the workflow invoked `execute_admitted_update` in live
+///   mode — the `RecordUpdateResult` commands must be appended to history before
+///   `WorkflowCompleted`/`WorkflowFailed`. For `Suspended` outcomes the commands
+///   are already carried inside the variant; this Vec will be empty.
+/// - `span_handle`: the open `harvest.workflow.execute` span. The caller should
+///   hold it alive while persisting producer-side side-effects (activity
+///   schedules, child workflow starts) so those producer spans are nested inside
+///   the executor cycle. Dropping the handle closes the span.
 pub async fn run_workflow_with_state(
     exec_id: ExecutionId,
     history: Vec<WorkflowEvent>,
@@ -173,7 +180,7 @@ pub async fn run_workflow_with_state(
     input: Value,
     state: SharedState,
     span_meta: Option<&WorkflowExecuteSpanMeta>,
-) -> (WorkflowOutcome, tracing::Span) {
+) -> (WorkflowOutcome, Vec<WorkflowCommand>, tracing::Span) {
     let ctx = WorkflowContext::for_replay_with_state(exec_id, history, state);
 
     // ADR-0001 §2.1: emit harvest.workflow.execute for every executor cycle.
@@ -210,19 +217,24 @@ pub async fn run_workflow_with_state(
     // the instrumented future has already completed.
     let span_handle = span.clone();
 
-    let outcome = async {
+    let (outcome, pending) = async {
         // Run the handler with a timeout. If it completes, we get the result.
         // If it blocks on a oneshot (suspended), the timeout fires and we drain
         // the accumulated commands.
         let timeout_result = tokio::time::timeout(SUSPENSION_TIMEOUT, handler(&ctx, input)).await;
 
         match timeout_result {
-            // Handler completed within the timeout window.
-            Ok(Ok(output)) => WorkflowOutcome::Completed { output },
-            Ok(Err(error)) => WorkflowOutcome::Failed { error },
+            // Handler completed within the timeout window.  Drain any commands
+            // emitted during live execution (e.g. RecordUpdateResult from
+            // execute_admitted_update) so the worker can persist them before the
+            // terminal WorkflowCompleted/WorkflowFailed event.
+            Ok(Ok(output)) => (WorkflowOutcome::Completed { output }, ctx.drain_commands()),
+            Ok(Err(error)) => (WorkflowOutcome::Failed { error }, ctx.drain_commands()),
 
             // Timeout elapsed -- the handler is suspended on a oneshot channel.
-            // Drain the commands it emitted before suspending.
+            // Drain the commands it emitted before suspending. RecordUpdateResult
+            // commands emitted in this cycle are included in the commands list and
+            // will be handled by the worker alongside the suspension side-effects.
             Err(_elapsed) => {
                 let mut commands = ctx.drain_commands();
                 // ContinueAsNew is terminal: when the workflow body parks on
@@ -236,16 +248,16 @@ pub async fn run_workflow_with_state(
                     .rposition(|cmd| matches!(cmd, WorkflowCommand::ContinueAsNew { .. }))
                     && let WorkflowCommand::ContinueAsNew { input } = commands.swap_remove(idx)
                 {
-                    return WorkflowOutcome::ContinuedAsNew { input };
+                    return (WorkflowOutcome::ContinuedAsNew { input }, vec![]);
                 }
-                WorkflowOutcome::Suspended { commands }
+                (WorkflowOutcome::Suspended { commands }, vec![])
             }
         }
     }
     .instrument(span)
     .await;
 
-    (outcome, span_handle)
+    (outcome, pending, span_handle)
 }
 
 // ---------------------------------------------------------------------------
