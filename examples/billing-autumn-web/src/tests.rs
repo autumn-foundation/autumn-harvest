@@ -131,6 +131,71 @@ async fn billing_checkout_happy_path_uses_saga_child_signal_version_and_timer() 
 }
 
 #[tokio::test]
+async fn billing_checkout_rejects_successful_capture_without_capture_id() {
+    let result =
+        WorkflowSimulator::new(workflows::__autumn_workflow_info_billing_checkout().handler)
+            .mock_activity("validate_checkout", Ok)
+            .mock_activity("create_customer_profile", |_| {
+                Ok(json!({ "customer_profile_id": "cus_demo" }))
+            })
+            .mock_activity("authorize_payment", |_| {
+                Ok(json!({ "authorization_id": "auth_demo", "amount_cents": 14_500 }))
+            })
+            .mock_activity("create_subscription_record", |input| {
+                Ok(json!({
+                    "subscription_id": input["subscription_id"],
+                    "state": "pending_capture",
+                }))
+            })
+            .mock_child_workflow("issue_initial_invoice", |_| {
+                Ok(json!({
+                    "invoice_id": "inv_demo",
+                    "total_cents": 15_950,
+                }))
+            })
+            .mock_activity("record_payment_capture", |_| Ok(json!({ "posted": true })))
+            .mock_activity("send_receipt", |_| Ok(json!({ "sent": true })))
+            .mock_activity("void_invoice", |_| Ok(json!({ "voided": true })))
+            .mock_activity("cancel_subscription_record", |_| {
+                Ok(json!({ "cancelled": true }))
+            })
+            .mock_activity("void_payment_authorization", |_| {
+                Ok(json!({ "voided": true }))
+            })
+            .mock_activity("delete_customer_profile", |_| {
+                Ok(json!({ "deleted": true }))
+            })
+            .send_signal(
+                "payment_captured",
+                json!({
+                    "captured": true,
+                }),
+            )
+            .run(json!(checkout()))
+            .await;
+
+    let error = result
+        .final_output
+        .expect_err("billing checkout should reject a captured signal without capture_id");
+    assert!(error.contains("capture_id"));
+
+    let scheduled: Vec<&str> = result
+        .history
+        .iter()
+        .filter_map(|event| match event {
+            WorkflowEvent::ActivityScheduled { name, .. } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(scheduled.contains(&"void_invoice"));
+    assert!(scheduled.contains(&"cancel_subscription_record"));
+    assert!(scheduled.contains(&"void_payment_authorization"));
+    assert!(scheduled.contains(&"delete_customer_profile"));
+    assert!(!scheduled.contains(&"record_payment_capture"));
+    assert!(!scheduled.contains(&"send_receipt"));
+}
+
+#[tokio::test]
 async fn billing_checkout_compensates_when_invoice_child_fails() {
     let result =
         WorkflowSimulator::new(workflows::__autumn_workflow_info_billing_checkout().handler)
