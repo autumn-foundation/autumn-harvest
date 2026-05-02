@@ -15,9 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use diesel::{
-    BoolExpressionMethods, ExpressionMethods, OptionalExtension, QueryDsl, SelectableHelper,
-};
+use diesel::{ExpressionMethods, OptionalExtension, QueryDsl, SelectableHelper};
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 use scoped_futures::ScopedFutureExt;
 use tokio::sync::Semaphore;
@@ -1235,28 +1233,34 @@ async fn persist_all_started_child_workflows(
                 queue::enqueue(conn, &params).await?;
             }
 
-            // Park the parent. Then check whether any of the pending children
-            // already reached a terminal state while this task was RUNNING —
-            // wake_workflow_task is a no-op against RUNNING rows, so the
-            // completion signal was lost. Re-wake here to avoid an indefinite
-            // park despite terminal history being present.
+            // Park the parent. Then lock all pending child rows with
+            // SELECT ... FOR UPDATE and read their states. The lock serializes
+            // against any concurrent update_workflow_execution_completed /
+            // failed / timed_out, which also acquires a row lock before
+            // appending the ChildWorkflowCompleted/Failed event and calling
+            // wake_workflow_task (a no-op while the parent is RUNNING). After
+            // our lock we see the post-update state, so if any child is already
+            // terminal we re-wake the now-PARKED parent, closing the race.
+            // TIMED_OUT and CANCELLED are also terminal states that emit a
+            // ChildWorkflowFailed event to the parent.
             queue::park_workflow_task(conn, task_id, sticky).await?;
 
-            let terminal_child_exists = harvest_workflow_executions::table
+            let child_states: Vec<String> = harvest_workflow_executions::table
                 .filter(harvest_workflow_executions::id.eq_any(&requested_ids))
-                .filter(
-                    harvest_workflow_executions::state
-                        .eq("COMPLETED")
-                        .or(harvest_workflow_executions::state.eq("FAILED")),
-                )
-                .select(harvest_workflow_executions::id)
-                .first::<uuid::Uuid>(conn)
+                .for_update()
+                .select(harvest_workflow_executions::state)
+                .load::<String>(conn)
                 .await
-                .optional()
-                .map_err(crate::error::database_error)?
-                .is_some();
+                .map_err(crate::error::database_error)?;
 
-            if terminal_child_exists {
+            let any_terminal = child_states.iter().any(|s| {
+                matches!(
+                    s.as_str(),
+                    "COMPLETED" | "FAILED" | "TIMED_OUT" | "CANCELLED"
+                )
+            });
+
+            if any_terminal {
                 queue::wake_workflow_task(conn, parent_exec_id).await?;
             }
 
