@@ -20,14 +20,14 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use autumn_harvest::dlq::{self, NewDeadLetterEntry};
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::info::{ActivityInfo, WorkflowInfo};
-use autumn_harvest::models::WorkflowExecution;
+use autumn_harvest::models::{NewWorkflowExecution, WorkflowExecution};
 use autumn_harvest::queue::{self as queue_mod, EnqueueParams, TaskType};
 use autumn_harvest::schema::harvest_workflow_executions;
 use autumn_harvest::store;
 use autumn_harvest::telemetry::{
-    ActivityStatus, MetricsRecorder, TelemetryConfig, WorkflowStatus,
-    METRIC_ACTIVITY_DURATION, METRIC_DLQ_ENTRIES, METRIC_QUEUE_DEPTH, METRIC_WORKFLOW_DURATION,
-    METRIC_WORKFLOW_STARTED,
+    ActivityStatus, METRIC_ACTIVITY_DURATION, METRIC_DLQ_ENTRIES, METRIC_QUEUE_DEPTH,
+    METRIC_WORKFLOW_DURATION, METRIC_WORKFLOW_STARTED, MetricsRecorder, TelemetryConfig,
+    WorkflowStatus,
 };
 use autumn_harvest::types::{ExecutionId, ShardId};
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
@@ -161,10 +161,7 @@ impl MetricsRecorder for RecordingMetrics {
     fn record_dlq_entries(&self, shard: u16, depth: u64) {
         self.push(
             METRIC_DLQ_ENTRIES,
-            vec![
-                ("depth", depth.to_string()),
-                ("shard", shard.to_string()),
-            ],
+            vec![("depth", depth.to_string()), ("shard", shard.to_string())],
         );
     }
 }
@@ -278,6 +275,7 @@ fn metrics_activity<'a>(
 /// Runs a real workflow (with one activity) end-to-end through the worker and
 /// verifies that `harvest.workflow.started`, `harvest.workflow.duration`, and
 /// `harvest.activity.duration` metrics are emitted with the correct labels.
+#[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn workflow_and_activity_metrics_are_recorded() {
     let (database_url, _container) = setup_test_database_url().await;
@@ -301,7 +299,6 @@ async fn workflow_and_activity_metrics_are_recorded() {
     .await
     .expect("append WorkflowStarted failed");
 
-    use autumn_harvest::models::NewWorkflowExecution;
     let exec_row = NewWorkflowExecution {
         id: exec_id.as_uuid(),
         workflow_name: "metrics_test_workflow",
@@ -534,8 +531,5 @@ async fn dlq_depth_sampler_emits_dlq_entries_metric() {
         .and_then(|s| s.strip_prefix("depth="))
         .and_then(|v| v.parse().ok())
         .expect("depth label must be a valid u64");
-    assert!(
-        depth >= 1,
-        "dlq.entries depth must be >= 1, got {depth}"
-    );
+    assert!(depth >= 1, "dlq.entries depth must be >= 1, got {depth}");
 }

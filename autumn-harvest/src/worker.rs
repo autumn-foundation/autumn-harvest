@@ -2369,15 +2369,19 @@ async fn process_workflow_task(
         .in_scope(|| {});
     }
 
-    // Only count on first live invocation — history has exactly one event
-    // A "first invocation" is detected by the absence of any scheduling event
-    // (ActivityScheduled, TimerStarted, etc.) that could only appear after a
-    // prior execution cycle committed work to history.  Checking raw length is
-    // unreliable: load_workflow_replay_state appends SignalReceived / TimerFired
-    // rows for pending signals and fired timers *before* this check runs, so a
-    // brand-new workflow that receives a signal between enqueue and first
-    // dispatch would incorrectly have len > 1.
-    let is_first_invocation = !prepared.history_events.iter().any(|e| {
+    // Emit workflow.started exactly once per execution.  Two independent
+    // conditions must both hold:
+    //
+    // 1. task.attempt == 1: the task queue has never dispatched this execution
+    //    before (attempt starts at 0 and is incremented to 1 on first claim;
+    //    signal-resume paths increment it again on re-claim).
+    //
+    // 2. No scheduling events in history: guards against counting replayed
+    //    first-dispatch tasks that already committed scheduling work.
+    //    load_workflow_replay_state prepends SignalReceived/TimerFired for
+    //    pending signals and fired timers, so checking raw length alone is
+    //    unreliable for brand-new workflows.
+    let has_scheduling_events = prepared.history_events.iter().any(|e| {
         matches!(
             e,
             WorkflowEvent::ActivityScheduled { .. }
@@ -2388,7 +2392,7 @@ async fn process_workflow_task(
                 | WorkflowEvent::MarkerRecorded { .. }
         )
     });
-    if is_first_invocation {
+    if task.attempt == 1 && !has_scheduling_events {
         telemetry
             .metrics
             .record_workflow_started(&prepared.execution.workflow_name, &task.queue_name);

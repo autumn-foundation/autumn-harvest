@@ -37,6 +37,8 @@ pub struct RecordingMetrics {
 }
 
 impl RecordingMetrics {
+    /// # Panics
+    /// Panics if the internal mutex is poisoned.
     pub fn drain(&self) -> Vec<MetricSample> {
         self.samples.lock().unwrap().drain(..).collect()
     }

@@ -618,22 +618,23 @@ async fn activate_queued_runs<'a>(
             .await
             .map_err(crate::error::database_error)?;
         let available = i64::from(schedule.max_active_runs) - running_count;
-        if available <= 0 {
-            metrics.record_schedule_skipped("dag", dag_name, "max_active_runs_reached");
-            continue;
-        }
 
         let queued = dag_runs_dsl::harvest_dag_runs
             .filter(dag_runs_dsl::dag_name.eq(dag_name))
             .filter(dag_runs_dsl::state.eq("QUEUED"))
             .order(dag_runs_dsl::logical_date.asc())
-            .limit(available)
+            .limit(available.max(1)) // load at least 1 to detect skip-worthy backlog
             .select(DagRun::as_select())
             .load(conn)
             .await
             .map_err(crate::error::database_error)?;
 
         if queued.is_empty() {
+            continue;
+        }
+
+        if available <= 0 {
+            metrics.record_schedule_skipped("dag", dag_name, "max_active_runs_reached");
             continue;
         }
         let queued_ids: Vec<_> = queued.iter().map(|r| r.id).collect();
