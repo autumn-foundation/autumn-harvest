@@ -295,6 +295,7 @@ async fn legacy_workflow_uniqueness_schema_can_be_upgraded_for_idempotent_starts
         memo: None,
         search_attrs: None,
         reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
+        trace_context: None,
     };
 
     // On the legacy schema there is no `(workflow_name, workflow_id)`
@@ -3066,6 +3067,7 @@ mod reuse_policy_helpers {
             memo: None,
             search_attrs: None,
             reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
+            trace_context: None,
         }
     }
 

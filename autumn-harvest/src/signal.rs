@@ -13,6 +13,8 @@ use scoped_futures::ScopedFutureExt;
 use crate::error::{HarvestError, HarvestResult};
 #[cfg(feature = "db")]
 use crate::models::{HarvestSignal, NewHarvestSignal};
+#[cfg(feature = "db")]
+use crate::telemetry::{ATTR_EXECUTION_ID, ATTR_WORKFLOW_ID};
 use crate::types::ExecutionId;
 
 /// Queue a workflow signal for durable delivery and wake the parked workflow.
@@ -35,6 +37,18 @@ pub async fn send_signal(
 ) -> HarvestResult<()> {
     use crate::schema::harvest_signals;
     use crate::schema::harvest_workflow_executions;
+
+    // ADR-0001 §2.5: harvest.signal.send — PRODUCER, parent = active span at call site.
+    // Emitted synchronously before the DB await so EnteredSpan (!Send) is dropped
+    // before the async transaction boundary.
+    tracing::info_span!(
+        "harvest.signal.send",
+        "otel.kind" = "producer",
+        { ATTR_WORKFLOW_ID } = %exec_id,
+        { ATTR_EXECUTION_ID } = %exec_id,
+        signal.name = %signal_name,
+    )
+    .in_scope(|| {});
 
     conn.transaction::<(), HarvestError, _>(|conn| {
         async move {

@@ -152,6 +152,7 @@ async fn seed_workflow(
             memo: None,
             search_attrs,
             reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
+            trace_context: None,
         },
     )
     .await

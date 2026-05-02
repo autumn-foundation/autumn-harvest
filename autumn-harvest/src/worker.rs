@@ -36,7 +36,10 @@ use crate::queue::{self, TaskType};
 use crate::schema::{harvest_timers, harvest_workflow_executions};
 use crate::signal;
 use crate::store;
-use crate::telemetry::{ActivityStatus, TraceContextCarrier, WorkflowStatus};
+use crate::telemetry::{
+    ATTR_ACTIVITY_NAME, ATTR_ATTEMPT, ATTR_EXECUTION_ID, ATTR_QUEUE, ATTR_REPLAY, ATTR_SHARD_ID,
+    ATTR_WORKFLOW_ID, ActivityStatus, TraceContextCarrier, WorkflowStatus,
+};
 use crate::types::{ActivityExecId, ExecutionId, ExternalActivityToken, TimerId, WorkerId};
 
 /// Type alias for the deadpool-managed async Diesel connection pool.
@@ -1052,10 +1055,22 @@ async fn persist_scheduled_activity(
         activity_id: scheduled.activity_id,
         name: scheduled.name.clone(),
         input: scheduled.input.clone(),
-        queue: queue_name,
+        queue: queue_name.clone(),
     }];
     let mut events = marker_events;
     events.extend(activity_events);
+
+    // ADR-0001 §2.4: harvest.activity.schedule — PRODUCER, parent = workflow execute span.
+    // Emitted synchronously before the DB await so EnteredSpan (!Send) is dropped
+    // before the async transaction boundary.
+    tracing::info_span!(
+        "harvest.activity.schedule",
+        "otel.kind" = "producer",
+        { ATTR_ACTIVITY_NAME } = %scheduled.name,
+        { ATTR_EXECUTION_ID } = %exec_id,
+        { ATTR_QUEUE } = %queue_name,
+    )
+    .in_scope(|| {});
 
     conn.transaction::<(), HarvestError, _>(|conn| {
         async move {
@@ -1083,15 +1098,14 @@ async fn persist_started_timer(
     let marker_events = marker_events_from_commands(commands);
     let fire_delay = chrono_duration_from_secs(timer.duration_secs, "timer duration")?;
     let fires_at = chrono::Utc::now() + fire_delay;
-    // Emit a short-lived span so operators can see timer placements in a
-    // distributed trace next to the activities and workflow suspensions that
-    // produced them.
+    // Emit a span for the timer placement (not to be confused with
+    // harvest.timer.fire which is emitted when the timer actually fires).
     let span = tracing::info_span!(
         "harvest.timer.start",
         "otel.kind" = "internal",
         timer.id = %timer.timer_id,
         timer.duration_secs = timer.duration_secs,
-        workflow.execution_id = %exec_id,
+        { ATTR_EXECUTION_ID } = %exec_id,
     );
     let timer_started = WorkflowEvent::TimerStarted {
         timer_id: timer.timer_id.clone(),
@@ -1228,6 +1242,18 @@ async fn persist_all_started_child_workflows(
                 params.workflow_exec_id = Some(child.child_id.as_uuid());
                 params.trace_context = trace_ctx.clone();
 
+                // ADR-0001 §2.8: harvest.child_workflow.start — PRODUCER span.
+                // Emitted synchronously (no `.await` inside) before enqueuing so that
+                // EnteredSpan (which is !Send) is dropped before the DB await below.
+                tracing::info_span!(
+                    "harvest.child_workflow.start",
+                    "otel.kind" = "producer",
+                    { ATTR_WORKFLOW_ID } = %child.workflow_name,
+                    { ATTR_EXECUTION_ID } = %child.child_id,
+                    { ATTR_SHARD_ID } = shard_id,
+                )
+                .in_scope(|| {});
+
                 diesel::insert_into(harvest_workflow_executions::table)
                     .values(&child_row)
                     .execute(conn)
@@ -1297,6 +1323,14 @@ async fn ingest_pending_signals(
     let (signal_ids, signal_events): (Vec<_>, Vec<_>) = pending_signals
         .into_iter()
         .map(|signal| {
+            // ADR-0001 §2.6: harvest.signal.deliver — CONSUMER, parent = workflow execute.
+            let _deliver_guard = tracing::info_span!(
+                "harvest.signal.deliver",
+                "otel.kind" = "consumer",
+                { ATTR_EXECUTION_ID } = %exec_id,
+                signal.name = %signal.signal_name,
+            )
+            .entered();
             (
                 signal.id,
                 WorkflowEvent::SignalReceived {
@@ -1354,6 +1388,16 @@ async fn ingest_fired_timers(
             )
         })
         .unzip();
+
+    // ADR-0001 §2.7: harvest.timer.fire — INTERNAL, parent = workflow execute span.
+    // The span is entered and exited synchronously before the await so that
+    // EnteredSpan (!Send) is not held across the async transaction boundary.
+    tracing::info_span!(
+        "harvest.timer.fire",
+        "otel.kind" = "internal",
+        { ATTR_EXECUTION_ID } = %exec_id,
+    )
+    .in_scope(|| {});
 
     conn.transaction::<(), HarvestError, _>(|conn| {
         async move {
@@ -1637,21 +1681,19 @@ async fn process_activity_task(
     .with_trace_context(trace_carrier.clone());
 
     let telemetry = registry.telemetry().clone();
-    // Reinstate the parent trace context (if any) so the activity span becomes
-    // a child of whichever span enqueued this task, stitching the trace across
-    // the Postgres queue boundary.
+    // ADR-0001 §3: restore the producer's trace context so the activity span
+    // becomes a child of the workflow executor span that enqueued this task.
     let _parent_guard = trace_carrier
         .as_ref()
         .map(|carrier| telemetry.install_trace_context(carrier));
+    // ADR-0001 §2.2: harvest.activity.execute — INTERNAL, parent = workflow span.
     let span = tracing::info_span!(
-        "harvest.activity.run",
-        "otel.kind" = "consumer",
-        activity.name = %activity_name,
-        activity.queue = %task.queue_name,
-        activity.attempt = task.attempt,
-        workflow.execution_id = %exec_id,
-        task.id = %task.id,
-        service.name = %telemetry.service_name,
+        "harvest.activity.execute",
+        "otel.kind" = "internal",
+        { ATTR_ACTIVITY_NAME } = %activity_name,
+        { ATTR_EXECUTION_ID } = %exec_id,
+        { ATTR_ATTEMPT } = task.attempt,
+        { ATTR_QUEUE } = %task.queue_name,
     );
     let started_at = std::time::Instant::now();
 
@@ -2269,12 +2311,36 @@ async fn process_workflow_task(
         .trace_context
         .as_ref()
         .and_then(TraceContextCarrier::from_json);
-    // Reinstate the producer's trace context so the executor's
-    // `harvest.workflow.run` span becomes a child of the span that enqueued
-    // this task — this is what stitches the trace across the queue boundary.
+    let is_replay = trace_carrier.as_ref().is_some_and(|c| c.is_replay);
+
+    // ADR-0001 §3 + §4: for live runs, restore the producer's trace context so
+    // the workflow span becomes a child of the span that enqueued this task.
+    // For replay runs, do NOT restore — replay spans must be new root spans
+    // (the original trace may have long since expired).
     let _parent_guard = trace_carrier
         .as_ref()
-        .map(|carrier| telemetry.install_trace_context(carrier));
+        .filter(|_| !is_replay)
+        .map(|c| telemetry.install_trace_context(c));
+
+    // ADR-0001 §2.1: harvest.workflow.execute — INTERNAL, wraps the full
+    // executor loop including any inline local-activity cycles.
+    // Additional attributes (workflow.id, shard.id, queue) are recorded via
+    // Span::current().record() so the executor inside run_workflow_with_state
+    // can see them in its own span.
+    {
+        let current = tracing::Span::current();
+        current.record(ATTR_WORKFLOW_ID, prepared.execution.workflow_name.as_str());
+        current.record(ATTR_SHARD_ID, i64::from(prepared.execution.shard_id));
+        current.record(ATTR_QUEUE, task.queue_name.as_str());
+        current.record(ATTR_REPLAY, is_replay);
+        if is_replay
+            && let Some(link) = trace_carrier
+                .as_ref()
+                .and_then(|c| c.link_traceparent.as_deref())
+        {
+            current.record("link.traceparent", link);
+        }
+    }
 
     telemetry
         .metrics
@@ -2318,7 +2384,6 @@ async fn process_workflow_task(
                 )
                 .await?;
                 history_events.extend(new_events);
-                // Loop: re-run the workflow with the extended history.
             }
             other => break other,
         }

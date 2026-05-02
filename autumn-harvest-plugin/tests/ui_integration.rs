@@ -195,6 +195,7 @@ async fn insert_workflow_on_url(
             memo: None,
             search_attrs: None,
             reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
+            trace_context: None,
         },
     )
     .await

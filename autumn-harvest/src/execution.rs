@@ -20,6 +20,7 @@ use crate::models::{NewWorkflowExecution, WorkflowExecution};
 use crate::queue::{self, EnqueueParams, TaskType};
 use crate::schema::harvest_workflow_executions;
 use crate::store;
+use crate::telemetry::TraceContextCarrier;
 use crate::types::{ExecutionId, WorkflowIdReusePolicy};
 
 /// Parameters for starting a workflow execution.
@@ -45,6 +46,10 @@ pub struct StartWorkflowParams<'a> {
     /// How to handle a duplicate `(workflow_name, workflow_id)` collision.
     /// Defaults to [`WorkflowIdReusePolicy::AllowDuplicate`].
     pub reuse_policy: WorkflowIdReusePolicy,
+    /// W3C trace context captured at the call site (e.g., from the HTTP handler's
+    /// `harvest.workflow.schedule` span) and stored on the task row so the worker
+    /// can stitch the trace across the queue boundary (ADR-0001 §3).
+    pub trace_context: Option<TraceContextCarrier>,
 }
 
 impl StartWorkflowParams<'_> {
@@ -195,6 +200,8 @@ pub async fn start_or_load_workflow_execution(
         request.input.clone(),
     );
     enqueue.workflow_exec_id = Some(exec_id.as_uuid());
+    // ADR-0001 §3: store the caller's trace context so the worker can restore it.
+    enqueue.trace_context = request.trace_context.clone();
 
     conn.transaction::<StartedWorkflowExecution, HarvestError, _>(|conn| {
         let row = row;
