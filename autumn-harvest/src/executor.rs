@@ -90,7 +90,9 @@ pub async fn run_workflow(
     handler: WorkflowHandlerFn,
     input: Value,
 ) -> WorkflowOutcome {
-    run_workflow_with_state(exec_id, history, handler, input, empty_shared_state(), None).await
+    let (outcome, _span) =
+        run_workflow_with_state(exec_id, history, handler, input, empty_shared_state(), None).await;
+    outcome
 }
 
 /// Like [`run_workflow`] but runs in strict replay mode.
@@ -158,6 +160,12 @@ pub async fn run_workflow_strict(
 }
 
 /// Run a workflow function through replay and live execution with shared state.
+///
+/// Returns the outcome paired with a [`tracing::Span`] handle for the
+/// `harvest.workflow.execute` span.  The caller should hold the handle alive
+/// while persisting producer-side side-effects (activity schedules, child
+/// workflow starts) so that those producer spans can be correctly parented to
+/// this executor cycle.  Dropping the handle closes the span.
 pub async fn run_workflow_with_state(
     exec_id: ExecutionId,
     history: Vec<WorkflowEvent>,
@@ -165,7 +173,7 @@ pub async fn run_workflow_with_state(
     input: Value,
     state: SharedState,
     span_meta: Option<&WorkflowExecuteSpanMeta>,
-) -> WorkflowOutcome {
+) -> (WorkflowOutcome, tracing::Span) {
     let ctx = WorkflowContext::for_replay_with_state(exec_id, history, state);
 
     // ADR-0001 §2.1: emit harvest.workflow.execute for every executor cycle.
@@ -194,7 +202,15 @@ pub async fn run_workflow_with_state(
         }
     }
 
-    async {
+    // Clone the span handle BEFORE passing ownership to .instrument().
+    // The clone keeps the ref-count above zero after .instrument() exits so the
+    // OTel span is not ended until the caller explicitly drops the returned handle.
+    // This allows caller-side producer spans (activity.schedule,
+    // child_workflow.start) to be created as children of this span even though
+    // the instrumented future has already completed.
+    let span_handle = span.clone();
+
+    let outcome = async {
         // Run the handler with a timeout. If it completes, we get the result.
         // If it blocks on a oneshot (suspended), the timeout fires and we drain
         // the accumulated commands.
@@ -227,7 +243,9 @@ pub async fn run_workflow_with_state(
         }
     }
     .instrument(span)
-    .await
+    .await;
+
+    (outcome, span_handle)
 }
 
 // ---------------------------------------------------------------------------
