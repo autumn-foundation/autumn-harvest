@@ -1015,10 +1015,9 @@ async fn persist_scheduled_activity(
     );
     params.workflow_exec_id = Some(exec_id.as_uuid());
     params.activity_name = Some(scheduled.name.clone());
-    // Snapshot the current trace context so the downstream activity worker
-    // can continue the same trace. `capture` returns `None` when telemetry is
-    // unconfigured, leaving the queue row's `trace_context` NULL.
-    params.trace_context = registry.telemetry().capture_trace_context();
+    // trace_context is set below, inside the harvest.activity.schedule span,
+    // so the downstream worker's harvest.activity.execute span is stitched to
+    // the producer span rather than the parent workflow-execute context.
 
     if let Some(retry_policy) = activity.default_retry_policy.clone() {
         params.max_attempts = i32::try_from(retry_policy.max_attempts).map_err(|_| {
@@ -1063,16 +1062,18 @@ async fn persist_scheduled_activity(
     events.extend(activity_events);
 
     // ADR-0001 §2.4: harvest.activity.schedule — PRODUCER, parent = workflow execute span.
-    // Emitted synchronously before the DB await so EnteredSpan (!Send) is dropped
-    // before the async transaction boundary.
-    tracing::info_span!(
+    // Context is captured INSIDE in_scope so params.trace_context is a child of
+    // this producer span; the downstream harvest.activity.execute span can then
+    // be stitched back to it across the queue boundary.
+    // EnteredSpan is !Send; in_scope drops it synchronously before any .await.
+    params.trace_context = tracing::info_span!(
         "harvest.activity.schedule",
         "otel.kind" = "producer",
         { ATTR_ACTIVITY_NAME } = %scheduled.name,
         { ATTR_EXECUTION_ID } = %exec_id,
         { ATTR_QUEUE } = %queue_name,
     )
-    .in_scope(|| {});
+    .in_scope(|| registry.telemetry().capture_trace_context());
 
     conn.transaction::<(), HarvestError, _>(|conn| {
         async move {
