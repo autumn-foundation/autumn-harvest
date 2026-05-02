@@ -47,8 +47,9 @@ use crate::telemetry::{
     ActivityStatus, METRIC_ACTIVITY_DURATION, METRIC_DLQ_ENTRIES, METRIC_LABEL_ACTIVITY,
     METRIC_LABEL_KEY, METRIC_LABEL_KIND, METRIC_LABEL_NAME, METRIC_LABEL_QUEUE, METRIC_LABEL_REASON,
     METRIC_LABEL_SHARD, METRIC_LABEL_STATUS, METRIC_LABEL_WORKFLOW, METRIC_QUEUE_DEPTH,
-    METRIC_RETENTION_DELETED, METRIC_SCHEDULE_RUNS, METRIC_SCHEDULE_SKIPPED, METRIC_TIMER_STARTED,
-    METRIC_WORKFLOW_DURATION, METRIC_WORKFLOW_STARTED, MetricsRecorder, WorkflowStatus,
+    METRIC_RETENTION_DELETED, METRIC_SCHEDULE_RUNS, METRIC_SCHEDULE_SKIPPED, METRIC_TIMER_DURATION,
+    METRIC_TIMER_STARTED, METRIC_WORKFLOW_DURATION, METRIC_WORKFLOW_STARTED, MetricsRecorder,
+    WorkflowStatus,
 };
 
 /// [`MetricsRecorder`] implementation that forwards every sample to the
@@ -102,10 +103,8 @@ impl MetricsRecorder for MetricsRsRecorder {
     }
 
     fn record_timer_started(&self, duration_secs: f64) {
-        // Timer duration recorded as a data point so operators can see the
-        // distribution of timer durations alongside the raw counter.
         counter!(METRIC_TIMER_STARTED).increment(1);
-        let _ = duration_secs;
+        histogram!(METRIC_TIMER_DURATION).record(duration_secs);
     }
 
     #[allow(clippy::cast_precision_loss)]

@@ -30,6 +30,7 @@ autumn-harvest/          <- workspace root (this file lives here)
       cache.rs           <- Phase 2: LRU workflow state cache
       dlq.rs             <- Phase 2: dead letter queue
       pool.rs            <- Phase 2: separate pool config with shared ceiling
+      testing.rs         <- Phase 3.5 (testing feature): WorkflowReplayer harness
     migrations/
       20260409000000_harvest_initial/
     tests/
@@ -163,7 +164,7 @@ Current implementation scope: `ExecutionId`/`ShardId` encoding, `ShardRouter`, `
 | `cache.rs` | 2 | LRU workflow state cache: bounded capacity, access-order eviction |
 | `dlq.rs` | 2 | Dead letter queue: `DeadLetterEntry` builder, move-to-DLQ on retry exhaustion |
 | `pool.rs` | 2 | Separate DB pool config: web pool + worker pool with shared ceiling, minimum guarantees |
-| `telemetry.rs` | 4 | OpenTelemetry surface: `TraceContextCarrier`, `TraceContextPropagator`, `MetricsRecorder`, `TelemetryConfig` — no-op by default, opt-in via `HarvestBuilder::telemetry`. See `docs/telemetry.md` for the full wiring recipe. Metric catalogue (ADR-0001 §7): `harvest.workflow.started` (counter, `worker.rs`), `harvest.workflow.duration` (histogram, `worker.rs`), `harvest.activity.duration` (histogram, `worker.rs`), `harvest.timer.started` (counter, `worker.rs`), `harvest.queue.depth` (gauge, `worker.rs` sampler), `harvest.dlq.entries` (gauge, `worker.rs` sampler), `harvest.schedule.runs` (counter, `scheduler.rs`), `harvest.schedule.skipped` (counter, `scheduler.rs`), `harvest.retention.deleted` (counter, `retention.rs`). Cardinality rule: `execution.id` is span-only; `MetricsRecorder` API enforces this by construction. |
+| `telemetry.rs` | 4 | OpenTelemetry surface: `TraceContextCarrier`, `TraceContextPropagator`, `MetricsRecorder`, `TelemetryConfig` — no-op by default, opt-in via `HarvestBuilder::telemetry`. Implements all 8 ADR-0001 span kinds (issue #136); see `docs/adr/0001-otel-trace-contract.md` for the full attribute schema and propagation rules. Metric catalogue (ADR-0001 §7): `harvest.workflow.started` (counter, `worker.rs`), `harvest.workflow.duration` (histogram, `worker.rs`), `harvest.activity.duration` (histogram, `worker.rs`), `harvest.timer.started` (counter, `worker.rs`), `harvest.queue.depth` (gauge, `worker.rs` sampler), `harvest.dlq.entries` (gauge, `worker.rs` sampler), `harvest.schedule.runs` (counter, `scheduler.rs`), `harvest.schedule.skipped` (counter, `scheduler.rs`), `harvest.retention.deleted` (counter, `retention.rs`). Cardinality rule: `execution.id` is span-only; `MetricsRecorder` API enforces this by construction. |
 | `metrics_rs_adapter.rs` | 4 | `metrics-rs` feature flag adapter: `MetricsRsRecorder` bridges `MetricsRecorder` → `metrics` crate global registry. See `docs/telemetry.md` for recipe. |
 | `migrations/` | 1 | SQL -- run with `diesel migration run` |
 
@@ -346,9 +347,45 @@ cargo test -p autumn-harvest --test integration_e2e
 # Replay tests
 cargo test -p autumn-harvest --test replay_tests
 
+# Replayer harness tests (WorkflowReplayer — no DB required)
+cargo test -p autumn-harvest --test replayer_tests --features testing --no-default-features
+
+# Replay throughput benchmark (issue #135 budget: 10k events < 200ms)
+cargo bench -p autumn-harvest --features testing --no-default-features --bench replay_bench
+
 # Macro tests
 cargo test -p autumn-harvest-macros
 ```
+
+### Testing workflow code changes with WorkflowReplayer
+
+`autumn_harvest::testing::WorkflowReplayer` (gated by the `testing` feature) lets
+you assert that a `#[workflow]` function is replay-safe against recorded histories
+before deploying a code change.  This catches non-determinism regressions in CI
+rather than via the DLQ in production.
+
+```rust
+// In your test binary (Cargo.toml: autumn-harvest = { features = ["testing"] })
+let report = WorkflowReplayer::new()
+    .register_fn("onboarding", onboarding_handler)
+    .replay_from_json(&std::fs::read_to_string("fixtures/onboarding_history.json").unwrap())
+    .await
+    .expect("fixture must parse");
+
+assert!(
+    matches!(report.status, ReplayStatus::ReplaySucceeded),
+    "replay regression:\n{report}"
+);
+```
+
+The replayer never executes activities or writes to the database — it runs the
+workflow function in pure replay mode and compares commands against the recorded
+history.  A `ReplayReport` with `ReplaySucceeded` means the workflow code can
+safely resume all in-flight executions that produced that history.
+
+Key types: `WorkflowReplayer`, `ReplayReport`, `ReplayStatus`, `NonDeterminismKind`,
+`HistorySnapshot` (the JSON round-trip format).  See `src/testing.rs` and
+`tests/replayer_tests.rs` for examples.
 
 ---
 

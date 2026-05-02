@@ -20,6 +20,7 @@ use crate::models::{NewWorkflowExecution, WorkflowExecution};
 use crate::queue::{self, EnqueueParams, TaskType};
 use crate::schema::harvest_workflow_executions;
 use crate::store;
+use crate::telemetry::TraceContextCarrier;
 use crate::types::{ExecutionId, WorkflowIdReusePolicy};
 
 /// Parameters for starting a workflow execution.
@@ -45,6 +46,10 @@ pub struct StartWorkflowParams<'a> {
     /// How to handle a duplicate `(workflow_name, workflow_id)` collision.
     /// Defaults to [`WorkflowIdReusePolicy::AllowDuplicate`].
     pub reuse_policy: WorkflowIdReusePolicy,
+    /// W3C trace context captured at the call site (e.g., from the HTTP handler's
+    /// `harvest.workflow.schedule` span) and stored on the task row so the worker
+    /// can stitch the trace across the queue boundary (ADR-0001 §3).
+    pub trace_context: Option<TraceContextCarrier>,
 }
 
 impl StartWorkflowParams<'_> {
@@ -195,6 +200,8 @@ pub async fn start_or_load_workflow_execution(
         request.input.clone(),
     );
     enqueue.workflow_exec_id = Some(exec_id.as_uuid());
+    // ADR-0001 §3: store the caller's trace context so the worker can restore it.
+    enqueue.trace_context = request.trace_context.clone();
 
     conn.transaction::<StartedWorkflowExecution, HarvestError, _>(|conn| {
         let row = row;
@@ -433,6 +440,98 @@ pub async fn cancel_workflow_execution(
                 conn,
                 exec_id,
                 &format!("workflow cancelled: {reason}"),
+            )
+            .await?;
+
+            Ok(CancelledWorkflowExecution::newly_cancelled(
+                exec_id,
+                reason,
+                failed_task_count,
+            ))
+        }
+        .scope_boxed()
+    })
+    .await
+}
+
+/// Hard-finalize a workflow execution to `CANCELLED` regardless of its
+/// current state.
+///
+/// `cancel_workflow_execution` is the graceful path: it requires the
+/// execution to be `RUNNING` and (in Phase 4) will run cancellation
+/// handlers before flipping the state. `terminate_workflow_execution` is
+/// the operator escape hatch — it accepts every non-cancelled state
+/// (including `RUNNING`, `FAILED`, `TIMED_OUT`) and forces the row to
+/// `CANCELLED`. Open task rows are still failed so workers don't keep
+/// chewing on a torn-down execution.
+///
+/// Like the cancel path, this emits a [`WorkflowEvent::WorkflowCancelled`]
+/// (no new event variant — the issue's append-only contract is intact),
+/// records the supplied reason on the row, and is idempotent against an
+/// execution that is already `CANCELLED`.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::NotFound`] when the execution does not exist
+/// and [`HarvestError::Database`] for persistence failures. Unlike
+/// `cancel_workflow_execution`, this never returns
+/// [`HarvestError::Config`] for "already terminal" — that's the whole
+/// point of the operator override.
+pub async fn terminate_workflow_execution(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    reason: &str,
+) -> HarvestResult<CancelledWorkflowExecution> {
+    let reason = reason.trim();
+    let reason = if reason.is_empty() {
+        "workflow termination requested".to_string()
+    } else {
+        reason.to_string()
+    };
+
+    conn.transaction::<CancelledWorkflowExecution, HarvestError, _>(|conn| {
+        async move {
+            let execution = harvest_workflow_executions::table
+                .find(exec_id.as_uuid())
+                .select(WorkflowExecution::as_select())
+                .for_update()
+                .first(conn)
+                .await
+                .optional()
+                .map_err(database_error)?
+                .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))?;
+
+            if execution.state == "CANCELLED" {
+                return Ok(CancelledWorkflowExecution::idempotent(exec_id, execution));
+            }
+
+            let history = store::load_history(conn, exec_id).await?;
+            store::append_events(
+                conn,
+                exec_id,
+                &[WorkflowEvent::WorkflowCancelled {
+                    reason: reason.clone(),
+                }],
+                history.next_event_id,
+            )
+            .await?;
+
+            // No state-precondition filter: operator override force-writes.
+            diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
+                .set((
+                    harvest_workflow_executions::state.eq("CANCELLED"),
+                    harvest_workflow_executions::output.eq(None::<serde_json::Value>),
+                    harvest_workflow_executions::error.eq(Some(reason.clone())),
+                    harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+                ))
+                .execute(conn)
+                .await
+                .map_err(database_error)?;
+
+            let failed_task_count = queue::fail_open_tasks_for_execution(
+                conn,
+                exec_id,
+                &format!("workflow terminated: {reason}"),
             )
             .await?;
 

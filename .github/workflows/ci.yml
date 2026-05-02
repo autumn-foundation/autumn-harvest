@@ -60,6 +60,16 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo test -p autumn-harvest-plugin --test api_scheduler_integration -- --test-threads=1
 
+  quickstart:
+    name: Quickstart example builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build quickstart
+        run: cargo build -p quickstart
+
   msrv:
     name: MSRV (1.88.0)
     runs-on: ubuntu-latest

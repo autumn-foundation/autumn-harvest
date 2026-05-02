@@ -72,6 +72,9 @@ pub const METRIC_ACTIVITY_DURATION: &str = "harvest.activity.duration";
 /// Counter: incremented when a durable timer is persisted.
 pub const METRIC_TIMER_STARTED: &str = "harvest.timer.started";
 
+/// Histogram: distribution of scheduled timer durations (seconds).
+pub const METRIC_TIMER_DURATION: &str = "harvest.timer.duration";
+
 /// Gauge: current number of pending (unclaimed) tasks in a queue.
 pub const METRIC_QUEUE_DEPTH: &str = "harvest.queue.depth";
 

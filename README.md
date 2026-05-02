@@ -20,6 +20,16 @@ the same shape with one fewer service to operate.
 
 ## Quick example
 
+Try it end-to-end: `cargo run -p quickstart` (see [`examples/quickstart/`](examples/quickstart/)).
+
+Need a real reference instead of the tiny hello-world path? See:
+
+- [`examples/billing-autumn-web/`](examples/billing-autumn-web/) for a full Autumn web billing
+  integration with app routes, workflow outbox publication, `HarvestPlugin`, saga compensation,
+  child workflows, version gates, signals, timers, deterministic side effects, and scheduled DAGs.
+- [`examples/standalone-runner/`](examples/standalone-runner/) for the out-of-the-box runner path:
+  no Autumn plugin, just `HarvestRunner` plus a manually mounted management API router.
+
 ```rust
 use autumn_harvest::prelude::*;
 
@@ -486,6 +496,161 @@ assert_eq!(exec_id.shard(), shard);
 Adding a shard (new workflows only): provision and migrate the new database,
 add it to `readable_shards`, restart the plugin, then flip it into
 `writable_shards`. In-flight workflows drain on their original shard.
+
+## Testing workflow code changes with the replayer
+
+Before deploying any edit to a `#[workflow]` function, verify it is
+replay-safe against recorded production histories using `WorkflowReplayer`
+(available when the `testing` feature is enabled).
+
+### CI pattern
+
+```toml
+# Cargo.toml — in your app's dev-dependencies
+autumn-harvest = { version = "0.2", features = ["testing"] }
+```
+
+```rust
+// tests/replay_regression.rs
+use autumn_harvest::testing::{HistorySnapshot, ReplayStatus, WorkflowReplayer};
+
+#[tokio::test]
+async fn onboarding_is_replay_safe() {
+    // Load a fixture exported from production or a previous run.
+    let json = std::fs::read_to_string("fixtures/onboarding_history.json").unwrap();
+
+    let report = WorkflowReplayer::new()
+        .register_fn("onboarding", onboarding_handler)  // your #[workflow] fn
+        .replay_from_json(&json)
+        .await
+        .expect("fixture must parse");
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "replay regression:\n{report}"
+    );
+}
+```
+
+### Exporting a history fixture
+
+Serialise a `HistorySnapshot` to JSON and check it in as a test fixture:
+
+```rust
+use autumn_harvest::testing::HistorySnapshot;
+
+let snapshot = HistorySnapshot {
+    workflow_name: "onboarding".to_string(),
+    execution_id: exec_id,
+    events,  // Vec<WorkflowEvent> loaded from harvest_events
+};
+let json = serde_json::to_string_pretty(&snapshot).unwrap();
+std::fs::write("fixtures/onboarding_history.json", json).unwrap();
+```
+
+### CLI validator
+
+```sh
+cargo run --bin harvest-replay -- \
+  --workflow onboarding \
+  --history-source json \
+  --json-path ./fixtures/onboarding_history.json
+```
+
+Exit code 0 = `ReplaySucceeded`. Exit code 1 = non-determinism or workflow
+failure. Extend `harvest-replay/src/bin/harvest_replay.rs` with your own
+workflow handlers so the binary can replay against live code.
+
+### What the replayer detects
+
+| Kind | Trigger |
+|---|---|
+| `ActivityScheduleMismatch` | Activity name changed or order swapped |
+| `LocalActivityScheduleMismatch` | Local activity name changed |
+| `TimerMismatch` | Timer inserted / removed / reordered |
+| `SignalMismatch` | Signal wait inserted where history has a non-signal event |
+| `ChildWorkflowMismatch` | Child workflow name or input changed |
+| `SideEffectMismatch` | `ctx.side_effect` ID changed |
+| `ContinueAsNewMismatch` | `continue_as_new` input changed |
+
+Changes that are safe without a `ctx.version()` fence: none of the above.
+Use `ctx.version("change_id", 1, 2)` and guard the new code path behind the
+returned version number; old histories replay with version 1 and skip the new
+path.
+
+## Telemetry
+
+Harvest emits [OpenTelemetry](https://opentelemetry.io/)-compatible spans via the [`tracing`](https://docs.rs/tracing) crate. Eight named spans cover every durable boundary:
+
+| Span | Kind | When |
+|---|---|---|
+| `harvest.workflow.execute` | INTERNAL | Every workflow executor cycle (live and replay) |
+| `harvest.workflow.schedule` | PRODUCER | HTTP `POST /workflows/{name}/start` |
+| `harvest.activity.execute` | INTERNAL | Activity handler dispatch |
+| `harvest.activity.schedule` | PRODUCER | Activity enqueued to task queue |
+| `harvest.signal.send` | PRODUCER | `send_signal` call |
+| `harvest.signal.deliver` | CONSUMER | Signal ingested into workflow history |
+| `harvest.timer.fire` | INTERNAL | Durable timer fires |
+| `harvest.child_workflow.start` | PRODUCER | Child workflow enqueued |
+
+Replay cycles emit `harvest.workflow.execute` as a **new root span** (`harvest.replay = true`) linked to the original via `link.traceparent` so APM backends can navigate between them.
+
+### Wiring harvest spans into your OTel pipeline
+
+Install [`tracing-opentelemetry`](https://docs.rs/tracing-opentelemetry) alongside your existing OTel SDK and implement `TraceContextPropagator`:
+
+```rust
+use autumn_harvest::{TelemetryConfig, TraceContextCarrier, TraceContextPropagator};
+use opentelemetry::Context;
+use opentelemetry_sdk::propagation::TraceContextPropagator as OtelPropagator;
+use std::any::Any;
+use std::sync::Arc;
+
+struct OtelBridge;
+
+impl TraceContextPropagator for OtelBridge {
+    fn capture(&self) -> Option<TraceContextCarrier> {
+        // Extract the active span context into a W3C traceparent.
+        let cx = Context::current();
+        let span = cx.span();
+        let ctx = span.span_context();
+        if !ctx.is_valid() {
+            return None;
+        }
+        let traceparent = format!(
+            "00-{}-{}-{:02x}",
+            ctx.trace_id(),
+            ctx.span_id(),
+            ctx.trace_flags().to_u8(),
+        );
+        Some(TraceContextCarrier::from_traceparent(traceparent))
+    }
+
+    fn install(&self, carrier: &TraceContextCarrier) -> Box<dyn Any + Send> {
+        // Restore the producer's span context as the OTel active context.
+        if let Some(tp) = carrier.traceparent.as_deref() {
+            let mut map = std::collections::HashMap::new();
+            map.insert("traceparent".to_string(), tp.to_string());
+            let cx = OtelPropagator::new().extract(&map);
+            let guard = cx.attach();
+            Box::new(guard)
+        } else {
+            Box::new(())
+        }
+    }
+}
+
+// Wire into HarvestBuilder:
+HarvestBuilder::new()
+    .telemetry(
+        TelemetryConfig::builder()
+            .propagator(Arc::new(OtelBridge))
+            .build(),
+    )
+    // ...
+```
+
+With no `telemetry(...)` call (the default), all `info_span!` sites compile to branch-on-atomic no-ops — zero allocation, no subscriber lock taken.
 
 ## License
 

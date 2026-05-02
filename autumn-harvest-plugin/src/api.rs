@@ -20,6 +20,10 @@ use diesel_async::RunQueryDsl;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use autumn_harvest::batch::{
+    self, BatchAction, BatchExecutorConfig, BatchFilter, BatchJobStatus, BatchJobView,
+    BatchSubmission,
+};
 use autumn_harvest::context::WorkflowContext;
 use autumn_harvest::dlq;
 use autumn_harvest::error::{HarvestError, HarvestResult, database_error};
@@ -35,6 +39,7 @@ use autumn_harvest::schema::{harvest_dag_runs, harvest_schedules, harvest_workfl
 use autumn_harvest::shard::ShardRouter;
 use autumn_harvest::signal;
 use autumn_harvest::store;
+use autumn_harvest::telemetry::{ATTR_EXECUTION_ID, ATTR_QUEUE, ATTR_SHARD_ID, ATTR_WORKFLOW_ID};
 use autumn_harvest::types::{ExecutionId, ExternalActivityToken, ShardId, WorkflowIdReusePolicy};
 use autumn_harvest::worker::{DbPool, HandlerRegistry};
 use autumn_harvest::workers::{
@@ -458,7 +463,174 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .route("/workers/health", get(workers_health))
         .route("/workers", get(list_workers_handler))
         .route("/workers/{worker_id}", get(get_worker_handler))
+        // Batch operations (issue #102): operator-facing fleet-wide cancel /
+        // terminate / signal so an incident commander does not have to script
+        // a one-off loop over GET /workflows.
+        .route("/batch-operations", get(list_batch_operations))
+        .route("/batch-operations", post(submit_batch_operation))
+        .route("/batch-operations/{id}", get(get_batch_operation))
         .layer(Extension(api_state))
+}
+
+#[derive(Debug, Deserialize)]
+struct SubmitBatchOperationRequest {
+    /// `Cancel`, `Terminate`, or `Signal`.
+    action: String,
+    /// Mirrors the `GET /workflows` filter contract.
+    #[serde(default)]
+    filter: BatchFilter,
+    /// Required when `action == "Signal"`.
+    #[serde(default)]
+    signal_name: Option<String>,
+    /// Optional payload sent to each matched workflow when `action == "Signal"`.
+    #[serde(default)]
+    signal_payload: Option<Value>,
+    /// Operator-supplied retry token. Re-submitting with the same key returns
+    /// the existing `batch_job_id` instead of starting a duplicate batch.
+    #[serde(default)]
+    idempotency_key: Option<String>,
+    /// Optional caller identity (e.g. the on-call handle) for audit.
+    #[serde(default)]
+    created_by: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SubmitBatchOperationResponse {
+    batch_job_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListBatchOperationsQuery {
+    status: Option<String>,
+    action: Option<String>,
+    limit: Option<i64>,
+}
+
+async fn submit_batch_operation(
+    Extension(api_state): Extension<HarvestApiState>,
+    Json(request): Json<SubmitBatchOperationRequest>,
+) -> Result<(axum::http::StatusCode, Json<SubmitBatchOperationResponse>), AutumnError> {
+    let action: BatchAction = request
+        .action
+        .parse()
+        .map_err(AutumnError::bad_request_msg)?;
+
+    // Reject `state=` values outside the canonical list before we hit the DB
+    // — otherwise the executor would silently match nothing and look like a
+    // success.
+    for state in &request.filter.states {
+        if !KNOWN_WORKFLOW_STATES.contains(&state.as_str()) {
+            return Err(AutumnError::bad_request_msg(format!(
+                "unknown workflow state '{state}' in batch filter"
+            )));
+        }
+    }
+
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    // Persist the row on the default shard. The executor will fan out across
+    // every configured shard at run time via iter_shards().
+    let mut conn = acquire_conn(pool.default_pool()).await?;
+    let job_id = batch::submit_batch_job(
+        &mut conn,
+        BatchSubmission {
+            action,
+            filter: request.filter,
+            signal_name: request.signal_name,
+            signal_payload: request.signal_payload,
+            idempotency_key: request.idempotency_key,
+            created_by: request.created_by,
+        },
+    )
+    .await
+    .map_err(map_error)?;
+
+    Ok((
+        axum::http::StatusCode::ACCEPTED,
+        Json(SubmitBatchOperationResponse {
+            batch_job_id: job_id.to_string(),
+        }),
+    ))
+}
+
+async fn get_batch_operation(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<BatchJobView>, AutumnError> {
+    let job_id = parse_uuid(&id, "batch job id")?;
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    let mut conn = acquire_conn(pool.default_pool()).await?;
+    let row = batch::get_batch_job(&mut conn, job_id)
+        .await
+        .map_err(map_error)?
+        .ok_or_else(|| AutumnError::not_found_msg(format!("batch job {id}")))?;
+    Ok(Json(BatchJobView::from_row(row)))
+}
+
+async fn list_batch_operations(
+    Extension(api_state): Extension<HarvestApiState>,
+    Query(query): Query<ListBatchOperationsQuery>,
+) -> Result<Json<Vec<BatchJobView>>, AutumnError> {
+    let status = query
+        .status
+        .as_deref()
+        .map(BatchJobStatus::from_str_or_err)
+        .transpose()?;
+    let action = query
+        .action
+        .as_deref()
+        .map(BatchAction::from_str_or_err)
+        .transpose()?;
+    let limit = query.limit.unwrap_or(50);
+
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    let mut conn = acquire_conn(pool.default_pool()).await?;
+    let rows = batch::list_batch_jobs(
+        &mut conn,
+        &batch::ListFilters {
+            status,
+            action,
+            limit,
+        },
+    )
+    .await
+    .map_err(map_error)?;
+    Ok(Json(rows.into_iter().map(BatchJobView::from_row).collect()))
+}
+
+trait ParseFromStrOrErr: Sized {
+    fn from_str_or_err(s: &str) -> Result<Self, AutumnError>;
+}
+
+impl ParseFromStrOrErr for BatchJobStatus {
+    fn from_str_or_err(s: &str) -> Result<Self, AutumnError> {
+        s.parse::<Self>().map_err(AutumnError::bad_request_msg)
+    }
+}
+
+impl ParseFromStrOrErr for BatchAction {
+    fn from_str_or_err(s: &str) -> Result<Self, AutumnError> {
+        s.parse::<Self>().map_err(AutumnError::bad_request_msg)
+    }
+}
+
+/// Run one tick of the batch executor across every configured shard.
+///
+/// Exposed for the plugin's lifecycle wiring; tests construct a
+/// [`HarvestDbPool`] and call into `autumn_harvest::batch::run_executor_once`
+/// directly with the underlying [`autumn_harvest::shard::ShardedDbPool`].
+///
+/// # Errors
+///
+/// Returns [`AutumnError`] when the executor cannot reach a shard or a
+/// per-shard SQL operation fails. Per-target failures are recorded on the
+/// job row and do not propagate as errors.
+pub async fn run_batch_executor_once(
+    pool: &HarvestDbPool,
+    config: &BatchExecutorConfig,
+) -> Result<(), AutumnError> {
+    batch::run_executor_once(pool.sharded_pool(), config)
+        .await
+        .map_err(map_error)
 }
 
 async fn list_workflows(
@@ -603,6 +775,19 @@ async fn start_workflow(
         Err(e) => return e.into_response(),
     };
 
+    // ADR-0001 §2.3: harvest.workflow.schedule — PRODUCER, parent = active HTTP span.
+    // Emitted synchronously before the DB await so EnteredSpan (!Send) is dropped
+    // before the async boundary.
+    let trace_ctx = tracing::info_span!(
+        "harvest.workflow.schedule",
+        "otel.kind" = "producer",
+        { ATTR_WORKFLOW_ID } = %workflow_name,
+        { ATTR_EXECUTION_ID } = %exec_id,
+        { ATTR_SHARD_ID } = i64::from(shard.as_i32()),
+        { ATTR_QUEUE } = %queue_name,
+    )
+    .in_scope(|| runtime.registry.telemetry().capture_trace_context());
+
     let result = start_or_load_workflow_execution(
         &mut conn,
         StartWorkflowParams {
@@ -618,6 +803,7 @@ async fn start_workflow(
             memo: request.memo.clone(),
             search_attrs: request.search_attrs.clone(),
             reuse_policy,
+            trace_context: trace_ctx,
         },
     )
     .await;

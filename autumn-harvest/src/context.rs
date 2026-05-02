@@ -313,6 +313,10 @@ pub struct WorkflowContext {
     /// yields [`HarvestError::Cancelled`]. Cooperative: the workflow function is
     /// expected to consult these at strategic points to run cleanup logic.
     cancellation_reason: Option<String>,
+    /// When `true`, activity and local-activity dispatch compares the input
+    /// payload against what was recorded in history, in addition to the name.
+    /// Set by the `WorkflowReplayer` to detect non-deterministic input changes.
+    strict_replay: bool,
 }
 
 impl WorkflowContext {
@@ -383,7 +387,49 @@ impl WorkflowContext {
             state,
             query_registry: Mutex::new(QueryRegistry::new()),
             cancellation_reason,
+            strict_replay: false,
         }
+    }
+
+    /// Create a strict replay context that also verifies activity input payloads.
+    ///
+    /// Identical to [`for_replay`](Self::for_replay) except that
+    /// `execute_activity_raw` and `execute_local_activity_raw` additionally
+    /// compare the input value against the recorded `ActivityScheduled` event,
+    /// returning [`HarvestError::NonDeterministic`] on any mismatch.
+    ///
+    /// Used by [`WorkflowReplayer`](crate::testing::WorkflowReplayer) to catch
+    /// non-deterministic changes to activity inputs before deployment.
+    #[must_use]
+    pub fn for_replay_strict(exec_id: ExecutionId, events: Vec<WorkflowEvent>) -> Self {
+        let mut ctx = Self::for_replay(exec_id, events);
+        ctx.strict_replay = true;
+        ctx
+    }
+
+    /// Like [`for_replay_strict`](Self::for_replay_strict) but injects shared
+    /// application state, required when the workflow calls `ctx.state::<T>()`.
+    #[must_use]
+    pub fn for_replay_strict_with_state(
+        exec_id: ExecutionId,
+        events: Vec<WorkflowEvent>,
+        state: SharedState,
+    ) -> Self {
+        let mut ctx = Self::for_replay_with_state(exec_id, events, state);
+        ctx.strict_replay = true;
+        ctx
+    }
+
+    /// Returns `true` if there are unconsumed recorded history events that are
+    /// not terminal lifecycle events (`WorkflowCompleted`, `WorkflowFailed`,
+    /// `WorkflowCancelled`).
+    ///
+    /// Used by `run_workflow_strict` to detect early-completion non-determinism.
+    /// Terminal lifecycle events are excluded because they are appended by the
+    /// executor after the workflow returns and are never consumed by workflow
+    /// commands.
+    pub fn history_has_unconsumed_events(&self) -> bool {
+        self.match_history(|m| m.has_non_lifecycle_unconsumed())
     }
 
     /// Test constructor -- creates a context in live (non-replay) mode with
@@ -402,6 +448,7 @@ impl WorkflowContext {
             state: empty_shared_state(),
             query_registry: Mutex::new(QueryRegistry::new()),
             cancellation_reason: None,
+            strict_replay: false,
         }
     }
 
@@ -618,11 +665,19 @@ impl WorkflowContext {
 
             HistoryMatch::Failed { .. }
             | HistoryMatch::TimedOut { .. }
-            | HistoryMatch::AwaitingExternalCompletion { .. } => {
+            | HistoryMatch::AwaitingExternalCompletion { .. }
+            | HistoryMatch::ChildInProgress { .. } => {
                 unreachable!("match_side_effect only returns Matched, Diverged or NoMatch")
             }
 
             HistoryMatch::NoMatch => {
+                if self.strict_replay {
+                    return Err(HarvestError::NonDeterministic(format!(
+                        "early completion mismatch: expected <end of history>, \
+                         got SideEffectRecorded({id})"
+                    )));
+                }
+
                 let result = f();
                 let output = serde_json::to_value(&result)?;
 
@@ -679,6 +734,10 @@ impl WorkflowContext {
     ///
     /// Panics if the internal matcher or commands mutex is poisoned.
     pub fn version(&self, change_id: &str, min: u32, max: u32) -> u32 {
+        assert!(
+            min <= max,
+            "version gate '{change_id}': min version {min} must not exceed max version {max}"
+        );
         let version = self.match_history(|m| m.match_version(change_id, min, max));
 
         // During live execution (matcher returned max_version and is past
@@ -718,7 +777,11 @@ impl WorkflowContext {
         queue: &str,
     ) -> HarvestResult<Value> {
         // Step 1: Match against history (lock is dropped before any .await).
-        let history_match = self.match_history(|m| m.match_activity(name));
+        let history_match = if self.strict_replay {
+            self.match_history(|m| m.match_activity_strict(name, &input))
+        } else {
+            self.match_history(|m| m.match_activity(name))
+        };
 
         match history_match {
             HistoryMatch::Matched { output } => Ok(output),
@@ -738,11 +801,23 @@ impl WorkflowContext {
                 format!("activity mismatch: expected {expected}, got {actual}"),
             )),
 
-            HistoryMatch::AwaitingExternalCompletion { .. } => {
-                unreachable!("match_activity never returns AwaitingExternalCompletion")
+            HistoryMatch::AwaitingExternalCompletion { .. }
+            | HistoryMatch::ChildInProgress { .. } => {
+                unreachable!(
+                    "match_activity never returns AwaitingExternalCompletion or ChildInProgress"
+                )
             }
 
             HistoryMatch::NoMatch => {
+                // Strict replay: a command with no matching history entry means
+                // the new code issues a command the recorded history never saw.
+                if self.strict_replay {
+                    return Err(HarvestError::NonDeterministic(format!(
+                        "early completion mismatch: expected <end of history>, \
+                         got ActivityScheduled({name})"
+                    )));
+                }
+
                 // Live execution: emit a ScheduleActivity command and suspend
                 // until the worker sends the result through the oneshot channel.
                 let activity_id = self.next_activity_id();
@@ -804,7 +879,11 @@ impl WorkflowContext {
         retry_policy: Option<crate::policy::RetryPolicy>,
         start_to_close_secs: Option<u64>,
     ) -> HarvestResult<Value> {
-        let history_match = self.match_history(|m| m.match_local_activity(name));
+        let history_match = if self.strict_replay {
+            self.match_history(|m| m.match_local_activity_strict(name, &input))
+        } else {
+            self.match_history(|m| m.match_local_activity(name))
+        };
 
         match history_match {
             HistoryMatch::Matched { output } => Ok(output),
@@ -824,11 +903,21 @@ impl WorkflowContext {
                 format!("local activity mismatch: expected {expected}, got {actual}"),
             )),
 
-            HistoryMatch::AwaitingExternalCompletion { .. } => {
-                unreachable!("match_local_activity never returns AwaitingExternalCompletion")
+            HistoryMatch::AwaitingExternalCompletion { .. }
+            | HistoryMatch::ChildInProgress { .. } => {
+                unreachable!(
+                    "match_local_activity never returns AwaitingExternalCompletion or ChildInProgress"
+                )
             }
 
             HistoryMatch::NoMatch => {
+                if self.strict_replay {
+                    return Err(HarvestError::NonDeterministic(format!(
+                        "early completion mismatch: expected <end of history>, \
+                         got LocalActivityScheduled({name})"
+                    )));
+                }
+
                 let activity_id = self.next_activity_id();
                 let (tx, rx) = oneshot::channel();
 
@@ -884,11 +973,19 @@ impl WorkflowContext {
 
             HistoryMatch::Failed { .. }
             | HistoryMatch::TimedOut { .. }
-            | HistoryMatch::AwaitingExternalCompletion { .. } => {
+            | HistoryMatch::AwaitingExternalCompletion { .. }
+            | HistoryMatch::ChildInProgress { .. } => {
                 unreachable!("timers do not fail or time out in history matching")
             }
 
             HistoryMatch::NoMatch => {
+                if self.strict_replay {
+                    return Err(HarvestError::NonDeterministic(format!(
+                        "early completion mismatch: expected <end of history>, \
+                         got TimerStarted({timer_id})"
+                    )));
+                }
+
                 let (tx, rx) = oneshot::channel();
                 self.push_command(WorkflowCommand::StartTimer {
                     timer_id: TimerId::new(timer_id),
@@ -941,7 +1038,49 @@ impl WorkflowContext {
             HistoryMatch::Diverged { expected, actual } => Err(HarvestError::NonDeterministic(
                 format!("child workflow mismatch: expected {expected}, got {actual}"),
             )),
+            // The child was already started (its ChildWorkflowStarted event is in
+            // history) but its terminal hasn't arrived yet.  This is the normal
+            // state when the parent wakes because one of several parallel children
+            // completed while this child is still running.
+            //
+            // In strict-replay mode (WorkflowReplayer) an incomplete history is
+            // treated as a non-determinism error — callers always provide complete
+            // histories.  In the worker's non-strict replay mode we re-emit the
+            // command carrying the *existing* child_id so the worker can re-park
+            // the parent without creating a duplicate child execution.
+            HistoryMatch::ChildInProgress { child_id } => {
+                if self.strict_replay {
+                    return Err(HarvestError::NonDeterministic(format!(
+                        "child workflow '{workflow_name}' started but terminal not in history"
+                    )));
+                }
+                let (tx, rx) = oneshot::channel();
+                self.push_command(WorkflowCommand::StartChildWorkflow {
+                    child_id,
+                    workflow_name: workflow_name.to_string(),
+                    input,
+                    result_tx: tx,
+                });
+                match rx.await {
+                    Ok(Ok(output)) => Ok(output),
+                    Ok(Err(error)) => Err(HarvestError::ActivityFailed {
+                        name: format!("child-workflow:{workflow_name}"),
+                        attempt: 1,
+                        source: error.into(),
+                    }),
+                    Err(_) => Err(HarvestError::Cancelled(format!(
+                        "child workflow '{workflow_name}' cancelled: result channel dropped"
+                    ))),
+                }
+            }
             HistoryMatch::NoMatch => {
+                if self.strict_replay {
+                    return Err(HarvestError::NonDeterministic(format!(
+                        "early completion mismatch: expected <end of history>, \
+                         got ChildWorkflowStarted({workflow_name})"
+                    )));
+                }
+
                 let (tx, rx) = oneshot::channel();
                 self.push_command(WorkflowCommand::StartChildWorkflow {
                     child_id: ExecutionId::new(),
@@ -986,10 +1125,18 @@ impl WorkflowContext {
             )),
             HistoryMatch::Failed { .. }
             | HistoryMatch::TimedOut { .. }
-            | HistoryMatch::AwaitingExternalCompletion { .. } => Err(
-                HarvestError::NonDeterministic("signal history contains unexpected failure".into()),
-            ),
+            | HistoryMatch::AwaitingExternalCompletion { .. }
+            | HistoryMatch::ChildInProgress { .. } => Err(HarvestError::NonDeterministic(
+                "signal history contains unexpected failure".into(),
+            )),
             HistoryMatch::NoMatch => {
+                if self.strict_replay {
+                    return Err(HarvestError::NonDeterministic(format!(
+                        "early completion mismatch: expected <end of history>, \
+                         got WaitForSignal({signal_name})"
+                    )));
+                }
+
                 let (tx, rx) = oneshot::channel();
                 self.push_command(WorkflowCommand::WaitForSignal {
                     signal_name: signal_name.to_string(),
@@ -1086,6 +1233,13 @@ impl WorkflowContext {
             }
 
             HistoryMatch::NoMatch => {
+                if self.strict_replay {
+                    return Err(HarvestError::NonDeterministic(format!(
+                        "early completion mismatch: expected <end of history>, \
+                         got ExternalActivityScheduled({name})"
+                    )));
+                }
+
                 // First time — generate a fresh token and schedule.
                 let activity_id = self.next_activity_id();
                 let token = ExternalActivityToken::new();
@@ -1110,6 +1264,10 @@ impl WorkflowContext {
                         "external activity '{name}' cancelled: result channel dropped"
                     ))),
                 }
+            }
+
+            HistoryMatch::ChildInProgress { .. } => {
+                unreachable!("match_external_activity never returns ChildInProgress")
             }
         }
     }
@@ -1157,12 +1315,18 @@ impl WorkflowContext {
             )),
             HistoryMatch::Failed { .. }
             | HistoryMatch::TimedOut { .. }
-            | HistoryMatch::AwaitingExternalCompletion { .. } => {
-                Err(HarvestError::NonDeterministic(
-                    "continue_as_new history contains unexpected terminal state".into(),
-                ))
-            }
+            | HistoryMatch::AwaitingExternalCompletion { .. }
+            | HistoryMatch::ChildInProgress { .. } => Err(HarvestError::NonDeterministic(
+                "continue_as_new history contains unexpected terminal state".into(),
+            )),
             HistoryMatch::NoMatch => {
+                if self.strict_replay {
+                    return Err(HarvestError::NonDeterministic(
+                        "early completion mismatch: expected <end of history>, \
+                         got ContinueAsNew"
+                            .to_string(),
+                    ));
+                }
                 self.push_command(WorkflowCommand::ContinueAsNew { input });
                 park_until_dropped().await
             }
@@ -1934,6 +2098,16 @@ mod tests {
         }
     }
 
+    // ── Red-phase versioning tests ────────────────────────────────────────
+
+    /// min > max is a programmer error — must panic immediately with a clear message.
+    #[test]
+    #[should_panic(expected = "min version 5 must not exceed max version 2")]
+    fn version_panics_when_min_exceeds_max() {
+        let ctx = WorkflowContext::new_test();
+        ctx.version("my_gate", 5, 2);
+    }
+
     #[test]
     fn context_version_emits_marker_during_live_execution() {
         let ctx = WorkflowContext::new_test();
@@ -2348,8 +2522,12 @@ mod tests {
         );
     }
 
+    /// When a child's `ChildWorkflowStarted` event is in history but its terminal
+    /// hasn't arrived yet, the context must re-emit a `StartChildWorkflow` command
+    /// carrying the **existing** `child_id` (not a fresh one) so the worker can
+    /// re-park the parent idempotently.
     #[tokio::test]
-    async fn context_child_without_terminal_does_not_emit_live_start() {
+    async fn context_child_in_progress_re_emits_with_existing_child_id() {
         let child_id = ExecutionId::new();
         let events = vec![
             WorkflowEvent::WorkflowStarted {
@@ -2363,16 +2541,41 @@ mod tests {
             },
         ];
 
-        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
-        let result = ctx
-            .spawn_child_workflow_raw("process_order", serde_json::json!({"sku":"book"}))
-            .await;
+        let ctx = Arc::new(WorkflowContext::for_replay(ExecutionId::new(), events));
+        let ctx_task = Arc::clone(&ctx);
+        let join = tokio::spawn(async move {
+            ctx_task
+                .spawn_child_workflow_raw("process_order", serde_json::json!({"sku":"book"}))
+                .await
+        });
+        tokio::task::yield_now().await;
 
-        assert!(matches!(result, Err(HarvestError::NonDeterministic(_))));
-        assert!(
-            ctx.drain_commands().is_empty(),
-            "replay must not emit new child start command"
+        let mut commands = ctx.drain_commands();
+        assert_eq!(
+            commands.len(),
+            1,
+            "in-progress child must re-emit exactly one StartChildWorkflow command"
         );
+        let WorkflowCommand::StartChildWorkflow {
+            child_id: reused_id,
+            workflow_name,
+            result_tx,
+            ..
+        } = commands.remove(0)
+        else {
+            panic!("expected StartChildWorkflow command");
+        };
+        assert_eq!(workflow_name, "process_order");
+        assert_eq!(
+            reused_id, child_id,
+            "re-emitted command must carry the existing child_id, not a new one"
+        );
+
+        result_tx
+            .send(Ok(serde_json::json!({"done": true})))
+            .expect("receiver must be alive");
+        let result = join.await.expect("join").expect("should succeed");
+        assert_eq!(result, serde_json::json!({"done": true}));
     }
 
     #[tokio::test]
@@ -2744,5 +2947,158 @@ mod tests {
             .execute_local_activity_raw("format_data", Value::Null, None, None)
             .await;
         assert!(matches!(result, Err(HarvestError::NonDeterministic(_))));
+    }
+
+    // ── Parallel child workflow tests ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn context_live_parallel_children_emit_two_start_commands() {
+        // Verify that two concurrent spawn_child_workflow_raw calls both push
+        // StartChildWorkflow commands and that the workflow context collects them.
+        let ctx = Arc::new(WorkflowContext::new_test());
+        let ctx_a = Arc::clone(&ctx);
+        let ctx_b = Arc::clone(&ctx);
+
+        // Spawn both children concurrently; the executor will collect both commands.
+        let join_a = tokio::spawn(async move {
+            ctx_a
+                .spawn_child_workflow_raw("child_a", serde_json::json!({"id":"A"}))
+                .await
+        });
+        let join_b = tokio::spawn(async move {
+            ctx_b
+                .spawn_child_workflow_raw("child_b", serde_json::json!({"id":"B"}))
+                .await
+        });
+
+        tokio::task::yield_now().await;
+
+        let mut commands = ctx.drain_commands();
+        assert_eq!(
+            commands.len(),
+            2,
+            "both children should have queued commands"
+        );
+        commands.sort_by_key(|c| match c {
+            WorkflowCommand::StartChildWorkflow { workflow_name, .. } => workflow_name.clone(),
+            _ => String::new(),
+        });
+
+        let WorkflowCommand::StartChildWorkflow {
+            workflow_name: name_a,
+            result_tx: tx_a,
+            ..
+        } = commands.remove(0)
+        else {
+            panic!("expected StartChildWorkflow for child_a");
+        };
+        let WorkflowCommand::StartChildWorkflow {
+            workflow_name: name_b,
+            result_tx: tx_b,
+            ..
+        } = commands.remove(0)
+        else {
+            panic!("expected StartChildWorkflow for child_b");
+        };
+
+        assert_eq!(name_a, "child_a");
+        assert_eq!(name_b, "child_b");
+
+        tx_a.send(Ok(serde_json::json!({"a":"done"}))).unwrap();
+        tx_b.send(Ok(serde_json::json!({"b":"done"}))).unwrap();
+
+        join_a.await.expect("join_a").expect("a should succeed");
+        join_b.await.expect("join_b").expect("b should succeed");
+    }
+
+    /// RED: parent wakes after child A completes but child B is still pending.
+    ///
+    /// With partial history [Started, ChildStarted(A), ChildStarted(B), ChildCompleted(A)],
+    /// replaying `spawn_child_workflow_raw("b")` should NOT return `NonDeterministic`.
+    /// Instead it should re-emit a `StartChildWorkflow` command carrying B's existing
+    /// `child_id` so the worker can re-park the parent without creating a duplicate child.
+    #[tokio::test]
+    async fn context_partial_history_parallel_children_re_parks_pending_child() {
+        let child_a = ExecutionId::new();
+        let child_b = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id: child_a,
+                workflow_name: "child_a".into(),
+                input: serde_json::json!({"id":"A"}),
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id: child_b,
+                workflow_name: "child_b".into(),
+                input: serde_json::json!({"id":"B"}),
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id: child_a,
+                output: serde_json::json!({"a":"done"}),
+            },
+            // No terminal for child_b yet — parent woke early.
+        ];
+
+        let ctx = Arc::new(WorkflowContext::for_replay(ExecutionId::new(), events));
+        let ctx_replay = Arc::clone(&ctx);
+
+        let handle = tokio::spawn(async move {
+            // child_a should replay from history immediately.
+            let a = ctx_replay
+                .spawn_child_workflow_raw("child_a", serde_json::json!({"id":"A"}))
+                .await
+                .expect("child_a should replay from completed history");
+
+            // child_b is still in-progress; the context should re-emit a
+            // StartChildWorkflow command (not return NonDeterministic).
+            ctx_replay
+                .spawn_child_workflow_raw("child_b", serde_json::json!({"id":"B"}))
+                .await
+                .map(|b| (a, b))
+        });
+
+        tokio::task::yield_now().await;
+
+        let commands = ctx.drain_commands();
+        assert_eq!(
+            commands.len(),
+            1,
+            "exactly one re-park command for the pending child"
+        );
+
+        let WorkflowCommand::StartChildWorkflow {
+            child_id: reused_id,
+            workflow_name,
+            result_tx,
+            ..
+        } = commands.into_iter().next().unwrap()
+        else {
+            panic!("expected StartChildWorkflow re-park command");
+        };
+
+        assert_eq!(workflow_name, "child_b");
+        // The re-emitted command MUST reuse the existing child_id from history,
+        // not generate a new one — the worker uses this to detect the child
+        // already exists and avoids creating a duplicate execution.
+        assert_eq!(
+            reused_id, child_b,
+            "re-park command must carry the child_id already recorded in history"
+        );
+
+        // Drive the result to unblock the spawned task.
+        result_tx
+            .send(Ok(serde_json::json!({"b":"done"})))
+            .expect("receiver must still be alive");
+
+        let (a, b) = handle
+            .await
+            .expect("task join")
+            .expect("both should succeed");
+        assert_eq!(a, serde_json::json!({"a":"done"}));
+        assert_eq!(b, serde_json::json!({"b":"done"}));
     }
 }

@@ -10,9 +10,9 @@ use diesel::prelude::*;
 use uuid::Uuid;
 
 use crate::schema::{
-    harvest_dag_runs, harvest_dead_letters, harvest_events, harvest_external_tasks,
-    harvest_schedules, harvest_signals, harvest_task_queue, harvest_timers, harvest_workers,
-    harvest_workflow_executions,
+    harvest_batch_jobs, harvest_dag_runs, harvest_dead_letters, harvest_events,
+    harvest_external_tasks, harvest_schedules, harvest_signals, harvest_task_queue, harvest_timers,
+    harvest_workers, harvest_workflow_executions,
 };
 
 // ── WorkflowExecution ─────────────────────────────────────────────────────────
@@ -400,4 +400,46 @@ pub struct NewHarvestWorker<'a> {
     pub max_concurrency: i32,
     pub host: &'a str,
     pub version: Option<&'a str>,
+}
+
+// ── BatchJob ──────────────────────────────────────────────────────────────────
+
+/// A submitted batch operation row from `harvest_batch_jobs` (issue #102).
+#[derive(
+    Debug, Clone, Queryable, Selectable, Identifiable, serde::Serialize, serde::Deserialize,
+)]
+#[diesel(table_name = harvest_batch_jobs)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct BatchJob {
+    pub id: Uuid,
+    pub action: String,
+    pub filter: serde_json::Value,
+    pub signal_name: Option<String>,
+    pub signal_payload: Option<serde_json::Value>,
+    pub status: String,
+    pub total: i64,
+    pub completed: i64,
+    pub failed: i64,
+    pub errors: serde_json::Value,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub idempotency_key: Option<String>,
+    pub created_by: Option<String>,
+    pub processed_ids: serde_json::Value,
+}
+
+/// Insert struct for submitting a new batch job.
+#[derive(Debug, Insertable)]
+#[diesel(table_name = harvest_batch_jobs)]
+pub struct NewBatchJob<'a> {
+    pub id: Uuid,
+    pub action: &'a str,
+    pub filter: serde_json::Value,
+    pub signal_name: Option<&'a str>,
+    pub signal_payload: Option<serde_json::Value>,
+    pub status: &'a str,
+    pub idempotency_key: Option<&'a str>,
+    pub created_by: Option<&'a str>,
 }

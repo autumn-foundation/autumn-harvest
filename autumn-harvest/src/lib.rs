@@ -16,9 +16,12 @@ pub const MIGRATIONS: diesel_migrations::EmbeddedMigrations =
 
 /// History analyzer and linter.
 pub mod analyzer;
+/// Batch operations for fleet-wide workflow cancel/terminate/signal (issue #102).
+pub mod batch;
 pub mod builder;
 pub mod cache;
 pub mod context;
+pub mod critical_path;
 pub mod dag;
 /// Export format types for Directed Acyclic Graphs (DAGs) representing workflows.
 pub mod dag_export;
@@ -59,6 +62,9 @@ pub mod simulator;
 pub mod telemetry;
 #[cfg(any(test, feature = "testing"))]
 pub mod test_generator;
+/// Replay test harness for verifying workflow determinism pre-deploy.
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 pub mod types;
 
 #[cfg(feature = "db")]
@@ -104,6 +110,7 @@ pub use analyzer::{
 pub use builder::{BuiltHarvest, HarvestBuilder, HarvestBuilderError, WorkerConfig};
 pub use cache::{CachedWorkflowState, WorkflowCache};
 pub use context::{ActivityContext, WorkflowCommand, WorkflowContext};
+pub use critical_path::{CriticalPathAnalyzer, CriticalPathResult};
 pub use dag::{DagBuildError, DagBuilder, DagDefinition, DagTask, DagTaskRef};
 pub use dag_export::{export_dot, export_mermaid};
 pub use dag_linter::{
@@ -118,7 +125,7 @@ pub use event::WorkflowEvent;
 #[cfg(feature = "db")]
 pub use execution::{
     CancelledWorkflowExecution, StartWorkflowParams, StartedWorkflowExecution,
-    cancel_workflow_execution, start_or_load_workflow_execution,
+    cancel_workflow_execution, start_or_load_workflow_execution, terminate_workflow_execution,
 };
 pub use executor::{WorkflowOutcome, run_workflow};
 pub use history_export::export_mermaid_sequence;
@@ -147,6 +154,10 @@ pub use telemetry::{
 };
 #[cfg(any(test, feature = "testing"))]
 pub use test_generator::TestHarnessGenerator;
+#[cfg(any(test, feature = "testing"))]
+pub use testing::{
+    HistorySnapshot, NonDeterminismKind, ReplayReport, ReplayStatus, WorkflowReplayer,
+};
 pub use types::{
     ActivityExecId, ExecutionId, ExternalActivityToken, ShardId, TimerId, WorkerId, WorkflowId,
     WorkflowIdReusePolicy,

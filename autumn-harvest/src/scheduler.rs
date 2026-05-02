@@ -310,22 +310,20 @@ pub async fn tick_once(
         .get()
         .await
         .map_err(|error| HarvestError::Database(error.to_string()))?;
+    let metrics = Arc::clone(&registry.telemetry().metrics);
     create_due_runs(&mut conn, dags.as_ref()).await?;
-    let runnable = activate_queued_runs(&mut conn, dags.as_ref()).await?;
+    let runnable = activate_queued_runs(&mut conn, dags.as_ref(), &metrics).await?;
 
     // Dispatch due workflow-schedule runs directly via start_or_load_workflow_execution.
     // Always check the DB — API-created schedules are DB-only and won't appear in the
     // in-memory workflow_schedules list.
-    {
-        let metrics = Arc::clone(&registry.telemetry().metrics);
-        if let Err(error) = tick_workflow_schedules(&mut conn, &metrics).await {
-            tracing::warn!(error = %error, "harvest workflow-schedule tick error");
-        }
+    if let Err(error) = tick_workflow_schedules(&mut conn, &metrics).await {
+        tracing::warn!(error = %error, "harvest workflow-schedule tick error");
     }
     drop(conn);
 
     for (run, dag) in runnable {
-        execute_dag_run(pool.clone(), Arc::clone(&registry), dag, run).await?;
+        execute_dag_run(pool.clone(), Arc::clone(&registry), dag, run, &metrics).await?;
     }
 
     Ok(())
@@ -591,6 +589,7 @@ async fn create_due_runs(conn: &mut AsyncPgConnection, dags: &DagCatalog) -> Har
 async fn activate_queued_runs<'a>(
     conn: &mut AsyncPgConnection,
     dags: &'a DagCatalog,
+    metrics: &Arc<dyn crate::telemetry::MetricsRecorder>,
 ) -> HarvestResult<Vec<(DagRun, &'a RegisteredDag)>> {
     use crate::schema::harvest_dag_runs::dsl as dag_runs_dsl;
     use crate::schema::harvest_schedules::dsl as schedules_dsl;
@@ -620,6 +619,7 @@ async fn activate_queued_runs<'a>(
             .map_err(crate::error::database_error)?;
         let available = i64::from(schedule.max_active_runs) - running_count;
         if available <= 0 {
+            metrics.record_schedule_skipped("dag", dag_name, "max_active_runs_reached");
             continue;
         }
 
@@ -834,6 +834,7 @@ async fn tick_one_workflow_schedule(
                 search_attrs: None,
                 // TODO(#87): switch to RejectDuplicate once #87 lands.
                 reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
+                trace_context: None,
             },
         )
         .await
@@ -881,6 +882,7 @@ async fn execute_dag_run(
     registry: Arc<HandlerRegistry>,
     dag: &RegisteredDag,
     run: DagRun,
+    metrics: &Arc<dyn crate::telemetry::MetricsRecorder>,
 ) -> HarvestResult<()> {
     // Bolt: Use Arc to avoid deep cloning the JSON Value for every task in the DAG
     let run_input = Arc::new(run.conf.unwrap_or(Value::Null));
@@ -927,6 +929,7 @@ async fn execute_dag_run(
         .await
         .map_err(crate::error::database_error)?;
 
+    metrics.record_schedule_run("dag", &dag.name);
     Ok(())
 }
 

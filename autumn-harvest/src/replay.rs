@@ -14,7 +14,7 @@ use std::collections::{HashSet, VecDeque};
 
 use crate::error::TimeoutType;
 use crate::event::WorkflowEvent;
-use crate::types::{ActivityExecId, ExternalActivityToken};
+use crate::types::{ActivityExecId, ExecutionId, ExternalActivityToken};
 
 /// Result of matching a workflow command against the event history.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,6 +55,16 @@ pub enum HistoryMatch {
         activity_id: ActivityExecId,
         /// The token already recorded in history. Must be reused to stay idempotent.
         token: ExternalActivityToken,
+    },
+    /// History shows a child workflow was started but no terminal event
+    /// (completed/failed) exists yet.  This occurs when the parent wakes after
+    /// one of several parallel children completes while others are still
+    /// running.  The workflow should re-emit a `StartChildWorkflow` command
+    /// carrying the **existing** `child_id` from history (idempotent at the
+    /// worker level) and then suspend until the child's terminal event arrives.
+    ChildInProgress {
+        /// The child execution ID already recorded in history. Must be reused.
+        child_id: ExecutionId,
     },
 }
 
@@ -98,6 +108,19 @@ impl HistoryMatcher {
         self.pending_signals.push_back((signal_name, payload));
     }
 
+    /// Format the `actual` field for a [`HistoryMatch::Diverged`] result.
+    ///
+    /// When the unexpected event is a `MarkerRecorded` its name is included so
+    /// the replayer's `classify_kind` can recognise `"MarkerRecorded(version:…)"`
+    /// and return [`crate::testing::NonDeterminismKind::VersionMarkerMismatch`]
+    /// instead of the generic command-level mismatch kind.
+    fn actual_event_name(event: &WorkflowEvent) -> String {
+        match event {
+            WorkflowEvent::MarkerRecorded { name, .. } => format!("MarkerRecorded({name})"),
+            other => other.type_name().to_string(),
+        }
+    }
+
     /// Prepares for matching by advancing past consumed events and draining early signals.
     /// Returns `true` if there are still events to replay.
     fn prepare_match(&mut self) -> bool {
@@ -114,6 +137,34 @@ impl HistoryMatcher {
             cursor += 1;
         }
         cursor < self.events.len()
+    }
+
+    /// Returns `true` if there are unconsumed events that are not terminal
+    /// lifecycle events (`WorkflowCompleted`, `WorkflowFailed`,
+    /// `WorkflowCancelled`), or if there are buffered signals that were never
+    /// delivered via `wait_for_signal`.
+    ///
+    /// Used by [`WorkflowContext::history_has_unconsumed_events`] to avoid
+    /// false non-determinism reports when replaying full histories that include
+    /// a terminal event appended after workflow completion.
+    ///
+    /// The pending-signal check is necessary because early `SignalReceived`
+    /// events are moved into `consumed_signal_events` when buffered, so they
+    /// are invisible to the cursor-based check.  If new code removes a
+    /// `wait_for_signal` call, the buffered signal would be silently ignored
+    /// without this additional check.
+    #[must_use]
+    pub fn has_non_lifecycle_unconsumed(&self) -> bool {
+        let mut cursor = self.cursor;
+        while cursor < self.events.len() {
+            if !self.is_consumed(cursor) && !self.events[cursor].is_terminal_lifecycle() {
+                return true;
+            }
+            cursor += 1;
+        }
+        // Signals buffered early (via drain_early_signals) that were never
+        // consumed by wait_for_signal represent unconsumed history.
+        !self.pending_signals.is_empty()
     }
 
     /// Current cursor position in the event list.
@@ -201,6 +252,7 @@ impl HistoryMatcher {
     /// - [`HistoryMatch::TimedOut`] if a timeout is found
     /// - [`HistoryMatch::NoMatch`] if past end of history
     /// - [`HistoryMatch::Diverged`] if the event at cursor is not the expected activity
+    #[allow(clippy::too_many_lines)]
     pub fn match_activity(&mut self, activity_name: &str) -> HistoryMatch {
         if !self.prepare_match() {
             return HistoryMatch::NoMatch;
@@ -215,7 +267,7 @@ impl HistoryMatcher {
         else {
             return HistoryMatch::Diverged {
                 expected: format!("ActivityScheduled({activity_name})"),
-                actual: self.events[self.cursor].type_name().to_string(),
+                actual: Self::actual_event_name(&self.events[self.cursor]),
             };
         };
         let activity_id = *activity_id;
@@ -319,6 +371,129 @@ impl HistoryMatcher {
         HistoryMatch::NoMatch
     }
 
+    /// Like [`match_activity`](Self::match_activity) but also verifies the input payload.
+    ///
+    /// Used by the [`WorkflowReplayer`](crate::testing::WorkflowReplayer) to detect
+    /// non-determinism caused by changing an activity's input arguments across deployments.
+    #[allow(clippy::too_many_lines)]
+    pub fn match_activity_strict(&mut self, activity_name: &str, input: &Value) -> HistoryMatch {
+        if !self.prepare_match() {
+            return HistoryMatch::NoMatch;
+        }
+
+        // Extract fields as owned values so the immutable borrow ends before cursor mutation.
+        let result = match &self.events[self.cursor] {
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: recorded_name,
+                input: recorded_input,
+                ..
+            } => {
+                if recorded_name != activity_name {
+                    return HistoryMatch::Diverged {
+                        expected: format!("ActivityScheduled({activity_name})"),
+                        actual: format!("ActivityScheduled({recorded_name})"),
+                    };
+                }
+                if recorded_input != input {
+                    return HistoryMatch::Diverged {
+                        expected: format!(
+                            "ActivityScheduled({activity_name}, input={recorded_input})"
+                        ),
+                        actual: format!("ActivityScheduled({activity_name}, input={input})"),
+                    };
+                }
+                Ok(*activity_id)
+            }
+            other => Err(HistoryMatch::Diverged {
+                expected: format!("ActivityScheduled({activity_name})"),
+                actual: Self::actual_event_name(other),
+            }),
+        };
+        let activity_id = match result {
+            Ok(id) => id,
+            Err(diverged) => return diverged,
+        };
+
+        self.cursor += 1;
+        let mut scan_cursor = self.cursor;
+        let mut first_interleaved_child_start = None;
+
+        while scan_cursor < self.events.len() {
+            if self.is_consumed(scan_cursor) {
+                scan_cursor += 1;
+                continue;
+            }
+            match &self.events[scan_cursor] {
+                WorkflowEvent::ActivityCompleted {
+                    activity_id: id,
+                    output,
+                } if *id == activity_id => {
+                    let result = HistoryMatch::Matched {
+                        output: output.clone(),
+                    };
+                    return self.settle_terminal(
+                        scan_cursor,
+                        first_interleaved_child_start,
+                        result,
+                    );
+                }
+                WorkflowEvent::ActivityFailed {
+                    activity_id: id,
+                    error,
+                    attempt,
+                } if *id == activity_id => {
+                    let result = HistoryMatch::Failed {
+                        error: error.clone(),
+                        attempt: *attempt,
+                    };
+                    return self.settle_terminal(
+                        scan_cursor,
+                        first_interleaved_child_start,
+                        result,
+                    );
+                }
+                WorkflowEvent::ActivityTimedOut {
+                    activity_id: id,
+                    timeout_type,
+                } if *id == activity_id => {
+                    let result = HistoryMatch::TimedOut {
+                        timeout_type: timeout_type.clone(),
+                    };
+                    return self.settle_terminal(
+                        scan_cursor,
+                        first_interleaved_child_start,
+                        result,
+                    );
+                }
+                WorkflowEvent::ActivityHeartbeat {
+                    activity_id: id, ..
+                }
+                | WorkflowEvent::ActivityStarted {
+                    activity_id: id, ..
+                } if *id == activity_id => {
+                    scan_cursor += 1;
+                }
+                WorkflowEvent::ChildWorkflowStarted { .. } => {
+                    first_interleaved_child_start.get_or_insert(scan_cursor);
+                    scan_cursor += 1;
+                }
+                WorkflowEvent::SignalReceived {
+                    signal_name,
+                    payload,
+                } => {
+                    let signal_name = signal_name.clone();
+                    let payload = payload.clone();
+                    self.stash_signal(scan_cursor, signal_name, payload);
+                    scan_cursor += 1;
+                }
+                _ => break,
+            }
+        }
+
+        HistoryMatch::NoMatch
+    }
+
     /// Match an `execute_activity_external` command against history.
     ///
     /// Expects `ActivityAwaitingExternal { name }` at the current cursor, then
@@ -347,7 +522,7 @@ impl HistoryMatcher {
         else {
             return HistoryMatch::Diverged {
                 expected: format!("ActivityAwaitingExternal({activity_name})"),
-                actual: self.events[self.cursor].type_name().to_string(),
+                actual: Self::actual_event_name(&self.events[self.cursor]),
             };
         };
 
@@ -458,7 +633,7 @@ impl HistoryMatcher {
         else {
             return HistoryMatch::Diverged {
                 expected: format!("TimerStarted({timer_id})"),
-                actual: self.events[self.cursor].type_name().to_string(),
+                actual: Self::actual_event_name(&self.events[self.cursor]),
             };
         };
 
@@ -569,7 +744,7 @@ impl HistoryMatcher {
                 other => {
                     return HistoryMatch::Diverged {
                         expected: format!("SignalReceived({signal_name})"),
-                        actual: other.type_name().to_string(),
+                        actual: Self::actual_event_name(other),
                     };
                 }
             }
@@ -593,7 +768,7 @@ impl HistoryMatcher {
         else {
             return HistoryMatch::Diverged {
                 expected: format!("WorkflowContinuedAsNew({input})"),
-                actual: self.events[self.cursor].type_name().to_string(),
+                actual: Self::actual_event_name(&self.events[self.cursor]),
             };
         };
 
@@ -629,7 +804,7 @@ impl HistoryMatcher {
         else {
             return HistoryMatch::Diverged {
                 expected: format!("ChildWorkflowStarted({workflow_name})"),
-                actual: self.events[self.cursor].type_name().to_string(),
+                actual: Self::actual_event_name(&self.events[self.cursor]),
             };
         };
         let child_id = *child_id;
@@ -675,11 +850,15 @@ impl HistoryMatcher {
             }
         }
 
-        self.cursor = start_cursor;
-        HistoryMatch::Diverged {
-            expected: format!("ChildWorkflowTerminal({workflow_name})"),
-            actual: "EndOfHistory".to_string(),
-        }
+        // The start event was found and name+input matched, but the terminal
+        // hasn't arrived yet.  This is the normal state when the parent wakes
+        // after one of several parallel children completes while this child is
+        // still running.  Return ChildInProgress so the caller can re-emit a
+        // StartChildWorkflow command with the existing child_id rather than
+        // treating the incomplete history as a non-determinism error.
+        self.cursor = start_cursor + 1;
+        self.advance_to_next_unconsumed_event();
+        HistoryMatch::ChildInProgress { child_id }
     }
 
     /// Match a version gate against history.
@@ -709,7 +888,7 @@ impl HistoryMatcher {
             }
             other => HistoryMatch::Diverged {
                 expected: format!("MarkerRecorded({marker_name})"),
-                actual: other.type_name().to_string(),
+                actual: Self::actual_event_name(other),
             },
         }
     }
@@ -742,7 +921,7 @@ impl HistoryMatcher {
         else {
             return HistoryMatch::Diverged {
                 expected: format!("LocalActivityScheduled({activity_name})"),
-                actual: self.events[self.cursor].type_name().to_string(),
+                actual: Self::actual_event_name(&self.events[self.cursor]),
             };
         };
         let activity_id = *activity_id;
@@ -808,6 +987,102 @@ impl HistoryMatcher {
         }
 
         // LocalActivityScheduled found but no terminal event yet — incomplete history.
+        HistoryMatch::NoMatch
+    }
+
+    /// Like [`match_local_activity`](Self::match_local_activity) but also verifies the input payload.
+    ///
+    /// Used by the [`WorkflowReplayer`](crate::testing::WorkflowReplayer) in strict replay mode.
+    pub fn match_local_activity_strict(
+        &mut self,
+        activity_name: &str,
+        input: &Value,
+    ) -> HistoryMatch {
+        if !self.prepare_match() {
+            return HistoryMatch::NoMatch;
+        }
+
+        let result = match &self.events[self.cursor] {
+            WorkflowEvent::LocalActivityScheduled {
+                activity_id,
+                name: recorded_name,
+                input: recorded_input,
+            } => {
+                if recorded_name != activity_name {
+                    return HistoryMatch::Diverged {
+                        expected: format!("LocalActivityScheduled({activity_name})"),
+                        actual: format!("LocalActivityScheduled({recorded_name})"),
+                    };
+                }
+                if recorded_input != input {
+                    return HistoryMatch::Diverged {
+                        expected: format!(
+                            "LocalActivityScheduled({activity_name}, input={recorded_input})"
+                        ),
+                        actual: format!("LocalActivityScheduled({activity_name}, input={input})"),
+                    };
+                }
+                Ok(*activity_id)
+            }
+            other => Err(HistoryMatch::Diverged {
+                expected: format!("LocalActivityScheduled({activity_name})"),
+                actual: Self::actual_event_name(other),
+            }),
+        };
+        let activity_id = match result {
+            Ok(id) => id,
+            Err(diverged) => return diverged,
+        };
+
+        self.cursor += 1;
+        let mut scan_cursor = self.cursor;
+        let mut last_failure: Option<HistoryMatch> = None;
+
+        while scan_cursor < self.events.len() {
+            if self.is_consumed(scan_cursor) {
+                scan_cursor += 1;
+                continue;
+            }
+            match &self.events[scan_cursor] {
+                WorkflowEvent::LocalActivityCompleted {
+                    activity_id: id,
+                    output,
+                } if *id == activity_id => {
+                    let output = output.clone();
+                    self.cursor = scan_cursor + 1;
+                    self.advance_to_next_unconsumed_event();
+                    return HistoryMatch::Matched { output };
+                }
+                WorkflowEvent::LocalActivityFailed {
+                    activity_id: id,
+                    error,
+                    attempt,
+                } if *id == activity_id => {
+                    last_failure = Some(HistoryMatch::Failed {
+                        error: error.clone(),
+                        attempt: *attempt,
+                    });
+                    scan_cursor += 1;
+                }
+                WorkflowEvent::SignalReceived {
+                    signal_name,
+                    payload,
+                } => {
+                    let signal_name = signal_name.clone();
+                    let payload = payload.clone();
+                    self.stash_signal(scan_cursor, signal_name, payload);
+                    scan_cursor += 1;
+                }
+                _ => break,
+            }
+        }
+
+        if let Some(failure) = last_failure {
+            self.cursor = scan_cursor;
+            self.advance_to_next_unconsumed_event();
+            return failure;
+        }
+
         HistoryMatch::NoMatch
     }
 
@@ -1211,7 +1486,7 @@ mod tests {
     }
 
     #[test]
-    fn matcher_child_workflow_without_terminal_diverges_and_preserves_cursor() {
+    fn matcher_child_workflow_without_terminal_returns_child_in_progress() {
         let child_id = crate::types::ExecutionId::new();
         let events = vec![WorkflowEvent::ChildWorkflowStarted {
             child_id,
@@ -1221,11 +1496,16 @@ mod tests {
 
         let mut matcher = HistoryMatcher::new(events);
         let result = matcher.match_child_workflow("process_order", &Value::Null);
-        assert!(matches!(result, HistoryMatch::Diverged { .. }));
+        assert!(
+            matches!(result, HistoryMatch::ChildInProgress { child_id: id } if id == child_id),
+            "should be ChildInProgress with the known child_id, got {result:?}"
+        );
+        // Cursor advances past the ChildWorkflowStarted event so subsequent
+        // commands (e.g. other parallel children) can be matched correctly.
         assert_eq!(
             matcher.position(),
-            0,
-            "cursor must not consume started event"
+            1,
+            "cursor must advance past started event"
         );
     }
 
