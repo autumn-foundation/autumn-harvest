@@ -24,6 +24,8 @@ pub mod dag;
 pub mod dag_export;
 #[cfg(any(test, feature = "testing"))]
 pub mod dag_simulator;
+/// Deterministic workflow guardrail rule catalog and finding types.
+pub mod determinism;
 pub mod error;
 pub mod event;
 #[cfg(feature = "db")]
@@ -92,6 +94,10 @@ pub use dag::{DagBuildError, DagBuilder, DagDefinition, DagTask, DagTaskRef};
 pub use dag_export::{export_dot, export_mermaid};
 #[cfg(any(test, feature = "testing"))]
 pub use dag_simulator::{DagSimulator, DagSimulatorResult};
+pub use determinism::{
+    DeterminismFinding, DeterminismRule, DeterminismRuleCategory, DeterminismSeverity,
+    DeterminismSourceLocation, DeterminismSuppression, deterministic_guardrail_catalog,
+};
 pub use error::{HarvestError, HarvestResult, TimeoutType};
 pub use event::WorkflowEvent;
 #[cfg(feature = "db")]
