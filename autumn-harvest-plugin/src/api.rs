@@ -39,7 +39,7 @@ use autumn_harvest::schema::{harvest_dag_runs, harvest_schedules, harvest_workfl
 use autumn_harvest::shard::ShardRouter;
 use autumn_harvest::signal;
 use autumn_harvest::store;
-use autumn_harvest::telemetry::{ATTR_EXECUTION_ID, ATTR_WORKFLOW_ID};
+use autumn_harvest::telemetry::{ATTR_EXECUTION_ID, ATTR_QUEUE, ATTR_SHARD_ID, ATTR_WORKFLOW_ID};
 use autumn_harvest::types::{ExecutionId, ExternalActivityToken, ShardId, WorkflowIdReusePolicy};
 use autumn_harvest::worker::{DbPool, HandlerRegistry};
 use autumn_harvest::workers::{
@@ -783,6 +783,8 @@ async fn start_workflow(
         "otel.kind" = "producer",
         { ATTR_WORKFLOW_ID } = %workflow_name,
         { ATTR_EXECUTION_ID } = %exec_id,
+        { ATTR_SHARD_ID } = i64::from(shard.as_i32()),
+        { ATTR_QUEUE } = %queue_name,
     )
     .in_scope(|| runtime.registry.telemetry().capture_trace_context());
 

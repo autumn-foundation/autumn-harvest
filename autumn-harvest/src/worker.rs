@@ -1313,6 +1313,7 @@ async fn persist_all_started_child_workflows(
 async fn ingest_pending_signals(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
+    workflow_name: &str,
     next_event_id: i32,
 ) -> HarvestResult<()> {
     let pending_signals = signal::load_pending_signals(conn, exec_id).await?;
@@ -1327,6 +1328,7 @@ async fn ingest_pending_signals(
             let _deliver_guard = tracing::info_span!(
                 "harvest.signal.deliver",
                 "otel.kind" = "consumer",
+                { ATTR_WORKFLOW_ID } = workflow_name,
                 { ATTR_EXECUTION_ID } = %exec_id,
                 signal.name = %signal.signal_name,
             )
@@ -2046,6 +2048,7 @@ async fn load_workflow_replay_state(
     task: &TaskQueueItem,
     worker_id: &str,
     exec_id: ExecutionId,
+    workflow_name: &str,
 ) -> HarvestResult<store::EventHistory> {
     let history_result = store::load_history(conn, exec_id).await;
     let initial_history = fail_execution_on_error(conn, task, worker_id, history_result).await?;
@@ -2057,8 +2060,13 @@ async fn load_workflow_replay_state(
     let history_after_timers =
         fail_execution_on_error(conn, task, worker_id, history_after_timers_result).await?;
 
-    let signals_result =
-        ingest_pending_signals(conn, exec_id, history_after_timers.next_event_id).await;
+    let signals_result = ingest_pending_signals(
+        conn,
+        exec_id,
+        workflow_name,
+        history_after_timers.next_event_id,
+    )
+    .await;
     fail_execution_on_error(conn, task, worker_id, signals_result).await?;
 
     let final_history_result = store::load_history(conn, exec_id).await;
@@ -2077,7 +2085,9 @@ async fn prepare_workflow_task(
     };
     let exec_id = execution_id_from_uuid(exec_uuid);
     let execution = load_task_execution(conn, task, exec_id).await?;
-    let history = load_workflow_replay_state(conn, task, worker_id, exec_id).await?;
+    let history =
+        load_workflow_replay_state(conn, task, worker_id, exec_id, &execution.workflow_name)
+            .await?;
 
     Ok(PreparedWorkflowTask {
         execution,
