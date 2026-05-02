@@ -36,6 +36,15 @@ pub mod executor;
 pub mod external_task;
 pub mod history_export;
 pub mod info;
+/// `metrics` crate adapter for [`telemetry::MetricsRecorder`].
+///
+/// Bridges every `record_*` call to the global [`metrics`] registry so
+/// applications using `metrics-exporter-prometheus` or another compatible
+/// backend get harvest engine metrics without any extra glue code.
+///
+/// Enabled by the `metrics-rs` cargo feature.
+#[cfg(feature = "metrics-rs")]
+pub mod metrics_rs_adapter;
 pub mod policy;
 pub mod pool;
 pub mod prelude;

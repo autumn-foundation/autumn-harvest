@@ -2415,6 +2415,58 @@ fn spawn_concurrency_sampler(
     })
 }
 
+/// Periodically sample the dead-letter queue entry count and forward it to
+/// the configured [`MetricsRecorder`](crate::telemetry::MetricsRecorder).
+///
+/// Runs on the same cadence as the queue-depth sampler. For sharded
+/// deployments the caller should spawn one instance per shard, passing the
+/// shard-specific pool; single-shard deployments pass their single pool and
+/// `shard_id = 0`.
+///
+/// Stops when the cancellation token fires.
+fn spawn_dlq_depth_sampler(
+    pool: DbPool,
+    cancel: CancellationToken,
+    telemetry: Arc<crate::telemetry::TelemetryConfig>,
+    shard_id: u16,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                () = cancel.cancelled() => break,
+                () = tokio::time::sleep(interval) => {}
+            }
+
+            let mut conn = match pool.get().await {
+                Ok(conn) => conn,
+                Err(error) => {
+                    tracing::debug!(
+                        error = %error,
+                        shard_id,
+                        "dlq depth sampler could not acquire DB connection"
+                    );
+                    continue;
+                }
+            };
+
+            match crate::dlq::dead_letter_count(&mut conn).await {
+                Ok(count) => {
+                    let depth = u64::try_from(count).unwrap_or(0);
+                    telemetry.metrics.record_dlq_entries(shard_id, depth);
+                }
+                Err(error) => {
+                    tracing::debug!(error = %error, "dlq depth sample failed");
+                }
+            }
+
+            if cancel.is_cancelled() {
+                break;
+            }
+        }
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Worker
 // ---------------------------------------------------------------------------
@@ -2518,6 +2570,21 @@ impl Worker {
             self.shutdown.clone(),
             self.registry.telemetry().clone(),
             self.config.queues.clone(),
+            self.config.poll_interval,
+        );
+        // DLQ depth gauge — one sampler per worker (single-shard uses shard 0,
+        // multi-shard deployments launch one Worker per shard so the shard
+        // assignment list identifies which shard this worker owns).
+        let shard_id = self
+            .config
+            .shard_assignments
+            .first()
+            .map_or(0u16, |s| u16::try_from(s.as_i32()).unwrap_or(0));
+        let dlq_depth_sampler = spawn_dlq_depth_sampler(
+            pool.clone(),
+            self.shutdown.clone(),
+            self.registry.telemetry().clone(),
+            shard_id,
             self.config.poll_interval,
         );
         let timeout_checker = crate::timeout::spawn_timeout_checker(
@@ -2628,6 +2695,13 @@ impl Worker {
                 worker_id = %self.config.worker_id,
                 error = %error,
                 "concurrency sampler failed during shutdown"
+            );
+        }
+        if let Err(error) = dlq_depth_sampler.await {
+            tracing::warn!(
+                worker_id = %self.config.worker_id,
+                error = %error,
+                "dlq depth sampler failed during shutdown"
             );
         }
         tracing::info!(worker_id = %self.config.worker_id, "worker stopped");
