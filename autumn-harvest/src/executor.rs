@@ -169,21 +169,23 @@ pub async fn run_workflow_with_state(
     let ctx = WorkflowContext::for_replay_with_state(exec_id, history, state);
 
     // ADR-0001 §2.1: emit harvest.workflow.execute for every executor cycle.
-    // Fields that the worker knows (workflow.id, shard.id, queue, replay) are
-    // declared Empty here and populated from span_meta so they land on THIS span
-    // rather than on whatever Span::current() was before the call.
+    // harvest.replay defaults to false at span creation so subscribers that only
+    // observe on_new_span (e.g. tests) see the correct value for callers that
+    // don't supply span_meta. The worker passes span_meta to override it and to
+    // populate the Empty fields (workflow.id, shard.id, queue) that only the
+    // worker context knows.
     let span = tracing::info_span!(
         "harvest.workflow.execute",
         "otel.kind" = "internal",
         { ATTR_EXECUTION_ID } = %exec_id,
-        { ATTR_REPLAY } = tracing::field::Empty,
+        { ATTR_REPLAY } = false,
         { ATTR_WORKFLOW_ID } = tracing::field::Empty,
         { ATTR_SHARD_ID } = tracing::field::Empty,
         { ATTR_QUEUE } = tracing::field::Empty,
         "link.traceparent" = tracing::field::Empty,
     );
-    span.record(ATTR_REPLAY, span_meta.is_some_and(|m| m.is_replay));
     if let Some(meta) = span_meta {
+        span.record(ATTR_REPLAY, meta.is_replay);
         span.record(ATTR_WORKFLOW_ID, meta.workflow_name.as_str());
         span.record(ATTR_SHARD_ID, meta.shard_id);
         span.record(ATTR_QUEUE, meta.queue_name.as_str());
