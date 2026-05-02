@@ -1171,13 +1171,34 @@ async fn persist_all_started_child_workflows(
     let children = children.to_vec();
     // Compute marker events outside the transaction (WorkflowCommand is not Clone).
     let marker_events = marker_events_from_commands(commands);
-    let trace_ctx = registry.telemetry().capture_trace_context();
     let shard_id = parent_execution.shard_id;
+
+    // ADR-0001 §2.8: emit harvest.child_workflow.start PRODUCER spans and
+    // capture per-child trace contexts before the transaction.  EnteredSpan is
+    // !Send, so it must be fully dropped before the first .await.  Each child
+    // gets a distinct captured context so its worker-side span links back to
+    // the correct producer span rather than a stale pre-loop context.
+    let child_trace_ctxs: std::collections::HashMap<uuid::Uuid, Option<TraceContextCarrier>> =
+        children
+            .iter()
+            .map(|child| {
+                let ctx = tracing::info_span!(
+                    "harvest.child_workflow.start",
+                    "otel.kind" = "producer",
+                    { ATTR_WORKFLOW_ID } = %child.workflow_name,
+                    { ATTR_EXECUTION_ID } = %child.child_id,
+                    { ATTR_SHARD_ID } = shard_id,
+                )
+                .in_scope(|| registry.telemetry().capture_trace_context());
+                (child.child_id.as_uuid(), ctx)
+            })
+            .collect();
 
     conn.transaction::<(), HarvestError, _>(|conn| {
         let children = children.clone();
         let marker_events = marker_events.clone();
         let queue_name = queue_name.clone();
+        let child_trace_ctxs = child_trace_ctxs.clone();
         async move {
             // Determine which children are genuinely new vs. already running.
             let requested_ids: Vec<uuid::Uuid> =
@@ -1240,19 +1261,13 @@ async fn persist_all_started_child_workflows(
                     child.input.clone(),
                 );
                 params.workflow_exec_id = Some(child.child_id.as_uuid());
-                params.trace_context = trace_ctx.clone();
-
-                // ADR-0001 §2.8: harvest.child_workflow.start — PRODUCER span.
-                // Emitted synchronously (no `.await` inside) before enqueuing so that
-                // EnteredSpan (which is !Send) is dropped before the DB await below.
-                tracing::info_span!(
-                    "harvest.child_workflow.start",
-                    "otel.kind" = "producer",
-                    { ATTR_WORKFLOW_ID } = %child.workflow_name,
-                    { ATTR_EXECUTION_ID } = %child.child_id,
-                    { ATTR_SHARD_ID } = shard_id,
-                )
-                .in_scope(|| {});
+                // Use the per-child context captured (with its own ADR-0001 span)
+                // before the transaction so each child links to the correct
+                // producer span rather than a shared stale context.
+                params.trace_context = child_trace_ctxs
+                    .get(&child.child_id.as_uuid())
+                    .cloned()
+                    .flatten();
 
                 diesel::insert_into(harvest_workflow_executions::table)
                     .values(&child_row)
@@ -2321,7 +2336,10 @@ async fn process_workflow_task(
         .trace_context
         .as_ref()
         .and_then(TraceContextCarrier::from_json);
-    let is_replay = trace_carrier.as_ref().is_some_and(|c| c.is_replay);
+    // Derive is_replay from the event history length: a fresh execution has
+    // exactly one event (WorkflowStarted); any additional events mean this is a
+    // resume cycle and the workflow function will replay past them.
+    let is_replay = prepared.history_events.len() > 1;
 
     // ADR-0001 §3 + §4: for live runs, restore the producer's trace context so
     // the workflow span becomes a child of the span that enqueued this task.
@@ -2343,7 +2361,7 @@ async fn process_workflow_task(
         link_traceparent: trace_carrier
             .as_ref()
             .filter(|_| is_replay)
-            .and_then(|c| c.link_traceparent.clone()),
+            .and_then(|c| c.link_traceparent.clone().or_else(|| c.traceparent.clone())),
     };
 
     telemetry
