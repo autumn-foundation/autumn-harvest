@@ -50,18 +50,6 @@ pub async fn send_signal(
                 .map_err(crate::error::database_error)?
                 .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))?;
 
-            // ADR-0001 §2.5: harvest.signal.send — PRODUCER, emitted after the
-            // execution row is fetched so ATTR_WORKFLOW_ID carries the workflow name.
-            // in_scope is synchronous so EnteredSpan (!Send) is dropped before any await.
-            tracing::info_span!(
-                "harvest.signal.send",
-                "otel.kind" = "producer",
-                { ATTR_WORKFLOW_ID } = execution.workflow_name.as_str(),
-                { ATTR_EXECUTION_ID } = %exec_id,
-                signal.name = %signal_name,
-            )
-            .in_scope(|| {});
-
             match execution.state.as_str() {
                 "RUNNING" => {}
                 "CANCELLED" => {
@@ -75,6 +63,18 @@ pub async fn send_signal(
                     )));
                 }
             }
+
+            // ADR-0001 §2.5: harvest.signal.send — PRODUCER, emitted only after
+            // confirming RUNNING state so the span is not created for rejected signals.
+            // in_scope is synchronous so EnteredSpan (!Send) is dropped before any await.
+            tracing::info_span!(
+                "harvest.signal.send",
+                "otel.kind" = "producer",
+                { ATTR_WORKFLOW_ID } = execution.workflow_name.as_str(),
+                { ATTR_EXECUTION_ID } = %exec_id,
+                signal.name = %signal_name,
+            )
+            .in_scope(|| {});
 
             let row = NewHarvestSignal {
                 workflow_exec_id: exec_id.as_uuid(),

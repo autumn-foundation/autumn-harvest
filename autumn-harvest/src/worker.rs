@@ -1173,32 +1173,15 @@ async fn persist_all_started_child_workflows(
     let marker_events = marker_events_from_commands(commands);
     let shard_id = parent_execution.shard_id;
 
-    // ADR-0001 §2.8: emit harvest.child_workflow.start PRODUCER spans and
-    // capture per-child trace contexts before the transaction.  EnteredSpan is
-    // !Send, so it must be fully dropped before the first .await.  Each child
-    // gets a distinct captured context so its worker-side span links back to
-    // the correct producer span rather than a stale pre-loop context.
-    let child_trace_ctxs: std::collections::HashMap<uuid::Uuid, Option<TraceContextCarrier>> =
-        children
-            .iter()
-            .map(|child| {
-                let ctx = tracing::info_span!(
-                    "harvest.child_workflow.start",
-                    "otel.kind" = "producer",
-                    { ATTR_WORKFLOW_ID } = %child.workflow_name,
-                    { ATTR_EXECUTION_ID } = %child.child_id,
-                    { ATTR_SHARD_ID } = shard_id,
-                )
-                .in_scope(|| registry.telemetry().capture_trace_context());
-                (child.child_id.as_uuid(), ctx)
-            })
-            .collect();
+    // Clone telemetry before the transaction closure so spans can be emitted
+    // inside the async move block without capturing the &HandlerRegistry reference.
+    let telemetry = registry.telemetry().clone();
 
     conn.transaction::<(), HarvestError, _>(|conn| {
         let children = children.clone();
         let marker_events = marker_events.clone();
         let queue_name = queue_name.clone();
-        let child_trace_ctxs = child_trace_ctxs.clone();
+        let telemetry = telemetry.clone();
         async move {
             // Determine which children are genuinely new vs. already running.
             let requested_ids: Vec<uuid::Uuid> =
@@ -1215,6 +1198,29 @@ async fn persist_all_started_child_workflows(
             let new_children: Vec<&StartedChildWorkflowCommand> = children
                 .iter()
                 .filter(|c| !existing_ids.contains(&c.child_id.as_uuid()))
+                .collect();
+
+            // ADR-0001 §2.8: emit harvest.child_workflow.start PRODUCER spans only
+            // for genuinely new children (after the existing_ids filter).  EnteredSpan
+            // is !Send so each span must be fully dropped (via .in_scope) before the
+            // next .await.  Capture each child's trace context inside the same in_scope
+            // call so the context is a child of the correct producer span.
+            let child_trace_ctxs: std::collections::HashMap<
+                uuid::Uuid,
+                Option<TraceContextCarrier>,
+            > = new_children
+                .iter()
+                .map(|child| {
+                    let ctx = tracing::info_span!(
+                        "harvest.child_workflow.start",
+                        "otel.kind" = "producer",
+                        { ATTR_WORKFLOW_ID } = %child.workflow_name,
+                        { ATTR_EXECUTION_ID } = %child.child_id,
+                        { ATTR_SHARD_ID } = shard_id,
+                    )
+                    .in_scope(|| telemetry.capture_trace_context());
+                    (child.child_id.as_uuid(), ctx)
+                })
                 .collect();
 
             // Append marker events + ChildWorkflowStarted for new children to parent.
@@ -1261,9 +1267,6 @@ async fn persist_all_started_child_workflows(
                     child.input.clone(),
                 );
                 params.workflow_exec_id = Some(child.child_id.as_uuid());
-                // Use the per-child context captured (with its own ADR-0001 span)
-                // before the transaction so each child links to the correct
-                // producer span rather than a shared stale context.
                 params.trace_context = child_trace_ctxs
                     .get(&child.child_id.as_uuid())
                     .cloned()
