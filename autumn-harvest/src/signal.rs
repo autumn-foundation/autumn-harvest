@@ -13,6 +13,8 @@ use scoped_futures::ScopedFutureExt;
 use crate::error::{HarvestError, HarvestResult};
 #[cfg(feature = "db")]
 use crate::models::{HarvestSignal, NewHarvestSignal};
+#[cfg(feature = "db")]
+use crate::telemetry::{ATTR_EXECUTION_ID, ATTR_WORKFLOW_ID};
 use crate::types::ExecutionId;
 
 /// Queue a workflow signal for durable delivery and wake the parked workflow.
@@ -61,6 +63,18 @@ pub async fn send_signal(
                     )));
                 }
             }
+
+            // ADR-0001 §2.5: harvest.signal.send — PRODUCER, emitted only after
+            // confirming RUNNING state so the span is not created for rejected signals.
+            // in_scope is synchronous so EnteredSpan (!Send) is dropped before any await.
+            tracing::info_span!(
+                "harvest.signal.send",
+                "otel.kind" = "producer",
+                { ATTR_WORKFLOW_ID } = execution.workflow_name.as_str(),
+                { ATTR_EXECUTION_ID } = %exec_id,
+                signal.name = %signal_name,
+            )
+            .in_scope(|| {});
 
             let row = NewHarvestSignal {
                 workflow_exec_id: exec_id.as_uuid(),

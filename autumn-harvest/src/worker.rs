@@ -25,7 +25,7 @@ use crate::builder::WorkerConfig;
 use crate::context::{ActivityContext, SharedState, WorkflowCommand, empty_shared_state};
 use crate::error::{HarvestError, HarvestResult};
 use crate::event::WorkflowEvent;
-use crate::executor::{WorkflowOutcome, run_workflow_with_state};
+use crate::executor::{WorkflowExecuteSpanMeta, WorkflowOutcome, run_workflow_with_state};
 use crate::external_task;
 use crate::info::{ActivityInfo, WorkflowInfo};
 use crate::models::{
@@ -36,7 +36,10 @@ use crate::queue::{self, TaskType};
 use crate::schema::{harvest_timers, harvest_workflow_executions};
 use crate::signal;
 use crate::store;
-use crate::telemetry::{ActivityStatus, TraceContextCarrier, WorkflowStatus};
+use crate::telemetry::{
+    ATTR_ACTIVITY_NAME, ATTR_ATTEMPT, ATTR_EXECUTION_ID, ATTR_QUEUE, ATTR_SHARD_ID,
+    ATTR_WORKFLOW_ID, ActivityStatus, TraceContextCarrier, WorkflowStatus,
+};
 use crate::types::{ActivityExecId, ExecutionId, ExternalActivityToken, TimerId, WorkerId};
 
 /// Type alias for the deadpool-managed async Diesel connection pool.
@@ -341,6 +344,8 @@ struct PreparedWorkflowTask {
     exec_id: ExecutionId,
     history_events: Vec<WorkflowEvent>,
     next_event_id: i32,
+    timers_fired: Vec<TimerId>,
+    signals_delivered: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -370,6 +375,10 @@ impl<'a> WorkflowTaskPersistence<'a> {
 struct SuspendedWorkflowContext<'a> {
     execution: &'a WorkflowExecution,
     persistence: WorkflowTaskPersistence<'a>,
+    /// Handle for the `harvest.workflow.execute` span that is still open.
+    /// Producer spans (`activity.schedule`, `child_workflow.start`) use this as
+    /// their explicit parent so they are nested inside the executor cycle.
+    execute_span: &'a tracing::Span,
 }
 
 fn marker_events_from_commands(commands: &[WorkflowCommand]) -> Vec<WorkflowEvent> {
@@ -988,6 +997,7 @@ async fn persist_scheduled_activity(
     commands: &[WorkflowCommand],
     scheduled: &ScheduledActivityCommand,
     sticky: Option<queue::StickyHint<'_>>,
+    execute_span: &tracing::Span,
 ) -> HarvestResult<()> {
     let activity = registry.activities.get(&scheduled.name).ok_or_else(|| {
         HarvestError::Config(format!(
@@ -1010,10 +1020,9 @@ async fn persist_scheduled_activity(
     );
     params.workflow_exec_id = Some(exec_id.as_uuid());
     params.activity_name = Some(scheduled.name.clone());
-    // Snapshot the current trace context so the downstream activity worker
-    // can continue the same trace. `capture` returns `None` when telemetry is
-    // unconfigured, leaving the queue row's `trace_context` NULL.
-    params.trace_context = registry.telemetry().capture_trace_context();
+    // trace_context is set below, inside the harvest.activity.schedule span,
+    // so the downstream worker's harvest.activity.execute span is stitched to
+    // the producer span rather than the parent workflow-execute context.
 
     if let Some(retry_policy) = activity.default_retry_policy.clone() {
         params.max_attempts = i32::try_from(retry_policy.max_attempts).map_err(|_| {
@@ -1052,10 +1061,25 @@ async fn persist_scheduled_activity(
         activity_id: scheduled.activity_id,
         name: scheduled.name.clone(),
         input: scheduled.input.clone(),
-        queue: queue_name,
+        queue: queue_name.clone(),
     }];
     let mut events = marker_events;
     events.extend(activity_events);
+
+    // ADR-0001 §2.4: harvest.activity.schedule — PRODUCER, child of the
+    // harvest.workflow.execute span for this cycle.  Using `parent: execute_span`
+    // explicitly parents the span even though the execute span's instrumented
+    // future has already completed; the handle is still open.  Context is
+    // captured INSIDE in_scope so the queued task links back to this producer.
+    params.trace_context = tracing::info_span!(
+        parent: execute_span,
+        "harvest.activity.schedule",
+        "otel.kind" = "producer",
+        { ATTR_ACTIVITY_NAME } = %scheduled.name,
+        { ATTR_EXECUTION_ID } = %exec_id,
+        { ATTR_QUEUE } = %queue_name,
+    )
+    .in_scope(|| registry.telemetry().capture_trace_context());
 
     conn.transaction::<(), HarvestError, _>(|conn| {
         async move {
@@ -1083,15 +1107,14 @@ async fn persist_started_timer(
     let marker_events = marker_events_from_commands(commands);
     let fire_delay = chrono_duration_from_secs(timer.duration_secs, "timer duration")?;
     let fires_at = chrono::Utc::now() + fire_delay;
-    // Emit a short-lived span so operators can see timer placements in a
-    // distributed trace next to the activities and workflow suspensions that
-    // produced them.
+    // Emit a span for the timer placement (not to be confused with
+    // harvest.timer.fire which is emitted when the timer actually fires).
     let span = tracing::info_span!(
         "harvest.timer.start",
         "otel.kind" = "internal",
         timer.id = %timer.timer_id,
         timer.duration_secs = timer.duration_secs,
-        workflow.execution_id = %exec_id,
+        { ATTR_EXECUTION_ID } = %exec_id,
     );
     let timer_started = WorkflowEvent::TimerStarted {
         timer_id: timer.timer_id.clone(),
@@ -1142,6 +1165,7 @@ async fn persist_all_started_child_workflows(
     commands: &[WorkflowCommand],
     children: &[StartedChildWorkflowCommand],
     sticky: Option<queue::StickyHint<'_>>,
+    execute_span: &tracing::Span,
 ) -> HarvestResult<()> {
     for child in children {
         if !registry.workflows.contains_key(&child.workflow_name) {
@@ -1157,13 +1181,19 @@ async fn persist_all_started_child_workflows(
     let children = children.to_vec();
     // Compute marker events outside the transaction (WorkflowCommand is not Clone).
     let marker_events = marker_events_from_commands(commands);
-    let trace_ctx = registry.telemetry().capture_trace_context();
     let shard_id = parent_execution.shard_id;
+
+    // Clone telemetry and execute_span before the transaction closure so they
+    // can be used inside the async move block without capturing references.
+    let telemetry = registry.telemetry().clone();
+    let execute_span = execute_span.clone();
 
     conn.transaction::<(), HarvestError, _>(|conn| {
         let children = children.clone();
         let marker_events = marker_events.clone();
         let queue_name = queue_name.clone();
+        let telemetry = telemetry.clone();
+        let execute_span = execute_span.clone();
         async move {
             // Determine which children are genuinely new vs. already running.
             let requested_ids: Vec<uuid::Uuid> =
@@ -1180,6 +1210,32 @@ async fn persist_all_started_child_workflows(
             let new_children: Vec<&StartedChildWorkflowCommand> = children
                 .iter()
                 .filter(|c| !existing_ids.contains(&c.child_id.as_uuid()))
+                .collect();
+
+            // ADR-0001 §2.8: emit harvest.child_workflow.start PRODUCER spans only
+            // for genuinely new children (after the existing_ids filter).
+            // `parent: &execute_span` makes each span a child of this executor
+            // cycle's harvest.workflow.execute span even though that span's
+            // instrumented future has already returned (the handle is still open).
+            // EnteredSpan is !Send so each span must be fully dropped (via
+            // .in_scope) before the next .await.
+            let child_trace_ctxs: std::collections::HashMap<
+                uuid::Uuid,
+                Option<TraceContextCarrier>,
+            > = new_children
+                .iter()
+                .map(|child| {
+                    let ctx = tracing::info_span!(
+                        parent: &execute_span,
+                        "harvest.child_workflow.start",
+                        "otel.kind" = "producer",
+                        { ATTR_WORKFLOW_ID } = %child.workflow_name,
+                        { ATTR_EXECUTION_ID } = %child.child_id,
+                        { ATTR_SHARD_ID } = shard_id,
+                    )
+                    .in_scope(|| telemetry.capture_trace_context());
+                    (child.child_id.as_uuid(), ctx)
+                })
                 .collect();
 
             // Append marker events + ChildWorkflowStarted for new children to parent.
@@ -1226,7 +1282,10 @@ async fn persist_all_started_child_workflows(
                     child.input.clone(),
                 );
                 params.workflow_exec_id = Some(child.child_id.as_uuid());
-                params.trace_context = trace_ctx.clone();
+                params.trace_context = child_trace_ctxs
+                    .get(&child.child_id.as_uuid())
+                    .cloned()
+                    .flatten();
 
                 diesel::insert_into(harvest_workflow_executions::table)
                     .values(&child_row)
@@ -1288,24 +1347,25 @@ async fn ingest_pending_signals(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
     next_event_id: i32,
-) -> HarvestResult<()> {
+) -> HarvestResult<Vec<String>> {
     let pending_signals = signal::load_pending_signals(conn, exec_id).await?;
     if pending_signals.is_empty() {
-        return Ok(());
+        return Ok(vec![]);
     }
 
-    let (signal_ids, signal_events): (Vec<_>, Vec<_>) = pending_signals
+    let (signal_ids, signals_data): (Vec<_>, Vec<_>) = pending_signals
         .into_iter()
         .map(|signal| {
-            (
-                signal.id,
-                WorkflowEvent::SignalReceived {
-                    signal_name: signal.signal_name,
-                    payload: signal.payload,
-                },
-            )
+            let name = signal.signal_name.clone();
+            let event = WorkflowEvent::SignalReceived {
+                signal_name: signal.signal_name,
+                payload: signal.payload,
+            };
+            (signal.id, (name, event))
         })
         .unzip();
+
+    let (signal_names, signal_events): (Vec<_>, Vec<_>) = signals_data.into_iter().unzip();
 
     conn.transaction::<(), HarvestError, _>(|conn| {
         async move {
@@ -1315,14 +1375,16 @@ async fn ingest_pending_signals(
         }
         .scope_boxed()
     })
-    .await
+    .await?;
+
+    Ok(signal_names)
 }
 
 async fn ingest_fired_timers(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
     next_event_id: i32,
-) -> HarvestResult<()> {
+) -> HarvestResult<Vec<TimerId>> {
     use crate::schema::harvest_timers::dsl;
     use diesel::dsl::sql;
     use diesel::sql_types::Timestamptz;
@@ -1340,20 +1402,22 @@ async fn ingest_fired_timers(
         .map_err(crate::error::database_error)?;
 
     if due_timers.is_empty() {
-        return Ok(());
+        return Ok(vec![]);
     }
 
-    let (timer_row_ids, timer_events): (Vec<_>, Vec<_>) = due_timers
+    let (timer_row_ids, timer_events_and_ids): (Vec<_>, Vec<_>) = due_timers
         .into_iter()
         .map(|timer| {
+            let timer_id = TimerId::new(timer.timer_id);
             (
                 timer.id,
-                WorkflowEvent::TimerFired {
-                    timer_id: TimerId::new(timer.timer_id),
-                },
+                (timer_id.clone(), WorkflowEvent::TimerFired { timer_id }),
             )
         })
         .unzip();
+
+    let (fired_timer_ids, timer_events): (Vec<_>, Vec<_>) =
+        timer_events_and_ids.into_iter().unzip();
 
     conn.transaction::<(), HarvestError, _>(|conn| {
         async move {
@@ -1367,7 +1431,9 @@ async fn ingest_fired_timers(
         }
         .scope_boxed()
     })
-    .await
+    .await?;
+
+    Ok(fired_timer_ids)
 }
 
 async fn fail_task_only(
@@ -1637,21 +1703,19 @@ async fn process_activity_task(
     .with_trace_context(trace_carrier.clone());
 
     let telemetry = registry.telemetry().clone();
-    // Reinstate the parent trace context (if any) so the activity span becomes
-    // a child of whichever span enqueued this task, stitching the trace across
-    // the Postgres queue boundary.
+    // ADR-0001 §3: restore the producer's trace context so the activity span
+    // becomes a child of the workflow executor span that enqueued this task.
     let _parent_guard = trace_carrier
         .as_ref()
         .map(|carrier| telemetry.install_trace_context(carrier));
+    // ADR-0001 §2.2: harvest.activity.execute — INTERNAL, parent = workflow span.
     let span = tracing::info_span!(
-        "harvest.activity.run",
-        "otel.kind" = "consumer",
-        activity.name = %activity_name,
-        activity.queue = %task.queue_name,
-        activity.attempt = task.attempt,
-        workflow.execution_id = %exec_id,
-        task.id = %task.id,
-        service.name = %telemetry.service_name,
+        "harvest.activity.execute",
+        "otel.kind" = "internal",
+        { ATTR_ACTIVITY_NAME } = %activity_name,
+        { ATTR_EXECUTION_ID } = %exec_id,
+        { ATTR_ATTEMPT } = task.attempt,
+        { ATTR_QUEUE } = %task.queue_name,
     );
     let started_at = std::time::Instant::now();
 
@@ -1873,6 +1937,7 @@ async fn handle_suspended_workflow(
             commands,
             &scheduled,
             sticky,
+            context.execute_span,
         )
         .await;
         return fail_execution_on_error(
@@ -1921,6 +1986,7 @@ async fn handle_suspended_workflow(
             commands,
             &children,
             sticky,
+            context.execute_span,
         )
         .await;
         return fail_execution_on_error(
@@ -2004,12 +2070,12 @@ async fn load_workflow_replay_state(
     task: &TaskQueueItem,
     worker_id: &str,
     exec_id: ExecutionId,
-) -> HarvestResult<store::EventHistory> {
+) -> HarvestResult<(store::EventHistory, Vec<TimerId>, Vec<String>)> {
     let history_result = store::load_history(conn, exec_id).await;
     let initial_history = fail_execution_on_error(conn, task, worker_id, history_result).await?;
 
     let timers_result = ingest_fired_timers(conn, exec_id, initial_history.next_event_id).await;
-    fail_execution_on_error(conn, task, worker_id, timers_result).await?;
+    let timers_fired = fail_execution_on_error(conn, task, worker_id, timers_result).await?;
 
     let history_after_timers_result = store::load_history(conn, exec_id).await;
     let history_after_timers =
@@ -2017,10 +2083,12 @@ async fn load_workflow_replay_state(
 
     let signals_result =
         ingest_pending_signals(conn, exec_id, history_after_timers.next_event_id).await;
-    fail_execution_on_error(conn, task, worker_id, signals_result).await?;
+    let signals_delivered = fail_execution_on_error(conn, task, worker_id, signals_result).await?;
 
     let final_history_result = store::load_history(conn, exec_id).await;
-    fail_execution_on_error(conn, task, worker_id, final_history_result).await
+    let final_history =
+        fail_execution_on_error(conn, task, worker_id, final_history_result).await?;
+    Ok((final_history, timers_fired, signals_delivered))
 }
 
 async fn prepare_workflow_task(
@@ -2035,13 +2103,16 @@ async fn prepare_workflow_task(
     };
     let exec_id = execution_id_from_uuid(exec_uuid);
     let execution = load_task_execution(conn, task, exec_id).await?;
-    let history = load_workflow_replay_state(conn, task, worker_id, exec_id).await?;
+    let (history, timers_fired, signals_delivered) =
+        load_workflow_replay_state(conn, task, worker_id, exec_id).await?;
 
     Ok(PreparedWorkflowTask {
         execution,
         exec_id,
         history_events: history.events,
         next_event_id: history.next_event_id,
+        timers_fired,
+        signals_delivered,
     })
 }
 
@@ -2176,6 +2247,7 @@ async fn persist_workflow_outcome(
     execution: &WorkflowExecution,
     persistence: WorkflowTaskPersistence<'_>,
     outcome: WorkflowOutcome,
+    execute_span: &tracing::Span,
 ) -> HarvestResult<()> {
     let parent_exec_id = execution.parent_id.map(execution_id_from_uuid);
 
@@ -2233,6 +2305,7 @@ async fn persist_workflow_outcome(
                 SuspendedWorkflowContext {
                     execution,
                     persistence,
+                    execute_span,
                 },
                 &commands,
             )
@@ -2246,6 +2319,7 @@ async fn persist_workflow_outcome(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn process_workflow_task(
     conn: &mut AsyncPgConnection,
     registry: &HandlerRegistry,
@@ -2269,12 +2343,31 @@ async fn process_workflow_task(
         .trace_context
         .as_ref()
         .and_then(TraceContextCarrier::from_json);
-    // Reinstate the producer's trace context so the executor's
-    // `harvest.workflow.run` span becomes a child of the span that enqueued
-    // this task — this is what stitches the trace across the queue boundary.
-    let _parent_guard = trace_carrier
-        .as_ref()
-        .map(|carrier| telemetry.install_trace_context(carrier));
+
+    // ADR-0001 §2.6 + §2.7: emit harvest.signal.deliver and harvest.timer.fire
+    // spans here, after the trace context is restored, so they are correlated
+    // with the workflow execution trace rather than being orphaned.
+    // EnteredSpan is !Send; .in_scope() drops it before any subsequent .await.
+    // ADR-0001 §2.7: one span per fired timer.
+    for timer_id in &prepared.timers_fired {
+        tracing::info_span!(
+            "harvest.timer.fire",
+            "otel.kind" = "internal",
+            { ATTR_EXECUTION_ID } = %prepared.exec_id,
+            timer.id = %timer_id,
+        )
+        .in_scope(|| {});
+    }
+    for signal_name in &prepared.signals_delivered {
+        tracing::info_span!(
+            "harvest.signal.deliver",
+            "otel.kind" = "consumer",
+            { ATTR_WORKFLOW_ID } = prepared.execution.workflow_name.as_str(),
+            { ATTR_EXECUTION_ID } = %prepared.exec_id,
+            signal.name = signal_name.as_str(),
+        )
+        .in_scope(|| {});
+    }
 
     telemetry
         .metrics
@@ -2290,13 +2383,43 @@ async fn process_workflow_task(
     let mut history_events = prepared.history_events;
     let mut next_event_id = prepared.next_event_id;
 
-    let outcome = loop {
-        let run_outcome = run_workflow_with_state(
+    let loop_result = loop {
+        // Recompute is_replay each iteration: after local-activity events are
+        // appended the workflow re-runs in replay mode (history_events.len() > 1).
+        // ADR-0001 §2.1: span metadata must reflect the current replay state so
+        // harvest.replay and link.traceparent are accurate on every executor call.
+        let is_replay = history_events.len() > 1;
+
+        // ADR-0001 §3 + §4: install the producer's trace context only for live
+        // (non-replay) iterations so the harvest.workflow.execute span is
+        // correctly parented.  For replay iterations the context must NOT be
+        // installed — replay spans must be new root spans (the original trace
+        // may have long since expired).  Installing per-iteration ensures that
+        // when local-activity events push history_events.len() > 1 the
+        // transition to is_replay=true correctly clears the live parent context.
+        let _iter_parent_guard = trace_carrier
+            .as_ref()
+            .filter(|_| !is_replay)
+            .map(|c| telemetry.install_trace_context(c));
+
+        let span_meta = WorkflowExecuteSpanMeta {
+            workflow_name: prepared.execution.workflow_name.clone(),
+            shard_id: i64::from(prepared.execution.shard_id),
+            queue_name: task.queue_name.clone(),
+            is_replay,
+            link_traceparent: trace_carrier
+                .as_ref()
+                .filter(|_| is_replay)
+                .and_then(|c| c.link_traceparent.clone().or_else(|| c.traceparent.clone())),
+        };
+
+        let (run_outcome, execute_span) = run_workflow_with_state(
             prepared.exec_id,
             history_events.clone(),
             workflow.handler,
             task.input.clone(),
             registry.shared_state(),
+            Some(&span_meta),
         )
         .await;
 
@@ -2306,6 +2429,9 @@ async fn process_workflow_task(
                     .iter()
                     .any(|c| matches!(c, WorkflowCommand::RunLocalActivity { .. })) =>
             {
+                // Local-activity re-run: drop this iteration's execute span
+                // so the OTel span closes before we start inline execution.
+                drop(execute_span);
                 let (markers, local_run) = extract_run_local_activity(commands);
                 let new_events = run_local_activity_inline(
                     conn,
@@ -2318,11 +2444,12 @@ async fn process_workflow_task(
                 )
                 .await?;
                 history_events.extend(new_events);
-                // Loop: re-run the workflow with the extended history.
             }
-            other => break other,
+            other => break (other, execute_span),
         }
     };
+
+    let (outcome, execute_span) = loop_result;
 
     let status = match &outcome {
         WorkflowOutcome::Completed { .. } => WorkflowStatus::Completed,
@@ -2349,8 +2476,11 @@ async fn process_workflow_task(
             sticky_timeout,
         },
         outcome,
+        &execute_span,
     )
     .await
+    // execute_span is dropped here, closing the OTel span after all producer
+    // spans have been emitted as its children.
 }
 
 async fn process_task(

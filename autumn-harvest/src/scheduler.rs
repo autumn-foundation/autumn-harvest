@@ -834,6 +834,7 @@ async fn tick_one_workflow_schedule(
                 search_attrs: None,
                 // TODO(#87): switch to RejectDuplicate once #87 lands.
                 reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
+                trace_context: None,
             },
         )
         .await

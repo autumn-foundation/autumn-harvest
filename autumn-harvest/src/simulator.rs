@@ -109,12 +109,13 @@ impl WorkflowSimulator {
         }];
 
         loop {
-            let outcome = run_workflow_with_state(
+            let (outcome, _span) = run_workflow_with_state(
                 exec_id,
                 history.clone(),
                 self.handler,
                 input.clone(),
                 self.state.clone(),
+                None,
             )
             .await;
 

@@ -106,6 +106,7 @@ async fn start_test_workflow(conn: &mut AsyncPgConnection) -> autumn_harvest::Ex
             memo: None,
             search_attrs: None,
             reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
+            trace_context: None,
         },
     )
     .await
@@ -435,6 +436,7 @@ async fn running_activity_heartbeat_observes_workflow_cancellation() {
             memo: None,
             search_attrs: None,
             reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
+            trace_context: None,
         },
     )
     .await
@@ -590,6 +592,7 @@ async fn uncooperative_activity_is_hard_aborted_after_grace_period() {
             memo: None,
             search_attrs: None,
             reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
+            trace_context: None,
         },
     )
     .await

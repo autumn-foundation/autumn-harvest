@@ -39,6 +39,7 @@ use autumn_harvest::schema::{harvest_dag_runs, harvest_schedules, harvest_workfl
 use autumn_harvest::shard::ShardRouter;
 use autumn_harvest::signal;
 use autumn_harvest::store;
+use autumn_harvest::telemetry::{ATTR_EXECUTION_ID, ATTR_QUEUE, ATTR_SHARD_ID, ATTR_WORKFLOW_ID};
 use autumn_harvest::types::{ExecutionId, ExternalActivityToken, ShardId, WorkflowIdReusePolicy};
 use autumn_harvest::worker::{DbPool, HandlerRegistry};
 use autumn_harvest::workers::{
@@ -774,6 +775,19 @@ async fn start_workflow(
         Err(e) => return e.into_response(),
     };
 
+    // ADR-0001 §2.3: harvest.workflow.schedule — PRODUCER, parent = active HTTP span.
+    // Emitted synchronously before the DB await so EnteredSpan (!Send) is dropped
+    // before the async boundary.
+    let trace_ctx = tracing::info_span!(
+        "harvest.workflow.schedule",
+        "otel.kind" = "producer",
+        { ATTR_WORKFLOW_ID } = %workflow_name,
+        { ATTR_EXECUTION_ID } = %exec_id,
+        { ATTR_SHARD_ID } = i64::from(shard.as_i32()),
+        { ATTR_QUEUE } = %queue_name,
+    )
+    .in_scope(|| runtime.registry.telemetry().capture_trace_context());
+
     let result = start_or_load_workflow_execution(
         &mut conn,
         StartWorkflowParams {
@@ -789,6 +803,7 @@ async fn start_workflow(
             memo: request.memo.clone(),
             search_attrs: request.search_attrs.clone(),
             reuse_policy,
+            trace_context: trace_ctx,
         },
     )
     .await;

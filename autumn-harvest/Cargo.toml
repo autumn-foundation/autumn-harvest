@@ -63,6 +63,7 @@ testcontainers-modules = { workspace = true }
 proptest = "1.11.0"
 loom = "0.7.2"
 criterion = { version = "0.5", features = ["async_tokio"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [[bench]]
 name = "replay_bench"

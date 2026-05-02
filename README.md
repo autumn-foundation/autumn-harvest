@@ -578,6 +578,80 @@ Use `ctx.version("change_id", 1, 2)` and guard the new code path behind the
 returned version number; old histories replay with version 1 and skip the new
 path.
 
+## Telemetry
+
+Harvest emits [OpenTelemetry](https://opentelemetry.io/)-compatible spans via the [`tracing`](https://docs.rs/tracing) crate. Eight named spans cover every durable boundary:
+
+| Span | Kind | When |
+|---|---|---|
+| `harvest.workflow.execute` | INTERNAL | Every workflow executor cycle (live and replay) |
+| `harvest.workflow.schedule` | PRODUCER | HTTP `POST /workflows/{name}/start` |
+| `harvest.activity.execute` | INTERNAL | Activity handler dispatch |
+| `harvest.activity.schedule` | PRODUCER | Activity enqueued to task queue |
+| `harvest.signal.send` | PRODUCER | `send_signal` call |
+| `harvest.signal.deliver` | CONSUMER | Signal ingested into workflow history |
+| `harvest.timer.fire` | INTERNAL | Durable timer fires |
+| `harvest.child_workflow.start` | PRODUCER | Child workflow enqueued |
+
+Replay cycles emit `harvest.workflow.execute` as a **new root span** (`harvest.replay = true`) linked to the original via `link.traceparent` so APM backends can navigate between them.
+
+### Wiring harvest spans into your OTel pipeline
+
+Install [`tracing-opentelemetry`](https://docs.rs/tracing-opentelemetry) alongside your existing OTel SDK and implement `TraceContextPropagator`:
+
+```rust
+use autumn_harvest::{TelemetryConfig, TraceContextCarrier, TraceContextPropagator};
+use opentelemetry::Context;
+use opentelemetry_sdk::propagation::TraceContextPropagator as OtelPropagator;
+use std::any::Any;
+use std::sync::Arc;
+
+struct OtelBridge;
+
+impl TraceContextPropagator for OtelBridge {
+    fn capture(&self) -> Option<TraceContextCarrier> {
+        // Extract the active span context into a W3C traceparent.
+        let cx = Context::current();
+        let span = cx.span();
+        let ctx = span.span_context();
+        if !ctx.is_valid() {
+            return None;
+        }
+        let traceparent = format!(
+            "00-{}-{}-{:02x}",
+            ctx.trace_id(),
+            ctx.span_id(),
+            ctx.trace_flags().to_u8(),
+        );
+        Some(TraceContextCarrier::from_traceparent(traceparent))
+    }
+
+    fn install(&self, carrier: &TraceContextCarrier) -> Box<dyn Any + Send> {
+        // Restore the producer's span context as the OTel active context.
+        if let Some(tp) = carrier.traceparent.as_deref() {
+            let mut map = std::collections::HashMap::new();
+            map.insert("traceparent".to_string(), tp.to_string());
+            let cx = OtelPropagator::new().extract(&map);
+            let guard = cx.attach();
+            Box::new(guard)
+        } else {
+            Box::new(())
+        }
+    }
+}
+
+// Wire into HarvestBuilder:
+HarvestBuilder::new()
+    .telemetry(
+        TelemetryConfig::builder()
+            .propagator(Arc::new(OtelBridge))
+            .build(),
+    )
+    // ...
+```
+
+With no `telemetry(...)` call (the default), all `info_span!` sites compile to branch-on-atomic no-ops — zero allocation, no subscriber lock taken.
+
 ## License
 
 Dual-licensed under MIT or Apache 2.0 at your option.

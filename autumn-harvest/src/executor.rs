@@ -17,6 +17,9 @@ use tracing::Instrument;
 use crate::context::{SharedState, WorkflowCommand, WorkflowContext, empty_shared_state};
 use crate::event::WorkflowEvent;
 use crate::info::WorkflowHandlerFn;
+use crate::telemetry::{
+    ATTR_EXECUTION_ID, ATTR_QUEUE, ATTR_REPLAY, ATTR_SHARD_ID, ATTR_WORKFLOW_ID,
+};
 use crate::types::ExecutionId;
 
 /// The outcome of running a workflow function through the executor.
@@ -52,6 +55,21 @@ pub enum WorkflowOutcome {
 /// within this window, it's blocked on a oneshot channel (suspended).
 const SUSPENSION_TIMEOUT: Duration = Duration::from_millis(100);
 
+/// Caller-supplied metadata recorded onto the `harvest.workflow.execute` span.
+pub struct WorkflowExecuteSpanMeta {
+    /// Logical workflow name (recorded as `harvest.workflow.id`).
+    pub workflow_name: String,
+    /// Shard identifier (recorded as `harvest.shard.id`).
+    pub shard_id: i64,
+    /// Task queue name (recorded as `harvest.queue`).
+    pub queue_name: String,
+    /// Whether this cycle is a deterministic replay (recorded as `harvest.replay`).
+    pub is_replay: bool,
+    /// W3C traceparent linking back to the original trace, present only on
+    /// replay runs and only when a prior carrier stored a link.
+    pub link_traceparent: Option<String>,
+}
+
 /// Run a workflow function through replay and live execution.
 ///
 /// Builds a [`WorkflowContext`] from the provided event history, invokes the
@@ -72,7 +90,9 @@ pub async fn run_workflow(
     handler: WorkflowHandlerFn,
     input: Value,
 ) -> WorkflowOutcome {
-    run_workflow_with_state(exec_id, history, handler, input, empty_shared_state()).await
+    let (outcome, _span) =
+        run_workflow_with_state(exec_id, history, handler, input, empty_shared_state(), None).await;
+    outcome
 }
 
 /// Like [`run_workflow`] but runs in strict replay mode.
@@ -91,10 +111,12 @@ pub async fn run_workflow_strict(
 ) -> WorkflowOutcome {
     let ctx = WorkflowContext::for_replay_strict_with_state(exec_id, history, state);
 
+    // ADR-0001 §2.1: strict mode is always a replay cycle.
     let span = tracing::info_span!(
-        "harvest.workflow.run_strict",
+        "harvest.workflow.execute",
         "otel.kind" = "internal",
-        workflow.execution_id = %exec_id,
+        { ATTR_EXECUTION_ID } = %exec_id,
+        { ATTR_REPLAY } = true,
     );
 
     async {
@@ -138,27 +160,57 @@ pub async fn run_workflow_strict(
 }
 
 /// Run a workflow function through replay and live execution with shared state.
+///
+/// Returns the outcome paired with a [`tracing::Span`] handle for the
+/// `harvest.workflow.execute` span.  The caller should hold the handle alive
+/// while persisting producer-side side-effects (activity schedules, child
+/// workflow starts) so that those producer spans can be correctly parented to
+/// this executor cycle.  Dropping the handle closes the span.
 pub async fn run_workflow_with_state(
     exec_id: ExecutionId,
     history: Vec<WorkflowEvent>,
     handler: WorkflowHandlerFn,
     input: Value,
     state: SharedState,
-) -> WorkflowOutcome {
+    span_meta: Option<&WorkflowExecuteSpanMeta>,
+) -> (WorkflowOutcome, tracing::Span) {
     let ctx = WorkflowContext::for_replay_with_state(exec_id, history, state);
 
-    // Emit a span around every executor cycle so operators can correlate the
-    // handler invocation with timers, activity dispatches, and log events that
-    // happen inside. Applications bridge `tracing` to OpenTelemetry via
-    // `tracing-opentelemetry` or an equivalent layer — the harvest engine
-    // itself stays backend-agnostic.
+    // ADR-0001 §2.1: emit harvest.workflow.execute for every executor cycle.
+    // harvest.replay defaults to false at span creation so subscribers that only
+    // observe on_new_span (e.g. tests) see the correct value for callers that
+    // don't supply span_meta. The worker passes span_meta to override it and to
+    // populate the Empty fields (workflow.id, shard.id, queue) that only the
+    // worker context knows.
     let span = tracing::info_span!(
-        "harvest.workflow.run",
+        "harvest.workflow.execute",
         "otel.kind" = "internal",
-        workflow.execution_id = %exec_id,
+        { ATTR_EXECUTION_ID } = %exec_id,
+        { ATTR_REPLAY } = false,
+        { ATTR_WORKFLOW_ID } = tracing::field::Empty,
+        { ATTR_SHARD_ID } = tracing::field::Empty,
+        { ATTR_QUEUE } = tracing::field::Empty,
+        "link.traceparent" = tracing::field::Empty,
     );
+    if let Some(meta) = span_meta {
+        span.record(ATTR_REPLAY, meta.is_replay);
+        span.record(ATTR_WORKFLOW_ID, meta.workflow_name.as_str());
+        span.record(ATTR_SHARD_ID, meta.shard_id);
+        span.record(ATTR_QUEUE, meta.queue_name.as_str());
+        if let Some(link) = meta.link_traceparent.as_deref() {
+            span.record("link.traceparent", link);
+        }
+    }
 
-    async {
+    // Clone the span handle BEFORE passing ownership to .instrument().
+    // The clone keeps the ref-count above zero after .instrument() exits so the
+    // OTel span is not ended until the caller explicitly drops the returned handle.
+    // This allows caller-side producer spans (activity.schedule,
+    // child_workflow.start) to be created as children of this span even though
+    // the instrumented future has already completed.
+    let span_handle = span.clone();
+
+    let outcome = async {
         // Run the handler with a timeout. If it completes, we get the result.
         // If it blocks on a oneshot (suspended), the timeout fires and we drain
         // the accumulated commands.
@@ -191,7 +243,9 @@ pub async fn run_workflow_with_state(
         }
     }
     .instrument(span)
-    .await
+    .await;
+
+    (outcome, span_handle)
 }
 
 // ---------------------------------------------------------------------------
@@ -375,5 +429,310 @@ mod tests {
             }
             other => panic!("expected Completed, got {other:?}"),
         }
+    }
+
+    // ── RED-phase span-emission tests ──────────────────────────────────────────
+    // These assert the ADR-0001 span contract: correct names, attribute keys from
+    // the ATTR_* constants, and replay semantics.  They drive the GREEN-phase
+    // changes in this module.
+
+    /// Minimal subscriber layer that records every span name seen during a test.
+    mod span_capture {
+        use std::sync::{Arc, Mutex};
+        use tracing::Subscriber;
+        use tracing_subscriber::Layer;
+
+        #[derive(Clone, Default)]
+        pub struct SpanNames(pub Arc<Mutex<Vec<String>>>);
+
+        impl SpanNames {
+            pub fn has(&self, name: &str) -> bool {
+                self.0.lock().unwrap().iter().any(|n| n == name)
+            }
+        }
+
+        pub struct SpanNameLayer(pub SpanNames);
+
+        impl<S: Subscriber> Layer<S> for SpanNameLayer {
+            fn on_new_span(
+                &self,
+                attrs: &tracing::span::Attributes<'_>,
+                _id: &tracing::span::Id,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                self.0
+                    .0
+                    .lock()
+                    .unwrap()
+                    .push(attrs.metadata().name().to_string());
+            }
+        }
+
+        /// Subscriber that captures per-span field values as `(field_name, value_string)`.
+        #[derive(Clone, Default)]
+        #[allow(clippy::type_complexity)]
+        pub struct SpanFields(pub Arc<Mutex<Vec<(String, Vec<(String, String)>)>>>);
+
+        impl SpanFields {
+            /// Returns all field values recorded for spans with the given name.
+            pub fn fields_for(&self, span_name: &str) -> Vec<Vec<(String, String)>> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(n, _)| n == span_name)
+                    .map(|(_, f)| f.clone())
+                    .collect()
+            }
+        }
+
+        struct FieldRecorder(Vec<(String, String)>);
+        impl tracing::field::Visit for FieldRecorder {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0
+                    .push((field.name().to_string(), format!("{value:?}")));
+            }
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                self.0.push((field.name().to_string(), value.to_string()));
+            }
+            fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+                self.0.push((field.name().to_string(), value.to_string()));
+            }
+        }
+
+        pub struct SpanFieldLayer(pub SpanFields);
+
+        impl<S: Subscriber> Layer<S> for SpanFieldLayer {
+            fn on_new_span(
+                &self,
+                attrs: &tracing::span::Attributes<'_>,
+                _id: &tracing::span::Id,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let mut visitor = FieldRecorder(Vec::new());
+                attrs.record(&mut visitor);
+                self.0
+                    .0
+                    .lock()
+                    .unwrap()
+                    .push((attrs.metadata().name().to_string(), visitor.0));
+            }
+        }
+    }
+
+    // ── ADR §2.1: harvest.workflow.execute span name ──────────────────────────
+    // These are plain `#[test]` (not `#[tokio::test]`) so they can build their
+    // own Tokio runtime inside `tracing::subscriber::with_default`, which requires
+    // a synchronous closure.
+
+    /// `run_workflow` must emit a span named `harvest.workflow.execute`
+    /// (the ADR-0001 §2.1 span name).
+    ///
+    /// RED: currently emits `harvest.workflow.run` — this test fails before the fix.
+    #[test]
+    fn executor_emits_harvest_workflow_execute_span() {
+        use span_capture::{SpanNameLayer, SpanNames};
+        use tracing_subscriber::prelude::*;
+
+        let names = SpanNames::default();
+        let subscriber = tracing_subscriber::registry().with(SpanNameLayer(names.clone()));
+
+        let exec_id = ExecutionId::new();
+        let history = vec![WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+        }];
+
+        tracing::subscriber::with_default(subscriber, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(run_workflow(exec_id, history, echo_workflow, Value::Null))
+        });
+
+        assert!(
+            names.has("harvest.workflow.execute"),
+            "expected span 'harvest.workflow.execute' but only saw: {:?}",
+            names.0.lock().unwrap()
+        );
+    }
+
+    /// `run_workflow` must NOT emit a span named `harvest.workflow.run`.
+    ///
+    /// RED: currently it does — this test fails before the rename.
+    #[test]
+    fn executor_no_longer_emits_old_harvest_workflow_run_span() {
+        use span_capture::{SpanNameLayer, SpanNames};
+        use tracing_subscriber::prelude::*;
+
+        let names = SpanNames::default();
+        let subscriber = tracing_subscriber::registry().with(SpanNameLayer(names.clone()));
+
+        let exec_id = ExecutionId::new();
+        let history = vec![WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+        }];
+
+        tracing::subscriber::with_default(subscriber, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(run_workflow(exec_id, history, echo_workflow, Value::Null))
+        });
+
+        assert!(
+            !names.has("harvest.workflow.run"),
+            "old span 'harvest.workflow.run' must be removed; saw: {:?}",
+            names.0.lock().unwrap()
+        );
+    }
+
+    // ── ADR §2.1: harvest.execution.id attribute ──────────────────────────────
+
+    /// The `harvest.workflow.execute` span must carry `harvest.execution.id`
+    /// (i.e. `ATTR_EXECUTION_ID`), not the old `workflow.execution_id` field.
+    ///
+    /// RED: current code uses `workflow.execution_id` as the field name.
+    #[test]
+    fn executor_span_has_attr_execution_id_field() {
+        use crate::telemetry::ATTR_EXECUTION_ID;
+        use span_capture::{SpanFieldLayer, SpanFields};
+        use tracing_subscriber::prelude::*;
+
+        let fields = SpanFields::default();
+        let subscriber = tracing_subscriber::registry().with(SpanFieldLayer(fields.clone()));
+
+        let exec_id = ExecutionId::new();
+        let history = vec![WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+        }];
+
+        tracing::subscriber::with_default(subscriber, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(run_workflow(exec_id, history, echo_workflow, Value::Null))
+        });
+
+        let span_fields = fields.fields_for("harvest.workflow.execute");
+        assert!(
+            !span_fields.is_empty(),
+            "no 'harvest.workflow.execute' span was emitted"
+        );
+        let any_has_exec_id = span_fields
+            .iter()
+            .any(|field_set| field_set.iter().any(|(name, _)| name == ATTR_EXECUTION_ID));
+        assert!(
+            any_has_exec_id,
+            "span must carry field '{ATTR_EXECUTION_ID}'; saw fields: {span_fields:?}"
+        );
+    }
+
+    // ── ADR §2.1: harvest.replay attribute on replay spans ────────────────────
+
+    /// `run_workflow_strict` is the replay path: it must emit `harvest.workflow.execute`
+    /// with `harvest.replay = true`.
+    ///
+    /// RED: currently emits `harvest.workflow.run_strict` with no replay attribute.
+    #[test]
+    fn replay_executor_emits_harvest_workflow_execute_with_replay_true() {
+        use crate::context::empty_shared_state;
+        use crate::telemetry::ATTR_REPLAY;
+        use span_capture::{SpanFieldLayer, SpanFields};
+        use tracing_subscriber::prelude::*;
+
+        let fields = SpanFields::default();
+        let subscriber = tracing_subscriber::registry().with(SpanFieldLayer(fields.clone()));
+
+        let exec_id = ExecutionId::new();
+        // Provide a complete single-event history so the strict executor
+        // completes cleanly without non-determinism errors.
+        let history = vec![WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+        }];
+
+        tracing::subscriber::with_default(subscriber, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(run_workflow_strict(
+                    exec_id,
+                    history,
+                    echo_workflow,
+                    Value::Null,
+                    empty_shared_state(),
+                ))
+        });
+
+        // 1. Span must be named correctly.
+        let span_fields = fields.fields_for("harvest.workflow.execute");
+        assert!(
+            !span_fields.is_empty(),
+            "run_workflow_strict must emit 'harvest.workflow.execute'; only saw: {:?}",
+            fields
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        // 2. harvest.replay must be `true`.
+        let any_has_replay_true = span_fields.iter().any(|field_set| {
+            field_set
+                .iter()
+                .any(|(name, value)| name == ATTR_REPLAY && value == "true")
+        });
+        assert!(
+            any_has_replay_true,
+            "replay span must carry '{ATTR_REPLAY} = true'; saw: {span_fields:?}"
+        );
+    }
+
+    /// `run_workflow` (live path) must emit `harvest.workflow.execute`
+    /// with `harvest.replay = false`.
+    ///
+    /// RED: current code does not set any `harvest.replay` attribute.
+    #[test]
+    fn live_executor_span_has_replay_false() {
+        use crate::telemetry::ATTR_REPLAY;
+        use span_capture::{SpanFieldLayer, SpanFields};
+        use tracing_subscriber::prelude::*;
+
+        let fields = SpanFields::default();
+        let subscriber = tracing_subscriber::registry().with(SpanFieldLayer(fields.clone()));
+
+        let exec_id = ExecutionId::new();
+        let history = vec![WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+        }];
+
+        tracing::subscriber::with_default(subscriber, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(run_workflow(exec_id, history, echo_workflow, Value::Null))
+        });
+
+        let span_fields = fields.fields_for("harvest.workflow.execute");
+        let any_has_replay_false = span_fields.iter().any(|field_set| {
+            field_set
+                .iter()
+                .any(|(name, value)| name == ATTR_REPLAY && value == "false")
+        });
+        assert!(
+            any_has_replay_false,
+            "live executor span must carry '{ATTR_REPLAY} = false'; saw: {span_fields:?}"
+        );
     }
 }
