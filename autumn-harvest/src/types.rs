@@ -630,4 +630,40 @@ mod tests {
         assert_eq!(id, parsed);
         Ok(())
     }
+
+    #[test]
+    fn should_display_ids_correctly() {
+        assert_eq!(WorkflowId::new("wf-123").to_string(), "wf-123");
+        assert_eq!(TimerId::new("timer-456").to_string(), "timer-456");
+        assert_eq!(WorkerId::new("worker-789").to_string(), "worker-789");
+
+        let token = ExternalActivityToken::new();
+        assert_eq!(token.to_string(), token.as_uuid().to_string());
+    }
+
+    #[test]
+    fn should_parse_uuid_ids_correctly() {
+        let exec_uuid = uuid::Uuid::new_v4();
+        let exec_id_str = exec_uuid.to_string();
+        let parsed_exec_id: ExecutionId = exec_id_str.parse().unwrap();
+        assert_eq!(parsed_exec_id.as_uuid(), exec_uuid);
+
+        let act_uuid = uuid::Uuid::new_v4();
+        let act_id_str = act_uuid.to_string();
+        let parsed_act_id: ActivityExecId = act_id_str.parse().unwrap();
+        assert_eq!(parsed_act_id.as_uuid(), act_uuid);
+
+        let ext_uuid = uuid::Uuid::new_v4();
+        let ext_id_str = ext_uuid.to_string();
+        let parsed_ext_id: ExternalActivityToken = ext_id_str.parse().unwrap();
+        assert_eq!(parsed_ext_id.as_uuid(), ext_uuid);
+    }
+
+    #[test]
+    fn should_return_error_for_invalid_uuid_parse() {
+        let invalid_uuid = "not-a-valid-uuid";
+        assert!(invalid_uuid.parse::<ExecutionId>().is_err());
+        assert!(invalid_uuid.parse::<ActivityExecId>().is_err());
+        assert!(invalid_uuid.parse::<ExternalActivityToken>().is_err());
+    }
 }
