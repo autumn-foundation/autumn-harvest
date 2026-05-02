@@ -778,15 +778,13 @@ async fn start_workflow(
     // ADR-0001 §2.3: harvest.workflow.schedule — PRODUCER, parent = active HTTP span.
     // Emitted synchronously before the DB await so EnteredSpan (!Send) is dropped
     // before the async boundary.
-    tracing::info_span!(
+    let trace_ctx = tracing::info_span!(
         "harvest.workflow.schedule",
         "otel.kind" = "producer",
         { ATTR_WORKFLOW_ID } = %workflow_name,
         { ATTR_EXECUTION_ID } = %exec_id,
     )
-    .in_scope(|| {});
-
-    let trace_ctx = runtime.registry.telemetry().capture_trace_context();
+    .in_scope(|| runtime.registry.telemetry().capture_trace_context());
 
     let result = start_or_load_workflow_execution(
         &mut conn,

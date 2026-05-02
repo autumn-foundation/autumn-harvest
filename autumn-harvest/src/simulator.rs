@@ -115,6 +115,7 @@ impl WorkflowSimulator {
                 self.handler,
                 input.clone(),
                 self.state.clone(),
+                None,
             )
             .await;
 

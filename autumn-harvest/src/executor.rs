@@ -17,7 +17,9 @@ use tracing::Instrument;
 use crate::context::{SharedState, WorkflowCommand, WorkflowContext, empty_shared_state};
 use crate::event::WorkflowEvent;
 use crate::info::WorkflowHandlerFn;
-use crate::telemetry::{ATTR_EXECUTION_ID, ATTR_REPLAY};
+use crate::telemetry::{
+    ATTR_EXECUTION_ID, ATTR_QUEUE, ATTR_REPLAY, ATTR_SHARD_ID, ATTR_WORKFLOW_ID,
+};
 use crate::types::ExecutionId;
 
 /// The outcome of running a workflow function through the executor.
@@ -53,6 +55,21 @@ pub enum WorkflowOutcome {
 /// within this window, it's blocked on a oneshot channel (suspended).
 const SUSPENSION_TIMEOUT: Duration = Duration::from_millis(100);
 
+/// Caller-supplied metadata recorded onto the `harvest.workflow.execute` span.
+pub struct WorkflowExecuteSpanMeta {
+    /// Logical workflow name (recorded as `harvest.workflow.id`).
+    pub workflow_name: String,
+    /// Shard identifier (recorded as `harvest.shard.id`).
+    pub shard_id: i64,
+    /// Task queue name (recorded as `harvest.queue`).
+    pub queue_name: String,
+    /// Whether this cycle is a deterministic replay (recorded as `harvest.replay`).
+    pub is_replay: bool,
+    /// W3C traceparent linking back to the original trace, present only on
+    /// replay runs and only when a prior carrier stored a link.
+    pub link_traceparent: Option<String>,
+}
+
 /// Run a workflow function through replay and live execution.
 ///
 /// Builds a [`WorkflowContext`] from the provided event history, invokes the
@@ -73,7 +90,7 @@ pub async fn run_workflow(
     handler: WorkflowHandlerFn,
     input: Value,
 ) -> WorkflowOutcome {
-    run_workflow_with_state(exec_id, history, handler, input, empty_shared_state()).await
+    run_workflow_with_state(exec_id, history, handler, input, empty_shared_state(), None).await
 }
 
 /// Like [`run_workflow`] but runs in strict replay mode.
@@ -147,19 +164,33 @@ pub async fn run_workflow_with_state(
     handler: WorkflowHandlerFn,
     input: Value,
     state: SharedState,
+    span_meta: Option<&WorkflowExecuteSpanMeta>,
 ) -> WorkflowOutcome {
     let ctx = WorkflowContext::for_replay_with_state(exec_id, history, state);
 
     // ADR-0001 §2.1: emit harvest.workflow.execute for every executor cycle.
-    // The worker enriches this span with workflow.id, shard.id, and queue via
-    // Span::current().record() before calling run_workflow_with_state so that
-    // callers that DO have that context (e.g. process_workflow_task) add it.
+    // Fields that the worker knows (workflow.id, shard.id, queue, replay) are
+    // declared Empty here and populated from span_meta so they land on THIS span
+    // rather than on whatever Span::current() was before the call.
     let span = tracing::info_span!(
         "harvest.workflow.execute",
         "otel.kind" = "internal",
         { ATTR_EXECUTION_ID } = %exec_id,
-        { ATTR_REPLAY } = false,
+        { ATTR_REPLAY } = tracing::field::Empty,
+        { ATTR_WORKFLOW_ID } = tracing::field::Empty,
+        { ATTR_SHARD_ID } = tracing::field::Empty,
+        { ATTR_QUEUE } = tracing::field::Empty,
+        "link.traceparent" = tracing::field::Empty,
     );
+    span.record(ATTR_REPLAY, span_meta.is_some_and(|m| m.is_replay));
+    if let Some(meta) = span_meta {
+        span.record(ATTR_WORKFLOW_ID, meta.workflow_name.as_str());
+        span.record(ATTR_SHARD_ID, meta.shard_id);
+        span.record(ATTR_QUEUE, meta.queue_name.as_str());
+        if let Some(link) = meta.link_traceparent.as_deref() {
+            span.record("link.traceparent", link);
+        }
+    }
 
     async {
         // Run the handler with a timeout. If it completes, we get the result.

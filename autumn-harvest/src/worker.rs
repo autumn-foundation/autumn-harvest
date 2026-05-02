@@ -25,7 +25,7 @@ use crate::builder::WorkerConfig;
 use crate::context::{ActivityContext, SharedState, WorkflowCommand, empty_shared_state};
 use crate::error::{HarvestError, HarvestResult};
 use crate::event::WorkflowEvent;
-use crate::executor::{WorkflowOutcome, run_workflow_with_state};
+use crate::executor::{WorkflowExecuteSpanMeta, WorkflowOutcome, run_workflow_with_state};
 use crate::external_task;
 use crate::info::{ActivityInfo, WorkflowInfo};
 use crate::models::{
@@ -37,7 +37,7 @@ use crate::schema::{harvest_timers, harvest_workflow_executions};
 use crate::signal;
 use crate::store;
 use crate::telemetry::{
-    ATTR_ACTIVITY_NAME, ATTR_ATTEMPT, ATTR_EXECUTION_ID, ATTR_QUEUE, ATTR_REPLAY, ATTR_SHARD_ID,
+    ATTR_ACTIVITY_NAME, ATTR_ATTEMPT, ATTR_EXECUTION_ID, ATTR_QUEUE, ATTR_SHARD_ID,
     ATTR_WORKFLOW_ID, ActivityStatus, TraceContextCarrier, WorkflowStatus,
 };
 use crate::types::{ActivityExecId, ExecutionId, ExternalActivityToken, TimerId, WorkerId};
@@ -2322,25 +2322,19 @@ async fn process_workflow_task(
         .filter(|_| !is_replay)
         .map(|c| telemetry.install_trace_context(c));
 
-    // ADR-0001 §2.1: harvest.workflow.execute — INTERNAL, wraps the full
-    // executor loop including any inline local-activity cycles.
-    // Additional attributes (workflow.id, shard.id, queue) are recorded via
-    // Span::current().record() so the executor inside run_workflow_with_state
-    // can see them in its own span.
-    {
-        let current = tracing::Span::current();
-        current.record(ATTR_WORKFLOW_ID, prepared.execution.workflow_name.as_str());
-        current.record(ATTR_SHARD_ID, i64::from(prepared.execution.shard_id));
-        current.record(ATTR_QUEUE, task.queue_name.as_str());
-        current.record(ATTR_REPLAY, is_replay);
-        if is_replay
-            && let Some(link) = trace_carrier
-                .as_ref()
-                .and_then(|c| c.link_traceparent.as_deref())
-        {
-            current.record("link.traceparent", link);
-        }
-    }
+    // ADR-0001 §2.1: pass span metadata into run_workflow_with_state so the
+    // harvest.workflow.execute span carries the correct workflow.id, shard.id,
+    // queue, replay flag, and link.traceparent on the span that actually exists.
+    let span_meta = WorkflowExecuteSpanMeta {
+        workflow_name: prepared.execution.workflow_name.clone(),
+        shard_id: i64::from(prepared.execution.shard_id),
+        queue_name: task.queue_name.clone(),
+        is_replay,
+        link_traceparent: trace_carrier
+            .as_ref()
+            .filter(|_| is_replay)
+            .and_then(|c| c.link_traceparent.clone()),
+    };
 
     telemetry
         .metrics
@@ -2363,6 +2357,7 @@ async fn process_workflow_task(
             workflow.handler,
             task.input.clone(),
             registry.shared_state(),
+            Some(&span_meta),
         )
         .await;
 

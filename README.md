@@ -623,10 +623,7 @@ impl TraceContextPropagator for OtelBridge {
         if let Some(tp) = carrier.traceparent.as_deref() {
             let mut map = std::collections::HashMap::new();
             map.insert("traceparent".to_string(), tp.to_string());
-            let cx = OtelPropagator::new()
-                .extract(&opentelemetry::propagation::TextMapPropagator::extract_with_context(
-                    &Context::new(), &map,
-                ));
+            let cx = OtelPropagator::new().extract(&map);
             let guard = cx.attach();
             Box::new(guard)
         } else {
