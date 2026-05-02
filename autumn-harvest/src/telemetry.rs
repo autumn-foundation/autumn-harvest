@@ -110,9 +110,9 @@ pub struct TraceContextCarrier {
     /// The W3C `traceparent` header for the *parent* span.
     ///
     /// During replay this field is `None` — the replay span roots itself and
-    /// links to [`link_traceparent`] instead.
+    /// links to [`TraceContextCarrier::link_traceparent`] instead.
     ///
-    /// [`link_traceparent`]: TraceContextCarrier::link_traceparent
+    /// [`TraceContextCarrier::link_traceparent`]: TraceContextCarrier::link_traceparent
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub traceparent: Option<String>,
 
@@ -123,7 +123,7 @@ pub struct TraceContextCarrier {
     /// When `true`, the worker must emit the span with attribute
     /// `harvest.replay = true` and must NOT restore `traceparent` as the
     /// parent context. Instead, it should create a new root span and attach a
-    /// span *link* pointing at [`link_traceparent`].
+    /// span *link* pointing at [`TraceContextCarrier::link_traceparent`].
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_replay: bool,
 

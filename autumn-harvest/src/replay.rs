@@ -134,7 +134,7 @@ impl HistoryMatcher {
     /// `WorkflowCancelled`), or if there are buffered signals that were never
     /// delivered via `wait_for_signal`.
     ///
-    /// Used by [`WorkflowContext::history_has_unconsumed_events`] to avoid
+    /// Used by [`crate::context::WorkflowContext::history_has_unconsumed_events`] to avoid
     /// false non-determinism reports when replaying full histories that include
     /// a terminal event appended after workflow completion.
     ///
