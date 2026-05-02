@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use diesel::{ExpressionMethods, OptionalExtension, QueryDsl, SelectableHelper};
+use diesel::{BoolExpressionMethods, ExpressionMethods, OptionalExtension, QueryDsl, SelectableHelper};
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 use scoped_futures::ScopedFutureExt;
 use tokio::sync::Semaphore;
@@ -1133,6 +1133,7 @@ async fn persist_started_timer(
 /// silently skipped — this is the idempotent re-park path taken when the parent
 /// wakes after one of several parallel children completes while others are still
 /// running.  Only genuinely new children get rows inserted and tasks enqueued.
+#[allow(clippy::too_many_lines)]
 async fn persist_all_started_child_workflows(
     conn: &mut AsyncPgConnection,
     registry: &HandlerRegistry,
@@ -1232,7 +1233,31 @@ async fn persist_all_started_child_workflows(
                 queue::enqueue(conn, &params).await?;
             }
 
+            // Park the parent. Then check whether any of the pending children
+            // already reached a terminal state while this task was RUNNING —
+            // wake_workflow_task is a no-op against RUNNING rows, so the
+            // completion signal was lost. Re-wake here to avoid an indefinite
+            // park despite terminal history being present.
             queue::park_workflow_task(conn, task_id, sticky).await?;
+
+            let terminal_child_exists = harvest_workflow_executions::table
+                .filter(harvest_workflow_executions::id.eq_any(&requested_ids))
+                .filter(
+                    harvest_workflow_executions::state
+                        .eq("COMPLETED")
+                        .or(harvest_workflow_executions::state.eq("FAILED")),
+                )
+                .select(harvest_workflow_executions::id)
+                .first::<uuid::Uuid>(conn)
+                .await
+                .optional()
+                .map_err(crate::error::database_error)?
+                .is_some();
+
+            if terminal_child_exists {
+                queue::wake_workflow_task(conn, parent_exec_id).await?;
+            }
+
             Ok(())
         }
         .scope_boxed()

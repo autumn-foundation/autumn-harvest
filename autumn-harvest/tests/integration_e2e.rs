@@ -1715,7 +1715,7 @@ async fn child_continue_as_new_rejection_wakes_parent_with_child_failure() {
 
 // ── Parallel child workflow handler functions ────────────────────────────────
 
-/// Parent that spawns two children concurrently via tokio::join! and returns
+/// Parent that spawns two children concurrently via `tokio::join!` and returns
 /// a merged result.
 fn parent_workflow_parallel_children<'a>(
     ctx: &'a WorkflowContext,
@@ -1773,11 +1773,11 @@ fn parallel_children_registry() -> Arc<HandlerRegistry> {
     ))
 }
 
-/// RED test: parent spawns two child workflows in parallel via tokio::join!.
+/// RED test: parent spawns two child workflows in parallel via `tokio::join!`.
 ///
 /// Both children must complete and the parent must produce a merged result
 /// containing both outputs.  With the current single-child dispatch the
-/// worker fails because it cannot handle two simultaneous StartChildWorkflow
+/// worker fails because it cannot handle two simultaneous `StartChildWorkflow`
 /// commands.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn worker_completes_parent_workflow_with_parallel_child_workflows() {

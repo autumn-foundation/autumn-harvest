@@ -2524,7 +2524,7 @@ mod tests {
 
     /// When a child's `ChildWorkflowStarted` event is in history but its terminal
     /// hasn't arrived yet, the context must re-emit a `StartChildWorkflow` command
-    /// carrying the **existing** child_id (not a fresh one) so the worker can
+    /// carrying the **existing** `child_id` (not a fresh one) so the worker can
     /// re-park the parent idempotently.
     #[tokio::test]
     async fn context_child_in_progress_re_emits_with_existing_child_id() {
@@ -3014,9 +3014,9 @@ mod tests {
     /// RED: parent wakes after child A completes but child B is still pending.
     ///
     /// With partial history [Started, ChildStarted(A), ChildStarted(B), ChildCompleted(A)],
-    /// replaying spawn_child_workflow_raw("b") should NOT return NonDeterministic.
-    /// Instead it should re-emit a StartChildWorkflow command carrying B's existing
-    /// child_id so the worker can re-park the parent without creating a duplicate child.
+    /// replaying `spawn_child_workflow_raw("b")` should NOT return `NonDeterministic`.
+    /// Instead it should re-emit a `StartChildWorkflow` command carrying B's existing
+    /// `child_id` so the worker can re-park the parent without creating a duplicate child.
     #[tokio::test]
     async fn context_partial_history_parallel_children_re_parks_pending_child() {
         let child_a = ExecutionId::new();
