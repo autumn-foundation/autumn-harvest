@@ -2303,6 +2303,7 @@ async fn persist_workflow_outcome(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn process_workflow_task(
     conn: &mut AsyncPgConnection,
     registry: &HandlerRegistry,
