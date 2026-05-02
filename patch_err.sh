@@ -1,0 +1,1 @@
+sed -i 's/^}$/    #[test]\n    #[cfg(feature = "db")]\n    fn from_diesel_result_error() {\n        let err: HarvestError = diesel::result::Error::NotFound.into();\n        match err {\n            HarvestError::Database(_) => (),\n            _ => panic!("Expected Database error"),\n        }\n    }\n}/' autumn-harvest/src/error.rs

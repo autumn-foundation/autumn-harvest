@@ -30,6 +30,24 @@ pub enum TimeoutType {
     ScheduleToClose,
     /// Activity stopped sending heartbeats.
     Heartbeat,
+    #[test]
+    #[cfg(feature = "db")]
+    fn from_diesel_result_error() {
+        let err: HarvestError = diesel::result::Error::NotFound.into();
+        match err {
+            HarvestError::Database(_) => (),
+            _ => panic!("Expected Database error"),
+        }
+    }
+    #[test]
+    #[cfg(feature = "db")]
+    fn from_diesel_result_error() {
+        let err: HarvestError = diesel::result::Error::NotFound.into();
+        match err {
+            HarvestError::Database(_) => (),
+            _ => panic!("Expected Database error"),
+        }
+    }
 }
 
 impl std::fmt::Display for TimeoutType {
@@ -39,6 +57,24 @@ impl std::fmt::Display for TimeoutType {
             Self::ScheduleToStart => write!(f, "ScheduleToStart"),
             Self::ScheduleToClose => write!(f, "ScheduleToClose"),
             Self::Heartbeat => write!(f, "Heartbeat"),
+        }
+    }
+    #[test]
+    #[cfg(feature = "db")]
+    fn from_diesel_result_error() {
+        let err: HarvestError = diesel::result::Error::NotFound.into();
+        match err {
+            HarvestError::Database(_) => (),
+            _ => panic!("Expected Database error"),
+        }
+    }
+    #[test]
+    #[cfg(feature = "db")]
+    fn from_diesel_result_error() {
+        let err: HarvestError = diesel::result::Error::NotFound.into();
+        match err {
+            HarvestError::Database(_) => (),
+            _ => panic!("Expected Database error"),
         }
     }
 }
@@ -141,6 +177,24 @@ pub enum HarvestError {
         /// The state of the conflicting prior run (e.g. `"RUNNING"`, `"COMPLETED"`).
         existing_state: String,
     },
+    #[test]
+    #[cfg(feature = "db")]
+    fn from_diesel_result_error() {
+        let err: HarvestError = diesel::result::Error::NotFound.into();
+        match err {
+            HarvestError::Database(_) => (),
+            _ => panic!("Expected Database error"),
+        }
+    }
+    #[test]
+    #[cfg(feature = "db")]
+    fn from_diesel_result_error() {
+        let err: HarvestError = diesel::result::Error::NotFound.into();
+        match err {
+            HarvestError::Database(_) => (),
+            _ => panic!("Expected Database error"),
+        }
+    }
 }
 
 /// Standard result type for internal harvest engine operations.
@@ -163,12 +217,48 @@ pub type HarvestResult<T> = Result<T, HarvestError>;
 /// ```
 pub fn database_error(e: impl std::fmt::Display) -> HarvestError {
     HarvestError::Database(e.to_string())
+    #[test]
+    #[cfg(feature = "db")]
+    fn from_diesel_result_error() {
+        let err: HarvestError = diesel::result::Error::NotFound.into();
+        match err {
+            HarvestError::Database(_) => (),
+            _ => panic!("Expected Database error"),
+        }
+    }
+    #[test]
+    #[cfg(feature = "db")]
+    fn from_diesel_result_error() {
+        let err: HarvestError = diesel::result::Error::NotFound.into();
+        match err {
+            HarvestError::Database(_) => (),
+            _ => panic!("Expected Database error"),
+        }
+    }
 }
 
 #[cfg(feature = "db")]
 impl From<diesel::result::Error> for HarvestError {
     fn from(value: diesel::result::Error) -> Self {
         database_error(value)
+    }
+    #[test]
+    #[cfg(feature = "db")]
+    fn from_diesel_result_error() {
+        let err: HarvestError = diesel::result::Error::NotFound.into();
+        match err {
+            HarvestError::Database(_) => (),
+            _ => panic!("Expected Database error"),
+        }
+    }
+    #[test]
+    #[cfg(feature = "db")]
+    fn from_diesel_result_error() {
+        let err: HarvestError = diesel::result::Error::NotFound.into();
+        match err {
+            HarvestError::Database(_) => (),
+            _ => panic!("Expected Database error"),
+        }
     }
 }
 
@@ -223,6 +313,24 @@ mod tests {
         let err = database_error("connection refused");
         match err {
             HarvestError::Database(msg) => assert_eq!(msg, "connection refused"),
+            _ => panic!("Expected Database error"),
+        }
+    }
+    #[test]
+    #[cfg(feature = "db")]
+    fn from_diesel_result_error() {
+        let err: HarvestError = diesel::result::Error::NotFound.into();
+        match err {
+            HarvestError::Database(_) => (),
+            _ => panic!("Expected Database error"),
+        }
+    }
+    #[test]
+    #[cfg(feature = "db")]
+    fn from_diesel_result_error() {
+        let err: HarvestError = diesel::result::Error::NotFound.into();
+        match err {
+            HarvestError::Database(_) => (),
             _ => panic!("Expected Database error"),
         }
     }

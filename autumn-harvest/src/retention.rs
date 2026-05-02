@@ -566,3 +566,173 @@ struct CountRow {
     #[diesel(sql_type = BigInt)]
     count: i64,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn test_retention_config_default() {
+        let config = RetentionConfig::default();
+        assert_eq!(config.max_age_secs, None);
+        assert_eq!(config.tick_interval_secs, DEFAULT_TICK_INTERVAL.as_secs());
+        assert_eq!(config.batch_size, DEFAULT_BATCH_SIZE);
+        assert!(!config.dry_run);
+        assert!(!config.enabled());
+    }
+
+    #[test]
+    fn test_retention_config_with_max_age() {
+        let config = RetentionConfig::with_max_age(Duration::from_secs(3600));
+        assert_eq!(config.max_age_secs, Some(3600));
+        assert_eq!(config.tick_interval_secs, DEFAULT_TICK_INTERVAL.as_secs());
+        assert!(config.enabled());
+    }
+
+    #[test]
+    fn test_retention_config_validate_valid() {
+        let config = RetentionConfig {
+            max_age_secs: Some(3600),
+            tick_interval_secs: 60,
+            batch_size: 100,
+            dry_run: false,
+        };
+        assert!(config.validate().is_ok());
+
+        let config_no_max = RetentionConfig {
+            max_age_secs: None,
+            tick_interval_secs: 60,
+            batch_size: 100,
+            dry_run: false,
+        };
+        assert!(config_no_max.validate().is_ok());
+    }
+
+    #[test]
+    fn test_retention_config_validate_invalid_tick_interval() {
+        let config = RetentionConfig {
+            max_age_secs: Some(3600),
+            tick_interval_secs: 0,
+            batch_size: 100,
+            dry_run: false,
+        };
+        assert_eq!(
+            config.validate(),
+            Err("tick_interval must be >= 1s".to_string())
+        );
+    }
+
+    #[test]
+    fn test_retention_config_validate_invalid_batch_size() {
+        let config = RetentionConfig {
+            max_age_secs: Some(3600),
+            tick_interval_secs: 60,
+            batch_size: 0,
+            dry_run: false,
+        };
+        assert_eq!(
+            config.validate(),
+            Err("batch_size must be >= 1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_retention_config_validate_invalid_max_age_too_small() {
+        let config = RetentionConfig {
+            max_age_secs: Some(0),
+            tick_interval_secs: 60,
+            batch_size: 100,
+            dry_run: false,
+        };
+        assert_eq!(
+            config.validate(),
+            Err(format!(
+                "max_age must be between {}s and {}s",
+                MIN_MAX_AGE.as_secs(),
+                MAX_MAX_AGE.as_secs()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_retention_config_validate_invalid_max_age_too_large() {
+        let config = RetentionConfig {
+            max_age_secs: Some(MAX_MAX_AGE.as_secs() + 1),
+            tick_interval_secs: 60,
+            batch_size: 100,
+            dry_run: false,
+        };
+        assert_eq!(
+            config.validate(),
+            Err(format!(
+                "max_age must be between {}s and {}s",
+                MIN_MAX_AGE.as_secs(),
+                MAX_MAX_AGE.as_secs()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_retention_monitor_snapshot() {
+        let config = RetentionConfig::default();
+        let monitor =
+            RetentionMonitor::new(config, vec![ShardId::new(1), ShardId::new(2)].into_iter());
+
+        let status = monitor.snapshot();
+        assert_eq!(status.per_shard.len(), 2);
+
+        let shards: Vec<u16> = status.per_shard.iter().map(|s| s.shard).collect();
+        assert!(shards.contains(&1));
+        assert!(shards.contains(&2));
+    }
+
+    #[test]
+    #[cfg(feature = "db")]
+    fn test_retention_monitor_update() {
+        let config = RetentionConfig::default();
+        let monitor = RetentionMonitor::new(config, vec![ShardId::new(1)].into_iter());
+
+        let tick_result = RetentionTickResult {
+            shard: 1,
+            ran_at: Some(chrono::Utc::now()),
+            candidate_count: 5,
+            deleted_count: 5,
+            oldest_age_secs_skipped: None,
+            duration_ms: 10,
+            last_error: None,
+        };
+
+        monitor.update(ShardId::new(1), tick_result);
+
+        let status = monitor.snapshot();
+        assert_eq!(status.per_shard.len(), 1);
+        assert_eq!(status.per_shard[0].candidate_count, 5);
+        assert_eq!(status.per_shard[0].deleted_count, 5);
+    }
+
+    #[test]
+    #[cfg(feature = "db")]
+    fn test_retention_monitor_update_missing_shard() {
+        let config = RetentionConfig::default();
+        let monitor = RetentionMonitor::new(config, vec![ShardId::new(1)].into_iter());
+
+        let tick_result = RetentionTickResult {
+            shard: 2,
+            ran_at: Some(chrono::Utc::now()),
+            candidate_count: 5,
+            deleted_count: 5,
+            oldest_age_secs_skipped: None,
+            duration_ms: 10,
+            last_error: None,
+        };
+
+        // Updating a shard that doesn't exist in the list should silently be ignored
+        // per the current implementation (`if let Some(existing) = guard.per_shard.iter_mut().find(...)`)
+        monitor.update(ShardId::new(2), tick_result);
+
+        let status = monitor.snapshot();
+        assert_eq!(status.per_shard.len(), 1);
+        assert_eq!(status.per_shard[0].candidate_count, 0); // Unchanged
+    }
+}
