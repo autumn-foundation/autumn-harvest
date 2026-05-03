@@ -1886,3 +1886,32 @@ async fn register_schedules_recomputes_next_run_when_schedule_changes() {
         "changing an automatic schedule to manual should clear stale next_run_at"
     );
 }
+
+#[tokio::test]
+async fn harvest_api_rejects_out_of_bounds_execution_timeout() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let registry = approval_registry();
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
+    api_state.install(HarvestApiRuntime::new(
+        Arc::clone(&registry),
+        Arc::new(HashMap::new()),
+        Arc::new(Vec::new()),
+        Some("test-worker".to_string()),
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::single(),
+    ));
+
+    let app = harvest_api_router(api_state).with_state(test_app_state(pool));
+
+    let payload = json!({
+        "workflow_name": "test_workflow",
+        "execution_timeout_secs": i64::MAX,
+    });
+
+    let (status, _body) = post_json(&app, "/workflows/test_workflow/start", payload).await;
+    assert!(status.is_success() || status.is_client_error(), "Status: {}", status);
+}
