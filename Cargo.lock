@@ -172,6 +172,7 @@ name = "autumn-harvest"
 version = "0.2.0"
 dependencies = [
  "autumn-harvest-macros",
+ "base64 0.22.1",
  "chrono",
  "criterion",
  "croner 2.2.0",

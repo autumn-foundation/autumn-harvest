@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use crate::context::SharedStateMap;
 use crate::info::{ActivityInfo, DagInfo, WorkflowInfo};
+use crate::payload_codec::{PayloadCodec, PayloadCodecs};
 use crate::policy::WorkflowSchedule;
 use crate::retention::RetentionConfig;
 use crate::telemetry::TelemetryConfig;
@@ -45,6 +46,7 @@ pub struct HarvestBuilder {
     state: SharedStateMap,
     telemetry: Option<TelemetryConfig>,
     retention: RetentionConfig,
+    payload_codecs: PayloadCodecs,
 }
 
 impl std::fmt::Debug for HarvestBuilder {
@@ -58,6 +60,7 @@ impl std::fmt::Debug for HarvestBuilder {
             .field("state_count", &self.state.len())
             .field("telemetry_configured", &self.telemetry.is_some())
             .field("retention", &self.retention)
+            .field("payload_codecs", &"configured")
             .finish()
     }
 }
@@ -72,6 +75,7 @@ pub struct BuiltHarvest {
     state: SharedStateMap,
     telemetry: Arc<TelemetryConfig>,
     retention: RetentionConfig,
+    payload_codecs: PayloadCodecs,
 }
 
 impl std::fmt::Debug for BuiltHarvest {
@@ -85,6 +89,7 @@ impl std::fmt::Debug for BuiltHarvest {
             .field("state_count", &self.state.len())
             .field("telemetry", &self.telemetry)
             .field("retention", &self.retention)
+            .field("payload_codecs", &"configured")
             .finish()
     }
 }
@@ -190,6 +195,11 @@ pub enum HarvestBuilderError {
 }
 
 impl BuiltHarvest {
+    #[must_use]
+    pub fn payload_codecs(&self) -> &PayloadCodecs {
+        &self.payload_codecs
+    }
+
     /// Number of registered workflows.
     #[must_use]
     pub const fn workflow_count(&self) -> usize {
@@ -395,6 +405,11 @@ impl HarvestBuilder {
     ///
     /// When unset, the runtime uses safe no-op defaults — telemetry is opt-in.
     #[must_use]
+    pub fn payload_codec(mut self, codec: impl PayloadCodec + 'static) -> Self {
+        self.payload_codecs.set_default(Arc::new(codec));
+        self
+    }
+
     pub fn telemetry(mut self, telemetry: TelemetryConfig) -> Self {
         self.telemetry = Some(telemetry);
         self
@@ -478,6 +493,7 @@ impl HarvestBuilder {
             state: self.state,
             telemetry: Arc::new(self.telemetry.unwrap_or_default()),
             retention: self.retention,
+            payload_codecs: self.payload_codecs,
         })
     }
 }

@@ -39,7 +39,12 @@ pub fn events_to_insert_rows(
     exec_id: ExecutionId,
     events: &[WorkflowEvent],
 ) -> Result<Vec<NewHarvestEvent<'_>>, crate::error::HarvestError> {
-    events_to_insert_rows_from(exec_id, events, 0)
+    events_to_insert_rows_from_with_codecs(
+        exec_id,
+        events,
+        0,
+        &crate::payload_codec::PayloadCodecs::default(),
+    )
 }
 
 /// Convert in-memory events to insertable rows with sequential event IDs
@@ -57,6 +62,20 @@ pub fn events_to_insert_rows_from(
     events: &[WorkflowEvent],
     start_id: i32,
 ) -> Result<Vec<NewHarvestEvent<'_>>, crate::error::HarvestError> {
+    events_to_insert_rows_from_with_codecs(
+        exec_id,
+        events,
+        start_id,
+        &crate::payload_codec::PayloadCodecs::default(),
+    )
+}
+
+pub fn events_to_insert_rows_from_with_codecs<'a>(
+    exec_id: ExecutionId,
+    events: &'a [WorkflowEvent],
+    start_id: i32,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> Result<Vec<NewHarvestEvent<'a>>, crate::error::HarvestError> {
     events
         .iter()
         .enumerate()
@@ -70,7 +89,7 @@ pub fn events_to_insert_rows_from(
                 workflow_exec_id: exec_id.as_uuid(),
                 event_id,
                 event_type: event.type_name(),
-                event_data: serde_json::to_value(event).expect("WorkflowEvent must serialize"),
+                event_data: codecs.encode_event(event)?,
             })
         })
         .collect()
@@ -244,6 +263,19 @@ pub async fn load_history(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
 ) -> HarvestResult<EventHistory> {
+    load_history_with_codecs(
+        conn,
+        exec_id,
+        &crate::payload_codec::PayloadCodecs::default(),
+    )
+    .await
+}
+
+pub async fn load_history_with_codecs(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<EventHistory> {
     use crate::models::HarvestEvent;
 
     let rows: Vec<HarvestEvent> = harvest_events::table
@@ -257,7 +289,7 @@ pub async fn load_history(
 
     let events = rows
         .into_iter()
-        .map(|row| serde_json::from_value(row.event_data))
+        .map(|row| codecs.decode_event(row.event_data))
         .collect::<Result<Vec<WorkflowEvent>, _>>()?;
 
     Ok(EventHistory {
