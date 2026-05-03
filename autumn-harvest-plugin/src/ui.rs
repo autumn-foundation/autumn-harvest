@@ -376,10 +376,10 @@ async fn list_workers_ui(
     let mut all_workers: Vec<(ShardId, WorkerRow)> = shard_results
         .iter()
         .flat_map(|(shard_id, result)| {
+            let shard_id = *shard_id;
             result
                 .iter()
-                .flat_map(|rows| rows.iter().map(|r| (*shard_id, r.clone())))
-                .collect::<Vec<_>>()
+                .flat_map(move |rows| rows.iter().map(move |r| (shard_id, r.clone())))
         })
         .filter(|(shard_id, row)| {
             if params.shard.is_some_and(|f| shard_id.as_i32() != f) {

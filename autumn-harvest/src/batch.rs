@@ -388,7 +388,7 @@ mod db {
                 dispatched_ids
                     .iter()
                     .map(Uuid::to_string)
-                    .collect::<Vec<_>>(),
+                    .collect::<Vec<String>>(),
             )
             .map_err(HarvestError::from)?
         };
@@ -736,7 +736,7 @@ mod db {
             }
             let mut completed_delta = 0i64;
             let mut failed_delta = 0i64;
-            let mut new_errors: Vec<BatchTargetError> = Vec::new();
+            let mut new_errors: Vec<BatchTargetError> = Vec::with_capacity(chunk.len());
             let mut dispatched_ids: Vec<Uuid> = Vec::with_capacity(chunk.len());
             while let Some((target, outcome)) = tasks.next().await {
                 dispatched_ids.push(target.as_uuid());
