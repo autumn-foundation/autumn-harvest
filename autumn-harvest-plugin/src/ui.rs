@@ -459,23 +459,27 @@ async fn load_workers_from_shards(
     status_filter: Option<&str>,
     stale_threshold: std::time::Duration,
 ) -> Vec<ShardWorkerResult> {
-    let unlimited = WorkerFilters {
-        limit: i64::MAX,
-        status: status_filter.map(str::to_string),
-        ..WorkerFilters::new()
-    };
-    let mut results: Vec<ShardWorkerResult> = Vec::new();
-    for (shard_id, shard_pool) in pool.iter_shards() {
-        let result = async {
-            let mut conn = acquire_conn(shard_pool).await.map_err(|e| e.to_string())?;
-            list_workers(&mut conn, &unlimited, stale_threshold)
-                .await
-                .map_err(|e| e.to_string())
-        }
-        .await;
-        results.push((shard_id, result));
-    }
-    results
+    let futs: Vec<_> = pool
+        .iter_shards()
+        .map(|(shard_id, shard_pool)| {
+            let unlimited = WorkerFilters {
+                limit: i64::MAX,
+                status: status_filter.map(str::to_string),
+                ..WorkerFilters::new()
+            };
+            async move {
+                let result = async {
+                    let mut conn = acquire_conn(shard_pool).await.map_err(|e| e.to_string())?;
+                    list_workers(&mut conn, &unlimited, stale_threshold)
+                        .await
+                        .map_err(|e| e.to_string())
+                }
+                .await;
+                (shard_id, result)
+            }
+        })
+        .collect();
+    futures::future::join_all(futs).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -580,11 +584,7 @@ fn render_worker_table(rows: &[WorkerRow], shard_id: ShardId) -> Markup {
                     @let is_stale = row.health == WorkerHealth::Stale;
                     @let row_class = if is_stale { "stale-row" } else { "" };
                     tr class=(row_class) {
-                        td {
-                            a href={ "workers/" (url_encode(&row.worker.worker_id)) } {
-                                code { (short_id(&row.worker.worker_id)) }
-                            }
-                        }
+                        td { code { (short_id(&row.worker.worker_id)) } }
                         td { (worker_status_badge(&row.worker.status, is_stale)) }
                         td {
                             @let rel = relative_time(row.worker.last_heartbeat_at);
