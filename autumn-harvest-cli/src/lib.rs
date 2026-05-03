@@ -424,11 +424,14 @@ enum BatchCommand {
         #[arg(long, value_name = "PATH", conflicts_with = "filter_json")]
         filter_file: Option<PathBuf>,
         /// Name of the signal (required if action is Signal).
-        #[arg(long)]
+        #[arg(long, required_if_eq("action", "Signal"))]
         signal_name: Option<String>,
         /// Inline JSON signal payload.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "signal_payload_file")]
         signal_payload_json: Option<String>,
+        /// File containing JSON signal payload. Use `-` for stdin.
+        #[arg(long, value_name = "PATH", conflicts_with = "signal_payload_json")]
+        signal_payload_file: Option<PathBuf>,
     },
 }
 
@@ -880,6 +883,7 @@ fn batch_request(command: &BatchCommand) -> Result<ApiRequest, CliError> {
             filter_file,
             signal_name,
             signal_payload_json,
+            signal_payload_file,
         } => {
             let filter = parse_json_source(
                 filter_json.as_deref(),
@@ -887,14 +891,23 @@ fn batch_request(command: &BatchCommand) -> Result<ApiRequest, CliError> {
                 "filter JSON",
             )?
             .unwrap_or_else(|| json!({}));
-            let mut body = json!({ "action": action, "filter": filter });
+            let mut body = Map::new();
+            body.insert("action".to_string(), json!(action));
+            body.insert("filter".to_string(), filter);
             if let Some(sn) = signal_name {
-                body["signal_name"] = json!(sn);
+                body.insert("signal_name".to_string(), json!(sn));
             }
-            if let Some(sp) = signal_payload_json {
-                body["signal_payload"] = serde_json::from_str(sp).unwrap_or_else(|_| json!(sp));
+            if let Some(payload) = parse_json_source(
+                signal_payload_json.as_deref(),
+                signal_payload_file.as_deref(),
+                "signal payload JSON",
+            )? {
+                body.insert("signal_payload".to_string(), payload);
             }
-            Ok(ApiRequest::post("/batch-operations", Some(body)))
+            Ok(ApiRequest::post(
+                "/batch-operations",
+                Some(Value::Object(body)),
+            ))
         }
     }
 }
