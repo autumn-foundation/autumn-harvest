@@ -397,7 +397,11 @@ async fn list_workers_ui(
         })
         .collect();
 
-    all_workers.sort_by(|(_, a), (_, b)| worker_sort_key(a).cmp(&worker_sort_key(b)));
+    all_workers.sort_by(|(sa, a), (sb, b)| {
+        sa.as_i32()
+            .cmp(&sb.as_i32())
+            .then_with(|| worker_sort_key(a).cmp(&worker_sort_key(b)))
+    });
 
     let total_filtered = all_workers.len();
     let offset_usize = usize::try_from(offset).unwrap_or(usize::MAX);
