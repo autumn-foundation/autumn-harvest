@@ -437,6 +437,37 @@ Worker lifecycle status values: `Active` (normal operation), `Draining` (receive
 
 In sharded deployments the API merges results across all shards via `iter_shards()`. The `harvest_workers` table lives on every shard; each worker row is pinned to the shard the worker is polling.
 
+### Vantage dashboard — Workers tab
+
+The embedded Vantage UI (`harvest_ui_router`, typically mounted at `/api/harvest/ui`) includes a **Workers** tab at `GET /ui/workers`. The page gives a single-screen answer to the canonical 2am question — "are my workers up?" — without any `curl | jq` round-trips:
+
+- **Fleet health banner**: one of `Healthy` / `Degraded` / `Unhealthy` with absolute counts (total, active, draining, stopped, stale workers).
+- **Worker table**: sorted stale-first within each status group (`Active` → `Draining` → `Stopped`), with worker ID (linked to the detail page), status pill, relative last-heartbeat time (e.g. `4m ago`), source shard, and in-flight task count. Stale workers are visually tinted and annotated `(stale)`.
+- **Filters**: `?status=`, `?shard=`, `?stale=true`; they compose with AND. Unknown values return 400.
+- **Pagination**: `?page=&limit=` matching the workflow list (max 200 per page).
+- **Partial shard failure**: if one shard's pool errors the banner shows `Degraded` and the affected section renders a "shard unavailable" stub — the rest of the page is unaffected.
+- **Auto-refresh**: add `?refresh=30` to emit a `<meta http-equiv="refresh" content="30">` tag; no JavaScript required.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ 🔭 Vantage  Harvest dashboard     Workflows  Workers        │
+├─────────────────────────────────────────────────────────────┤
+│ Workers                                                     │
+│                                                             │
+│ ┌─ Healthy ────────────────────────────────────────────┐   │
+│ │ Healthy — 5 workers | 5 active | 0 draining |       │   │
+│ │ 0 stopped | 0 stale                                  │   │
+│ └──────────────────────────────────────────────────────┘   │
+│                                                             │
+│ [Status ▼] [Shard ____] [Stale ▼] [Per page ____] [Apply] │
+│                                                             │
+│ Worker ID   Status   Last Heartbeat   Shard   In-Flight    │
+│ ─────────────────────────────────────────────────────────  │
+│ abc123…     Active   just now         0       2            │
+│ def456…     Active   3s ago           0       0            │
+└─────────────────────────────────────────────────────────────┘
+```
+
 ## Requirements
 
 - Rust 1.88.0 or newer (MSRV)

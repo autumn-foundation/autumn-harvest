@@ -530,7 +530,7 @@ fn render_workers_page(
                 @if is_multi_shard {
                     div.shard-header { "Shard " (shard_id.as_i32()) }
                 }
-                (render_worker_table(rows))
+                (render_worker_table(rows, *shard_id))
             }
         }
 
@@ -562,7 +562,7 @@ fn render_fleet_banner(stats: &WorkerFleetStats, banner_state: Option<BannerStat
     }
 }
 
-fn render_worker_table(rows: &[WorkerRow]) -> Markup {
+fn render_worker_table(rows: &[WorkerRow], shard_id: ShardId) -> Markup {
     html! {
         table {
             thead {
@@ -570,6 +570,7 @@ fn render_worker_table(rows: &[WorkerRow]) -> Markup {
                     th { "Worker ID" }
                     th { "Status" }
                     th { "Last Heartbeat" }
+                    th { "Shard" }
                     th { "In-Flight" }
                 }
             }
@@ -591,6 +592,7 @@ fn render_worker_table(rows: &[WorkerRow]) -> Markup {
                                 (rel)
                             }
                         }
+                        td { (shard_id.as_i32()) }
                         td { (row.worker.in_flight_count) }
                     }
                 }

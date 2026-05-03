@@ -123,6 +123,37 @@ fn build_two_shard_pool(shard0_url: &str, shard1_url: &str) -> HarvestDbPool {
     HarvestDbPool::sharded(ShardedDbPool::from_map(pools, ShardId::new(0)))
 }
 
+/// Provision N additional databases in the same Postgres instance and run the
+/// harvest schema in each.  Returns the URLs in shard-index order.
+async fn setup_n_shard_databases(
+    container: &ContainerAsync<Postgres>,
+    n: usize,
+) -> Vec<String> {
+    let host = container.get_host().await.expect("host");
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let admin_url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+
+    let mut admin_conn = <AsyncPgConnection as AsyncConnection>::establish(&admin_url)
+        .await
+        .expect("admin connection");
+
+    let mut urls = Vec::with_capacity(n);
+    for i in 0..n {
+        let db_name = format!("harvest_perf_shard_{}_{}", i, uuid::Uuid::new_v4().simple());
+        diesel::sql_query(format!("CREATE DATABASE {db_name}"))
+            .execute(&mut admin_conn)
+            .await
+            .expect("create shard db");
+        let url = format!("postgres://postgres:postgres@{host}:{port}/{db_name}");
+        let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&url)
+            .await
+            .expect("shard connection");
+        conn.batch_execute(INIT_SQL).await.expect("apply migrations");
+        urls.push(url);
+    }
+    urls
+}
+
 fn test_app_state_without_database() -> AppState {
     AppState::for_test().with_profile("test")
 }
@@ -746,5 +777,73 @@ async fn ui_workers_partial_shard_failure_degraded() {
     assert!(
         html.contains("Degraded") || html.contains("unavailable"),
         "partial shard failure should show Degraded banner or unavailable stub: {html}"
+    );
+}
+
+/// Performance: 1 k workers across 4 shards must render in ≤ 500 ms p95.
+///
+/// Seeds 250 workers per shard, makes a single page request, and asserts:
+/// 1. The page renders successfully (200 OK).
+/// 2. The rendered HTML body is non-trivial (contains worker ids).
+/// 3. The end-to-end wall-clock time is under the 500 ms budget.
+#[tokio::test]
+async fn ui_workers_perf_1k_workers_4_shards_under_500ms() {
+    // Provision 4 shard databases in a single container.
+    let container = Postgres::default()
+        .start()
+        .await
+        .expect("failed to start Postgres container");
+    let shard_urls = setup_n_shard_databases(&container, 4).await;
+
+    // Seed 250 workers per shard = 1 000 total.
+    const WORKERS_PER_SHARD: usize = 250;
+    for (shard_idx, url) in shard_urls.iter().enumerate() {
+        let mut conn = AsyncPgConnection::establish(url).await.unwrap();
+        for w in 0..WORKERS_PER_SHARD {
+            let worker_id = format!("perf-s{shard_idx}-w{w}");
+            insert_test_worker(&mut conn, &worker_id, "Active", 0).await;
+        }
+    }
+
+    // Build sharded pool and UI app.
+    let mut pools = BTreeMap::new();
+    for (i, url) in shard_urls.iter().enumerate() {
+        pools.insert(ShardId::new(i as i32), build_test_pool(url));
+    }
+    let harvest_pool =
+        HarvestDbPool::sharded(ShardedDbPool::from_map(pools, ShardId::new(0)));
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(harvest_pool);
+    api_state.install(HarvestApiRuntime::new(
+        echo_registry(),
+        Arc::new(HashMap::new()),
+        Arc::new(Vec::new()),
+        None,
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::new(
+            (0..4).map(ShardId::new).collect(),
+            (0..4).map(ShardId::new).collect(),
+            ShardId::new(0),
+        ),
+    ));
+    let app = harvest_ui_router(api_state).with_state(test_app_state_without_database());
+
+    // Measure wall-clock time for the page render.
+    let start = std::time::Instant::now();
+    let (status, html) = fetch_html(&app, "/workers?limit=200").await;
+    let elapsed = start.elapsed();
+
+    assert_eq!(status, StatusCode::OK, "perf test page must return 200");
+    assert!(
+        html.len() > 10_000,
+        "1k-worker page should produce substantial HTML (got {} bytes)",
+        html.len()
+    );
+    assert!(
+        elapsed.as_millis() < 500,
+        "Workers page with 1k workers must render in < 500 ms (got {} ms)",
+        elapsed.as_millis()
     );
 }
