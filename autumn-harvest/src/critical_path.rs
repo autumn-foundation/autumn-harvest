@@ -67,6 +67,36 @@ impl CriticalPathAnalyzer {
             };
         }
 
+        let (distances, predecessors) = self.calculate_distances_and_predecessors(tasks, &levels);
+        let end_node = Self::find_critical_sink_node(tasks, &distances);
+
+        let mut path_indices = Vec::new();
+        let mut current = end_node;
+
+        while let Some(node) = current {
+            path_indices.push(node);
+            current = predecessors[node];
+        }
+
+        path_indices.reverse();
+
+        let path_names = path_indices
+            .iter()
+            .map(|&i| tasks[i].activity_name.clone())
+            .collect();
+
+        CriticalPathResult {
+            total_duration: end_node.map_or(Duration::ZERO, |n| distances[n]),
+            path_indices,
+            path_names,
+        }
+    }
+
+    fn calculate_distances_and_predecessors(
+        &self,
+        tasks: &[crate::dag::DagTask],
+        levels: &[Vec<usize>],
+    ) -> (Vec<Duration>, Vec<Option<usize>>) {
         let mut distances = vec![Duration::ZERO; tasks.len()];
         let mut predecessors = vec![None; tasks.len()];
 
@@ -99,7 +129,13 @@ impl CriticalPathAnalyzer {
                 predecessors[task_index] = best_pred;
             }
         }
+        (distances, predecessors)
+    }
 
+    fn find_critical_sink_node(
+        tasks: &[crate::dag::DagTask],
+        distances: &[Duration],
+    ) -> Option<usize> {
         // Identify sink nodes (nodes with no downstreams)
         let mut is_sink = vec![true; tasks.len()];
         for task in tasks {
@@ -118,27 +154,7 @@ impl CriticalPathAnalyzer {
                 end_node = Some(i);
             }
         }
-
-        let mut path_indices = Vec::new();
-        let mut current = end_node;
-
-        while let Some(node) = current {
-            path_indices.push(node);
-            current = predecessors[node];
-        }
-
-        path_indices.reverse();
-
-        let path_names = path_indices
-            .iter()
-            .map(|&i| tasks[i].activity_name.clone())
-            .collect();
-
-        CriticalPathResult {
-            total_duration: max_dist,
-            path_indices,
-            path_names,
-        }
+        end_node
     }
 }
 

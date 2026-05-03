@@ -50,50 +50,14 @@ impl TestHarnessGenerator {
     ///
     /// # Errors
     /// Returns `std::fmt::Error` if string formatting fails.
-    #[allow(clippy::too_many_lines)]
     pub fn generate(&self, history: &[WorkflowEvent]) -> Result<String, std::fmt::Error> {
+        let ExtractedHistory {
+            mocks,
+            workflow_input,
+            final_result,
+        } = Self::extract_history_mocks(history);
+
         let mut out = String::new();
-        let mut activity_names: HashMap<ActivityExecId, String> = HashMap::new();
-        let mut mocks = Vec::new();
-        let mut workflow_input = serde_json::Value::Null;
-        let mut final_result: Option<Result<serde_json::Value, String>> = None;
-
-        for event in history {
-            match event {
-                WorkflowEvent::WorkflowStarted { input, .. } => {
-                    workflow_input = input.clone();
-                }
-                WorkflowEvent::ActivityScheduled {
-                    activity_id, name, ..
-                } => {
-                    activity_names.insert(*activity_id, name.clone());
-                }
-                WorkflowEvent::ActivityCompleted {
-                    activity_id,
-                    output,
-                } => {
-                    if let Some(name) = activity_names.get(activity_id) {
-                        mocks.push((name.clone(), Ok(output.clone())));
-                    }
-                }
-                WorkflowEvent::ActivityFailed {
-                    activity_id, error, ..
-                } => {
-                    if let Some(name) = activity_names.get(activity_id) {
-                        // For simplicity, we just capture the failure outcome for the mock.
-                        mocks.push((name.clone(), Err(error.clone())));
-                    }
-                }
-                WorkflowEvent::WorkflowCompleted { output } => {
-                    final_result = Some(Ok(output.clone()));
-                }
-                WorkflowEvent::WorkflowFailed { error } => {
-                    final_result = Some(Err(error.clone()));
-                }
-                _ => {}
-            }
-        }
-
         writeln!(out, "#[tokio::test]")?;
         writeln!(out, "async fn {}() {{", self.test_name)?;
         writeln!(out, "    use autumn_harvest::simulator::WorkflowSimulator;")?;
@@ -158,6 +122,61 @@ impl TestHarnessGenerator {
 
         Ok(out)
     }
+
+    fn extract_history_mocks(history: &[WorkflowEvent]) -> ExtractedHistory {
+        let mut activity_names: HashMap<ActivityExecId, String> = HashMap::new();
+        let mut mocks = Vec::new();
+        let mut workflow_input = serde_json::Value::Null;
+        let mut final_result: Option<Result<serde_json::Value, String>> = None;
+
+        for event in history {
+            match event {
+                WorkflowEvent::WorkflowStarted { input, .. } => {
+                    workflow_input = input.clone();
+                }
+                WorkflowEvent::ActivityScheduled {
+                    activity_id, name, ..
+                } => {
+                    activity_names.insert(*activity_id, name.clone());
+                }
+                WorkflowEvent::ActivityCompleted {
+                    activity_id,
+                    output,
+                } => {
+                    if let Some(name) = activity_names.get(activity_id) {
+                        mocks.push((name.clone(), Ok(output.clone())));
+                    }
+                }
+                WorkflowEvent::ActivityFailed {
+                    activity_id, error, ..
+                } => {
+                    if let Some(name) = activity_names.get(activity_id) {
+                        // For simplicity, we just capture the failure outcome for the mock.
+                        mocks.push((name.clone(), Err(error.clone())));
+                    }
+                }
+                WorkflowEvent::WorkflowCompleted { output } => {
+                    final_result = Some(Ok(output.clone()));
+                }
+                WorkflowEvent::WorkflowFailed { error } => {
+                    final_result = Some(Err(error.clone()));
+                }
+                _ => {}
+            }
+        }
+
+        ExtractedHistory {
+            mocks,
+            workflow_input,
+            final_result,
+        }
+    }
+}
+
+struct ExtractedHistory {
+    mocks: Vec<(String, Result<serde_json::Value, String>)>,
+    workflow_input: serde_json::Value,
+    final_result: Option<Result<serde_json::Value, String>>,
 }
 
 #[cfg(test)]
