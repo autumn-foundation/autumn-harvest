@@ -385,8 +385,8 @@ pub async fn bulk_replay_dead_letters(
 
     let mut acted_on = 0usize;
     let mut skipped = 0usize;
-    let mut acted_ids: Vec<String> = Vec::new();
-    let mut failures: Vec<BulkDlqFailure> = Vec::new();
+    let mut acted_ids: Vec<String> = Vec::with_capacity(rows.len());
+    let mut failures: Vec<BulkDlqFailure> = Vec::with_capacity(rows.len());
 
     for row in &rows {
         match replay_dead_letter(conn, row.id).await {
@@ -449,8 +449,8 @@ pub async fn bulk_discard_dead_letters(
 
     let mut acted_on = 0usize;
     let mut skipped = 0usize;
-    let mut acted_ids: Vec<String> = Vec::new();
-    let mut failures: Vec<BulkDlqFailure> = Vec::new();
+    let mut acted_ids: Vec<String> = Vec::with_capacity(rows.len());
+    let mut failures: Vec<BulkDlqFailure> = Vec::with_capacity(rows.len());
 
     for row in &rows {
         match diesel::delete(dsl::harvest_dead_letters.find(row.id))
