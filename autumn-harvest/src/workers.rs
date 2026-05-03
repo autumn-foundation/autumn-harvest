@@ -480,7 +480,7 @@ pub async fn fleet_health(
 // ---------------------------------------------------------------------------
 
 /// A worker row enriched with the derived health classification.
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct WorkerRow {
     #[serde(flatten)]
     pub worker: HarvestWorker,
