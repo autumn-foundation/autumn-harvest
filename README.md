@@ -137,6 +137,7 @@ cargo run -p autumn-harvest-cli -- workflow start approval_workflow --input-json
 cargo run -p autumn-harvest-cli -- workflow signal <execution-id> approved --payload-json '{"approved":true}'
 cargo run -p autumn-harvest-cli -- workflow query <execution-id> status
 cargo run -p autumn-harvest-cli -- workflow cancel <execution-id> --reason "operator request"
+cargo run -p autumn-harvest-cli -- workflow stack <execution-id>
 cargo run -p autumn-harvest-cli -- dag list
 cargo run -p autumn-harvest-cli -- dag trigger daily_pipeline --conf-json '{"date":"2026-04-21"}'
 cargo run -p autumn-harvest-cli -- dag pause daily_pipeline
@@ -298,6 +299,36 @@ cargo run -p autumn-harvest-cli -- workflow list \
     --workflow-name onboarding \
     --search-attr tenant=acme
 ```
+
+### Inspecting workflow stack (current wait-state)
+
+Use the stack endpoint to inspect what an execution is currently waiting on
+(pending activities, local activities, timers, buffered signals, child
+workflows) plus the latest durable event cursor:
+
+```bash
+# CLI
+cargo run -p autumn-harvest-cli -- workflow stack <execution-id>
+
+# HTTP
+curl -s http://localhost:3000/api/harvest/workflows/<execution-id>/stack | jq .
+```
+
+Route:
+
+```text
+GET /api/harvest/workflows/{execution_id}/stack
+```
+
+Forward-compatibility contract:
+
+- Unknown top-level fields are additive; clients should ignore what they do not
+  recognize.
+- Collection item objects may gain new optional fields over time.
+- Known fields retain their current meaning; optional fields may be `null` when
+  data is unavailable.
+- `last_event_id` is monotonic per execution and can be used as a lightweight
+  change cursor.
 
 ### Post-incident DLQ drain
 

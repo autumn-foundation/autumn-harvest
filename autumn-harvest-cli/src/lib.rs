@@ -209,6 +209,11 @@ enum WorkflowCommand {
         /// Workflow execution ID.
         execution_id: String,
     },
+    /// Show what a workflow is currently waiting on.
+    Stack {
+        /// Workflow execution ID.
+        execution_id: String,
+    },
     /// Start a workflow execution.
     Start {
         /// Registered workflow name.
@@ -595,6 +600,10 @@ fn workflow_request(command: &WorkflowCommand) -> Result<ApiRequest, CliError> {
         )?)),
         WorkflowCommand::Get { execution_id } => Ok(ApiRequest::get(format!(
             "/workflows/{}",
+            path_segment(execution_id)
+        ))),
+        WorkflowCommand::Stack { execution_id } => Ok(ApiRequest::get(format!(
+            "/workflows/{}/stack",
             path_segment(execution_id)
         ))),
         WorkflowCommand::Start {

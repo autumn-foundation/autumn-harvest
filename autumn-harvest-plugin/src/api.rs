@@ -35,7 +35,10 @@ use autumn_harvest::retention::{RetentionConfig, RetentionMonitor, RetentionStat
 use autumn_harvest::scheduler::{
     DagCatalog, RegisteredDag, SchedulerMonitor, SchedulerSnapshot, trigger_dag,
 };
-use autumn_harvest::schema::{harvest_dag_runs, harvest_schedules, harvest_workflow_executions};
+use autumn_harvest::schema::{
+    harvest_dag_runs, harvest_events, harvest_schedules, harvest_signals, harvest_task_queue,
+    harvest_timers, harvest_workflow_executions,
+};
 use autumn_harvest::shard::ShardRouter;
 use autumn_harvest::signal;
 use autumn_harvest::store;
@@ -251,6 +254,82 @@ struct WorkflowDetailsResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct WorkflowStackResponse {
+    exec_id: String,
+    workflow_id: String,
+    workflow_name: String,
+    state: String,
+    is_terminal: bool,
+    pending_activities: Vec<PendingActivity>,
+    pending_local_activities: Vec<PendingLocalActivity>,
+    pending_timers: Vec<PendingTimer>,
+    pending_signals: Vec<PendingSignal>,
+    buffered_signals: Vec<BufferedSignal>,
+    pending_child_workflows: Vec<PendingChildWorkflow>,
+    last_event_id: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct PendingActivity {
+    activity_exec_id: String,
+    activity_name: String,
+    queue: String,
+    scheduled_at: chrono::DateTime<chrono::Utc>,
+    attempt: i32,
+    max_attempts: i32,
+    task_status: String,
+    claimed_by_worker_id: Option<String>,
+    last_heartbeat_at: Option<chrono::DateTime<chrono::Utc>>,
+    next_retry_at: Option<chrono::DateTime<chrono::Utc>>,
+    schedule_to_start_deadline: Option<chrono::DateTime<chrono::Utc>>,
+    start_to_close_deadline: Option<chrono::DateTime<chrono::Utc>>,
+    heartbeat_deadline: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Debug, Serialize)]
+struct PendingLocalActivity {
+    activity_exec_id: String,
+    activity_name: String,
+    scheduled_at: chrono::DateTime<chrono::Utc>,
+    attempt: i32,
+    max_attempts: i32,
+    task_status: String,
+    last_heartbeat_at: Option<chrono::DateTime<chrono::Utc>>,
+    next_retry_at: Option<chrono::DateTime<chrono::Utc>>,
+    start_to_close_deadline: Option<chrono::DateTime<chrono::Utc>>,
+    heartbeat_deadline: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Debug, Serialize)]
+struct PendingTimer {
+    timer_id: String,
+    name: Option<String>,
+    fires_at: chrono::DateTime<chrono::Utc>,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Serialize)]
+struct PendingSignal {
+    signal_name: String,
+    waiters: i64,
+    oldest_waiter_since: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Serialize)]
+struct BufferedSignal {
+    signal_name: String,
+    buffered: i64,
+    oldest_received_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Serialize)]
+struct PendingChildWorkflow {
+    child_exec_id: String,
+    child_workflow_name: String,
+    state: String,
+}
+
+#[derive(Debug, Serialize)]
 struct StartWorkflowResponse {
     execution_id: String,
     workflow_name: String,
@@ -416,6 +495,7 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
     Router::new()
         .route("/workflows", get(list_workflows))
         .route("/workflows/{id}", get(get_workflow))
+        .route("/workflows/{id}/stack", get(get_workflow_stack))
         .route("/workflows/{workflow_name}/start", post(start_workflow))
         .route("/workflows/{id}/cancel", post(cancel_workflow))
         .route(
@@ -744,6 +824,175 @@ async fn get_workflow(
     Ok(Json(WorkflowDetailsResponse {
         execution,
         history: events,
+    }))
+}
+
+async fn get_workflow_stack(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<WorkflowStackResponse>, AutumnError> {
+    let exec_id = parse_execution_id(&id)?;
+    let exec_uuid = exec_id.as_uuid();
+    let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
+    let execution = load_execution(&mut conn, exec_id)
+        .await
+        .map_err(map_error)?;
+    let is_terminal = matches!(
+        execution.state.as_str(),
+        "COMPLETED" | "FAILED" | "CANCELLED" | "TERMINATED"
+    );
+    let last_event_id = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq(exec_uuid))
+        .select(diesel::dsl::max(harvest_events::event_id))
+        .first::<Option<i32>>(&mut conn)
+        .await
+        .map_err(database_error)?
+        .map_or(0_i64, i64::from);
+    if is_terminal {
+        return Ok(Json(WorkflowStackResponse {
+            exec_id: exec_id.to_string(),
+            workflow_id: execution.workflow_id,
+            workflow_name: execution.workflow_name,
+            state: execution.state,
+            is_terminal,
+            pending_activities: Vec::new(),
+            pending_local_activities: Vec::new(),
+            pending_timers: Vec::new(),
+            pending_signals: Vec::new(),
+            buffered_signals: Vec::new(),
+            pending_child_workflows: Vec::new(),
+            last_event_id,
+        }));
+    }
+
+    let tasks = harvest_task_queue::table
+        .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_uuid)))
+        .filter(harvest_task_queue::state.eq_any(["PENDING", "CLAIMED", "RUNNING", "BACKOFF"]))
+        .select(autumn_harvest::models::TaskQueueItem::as_select())
+        .load::<autumn_harvest::models::TaskQueueItem>(&mut conn)
+        .await
+        .map_err(database_error)?;
+    let (activity_tasks, local_tasks): (Vec<_>, Vec<_>) = tasks
+        .into_iter()
+        .partition(|task| task.task_type != "LOCAL_ACTIVITY");
+    let pending_activities = activity_tasks
+        .into_iter()
+        .map(|t| PendingActivity {
+            activity_exec_id: t.id.to_string(),
+            activity_name: t.activity_name.unwrap_or_default(),
+            queue: t.queue_name,
+            scheduled_at: t.scheduled_at,
+            attempt: t.attempt,
+            max_attempts: t.max_attempts,
+            task_status: t.state,
+            claimed_by_worker_id: t.worker_id,
+            last_heartbeat_at: t.last_heartbeat_at,
+            next_retry_at: None,
+            schedule_to_start_deadline: t.schedule_to_start.map(|d| t.scheduled_at + d),
+            start_to_close_deadline: t.started_at.zip(t.start_to_close).map(|(s, d)| s + d),
+            heartbeat_deadline: t
+                .last_heartbeat_at
+                .zip(t.heartbeat_timeout)
+                .map(|(h, d)| h + d),
+        })
+        .collect::<Vec<_>>();
+    let pending_local_activities = local_tasks
+        .into_iter()
+        .map(|t| PendingLocalActivity {
+            activity_exec_id: t.id.to_string(),
+            activity_name: t.activity_name.unwrap_or_default(),
+            scheduled_at: t.scheduled_at,
+            attempt: t.attempt,
+            max_attempts: t.max_attempts,
+            task_status: t.state,
+            last_heartbeat_at: t.last_heartbeat_at,
+            next_retry_at: None,
+            start_to_close_deadline: t.started_at.zip(t.start_to_close).map(|(s, d)| s + d),
+            heartbeat_deadline: t
+                .last_heartbeat_at
+                .zip(t.heartbeat_timeout)
+                .map(|(h, d)| h + d),
+        })
+        .collect::<Vec<_>>();
+    let pending_timers = harvest_timers::table
+        .filter(harvest_timers::workflow_exec_id.eq(exec_uuid))
+        .filter(harvest_timers::fired.eq(false))
+        .select((harvest_timers::timer_id, harvest_timers::fires_at))
+        .load::<(String, chrono::DateTime<chrono::Utc>)>(&mut conn)
+        .await
+        .map_err(database_error)?
+        .into_iter()
+        .map(|(timer_id, fires_at)| PendingTimer {
+            timer_id,
+            name: None,
+            created_at: fires_at,
+            fires_at,
+        })
+        .collect::<Vec<_>>();
+    let buffered_signals = harvest_signals::table
+        .filter(harvest_signals::workflow_exec_id.eq(exec_uuid))
+        .filter(harvest_signals::consumed.eq(false))
+        .select((harvest_signals::signal_name, harvest_signals::received_at))
+        .load::<(String, chrono::DateTime<chrono::Utc>)>(&mut conn)
+        .await
+        .map_err(database_error)?
+        .into_iter()
+        .fold(
+            std::collections::BTreeMap::<String, (i64, chrono::DateTime<chrono::Utc>)>::new(),
+            |mut acc, (name, ts)| {
+                acc.entry(name)
+                    .and_modify(|entry| {
+                        entry.0 += 1;
+                        if ts < entry.1 {
+                            entry.1 = ts;
+                        }
+                    })
+                    .or_insert((1, ts));
+                acc
+            },
+        )
+        .into_iter()
+        .map(
+            |(signal_name, (buffered, oldest_received_at))| BufferedSignal {
+                signal_name,
+                buffered,
+                oldest_received_at,
+            },
+        )
+        .collect::<Vec<_>>();
+    let pending_child_workflows = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::parent_id.eq(Some(exec_uuid)))
+        .filter(harvest_workflow_executions::state.ne_all(["COMPLETED", "FAILED", "CANCELLED"]))
+        .select((
+            harvest_workflow_executions::id,
+            harvest_workflow_executions::workflow_name,
+            harvest_workflow_executions::state,
+        ))
+        .load::<(uuid::Uuid, String, String)>(&mut conn)
+        .await
+        .map_err(database_error)?
+        .into_iter()
+        .map(
+            |(child_exec_id, child_workflow_name, state)| PendingChildWorkflow {
+                child_exec_id: child_exec_id.to_string(),
+                child_workflow_name,
+                state,
+            },
+        )
+        .collect::<Vec<_>>();
+    Ok(Json(WorkflowStackResponse {
+        exec_id: exec_id.to_string(),
+        workflow_id: execution.workflow_id,
+        workflow_name: execution.workflow_name,
+        state: execution.state,
+        is_terminal,
+        pending_activities,
+        pending_local_activities,
+        pending_timers,
+        pending_signals: Vec::new(),
+        buffered_signals,
+        pending_child_workflows,
+        last_event_id,
     }))
 }
 
