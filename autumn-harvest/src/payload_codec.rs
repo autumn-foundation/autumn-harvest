@@ -9,7 +9,17 @@ use crate::error::{HarvestError, HarvestResult};
 
 pub trait PayloadCodec: Send + Sync {
     fn codec_id(&self) -> &'static str;
+    /// Encode raw payload bytes for persistence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CodecError`] when encoding fails.
     fn encode(&self, raw: &[u8]) -> Result<Vec<u8>, CodecError>;
+    /// Decode persisted payload bytes back into raw bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CodecError`] when decoding fails.
     fn decode(&self, encoded: &[u8]) -> Result<Vec<u8>, CodecError>;
 }
 
@@ -54,6 +64,11 @@ static GLOBAL_PAYLOAD_CODECS: LazyLock<RwLock<PayloadCodecs>> =
     LazyLock::new(|| RwLock::new(PayloadCodecs::default()));
 
 impl PayloadCodecs {
+    /// Return a clone of the globally installed payload codec registry.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the global registry lock is poisoned.
     pub fn global() -> Self {
         GLOBAL_PAYLOAD_CODECS
             .read()
@@ -61,6 +76,11 @@ impl PayloadCodecs {
             .clone()
     }
 
+    /// Install this codec registry as the process-global default.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the global registry lock is poisoned.
     pub fn install_global(self) {
         *GLOBAL_PAYLOAD_CODECS
             .write()
@@ -76,12 +96,22 @@ impl PayloadCodecs {
         self.default = codec;
     }
 
+    /// Encode payload-bearing fields inside an event into codec envelopes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError`] if event serialization or codec encoding fails.
     pub fn encode_event(&self, event: &crate::event::WorkflowEvent) -> HarvestResult<Value> {
         let mut value = serde_json::to_value(event)?;
         self.transform_event_data(&mut value, true)?;
         Ok(value)
     }
 
+    /// Decode codec envelopes in a serialized event back to raw JSON payloads.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError`] if codec decoding or event deserialization fails.
     pub fn decode_event(&self, mut value: Value) -> HarvestResult<crate::event::WorkflowEvent> {
         self.transform_event_data(&mut value, false)?;
         Ok(serde_json::from_value(value)?)

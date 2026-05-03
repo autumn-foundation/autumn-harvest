@@ -196,7 +196,7 @@ pub enum HarvestBuilderError {
 
 impl BuiltHarvest {
     #[must_use]
-    pub fn payload_codecs(&self) -> &PayloadCodecs {
+    pub const fn payload_codecs(&self) -> &PayloadCodecs {
         &self.payload_codecs
     }
 
@@ -410,6 +410,7 @@ impl HarvestBuilder {
         self
     }
 
+    #[must_use]
     pub fn telemetry(mut self, telemetry: TelemetryConfig) -> Self {
         self.telemetry = Some(telemetry);
         self
