@@ -12,7 +12,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::error::TimeoutType;
-use crate::types::{ActivityExecId, ExecutionId, ExternalActivityToken, TimerId, WorkerId};
+use crate::types::{
+    ActivityExecId, ExecutionId, ExternalActivityToken, TimerId, UpdateId, WorkerId,
+};
 
 /// All possible events in a workflow's history.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -241,6 +243,38 @@ pub enum WorkflowEvent {
         /// Token of the activity whose deadline was extended.
         token: ExternalActivityToken,
     },
+
+    // ── Updates (issue #140) ──────────────────────────────────────────────
+    /// An update request passed its validator and was durably admitted into
+    /// the workflow's event history. The `update_id` correlates with the
+    /// paired `UpdateCompleted` or `UpdateFailed` event.
+    ///
+    /// Validator failures leave **no trace** in history — only admitted updates
+    /// produce this event.
+    UpdateAdmitted {
+        /// Unique ID for this update invocation. Stable across worker restarts.
+        update_id: UpdateId,
+        /// The name of the registered update handler.
+        name: String,
+        /// JSON payload delivered with the update request.
+        input: serde_json::Value,
+        /// Time when the update was admitted.
+        timestamp: DateTime<Utc>,
+    },
+    /// The update handler ran to completion and returned a value.
+    UpdateCompleted {
+        /// Unique ID matching the corresponding `UpdateAdmitted`.
+        update_id: UpdateId,
+        /// The JSON result returned by the update handler.
+        output: serde_json::Value,
+    },
+    /// The update handler returned an error.
+    UpdateFailed {
+        /// Unique ID matching the corresponding `UpdateAdmitted`.
+        update_id: UpdateId,
+        /// String representation of the handler error.
+        error: String,
+    },
 }
 
 impl WorkflowEvent {
@@ -274,6 +308,9 @@ impl WorkflowEvent {
             Self::ActivityCompletedExternally { .. } => "ActivityCompletedExternally",
             Self::ActivityFailedExternally { .. } => "ActivityFailedExternally",
             Self::ActivityExternalDeadlineExtended { .. } => "ActivityExternalDeadlineExtended",
+            Self::UpdateAdmitted { .. } => "UpdateAdmitted",
+            Self::UpdateCompleted { .. } => "UpdateCompleted",
+            Self::UpdateFailed { .. } => "UpdateFailed",
         }
     }
 
@@ -484,10 +521,24 @@ mod tests {
                 error: "transient".into(),
                 attempt: 1,
             },
+            WorkflowEvent::UpdateAdmitted {
+                update_id: crate::types::UpdateId::new(),
+                name: "approve".into(),
+                input: serde_json::Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::UpdateCompleted {
+                update_id: crate::types::UpdateId::new(),
+                output: serde_json::Value::Null,
+            },
+            WorkflowEvent::UpdateFailed {
+                update_id: crate::types::UpdateId::new(),
+                error: "x".into(),
+            },
         ];
 
-        assert_eq!(events.len(), 25);
+        assert_eq!(events.len(), 28);
         let names: HashSet<_> = events.iter().map(WorkflowEvent::type_name).collect();
-        assert_eq!(names.len(), 25, "duplicate type names detected");
+        assert_eq!(names.len(), 28, "duplicate type names detected");
     }
 }

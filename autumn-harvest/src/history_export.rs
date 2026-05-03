@@ -77,6 +77,11 @@ impl MermaidExporter {
                 | WorkflowEvent::LocalActivityFailed { .. } => {
                     self.handle_local_activity_event(event)?;
                 }
+                WorkflowEvent::UpdateAdmitted { .. }
+                | WorkflowEvent::UpdateCompleted { .. }
+                | WorkflowEvent::UpdateFailed { .. } => {
+                    self.handle_update_event(event)?;
+                }
             }
         }
         Ok(())
@@ -331,6 +336,34 @@ impl MermaidExporter {
                 writeln!(
                     self.out,
                     "    Note right of WF: Deadline Extended (token: {token})"
+                )?;
+            }
+            _ => unreachable!(),
+        }
+        Ok(())
+    }
+
+    fn handle_update_event(&mut self, event: &WorkflowEvent) -> Result<(), std::fmt::Error> {
+        match event {
+            WorkflowEvent::UpdateAdmitted {
+                update_id, name, ..
+            } => {
+                writeln!(
+                    self.out,
+                    "    Note over WF: Update Admitted: {name} (id: {update_id})"
+                )?;
+            }
+            WorkflowEvent::UpdateCompleted { update_id, .. } => {
+                writeln!(
+                    self.out,
+                    "    Note over WF: Update Completed (id: {update_id})"
+                )?;
+            }
+            WorkflowEvent::UpdateFailed { update_id, error } => {
+                let safe_error = error.replace('\n', " ").replace('"', "'");
+                writeln!(
+                    self.out,
+                    "    Note over WF: Update Failed (id: {update_id}): {safe_error}"
                 )?;
             }
             _ => unreachable!(),

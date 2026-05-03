@@ -342,6 +342,62 @@ impl FromStr for ActivityExecId {
     }
 }
 
+/// Unique identifier for a single workflow update invocation.
+///
+/// Generated when an update request is admitted (validator passed) and embedded
+/// in the `UpdateAdmitted`, `UpdateCompleted`, and `UpdateFailed` events so the
+/// result can be looked up by any worker after a restart.
+///
+/// ## Examples
+///
+/// ```rust
+/// use autumn_harvest::types::UpdateId;
+///
+/// let id = UpdateId::new();
+/// assert!(!id.as_uuid().is_nil());
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct UpdateId(Uuid);
+
+impl UpdateId {
+    /// Creates a new, random `UpdateId` using a v4 UUID.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+
+    /// Returns the underlying `Uuid`.
+    #[must_use]
+    pub const fn as_uuid(&self) -> Uuid {
+        self.0
+    }
+
+    /// Wraps an existing `Uuid` as an `UpdateId`.
+    #[must_use]
+    pub const fn from_uuid(id: Uuid) -> Self {
+        Self(id)
+    }
+}
+
+impl Default for UpdateId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for UpdateId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl FromStr for UpdateId {
+    type Err = uuid::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Uuid::parse_str(s).map(Self)
+    }
+}
+
 /// Opaque single-use token that uniquely identifies a pending external activity.
 ///
 /// The token is embedded in the `ActivityAwaitingExternal` event when a workflow

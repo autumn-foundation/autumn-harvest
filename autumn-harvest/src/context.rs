@@ -20,7 +20,8 @@ use crate::error::{HarvestError, HarvestResult};
 use crate::event::WorkflowEvent;
 use crate::query::QueryRegistry;
 use crate::replay::{HistoryMatch, HistoryMatcher};
-use crate::types::{ActivityExecId, ExecutionId, ExternalActivityToken, TimerId};
+use crate::types::{ActivityExecId, ExecutionId, ExternalActivityToken, TimerId, UpdateId};
+use crate::update::{BoxUpdateHandler, BoxUpdateValidator, UpdateRegistry};
 
 /// Runtime map of typed shared state registered on the harvest builder.
 pub type SharedStateMap = HashMap<TypeId, Box<dyn Any + Send + Sync>>;
@@ -187,6 +188,18 @@ pub enum WorkflowCommand {
         /// The worker sends the final result (success or exhausted retries) here.
         result_tx: oneshot::Sender<Result<Value, String>>,
     },
+    /// Record a terminal result for an admitted update.
+    ///
+    /// Pushed by [`WorkflowContext::execute_admitted_update`] in live mode so
+    /// the worker can durably append `UpdateCompleted` or `UpdateFailed` to the
+    /// event history before persisting any other side effects from the same
+    /// execution cycle.
+    RecordUpdateResult {
+        /// The update whose result is being recorded.
+        update_id: crate::types::UpdateId,
+        /// `Ok(value)` on success; `Err(reason)` when the handler returned an error.
+        result: Result<Value, String>,
+    },
 }
 
 // Manual Debug because oneshot::Sender is not Debug.
@@ -265,6 +278,14 @@ impl std::fmt::Debug for WorkflowCommand {
                 .field("name", name)
                 .field("start_to_close_secs", start_to_close_secs)
                 .finish_non_exhaustive(),
+            Self::RecordUpdateResult { update_id, result } => f
+                .debug_struct("RecordUpdateResult")
+                .field("update_id", update_id)
+                .field(
+                    "result",
+                    &result.as_ref().map(|_| "<output>").map_err(String::as_str),
+                )
+                .finish(),
         }
     }
 }
@@ -308,6 +329,9 @@ pub struct WorkflowContext {
     state: SharedState,
     /// In-memory query handlers (not persisted to history).
     query_registry: Mutex<QueryRegistry>,
+    /// In-memory update handlers and their validators (not persisted to history).
+    /// Registration is idempotent — the first registration wins on each replay.
+    update_registry: Mutex<UpdateRegistry>,
     /// Cancellation reason captured from a `WorkflowCancelled` event in history,
     /// if any. When set, `is_cancelled()` returns true and `check_cancellation()`
     /// yields [`HarvestError::Cancelled`]. Cooperative: the workflow function is
@@ -386,6 +410,7 @@ impl WorkflowContext {
             activity_seq: Mutex::new(0),
             state,
             query_registry: Mutex::new(QueryRegistry::new()),
+            update_registry: Mutex::new(UpdateRegistry::new()),
             cancellation_reason,
             strict_replay: false,
         }
@@ -447,6 +472,7 @@ impl WorkflowContext {
             activity_seq: Mutex::new(0),
             state: empty_shared_state(),
             query_registry: Mutex::new(QueryRegistry::new()),
+            update_registry: Mutex::new(UpdateRegistry::new()),
             cancellation_reason: None,
             strict_replay: false,
         }
@@ -1412,6 +1438,153 @@ impl WorkflowContext {
             || Err(HarvestError::NotFound(format!("query handler '{name}'"))),
             |h| Ok(h()),
         )
+    }
+
+    // ── Update handlers ───────────────────────────────────────────────
+
+    /// Register a typed update handler with an optional validator.
+    ///
+    /// The `validator` runs synchronously before the update is admitted to
+    /// history. A rejected update writes **no event** and the caller receives
+    /// the rejection reason. The `handler` is an async closure that mutates
+    /// workflow state and returns a typed result.
+    ///
+    /// Registration is **idempotent** — calling this with the same `name`
+    /// multiple times (e.g., on every replay cycle at the top of the workflow
+    /// function) is a no-op after the first call.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal update registry mutex is poisoned.
+    pub fn register_update_handler<V, H, F>(&self, name: &str, validator: V, handler: H)
+    where
+        V: Fn(&Value) -> Result<(), String> + Send + Sync + 'static,
+        H: Fn(Value) -> F + Send + Sync + 'static,
+        F: std::future::Future<Output = Result<Value, String>> + Send + 'static,
+    {
+        let boxed_validator: BoxUpdateValidator = Arc::new(validator);
+        let boxed_handler: BoxUpdateHandler = Arc::new(move |input| Box::pin(handler(input)));
+        self.update_registry
+            .lock()
+            .expect("update_registry lock poisoned")
+            .register(name, Some(boxed_validator), boxed_handler);
+    }
+
+    /// Register an update handler with no validator (always admitted).
+    ///
+    /// Equivalent to [`register_update_handler`](Self::register_update_handler)
+    /// with a validator that always returns `Ok(())`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal update registry mutex is poisoned.
+    pub fn register_update_handler_no_validator<H, F>(&self, name: &str, handler: H)
+    where
+        H: Fn(Value) -> F + Send + Sync + 'static,
+        F: std::future::Future<Output = Result<Value, String>> + Send + 'static,
+    {
+        let boxed_handler: BoxUpdateHandler = Arc::new(move |input| Box::pin(handler(input)));
+        self.update_registry
+            .lock()
+            .expect("update_registry lock poisoned")
+            .register(name, None, boxed_handler);
+    }
+
+    /// Validate an incoming update without admitting it.
+    ///
+    /// - Returns `Ok(())` if the handler exists and the validator accepts.
+    /// - Returns [`HarvestError::UpdateHandlerNotFound`] if no handler is registered.
+    /// - Returns [`HarvestError::UpdateRejected`] if the validator rejects.
+    ///
+    /// **No event is appended** — the caller is responsible for appending
+    /// `UpdateAdmitted` only when this returns `Ok(())`.
+    ///
+    /// # Errors
+    ///
+    /// - Returns [`HarvestError::UpdateHandlerNotFound`] if no handler is registered under `name`.
+    /// - Returns [`HarvestError::UpdateRejected`] if the validator rejects `input`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal update registry mutex is poisoned.
+    pub fn validate_update(&self, name: &str, input: &Value) -> HarvestResult<()> {
+        let registry = self
+            .update_registry
+            .lock()
+            .expect("update_registry lock poisoned");
+        // Check existence structurally so validator errors are never confused
+        // with a missing handler, regardless of the error message text.
+        if !registry.contains(name) {
+            return Err(HarvestError::UpdateHandlerNotFound(name.to_string()));
+        }
+        registry
+            .validate(name, input)
+            .map_err(|reason| HarvestError::UpdateRejected { reason })
+    }
+
+    /// Execute an already-admitted update by `update_id`.
+    ///
+    /// Call this **after** the `UpdateAdmitted` event has been durably appended
+    /// to `harvest_events`. The method:
+    ///
+    /// - In **replay mode**: returns the recorded `UpdateCompleted` output or
+    ///   `UpdateFailed` error without re-running the handler.
+    /// - In **live mode** (no completion in history): runs the registered
+    ///   handler and returns its result. The caller is responsible for
+    ///   appending `UpdateCompleted` or `UpdateFailed` to history.
+    ///
+    /// Returns `Err(String)` matching the handler error on failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err("update handler 'name' not found")` if no handler is
+    /// registered under `name`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal update registry or matcher mutex is poisoned.
+    pub async fn execute_admitted_update(
+        &self,
+        update_id: UpdateId,
+        name: &str,
+        input: Value,
+    ) -> Result<Value, String> {
+        // Check history first (replay path).
+        let history_match = self.match_history(|m| m.match_update(update_id));
+
+        match history_match {
+            HistoryMatch::Matched { output } => return Ok(output),
+            HistoryMatch::Failed { error, .. } => return Err(error),
+            HistoryMatch::NoMatch => {} // live path — run the handler
+            other => {
+                return Err(format!(
+                    "unexpected history match for update '{name}': {other:?}"
+                ));
+            }
+        }
+
+        // Live path: invoke the registered handler.
+        let future = {
+            let registry = self
+                .update_registry
+                .lock()
+                .expect("update_registry lock poisoned");
+            registry.invoke(name, input)
+        };
+
+        let result = match future {
+            Some(fut) => fut.await,
+            None => Err(format!("update handler '{name}' not found")),
+        };
+
+        // Durably record the terminal result so the worker can append
+        // UpdateCompleted/UpdateFailed before persisting other side effects.
+        self.push_command(WorkflowCommand::RecordUpdateResult {
+            update_id,
+            result: result.clone(),
+        });
+
+        result
     }
 
     // ── Command drain ─────────────────────────────────────────────────

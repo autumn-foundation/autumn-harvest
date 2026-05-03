@@ -262,6 +262,7 @@ const fn workflow_command_name(command: &WorkflowCommand) -> &'static str {
         WorkflowCommand::Fail { .. } => "Fail",
         WorkflowCommand::ContinueAsNew { .. } => "ContinueAsNew",
         WorkflowCommand::RunLocalActivity { .. } => "RunLocalActivity",
+        WorkflowCommand::RecordUpdateResult { .. } => "RecordUpdateResult",
     }
 }
 
@@ -297,14 +298,18 @@ fn should_requeue_signal_wait(commands: &[WorkflowCommand]) -> bool {
     let has_wait = commands
         .iter()
         .any(|cmd| matches!(cmd, WorkflowCommand::WaitForSignal { .. }));
-    let only_wait_or_marker = commands.iter().all(|cmd| {
+    // RecordUpdateResult commands are bookkeeping already handled before this
+    // check; they don't affect the signal-wait decision.
+    let only_wait_or_bookkeeping = commands.iter().all(|cmd| {
         matches!(
             cmd,
-            WorkflowCommand::WaitForSignal { .. } | WorkflowCommand::RecordMarker { .. }
+            WorkflowCommand::WaitForSignal { .. }
+                | WorkflowCommand::RecordMarker { .. }
+                | WorkflowCommand::RecordUpdateResult { .. }
         )
     });
 
-    has_wait && only_wait_or_marker
+    has_wait && only_wait_or_bookkeeping
 }
 
 #[derive(Debug, Clone)]
@@ -400,9 +405,15 @@ fn extract_single_command<T>(
     commands: &[WorkflowCommand],
     extractor: impl Fn(&WorkflowCommand) -> Option<T>,
 ) -> Option<T> {
-    let mut iter = commands
-        .iter()
-        .filter(|cmd| !matches!(cmd, WorkflowCommand::RecordMarker { .. }));
+    // RecordUpdateResult and RecordMarker are bookkeeping commands that have
+    // already been (or are about to be) persisted; they do not count toward
+    // the suspension-type determination.
+    let mut iter = commands.iter().filter(|cmd| {
+        !matches!(
+            cmd,
+            WorkflowCommand::RecordMarker { .. } | WorkflowCommand::RecordUpdateResult { .. }
+        )
+    });
 
     let first_cmd = iter.next()?;
 
@@ -457,15 +468,21 @@ fn extract_single_started_timer(commands: &[WorkflowCommand]) -> Option<StartedT
     })
 }
 
-/// Extract all `StartChildWorkflow` commands when every non-marker command is
+/// Extract all `StartChildWorkflow` commands when every non-bookkeeping command is
 /// a child-workflow start.  Returns `Some(children)` (may have length > 1 for
-/// parallel spawns) or `None` if any non-marker command is of a different type.
+/// parallel spawns) or `None` if any non-bookkeeping command is of a different type.
+/// `RecordMarker` and `RecordUpdateResult` are considered bookkeeping and ignored.
 fn extract_all_started_child_workflows(
     commands: &[WorkflowCommand],
 ) -> Option<Vec<StartedChildWorkflowCommand>> {
     let non_markers: Vec<&WorkflowCommand> = commands
         .iter()
-        .filter(|c| !matches!(c, WorkflowCommand::RecordMarker { .. }))
+        .filter(|c| {
+            !matches!(
+                c,
+                WorkflowCommand::RecordMarker { .. } | WorkflowCommand::RecordUpdateResult { .. }
+            )
+        })
         .collect();
 
     if non_markers.is_empty() {
@@ -948,6 +965,44 @@ async fn persist_workflow_failure(
         .scope_boxed()
     })
     .await
+}
+
+/// Append `UpdateCompleted` or `UpdateFailed` events for each
+/// `RecordUpdateResult` command in `commands`, in order.
+///
+/// Used to durably record in-flight update results before the terminal workflow
+/// event (`WorkflowCompleted`, `WorkflowFailed`, or a suspension side-effect).
+/// `next_event_id` is advanced by the number of events written.
+async fn persist_update_result_commands(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    commands: &[WorkflowCommand],
+    next_event_id: &mut i32,
+) -> HarvestResult<()> {
+    let events: Vec<WorkflowEvent> = commands
+        .iter()
+        .filter_map(|cmd| match cmd {
+            WorkflowCommand::RecordUpdateResult { update_id, result } => Some(match result {
+                Ok(output) => WorkflowEvent::UpdateCompleted {
+                    update_id: *update_id,
+                    output: output.clone(),
+                },
+                Err(error) => WorkflowEvent::UpdateFailed {
+                    update_id: *update_id,
+                    error: error.clone(),
+                },
+            }),
+            _ => None,
+        })
+        .collect();
+
+    if events.is_empty() {
+        return Ok(());
+    }
+
+    store::append_events(conn, exec_id, &events, *next_event_id).await?;
+    *next_event_id = next_event_id.saturating_add(i32::try_from(events.len()).unwrap_or(i32::MAX));
+    Ok(())
 }
 
 async fn persist_signal_wait_park(
@@ -1902,9 +1957,29 @@ async fn persist_scheduled_external_activity(
 async fn handle_suspended_workflow(
     conn: &mut AsyncPgConnection,
     registry: &HandlerRegistry,
-    context: SuspendedWorkflowContext<'_>,
+    mut context: SuspendedWorkflowContext<'_>,
     commands: &[WorkflowCommand],
 ) -> HarvestResult<()> {
+    // Persist UpdateCompleted/UpdateFailed events for any update handlers that
+    // ran in this execution cycle before the suspension side-effects.
+    // next_event_id is advanced so subsequent persist calls use correct IDs.
+    if let Err(e) = persist_update_result_commands(
+        conn,
+        context.persistence.exec_id,
+        commands,
+        &mut context.persistence.next_event_id,
+    )
+    .await
+    {
+        return fail_execution_on_error(
+            conn,
+            context.persistence.task,
+            context.persistence.worker_id,
+            Err(e),
+        )
+        .await;
+    }
+
     let sticky = context.persistence.sticky_hint();
 
     if should_requeue_signal_wait(commands) {
@@ -2438,7 +2513,7 @@ async fn process_workflow_task(
                 .and_then(|c| c.link_traceparent.clone().or_else(|| c.traceparent.clone())),
         };
 
-        let (run_outcome, execute_span) = run_workflow_with_state(
+        let (run_outcome, pending_cmds, execute_span) = run_workflow_with_state(
             prepared.exec_id,
             history_events.clone(),
             workflow.handler,
@@ -2470,11 +2545,11 @@ async fn process_workflow_task(
                 .await?;
                 history_events.extend(new_events);
             }
-            other => break (other, execute_span),
+            other => break (other, pending_cmds, execute_span),
         }
     };
 
-    let (outcome, execute_span) = loop_result;
+    let (outcome, pending_cmds, execute_span) = loop_result;
 
     let status = match &outcome {
         WorkflowOutcome::Completed { .. } => WorkflowStatus::Completed,
@@ -2488,6 +2563,16 @@ async fn process_workflow_task(
         started_at.elapsed().as_secs_f64(),
         status,
     );
+
+    // Append UpdateCompleted/UpdateFailed events for any update handlers that
+    // ran during this live execution cycle before the terminal event.  For
+    // Suspended outcomes these commands are inside the variant and are handled
+    // inside handle_suspended_workflow; pending_cmds is only non-empty for
+    // Completed/Failed outcomes.
+    if !pending_cmds.is_empty() {
+        persist_update_result_commands(conn, prepared.exec_id, &pending_cmds, &mut next_event_id)
+            .await?;
+    }
 
     persist_workflow_outcome(
         conn,
