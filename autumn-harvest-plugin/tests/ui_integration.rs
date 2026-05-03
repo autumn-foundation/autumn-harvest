@@ -125,10 +125,7 @@ fn build_two_shard_pool(shard0_url: &str, shard1_url: &str) -> HarvestDbPool {
 
 /// Provision N additional databases in the same Postgres instance and run the
 /// harvest schema in each.  Returns the URLs in shard-index order.
-async fn setup_n_shard_databases(
-    container: &ContainerAsync<Postgres>,
-    n: usize,
-) -> Vec<String> {
+async fn setup_n_shard_databases(container: &ContainerAsync<Postgres>, n: usize) -> Vec<String> {
     let host = container.get_host().await.expect("host");
     let port = container.get_host_port_ipv4(5432).await.expect("port");
     let admin_url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
@@ -148,7 +145,9 @@ async fn setup_n_shard_databases(
         let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&url)
             .await
             .expect("shard connection");
-        conn.batch_execute(INIT_SQL).await.expect("apply migrations");
+        conn.batch_execute(INIT_SQL)
+            .await
+            .expect("apply migrations");
         urls.push(url);
     }
     urls
@@ -462,7 +461,9 @@ async fn insert_test_worker(
             SET last_heartbeat_at = excluded.last_heartbeat_at, \
                 status            = excluded.status"
     );
-    conn.batch_execute(&sql).await.expect("insert_test_worker failed");
+    conn.batch_execute(&sql)
+        .await
+        .expect("insert_test_worker failed");
 }
 
 fn build_single_shard_ui_app(database_url: &str) -> axum::Router {
@@ -582,9 +583,15 @@ async fn ui_workers_shows_worker_rows() {
     let app = build_single_shard_ui_app(&database_url);
     let (status, html) = fetch_html(&app, "/workers").await;
     assert_eq!(status, StatusCode::OK);
-    assert!(html.contains("worker-alpha"), "alpha worker missing: {html}");
+    assert!(
+        html.contains("worker-alpha"),
+        "alpha worker missing: {html}"
+    );
     assert!(html.contains("worker-beta"), "beta worker missing: {html}");
-    assert!(html.contains("worker-gamma"), "gamma worker missing: {html}");
+    assert!(
+        html.contains("worker-gamma"),
+        "gamma worker missing: {html}"
+    );
     assert!(html.contains("Active"), "Active status missing: {html}");
     assert!(html.contains("Draining"), "Draining status missing: {html}");
     assert!(html.contains("Stopped"), "Stopped status missing: {html}");
@@ -623,7 +630,10 @@ async fn ui_workers_filter_by_status_active() {
     let app = build_single_shard_ui_app(&database_url);
     let (status, html) = fetch_html(&app, "/workers?status=Active").await;
     assert_eq!(status, StatusCode::OK);
-    assert!(html.contains("w-act"), "Active worker should appear: {html}");
+    assert!(
+        html.contains("w-act"),
+        "Active worker should appear: {html}"
+    );
     assert!(
         !html.contains("w-drain"),
         "Draining worker should NOT appear after status=Active filter: {html}"
@@ -641,7 +651,10 @@ async fn ui_workers_filter_stale_true() {
     let app = build_single_shard_ui_app(&database_url);
     let (status, html) = fetch_html(&app, "/workers?stale=true").await;
     assert_eq!(status, StatusCode::OK);
-    assert!(html.contains("w-stale-2"), "stale worker should appear: {html}");
+    assert!(
+        html.contains("w-stale-2"),
+        "stale worker should appear: {html}"
+    );
     assert!(
         !html.contains("w-fresh-2"),
         "fresh worker should NOT appear after ?stale=true filter: {html}"
@@ -719,8 +732,14 @@ async fn ui_workers_multi_shard_grouped() {
 
     let (status, html) = fetch_html(&app, "/workers").await;
     assert_eq!(status, StatusCode::OK);
-    assert!(html.contains("shard0-worker"), "shard 0 worker missing: {html}");
-    assert!(html.contains("shard1-worker"), "shard 1 worker missing: {html}");
+    assert!(
+        html.contains("shard0-worker"),
+        "shard 0 worker missing: {html}"
+    );
+    assert!(
+        html.contains("shard1-worker"),
+        "shard 1 worker missing: {html}"
+    );
     // Multi-shard deployments should group workers with shard headers.
     assert!(
         html.contains("Shard") || html.contains("shard"),
@@ -741,8 +760,7 @@ async fn ui_workers_partial_shard_failure_degraded() {
     let mut pools = BTreeMap::new();
     pools.insert(ShardId::new(0), good_pool);
     pools.insert(ShardId::new(1), bad_pool);
-    let harvest_pool =
-        HarvestDbPool::sharded(ShardedDbPool::from_map(pools, ShardId::new(0)));
+    let harvest_pool = HarvestDbPool::sharded(ShardedDbPool::from_map(pools, ShardId::new(0)));
 
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(harvest_pool);
@@ -810,8 +828,7 @@ async fn ui_workers_perf_1k_workers_4_shards_under_500ms() {
     for (i, url) in shard_urls.iter().enumerate() {
         pools.insert(ShardId::new(i as i32), build_test_pool(url));
     }
-    let harvest_pool =
-        HarvestDbPool::sharded(ShardedDbPool::from_map(pools, ShardId::new(0)));
+    let harvest_pool = HarvestDbPool::sharded(ShardedDbPool::from_map(pools, ShardId::new(0)));
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(harvest_pool);
     api_state.install(HarvestApiRuntime::new(

@@ -170,9 +170,7 @@ impl BannerState {
     }
 }
 
-fn compute_fleet_stats(
-    shard_results: &[ShardWorkerResult],
-) -> WorkerFleetStats {
+fn compute_fleet_stats(shard_results: &[ShardWorkerResult]) -> WorkerFleetStats {
     let any_shard_errored = shard_results.iter().any(|(_, r)| r.is_err());
     let mut total = 0usize;
     let mut active = 0usize;
@@ -196,7 +194,14 @@ fn compute_fleet_stats(
         }
     }
 
-    WorkerFleetStats { total, active, draining, stopped, stale, any_shard_errored }
+    WorkerFleetStats {
+        total,
+        active,
+        draining,
+        stopped,
+        stale,
+        any_shard_errored,
+    }
 }
 
 const fn determine_banner_state(stats: &WorkerFleetStats) -> Option<BannerState> {
@@ -402,9 +407,7 @@ async fn list_workers_ui(
 
     let shard_errors: Vec<(ShardId, &str)> = shard_results
         .iter()
-        .filter_map(|(shard_id, result)| {
-            result.as_ref().err().map(|e| (*shard_id, e.as_str()))
-        })
+        .filter_map(|(shard_id, result)| result.as_ref().err().map(|e| (*shard_id, e.as_str())))
         .collect();
 
     Ok(render_workers_page(
@@ -464,9 +467,7 @@ async fn load_workers_from_shards(
     let mut results: Vec<ShardWorkerResult> = Vec::new();
     for (shard_id, shard_pool) in pool.iter_shards() {
         let result = async {
-            let mut conn = acquire_conn(shard_pool)
-                .await
-                .map_err(|e| e.to_string())?;
+            let mut conn = acquire_conn(shard_pool).await.map_err(|e| e.to_string())?;
             list_workers(&mut conn, &unlimited, stale_threshold)
                 .await
                 .map_err(|e| e.to_string())
@@ -1271,7 +1272,10 @@ mod tests {
     fn layout_includes_workers_nav_link() {
         let body = html! { p { "test" } };
         let html = layout("Test", &body).into_string();
-        assert!(html.contains("workers"), "layout must include a Workers nav link");
+        assert!(
+            html.contains("workers"),
+            "layout must include a Workers nav link"
+        );
     }
 
     #[test]
