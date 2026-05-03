@@ -329,6 +329,13 @@ struct PendingChildWorkflow {
     state: String,
 }
 
+fn is_terminal_state(state: &str) -> bool {
+    matches!(
+        state,
+        "COMPLETED" | "FAILED" | "CANCELLED" | "TIMED_OUT" | "CONTINUED_AS_NEW"
+    )
+}
+
 #[derive(Debug, Serialize)]
 struct StartWorkflowResponse {
     execution_id: String,
@@ -722,6 +729,21 @@ pub async fn run_batch_executor_once(
         .map_err(map_error)
 }
 
+#[cfg(test)]
+mod stack_state_tests {
+    use super::is_terminal_state;
+
+    #[test]
+    fn terminal_state_classifier_includes_timeout_and_continue_as_new() {
+        assert!(is_terminal_state("COMPLETED"));
+        assert!(is_terminal_state("FAILED"));
+        assert!(is_terminal_state("CANCELLED"));
+        assert!(is_terminal_state("TIMED_OUT"));
+        assert!(is_terminal_state("CONTINUED_AS_NEW"));
+        assert!(!is_terminal_state("RUNNING"));
+    }
+}
+
 async fn list_workflows(
     Extension(api_state): Extension<HarvestApiState>,
     Query(pairs): Query<Vec<(String, String)>>,
@@ -837,10 +859,7 @@ async fn get_workflow_stack(
     let execution = load_execution(&mut conn, exec_id)
         .await
         .map_err(map_error)?;
-    let is_terminal = matches!(
-        execution.state.as_str(),
-        "COMPLETED" | "FAILED" | "CANCELLED" | "TERMINATED"
-    );
+    let is_terminal = is_terminal_state(&execution.state);
     let last_event_id = harvest_events::table
         .filter(harvest_events::workflow_exec_id.eq(exec_uuid))
         .select(diesel::dsl::max(harvest_events::event_id))
@@ -872,10 +891,7 @@ async fn get_workflow_stack(
         .load::<autumn_harvest::models::TaskQueueItem>(&mut conn)
         .await
         .map_err(database_error)?;
-    let (activity_tasks, local_tasks): (Vec<_>, Vec<_>) = tasks
-        .into_iter()
-        .partition(|task| task.task_type != "LOCAL_ACTIVITY");
-    let pending_activities = activity_tasks
+    let pending_activities = tasks
         .into_iter()
         .map(|t| PendingActivity {
             activity_exec_id: t.id.to_string(),
@@ -896,23 +912,60 @@ async fn get_workflow_stack(
                 .map(|(h, d)| h + d),
         })
         .collect::<Vec<_>>();
-    let pending_local_activities = local_tasks
+    let pending_local_activities = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq(exec_uuid))
+        .filter(
+            harvest_events::event_type.eq_any(["LocalActivityScheduled", "LocalActivityCompleted"]),
+        )
+        .order(harvest_events::event_id.asc())
+        .select((
+            harvest_events::event_type,
+            harvest_events::event_data,
+            harvest_events::timestamp,
+        ))
+        .load::<(String, serde_json::Value, chrono::DateTime<chrono::Utc>)>(&mut conn)
+        .await
+        .map_err(database_error)?
         .into_iter()
-        .map(|t| PendingLocalActivity {
-            activity_exec_id: t.id.to_string(),
-            activity_name: t.activity_name.unwrap_or_default(),
-            scheduled_at: t.scheduled_at,
-            attempt: t.attempt,
-            max_attempts: t.max_attempts,
-            task_status: t.state,
-            last_heartbeat_at: t.last_heartbeat_at,
-            next_retry_at: None,
-            start_to_close_deadline: t.started_at.zip(t.start_to_close).map(|(s, d)| s + d),
-            heartbeat_deadline: t
-                .last_heartbeat_at
-                .zip(t.heartbeat_timeout)
-                .map(|(h, d)| h + d),
-        })
+        .fold(
+            std::collections::BTreeMap::<String, PendingLocalActivity>::new(),
+            |mut acc, (event_type, event_data, ts)| {
+                let activity_id = event_data
+                    .get("activity_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToOwned::to_owned);
+                match (event_type.as_str(), activity_id) {
+                    ("LocalActivityScheduled", Some(activity_exec_id)) => {
+                        let activity_name = event_data
+                            .get("name")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        acc.insert(
+                            activity_exec_id.clone(),
+                            PendingLocalActivity {
+                                activity_exec_id,
+                                activity_name,
+                                scheduled_at: ts,
+                                attempt: 1,
+                                max_attempts: 1,
+                                task_status: "PENDING".to_string(),
+                                last_heartbeat_at: None,
+                                next_retry_at: None,
+                                start_to_close_deadline: None,
+                                heartbeat_deadline: None,
+                            },
+                        );
+                    }
+                    ("LocalActivityCompleted", Some(activity_exec_id)) => {
+                        acc.remove(&activity_exec_id);
+                    }
+                    _ => {}
+                }
+                acc
+            },
+        )
+        .into_values()
         .collect::<Vec<_>>();
     let pending_timers = harvest_timers::table
         .filter(harvest_timers::workflow_exec_id.eq(exec_uuid))
@@ -962,7 +1015,13 @@ async fn get_workflow_stack(
         .collect::<Vec<_>>();
     let pending_child_workflows = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::parent_id.eq(Some(exec_uuid)))
-        .filter(harvest_workflow_executions::state.ne_all(["COMPLETED", "FAILED", "CANCELLED"]))
+        .filter(harvest_workflow_executions::state.ne_all([
+            "COMPLETED",
+            "FAILED",
+            "CANCELLED",
+            "TIMED_OUT",
+            "CONTINUED_AS_NEW",
+        ]))
         .select((
             harvest_workflow_executions::id,
             harvest_workflow_executions::workflow_name,
