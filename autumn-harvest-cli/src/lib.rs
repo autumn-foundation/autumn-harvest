@@ -181,6 +181,11 @@ enum Commands {
         #[command(subcommand)]
         command: ConcurrencyCommand,
     },
+    /// Manage batch operations.
+    Batch {
+        #[command(subcommand)]
+        command: BatchCommand,
+    },
     /// Open the TUI dashboard to monitor workflows.
     Tui,
 }
@@ -396,6 +401,38 @@ enum ConcurrencyCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum BatchCommand {
+    /// List batch operations.
+    List {
+        /// Maximum number of rows to return.
+        #[arg(long, value_parser = clap::value_parser!(i64).range(1..=200))]
+        limit: Option<i64>,
+    },
+    /// Get details of a batch operation.
+    Get {
+        /// Batch operation ID.
+        batch_job_id: String,
+    },
+    /// Submit a new batch operation.
+    Submit {
+        /// Action to perform: Cancel, Terminate, or Signal.
+        action: String,
+        /// Inline JSON filter definition.
+        #[arg(long, conflicts_with = "filter_file")]
+        filter_json: Option<String>,
+        /// File containing JSON filter definition. Use `-` for stdin.
+        #[arg(long, value_name = "PATH", conflicts_with = "filter_json")]
+        filter_file: Option<PathBuf>,
+        /// Name of the signal (required if action is Signal).
+        #[arg(long)]
+        signal_name: Option<String>,
+        /// Inline JSON signal payload.
+        #[arg(long)]
+        signal_payload_json: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum DeadLetterCommand {
     /// List dead-lettered tasks.
     List {
@@ -474,6 +511,7 @@ impl Cli {
             Commands::Dlq { command } => Ok(dead_letter_request(command)),
             Commands::Retention { command } => Ok(retention_request(command)),
             Commands::Concurrency { command } => Ok(concurrency_request(command)),
+            Commands::Batch { command } => batch_request(command),
             Commands::Tui => unreachable!("Tui command handles its own requests"),
         }
     }
@@ -823,6 +861,41 @@ fn retention_request(command: &RetentionCommand) -> ApiRequest {
 fn concurrency_request(command: &ConcurrencyCommand) -> ApiRequest {
     match command {
         ConcurrencyCommand::Status => ApiRequest::get("/admin/concurrency"),
+    }
+}
+
+fn batch_request(command: &BatchCommand) -> Result<ApiRequest, CliError> {
+    match command {
+        BatchCommand::List { limit } => Ok(ApiRequest::get(path_with_limit(
+            "/batch-operations",
+            limit.map(|value| ("limit", value)),
+        ))),
+        BatchCommand::Get { batch_job_id } => Ok(ApiRequest::get(format!(
+            "/batch-operations/{}",
+            path_segment(batch_job_id)
+        ))),
+        BatchCommand::Submit {
+            action,
+            filter_json,
+            filter_file,
+            signal_name,
+            signal_payload_json,
+        } => {
+            let filter = parse_json_source(
+                filter_json.as_deref(),
+                filter_file.as_deref(),
+                "filter JSON",
+            )?
+            .unwrap_or_else(|| json!({}));
+            let mut body = json!({ "action": action, "filter": filter });
+            if let Some(sn) = signal_name {
+                body["signal_name"] = json!(sn);
+            }
+            if let Some(sp) = signal_payload_json {
+                body["signal_payload"] = serde_json::from_str(sp).unwrap_or_else(|_| json!(sp));
+            }
+            Ok(ApiRequest::post("/batch-operations", Some(body)))
+        }
     }
 }
 
