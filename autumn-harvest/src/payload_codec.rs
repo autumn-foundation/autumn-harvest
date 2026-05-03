@@ -108,6 +108,9 @@ impl PayloadCodecs {
     }
 
     fn encode_payload(&self, payload: &Value) -> HarvestResult<Value> {
+        if self.default.codec_id() == "identity" {
+            return Ok(payload.clone());
+        }
         let raw = serde_json::to_vec(payload)?;
         let encoded = self
             .default
@@ -198,6 +201,16 @@ mod tests {
             }
             _ => panic!("unexpected event"),
         }
+    }
+
+    #[test]
+    fn identity_codec_preserves_raw_payload_shape() {
+        let codecs = PayloadCodecs::default();
+        let event = crate::event::WorkflowEvent::WorkflowCompleted {
+            output: serde_json::json!({"a": 1}),
+        };
+        let encoded = codecs.encode_event(&event).expect("encode");
+        assert_eq!(encoded["data"]["output"], serde_json::json!({"a": 1}));
     }
 
     #[test]
