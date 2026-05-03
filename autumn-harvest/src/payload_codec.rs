@@ -122,9 +122,7 @@ impl PayloadCodecs {
         let Some(obj) = payload.as_object() else {
             return Ok(payload.clone());
         };
-        let Some(envelope_version) = obj
-            .get("_harvest_codec_envelope")
-            .and_then(Value::as_i64)
+        let Some(envelope_version) = obj.get("_harvest_codec_envelope").and_then(Value::as_i64)
         else {
             return Ok(payload.clone());
         };
