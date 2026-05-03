@@ -443,8 +443,8 @@ async fn ui_lists_workflows_across_shards() {
 // Workers page tests
 // ---------------------------------------------------------------------------
 
-/// Insert a single row into harvest_workers with controllable status and
-/// heartbeat time.  heartbeat_offset_secs < 0 → past (stale); 0 → now.
+/// Insert a single row into `harvest_workers` with controllable status and
+/// heartbeat time.  `heartbeat_offset_secs` < 0 → past (stale); 0 → now.
 async fn insert_test_worker(
     conn: &mut AsyncPgConnection,
     worker_id: &str,
@@ -814,10 +814,10 @@ async fn ui_workers_perf_1k_workers_4_shards_under_500ms() {
     let shard_urls = setup_n_shard_databases(&container, 4).await;
 
     // Seed 250 workers per shard = 1 000 total.
-    const WORKERS_PER_SHARD: usize = 250;
+    let workers_per_shard: usize = 250;
     for (shard_idx, url) in shard_urls.iter().enumerate() {
         let mut conn = AsyncPgConnection::establish(url).await.unwrap();
-        for w in 0..WORKERS_PER_SHARD {
+        for w in 0..workers_per_shard {
             let worker_id = format!("perf-s{shard_idx}-w{w}");
             insert_test_worker(&mut conn, &worker_id, "Active", 0).await;
         }
@@ -826,7 +826,10 @@ async fn ui_workers_perf_1k_workers_4_shards_under_500ms() {
     // Build sharded pool and UI app.
     let mut pools = BTreeMap::new();
     for (i, url) in shard_urls.iter().enumerate() {
-        pools.insert(ShardId::new(i as i32), build_test_pool(url));
+        pools.insert(
+            ShardId::new(i32::try_from(i).unwrap()),
+            build_test_pool(url),
+        );
     }
     let harvest_pool = HarvestDbPool::sharded(ShardedDbPool::from_map(pools, ShardId::new(0)));
     let api_state = HarvestApiState::new();

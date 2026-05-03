@@ -360,7 +360,9 @@ async fn list_workers_ui(
     let stale_threshold = api_state.worker_stale_threshold();
     let pool = api_state.storage_pool().map_err(map_error)?;
 
-    let shard_results = load_workers_from_shards(&pool, status_filter, stale_threshold).await;
+    // Load all workers without status filter so fleet stats reflect true fleet
+    // state regardless of the active UI filter.
+    let shard_results = load_workers_from_shards(&pool, None, stale_threshold).await;
 
     let stats = compute_fleet_stats(&shard_results);
     let banner_state = determine_banner_state(&stats);
@@ -376,6 +378,11 @@ async fn list_workers_ui(
         })
         .filter(|(shard_id, row)| {
             if params.shard.is_some_and(|f| shard_id.as_i32() != f) {
+                return false;
+            }
+            if let Some(sf) = status_filter
+                && row.worker.status != sf
+            {
                 return false;
             }
             if stale_only && row.health != WorkerHealth::Stale {
@@ -804,7 +811,7 @@ fn render_workflow_list(
         (render_pagination(page, limit, has_next, state_filter, workflow_name_filter, search_attr_filter))
     };
 
-    layout("Workflows · Vantage", &body)
+    layout("Workflows · Vantage", &body, "")
 }
 
 fn render_filters(
@@ -1003,7 +1010,7 @@ fn render_workflow_detail(execution: &WorkflowExecution, events: &[Value]) -> Ma
         }
     };
 
-    layout(&title, &body)
+    layout(&title, &body, "../")
 }
 
 fn kv(key: &str, value: &str, mono: bool) -> Markup {
@@ -1070,7 +1077,7 @@ fn url_encode(input: &str) -> String {
     out
 }
 
-fn layout(title: &str, body: &Markup) -> Markup {
+fn layout(title: &str, body: &Markup, base_href: &str) -> Markup {
     html! {
         (PreEscaped("<!DOCTYPE html>"))
         html lang="en" {
@@ -1083,12 +1090,12 @@ fn layout(title: &str, body: &Markup) -> Markup {
             body {
                 header {
                     h1 {
-                        a href="workflows" { "🔭 Vantage" }
+                        a href={ (base_href) "workflows" } { "🔭 Vantage" }
                         span.subtitle { "Harvest dashboard" }
                     }
                     nav {
-                        a.active href="workflows" { "Workflows" }
-                        a href="workers" { "Workers" }
+                        a.active href={ (base_href) "workflows" } { "Workflows" }
+                        a href={ (base_href) "workers" } { "Workers" }
                     }
                 }
                 main { (body) }
@@ -1121,7 +1128,7 @@ mod tests {
     #[test]
     fn layout_escapes_title_but_keeps_body_markup() {
         let body = html! { p { "hello" } };
-        let html = layout("<evil>", &body).into_string();
+        let html = layout("<evil>", &body, "").into_string();
         assert!(html.contains("<title>&lt;evil&gt;</title>"));
         assert!(html.contains("<p>hello</p>"));
         assert!(html.contains("🔭 Vantage"));
@@ -1271,7 +1278,7 @@ mod tests {
     #[test]
     fn layout_includes_workers_nav_link() {
         let body = html! { p { "test" } };
-        let html = layout("Test", &body).into_string();
+        let html = layout("Test", &body, "").into_string();
         assert!(
             html.contains("workers"),
             "layout must include a Workers nav link"
