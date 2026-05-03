@@ -3,6 +3,7 @@
 [![Crates.io](https://img.shields.io/crates/v/autumn-harvest.svg)](https://crates.io/crates/autumn-harvest)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](#license)
 [![CI](https://github.com/madmax983/autumn-harvest/actions/workflows/ci.yml/badge.svg)](https://github.com/madmax983/autumn-harvest/actions/workflows/ci.yml)
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/madmax983/autumn-harvest)
 
 Postgres-backed durable workflow engine for Rust, designed as a companion to the
 [Autumn](https://github.com/madmax983/autumn) web framework. Provides
