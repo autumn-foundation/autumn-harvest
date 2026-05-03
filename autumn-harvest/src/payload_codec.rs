@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
-use std::sync::LazyLock;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use base64::Engine as _;
 use serde_json::Value;
@@ -60,33 +59,7 @@ impl Default for PayloadCodecs {
     }
 }
 
-static GLOBAL_PAYLOAD_CODECS: LazyLock<RwLock<PayloadCodecs>> =
-    LazyLock::new(|| RwLock::new(PayloadCodecs::default()));
-
 impl PayloadCodecs {
-    /// Return a clone of the globally installed payload codec registry.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the global registry lock is poisoned.
-    pub fn global() -> Self {
-        GLOBAL_PAYLOAD_CODECS
-            .read()
-            .expect("global payload codecs lock poisoned")
-            .clone()
-    }
-
-    /// Install this codec registry as the process-global default.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the global registry lock is poisoned.
-    pub fn install_global(self) {
-        *GLOBAL_PAYLOAD_CODECS
-            .write()
-            .expect("global payload codecs lock poisoned") = self;
-    }
-
     pub fn register(&mut self, codec: Arc<dyn PayloadCodec>) {
         self.codecs.insert(codec.codec_id(), codec);
     }
@@ -141,7 +114,7 @@ impl PayloadCodecs {
             .encode(&raw)
             .map_err(|e| HarvestError::Config(e.to_string()))?;
         Ok(
-            serde_json::json!({"codec_id": self.default.codec_id(), "data": base64::engine::general_purpose::STANDARD.encode(encoded)}),
+            serde_json::json!({"_harvest_codec_envelope": 1, "codec_id": self.default.codec_id(), "data": base64::engine::general_purpose::STANDARD.encode(encoded)}),
         )
     }
 
@@ -149,13 +122,22 @@ impl PayloadCodecs {
         let Some(obj) = payload.as_object() else {
             return Ok(payload.clone());
         };
+        let Some(envelope_version) = obj
+            .get("_harvest_codec_envelope")
+            .and_then(Value::as_i64)
+        else {
+            return Ok(payload.clone());
+        };
+        if envelope_version != 1 {
+            return Ok(payload.clone());
+        }
         let Some(codec_id) = obj.get("codec_id").and_then(Value::as_str) else {
             return Ok(payload.clone());
         };
         let Some(encoded_b64) = obj.get("data").and_then(Value::as_str) else {
             return Ok(payload.clone());
         };
-        if obj.len() != 2 {
+        if obj.len() != 3 {
             return Ok(payload.clone());
         }
         let codec = self
@@ -208,6 +190,7 @@ mod tests {
         };
 
         let encoded = codecs.encode_event(&event).expect("encode");
+        assert_eq!(encoded["data"]["input"]["_harvest_codec_envelope"], 1);
         assert_eq!(encoded["data"]["input"]["codec_id"], "reverse");
 
         let decoded = codecs.decode_event(encoded).expect("decode");
@@ -249,6 +232,7 @@ mod tests {
             "type": "WorkflowCompleted",
             "data": {
                 "output": {
+                    "_harvest_codec_envelope": 1,
                     "codec_id": "missing",
                     "data": "e30="
                 }

@@ -485,8 +485,6 @@ impl HarvestBuilder {
             self.worker_config.max_local_activity_start_to_close,
         )?;
 
-        self.payload_codecs.clone().install_global();
-
         Ok(BuiltHarvest {
             workflows: self.workflows,
             activities: self.activities,
