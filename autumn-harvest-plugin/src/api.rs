@@ -886,6 +886,7 @@ async fn get_workflow_stack(
 
     let tasks = harvest_task_queue::table
         .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_uuid)))
+        .filter(harvest_task_queue::task_type.eq("activity"))
         .filter(harvest_task_queue::state.eq_any(["PENDING", "CLAIMED", "RUNNING", "BACKOFF"]))
         .select(autumn_harvest::models::TaskQueueItem::as_select())
         .load::<autumn_harvest::models::TaskQueueItem>(&mut conn)
@@ -914,9 +915,11 @@ async fn get_workflow_stack(
         .collect::<Vec<_>>();
     let pending_local_activities = harvest_events::table
         .filter(harvest_events::workflow_exec_id.eq(exec_uuid))
-        .filter(
-            harvest_events::event_type.eq_any(["LocalActivityScheduled", "LocalActivityCompleted"]),
-        )
+        .filter(harvest_events::event_type.eq_any([
+            "LocalActivityScheduled",
+            "LocalActivityCompleted",
+            "LocalActivityFailed",
+        ]))
         .order(harvest_events::event_id.asc())
         .select((
             harvest_events::event_type,
@@ -957,7 +960,7 @@ async fn get_workflow_stack(
                             },
                         );
                     }
-                    ("LocalActivityCompleted", Some(activity_exec_id)) => {
+                    ("LocalActivityCompleted" | "LocalActivityFailed", Some(activity_exec_id)) => {
                         acc.remove(&activity_exec_id);
                     }
                     _ => {}
@@ -1013,6 +1016,14 @@ async fn get_workflow_stack(
             },
         )
         .collect::<Vec<_>>();
+    let pending_signals = buffered_signals
+        .iter()
+        .map(|entry| PendingSignal {
+            signal_name: entry.signal_name.clone(),
+            waiters: entry.buffered,
+            oldest_waiter_since: entry.oldest_received_at,
+        })
+        .collect::<Vec<_>>();
     let pending_child_workflows = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::parent_id.eq(Some(exec_uuid)))
         .filter(harvest_workflow_executions::state.ne_all([
@@ -1048,7 +1059,7 @@ async fn get_workflow_stack(
         pending_activities,
         pending_local_activities,
         pending_timers,
-        pending_signals: Vec::new(),
+        pending_signals,
         buffered_signals,
         pending_child_workflows,
         last_event_id,
