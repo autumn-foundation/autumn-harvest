@@ -542,8 +542,9 @@ struct LocalActivityRun {
 fn extract_run_local_activity(
     commands: Vec<WorkflowCommand>,
 ) -> (Vec<WorkflowEvent>, LocalActivityRun) {
-    // Pre-allocate markers with capacity for the markers and the subsequent scheduled event.
-    let mut markers = Vec::with_capacity(commands.len());
+    // ⚡ Bolt: Pre-allocate `markers` `Vec` using `with_capacity`.
+    // The number of markers is at most `commands.len().saturating_sub(1)` since one is `RunLocalActivity`.
+    let mut markers = Vec::with_capacity(commands.len().saturating_sub(1));
     let mut local_run = None;
     for cmd in commands {
         match cmd {
