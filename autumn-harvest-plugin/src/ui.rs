@@ -208,10 +208,15 @@ const fn determine_banner_state(stats: &WorkerFleetStats) -> Option<BannerState>
     if stats.total == 0 && !stats.any_shard_errored {
         return None;
     }
+    // Shard errors mean partial visibility — we can't rule out active workers
+    // on the unreachable shard, so cap severity at Degraded.
+    if stats.any_shard_errored {
+        return Some(BannerState::Degraded);
+    }
     if stats.active == 0 {
         return Some(BannerState::Unhealthy);
     }
-    if stats.any_shard_errored || stats.stale > 0 {
+    if stats.stale > 0 {
         return Some(BannerState::Degraded);
     }
     Some(BannerState::Healthy)
@@ -1215,10 +1220,10 @@ mod tests {
     }
 
     #[test]
-    fn banner_unhealthy_still_when_empty_plus_shard_error() {
-        // Shard errored and no active workers → Unhealthy (active == 0 check fires first).
+    fn banner_degraded_when_shard_error_and_no_active_workers() {
+        // Shard errored: state is partially unknown, so Degraded not Unhealthy.
         let stats = fleet(0, 0, 0, true);
-        assert_eq!(determine_banner_state(&stats), Some(BannerState::Unhealthy));
+        assert_eq!(determine_banner_state(&stats), Some(BannerState::Degraded));
     }
 
     #[test]
