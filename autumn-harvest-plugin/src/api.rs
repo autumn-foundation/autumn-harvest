@@ -305,7 +305,7 @@ struct PendingTimer {
     timer_id: String,
     name: Option<String>,
     fires_at: chrono::DateTime<chrono::Utc>,
-    created_at: chrono::DateTime<chrono::Utc>,
+    created_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1007,7 +1007,7 @@ async fn get_workflow_stack(
         .map(|(timer_id, fires_at)| PendingTimer {
             timer_id,
             name: None,
-            created_at: fires_at,
+            created_at: None,
             fires_at,
         })
         .collect::<Vec<_>>();
