@@ -22,10 +22,12 @@ use serde_json::Value;
 use autumn_harvest::error::{HarvestError, HarvestResult};
 use autumn_harvest::models::WorkflowExecution;
 use autumn_harvest::store;
+use autumn_harvest::types::ShardId;
+use autumn_harvest::workers::{WorkerFilters, WorkerHealth, WorkerRow, list_workers};
 
 use crate::api::{
-    HarvestApiState, KNOWN_WORKFLOW_STATES, WorkflowFilters, db_conn_for_execution, load_execution,
-    load_workflows_from_shards, map_error, parse_execution_id,
+    HarvestApiState, KNOWN_WORKFLOW_STATES, WorkflowFilters, acquire_conn, db_conn_for_execution,
+    load_execution, load_workflows_from_shards, map_error, parse_execution_id,
 };
 
 const DEFAULT_PAGE_SIZE: i64 = 25;
@@ -42,6 +44,9 @@ header{background:#1e293b;border-bottom:1px solid #334155;padding:16px 24px;disp
 header h1{margin:0;font-size:20px;font-weight:600}
 header h1 a{color:#f8fafc;text-decoration:none}
 header .subtitle{color:#94a3b8;font-size:13px;margin-left:8px}
+header nav{display:flex;gap:16px;font-size:13px}
+header nav a{color:#cbd5e1}
+header nav a.active{color:#f8fafc;font-weight:600}
 main{padding:24px;max-width:1200px;margin:0 auto}
 h2{font-size:18px;margin:0 0 16px;color:#f8fafc}
 h3{font-size:14px;margin:24px 0 8px;color:#cbd5e1;text-transform:uppercase;letter-spacing:.06em}
@@ -56,6 +61,8 @@ th,td{padding:10px 14px;text-align:left;border-bottom:1px solid #334155;vertical
 th{background:#0f172a;color:#94a3b8;font-weight:500;text-transform:uppercase;letter-spacing:.05em;font-size:11px}
 tbody tr:last-child td{border-bottom:0}
 tbody tr:hover{background:#263449}
+tbody tr.stale-row{background:#1c1917}
+tbody tr.stale-row:hover{background:#292524}
 td code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;color:#cbd5e1}
 .badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:600;letter-spacing:.03em}
 .badge.RUNNING{background:#1d4ed8;color:#dbeafe}
@@ -63,6 +70,15 @@ td code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;c
 .badge.FAILED{background:#991b1b;color:#fee2e2}
 .badge.CANCELLED{background:#6b7280;color:#f3f4f6}
 .badge.UNKNOWN{background:#334155;color:#e2e8f0}
+.badge.Active{background:#166534;color:#dcfce7}
+.badge.Draining{background:#92400e;color:#fef3c7}
+.badge.Stopped{background:#334155;color:#e2e8f0}
+.banner{padding:12px 16px;border-radius:8px;margin-bottom:20px;font-size:13px;font-weight:500}
+.banner.Healthy{background:#14532d;color:#bbf7d0;border:1px solid #166534}
+.banner.Degraded{background:#431407;color:#fed7aa;border:1px solid #92400e}
+.banner.Unhealthy{background:#450a0a;color:#fecaca;border:1px solid #991b1b}
+.shard-header{margin:20px 0 8px;font-size:13px;color:#94a3b8;font-weight:600;text-transform:uppercase;letter-spacing:.06em;border-bottom:1px solid #1e293b;padding-bottom:6px}
+.shard-error{background:#1c1917;border:1px solid #57534e;border-radius:6px;padding:12px 16px;color:#a8a29e;font-size:13px;margin-bottom:12px}
 .pagination{display:flex;gap:8px;align-items:center;margin-top:16px;font-size:13px;color:#94a3b8}
 .pagination a,.pagination span{padding:6px 10px;border-radius:6px;border:1px solid #334155}
 .pagination a{color:#93c5fd}
@@ -98,12 +114,133 @@ pub(crate) struct WorkflowListParams {
     search_attr_value: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub(crate) struct WorkerListParams {
+    #[serde(default)]
+    page: Option<i64>,
+    #[serde(default)]
+    limit: Option<i64>,
+    /// Filter by lifecycle status: `Active`, `Draining`, or `Stopped`.
+    #[serde(default)]
+    status: Option<String>,
+    /// Filter by source shard id.
+    #[serde(default)]
+    shard: Option<i32>,
+    /// Set to `"true"` to show only stale workers.
+    #[serde(default)]
+    stale: Option<String>,
+    /// Auto-refresh interval in seconds (emits a `<meta http-equiv="refresh">` tag).
+    #[serde(default)]
+    refresh: Option<u64>,
+}
+
+// ---------------------------------------------------------------------------
+// Per-shard query result (Ok = rows, Err = error message)
+// ---------------------------------------------------------------------------
+
+type ShardWorkerResult = (ShardId, Result<Vec<WorkerRow>, String>);
+
+// ---------------------------------------------------------------------------
+// Internal fleet stats computed from the full unfiltered worker list
+// ---------------------------------------------------------------------------
+
+struct WorkerFleetStats {
+    total: usize,
+    active: usize,
+    draining: usize,
+    stopped: usize,
+    stale: usize,
+    any_shard_errored: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BannerState {
+    Healthy,
+    Degraded,
+    Unhealthy,
+}
+
+impl BannerState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Healthy => "Healthy",
+            Self::Degraded => "Degraded",
+            Self::Unhealthy => "Unhealthy",
+        }
+    }
+}
+
+fn compute_fleet_stats(shard_results: &[ShardWorkerResult]) -> WorkerFleetStats {
+    let any_shard_errored = shard_results.iter().any(|(_, r)| r.is_err());
+    let mut total = 0usize;
+    let mut active = 0usize;
+    let mut draining = 0usize;
+    let mut stopped = 0usize;
+    let mut stale = 0usize;
+
+    for (_, result) in shard_results {
+        if let Ok(rows) = result {
+            for row in rows {
+                total += 1;
+                match row.worker.status.as_str() {
+                    "Active" => active += 1,
+                    "Draining" => draining += 1,
+                    _ => stopped += 1,
+                }
+                if row.health == WorkerHealth::Stale {
+                    stale += 1;
+                }
+            }
+        }
+    }
+
+    WorkerFleetStats {
+        total,
+        active,
+        draining,
+        stopped,
+        stale,
+        any_shard_errored,
+    }
+}
+
+const fn determine_banner_state(stats: &WorkerFleetStats) -> Option<BannerState> {
+    if stats.total == 0 && !stats.any_shard_errored {
+        return None;
+    }
+    // Shard errors mean partial visibility — we can't rule out active workers
+    // on the unreachable shard, so cap severity at Degraded.
+    if stats.any_shard_errored {
+        return Some(BannerState::Degraded);
+    }
+    if stats.active == 0 {
+        return Some(BannerState::Unhealthy);
+    }
+    if stats.stale > 0 {
+        return Some(BannerState::Degraded);
+    }
+    Some(BannerState::Healthy)
+}
+
+// Numeric sort key for a worker: (status_rank, is_healthy, worker_id).
+// Stale workers sort before healthy within the same status bucket.
+fn worker_sort_key(row: &WorkerRow) -> (u8, u8, &str) {
+    let status_rank = match row.worker.status.as_str() {
+        "Active" => 0,
+        "Draining" => 1,
+        _ => 2,
+    };
+    let health_rank = u8::from(row.health != WorkerHealth::Stale);
+    (status_rank, health_rank, row.worker.worker_id.as_str())
+}
+
 /// Build the Vantage dashboard router.
 pub fn harvest_ui_router(api_state: HarvestApiState) -> Router<AppState> {
     Router::new()
         .route("/", get(index))
         .route("/workflows", get(list_workflows_ui))
         .route("/workflows/{id}", get(workflow_detail_ui))
+        .route("/workers", get(list_workers_ui))
         .layer(Extension(api_state))
 }
 
@@ -208,6 +345,433 @@ async fn workflow_detail_ui(
     Ok(render_workflow_detail(&execution, &events))
 }
 
+// ---------------------------------------------------------------------------
+// Workers UI
+// ---------------------------------------------------------------------------
+
+async fn list_workers_ui(
+    Extension(api_state): Extension<HarvestApiState>,
+    Query(params): Query<WorkerListParams>,
+) -> Result<Markup, AutumnError> {
+    let (status_filter, stale_only) = parse_worker_ui_filters(&params)?;
+
+    let limit = params
+        .limit
+        .unwrap_or(DEFAULT_PAGE_SIZE)
+        .clamp(1, MAX_PAGE_SIZE);
+    let page = params.page.unwrap_or(0).max(0);
+    let offset = page.saturating_mul(limit);
+
+    let stale_threshold = api_state.worker_stale_threshold();
+    let pool = api_state.storage_pool().map_err(map_error)?;
+
+    // Load all workers without status filter so fleet stats reflect true fleet
+    // state regardless of the active UI filter.
+    let shard_results = load_workers_from_shards(&pool, None, stale_threshold).await;
+
+    let stats = compute_fleet_stats(&shard_results);
+    let banner_state = determine_banner_state(&stats);
+    let is_multi_shard = shard_results.len() > 1;
+
+    let mut all_workers: Vec<(ShardId, WorkerRow)> = shard_results
+        .iter()
+        .flat_map(|(shard_id, result)| {
+            result
+                .iter()
+                .flat_map(|rows| rows.iter().map(|r| (*shard_id, r.clone())))
+                .collect::<Vec<_>>()
+        })
+        .filter(|(shard_id, row)| {
+            if params.shard.is_some_and(|f| shard_id.as_i32() != f) {
+                return false;
+            }
+            if let Some(sf) = status_filter
+                && row.worker.status != sf
+            {
+                return false;
+            }
+            if stale_only && row.health != WorkerHealth::Stale {
+                return false;
+            }
+            true
+        })
+        .collect();
+
+    all_workers.sort_by(|(sa, a), (sb, b)| {
+        sa.as_i32()
+            .cmp(&sb.as_i32())
+            .then_with(|| worker_sort_key(a).cmp(&worker_sort_key(b)))
+    });
+
+    let total_filtered = all_workers.len();
+    let offset_usize = usize::try_from(offset).unwrap_or(usize::MAX);
+    let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
+    let has_next = total_filtered > offset_usize.saturating_add(limit_usize);
+    let page_workers: Vec<(ShardId, WorkerRow)> = all_workers
+        .into_iter()
+        .skip(offset_usize)
+        .take(limit_usize)
+        .collect();
+
+    let mut grouped: Vec<(ShardId, Vec<WorkerRow>)> = Vec::new();
+    for (shard_id, row) in page_workers {
+        match grouped.last_mut() {
+            Some((sid, rows)) if *sid == shard_id => rows.push(row),
+            _ => grouped.push((shard_id, vec![row])),
+        }
+    }
+
+    let shard_errors: Vec<(ShardId, &str)> = shard_results
+        .iter()
+        .filter_map(|(shard_id, result)| result.as_ref().err().map(|e| (*shard_id, e.as_str())))
+        .collect();
+
+    Ok(render_workers_page(
+        &stats,
+        banner_state,
+        &grouped,
+        &shard_errors,
+        is_multi_shard,
+        page,
+        limit,
+        has_next,
+        status_filter,
+        params.shard,
+        stale_only,
+        params.refresh,
+    ))
+}
+
+fn parse_worker_ui_filters(
+    params: &WorkerListParams,
+) -> Result<(Option<&'static str>, bool), AutumnError> {
+    let status_filter = match params.status.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(s) => Some(match s.to_lowercase().as_str() {
+            "active" => "Active",
+            "draining" => "Draining",
+            "stopped" => "Stopped",
+            other => {
+                return Err(AutumnError::bad_request_msg(format!(
+                    "unknown status '{other}'; expected one of Active, Draining, Stopped"
+                )));
+            }
+        }),
+    };
+    let stale_only = match params.stale.as_deref().map(str::trim) {
+        None | Some("" | "false") => false,
+        Some("true") => true,
+        Some(other) => {
+            return Err(AutumnError::bad_request_msg(format!(
+                "unknown stale value '{other}'; expected 'true' or 'false'"
+            )));
+        }
+    };
+    Ok((status_filter, stale_only))
+}
+
+async fn load_workers_from_shards(
+    pool: &crate::HarvestDbPool,
+    status_filter: Option<&str>,
+    stale_threshold: std::time::Duration,
+) -> Vec<ShardWorkerResult> {
+    let futs: Vec<_> = pool
+        .iter_shards()
+        .map(|(shard_id, shard_pool)| {
+            let unlimited = WorkerFilters {
+                limit: i64::MAX,
+                status: status_filter.map(str::to_string),
+                ..WorkerFilters::new()
+            };
+            async move {
+                let result = async {
+                    let mut conn = acquire_conn(shard_pool).await.map_err(|e| e.to_string())?;
+                    list_workers(&mut conn, &unlimited, stale_threshold)
+                        .await
+                        .map_err(|e| e.to_string())
+                }
+                .await;
+                (shard_id, result)
+            }
+        })
+        .collect();
+    futures::future::join_all(futs).await
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_workers_page(
+    stats: &WorkerFleetStats,
+    banner_state: Option<BannerState>,
+    grouped: &[(ShardId, Vec<WorkerRow>)],
+    shard_errors: &[(ShardId, &str)],
+    is_multi_shard: bool,
+    page: i64,
+    limit: i64,
+    has_next: bool,
+    status_filter: Option<&str>,
+    shard_filter: Option<i32>,
+    stale_only: bool,
+    refresh: Option<u64>,
+) -> Markup {
+    let total_workers: usize = grouped.iter().map(|(_, rows)| rows.len()).sum();
+
+    let body = html! {
+        h2 { "Workers" }
+
+        // Fleet health banner
+        (render_fleet_banner(stats, banner_state))
+
+        // Filters
+        (render_worker_filters(status_filter, shard_filter, stale_only, limit))
+
+        // Worker table (grouped by shard if multi-shard)
+        @if total_workers == 0 && shard_errors.is_empty() {
+            div.card.empty {
+                @if stats.total == 0 {
+                    "No workers registered. Start a worker to see it here."
+                } @else {
+                    "No workers match this filter."
+                }
+            }
+        } @else {
+            // Shard error stubs
+            @for (shard_id, error) in shard_errors {
+                div.shard-error {
+                    @if is_multi_shard {
+                        strong { "Shard " (shard_id.as_i32()) " unavailable: " }
+                    } @else {
+                        strong { "Shard unavailable: " }
+                    }
+                    (error)
+                }
+            }
+
+            // Worker rows grouped by shard
+            @for (shard_id, rows) in grouped {
+                @if is_multi_shard {
+                    div.shard-header { "Shard " (shard_id.as_i32()) }
+                }
+                (render_worker_table(rows, *shard_id))
+            }
+        }
+
+        (render_worker_pagination(page, limit, has_next, status_filter, shard_filter, stale_only))
+    };
+
+    layout_workers("Workers · Vantage", &body, refresh)
+}
+
+fn render_fleet_banner(stats: &WorkerFleetStats, banner_state: Option<BannerState>) -> Markup {
+    let Some(verdict) = banner_state else {
+        return html! {
+            div.banner.Healthy { "Healthy — 0 workers registered" }
+        };
+    };
+
+    let label = verdict.as_str();
+    let class = format!("banner {label}");
+    html! {
+        div class=(class) {
+            strong { (label) }
+            " — "
+            (stats.total) " workers | "
+            (stats.active) " active | "
+            (stats.draining) " draining | "
+            (stats.stopped) " stopped | "
+            (stats.stale) " stale"
+        }
+    }
+}
+
+fn render_worker_table(rows: &[WorkerRow], shard_id: ShardId) -> Markup {
+    html! {
+        table {
+            thead {
+                tr {
+                    th { "Worker ID" }
+                    th { "Status" }
+                    th { "Last Heartbeat" }
+                    th { "Shard" }
+                    th { "In-Flight" }
+                }
+            }
+            tbody {
+                @for row in rows {
+                    @let is_stale = row.health == WorkerHealth::Stale;
+                    @let row_class = if is_stale { "stale-row" } else { "" };
+                    tr class=(row_class) {
+                        td { code { (short_id(&row.worker.worker_id)) } }
+                        td { (worker_status_badge(&row.worker.status, is_stale)) }
+                        td {
+                            @let rel = relative_time(row.worker.last_heartbeat_at);
+                            @let abs = format_timestamp(Some(row.worker.last_heartbeat_at));
+                            time datetime=(row.worker.last_heartbeat_at.to_rfc3339()) title=(abs) {
+                                (rel)
+                            }
+                        }
+                        td { (shard_id.as_i32()) }
+                        td { (row.worker.in_flight_count) }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn render_worker_filters(
+    status_filter: Option<&str>,
+    shard_filter: Option<i32>,
+    stale_only: bool,
+    limit: i64,
+) -> Markup {
+    let shard_value = shard_filter.map(|s| s.to_string()).unwrap_or_default();
+    html! {
+        form.filters method="get" action="workers" {
+            label {
+                "Status"
+                select name="status" {
+                    option value="" selected[status_filter.is_none()] { "All" }
+                    @for s in ["Active", "Draining", "Stopped"] {
+                        option value=(s) selected[status_filter == Some(s)] { (s) }
+                    }
+                }
+            }
+            label {
+                "Shard"
+                input type="number" name="shard" value=(shard_value) placeholder="e.g. 0";
+            }
+            label {
+                "Stale only"
+                select name="stale" {
+                    option value="" selected[!stale_only] { "All" }
+                    option value="true" selected[stale_only] { "Stale only" }
+                }
+            }
+            label {
+                "Per page"
+                input type="number" name="limit" min="1" max=(MAX_PAGE_SIZE) value=(limit);
+            }
+            button type="submit" { "Apply" }
+            a.reset href="workers" { "Reset" }
+        }
+    }
+}
+
+fn render_worker_pagination(
+    page: i64,
+    limit: i64,
+    has_next: bool,
+    status_filter: Option<&str>,
+    shard_filter: Option<i32>,
+    stale_only: bool,
+) -> Markup {
+    let base = build_worker_query_string(limit, status_filter, shard_filter, stale_only);
+    html! {
+        div.pagination {
+            @if page > 0 {
+                a href={ "workers?page=" (page - 1) (PreEscaped(&base)) } {
+                    (PreEscaped("&larr;")) " Previous"
+                }
+            } @else {
+                span.disabled { (PreEscaped("&larr;")) " Previous" }
+            }
+
+            span { "Page " (page + 1) }
+
+            @if has_next {
+                a href={ "workers?page=" (page + 1) (PreEscaped(&base)) } {
+                    "Next " (PreEscaped("&rarr;"))
+                }
+            } @else {
+                span.disabled { "Next " (PreEscaped("&rarr;")) }
+            }
+        }
+    }
+}
+
+fn build_worker_query_string(
+    limit: i64,
+    status_filter: Option<&str>,
+    shard_filter: Option<i32>,
+    stale_only: bool,
+) -> String {
+    let mut out = String::new();
+    if limit != DEFAULT_PAGE_SIZE {
+        let _ = write!(out, "&limit={limit}");
+    }
+    if let Some(status) = status_filter {
+        let _ = write!(out, "&status={}", url_encode(status));
+    }
+    if let Some(shard) = shard_filter {
+        let _ = write!(out, "&shard={shard}");
+    }
+    if stale_only {
+        let _ = write!(out, "&stale=true");
+    }
+    out
+}
+
+fn worker_status_badge(status: &str, stale: bool) -> Markup {
+    let class = format!("badge {status}");
+    html! {
+        span class=(class) {
+            (status)
+            @if stale { " (stale)" }
+        }
+    }
+}
+
+/// Format a `DateTime<Utc>` as a human-readable relative time string.
+fn relative_time(ts: DateTime<Utc>) -> String {
+    let elapsed = Utc::now()
+        .signed_duration_since(ts)
+        .to_std()
+        .unwrap_or(std::time::Duration::ZERO);
+    let secs = elapsed.as_secs();
+    if secs < 5 {
+        "just now".to_string()
+    } else if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86400)
+    }
+}
+
+fn layout_workers(title: &str, body: &Markup, refresh: Option<u64>) -> Markup {
+    html! {
+        (PreEscaped("<!DOCTYPE html>"))
+        html lang="en" {
+            head {
+                meta charset="utf-8";
+                meta name="viewport" content="width=device-width,initial-scale=1";
+                @if let Some(secs) = refresh {
+                    meta http-equiv="refresh" content=(secs);
+                }
+                title { (title) }
+                style { (PreEscaped(STYLE)) }
+            }
+            body {
+                header {
+                    h1 {
+                        a href="workflows" { "🔭 Vantage" }
+                        span.subtitle { "Harvest dashboard" }
+                    }
+                    nav {
+                        a href="workflows" { "Workflows" }
+                        a.active href="workers" { "Workers" }
+                    }
+                }
+                main { (body) }
+                footer { "Read-only dashboard — autumn-harvest" }
+            }
+        }
+    }
+}
+
 fn render_workflow_list(
     workflows: &[WorkflowExecution],
     page: i64,
@@ -256,7 +820,7 @@ fn render_workflow_list(
         (render_pagination(page, limit, has_next, state_filter, workflow_name_filter, search_attr_filter))
     };
 
-    layout("Workflows · Vantage", &body)
+    layout("Workflows · Vantage", &body, "")
 }
 
 fn render_filters(
@@ -455,7 +1019,7 @@ fn render_workflow_detail(execution: &WorkflowExecution, events: &[Value]) -> Ma
         }
     };
 
-    layout(&title, &body)
+    layout(&title, &body, "../")
 }
 
 fn kv(key: &str, value: &str, mono: bool) -> Markup {
@@ -522,7 +1086,7 @@ fn url_encode(input: &str) -> String {
     out
 }
 
-fn layout(title: &str, body: &Markup) -> Markup {
+fn layout(title: &str, body: &Markup, base_href: &str) -> Markup {
     html! {
         (PreEscaped("<!DOCTYPE html>"))
         html lang="en" {
@@ -535,8 +1099,12 @@ fn layout(title: &str, body: &Markup) -> Markup {
             body {
                 header {
                     h1 {
-                        a href="workflows" { "🔭 Vantage" }
+                        a href={ (base_href) "workflows" } { "🔭 Vantage" }
                         span.subtitle { "Harvest dashboard" }
+                    }
+                    nav {
+                        a.active href={ (base_href) "workflows" } { "Workflows" }
+                        a href={ (base_href) "workers" } { "Workers" }
                     }
                 }
                 main { (body) }
@@ -569,7 +1137,7 @@ mod tests {
     #[test]
     fn layout_escapes_title_but_keeps_body_markup() {
         let body = html! { p { "hello" } };
-        let html = layout("<evil>", &body).into_string();
+        let html = layout("<evil>", &body, "").into_string();
         assert!(html.contains("<title>&lt;evil&gt;</title>"));
         assert!(html.contains("<p>hello</p>"));
         assert!(html.contains("🔭 Vantage"));
@@ -616,5 +1184,127 @@ mod tests {
         assert!(html.contains("&quot;hello&quot;"));
         assert!(html.contains("&quot;world&quot;"));
         assert!(!html.contains("<script"));
+    }
+
+    // -- Workers page pure-logic unit tests --
+
+    fn fleet(total: usize, active: usize, stale: usize, errored: bool) -> WorkerFleetStats {
+        WorkerFleetStats {
+            total,
+            active,
+            draining: 0,
+            stopped: total.saturating_sub(active),
+            stale,
+            any_shard_errored: errored,
+        }
+    }
+
+    #[test]
+    fn banner_healthy_when_active_no_stale() {
+        let stats = fleet(2, 2, 0, false);
+        assert_eq!(determine_banner_state(&stats), Some(BannerState::Healthy));
+    }
+
+    #[test]
+    fn banner_degraded_when_stale_workers_exist() {
+        let stats = fleet(3, 2, 1, false);
+        assert_eq!(determine_banner_state(&stats), Some(BannerState::Degraded));
+    }
+
+    #[test]
+    fn banner_unhealthy_when_no_active_workers() {
+        let stats = fleet(2, 0, 0, false);
+        assert_eq!(determine_banner_state(&stats), Some(BannerState::Unhealthy));
+    }
+
+    #[test]
+    fn banner_none_when_empty_fleet_and_no_errors() {
+        let stats = fleet(0, 0, 0, false);
+        assert_eq!(determine_banner_state(&stats), None);
+    }
+
+    #[test]
+    fn banner_degraded_when_shard_error_and_no_active_workers() {
+        // Shard errored: state is partially unknown, so Degraded not Unhealthy.
+        let stats = fleet(0, 0, 0, true);
+        assert_eq!(determine_banner_state(&stats), Some(BannerState::Degraded));
+    }
+
+    #[test]
+    fn banner_degraded_when_shard_errored_even_if_healthy_otherwise() {
+        let stats = fleet(3, 3, 0, true);
+        assert_eq!(determine_banner_state(&stats), Some(BannerState::Degraded));
+    }
+
+    #[test]
+    fn banner_as_str_round_trips() {
+        assert_eq!(BannerState::Healthy.as_str(), "Healthy");
+        assert_eq!(BannerState::Degraded.as_str(), "Degraded");
+        assert_eq!(BannerState::Unhealthy.as_str(), "Unhealthy");
+    }
+
+    #[test]
+    fn relative_time_just_now_for_recent() {
+        let ts = chrono::Utc::now() - chrono::Duration::seconds(2);
+        assert_eq!(relative_time(ts), "just now");
+    }
+
+    #[test]
+    fn relative_time_seconds_ago() {
+        let ts = chrono::Utc::now() - chrono::Duration::seconds(20);
+        assert_eq!(relative_time(ts), "20s ago");
+    }
+
+    #[test]
+    fn relative_time_minutes_ago() {
+        let ts = chrono::Utc::now() - chrono::Duration::seconds(90);
+        assert_eq!(relative_time(ts), "1m ago");
+    }
+
+    #[test]
+    fn relative_time_hours_ago() {
+        let ts = chrono::Utc::now() - chrono::Duration::seconds(7200);
+        assert_eq!(relative_time(ts), "2h ago");
+    }
+
+    #[test]
+    fn build_worker_query_string_empty_defaults() {
+        assert_eq!(
+            build_worker_query_string(DEFAULT_PAGE_SIZE, None, None, false),
+            ""
+        );
+    }
+
+    #[test]
+    fn build_worker_query_string_includes_all_params() {
+        let q = build_worker_query_string(10, Some("Active"), Some(1), true);
+        assert!(q.contains("limit=10"));
+        assert!(q.contains("status=Active"));
+        assert!(q.contains("shard=1"));
+        assert!(q.contains("stale=true"));
+    }
+
+    #[test]
+    fn layout_includes_workers_nav_link() {
+        let body = html! { p { "test" } };
+        let html = layout("Test", &body, "").into_string();
+        assert!(
+            html.contains("workers"),
+            "layout must include a Workers nav link"
+        );
+    }
+
+    #[test]
+    fn worker_status_badge_shows_stale_annotation() {
+        let html = worker_status_badge("Active", true).into_string();
+        assert!(html.contains("stale"));
+        assert!(html.contains("Active"));
+    }
+
+    #[test]
+    fn worker_status_badge_no_annotation_when_healthy() {
+        let html = worker_status_badge("Active", false).into_string();
+        assert!(html.contains("Active"));
+        assert!(!html.contains("stale"));
     }
 }

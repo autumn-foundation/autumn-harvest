@@ -178,7 +178,7 @@ impl HarvestApiState {
             .expect("harvest api state lock poisoned") = threshold;
     }
 
-    fn worker_stale_threshold(&self) -> std::time::Duration {
+    pub(crate) fn worker_stale_threshold(&self) -> std::time::Duration {
         *self
             .worker_stale_threshold
             .lock()
@@ -233,7 +233,7 @@ impl HarvestApiState {
             .ok_or_else(|| HarvestError::Config("harvest runtime is not started".to_string()))
     }
 
-    fn storage_pool(&self) -> HarvestResult<HarvestDbPool> {
+    pub(crate) fn storage_pool(&self) -> HarvestResult<HarvestDbPool> {
         self.storage_pool
             .lock()
             .expect("harvest api state lock poisoned")
@@ -1565,7 +1565,7 @@ fn map_pool_error(error: &impl ToString) -> AutumnError {
     AutumnError::service_unavailable_msg(error.to_string())
 }
 
-async fn acquire_conn(pool: &DbPool) -> Result<PoolConn, AutumnError> {
+pub(crate) async fn acquire_conn(pool: &DbPool) -> Result<PoolConn, AutumnError> {
     pool.get().await.map_err(|error| map_pool_error(&error))
 }
 

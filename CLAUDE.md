@@ -54,7 +54,7 @@ Two crates in the workspace. `autumn-harvest` is the public library. `autumn-har
 - **Phase 3** (implemented): DAG scheduler/runtime, `DagBuilder`, `#[dag]` macro, trigger rules, signals/queries, management HTTP API, Autumn adapter crate with `HarvestExt` lifecycle integration
 - **Phase 3.5** (implemented): Local activities (`#[activity(local = true)]`, `ctx.execute_local_activity_raw`, `WorkflowCommand::RunLocalActivity`, three new `WorkflowEvent` variants, builder cap validation) — see issue #98
 - **Phase 3.6** (implemented): Update primitive (`UpdateAdmitted`, `UpdateCompleted`, `UpdateFailed` event variants, `UpdateId` type, `UpdateRegistry`, `WorkflowContext::register_update_handler`, `validate_update`, `execute_admitted_update`, `HistoryMatcher::match_update`, `drain_admitted_updates`) — see issue #140
-- **Phase 4** (next): production hardening -- cancellation/saga semantics, sharding, sticky cross-worker routing, observability, metrics, dashboard (autumn-harvest-ui)
+- **Phase 4** (next): production hardening -- cancellation/saga semantics, sharding, sticky cross-worker routing, observability, metrics, dashboard (Vantage UI — Workers tab shipped in issue #142; DLQ, schedules, and DAG visualization pages remain)
 
 ---
 

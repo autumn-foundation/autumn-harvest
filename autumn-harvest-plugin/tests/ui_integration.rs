@@ -42,6 +42,8 @@ const INIT_SQL: &str = concat!(
     include_str!(
         "../../autumn-harvest/migrations/20260430000000_harvest_workflow_schedules/up.sql"
     ),
+    "\n",
+    include_str!("../../autumn-harvest/migrations/20260501000000_harvest_workers/up.sql"),
 );
 
 async fn setup_test_database_url() -> (String, ContainerAsync<Postgres>) {
@@ -119,6 +121,36 @@ fn build_two_shard_pool(shard0_url: &str, shard1_url: &str) -> HarvestDbPool {
     pools.insert(ShardId::new(0), build_test_pool(shard0_url));
     pools.insert(ShardId::new(1), build_test_pool(shard1_url));
     HarvestDbPool::sharded(ShardedDbPool::from_map(pools, ShardId::new(0)))
+}
+
+/// Provision N additional databases in the same Postgres instance and run the
+/// harvest schema in each.  Returns the URLs in shard-index order.
+async fn setup_n_shard_databases(container: &ContainerAsync<Postgres>, n: usize) -> Vec<String> {
+    let host = container.get_host().await.expect("host");
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let admin_url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+
+    let mut admin_conn = <AsyncPgConnection as AsyncConnection>::establish(&admin_url)
+        .await
+        .expect("admin connection");
+
+    let mut urls = Vec::with_capacity(n);
+    for i in 0..n {
+        let db_name = format!("harvest_perf_shard_{}_{}", i, uuid::Uuid::new_v4().simple());
+        diesel::sql_query(format!("CREATE DATABASE {db_name}"))
+            .execute(&mut admin_conn)
+            .await
+            .expect("create shard db");
+        let url = format!("postgres://postgres:postgres@{host}:{port}/{db_name}");
+        let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&url)
+            .await
+            .expect("shard connection");
+        conn.batch_execute(INIT_SQL)
+            .await
+            .expect("apply migrations");
+        urls.push(url);
+    }
+    urls
 }
 
 fn test_app_state_without_database() -> AppState {
@@ -404,5 +436,434 @@ async fn ui_lists_workflows_across_shards() {
     assert!(
         list_html.contains("workflow_on_one") && list_html.contains(&exec_on_one.to_string()),
         "workflow from shard 1 should appear in the UI list"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Workers page tests
+// ---------------------------------------------------------------------------
+
+/// Insert a single row into `harvest_workers` with controllable status and
+/// heartbeat time.  `heartbeat_offset_secs` < 0 → past (stale); 0 → now.
+async fn insert_test_worker(
+    conn: &mut AsyncPgConnection,
+    worker_id: &str,
+    status: &str,
+    heartbeat_offset_secs: i64,
+) {
+    let sql = format!(
+        "INSERT INTO harvest_workers \
+            (worker_id, last_heartbeat_at, status, queues, shard_assignments, max_concurrency, host) \
+         VALUES \
+            ('{worker_id}', NOW() + interval '{heartbeat_offset_secs} seconds', \
+             '{status}', '[]'::jsonb, '[0]'::jsonb, 10, 'test-host') \
+         ON CONFLICT (worker_id) DO UPDATE \
+            SET last_heartbeat_at = excluded.last_heartbeat_at, \
+                status            = excluded.status"
+    );
+    conn.batch_execute(&sql)
+        .await
+        .expect("insert_test_worker failed");
+}
+
+fn build_single_shard_ui_app(database_url: &str) -> axum::Router {
+    let pool = build_test_pool(database_url);
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool));
+    api_state.install(HarvestApiRuntime::new(
+        echo_registry(),
+        Arc::new(HashMap::new()),
+        Arc::new(Vec::new()),
+        None,
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::single(),
+    ));
+    harvest_ui_router(api_state).with_state(test_app_state_without_database())
+}
+
+/// Navigation link: the index and workflows pages must include a Workers link.
+#[tokio::test]
+async fn ui_workers_nav_link_on_index_page() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_single_shard_ui_app(&database_url);
+
+    let (status, html) = fetch_html(&app, "/workflows").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains("workers") || html.contains("Workers"),
+        "workflows page should have a navigation link to Workers: {html}"
+    );
+}
+
+/// Empty fleet: GET /workers returns 200 with an empty-state explanation.
+#[tokio::test]
+async fn ui_workers_empty_fleet() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_single_shard_ui_app(&database_url);
+
+    let (status, html) = fetch_html(&app, "/workers").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "workers page must return 200, got {status}"
+    );
+    assert!(html.contains("🔭 Vantage"), "layout header missing");
+    assert!(
+        html.contains("No workers") || html.contains("no workers"),
+        "empty fleet should show a message: {html}"
+    );
+    assert!(!html.contains("<script"), "no script tags allowed");
+    assert!(!html.contains("http://"), "no external URLs allowed");
+    assert!(!html.contains("https://"), "no external HTTPS URLs allowed");
+}
+
+/// Health banner: all fresh Active workers → Healthy.
+#[tokio::test]
+async fn ui_workers_banner_healthy() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = AsyncPgConnection::establish(&database_url).await.unwrap();
+    insert_test_worker(&mut conn, "w-healthy-1", "Active", 0).await;
+    insert_test_worker(&mut conn, "w-healthy-2", "Active", 0).await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, html) = fetch_html(&app, "/workers").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains("Healthy"),
+        "banner should say Healthy with all fresh Active workers: {html}"
+    );
+}
+
+/// Health banner: some stale workers but at least one active → Degraded.
+#[tokio::test]
+async fn ui_workers_banner_degraded_stale() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = AsyncPgConnection::establish(&database_url).await.unwrap();
+    insert_test_worker(&mut conn, "w-active", "Active", 0).await;
+    // stale: heartbeat 60 s ago, well past the default 10 s threshold
+    insert_test_worker(&mut conn, "w-stale", "Active", -60).await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, html) = fetch_html(&app, "/workers").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains("Degraded"),
+        "banner should say Degraded when stale workers exist: {html}"
+    );
+}
+
+/// Health banner: no Active workers at all → Unhealthy.
+#[tokio::test]
+async fn ui_workers_banner_unhealthy_no_active() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = AsyncPgConnection::establish(&database_url).await.unwrap();
+    insert_test_worker(&mut conn, "w-stopped", "Stopped", -5).await;
+    insert_test_worker(&mut conn, "w-draining", "Draining", -5).await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, html) = fetch_html(&app, "/workers").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains("Unhealthy"),
+        "banner should say Unhealthy when no Active workers: {html}"
+    );
+}
+
+/// Worker rows: ID, status, relative heartbeat time and in-flight count are rendered.
+#[tokio::test]
+async fn ui_workers_shows_worker_rows() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = AsyncPgConnection::establish(&database_url).await.unwrap();
+    insert_test_worker(&mut conn, "worker-alpha", "Active", 0).await;
+    insert_test_worker(&mut conn, "worker-beta", "Draining", -3).await;
+    insert_test_worker(&mut conn, "worker-gamma", "Stopped", -5).await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, html) = fetch_html(&app, "/workers").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains("worker-alpha"),
+        "alpha worker missing: {html}"
+    );
+    assert!(html.contains("worker-beta"), "beta worker missing: {html}");
+    assert!(
+        html.contains("worker-gamma"),
+        "gamma worker missing: {html}"
+    );
+    assert!(html.contains("Active"), "Active status missing: {html}");
+    assert!(html.contains("Draining"), "Draining status missing: {html}");
+    assert!(html.contains("Stopped"), "Stopped status missing: {html}");
+    // Relative time should appear (e.g. "just now", "Xs ago")
+    assert!(
+        html.contains("ago") || html.contains("just now"),
+        "relative heartbeat time missing: {html}"
+    );
+}
+
+/// Stale workers are visually flagged in the table.
+#[tokio::test]
+async fn ui_workers_stale_rows_flagged() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = AsyncPgConnection::establish(&database_url).await.unwrap();
+    insert_test_worker(&mut conn, "w-fresh", "Active", 0).await;
+    insert_test_worker(&mut conn, "w-old", "Active", -120).await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, html) = fetch_html(&app, "/workers").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains("stale"),
+        "stale workers should be flagged in the table: {html}"
+    );
+}
+
+/// Filter ?status=Active shows only Active workers.
+#[tokio::test]
+async fn ui_workers_filter_by_status_active() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = AsyncPgConnection::establish(&database_url).await.unwrap();
+    insert_test_worker(&mut conn, "w-act", "Active", 0).await;
+    insert_test_worker(&mut conn, "w-drain", "Draining", 0).await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, html) = fetch_html(&app, "/workers?status=Active").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains("w-act"),
+        "Active worker should appear: {html}"
+    );
+    assert!(
+        !html.contains("w-drain"),
+        "Draining worker should NOT appear after status=Active filter: {html}"
+    );
+}
+
+/// Filter ?stale=true shows only stale workers.
+#[tokio::test]
+async fn ui_workers_filter_stale_true() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = AsyncPgConnection::establish(&database_url).await.unwrap();
+    insert_test_worker(&mut conn, "w-fresh-2", "Active", 0).await;
+    insert_test_worker(&mut conn, "w-stale-2", "Active", -120).await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, html) = fetch_html(&app, "/workers?stale=true").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains("w-stale-2"),
+        "stale worker should appear: {html}"
+    );
+    assert!(
+        !html.contains("w-fresh-2"),
+        "fresh worker should NOT appear after ?stale=true filter: {html}"
+    );
+}
+
+/// Unknown status value returns 400.
+#[tokio::test]
+async fn ui_workers_unknown_status_value_returns_400() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_single_shard_ui_app(&database_url);
+
+    let (status, html) = fetch_html(&app, "/workers?status=zombie").await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "unknown status value should return 400: {html}"
+    );
+}
+
+/// Pagination: ?limit=1 caps the rendered set to one row.
+#[tokio::test]
+async fn ui_workers_pagination_limits_rows() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = AsyncPgConnection::establish(&database_url).await.unwrap();
+    insert_test_worker(&mut conn, "pg-worker-1", "Active", 0).await;
+    insert_test_worker(&mut conn, "pg-worker-2", "Active", 0).await;
+    insert_test_worker(&mut conn, "pg-worker-3", "Active", 0).await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, html) = fetch_html(&app, "/workers?limit=1").await;
+    assert_eq!(status, StatusCode::OK);
+    // With limit=1, exactly one row appears and the Next pagination link is present.
+    let worker_count = ["pg-worker-1", "pg-worker-2", "pg-worker-3"]
+        .iter()
+        .filter(|id| html.contains(*id))
+        .count();
+    assert_eq!(
+        worker_count, 1,
+        "limit=1 should render exactly 1 worker row: {html}"
+    );
+    assert!(
+        html.contains("Next"),
+        "Next pagination link should appear when there are more rows: {html}"
+    );
+}
+
+/// Multi-shard: workers from two shards both appear and are grouped.
+#[tokio::test]
+async fn ui_workers_multi_shard_grouped() {
+    let ((shard0_url, shard1_url), _container) = setup_sharded_test_database_urls().await;
+
+    let mut conn0 = AsyncPgConnection::establish(&shard0_url).await.unwrap();
+    let mut conn1 = AsyncPgConnection::establish(&shard1_url).await.unwrap();
+    insert_test_worker(&mut conn0, "shard0-worker", "Active", 0).await;
+    insert_test_worker(&mut conn1, "shard1-worker", "Active", 0).await;
+
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(build_two_shard_pool(&shard0_url, &shard1_url));
+    api_state.install(HarvestApiRuntime::new(
+        echo_registry(),
+        Arc::new(HashMap::new()),
+        Arc::new(Vec::new()),
+        None,
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::new(
+            vec![ShardId::new(0), ShardId::new(1)],
+            vec![ShardId::new(0), ShardId::new(1)],
+            ShardId::new(0),
+        ),
+    ));
+    let app = harvest_ui_router(api_state).with_state(test_app_state_without_database());
+
+    let (status, html) = fetch_html(&app, "/workers").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains("shard0-worker"),
+        "shard 0 worker missing: {html}"
+    );
+    assert!(
+        html.contains("shard1-worker"),
+        "shard 1 worker missing: {html}"
+    );
+    // Multi-shard deployments should group workers with shard headers.
+    assert!(
+        html.contains("Shard") || html.contains("shard"),
+        "multi-shard page should show shard grouping: {html}"
+    );
+}
+
+/// Partial shard failure: degraded banner + shard-unavailable stub.
+#[tokio::test]
+async fn ui_workers_partial_shard_failure_degraded() {
+    let (good_url, _container) = setup_test_database_url().await;
+    let mut conn = AsyncPgConnection::establish(&good_url).await.unwrap();
+    insert_test_worker(&mut conn, "good-worker", "Active", 0).await;
+
+    // Build a two-shard pool where shard 1 has an invalid URL so it will error.
+    let bad_pool = build_test_pool("postgres://invalid:5432/nonexistent");
+    let good_pool = build_test_pool(&good_url);
+    let mut pools = BTreeMap::new();
+    pools.insert(ShardId::new(0), good_pool);
+    pools.insert(ShardId::new(1), bad_pool);
+    let harvest_pool = HarvestDbPool::sharded(ShardedDbPool::from_map(pools, ShardId::new(0)));
+
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(harvest_pool);
+    api_state.install(HarvestApiRuntime::new(
+        echo_registry(),
+        Arc::new(HashMap::new()),
+        Arc::new(Vec::new()),
+        None,
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::new(
+            vec![ShardId::new(0), ShardId::new(1)],
+            vec![ShardId::new(0), ShardId::new(1)],
+            ShardId::new(0),
+        ),
+    ));
+    let app = harvest_ui_router(api_state).with_state(test_app_state_without_database());
+
+    let (status, html) = fetch_html(&app, "/workers").await;
+    // Must not 5xx — partial shard failure is a degraded scenario, not a crash.
+    assert_ne!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "partial shard failure must not 5xx: {html}"
+    );
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "partial shard failure should return 200 with degraded view: {html}"
+    );
+    assert!(
+        html.contains("Degraded") || html.contains("unavailable"),
+        "partial shard failure should show Degraded banner or unavailable stub: {html}"
+    );
+}
+
+/// Performance: 1 k workers across 4 shards must render in ≤ 500 ms p95.
+///
+/// Seeds 250 workers per shard, makes a single page request, and asserts:
+/// 1. The page renders successfully (200 OK).
+/// 2. The rendered HTML body is non-trivial (contains worker ids).
+/// 3. The end-to-end wall-clock time is under the 500 ms budget.
+#[tokio::test]
+async fn ui_workers_perf_1k_workers_4_shards_under_500ms() {
+    // Provision 4 shard databases in a single container.
+    let container = Postgres::default()
+        .start()
+        .await
+        .expect("failed to start Postgres container");
+    let shard_urls = setup_n_shard_databases(&container, 4).await;
+
+    // Seed 250 workers per shard = 1 000 total.
+    let workers_per_shard: usize = 250;
+    for (shard_idx, url) in shard_urls.iter().enumerate() {
+        let mut conn = AsyncPgConnection::establish(url).await.unwrap();
+        for w in 0..workers_per_shard {
+            let worker_id = format!("perf-s{shard_idx}-w{w}");
+            insert_test_worker(&mut conn, &worker_id, "Active", 0).await;
+        }
+    }
+
+    // Build sharded pool and UI app.
+    let mut pools = BTreeMap::new();
+    for (i, url) in shard_urls.iter().enumerate() {
+        pools.insert(
+            ShardId::new(i32::try_from(i).unwrap()),
+            build_test_pool(url),
+        );
+    }
+    let harvest_pool = HarvestDbPool::sharded(ShardedDbPool::from_map(pools, ShardId::new(0)));
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(harvest_pool);
+    api_state.install(HarvestApiRuntime::new(
+        echo_registry(),
+        Arc::new(HashMap::new()),
+        Arc::new(Vec::new()),
+        None,
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::new(
+            (0..4).map(ShardId::new).collect(),
+            (0..4).map(ShardId::new).collect(),
+            ShardId::new(0),
+        ),
+    ));
+    let app = harvest_ui_router(api_state).with_state(test_app_state_without_database());
+
+    // Measure wall-clock time for the page render.
+    let start = std::time::Instant::now();
+    let (status, html) = fetch_html(&app, "/workers?limit=200").await;
+    let elapsed = start.elapsed();
+
+    assert_eq!(status, StatusCode::OK, "perf test page must return 200");
+    assert!(
+        html.len() > 10_000,
+        "1k-worker page should produce substantial HTML (got {} bytes)",
+        html.len()
+    );
+    assert!(
+        elapsed.as_millis() < 500,
+        "Workers page with 1k workers must render in < 500 ms (got {} ms)",
+        elapsed.as_millis()
     );
 }
