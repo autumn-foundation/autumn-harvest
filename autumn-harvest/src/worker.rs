@@ -1708,6 +1708,81 @@ async fn observe_task_cancellation(pool: &DbPool, task_id: uuid::Uuid) {
 }
 
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
+async fn handle_activity_result(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+    exec_id: ExecutionId,
+    next_event_id: i32,
+    activity_id: ActivityExecId,
+    worker_id: &str,
+    retry_policy: Option<&crate::policy::RetryPolicy>,
+    activity_result: Result<serde_json::Value, String>,
+) -> HarvestResult<()> {
+    match activity_result {
+        Ok(output) => {
+            finalize_activity_completion(conn, task, exec_id, next_event_id, activity_id, output)
+                .await
+        }
+        Err(error) => {
+            let delay_result = next_retry_delay(task, &error, retry_policy);
+            let delay = fail_execution_on_error(conn, task, worker_id, delay_result).await?;
+
+            if let Some(delay) = delay {
+                return queue::requeue_for_retry(conn, task.id, delay).await;
+            }
+
+            finalize_activity_failure(conn, task, exec_id, next_event_id, activity_id, &error).await
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_activity_future_with_cancellation(
+    activity_name: &str,
+    task_id: uuid::Uuid,
+    cancellation_grace_period: Duration,
+    activity_future: &mut (
+             dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + Unpin
+         ),
+    mut cancellation_observer: impl std::future::Future<Output = ()> + Send + Unpin,
+    cancel: tokio_util::sync::CancellationToken,
+    span: tracing::Span,
+) -> Result<serde_json::Value, String> {
+    use tracing::Instrument;
+    async {
+        tokio::select! {
+            biased;
+            result = &mut *activity_future => result,
+            () = &mut cancellation_observer => {
+                cancel.cancel();
+                tracing::info!(
+                    task_id = %task_id,
+                    activity = %activity_name,
+                    grace_period_ms = %cancellation_grace_period.as_millis(),
+                    "workflow cancellation detected for running activity; awaiting cooperative unwind"
+                );
+                tokio::time::timeout(cancellation_grace_period, activity_future)
+                    .await
+                    .unwrap_or_else(|_| {
+                        tracing::warn!(
+                            task_id = %task_id,
+                            activity = %activity_name,
+                            grace_period_ms = %cancellation_grace_period.as_millis(),
+                            "activity ignored cancellation; hard-aborting handler"
+                        );
+                        Err(format!(
+                            "workflow cancelled: activity '{activity_name}' exceeded {}ms cancellation grace period",
+                            cancellation_grace_period.as_millis()
+                        ))
+                    })
+            }
+        }
+    }
+    .instrument(span)
+    .await
+}
+
 async fn process_activity_task(
     pool: &DbPool,
     conn: &mut AsyncPgConnection,
@@ -1781,40 +1856,16 @@ async fn process_activity_task(
     let cancellation_observer = observe_task_cancellation(pool, task.id);
     tokio::pin!(cancellation_observer);
 
-    let activity_result = {
-        use tracing::Instrument;
-        async {
-            tokio::select! {
-                biased;
-                result = &mut activity_future => result,
-                () = &mut cancellation_observer => {
-                    cancel.cancel();
-                    tracing::info!(
-                        task_id = %task.id,
-                        activity = %activity_name,
-                        grace_period_ms = %cancellation_grace_period.as_millis(),
-                        "workflow cancellation detected for running activity; awaiting cooperative unwind"
-                    );
-                    tokio::time::timeout(cancellation_grace_period, &mut activity_future)
-                        .await
-                        .unwrap_or_else(|_| {
-                            tracing::warn!(
-                                task_id = %task.id,
-                                activity = %activity_name,
-                                grace_period_ms = %cancellation_grace_period.as_millis(),
-                                "activity ignored cancellation; hard-aborting handler"
-                            );
-                            Err(format!(
-                                "workflow cancelled: activity '{activity_name}' exceeded {}ms cancellation grace period",
-                                cancellation_grace_period.as_millis()
-                            ))
-                        })
-                }
-            }
-        }
-        .instrument(span)
-        .await
-    };
+    let activity_result = execute_activity_future_with_cancellation(
+        activity_name,
+        task.id,
+        cancellation_grace_period,
+        &mut activity_future,
+        cancellation_observer,
+        cancel.clone(),
+        span,
+    )
+    .await;
 
     let duration_secs = started_at.elapsed().as_secs_f64();
     let status = if activity_result.is_ok() {
@@ -1834,37 +1885,17 @@ async fn process_activity_task(
     let retry_policy_result = configured_retry_policy(task);
     let retry_policy = fail_execution_on_error(conn, task, worker_id, retry_policy_result).await?;
 
-    match activity_result {
-        Ok(output) => {
-            finalize_activity_completion(
-                conn,
-                task,
-                exec_id,
-                history.next_event_id + 1,
-                activity_id,
-                output,
-            )
-            .await
-        }
-        Err(error) => {
-            let delay_result = next_retry_delay(task, &error, retry_policy.as_ref());
-            let delay = fail_execution_on_error(conn, task, worker_id, delay_result).await?;
-
-            if let Some(delay) = delay {
-                return queue::requeue_for_retry(conn, task.id, delay).await;
-            }
-
-            finalize_activity_failure(
-                conn,
-                task,
-                exec_id,
-                history.next_event_id + 1,
-                activity_id,
-                &error,
-            )
-            .await
-        }
-    }
+    handle_activity_result(
+        conn,
+        task,
+        exec_id,
+        history.next_event_id + 1,
+        activity_id,
+        worker_id,
+        retry_policy.as_ref(),
+        activity_result,
+    )
+    .await
 }
 
 async fn persist_scheduled_external_activity(
@@ -1985,9 +2016,9 @@ async fn handle_suspended_workflow(
 
     let sticky = context.persistence.sticky_hint();
 
-    if should_requeue_signal_wait(commands) {
+    let result = if should_requeue_signal_wait(commands) {
         let marker_events = marker_events_from_commands(commands);
-        let result = persist_signal_wait_park(
+        persist_signal_wait_park(
             conn,
             context.persistence.task.id,
             context.persistence.exec_id,
@@ -1995,18 +2026,9 @@ async fn handle_suspended_workflow(
             &marker_events,
             sticky,
         )
-        .await;
-        return fail_execution_on_error(
-            conn,
-            context.persistence.task,
-            context.persistence.worker_id,
-            result,
-        )
-        .await;
-    }
-
-    if let Some(scheduled) = extract_single_schedule_activity(commands) {
-        let result = persist_scheduled_activity(
+        .await
+    } else if let Some(scheduled) = extract_single_schedule_activity(commands) {
+        persist_scheduled_activity(
             conn,
             registry,
             context.persistence.task.id,
@@ -2017,18 +2039,9 @@ async fn handle_suspended_workflow(
             sticky,
             context.execute_span,
         )
-        .await;
-        return fail_execution_on_error(
-            conn,
-            context.persistence.task,
-            context.persistence.worker_id,
-            result,
-        )
-        .await;
-    }
-
-    if let Some(timer) = extract_single_started_timer(commands) {
-        let result = persist_started_timer(
+        .await
+    } else if let Some(timer) = extract_single_started_timer(commands) {
+        let res = persist_started_timer(
             conn,
             context.persistence.exec_id,
             context.persistence.next_event_id,
@@ -2038,7 +2051,7 @@ async fn handle_suspended_workflow(
             sticky,
         )
         .await;
-        if result.is_ok() {
+        if res.is_ok() {
             #[allow(clippy::cast_precision_loss)]
             let duration_secs = timer.duration_secs as f64;
             registry
@@ -2046,17 +2059,9 @@ async fn handle_suspended_workflow(
                 .metrics
                 .record_timer_started(duration_secs);
         }
-        return fail_execution_on_error(
-            conn,
-            context.persistence.task,
-            context.persistence.worker_id,
-            result,
-        )
-        .await;
-    }
-
-    if let Some(children) = extract_all_started_child_workflows(commands) {
-        let result = persist_all_started_child_workflows(
+        res
+    } else if let Some(children) = extract_all_started_child_workflows(commands) {
+        persist_all_started_child_workflows(
             conn,
             registry,
             context.persistence.task.id,
@@ -2066,18 +2071,9 @@ async fn handle_suspended_workflow(
             sticky,
             context.execute_span,
         )
-        .await;
-        return fail_execution_on_error(
-            conn,
-            context.persistence.task,
-            context.persistence.worker_id,
-            result,
-        )
-        .await;
-    }
-
-    if let Some(scheduled) = extract_single_schedule_external_activity(commands) {
-        let result = persist_scheduled_external_activity(
+        .await
+    } else if let Some(scheduled) = extract_single_schedule_external_activity(commands) {
+        persist_scheduled_external_activity(
             conn,
             context.persistence.exec_id,
             context.persistence.next_event_id,
@@ -2086,26 +2082,19 @@ async fn handle_suspended_workflow(
             &scheduled,
             sticky,
         )
-        .await;
-        return fail_execution_on_error(
+        .await
+    } else {
+        let error = suspended_workflow_error(commands);
+        persist_workflow_failure(
             conn,
-            context.persistence.task,
+            context.persistence.task.id,
+            context.persistence.exec_id,
+            context.persistence.next_event_id,
             context.persistence.worker_id,
-            result,
+            &error,
         )
-        .await;
-    }
-
-    let error = suspended_workflow_error(commands);
-    let result = persist_workflow_failure(
-        conn,
-        context.persistence.task.id,
-        context.persistence.exec_id,
-        context.persistence.next_event_id,
-        context.persistence.worker_id,
-        &error,
-    )
-    .await;
+        .await
+    };
 
     fail_execution_on_error(
         conn,

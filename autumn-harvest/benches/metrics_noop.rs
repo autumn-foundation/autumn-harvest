@@ -30,7 +30,7 @@ fn bench_noop_workflow_completed(c: &mut Criterion) {
     let rec = NoOpMetrics;
     c.bench_function("noop/workflow_completed", |b| {
         b.iter(|| {
-            rec.record_workflow_completed("onboarding", "default", 1.0, WorkflowStatus::Completed)
+            rec.record_workflow_completed("onboarding", "default", 1.0, WorkflowStatus::Completed);
         });
     });
 }
@@ -39,7 +39,7 @@ fn bench_noop_activity_completed(c: &mut Criterion) {
     let rec = NoOpMetrics;
     c.bench_function("noop/activity_completed", |b| {
         b.iter(|| {
-            rec.record_activity_completed("send_email", "default", 0.5, ActivityStatus::Completed)
+            rec.record_activity_completed("send_email", "default", 0.5, ActivityStatus::Completed);
         });
     });
 }
