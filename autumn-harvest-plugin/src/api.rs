@@ -1042,21 +1042,11 @@ async fn get_workflow_stack(
             },
         )
         .collect::<Vec<_>>();
-    let pending_signals = harvest_task_queue::table
-        .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_uuid)))
-        .filter(harvest_task_queue::task_type.eq("workflow"))
-        .filter(harvest_task_queue::state.eq_any(["PENDING", "CLAIMED", "RUNNING"]))
-        .select(harvest_task_queue::scheduled_at)
-        .load::<chrono::DateTime<chrono::Utc>>(&mut conn)
-        .await
-        .map_err(database_error)?
-        .into_iter()
-        .map(|oldest_waiter_since| PendingSignal {
-            signal_name: "*".to_string(),
-            waiters: 1,
-            oldest_waiter_since,
-        })
-        .collect::<Vec<_>>();
+    // Signal waiters are not directly materialized in a dedicated table today.
+    // Avoid inferring waiters from generic workflow-task rows because parked
+    // workflow tasks represent several suspension causes (timers, activities,
+    // children, etc.) and would over-report signal waits.
+    let pending_signals = Vec::new();
     let pending_child_workflows = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::parent_id.eq(Some(exec_uuid)))
         .filter(harvest_workflow_executions::state.ne_all([
