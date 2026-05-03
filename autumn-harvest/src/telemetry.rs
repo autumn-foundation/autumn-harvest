@@ -153,7 +153,7 @@ pub struct TraceContextCarrier {
     /// When `true`, the worker must emit the span with attribute
     /// `harvest.replay = true` and must NOT restore `traceparent` as the
     /// parent context. Instead, it should create a new root span and attach a
-    /// span *link* pointing at [`link_traceparent`].
+    /// span *link* pointing at [`TraceContextCarrier::link_traceparent`].
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_replay: bool,
 
