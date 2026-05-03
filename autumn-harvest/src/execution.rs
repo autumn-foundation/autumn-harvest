@@ -201,7 +201,7 @@ pub async fn start_or_load_workflow_execution(
     );
     enqueue.workflow_exec_id = Some(exec_id.as_uuid());
     // ADR-0001 §3: store the caller's trace context so the worker can restore it.
-    enqueue.trace_context = request.trace_context.clone();
+    enqueue.trace_context.clone_from(&request.trace_context);
 
     conn.transaction::<StartedWorkflowExecution, HarvestError, _>(|conn| {
         let row = row;

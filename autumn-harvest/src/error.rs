@@ -112,6 +112,13 @@ pub enum HarvestError {
     #[error("database error: {0}")]
     Database(String),
 
+    /// Replay encountered a payload encoded with an unregistered codec id.
+    #[error("unknown payload codec: {id}")]
+    UnknownPayloadCodec {
+        /// The codec identifier stored on the event payload.
+        id: String,
+    },
+
     /// A task queue reached its maximum capacity.
     #[error("task queue is full (queue: {queue}, depth: {depth})")]
     QueueFull {

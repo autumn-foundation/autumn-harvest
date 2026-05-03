@@ -48,6 +48,7 @@ pub mod info;
 /// Enabled by the `metrics-rs` cargo feature.
 #[cfg(feature = "metrics-rs")]
 pub mod metrics_rs_adapter;
+pub mod payload_codec;
 pub mod policy;
 pub mod pool;
 pub mod prelude;
@@ -131,6 +132,7 @@ pub use execution::{
 pub use executor::{WorkflowOutcome, run_workflow};
 pub use history_export::export_mermaid_sequence;
 pub use info::{ActivityHandlerFn, ActivityInfo, DagInfo, WorkflowHandlerFn, WorkflowInfo};
+pub use payload_codec::{CodecError, IdentityCodec, PayloadCodec, PayloadCodecs};
 pub use policy::validate_schedule;
 pub use policy::{RetryPolicy, Schedule, TaskStatus, TriggerRule, WorkflowSchedule};
 pub use pool::{HarvestPoolConfig, compute_pool_sizes};
