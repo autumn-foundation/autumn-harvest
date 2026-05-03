@@ -1183,6 +1183,47 @@ async fn harvest_api_duplicate_start_reuses_existing_execution() {
 }
 
 #[tokio::test]
+async fn harvest_api_stack_endpoint_returns_shape() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let registry = approval_registry();
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
+    api_state.install(HarvestApiRuntime::new(
+        Arc::clone(&registry),
+        Arc::new(HashMap::new()),
+        Arc::new(Vec::new()),
+        Some("test-worker".to_string()),
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::single(),
+    ));
+    let app = harvest_api_router(api_state).with_state(test_app_state(pool));
+
+    let (start_status, start_json) = post_json(
+        &app,
+        "/workflows/approval_workflow/start",
+        json!({"workflow_id":"stack-shape","input":{"request_id":"stack"}}),
+    )
+    .await;
+    assert_eq!(start_status, StatusCode::CREATED);
+    let exec_id = start_json["execution_id"].as_str().unwrap();
+
+    let (status, payload) = get_json(&app, format!("/workflows/{exec_id}/stack")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["exec_id"], exec_id);
+    assert_eq!(payload["workflow_name"], "approval_workflow");
+    assert!(payload["pending_activities"].is_array());
+    assert!(payload["pending_local_activities"].is_array());
+    assert!(payload["pending_timers"].is_array());
+    assert!(payload["pending_signals"].is_array());
+    assert!(payload["buffered_signals"].is_array());
+    assert!(payload["pending_child_workflows"].is_array());
+    assert!(payload["last_event_id"].is_number());
+}
+
+#[tokio::test]
 async fn harvest_api_cancels_workflows_and_rejects_late_signals() {
     let (database_url, _container) = setup_test_database_url().await;
     let pool = build_test_pool(&database_url);

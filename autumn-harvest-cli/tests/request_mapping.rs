@@ -67,6 +67,21 @@ fn workflow_list_and_query_use_get_requests() {
         "/workflows/00000000-0000-0000-0000-000000000001/query/status"
     );
     assert_eq!(query_request.body, None);
+
+    let stack = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "stack",
+        "00000000-0000-0000-0000-000000000001",
+    ])
+    .expect("workflow stack args should parse");
+    let stack_request = stack.api_request().expect("stack request should build");
+    assert_eq!(stack_request.method, ApiMethod::Get);
+    assert_eq!(
+        stack_request.path,
+        "/workflows/00000000-0000-0000-0000-000000000001/stack"
+    );
+    assert_eq!(stack_request.body, None);
 }
 
 #[test]
