@@ -36,8 +36,8 @@ use autumn_harvest::scheduler::{
     DagCatalog, RegisteredDag, SchedulerMonitor, SchedulerSnapshot, trigger_dag,
 };
 use autumn_harvest::schema::{
-    harvest_dag_runs, harvest_events, harvest_schedules, harvest_signals, harvest_task_queue,
-    harvest_timers, harvest_workflow_executions,
+    harvest_dag_runs, harvest_events, harvest_external_tasks, harvest_schedules, harvest_signals,
+    harvest_task_queue, harvest_timers, harvest_workflow_executions,
 };
 use autumn_harvest::shard::ShardRouter;
 use autumn_harvest::signal;
@@ -913,6 +913,32 @@ async fn get_workflow_stack(
                 .map(|(h, d)| h + d),
         })
         .collect::<Vec<_>>();
+    let external_pending = harvest_external_tasks::table
+        .filter(harvest_external_tasks::workflow_exec_id.eq(exec_uuid))
+        .filter(harvest_external_tasks::state.eq("PENDING"))
+        .select(autumn_harvest::models::ExternalTask::as_select())
+        .load::<autumn_harvest::models::ExternalTask>(&mut conn)
+        .await
+        .map_err(database_error)?
+        .into_iter()
+        .map(|task| PendingActivity {
+            activity_exec_id: task.activity_id.to_string(),
+            activity_name: task.name,
+            queue: task.queue,
+            scheduled_at: task.created_at,
+            attempt: 1,
+            max_attempts: 1,
+            task_status: "PENDING".to_string(),
+            claimed_by_worker_id: None,
+            last_heartbeat_at: None,
+            next_retry_at: None,
+            schedule_to_start_deadline: None,
+            start_to_close_deadline: Some(task.schedule_to_close_at),
+            heartbeat_deadline: None,
+        })
+        .collect::<Vec<_>>();
+    let mut pending_activities = pending_activities;
+    pending_activities.extend(external_pending);
     let pending_local_activities = harvest_events::table
         .filter(harvest_events::workflow_exec_id.eq(exec_uuid))
         .filter(harvest_events::event_type.eq_any([
@@ -960,7 +986,7 @@ async fn get_workflow_stack(
                             },
                         );
                     }
-                    ("LocalActivityCompleted" | "LocalActivityFailed", Some(activity_exec_id)) => {
+                    ("LocalActivityCompleted", Some(activity_exec_id)) => {
                         acc.remove(&activity_exec_id);
                     }
                     _ => {}
@@ -1016,12 +1042,19 @@ async fn get_workflow_stack(
             },
         )
         .collect::<Vec<_>>();
-    let pending_signals = buffered_signals
-        .iter()
-        .map(|entry| PendingSignal {
-            signal_name: entry.signal_name.clone(),
-            waiters: entry.buffered,
-            oldest_waiter_since: entry.oldest_received_at,
+    let pending_signals = harvest_task_queue::table
+        .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_uuid)))
+        .filter(harvest_task_queue::task_type.eq("workflow"))
+        .filter(harvest_task_queue::state.eq_any(["PENDING", "CLAIMED", "RUNNING"]))
+        .select(harvest_task_queue::scheduled_at)
+        .load::<chrono::DateTime<chrono::Utc>>(&mut conn)
+        .await
+        .map_err(database_error)?
+        .into_iter()
+        .map(|oldest_waiter_since| PendingSignal {
+            signal_name: "*".to_string(),
+            waiters: 1,
+            oldest_waiter_since,
         })
         .collect::<Vec<_>>();
     let pending_child_workflows = harvest_workflow_executions::table
