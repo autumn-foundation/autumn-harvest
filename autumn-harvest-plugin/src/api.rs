@@ -849,6 +849,7 @@ async fn get_workflow(
     }))
 }
 
+#[allow(clippy::too_many_lines)]
 async fn get_workflow_stack(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
