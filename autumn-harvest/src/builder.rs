@@ -484,6 +484,8 @@ impl HarvestBuilder {
             self.worker_config.max_local_activity_start_to_close,
         )?;
 
+        self.payload_codecs.clone().install_global();
+
         Ok(BuiltHarvest {
             workflows: self.workflows,
             activities: self.activities,
@@ -493,7 +495,7 @@ impl HarvestBuilder {
             state: self.state,
             telemetry: Arc::new(self.telemetry.unwrap_or_default()),
             retention: self.retention,
-            payload_codecs: self.payload_codecs,
+            payload_codecs: self.payload_codecs.clone(),
         })
     }
 }

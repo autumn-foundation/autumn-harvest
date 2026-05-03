@@ -43,7 +43,7 @@ pub fn events_to_insert_rows(
         exec_id,
         events,
         0,
-        &crate::payload_codec::PayloadCodecs::default(),
+        &crate::payload_codec::PayloadCodecs::global(),
     )
 }
 
@@ -66,7 +66,7 @@ pub fn events_to_insert_rows_from(
         exec_id,
         events,
         start_id,
-        &crate::payload_codec::PayloadCodecs::default(),
+        &crate::payload_codec::PayloadCodecs::global(),
     )
 }
 
@@ -266,7 +266,7 @@ pub async fn load_history(
     load_history_with_codecs(
         conn,
         exec_id,
-        &crate::payload_codec::PayloadCodecs::default(),
+        &crate::payload_codec::PayloadCodecs::global(),
     )
     .await
 }

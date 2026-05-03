@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::LazyLock;
+use std::sync::{Arc, RwLock};
 
 use base64::Engine as _;
 use serde_json::Value;
@@ -49,7 +50,23 @@ impl Default for PayloadCodecs {
     }
 }
 
+static GLOBAL_PAYLOAD_CODECS: LazyLock<RwLock<PayloadCodecs>> =
+    LazyLock::new(|| RwLock::new(PayloadCodecs::default()));
+
 impl PayloadCodecs {
+    pub fn global() -> Self {
+        GLOBAL_PAYLOAD_CODECS
+            .read()
+            .expect("global payload codecs lock poisoned")
+            .clone()
+    }
+
+    pub fn install_global(self) {
+        *GLOBAL_PAYLOAD_CODECS
+            .write()
+            .expect("global payload codecs lock poisoned") = self;
+    }
+
     pub fn register(&mut self, codec: Arc<dyn PayloadCodec>) {
         self.codecs.insert(codec.codec_id(), codec);
     }
@@ -105,17 +122,18 @@ impl PayloadCodecs {
         let Some(codec_id) = obj.get("codec_id").and_then(Value::as_str) else {
             return Ok(payload.clone());
         };
+        let Some(encoded_b64) = obj.get("data").and_then(Value::as_str) else {
+            return Ok(payload.clone());
+        };
+        if obj.len() != 2 {
+            return Ok(payload.clone());
+        }
         let codec = self
             .codecs
             .get(codec_id)
             .ok_or_else(|| HarvestError::UnknownPayloadCodec {
                 id: codec_id.to_string(),
             })?;
-        let encoded_b64 = obj.get("data").and_then(Value::as_str).ok_or_else(|| {
-            HarvestError::Serialization(serde_json::Error::io(std::io::Error::other(
-                "missing codec data",
-            )))
-        })?;
         let encoded = base64::engine::general_purpose::STANDARD
             .decode(encoded_b64)
             .map_err(|e| HarvestError::Config(e.to_string()))?;
@@ -168,6 +186,29 @@ mod tests {
                 assert_eq!(input, serde_json::json!({"user":"alice"}));
             }
             _ => panic!("unexpected event"),
+        }
+    }
+
+    #[test]
+    fn legacy_object_with_codec_id_but_not_envelope_is_not_decoded() {
+        let codecs = PayloadCodecs::default();
+        let event = serde_json::json!({
+            "type": "WorkflowCompleted",
+            "data": {
+                "output": {
+                    "codec_id": "business-field",
+                    "value": 1
+                }
+            }
+        });
+
+        let decoded = codecs.decode_event(event).expect("decode");
+        match decoded {
+            crate::event::WorkflowEvent::WorkflowCompleted { output } => {
+                assert_eq!(output["codec_id"], "business-field");
+                assert_eq!(output["value"], 1);
+            }
+            _ => panic!("unexpected"),
         }
     }
 
