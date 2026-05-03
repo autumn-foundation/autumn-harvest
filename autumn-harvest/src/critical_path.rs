@@ -67,7 +67,7 @@ impl CriticalPathAnalyzer {
             };
         }
 
-        let (distances, predecessors) = self.calculate_distances_and_predecessors(tasks, &levels);
+        let (distances, predecessors) = self.calculate_distances_and_predecessors(tasks, levels);
         let end_node = Self::find_critical_sink_node(tasks, &distances);
 
         let mut path_indices = Vec::new();
