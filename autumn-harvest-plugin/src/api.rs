@@ -253,6 +253,7 @@ impl HarvestApiState {
 
 #[derive(Debug, Serialize)]
 struct WorkflowDetailsResponse {
+    parent_id: Option<uuid::Uuid>,
     execution: WorkflowExecution,
     history: Vec<Value>,
 }
@@ -526,6 +527,9 @@ pub(crate) const KNOWN_WORKFLOW_STATES: &[&str] = &[
 
 const DEFAULT_WORKFLOW_LIMIT: i64 = 50;
 const MAX_WORKFLOW_LIMIT: i64 = 200;
+const DEFAULT_WORKFLOW_CHILDREN_LIMIT: usize = 50;
+const MAX_WORKFLOW_CHILDREN_LIMIT: usize = 500;
+const MAX_WORKFLOW_CHILDREN_DEPTH: u8 = 5;
 
 #[derive(Debug, Default, Clone)]
 pub(crate) struct WorkflowFilters {
@@ -542,6 +546,51 @@ impl WorkflowFilters {
     }
 }
 
+#[derive(Debug, Clone)]
+struct WorkflowChildrenFilters {
+    limit: usize,
+    statuses: Vec<String>,
+    workflow_name: Option<String>,
+    cursor: Option<WorkflowChildrenCursor>,
+    max_depth: u8,
+}
+
+impl Default for WorkflowChildrenFilters {
+    fn default() -> Self {
+        Self {
+            limit: DEFAULT_WORKFLOW_CHILDREN_LIMIT,
+            statuses: Vec::new(),
+            workflow_name: None,
+            cursor: None,
+            max_depth: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct WorkflowChildrenCursor {
+    started_at: chrono::DateTime<chrono::Utc>,
+    exec_id: uuid::Uuid,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkflowChildrenResponse {
+    items: Vec<WorkflowChildResponse>,
+    next_cursor: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkflowChildResponse {
+    exec_id: String,
+    workflow_name: String,
+    status: String,
+    started_at: chrono::DateTime<chrono::Utc>,
+    completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    error_summary: Option<String>,
+    shard_id: i32,
+    depth: u8,
+}
+
 #[derive(Debug, Deserialize)]
 struct DeadLetterListQuery {
     limit: Option<i64>,
@@ -551,6 +600,7 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
     Router::new()
         .route("/workflows", get(list_workflows))
         .route("/workflows/{id}", get(get_workflow))
+        .route("/workflows/{id}/children", get(list_workflow_children))
         .route("/workflows/{id}/stack", get(get_workflow_stack))
         .route("/workflows/{workflow_name}/start", post(start_workflow))
         .route("/workflows/{id}/cancel", post(cancel_workflow))
@@ -895,9 +945,242 @@ async fn get_workflow(
         .map_err(map_error)?;
 
     Ok(Json(WorkflowDetailsResponse {
+        parent_id: execution.parent_id,
         execution,
         history: events,
     }))
+}
+
+async fn list_workflow_children(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id): Path<String>,
+    Query(pairs): Query<Vec<(String, String)>>,
+) -> Result<Json<WorkflowChildrenResponse>, AutumnError> {
+    let exec_id = parse_execution_id(&id)?;
+    let filters = parse_workflow_children_filters(&pairs)?;
+
+    {
+        let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
+        load_execution(&mut conn, exec_id)
+            .await
+            .map_err(map_error)?;
+    }
+
+    let mut rows =
+        load_workflow_children_tree_from_shards(&api_state, exec_id, filters.max_depth).await?;
+    rows.retain(|row| workflow_child_matches_filters(row, &filters));
+    sort_workflow_child_rows(&mut rows);
+    if let Some(cursor) = &filters.cursor {
+        rows.retain(|row| workflow_child_is_after_cursor(row, cursor));
+    }
+
+    let next_cursor = if rows.len() > filters.limit {
+        let cursor = encode_workflow_children_cursor(&rows[filters.limit - 1]);
+        rows.truncate(filters.limit);
+        Some(cursor)
+    } else {
+        None
+    };
+
+    Ok(Json(WorkflowChildrenResponse {
+        items: rows.into_iter().map(WorkflowChildResponse::from).collect(),
+        next_cursor,
+    }))
+}
+
+async fn load_workflow_children_tree_from_shards(
+    api_state: &HarvestApiState,
+    parent_id: ExecutionId,
+    max_depth: u8,
+) -> Result<Vec<store::WorkflowChildRow>, AutumnError> {
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    let mut rows = Vec::new();
+    let mut frontier = vec![parent_id];
+    let query_filters = store::WorkflowChildFilters::default();
+
+    for depth in 0..=max_depth {
+        if frontier.is_empty() {
+            break;
+        }
+
+        let mut level_rows = Vec::new();
+        for parent in &frontier {
+            for (_shard, shard_pool) in pool.iter_shards() {
+                let mut conn = acquire_conn(shard_pool).await?;
+                let mut shard_rows =
+                    store::load_workflow_children(&mut conn, *parent, &query_filters, depth)
+                        .await
+                        .map_err(map_error)?;
+                level_rows.append(&mut shard_rows);
+            }
+        }
+
+        frontier = level_rows.iter().map(|row| row.exec_id).collect();
+        rows.append(&mut level_rows);
+    }
+
+    Ok(rows)
+}
+
+fn parse_workflow_children_filters(
+    pairs: &[(String, String)],
+) -> Result<WorkflowChildrenFilters, AutumnError> {
+    let mut filters = WorkflowChildrenFilters::default();
+
+    for (key, value) in pairs {
+        match key.as_str() {
+            "status" => {
+                for raw in value.split(',') {
+                    let trimmed = raw.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    let status = parse_workflow_child_status(trimmed)?;
+                    if !filters.statuses.contains(&status) {
+                        filters.statuses.push(status);
+                    }
+                }
+            }
+            "workflow_name" => {
+                let trimmed = value.trim();
+                if !trimmed.is_empty() {
+                    filters.workflow_name = Some(trimmed.to_string());
+                }
+            }
+            "limit" => {
+                let parsed = value.parse::<usize>().map_err(|_| {
+                    AutumnError::bad_request_msg(format!("invalid limit '{value}'"))
+                })?;
+                filters.limit = parsed.clamp(1, MAX_WORKFLOW_CHILDREN_LIMIT);
+            }
+            "cursor" => {
+                filters.cursor = Some(parse_workflow_children_cursor(value)?);
+            }
+            "depth" => {
+                let parsed = value.parse::<u8>().map_err(|_| {
+                    AutumnError::bad_request_msg(format!("invalid depth '{value}'"))
+                })?;
+                if parsed > MAX_WORKFLOW_CHILDREN_DEPTH {
+                    return Err(AutumnError::bad_request_msg(format!(
+                        "depth {parsed} exceeds maximum {MAX_WORKFLOW_CHILDREN_DEPTH}"
+                    )));
+                }
+                filters.max_depth = parsed;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(filters)
+}
+
+fn parse_workflow_child_status(raw: &str) -> Result<String, AutumnError> {
+    let normalized = raw
+        .chars()
+        .filter(|ch| *ch != '_' && *ch != '-')
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    let status = match normalized.as_str() {
+        "running" => "RUNNING",
+        "failed" => "FAILED",
+        "completed" => "COMPLETED",
+        "cancelled" | "canceled" => "CANCELLED",
+        "terminated" => "TERMINATED",
+        "timedout" => "TIMED_OUT",
+        _ => {
+            return Err(AutumnError::bad_request_msg(format!(
+                "unknown workflow child status '{raw}'; expected one of Running, Failed, Completed, Cancelled, Terminated, TimedOut"
+            )));
+        }
+    };
+    Ok(status.to_string())
+}
+
+fn parse_workflow_children_cursor(raw: &str) -> Result<WorkflowChildrenCursor, AutumnError> {
+    let (started_at, exec_id) = raw.split_once('|').ok_or_else(|| {
+        AutumnError::bad_request_msg("invalid cursor; expected '<started_at>|<exec_id>'")
+    })?;
+    let started_at = chrono::DateTime::parse_from_rfc3339(started_at)
+        .map_err(|_| AutumnError::bad_request_msg("invalid cursor timestamp"))?
+        .with_timezone(&chrono::Utc);
+    let exec_id = exec_id
+        .parse::<uuid::Uuid>()
+        .map_err(|_| AutumnError::bad_request_msg("invalid cursor execution id"))?;
+
+    Ok(WorkflowChildrenCursor {
+        started_at,
+        exec_id,
+    })
+}
+
+fn workflow_child_matches_filters(
+    row: &store::WorkflowChildRow,
+    filters: &WorkflowChildrenFilters,
+) -> bool {
+    if !filters.statuses.is_empty() && !filters.statuses.contains(&row.status) {
+        return false;
+    }
+    if let Some(name) = &filters.workflow_name
+        && row.workflow_name != *name
+    {
+        return false;
+    }
+    true
+}
+
+fn sort_workflow_child_rows(rows: &mut [store::WorkflowChildRow]) {
+    rows.sort_by(|left, right| {
+        right
+            .started_at
+            .cmp(&left.started_at)
+            .then_with(|| right.exec_id.as_uuid().cmp(&left.exec_id.as_uuid()))
+    });
+}
+
+fn workflow_child_is_after_cursor(
+    row: &store::WorkflowChildRow,
+    cursor: &WorkflowChildrenCursor,
+) -> bool {
+    row.started_at < cursor.started_at
+        || (row.started_at == cursor.started_at && row.exec_id.as_uuid() < cursor.exec_id)
+}
+
+fn encode_workflow_children_cursor(row: &store::WorkflowChildRow) -> String {
+    format!(
+        "{}|{}",
+        row.started_at
+            .to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+        row.exec_id
+    )
+}
+
+fn workflow_child_status_label(status: &str) -> String {
+    match status {
+        "RUNNING" => "Running",
+        "FAILED" => "Failed",
+        "COMPLETED" => "Completed",
+        "CANCELLED" => "Cancelled",
+        "TERMINATED" => "Terminated",
+        "TIMED_OUT" => "TimedOut",
+        "CONTINUED_AS_NEW" => "ContinuedAsNew",
+        other => other,
+    }
+    .to_string()
+}
+
+impl From<store::WorkflowChildRow> for WorkflowChildResponse {
+    fn from(row: store::WorkflowChildRow) -> Self {
+        Self {
+            exec_id: row.exec_id.to_string(),
+            workflow_name: row.workflow_name,
+            status: workflow_child_status_label(&row.status),
+            started_at: row.started_at,
+            completed_at: row.completed_at,
+            error_summary: row.error_summary,
+            shard_id: row.shard_id,
+            depth: row.depth,
+        }
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -2845,6 +3128,44 @@ mod tests {
             .expect("unknown keys should be skipped");
         assert!(filters.states.is_empty());
         assert!(filters.workflow_name.is_none());
+    }
+
+    #[test]
+    fn parse_workflow_children_filters_accepts_statuses_limit_and_depth() {
+        let filters = parse_workflow_children_filters(&pairs(&[
+            ("status", "Failed,Running"),
+            ("status", "TimedOut"),
+            ("workflow_name", "billing_child"),
+            ("limit", "9001"),
+            ("depth", "2"),
+        ]))
+        .expect("children filters should parse");
+
+        assert_eq!(
+            filters.statuses,
+            vec![
+                "FAILED".to_string(),
+                "RUNNING".to_string(),
+                "TIMED_OUT".to_string(),
+            ]
+        );
+        assert_eq!(filters.workflow_name.as_deref(), Some("billing_child"));
+        assert_eq!(filters.limit, MAX_WORKFLOW_CHILDREN_LIMIT);
+        assert_eq!(filters.max_depth, 2);
+    }
+
+    #[test]
+    fn parse_workflow_children_filters_rejects_depth_above_cap() {
+        let err = parse_workflow_children_filters(&pairs(&[("depth", "6")]))
+            .expect_err("depth above cap must error");
+        assert!(err.to_string().contains("exceeds maximum"));
+    }
+
+    #[test]
+    fn parse_workflow_children_filters_rejects_unknown_status() {
+        let err = parse_workflow_children_filters(&pairs(&[("status", "Zombie")]))
+            .expect_err("unknown child status must error");
+        assert!(err.to_string().contains("unknown workflow child status"));
     }
 
     #[test]

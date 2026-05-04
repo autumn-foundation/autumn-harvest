@@ -232,6 +232,30 @@ enum WorkflowCommand {
         /// Workflow execution ID.
         execution_id: String,
     },
+    /// List child workflow executions for a parent execution.
+    Children {
+        /// Parent workflow execution ID.
+        execution_id: String,
+        /// Filter by child workflow status. Repeat the flag or pass a
+        /// comma-separated list to match any of several statuses.
+        #[arg(long, value_delimiter = ',')]
+        status: Vec<String>,
+        /// Filter by registered child workflow name (exact match).
+        #[arg(long)]
+        workflow_name: Option<String>,
+        /// Maximum number of rows to return.
+        #[arg(long, value_parser = clap::value_parser!(i64).range(1..=500))]
+        limit: Option<i64>,
+        /// Opaque pagination cursor returned by the previous response.
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Recursive descent depth; 0 returns direct children only.
+        #[arg(long, value_parser = clap::value_parser!(u8).range(0..=5))]
+        depth: Option<u8>,
+        /// Print the raw JSON API payload instead of a human table.
+        #[arg(long)]
+        json: bool,
+    },
     /// Start a workflow execution.
     Start {
         /// Registered workflow name.
@@ -561,9 +585,8 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
         return tui::run_tui(&cli).await;
     }
 
-    let output = cli.output;
     let response = execute(&cli).await?;
-    let rendered = format_output(&response, output)?;
+    let rendered = render_response(&cli, &response)?;
     println!("{rendered}");
     Ok(())
 }
@@ -622,6 +645,107 @@ pub fn format_output(value: &Value, output: OutputFormat) -> Result<String, CliE
     }
 }
 
+fn render_response(cli: &Cli, value: &Value) -> Result<String, CliError> {
+    if workflow_children_wants_table(cli) {
+        return Ok(format_workflow_children_table(value));
+    }
+
+    let output = if workflow_children_wants_raw_json(cli) {
+        OutputFormat::Json
+    } else {
+        cli.output
+    };
+    format_output(value, output)
+}
+
+fn workflow_children_wants_table(cli: &Cli) -> bool {
+    matches!(
+        &cli.command,
+        Commands::Workflow {
+            command: WorkflowCommand::Children { json: false, .. }
+        } if cli.output == OutputFormat::PrettyJson
+    )
+}
+
+const fn workflow_children_wants_raw_json(cli: &Cli) -> bool {
+    matches!(
+        &cli.command,
+        Commands::Workflow {
+            command: WorkflowCommand::Children { json: true, .. }
+        }
+    )
+}
+
+fn format_workflow_children_table(value: &Value) -> String {
+    let Some(items) = value.get("items").and_then(Value::as_array) else {
+        return "No child workflows found.".to_string();
+    };
+    if items.is_empty() {
+        return "No child workflows found.".to_string();
+    }
+
+    let mut rows = Vec::with_capacity(items.len() + 1);
+    rows.push(vec![
+        "DEPTH".to_string(),
+        "EXEC ID".to_string(),
+        "WORKFLOW".to_string(),
+        "STATUS".to_string(),
+        "STARTED".to_string(),
+        "COMPLETED".to_string(),
+        "SHARD".to_string(),
+        "ERROR".to_string(),
+    ]);
+    for item in items {
+        rows.push(vec![
+            cell_number(item.get("depth")),
+            cell_str(item.get("exec_id")),
+            cell_str(item.get("workflow_name")),
+            cell_str(item.get("status")),
+            cell_str(item.get("started_at")),
+            cell_optional_str(item.get("completed_at")),
+            cell_number(item.get("shard_id")),
+            cell_optional_str(item.get("error_summary")),
+        ]);
+    }
+
+    let widths = (0..rows[0].len())
+        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
+        .collect::<Vec<_>>();
+    let mut rendered = rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .enumerate()
+                .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
+                .collect::<Vec<_>>()
+                .join("  ")
+                .trim_end()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if let Some(cursor) = value.get("next_cursor").and_then(Value::as_str) {
+        rendered.push_str("\nnext_cursor: ");
+        rendered.push_str(cursor);
+    }
+    rendered
+}
+
+fn cell_str(value: Option<&Value>) -> String {
+    value.and_then(Value::as_str).unwrap_or("").to_string()
+}
+
+fn cell_optional_str(value: Option<&Value>) -> String {
+    value.and_then(Value::as_str).unwrap_or("-").to_string()
+}
+
+fn cell_number(value: Option<&Value>) -> String {
+    value
+        .and_then(Value::as_i64)
+        .map_or_else(String::new, |number| number.to_string())
+}
+
 #[allow(clippy::too_many_lines)]
 fn workflow_request(command: &WorkflowCommand) -> Result<ApiRequest, CliError> {
     match command {
@@ -643,6 +767,22 @@ fn workflow_request(command: &WorkflowCommand) -> Result<ApiRequest, CliError> {
         WorkflowCommand::Stack { execution_id } => Ok(ApiRequest::get(format!(
             "/workflows/{}/stack",
             path_segment(execution_id)
+        ))),
+        WorkflowCommand::Children {
+            execution_id,
+            status,
+            workflow_name,
+            limit,
+            cursor,
+            depth,
+            json: _,
+        } => Ok(ApiRequest::get(build_workflow_children_path(
+            execution_id,
+            status,
+            workflow_name.as_deref(),
+            *limit,
+            cursor.as_deref(),
+            *depth,
         ))),
         WorkflowCommand::Start {
             workflow_name,
@@ -1076,6 +1216,43 @@ fn build_workflow_list_path(
     Ok(format!("/workflows?{encoded}"))
 }
 
+fn build_workflow_children_path(
+    execution_id: &str,
+    statuses: &[String],
+    workflow_name: Option<&str>,
+    limit: Option<i64>,
+    cursor: Option<&str>,
+    depth: Option<u8>,
+) -> String {
+    let mut params: Vec<(&'static str, String)> = Vec::new();
+    for status in statuses {
+        params.push(("status", status.clone()));
+    }
+    if let Some(name) = workflow_name {
+        params.push(("workflow_name", name.to_string()));
+    }
+    if let Some(value) = limit {
+        params.push(("limit", value.to_string()));
+    }
+    if let Some(value) = cursor {
+        params.push(("cursor", value.to_string()));
+    }
+    if let Some(value) = depth {
+        params.push(("depth", value.to_string()));
+    }
+
+    let base = format!("/workflows/{}/children", path_segment(execution_id));
+    if params.is_empty() {
+        return base;
+    }
+    let encoded = params
+        .iter()
+        .map(|(key, value)| format!("{key}={}", query_encode(value)))
+        .collect::<Vec<_>>()
+        .join("&");
+    format!("{base}?{encoded}")
+}
+
 fn query_encode(input: &str) -> String {
     // RFC 3986 query-component encoding. We intentionally leave `:` unencoded
     // so the management API sees `search_attr=key:value` as a stable shape.
@@ -1182,5 +1359,52 @@ mod reuse_policy_tests {
         let body = req.body.as_ref().unwrap();
         assert_eq!(body["workflow_id"], "wf-123");
         assert_eq!(body["reuse_policy"], "reject_duplicate");
+    }
+
+    #[test]
+    fn children_default_output_renders_human_table() {
+        let cli = parse(&[
+            "workflow",
+            "children",
+            "00000000-0000-0000-0000-000000000001",
+        ]);
+        let payload = json!({
+            "items": [{
+                "exec_id": "00000000-0000-0000-0000-000000000002",
+                "workflow_name": "billing_child",
+                "status": "Failed",
+                "started_at": "2026-05-04T12:00:00Z",
+                "completed_at": null,
+                "error_summary": "charge card failed",
+                "shard_id": 1,
+                "depth": 0
+            }],
+            "next_cursor": null
+        });
+
+        let rendered = render_response(&cli, &payload).expect("table output should render");
+
+        assert!(rendered.contains("EXEC ID"));
+        assert!(rendered.contains("billing_child"));
+        assert!(rendered.contains("charge card failed"));
+        assert!(!rendered.trim_start().starts_with('{'));
+    }
+
+    #[test]
+    fn children_json_flag_renders_raw_payload() {
+        let cli = parse(&[
+            "workflow",
+            "children",
+            "00000000-0000-0000-0000-000000000001",
+            "--json",
+        ]);
+        let payload = json!({
+            "items": [],
+            "next_cursor": null
+        });
+
+        let rendered = render_response(&cli, &payload).expect("json output should render");
+
+        assert_eq!(rendered, r#"{"items":[],"next_cursor":null}"#);
     }
 }

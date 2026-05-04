@@ -129,6 +129,40 @@ fn workflow_list_supports_repeated_and_comma_states() {
 }
 
 #[test]
+fn workflow_children_maps_to_management_api_request() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "children",
+        "00000000-0000-0000-0000-000000000001",
+        "--status",
+        "Failed",
+        "--status",
+        "Running",
+        "--workflow-name",
+        "billing_child",
+        "--limit",
+        "25",
+        "--cursor",
+        "2026-05-04T12:00:00Z|00000000-0000-0000-0000-000000000099",
+        "--depth",
+        "2",
+        "--json",
+    ])
+    .expect("workflow children args should parse");
+    let request = cli.api_request().expect("children request should build");
+
+    assert_eq!(request.method, ApiMethod::Get);
+    assert_eq!(
+        request.path,
+        "/workflows/00000000-0000-0000-0000-000000000001/children\
+         ?status=Failed&status=Running&workflow_name=billing_child&limit=25\
+         &cursor=2026-05-04T12:00:00Z%7C00000000-0000-0000-0000-000000000099&depth=2"
+    );
+    assert_eq!(request.body, None);
+}
+
+#[test]
 fn workflow_list_rejects_search_attr_without_equals() {
     let list = Cli::try_parse_from(["harvest", "workflow", "list", "--search-attr", "tenant"])
         .expect("malformed search-attr args should still parse at clap level");

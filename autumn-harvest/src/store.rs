@@ -15,8 +15,8 @@ use scoped_futures::ScopedFutureExt as _;
 
 use crate::error::HarvestResult;
 use crate::event::WorkflowEvent;
-use crate::models::NewHarvestEvent;
-use crate::schema::harvest_events;
+use crate::models::{NewHarvestEvent, WorkflowExecution};
+use crate::schema::{harvest_events, harvest_workflow_executions};
 use crate::types::ExecutionId;
 
 /// Loaded event history for a single workflow execution.
@@ -28,6 +28,26 @@ pub struct EventHistory {
     pub exec_id: ExecutionId,
     pub events: Vec<WorkflowEvent>,
     pub next_event_id: i32,
+}
+
+/// Filters for loading child workflow execution rows under one parent.
+#[derive(Debug, Clone, Default)]
+pub struct WorkflowChildFilters {
+    pub statuses: Vec<String>,
+    pub workflow_name: Option<String>,
+}
+
+/// Operator-facing child workflow row used by management API read models.
+#[derive(Debug, Clone)]
+pub struct WorkflowChildRow {
+    pub exec_id: ExecutionId,
+    pub workflow_name: String,
+    pub status: String,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub error_summary: Option<String>,
+    pub shard_id: i32,
+    pub depth: u8,
 }
 
 /// Convert in-memory events to insertable rows with sequential event IDs
@@ -297,6 +317,72 @@ pub async fn load_history_with_codecs(
         events,
         next_event_id,
     })
+}
+
+/// Load the direct children of `parent_id` from one shard.
+///
+/// Callers that need cross-shard discovery should call this once per shard and
+/// merge the rows after applying any global ordering/pagination.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub async fn load_workflow_children(
+    conn: &mut AsyncPgConnection,
+    parent_id: ExecutionId,
+    filters: &WorkflowChildFilters,
+    depth: u8,
+) -> HarvestResult<Vec<WorkflowChildRow>> {
+    let mut query = harvest_workflow_executions::table
+        .into_boxed()
+        .filter(harvest_workflow_executions::parent_id.eq(Some(parent_id.as_uuid())))
+        .order((
+            harvest_workflow_executions::started_at.desc(),
+            harvest_workflow_executions::id.desc(),
+        ));
+
+    if !filters.statuses.is_empty() {
+        query = query.filter(harvest_workflow_executions::state.eq_any(filters.statuses.clone()));
+    }
+    if let Some(name) = &filters.workflow_name {
+        query = query.filter(harvest_workflow_executions::workflow_name.eq(name.clone()));
+    }
+
+    query
+        .select(WorkflowExecution::as_select())
+        .load::<WorkflowExecution>(conn)
+        .await
+        .map_err(crate::error::database_error)
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| WorkflowChildRow {
+                    exec_id: ExecutionId::from_uuid(row.id),
+                    workflow_name: row.workflow_name,
+                    status: row.state,
+                    started_at: row.started_at,
+                    completed_at: row.completed_at,
+                    error_summary: summarize_error(row.error),
+                    shard_id: row.shard_id,
+                    depth,
+                })
+                .collect()
+        })
+}
+
+fn summarize_error(error: Option<String>) -> Option<String> {
+    const MAX_ERROR_SUMMARY_CHARS: usize = 240;
+
+    let first_line = error?.lines().next().unwrap_or_default().trim().to_string();
+    if first_line.is_empty() {
+        return None;
+    }
+
+    let mut chars = first_line.chars();
+    let summary = chars
+        .by_ref()
+        .take(MAX_ERROR_SUMMARY_CHARS)
+        .collect::<String>();
+    Some(summary)
 }
 
 #[cfg(test)]

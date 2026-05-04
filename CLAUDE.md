@@ -153,7 +153,7 @@ Current implementation scope: `ExecutionId`/`ShardId` encoding, `ShardRouter`, `
 | `prelude.rs` | 1 | Core glob re-export surface including macros |
 | `schema.rs` | 1 | Diesel `table!` macros -- 9 tables |
 | `models.rs` | 1 | `Queryable`/`Selectable` read structs and `Insertable` `New*` write structs for all 9 tables |
-| `store.rs` | 2 | Event store: `append_events`, `load_history`, `events_to_rows` with sequential event IDs |
+| `store.rs` | 2 | Event store and read helpers: `append_events`, `load_history`, `events_to_rows` with sequential event IDs, `load_workflow_children` for parent -> child operator queries |
 | `replay.rs` | 2 | Deterministic replay engine: `HistoryMatcher` walks event history, detects non-determinism |
 | `executor.rs` | 2 | Workflow executor: `run_workflow` drives replay + live execution, handles suspension |
 | `queue.rs` | 2 | Postgres task queue: `enqueue`, `claim` (FOR UPDATE SKIP LOCKED), `complete`, `fail` |

@@ -206,6 +206,18 @@ async fn eris_require_auth_blocks_get_workflow() {
 }
 
 #[tokio::test]
+async fn eris_require_auth_blocks_workflow_children() {
+    let app = authenticated_app();
+    let res = app
+        .oneshot(get(
+            "/workflows/00000000-0000-0000-0000-000000000001/children",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn eris_require_auth_blocks_start_workflow() {
     let app = authenticated_app();
     let res = app
