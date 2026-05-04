@@ -1311,6 +1311,59 @@ async fn harvest_api_lists_direct_workflow_children_with_filters() {
 }
 
 #[tokio::test]
+async fn harvest_api_filters_workflow_children_by_continued_as_new_status() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool));
+    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+
+    let parent = insert_workflow_on_url(
+        &database_url,
+        ShardId::new(0),
+        "fanout_parent",
+        "parent-continued-as-new",
+    )
+    .await;
+    let continued_child = insert_child_workflow_on_url(ChildWorkflowFixture {
+        database_url: &database_url,
+        shard: ShardId::new(0),
+        parent_id: parent,
+        workflow_name: "billing_child",
+        workflow_id: "continued-child",
+        state: "CONTINUED_AS_NEW",
+        error: None,
+        started_offset_secs: 10,
+    })
+    .await;
+    insert_child_workflow_on_url(ChildWorkflowFixture {
+        database_url: &database_url,
+        shard: ShardId::new(0),
+        parent_id: parent,
+        workflow_name: "billing_child",
+        workflow_id: "failed-child",
+        state: "FAILED",
+        error: Some("not the requested state"),
+        started_offset_secs: 5,
+    })
+    .await;
+
+    let (status, body) = get_json(
+        &app,
+        format!("/workflows/{parent}/children?status=ContinuedAsNew"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let items = body["items"]
+        .as_array()
+        .expect("children response must have an items array");
+
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["exec_id"], continued_child.to_string());
+    assert_eq!(items[0]["status"], "ContinuedAsNew");
+}
+
+#[tokio::test]
 async fn harvest_api_lists_workflow_children_across_shards_and_paginates() {
     let ((shard0_url, shard1_url), _container) = setup_sharded_test_database_urls().await;
     let api_state = HarvestApiState::new();

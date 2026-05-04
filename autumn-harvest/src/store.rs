@@ -15,7 +15,7 @@ use scoped_futures::ScopedFutureExt as _;
 
 use crate::error::HarvestResult;
 use crate::event::WorkflowEvent;
-use crate::models::{NewHarvestEvent, WorkflowExecution};
+use crate::models::NewHarvestEvent;
 use crate::schema::{harvest_events, harvest_workflow_executions};
 use crate::types::ExecutionId;
 
@@ -49,6 +49,16 @@ pub struct WorkflowChildRow {
     pub shard_id: i32,
     pub depth: u8,
 }
+
+type WorkflowChildProjection = (
+    uuid::Uuid,
+    String,
+    String,
+    chrono::DateTime<chrono::Utc>,
+    Option<chrono::DateTime<chrono::Utc>>,
+    Option<String>,
+    i32,
+);
 
 /// Convert in-memory events to insertable rows with sequential event IDs
 /// starting from 0.
@@ -349,22 +359,34 @@ pub async fn load_workflow_children(
     }
 
     query
-        .select(WorkflowExecution::as_select())
-        .load::<WorkflowExecution>(conn)
+        .select((
+            harvest_workflow_executions::id,
+            harvest_workflow_executions::workflow_name,
+            harvest_workflow_executions::state,
+            harvest_workflow_executions::started_at,
+            harvest_workflow_executions::completed_at,
+            harvest_workflow_executions::error,
+            harvest_workflow_executions::shard_id,
+        ))
+        .load::<WorkflowChildProjection>(conn)
         .await
         .map_err(crate::error::database_error)
         .map(|rows| {
             rows.into_iter()
-                .map(|row| WorkflowChildRow {
-                    exec_id: ExecutionId::from_uuid(row.id),
-                    workflow_name: row.workflow_name,
-                    status: row.state,
-                    started_at: row.started_at,
-                    completed_at: row.completed_at,
-                    error_summary: summarize_error(row.error),
-                    shard_id: row.shard_id,
-                    depth,
-                })
+                .map(
+                    |(id, workflow_name, state, started_at, completed_at, error, shard_id)| {
+                        WorkflowChildRow {
+                            exec_id: ExecutionId::from_uuid(id),
+                            workflow_name,
+                            status: state,
+                            started_at,
+                            completed_at,
+                            error_summary: summarize_error(error),
+                            shard_id,
+                            depth,
+                        }
+                    },
+                )
                 .collect()
         })
 }
@@ -372,17 +394,12 @@ pub async fn load_workflow_children(
 fn summarize_error(error: Option<String>) -> Option<String> {
     const MAX_ERROR_SUMMARY_CHARS: usize = 240;
 
-    let first_line = error?.lines().next().unwrap_or_default().trim().to_string();
+    let first_line = error?.lines().next()?.trim().to_string();
     if first_line.is_empty() {
         return None;
     }
 
-    let mut chars = first_line.chars();
-    let summary = chars
-        .by_ref()
-        .take(MAX_ERROR_SUMMARY_CHARS)
-        .collect::<String>();
-    Some(summary)
+    Some(first_line.chars().take(MAX_ERROR_SUMMARY_CHARS).collect())
 }
 
 #[cfg(test)]

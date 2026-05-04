@@ -311,7 +311,7 @@ combined result.
 
 | CLI flag | Query param | Behavior |
 |---|---|---|
-| `--status Failed` (repeatable, also accepts comma-separated values) | `?status=Failed&status=Running` | OR filter on child status. Allowed values: `Running`, `Failed`, `Completed`, `Cancelled`, `Terminated`, `TimedOut`. |
+| `--status Failed` (repeatable, also accepts comma-separated values) | `?status=Failed&status=Running` | OR filter on child status. Allowed values: `Running`, `Failed`, `Completed`, `Cancelled`, `Terminated`, `TimedOut`, `ContinuedAsNew`. |
 | `--workflow-name billing_child` | `?workflow_name=billing_child` | Exact match on the child workflow name. |
 | `--limit 100` | `?limit=100` | Page size. Defaults to 50 and is capped at 500. |
 | `--cursor <cursor>` | `?cursor=<cursor>` | Continue from the previous page's `next_cursor`. |

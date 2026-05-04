@@ -1087,9 +1087,10 @@ fn parse_workflow_child_status(raw: &str) -> Result<String, AutumnError> {
         "cancelled" | "canceled" => "CANCELLED",
         "terminated" => "TERMINATED",
         "timedout" => "TIMED_OUT",
+        "continuedasnew" => "CONTINUED_AS_NEW",
         _ => {
             return Err(AutumnError::bad_request_msg(format!(
-                "unknown workflow child status '{raw}'; expected one of Running, Failed, Completed, Cancelled, Terminated, TimedOut"
+                "unknown workflow child status '{raw}'; expected one of Running, Failed, Completed, Cancelled, Terminated, TimedOut, ContinuedAsNew"
             )));
         }
     };
@@ -3152,6 +3153,14 @@ mod tests {
         assert_eq!(filters.workflow_name.as_deref(), Some("billing_child"));
         assert_eq!(filters.limit, MAX_WORKFLOW_CHILDREN_LIMIT);
         assert_eq!(filters.max_depth, 2);
+    }
+
+    #[test]
+    fn parse_workflow_children_filters_accepts_continued_as_new() {
+        let filters = parse_workflow_children_filters(&pairs(&[("status", "ContinuedAsNew")]))
+            .expect("ContinuedAsNew is a valid workflow execution state");
+
+        assert_eq!(filters.statuses, vec!["CONTINUED_AS_NEW".to_string()]);
     }
 
     #[test]
