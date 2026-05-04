@@ -416,6 +416,7 @@ enum BatchCommand {
     /// Submit a new batch operation.
     Submit {
         /// Action to perform: Cancel, Terminate, or Signal.
+        #[arg(value_parser = clap::builder::PossibleValuesParser::new(["Cancel", "Terminate", "Signal"]))]
         action: String,
         /// Inline JSON filter definition.
         #[arg(long, conflicts_with = "filter_file")]
