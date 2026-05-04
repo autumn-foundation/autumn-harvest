@@ -358,7 +358,7 @@ async fn run_shard_tick(
         let candidates = diesel::sql_query(
             "SELECT id, workflow_name, workflow_id, completed_at
              FROM harvest_workflow_executions
-             WHERE state IN ('COMPLETED','FAILED','CANCELLED','TIMED_OUT','CONTINUED_AS_NEW')
+             WHERE state IN ('COMPLETED','FAILED','CANCELLED','TIMED_OUT','CONTINUED_AS_NEW','TERMINATED')
                AND completed_at IS NOT NULL
                AND completed_at < $1
                AND (
@@ -443,6 +443,7 @@ async fn delete_candidate_execution(
                         "CANCELLED",
                         "TIMED_OUT",
                         "CONTINUED_AS_NEW",
+                        "TERMINATED",
                     ])),
             )
             .set(harvest_workflow_executions::parent_id.eq::<Option<uuid::Uuid>>(None))
@@ -481,7 +482,7 @@ async fn should_skip_candidate(
         "SELECT COUNT(*) AS count
          FROM harvest_workflow_executions
          WHERE parent_id = $1
-           AND state NOT IN ('COMPLETED','FAILED','CANCELLED','TIMED_OUT','CONTINUED_AS_NEW')",
+           AND state NOT IN ('COMPLETED','FAILED','CANCELLED','TIMED_OUT','CONTINUED_AS_NEW','TERMINATED')",
     )
     .bind::<SqlUuid, _>(candidate.id)
     .get_result::<CountRow>(conn)
@@ -543,7 +544,7 @@ async fn should_skip_candidate(
            AND workflow_id = $2
            AND id <> $3
            AND (
-               state NOT IN ('COMPLETED','FAILED','CANCELLED','TIMED_OUT','CONTINUED_AS_NEW')
+                state NOT IN ('COMPLETED','FAILED','CANCELLED','TIMED_OUT','CONTINUED_AS_NEW','TERMINATED')
                OR completed_at IS NULL
                OR completed_at >= $4
            )",

@@ -434,6 +434,64 @@ impl WorkflowReplayer {
         outcome_to_report(exec_id, total_events, &events, outcome)
     }
 
+    /// Replay as if the workflow history were reset at `reset_to_event_id`.
+    ///
+    /// This helper truncates the supplied history through the chosen boundary,
+    /// appends a synthetic [`WorkflowEvent::WorkflowResetFork`] marker, and runs
+    /// the normal strict replay path. It is intentionally read-only: no
+    /// database rows are copied or mutated.
+    pub async fn replay_with_reset(
+        &self,
+        history: Vec<WorkflowEvent>,
+        reset_to_event_id: i64,
+    ) -> ReplayReport {
+        if reset_to_event_id < 0 {
+            return ReplayReport {
+                execution_id: ExecutionId::new(),
+                events_replayed: 0,
+                status: ReplayStatus::WorkflowFailed {
+                    error: format!("reset_to_event_id {reset_to_event_id} is negative"),
+                    event_index: 0,
+                },
+                mismatched_command_summary: None,
+            };
+        }
+
+        let Ok(target) = usize::try_from(reset_to_event_id) else {
+            return ReplayReport {
+                execution_id: ExecutionId::new(),
+                events_replayed: 0,
+                status: ReplayStatus::WorkflowFailed {
+                    error: format!("reset_to_event_id {reset_to_event_id} cannot be represented"),
+                    event_index: 0,
+                },
+                mismatched_command_summary: None,
+            };
+        };
+        if target >= history.len() {
+            return ReplayReport {
+                execution_id: ExecutionId::new(),
+                events_replayed: history.len(),
+                status: ReplayStatus::WorkflowFailed {
+                    error: format!(
+                        "reset_to_event_id {reset_to_event_id} is outside history range"
+                    ),
+                    event_index: history.len(),
+                },
+                mismatched_command_summary: None,
+            };
+        }
+
+        let mut reset_history = history.into_iter().take(target + 1).collect::<Vec<_>>();
+        reset_history.push(WorkflowEvent::WorkflowResetFork {
+            reset_from_exec_id: ExecutionId::new(),
+            reset_to_event_id,
+            reason: "replay_with_reset".to_string(),
+            operator_id: "workflow-replayer".to_string(),
+        });
+        self.replay_from_events(reset_history).await
+    }
+
     /// Replay from a JSON [`HistorySnapshot`] document.
     ///
     /// The JSON must be a serialised [`HistorySnapshot`] — it contains the
@@ -732,6 +790,37 @@ mod tests {
         let replayer = WorkflowReplayer::new().register_fn("activity", activity_workflow);
         let report = replayer.replay_from_events(events).await;
         assert!(matches!(report.status, ReplayStatus::ReplaySucceeded));
+    }
+
+    #[tokio::test]
+    async fn replay_with_reset_replays_only_history_through_boundary() {
+        let activity_id = ActivityExecId::new();
+        let history = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "do_work".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: serde_json::json!("done"),
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "bad-branch-only".into(),
+                details: Value::Null,
+            },
+        ];
+
+        let replayer = WorkflowReplayer::new().register_fn("activity", activity_workflow);
+        let report = replayer.replay_with_reset(history, 2).await;
+
+        assert!(matches!(report.status, ReplayStatus::ReplaySucceeded));
+        assert_eq!(report.events_replayed, 4);
     }
 
     #[tokio::test]

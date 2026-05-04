@@ -275,6 +275,31 @@ pub enum WorkflowEvent {
         /// String representation of the handler error.
         error: String,
     },
+
+    // ── Workflow reset (issue #148) ─────────────────────────────────────────
+    /// Marker appended to the forked execution after the carried-over history.
+    ///
+    /// Replay treats this as informational: it records why the fork exists
+    /// without corresponding to a workflow command.
+    WorkflowResetFork {
+        /// The source execution that was reset.
+        reset_from_exec_id: ExecutionId,
+        /// Last source event copied into this fork.
+        reset_to_event_id: i64,
+        /// Operator-supplied recovery reason.
+        reason: String,
+        /// Operator identity for audit.
+        operator_id: String,
+    },
+    /// Marker appended to the source execution when a reset fork supersedes it.
+    WorkflowResetTerminated {
+        /// The forked execution that should continue forward.
+        reset_to_exec_id: ExecutionId,
+        /// Operator-supplied recovery reason.
+        reason: String,
+        /// Operator identity for audit.
+        operator_id: String,
+    },
 }
 
 impl WorkflowEvent {
@@ -311,6 +336,8 @@ impl WorkflowEvent {
             Self::UpdateAdmitted { .. } => "UpdateAdmitted",
             Self::UpdateCompleted { .. } => "UpdateCompleted",
             Self::UpdateFailed { .. } => "UpdateFailed",
+            Self::WorkflowResetFork { .. } => "WorkflowResetFork",
+            Self::WorkflowResetTerminated { .. } => "WorkflowResetTerminated",
         }
     }
 
@@ -324,6 +351,7 @@ impl WorkflowEvent {
             Self::WorkflowCompleted { .. }
                 | Self::WorkflowFailed { .. }
                 | Self::WorkflowCancelled { .. }
+                | Self::WorkflowResetTerminated { .. }
         )
     }
 }
@@ -535,10 +563,55 @@ mod tests {
                 update_id: crate::types::UpdateId::new(),
                 error: "x".into(),
             },
+            WorkflowEvent::WorkflowResetFork {
+                reset_from_exec_id: ExecutionId::new(),
+                reset_to_event_id: 1,
+                reason: "bad deploy".into(),
+                operator_id: "ops".into(),
+            },
+            WorkflowEvent::WorkflowResetTerminated {
+                reset_to_exec_id: ExecutionId::new(),
+                reason: "bad deploy".into(),
+                operator_id: "ops".into(),
+            },
         ];
 
-        assert_eq!(events.len(), 28);
+        assert_eq!(events.len(), 30);
         let names: HashSet<_> = events.iter().map(WorkflowEvent::type_name).collect();
-        assert_eq!(names.len(), 28, "duplicate type names detected");
+        assert_eq!(names.len(), 30, "duplicate type names detected");
+    }
+
+    #[test]
+    fn workflow_reset_events_round_trip_and_type_names_are_stable() -> Result<(), serde_json::Error>
+    {
+        let source = ExecutionId::new();
+        let fork = ExecutionId::new();
+        let fork_event = WorkflowEvent::WorkflowResetFork {
+            reset_from_exec_id: source,
+            reset_to_event_id: 42,
+            reason: "rolled back bad signal".into(),
+            operator_id: "oncall".into(),
+        };
+        let terminated_event = WorkflowEvent::WorkflowResetTerminated {
+            reset_to_exec_id: fork,
+            reason: "rolled back bad signal".into(),
+            operator_id: "oncall".into(),
+        };
+
+        assert_eq!(fork_event.type_name(), "WorkflowResetFork");
+        assert_eq!(terminated_event.type_name(), "WorkflowResetTerminated");
+
+        let json = serde_json::to_string(&fork_event)?;
+        let back: WorkflowEvent = serde_json::from_str(&json)?;
+        assert!(matches!(
+            back,
+            WorkflowEvent::WorkflowResetFork {
+                reset_from_exec_id,
+                reset_to_event_id: 42,
+                ..
+            } if reset_from_exec_id == source
+        ));
+
+        Ok(())
     }
 }

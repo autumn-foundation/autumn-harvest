@@ -356,6 +356,11 @@ async fn batch_per_target_failures_dont_abort_run() {
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&url)
         .await
         .unwrap();
+    diesel::update(harvest_workflow_executions::table.find(ids[0].as_uuid()))
+        .set(harvest_workflow_executions::state.eq("CANCELLED"))
+        .execute(&mut conn)
+        .await
+        .unwrap();
     diesel::update(harvest_workflow_executions::table.find(ids[1].as_uuid()))
         .set(harvest_workflow_executions::state.eq("COMPLETED"))
         .execute(&mut conn)
@@ -367,7 +372,10 @@ async fn batch_per_target_failures_dont_abort_run() {
         "/batch-operations",
         json!({
             "action": "Cancel",
-            "filter": { "workflow_name": "onboarding" }
+            "filter": {
+                "workflow_name": "onboarding",
+                "states": ["RUNNING", "CANCELLED", "COMPLETED"]
+            }
         }),
     )
     .await;

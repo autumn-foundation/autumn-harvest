@@ -507,6 +507,38 @@ pub async fn fail_open_tasks_for_execution(
     .map_err(crate::error::database_error)
 }
 
+/// Mark all pending or running task rows for a workflow execution as cancelled.
+///
+/// Reset uses this instead of failure so operators can distinguish work torn
+/// down by a fork from work that exhausted retries or crashed.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`](crate::error::HarvestError::Database) on
+/// update failure.
+pub async fn cancel_open_tasks_for_execution(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    reason: &str,
+) -> HarvestResult<usize> {
+    use crate::schema::harvest_task_queue::dsl;
+
+    diesel::update(
+        dsl::harvest_task_queue
+            .filter(dsl::workflow_exec_id.eq(Some(exec_id.as_uuid())))
+            .filter(dsl::state.eq_any(["PENDING", "RUNNING"])),
+    )
+    .set((
+        dsl::state.eq("CANCELLED"),
+        dsl::worker_id.eq(None::<String>),
+        dsl::error.eq(Some(reason.to_string())),
+        dsl::completed_at.eq(Some(Utc::now())),
+    ))
+    .execute(conn)
+    .await
+    .map_err(crate::error::database_error)
+}
+
 /// Count pending tasks per queue for observability / metrics.
 ///
 /// Returns one row per queue name (unseen queues are omitted). Only tasks in

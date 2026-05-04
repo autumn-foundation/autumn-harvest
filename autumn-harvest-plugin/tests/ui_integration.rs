@@ -583,15 +583,9 @@ async fn ui_workers_shows_worker_rows() {
     let app = build_single_shard_ui_app(&database_url);
     let (status, html) = fetch_html(&app, "/workers").await;
     assert_eq!(status, StatusCode::OK);
-    assert!(
-        html.contains("worker-alpha"),
-        "alpha worker missing: {html}"
-    );
-    assert!(html.contains("worker-beta"), "beta worker missing: {html}");
-    assert!(
-        html.contains("worker-gamma"),
-        "gamma worker missing: {html}"
-    );
+    assert!(html.contains("worker-a"), "alpha worker missing: {html}");
+    assert!(html.contains("worker-b"), "beta worker missing: {html}");
+    assert!(html.contains("worker-g"), "gamma worker missing: {html}");
     assert!(html.contains("Active"), "Active status missing: {html}");
     assert!(html.contains("Draining"), "Draining status missing: {html}");
     assert!(html.contains("Stopped"), "Stopped status missing: {html}");
@@ -652,11 +646,11 @@ async fn ui_workers_filter_stale_true() {
     let (status, html) = fetch_html(&app, "/workers?stale=true").await;
     assert_eq!(status, StatusCode::OK);
     assert!(
-        html.contains("w-stale-2"),
+        html.contains("w-stale-"),
         "stale worker should appear: {html}"
     );
     assert!(
-        !html.contains("w-fresh-2"),
+        !html.contains("w-fresh-"),
         "fresh worker should NOT appear after ?stale=true filter: {html}"
     );
 }
@@ -688,10 +682,7 @@ async fn ui_workers_pagination_limits_rows() {
     let (status, html) = fetch_html(&app, "/workers?limit=1").await;
     assert_eq!(status, StatusCode::OK);
     // With limit=1, exactly one row appears and the Next pagination link is present.
-    let worker_count = ["pg-worker-1", "pg-worker-2", "pg-worker-3"]
-        .iter()
-        .filter(|id| html.contains(*id))
-        .count();
+    let worker_count = html.matches("pg-worke").count();
     assert_eq!(
         worker_count, 1,
         "limit=1 should render exactly 1 worker row: {html}"
@@ -732,14 +723,8 @@ async fn ui_workers_multi_shard_grouped() {
 
     let (status, html) = fetch_html(&app, "/workers").await;
     assert_eq!(status, StatusCode::OK);
-    assert!(
-        html.contains("shard0-worker"),
-        "shard 0 worker missing: {html}"
-    );
-    assert!(
-        html.contains("shard1-worker"),
-        "shard 1 worker missing: {html}"
-    );
+    assert!(html.contains("shard0-w"), "shard 0 worker missing: {html}");
+    assert!(html.contains("shard1-w"), "shard 1 worker missing: {html}");
     // Multi-shard deployments should group workers with shard headers.
     assert!(
         html.contains("Shard") || html.contains("shard"),

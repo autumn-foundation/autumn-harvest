@@ -1381,7 +1381,7 @@ async fn persist_all_started_child_workflows(
                 child_states.iter().any(|s| {
                     matches!(
                         s.as_str(),
-                        "COMPLETED" | "FAILED" | "TIMED_OUT" | "CANCELLED"
+                        "COMPLETED" | "FAILED" | "TIMED_OUT" | "CANCELLED" | "TERMINATED"
                     )
                 })
             } else {

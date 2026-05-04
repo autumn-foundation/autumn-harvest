@@ -287,18 +287,6 @@ async fn workflow_and_activity_metrics_are_recorded() {
     let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
     let workflow_input = serde_json::json!({"msg": "hello metrics"});
 
-    store::append_events(
-        &mut conn,
-        exec_id,
-        &[WorkflowEvent::WorkflowStarted {
-            input: workflow_input.clone(),
-            timestamp: Utc::now(),
-        }],
-        0,
-    )
-    .await
-    .expect("append WorkflowStarted failed");
-
     let exec_row = NewWorkflowExecution {
         id: exec_id.as_uuid(),
         workflow_name: "metrics_test_workflow",
@@ -317,6 +305,18 @@ async fn workflow_and_activity_metrics_are_recorded() {
         .execute(&mut conn)
         .await
         .expect("failed to insert workflow execution row");
+
+    store::append_events(
+        &mut conn,
+        exec_id,
+        &[WorkflowEvent::WorkflowStarted {
+            input: workflow_input.clone(),
+            timestamp: Utc::now(),
+        }],
+        0,
+    )
+    .await
+    .expect("append WorkflowStarted failed");
 
     let mut enqueue_params =
         EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
@@ -428,8 +428,8 @@ async fn workflow_and_activity_metrics_are_recorded() {
     // Verify workflow completion status label is "completed".
     let wf_duration_emission = emissions
         .iter()
-        .find(|e| e.name == METRIC_WORKFLOW_DURATION)
-        .expect("workflow.duration emission must exist");
+        .find(|e| e.name == METRIC_WORKFLOW_DURATION && e.labels_debug.contains("status=completed"))
+        .expect("workflow.duration completed emission must exist");
     assert!(
         wf_duration_emission
             .labels_debug
@@ -491,8 +491,9 @@ async fn dlq_depth_sampler_emits_dlq_entries_metric() {
         runner.run(&pool_for_run).await;
     });
 
-    // poll_interval is 25ms; wait up to 3 seconds for at least one DLQ sample.
-    let sampled = tokio::time::timeout(Duration::from_secs(3), async {
+    // poll_interval is 25ms, but Docker-backed worker startup on Windows can
+    // spend a few seconds opening the first pooled connections.
+    let sampled = tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             if recording
                 .names()
@@ -509,7 +510,7 @@ async fn dlq_depth_sampler_emits_dlq_entries_metric() {
     worker.shutdown();
     handle.await.expect("worker task should join cleanly");
 
-    sampled.expect("harvest.dlq.entries must be sampled within 3 s");
+    sampled.expect("harvest.dlq.entries must be sampled within 15 s");
 
     // Verify the depth is >= 1 (we inserted one entry above).
     let emissions = recording.drain();

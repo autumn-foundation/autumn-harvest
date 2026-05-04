@@ -187,6 +187,75 @@ fn workflow_signal_and_cancel_use_post_bodies() {
 }
 
 #[test]
+fn workflow_reset_maps_to_management_api_request() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "reset",
+        "00000000-0000-0000-0000-000000000001",
+        "--to-event",
+        "100",
+        "--reason",
+        "bad deploy",
+        "--operator-id",
+        "oncall",
+        "--signal-reapply",
+        "buffer",
+    ])
+    .expect("workflow reset args should parse");
+    let request = cli.api_request().expect("reset request should build");
+
+    assert_eq!(request.method, ApiMethod::Post);
+    assert_eq!(
+        request.path,
+        "/workflows/00000000-0000-0000-0000-000000000001/reset"
+    );
+    assert_eq!(
+        request.body,
+        Some(json!({
+            "reset_to_event_id": 100,
+            "reason": "bad deploy",
+            "operator_id": "oncall",
+            "signal_reapply": "buffer"
+        }))
+    );
+}
+
+#[test]
+fn workflow_reset_dry_run_sets_query_flag() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "reset",
+        "00000000-0000-0000-0000-000000000001",
+        "--to-event",
+        "10",
+        "--reason",
+        "verify before the pointy end",
+        "--dry-run",
+    ])
+    .expect("workflow reset dry-run args should parse");
+    let request = cli
+        .api_request()
+        .expect("reset dry-run request should build");
+
+    assert_eq!(request.method, ApiMethod::Post);
+    assert_eq!(
+        request.path,
+        "/workflows/00000000-0000-0000-0000-000000000001/reset?dry_run=true"
+    );
+    assert_eq!(
+        request.body,
+        Some(json!({
+            "reset_to_event_id": 10,
+            "reason": "verify before the pointy end",
+            "operator_id": "cli",
+            "signal_reapply": "drop"
+        }))
+    );
+}
+
+#[test]
 fn dag_commands_match_dag_management_routes() {
     let trigger = Cli::try_parse_from([
         "harvest",
