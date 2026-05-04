@@ -62,6 +62,24 @@ pub enum OutputFormat {
     Json,
 }
 
+/// Signal reapply policy for `workflow reset`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum ResetSignalReapply {
+    /// Discard undelivered signals on the source execution.
+    Drop,
+    /// Re-enqueue undelivered source signals onto the fork.
+    Buffer,
+}
+
+impl ResetSignalReapply {
+    const fn as_wire(self) -> &'static str {
+        match self {
+            Self::Drop => "drop",
+            Self::Buffer => "buffer",
+        }
+    }
+}
+
 /// HTTP method used by a management API request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ApiMethod {
@@ -258,6 +276,26 @@ enum WorkflowCommand {
         /// Cancellation reason.
         #[arg(long)]
         reason: Option<String>,
+    },
+    /// Fork a workflow execution at an event boundary.
+    Reset {
+        /// Workflow execution ID.
+        execution_id: String,
+        /// Last event ID to carry into the fork.
+        #[arg(long = "to-event")]
+        reset_to_event_id: i64,
+        /// Recovery reason recorded in reset marker events.
+        #[arg(long)]
+        reason: String,
+        /// Operator identity recorded in reset marker events.
+        #[arg(long, default_value = "cli")]
+        operator_id: String,
+        /// How to handle undelivered source signals.
+        #[arg(long, value_enum, default_value = "drop")]
+        signal_reapply: ResetSignalReapply,
+        /// Validate and print the reset plan without committing.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Send a signal to a workflow execution.
     Signal {
@@ -663,6 +701,31 @@ fn workflow_request(command: &WorkflowCommand) -> Result<ApiRequest, CliError> {
             insert_string(&mut body, "reason", reason.as_deref());
             Ok(ApiRequest::post(
                 format!("/workflows/{}/cancel", path_segment(execution_id)),
+                Some(Value::Object(body)),
+            ))
+        }
+        WorkflowCommand::Reset {
+            execution_id,
+            reset_to_event_id,
+            reason,
+            operator_id,
+            signal_reapply,
+            dry_run,
+        } => {
+            let mut body = Map::new();
+            body.insert("reset_to_event_id".to_string(), json!(reset_to_event_id));
+            body.insert("reason".to_string(), Value::String(reason.clone()));
+            body.insert(
+                "operator_id".to_string(),
+                Value::String(operator_id.clone()),
+            );
+            body.insert(
+                "signal_reapply".to_string(),
+                Value::String(signal_reapply.as_wire().to_string()),
+            );
+            let suffix = if *dry_run { "?dry_run=true" } else { "" };
+            Ok(ApiRequest::post(
+                format!("/workflows/{}/reset{suffix}", path_segment(execution_id)),
                 Some(Value::Object(body)),
             ))
         }

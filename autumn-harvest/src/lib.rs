@@ -55,6 +55,8 @@ pub mod prelude;
 /// Types and definitions for querying workflow state and metadata.
 pub mod query;
 pub mod replay;
+#[cfg(feature = "db")]
+pub mod reset;
 pub mod retention;
 pub mod saga;
 pub mod shard;
@@ -138,6 +140,12 @@ pub use policy::{RetryPolicy, Schedule, TaskStatus, TriggerRule, WorkflowSchedul
 pub use pool::{HarvestPoolConfig, compute_pool_sizes};
 pub use query::QueryRegistry;
 pub use replay::{HistoryMatch, HistoryMatcher};
+#[cfg(feature = "db")]
+pub use reset::{
+    ResetInvalidPoint, ResetPlan, ResetResult, ResetSignalReapplyPolicy, ResetUnresolvedSideEffect,
+    WorkflowResetError, WorkflowResetRequest, preview_workflow_reset, reset_workflow_execution,
+    validate_reset_point,
+};
 pub use retention::RetentionConfig;
 #[cfg(feature = "db")]
 pub use retention::{RetentionMonitor, RetentionRuntime, RetentionStatus, RetentionTickResult};

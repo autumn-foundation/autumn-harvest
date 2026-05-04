@@ -31,6 +31,10 @@ use autumn_harvest::external_task;
 use autumn_harvest::models::{DagRun, DeadLetter, HarvestSchedule, WorkflowExecution};
 use autumn_harvest::policy::WorkflowSchedule;
 use autumn_harvest::queue::{self, ConcurrencyKeyStats};
+use autumn_harvest::reset::{
+    ResetInvalidPoint, ResetResult, WorkflowResetError, WorkflowResetRequest,
+    preview_workflow_reset, reset_workflow_execution,
+};
 use autumn_harvest::retention::{RetentionConfig, RetentionMonitor, RetentionStatus};
 use autumn_harvest::scheduler::{
     DagCatalog, RegisteredDag, SchedulerMonitor, SchedulerSnapshot, trigger_dag,
@@ -332,7 +336,7 @@ struct PendingChildWorkflow {
 fn is_terminal_state(state: &str) -> bool {
     matches!(
         state,
-        "COMPLETED" | "FAILED" | "CANCELLED" | "TIMED_OUT" | "CONTINUED_AS_NEW"
+        "COMPLETED" | "FAILED" | "CANCELLED" | "TIMED_OUT" | "CONTINUED_AS_NEW" | "TERMINATED"
     )
 }
 
@@ -384,6 +388,44 @@ struct CancelWorkflowResponse {
     reason: String,
     newly_cancelled: bool,
     failed_task_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct ResetWorkflowResponse {
+    new_exec_id: String,
+    reset_from_exec_id: String,
+    reset_to_event_id: i64,
+    events_carried_over: usize,
+    source_tasks_cancelled: usize,
+    source_timers_removed: usize,
+    source_signals_dropped: usize,
+    source_signals_buffered: usize,
+}
+
+impl From<ResetResult> for ResetWorkflowResponse {
+    fn from(result: ResetResult) -> Self {
+        Self {
+            new_exec_id: result.new_exec_id.to_string(),
+            reset_from_exec_id: result.reset_from_exec_id.to_string(),
+            reset_to_event_id: result.reset_to_event_id,
+            events_carried_over: result.events_carried_over,
+            source_tasks_cancelled: result.source_tasks_cancelled,
+            source_timers_removed: result.source_timers_removed,
+            source_signals_dropped: result.source_signals_dropped,
+            source_signals_buffered: result.source_signals_buffered,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ResetWorkflowQuery {
+    #[serde(default)]
+    dry_run: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ResetErrorResponse {
+    message: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -472,8 +514,15 @@ const fn default_max_active_runs() -> u32 {
 
 /// Workflow execution states that the management API recognises in `state=`
 /// filters. Anything outside this list is rejected with `400 Bad Request`.
-pub(crate) const KNOWN_WORKFLOW_STATES: &[&str] =
-    &["RUNNING", "COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT"];
+pub(crate) const KNOWN_WORKFLOW_STATES: &[&str] = &[
+    "RUNNING",
+    "COMPLETED",
+    "FAILED",
+    "CANCELLED",
+    "TIMED_OUT",
+    "CONTINUED_AS_NEW",
+    "TERMINATED",
+];
 
 const DEFAULT_WORKFLOW_LIMIT: i64 = 50;
 const MAX_WORKFLOW_LIMIT: i64 = 200;
@@ -505,6 +554,7 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .route("/workflows/{id}/stack", get(get_workflow_stack))
         .route("/workflows/{workflow_name}/start", post(start_workflow))
         .route("/workflows/{id}/cancel", post(cancel_workflow))
+        .route("/workflows/{id}/reset", post(reset_workflow))
         .route(
             "/workflows/{id}/signal/{signal_name}",
             post(signal_workflow),
@@ -740,6 +790,7 @@ mod stack_state_tests {
         assert!(is_terminal_state("CANCELLED"));
         assert!(is_terminal_state("TIMED_OUT"));
         assert!(is_terminal_state("CONTINUED_AS_NEW"));
+        assert!(is_terminal_state("TERMINATED"));
         assert!(!is_terminal_state("RUNNING"));
     }
 }
@@ -1056,6 +1107,7 @@ async fn get_workflow_stack(
             "CANCELLED",
             "TIMED_OUT",
             "CONTINUED_AS_NEW",
+            "TERMINATED",
         ]))
         .select((
             harvest_workflow_executions::id,
@@ -1216,6 +1268,78 @@ async fn cancel_workflow(
             failed_task_count: cancelled.failed_task_count,
         }),
     ))
+}
+
+async fn reset_workflow(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id): Path<String>,
+    Query(query): Query<ResetWorkflowQuery>,
+    Json(request): Json<WorkflowResetRequest>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+
+    let exec_id = match parse_execution_id(&id) {
+        Ok(id) => id,
+        Err(e) => return e.into_response(),
+    };
+    let mut conn = match db_conn_for_execution(&api_state, exec_id).await {
+        Ok(conn) => conn,
+        Err(e) => return e.into_response(),
+    };
+
+    if query.dry_run {
+        return match preview_workflow_reset(&mut conn, exec_id, request).await {
+            Ok(plan) => (axum::http::StatusCode::OK, Json(plan)).into_response(),
+            Err(error) => reset_error_response(error),
+        };
+    }
+
+    match reset_workflow_execution(&mut conn, exec_id, request).await {
+        Ok(result) => (
+            axum::http::StatusCode::CREATED,
+            Json(ResetWorkflowResponse::from(result)),
+        )
+            .into_response(),
+        Err(error) => reset_error_response(error),
+    }
+}
+
+fn reset_error_response(error: WorkflowResetError) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+
+    match error {
+        WorkflowResetError::InvalidPoint(invalid) => reset_invalid_point_response(invalid),
+        WorkflowResetError::TerminalSource { exec_id, state } => (
+            axum::http::StatusCode::CONFLICT,
+            Json(ResetErrorResponse {
+                message: format!("workflow execution {exec_id} is terminal ({state})"),
+            }),
+        )
+            .into_response(),
+        WorkflowResetError::ChildWorkflow { exec_id, parent_id } => (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(ResetErrorResponse {
+                message: format!(
+                    "workflow execution {exec_id} is a child workflow of {parent_id}; reset the root parent in v1"
+                ),
+            }),
+        )
+            .into_response(),
+        WorkflowResetError::ContinueAsNew => (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(ResetErrorResponse {
+                message: "continue-as-new histories cannot be reset in v1".to_string(),
+            }),
+        )
+            .into_response(),
+        WorkflowResetError::Harvest(error) => map_error(error).into_response(),
+    }
+}
+
+fn reset_invalid_point_response(invalid: ResetInvalidPoint) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+
+    (axum::http::StatusCode::BAD_REQUEST, Json(invalid)).into_response()
 }
 
 async fn signal_workflow(

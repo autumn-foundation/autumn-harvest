@@ -69,6 +69,7 @@ td code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;c
 .badge.COMPLETED{background:#166534;color:#dcfce7}
 .badge.FAILED{background:#991b1b;color:#fee2e2}
 .badge.CANCELLED{background:#6b7280;color:#f3f4f6}
+.badge.TERMINATED{background:#52525b;color:#f4f4f5}
 .badge.UNKNOWN{background:#334155;color:#e2e8f0}
 .badge.Active{background:#166534;color:#dcfce7}
 .badge.Draining{background:#92400e;color:#fef3c7}
@@ -1066,6 +1067,7 @@ fn badge_class(state: &str) -> &'static str {
         "COMPLETED" => "COMPLETED",
         "FAILED" => "FAILED",
         "CANCELLED" => "CANCELLED",
+        "TERMINATED" => "TERMINATED",
         _ => "UNKNOWN",
     }
 }
@@ -1131,6 +1133,7 @@ mod tests {
         assert_eq!(badge_class("COMPLETED"), "COMPLETED");
         assert_eq!(badge_class("FAILED"), "FAILED");
         assert_eq!(badge_class("CANCELLED"), "CANCELLED");
+        assert_eq!(badge_class("TERMINATED"), "TERMINATED");
         assert_eq!(badge_class("MYSTERY"), "UNKNOWN");
     }
 

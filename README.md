@@ -138,6 +138,7 @@ cargo run -p autumn-harvest-cli -- workflow signal <execution-id> approved --pay
 cargo run -p autumn-harvest-cli -- workflow query <execution-id> status
 cargo run -p autumn-harvest-cli -- workflow cancel <execution-id> --reason "operator request"
 cargo run -p autumn-harvest-cli -- workflow stack <execution-id>
+cargo run -p autumn-harvest-cli -- workflow reset <execution-id> --to-event 42 --reason "bad deploy recovery" --operator-id mark
 cargo run -p autumn-harvest-cli -- dag list
 cargo run -p autumn-harvest-cli -- dag trigger daily_pipeline --conf-json '{"date":"2026-04-21"}'
 cargo run -p autumn-harvest-cli -- dag pause daily_pipeline
@@ -284,7 +285,7 @@ top of `limit`:
 
 | CLI flag | Query param | Behavior |
 |---|---|---|
-| `--state RUNNING` (repeatable, also accepts `RUNNING,FAILED`) | `?state=RUNNING,FAILED` (repeatable) | Exact match on the workflow execution state. Allowed values: `RUNNING`, `COMPLETED`, `FAILED`, `CANCELLED`, `TIMED_OUT`. |
+| `--state RUNNING` (repeatable, also accepts `RUNNING,FAILED`) | `?state=RUNNING,FAILED` (repeatable) | Exact match on the workflow execution state. Allowed values: `RUNNING`, `COMPLETED`, `FAILED`, `CANCELLED`, `TIMED_OUT`, `CONTINUED_AS_NEW`, `TERMINATED`. |
 | `--workflow-name onboarding` | `?workflow_name=onboarding` | Exact match on the registered workflow name. |
 | `--search-attr tenant=acme` (repeatable) | `?search_attr=tenant:acme` (repeatable) | JSONB containment predicate on `search_attrs`. Multiple flags AND together; repeating a key narrows. Hits the existing `idx_harvest_we_search` GIN index. |
 
@@ -623,6 +624,48 @@ cargo run --bin harvest-replay -- \
 Exit code 0 = `ReplaySucceeded`. Exit code 1 = non-determinism or workflow
 failure. Extend `harvest-replay/src/bin/harvest_replay.rs` with your own
 workflow handlers so the binary can replay against live code.
+
+### Resetting a workflow after a bad deploy
+
+Use reset when a running top-level workflow is stuck on history produced by code
+that the new workflow definition can no longer replay. Reset terminates the
+source execution, creates a new execution on the same shard, copies history
+through a valid event boundary, appends a `WorkflowResetFork` marker, and queues
+the fork for execution under the current code.
+
+The reset point must be a completed boundary: no open activity, local activity,
+timer, child workflow, external completion, or update may still be unresolved at
+or before `--to-event`. Terminal workflows, child workflows, and
+continue-as-new histories are rejected; those are different demons.
+
+Operator flow:
+
+```sh
+# Inspect the current wait-state and pick a candidate event cursor.
+cargo run -p autumn-harvest-cli -- workflow stack <execution-id>
+
+# Verify the boundary and side effects without writing anything.
+cargo run -p autumn-harvest-cli -- workflow reset <execution-id> \
+  --to-event 42 \
+  --reason "recover from bad deploy 2026-05-03" \
+  --operator-id "oncall-mark" \
+  --signal-reapply buffer \
+  --dry-run
+
+# Apply the reset once the dry run reports a valid plan.
+cargo run -p autumn-harvest-cli -- workflow reset <execution-id> \
+  --to-event 42 \
+  --reason "recover from bad deploy 2026-05-03" \
+  --operator-id "oncall-mark" \
+  --signal-reapply buffer
+```
+
+`--signal-reapply drop` consumes pending source signals during teardown.
+`--signal-reapply buffer` copies pending source signals onto the fork so the new
+run sees them after replay. The source execution ends in `TERMINATED`; verify
+the returned `new_exec_id` reaches `RUNNING` and then normal terminal state.
+For tests and pre-deploy checks, `WorkflowReplayer::replay_with_reset(history,
+reset_to_event_id)` replays only the carried history plus the reset marker.
 
 ### What the replayer detects
 

@@ -108,17 +108,20 @@ impl HistoryMatcher {
         self.pending_signals.push_back((signal_name, payload));
     }
 
-    /// Returns `true` for the three update event variants.
+    /// Returns `true` for events transparent to main workflow command replay.
     ///
     /// Update events are transparent to the main workflow replay sequence —
     /// they are skipped during activity/timer/signal/child-workflow matching
     /// and are consumed by the `match_update` / `drain_admitted_updates` APIs.
+    /// `WorkflowResetFork` is informational and likewise has no workflow
+    /// command counterpart.
     const fn is_update_event(event: &WorkflowEvent) -> bool {
         matches!(
             event,
             WorkflowEvent::UpdateAdmitted { .. }
                 | WorkflowEvent::UpdateCompleted { .. }
                 | WorkflowEvent::UpdateFailed { .. }
+                | WorkflowEvent::WorkflowResetFork { .. }
         )
     }
 
@@ -171,7 +174,10 @@ impl HistoryMatcher {
     pub fn has_non_lifecycle_unconsumed(&self) -> bool {
         let mut cursor = self.cursor;
         while cursor < self.events.len() {
-            if !self.is_consumed(cursor) && !self.events[cursor].is_terminal_lifecycle() {
+            if !self.is_consumed(cursor)
+                && !self.events[cursor].is_terminal_lifecycle()
+                && !Self::is_update_event(&self.events[cursor])
+            {
                 return true;
             }
             cursor += 1;
@@ -2028,6 +2034,35 @@ mod tests {
         let r2 = matcher.match_activity("charge_payment");
         assert_eq!(r2, HistoryMatch::Matched { output: output2 });
 
+        assert!(!matcher.is_replaying());
+    }
+
+    #[test]
+    fn matcher_treats_reset_fork_marker_as_informational() {
+        let activity_id = ActivityExecId::new();
+        let output = serde_json::json!({"ok": true});
+        let events = vec![
+            WorkflowEvent::WorkflowResetFork {
+                reset_from_exec_id: ExecutionId::new(),
+                reset_to_event_id: 0,
+                reason: "bad deploy".into(),
+                operator_id: "oncall".into(),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "resume_work".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: output.clone(),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+
+        let result = matcher.match_activity("resume_work");
+        assert_eq!(result, HistoryMatch::Matched { output });
         assert!(!matcher.is_replaying());
     }
 

@@ -44,7 +44,9 @@ impl MermaidExporter {
                 | WorkflowEvent::WorkflowCompleted { .. }
                 | WorkflowEvent::WorkflowFailed { .. }
                 | WorkflowEvent::WorkflowCancelled { .. }
-                | WorkflowEvent::WorkflowContinuedAsNew { .. } => {
+                | WorkflowEvent::WorkflowContinuedAsNew { .. }
+                | WorkflowEvent::WorkflowResetFork { .. }
+                | WorkflowEvent::WorkflowResetTerminated { .. } => {
                     self.handle_workflow_event(event)?;
                 }
                 WorkflowEvent::ActivityScheduled { .. }
@@ -110,6 +112,29 @@ impl MermaidExporter {
                 writeln!(
                     self.out,
                     "    Note over WF: Continued As New (next: {new_exec_id})"
+                )?;
+            }
+            WorkflowEvent::WorkflowResetFork {
+                reset_from_exec_id,
+                reset_to_event_id,
+                reason,
+                ..
+            } => {
+                let safe_reason = reason.replace('\n', " ").replace('"', "'");
+                writeln!(
+                    self.out,
+                    "    Note over WF: Reset Fork from {reset_from_exec_id} at event {reset_to_event_id}: {safe_reason}"
+                )?;
+            }
+            WorkflowEvent::WorkflowResetTerminated {
+                reset_to_exec_id,
+                reason,
+                ..
+            } => {
+                let safe_reason = reason.replace('\n', " ").replace('"', "'");
+                writeln!(
+                    self.out,
+                    "    Note over WF: Reset Terminated (fork: {reset_to_exec_id}): {safe_reason}"
                 )?;
             }
             _ => unreachable!(),
