@@ -12,3 +12,9 @@
 - Default PR base branch is always `trunk-dev`.
 - `trunk` is the production release branch and must never be used as a PR base unless the user explicitly says `base trunk`.
 - If unsure, ask before creating or retargeting the PR.
+
+## PR Review State
+
+- Open pull requests as ready for review by default.
+- Create a draft PR only when the user explicitly asks for a draft.
+- Never change an existing PR between draft and ready-for-review unless the user explicitly requests that state change.
