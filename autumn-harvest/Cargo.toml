@@ -13,6 +13,7 @@ categories = ["asynchronous", "database"]
 
 [features]
 default = ["db"]
+anonymize = []
 db = [
     "dep:deadpool",
     "dep:diesel",

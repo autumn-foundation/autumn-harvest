@@ -16,6 +16,9 @@ pub const MIGRATIONS: diesel_migrations::EmbeddedMigrations =
 
 /// History analyzer and linter.
 pub mod analyzer;
+/// History anonymizer for redacting sensitive PII before export or replay.
+#[cfg(feature = "anonymize")]
+pub mod anonymize;
 /// Batch operations for fleet-wide workflow cancel/terminate/signal (issue #102).
 pub mod batch;
 pub mod builder;
@@ -111,6 +114,8 @@ pub use analyzer::{
     AnalyzerRule, AnalyzerWarning, ExcessiveRetriesRule, HistoryAnalyzer, LargePayloadRule,
     SuspiciousTimerRule,
 };
+#[cfg(feature = "anonymize")]
+pub use anonymize::anonymize_history;
 pub use builder::{BuiltHarvest, HarvestBuilder, HarvestBuilderError, WorkerConfig};
 pub use cache::{CachedWorkflowState, WorkflowCache};
 pub use context::{ActivityContext, WorkflowCommand, WorkflowContext};
