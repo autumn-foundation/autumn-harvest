@@ -1643,6 +1643,10 @@ pub struct ActivityContext {
     state: SharedState,
     /// Heartbeat channel -- `None` in test contexts.
     heartbeat_tx: Option<tokio::sync::mpsc::Sender<serde_json::Value>>,
+    /// Latest heartbeat payload durably persisted by the previous attempt.
+    heartbeat_details: Option<serde_json::Value>,
+    /// `false` for local activities, which never write task-queue heartbeat rows.
+    heartbeats_supported: bool,
     /// Cancellation token -- allows the worker to signal graceful shutdown.
     cancel: tokio_util::sync::CancellationToken,
     /// Optional durable queue-state cancellation check for worker activities.
@@ -1665,6 +1669,8 @@ impl ActivityContext {
         Self {
             state,
             heartbeat_tx,
+            heartbeat_details: None,
+            heartbeats_supported: true,
             cancel,
             #[cfg(feature = "db")]
             cancellation_check: None,
@@ -1677,6 +1683,7 @@ impl ActivityContext {
     pub(crate) fn new_with_cancellation_check(
         state: SharedState,
         heartbeat_tx: Option<tokio::sync::mpsc::Sender<serde_json::Value>>,
+        heartbeat_details: Option<serde_json::Value>,
         cancel: tokio_util::sync::CancellationToken,
         task_id: uuid::Uuid,
         pool: ActivityCancellationPool,
@@ -1684,12 +1691,31 @@ impl ActivityContext {
         Self {
             state,
             heartbeat_tx,
+            heartbeat_details,
+            heartbeats_supported: true,
             cancel,
             cancellation_check: Some(ActivityCancellationCheck {
                 task_id,
                 pool,
                 last_checked_at: Mutex::new(None),
             }),
+            trace_context: None,
+        }
+    }
+
+    #[cfg_attr(not(feature = "db"), allow(dead_code))]
+    pub(crate) fn new_local_activity(
+        state: SharedState,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Self {
+        Self {
+            state,
+            heartbeat_tx: None,
+            heartbeat_details: None,
+            heartbeats_supported: false,
+            cancel,
+            #[cfg(feature = "db")]
+            cancellation_check: None,
             trace_context: None,
         }
     }
@@ -1736,12 +1762,46 @@ impl ActivityContext {
         self.state.get(&TypeId::of::<T>())?.downcast_ref::<T>()
     }
 
+    /// Return the heartbeat payload durably persisted by the previous attempt.
+    ///
+    /// This is a snapshot captured before the current attempt starts. Heartbeats
+    /// sent by the current attempt become visible only to a later retry attempt,
+    /// after the heartbeat flusher successfully writes them to Postgres.
+    ///
+    /// # Errors
+    ///
+    /// - [`HarvestError::Serialization`] if the stored payload does not
+    ///   deserialize into `T`.
+    /// - [`HarvestError::Config`] for local activities, which do not support
+    ///   heartbeating.
+    pub fn heartbeat_details<T: serde::de::DeserializeOwned>(
+        &self,
+    ) -> crate::HarvestResult<Option<T>> {
+        if !self.heartbeats_supported {
+            return Err(HarvestError::Config(
+                "local activities do not support heartbeat details; use a regular activity".into(),
+            ));
+        }
+
+        self.heartbeat_details
+            .clone()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(HarvestError::from)
+    }
+
     /// Send a heartbeat to signal the activity is still running.
     ///
     /// The `details` payload is serialized to JSON and forwarded to the worker's
-    /// heartbeat loop, which batches writes to the database. Always check the
-    /// return value -- an `Err(Cancelled)` means the workflow was cancelled and
-    /// the activity should wind down promptly.
+    /// heartbeat loop, which batches writes to the database. On retry, the last
+    /// successfully flushed payload from the previous attempt is available via
+    /// [`Self::heartbeat_details`]. Always check the return value -- an
+    /// `Err(Cancelled)` means the workflow was cancelled and the activity should
+    /// wind down promptly.
+    ///
+    /// Within a single attempt, heartbeat payloads are last-write-wins and are
+    /// not read back through this context. Call [`Self::heartbeat_details`] at
+    /// the start of a later retry attempt to resume from the prior checkpoint.
     ///
     /// ## Examples
     ///
@@ -1775,6 +1835,12 @@ impl ActivityContext {
 
         #[cfg(feature = "db")]
         self.check_durable_cancellation().await?;
+
+        if !self.heartbeats_supported {
+            return Err(HarvestError::Config(
+                "local activities do not support heartbeats; use a regular activity".into(),
+            ));
+        }
 
         let payload = serde_json::to_value(details)?;
 
@@ -1873,6 +1939,14 @@ impl ActivityContext {
             None,
             tokio_util::sync::CancellationToken::new(),
         )
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub(crate) fn new_test_with_heartbeat_details(details: Option<serde_json::Value>) -> Self {
+        let mut ctx = Self::new_test();
+        ctx.heartbeat_details = details;
+        ctx
     }
 }
 
@@ -2010,6 +2084,49 @@ mod tests {
     fn activity_context_trace_context_defaults_to_none() {
         let ctx = ActivityContext::new_test();
         assert!(ctx.trace_context().is_none());
+    }
+
+    #[derive(Debug, PartialEq, serde::Deserialize)]
+    struct TestHeartbeatDetails {
+        progress: u32,
+    }
+
+    #[test]
+    fn activity_context_heartbeat_details_deserializes_previous_payload() {
+        let ctx = ActivityContext::new_test_with_heartbeat_details(Some(serde_json::json!({
+            "progress": 42,
+        })));
+
+        let details = ctx
+            .heartbeat_details::<TestHeartbeatDetails>()
+            .expect("heartbeat details should deserialize");
+
+        assert_eq!(details, Some(TestHeartbeatDetails { progress: 42 }));
+    }
+
+    #[test]
+    fn activity_context_heartbeat_details_type_mismatch_returns_error() {
+        let ctx = ActivityContext::new_test_with_heartbeat_details(Some(serde_json::json!({
+            "progress": "not a number",
+        })));
+
+        let result = ctx.heartbeat_details::<TestHeartbeatDetails>();
+
+        assert!(matches!(result, Err(HarvestError::Serialization(_))));
+    }
+
+    #[tokio::test]
+    async fn local_activity_context_heartbeat_returns_explicit_error() {
+        let ctx = ActivityContext::new_local_activity(
+            empty_shared_state(),
+            tokio_util::sync::CancellationToken::new(),
+        );
+
+        let result = ctx.heartbeat(serde_json::json!({"progress": 1})).await;
+
+        assert!(
+            matches!(result, Err(HarvestError::Config(message)) if message.contains("local activities do not support heartbeats"))
+        );
     }
 
     #[tokio::test]
