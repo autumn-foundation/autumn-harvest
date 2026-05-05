@@ -177,19 +177,8 @@ pub enum WorkflowResetError {
         parent_id: Uuid,
     },
     #[error("continue-as-new histories cannot be reset in v1")]
-    /// Emitted when trying to reset an execution that invoked `ContinueAsNew`.
-    ///
-    /// **Why does this exist?**
-    /// In v1, continued executions break the contiguous history requirement for
-    /// a simple reset fork, meaning the engine would need to reconstruct state
-    /// across multiple physical database rows. This is not yet supported.
     ContinueAsNew,
     #[error(transparent)]
-    /// Wraps underlying database or systemic errors encountered during the reset operation.
-    ///
-    /// **Why does this exist?**
-    /// Ensures that operators can trace back to underlying `HarvestError` problems
-    /// (e.g. database connectivity loss or schema drift) without losing context.
     Harvest(#[from] HarvestError),
 }
 

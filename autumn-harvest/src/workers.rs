@@ -27,23 +27,13 @@ use crate::error::{HarvestError, HarvestResult};
 
 /// Static fields that identify a worker process, used for initial registration
 /// and heartbeat self-healing.
-///
-/// **Why does this exist?**
-/// This payload is submitted by workers when they first start up, establishing their identity
-/// and capabilities so the engine can route tasks to them.
 #[derive(Debug, Clone)]
 pub struct WorkerRegistration {
-    /// The unique identifier for the worker instance.
     pub worker_id: String,
-    /// Which task queues the worker is polling.
     pub queues: Vec<String>,
-    /// Which database shards this worker is assigned to process.
     pub shard_assignments: Vec<i32>,
-    /// The maximum number of concurrent tasks this worker will accept.
     pub max_concurrency: i32,
-    /// The hostname or IP address where the worker is running.
     pub host: String,
-    /// The version of the Harvest SDK/binary the worker is using.
     pub version: Option<String>,
 }
 use crate::models::{HarvestWorker, NewHarvestWorker};
@@ -55,26 +45,14 @@ use crate::worker::DbPool;
 // ---------------------------------------------------------------------------
 
 /// Lifecycle status of a worker process.
-///
-/// **Why does this exist?**
-/// Distinguishes between workers that are actively taking new tasks (`Active`),
-/// those finishing current work but refusing new tasks (`Draining`), and those
-/// that have fully stopped (`Stopped`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkerStatus {
-    /// The worker is healthy and accepting tasks.
     Active,
-    /// The worker is shutting down and refuses new task assignments.
     Draining,
-    /// The worker has fully terminated.
     Stopped,
 }
 
 impl WorkerStatus {
-    /// Convert the status to its string representation.
-    ///
-    /// **Why does this exist?**
-    /// Provides a zero-allocation way to get the database-compatible string representation.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -84,11 +62,6 @@ impl WorkerStatus {
         }
     }
 
-    /// Parse a worker status from a string.
-    ///
-    /// **Why does this exist?**
-    /// Necessary for deserializing database string columns or API query parameters
-    /// back into the strongly-typed enum.
     #[must_use]
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
@@ -112,16 +85,10 @@ impl std::fmt::Display for WorkerStatus {
 // ---------------------------------------------------------------------------
 
 /// Health classification derived from `last_heartbeat_at`.
-///
-/// **Why does this exist?**
-/// Since workers are distributed processes, they may crash without sending a `Stopped` status.
-/// This enum allows the system to classify workers as dead (`Stale`) if they fail to check in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum WorkerHealth {
-    /// The worker has sent a heartbeat recently.
     Healthy,
-    /// The worker has not sent a heartbeat within the configured threshold.
     Stale,
 }
 
@@ -152,34 +119,19 @@ impl WorkerHealth {
 // ---------------------------------------------------------------------------
 
 /// Filters for `list_workers` queries from the management API.
-///
-/// **Why does this exist?**
-/// Provides strongly-typed search parameters so the API layer can easily parse HTTP
-/// query strings and pass them down into the database operations.
 #[derive(Debug, Default, Clone)]
 pub struct WorkerFilters {
-    /// Return only workers listening on this exact queue name.
     pub queue: Option<String>,
-    /// Return only workers assigned to this specific database shard.
     pub shard_id: Option<i32>,
-    /// Return only workers in this lifecycle state (e.g. `Active`, `Stopped`).
     pub status: Option<String>,
-    /// Return only workers matching this health classification (e.g. `Healthy`, `Stale`).
     pub health: Option<WorkerHealth>,
-    /// The maximum number of workers to return in a single page.
     pub limit: i64,
 }
 
 impl WorkerFilters {
-    /// The default page size when the user does not specify a limit.
     pub const DEFAULT_LIMIT: i64 = 100;
-    /// The absolute maximum number of rows the list endpoint will return to prevent memory exhaustion.
     pub const MAX_LIMIT: i64 = 500;
 
-    /// Create a new, empty filter set with the default limit.
-    ///
-    /// **Why does this exist?**
-    /// Ensures limits are automatically enforced even when no other filters are applied.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -528,17 +480,10 @@ pub async fn fleet_health(
 // ---------------------------------------------------------------------------
 
 /// A worker row enriched with the derived health classification.
-///
-/// **Why does this exist?**
-/// The raw database model `HarvestWorker` only contains a timestamp (`last_heartbeat_at`).
-/// The API layer enriches it with the computed `health` status before serializing
-/// it to JSON for the client.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct WorkerRow {
-    /// The raw worker row from the database.
     #[serde(flatten)]
     pub worker: HarvestWorker,
-    /// The computed health status based on `last_heartbeat_at` relative to now.
     pub health: WorkerHealth,
     /// IDs of task-queue items currently claimed by this worker (`state = RUNNING`).
     /// Populated only by `get_worker`; the list endpoint returns an empty vec.
@@ -546,21 +491,12 @@ pub struct WorkerRow {
 }
 
 /// Aggregated fleet health roll-up.
-///
-/// **Why does this exist?**
-/// Provides operators with a high-level overview of the entire worker fleet's status
-/// in a single API call, useful for dashboards and monitoring alerts.
 #[derive(Debug, serde::Serialize)]
 pub struct FleetHealth {
-    /// The total number of healthy workers.
     pub healthy: usize,
-    /// The total number of stale (potentially crashed) workers.
     pub stale: usize,
-    /// The total number of workers currently draining their tasks.
     pub draining: usize,
-    /// A breakdown of healthy worker counts grouped by queue name.
     pub by_queue: std::collections::HashMap<String, usize>,
-    /// A breakdown of healthy worker counts grouped by shard ID.
     pub by_shard: std::collections::HashMap<i32, usize>,
 }
 

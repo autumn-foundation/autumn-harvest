@@ -40,21 +40,11 @@ const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const DEFAULT_BATCH_SIZE: usize = 1_000;
 const MIN_MAX_AGE: Duration = Duration::from_secs(1);
 const MAX_MAX_AGE: Duration = Duration::from_secs(60 * 60 * 24 * 365 * 10);
-/// Configuration for the background retention task.
-///
-/// **Why does this exist?**
-/// To prevent unbounded database growth, the system must clean up terminal workflow executions.
-/// This configuration object allows operators to tune how aggressively this janitor process operates.
 #[derive(Debug, Clone, Serialize)]
 pub struct RetentionConfig {
-    /// Workflows completed older than this amount of seconds will be deleted.
-    /// If `None`, retention cleanup is disabled.
     pub max_age_secs: Option<u64>,
-    /// How often the background worker will scan the database for old workflows.
     pub tick_interval_secs: u64,
-    /// The maximum number of executions to load into memory and delete at once.
     pub batch_size: usize,
-    /// If `true`, the background worker will scan the database and emit metrics, but will not actually delete anything.
     pub dry_run: bool,
 }
 
@@ -70,21 +60,6 @@ impl Default for RetentionConfig {
 }
 
 impl RetentionConfig {
-    /// Create a new configuration with a specified max age.
-    ///
-    /// **Why does this exist?**
-    /// It provides a convenient builder-like method for the most common requirement:
-    /// enabling retention with a specific duration.
-    ///
-    /// ## Examples
-    ///
-    /// ```rust
-    /// use std::time::Duration;
-    /// use autumn_harvest::RetentionConfig;
-    ///
-    /// let config = RetentionConfig::with_max_age(Duration::from_secs(60 * 60 * 24 * 30));
-    /// assert_eq!(config.max_age_secs, Some(2592000));
-    /// ```
     #[must_use]
     pub fn with_max_age(max_age: Duration) -> Self {
         Self {
@@ -93,21 +68,11 @@ impl RetentionConfig {
         }
     }
 
-    /// Retrieve the max age configuration as a `Duration`.
-    ///
-    /// **Why does this exist?**
-    /// The core system prefers strongly-typed `Duration`s to avoid logic errors
-    /// related to time scales, while the public struct exposes primitives for easy serialization.
     #[must_use]
     pub fn max_age(&self) -> Option<Duration> {
         self.max_age_secs.map(Duration::from_secs)
     }
 
-    /// Retrieve the tick interval as a `Duration`.
-    ///
-    /// **Why does this exist?**
-    /// Transforms the raw `u64` seconds configuration parameter into a strongly-typed
-    /// duration for safer internal scheduling logic.
     #[must_use]
     pub const fn tick_interval(&self) -> Duration {
         Duration::from_secs(self.tick_interval_secs)
@@ -136,69 +101,35 @@ impl RetentionConfig {
         Ok(())
     }
 
-    /// Determines if retention is enabled.
-    ///
-    /// **Why does this exist?**
-    /// Provides a single source of truth for checking if the janitor system should spawn at all.
-    /// Retention is only enabled if a `max_age` is configured.
     #[must_use]
     pub const fn enabled(&self) -> bool {
         self.max_age_secs.is_some()
     }
 }
 
-/// A snapshot of what happened during a single shard's retention sweep.
-///
-/// **Why does this exist?**
-/// Observability. It allows operators to query the system via API to see *what* the
-/// retention background worker has been doing, and if it's falling behind or failing.
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct RetentionTickResult {
-    /// The shard this tick was responsible for.
     pub shard: u16,
-    /// When the tick ran.
     pub ran_at: Option<DateTime<Utc>>,
-    /// Number of old executions found that were considered for deletion.
     pub candidate_count: usize,
-    /// Number of executions actually deleted.
     pub deleted_count: usize,
-    /// The age of the oldest execution that was skipped (because it had active children/timers/etc).
     pub oldest_age_secs_skipped: Option<u64>,
-    /// How long the tick took to run.
     pub duration_ms: u128,
-    /// The last error encountered, if any.
     pub last_error: Option<String>,
 }
 
-/// The overall health and configuration of the retention sub-system across the fleet.
-///
-/// **Why does this exist?**
-/// Used primarily by the API to dump a consolidated view of retention activities
-/// across all active database shards.
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct RetentionStatus {
-    /// The active configuration.
     pub config: RetentionConfig,
-    /// The most recent result for each shard.
     pub per_shard: Vec<RetentionTickResult>,
 }
 
-/// A thread-safe handle for querying the state of the retention system.
-///
-/// **Why does this exist?**
-/// It acts as a decoupled read-only view that can be freely cloned and passed
-/// into HTTP handlers or other monitoring tasks without borrowing the core runtime.
 #[derive(Debug, Clone)]
 pub struct RetentionMonitor {
     inner: Arc<Mutex<RetentionStatus>>,
 }
 
 impl RetentionMonitor {
-    /// Create a new monitor initialized for the given shards.
-    ///
-    /// **Why does this exist?**
-    /// Initializes the internal state map with zeroed records for all expected shards,
-    /// preventing "missing data" bugs when a shard has yet to be scanned.
     #[must_use]
     pub fn new(config: RetentionConfig, shards: impl Iterator<Item = ShardId>) -> Self {
         let per_shard = shards
@@ -237,11 +168,6 @@ impl RetentionMonitor {
 }
 
 #[cfg(feature = "db")]
-/// The background daemon responsible for executing retention sweeps.
-///
-/// **Why does this exist?**
-/// Encapsulates the tokio tasks, cancellation tokens, and communication channels
-/// needed to run the janitor process asynchronously without leaking implementation details.
 pub struct RetentionRuntime {
     shutdown: CancellationToken,
     trigger_tx: mpsc::Sender<()>,
@@ -354,40 +280,20 @@ impl RetentionRuntime {
         })
     }
 
-    /// Retrieve a clone of the monitor.
-    ///
-    /// **Why does this exist?**
-    /// Allows the caller (e.g. the API server) to obtain the thread-safe read handle
-    /// after the runtime has already been spawned.
     #[must_use]
     pub fn monitor(&self) -> RetentionMonitor {
         self.monitor.clone()
     }
 
-    /// Force a retention tick to execute immediately, bypassing the interval timer.
-    ///
-    /// **Why does this exist?**
-    /// Useful in test environments or via administrative API to synchronously purge
-    /// old executions without waiting for the next hour to roll over.
     pub fn run_now(&self) {
         let _ = self.trigger_tx.try_send(());
     }
 
-    /// Get a clone of the channel sender used to trigger immediate runs.
-    ///
-    /// **Why does this exist?**
-    /// Exposes the trigger mechanism for injection into external API routers or
-    /// background signal handlers that do not own the runtime itself.
     #[must_use]
     pub fn trigger_sender(&self) -> mpsc::Sender<()> {
         self.trigger_tx.clone()
     }
 
-    /// Signal the background runtime to shut down gracefully.
-    ///
-    /// **Why does this exist?**
-    /// Allows the application to cleanly abort the retention loop during a SIGTERM
-    /// event, preventing database connections from being abruptly dropped.
     pub fn shutdown(&self) {
         self.shutdown.cancel();
     }
