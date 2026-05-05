@@ -193,6 +193,10 @@ pub enum WorkflowCommand {
         retry_policy: Option<crate::policy::RetryPolicy>,
         /// The worker sends the final result (success or exhausted retries) here.
         result_tx: oneshot::Sender<Result<Value, String>>,
+        /// `true` when the `LocalActivityScheduled` event is already in history
+        /// (worker crashed after appending it but before recording a terminal
+        /// event). The worker must **not** append a second scheduled event.
+        already_scheduled: bool,
     },
     /// Record a terminal result for an admitted update.
     ///
@@ -698,7 +702,8 @@ impl WorkflowContext {
             HistoryMatch::Failed { .. }
             | HistoryMatch::TimedOut { .. }
             | HistoryMatch::AwaitingExternalCompletion { .. }
-            | HistoryMatch::ChildInProgress { .. } => {
+            | HistoryMatch::ChildInProgress { .. }
+            | HistoryMatch::LocalActivityInProgress { .. } => {
                 unreachable!("match_side_effect only returns Matched, Diverged or NoMatch")
             }
 
@@ -834,9 +839,11 @@ impl WorkflowContext {
             )),
 
             HistoryMatch::AwaitingExternalCompletion { .. }
-            | HistoryMatch::ChildInProgress { .. } => {
+            | HistoryMatch::ChildInProgress { .. }
+            | HistoryMatch::LocalActivityInProgress { .. } => {
                 unreachable!(
-                    "match_activity never returns AwaitingExternalCompletion or ChildInProgress"
+                    "match_activity never returns AwaitingExternalCompletion, ChildInProgress, \
+                     or LocalActivityInProgress"
                 )
             }
 
@@ -942,6 +949,34 @@ impl WorkflowContext {
                 )
             }
 
+            // Worker crashed after appending `LocalActivityScheduled` but before
+            // recording a terminal event. Re-run with the original `activity_id`
+            // so the idempotency key is stable. Signal the worker not to append a
+            // second scheduled event.
+            HistoryMatch::LocalActivityInProgress { activity_id } => {
+                let (tx, rx) = oneshot::channel();
+                self.push_command(WorkflowCommand::RunLocalActivity {
+                    activity_id,
+                    name: name.to_string(),
+                    input,
+                    start_to_close_secs,
+                    retry_policy,
+                    result_tx: tx,
+                    already_scheduled: true,
+                });
+                match rx.await {
+                    Ok(Ok(output)) => Ok(output),
+                    Ok(Err(error)) => Err(HarvestError::ActivityFailed {
+                        name: name.to_string(),
+                        attempt: 1,
+                        source: error.into(),
+                    }),
+                    Err(_) => Err(HarvestError::Cancelled(format!(
+                        "local activity '{name}' cancelled: result channel dropped"
+                    ))),
+                }
+            }
+
             HistoryMatch::NoMatch => {
                 if self.strict_replay {
                     return Err(HarvestError::NonDeterministic(format!(
@@ -960,6 +995,7 @@ impl WorkflowContext {
                     start_to_close_secs,
                     retry_policy,
                     result_tx: tx,
+                    already_scheduled: false,
                 });
 
                 match rx.await {
@@ -1006,7 +1042,8 @@ impl WorkflowContext {
             HistoryMatch::Failed { .. }
             | HistoryMatch::TimedOut { .. }
             | HistoryMatch::AwaitingExternalCompletion { .. }
-            | HistoryMatch::ChildInProgress { .. } => {
+            | HistoryMatch::ChildInProgress { .. }
+            | HistoryMatch::LocalActivityInProgress { .. } => {
                 unreachable!("timers do not fail or time out in history matching")
             }
 
@@ -1064,7 +1101,9 @@ impl WorkflowContext {
                 attempt,
                 source: error.into(),
             }),
-            HistoryMatch::TimedOut { .. } | HistoryMatch::AwaitingExternalCompletion { .. } => {
+            HistoryMatch::TimedOut { .. }
+            | HistoryMatch::AwaitingExternalCompletion { .. }
+            | HistoryMatch::LocalActivityInProgress { .. } => {
                 unreachable!("child workflows do not time out in match_child_workflow")
             }
             HistoryMatch::Diverged { expected, actual } => Err(HarvestError::NonDeterministic(
@@ -1158,7 +1197,8 @@ impl WorkflowContext {
             HistoryMatch::Failed { .. }
             | HistoryMatch::TimedOut { .. }
             | HistoryMatch::AwaitingExternalCompletion { .. }
-            | HistoryMatch::ChildInProgress { .. } => Err(HarvestError::NonDeterministic(
+            | HistoryMatch::ChildInProgress { .. }
+            | HistoryMatch::LocalActivityInProgress { .. } => Err(HarvestError::NonDeterministic(
                 "signal history contains unexpected failure".into(),
             )),
             HistoryMatch::NoMatch => {
@@ -1298,8 +1338,10 @@ impl WorkflowContext {
                 }
             }
 
-            HistoryMatch::ChildInProgress { .. } => {
-                unreachable!("match_external_activity never returns ChildInProgress")
+            HistoryMatch::ChildInProgress { .. } | HistoryMatch::LocalActivityInProgress { .. } => {
+                unreachable!(
+                    "match_external_activity never returns ChildInProgress or LocalActivityInProgress"
+                )
             }
         }
     }
@@ -1348,7 +1390,8 @@ impl WorkflowContext {
             HistoryMatch::Failed { .. }
             | HistoryMatch::TimedOut { .. }
             | HistoryMatch::AwaitingExternalCompletion { .. }
-            | HistoryMatch::ChildInProgress { .. } => Err(HarvestError::NonDeterministic(
+            | HistoryMatch::ChildInProgress { .. }
+            | HistoryMatch::LocalActivityInProgress { .. } => Err(HarvestError::NonDeterministic(
                 "continue_as_new history contains unexpected terminal state".into(),
             )),
             HistoryMatch::NoMatch => {

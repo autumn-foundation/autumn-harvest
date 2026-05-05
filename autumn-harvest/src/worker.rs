@@ -549,6 +549,10 @@ struct LocalActivityRun {
     input: serde_json::Value,
     start_to_close_secs: Option<u64>,
     retry_policy: Option<crate::policy::RetryPolicy>,
+    /// `true` when `LocalActivityScheduled` is already in the durable history —
+    /// the worker crashed after appending it but before recording a terminal event.
+    /// `run_local_activity_inline` must skip re-appending the scheduled event.
+    already_scheduled: bool,
 }
 
 /// Extract a `RunLocalActivity` command from an owned command list.
@@ -575,6 +579,7 @@ fn extract_run_local_activity(
                 start_to_close_secs,
                 retry_policy,
                 result_tx,
+                already_scheduled,
             } => {
                 drop(result_tx); // coroutine already dropped; close the channel
                 local_run = Some(LocalActivityRun {
@@ -583,6 +588,7 @@ fn extract_run_local_activity(
                     input,
                     start_to_close_secs,
                     retry_policy,
+                    already_scheduled,
                 });
             }
             _ => {} // unexpected alongside RunLocalActivity; ignore
@@ -621,18 +627,21 @@ async fn run_local_activity_inline(
 
     let max_attempts = run.retry_policy.as_ref().map_or(1, |p| p.max_attempts);
 
-    let scheduled_event = WorkflowEvent::LocalActivityScheduled {
-        activity_id: run.activity_id,
-        name: run.name.clone(),
-        input: run.input.clone(),
-    };
-
-    // Append marker events + scheduled event in a single call.
+    // When the worker crashed after appending LocalActivityScheduled but before
+    // recording a terminal event, skip re-appending to avoid a duplicate.
     let mut prefix_events = marker_events;
-    prefix_events.push(scheduled_event);
-    store::append_events(conn, exec_id, &prefix_events, *next_event_id).await?;
-    *next_event_id += i32::try_from(prefix_events.len())
-        .map_err(|_| HarvestError::Config("event count overflow".into()))?;
+    if !run.already_scheduled {
+        prefix_events.push(WorkflowEvent::LocalActivityScheduled {
+            activity_id: run.activity_id,
+            name: run.name.clone(),
+            input: run.input.clone(),
+        });
+    }
+    if !prefix_events.is_empty() {
+        store::append_events(conn, exec_id, &prefix_events, *next_event_id).await?;
+        *next_event_id += i32::try_from(prefix_events.len())
+            .map_err(|_| HarvestError::Config("event count overflow".into()))?;
+    }
 
     let mut all_new_events = prefix_events;
     let handler = activity.handler;

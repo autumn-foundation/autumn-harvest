@@ -66,6 +66,17 @@ pub enum HistoryMatch {
         /// The child execution ID already recorded in history. Must be reused.
         child_id: ExecutionId,
     },
+    /// History has a `LocalActivityScheduled` event but no terminal
+    /// (`LocalActivityCompleted` / `LocalActivityFailed`) event yet.
+    ///
+    /// This happens when a worker appended `LocalActivityScheduled` and then
+    /// crashed before running (or before recording the result). The caller
+    /// must re-execute the local activity using the **same** `activity_id` so
+    /// that the derived idempotency key is unchanged across the crash.
+    LocalActivityInProgress {
+        /// The `ActivityExecId` already recorded in history. Must be reused.
+        activity_id: ActivityExecId,
+    },
 }
 
 /// Walks through recorded workflow events during replay, matching
@@ -1039,8 +1050,10 @@ impl HistoryMatcher {
             return failure;
         }
 
-        // LocalActivityScheduled found but no terminal event yet — incomplete history.
-        HistoryMatch::NoMatch
+        // `LocalActivityScheduled` found but no terminal event yet — the worker
+        // crashed after appending the scheduled event. Return the original
+        // `activity_id` so the retry can reuse it and preserve idempotency.
+        HistoryMatch::LocalActivityInProgress { activity_id }
     }
 
     /// Like [`match_local_activity`](Self::match_local_activity) but also verifies the input payload.
