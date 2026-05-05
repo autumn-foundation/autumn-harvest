@@ -138,6 +138,7 @@ cargo run -p autumn-harvest-cli -- workflow signal <execution-id> approved --pay
 cargo run -p autumn-harvest-cli -- workflow query <execution-id> status
 cargo run -p autumn-harvest-cli -- workflow cancel <execution-id> --reason "operator request"
 cargo run -p autumn-harvest-cli -- workflow stack <execution-id>
+cargo run -p autumn-harvest-cli -- workflow children <execution-id> --status Failed
 cargo run -p autumn-harvest-cli -- workflow reset <execution-id> --to-event 42 --reason "bad deploy recovery" --operator-id mark
 cargo run -p autumn-harvest-cli -- dag list
 cargo run -p autumn-harvest-cli -- dag trigger daily_pipeline --conf-json '{"date":"2026-04-21"}'
@@ -300,6 +301,27 @@ cargo run -p autumn-harvest-cli -- workflow list \
     --workflow-name onboarding \
     --search-attr tenant=acme
 ```
+
+### Listing child workflows
+
+`workflow children` and `GET /workflows/{execution_id}/children` expose the
+parent -> child relationship recorded on workflow execution rows. The API fans
+out across all configured shards, merges by `started_at DESC`, and paginates the
+combined result.
+
+| CLI flag | Query param | Behavior |
+|---|---|---|
+| `--status Failed` (repeatable, also accepts comma-separated values) | `?status=Failed&status=Running` | OR filter on child status. Allowed values: `Running`, `Failed`, `Completed`, `Cancelled`, `Terminated`, `TimedOut`, `ContinuedAsNew`. |
+| `--workflow-name billing_child` | `?workflow_name=billing_child` | Exact match on the child workflow name. |
+| `--limit 100` | `?limit=100` | Page size. Defaults to 50 and is capped at 500. |
+| `--cursor <cursor>` | `?cursor=<cursor>` | Continue from the previous page's `next_cursor`. |
+| `--depth 1` | `?depth=1` | Include recursive descendants through the given zero-based depth. Direct children are depth `0`; values above `5` return `400 Bad Request`. |
+| `--json` | n/a | Print the raw JSON payload. Without `--json`, the CLI renders a table. |
+
+Each child entry includes `exec_id`, `workflow_name`, `status`, `started_at`,
+`completed_at`, `error_summary`, `shard_id`, and `depth`. `GET
+/workflows/{execution_id}` also includes top-level `parent_id` alongside the
+existing execution/history payload.
 
 ### Inspecting workflow stack (current wait-state)
 

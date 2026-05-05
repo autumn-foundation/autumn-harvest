@@ -4,6 +4,7 @@
 //! The `UNIQUE(workflow_exec_id, event_id)` constraint guarantees
 //! that two workers can't append conflicting events to the same workflow.
 
+use diesel::BoolExpressionMethods;
 use diesel::ExpressionMethods;
 use diesel::OptionalExtension;
 use diesel::QueryDsl;
@@ -16,7 +17,7 @@ use scoped_futures::ScopedFutureExt as _;
 use crate::error::HarvestResult;
 use crate::event::WorkflowEvent;
 use crate::models::NewHarvestEvent;
-use crate::schema::harvest_events;
+use crate::schema::{harvest_events, harvest_workflow_executions};
 use crate::types::ExecutionId;
 
 /// Loaded event history for a single workflow execution.
@@ -29,6 +30,45 @@ pub struct EventHistory {
     pub events: Vec<WorkflowEvent>,
     pub next_event_id: i32,
 }
+
+/// Filters for loading child workflow execution rows under one parent.
+#[derive(Debug, Clone, Default)]
+pub struct WorkflowChildFilters {
+    pub statuses: Vec<String>,
+    pub workflow_name: Option<String>,
+    pub cursor: Option<WorkflowChildCursor>,
+    pub limit: Option<i64>,
+}
+
+/// Cursor anchor for paged child workflow queries.
+#[derive(Debug, Clone)]
+pub struct WorkflowChildCursor {
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    pub exec_id: uuid::Uuid,
+}
+
+/// Operator-facing child workflow row used by management API read models.
+#[derive(Debug, Clone)]
+pub struct WorkflowChildRow {
+    pub exec_id: ExecutionId,
+    pub workflow_name: String,
+    pub status: String,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub error_summary: Option<String>,
+    pub shard_id: i32,
+    pub depth: u8,
+}
+
+type WorkflowChildProjection = (
+    uuid::Uuid,
+    String,
+    String,
+    chrono::DateTime<chrono::Utc>,
+    Option<chrono::DateTime<chrono::Utc>>,
+    Option<String>,
+    i32,
+);
 
 /// Convert in-memory events to insertable rows with sequential event IDs
 /// starting from 0.
@@ -297,6 +337,114 @@ pub async fn load_history_with_codecs(
         events,
         next_event_id,
     })
+}
+
+/// Load the direct children of `parent_id` from one shard.
+///
+/// Callers that need cross-shard discovery should call this once per shard and
+/// merge the rows after applying any global ordering/pagination.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub async fn load_workflow_children(
+    conn: &mut AsyncPgConnection,
+    parent_id: ExecutionId,
+    filters: &WorkflowChildFilters,
+    depth: u8,
+) -> HarvestResult<Vec<WorkflowChildRow>> {
+    let mut query = harvest_workflow_executions::table
+        .into_boxed()
+        .filter(harvest_workflow_executions::parent_id.eq(Some(parent_id.as_uuid())))
+        .order((
+            harvest_workflow_executions::started_at.desc(),
+            harvest_workflow_executions::id.desc(),
+        ));
+
+    if !filters.statuses.is_empty() {
+        query = query.filter(harvest_workflow_executions::state.eq_any(filters.statuses.clone()));
+    }
+    if let Some(name) = &filters.workflow_name {
+        query = query.filter(harvest_workflow_executions::workflow_name.eq(name.clone()));
+    }
+    if let Some(cursor) = &filters.cursor {
+        query = query.filter(
+            harvest_workflow_executions::started_at
+                .lt(cursor.started_at)
+                .or(harvest_workflow_executions::started_at
+                    .eq(cursor.started_at)
+                    .and(harvest_workflow_executions::id.lt(cursor.exec_id))),
+        );
+    }
+    if let Some(limit) = filters.limit {
+        query = query.limit(limit);
+    }
+
+    query
+        .select((
+            harvest_workflow_executions::id,
+            harvest_workflow_executions::workflow_name,
+            harvest_workflow_executions::state,
+            harvest_workflow_executions::started_at,
+            harvest_workflow_executions::completed_at,
+            harvest_workflow_executions::error,
+            harvest_workflow_executions::shard_id,
+        ))
+        .load::<WorkflowChildProjection>(conn)
+        .await
+        .map_err(crate::error::database_error)
+        .map(|rows| {
+            rows.into_iter()
+                .map(
+                    |(id, workflow_name, state, started_at, completed_at, error, shard_id)| {
+                        workflow_child_row_from_parts(
+                            id,
+                            workflow_name,
+                            state,
+                            started_at,
+                            completed_at,
+                            error,
+                            shard_id,
+                            depth,
+                        )
+                    },
+                )
+                .collect()
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn workflow_child_row_from_parts(
+    id: uuid::Uuid,
+    workflow_name: String,
+    state: String,
+    started_at: chrono::DateTime<chrono::Utc>,
+    completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    error: Option<String>,
+    shard_id: i32,
+    depth: u8,
+) -> WorkflowChildRow {
+    WorkflowChildRow {
+        exec_id: ExecutionId::from_uuid(id),
+        workflow_name,
+        status: state,
+        started_at,
+        completed_at,
+        error_summary: summarize_error(error),
+        shard_id,
+        depth,
+    }
+}
+
+fn summarize_error(error: Option<String>) -> Option<String> {
+    const MAX_ERROR_SUMMARY_CHARS: usize = 240;
+
+    let first_line = error?.lines().next()?.trim().to_string();
+    if first_line.is_empty() {
+        return None;
+    }
+
+    Some(first_line.chars().take(MAX_ERROR_SUMMARY_CHARS).collect())
 }
 
 #[cfg(test)]

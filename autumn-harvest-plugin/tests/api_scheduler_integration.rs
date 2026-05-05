@@ -18,6 +18,7 @@ use autumn_harvest::schema::{
     harvest_workflow_executions,
 };
 use autumn_harvest::shard::{ShardRouter, ShardedDbPool};
+use autumn_harvest::store;
 use autumn_harvest::types::{ExecutionId, ShardId};
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{
@@ -64,6 +65,10 @@ const INIT_SQL: &str = concat!(
     ),
     "\n",
     include_str!("../../autumn-harvest/migrations/20260430000001_harvest_external_tasks/up.sql"),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260504000000_harvest_workflow_parent_children/up.sql"
+    ),
 );
 type HarvestApiApp = axum::Router;
 
@@ -71,6 +76,12 @@ type HarvestApiApp = axum::Router;
 struct CountByName {
     #[diesel(sql_type = diesel::sql_types::BigInt)]
     count: i64,
+}
+
+#[derive(diesel::QueryableByName)]
+struct ExistsByName {
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    exists: bool,
 }
 
 async fn setup_test_database_url() -> (String, ContainerAsync<Postgres>) {
@@ -207,6 +218,14 @@ async fn get_json(app: &HarvestApiApp, uri: impl Into<String>) -> (StatusCode, V
     let status = response.status();
     let json = read_json_response(response).await;
     (status, json)
+}
+
+async fn get_response(app: &HarvestApiApp, uri: impl Into<String>) -> axum::response::Response {
+    let uri = uri.into();
+    app.clone()
+        .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+        .await
+        .expect("GET request failed")
 }
 
 async fn post_json(
@@ -358,6 +377,71 @@ async fn insert_workflow_on_url(
     )
     .await
     .expect("workflow insert should succeed");
+    exec_id
+}
+
+struct ChildWorkflowFixture<'a> {
+    database_url: &'a str,
+    shard: ShardId,
+    parent_id: ExecutionId,
+    workflow_name: &'a str,
+    workflow_id: &'a str,
+    state: &'a str,
+    error: Option<&'a str>,
+    started_offset_secs: i64,
+}
+
+async fn insert_child_workflow_on_url(fixture: ChildWorkflowFixture<'_>) -> ExecutionId {
+    let ChildWorkflowFixture {
+        database_url,
+        shard,
+        parent_id,
+        workflow_name,
+        workflow_id,
+        state,
+        error,
+        started_offset_secs,
+    } = fixture;
+    let exec_id = ExecutionId::new_for_shard(shard);
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("failed to connect fresh Postgres client for child workflow insert");
+    start_or_load_workflow_execution(
+        &mut conn,
+        StartWorkflowParams {
+            workflow_name,
+            workflow_id,
+            exec_id,
+            input: json!({ "workflow_id": workflow_id, "shard": shard.as_i32() }),
+            parent_id: Some(parent_id.as_uuid()),
+            queue_name: "default",
+            execution_timeout: None,
+            memo: None,
+            search_attrs: None,
+            reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
+            trace_context: None,
+        },
+    )
+    .await
+    .expect("child workflow insert should succeed");
+
+    let started_at = chrono::Utc::now() - chrono::Duration::seconds(started_offset_secs);
+    let completed_at = if state == "RUNNING" {
+        None
+    } else {
+        Some(started_at + chrono::Duration::seconds(5))
+    };
+    diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
+        .set((
+            harvest_workflow_executions::state.eq(state),
+            harvest_workflow_executions::error.eq(error.map(ToOwned::to_owned)),
+            harvest_workflow_executions::started_at.eq(started_at),
+            harvest_workflow_executions::completed_at.eq(completed_at),
+        ))
+        .execute(&mut conn)
+        .await
+        .expect("failed to update child workflow fixture state");
+
     exec_id
 }
 
@@ -1121,6 +1205,501 @@ async fn harvest_api_uses_installed_storage_pool_when_app_state_has_no_database(
     );
 
     shutdown_test_worker(&worker, worker_task).await;
+}
+
+#[tokio::test]
+async fn harvest_api_workflow_details_include_parent_id_at_top_level() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool));
+    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+
+    let parent = insert_workflow_on_url(
+        &database_url,
+        ShardId::new(0),
+        "fanout_parent",
+        "parent-details",
+    )
+    .await;
+    let child = insert_child_workflow_on_url(ChildWorkflowFixture {
+        database_url: &database_url,
+        shard: ShardId::new(0),
+        parent_id: parent,
+        workflow_name: "billing_child",
+        workflow_id: "child-details",
+        state: "RUNNING",
+        error: None,
+        started_offset_secs: 0,
+    })
+    .await;
+
+    let (status, details_json) = get_json(&app, format!("/workflows/{child}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(details_json["parent_id"], parent.to_string());
+}
+
+#[tokio::test]
+async fn harvest_api_lists_direct_workflow_children_with_filters() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool));
+    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+
+    let parent = insert_workflow_on_url(
+        &database_url,
+        ShardId::new(0),
+        "fanout_parent",
+        "parent-children",
+    )
+    .await;
+    let failed_child = insert_child_workflow_on_url(ChildWorkflowFixture {
+        database_url: &database_url,
+        shard: ShardId::new(0),
+        parent_id: parent,
+        workflow_name: "billing_child",
+        workflow_id: "failed-child",
+        state: "FAILED",
+        error: Some("charge card failed\nstack trace omitted"),
+        started_offset_secs: 10,
+    })
+    .await;
+    insert_child_workflow_on_url(ChildWorkflowFixture {
+        database_url: &database_url,
+        shard: ShardId::new(0),
+        parent_id: parent,
+        workflow_name: "billing_child",
+        workflow_id: "running-child",
+        state: "RUNNING",
+        error: None,
+        started_offset_secs: 20,
+    })
+    .await;
+    insert_child_workflow_on_url(ChildWorkflowFixture {
+        database_url: &database_url,
+        shard: ShardId::new(0),
+        parent_id: parent,
+        workflow_name: "email_child",
+        workflow_id: "failed-other-name",
+        state: "FAILED",
+        error: Some("smtp failed"),
+        started_offset_secs: 30,
+    })
+    .await;
+
+    let response = get_response(
+        &app,
+        format!("/workflows/{parent}/children?status=Failed&workflow_name=billing_child"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = read_json_response(response).await;
+    let items = body["items"]
+        .as_array()
+        .expect("children response must have an items array");
+
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["exec_id"], failed_child.to_string());
+    assert_eq!(items[0]["workflow_name"], "billing_child");
+    assert_eq!(items[0]["status"], "Failed");
+    assert_eq!(items[0]["error_summary"], "charge card failed");
+    assert_eq!(items[0]["shard_id"], 0);
+    assert_eq!(items[0]["depth"], 0);
+    assert!(items[0]["started_at"].is_string());
+    assert!(items[0]["completed_at"].is_string());
+    assert!(body["next_cursor"].is_null());
+}
+
+#[tokio::test]
+async fn harvest_api_filters_workflow_children_by_continued_as_new_status() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool));
+    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+
+    let parent = insert_workflow_on_url(
+        &database_url,
+        ShardId::new(0),
+        "fanout_parent",
+        "parent-continued-as-new",
+    )
+    .await;
+    let continued_child = insert_child_workflow_on_url(ChildWorkflowFixture {
+        database_url: &database_url,
+        shard: ShardId::new(0),
+        parent_id: parent,
+        workflow_name: "billing_child",
+        workflow_id: "continued-child",
+        state: "CONTINUED_AS_NEW",
+        error: None,
+        started_offset_secs: 10,
+    })
+    .await;
+    insert_child_workflow_on_url(ChildWorkflowFixture {
+        database_url: &database_url,
+        shard: ShardId::new(0),
+        parent_id: parent,
+        workflow_name: "billing_child",
+        workflow_id: "failed-child",
+        state: "FAILED",
+        error: Some("not the requested state"),
+        started_offset_secs: 5,
+    })
+    .await;
+
+    let (status, body) = get_json(
+        &app,
+        format!("/workflows/{parent}/children?status=ContinuedAsNew"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let items = body["items"]
+        .as_array()
+        .expect("children response must have an items array");
+
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["exec_id"], continued_child.to_string());
+    assert_eq!(items[0]["status"], "ContinuedAsNew");
+}
+
+#[tokio::test]
+async fn load_workflow_children_applies_limit_and_cursor_before_returning_rows() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let parent = insert_workflow_on_url(
+        &database_url,
+        ShardId::new(0),
+        "fanout_parent",
+        "store-page-parent",
+    )
+    .await;
+    let newest_child = insert_child_workflow_on_url(ChildWorkflowFixture {
+        database_url: &database_url,
+        shard: ShardId::new(0),
+        parent_id: parent,
+        workflow_name: "billing_child",
+        workflow_id: "store-page-newest",
+        state: "FAILED",
+        error: None,
+        started_offset_secs: 5,
+    })
+    .await;
+    let middle_child = insert_child_workflow_on_url(ChildWorkflowFixture {
+        database_url: &database_url,
+        shard: ShardId::new(0),
+        parent_id: parent,
+        workflow_name: "billing_child",
+        workflow_id: "store-page-middle",
+        state: "FAILED",
+        error: None,
+        started_offset_secs: 10,
+    })
+    .await;
+    let oldest_child = insert_child_workflow_on_url(ChildWorkflowFixture {
+        database_url: &database_url,
+        shard: ShardId::new(0),
+        parent_id: parent,
+        workflow_name: "billing_child",
+        workflow_id: "store-page-oldest",
+        state: "FAILED",
+        error: None,
+        started_offset_secs: 15,
+    })
+    .await;
+
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect for store page query");
+    let first_page = store::load_workflow_children(
+        &mut conn,
+        parent,
+        &store::WorkflowChildFilters {
+            statuses: Vec::new(),
+            workflow_name: None,
+            cursor: None,
+            limit: Some(2),
+        },
+        0,
+    )
+    .await
+    .expect("first child page should load");
+    assert_eq!(
+        first_page.iter().map(|row| row.exec_id).collect::<Vec<_>>(),
+        vec![newest_child, middle_child]
+    );
+
+    let cursor_row = first_page
+        .last()
+        .expect("first page should include a cursor row");
+    let second_page = store::load_workflow_children(
+        &mut conn,
+        parent,
+        &store::WorkflowChildFilters {
+            statuses: Vec::new(),
+            workflow_name: None,
+            cursor: Some(store::WorkflowChildCursor {
+                started_at: cursor_row.started_at,
+                exec_id: cursor_row.exec_id.as_uuid(),
+            }),
+            limit: Some(2),
+        },
+        0,
+    )
+    .await
+    .expect("second child page should load");
+
+    assert_eq!(
+        second_page
+            .iter()
+            .map(|row| row.exec_id)
+            .collect::<Vec<_>>(),
+        vec![oldest_child]
+    );
+}
+
+#[tokio::test]
+async fn harvest_api_lists_workflow_children_across_shards_and_paginates() {
+    let ((shard0_url, shard1_url), _container) = setup_sharded_test_database_urls().await;
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(build_two_shard_pool(&shard0_url, &shard1_url));
+    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+
+    let mut shard0_conn = <AsyncPgConnection as AsyncConnection>::establish(&shard0_url)
+        .await
+        .expect("failed to connect to shard 0");
+    let index_exists: ExistsByName = diesel::sql_query(
+        "SELECT EXISTS (
+            SELECT 1 FROM pg_indexes
+            WHERE schemaname = 'public' AND indexname = 'idx_harvest_we_parent_id'
+         ) AS exists",
+    )
+    .get_result(&mut shard0_conn)
+    .await
+    .expect("failed to inspect parent_id index");
+    assert!(
+        index_exists.exists,
+        "parent_id lookup must have a per-shard index"
+    );
+
+    let parent = insert_workflow_on_url(
+        &shard0_url,
+        ShardId::new(0),
+        "fanout_parent",
+        "parent-cross-shard",
+    )
+    .await;
+    let newest_child = insert_child_workflow_on_url(ChildWorkflowFixture {
+        database_url: &shard1_url,
+        shard: ShardId::new(1),
+        parent_id: parent,
+        workflow_name: "billing_child",
+        workflow_id: "newest-cross-shard-child",
+        state: "FAILED",
+        error: Some("newest failed"),
+        started_offset_secs: 5,
+    })
+    .await;
+    let older_child = insert_child_workflow_on_url(ChildWorkflowFixture {
+        database_url: &shard0_url,
+        shard: ShardId::new(0),
+        parent_id: parent,
+        workflow_name: "billing_child",
+        workflow_id: "older-cross-shard-child",
+        state: "FAILED",
+        error: Some("older failed"),
+        started_offset_secs: 20,
+    })
+    .await;
+
+    let (first_status, first_page) =
+        get_json(&app, format!("/workflows/{parent}/children?limit=1")).await;
+    assert_eq!(first_status, StatusCode::OK);
+    let first_items = first_page["items"]
+        .as_array()
+        .expect("children response must have an items array");
+    assert_eq!(first_items.len(), 1);
+    assert_eq!(first_items[0]["exec_id"], newest_child.to_string());
+    assert_eq!(first_items[0]["shard_id"], 1);
+    let cursor = first_page["next_cursor"]
+        .as_str()
+        .expect("limited page should return a cursor");
+    let encoded_cursor = cursor.replace('|', "%7C");
+
+    let (second_status, second_page) = get_json(
+        &app,
+        format!("/workflows/{parent}/children?limit=1&cursor={encoded_cursor}"),
+    )
+    .await;
+    assert_eq!(second_status, StatusCode::OK);
+    let second_items = second_page["items"]
+        .as_array()
+        .expect("children response must have an items array");
+    assert_eq!(second_items.len(), 1);
+    assert_eq!(second_items[0]["exec_id"], older_child.to_string());
+    assert_eq!(second_items[0]["shard_id"], 0);
+    assert!(second_page["next_cursor"].is_null());
+}
+
+#[tokio::test]
+async fn harvest_api_recursive_children_traverse_across_shards() {
+    let ((shard0_url, shard1_url), _container) = setup_sharded_test_database_urls().await;
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(build_two_shard_pool(&shard0_url, &shard1_url));
+    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+
+    let parent = insert_workflow_on_url(
+        &shard0_url,
+        ShardId::new(0),
+        "fanout_parent",
+        "cross-shard-recursive-parent",
+    )
+    .await;
+    let child = insert_child_workflow_on_url(ChildWorkflowFixture {
+        database_url: &shard1_url,
+        shard: ShardId::new(1),
+        parent_id: parent,
+        workflow_name: "middle_child",
+        workflow_id: "cross-shard-recursive-child",
+        state: "RUNNING",
+        error: None,
+        started_offset_secs: 10,
+    })
+    .await;
+    let grandchild = insert_child_workflow_on_url(ChildWorkflowFixture {
+        database_url: &shard0_url,
+        shard: ShardId::new(0),
+        parent_id: child,
+        workflow_name: "leaf_child",
+        workflow_id: "cross-shard-recursive-grandchild",
+        state: "FAILED",
+        error: Some("leaf failed across shards"),
+        started_offset_secs: 5,
+    })
+    .await;
+
+    let (status, body) = get_json(&app, format!("/workflows/{parent}/children?depth=1")).await;
+    assert_eq!(status, StatusCode::OK);
+    let items = body["items"]
+        .as_array()
+        .expect("children response must have an items array");
+
+    assert_eq!(items.len(), 2);
+    assert!(items.iter().any(|row| row["exec_id"] == child.to_string()
+        && row["depth"] == 0
+        && row["shard_id"] == 1));
+    assert!(
+        items
+            .iter()
+            .any(|row| row["exec_id"] == grandchild.to_string()
+                && row["depth"] == 1
+                && row["shard_id"] == 0)
+    );
+}
+
+#[tokio::test]
+async fn harvest_api_children_distinguishes_empty_parent_from_missing_parent() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool));
+    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+
+    let parent = insert_workflow_on_url(
+        &database_url,
+        ShardId::new(0),
+        "fanout_parent",
+        "parent-without-children",
+    )
+    .await;
+
+    let (empty_status, empty_body) = get_json(&app, format!("/workflows/{parent}/children")).await;
+    assert_eq!(empty_status, StatusCode::OK);
+    assert_eq!(
+        empty_body["items"]
+            .as_array()
+            .expect("children response must have an items array")
+            .len(),
+        0
+    );
+    assert!(empty_body["next_cursor"].is_null());
+
+    let missing_parent = ExecutionId::new_for_shard(ShardId::new(0));
+    let missing_response =
+        get_response(&app, format!("/workflows/{missing_parent}/children")).await;
+    assert_eq!(missing_response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn harvest_api_children_supports_recursive_depth_with_cap() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool));
+    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+
+    let parent = insert_workflow_on_url(
+        &database_url,
+        ShardId::new(0),
+        "fanout_parent",
+        "recursive-parent",
+    )
+    .await;
+    let child = insert_child_workflow_on_url(ChildWorkflowFixture {
+        database_url: &database_url,
+        shard: ShardId::new(0),
+        parent_id: parent,
+        workflow_name: "middle_child",
+        workflow_id: "recursive-child",
+        state: "RUNNING",
+        error: None,
+        started_offset_secs: 10,
+    })
+    .await;
+    let grandchild = insert_child_workflow_on_url(ChildWorkflowFixture {
+        database_url: &database_url,
+        shard: ShardId::new(0),
+        parent_id: child,
+        workflow_name: "leaf_child",
+        workflow_id: "recursive-grandchild",
+        state: "FAILED",
+        error: Some("leaf failed"),
+        started_offset_secs: 5,
+    })
+    .await;
+
+    let (status, body) = get_json(&app, format!("/workflows/{parent}/children?depth=1")).await;
+    assert_eq!(status, StatusCode::OK);
+    let items = body["items"]
+        .as_array()
+        .expect("children response must have an items array");
+    assert_eq!(items.len(), 2);
+    assert!(items.iter().any(|row| row["exec_id"] == child.to_string()
+        && row["depth"] == 0
+        && row["workflow_name"] == "middle_child"));
+    assert!(
+        items
+            .iter()
+            .any(|row| row["exec_id"] == grandchild.to_string()
+                && row["depth"] == 1
+                && row["workflow_name"] == "leaf_child")
+    );
+
+    let (filtered_status, filtered_body) = get_json(
+        &app,
+        format!("/workflows/{parent}/children?depth=1&status=Failed"),
+    )
+    .await;
+    assert_eq!(filtered_status, StatusCode::OK);
+    let filtered_items = filtered_body["items"]
+        .as_array()
+        .expect("filtered children response must have an items array");
+    assert_eq!(filtered_items.len(), 1);
+    assert_eq!(filtered_items[0]["exec_id"], grandchild.to_string());
+    assert_eq!(filtered_items[0]["depth"], 1);
+
+    let too_deep = get_response(&app, format!("/workflows/{parent}/children?depth=6")).await;
+    assert_eq!(too_deep.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
