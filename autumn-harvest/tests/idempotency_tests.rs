@@ -284,3 +284,47 @@ fn nested_subkeys_are_stable_and_distinct() {
     // Distinct siblings
     assert_ne!(charge.as_str(), refund.as_str());
 }
+
+// ── Subkey name validation ────────────────────────────────────────────────
+
+#[test]
+fn subkey_slash_in_name_does_not_collide_with_nested_subkey() {
+    // "a/b" as a single name must not equal subkey("a").subkey("b").
+    // The slash is rejected by the validator, so the collision is impossible
+    // at the API level.
+    let key = IdempotencyKey::from_activity_exec_id(ActivityExecId::new());
+    // Nested: key -> "a" -> "b"
+    let nested = key.subkey("a").subkey("b");
+    // A flat name that *looks* like the path "a/b" would panic — test that
+    // the flat and nested forms are provably distinct by ensuring the nested
+    // path prefix includes the intermediate segment.
+    assert!(nested.as_str().contains("/a/"), "nested path must include both segments");
+}
+
+#[test]
+#[should_panic(expected = "non-empty printable ASCII without '/'")]
+fn subkey_panics_on_slash_in_name() {
+    let key = IdempotencyKey::from_activity_exec_id(ActivityExecId::new());
+    let _ = key.subkey("a/b");
+}
+
+#[test]
+#[should_panic(expected = "non-empty printable ASCII without '/'")]
+fn subkey_panics_on_empty_name() {
+    let key = IdempotencyKey::from_activity_exec_id(ActivityExecId::new());
+    let _ = key.subkey("");
+}
+
+#[test]
+#[should_panic(expected = "non-empty printable ASCII without '/'")]
+fn subkey_panics_on_non_ascii_name() {
+    let key = IdempotencyKey::from_activity_exec_id(ActivityExecId::new());
+    let _ = key.subkey("café");
+}
+
+#[test]
+#[should_panic(expected = "non-empty printable ASCII without '/'")]
+fn subkey_panics_on_control_char_in_name() {
+    let key = IdempotencyKey::from_activity_exec_id(ActivityExecId::new());
+    let _ = key.subkey("charge\tcard");
+}

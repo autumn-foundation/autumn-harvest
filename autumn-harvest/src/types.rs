@@ -689,11 +689,19 @@ impl IdempotencyKey {
     ///
     /// Subkeys are themselves `IdempotencyKey` values so they can be further
     /// nested if necessary.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `name` is empty, contains `/`, or contains any character that
+    /// is not printable ASCII (byte range `0x21`–`0x7E`).  Subkey names are
+    /// programmer-provided constants; a panic surfaces the mistake immediately
+    /// rather than silently producing a malformed or colliding key.
     #[must_use]
     pub fn subkey(&self, name: &str) -> Self {
-        // Stable, readable, and unambiguous: the parent UUID prefix ensures
-        // cross-invocation uniqueness; the `name` suffix ensures sibling
-        // subkeys are distinct.
+        assert!(
+            !name.is_empty() && name.bytes().all(|b| b > b' ' && b < b'\x7f' && b != b'/'),
+            "IdempotencyKey::subkey: name must be non-empty printable ASCII without '/'; got {name:?}"
+        );
         Self {
             base: format!("{}/{name}", self.base),
         }

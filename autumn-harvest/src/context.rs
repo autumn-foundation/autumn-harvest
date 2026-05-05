@@ -1783,7 +1783,7 @@ impl ActivityContext {
     /// `1` means the first attempt. The engine sets this automatically; you
     /// only need it when constructing a context manually in tests.
     #[must_use]
-    pub fn with_attempt(mut self, attempt: u32) -> Self {
+    pub const fn with_attempt(mut self, attempt: u32) -> Self {
         self.attempt = Some(attempt);
         self
     }
@@ -1824,7 +1824,7 @@ impl ActivityContext {
     /// ctx.attempt().unwrap_or(1)))` to opt into an attempt-scoped subkey if
     /// your downstream API requires distinct keys per attempt.
     #[must_use]
-    pub fn attempt(&self) -> Option<u32> {
+    pub const fn attempt(&self) -> Option<u32> {
         self.attempt
     }
 
