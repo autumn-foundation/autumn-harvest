@@ -54,7 +54,11 @@ fn keys_for_ten_thousand_invocations_have_no_collisions() {
                 .to_owned()
         })
         .collect();
-    assert_eq!(keys.len(), 10_000, "10,000 distinct invocations must yield 10,000 distinct keys");
+    assert_eq!(
+        keys.len(),
+        10_000,
+        "10,000 distinct invocations must yield 10,000 distinct keys"
+    );
 }
 
 // ── Subkey derivation ────────────────────────────────────────────────────
@@ -64,7 +68,10 @@ fn subkey_derivation_is_deterministic() {
     let key = IdempotencyKey::from_activity_exec_id(ActivityExecId::new());
     let s1 = key.subkey("charge").as_str().to_owned();
     let s2 = key.subkey("charge").as_str().to_owned();
-    assert_eq!(s1, s2, "subkey(same_name) must return the same value every time");
+    assert_eq!(
+        s1, s2,
+        "subkey(same_name) must return the same value every time"
+    );
 }
 
 #[test]
@@ -83,7 +90,11 @@ fn different_subkey_names_produce_different_keys() {
 fn subkey_is_distinct_from_its_parent() {
     let key = IdempotencyKey::from_activity_exec_id(ActivityExecId::new());
     let sub = key.subkey("charge");
-    assert_ne!(key.as_str(), sub.as_str(), "subkey must differ from parent key");
+    assert_ne!(
+        key.as_str(),
+        sub.as_str(),
+        "subkey must differ from parent key"
+    );
 }
 
 #[test]
@@ -100,9 +111,7 @@ fn same_subkey_name_different_parents_produce_different_keys() {
 // ── HTTP-header safety ───────────────────────────────────────────────────
 
 fn is_http_header_safe(s: &str) -> bool {
-    !s.is_empty()
-        && s.chars()
-            .all(|c| c.is_ascii() && c >= ' ' && c != '\x7f')
+    !s.is_empty() && s.chars().all(|c| c.is_ascii() && c >= ' ' && c != '\x7f')
 }
 
 #[test]
@@ -208,8 +217,7 @@ async fn payment_gateway_duplicate_dispatch_commits_exactly_once() {
     // Every attempt must carry the *same* idempotency key so the gateway
     // deduplicates to exactly one charge.
     let gateway = Arc::new(FakeGateway::new());
-    let idempotency_key =
-        IdempotencyKey::from_activity_exec_id(ActivityExecId::new());
+    let idempotency_key = IdempotencyKey::from_activity_exec_id(ActivityExecId::new());
 
     for attempt in 1u32..=5 {
         let ctx = ActivityContext::new_test()
@@ -298,7 +306,10 @@ fn subkey_slash_in_name_does_not_collide_with_nested_subkey() {
     // A flat name that *looks* like the path "a/b" would panic — test that
     // the flat and nested forms are provably distinct by ensuring the nested
     // path prefix includes the intermediate segment.
-    assert!(nested.as_str().contains("/a/"), "nested path must include both segments");
+    assert!(
+        nested.as_str().contains("/a/"),
+        "nested path must include both segments"
+    );
 }
 
 #[test]

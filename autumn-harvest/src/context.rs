@@ -20,7 +20,9 @@ use crate::error::{HarvestError, HarvestResult};
 use crate::event::WorkflowEvent;
 use crate::query::QueryRegistry;
 use crate::replay::{HistoryMatch, HistoryMatcher};
-use crate::types::{ActivityExecId, ExecutionId, ExternalActivityToken, IdempotencyKey, TimerId, UpdateId};
+use crate::types::{
+    ActivityExecId, ExecutionId, ExternalActivityToken, IdempotencyKey, TimerId, UpdateId,
+};
 use crate::update::{BoxUpdateHandler, BoxUpdateValidator, UpdateRegistry};
 
 /// Runtime map of typed shared state registered on the harvest builder.

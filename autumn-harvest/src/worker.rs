@@ -40,7 +40,9 @@ use crate::telemetry::{
     ATTR_ACTIVITY_NAME, ATTR_ATTEMPT, ATTR_EXECUTION_ID, ATTR_QUEUE, ATTR_SHARD_ID,
     ATTR_WORKFLOW_ID, ActivityStatus, TraceContextCarrier, WorkflowStatus,
 };
-use crate::types::{ActivityExecId, ExecutionId, ExternalActivityToken, IdempotencyKey, TimerId, WorkerId};
+use crate::types::{
+    ActivityExecId, ExecutionId, ExternalActivityToken, IdempotencyKey, TimerId, WorkerId,
+};
 
 /// Type alias for the deadpool-managed async Diesel connection pool.
 pub type DbPool = deadpool::managed::Pool<
@@ -637,12 +639,10 @@ async fn run_local_activity_inline(
     let local_idempotency_key = IdempotencyKey::from_activity_exec_id(run.activity_id);
 
     for attempt in 1..=max_attempts {
-        let ctx = ActivityContext::new_local_activity(
-            registry.shared_state(),
-            CancellationToken::new(),
-        )
-        .with_idempotency_key(local_idempotency_key.clone())
-        .with_attempt(attempt);
+        let ctx =
+            ActivityContext::new_local_activity(registry.shared_state(), CancellationToken::new())
+                .with_idempotency_key(local_idempotency_key.clone())
+                .with_attempt(attempt);
         let result = tokio::time::timeout(per_attempt_timeout, (handler)(&ctx, run.input.clone()))
             .await
             .unwrap_or_else(|_| {
