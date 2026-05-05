@@ -199,6 +199,11 @@ enum Commands {
         #[command(subcommand)]
         command: ConcurrencyCommand,
     },
+    /// Manage batch operations.
+    Batch {
+        #[command(subcommand)]
+        command: BatchCommand,
+    },
     /// Open the TUI dashboard to monitor workflows.
     Tui,
 }
@@ -439,6 +444,42 @@ enum ConcurrencyCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum BatchCommand {
+    /// List batch operations.
+    List {
+        /// Maximum number of rows to return.
+        #[arg(long, value_parser = clap::value_parser!(i64).range(1..=200))]
+        limit: Option<i64>,
+    },
+    /// Get details of a batch operation.
+    Get {
+        /// Batch operation ID.
+        batch_job_id: String,
+    },
+    /// Submit a new batch operation.
+    Submit {
+        /// Action to perform: Cancel, Terminate, or Signal.
+        #[arg(value_parser = clap::builder::PossibleValuesParser::new(["Cancel", "Terminate", "Signal"]))]
+        action: String,
+        /// Inline JSON filter definition.
+        #[arg(long, conflicts_with = "filter_file")]
+        filter_json: Option<String>,
+        /// File containing JSON filter definition. Use `-` for stdin.
+        #[arg(long, value_name = "PATH", conflicts_with = "filter_json")]
+        filter_file: Option<PathBuf>,
+        /// Name of the signal (required if action is Signal).
+        #[arg(long, required_if_eq("action", "Signal"))]
+        signal_name: Option<String>,
+        /// Inline JSON signal payload.
+        #[arg(long, conflicts_with = "signal_payload_file")]
+        signal_payload_json: Option<String>,
+        /// File containing JSON signal payload. Use `-` for stdin.
+        #[arg(long, value_name = "PATH", conflicts_with = "signal_payload_json")]
+        signal_payload_file: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum DeadLetterCommand {
     /// List dead-lettered tasks.
     List {
@@ -517,6 +558,7 @@ impl Cli {
             Commands::Dlq { command } => Ok(dead_letter_request(command)),
             Commands::Retention { command } => Ok(retention_request(command)),
             Commands::Concurrency { command } => Ok(concurrency_request(command)),
+            Commands::Batch { command } => batch_request(command),
             Commands::Tui => unreachable!("Tui command handles its own requests"),
         }
     }
@@ -895,6 +937,51 @@ fn retention_request(command: &RetentionCommand) -> ApiRequest {
 fn concurrency_request(command: &ConcurrencyCommand) -> ApiRequest {
     match command {
         ConcurrencyCommand::Status => ApiRequest::get("/admin/concurrency"),
+    }
+}
+
+fn batch_request(command: &BatchCommand) -> Result<ApiRequest, CliError> {
+    match command {
+        BatchCommand::List { limit } => Ok(ApiRequest::get(path_with_limit(
+            "/batch-operations",
+            limit.map(|value| ("limit", value)),
+        ))),
+        BatchCommand::Get { batch_job_id } => Ok(ApiRequest::get(format!(
+            "/batch-operations/{}",
+            path_segment(batch_job_id)
+        ))),
+        BatchCommand::Submit {
+            action,
+            filter_json,
+            filter_file,
+            signal_name,
+            signal_payload_json,
+            signal_payload_file,
+        } => {
+            let filter = parse_json_source(
+                filter_json.as_deref(),
+                filter_file.as_deref(),
+                "filter JSON",
+            )?
+            .unwrap_or_else(|| json!({}));
+            let mut body = Map::new();
+            body.insert("action".to_string(), json!(action));
+            body.insert("filter".to_string(), filter);
+            if let Some(sn) = signal_name {
+                body.insert("signal_name".to_string(), json!(sn));
+            }
+            if let Some(payload) = parse_json_source(
+                signal_payload_json.as_deref(),
+                signal_payload_file.as_deref(),
+                "signal payload JSON",
+            )? {
+                body.insert("signal_payload".to_string(), payload);
+            }
+            Ok(ApiRequest::post(
+                "/batch-operations",
+                Some(Value::Object(body)),
+            ))
+        }
     }
 }
 
