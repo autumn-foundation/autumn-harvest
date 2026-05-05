@@ -197,6 +197,14 @@ pub enum WorkflowCommand {
         /// (worker crashed after appending it but before recording a terminal
         /// event). The worker must **not** append a second scheduled event.
         already_scheduled: bool,
+        /// Number of `LocalActivityFailed` events already recorded in history.
+        /// The worker starts its retry loop from `failed_attempts + 1`.
+        /// When `failed_attempts >= max_attempts`, the worker returns `last_error`
+        /// immediately without executing the handler.
+        failed_attempts: u32,
+        /// Error from the last recorded `LocalActivityFailed`, used when
+        /// `failed_attempts >= max_attempts` to return the correct error.
+        last_error: Option<String>,
     },
     /// Record a terminal result for an admitted update.
     ///
@@ -911,6 +919,7 @@ impl WorkflowContext {
     /// # Panics
     ///
     /// Panics if the internal matcher or commands mutex is poisoned.
+    #[allow(clippy::too_many_lines)]
     pub async fn execute_local_activity_raw(
         &self,
         name: &str,
@@ -949,11 +958,38 @@ impl WorkflowContext {
                 )
             }
 
-            // Worker crashed after appending `LocalActivityScheduled` but before
+            // Worker crashed after appending `LocalActivityScheduled` (and
+            // possibly one or more `LocalActivityFailed` events) but before
             // recording a terminal event. Re-run with the original `activity_id`
-            // so the idempotency key is stable. Signal the worker not to append a
-            // second scheduled event.
-            HistoryMatch::LocalActivityInProgress { activity_id } => {
+            // so the idempotency key is stable across the crash.
+            HistoryMatch::LocalActivityInProgress {
+                activity_id,
+                failed_attempts,
+                last_error,
+            } => {
+                if self.strict_replay {
+                    return Err(HarvestError::NonDeterministic(format!(
+                        "local activity '{name}' scheduled but terminal not in history"
+                    )));
+                }
+
+                // If the recorded failure count already covers all retry
+                // attempts, return the last error immediately — no handler
+                // execution is needed and no command should be pushed.
+                let max_attempts = retry_policy.as_ref().map_or(1, |p| p.max_attempts);
+                if failed_attempts >= max_attempts {
+                    let error = last_error.unwrap_or_else(|| {
+                        format!("local activity '{name}' failed after {failed_attempts} attempts")
+                    });
+                    return Err(HarvestError::ActivityFailed {
+                        name: name.to_string(),
+                        attempt: failed_attempts,
+                        source: error.into(),
+                    });
+                }
+
+                // Some retry attempts remain — push the command so the worker
+                // re-runs the handler starting from the next unrecorded attempt.
                 let (tx, rx) = oneshot::channel();
                 self.push_command(WorkflowCommand::RunLocalActivity {
                     activity_id,
@@ -963,12 +999,14 @@ impl WorkflowContext {
                     retry_policy,
                     result_tx: tx,
                     already_scheduled: true,
+                    failed_attempts,
+                    last_error,
                 });
                 match rx.await {
                     Ok(Ok(output)) => Ok(output),
                     Ok(Err(error)) => Err(HarvestError::ActivityFailed {
                         name: name.to_string(),
-                        attempt: 1,
+                        attempt: failed_attempts.max(1),
                         source: error.into(),
                     }),
                     Err(_) => Err(HarvestError::Cancelled(format!(
@@ -996,6 +1034,8 @@ impl WorkflowContext {
                     retry_policy,
                     result_tx: tx,
                     already_scheduled: false,
+                    failed_attempts: 0,
+                    last_error: None,
                 });
 
                 match rx.await {

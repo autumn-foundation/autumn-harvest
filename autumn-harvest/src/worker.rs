@@ -553,6 +553,12 @@ struct LocalActivityRun {
     /// the worker crashed after appending it but before recording a terminal event.
     /// `run_local_activity_inline` must skip re-appending the scheduled event.
     already_scheduled: bool,
+    /// Number of `LocalActivityFailed` events already durable in history.
+    /// `run_local_activity_inline` starts its retry loop from `failed_attempts + 1`.
+    failed_attempts: u32,
+    /// Error from the last recorded `LocalActivityFailed`. Returned immediately
+    /// when `failed_attempts >= max_attempts` without running the handler again.
+    last_error: Option<String>,
 }
 
 /// Extract a `RunLocalActivity` command from an owned command list.
@@ -580,6 +586,8 @@ fn extract_run_local_activity(
                 retry_policy,
                 result_tx,
                 already_scheduled,
+                failed_attempts,
+                last_error,
             } => {
                 drop(result_tx); // coroutine already dropped; close the channel
                 local_run = Some(LocalActivityRun {
@@ -589,6 +597,8 @@ fn extract_run_local_activity(
                     start_to_close_secs,
                     retry_policy,
                     already_scheduled,
+                    failed_attempts,
+                    last_error,
                 });
             }
             _ => {} // unexpected alongside RunLocalActivity; ignore
@@ -647,7 +657,26 @@ async fn run_local_activity_inline(
     let handler = activity.handler;
     let local_idempotency_key = IdempotencyKey::from_activity_exec_id(run.activity_id);
 
-    for attempt in 1..=max_attempts {
+    // When recovering after a crash-between-retries, all attempts up to
+    // `failed_attempts` are already durable in history. If they already cover
+    // max_attempts, every retry was exhausted before the crash — return the
+    // last recorded error without executing the handler again.
+    let start_attempt = run.failed_attempts + 1;
+    if start_attempt > max_attempts {
+        let error = run.last_error.unwrap_or_else(|| {
+            format!(
+                "local activity '{}' failed after {} attempts (recorded in history)",
+                run.name, run.failed_attempts
+            )
+        });
+        return Err(HarvestError::ActivityFailed {
+            name: run.name.clone(),
+            attempt: run.failed_attempts,
+            source: error.into(),
+        });
+    }
+
+    for attempt in start_attempt..=max_attempts {
         let ctx =
             ActivityContext::new_local_activity(registry.shared_state(), CancellationToken::new())
                 .with_idempotency_key(local_idempotency_key.clone())
