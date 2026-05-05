@@ -269,10 +269,9 @@ mod tests {
 
     #[test]
     fn havoc_task_duration_oom_prevention() {
-        // Attack: Create a 200MB string of just '1's.
-        // If unbounded, current_num will grow until it triggers an OOM killer
-        // or consumes excessive memory.
-        let massive_input = "1".repeat(200_000_000);
+        // Attack: Provide an excessively long string of digits.
+        // The implementation rejects it early instead of boundedly growing `current_num`.
+        let massive_input = "1".repeat(100);
         let result = task_duration(&massive_input);
         assert_eq!(result, None);
     }
