@@ -272,8 +272,7 @@ fn context_without_key_returns_config_error() {
     let result = ctx.idempotency_key();
     assert!(
         matches!(result, Err(HarvestError::Config(_))),
-        "missing idempotency key must return HarvestError::Config, got: {:?}",
-        result
+        "missing idempotency key must return HarvestError::Config, got: {result:?}"
     );
 }
 
