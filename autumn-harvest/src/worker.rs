@@ -617,6 +617,7 @@ fn extract_run_local_activity(
 /// `LocalActivityFailed` event; on success a `LocalActivityCompleted` event is
 /// appended. Returns all newly-appended events so the caller can extend its
 /// in-memory replay history and avoid a DB round-trip.
+#[allow(clippy::too_many_lines)]
 async fn run_local_activity_inline(
     conn: &mut AsyncPgConnection,
     registry: &HandlerRegistry,
@@ -723,11 +724,29 @@ async fn run_local_activity_inline(
                 *next_event_id += 1;
                 all_new_events.push(failed_event);
 
-                if attempt < max_attempts
-                    && let Some(delay) = run
-                        .retry_policy
-                        .as_ref()
-                        .and_then(|p| p.next_delay(attempt))
+                if attempt == max_attempts {
+                    // All retries exhausted. Append an explicit terminal event
+                    // so replay can identify the exhausted state independent
+                    // of the current retry policy, preventing spurious re-runs
+                    // when max_attempts increases between deployments.
+                    let exhausted_event = WorkflowEvent::LocalActivityExhausted {
+                        activity_id: run.activity_id,
+                        error: error.clone(),
+                        attempt,
+                    };
+                    store::append_events(
+                        conn,
+                        exec_id,
+                        std::slice::from_ref(&exhausted_event),
+                        *next_event_id,
+                    )
+                    .await?;
+                    *next_event_id += 1;
+                    all_new_events.push(exhausted_event);
+                } else if let Some(delay) = run
+                    .retry_policy
+                    .as_ref()
+                    .and_then(|p| p.next_delay(attempt))
                 {
                     tokio::time::sleep(delay).await;
                 }

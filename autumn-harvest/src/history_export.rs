@@ -76,7 +76,8 @@ impl MermaidExporter {
                 }
                 WorkflowEvent::LocalActivityScheduled { .. }
                 | WorkflowEvent::LocalActivityCompleted { .. }
-                | WorkflowEvent::LocalActivityFailed { .. } => {
+                | WorkflowEvent::LocalActivityFailed { .. }
+                | WorkflowEvent::LocalActivityExhausted { .. } => {
                     self.handle_local_activity_event(event)?;
                 }
                 WorkflowEvent::UpdateAdmitted { .. }

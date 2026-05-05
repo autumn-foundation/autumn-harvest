@@ -3412,6 +3412,13 @@ mod tests {
                 error: "always fails".into(),
                 attempt: 1,
             },
+            // LocalActivityExhausted is the authoritative terminal marker; without
+            // it the context would treat this as a crash-between-retries case.
+            WorkflowEvent::LocalActivityExhausted {
+                activity_id: id,
+                error: "always fails".into(),
+                attempt: 1,
+            },
         ];
         let ctx = WorkflowContext::for_replay(crate::types::ExecutionId::new(), events);
         let result = ctx
