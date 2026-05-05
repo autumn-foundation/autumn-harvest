@@ -195,6 +195,12 @@ pub fn task_duration(s: &str) -> Option<std::time::Duration> {
 
     for ch in s.chars() {
         if ch.is_ascii_digit() {
+            if current_num == "0" {
+                current_num.clear();
+            }
+            if current_num.len() > 20 {
+                return None;
+            }
             current_num.push(ch);
         } else if ch.is_ascii_alphabetic() {
             let num: u64 = current_num.parse().ok()?;
@@ -262,5 +268,23 @@ mod tests {
         assert_eq!(task_duration("18446744073709551615h"), None); // u64::MAX
         assert_eq!(task_duration("18446744073709551615m"), None); // u64::MAX
         assert_eq!(task_duration("18446744073709551614s 2s"), None); // Add overflow
+    }
+
+    #[test]
+    fn havoc_task_duration_oom_prevention() {
+        // Attack: Provide an excessively long string of digits.
+        // The implementation rejects it early instead of boundedly growing `current_num`.
+        let massive_input = "1".repeat(100);
+        let result = task_duration(&massive_input);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn task_duration_allows_zero_padded_values() {
+        let zero_padded = format!("{}1s", "0".repeat(50));
+        assert_eq!(task_duration(&zero_padded), Some(Duration::from_secs(1)));
+        // 0s is rejected globally by task_duration, so we test None
+        assert_eq!(task_duration("000000000000s"), None);
+        assert_eq!(task_duration("0000010m"), Some(Duration::from_secs(600)));
     }
 }
