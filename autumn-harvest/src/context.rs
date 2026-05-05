@@ -463,7 +463,7 @@ impl WorkflowContext {
 
     /// Test constructor -- creates a context in live (non-replay) mode with
     /// empty state and a fresh execution ID.
-    #[cfg(any(test, feature = "testing"))]
+    #[cfg(test)]
     #[must_use]
     pub fn new_test() -> Self {
         let exec_id = ExecutionId::new();
@@ -1950,15 +1950,6 @@ impl ActivityContext {
             tokio_util::sync::CancellationToken::new(),
         )
     }
-
-    #[cfg(any(test, feature = "testing"))]
-    #[must_use]
-    pub(crate) fn new_test_with_heartbeat_details(details: Option<serde_json::Value>) -> Self {
-        let mut ctx = Self::new_test();
-        ctx.heartbeat_details = details;
-        ctx.heartbeat_unsupported_reason = None;
-        ctx
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2102,9 +2093,18 @@ mod tests {
         progress: u32,
     }
 
+    fn activity_context_with_heartbeat_details(
+        details: Option<serde_json::Value>,
+    ) -> ActivityContext {
+        let mut ctx = ActivityContext::new_test();
+        ctx.heartbeat_details = details;
+        ctx.heartbeat_unsupported_reason = None;
+        ctx
+    }
+
     #[test]
     fn activity_context_heartbeat_details_deserializes_previous_payload() {
-        let ctx = ActivityContext::new_test_with_heartbeat_details(Some(serde_json::json!({
+        let ctx = activity_context_with_heartbeat_details(Some(serde_json::json!({
             "progress": 42,
         })));
 
@@ -2117,7 +2117,7 @@ mod tests {
 
     #[test]
     fn activity_context_heartbeat_details_type_mismatch_returns_error() {
-        let ctx = ActivityContext::new_test_with_heartbeat_details(Some(serde_json::json!({
+        let ctx = activity_context_with_heartbeat_details(Some(serde_json::json!({
             "progress": "not a number",
         })));
 
