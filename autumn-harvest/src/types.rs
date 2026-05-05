@@ -610,6 +610,102 @@ pub enum WorkflowIdReusePolicy {
     TerminateIfRunning,
 }
 
+// ---------------------------------------------------------------------------
+// IdempotencyKey
+// ---------------------------------------------------------------------------
+
+/// A stable, deterministic idempotency key for a single logical activity
+/// invocation.
+///
+/// The key is derived from the `ActivityExecId` recorded in the
+/// `ActivityScheduled` (or `LocalActivityScheduled`) event the first time the
+/// activity is dispatched.  Because that event is part of the durable history,
+/// the key is identical across:
+///
+/// - worker restarts
+/// - duplicate task-queue dispatch
+/// - deterministic replay
+/// - every retry attempt for the same logical invocation
+///
+/// Two distinct activity invocations in the same workflow execution receive
+/// distinct keys, even when they call the same activity with the same input.
+///
+/// ## Subkeys
+///
+/// Use [`subkey`](Self::subkey) to derive a named child key when one activity
+/// must produce multiple distinct side effects (e.g. charge + notify).
+/// Subkeys are stable and collision-resistant within their parent.
+///
+/// ## HTTP-header safety
+///
+/// Both base keys and subkeys contain only printable ASCII characters and are
+/// safe to use as the value of an `Idempotency-Key` HTTP request header.
+///
+/// ## Example
+///
+/// ```rust
+/// use autumn_harvest::types::{ActivityExecId, IdempotencyKey};
+///
+/// // In production the engine sets this on ActivityContext for you.
+/// let id = ActivityExecId::new();
+/// let key = IdempotencyKey::from_activity_exec_id(id);
+///
+/// // Pass the base key to a payment gateway or email provider.
+/// let _charge_key: &str = key.as_str();
+///
+/// // Derive a subkey for a second outbound call within the same activity.
+/// let notify_key = key.subkey("notify");
+/// assert_ne!(key.as_str(), notify_key.as_str());
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct IdempotencyKey {
+    base: String,
+}
+
+impl IdempotencyKey {
+    /// Build an `IdempotencyKey` from the stable `ActivityExecId` for this
+    /// logical activity invocation.
+    #[must_use]
+    pub fn from_activity_exec_id(id: ActivityExecId) -> Self {
+        Self {
+            base: id.as_uuid().to_string(),
+        }
+    }
+
+    /// The key as a string slice — safe to pass directly as an
+    /// `Idempotency-Key` HTTP header value.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.base
+    }
+
+    /// Derive a stable named subkey for a secondary outbound call within the
+    /// same activity.
+    ///
+    /// `name` should be a short, stable identifier (e.g. `"charge"`,
+    /// `"notify"`, `"provision"`).  Distinct names always produce distinct
+    /// subkeys.  The same `(parent_key, name)` pair always produces the same
+    /// subkey, making it safe to use in retry loops.
+    ///
+    /// Subkeys are themselves `IdempotencyKey` values so they can be further
+    /// nested if necessary.
+    #[must_use]
+    pub fn subkey(&self, name: &str) -> Self {
+        // Stable, readable, and unambiguous: the parent UUID prefix ensures
+        // cross-invocation uniqueness; the `name` suffix ensures sibling
+        // subkeys are distinct.
+        Self {
+            base: format!("{}/{name}", self.base),
+        }
+    }
+}
+
+impl fmt::Display for IdempotencyKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.base)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

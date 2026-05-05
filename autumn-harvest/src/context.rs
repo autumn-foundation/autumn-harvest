@@ -20,7 +20,7 @@ use crate::error::{HarvestError, HarvestResult};
 use crate::event::WorkflowEvent;
 use crate::query::QueryRegistry;
 use crate::replay::{HistoryMatch, HistoryMatcher};
-use crate::types::{ActivityExecId, ExecutionId, ExternalActivityToken, TimerId, UpdateId};
+use crate::types::{ActivityExecId, ExecutionId, ExternalActivityToken, IdempotencyKey, TimerId, UpdateId};
 use crate::update::{BoxUpdateHandler, BoxUpdateValidator, UpdateRegistry};
 
 /// Runtime map of typed shared state registered on the harvest builder.
@@ -1659,6 +1659,15 @@ pub struct ActivityContext {
     /// W3C tracecontext carrier captured at enqueue, surfaced so activity
     /// handlers can propagate the trace to downstream services.
     trace_context: Option<crate::telemetry::TraceContextCarrier>,
+    /// Stable idempotency key for this logical activity invocation.
+    ///
+    /// Derived from the `ActivityExecId` recorded in the `ActivityScheduled`
+    /// or `LocalActivityScheduled` event — identical across all retry attempts
+    /// for the same logical invocation.
+    idempotency_key: Option<IdempotencyKey>,
+    /// Which attempt of the logical activity invocation this context represents.
+    /// `1` for the first attempt. Stable retries share a key but differ here.
+    attempt: Option<u32>,
 }
 
 impl ActivityContext {
@@ -1683,6 +1692,8 @@ impl ActivityContext {
             #[cfg(feature = "db")]
             cancellation_check: None,
             trace_context: None,
+            idempotency_key: None,
+            attempt: None,
         }
     }
 
@@ -1712,6 +1723,8 @@ impl ActivityContext {
                 last_checked_at: Mutex::new(None),
             }),
             trace_context: None,
+            idempotency_key: None,
+            attempt: None,
         }
     }
 
@@ -1729,6 +1742,8 @@ impl ActivityContext {
             #[cfg(feature = "db")]
             cancellation_check: None,
             trace_context: None,
+            idempotency_key: None,
+            attempt: None,
         }
     }
 
@@ -1750,6 +1765,67 @@ impl ActivityContext {
     #[must_use]
     pub const fn trace_context(&self) -> Option<&crate::telemetry::TraceContextCarrier> {
         self.trace_context.as_ref()
+    }
+
+    /// Attach a stable idempotency key to this context.
+    ///
+    /// The engine calls this automatically for both regular and local
+    /// activities. You only need it when constructing a context manually in
+    /// tests.
+    #[must_use]
+    pub fn with_idempotency_key(mut self, key: IdempotencyKey) -> Self {
+        self.idempotency_key = Some(key);
+        self
+    }
+
+    /// Set the attempt number for this activity invocation.
+    ///
+    /// `1` means the first attempt. The engine sets this automatically; you
+    /// only need it when constructing a context manually in tests.
+    #[must_use]
+    pub fn with_attempt(mut self, attempt: u32) -> Self {
+        self.attempt = Some(attempt);
+        self
+    }
+
+    /// The stable idempotency key for this logical activity invocation.
+    ///
+    /// Identical across all retry attempts for the same logical invocation
+    /// (worker restarts, duplicate dispatch, and deterministic replay all
+    /// produce the same key).  Safe to use directly as an `Idempotency-Key`
+    /// HTTP request header.
+    ///
+    /// Use [`IdempotencyKey::subkey`] to derive a named child key when one
+    /// activity must produce multiple distinct side effects.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Config`] if no idempotency key was attached to
+    /// this context.  In production this never happens; in tests use
+    /// [`Self::with_idempotency_key`] or [`Self::new_test`] which always
+    /// provides a key.
+    pub fn idempotency_key(&self) -> Result<&IdempotencyKey, HarvestError> {
+        self.idempotency_key.as_ref().ok_or_else(|| {
+            HarvestError::Config(
+                "idempotency key not available on this context; \
+                 use ActivityContext::new_test() or ActivityContext::with_idempotency_key()"
+                    .into(),
+            )
+        })
+    }
+
+    /// Which attempt of the logical activity invocation this context
+    /// represents.  `Some(1)` for the first attempt, `Some(2)` for the first
+    /// retry, and so on.  `None` if the engine did not set an attempt (e.g.
+    /// contexts built with the bare `new` constructor).
+    ///
+    /// The default idempotency key is **retry-stable** (same value for all
+    /// attempts).  Call `ctx.idempotency_key()?.subkey(&format!("attempt-{}",
+    /// ctx.attempt().unwrap_or(1)))` to opt into an attempt-scoped subkey if
+    /// your downstream API requires distinct keys per attempt.
+    #[must_use]
+    pub fn attempt(&self) -> Option<u32> {
+        self.attempt
     }
 
     /// Access typed shared state.
@@ -1944,6 +2020,21 @@ impl ActivityContext {
     #[cfg(any(test, feature = "testing"))]
     #[must_use]
     pub fn new_test() -> Self {
+        let id = ActivityExecId::new();
+        Self::new(
+            empty_shared_state(),
+            None,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .with_idempotency_key(IdempotencyKey::from_activity_exec_id(id))
+        .with_attempt(1)
+    }
+
+    /// Like [`new_test`](Self::new_test) but intentionally omits the
+    /// idempotency key.  Used only in tests that verify the error path.
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn new_for_idempotency_test_no_key() -> Self {
         Self::new(
             empty_shared_state(),
             None,

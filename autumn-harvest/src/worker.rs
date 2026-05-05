@@ -40,7 +40,7 @@ use crate::telemetry::{
     ATTR_ACTIVITY_NAME, ATTR_ATTEMPT, ATTR_EXECUTION_ID, ATTR_QUEUE, ATTR_SHARD_ID,
     ATTR_WORKFLOW_ID, ActivityStatus, TraceContextCarrier, WorkflowStatus,
 };
-use crate::types::{ActivityExecId, ExecutionId, ExternalActivityToken, TimerId, WorkerId};
+use crate::types::{ActivityExecId, ExecutionId, ExternalActivityToken, IdempotencyKey, TimerId, WorkerId};
 
 /// Type alias for the deadpool-managed async Diesel connection pool.
 pub type DbPool = deadpool::managed::Pool<
@@ -633,11 +633,16 @@ async fn run_local_activity_inline(
         .map_err(|_| HarvestError::Config("event count overflow".into()))?;
 
     let mut all_new_events = prefix_events;
-    let ctx =
-        ActivityContext::new_local_activity(registry.shared_state(), CancellationToken::new());
     let handler = activity.handler;
+    let local_idempotency_key = IdempotencyKey::from_activity_exec_id(run.activity_id);
 
     for attempt in 1..=max_attempts {
+        let ctx = ActivityContext::new_local_activity(
+            registry.shared_state(),
+            CancellationToken::new(),
+        )
+        .with_idempotency_key(local_idempotency_key.clone())
+        .with_attempt(attempt);
         let result = tokio::time::timeout(per_attempt_timeout, (handler)(&ctx, run.input.clone()))
             .await
             .unwrap_or_else(|_| {
@@ -1835,7 +1840,9 @@ async fn process_activity_task(
         task.id,
         pool.clone(),
     )
-    .with_trace_context(trace_carrier.clone());
+    .with_trace_context(trace_carrier.clone())
+    .with_idempotency_key(IdempotencyKey::from_activity_exec_id(activity_id))
+    .with_attempt(task_attempt(task));
 
     let telemetry = registry.telemetry().clone();
     // ADR-0001 §3: restore the producer's trace context so the activity span
