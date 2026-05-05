@@ -194,6 +194,7 @@ pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> Ha
         start_to_close: params.start_to_close,
         schedule_to_start: params.schedule_to_start,
         retry_policy: params.retry_policy.clone(),
+        heartbeat_details: None,
         sticky_worker_id: None,
         sticky_until: None,
         sticky_timeout: None,
@@ -407,6 +408,9 @@ pub async fn concurrency_key_stats(
 
 /// Mark a task as completed with the given output.
 ///
+/// Terminal completion clears any heartbeat checkpoint payload so it cannot be
+/// observed after the activity has successfully finished.
+///
 /// # Errors
 ///
 /// Returns [`crate::error::HarvestError::Database`] on update failure.
@@ -425,6 +429,7 @@ pub async fn complete_task(
     .set((
         dsl::state.eq("COMPLETED"),
         dsl::output.eq(Some(output)),
+        dsl::heartbeat_details.eq(None::<serde_json::Value>),
         dsl::completed_at.eq(Some(Utc::now())),
     ))
     .execute(conn)
@@ -441,6 +446,10 @@ pub async fn complete_task(
 }
 
 /// Mark a task as failed with the given error message.
+///
+/// This is a terminal transition, so heartbeat checkpoint payloads are cleared.
+/// Retry rescheduling uses [`requeue_for_retry`] instead and preserves the
+/// payload for the next attempt.
 ///
 /// # Errors
 ///
@@ -460,6 +469,7 @@ pub async fn fail_task(
     .set((
         dsl::state.eq("FAILED"),
         dsl::error.eq(Some(error)),
+        dsl::heartbeat_details.eq(None::<serde_json::Value>),
         dsl::completed_at.eq(Some(Utc::now())),
     ))
     .execute(conn)
@@ -500,6 +510,7 @@ pub async fn fail_open_tasks_for_execution(
     .set((
         dsl::state.eq("FAILED"),
         dsl::error.eq(Some(error.to_string())),
+        dsl::heartbeat_details.eq(None::<serde_json::Value>),
         dsl::completed_at.eq(Some(Utc::now())),
     ))
     .execute(conn)
@@ -532,6 +543,7 @@ pub async fn cancel_open_tasks_for_execution(
         dsl::state.eq("CANCELLED"),
         dsl::worker_id.eq(None::<String>),
         dsl::error.eq(Some(reason.to_string())),
+        dsl::heartbeat_details.eq(None::<serde_json::Value>),
         dsl::completed_at.eq(Some(Utc::now())),
     ))
     .execute(conn)
@@ -576,12 +588,16 @@ pub async fn queue_depths(
     Ok(rows.into_iter().map(|r| (r.queue_name, r.depth)).collect())
 }
 
-/// Update the `last_heartbeat_at` timestamp for a running task.
+/// Update the `last_heartbeat_at` timestamp and checkpoint payload for a running task.
 ///
 /// # Errors
 ///
 /// Returns [`crate::error::HarvestError::Database`] on update failure.
-pub async fn record_heartbeat(conn: &mut AsyncPgConnection, task_id: Uuid) -> HarvestResult<()> {
+pub async fn record_heartbeat(
+    conn: &mut AsyncPgConnection,
+    task_id: Uuid,
+    details: serde_json::Value,
+) -> HarvestResult<()> {
     use crate::schema::harvest_task_queue::dsl;
 
     let updated = diesel::update(
@@ -589,7 +605,10 @@ pub async fn record_heartbeat(conn: &mut AsyncPgConnection, task_id: Uuid) -> Ha
             .find(task_id)
             .filter(dsl::state.eq("RUNNING")),
     )
-    .set(dsl::last_heartbeat_at.eq(Some(Utc::now())))
+    .set((
+        dsl::last_heartbeat_at.eq(Some(Utc::now())),
+        dsl::heartbeat_details.eq(Some(details)),
+    ))
     .execute(conn)
     .await
     .map_err(crate::error::database_error)?;
@@ -618,6 +637,10 @@ pub async fn requeue_for_retry(
 }
 
 /// Reset a task to `PENDING` at an explicit timestamp.
+///
+/// Clears only the liveness timestamp for the failed attempt. The heartbeat
+/// details payload is intentionally preserved so the retry attempt can resume
+/// from the last flushed checkpoint.
 ///
 /// # Errors
 ///

@@ -32,9 +32,13 @@ use diesel_async::RunQueryDsl;
 use diesel_async::SimpleAsyncConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use scoped_futures::ScopedFutureExt;
+use std::any::TypeId;
+use std::collections::HashMap;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use testcontainers::ContainerAsync;
 use testcontainers_modules::postgres::Postgres;
@@ -53,6 +57,8 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260409000000_harvest_initial/up.sql"),
     "\n",
     include_str!("../migrations/20260424000001_harvest_trace_context/up.sql"),
+    "\n",
+    include_str!("../migrations/20260505000000_harvest_heartbeat_details/up.sql"),
     "\n",
     include_str!("../migrations/20260427000000_harvest_continue_as_new/up.sql"),
     "\n",
@@ -75,6 +81,8 @@ const LEGACY_INIT_SQL: &str = concat!(
     include_str!("../migrations/20260409000000_harvest_initial/up.sql"),
     "\n",
     include_str!("../migrations/20260424000001_harvest_trace_context/up.sql"),
+    "\n",
+    include_str!("../migrations/20260505000000_harvest_heartbeat_details/up.sql"),
     "\n",
     include_str!("../migrations/20260429000000_harvest_concurrency_key/up.sql"),
 );
@@ -504,6 +512,17 @@ fn workflow_with_activity<'a>(
     })
 }
 
+fn workflow_with_checkpointed_activity<'a>(
+    ctx: &'a WorkflowContext,
+    input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        ctx.execute_activity_raw("checkpointed_import", input, "default")
+            .await
+            .map_err(|e| e.to_string())
+    })
+}
+
 fn send_email_activity<'a>(
     _ctx: &'a ActivityContext,
     input: serde_json::Value,
@@ -516,6 +535,81 @@ fn send_email_activity<'a>(
         Ok(serde_json::json!({
             "sent": true,
             "to": to,
+        }))
+    })
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ImportCheckpoint {
+    next_offset: usize,
+}
+
+#[derive(Debug, Default)]
+struct HeartbeatResumeStats {
+    attempts: AtomicUsize,
+    processed_steps: AtomicUsize,
+    resume_offsets: Mutex<Vec<usize>>,
+}
+
+fn heartbeat_resume_state(
+    stats: Arc<HeartbeatResumeStats>,
+) -> autumn_harvest::context::SharedState {
+    let mut shared_state_map = HashMap::new();
+    shared_state_map.insert(
+        TypeId::of::<Arc<HeartbeatResumeStats>>(),
+        Box::new(stats) as Box<dyn std::any::Any + Send + Sync>,
+    );
+    Arc::new(shared_state_map)
+}
+
+fn checkpointed_import_activity<'a>(
+    ctx: &'a ActivityContext,
+    input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let total = input
+            .get("total")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|n| usize::try_from(n).ok())
+            .unwrap_or(6);
+        let fail_after = input
+            .get("fail_after")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|n| usize::try_from(n).ok())
+            .unwrap_or(3);
+
+        let checkpoint = ctx
+            .heartbeat_details::<ImportCheckpoint>()
+            .map_err(|e| e.to_string())?;
+        let start = checkpoint.map_or(0, |details| details.next_offset);
+        let stats = Arc::clone(
+            ctx.state::<Arc<HeartbeatResumeStats>>()
+                .expect("test stats should be registered"),
+        );
+        let attempt = stats.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+        stats
+            .resume_offsets
+            .lock()
+            .expect("resume offset lock poisoned")
+            .push(start);
+
+        for offset in start..total {
+            stats.processed_steps.fetch_add(1, Ordering::SeqCst);
+            let next_offset = offset + 1;
+            ctx.heartbeat(ImportCheckpoint { next_offset })
+                .await
+                .map_err(|e| e.to_string())?;
+
+            if attempt == 1 && next_offset == fail_after {
+                tokio::time::sleep(Duration::from_millis(1_200)).await;
+                return Err(format!("fail after checkpoint {next_offset}"));
+            }
+        }
+
+        Ok(serde_json::json!({
+            "attempt": attempt,
+            "resumed_from": start,
+            "processed_total": AtomicUsize::load(&stats.processed_steps, Ordering::SeqCst),
         }))
     })
 }
@@ -1126,6 +1220,94 @@ async fn worker_completes_workflow_with_activity_round_trip() {
     assert_eq!(tasks.len(), 2, "workflow + activity task rows should exist");
     assert!(tasks.iter().all(|task| task.state == "COMPLETED"));
     assert!(tasks.iter().any(|task| task.id == workflow_task_id));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn activity_retry_resumes_from_persisted_heartbeat_details() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect to Postgres container");
+
+    let exec_id = insert_workflow_execution(&mut conn).await;
+    let workflow_input = serde_json::json!({
+        "total": 6,
+        "fail_after": 3,
+    });
+    store::append_events(
+        &mut conn,
+        exec_id,
+        &[WorkflowEvent::WorkflowStarted {
+            input: workflow_input.clone(),
+            timestamp: Utc::now(),
+        }],
+        0,
+    )
+    .await
+    .expect("append WorkflowStarted failed");
+
+    let mut params = EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
+    params.workflow_exec_id = Some(exec_id.as_uuid());
+    params.scheduled_at = Utc::now() - chrono::Duration::seconds(5);
+    queue::enqueue(&mut conn, &params)
+        .await
+        .expect("enqueue workflow task failed");
+
+    let stats = Arc::new(HeartbeatResumeStats::default());
+    let registry = Arc::new(HandlerRegistry::with_state(
+        vec![WorkflowInfo {
+            name: "e2e_test_workflow",
+            module: "integration_e2e",
+            handler: workflow_with_checkpointed_activity,
+        }],
+        vec![ActivityInfo {
+            name: "checkpointed_import",
+            module: "integration_e2e",
+            default_retry_policy: Some(autumn_harvest::RetryPolicy::fixed(
+                2,
+                Duration::from_millis(10),
+            )),
+            default_start_to_close: None,
+            default_heartbeat_timeout: None,
+            default_schedule_to_start: None,
+            default_queue: Some("default"),
+            max_concurrent: None,
+            concurrency_key: None,
+            is_local: false,
+            handler: checkpointed_import_activity,
+        }],
+        heartbeat_resume_state(Arc::clone(&stats)),
+    ));
+    let worker = build_runtime_worker("worker-heartbeat-resume", 1, 1, registry);
+    let pool = build_test_pool(&database_url);
+    let handle = spawn_test_worker(Arc::clone(&worker), pool);
+
+    let execution = wait_for_execution_state(&database_url, exec_id, "COMPLETED").await;
+
+    worker.shutdown();
+    handle.await.expect("worker task should join");
+
+    assert_eq!(
+        execution.output,
+        Some(serde_json::json!({
+            "attempt": 2,
+            "resumed_from": 3,
+            "processed_total": 6,
+        }))
+    );
+    assert_eq!(AtomicUsize::load(&stats.attempts, Ordering::SeqCst), 2);
+    assert_eq!(
+        AtomicUsize::load(&stats.processed_steps, Ordering::SeqCst),
+        6
+    );
+    assert_eq!(
+        *stats
+            .resume_offsets
+            .lock()
+            .expect("resume offset lock poisoned"),
+        vec![0, 3],
+        "second attempt must start from the checkpoint persisted by the first attempt",
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2125,13 +2307,19 @@ async fn reschedule_task_clears_stale_heartbeat_timestamp() {
         .expect("activity task should be claimable");
     assert_eq!(claimed.id, task_id);
 
-    queue::record_heartbeat(&mut conn, task_id)
+    let checkpoint = serde_json::json!({"next_offset": 7});
+    queue::record_heartbeat(&mut conn, task_id, checkpoint.clone())
         .await
         .expect("record heartbeat should succeed");
     let heartbeating = load_task_from_url(&database_url, task_id).await;
     assert!(
         heartbeating.last_heartbeat_at.is_some(),
         "heartbeat should be recorded before reschedule"
+    );
+    assert_eq!(
+        heartbeating.heartbeat_details,
+        Some(checkpoint.clone()),
+        "heartbeat payload should be recorded before reschedule"
     );
 
     queue::reschedule_task(
@@ -2149,6 +2337,11 @@ async fn reschedule_task_clears_stale_heartbeat_timestamp() {
     assert!(
         task.last_heartbeat_at.is_none(),
         "rescheduling should clear stale heartbeat timestamps"
+    );
+    assert_eq!(
+        task.heartbeat_details,
+        Some(checkpoint),
+        "rescheduling should preserve checkpoint payload for the retry attempt"
     );
 }
 

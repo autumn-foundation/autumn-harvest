@@ -160,7 +160,7 @@ Current implementation scope: `ExecutionId`/`ShardId` encoding, `ShardRouter`, `
 | `notify.rs` | 2 | LISTEN/NOTIFY wrapper: `Listener` (async stream), `Notifier` (pg_notify), channel naming |
 | `worker.rs` | 2 | Worker runtime: poll loop, semaphore-bounded concurrent dispatch, graceful shutdown |
 | `workers.rs` | 4 | Worker fleet registry: `register_worker`, `heartbeat_worker`, `transition_status`, `list_workers`, `get_worker`, `fleet_health`, `spawn_worker_heartbeat` |
-| `heartbeat.rs` | 2 | Batched heartbeat flusher: debounced channel receiver, bulk DB update |
+| `heartbeat.rs` | 2 | Batched heartbeat flusher: debounced channel receiver, last-write-wins timestamp + checkpoint payload DB update |
 | `timeout.rs` | 2 | Timeout enforcement scanner: start-to-close, schedule-to-start, heartbeat timeout queries |
 | `cache.rs` | 2 | LRU workflow state cache: bounded capacity, access-order eviction |
 | `dlq.rs` | 2 | Dead letter queue: `DeadLetterEntry` builder, move-to-DLQ on retry exhaustion |
@@ -238,7 +238,7 @@ async fn compute_checksum(ctx: &ActivityContext, data: Vec<u8>) -> Result<String
 | Execution location | Inline on the workflow worker | Dispatched to task queue / remote worker |
 | Typical duration | < 1 s | Any duration |
 | Hard timeout cap | `WorkerConfig::max_local_activity_start_to_close` (default 60 s) | No cap enforced by Harvest |
-| Heartbeating | **Not supported** | Supported |
+| Heartbeating | **Not supported**; `ctx.heartbeat(...)` returns a runtime `Config` error and no heartbeat checkpoint is available | Supported; retry attempts can read the last flushed payload with `ctx.heartbeat_details::<T>()` |
 | `schedule_to_start` timeout | **Not supported** | Supported |
 | Custom task queue | **Not supported** | Supported |
 | Retry policy | Supported | Supported |

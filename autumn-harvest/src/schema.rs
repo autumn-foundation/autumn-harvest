@@ -64,6 +64,7 @@ diesel::table! {
         started_at -> Nullable<Timestamptz>,
         completed_at -> Nullable<Timestamptz>,
         last_heartbeat_at -> Nullable<Timestamptz>,
+        heartbeat_details -> Nullable<Jsonb>,
         heartbeat_timeout -> Nullable<Interval>,
         start_to_close -> Nullable<Interval>,
         schedule_to_start -> Nullable<Interval>,

@@ -633,7 +633,8 @@ async fn run_local_activity_inline(
         .map_err(|_| HarvestError::Config("event count overflow".into()))?;
 
     let mut all_new_events = prefix_events;
-    let ctx = ActivityContext::new(registry.shared_state(), None, CancellationToken::new());
+    let ctx =
+        ActivityContext::new_local_activity(registry.shared_state(), CancellationToken::new());
     let handler = activity.handler;
 
     for attempt in 1..=max_attempts {
@@ -1829,6 +1830,7 @@ async fn process_activity_task(
     let ctx = ActivityContext::new_with_cancellation_check(
         registry.shared_state(),
         Some(heartbeat_tx),
+        task.heartbeat_details.clone(),
         cancel.clone(),
         task.id,
         pool.clone(),
