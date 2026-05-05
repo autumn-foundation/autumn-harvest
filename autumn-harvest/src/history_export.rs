@@ -325,6 +325,17 @@ impl MermaidExporter {
                     "    Note right of WF: Local Activity Failed (ID: {activity_id}, Attempt: {attempt}): {safe_error}"
                 )?;
             }
+            WorkflowEvent::LocalActivityExhausted {
+                activity_id,
+                error,
+                attempt,
+            } => {
+                let safe_error = error.replace('\n', " ").replace('"', "'");
+                writeln!(
+                    self.out,
+                    "    Note right of WF: Local Activity Exhausted (ID: {activity_id}, Attempts: {attempt}): {safe_error}"
+                )?;
+            }
             _ => unreachable!(),
         }
         Ok(())
