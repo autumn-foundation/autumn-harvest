@@ -81,6 +81,9 @@ async fn main() {
   up at the same state.
 - **Activities with retries.** Side effects live in `#[activity]` functions
   with configurable `start_to_close`, `heartbeat_timeout`, and `retry` policies.
+  Activities are **at-least-once**: a worker crash or timeout will trigger a
+  retry. Use `ctx.idempotency_key()` (see below) to make downstream calls safe
+  to retry without duplicate charges or duplicate emails.
 - **Per-activity concurrency caps.** Declare `max_concurrent = N` on an
   activity to enforce a cluster-wide cap without spinning up dedicated worker
   processes. Activities sharing a rate-limited dependency can share a budget
@@ -277,6 +280,99 @@ Or via the management API directly:
 
 ```bash
 GET /api/harvest/admin/concurrency
+```
+
+### Activity idempotency keys
+
+Harvest activities are **at-least-once**. A worker crash, a `start_to_close`
+timeout, or a duplicate task-queue dispatch will cause the activity to run
+again — potentially after the external system has already accepted the first
+request.  Passing a stable idempotency key to the downstream API (Stripe,
+SendGrid, Twilio, S3 multipart, your own mutation endpoint) converts
+at-least-once into effectively-exactly-once by letting the provider
+deduplicate.
+
+Every activity — **regular and local** — receives a Harvest-provided key via
+`ctx.idempotency_key()`.  The key is stable across:
+
+- worker restarts
+- duplicate task-queue dispatch of the same logical invocation
+- deterministic replay
+- every retry attempt for the same logical invocation
+
+Two distinct activity invocations — even calling the same activity name with
+the same input — always receive different keys.
+
+**Local activities** (`#[activity(local = true)]`) are fully supported.  The
+key is derived from the `ActivityExecId` recorded in the
+`LocalActivityScheduled` event, so it is identical across all inline retry
+attempts.  Local activities do not support heartbeating, but `idempotency_key()`
+works identically to regular activities.  If a future activity type were ever
+excluded, `idempotency_key()` would return a descriptive
+`HarvestError::Config` rather than silently producing an unstable or
+meaningless value.
+
+#### Billing / payment example
+
+```rust
+#[activity(start_to_close = "30s", retry = RetryPolicy::exponential(3, Duration::from_secs(2)))]
+async fn charge_card(
+    ctx: &ActivityContext,
+    amount_cents: u64,
+    customer_id: String,
+) -> HarvestResult<String> {
+    // idempotency_key() is always Ok in production; only None in bare unit-test
+    // contexts built without with_idempotency_key().
+    let idem_key = ctx.idempotency_key()?.as_str().to_owned();
+
+    let charge_id = stripe_client
+        .charges()
+        .create(CreateCharge {
+            amount: amount_cents as i64,
+            customer: customer_id,
+            idempotency_key: Some(idem_key), // ← same on every retry attempt
+            ..Default::default()
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(charge_id)
+}
+```
+
+If the worker crashes after Stripe accepts the charge but before Harvest
+records `ActivityCompleted`, the retry carries the same key and Stripe returns
+the already-created charge — no duplicate payment.
+
+#### Subkeys for multiple side effects
+
+When one activity must produce several distinct outbound calls, derive named
+subkeys from the base key:
+
+```rust
+#[activity(start_to_close = "60s")]
+async fn provision_account(ctx: &ActivityContext, user_id: i64) -> HarvestResult<()> {
+    let key = ctx.idempotency_key()?;
+
+    // Each call gets a distinct, stable key derived from the same parent.
+    create_db_user(&user_id, key.subkey("db").as_str()).await?;
+    send_welcome_email(&user_id, key.subkey("email").as_str()).await?;
+    create_billing_profile(&user_id, key.subkey("billing").as_str()).await?;
+
+    Ok(())
+}
+```
+
+#### Attempt-scoped keys (opt-in)
+
+The default key is **retry-stable** — the same value across all attempts for
+the same logical invocation. If a downstream API requires a fresh key on each
+attempt (uncommon), derive an attempt-scoped subkey:
+
+```rust
+let idem_key = ctx
+    .idempotency_key()?
+    .subkey(&format!("attempt-{}", ctx.attempt().unwrap_or(1)));
 ```
 
 ### Filtering the workflow list
