@@ -540,3 +540,84 @@ fn retention_commands_match_management_routes() {
     assert_eq!(run_now_request.path, "/admin/retention/run-now");
     assert_eq!(run_now_request.body, None);
 }
+
+#[test]
+fn audit_list_no_filters_maps_to_admin_audit() {
+    let cli = Cli::try_parse_from(["harvest", "audit", "list"])
+        .expect("audit list args should parse");
+    let request = cli.api_request().expect("request should build");
+    assert_eq!(request.method, ApiMethod::Get);
+    assert_eq!(request.path, "/admin/audit");
+    assert_eq!(request.body, None);
+}
+
+#[test]
+fn audit_list_all_filters_builds_correct_query_string() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "audit",
+        "list",
+        "--actor",
+        "alice@example.com",
+        "--operation",
+        "workflow.cancel",
+        "--target-type",
+        "workflow",
+        "--target-id",
+        "00000000-0000-0000-0000-000000000001",
+        "--status",
+        "succeeded",
+        "--since",
+        "2026-01-01T00:00:00Z",
+        "--before",
+        "2026-02-01T00:00:00Z",
+        "--limit",
+        "25",
+    ])
+    .expect("audit list args should parse");
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(request.method, ApiMethod::Get);
+    assert!(
+        request.path.starts_with("/admin/audit?"),
+        "path should include query string"
+    );
+    // Each filter must appear in the path. Colons in ISO timestamps are left
+    // unencoded by query_encode (matches the server's stable key:value shape).
+    for fragment in &[
+        "actor=alice%40example.com",
+        "operation=workflow.cancel",
+        "target_type=workflow",
+        "target_id=00000000-0000-0000-0000-000000000001",
+        "status=succeeded",
+        "since=2026-01-01T00:00:00Z",
+        "before=2026-02-01T00:00:00Z",
+        "limit=25",
+    ] {
+        assert!(
+            request.path.contains(fragment),
+            "expected fragment '{fragment}' not found in '{}'",
+            request.path
+        );
+    }
+    assert_eq!(request.body, None);
+}
+
+#[test]
+fn audit_list_partial_filters() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "audit",
+        "list",
+        "--status",
+        "failed",
+        "--limit",
+        "10",
+    ])
+    .expect("audit list partial args should parse");
+    let request = cli.api_request().expect("request should build");
+    assert_eq!(request.method, ApiMethod::Get);
+    assert!(request.path.contains("status=failed"));
+    assert!(request.path.contains("limit=10"));
+    assert!(!request.path.contains("actor="), "actor should be absent");
+}

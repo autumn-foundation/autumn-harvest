@@ -45,6 +45,16 @@ pub struct Cli {
     #[arg(long, global = true, env = "HARVEST_TOKEN", hide_env_values = true)]
     token: Option<String>,
 
+    /// Operator identity recorded in the audit trail for mutating commands.
+    /// Only sent on POST/PATCH/DELETE requests as `x-harvest-actor`.
+    /// If omitted, the server defaults to `"anonymous"` (acceptable only for dev).
+    #[arg(long, global = true, env = "HARVEST_ACTOR")]
+    actor: Option<String>,
+
+    /// Correlation request-id forwarded as `x-request-id` on mutating commands.
+    #[arg(long, global = true, env = "HARVEST_REQUEST_ID")]
+    request_id: Option<String>,
+
     /// Output format for successful API responses.
     #[arg(long, global = true, value_enum, default_value = "pretty-json")]
     output: OutputFormat,
@@ -204,8 +214,44 @@ enum Commands {
         #[command(subcommand)]
         command: BatchCommand,
     },
+    /// Browse the management API audit trail.
+    Audit {
+        #[command(subcommand)]
+        command: AuditCommand,
+    },
     /// Open the TUI dashboard to monitor workflows.
     Tui,
+}
+
+#[derive(Debug, Subcommand)]
+enum AuditCommand {
+    /// List audit records, newest first.
+    List {
+        /// Filter by operator identity.
+        #[arg(long)]
+        actor: Option<String>,
+        /// Filter by operation name (e.g. `workflow.start`, `dlq.replay`).
+        #[arg(long)]
+        operation: Option<String>,
+        /// Filter by target type (e.g. `workflow`, `schedule`, `dead_letter`).
+        #[arg(long)]
+        target_type: Option<String>,
+        /// Filter by target ID (execution ID, schedule name, DLQ entry ID, …).
+        #[arg(long)]
+        target_id: Option<String>,
+        /// Filter by outcome: `succeeded` or `failed`.
+        #[arg(long)]
+        status: Option<String>,
+        /// Lower bound (inclusive), RFC 3339 (e.g. `2026-01-01T00:00:00Z`).
+        #[arg(long)]
+        since: Option<String>,
+        /// Upper bound (exclusive), RFC 3339.
+        #[arg(long)]
+        before: Option<String>,
+        /// Maximum number of records to return [1–500].
+        #[arg(long, value_parser = clap::value_parser!(i64).range(1..=500))]
+        limit: Option<i64>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -583,6 +629,7 @@ impl Cli {
             Commands::Retention { command } => Ok(retention_request(command)),
             Commands::Concurrency { command } => Ok(concurrency_request(command)),
             Commands::Batch { command } => batch_request(command),
+            Commands::Audit { command } => Ok(audit_request(command)),
             Commands::Tui => unreachable!("Tui command handles its own requests"),
         }
     }
@@ -654,6 +701,20 @@ pub async fn execute(cli: &Cli) -> Result<Value, CliError> {
     } else {
         builder
     };
+    // Mutating requests identify the CLI as the call source and carry the
+    // operator identity and correlation id when supplied.
+    let builder = if request.method == ApiMethod::Get {
+        builder
+    } else {
+        let mut b = builder.header("x-harvest-source", "cli");
+        if let Some(actor) = &cli.actor {
+            b = b.header("x-harvest-actor", actor);
+        }
+        if let Some(rid) = &cli.request_id {
+            b = b.header("x-request-id", rid);
+        }
+        b
+    };
     let builder = if let Some(body) = &request.body {
         builder.json(body)
     } else {
@@ -691,6 +752,9 @@ fn render_response(cli: &Cli, value: &Value) -> Result<String, CliError> {
     if workflow_children_wants_table(cli) {
         return Ok(format_workflow_children_table(value));
     }
+    if audit_list_wants_table(cli) {
+        return Ok(format_audit_table(value));
+    }
 
     let output = if workflow_children_wants_raw_json(cli) {
         OutputFormat::Json
@@ -698,6 +762,15 @@ fn render_response(cli: &Cli, value: &Value) -> Result<String, CliError> {
         cli.output
     };
     format_output(value, output)
+}
+
+fn audit_list_wants_table(cli: &Cli) -> bool {
+    matches!(
+        &cli.command,
+        Commands::Audit {
+            command: AuditCommand::List { .. }
+        }
+    ) && cli.output == OutputFormat::PrettyJson
 }
 
 fn workflow_children_wants_table(cli: &Cli) -> bool {
@@ -772,6 +845,61 @@ fn format_workflow_children_table(value: &Value) -> String {
         rendered.push_str(cursor);
     }
     rendered
+}
+
+fn format_audit_table(value: &Value) -> String {
+    let Some(items) = value.as_array() else {
+        return "No audit records found.".to_string();
+    };
+    if items.is_empty() {
+        return "No audit records found.".to_string();
+    }
+
+    let mut rows: Vec<Vec<String>> = Vec::with_capacity(items.len() + 1);
+    rows.push(vec![
+        "OCCURRED_AT".to_string(),
+        "ACTOR".to_string(),
+        "OPERATION".to_string(),
+        "TARGET".to_string(),
+        "STATUS".to_string(),
+        "SRC".to_string(),
+        "ERROR".to_string(),
+    ]);
+    for item in items {
+        let target = match (
+            item.get("target_type").and_then(Value::as_str),
+            item.get("target_id").and_then(Value::as_str),
+        ) {
+            (Some(tt), Some(tid)) => format!("{tt}:{tid}"),
+            (Some(tt), None) => tt.to_string(),
+            _ => String::new(),
+        };
+        rows.push(vec![
+            cell_str(item.get("occurred_at")),
+            cell_str(item.get("actor")),
+            cell_str(item.get("operation")),
+            target,
+            cell_str(item.get("status")),
+            cell_str(item.get("source")),
+            cell_optional_str(item.get("error_summary")),
+        ]);
+    }
+
+    let widths = (0..rows[0].len())
+        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
+        .collect::<Vec<_>>();
+    rows.iter()
+        .map(|row| {
+            row.iter()
+                .enumerate()
+                .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
+                .collect::<Vec<_>>()
+                .join("  ")
+                .trim_end()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn cell_str(value: Option<&Value>) -> String {
@@ -1077,6 +1205,56 @@ fn retention_request(command: &RetentionCommand) -> ApiRequest {
 fn concurrency_request(command: &ConcurrencyCommand) -> ApiRequest {
     match command {
         ConcurrencyCommand::Status => ApiRequest::get("/admin/concurrency"),
+    }
+}
+
+fn audit_request(command: &AuditCommand) -> ApiRequest {
+    match command {
+        AuditCommand::List {
+            actor,
+            operation,
+            target_type,
+            target_id,
+            status,
+            since,
+            before,
+            limit,
+        } => {
+            let mut params: Vec<(&'static str, String)> = Vec::new();
+            if let Some(v) = actor {
+                params.push(("actor", v.clone()));
+            }
+            if let Some(v) = operation {
+                params.push(("operation", v.clone()));
+            }
+            if let Some(v) = target_type {
+                params.push(("target_type", v.clone()));
+            }
+            if let Some(v) = target_id {
+                params.push(("target_id", v.clone()));
+            }
+            if let Some(v) = status {
+                params.push(("status", v.clone()));
+            }
+            if let Some(v) = since {
+                params.push(("since", v.clone()));
+            }
+            if let Some(v) = before {
+                params.push(("before", v.clone()));
+            }
+            if let Some(v) = limit {
+                params.push(("limit", v.to_string()));
+            }
+            if params.is_empty() {
+                return ApiRequest::get("/admin/audit");
+            }
+            let qs = params
+                .iter()
+                .map(|(k, v)| format!("{k}={}", query_encode(v)))
+                .collect::<Vec<_>>()
+                .join("&");
+            ApiRequest::get(format!("/admin/audit?{qs}"))
+        }
     }
 }
 
