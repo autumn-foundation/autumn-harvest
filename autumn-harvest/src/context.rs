@@ -463,7 +463,7 @@ impl WorkflowContext {
 
     /// Test constructor -- creates a context in live (non-replay) mode with
     /// empty state and a fresh execution ID.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     #[must_use]
     pub fn new_test() -> Self {
         let exec_id = ExecutionId::new();
