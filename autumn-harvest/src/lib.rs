@@ -195,6 +195,9 @@ pub fn task_duration(s: &str) -> Option<std::time::Duration> {
 
     for ch in s.chars() {
         if ch.is_ascii_digit() {
+            if current_num.len() > 20 {
+                return None;
+            }
             current_num.push(ch);
         } else if ch.is_ascii_alphabetic() {
             let num: u64 = current_num.parse().ok()?;
@@ -262,5 +265,15 @@ mod tests {
         assert_eq!(task_duration("18446744073709551615h"), None); // u64::MAX
         assert_eq!(task_duration("18446744073709551615m"), None); // u64::MAX
         assert_eq!(task_duration("18446744073709551614s 2s"), None); // Add overflow
+    }
+
+    #[test]
+    fn havoc_task_duration_oom_prevention() {
+        // Attack: Create a 200MB string of just '1's.
+        // If unbounded, current_num will grow until it triggers an OOM killer
+        // or consumes excessive memory.
+        let massive_input = "1".repeat(200_000_000);
+        let result = task_duration(&massive_input);
+        assert_eq!(result, None);
     }
 }
