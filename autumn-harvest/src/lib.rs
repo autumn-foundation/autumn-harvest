@@ -195,6 +195,9 @@ pub fn task_duration(s: &str) -> Option<std::time::Duration> {
 
     for ch in s.chars() {
         if ch.is_ascii_digit() {
+            if current_num.len() >= 20 {
+                return None;
+            }
             current_num.push(ch);
         } else if ch.is_ascii_alphabetic() {
             let num: u64 = current_num.parse().ok()?;
@@ -262,5 +265,12 @@ mod tests {
         assert_eq!(task_duration("18446744073709551615h"), None); // u64::MAX
         assert_eq!(task_duration("18446744073709551615m"), None); // u64::MAX
         assert_eq!(task_duration("18446744073709551614s 2s"), None); // Add overflow
+    }
+
+    #[test]
+    fn task_duration_rejects_unbounded_strings() {
+        // Create a string with 21 digits (exceeds the max buffer of 20)
+        let unbounded_input = format!("{}s", "9".repeat(21));
+        assert_eq!(task_duration(&unbounded_input), None);
     }
 }
