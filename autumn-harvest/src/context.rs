@@ -42,6 +42,10 @@ type ActivityCancellationPool =
 #[cfg(feature = "db")]
 const DURABLE_CANCELLATION_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
+const NO_HEARTBEAT_FLUSHER_REASON: &str = "heartbeats are not supported for this activity context because no heartbeat flusher is attached";
+const LOCAL_ACTIVITY_HEARTBEAT_REASON: &str =
+    "local activities do not support heartbeats; use a regular activity";
+
 #[cfg(feature = "db")]
 struct ActivityCancellationCheck {
     task_id: uuid::Uuid,
@@ -1645,8 +1649,8 @@ pub struct ActivityContext {
     heartbeat_tx: Option<tokio::sync::mpsc::Sender<serde_json::Value>>,
     /// Latest heartbeat payload durably persisted by the previous attempt.
     heartbeat_details: Option<serde_json::Value>,
-    /// `false` for local activities, which never write task-queue heartbeat rows.
-    heartbeats_supported: bool,
+    /// Why heartbeat APIs are unavailable for this activity context.
+    heartbeat_unsupported_reason: Option<&'static str>,
     /// Cancellation token -- allows the worker to signal graceful shutdown.
     cancel: tokio_util::sync::CancellationToken,
     /// Optional durable queue-state cancellation check for worker activities.
@@ -1666,11 +1670,15 @@ impl ActivityContext {
         heartbeat_tx: Option<tokio::sync::mpsc::Sender<serde_json::Value>>,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Self {
+        let heartbeat_unsupported_reason = heartbeat_tx
+            .is_none()
+            .then_some(NO_HEARTBEAT_FLUSHER_REASON);
+
         Self {
             state,
             heartbeat_tx,
             heartbeat_details: None,
-            heartbeats_supported: true,
+            heartbeat_unsupported_reason,
             cancel,
             #[cfg(feature = "db")]
             cancellation_check: None,
@@ -1688,11 +1696,15 @@ impl ActivityContext {
         task_id: uuid::Uuid,
         pool: ActivityCancellationPool,
     ) -> Self {
+        let heartbeat_unsupported_reason = heartbeat_tx
+            .is_none()
+            .then_some(NO_HEARTBEAT_FLUSHER_REASON);
+
         Self {
             state,
             heartbeat_tx,
             heartbeat_details,
-            heartbeats_supported: true,
+            heartbeat_unsupported_reason,
             cancel,
             cancellation_check: Some(ActivityCancellationCheck {
                 task_id,
@@ -1712,7 +1724,7 @@ impl ActivityContext {
             state,
             heartbeat_tx: None,
             heartbeat_details: None,
-            heartbeats_supported: false,
+            heartbeat_unsupported_reason: Some(LOCAL_ACTIVITY_HEARTBEAT_REASON),
             cancel,
             #[cfg(feature = "db")]
             cancellation_check: None,
@@ -1777,10 +1789,8 @@ impl ActivityContext {
     pub fn heartbeat_details<T: serde::de::DeserializeOwned>(
         &self,
     ) -> crate::HarvestResult<Option<T>> {
-        if !self.heartbeats_supported {
-            return Err(HarvestError::Config(
-                "local activities do not support heartbeat details; use a regular activity".into(),
-            ));
+        if let Some(reason) = self.heartbeat_unsupported_reason {
+            return Err(HarvestError::Config(reason.into()));
         }
 
         self.heartbeat_details
@@ -1836,10 +1846,8 @@ impl ActivityContext {
         #[cfg(feature = "db")]
         self.check_durable_cancellation().await?;
 
-        if !self.heartbeats_supported {
-            return Err(HarvestError::Config(
-                "local activities do not support heartbeats; use a regular activity".into(),
-            ));
+        if let Some(reason) = self.heartbeat_unsupported_reason {
+            return Err(HarvestError::Config(reason.into()));
         }
 
         let payload = serde_json::to_value(details)?;
@@ -1916,7 +1924,9 @@ impl ActivityContext {
     ///
     /// This method allows you to instantiate an `ActivityContext` in isolation
     /// for unit testing activity handlers without needing to spin up the entire
-    /// workflow engine.
+    /// workflow engine. It does not attach a heartbeat flusher, so
+    /// [`Self::heartbeat`] and [`Self::heartbeat_details`] return
+    /// [`HarvestError::Config`].
     ///
     /// ## Examples
     ///
@@ -1946,6 +1956,7 @@ impl ActivityContext {
     pub(crate) fn new_test_with_heartbeat_details(details: Option<serde_json::Value>) -> Self {
         let mut ctx = Self::new_test();
         ctx.heartbeat_details = details;
+        ctx.heartbeat_unsupported_reason = None;
         ctx
     }
 }
@@ -2126,6 +2137,25 @@ mod tests {
 
         assert!(
             matches!(result, Err(HarvestError::Config(message)) if message.contains("local activities do not support heartbeats"))
+        );
+    }
+
+    #[tokio::test]
+    async fn activity_context_without_heartbeat_channel_rejects_heartbeats() {
+        let ctx = ActivityContext::new(
+            empty_shared_state(),
+            None,
+            tokio_util::sync::CancellationToken::new(),
+        );
+
+        let heartbeat_result = ctx.heartbeat(serde_json::json!({"progress": 1})).await;
+        let details_result = ctx.heartbeat_details::<TestHeartbeatDetails>();
+
+        assert!(
+            matches!(heartbeat_result, Err(HarvestError::Config(message)) if message.contains("heartbeats are not supported"))
+        );
+        assert!(
+            matches!(details_result, Err(HarvestError::Config(message)) if message.contains("heartbeats are not supported"))
         );
     }
 
