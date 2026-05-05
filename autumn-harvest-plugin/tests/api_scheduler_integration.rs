@@ -18,6 +18,7 @@ use autumn_harvest::schema::{
     harvest_workflow_executions,
 };
 use autumn_harvest::shard::{ShardRouter, ShardedDbPool};
+use autumn_harvest::store;
 use autumn_harvest::types::{ExecutionId, ShardId};
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{
@@ -1364,6 +1365,100 @@ async fn harvest_api_filters_workflow_children_by_continued_as_new_status() {
 }
 
 #[tokio::test]
+async fn load_workflow_children_applies_limit_and_cursor_before_returning_rows() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let parent = insert_workflow_on_url(
+        &database_url,
+        ShardId::new(0),
+        "fanout_parent",
+        "store-page-parent",
+    )
+    .await;
+    let newest_child = insert_child_workflow_on_url(ChildWorkflowFixture {
+        database_url: &database_url,
+        shard: ShardId::new(0),
+        parent_id: parent,
+        workflow_name: "billing_child",
+        workflow_id: "store-page-newest",
+        state: "FAILED",
+        error: None,
+        started_offset_secs: 5,
+    })
+    .await;
+    let middle_child = insert_child_workflow_on_url(ChildWorkflowFixture {
+        database_url: &database_url,
+        shard: ShardId::new(0),
+        parent_id: parent,
+        workflow_name: "billing_child",
+        workflow_id: "store-page-middle",
+        state: "FAILED",
+        error: None,
+        started_offset_secs: 10,
+    })
+    .await;
+    let oldest_child = insert_child_workflow_on_url(ChildWorkflowFixture {
+        database_url: &database_url,
+        shard: ShardId::new(0),
+        parent_id: parent,
+        workflow_name: "billing_child",
+        workflow_id: "store-page-oldest",
+        state: "FAILED",
+        error: None,
+        started_offset_secs: 15,
+    })
+    .await;
+
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect for store page query");
+    let first_page = store::load_workflow_children(
+        &mut conn,
+        parent,
+        &store::WorkflowChildFilters {
+            statuses: Vec::new(),
+            workflow_name: None,
+            cursor: None,
+            limit: Some(2),
+        },
+        0,
+    )
+    .await
+    .expect("first child page should load");
+    assert_eq!(
+        first_page.iter().map(|row| row.exec_id).collect::<Vec<_>>(),
+        vec![newest_child, middle_child]
+    );
+
+    let cursor_row = first_page
+        .last()
+        .expect("first page should include a cursor row");
+    let second_page = store::load_workflow_children(
+        &mut conn,
+        parent,
+        &store::WorkflowChildFilters {
+            statuses: Vec::new(),
+            workflow_name: None,
+            cursor: Some(store::WorkflowChildCursor {
+                started_at: cursor_row.started_at,
+                exec_id: cursor_row.exec_id.as_uuid(),
+            }),
+            limit: Some(2),
+        },
+        0,
+    )
+    .await
+    .expect("second child page should load");
+
+    assert_eq!(
+        second_page
+            .iter()
+            .map(|row| row.exec_id)
+            .collect::<Vec<_>>(),
+        vec![oldest_child]
+    );
+}
+
+#[tokio::test]
 async fn harvest_api_lists_workflow_children_across_shards_and_paginates() {
     let ((shard0_url, shard1_url), _container) = setup_sharded_test_database_urls().await;
     let api_state = HarvestApiState::new();
@@ -1533,6 +1628,19 @@ async fn harvest_api_children_supports_recursive_depth_with_cap() {
                 && row["depth"] == 1
                 && row["workflow_name"] == "leaf_child")
     );
+
+    let (filtered_status, filtered_body) = get_json(
+        &app,
+        format!("/workflows/{parent}/children?depth=1&status=Failed"),
+    )
+    .await;
+    assert_eq!(filtered_status, StatusCode::OK);
+    let filtered_items = filtered_body["items"]
+        .as_array()
+        .expect("filtered children response must have an items array");
+    assert_eq!(filtered_items.len(), 1);
+    assert_eq!(filtered_items[0]["exec_id"], grandchild.to_string());
+    assert_eq!(filtered_items[0]["depth"], 1);
 
     let too_deep = get_response(&app, format!("/workflows/{parent}/children?depth=6")).await;
     assert_eq!(too_deep.status(), StatusCode::BAD_REQUEST);

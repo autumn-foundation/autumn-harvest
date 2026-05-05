@@ -966,13 +966,8 @@ async fn list_workflow_children(
             .map_err(map_error)?;
     }
 
-    let mut rows =
-        load_workflow_children_tree_from_shards(&api_state, exec_id, filters.max_depth).await?;
-    rows.retain(|row| workflow_child_matches_filters(row, &filters));
+    let mut rows = load_workflow_children_page_from_shards(&api_state, exec_id, &filters).await?;
     sort_workflow_child_rows(&mut rows);
-    if let Some(cursor) = &filters.cursor {
-        rows.retain(|row| workflow_child_is_after_cursor(row, cursor));
-    }
 
     let next_cursor = if rows.len() > filters.limit {
         let cursor = encode_workflow_children_cursor(&rows[filters.limit - 1]);
@@ -988,38 +983,53 @@ async fn list_workflow_children(
     }))
 }
 
-async fn load_workflow_children_tree_from_shards(
+async fn load_workflow_children_page_from_shards(
     api_state: &HarvestApiState,
     parent_id: ExecutionId,
-    max_depth: u8,
+    filters: &WorkflowChildrenFilters,
 ) -> Result<Vec<store::WorkflowChildRow>, AutumnError> {
     let pool = api_state.storage_pool().map_err(map_error)?;
     let mut rows = Vec::new();
-    let mut frontier = vec![parent_id];
-    let query_filters = store::WorkflowChildFilters::default();
+    let query_filters = workflow_children_store_filters(filters);
 
-    for depth in 0..=max_depth {
-        if frontier.is_empty() {
-            break;
-        }
-
-        let mut level_rows = Vec::new();
-        for parent in &frontier {
-            for (_shard, shard_pool) in pool.iter_shards() {
-                let mut conn = acquire_conn(shard_pool).await?;
-                let mut shard_rows =
-                    store::load_workflow_children(&mut conn, *parent, &query_filters, depth)
-                        .await
-                        .map_err(map_error)?;
-                level_rows.append(&mut shard_rows);
-            }
-        }
-
-        frontier = level_rows.iter().map(|row| row.exec_id).collect();
-        rows.append(&mut level_rows);
+    for (_shard, shard_pool) in pool.iter_shards() {
+        let mut conn = acquire_conn(shard_pool).await?;
+        let mut shard_rows = if filters.max_depth == 0 {
+            store::load_workflow_children(&mut conn, parent_id, &query_filters, 0)
+                .await
+                .map_err(map_error)?
+        } else {
+            store::load_workflow_child_descendants(
+                &mut conn,
+                parent_id,
+                &query_filters,
+                filters.max_depth,
+            )
+            .await
+            .map_err(map_error)?
+        };
+        rows.append(&mut shard_rows);
     }
 
     Ok(rows)
+}
+
+fn workflow_children_store_filters(
+    filters: &WorkflowChildrenFilters,
+) -> store::WorkflowChildFilters {
+    let query_limit = filters.limit.saturating_add(1);
+    store::WorkflowChildFilters {
+        statuses: filters.statuses.clone(),
+        workflow_name: filters.workflow_name.clone(),
+        cursor: filters
+            .cursor
+            .as_ref()
+            .map(|cursor| store::WorkflowChildCursor {
+                started_at: cursor.started_at,
+                exec_id: cursor.exec_id,
+            }),
+        limit: Some(i64::try_from(query_limit).unwrap_or(i64::MAX)),
+    }
 }
 
 fn parse_workflow_children_filters(
@@ -1114,21 +1124,6 @@ fn parse_workflow_children_cursor(raw: &str) -> Result<WorkflowChildrenCursor, A
     })
 }
 
-fn workflow_child_matches_filters(
-    row: &store::WorkflowChildRow,
-    filters: &WorkflowChildrenFilters,
-) -> bool {
-    if !filters.statuses.is_empty() && !filters.statuses.contains(&row.status) {
-        return false;
-    }
-    if let Some(name) = &filters.workflow_name
-        && row.workflow_name != *name
-    {
-        return false;
-    }
-    true
-}
-
 fn sort_workflow_child_rows(rows: &mut [store::WorkflowChildRow]) {
     rows.sort_by(|left, right| {
         right
@@ -1136,14 +1131,6 @@ fn sort_workflow_child_rows(rows: &mut [store::WorkflowChildRow]) {
             .cmp(&left.started_at)
             .then_with(|| right.exec_id.as_uuid().cmp(&left.exec_id.as_uuid()))
     });
-}
-
-fn workflow_child_is_after_cursor(
-    row: &store::WorkflowChildRow,
-    cursor: &WorkflowChildrenCursor,
-) -> bool {
-    row.started_at < cursor.started_at
-        || (row.started_at == cursor.started_at && row.exec_id.as_uuid() < cursor.exec_id)
 }
 
 fn encode_workflow_children_cursor(row: &store::WorkflowChildRow) -> String {

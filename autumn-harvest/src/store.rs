@@ -4,10 +4,12 @@
 //! The `UNIQUE(workflow_exec_id, event_id)` constraint guarantees
 //! that two workers can't append conflicting events to the same workflow.
 
+use diesel::BoolExpressionMethods;
 use diesel::ExpressionMethods;
 use diesel::OptionalExtension;
 use diesel::QueryDsl;
 use diesel::SelectableHelper;
+use diesel::sql_types::{Array, BigInt, Bool, Integer, Nullable, Text};
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
@@ -35,6 +37,15 @@ pub struct EventHistory {
 pub struct WorkflowChildFilters {
     pub statuses: Vec<String>,
     pub workflow_name: Option<String>,
+    pub cursor: Option<WorkflowChildCursor>,
+    pub limit: Option<i64>,
+}
+
+/// Cursor anchor for paged child workflow queries.
+#[derive(Debug, Clone)]
+pub struct WorkflowChildCursor {
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    pub exec_id: uuid::Uuid,
 }
 
 /// Operator-facing child workflow row used by management API read models.
@@ -59,6 +70,26 @@ type WorkflowChildProjection = (
     Option<String>,
     i32,
 );
+
+#[derive(Debug, diesel::QueryableByName)]
+struct WorkflowChildQueryRow {
+    #[diesel(sql_type = diesel::sql_types::Uuid)]
+    id: uuid::Uuid,
+    #[diesel(sql_type = Text)]
+    workflow_name: String,
+    #[diesel(sql_type = Text)]
+    state: String,
+    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+    started_at: chrono::DateTime<chrono::Utc>,
+    #[diesel(sql_type = Nullable<diesel::sql_types::Timestamptz>)]
+    completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[diesel(sql_type = Nullable<Text>)]
+    error: Option<String>,
+    #[diesel(sql_type = Integer)]
+    shard_id: i32,
+    #[diesel(sql_type = Integer)]
+    depth: i32,
+}
 
 /// Convert in-memory events to insertable rows with sequential event IDs
 /// starting from 0.
@@ -357,6 +388,18 @@ pub async fn load_workflow_children(
     if let Some(name) = &filters.workflow_name {
         query = query.filter(harvest_workflow_executions::workflow_name.eq(name.clone()));
     }
+    if let Some(cursor) = &filters.cursor {
+        query = query.filter(
+            harvest_workflow_executions::started_at
+                .lt(cursor.started_at)
+                .or(harvest_workflow_executions::started_at
+                    .eq(cursor.started_at)
+                    .and(harvest_workflow_executions::id.lt(cursor.exec_id))),
+        );
+    }
+    if let Some(limit) = filters.limit {
+        query = query.limit(limit);
+    }
 
     query
         .select((
@@ -375,20 +418,147 @@ pub async fn load_workflow_children(
             rows.into_iter()
                 .map(
                     |(id, workflow_name, state, started_at, completed_at, error, shard_id)| {
-                        WorkflowChildRow {
-                            exec_id: ExecutionId::from_uuid(id),
+                        workflow_child_row_from_parts(
+                            id,
                             workflow_name,
-                            status: state,
+                            state,
                             started_at,
                             completed_at,
-                            error_summary: summarize_error(error),
+                            error,
                             shard_id,
                             depth,
-                        }
+                        )
                     },
                 )
                 .collect()
         })
+}
+
+/// Load descendants of `parent_id` from one shard, applying result filters and
+/// pagination in SQL before rows are returned to the API layer.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub async fn load_workflow_child_descendants(
+    conn: &mut AsyncPgConnection,
+    parent_id: ExecutionId,
+    filters: &WorkflowChildFilters,
+    max_depth: u8,
+) -> HarvestResult<Vec<WorkflowChildRow>> {
+    let no_status_filter = filters.statuses.is_empty();
+    let no_name_filter = filters.workflow_name.is_none();
+    let no_cursor = filters.cursor.is_none();
+    let workflow_name = filters.workflow_name.clone().unwrap_or_default();
+    let cursor_started_at = filters
+        .cursor
+        .as_ref()
+        .map_or_else(chrono::Utc::now, |cursor| cursor.started_at);
+    let cursor_exec_id = filters
+        .cursor
+        .as_ref()
+        .map_or_else(uuid::Uuid::nil, |cursor| cursor.exec_id);
+    let limit = filters.limit.unwrap_or(i64::MAX);
+
+    diesel::sql_query(
+        "WITH RECURSIVE descendants AS (
+            SELECT
+                id,
+                workflow_name,
+                state,
+                started_at,
+                completed_at,
+                error,
+                shard_id,
+                0::int AS depth
+            FROM harvest_workflow_executions
+            WHERE parent_id = $1
+            UNION ALL
+            SELECT
+                child.id,
+                child.workflow_name,
+                child.state,
+                child.started_at,
+                child.completed_at,
+                child.error,
+                child.shard_id,
+                descendants.depth + 1
+            FROM harvest_workflow_executions child
+            JOIN descendants ON child.parent_id = descendants.id
+            WHERE descendants.depth < $2
+        )
+        SELECT
+            id,
+            workflow_name,
+            state,
+            started_at,
+            completed_at,
+            error,
+            shard_id,
+            depth
+        FROM descendants
+        WHERE ($3 OR state = ANY($4))
+          AND ($5 OR workflow_name = $6)
+          AND ($7 OR started_at < $8 OR (started_at = $8 AND id < $9))
+        ORDER BY started_at DESC, id DESC
+        LIMIT $10",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(parent_id.as_uuid())
+    .bind::<Integer, _>(i32::from(max_depth))
+    .bind::<Bool, _>(no_status_filter)
+    .bind::<Array<Text>, _>(filters.statuses.clone())
+    .bind::<Bool, _>(no_name_filter)
+    .bind::<Text, _>(workflow_name)
+    .bind::<Bool, _>(no_cursor)
+    .bind::<diesel::sql_types::Timestamptz, _>(cursor_started_at)
+    .bind::<diesel::sql_types::Uuid, _>(cursor_exec_id)
+    .bind::<BigInt, _>(limit)
+    .load::<WorkflowChildQueryRow>(conn)
+    .await
+    .map_err(crate::error::database_error)?
+    .into_iter()
+    .map(|row| {
+        let depth = u8::try_from(row.depth).map_err(|_| {
+            crate::error::HarvestError::Database(format!(
+                "workflow child depth {} does not fit in u8",
+                row.depth
+            ))
+        })?;
+        Ok(workflow_child_row_from_parts(
+            row.id,
+            row.workflow_name,
+            row.state,
+            row.started_at,
+            row.completed_at,
+            row.error,
+            row.shard_id,
+            depth,
+        ))
+    })
+    .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn workflow_child_row_from_parts(
+    id: uuid::Uuid,
+    workflow_name: String,
+    state: String,
+    started_at: chrono::DateTime<chrono::Utc>,
+    completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    error: Option<String>,
+    shard_id: i32,
+    depth: u8,
+) -> WorkflowChildRow {
+    WorkflowChildRow {
+        exec_id: ExecutionId::from_uuid(id),
+        workflow_name,
+        status: state,
+        started_at,
+        completed_at,
+        error_summary: summarize_error(error),
+        shard_id,
+        depth,
+    }
 }
 
 fn summarize_error(error: Option<String>) -> Option<String> {
