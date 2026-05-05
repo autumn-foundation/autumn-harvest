@@ -1,5 +1,6 @@
 //! Axum management routes for Harvest workflows and DAGs.
 
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -988,27 +989,67 @@ async fn load_workflow_children_page_from_shards(
     parent_id: ExecutionId,
     filters: &WorkflowChildrenFilters,
 ) -> Result<Vec<store::WorkflowChildRow>, AutumnError> {
+    if filters.max_depth > 0 {
+        return load_workflow_children_tree_from_shards(api_state, parent_id, filters).await;
+    }
+
     let pool = api_state.storage_pool().map_err(map_error)?;
     let mut rows = Vec::new();
     let query_filters = workflow_children_store_filters(filters);
 
     for (_shard, shard_pool) in pool.iter_shards() {
         let mut conn = acquire_conn(shard_pool).await?;
-        let mut shard_rows = if filters.max_depth == 0 {
-            store::load_workflow_children(&mut conn, parent_id, &query_filters, 0)
-                .await
-                .map_err(map_error)?
-        } else {
-            store::load_workflow_child_descendants(
-                &mut conn,
-                parent_id,
-                &query_filters,
-                filters.max_depth,
-            )
+        let mut shard_rows = store::load_workflow_children(&mut conn, parent_id, &query_filters, 0)
             .await
-            .map_err(map_error)?
-        };
+            .map_err(map_error)?;
         rows.append(&mut shard_rows);
+    }
+
+    Ok(rows)
+}
+
+async fn load_workflow_children_tree_from_shards(
+    api_state: &HarvestApiState,
+    parent_id: ExecutionId,
+    filters: &WorkflowChildrenFilters,
+) -> Result<Vec<store::WorkflowChildRow>, AutumnError> {
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    let mut rows = Vec::new();
+    let mut frontier = vec![parent_id];
+    let mut seen = HashSet::new();
+    // Result filters cannot constrain traversal: a nonmatching child can have
+    // matching descendants, and either row may live on any shard.
+    let traversal_filters = store::WorkflowChildFilters::default();
+
+    for depth in 0..=filters.max_depth {
+        if frontier.is_empty() {
+            break;
+        }
+
+        let mut next_frontier = Vec::new();
+        for parent in &frontier {
+            for (_shard, shard_pool) in pool.iter_shards() {
+                let mut conn = acquire_conn(shard_pool).await?;
+                let shard_rows =
+                    store::load_workflow_children(&mut conn, *parent, &traversal_filters, depth)
+                        .await
+                        .map_err(map_error)?;
+                for row in shard_rows {
+                    if !seen.insert(row.exec_id.as_uuid()) {
+                        continue;
+                    }
+
+                    next_frontier.push(row.exec_id);
+                    if workflow_child_matches_filters(&row, filters)
+                        && workflow_child_is_after_cursor(&row, filters.cursor.as_ref())
+                    {
+                        rows.push(row);
+                    }
+                }
+            }
+        }
+
+        frontier = next_frontier;
     }
 
     Ok(rows)
@@ -1122,6 +1163,33 @@ fn parse_workflow_children_cursor(raw: &str) -> Result<WorkflowChildrenCursor, A
         started_at,
         exec_id,
     })
+}
+
+fn workflow_child_matches_filters(
+    row: &store::WorkflowChildRow,
+    filters: &WorkflowChildrenFilters,
+) -> bool {
+    if !filters.statuses.is_empty() && !filters.statuses.contains(&row.status) {
+        return false;
+    }
+    if let Some(name) = &filters.workflow_name
+        && row.workflow_name != *name
+    {
+        return false;
+    }
+    true
+}
+
+fn workflow_child_is_after_cursor(
+    row: &store::WorkflowChildRow,
+    cursor: Option<&WorkflowChildrenCursor>,
+) -> bool {
+    let Some(cursor) = cursor else {
+        return true;
+    };
+
+    row.started_at < cursor.started_at
+        || (row.started_at == cursor.started_at && row.exec_id.as_uuid() < cursor.exec_id)
 }
 
 fn sort_workflow_child_rows(rows: &mut [store::WorkflowChildRow]) {

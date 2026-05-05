@@ -1542,6 +1542,62 @@ async fn harvest_api_lists_workflow_children_across_shards_and_paginates() {
 }
 
 #[tokio::test]
+async fn harvest_api_recursive_children_traverse_across_shards() {
+    let ((shard0_url, shard1_url), _container) = setup_sharded_test_database_urls().await;
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(build_two_shard_pool(&shard0_url, &shard1_url));
+    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+
+    let parent = insert_workflow_on_url(
+        &shard0_url,
+        ShardId::new(0),
+        "fanout_parent",
+        "cross-shard-recursive-parent",
+    )
+    .await;
+    let child = insert_child_workflow_on_url(ChildWorkflowFixture {
+        database_url: &shard1_url,
+        shard: ShardId::new(1),
+        parent_id: parent,
+        workflow_name: "middle_child",
+        workflow_id: "cross-shard-recursive-child",
+        state: "RUNNING",
+        error: None,
+        started_offset_secs: 10,
+    })
+    .await;
+    let grandchild = insert_child_workflow_on_url(ChildWorkflowFixture {
+        database_url: &shard0_url,
+        shard: ShardId::new(0),
+        parent_id: child,
+        workflow_name: "leaf_child",
+        workflow_id: "cross-shard-recursive-grandchild",
+        state: "FAILED",
+        error: Some("leaf failed across shards"),
+        started_offset_secs: 5,
+    })
+    .await;
+
+    let (status, body) = get_json(&app, format!("/workflows/{parent}/children?depth=1")).await;
+    assert_eq!(status, StatusCode::OK);
+    let items = body["items"]
+        .as_array()
+        .expect("children response must have an items array");
+
+    assert_eq!(items.len(), 2);
+    assert!(items.iter().any(|row| row["exec_id"] == child.to_string()
+        && row["depth"] == 0
+        && row["shard_id"] == 1));
+    assert!(
+        items
+            .iter()
+            .any(|row| row["exec_id"] == grandchild.to_string()
+                && row["depth"] == 1
+                && row["shard_id"] == 0)
+    );
+}
+
+#[tokio::test]
 async fn harvest_api_children_distinguishes_empty_parent_from_missing_parent() {
     let (database_url, _container) = setup_test_database_url().await;
     let pool = build_test_pool(&database_url);
