@@ -384,13 +384,7 @@ mod db {
         let ids_value = if dispatched_ids.is_empty() {
             Value::Array(Vec::new())
         } else {
-            serde_json::to_value(
-                dispatched_ids
-                    .iter()
-                    .map(Uuid::to_string)
-                    .collect::<Vec<String>>(),
-            )
-            .map_err(HarvestError::from)?
+            serde_json::to_value(dispatched_ids).map_err(HarvestError::from)?
         };
 
         // Single UPDATE = single transaction = atomic. Appending an empty
