@@ -10,7 +10,7 @@ use diesel::prelude::*;
 use uuid::Uuid;
 
 use crate::schema::{
-    harvest_batch_jobs, harvest_dag_runs, harvest_dead_letters, harvest_events,
+    harvest_audit_log, harvest_batch_jobs, harvest_dag_runs, harvest_dead_letters, harvest_events,
     harvest_external_tasks, harvest_schedules, harvest_signals, harvest_task_queue, harvest_timers,
     harvest_workers, harvest_workflow_executions,
 };
@@ -444,4 +444,45 @@ pub struct NewBatchJob<'a> {
     pub status: &'a str,
     pub idempotency_key: Option<&'a str>,
     pub created_by: Option<&'a str>,
+}
+
+// ── AuditRecord ───────────────────────────────────────────────────────────────
+
+/// A single management API audit record (issue #158).
+#[derive(
+    Debug, Clone, Queryable, Selectable, Identifiable, serde::Serialize, serde::Deserialize,
+)]
+#[diesel(table_name = harvest_audit_log)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct AuditRecord {
+    pub id: Uuid,
+    pub occurred_at: DateTime<Utc>,
+    pub actor: String,
+    pub operation: String,
+    pub target_type: String,
+    pub target_id: Option<String>,
+    pub route_or_command: String,
+    pub request_id: Option<String>,
+    pub idempotency_key: Option<String>,
+    pub status: String,
+    pub error_summary: Option<String>,
+    pub shard_id: Option<i32>,
+    pub source: String,
+}
+
+/// Insert struct for recording a new audit event.
+#[derive(Debug, Insertable, serde::Serialize, serde::Deserialize)]
+#[diesel(table_name = harvest_audit_log)]
+pub struct NewAuditRecord<'a> {
+    pub actor: &'a str,
+    pub operation: &'a str,
+    pub target_type: &'a str,
+    pub target_id: Option<&'a str>,
+    pub route_or_command: &'a str,
+    pub request_id: Option<&'a str>,
+    pub idempotency_key: Option<&'a str>,
+    pub status: &'a str,
+    pub error_summary: Option<&'a str>,
+    pub shard_id: Option<i32>,
+    pub source: &'a str,
 }
