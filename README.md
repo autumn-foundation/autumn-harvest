@@ -292,8 +292,8 @@ SendGrid, Twilio, S3 multipart, your own mutation endpoint) converts
 at-least-once into effectively-exactly-once by letting the provider
 deduplicate.
 
-Every activity receives a Harvest-provided key via `ctx.idempotency_key()`.
-The key is stable across:
+Every activity — **regular and local** — receives a Harvest-provided key via
+`ctx.idempotency_key()`.  The key is stable across:
 
 - worker restarts
 - duplicate task-queue dispatch of the same logical invocation
@@ -302,6 +302,15 @@ The key is stable across:
 
 Two distinct activity invocations — even calling the same activity name with
 the same input — always receive different keys.
+
+**Local activities** (`#[activity(local = true)]`) are fully supported.  The
+key is derived from the `ActivityExecId` recorded in the
+`LocalActivityScheduled` event, so it is identical across all inline retry
+attempts.  Local activities do not support heartbeating, but `idempotency_key()`
+works identically to regular activities.  If a future activity type were ever
+excluded, `idempotency_key()` would return a descriptive
+`HarvestError::Config` rather than silently producing an unstable or
+meaningless value.
 
 #### Billing / payment example
 
