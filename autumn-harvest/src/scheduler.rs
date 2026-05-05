@@ -23,6 +23,7 @@ use crate::info::DagInfo;
 use crate::models::{DagRun, HarvestSchedule, NewDagRun, NewHarvestSchedule};
 use crate::policy::{RetryPolicy, Schedule, TaskStatus, WorkflowSchedule};
 use crate::schema::{harvest_dag_runs, harvest_schedules, harvest_workflow_executions};
+use crate::types::{ActivityExecId, IdempotencyKey};
 use crate::worker::{DbPool, HandlerRegistry};
 
 const DEFAULT_SCHEDULER_TICK_INTERVAL: Duration = Duration::from_secs(1);
@@ -906,7 +907,19 @@ async fn execute_dag_run(
                 .upstreams
                 .iter()
                 .map(move |upstream| &statuses_ref[*upstream]);
-            async move { execute_dag_task(&registry, task, upstream_statuses, &task_input).await }
+            let dag_run_id = run.id;
+            let node_index = *task_index;
+            async move {
+                execute_dag_task(
+                    &registry,
+                    task,
+                    upstream_statuses,
+                    &task_input,
+                    dag_run_id,
+                    node_index,
+                )
+                .await
+            }
         });
         let results = futures::future::join_all(tasks).await;
         for (task_index, result) in level.iter().zip(results) {
@@ -935,11 +948,21 @@ async fn execute_dag_run(
     Ok(())
 }
 
+/// Namespace UUID for deriving stable DAG task idempotency keys.
+///
+/// Keyed on (`dag_run_id`, `task_name`) so each logical DAG task invocation
+/// always produces the same [`ActivityExecId`] regardless of retry attempt.
+const DAG_TASK_KEY_NAMESPACE: uuid::Uuid = uuid::Uuid::from_bytes([
+    0x6b, 0xa7, 0xb8, 0x14, 0x9d, 0xad, 0x11, 0xd1, 0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8,
+]);
+
 async fn execute_dag_task<'a>(
     registry: &HandlerRegistry,
     task: &crate::dag::DagTask,
     upstream_statuses: impl IntoIterator<Item = &'a TaskStatus>,
     conf: &Value,
+    dag_run_id: uuid::Uuid,
+    node_index: usize,
 ) -> TaskStatus {
     if !task.trigger_rule.should_run(upstream_statuses) {
         return TaskStatus::Skipped;
@@ -954,11 +977,23 @@ async fn execute_dag_task<'a>(
         .or_else(|| activity.default_retry_policy.clone());
     let timeout = task.start_to_close.or(activity.default_start_to_close);
     let input = task_input(conf, &task.activity_name);
-    let mut attempt = 1;
+    let mut attempt = 1u32;
+
+    // Derive a stable ActivityExecId from the DAG run ID and task name so
+    // the idempotency key is the same across retries for this logical task.
+    // node_index is included so two nodes that share the same activity_name
+    // within a DAG run receive distinct keys.
+    let task_exec_id = ActivityExecId::from_uuid(uuid::Uuid::new_v5(
+        &DAG_TASK_KEY_NAMESPACE,
+        format!("{dag_run_id}:{node_index}:{}", task.activity_name).as_bytes(),
+    ));
+    let idempotency_key = IdempotencyKey::from_activity_exec_id(task_exec_id);
 
     loop {
         let cancel = CancellationToken::new();
-        let ctx = ActivityContext::new(registry.shared_state(), None, cancel.clone());
+        let ctx = ActivityContext::new(registry.shared_state(), None, cancel.clone())
+            .with_idempotency_key(idempotency_key.clone())
+            .with_attempt(attempt);
         let future = (activity.handler)(&ctx, input.clone());
         let result = match timeout {
             Some(timeout) => tokio::time::timeout(timeout, future)
