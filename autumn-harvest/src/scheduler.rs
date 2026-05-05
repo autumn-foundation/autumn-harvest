@@ -908,8 +908,17 @@ async fn execute_dag_run(
                 .iter()
                 .map(move |upstream| &statuses_ref[*upstream]);
             let dag_run_id = run.id;
+            let node_index = *task_index;
             async move {
-                execute_dag_task(&registry, task, upstream_statuses, &task_input, dag_run_id).await
+                execute_dag_task(
+                    &registry,
+                    task,
+                    upstream_statuses,
+                    &task_input,
+                    dag_run_id,
+                    node_index,
+                )
+                .await
             }
         });
         let results = futures::future::join_all(tasks).await;
@@ -953,6 +962,7 @@ async fn execute_dag_task<'a>(
     upstream_statuses: impl IntoIterator<Item = &'a TaskStatus>,
     conf: &Value,
     dag_run_id: uuid::Uuid,
+    node_index: usize,
 ) -> TaskStatus {
     if !task.trigger_rule.should_run(upstream_statuses) {
         return TaskStatus::Skipped;
@@ -971,9 +981,11 @@ async fn execute_dag_task<'a>(
 
     // Derive a stable ActivityExecId from the DAG run ID and task name so
     // the idempotency key is the same across retries for this logical task.
+    // node_index is included so two nodes that share the same activity_name
+    // within a DAG run receive distinct keys.
     let task_exec_id = ActivityExecId::from_uuid(uuid::Uuid::new_v5(
         &DAG_TASK_KEY_NAMESPACE,
-        format!("{dag_run_id}:{}", task.activity_name).as_bytes(),
+        format!("{dag_run_id}:{node_index}:{}", task.activity_name).as_bytes(),
     ));
     let idempotency_key = IdempotencyKey::from_activity_exec_id(task_exec_id);
 
