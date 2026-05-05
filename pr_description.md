@@ -1,0 +1,4 @@
+🚮 **Smell**: Repetitive pattern matching on `HistoryMatch` causing "boolean blindness" and massive boilerplate strings, as well as `worker.rs` having "God Functions" containing deeply nested drive loops causing significant cognitive load.
+✨ **Solution**: Extracted `strict_replay` checking into `check_strict_replay_no_match` in `context.rs` using `format_args!` to avoid string allocation regressions. Extracted the core loop of `process_workflow_task` in `worker.rs` into a standalone `run_workflow_task_loop` helper.
+🧼 **Benefit**: Massively reduces boilerplate checking across all 8 execution dispatch functions in the `context.rs`. Drastically flattens and shrinks `process_workflow_task`, making it straightforward to read and audit.
+🛡️ **Verification**: Tests passed successfully. `cargo clippy` and `cargo fmt` executed safely.

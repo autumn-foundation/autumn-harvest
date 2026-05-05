@@ -2389,6 +2389,76 @@ async fn persist_workflow_outcome(
 }
 
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
+async fn run_workflow_task_loop(
+    conn: &mut AsyncPgConnection,
+    registry: &HandlerRegistry,
+    task: &TaskQueueItem,
+    mut history_events: Vec<WorkflowEvent>,
+    mut next_event_id: i32,
+    workflow: &WorkflowInfo,
+    max_local_activity_start_to_close: Duration,
+    trace_carrier: Option<&TraceContextCarrier>,
+    exec_id: ExecutionId,
+    workflow_name: &str,
+    shard_id: i32,
+) -> HarvestResult<(WorkflowOutcome, Vec<WorkflowCommand>, tracing::Span, i32)> {
+    let telemetry = registry.telemetry().clone();
+
+    let loop_result = loop {
+        let is_replay = history_events.len() > 1;
+
+        let _iter_parent_guard = trace_carrier
+            .filter(|_| !is_replay)
+            .map(|c| telemetry.install_trace_context(c));
+
+        let span_meta = WorkflowExecuteSpanMeta {
+            workflow_name: workflow_name.to_string(),
+            shard_id: i64::from(shard_id),
+            queue_name: task.queue_name.clone(),
+            is_replay,
+            link_traceparent: trace_carrier
+                .filter(|_| is_replay)
+                .and_then(|c| c.link_traceparent.clone().or_else(|| c.traceparent.clone())),
+        };
+
+        let (run_outcome, pending_cmds, execute_span) = run_workflow_with_state(
+            exec_id,
+            history_events.clone(),
+            workflow.handler,
+            task.input.clone(),
+            registry.shared_state(),
+            Some(&span_meta),
+        )
+        .await;
+
+        match run_outcome {
+            WorkflowOutcome::Suspended { commands }
+                if commands
+                    .iter()
+                    .any(|c| matches!(c, WorkflowCommand::RunLocalActivity { .. })) =>
+            {
+                drop(execute_span);
+                let (markers, local_run) = extract_run_local_activity(commands);
+                let new_events = run_local_activity_inline(
+                    conn,
+                    registry,
+                    exec_id,
+                    markers,
+                    local_run,
+                    max_local_activity_start_to_close,
+                    &mut next_event_id,
+                )
+                .await?;
+                history_events.extend(new_events);
+            }
+            other => break (other, pending_cmds, execute_span, next_event_id),
+        }
+    };
+
+    Ok(loop_result)
+}
+
 async fn process_workflow_task(
     conn: &mut AsyncPgConnection,
     registry: &HandlerRegistry,
@@ -2474,76 +2544,20 @@ async fn process_workflow_task(
     // is executed here, its events are appended to history, and the workflow
     // is re-run with the extended history. Any other suspension (regular
     // activity, timer, signal wait, …) breaks out of the loop.
-    let mut history_events = prepared.history_events;
-    let mut next_event_id = prepared.next_event_id;
-
-    let loop_result = loop {
-        // Recompute is_replay each iteration: after local-activity events are
-        // appended the workflow re-runs in replay mode (history_events.len() > 1).
-        // ADR-0001 §2.1: span metadata must reflect the current replay state so
-        // harvest.replay and link.traceparent are accurate on every executor call.
-        let is_replay = history_events.len() > 1;
-
-        // ADR-0001 §3 + §4: install the producer's trace context only for live
-        // (non-replay) iterations so the harvest.workflow.execute span is
-        // correctly parented.  For replay iterations the context must NOT be
-        // installed — replay spans must be new root spans (the original trace
-        // may have long since expired).  Installing per-iteration ensures that
-        // when local-activity events push history_events.len() > 1 the
-        // transition to is_replay=true correctly clears the live parent context.
-        let _iter_parent_guard = trace_carrier
-            .as_ref()
-            .filter(|_| !is_replay)
-            .map(|c| telemetry.install_trace_context(c));
-
-        let span_meta = WorkflowExecuteSpanMeta {
-            workflow_name: prepared.execution.workflow_name.clone(),
-            shard_id: i64::from(prepared.execution.shard_id),
-            queue_name: task.queue_name.clone(),
-            is_replay,
-            link_traceparent: trace_carrier
-                .as_ref()
-                .filter(|_| is_replay)
-                .and_then(|c| c.link_traceparent.clone().or_else(|| c.traceparent.clone())),
-        };
-
-        let (run_outcome, pending_cmds, execute_span) = run_workflow_with_state(
-            prepared.exec_id,
-            history_events.clone(),
-            workflow.handler,
-            task.input.clone(),
-            registry.shared_state(),
-            Some(&span_meta),
-        )
-        .await;
-
-        match run_outcome {
-            WorkflowOutcome::Suspended { commands }
-                if commands
-                    .iter()
-                    .any(|c| matches!(c, WorkflowCommand::RunLocalActivity { .. })) =>
-            {
-                // Local-activity re-run: drop this iteration's execute span
-                // so the OTel span closes before we start inline execution.
-                drop(execute_span);
-                let (markers, local_run) = extract_run_local_activity(commands);
-                let new_events = run_local_activity_inline(
-                    conn,
-                    registry,
-                    prepared.exec_id,
-                    markers,
-                    local_run,
-                    max_local_activity_start_to_close,
-                    &mut next_event_id,
-                )
-                .await?;
-                history_events.extend(new_events);
-            }
-            other => break (other, pending_cmds, execute_span),
-        }
-    };
-
-    let (outcome, pending_cmds, execute_span) = loop_result;
+    let (outcome, pending_cmds, execute_span, mut next_event_id) = run_workflow_task_loop(
+        conn,
+        registry,
+        task,
+        prepared.history_events,
+        prepared.next_event_id,
+        workflow,
+        max_local_activity_start_to_close,
+        trace_carrier.as_ref(),
+        prepared.exec_id,
+        &prepared.execution.workflow_name,
+        prepared.execution.shard_id,
+    )
+    .await?;
 
     let status = match &outcome {
         WorkflowOutcome::Completed { .. } => WorkflowStatus::Completed,
