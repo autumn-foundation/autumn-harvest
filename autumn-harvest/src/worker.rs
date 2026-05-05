@@ -714,41 +714,40 @@ async fn run_local_activity_inline(
                     error: error.clone(),
                     attempt,
                 };
-                store::append_events(
-                    conn,
-                    exec_id,
-                    std::slice::from_ref(&failed_event),
-                    *next_event_id,
-                )
-                .await?;
-                *next_event_id += 1;
-                all_new_events.push(failed_event);
 
                 if attempt == max_attempts {
-                    // All retries exhausted. Append an explicit terminal event
-                    // so replay can identify the exhausted state independent
-                    // of the current retry policy, preventing spurious re-runs
-                    // when max_attempts increases between deployments.
+                    // Final attempt: append LocalActivityFailed and
+                    // LocalActivityExhausted atomically so a crash between the
+                    // two cannot leave history without the terminal marker,
+                    // which would make the policy-invariant guarantee unsound.
                     let exhausted_event = WorkflowEvent::LocalActivityExhausted {
                         activity_id: run.activity_id,
                         error: error.clone(),
                         attempt,
                     };
+                    let terminal_pair = [failed_event, exhausted_event];
+                    store::append_events(conn, exec_id, &terminal_pair, *next_event_id).await?;
+                    *next_event_id += i32::try_from(terminal_pair.len())
+                        .map_err(|_| HarvestError::Config("event count overflow".into()))?;
+                    all_new_events.extend(terminal_pair);
+                } else {
                     store::append_events(
                         conn,
                         exec_id,
-                        std::slice::from_ref(&exhausted_event),
+                        std::slice::from_ref(&failed_event),
                         *next_event_id,
                     )
                     .await?;
                     *next_event_id += 1;
-                    all_new_events.push(exhausted_event);
-                } else if let Some(delay) = run
-                    .retry_policy
-                    .as_ref()
-                    .and_then(|p| p.next_delay(attempt))
-                {
-                    tokio::time::sleep(delay).await;
+                    all_new_events.push(failed_event);
+
+                    if let Some(delay) = run
+                        .retry_policy
+                        .as_ref()
+                        .and_then(|p| p.next_delay(attempt))
+                    {
+                        tokio::time::sleep(delay).await;
+                    }
                 }
             }
         }
