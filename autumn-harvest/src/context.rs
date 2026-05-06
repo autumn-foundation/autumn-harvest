@@ -444,6 +444,16 @@ pub struct WorkflowContext {
 impl WorkflowContext {
     // ── Internal Helpers ──────────────────────────────────────────────────
 
+    fn check_strict_replay_no_match(&self, actual_event: &str) -> HarvestResult<()> {
+        if self.strict_replay {
+            return Err(HarvestError::NonDeterministic(format!(
+                "early completion mismatch: expected <end of history>, \
+                 got {actual_event}"
+            )));
+        }
+        Ok(())
+    }
+
     fn match_history<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&mut HistoryMatcher) -> R,
@@ -855,12 +865,7 @@ impl WorkflowContext {
             }
 
             HistoryMatch::NoMatch => {
-                if self.strict_replay {
-                    return Err(HarvestError::NonDeterministic(format!(
-                        "early completion mismatch: expected <end of history>, \
-                         got SideEffectRecorded({id})"
-                    )));
-                }
+                self.check_strict_replay_no_match(&format!("SideEffectRecorded({id})"))?;
 
                 let result = f();
                 let output = serde_json::to_value(&result)?;
@@ -997,12 +1002,7 @@ impl WorkflowContext {
             HistoryMatch::NoMatch => {
                 // Strict replay: a command with no matching history entry means
                 // the new code issues a command the recorded history never saw.
-                if self.strict_replay {
-                    return Err(HarvestError::NonDeterministic(format!(
-                        "early completion mismatch: expected <end of history>, \
-                         got ActivityScheduled({name})"
-                    )));
-                }
+                self.check_strict_replay_no_match(&format!("ActivityScheduled({name})"))?;
 
                 // Live execution: emit a ScheduleActivity command and suspend
                 // until the worker sends the result through the oneshot channel.
@@ -1155,12 +1155,7 @@ impl WorkflowContext {
             }
 
             HistoryMatch::NoMatch => {
-                if self.strict_replay {
-                    return Err(HarvestError::NonDeterministic(format!(
-                        "early completion mismatch: expected <end of history>, \
-                         got LocalActivityScheduled({name})"
-                    )));
-                }
+                self.check_strict_replay_no_match(&format!("LocalActivityScheduled({name})"))?;
 
                 let activity_id = self.next_activity_id();
                 let (tx, rx) = oneshot::channel();
@@ -1227,12 +1222,7 @@ impl WorkflowContext {
             }
 
             HistoryMatch::NoMatch => {
-                if self.strict_replay {
-                    return Err(HarvestError::NonDeterministic(format!(
-                        "early completion mismatch: expected <end of history>, \
-                         got TimerStarted({timer_id})"
-                    )));
-                }
+                self.check_strict_replay_no_match(&format!("TimerStarted({timer_id})"))?;
 
                 let (tx, rx) = oneshot::channel();
                 self.push_command(WorkflowCommand::StartTimer {
@@ -1324,12 +1314,9 @@ impl WorkflowContext {
                 }
             }
             HistoryMatch::NoMatch => {
-                if self.strict_replay {
-                    return Err(HarvestError::NonDeterministic(format!(
-                        "early completion mismatch: expected <end of history>, \
-                         got ChildWorkflowStarted({workflow_name})"
-                    )));
-                }
+                self.check_strict_replay_no_match(&format!(
+                    "ChildWorkflowStarted({workflow_name})"
+                ))?;
 
                 let (tx, rx) = oneshot::channel();
                 self.push_command(WorkflowCommand::StartChildWorkflow {
@@ -1381,12 +1368,7 @@ impl WorkflowContext {
                 "signal history contains unexpected failure".into(),
             )),
             HistoryMatch::NoMatch => {
-                if self.strict_replay {
-                    return Err(HarvestError::NonDeterministic(format!(
-                        "early completion mismatch: expected <end of history>, \
-                         got WaitForSignal({signal_name})"
-                    )));
-                }
+                self.check_strict_replay_no_match(&format!("WaitForSignal({signal_name})"))?;
 
                 let (tx, rx) = oneshot::channel();
                 self.push_command(WorkflowCommand::WaitForSignal {
@@ -1484,12 +1466,7 @@ impl WorkflowContext {
             }
 
             HistoryMatch::NoMatch => {
-                if self.strict_replay {
-                    return Err(HarvestError::NonDeterministic(format!(
-                        "early completion mismatch: expected <end of history>, \
-                         got ExternalActivityScheduled({name})"
-                    )));
-                }
+                self.check_strict_replay_no_match(&format!("ExternalActivityScheduled({name})"))?;
 
                 // First time — generate a fresh token and schedule.
                 let activity_id = self.next_activity_id();
@@ -1574,13 +1551,7 @@ impl WorkflowContext {
                 "continue_as_new history contains unexpected terminal state".into(),
             )),
             HistoryMatch::NoMatch => {
-                if self.strict_replay {
-                    return Err(HarvestError::NonDeterministic(
-                        "early completion mismatch: expected <end of history>, \
-                         got ContinueAsNew"
-                            .to_string(),
-                    ));
-                }
+                self.check_strict_replay_no_match("ContinueAsNew")?;
                 self.push_command(WorkflowCommand::ContinueAsNew { input });
                 park_until_dropped().await
             }
