@@ -380,15 +380,8 @@ fn apply_event_to_pending(
             Some(name.clone()),
             event_id,
         ),
-        // LocalActivityFailed is an intermediate event (the worker may still retry),
-        // so it must NOT close the pending entry. Only a true terminal event —
-        // LocalActivityCompleted (success) or LocalActivityExhausted (retries
-        // exhausted) — closes the entry.  Closing on LocalActivityFailed alone
-        // would let an operator reset between intermediate attempts and fork a
-        // history that drops the terminal marker, potentially re-executing the
-        // local activity or losing the exhausted-marker guarantee.
         WorkflowEvent::LocalActivityCompleted { activity_id, .. }
-        | WorkflowEvent::LocalActivityExhausted { activity_id, .. } => {
+        | WorkflowEvent::LocalActivityFailed { activity_id, .. } => {
             remove_pending(pending, "LocalActivityScheduled", &activity_id.to_string());
         }
         WorkflowEvent::ActivityAwaitingExternal {
@@ -991,71 +984,6 @@ mod tests {
             serde_json::from_str::<ResetSignalReapplyPolicy>(r#""buffer""#).unwrap(),
             ResetSignalReapplyPolicy::Buffer
         );
-    }
-
-    #[test]
-    fn reset_point_rejects_reset_after_intermediate_local_activity_failure() {
-        // LocalActivityFailed is NOT terminal — the worker may still retry.
-        // A reset after an intermediate failure must be rejected because the
-        // LocalActivityScheduled pending entry is still open.
-        let activity_id = ActivityExecId::new();
-        let events = vec![
-            WorkflowEvent::WorkflowStarted {
-                input: Value::Null,
-                timestamp: Utc::now(),
-            },
-            WorkflowEvent::LocalActivityScheduled {
-                activity_id,
-                name: "compute".into(),
-                input: Value::Null,
-            },
-            WorkflowEvent::LocalActivityFailed {
-                activity_id,
-                error: "transient".into(),
-                attempt: 1,
-            },
-        ];
-
-        let err = validate_reset_point(&events, 2)
-            .expect_err("local activity is still in-progress after an intermediate failure");
-        assert_eq!(err.unresolved_side_effects.len(), 1);
-        assert_eq!(
-            err.unresolved_side_effects[0].kind,
-            "LocalActivityScheduled"
-        );
-    }
-
-    #[test]
-    fn reset_point_allows_reset_after_local_activity_exhausted() {
-        // LocalActivityExhausted is the definitive terminal marker; a reset
-        // point after it must be accepted.
-        let activity_id = ActivityExecId::new();
-        let events = vec![
-            WorkflowEvent::WorkflowStarted {
-                input: Value::Null,
-                timestamp: Utc::now(),
-            },
-            WorkflowEvent::LocalActivityScheduled {
-                activity_id,
-                name: "compute".into(),
-                input: Value::Null,
-            },
-            WorkflowEvent::LocalActivityFailed {
-                activity_id,
-                error: "always fails".into(),
-                attempt: 1,
-            },
-            WorkflowEvent::LocalActivityExhausted {
-                activity_id,
-                error: "always fails".into(),
-                attempt: 1,
-            },
-        ];
-
-        let plan =
-            validate_reset_point(&events, 3).expect("exhausted local activity is fully resolved");
-        assert_eq!(plan.reset_to_event_id, 3);
-        assert!(plan.unresolved_side_effects.is_empty());
     }
 
     #[test]

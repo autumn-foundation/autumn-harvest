@@ -66,34 +66,6 @@ pub enum HistoryMatch {
         /// The child execution ID already recorded in history. Must be reused.
         child_id: ExecutionId,
     },
-    /// History has a `LocalActivityScheduled` event but no `LocalActivityCompleted`
-    /// event yet.  This covers two cases:
-    ///
-    /// 1. **Crash before first run** — the worker appended `LocalActivityScheduled`
-    ///    then crashed before executing the handler. `failed_attempts` is 0.
-    ///
-    /// 2. **Crash between retries** — the worker recorded one or more
-    ///    `LocalActivityFailed` events and then crashed before the next attempt.
-    ///    `failed_attempts` reflects how many failures are already durable.
-    ///
-    ///    This case is also returned when all retry attempts have already been
-    ///    recorded (`failed_attempts >= max_attempts`). In that situation the
-    ///    worker compares `failed_attempts` against its retry policy and returns
-    ///    `last_error` immediately without executing the handler.
-    ///
-    /// The caller must re-execute the local activity using the **same**
-    /// `activity_id` so that the derived idempotency key is unchanged across
-    /// the crash.
-    LocalActivityInProgress {
-        /// The `ActivityExecId` already recorded in history. Must be reused.
-        activity_id: ActivityExecId,
-        /// How many `LocalActivityFailed` events are already durable for this
-        /// invocation. The worker starts its retry loop from `failed_attempts + 1`.
-        failed_attempts: u32,
-        /// Error from the last recorded `LocalActivityFailed`, if any.
-        /// Returned by the worker when `failed_attempts >= max_attempts`.
-        last_error: Option<String>,
-    },
 }
 
 /// Walks through recorded workflow events during replay, matching
@@ -1014,8 +986,7 @@ impl HistoryMatcher {
         // Advance past LocalActivityScheduled
         self.cursor += 1;
         let mut scan_cursor = self.cursor;
-        let mut failed_attempts: u32 = 0;
-        let mut last_error: Option<String> = None;
+        let mut last_failure: Option<HistoryMatch> = None;
 
         while scan_cursor < self.events.len() {
             if self.is_consumed(scan_cursor) {
@@ -1033,26 +1004,15 @@ impl HistoryMatcher {
                     self.advance_to_next_unconsumed_event();
                     return HistoryMatch::Matched { output };
                 }
-                // Terminal: all retries exhausted. This event is always
-                // authoritative regardless of the current retry policy.
-                WorkflowEvent::LocalActivityExhausted {
+                WorkflowEvent::LocalActivityFailed {
                     activity_id: id,
                     error,
                     attempt,
                 } if *id == activity_id => {
-                    let error = error.clone();
-                    let attempt = *attempt;
-                    self.cursor = scan_cursor + 1;
-                    self.advance_to_next_unconsumed_event();
-                    return HistoryMatch::Failed { error, attempt };
-                }
-                WorkflowEvent::LocalActivityFailed {
-                    activity_id: id,
-                    error,
-                    attempt: _,
-                } if *id == activity_id => {
-                    failed_attempts += 1;
-                    last_error = Some(error.clone());
+                    last_failure = Some(HistoryMatch::Failed {
+                        error: error.clone(),
+                        attempt: *attempt,
+                    });
                     scan_cursor += 1;
                 }
                 // Signals can be ingested while a local activity is retrying
@@ -1072,20 +1032,15 @@ impl HistoryMatcher {
             }
         }
 
-        // No LocalActivityCompleted or LocalActivityExhausted found. The worker
-        // either crashed before the first attempt or between retry attempts.
-        // Return InProgress so the worker can resume from the right attempt.
-        if failed_attempts > 0 {
-            // Advance the cursor past the recorded failure events so the next
-            // match picks up from the right position on the next worker call.
+        if let Some(failure) = last_failure {
+            // Scanned past all retry failures with no completion — this is terminal.
             self.cursor = scan_cursor;
             self.advance_to_next_unconsumed_event();
+            return failure;
         }
-        HistoryMatch::LocalActivityInProgress {
-            activity_id,
-            failed_attempts,
-            last_error,
-        }
+
+        // LocalActivityScheduled found but no terminal event yet — incomplete history.
+        HistoryMatch::NoMatch
     }
 
     /// Like [`match_local_activity`](Self::match_local_activity) but also verifies the input payload.
@@ -1134,8 +1089,7 @@ impl HistoryMatcher {
 
         self.cursor += 1;
         let mut scan_cursor = self.cursor;
-        let mut failed_attempts: u32 = 0;
-        let mut last_error: Option<String> = None;
+        let mut last_failure: Option<HistoryMatch> = None;
 
         while scan_cursor < self.events.len() {
             if self.is_consumed(scan_cursor) {
@@ -1152,24 +1106,15 @@ impl HistoryMatcher {
                     self.advance_to_next_unconsumed_event();
                     return HistoryMatch::Matched { output };
                 }
-                WorkflowEvent::LocalActivityExhausted {
+                WorkflowEvent::LocalActivityFailed {
                     activity_id: id,
                     error,
                     attempt,
                 } if *id == activity_id => {
-                    let error = error.clone();
-                    let attempt = *attempt;
-                    self.cursor = scan_cursor + 1;
-                    self.advance_to_next_unconsumed_event();
-                    return HistoryMatch::Failed { error, attempt };
-                }
-                WorkflowEvent::LocalActivityFailed {
-                    activity_id: id,
-                    error,
-                    attempt: _,
-                } if *id == activity_id => {
-                    failed_attempts += 1;
-                    last_error = Some(error.clone());
+                    last_failure = Some(HistoryMatch::Failed {
+                        error: error.clone(),
+                        attempt: *attempt,
+                    });
                     scan_cursor += 1;
                 }
                 WorkflowEvent::SignalReceived {
@@ -1188,14 +1133,10 @@ impl HistoryMatcher {
             }
         }
 
-        if failed_attempts > 0 {
+        if let Some(failure) = last_failure {
             self.cursor = scan_cursor;
             self.advance_to_next_unconsumed_event();
-            return HistoryMatch::LocalActivityInProgress {
-                activity_id,
-                failed_attempts,
-                last_error,
-            };
+            return failure;
         }
 
         HistoryMatch::NoMatch
@@ -2376,11 +2317,7 @@ mod tests {
     }
 
     #[test]
-    fn matcher_local_activity_with_recorded_failures_returns_in_progress() {
-        // The replay engine does not know max_attempts, so it always returns
-        // LocalActivityInProgress when there is no completion event — even if
-        // all retries may be exhausted. The worker checks max_attempts and
-        // either returns last_error immediately or runs the next attempt.
+    fn matcher_replays_failed_local_activity_retries_exhausted() {
         let id = ActivityExecId::new();
         let events = vec![
             WorkflowEvent::LocalActivityScheduled {
@@ -2401,48 +2338,11 @@ mod tests {
         ];
         let mut matcher = HistoryMatcher::new(events);
         let result = matcher.match_local_activity("format_data");
-        assert!(
-            matches!(
-                &result,
-                HistoryMatch::LocalActivityInProgress {
-                    activity_id: rid,
-                    failed_attempts: 2,
-                    last_error: Some(e),
-                } if *rid == id && e == "still failing"
-            ),
-            "expected LocalActivityInProgress with 2 failed attempts, got {result:?}"
-        );
-    }
-
-    #[test]
-    fn matcher_local_activity_exhausted_event_returns_failed() {
-        // LocalActivityExhausted is the authoritative terminal marker. Replay
-        // must return Failed regardless of any current retry-policy value.
-        let id = ActivityExecId::new();
-        let events = vec![
-            WorkflowEvent::LocalActivityScheduled {
-                activity_id: id,
-                name: "format_data".into(),
-                input: Value::Null,
-            },
-            WorkflowEvent::LocalActivityFailed {
-                activity_id: id,
-                error: "transient".into(),
-                attempt: 1,
-            },
-            WorkflowEvent::LocalActivityExhausted {
-                activity_id: id,
-                error: "transient".into(),
-                attempt: 1,
-            },
-        ];
-        let mut matcher = HistoryMatcher::new(events);
-        let result = matcher.match_local_activity("format_data");
         assert_eq!(
             result,
             HistoryMatch::Failed {
-                error: "transient".into(),
-                attempt: 1,
+                error: "still failing".into(),
+                attempt: 2,
             }
         );
     }

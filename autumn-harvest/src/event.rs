@@ -186,8 +186,8 @@ pub enum WorkflowEvent {
     ///
     /// Multiple `LocalActivityFailed` events may appear in sequence (one per
     /// attempt) before a terminal `LocalActivityCompleted` (retry eventually
-    /// succeeded) or before the retry budget is exhausted (followed by a
-    /// `LocalActivityExhausted` event that marks the terminal state).
+    /// succeeded) or before the retry budget is exhausted (the last
+    /// `LocalActivityFailed` with no following `LocalActivityCompleted`).
     LocalActivityFailed {
         /// Unique ID matching the corresponding `LocalActivityScheduled`.
         activity_id: ActivityExecId,
@@ -300,23 +300,6 @@ pub enum WorkflowEvent {
         /// Operator identity for audit.
         operator_id: String,
     },
-    /// All retry attempts for a local activity were exhausted. Appended
-    /// immediately after the final `LocalActivityFailed` event so replay can
-    /// identify the terminal state without knowing the current retry policy.
-    ///
-    /// This makes the terminal-vs-in-progress distinction policy-invariant:
-    /// if this event is present the activity is unambiguously done; if only
-    /// `LocalActivityFailed` events are present (without a following
-    /// `LocalActivityExhausted`) the worker crashed between retries and must
-    /// continue from the next attempt.
-    LocalActivityExhausted {
-        /// Unique ID matching the corresponding `LocalActivityScheduled`.
-        activity_id: ActivityExecId,
-        /// Error from the final attempt.
-        error: String,
-        /// Total attempts that were made (equals `max_attempts`).
-        attempt: u32,
-    },
 }
 
 impl WorkflowEvent {
@@ -355,7 +338,6 @@ impl WorkflowEvent {
             Self::UpdateFailed { .. } => "UpdateFailed",
             Self::WorkflowResetFork { .. } => "WorkflowResetFork",
             Self::WorkflowResetTerminated { .. } => "WorkflowResetTerminated",
-            Self::LocalActivityExhausted { .. } => "LocalActivityExhausted",
         }
     }
 
@@ -444,24 +426,6 @@ mod tests {
             back,
             WorkflowEvent::LocalActivityFailed { attempt: 3, .. }
         ));
-        Ok(())
-    }
-
-    #[test]
-    fn local_activity_exhausted_round_trips() -> Result<(), serde_json::Error> {
-        let id = ActivityExecId::new();
-        let event = WorkflowEvent::LocalActivityExhausted {
-            activity_id: id,
-            error: "always fails".into(),
-            attempt: 3,
-        };
-        let json = serde_json::to_string(&event)?;
-        let back: WorkflowEvent = serde_json::from_str(&json)?;
-        assert!(matches!(
-            back,
-            WorkflowEvent::LocalActivityExhausted { attempt: 3, .. }
-        ));
-        assert_eq!(event.type_name(), "LocalActivityExhausted");
         Ok(())
     }
 

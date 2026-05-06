@@ -40,9 +40,7 @@ use crate::telemetry::{
     ATTR_ACTIVITY_NAME, ATTR_ATTEMPT, ATTR_EXECUTION_ID, ATTR_QUEUE, ATTR_SHARD_ID,
     ATTR_WORKFLOW_ID, ActivityStatus, TraceContextCarrier, WorkflowStatus,
 };
-use crate::types::{
-    ActivityExecId, ExecutionId, ExternalActivityToken, IdempotencyKey, TimerId, WorkerId,
-};
+use crate::types::{ActivityExecId, ExecutionId, ExternalActivityToken, TimerId, WorkerId};
 
 /// Type alias for the deadpool-managed async Diesel connection pool.
 pub type DbPool = deadpool::managed::Pool<
@@ -549,16 +547,6 @@ struct LocalActivityRun {
     input: serde_json::Value,
     start_to_close_secs: Option<u64>,
     retry_policy: Option<crate::policy::RetryPolicy>,
-    /// `true` when `LocalActivityScheduled` is already in the durable history —
-    /// the worker crashed after appending it but before recording a terminal event.
-    /// `run_local_activity_inline` must skip re-appending the scheduled event.
-    already_scheduled: bool,
-    /// Number of `LocalActivityFailed` events already durable in history.
-    /// `run_local_activity_inline` starts its retry loop from `failed_attempts + 1`.
-    failed_attempts: u32,
-    /// Error from the last recorded `LocalActivityFailed`. Returned immediately
-    /// when `failed_attempts >= max_attempts` without running the handler again.
-    last_error: Option<String>,
 }
 
 /// Extract a `RunLocalActivity` command from an owned command list.
@@ -585,9 +573,6 @@ fn extract_run_local_activity(
                 start_to_close_secs,
                 retry_policy,
                 result_tx,
-                already_scheduled,
-                failed_attempts,
-                last_error,
             } => {
                 drop(result_tx); // coroutine already dropped; close the channel
                 local_run = Some(LocalActivityRun {
@@ -596,9 +581,6 @@ fn extract_run_local_activity(
                     input,
                     start_to_close_secs,
                     retry_policy,
-                    already_scheduled,
-                    failed_attempts,
-                    last_error,
                 });
             }
             _ => {} // unexpected alongside RunLocalActivity; ignore
@@ -617,7 +599,6 @@ fn extract_run_local_activity(
 /// `LocalActivityFailed` event; on success a `LocalActivityCompleted` event is
 /// appended. Returns all newly-appended events so the caller can extend its
 /// in-memory replay history and avoid a DB round-trip.
-#[allow(clippy::too_many_lines)]
 async fn run_local_activity_inline(
     conn: &mut AsyncPgConnection,
     registry: &HandlerRegistry,
@@ -638,50 +619,25 @@ async fn run_local_activity_inline(
 
     let max_attempts = run.retry_policy.as_ref().map_or(1, |p| p.max_attempts);
 
-    // When the worker crashed after appending LocalActivityScheduled but before
-    // recording a terminal event, skip re-appending to avoid a duplicate.
+    let scheduled_event = WorkflowEvent::LocalActivityScheduled {
+        activity_id: run.activity_id,
+        name: run.name.clone(),
+        input: run.input.clone(),
+    };
+
+    // Append marker events + scheduled event in a single call.
     let mut prefix_events = marker_events;
-    if !run.already_scheduled {
-        prefix_events.push(WorkflowEvent::LocalActivityScheduled {
-            activity_id: run.activity_id,
-            name: run.name.clone(),
-            input: run.input.clone(),
-        });
-    }
-    if !prefix_events.is_empty() {
-        store::append_events(conn, exec_id, &prefix_events, *next_event_id).await?;
-        *next_event_id += i32::try_from(prefix_events.len())
-            .map_err(|_| HarvestError::Config("event count overflow".into()))?;
-    }
+    prefix_events.push(scheduled_event);
+    store::append_events(conn, exec_id, &prefix_events, *next_event_id).await?;
+    *next_event_id += i32::try_from(prefix_events.len())
+        .map_err(|_| HarvestError::Config("event count overflow".into()))?;
 
     let mut all_new_events = prefix_events;
+    let ctx =
+        ActivityContext::new_local_activity(registry.shared_state(), CancellationToken::new());
     let handler = activity.handler;
-    let local_idempotency_key = IdempotencyKey::from_activity_exec_id(run.activity_id);
 
-    // When recovering after a crash-between-retries, all attempts up to
-    // `failed_attempts` are already durable in history. If they already cover
-    // max_attempts, every retry was exhausted before the crash — return the
-    // last recorded error without executing the handler again.
-    let start_attempt = run.failed_attempts + 1;
-    if start_attempt > max_attempts {
-        let error = run.last_error.unwrap_or_else(|| {
-            format!(
-                "local activity '{}' failed after {} attempts (recorded in history)",
-                run.name, run.failed_attempts
-            )
-        });
-        return Err(HarvestError::ActivityFailed {
-            name: run.name.clone(),
-            attempt: run.failed_attempts,
-            source: error.into(),
-        });
-    }
-
-    for attempt in start_attempt..=max_attempts {
-        let ctx =
-            ActivityContext::new_local_activity(registry.shared_state(), CancellationToken::new())
-                .with_idempotency_key(local_idempotency_key.clone())
-                .with_attempt(attempt);
+    for attempt in 1..=max_attempts {
         let result = tokio::time::timeout(per_attempt_timeout, (handler)(&ctx, run.input.clone()))
             .await
             .unwrap_or_else(|_| {
@@ -714,40 +670,23 @@ async fn run_local_activity_inline(
                     error: error.clone(),
                     attempt,
                 };
+                store::append_events(
+                    conn,
+                    exec_id,
+                    std::slice::from_ref(&failed_event),
+                    *next_event_id,
+                )
+                .await?;
+                *next_event_id += 1;
+                all_new_events.push(failed_event);
 
-                if attempt == max_attempts {
-                    // Final attempt: append LocalActivityFailed and
-                    // LocalActivityExhausted atomically so a crash between the
-                    // two cannot leave history without the terminal marker,
-                    // which would make the policy-invariant guarantee unsound.
-                    let exhausted_event = WorkflowEvent::LocalActivityExhausted {
-                        activity_id: run.activity_id,
-                        error: error.clone(),
-                        attempt,
-                    };
-                    let terminal_pair = [failed_event, exhausted_event];
-                    store::append_events(conn, exec_id, &terminal_pair, *next_event_id).await?;
-                    *next_event_id += i32::try_from(terminal_pair.len())
-                        .map_err(|_| HarvestError::Config("event count overflow".into()))?;
-                    all_new_events.extend(terminal_pair);
-                } else {
-                    store::append_events(
-                        conn,
-                        exec_id,
-                        std::slice::from_ref(&failed_event),
-                        *next_event_id,
-                    )
-                    .await?;
-                    *next_event_id += 1;
-                    all_new_events.push(failed_event);
-
-                    if let Some(delay) = run
+                if attempt < max_attempts
+                    && let Some(delay) = run
                         .retry_policy
                         .as_ref()
                         .and_then(|p| p.next_delay(attempt))
-                    {
-                        tokio::time::sleep(delay).await;
-                    }
+                {
+                    tokio::time::sleep(delay).await;
                 }
             }
         }
@@ -1896,9 +1835,7 @@ async fn process_activity_task(
         task.id,
         pool.clone(),
     )
-    .with_trace_context(trace_carrier.clone())
-    .with_idempotency_key(IdempotencyKey::from_activity_exec_id(activity_id))
-    .with_attempt(task_attempt(task));
+    .with_trace_context(trace_carrier.clone());
 
     let telemetry = registry.telemetry().clone();
     // ADR-0001 §3: restore the producer's trace context so the activity span

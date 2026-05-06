@@ -56,10 +56,6 @@ name = "metrics_noop"
 harness = false
 
 [[test]]
-name = "idempotency_tests"
-required-features = ["testing"]
-
-[[test]]
 name = "replayer_tests"
 required-features = ["testing"]
 
