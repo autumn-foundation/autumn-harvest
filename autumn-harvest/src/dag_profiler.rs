@@ -89,12 +89,11 @@ impl DagProfiler {
         for level in levels {
             for &task_index in level {
                 let task = &tasks[task_index];
-                let duration = task.start_to_close.unwrap_or_else(|| {
-                    self.activity_durations
-                        .get(&task.activity_name)
-                        .copied()
-                        .unwrap_or(self.default_duration)
-                });
+                let duration = self.activity_durations
+                    .get(&task.activity_name)
+                    .copied()
+                    .or(task.start_to_close)
+                    .unwrap_or(self.default_duration);
 
                 // Find when this task can start
                 let mut start_time = Duration::ZERO;
