@@ -89,7 +89,8 @@ impl DagProfiler {
         for level in levels {
             for &task_index in level {
                 let task = &tasks[task_index];
-                let duration = self.activity_durations
+                let duration = self
+                    .activity_durations
                     .get(&task.activity_name)
                     .copied()
                     .or(task.start_to_close)
