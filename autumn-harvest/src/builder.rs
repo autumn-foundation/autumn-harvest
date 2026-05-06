@@ -260,6 +260,14 @@ impl BuiltHarvest {
         &self.retention
     }
 
+    /// Override the audit log retention window after the build step.
+    ///
+    /// Use this to apply a runtime-configured value (e.g. from `HarvestApiState`)
+    /// without rebuilding the entire harvest configuration.
+    pub const fn set_audit_retention_days(&mut self, days: i64) {
+        self.retention.audit_retention_days = days;
+    }
+
     /// Convert the built harvest registration into worker-ready parts.
     #[cfg(feature = "db")]
     #[must_use]

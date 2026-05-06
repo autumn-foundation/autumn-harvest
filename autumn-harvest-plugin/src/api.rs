@@ -256,7 +256,6 @@ impl HarvestApiState {
             .expect("harvest api state lock poisoned") = days;
     }
 
-    #[allow(dead_code)]
     pub(crate) fn audit_retention_days(&self) -> i64 {
         *self
             .audit_retention_days
@@ -2790,6 +2789,14 @@ async fn bulk_replay_dead_letters_handler(
             .into_response();
     }
 
+    // Dry-run previews are read-only: no audit record needed.
+    if filter.dry_run {
+        return match bulk_replay_from_shards(&api_state, &filter).await {
+            Ok(result) => (axum::http::StatusCode::OK, Json(result)).into_response(),
+            Err(e) => map_error(e).into_response(),
+        };
+    }
+
     let (actor, source, request_id) = audit_context(&headers, &api_state);
     let route = "POST /dead-letters/replay";
 
@@ -2877,6 +2884,14 @@ async fn bulk_discard_dead_letters_handler(
             })),
         )
             .into_response();
+    }
+
+    // Dry-run previews are read-only: no audit record needed.
+    if filter.dry_run {
+        return match bulk_discard_from_shards(&api_state, &filter).await {
+            Ok(result) => (axum::http::StatusCode::OK, Json(result)).into_response(),
+            Err(e) => map_error(e).into_response(),
+        };
     }
 
     let (actor, source, request_id) = audit_context(&headers, &api_state);
