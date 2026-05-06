@@ -2676,20 +2676,39 @@ async fn set_schedule_paused(
 ) -> Result<Json<BasicAck>, AutumnError> {
     use autumn_harvest::schema::harvest_schedules::dsl;
 
-    let id = parse_uuid(id_str, "schedule id")?;
-    let pool = api_state.storage_pool().map_err(map_error)?;
-
     let (actor, source, request_id) = audit_context(headers, api_state);
-    let operation = if paused {
-        OP_SCHEDULE_PAUSE
-    } else {
-        OP_SCHEDULE_RESUME
-    };
+    let operation = if paused { OP_SCHEDULE_PAUSE } else { OP_SCHEDULE_RESUME };
     let route = if paused {
         "POST /admin/schedules/{id}/pause"
     } else {
         "POST /admin/schedules/{id}/resume"
     };
+
+    let id = match parse_uuid(id_str, "schedule id") {
+        Ok(u) => u,
+        Err(e) => {
+            if let Ok(pool) = api_state.storage_pool()
+                && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+            {
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation,
+                    target_type: TARGET_SCHEDULE,
+                    target_id: Some(id_str),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: None,
+                    status: STATUS_FAILED,
+                    error_summary: Some("malformed schedule id"),
+                    shard_id: None,
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+            }
+            return Err(e);
+        }
+    };
+    let pool = api_state.storage_pool().map_err(map_error)?;
     let id_str_owned = id.to_string();
 
     let mut updated_count = 0usize;
@@ -2834,6 +2853,7 @@ async fn schedule_delete_audit_failed(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn delete_schedule(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
@@ -2842,11 +2862,25 @@ async fn delete_schedule(
     use autumn_harvest::models::HarvestSchedule;
     use autumn_harvest::schema::harvest_schedules::dsl;
 
-    let id = parse_uuid(&id, "schedule id")?;
-    let pool = api_state.storage_pool().map_err(map_error)?;
-
     let (actor, source, request_id) = audit_context(&headers, &api_state);
     let route = "DELETE /admin/schedules/{id}";
+    let pool = api_state.storage_pool().map_err(map_error)?;
+
+    let id = match parse_uuid(&id, "schedule id") {
+        Ok(u) => u,
+        Err(e) => {
+            schedule_delete_audit_failed(
+                &pool,
+                &actor,
+                &source,
+                request_id.as_deref(),
+                &id,
+                "malformed schedule id",
+            )
+            .await;
+            return Err(e);
+        }
+    };
     let id_str = id.to_string();
 
     let mut deleted_count = 0usize;
@@ -2984,10 +3018,33 @@ async fn replay_dead_letter(
     Path(id): Path<String>,
     headers: axum::http::HeaderMap,
 ) -> Result<(axum::http::StatusCode, Json<ReplayDeadLetterResponse>), AutumnError> {
-    let dead_letter_id = parse_uuid(&id, "dead-letter id")?;
-
     let (actor, source, request_id) = audit_context(&headers, &api_state);
     let route = "POST /dead-letters/{id}/replay";
+
+    let dead_letter_id = match parse_uuid(&id, "dead-letter id") {
+        Ok(u) => u,
+        Err(e) => {
+            if let Ok(pool) = api_state.storage_pool()
+                && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+            {
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_DLQ_REPLAY,
+                    target_type: TARGET_DEAD_LETTER,
+                    target_id: Some(id.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: None,
+                    status: STATUS_FAILED,
+                    error_summary: Some("malformed dead-letter id"),
+                    shard_id: None,
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+            }
+            return Err(e);
+        }
+    };
     let dl_id_str = dead_letter_id.to_string();
 
     let replay_result = replay_dead_letter_from_shards(&api_state, dead_letter_id).await;
@@ -3780,11 +3837,34 @@ async fn complete_external_activity(
     headers: axum::http::HeaderMap,
     Json(request): Json<CompleteExternalActivityRequest>,
 ) -> Result<Json<ExternalActivityAck>, AutumnError> {
-    let token = parse_external_token(&token_str)?;
-    let output = request.output.unwrap_or(Value::Null);
-
     let (actor, source, request_id) = audit_context(&headers, &api_state);
     let route = "POST /activities/external/{token}/complete";
+
+    let token = match parse_external_token(&token_str) {
+        Ok(t) => t,
+        Err(e) => {
+            if let Ok(pool) = api_state.storage_pool()
+                && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+            {
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_EXTERNAL_ACTIVITY_COMPLETE,
+                    target_type: TARGET_EXTERNAL_ACTIVITY,
+                    target_id: Some(token_str.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: None,
+                    status: STATUS_FAILED,
+                    error_summary: Some("malformed external token"),
+                    shard_id: None,
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+            }
+            return Err(e);
+        }
+    };
+    let output = request.output.unwrap_or(Value::Null);
 
     let complete_result = resolve_external_on_shards(&api_state, token, |conn, tok| {
         let out = output.clone();
@@ -3844,10 +3924,33 @@ async fn fail_external_activity(
     headers: axum::http::HeaderMap,
     Json(request): Json<FailExternalActivityRequest>,
 ) -> Result<Json<ExternalActivityAck>, AutumnError> {
-    let token = parse_external_token(&token_str)?;
-
     let (actor, source, request_id) = audit_context(&headers, &api_state);
     let route = "POST /activities/external/{token}/fail";
+
+    let token = match parse_external_token(&token_str) {
+        Ok(t) => t,
+        Err(e) => {
+            if let Ok(pool) = api_state.storage_pool()
+                && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+            {
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_EXTERNAL_ACTIVITY_FAIL,
+                    target_type: TARGET_EXTERNAL_ACTIVITY,
+                    target_id: Some(token_str.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: None,
+                    status: STATUS_FAILED,
+                    error_summary: Some("malformed external token"),
+                    shard_id: None,
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+            }
+            return Err(e);
+        }
+    };
 
     let fail_result = resolve_external_on_shards(&api_state, token, |conn, tok| {
         let err = request.error.clone();
