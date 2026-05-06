@@ -2677,7 +2677,11 @@ async fn set_schedule_paused(
     use autumn_harvest::schema::harvest_schedules::dsl;
 
     let (actor, source, request_id) = audit_context(headers, api_state);
-    let operation = if paused { OP_SCHEDULE_PAUSE } else { OP_SCHEDULE_RESUME };
+    let operation = if paused {
+        OP_SCHEDULE_PAUSE
+    } else {
+        OP_SCHEDULE_RESUME
+    };
     let route = if paused {
         "POST /admin/schedules/{id}/pause"
     } else {
