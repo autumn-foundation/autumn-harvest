@@ -505,4 +505,37 @@ mod tests {
         };
         let _ = exporter.handle_misc_event(&event);
     }
+
+    #[test]
+    #[should_panic(expected = "internal error: entered unreachable code")]
+    fn test_handle_local_activity_event_unreachable_panics() {
+        let mut exporter = MermaidExporter::new();
+        let event = WorkflowEvent::WorkflowStarted {
+            input: serde_json::json!({}),
+            timestamp: Utc::now(),
+        };
+        let _ = exporter.handle_local_activity_event(&event);
+    }
+
+    #[test]
+    #[should_panic(expected = "internal error: entered unreachable code")]
+    fn test_handle_external_activity_event_unreachable_panics() {
+        let mut exporter = MermaidExporter::new();
+        let event = WorkflowEvent::WorkflowStarted {
+            input: serde_json::json!({}),
+            timestamp: Utc::now(),
+        };
+        let _ = exporter.handle_external_activity_event(&event);
+    }
+
+    #[test]
+    #[should_panic(expected = "internal error: entered unreachable code")]
+    fn test_handle_update_event_unreachable_panics() {
+        let mut exporter = MermaidExporter::new();
+        let event = WorkflowEvent::WorkflowStarted {
+            input: serde_json::json!({}),
+            timestamp: Utc::now(),
+        };
+        let _ = exporter.handle_update_event(&event);
+    }
 }
