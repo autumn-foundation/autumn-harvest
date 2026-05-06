@@ -243,16 +243,16 @@ pub async fn run_workflow_with_state(
                 let mut commands = ctx.drain_commands();
                 // ContinueAsNew is terminal: when the workflow body parks on
                 // the dedicated suspension future, the latest command in the
-                // drain is the ContinueAsNew the user requested. Any commands
-                // earlier in the drain (e.g. RecordMarker for `version()` or
-                // `side_effect`) are intentionally discarded — they describe
-                // bookkeeping for an execution that is about to be sealed.
+                // drain is the ContinueAsNew the user requested. Bookkeeping
+                // commands earlier in the drain (e.g. RecordMarker, side_effect)
+                // are returned as pending_cmds so the worker can still apply
+                // any UpsertSearchAttributes patches before sealing the execution.
                 if let Some(idx) = commands
                     .iter()
                     .rposition(|cmd| matches!(cmd, WorkflowCommand::ContinueAsNew { .. }))
                     && let WorkflowCommand::ContinueAsNew { input } = commands.swap_remove(idx)
                 {
-                    return (WorkflowOutcome::ContinuedAsNew { input }, vec![]);
+                    return (WorkflowOutcome::ContinuedAsNew { input }, commands);
                 }
                 (WorkflowOutcome::Suspended { commands }, vec![])
             }
