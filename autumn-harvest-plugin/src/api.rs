@@ -2635,6 +2635,32 @@ async fn set_schedule_paused(
     Ok(Json(BasicAck { ok: true }))
 }
 
+async fn schedule_delete_audit_failed(
+    pool: &HarvestDbPool,
+    actor: &str,
+    source: &str,
+    request_id: Option<&str>,
+    id_str: &str,
+    error_summary: &'static str,
+) {
+    if let Ok(mut conn) = acquire_conn(pool.default_pool()).await {
+        let ar = NewAuditRecord {
+            actor,
+            operation: OP_SCHEDULE_DELETE,
+            target_type: TARGET_SCHEDULE,
+            target_id: Some(id_str),
+            route_or_command: "DELETE /admin/schedules/{id}",
+            request_id,
+            idempotency_key: None,
+            status: STATUS_FAILED,
+            error_summary: Some(error_summary),
+            shard_id: None,
+            source,
+        };
+        let _ = audit::insert_audit(&mut conn, &ar).await;
+    }
+}
+
 async fn delete_schedule(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
@@ -2665,6 +2691,15 @@ async fn delete_schedule(
             continue;
         };
         if row.dag_name.is_some() {
+            schedule_delete_audit_failed(
+                &pool,
+                &actor,
+                &source,
+                request_id.as_deref(),
+                &id_str,
+                "dag-managed schedule cannot be deleted via API",
+            )
+            .await;
             return Err(AutumnError::bad_request_msg(format!(
                 "schedule {id} is managed by the DAG catalog and cannot be deleted via API; \
                  remove the DAG definition to stop scheduling"
@@ -2677,6 +2712,15 @@ async fn delete_schedule(
                 .iter()
                 .any(|ws| ws.workflow_name == *wf_name);
             if is_code_managed {
+                schedule_delete_audit_failed(
+                    &pool,
+                    &actor,
+                    &source,
+                    request_id.as_deref(),
+                    &id_str,
+                    "code-managed schedule cannot be deleted via API",
+                )
+                .await;
                 return Err(AutumnError::bad_request_msg(format!(
                     "schedule {id} is managed by the in-process workflow schedule catalog \
                      and cannot be deleted via API; it will be re-created on the next \
@@ -2712,22 +2756,15 @@ async fn delete_schedule(
     }
 
     if deleted_count == 0 {
-        if let Ok(mut conn) = acquire_conn(pool.default_pool()).await {
-            let ar = NewAuditRecord {
-                actor: &actor,
-                operation: OP_SCHEDULE_DELETE,
-                target_type: TARGET_SCHEDULE,
-                target_id: Some(id_str.as_str()),
-                route_or_command: route,
-                request_id: request_id.as_deref(),
-                idempotency_key: None,
-                status: STATUS_FAILED,
-                error_summary: Some("schedule not found"),
-                shard_id: None,
-                source: &source,
-            };
-            let _ = audit::insert_audit(&mut conn, &ar).await;
-        }
+        schedule_delete_audit_failed(
+            &pool,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            &id_str,
+            "schedule not found",
+        )
+        .await;
         return Err(AutumnError::not_found_msg(format!("schedule {id}")));
     }
     Ok(Json(BasicAck { ok: true }))
