@@ -814,21 +814,39 @@ async fn submit_batch_operation(
         .parse()
         .map_err(AutumnError::bad_request_msg)?;
 
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+    let route = "POST /batch-operations";
+    let idempotency_key = request.idempotency_key.clone();
+
     // Reject `state=` values outside the canonical list before we hit the DB
     // — otherwise the executor would silently match nothing and look like a
     // success.
     for state in &request.filter.states {
         if !KNOWN_WORKFLOW_STATES.contains(&state.as_str()) {
-            return Err(AutumnError::bad_request_msg(format!(
-                "unknown workflow state '{state}' in batch filter"
-            )));
+            let err_msg = format!("unknown workflow state '{state}' in batch filter");
+            if let Ok(pool) = api_state.storage_pool()
+                && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+            {
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_BATCH_SUBMIT,
+                    target_type: TARGET_BATCH,
+                    target_id: None,
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: idempotency_key.as_deref(),
+                    status: STATUS_FAILED,
+                    error_summary: Some(err_msg.as_str()),
+                    shard_id: None,
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+            }
+            return Err(AutumnError::bad_request_msg(err_msg));
         }
     }
 
     let pool = api_state.storage_pool().map_err(map_error)?;
-    let (actor, source, request_id) = audit_context(&headers, &api_state);
-    let route = "POST /batch-operations";
-    let idempotency_key = request.idempotency_key.clone();
 
     // Persist the row on the default shard. The executor will fan out across
     // every configured shard at run time via iter_shards().
