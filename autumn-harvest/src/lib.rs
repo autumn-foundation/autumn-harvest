@@ -29,6 +29,8 @@ pub mod dag;
 /// Export format types for Directed Acyclic Graphs (DAGs) representing workflows.
 pub mod dag_export;
 pub mod dag_linter;
+#[cfg(feature = "testing")]
+pub mod dag_profiler;
 #[cfg(any(test, feature = "testing"))]
 pub mod dag_simulator;
 pub mod diagnostic;
@@ -124,6 +126,8 @@ pub use dag_linter::{
     DagLinter, DagRule, DagWarning, ExcessiveParallelismRule, MissingRetryPolicyRule,
     MissingTimeoutRule,
 };
+#[cfg(feature = "testing")]
+pub use dag_profiler::{DagProfile, DagProfiler, ProfilerEvent, ProfilerEventKind};
 #[cfg(any(test, feature = "testing"))]
 pub use dag_simulator::{DagSimulator, DagSimulatorResult};
 pub use diagnostic::{DiagnosticReport, SimulatorResultExt};
