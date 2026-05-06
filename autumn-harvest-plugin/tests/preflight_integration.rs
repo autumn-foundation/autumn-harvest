@@ -23,7 +23,7 @@ use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
-use serde_json::Value;
+use serde_json::{Value, json};
 use testcontainers::ContainerAsync;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
@@ -146,6 +146,24 @@ fn runtime_for(
             vec![workflow_info()],
             vec![activity_info(Some("email"))],
         )),
+        Arc::new(DagCatalog::new()),
+        Arc::new(schedules),
+        None,
+        queues.iter().map(|queue| (*queue).to_string()).collect(),
+        scheduler_monitor,
+        HarvestRetentionRuntime::disabled(RetentionConfig::default()),
+        router,
+    )
+}
+
+fn workflow_runtime_for(
+    queues: &[&str],
+    schedules: Vec<WorkflowSchedule>,
+    router: ShardRouter,
+    scheduler_monitor: SchedulerMonitor,
+) -> HarvestApiRuntime {
+    HarvestApiRuntime::new(
+        Arc::new(HandlerRegistry::new(vec![workflow_info()], Vec::new())),
         Arc::new(DagCatalog::new()),
         Arc::new(schedules),
         None,
@@ -369,6 +387,41 @@ async fn registered_queue_without_active_worker_fails_preflight() {
     assert_eq!(
         check_status(&report, "worker_coverage"),
         PreflightStatus::Fail
+    );
+}
+
+#[tokio::test]
+async fn workflow_runtime_with_custom_queue_does_not_require_default_worker() {
+    let (database_url, _container) = setup_database_url_with_migrations().await;
+    let pool = build_test_pool(&database_url);
+    register_active_worker(&pool, "billing-worker", &["billing".to_string()], &[0]).await;
+    let state = api_state(
+        HarvestDbPool::from(pool),
+        workflow_runtime_for(
+            &["billing"],
+            Vec::new(),
+            ShardRouter::single(),
+            SchedulerMonitor::offline(),
+        ),
+        "prod",
+        true,
+    );
+
+    let report = build_preflight_report(&state).await;
+
+    assert_eq!(report.overall_status, PreflightStatus::Pass);
+    assert_eq!(
+        check_status(&report, "worker_coverage"),
+        PreflightStatus::Pass
+    );
+    let worker_coverage = report
+        .checks
+        .iter()
+        .find(|check| check.name == "worker_coverage")
+        .expect("worker coverage check should exist");
+    assert_eq!(
+        worker_coverage.details["required_queues"],
+        json!(["billing"])
     );
 }
 

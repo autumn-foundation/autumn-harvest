@@ -805,7 +805,7 @@ async fn observe_worker_coverage_shard(
 
 fn required_queues(runtime: &crate::api::HarvestApiRuntime) -> BTreeSet<String> {
     let mut queues = runtime.queues().iter().cloned().collect::<BTreeSet<_>>();
-    if !runtime.registry().workflows.is_empty() {
+    if !runtime.registry().workflows.is_empty() && queues.is_empty() {
         queues.insert("default".to_string());
     }
     for activity in runtime.registry().activities.values() {
