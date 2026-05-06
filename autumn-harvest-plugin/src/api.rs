@@ -2428,16 +2428,73 @@ async fn list_schedules(
     Ok(Json(entries))
 }
 
+async fn schedule_create_audit_failed(
+    api_state: &HarvestApiState,
+    actor: &str,
+    source: &str,
+    request_id: Option<&str>,
+    workflow_name: &str,
+    error_summary: &str,
+) {
+    let Ok(pool) = api_state.storage_pool() else {
+        return;
+    };
+    let Ok(mut conn) = acquire_conn(pool.default_pool()).await else {
+        return;
+    };
+    let ar = NewAuditRecord {
+        actor,
+        operation: OP_SCHEDULE_CREATE,
+        target_type: TARGET_SCHEDULE,
+        target_id: Some(workflow_name),
+        route_or_command: "POST /admin/schedules/workflow",
+        request_id,
+        idempotency_key: None,
+        status: STATUS_FAILED,
+        error_summary: Some(error_summary),
+        shard_id: None,
+        source,
+    };
+    let _ = audit::insert_audit(&mut conn, &ar).await;
+}
+
+async fn upsert_workflow_schedule_and_read_back(
+    conn: &mut diesel_async::AsyncPgConnection,
+    ws: &WorkflowSchedule,
+) -> Result<ScheduleEntry, AutumnError> {
+    use autumn_harvest::schema::harvest_schedules::dsl;
+    autumn_harvest::register_workflow_schedules(conn, std::slice::from_ref(ws))
+        .await
+        .map_err(map_error)?;
+    let row: autumn_harvest::models::HarvestSchedule = dsl::harvest_schedules
+        .filter(dsl::workflow_name.eq(&ws.workflow_name))
+        .select(autumn_harvest::models::HarvestSchedule::as_select())
+        .first(conn)
+        .await
+        .map_err(database_error)
+        .map_err(map_error)?;
+    Ok(ScheduleEntry {
+        id: row.id,
+        kind: ScheduleKind::Workflow,
+        name: ws.workflow_name.clone(),
+        schedule_expr: row.schedule_expr,
+        is_paused: row.is_paused,
+        next_run_at: row.next_run_at,
+        last_run_at: row.last_run_at,
+        max_active_runs: row.max_active_runs,
+        catchup: row.catchup,
+    })
+}
+
 async fn create_workflow_schedule(
     Extension(api_state): Extension<HarvestApiState>,
     headers: axum::http::HeaderMap,
     Json(request): Json<CreateWorkflowScheduleRequest>,
 ) -> Result<(axum::http::StatusCode, Json<ScheduleEntry>), AutumnError> {
-    use autumn_harvest::schema::harvest_schedules::dsl;
-
     let runtime = api_state.runtime().map_err(map_error)?;
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+    let route = "POST /admin/schedules/workflow";
 
-    // Validate: workflow_name must be registered.
     if !runtime
         .registry
         .workflows
@@ -2449,23 +2506,41 @@ async fn create_workflow_schedule(
             .keys()
             .map(String::as_str)
             .collect();
+        schedule_create_audit_failed(
+            &api_state,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            &request.workflow_name,
+            "workflow not registered",
+        )
+        .await;
         return Err(AutumnError::not_found_msg(format!(
             "workflow '{}' is not registered; registered: {:?}",
             request.workflow_name, registered
         )));
     }
 
-    // Parse the schedule expression.
-    let schedule = parse_schedule_expr(&request.schedule_expr)
-        .map_err(|e| AutumnError::bad_request_msg(format!("invalid schedule_expr: {e}")))?;
+    let schedule = match parse_schedule_expr(&request.schedule_expr) {
+        Ok(s) => s,
+        Err(e) => {
+            let err_summary = format!("invalid schedule_expr: {e}");
+            schedule_create_audit_failed(
+                &api_state,
+                &actor,
+                &source,
+                request_id.as_deref(),
+                &request.workflow_name,
+                &err_summary,
+            )
+            .await;
+            return Err(AutumnError::bad_request_msg(err_summary));
+        }
+    };
 
     let pool = api_state.storage_pool().map_err(map_error)?;
     let mut conn = acquire_conn(pool.pool_for(runtime.router().default_shard())).await?;
 
-    let (actor, source, request_id) = audit_context(&headers, &api_state);
-    let route = "POST /admin/schedules/workflow";
-
-    // Upsert the schedule row.
     let ws = WorkflowSchedule {
         workflow_name: request.workflow_name.clone(),
         schedule,
@@ -2475,55 +2550,34 @@ async fn create_workflow_schedule(
         paused: request.paused,
         queue_name: request.queue_name.clone(),
     };
-    let upsert_result =
-        autumn_harvest::register_workflow_schedules(&mut conn, std::slice::from_ref(&ws)).await;
-
-    if let Err(e) = upsert_result {
-        let err_str = e.to_string();
-        let ar = NewAuditRecord {
-            actor: &actor,
-            operation: OP_SCHEDULE_CREATE,
-            target_type: TARGET_SCHEDULE,
-            target_id: Some(request.workflow_name.as_str()),
-            route_or_command: route,
-            request_id: request_id.as_deref(),
-            idempotency_key: None,
-            status: STATUS_FAILED,
-            error_summary: Some(err_str.as_str()),
-            shard_id: None,
-            source: &source,
-        };
-        let _ = audit::insert_audit(&mut conn, &ar).await;
-        return Err(map_error(e));
-    }
-
-    // Read back the upserted row to return it.
-    let row: autumn_harvest::models::HarvestSchedule = dsl::harvest_schedules
-        .filter(dsl::workflow_name.eq(&request.workflow_name))
-        .select(autumn_harvest::models::HarvestSchedule::as_select())
-        .first(&mut conn)
-        .await
-        .map_err(database_error)
-        .map_err(map_error)?;
-
-    let schedule_id_str = row.id.to_string();
-    let entry = ScheduleEntry {
-        id: row.id,
-        kind: ScheduleKind::Workflow,
-        name: request.workflow_name.clone(),
-        schedule_expr: row.schedule_expr,
-        is_paused: row.is_paused,
-        next_run_at: row.next_run_at,
-        last_run_at: row.last_run_at,
-        max_active_runs: row.max_active_runs,
-        catchup: row.catchup,
+    let entry = match upsert_workflow_schedule_and_read_back(&mut conn, &ws).await {
+        Ok(e) => e,
+        Err(e) => {
+            let err_str = e.to_string();
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_SCHEDULE_CREATE,
+                target_type: TARGET_SCHEDULE,
+                target_id: Some(request.workflow_name.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_FAILED,
+                error_summary: Some(err_str.as_str()),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+            return Err(e);
+        }
     };
 
+    let entry_id_str = entry.id.to_string();
     let ar = NewAuditRecord {
         actor: &actor,
         operation: OP_SCHEDULE_CREATE,
         target_type: TARGET_SCHEDULE,
-        target_id: Some(schedule_id_str.as_str()),
+        target_id: Some(entry_id_str.as_str()),
         route_or_command: route,
         request_id: request_id.as_deref(),
         idempotency_key: None,
