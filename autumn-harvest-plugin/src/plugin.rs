@@ -253,9 +253,11 @@ fn start_harvest_runtime(
     // /workers correctly classifies workers under non-default configurations.
     api_state.set_worker_stale_threshold(built.worker_config().worker_heartbeat_interval * 2);
 
-    // Apply the api_state audit retention override so that
-    // api_state.set_audit_retention_days() takes effect in the retention janitor.
-    built.set_audit_retention_days(api_state.audit_retention_days());
+    // Apply the api_state audit retention override only when explicitly set,
+    // so that builder-level retention config is not silently clobbered.
+    if let Some(days) = api_state.audit_retention_days() {
+        built.set_audit_retention_days(days);
+    }
 
     state.insert_extension(harvest_config.outbox.clone());
     state.insert_extension(router.clone());

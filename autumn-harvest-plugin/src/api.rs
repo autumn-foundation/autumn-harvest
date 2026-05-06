@@ -23,14 +23,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use autumn_harvest::audit::{
-    self, AuditFilters, DEFAULT_AUDIT_RETENTION_DAYS, HEADER_ACTOR, HEADER_REQUEST_ID,
-    HEADER_SOURCE, OP_BATCH_SUBMIT, OP_DAG_PATCH, OP_DAG_TRIGGER, OP_DLQ_DISCARD_BULK,
-    OP_DLQ_REPLAY, OP_DLQ_REPLAY_BULK, OP_EXTERNAL_ACTIVITY_COMPLETE, OP_EXTERNAL_ACTIVITY_FAIL,
-    OP_RETENTION_RUN_NOW, OP_SCHEDULE_CREATE, OP_SCHEDULE_DELETE, OP_SCHEDULE_PAUSE,
-    OP_SCHEDULE_RESUME, OP_WORKFLOW_CANCEL, OP_WORKFLOW_RESET, OP_WORKFLOW_SIGNAL,
-    OP_WORKFLOW_START, SOURCE_API, STATUS_FAILED, STATUS_SUCCEEDED, TARGET_BATCH, TARGET_DAG,
-    TARGET_DEAD_LETTER, TARGET_EXTERNAL_ACTIVITY, TARGET_RETENTION, TARGET_SCHEDULE,
-    TARGET_WORKFLOW,
+    self, AuditFilters, HEADER_ACTOR, HEADER_REQUEST_ID, HEADER_SOURCE, OP_BATCH_SUBMIT,
+    OP_DAG_PATCH, OP_DAG_TRIGGER, OP_DLQ_DISCARD_BULK, OP_DLQ_REPLAY, OP_DLQ_REPLAY_BULK,
+    OP_EXTERNAL_ACTIVITY_COMPLETE, OP_EXTERNAL_ACTIVITY_FAIL, OP_RETENTION_RUN_NOW,
+    OP_SCHEDULE_CREATE, OP_SCHEDULE_DELETE, OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME,
+    OP_WORKFLOW_CANCEL, OP_WORKFLOW_RESET, OP_WORKFLOW_SIGNAL, OP_WORKFLOW_START, SOURCE_API,
+    STATUS_FAILED, STATUS_SUCCEEDED, TARGET_BATCH, TARGET_DAG, TARGET_DEAD_LETTER,
+    TARGET_EXTERNAL_ACTIVITY, TARGET_RETENTION, TARGET_SCHEDULE, TARGET_WORKFLOW,
 };
 use autumn_harvest::batch::{
     self, BatchAction, BatchExecutorConfig, BatchFilter, BatchJobStatus, BatchJobView,
@@ -180,7 +179,7 @@ pub struct HarvestApiState {
     /// Optional actor extractor injected by the plugin embedder.
     actor_extractor: Arc<Mutex<Option<ActorExtractorFn>>>,
     /// Audit log retention in days (default: 90).
-    audit_retention_days: Arc<Mutex<i64>>,
+    audit_retention_days: Arc<Mutex<Option<i64>>>,
 }
 
 impl Default for HarvestApiState {
@@ -190,7 +189,7 @@ impl Default for HarvestApiState {
             storage_pool: Arc::default(),
             worker_stale_threshold: Arc::new(Mutex::new(std::time::Duration::from_secs(10))),
             actor_extractor: Arc::default(),
-            audit_retention_days: Arc::new(Mutex::new(DEFAULT_AUDIT_RETENTION_DAYS)),
+            audit_retention_days: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -253,10 +252,12 @@ impl HarvestApiState {
         *self
             .audit_retention_days
             .lock()
-            .expect("harvest api state lock poisoned") = days;
+            .expect("harvest api state lock poisoned") = Some(days);
     }
 
-    pub(crate) fn audit_retention_days(&self) -> i64 {
+    /// Returns `Some(days)` only when explicitly set via [`set_audit_retention_days`];
+    /// `None` means "use the builder's retention config unchanged".
+    pub(crate) fn audit_retention_days(&self) -> Option<i64> {
         *self
             .audit_retention_days
             .lock()
@@ -2597,6 +2598,22 @@ async fn set_schedule_paused(
     }
 
     if updated_count == 0 {
+        if let Ok(mut conn) = acquire_conn(pool.default_pool()).await {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation,
+                target_type: TARGET_SCHEDULE,
+                target_id: Some(id_str_owned.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_FAILED,
+                error_summary: Some("schedule not found"),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+        }
         return Err(AutumnError::not_found_msg(format!("schedule {id}")));
     }
     Ok(Json(BasicAck { ok: true }))
@@ -2679,6 +2696,22 @@ async fn delete_schedule(
     }
 
     if deleted_count == 0 {
+        if let Ok(mut conn) = acquire_conn(pool.default_pool()).await {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_SCHEDULE_DELETE,
+                target_type: TARGET_SCHEDULE,
+                target_id: Some(id_str.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_FAILED,
+                error_summary: Some("schedule not found"),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+        }
         return Err(AutumnError::not_found_msg(format!("schedule {id}")));
     }
     Ok(Json(BasicAck { ok: true }))
