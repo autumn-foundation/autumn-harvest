@@ -47,19 +47,34 @@ curl -s "https://app.example.com/api/harvest/admin/audit?operation=workflow.canc
 
 ## Scenario 2 — "Who changed this schedule?"
 
-### Via CLI
+Schedule audit rows store the **schedule UUID** as `target_id` (the UUID returned by
+`POST /admin/schedules/workflow` and visible in `GET /admin/schedules`). Look up the
+UUID first, then query the audit log.
+
+### Step 1 — find the schedule UUID
+
+```bash
+curl -s "https://app.example.com/api/harvest/admin/schedules" \
+  -H "Authorization: Bearer $HARVEST_TOKEN" \
+  | jq '.[] | select(.workflow_name == "approval_workflow") | .id'
+# → "a1b2c3d4-0000-7000-0001-000000000042"
+```
+
+### Step 2 — query the audit log by UUID
+
+#### Via CLI
 
 ```bash
 harvest audit list \
   --target-type schedule \
-  --target-id approval_workflow \
+  --target-id a1b2c3d4-0000-7000-0001-000000000042 \
   --since 2026-05-01T00:00:00Z
 ```
 
-### Via API
+#### Via API
 
 ```bash
-curl -s "https://app.example.com/api/harvest/admin/audit?target_type=schedule&target_id=approval_workflow&since=2026-05-01T00%3A00%3A00Z" \
+curl -s "https://app.example.com/api/harvest/admin/audit?target_type=schedule&target_id=a1b2c3d4-0000-7000-0001-000000000042&since=2026-05-01T00%3A00%3A00Z" \
   -H "Authorization: Bearer $HARVEST_TOKEN" | jq .
 ```
 
