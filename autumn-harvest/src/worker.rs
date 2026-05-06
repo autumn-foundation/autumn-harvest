@@ -1076,6 +1076,49 @@ async fn persist_update_result_commands(
     Ok(())
 }
 
+/// Apply `UpsertSearchAttributes` patches from `commands` to `base` in memory.
+///
+/// Returns the patched value, or the original `base` if no patch commands exist.
+fn apply_search_attrs_patch_in_memory(
+    base: Option<serde_json::Value>,
+    commands: &[WorkflowCommand],
+) -> Option<serde_json::Value> {
+    let mut patch: std::collections::HashMap<String, Option<serde_json::Value>> =
+        std::collections::HashMap::new();
+    for cmd in commands {
+        if let WorkflowCommand::UpsertSearchAttributes { patch: p } = cmd {
+            patch.extend(p.iter().map(|(k, v)| (k.clone(), v.clone())));
+        }
+    }
+    if patch.is_empty() {
+        return base;
+    }
+    let mut obj = base
+        .and_then(|v| {
+            if let serde_json::Value::Object(m) = v {
+                Some(m)
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default();
+    for (k, v) in patch {
+        match v {
+            Some(val) => {
+                obj.insert(k, val);
+            }
+            None => {
+                obj.remove(&k);
+            }
+        }
+    }
+    if obj.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Object(obj))
+    }
+}
+
 /// Apply `UpsertSearchAttributes` commands from a command list to the DB.
 ///
 /// Multiple `UpsertSearchAttributes` commands are merged left-to-right before
@@ -2505,7 +2548,7 @@ async fn process_workflow_task(
     sticky_timeout: Duration,
     max_local_activity_start_to_close: Duration,
 ) -> HarvestResult<()> {
-    let prepared = prepare_workflow_task(conn, task, worker_id).await?;
+    let mut prepared = prepare_workflow_task(conn, task, worker_id).await?;
     let Some(workflow) = registry.workflows.get(&prepared.execution.workflow_name) else {
         let error = format!(
             "no workflow handler registered for '{}'",
@@ -2674,11 +2717,18 @@ async fn process_workflow_task(
     // patches for any commands emitted during this live execution cycle before
     // the terminal event.  For Suspended outcomes these commands are inside the
     // variant and are handled inside handle_suspended_workflow; pending_cmds is
-    // only non-empty for Completed/Failed outcomes.
+    // only non-empty for Completed/Failed/ContinuedAsNew outcomes.
     if !pending_cmds.is_empty() {
         persist_update_result_commands(conn, prepared.exec_id, &pending_cmds, &mut next_event_id)
             .await?;
         persist_search_attrs_from_commands(conn, prepared.exec_id, &pending_cmds).await?;
+        // Keep the in-memory execution snapshot current so that
+        // persist_workflow_continue_as_new copies the patched attrs to the
+        // successor row rather than the stale pre-patch snapshot.
+        prepared.execution.search_attrs = apply_search_attrs_patch_in_memory(
+            prepared.execution.search_attrs.take(),
+            &pending_cmds,
+        );
     }
 
     persist_workflow_outcome(
