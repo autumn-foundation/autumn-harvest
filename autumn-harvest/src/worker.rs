@@ -2418,7 +2418,8 @@ async fn run_workflow_task_loop(
     let (outcome, pending_cmds, execute_span) = loop {
         let is_replay = ctx.history_events.len() > 1;
 
-        let _iter_parent_guard = ctx.trace_carrier
+        let _iter_parent_guard = ctx
+            .trace_carrier
             .filter(|_| !is_replay)
             .map(|c| telemetry.install_trace_context(c));
 
@@ -2427,7 +2428,8 @@ async fn run_workflow_task_loop(
             shard_id: i64::from(ctx.shard_id),
             queue_name: ctx.task.queue_name.clone(),
             is_replay,
-            link_traceparent: ctx.trace_carrier
+            link_traceparent: ctx
+                .trace_carrier
                 .filter(|_| is_replay)
                 .and_then(|c| c.link_traceparent.clone().or_else(|| c.traceparent.clone())),
         };
