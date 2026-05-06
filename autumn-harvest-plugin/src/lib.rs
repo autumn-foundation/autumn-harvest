@@ -4,6 +4,7 @@ pub mod api;
 pub mod config;
 pub mod outbox;
 pub mod plugin;
+pub mod preflight;
 pub mod prelude;
 pub mod runner;
 pub mod state;
