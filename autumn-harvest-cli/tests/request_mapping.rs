@@ -543,8 +543,8 @@ fn retention_commands_match_management_routes() {
 
 #[test]
 fn audit_list_no_filters_maps_to_admin_audit() {
-    let cli = Cli::try_parse_from(["harvest", "audit", "list"])
-        .expect("audit list args should parse");
+    let cli =
+        Cli::try_parse_from(["harvest", "audit", "list"]).expect("audit list args should parse");
     let request = cli.api_request().expect("request should build");
     assert_eq!(request.method, ApiMethod::Get);
     assert_eq!(request.path, "/admin/audit");
@@ -606,13 +606,7 @@ fn audit_list_all_filters_builds_correct_query_string() {
 #[test]
 fn audit_list_partial_filters() {
     let cli = Cli::try_parse_from([
-        "harvest",
-        "audit",
-        "list",
-        "--status",
-        "failed",
-        "--limit",
-        "10",
+        "harvest", "audit", "list", "--status", "failed", "--limit", "10",
     ])
     .expect("audit list partial args should parse");
     let request = cli.api_request().expect("request should build");

@@ -169,10 +169,16 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ("GET /workflows/{id}", None),
     ("GET /workflows/{id}/children", None),
     ("GET /workflows/{id}/stack", None),
-    ("POST /workflows/{workflow_name}/start", Some(OP_WORKFLOW_START)),
+    (
+        "POST /workflows/{workflow_name}/start",
+        Some(OP_WORKFLOW_START),
+    ),
     ("POST /workflows/{id}/cancel", Some(OP_WORKFLOW_CANCEL)),
     ("POST /workflows/{id}/reset", Some(OP_WORKFLOW_RESET)),
-    ("POST /workflows/{id}/signal/{signal_name}", Some(OP_WORKFLOW_SIGNAL)),
+    (
+        "POST /workflows/{id}/signal/{signal_name}",
+        Some(OP_WORKFLOW_SIGNAL),
+    ),
     ("GET /workflows/{id}/query/{query_name}", None),
     ("POST /workflows/{id}/update/{update_name}", None),
     ("GET /workflows/{id}/update/{update_id}/result", None),
@@ -195,11 +201,20 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ("GET /admin/schedules", None),
     ("POST /admin/schedules/workflow", Some(OP_SCHEDULE_CREATE)),
     ("POST /admin/schedules/{id}/pause", Some(OP_SCHEDULE_PAUSE)),
-    ("POST /admin/schedules/{id}/resume", Some(OP_SCHEDULE_RESUME)),
+    (
+        "POST /admin/schedules/{id}/resume",
+        Some(OP_SCHEDULE_RESUME),
+    ),
     ("DELETE /admin/schedules/{id}", Some(OP_SCHEDULE_DELETE)),
     // External activity completion
-    ("POST /activities/external/{token}/complete", Some(OP_EXTERNAL_ACTIVITY_COMPLETE)),
-    ("POST /activities/external/{token}/fail", Some(OP_EXTERNAL_ACTIVITY_FAIL)),
+    (
+        "POST /activities/external/{token}/complete",
+        Some(OP_EXTERNAL_ACTIVITY_COMPLETE),
+    ),
+    (
+        "POST /activities/external/{token}/fail",
+        Some(OP_EXTERNAL_ACTIVITY_FAIL),
+    ),
     ("POST /activities/external/{token}/heartbeat", None),
     // Worker fleet (read-only)
     ("GET /workers/health", None),
@@ -336,12 +351,10 @@ pub async fn purge_old_audit_records(
     retention_days: i64,
 ) -> HarvestResult<usize> {
     let cutoff = chrono::Utc::now() - chrono::Duration::days(retention_days);
-    diesel::delete(
-        harvest_audit_log::table.filter(harvest_audit_log::occurred_at.lt(cutoff)),
-    )
-    .execute(conn)
-    .await
-    .map_err(database_error)
+    diesel::delete(harvest_audit_log::table.filter(harvest_audit_log::occurred_at.lt(cutoff)))
+        .execute(conn)
+        .await
+        .map_err(database_error)
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────

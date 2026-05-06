@@ -169,8 +169,7 @@ impl HarvestApiRuntime {
 /// If no extractor is configured, the default header-based fallback is used:
 /// read `X-Harvest-Actor`, otherwise return `"anonymous"`. Using `"anonymous"`
 /// is only acceptable for local or dev deployments.
-pub type ActorExtractorFn =
-    Arc<dyn Fn(&axum::http::HeaderMap) -> String + Send + Sync + 'static>;
+pub type ActorExtractorFn = Arc<dyn Fn(&axum::http::HeaderMap) -> String + Send + Sync + 'static>;
 
 #[derive(Clone)]
 pub struct HarvestApiState {
@@ -1024,9 +1023,7 @@ async fn list_audit_records(
     Ok(Json(records))
 }
 
-fn parse_audit_datetime(
-    raw: &str,
-) -> Result<chrono::DateTime<chrono::Utc>, AutumnError> {
+fn parse_audit_datetime(raw: &str) -> Result<chrono::DateTime<chrono::Utc>, AutumnError> {
     chrono::DateTime::parse_from_rfc3339(raw)
         .map(|dt| dt.with_timezone(&chrono::Utc))
         .map_err(|_| {
@@ -2102,8 +2099,7 @@ async fn signal_workflow(
     let exec_id_str = exec_id.to_string();
 
     // Signal payload is intentionally not stored in the audit record (no PII).
-    let signal_result =
-        signal::send_signal(&mut conn, exec_id, &signal_name, payload).await;
+    let signal_result = signal::send_signal(&mut conn, exec_id, &signal_name, payload).await;
 
     if let Err(e) = signal_result {
         let err_str = e.to_string();
@@ -2139,7 +2135,10 @@ async fn signal_workflow(
     audit::insert_audit(&mut conn, &ar)
         .await
         .map_err(map_error)?;
-    Ok((axum::http::StatusCode::ACCEPTED, Json(BasicAck { ok: true })))
+    Ok((
+        axum::http::StatusCode::ACCEPTED,
+        Json(BasicAck { ok: true }),
+    ))
 }
 
 async fn query_workflow(
@@ -2811,7 +2810,10 @@ async fn bulk_replay_dead_letters_handler(
             let (audit_status, audit_error) = if result.failures.is_empty() {
                 (STATUS_SUCCEEDED, None)
             } else {
-                (STATUS_FAILED, Some(format!("{} failures", result.failures.len())))
+                (
+                    STATUS_FAILED,
+                    Some(format!("{} failures", result.failures.len())),
+                )
             };
             match audit_conn {
                 Ok(mut conn) => {
@@ -2897,7 +2899,10 @@ async fn bulk_discard_dead_letters_handler(
             let (audit_status, audit_error) = if result.failures.is_empty() {
                 (STATUS_SUCCEEDED, None)
             } else {
-                (STATUS_FAILED, Some(format!("{} failures", result.failures.len())))
+                (
+                    STATUS_FAILED,
+                    Some(format!("{} failures", result.failures.len())),
+                )
             };
             match audit_conn {
                 Ok(mut conn) => {
@@ -3090,7 +3095,9 @@ async fn retention_run_now(
             shard_id: None,
             source: &source,
         };
-        audit::insert_audit(&mut conn, &ar).await.map_err(map_error)?;
+        audit::insert_audit(&mut conn, &ar)
+            .await
+            .map_err(map_error)?;
     } else if let Err(ref e) = send_result {
         let err_str = e.to_string();
         if let Ok(mut conn) = acquire_conn(pool.default_pool()).await {
@@ -3475,7 +3482,9 @@ async fn complete_external_activity(
             shard_id: None,
             source: &source,
         };
-        audit::insert_audit(&mut conn, &ar).await.map_err(map_error)?;
+        audit::insert_audit(&mut conn, &ar)
+            .await
+            .map_err(map_error)?;
     } else if let Err(ref e) = complete_result {
         let err_str = e.to_string();
         if let Ok(mut conn) = acquire_conn(pool.default_pool()).await {
@@ -3537,7 +3546,9 @@ async fn fail_external_activity(
             shard_id: None,
             source: &source,
         };
-        audit::insert_audit(&mut conn, &ar).await.map_err(map_error)?;
+        audit::insert_audit(&mut conn, &ar)
+            .await
+            .map_err(map_error)?;
     } else if let Err(ref e) = fail_result {
         let err_str = e.to_string();
         if let Ok(mut conn) = acquire_conn(pool.default_pool()).await {

@@ -6,8 +6,8 @@
 //! exercises `autumn_harvest::audit` insert/list/filter behaviour.
 
 use autumn_harvest::audit::{
-    self, AuditFilters, STATUS_FAILED, STATUS_SUCCEEDED, TARGET_SCHEDULE, TARGET_WORKFLOW,
-    OP_WORKFLOW_CANCEL, OP_WORKFLOW_START,
+    self, AuditFilters, OP_WORKFLOW_CANCEL, OP_WORKFLOW_START, STATUS_FAILED, STATUS_SUCCEEDED,
+    TARGET_SCHEDULE, TARGET_WORKFLOW,
 };
 use autumn_harvest::models::NewAuditRecord;
 
@@ -46,7 +46,10 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260506000000_harvest_audit_log/up.sql"),
 );
 
-async fn make_conn() -> (diesel_async::AsyncPgConnection, testcontainers::ContainerAsync<Postgres>) {
+async fn make_conn() -> (
+    diesel_async::AsyncPgConnection,
+    testcontainers::ContainerAsync<Postgres>,
+) {
     let container = Postgres::default().start().await.expect("postgres start");
     let port = container.get_host_port_ipv4(5432).await.expect("port");
     let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
@@ -57,7 +60,7 @@ async fn make_conn() -> (diesel_async::AsyncPgConnection, testcontainers::Contai
     (conn, container)
 }
 
-fn succeeded_record<'a>(
+const fn succeeded_record<'a>(
     actor: &'a str,
     operation: &'a str,
     target_type: &'a str,
@@ -78,7 +81,7 @@ fn succeeded_record<'a>(
     }
 }
 
-fn failed_record<'a>(
+const fn failed_record<'a>(
     actor: &'a str,
     operation: &'a str,
     target_type: &'a str,
@@ -105,7 +108,12 @@ fn failed_record<'a>(
 async fn insert_and_retrieve_audit_record() {
     let (mut conn, _c) = make_conn().await;
 
-    let record = succeeded_record("alice", OP_WORKFLOW_START, TARGET_WORKFLOW, Some("exec-123"));
+    let record = succeeded_record(
+        "alice",
+        OP_WORKFLOW_START,
+        TARGET_WORKFLOW,
+        Some("exec-123"),
+    );
     let id = audit::insert_audit(&mut conn, &record)
         .await
         .expect("insert audit");
@@ -424,12 +432,8 @@ async fn failed_audit_record_includes_error_summary() {
         Some("workflow not found: exec-xyz")
     );
     // error_summary should not be the full raw payload.
-    assert!(!rows[0]
-        .error_summary
-        .as_deref()
-        .unwrap_or("")
-        .contains("input")
-        || true);
+    let summary = rows[0].error_summary.as_deref().unwrap_or("");
+    assert!(!summary.contains("input"));
 }
 
 #[tokio::test]
@@ -484,7 +488,7 @@ fn audit_coverage_all_mutation_routes_declared() {
     // When you add a new mutating route to `harvest_api_router`, add an entry to
     // that const — audited routes with `Some(OP_*)`, excluded routes with `None`.
 
-    use autumn_harvest::audit::{AUDITED_OPERATIONS, ALL_MUTATION_ROUTES};
+    use autumn_harvest::audit::{ALL_MUTATION_ROUTES, AUDITED_OPERATIONS};
 
     // Every declared audited operation must exist in AUDITED_OPERATIONS.
     for (route, declared_op) in ALL_MUTATION_ROUTES {

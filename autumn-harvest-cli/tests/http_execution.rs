@@ -91,8 +91,7 @@ async fn spawn_one_response_server(
 
 #[tokio::test]
 async fn mutating_command_sends_harvest_source_cli_header() {
-    let (base_url, request_task) =
-        spawn_one_response_server("200 OK", r#"{"ok":true}"#).await;
+    let (base_url, request_task) = spawn_one_response_server("200 OK", r#"{"ok":true}"#).await;
     let cli = Cli::try_parse_from([
         "harvest",
         "--base-url",
@@ -114,8 +113,7 @@ async fn mutating_command_sends_harvest_source_cli_header() {
 
 #[tokio::test]
 async fn mutating_command_with_actor_flag_sends_actor_header() {
-    let (base_url, request_task) =
-        spawn_one_response_server("200 OK", r#"{"ok":true}"#).await;
+    let (base_url, request_task) = spawn_one_response_server("200 OK", r#"{"ok":true}"#).await;
     let cli = Cli::try_parse_from([
         "harvest",
         "--base-url",
@@ -145,8 +143,7 @@ async fn mutating_command_with_actor_flag_sends_actor_header() {
 
 #[tokio::test]
 async fn read_only_command_does_not_send_source_header() {
-    let (base_url, request_task) =
-        spawn_one_response_server("200 OK", r#"{"status":"ok"}"#).await;
+    let (base_url, request_task) = spawn_one_response_server("200 OK", r#"{"status":"ok"}"#).await;
     let cli = Cli::try_parse_from(["harvest", "--base-url", &base_url, "health"])
         .expect("CLI args should parse");
 

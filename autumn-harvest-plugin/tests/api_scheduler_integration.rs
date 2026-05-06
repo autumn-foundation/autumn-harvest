@@ -1990,6 +1990,7 @@ async fn retention_janitor_deletes_only_rows_older_than_max_age_and_cascades_chi
                 tick_interval_secs: 60 * 60,
                 batch_size: 1000,
                 dry_run: false,
+                audit_retention_days: 90,
             })
             .build(),
         &HarvestRuntimeConfig {

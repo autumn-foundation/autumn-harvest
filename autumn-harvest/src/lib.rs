@@ -14,11 +14,11 @@
 pub const MIGRATIONS: diesel_migrations::EmbeddedMigrations =
     diesel_migrations::embed_migrations!();
 
+/// History analyzer and linter.
+pub mod analyzer;
 /// Audit trail for management API mutations (issue #158).
 #[cfg(feature = "db")]
 pub mod audit;
-/// History analyzer and linter.
-pub mod analyzer;
 /// Batch operations for fleet-wide workflow cancel/terminate/signal (issue #102).
 pub mod batch;
 pub mod builder;
