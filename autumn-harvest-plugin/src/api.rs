@@ -2813,21 +2813,26 @@ async fn bulk_replay_dead_letters_handler(
             } else {
                 (STATUS_FAILED, Some(format!("{} failures", result.failures.len())))
             };
-            if let Ok(mut conn) = audit_conn {
-                let ar = NewAuditRecord {
-                    actor: &actor,
-                    operation: OP_DLQ_REPLAY_BULK,
-                    target_type: TARGET_DEAD_LETTER,
-                    target_id: None,
-                    route_or_command: route,
-                    request_id: request_id.as_deref(),
-                    idempotency_key: None,
-                    status: audit_status,
-                    error_summary: audit_error.as_deref(),
-                    shard_id: None,
-                    source: &source,
-                };
-                let _ = audit::insert_audit(&mut conn, &ar).await;
+            match audit_conn {
+                Ok(mut conn) => {
+                    let ar = NewAuditRecord {
+                        actor: &actor,
+                        operation: OP_DLQ_REPLAY_BULK,
+                        target_type: TARGET_DEAD_LETTER,
+                        target_id: None,
+                        route_or_command: route,
+                        request_id: request_id.as_deref(),
+                        idempotency_key: None,
+                        status: audit_status,
+                        error_summary: audit_error.as_deref(),
+                        shard_id: None,
+                        source: &source,
+                    };
+                    if let Err(e) = audit::insert_audit(&mut conn, &ar).await {
+                        return map_error(e).into_response();
+                    }
+                }
+                Err(e) => return e.into_response(),
             }
             (status, Json(result)).into_response()
         }
@@ -2894,21 +2899,26 @@ async fn bulk_discard_dead_letters_handler(
             } else {
                 (STATUS_FAILED, Some(format!("{} failures", result.failures.len())))
             };
-            if let Ok(mut conn) = audit_conn {
-                let ar = NewAuditRecord {
-                    actor: &actor,
-                    operation: OP_DLQ_DISCARD_BULK,
-                    target_type: TARGET_DEAD_LETTER,
-                    target_id: None,
-                    route_or_command: route,
-                    request_id: request_id.as_deref(),
-                    idempotency_key: None,
-                    status: audit_status,
-                    error_summary: audit_error.as_deref(),
-                    shard_id: None,
-                    source: &source,
-                };
-                let _ = audit::insert_audit(&mut conn, &ar).await;
+            match audit_conn {
+                Ok(mut conn) => {
+                    let ar = NewAuditRecord {
+                        actor: &actor,
+                        operation: OP_DLQ_DISCARD_BULK,
+                        target_type: TARGET_DEAD_LETTER,
+                        target_id: None,
+                        route_or_command: route,
+                        request_id: request_id.as_deref(),
+                        idempotency_key: None,
+                        status: audit_status,
+                        error_summary: audit_error.as_deref(),
+                        shard_id: None,
+                        source: &source,
+                    };
+                    if let Err(e) = audit::insert_audit(&mut conn, &ar).await {
+                        return map_error(e).into_response();
+                    }
+                }
+                Err(e) => return e.into_response(),
             }
             (status, Json(result)).into_response()
         }
@@ -3065,11 +3075,8 @@ async fn retention_run_now(
     let send_result = trigger.try_send(());
 
     let pool = api_state.storage_pool().map_err(map_error)?;
-    if let Ok(mut conn) = acquire_conn(pool.default_pool()).await {
-        let (status, error_summary) = match &send_result {
-            Ok(()) => (STATUS_SUCCEEDED, None),
-            Err(e) => (STATUS_FAILED, Some(e.to_string())),
-        };
+    if send_result.is_ok() {
+        let mut conn = acquire_conn(pool.default_pool()).await?;
         let ar = NewAuditRecord {
             actor: &actor,
             operation: OP_RETENTION_RUN_NOW,
@@ -3078,12 +3085,30 @@ async fn retention_run_now(
             route_or_command: route,
             request_id: request_id.as_deref(),
             idempotency_key: None,
-            status,
-            error_summary: error_summary.as_deref(),
+            status: STATUS_SUCCEEDED,
+            error_summary: None,
             shard_id: None,
             source: &source,
         };
-        let _ = audit::insert_audit(&mut conn, &ar).await;
+        audit::insert_audit(&mut conn, &ar).await.map_err(map_error)?;
+    } else if let Err(ref e) = send_result {
+        let err_str = e.to_string();
+        if let Ok(mut conn) = acquire_conn(pool.default_pool()).await {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_RETENTION_RUN_NOW,
+                target_type: TARGET_RETENTION,
+                target_id: None,
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_FAILED,
+                error_summary: Some(err_str.as_str()),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+        }
     }
 
     send_result.map_err(|error| {
@@ -3435,11 +3460,8 @@ async fn complete_external_activity(
     .await;
 
     let pool = api_state.storage_pool().map_err(map_error)?;
-    if let Ok(mut conn) = acquire_conn(pool.default_pool()).await {
-        let (status, error_summary) = match &complete_result {
-            Ok(_) => (STATUS_SUCCEEDED, None),
-            Err(e) => (STATUS_FAILED, Some(e.to_string())),
-        };
+    if complete_result.is_ok() {
+        let mut conn = acquire_conn(pool.default_pool()).await?;
         let ar = NewAuditRecord {
             actor: &actor,
             operation: OP_EXTERNAL_ACTIVITY_COMPLETE,
@@ -3448,12 +3470,30 @@ async fn complete_external_activity(
             route_or_command: route,
             request_id: request_id.as_deref(),
             idempotency_key: None,
-            status,
-            error_summary: error_summary.as_deref(),
+            status: STATUS_SUCCEEDED,
+            error_summary: None,
             shard_id: None,
             source: &source,
         };
-        let _ = audit::insert_audit(&mut conn, &ar).await;
+        audit::insert_audit(&mut conn, &ar).await.map_err(map_error)?;
+    } else if let Err(ref e) = complete_result {
+        let err_str = e.to_string();
+        if let Ok(mut conn) = acquire_conn(pool.default_pool()).await {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_EXTERNAL_ACTIVITY_COMPLETE,
+                target_type: TARGET_EXTERNAL_ACTIVITY,
+                target_id: Some(token_str.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_FAILED,
+                error_summary: Some(err_str.as_str()),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+        }
     }
 
     let newly_resolved = complete_result?;
@@ -3482,11 +3522,8 @@ async fn fail_external_activity(
     .await;
 
     let pool = api_state.storage_pool().map_err(map_error)?;
-    if let Ok(mut conn) = acquire_conn(pool.default_pool()).await {
-        let (status, error_summary) = match &fail_result {
-            Ok(_) => (STATUS_SUCCEEDED, None),
-            Err(e) => (STATUS_FAILED, Some(e.to_string())),
-        };
+    if fail_result.is_ok() {
+        let mut conn = acquire_conn(pool.default_pool()).await?;
         let ar = NewAuditRecord {
             actor: &actor,
             operation: OP_EXTERNAL_ACTIVITY_FAIL,
@@ -3495,12 +3532,30 @@ async fn fail_external_activity(
             route_or_command: route,
             request_id: request_id.as_deref(),
             idempotency_key: None,
-            status,
-            error_summary: error_summary.as_deref(),
+            status: STATUS_SUCCEEDED,
+            error_summary: None,
             shard_id: None,
             source: &source,
         };
-        let _ = audit::insert_audit(&mut conn, &ar).await;
+        audit::insert_audit(&mut conn, &ar).await.map_err(map_error)?;
+    } else if let Err(ref e) = fail_result {
+        let err_str = e.to_string();
+        if let Ok(mut conn) = acquire_conn(pool.default_pool()).await {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_EXTERNAL_ACTIVITY_FAIL,
+                target_type: TARGET_EXTERNAL_ACTIVITY,
+                target_id: Some(token_str.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_FAILED,
+                error_summary: Some(err_str.as_str()),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+        }
     }
 
     let newly_resolved = fail_result?;

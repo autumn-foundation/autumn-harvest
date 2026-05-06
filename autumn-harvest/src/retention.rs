@@ -46,6 +46,9 @@ pub struct RetentionConfig {
     pub tick_interval_secs: u64,
     pub batch_size: usize,
     pub dry_run: bool,
+    /// Audit log retention in days, independent of workflow-history retention.
+    /// Defaults to 90 days (3 months). Set to 0 to disable audit purging.
+    pub audit_retention_days: i64,
 }
 
 impl Default for RetentionConfig {
@@ -55,6 +58,7 @@ impl Default for RetentionConfig {
             tick_interval_secs: DEFAULT_TICK_INTERVAL.as_secs(),
             batch_size: DEFAULT_BATCH_SIZE,
             dry_run: false,
+            audit_retention_days: 90,
         }
     }
 }
@@ -66,6 +70,13 @@ impl RetentionConfig {
             max_age_secs: Some(max_age.as_secs()),
             ..Self::default()
         }
+    }
+
+    /// Override the audit log retention window.
+    #[must_use]
+    pub const fn with_audit_retention_days(mut self, days: i64) -> Self {
+        self.audit_retention_days = days;
+        self
     }
 
     #[must_use]
@@ -268,6 +279,21 @@ impl RetentionRuntime {
                         }
                     }
                     monitor_task.update(shard, result);
+                }
+
+                // Purge old audit records once per tick, best-effort.
+                // Audit rows live on the default shard; a single pass is enough.
+                if config.audit_retention_days > 0 && !config.dry_run {
+                    let default_shard = pools.default_shard();
+                    if let Ok(mut conn) = pools.pool_for(default_shard).get().await
+                        && let Err(err) = crate::audit::purge_old_audit_records(
+                            &mut conn,
+                            config.audit_retention_days,
+                        )
+                        .await
+                    {
+                        tracing::warn!(error = %err, "harvest audit log purge failed");
+                    }
                 }
             }
         });

@@ -216,7 +216,7 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
 // ── Query filters ─────────────────────────────────────────────────────────────
 
 /// Filters for `list_audit`.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct AuditFilters {
     pub actor: Option<String>,
     pub operation: Option<String>,
@@ -233,6 +233,21 @@ impl AuditFilters {
     #[must_use]
     pub const fn default_limit() -> i64 {
         50
+    }
+}
+
+impl Default for AuditFilters {
+    fn default() -> Self {
+        Self {
+            actor: None,
+            operation: None,
+            target_type: None,
+            target_id: None,
+            status: None,
+            since: None,
+            before: None,
+            limit: Self::default_limit(),
+        }
     }
 }
 
@@ -366,6 +381,13 @@ mod tests {
     #[test]
     fn audit_filters_default_limit_is_50() {
         assert_eq!(AuditFilters::default_limit(), 50);
+    }
+
+    #[test]
+    fn audit_filters_default_uses_default_limit_not_zero() {
+        // Derived Default would give limit=0, which list_audit clamps to 1.
+        // The manual Default implementation must use default_limit() instead.
+        assert_eq!(AuditFilters::default().limit, AuditFilters::default_limit());
     }
 
     #[test]

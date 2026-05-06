@@ -848,12 +848,9 @@ fn format_workflow_children_table(value: &Value) -> String {
 }
 
 fn format_audit_table(value: &Value) -> String {
-    let Some(items) = value.as_array() else {
+    let Some(items) = value.as_array().filter(|v| !v.is_empty()) else {
         return "No audit records found.".to_string();
     };
-    if items.is_empty() {
-        return "No audit records found.".to_string();
-    }
 
     let mut rows: Vec<Vec<String>> = Vec::with_capacity(items.len() + 1);
     rows.push(vec![

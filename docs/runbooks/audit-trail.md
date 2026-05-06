@@ -143,6 +143,7 @@ api_state.set_actor_extractor(|headers| {
     headers
         .get("x-authenticated-user")
         .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
         .unwrap_or("anonymous")
         .to_string()
 });
