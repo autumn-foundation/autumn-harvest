@@ -1960,15 +1960,38 @@ async fn cancel_workflow(
     headers: axum::http::HeaderMap,
     Json(request): Json<CancelWorkflowRequest>,
 ) -> Result<(axum::http::StatusCode, Json<CancelWorkflowResponse>), AutumnError> {
-    let exec_id = parse_execution_id(&id)?;
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+    let route = "POST /workflows/{id}/cancel";
+
+    let exec_id = match parse_execution_id(&id) {
+        Ok(eid) => eid,
+        Err(e) => {
+            if let Ok(pool) = api_state.storage_pool()
+                && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+            {
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_CANCEL,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: Some(id.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: None,
+                    status: STATUS_FAILED,
+                    error_summary: Some("malformed execution id"),
+                    shard_id: None,
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+            }
+            return Err(e);
+        }
+    };
     let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
     let reason = request
         .reason
         .as_deref()
         .unwrap_or("workflow cancellation requested");
-
-    let (actor, source, request_id) = audit_context(&headers, &api_state);
-    let route = "POST /workflows/{id}/cancel";
     let exec_id_str = exec_id.to_string();
 
     let cancel_result = cancel_workflow_execution(&mut conn, exec_id, reason).await;
@@ -2032,9 +2055,32 @@ async fn reset_workflow(
 ) -> axum::response::Response {
     use axum::response::IntoResponse as _;
 
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+    let route = "POST /workflows/{id}/reset";
+
     let exec_id = match parse_execution_id(&id) {
-        Ok(id) => id,
-        Err(e) => return e.into_response(),
+        Ok(eid) => eid,
+        Err(e) => {
+            if let Ok(pool) = api_state.storage_pool()
+                && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+            {
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_RESET,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: Some(id.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: None,
+                    status: STATUS_FAILED,
+                    error_summary: Some("malformed execution id"),
+                    shard_id: None,
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+            }
+            return e.into_response();
+        }
     };
     let mut conn = match db_conn_for_execution(&api_state, exec_id).await {
         Ok(conn) => conn,
@@ -2049,8 +2095,6 @@ async fn reset_workflow(
         };
     }
 
-    let (actor, source, request_id) = audit_context(&headers, &api_state);
-    let route = "POST /workflows/{id}/reset";
     let exec_id_str = exec_id.to_string();
 
     match reset_workflow_execution(&mut conn, exec_id, request).await {
@@ -2147,11 +2191,34 @@ async fn signal_workflow(
     headers: axum::http::HeaderMap,
     Json(payload): Json<Value>,
 ) -> Result<(axum::http::StatusCode, Json<BasicAck>), AutumnError> {
-    let exec_id = parse_execution_id(&id)?;
-    let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
-
     let (actor, source, request_id) = audit_context(&headers, &api_state);
     let route = "POST /workflows/{id}/signal/{signal_name}";
+
+    let exec_id = match parse_execution_id(&id) {
+        Ok(eid) => eid,
+        Err(e) => {
+            if let Ok(pool) = api_state.storage_pool()
+                && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+            {
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_SIGNAL,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: Some(id.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: None,
+                    status: STATUS_FAILED,
+                    error_summary: Some("malformed execution id"),
+                    shard_id: None,
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+            }
+            return Err(e);
+        }
+    };
+    let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
     let exec_id_str = exec_id.to_string();
 
     if let Err(e) = load_execution(&mut conn, exec_id).await {
