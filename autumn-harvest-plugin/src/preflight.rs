@@ -309,19 +309,19 @@ struct RecoveryRow {
 const HARVEST_WRITE_PRIVILEGE_REQUIREMENTS: &[(&str, &[&str])] = &[
     (
         "harvest_workflow_executions",
-        &["INSERT", "UPDATE", "DELETE"],
+        &["SELECT", "INSERT", "UPDATE", "DELETE"],
     ),
-    ("harvest_events", &["INSERT"]),
-    ("harvest_task_queue", &["INSERT", "UPDATE"]),
-    ("harvest_dag_runs", &["INSERT", "UPDATE"]),
-    ("harvest_schedules", &["INSERT", "UPDATE"]),
-    ("harvest_signals", &["INSERT", "UPDATE"]),
-    ("harvest_timers", &["INSERT", "UPDATE", "DELETE"]),
-    ("harvest_dead_letters", &["INSERT", "DELETE"]),
-    ("harvest_external_tasks", &["INSERT", "UPDATE"]),
-    ("harvest_workers", &["INSERT", "UPDATE"]),
-    ("harvest_batch_jobs", &["INSERT", "UPDATE"]),
-    ("harvest_audit_log", &["INSERT", "DELETE"]),
+    ("harvest_events", &["SELECT", "INSERT"]),
+    ("harvest_task_queue", &["SELECT", "INSERT", "UPDATE"]),
+    ("harvest_dag_runs", &["SELECT", "INSERT", "UPDATE"]),
+    ("harvest_schedules", &["SELECT", "INSERT", "UPDATE"]),
+    ("harvest_signals", &["SELECT", "INSERT", "UPDATE"]),
+    ("harvest_timers", &["SELECT", "INSERT", "UPDATE", "DELETE"]),
+    ("harvest_dead_letters", &["SELECT", "INSERT", "DELETE"]),
+    ("harvest_external_tasks", &["SELECT", "INSERT", "UPDATE"]),
+    ("harvest_workers", &["SELECT", "INSERT", "UPDATE"]),
+    ("harvest_batch_jobs", &["SELECT", "INSERT", "UPDATE"]),
+    ("harvest_audit_log", &["SELECT", "INSERT", "DELETE"]),
 ];
 
 const HARVEST_SEQUENCE_PRIVILEGE_REQUIREMENTS: &[(&str, &[&str])] =
@@ -1280,6 +1280,16 @@ mod tests {
         assert!(sql.contains("INSERT"));
         assert!(sql.contains("UPDATE"));
         assert!(sql.contains("DELETE"));
+    }
+
+    #[test]
+    fn every_harvest_runtime_table_requires_select_privilege() {
+        for (table, privileges) in HARVEST_WRITE_PRIVILEGE_REQUIREMENTS {
+            assert!(
+                privileges.contains(&"SELECT"),
+                "{table} must require SELECT so readable/writable preflight matches runtime access"
+            );
+        }
     }
 
     #[test]
