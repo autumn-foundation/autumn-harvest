@@ -1736,18 +1736,25 @@ impl WorkflowContext {
     ///
     /// Panics if the internal update registry mutex is poisoned.
     pub fn validate_update(&self, name: &str, input: &Value) -> HarvestResult<()> {
-        let registry = self
-            .update_registry
-            .lock()
-            .expect("update_registry lock poisoned");
-        // Check existence structurally so validator errors are never confused
-        // with a missing handler, regardless of the error message text.
-        if !registry.contains(name) {
-            return Err(HarvestError::UpdateHandlerNotFound(name.to_string()));
+        let validator_opt = {
+            let registry = self
+                .update_registry
+                .lock()
+                .expect("update_registry lock poisoned");
+            // Check existence structurally so validator errors are never confused
+            // with a missing handler, regardless of the error message text.
+            if !registry.contains(name) {
+                return Err(HarvestError::UpdateHandlerNotFound(name.to_string()));
+            }
+            registry
+                .get_validator(name)
+                .map_err(|reason| HarvestError::UpdateRejected { reason })?
+        };
+
+        if let Some(validator) = validator_opt {
+            validator(input).map_err(|reason| HarvestError::UpdateRejected { reason })?;
         }
-        registry
-            .validate(name, input)
-            .map_err(|reason| HarvestError::UpdateRejected { reason })
+        Ok(())
     }
 
     /// Execute an already-admitted update by `update_id`.
