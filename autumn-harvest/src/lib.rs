@@ -16,6 +16,9 @@ pub const MIGRATIONS: diesel_migrations::EmbeddedMigrations =
 
 /// History analyzer and linter.
 pub mod analyzer;
+/// Audit trail for management API mutations (issue #158).
+#[cfg(feature = "db")]
+pub mod audit;
 /// Batch operations for fleet-wide workflow cancel/terminate/signal (issue #102).
 pub mod batch;
 pub mod builder;
@@ -177,6 +180,9 @@ pub use update::UpdateRegistry;
 
 #[cfg(feature = "db")]
 pub use store::EventHistory;
+
+#[cfg(feature = "db")]
+pub use models::{AuditRecord, NewAuditRecord};
 
 #[cfg(feature = "db")]
 pub use queue::ConcurrencyKeyStats;

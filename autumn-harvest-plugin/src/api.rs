@@ -1,4 +1,5 @@
 //! Axum management routes for Harvest workflows and DAGs.
+#![allow(clippy::literal_string_with_formatting_args)]
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -21,6 +22,15 @@ use diesel_async::RunQueryDsl;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use autumn_harvest::audit::{
+    self, AuditFilters, HEADER_ACTOR, HEADER_REQUEST_ID, HEADER_SOURCE, OP_BATCH_SUBMIT,
+    OP_DAG_PATCH, OP_DAG_TRIGGER, OP_DLQ_DISCARD_BULK, OP_DLQ_REPLAY, OP_DLQ_REPLAY_BULK,
+    OP_EXTERNAL_ACTIVITY_COMPLETE, OP_EXTERNAL_ACTIVITY_FAIL, OP_RETENTION_RUN_NOW,
+    OP_SCHEDULE_CREATE, OP_SCHEDULE_DELETE, OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME,
+    OP_WORKFLOW_CANCEL, OP_WORKFLOW_RESET, OP_WORKFLOW_SIGNAL, OP_WORKFLOW_START, SOURCE_API,
+    STATUS_FAILED, STATUS_SUCCEEDED, TARGET_BATCH, TARGET_DAG, TARGET_DEAD_LETTER,
+    TARGET_EXTERNAL_ACTIVITY, TARGET_RETENTION, TARGET_SCHEDULE, TARGET_WORKFLOW,
+};
 use autumn_harvest::batch::{
     self, BatchAction, BatchExecutorConfig, BatchFilter, BatchJobStatus, BatchJobView,
     BatchSubmission,
@@ -29,7 +39,9 @@ use autumn_harvest::context::WorkflowContext;
 use autumn_harvest::dlq;
 use autumn_harvest::error::{HarvestError, HarvestResult, database_error};
 use autumn_harvest::external_task;
-use autumn_harvest::models::{DagRun, DeadLetter, HarvestSchedule, WorkflowExecution};
+use autumn_harvest::models::{
+    AuditRecord, DagRun, DeadLetter, HarvestSchedule, NewAuditRecord, WorkflowExecution,
+};
 use autumn_harvest::policy::WorkflowSchedule;
 use autumn_harvest::queue::{self, ConcurrencyKeyStats};
 use autumn_harvest::reset::{
@@ -147,12 +159,27 @@ impl HarvestApiRuntime {
     }
 }
 
+/// A function that extracts an actor identity string from request headers.
+///
+/// Implement this to integrate with the application's authentication layer.
+/// The returned string should identify the operator performing the action
+/// (e.g. a username, API key owner, or service account name).
+///
+/// If no extractor is configured, the default header-based fallback is used:
+/// read `X-Harvest-Actor`, otherwise return `"anonymous"`. Using `"anonymous"`
+/// is only acceptable for local or dev deployments.
+pub type ActorExtractorFn = Arc<dyn Fn(&axum::http::HeaderMap) -> String + Send + Sync + 'static>;
+
 #[derive(Clone)]
 pub struct HarvestApiState {
     runtime: Arc<Mutex<Option<HarvestApiRuntime>>>,
     storage_pool: Arc<Mutex<Option<HarvestDbPool>>>,
     /// `2 × worker_heartbeat_interval`; derived from `WorkerConfig` at startup.
     worker_stale_threshold: Arc<Mutex<std::time::Duration>>,
+    /// Optional actor extractor injected by the plugin embedder.
+    actor_extractor: Arc<Mutex<Option<ActorExtractorFn>>>,
+    /// Audit log retention in days (default: 90).
+    audit_retention_days: Arc<Mutex<Option<i64>>>,
 }
 
 impl Default for HarvestApiState {
@@ -161,6 +188,8 @@ impl Default for HarvestApiState {
             runtime: Arc::default(),
             storage_pool: Arc::default(),
             worker_stale_threshold: Arc::new(Mutex::new(std::time::Duration::from_secs(10))),
+            actor_extractor: Arc::default(),
+            audit_retention_days: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -184,6 +213,75 @@ impl HarvestApiState {
             .worker_stale_threshold
             .lock()
             .expect("harvest api state lock poisoned") = threshold;
+    }
+
+    /// Install a custom actor extractor used to derive the `actor` field of
+    /// audit records from incoming request headers.
+    ///
+    /// The closure receives the full `HeaderMap` of the mutating request and
+    /// must return a non-empty string identifying the caller. Common patterns:
+    /// - Read a `X-User-ID` header set by an upstream auth gateway.
+    /// - Decode a JWT claim from `Authorization`.
+    /// - Fall back to `"anonymous"` for unauthenticated dev routes.
+    ///
+    /// When no extractor is installed the default behaviour reads the
+    /// `X-Harvest-Actor` header and falls back to `"anonymous"`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    pub fn set_actor_extractor<F>(&self, f: F)
+    where
+        F: Fn(&axum::http::HeaderMap) -> String + Send + Sync + 'static,
+    {
+        *self
+            .actor_extractor
+            .lock()
+            .expect("harvest api state lock poisoned") = Some(Arc::new(f));
+    }
+
+    /// Set the audit log retention period in days.
+    ///
+    /// Audit records older than this threshold will be deleted on each
+    /// retention sweep. Default: 90 days.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    pub fn set_audit_retention_days(&self, days: i64) {
+        *self
+            .audit_retention_days
+            .lock()
+            .expect("harvest api state lock poisoned") = Some(days);
+    }
+
+    /// Returns `Some(days)` only when explicitly set via [`set_audit_retention_days`];
+    /// `None` means "use the builder's retention config unchanged".
+    pub(crate) fn audit_retention_days(&self) -> Option<i64> {
+        *self
+            .audit_retention_days
+            .lock()
+            .expect("harvest api state lock poisoned")
+    }
+
+    /// Extract the actor identity from request headers using the configured
+    /// extractor, or fall back to reading `X-Harvest-Actor` / `"anonymous"`.
+    pub(crate) fn extract_actor(&self, headers: &axum::http::HeaderMap) -> String {
+        let extractor = self
+            .actor_extractor
+            .lock()
+            .expect("harvest api state lock poisoned")
+            .clone();
+        if let Some(f) = extractor {
+            return f(headers);
+        }
+        // Default: read X-Harvest-Actor header.
+        headers
+            .get(HEADER_ACTOR)
+            .and_then(|v| v.to_str().ok())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("anonymous")
+            .to_string()
     }
 
     pub(crate) fn worker_stale_threshold(&self) -> std::time::Duration {
@@ -666,6 +764,9 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .route("/batch-operations", get(list_batch_operations))
         .route("/batch-operations", post(submit_batch_operation))
         .route("/batch-operations/{id}", get(get_batch_operation))
+        // Audit trail (issue #158): read-only endpoint to query management
+        // API mutations. See `audit::ALL_MUTATION_ROUTES` for covered paths.
+        .route("/admin/audit", get(list_audit_records))
         .layer(Extension(api_state))
 }
 
@@ -705,29 +806,54 @@ struct ListBatchOperationsQuery {
 
 async fn submit_batch_operation(
     Extension(api_state): Extension<HarvestApiState>,
+    headers: axum::http::HeaderMap,
     Json(request): Json<SubmitBatchOperationRequest>,
 ) -> Result<(axum::http::StatusCode, Json<SubmitBatchOperationResponse>), AutumnError> {
-    let action: BatchAction = request
-        .action
-        .parse()
-        .map_err(AutumnError::bad_request_msg)?;
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+    let route = "POST /batch-operations";
+    let idempotency_key = request.idempotency_key.clone();
+
+    let action: BatchAction = match request.action.parse() {
+        Ok(a) => a,
+        Err(err_msg) => {
+            batch_submit_audit_failed(
+                &api_state,
+                &actor,
+                &source,
+                request_id.as_deref(),
+                idempotency_key.as_deref(),
+                &err_msg,
+            )
+            .await;
+            return Err(AutumnError::bad_request_msg(err_msg));
+        }
+    };
 
     // Reject `state=` values outside the canonical list before we hit the DB
     // — otherwise the executor would silently match nothing and look like a
     // success.
     for state in &request.filter.states {
         if !KNOWN_WORKFLOW_STATES.contains(&state.as_str()) {
-            return Err(AutumnError::bad_request_msg(format!(
-                "unknown workflow state '{state}' in batch filter"
-            )));
+            let err_msg = format!("unknown workflow state '{state}' in batch filter");
+            batch_submit_audit_failed(
+                &api_state,
+                &actor,
+                &source,
+                request_id.as_deref(),
+                idempotency_key.as_deref(),
+                &err_msg,
+            )
+            .await;
+            return Err(AutumnError::bad_request_msg(err_msg));
         }
     }
 
     let pool = api_state.storage_pool().map_err(map_error)?;
+
     // Persist the row on the default shard. The executor will fan out across
     // every configured shard at run time via iter_shards().
     let mut conn = acquire_conn(pool.default_pool()).await?;
-    let job_id = batch::submit_batch_job(
+    let submit_result = batch::submit_batch_job(
         &mut conn,
         BatchSubmission {
             action,
@@ -738,15 +864,53 @@ async fn submit_batch_operation(
             created_by: request.created_by,
         },
     )
-    .await
-    .map_err(map_error)?;
+    .await;
 
-    Ok((
-        axum::http::StatusCode::ACCEPTED,
-        Json(SubmitBatchOperationResponse {
-            batch_job_id: job_id.to_string(),
-        }),
-    ))
+    match submit_result {
+        Err(e) => {
+            let err_str = e.to_string();
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_BATCH_SUBMIT,
+                target_type: TARGET_BATCH,
+                target_id: None,
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: idempotency_key.as_deref(),
+                status: STATUS_FAILED,
+                error_summary: Some(err_str.as_str()),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+            Err(map_error(e))
+        }
+        Ok(job_id) => {
+            let job_id_str = job_id.to_string();
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_BATCH_SUBMIT,
+                target_type: TARGET_BATCH,
+                target_id: Some(job_id_str.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: idempotency_key.as_deref(),
+                status: STATUS_SUCCEEDED,
+                error_summary: None,
+                shard_id: None,
+                source: &source,
+            };
+            audit::insert_audit(&mut conn, &ar)
+                .await
+                .map_err(map_error)?;
+            Ok((
+                axum::http::StatusCode::ACCEPTED,
+                Json(SubmitBatchOperationResponse {
+                    batch_job_id: job_id_str,
+                }),
+            ))
+        }
+    }
 }
 
 async fn get_batch_operation(
@@ -808,6 +972,112 @@ impl ParseFromStrOrErr for BatchAction {
     fn from_str_or_err(s: &str) -> Result<Self, AutumnError> {
         s.parse::<Self>().map_err(AutumnError::bad_request_msg)
     }
+}
+
+// ── Audit trail read endpoint (issue #158) ────────────────────────────────────
+
+#[derive(Debug, serde::Deserialize)]
+struct AuditListQuery {
+    actor: Option<String>,
+    operation: Option<String>,
+    target_type: Option<String>,
+    target_id: Option<String>,
+    status: Option<String>,
+    /// ISO 8601 timestamp lower bound (inclusive).
+    since: Option<String>,
+    /// ISO 8601 timestamp upper bound (exclusive).
+    before: Option<String>,
+    limit: Option<i64>,
+}
+
+async fn list_audit_records(
+    Extension(api_state): Extension<HarvestApiState>,
+    Query(query): Query<AuditListQuery>,
+) -> Result<Json<Vec<AuditRecord>>, AutumnError> {
+    let limit = query
+        .limit
+        .unwrap_or(AuditFilters::default_limit())
+        .clamp(1, 500);
+
+    let since = query
+        .since
+        .as_deref()
+        .map(parse_audit_datetime)
+        .transpose()?;
+    let before = query
+        .before
+        .as_deref()
+        .map(parse_audit_datetime)
+        .transpose()?;
+
+    let filters = AuditFilters {
+        actor: query.actor,
+        operation: query.operation,
+        target_type: query.target_type,
+        target_id: query.target_id,
+        status: query.status,
+        since,
+        before,
+        limit,
+    };
+
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    let mut records: Vec<AuditRecord> = Vec::new();
+
+    for (_shard, shard_pool) in pool.iter_shards() {
+        let mut conn = acquire_conn(shard_pool).await?;
+        let mut rows = audit::list_audit(&mut conn, &filters)
+            .await
+            .map_err(map_error)?;
+        records.append(&mut rows);
+    }
+
+    // Merge shards: sort by occurred_at DESC, then id for determinism.
+    records.sort_by(|a, b| {
+        b.occurred_at
+            .cmp(&a.occurred_at)
+            .then_with(|| b.id.cmp(&a.id))
+    });
+    records.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+
+    Ok(Json(records))
+}
+
+fn parse_audit_datetime(raw: &str) -> Result<chrono::DateTime<chrono::Utc>, AutumnError> {
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .map_err(|_| {
+            AutumnError::bad_request_msg(format!(
+                "invalid datetime '{raw}'; expected RFC 3339 format, e.g. 2026-05-06T00:00:00Z"
+            ))
+        })
+}
+
+// ── Audit emission helpers ─────────────────────────────────────────────────────
+
+/// Extract audit context (`actor`, `source`, `request_id`) from request headers.
+fn audit_context(
+    headers: &axum::http::HeaderMap,
+    api_state: &HarvestApiState,
+) -> (String, String, Option<String>) {
+    let actor = api_state.extract_actor(headers);
+
+    let source = headers
+        .get(HEADER_SOURCE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| match s {
+            "api" | "cli" | "ui" => Some(s.to_string()),
+            _ => None,
+        })
+        .unwrap_or_else(|| SOURCE_API.to_string());
+
+    let request_id = headers
+        .get(HEADER_REQUEST_ID)
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned);
+
+    (actor, source, request_id)
 }
 
 /// Run one tick of the batch executor across every configured shard.
@@ -1481,9 +1751,11 @@ async fn get_workflow_stack(
     }))
 }
 
+#[allow(clippy::too_many_lines)]
 async fn start_workflow(
     Extension(api_state): Extension<HarvestApiState>,
     Path(workflow_name): Path<String>,
+    headers: axum::http::HeaderMap,
     Json(request): Json<StartWorkflowRequest>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse as _;
@@ -1492,13 +1764,55 @@ async fn start_workflow(
         Ok(r) => r,
         Err(e) => return map_error(e).into_response(),
     };
+
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+    let route = "POST /workflows/{workflow_name}/start";
+
     if !runtime.registry.workflows.contains_key(&workflow_name) {
+        if let Ok(pool) = api_state.storage_pool()
+            && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+        {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_START,
+                target_type: TARGET_WORKFLOW,
+                target_id: Some(workflow_name.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_FAILED,
+                error_summary: Some("workflow not registered"),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+        }
         return AutumnError::not_found_msg(format!("workflow '{workflow_name}'")).into_response();
     }
 
     let reuse_policy = match parse_reuse_policy(request.reuse_policy.as_deref()) {
         Ok(p) => p,
-        Err(e) => return e.into_response(),
+        Err(e) => {
+            if let Ok(pool) = api_state.storage_pool()
+                && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+            {
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_START,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: Some(workflow_name.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: None,
+                    status: STATUS_FAILED,
+                    error_summary: Some("invalid reuse policy"),
+                    shard_id: None,
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+            }
+            return e.into_response();
+        }
     };
     let workflow_id = request
         .workflow_id
@@ -1555,77 +1869,225 @@ async fn start_workflow(
         Err(HarvestError::AlreadyExists {
             existing_exec_id,
             existing_state,
-        }) => (
-            axum::http::StatusCode::CONFLICT,
-            Json(AlreadyExistsResponse {
-                existing_execution_id: existing_exec_id.to_string(),
-                existing_state,
-            }),
-        )
-            .into_response(),
-        Err(e) => map_error(e).into_response(),
-        Ok(start) => (
-            if start.created {
-                axum::http::StatusCode::CREATED
-            } else {
-                axum::http::StatusCode::OK
-            },
-            Json(StartWorkflowResponse {
-                execution_id: start.exec_id.to_string(),
-                workflow_name: start.workflow_name,
-                workflow_id: start.workflow_id,
-                state: start.state,
-            }),
-        )
-            .into_response(),
+        }) => {
+            // AlreadyExists is a non-error outcome for some reuse policies;
+            // record it as a failed audit so the caller can see the conflict.
+            let exec_id_str = existing_exec_id.to_string();
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_START,
+                target_type: TARGET_WORKFLOW,
+                target_id: Some(exec_id_str.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_FAILED,
+                error_summary: Some("workflow already exists"),
+                shard_id: Some(shard.as_i32()),
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+            (
+                axum::http::StatusCode::CONFLICT,
+                Json(AlreadyExistsResponse {
+                    existing_execution_id: existing_exec_id.to_string(),
+                    existing_state,
+                }),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            let err_str = e.to_string();
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_START,
+                target_type: TARGET_WORKFLOW,
+                target_id: None,
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_FAILED,
+                error_summary: Some(err_str.as_str()),
+                shard_id: Some(shard.as_i32()),
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+            map_error(e).into_response()
+        }
+        Ok(start) => {
+            let exec_id_str = start.exec_id.to_string();
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_START,
+                target_type: TARGET_WORKFLOW,
+                target_id: Some(exec_id_str.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_SUCCEEDED,
+                error_summary: None,
+                shard_id: Some(shard.as_i32()),
+                source: &source,
+            };
+            if let Err(audit_err) = audit::insert_audit(&mut conn, &ar).await {
+                tracing::error!(error = %audit_err, "audit insert failed for workflow.start");
+                return AutumnError::service_unavailable_msg(format!(
+                    "audit insert failed: {audit_err}"
+                ))
+                .into_response();
+            }
+            (
+                if start.created {
+                    axum::http::StatusCode::CREATED
+                } else {
+                    axum::http::StatusCode::OK
+                },
+                Json(StartWorkflowResponse {
+                    execution_id: start.exec_id.to_string(),
+                    workflow_name: start.workflow_name,
+                    workflow_id: start.workflow_id,
+                    state: start.state,
+                }),
+            )
+                .into_response()
+        }
     }
 }
 
 async fn cancel_workflow(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
     Json(request): Json<CancelWorkflowRequest>,
 ) -> Result<(axum::http::StatusCode, Json<CancelWorkflowResponse>), AutumnError> {
-    let exec_id = parse_execution_id(&id)?;
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+    let route = "POST /workflows/{id}/cancel";
+
+    let exec_id = match parse_execution_id(&id) {
+        Ok(eid) => eid,
+        Err(e) => {
+            if let Ok(pool) = api_state.storage_pool()
+                && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+            {
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_CANCEL,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: Some(id.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: None,
+                    status: STATUS_FAILED,
+                    error_summary: Some("malformed execution id"),
+                    shard_id: None,
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+            }
+            return Err(e);
+        }
+    };
     let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
     let reason = request
         .reason
         .as_deref()
         .unwrap_or("workflow cancellation requested");
-    let cancelled = cancel_workflow_execution(&mut conn, exec_id, reason)
-        .await
-        .map_err(map_error)?;
+    let exec_id_str = exec_id.to_string();
 
-    Ok((
-        axum::http::StatusCode::ACCEPTED,
-        Json(CancelWorkflowResponse {
-            ok: true,
-            execution_id: cancelled.exec_id.to_string(),
-            state: cancelled.state,
-            reason: cancelled.reason,
-            newly_cancelled: cancelled.newly_cancelled,
-            failed_task_count: cancelled.failed_task_count,
-        }),
-    ))
+    let cancel_result = cancel_workflow_execution(&mut conn, exec_id, reason).await;
+    match cancel_result {
+        Err(e) => {
+            let err_str = e.to_string();
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_CANCEL,
+                target_type: TARGET_WORKFLOW,
+                target_id: Some(exec_id_str.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_FAILED,
+                error_summary: Some(err_str.as_str()),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+            Err(map_error(e))
+        }
+        Ok(cancelled) => {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_CANCEL,
+                target_type: TARGET_WORKFLOW,
+                target_id: Some(exec_id_str.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_SUCCEEDED,
+                error_summary: None,
+                shard_id: None,
+                source: &source,
+            };
+            audit::insert_audit(&mut conn, &ar)
+                .await
+                .map_err(map_error)?;
+            Ok((
+                axum::http::StatusCode::ACCEPTED,
+                Json(CancelWorkflowResponse {
+                    ok: true,
+                    execution_id: cancelled.exec_id.to_string(),
+                    state: cancelled.state,
+                    reason: cancelled.reason,
+                    newly_cancelled: cancelled.newly_cancelled,
+                    failed_task_count: cancelled.failed_task_count,
+                }),
+            ))
+        }
+    }
 }
 
 async fn reset_workflow(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
     Query(query): Query<ResetWorkflowQuery>,
+    headers: axum::http::HeaderMap,
     Json(request): Json<WorkflowResetRequest>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse as _;
 
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+    let route = "POST /workflows/{id}/reset";
+
     let exec_id = match parse_execution_id(&id) {
-        Ok(id) => id,
-        Err(e) => return e.into_response(),
+        Ok(eid) => eid,
+        Err(e) => {
+            if let Ok(pool) = api_state.storage_pool()
+                && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+            {
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_RESET,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: Some(id.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: None,
+                    status: STATUS_FAILED,
+                    error_summary: Some("malformed execution id"),
+                    shard_id: None,
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+            }
+            return e.into_response();
+        }
     };
     let mut conn = match db_conn_for_execution(&api_state, exec_id).await {
         Ok(conn) => conn,
         Err(e) => return e.into_response(),
     };
 
+    // Dry-run previews are read-only: no audit record needed.
     if query.dry_run {
         return match preview_workflow_reset(&mut conn, exec_id, request).await {
             Ok(plan) => (axum::http::StatusCode::OK, Json(plan)).into_response(),
@@ -1633,13 +2095,55 @@ async fn reset_workflow(
         };
     }
 
+    let exec_id_str = exec_id.to_string();
+
     match reset_workflow_execution(&mut conn, exec_id, request).await {
-        Ok(result) => (
-            axum::http::StatusCode::CREATED,
-            Json(ResetWorkflowResponse::from(result)),
-        )
-            .into_response(),
-        Err(error) => reset_error_response(error),
+        Ok(result) => {
+            let new_exec_id_str = result.new_exec_id.to_string();
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_RESET,
+                target_type: TARGET_WORKFLOW,
+                target_id: Some(exec_id_str.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_SUCCEEDED,
+                error_summary: None,
+                shard_id: None,
+                source: &source,
+            };
+            if let Err(audit_err) = audit::insert_audit(&mut conn, &ar).await {
+                tracing::error!(error = %audit_err, new_exec_id = %new_exec_id_str, "audit insert failed for workflow.reset");
+                return AutumnError::service_unavailable_msg(format!(
+                    "audit insert failed: {audit_err}"
+                ))
+                .into_response();
+            }
+            (
+                axum::http::StatusCode::CREATED,
+                Json(ResetWorkflowResponse::from(result)),
+            )
+                .into_response()
+        }
+        Err(error) => {
+            let err_str = format!("{error:?}");
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_RESET,
+                target_type: TARGET_WORKFLOW,
+                target_id: Some(exec_id_str.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_FAILED,
+                error_summary: Some(err_str.as_str()),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+            reset_error_response(error)
+        }
     }
 }
 
@@ -1684,17 +2188,95 @@ fn reset_invalid_point_response(invalid: ResetInvalidPoint) -> axum::response::R
 async fn signal_workflow(
     Extension(api_state): Extension<HarvestApiState>,
     Path((id, signal_name)): Path<(String, String)>,
+    headers: axum::http::HeaderMap,
     Json(payload): Json<Value>,
 ) -> Result<(axum::http::StatusCode, Json<BasicAck>), AutumnError> {
-    let exec_id = parse_execution_id(&id)?;
-    let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
-    load_execution(&mut conn, exec_id)
-        .await
-        .map_err(map_error)?;
-    signal::send_signal(&mut conn, exec_id, &signal_name, payload)
-        .await
-        .map_err(map_error)?;
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+    let route = "POST /workflows/{id}/signal/{signal_name}";
 
+    let exec_id = match parse_execution_id(&id) {
+        Ok(eid) => eid,
+        Err(e) => {
+            if let Ok(pool) = api_state.storage_pool()
+                && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+            {
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_SIGNAL,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: Some(id.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: None,
+                    status: STATUS_FAILED,
+                    error_summary: Some("malformed execution id"),
+                    shard_id: None,
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+            }
+            return Err(e);
+        }
+    };
+    let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
+    let exec_id_str = exec_id.to_string();
+
+    if let Err(e) = load_execution(&mut conn, exec_id).await {
+        let err_str = e.to_string();
+        let ar = NewAuditRecord {
+            actor: &actor,
+            operation: OP_WORKFLOW_SIGNAL,
+            target_type: TARGET_WORKFLOW,
+            target_id: Some(exec_id_str.as_str()),
+            route_or_command: route,
+            request_id: request_id.as_deref(),
+            idempotency_key: None,
+            status: STATUS_FAILED,
+            error_summary: Some(err_str.as_str()),
+            shard_id: None,
+            source: &source,
+        };
+        let _ = audit::insert_audit(&mut conn, &ar).await;
+        return Err(map_error(e));
+    }
+
+    // Signal payload is intentionally not stored in the audit record (no PII).
+    let signal_result = signal::send_signal(&mut conn, exec_id, &signal_name, payload).await;
+
+    if let Err(e) = signal_result {
+        let err_str = e.to_string();
+        let ar = NewAuditRecord {
+            actor: &actor,
+            operation: OP_WORKFLOW_SIGNAL,
+            target_type: TARGET_WORKFLOW,
+            target_id: Some(exec_id_str.as_str()),
+            route_or_command: route,
+            request_id: request_id.as_deref(),
+            idempotency_key: None,
+            status: STATUS_FAILED,
+            error_summary: Some(err_str.as_str()),
+            shard_id: None,
+            source: &source,
+        };
+        let _ = audit::insert_audit(&mut conn, &ar).await;
+        return Err(map_error(e));
+    }
+    let ar = NewAuditRecord {
+        actor: &actor,
+        operation: OP_WORKFLOW_SIGNAL,
+        target_type: TARGET_WORKFLOW,
+        target_id: Some(exec_id_str.as_str()),
+        route_or_command: route,
+        request_id: request_id.as_deref(),
+        idempotency_key: None,
+        status: STATUS_SUCCEEDED,
+        error_summary: None,
+        shard_id: None,
+        source: &source,
+    };
+    audit::insert_audit(&mut conn, &ar)
+        .await
+        .map_err(map_error)?;
     Ok((
         axum::http::StatusCode::ACCEPTED,
         Json(BasicAck { ok: true }),
@@ -1786,12 +2368,17 @@ async fn list_dag_runs(
 async fn trigger_dag_run(
     Extension(api_state): Extension<HarvestApiState>,
     Path(dag_name): Path<String>,
+    headers: axum::http::HeaderMap,
     Json(request): Json<DagTriggerRequest>,
 ) -> Result<(axum::http::StatusCode, Json<DagRun>), AutumnError> {
     let runtime = api_state.runtime().map_err(map_error)?;
     let pool = api_state.storage_pool().map_err(map_error)?;
     let shard = runtime.router.pick_for_dag(&dag_name);
-    let run = trigger_dag(
+
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+    let route = "POST /dags/{dag_name}/trigger";
+
+    let trigger_result = trigger_dag(
         pool.pool_for(shard).clone(),
         Arc::clone(&runtime.registry),
         Arc::clone(&runtime.dags),
@@ -1799,40 +2386,141 @@ async fn trigger_dag_run(
         request.conf,
         runtime.scheduler,
     )
-    .await
-    .map_err(map_error)?;
-    Ok((axum::http::StatusCode::CREATED, Json(run)))
+    .await;
+
+    let mut audit_conn = acquire_conn(pool.pool_for(shard)).await?;
+
+    match trigger_result {
+        Err(e) => {
+            let err_str = e.to_string();
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_DAG_TRIGGER,
+                target_type: TARGET_DAG,
+                target_id: Some(dag_name.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_FAILED,
+                error_summary: Some(err_str.as_str()),
+                shard_id: Some(shard.as_i32()),
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut audit_conn, &ar).await;
+            Err(map_error(e))
+        }
+        Ok(run) => {
+            let run_id_str = run.id.to_string();
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_DAG_TRIGGER,
+                target_type: TARGET_DAG,
+                target_id: Some(dag_name.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_SUCCEEDED,
+                error_summary: None,
+                shard_id: Some(shard.as_i32()),
+                source: &source,
+            };
+            if let Err(audit_err) = audit::insert_audit(&mut audit_conn, &ar).await {
+                tracing::error!(error = %audit_err, run_id = %run_id_str, "audit insert failed for dag.trigger");
+                return Err(AutumnError::service_unavailable_msg(format!(
+                    "audit insert failed: {audit_err}"
+                )));
+            }
+            Ok((axum::http::StatusCode::CREATED, Json(run)))
+        }
+    }
 }
 
 async fn patch_dag(
     Extension(api_state): Extension<HarvestApiState>,
     Path(dag_name): Path<String>,
+    headers: axum::http::HeaderMap,
     Json(request): Json<DagPauseRequest>,
 ) -> Result<Json<HarvestSchedule>, AutumnError> {
     use autumn_harvest::schema::harvest_schedules::dsl;
 
     let mut conn = db_conn_for_dag(&api_state, &dag_name).await?;
-    let updated = diesel::update(dsl::harvest_schedules.filter(dsl::dag_name.eq(&dag_name)))
+
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+    let route = "PATCH /dags/{dag_name}";
+
+    let update_result = diesel::update(dsl::harvest_schedules.filter(dsl::dag_name.eq(&dag_name)))
         .set((
             dsl::is_paused.eq(request.paused),
             dsl::updated_at.eq(chrono::Utc::now()),
         ))
         .execute(&mut conn)
         .await
-        .map_err(database_error)
-        .map_err(map_error)?;
-    if updated == 0 {
-        return Err(AutumnError::not_found_msg(format!("dag '{dag_name}'")));
-    }
+        .map_err(database_error);
 
-    let schedule = dsl::harvest_schedules
-        .filter(dsl::dag_name.eq(&dag_name))
-        .select(HarvestSchedule::as_select())
-        .first(&mut conn)
-        .await
-        .map_err(database_error)
-        .map_err(map_error)?;
-    Ok(Json(schedule))
+    match update_result {
+        Err(e) => {
+            let err_str = e.to_string();
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_DAG_PATCH,
+                target_type: TARGET_DAG,
+                target_id: Some(dag_name.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_FAILED,
+                error_summary: Some(err_str.as_str()),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+            Err(map_error(e))
+        }
+        Ok(0) => {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_DAG_PATCH,
+                target_type: TARGET_DAG,
+                target_id: Some(dag_name.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_FAILED,
+                error_summary: Some("dag not found"),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+            Err(AutumnError::not_found_msg(format!("dag '{dag_name}'")))
+        }
+        Ok(_) => {
+            let schedule = dsl::harvest_schedules
+                .filter(dsl::dag_name.eq(&dag_name))
+                .select(HarvestSchedule::as_select())
+                .first(&mut conn)
+                .await
+                .map_err(database_error)
+                .map_err(map_error)?;
+
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_DAG_PATCH,
+                target_type: TARGET_DAG,
+                target_id: Some(dag_name.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_SUCCEEDED,
+                error_summary: None,
+                shard_id: None,
+                source: &source,
+            };
+            audit::insert_audit(&mut conn, &ar)
+                .await
+                .map_err(map_error)?;
+            Ok(Json(schedule))
+        }
+    }
 }
 
 async fn list_schedules(
@@ -1866,15 +2554,73 @@ async fn list_schedules(
     Ok(Json(entries))
 }
 
+async fn schedule_create_audit_failed(
+    api_state: &HarvestApiState,
+    actor: &str,
+    source: &str,
+    request_id: Option<&str>,
+    workflow_name: &str,
+    error_summary: &str,
+) {
+    let Ok(pool) = api_state.storage_pool() else {
+        return;
+    };
+    let Ok(mut conn) = acquire_conn(pool.default_pool()).await else {
+        return;
+    };
+    let ar = NewAuditRecord {
+        actor,
+        operation: OP_SCHEDULE_CREATE,
+        target_type: TARGET_SCHEDULE,
+        target_id: Some(workflow_name),
+        route_or_command: "POST /admin/schedules/workflow",
+        request_id,
+        idempotency_key: None,
+        status: STATUS_FAILED,
+        error_summary: Some(error_summary),
+        shard_id: None,
+        source,
+    };
+    let _ = audit::insert_audit(&mut conn, &ar).await;
+}
+
+async fn upsert_workflow_schedule_and_read_back(
+    conn: &mut diesel_async::AsyncPgConnection,
+    ws: &WorkflowSchedule,
+) -> Result<ScheduleEntry, AutumnError> {
+    use autumn_harvest::schema::harvest_schedules::dsl;
+    autumn_harvest::register_workflow_schedules(conn, std::slice::from_ref(ws))
+        .await
+        .map_err(map_error)?;
+    let row: autumn_harvest::models::HarvestSchedule = dsl::harvest_schedules
+        .filter(dsl::workflow_name.eq(&ws.workflow_name))
+        .select(autumn_harvest::models::HarvestSchedule::as_select())
+        .first(conn)
+        .await
+        .map_err(database_error)
+        .map_err(map_error)?;
+    Ok(ScheduleEntry {
+        id: row.id,
+        kind: ScheduleKind::Workflow,
+        name: ws.workflow_name.clone(),
+        schedule_expr: row.schedule_expr,
+        is_paused: row.is_paused,
+        next_run_at: row.next_run_at,
+        last_run_at: row.last_run_at,
+        max_active_runs: row.max_active_runs,
+        catchup: row.catchup,
+    })
+}
+
 async fn create_workflow_schedule(
     Extension(api_state): Extension<HarvestApiState>,
+    headers: axum::http::HeaderMap,
     Json(request): Json<CreateWorkflowScheduleRequest>,
 ) -> Result<(axum::http::StatusCode, Json<ScheduleEntry>), AutumnError> {
-    use autumn_harvest::schema::harvest_schedules::dsl;
-
     let runtime = api_state.runtime().map_err(map_error)?;
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+    let route = "POST /admin/schedules/workflow";
 
-    // Validate: workflow_name must be registered.
     if !runtime
         .registry
         .workflows
@@ -1886,20 +2632,41 @@ async fn create_workflow_schedule(
             .keys()
             .map(String::as_str)
             .collect();
+        schedule_create_audit_failed(
+            &api_state,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            &request.workflow_name,
+            "workflow not registered",
+        )
+        .await;
         return Err(AutumnError::not_found_msg(format!(
             "workflow '{}' is not registered; registered: {:?}",
             request.workflow_name, registered
         )));
     }
 
-    // Parse the schedule expression.
-    let schedule = parse_schedule_expr(&request.schedule_expr)
-        .map_err(|e| AutumnError::bad_request_msg(format!("invalid schedule_expr: {e}")))?;
+    let schedule = match parse_schedule_expr(&request.schedule_expr) {
+        Ok(s) => s,
+        Err(e) => {
+            let err_summary = format!("invalid schedule_expr: {e}");
+            schedule_create_audit_failed(
+                &api_state,
+                &actor,
+                &source,
+                request_id.as_deref(),
+                &request.workflow_name,
+                &err_summary,
+            )
+            .await;
+            return Err(AutumnError::bad_request_msg(err_summary));
+        }
+    };
 
     let pool = api_state.storage_pool().map_err(map_error)?;
     let mut conn = acquire_conn(pool.pool_for(runtime.router().default_shard())).await?;
 
-    // Upsert the schedule row.
     let ws = WorkflowSchedule {
         workflow_name: request.workflow_name.clone(),
         schedule,
@@ -1909,30 +2676,45 @@ async fn create_workflow_schedule(
         paused: request.paused,
         queue_name: request.queue_name.clone(),
     };
-    autumn_harvest::register_workflow_schedules(&mut conn, std::slice::from_ref(&ws))
-        .await
-        .map_err(map_error)?;
-
-    // Read back the upserted row to return it.
-    let row: autumn_harvest::models::HarvestSchedule = dsl::harvest_schedules
-        .filter(dsl::workflow_name.eq(&request.workflow_name))
-        .select(autumn_harvest::models::HarvestSchedule::as_select())
-        .first(&mut conn)
-        .await
-        .map_err(database_error)
-        .map_err(map_error)?;
-
-    let entry = ScheduleEntry {
-        id: row.id,
-        kind: ScheduleKind::Workflow,
-        name: request.workflow_name.clone(),
-        schedule_expr: row.schedule_expr,
-        is_paused: row.is_paused,
-        next_run_at: row.next_run_at,
-        last_run_at: row.last_run_at,
-        max_active_runs: row.max_active_runs,
-        catchup: row.catchup,
+    let entry = match upsert_workflow_schedule_and_read_back(&mut conn, &ws).await {
+        Ok(e) => e,
+        Err(e) => {
+            let err_str = e.to_string();
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_SCHEDULE_CREATE,
+                target_type: TARGET_SCHEDULE,
+                target_id: Some(request.workflow_name.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_FAILED,
+                error_summary: Some(err_str.as_str()),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+            return Err(e);
+        }
     };
+
+    let entry_id_str = entry.id.to_string();
+    let ar = NewAuditRecord {
+        actor: &actor,
+        operation: OP_SCHEDULE_CREATE,
+        target_type: TARGET_SCHEDULE,
+        target_id: Some(entry_id_str.as_str()),
+        route_or_command: route,
+        request_id: request_id.as_deref(),
+        idempotency_key: None,
+        status: STATUS_SUCCEEDED,
+        error_summary: None,
+        shard_id: None,
+        source: &source,
+    };
+    audit::insert_audit(&mut conn, &ar)
+        .await
+        .map_err(map_error)?;
 
     Ok((axum::http::StatusCode::CREATED, Json(entry)))
 }
@@ -1940,26 +2722,65 @@ async fn create_workflow_schedule(
 async fn pause_schedule(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Json<BasicAck>, AutumnError> {
-    set_schedule_paused(&api_state, &id, true).await
+    set_schedule_paused(&api_state, &id, true, &headers).await
 }
 
 async fn resume_schedule(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Json<BasicAck>, AutumnError> {
-    set_schedule_paused(&api_state, &id, false).await
+    set_schedule_paused(&api_state, &id, false, &headers).await
 }
 
 async fn set_schedule_paused(
     api_state: &HarvestApiState,
     id_str: &str,
     paused: bool,
+    headers: &axum::http::HeaderMap,
 ) -> Result<Json<BasicAck>, AutumnError> {
     use autumn_harvest::schema::harvest_schedules::dsl;
 
-    let id = parse_uuid(id_str, "schedule id")?;
+    let (actor, source, request_id) = audit_context(headers, api_state);
+    let operation = if paused {
+        OP_SCHEDULE_PAUSE
+    } else {
+        OP_SCHEDULE_RESUME
+    };
+    let route = if paused {
+        "POST /admin/schedules/{id}/pause"
+    } else {
+        "POST /admin/schedules/{id}/resume"
+    };
+
+    let id = match parse_uuid(id_str, "schedule id") {
+        Ok(u) => u,
+        Err(e) => {
+            if let Ok(pool) = api_state.storage_pool()
+                && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+            {
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation,
+                    target_type: TARGET_SCHEDULE,
+                    target_id: Some(id_str),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: None,
+                    status: STATUS_FAILED,
+                    error_summary: Some("malformed schedule id"),
+                    shard_id: None,
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+            }
+            return Err(e);
+        }
+    };
     let pool = api_state.storage_pool().map_err(map_error)?;
+    let id_str_owned = id.to_string();
 
     let mut updated_count = 0usize;
     for (_shard, shard_pool) in pool.iter_shards() {
@@ -1975,25 +2796,163 @@ async fn set_schedule_paused(
             .map_err(map_error)?;
         updated_count += n;
         if updated_count > 0 {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation,
+                target_type: TARGET_SCHEDULE,
+                target_id: Some(id_str_owned.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_SUCCEEDED,
+                error_summary: None,
+                shard_id: None,
+                source: &source,
+            };
+            audit::insert_audit(&mut conn, &ar)
+                .await
+                .map_err(map_error)?;
             break;
         }
     }
 
     if updated_count == 0 {
+        if let Ok(mut conn) = acquire_conn(pool.default_pool()).await {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation,
+                target_type: TARGET_SCHEDULE,
+                target_id: Some(id_str_owned.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_FAILED,
+                error_summary: Some("schedule not found"),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+        }
         return Err(AutumnError::not_found_msg(format!("schedule {id}")));
     }
     Ok(Json(BasicAck { ok: true }))
 }
 
+async fn batch_submit_audit_failed(
+    api_state: &HarvestApiState,
+    actor: &str,
+    source: &str,
+    request_id: Option<&str>,
+    idempotency_key: Option<&str>,
+    error_summary: &str,
+) {
+    let Ok(pool) = api_state.storage_pool() else {
+        return;
+    };
+    let Ok(mut conn) = acquire_conn(pool.default_pool()).await else {
+        return;
+    };
+    let ar = NewAuditRecord {
+        actor,
+        operation: OP_BATCH_SUBMIT,
+        target_type: TARGET_BATCH,
+        target_id: None,
+        route_or_command: "POST /batch-operations",
+        request_id,
+        idempotency_key,
+        status: STATUS_FAILED,
+        error_summary: Some(error_summary),
+        shard_id: None,
+        source,
+    };
+    let _ = audit::insert_audit(&mut conn, &ar).await;
+}
+
+async fn dlq_bulk_audit_reject_empty_filter(
+    api_state: &HarvestApiState,
+    actor: &str,
+    source: &str,
+    request_id: Option<&str>,
+    operation: &'static str,
+    route: &'static str,
+) {
+    let Ok(pool) = api_state.storage_pool() else {
+        return;
+    };
+    let Ok(mut conn) = acquire_conn(pool.default_pool()).await else {
+        return;
+    };
+    let ar = NewAuditRecord {
+        actor,
+        operation,
+        target_type: TARGET_DEAD_LETTER,
+        target_id: None,
+        route_or_command: route,
+        request_id,
+        idempotency_key: None,
+        status: STATUS_FAILED,
+        error_summary: Some("empty bulk filter"),
+        shard_id: None,
+        source,
+    };
+    let _ = audit::insert_audit(&mut conn, &ar).await;
+}
+
+async fn schedule_delete_audit_failed(
+    pool: &HarvestDbPool,
+    actor: &str,
+    source: &str,
+    request_id: Option<&str>,
+    id_str: &str,
+    error_summary: &'static str,
+) {
+    if let Ok(mut conn) = acquire_conn(pool.default_pool()).await {
+        let ar = NewAuditRecord {
+            actor,
+            operation: OP_SCHEDULE_DELETE,
+            target_type: TARGET_SCHEDULE,
+            target_id: Some(id_str),
+            route_or_command: "DELETE /admin/schedules/{id}",
+            request_id,
+            idempotency_key: None,
+            status: STATUS_FAILED,
+            error_summary: Some(error_summary),
+            shard_id: None,
+            source,
+        };
+        let _ = audit::insert_audit(&mut conn, &ar).await;
+    }
+}
+
+#[allow(clippy::too_many_lines)]
 async fn delete_schedule(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Json<BasicAck>, AutumnError> {
     use autumn_harvest::models::HarvestSchedule;
     use autumn_harvest::schema::harvest_schedules::dsl;
 
-    let id = parse_uuid(&id, "schedule id")?;
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+    let route = "DELETE /admin/schedules/{id}";
     let pool = api_state.storage_pool().map_err(map_error)?;
+
+    let id = match parse_uuid(&id, "schedule id") {
+        Ok(u) => u,
+        Err(e) => {
+            schedule_delete_audit_failed(
+                &pool,
+                &actor,
+                &source,
+                request_id.as_deref(),
+                &id,
+                "malformed schedule id",
+            )
+            .await;
+            return Err(e);
+        }
+    };
+    let id_str = id.to_string();
 
     let mut deleted_count = 0usize;
     for (_shard, shard_pool) in pool.iter_shards() {
@@ -2010,6 +2969,15 @@ async fn delete_schedule(
             continue;
         };
         if row.dag_name.is_some() {
+            schedule_delete_audit_failed(
+                &pool,
+                &actor,
+                &source,
+                request_id.as_deref(),
+                &id_str,
+                "dag-managed schedule cannot be deleted via API",
+            )
+            .await;
             return Err(AutumnError::bad_request_msg(format!(
                 "schedule {id} is managed by the DAG catalog and cannot be deleted via API; \
                  remove the DAG definition to stop scheduling"
@@ -2022,6 +2990,15 @@ async fn delete_schedule(
                 .iter()
                 .any(|ws| ws.workflow_name == *wf_name);
             if is_code_managed {
+                schedule_delete_audit_failed(
+                    &pool,
+                    &actor,
+                    &source,
+                    request_id.as_deref(),
+                    &id_str,
+                    "code-managed schedule cannot be deleted via API",
+                )
+                .await;
                 return Err(AutumnError::bad_request_msg(format!(
                     "schedule {id} is managed by the in-process workflow schedule catalog \
                      and cannot be deleted via API; it will be re-created on the next \
@@ -2036,11 +3013,36 @@ async fn delete_schedule(
             .map_err(map_error)?;
         deleted_count += n;
         if deleted_count > 0 {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_SCHEDULE_DELETE,
+                target_type: TARGET_SCHEDULE,
+                target_id: Some(id_str.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_SUCCEEDED,
+                error_summary: None,
+                shard_id: None,
+                source: &source,
+            };
+            audit::insert_audit(&mut conn, &ar)
+                .await
+                .map_err(map_error)?;
             break;
         }
     }
 
     if deleted_count == 0 {
+        schedule_delete_audit_failed(
+            &pool,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            &id_str,
+            "schedule not found",
+        )
+        .await;
         return Err(AutumnError::not_found_msg(format!("schedule {id}")));
     }
     Ok(Json(BasicAck { ok: true }))
@@ -2085,27 +3087,113 @@ async fn list_dead_letters(
 async fn replay_dead_letter(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
 ) -> Result<(axum::http::StatusCode, Json<ReplayDeadLetterResponse>), AutumnError> {
-    let dead_letter_id = parse_uuid(&id, "dead-letter id")?;
-    let task_id = replay_dead_letter_from_shards(&api_state, dead_letter_id).await?;
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+    let route = "POST /dead-letters/{id}/replay";
 
-    Ok((
-        axum::http::StatusCode::ACCEPTED,
-        Json(ReplayDeadLetterResponse {
-            ok: true,
-            dead_letter_id: dead_letter_id.to_string(),
-            task_id: task_id.to_string(),
-        }),
-    ))
+    let dead_letter_id = match parse_uuid(&id, "dead-letter id") {
+        Ok(u) => u,
+        Err(e) => {
+            if let Ok(pool) = api_state.storage_pool()
+                && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+            {
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_DLQ_REPLAY,
+                    target_type: TARGET_DEAD_LETTER,
+                    target_id: Some(id.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: None,
+                    status: STATUS_FAILED,
+                    error_summary: Some("malformed dead-letter id"),
+                    shard_id: None,
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+            }
+            return Err(e);
+        }
+    };
+    let dl_id_str = dead_letter_id.to_string();
+
+    let replay_result = replay_dead_letter_from_shards(&api_state, dead_letter_id).await;
+
+    // For the single-replay path we insert the audit record on the default pool
+    // since the DLQ entry may live on any shard and we don't track which one.
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    let mut audit_conn = acquire_conn(pool.default_pool()).await?;
+
+    match replay_result {
+        Err(e) => {
+            let err_str = e.to_string();
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_DLQ_REPLAY,
+                target_type: TARGET_DEAD_LETTER,
+                target_id: Some(dl_id_str.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_FAILED,
+                error_summary: Some(err_str.as_str()),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut audit_conn, &ar).await;
+            Err(e)
+        }
+        Ok(task_id) => {
+            let task_id_str = task_id.to_string();
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_DLQ_REPLAY,
+                target_type: TARGET_DEAD_LETTER,
+                target_id: Some(dl_id_str.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_SUCCEEDED,
+                error_summary: None,
+                shard_id: None,
+                source: &source,
+            };
+            audit::insert_audit(&mut audit_conn, &ar)
+                .await
+                .map_err(map_error)?;
+            Ok((
+                axum::http::StatusCode::ACCEPTED,
+                Json(ReplayDeadLetterResponse {
+                    ok: true,
+                    dead_letter_id: dl_id_str,
+                    task_id: task_id_str,
+                }),
+            ))
+        }
+    }
 }
 
 async fn bulk_replay_dead_letters_handler(
     Extension(api_state): Extension<HarvestApiState>,
+    headers: axum::http::HeaderMap,
     Json(filter): Json<dlq::BulkDlqFilter>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse as _;
 
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+    let route = "POST /dead-letters/replay";
+
     if filter.is_empty() {
+        dlq_bulk_audit_reject_empty_filter(
+            &api_state,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            OP_DLQ_REPLAY_BULK,
+            route,
+        )
+        .await;
         return (
             axum::http::StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
@@ -2116,26 +3204,102 @@ async fn bulk_replay_dead_letters_handler(
             .into_response();
     }
 
-    match bulk_replay_from_shards(&api_state, &filter).await {
+    // Dry-run previews are read-only: no audit record needed.
+    if filter.dry_run {
+        return match bulk_replay_from_shards(&api_state, &filter).await {
+            Ok(result) => (axum::http::StatusCode::OK, Json(result)).into_response(),
+            Err(e) => map_error(e).into_response(),
+        };
+    }
+
+    let replay_result = bulk_replay_from_shards(&api_state, &filter).await;
+    let pool = match api_state.storage_pool() {
+        Ok(p) => p,
+        Err(e) => return map_error(e).into_response(),
+    };
+    let audit_conn = acquire_conn(pool.default_pool()).await;
+
+    match replay_result {
         Ok(result) => {
             let status = if result.acted_on == 0 && !result.failures.is_empty() {
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR
             } else {
                 axum::http::StatusCode::OK
             };
+            let (audit_status, audit_error) = if result.failures.is_empty() {
+                (STATUS_SUCCEEDED, None)
+            } else {
+                (
+                    STATUS_FAILED,
+                    Some(format!("{} failures", result.failures.len())),
+                )
+            };
+            match audit_conn {
+                Ok(mut conn) => {
+                    let ar = NewAuditRecord {
+                        actor: &actor,
+                        operation: OP_DLQ_REPLAY_BULK,
+                        target_type: TARGET_DEAD_LETTER,
+                        target_id: None,
+                        route_or_command: route,
+                        request_id: request_id.as_deref(),
+                        idempotency_key: None,
+                        status: audit_status,
+                        error_summary: audit_error.as_deref(),
+                        shard_id: None,
+                        source: &source,
+                    };
+                    if let Err(e) = audit::insert_audit(&mut conn, &ar).await {
+                        return map_error(e).into_response();
+                    }
+                }
+                Err(e) => return e.into_response(),
+            }
             (status, Json(result)).into_response()
         }
-        Err(e) => map_error(e).into_response(),
+        Err(e) => {
+            let err_str = e.to_string();
+            if let Ok(mut conn) = audit_conn {
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_DLQ_REPLAY_BULK,
+                    target_type: TARGET_DEAD_LETTER,
+                    target_id: None,
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: None,
+                    status: STATUS_FAILED,
+                    error_summary: Some(err_str.as_str()),
+                    shard_id: None,
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+            }
+            map_error(e).into_response()
+        }
     }
 }
 
 async fn bulk_discard_dead_letters_handler(
     Extension(api_state): Extension<HarvestApiState>,
+    headers: axum::http::HeaderMap,
     Json(filter): Json<dlq::BulkDlqFilter>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse as _;
 
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+    let route = "POST /dead-letters/discard";
+
     if filter.is_empty() {
+        dlq_bulk_audit_reject_empty_filter(
+            &api_state,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            OP_DLQ_DISCARD_BULK,
+            route,
+        )
+        .await;
         return (
             axum::http::StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
@@ -2146,16 +3310,79 @@ async fn bulk_discard_dead_letters_handler(
             .into_response();
     }
 
-    match bulk_discard_from_shards(&api_state, &filter).await {
+    // Dry-run previews are read-only: no audit record needed.
+    if filter.dry_run {
+        return match bulk_discard_from_shards(&api_state, &filter).await {
+            Ok(result) => (axum::http::StatusCode::OK, Json(result)).into_response(),
+            Err(e) => map_error(e).into_response(),
+        };
+    }
+
+    let discard_result = bulk_discard_from_shards(&api_state, &filter).await;
+    let pool = match api_state.storage_pool() {
+        Ok(p) => p,
+        Err(e) => return map_error(e).into_response(),
+    };
+    let audit_conn = acquire_conn(pool.default_pool()).await;
+
+    match discard_result {
         Ok(result) => {
             let status = if result.acted_on == 0 && !result.failures.is_empty() {
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR
             } else {
                 axum::http::StatusCode::OK
             };
+            let (audit_status, audit_error) = if result.failures.is_empty() {
+                (STATUS_SUCCEEDED, None)
+            } else {
+                (
+                    STATUS_FAILED,
+                    Some(format!("{} failures", result.failures.len())),
+                )
+            };
+            match audit_conn {
+                Ok(mut conn) => {
+                    let ar = NewAuditRecord {
+                        actor: &actor,
+                        operation: OP_DLQ_DISCARD_BULK,
+                        target_type: TARGET_DEAD_LETTER,
+                        target_id: None,
+                        route_or_command: route,
+                        request_id: request_id.as_deref(),
+                        idempotency_key: None,
+                        status: audit_status,
+                        error_summary: audit_error.as_deref(),
+                        shard_id: None,
+                        source: &source,
+                    };
+                    if let Err(e) = audit::insert_audit(&mut conn, &ar).await {
+                        return map_error(e).into_response();
+                    }
+                }
+                Err(e) => return e.into_response(),
+            }
             (status, Json(result)).into_response()
         }
-        Err(e) => map_error(e).into_response(),
+        Err(e) => {
+            let err_str = e.to_string();
+            if let Ok(mut conn) = audit_conn {
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_DLQ_DISCARD_BULK,
+                    target_type: TARGET_DEAD_LETTER,
+                    target_id: None,
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: None,
+                    status: STATUS_FAILED,
+                    error_summary: Some(err_str.as_str()),
+                    shard_id: None,
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+            }
+            map_error(e).into_response()
+        }
     }
 }
 
@@ -2274,14 +3501,78 @@ async fn retention_status(
 
 async fn retention_run_now(
     Extension(api_state): Extension<HarvestApiState>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Json<BasicAck>, AutumnError> {
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+    let route = "POST /admin/retention/run-now";
+
     let runtime = api_state.runtime().map_err(map_error)?;
-    let trigger = runtime.retention.trigger.as_ref().ok_or_else(|| {
-        AutumnError::service_unavailable_msg(
+    let Some(trigger) = runtime.retention.trigger.as_ref() else {
+        if let Ok(pool) = api_state.storage_pool()
+            && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+        {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_RETENTION_RUN_NOW,
+                target_type: TARGET_RETENTION,
+                target_id: None,
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_FAILED,
+                error_summary: Some("no local retention runtime owner"),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+        }
+        return Err(AutumnError::service_unavailable_msg(
             "retention run-now unavailable: no local retention runtime owner",
-        )
-    })?;
-    trigger.try_send(()).map_err(|error| {
+        ));
+    };
+
+    let send_result = trigger.try_send(());
+
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    if send_result.is_ok() {
+        let mut conn = acquire_conn(pool.default_pool()).await?;
+        let ar = NewAuditRecord {
+            actor: &actor,
+            operation: OP_RETENTION_RUN_NOW,
+            target_type: TARGET_RETENTION,
+            target_id: None,
+            route_or_command: route,
+            request_id: request_id.as_deref(),
+            idempotency_key: None,
+            status: STATUS_SUCCEEDED,
+            error_summary: None,
+            shard_id: None,
+            source: &source,
+        };
+        audit::insert_audit(&mut conn, &ar)
+            .await
+            .map_err(map_error)?;
+    } else if let Err(ref e) = send_result {
+        let err_str = e.to_string();
+        if let Ok(mut conn) = acquire_conn(pool.default_pool()).await {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_RETENTION_RUN_NOW,
+                target_type: TARGET_RETENTION,
+                target_id: None,
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_FAILED,
+                error_summary: Some(err_str.as_str()),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+        }
+    }
+
+    send_result.map_err(|error| {
         AutumnError::service_unavailable_msg(format!(
             "retention run-now unavailable: failed to enqueue trigger ({error})"
         ))
@@ -2614,17 +3905,84 @@ struct ExternalActivityAck {
 async fn complete_external_activity(
     Extension(api_state): Extension<HarvestApiState>,
     Path(token_str): Path<String>,
+    headers: axum::http::HeaderMap,
     Json(request): Json<CompleteExternalActivityRequest>,
 ) -> Result<Json<ExternalActivityAck>, AutumnError> {
-    let token = parse_external_token(&token_str)?;
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+    let route = "POST /activities/external/{token}/complete";
+
+    let token = match parse_external_token(&token_str) {
+        Ok(t) => t,
+        Err(e) => {
+            if let Ok(pool) = api_state.storage_pool()
+                && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+            {
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_EXTERNAL_ACTIVITY_COMPLETE,
+                    target_type: TARGET_EXTERNAL_ACTIVITY,
+                    target_id: Some(token_str.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: None,
+                    status: STATUS_FAILED,
+                    error_summary: Some("malformed external token"),
+                    shard_id: None,
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+            }
+            return Err(e);
+        }
+    };
     let output = request.output.unwrap_or(Value::Null);
 
-    let newly_resolved = resolve_external_on_shards(&api_state, token, |conn, tok| {
+    let complete_result = resolve_external_on_shards(&api_state, token, |conn, tok| {
         let out = output.clone();
         Box::pin(async move { external_task::complete_externally(conn, tok, out).await })
     })
-    .await?;
+    .await;
 
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    if complete_result.is_ok() {
+        let mut conn = acquire_conn(pool.default_pool()).await?;
+        let ar = NewAuditRecord {
+            actor: &actor,
+            operation: OP_EXTERNAL_ACTIVITY_COMPLETE,
+            target_type: TARGET_EXTERNAL_ACTIVITY,
+            target_id: Some(token_str.as_str()),
+            route_or_command: route,
+            request_id: request_id.as_deref(),
+            idempotency_key: None,
+            status: STATUS_SUCCEEDED,
+            error_summary: None,
+            shard_id: None,
+            source: &source,
+        };
+        audit::insert_audit(&mut conn, &ar)
+            .await
+            .map_err(map_error)?;
+    } else if let Err(ref e) = complete_result {
+        let err_str = e.to_string();
+        if let Ok(mut conn) = acquire_conn(pool.default_pool()).await {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_EXTERNAL_ACTIVITY_COMPLETE,
+                target_type: TARGET_EXTERNAL_ACTIVITY,
+                target_id: Some(token_str.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_FAILED,
+                error_summary: Some(err_str.as_str()),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+        }
+    }
+
+    let newly_resolved = complete_result?;
     Ok(Json(ExternalActivityAck {
         ok: true,
         newly_resolved,
@@ -2634,17 +3992,84 @@ async fn complete_external_activity(
 async fn fail_external_activity(
     Extension(api_state): Extension<HarvestApiState>,
     Path(token_str): Path<String>,
+    headers: axum::http::HeaderMap,
     Json(request): Json<FailExternalActivityRequest>,
 ) -> Result<Json<ExternalActivityAck>, AutumnError> {
-    let token = parse_external_token(&token_str)?;
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+    let route = "POST /activities/external/{token}/fail";
 
-    let newly_resolved = resolve_external_on_shards(&api_state, token, |conn, tok| {
+    let token = match parse_external_token(&token_str) {
+        Ok(t) => t,
+        Err(e) => {
+            if let Ok(pool) = api_state.storage_pool()
+                && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+            {
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_EXTERNAL_ACTIVITY_FAIL,
+                    target_type: TARGET_EXTERNAL_ACTIVITY,
+                    target_id: Some(token_str.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: None,
+                    status: STATUS_FAILED,
+                    error_summary: Some("malformed external token"),
+                    shard_id: None,
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+            }
+            return Err(e);
+        }
+    };
+
+    let fail_result = resolve_external_on_shards(&api_state, token, |conn, tok| {
         let err = request.error.clone();
         let retryable = request.retryable;
         Box::pin(async move { external_task::fail_externally(conn, tok, err, retryable).await })
     })
-    .await?;
+    .await;
 
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    if fail_result.is_ok() {
+        let mut conn = acquire_conn(pool.default_pool()).await?;
+        let ar = NewAuditRecord {
+            actor: &actor,
+            operation: OP_EXTERNAL_ACTIVITY_FAIL,
+            target_type: TARGET_EXTERNAL_ACTIVITY,
+            target_id: Some(token_str.as_str()),
+            route_or_command: route,
+            request_id: request_id.as_deref(),
+            idempotency_key: None,
+            status: STATUS_SUCCEEDED,
+            error_summary: None,
+            shard_id: None,
+            source: &source,
+        };
+        audit::insert_audit(&mut conn, &ar)
+            .await
+            .map_err(map_error)?;
+    } else if let Err(ref e) = fail_result {
+        let err_str = e.to_string();
+        if let Ok(mut conn) = acquire_conn(pool.default_pool()).await {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_EXTERNAL_ACTIVITY_FAIL,
+                target_type: TARGET_EXTERNAL_ACTIVITY,
+                target_id: Some(token_str.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_FAILED,
+                error_summary: Some(err_str.as_str()),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+        }
+    }
+
+    let newly_resolved = fail_result?;
     Ok(Json(ExternalActivityAck {
         ok: true,
         newly_resolved,

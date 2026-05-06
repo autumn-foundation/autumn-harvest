@@ -71,6 +71,8 @@ const INIT_SQL: &str = concat!(
     ),
     "\n",
     include_str!("../../autumn-harvest/migrations/20260505000000_harvest_heartbeat_details/up.sql"),
+    "\n",
+    include_str!("../../autumn-harvest/migrations/20260506000000_harvest_audit_log/up.sql"),
 );
 type HarvestApiApp = axum::Router;
 
@@ -1990,6 +1992,7 @@ async fn retention_janitor_deletes_only_rows_older_than_max_age_and_cascades_chi
                 tick_interval_secs: 60 * 60,
                 batch_size: 1000,
                 dry_run: false,
+                audit_retention_days: 90,
             })
             .build(),
         &HarvestRuntimeConfig {
