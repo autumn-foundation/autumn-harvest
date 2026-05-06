@@ -436,6 +436,60 @@ fn workflow_child_row_from_parts(
     }
 }
 
+/// Merge-patch the `search_attrs` JSONB column for a workflow execution.
+///
+/// `Some(value)` entries in `patch` overwrite the stored key; `None` entries
+/// remove the key. Keys absent from `patch` are preserved. The update is done
+/// as an atomic read-modify-write within the caller's transaction context so
+/// concurrent same-execution updates (which the task queue serialises) do not
+/// race.
+pub async fn update_search_attrs<S: std::hash::BuildHasher + Sync>(
+    conn: &mut AsyncPgConnection,
+    exec_id: crate::types::ExecutionId,
+    patch: &std::collections::HashMap<String, Option<serde_json::Value>, S>,
+) -> HarvestResult<()> {
+    use crate::schema::harvest_workflow_executions::dsl;
+
+    if patch.is_empty() {
+        return Ok(());
+    }
+
+    // Read the current value so we can apply the merge in Rust.  Workflow
+    // tasks are serialised per-execution by SKIP LOCKED, so no TOCTOU risk.
+    let current: Option<serde_json::Value> = dsl::harvest_workflow_executions
+        .find(exec_id.as_uuid())
+        .select(dsl::search_attrs)
+        .first::<Option<serde_json::Value>>(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    let mut merged: serde_json::Map<String, serde_json::Value> = match current {
+        Some(serde_json::Value::Object(m)) => m,
+        _ => serde_json::Map::new(),
+    };
+
+    for (key, value) in patch {
+        match value {
+            Some(v) => {
+                merged.insert(key.clone(), v.clone());
+            }
+            None => {
+                merged.remove(key.as_str());
+            }
+        }
+    }
+
+    let new_attrs = serde_json::Value::Object(merged);
+
+    diesel::update(dsl::harvest_workflow_executions.find(exec_id.as_uuid()))
+        .set(dsl::search_attrs.eq(Some(new_attrs)))
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    Ok(())
+}
+
 fn summarize_error(error: Option<String>) -> Option<String> {
     const MAX_ERROR_SUMMARY_CHARS: usize = 240;
 

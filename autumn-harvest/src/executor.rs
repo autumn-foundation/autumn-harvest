@@ -129,7 +129,11 @@ pub async fn run_workflow_strict(
                                 expected <end of history>, got <workflow returned early>"
                             .to_string(),
                     }
-                } else if !ctx.drain_commands().is_empty() {
+                } else if ctx.drain_commands().into_iter().any(|cmd| {
+                    // UpsertSearchAttributes is pure metadata and does not
+                    // affect replay determinism; exclude it from this check.
+                    !matches!(cmd, WorkflowCommand::UpsertSearchAttributes { .. })
+                }) {
                     // New commands emitted after history was fully consumed (e.g. a
                     // newly-added version() or side_effect() call on an old history).
                     WorkflowOutcome::Failed {

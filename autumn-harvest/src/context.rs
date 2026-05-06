@@ -218,6 +218,16 @@ pub enum WorkflowCommand {
         /// `Ok(value)` on success; `Err(reason)` when the handler returned an error.
         result: Result<Value, String>,
     },
+    /// Merge-patch the workflow execution's `search_attrs` column.
+    ///
+    /// `Some(value)` entries overwrite the keyed attribute; `None` entries
+    /// remove the key entirely. Keys absent from the patch are left untouched.
+    /// This command is suppressed during replay so the DB write is idempotent
+    /// across worker restarts.
+    UpsertSearchAttributes {
+        /// Per-key merge patch: `Some(v)` → set/overwrite, `None` → remove.
+        patch: std::collections::HashMap<String, Option<Value>>,
+    },
 }
 
 // Manual Debug because oneshot::Sender is not Debug.
@@ -296,6 +306,10 @@ impl std::fmt::Debug for WorkflowCommand {
                 .field("name", name)
                 .field("start_to_close_secs", start_to_close_secs)
                 .finish_non_exhaustive(),
+            Self::UpsertSearchAttributes { patch } => f
+                .debug_struct("UpsertSearchAttributes")
+                .field("keys", &patch.keys().collect::<Vec<_>>())
+                .finish(),
             Self::RecordUpdateResult { update_id, result } => f
                 .debug_struct("RecordUpdateResult")
                 .field("update_id", update_id)
@@ -315,6 +329,72 @@ impl std::fmt::Debug for WorkflowCommand {
 async fn park_until_dropped() -> HarvestResult<()> {
     std::future::pending::<()>().await;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Search-attribute validation helpers
+// ---------------------------------------------------------------------------
+
+const SEARCH_ATTR_KEY_MAX_LEN: usize = 64;
+
+const RESERVED_SEARCH_ATTR_KEYS: &[&str] =
+    &["exec_id", "workflow_name", "shard_id", "status", "run_id"];
+
+const RESERVED_SEARCH_ATTR_PREFIX: &str = "_harvest";
+
+fn validate_search_attr_key(key: &str) -> HarvestResult<()> {
+    if key.is_empty() {
+        return Err(HarvestError::InvalidSearchAttribute {
+            reason: "search attribute key must not be empty".into(),
+        });
+    }
+    if key.len() > SEARCH_ATTR_KEY_MAX_LEN {
+        return Err(HarvestError::InvalidSearchAttribute {
+            reason: format!(
+                "search attribute key '{key}' exceeds maximum length of {SEARCH_ATTR_KEY_MAX_LEN}"
+            ),
+        });
+    }
+    if !key
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(HarvestError::InvalidSearchAttribute {
+            reason: format!(
+                "search attribute key '{key}' contains invalid characters; \
+                 only [a-zA-Z0-9_-] are allowed"
+            ),
+        });
+    }
+    if RESERVED_SEARCH_ATTR_KEYS.contains(&key) {
+        return Err(HarvestError::InvalidSearchAttribute {
+            reason: format!("search attribute key '{key}' is reserved by the engine"),
+        });
+    }
+    if key.starts_with(RESERVED_SEARCH_ATTR_PREFIX) {
+        return Err(HarvestError::InvalidSearchAttribute {
+            reason: format!("search attribute key '{key}' uses the reserved '_harvest' prefix"),
+        });
+    }
+    Ok(())
+}
+
+fn validate_search_attr_value(value: &Value) -> HarvestResult<()> {
+    match value {
+        Value::Object(_) => Err(HarvestError::InvalidSearchAttribute {
+            reason:
+                "search attribute values must be primitives (string, number, boolean, or null); \
+                     objects are not allowed"
+                    .into(),
+        }),
+        Value::Array(_) => Err(HarvestError::InvalidSearchAttribute {
+            reason:
+                "search attribute values must be primitives (string, number, boolean, or null); \
+                     arrays are not allowed"
+                    .into(),
+        }),
+        _ => Ok(()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -642,6 +722,65 @@ impl WorkflowContext {
         if let Some(reason) = self.cancellation_reason.as_deref() {
             return Err(HarvestError::Cancelled(reason.to_string()));
         }
+        Ok(())
+    }
+
+    // ── Search attribute mutations ────────────────────────────────────
+
+    /// Merge-patch the search attributes for this workflow execution.
+    ///
+    /// Keys present in `patch` with `Some(value)` overwrite the stored attribute.
+    /// Keys present with `None` remove the attribute. Keys absent from `patch`
+    /// are untouched (merge semantics, not full replacement).
+    ///
+    /// This is a **fire-and-forget metadata operation**: the method returns
+    /// immediately and the DB write is processed by the worker after the next
+    /// suspension or completion. Workflow logic must not branch on the return
+    /// value to maintain determinism.
+    ///
+    /// During **replay**, this call is a no-op — the attributes are already
+    /// correct in the database from the previous live execution cycle.
+    ///
+    /// # Key constraints
+    ///
+    /// - Non-empty, ≤ 64 characters, matching `[a-zA-Z0-9_-]+`.
+    /// - Not one of the reserved engine keys: `exec_id`, `workflow_name`,
+    ///   `shard_id`, `status`, `run_id`.
+    /// - Must not start with the `_harvest` prefix.
+    ///
+    /// # Value constraints
+    ///
+    /// Values must be JSON primitives (string, number, boolean, or `null`).
+    /// Objects and arrays are rejected.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::InvalidSearchAttribute`] if any key or value
+    /// violates the above constraints. The entire patch is rejected atomically —
+    /// no partial updates are applied.
+    pub fn upsert_search_attrs(
+        &self,
+        patch: impl IntoIterator<Item = (String, Option<Value>)>,
+    ) -> HarvestResult<()> {
+        let patch: std::collections::HashMap<String, Option<Value>> = patch.into_iter().collect();
+
+        if patch.is_empty() {
+            return Ok(());
+        }
+
+        for (key, value) in &patch {
+            validate_search_attr_key(key)?;
+            if let Some(v) = value {
+                validate_search_attr_value(v)?;
+            }
+        }
+
+        // During replay the DB update already happened; suppress the command.
+        if self.is_replaying() {
+            return Ok(());
+        }
+
+        self.push_command(WorkflowCommand::UpsertSearchAttributes { patch });
         Ok(())
     }
 
@@ -3603,5 +3742,195 @@ mod tests {
             .expect("both should succeed");
         assert_eq!(a, serde_json::json!({"a":"done"}));
         assert_eq!(b, serde_json::json!({"b":"done"}));
+    }
+
+    // ── upsert_search_attrs tests ─────────────────────────────────────
+
+    #[test]
+    fn upsert_search_attrs_live_emits_command() {
+        let ctx = WorkflowContext::new_test();
+        ctx.upsert_search_attrs([
+            (
+                "tenant".to_string(),
+                Some(Value::String("acme".to_string())),
+            ),
+            (
+                "phase".to_string(),
+                Some(Value::String("awaiting_approval".to_string())),
+            ),
+        ])
+        .expect("should succeed in live mode");
+
+        let cmds = ctx.drain_commands();
+        assert_eq!(cmds.len(), 1);
+        match &cmds[0] {
+            WorkflowCommand::UpsertSearchAttributes { patch } => {
+                assert_eq!(
+                    patch.get("tenant"),
+                    Some(&Some(Value::String("acme".to_string())))
+                );
+                assert_eq!(
+                    patch.get("phase"),
+                    Some(&Some(Value::String("awaiting_approval".to_string())))
+                );
+            }
+            other => panic!("expected UpsertSearchAttributes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn upsert_search_attrs_replay_is_noop() {
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: ActivityExecId::new(),
+                name: "step_1".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        assert!(ctx.is_replaying(), "context should be replaying");
+
+        ctx.upsert_search_attrs([("phase".to_string(), Some(Value::String("v1".to_string())))])
+            .expect("should succeed silently during replay");
+
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "no command emitted during replay"
+        );
+    }
+
+    #[test]
+    fn upsert_search_attrs_none_value_means_remove() {
+        let ctx = WorkflowContext::new_test();
+        ctx.upsert_search_attrs([("old_key".to_string(), None)])
+            .expect("removal should succeed");
+
+        let cmds = ctx.drain_commands();
+        assert_eq!(cmds.len(), 1);
+        match &cmds[0] {
+            WorkflowCommand::UpsertSearchAttributes { patch } => {
+                assert_eq!(patch.get("old_key"), Some(&None));
+            }
+            other => panic!("expected UpsertSearchAttributes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn upsert_search_attrs_rejects_empty_key() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .upsert_search_attrs([("".to_string(), Some(Value::Bool(true)))])
+            .expect_err("empty key must be rejected");
+        assert!(matches!(err, HarvestError::InvalidSearchAttribute { .. }));
+    }
+
+    #[test]
+    fn upsert_search_attrs_rejects_key_too_long() {
+        let ctx = WorkflowContext::new_test();
+        let long_key = "a".repeat(65);
+        let err = ctx
+            .upsert_search_attrs([(long_key, Some(Value::Bool(true)))])
+            .expect_err("key > 64 chars must be rejected");
+        assert!(matches!(err, HarvestError::InvalidSearchAttribute { .. }));
+    }
+
+    #[test]
+    fn upsert_search_attrs_rejects_invalid_key_chars() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .upsert_search_attrs([("bad key!".to_string(), Some(Value::Bool(true)))])
+            .expect_err("key with space/special chars must be rejected");
+        assert!(matches!(err, HarvestError::InvalidSearchAttribute { .. }));
+    }
+
+    #[test]
+    fn upsert_search_attrs_rejects_reserved_key() {
+        let ctx = WorkflowContext::new_test();
+        for key in &["exec_id", "workflow_name", "shard_id", "status", "run_id"] {
+            let err = ctx
+                .upsert_search_attrs([(key.to_string(), Some(Value::String("x".to_string())))])
+                .expect_err(&format!("reserved key '{key}' must be rejected"));
+            assert!(
+                matches!(err, HarvestError::InvalidSearchAttribute { .. }),
+                "key '{key}': expected InvalidSearchAttribute"
+            );
+        }
+    }
+
+    #[test]
+    fn upsert_search_attrs_rejects_reserved_prefix() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .upsert_search_attrs([(
+                "_harvest_shard".to_string(),
+                Some(Value::String("1".to_string())),
+            )])
+            .expect_err("key with _harvest prefix must be rejected");
+        assert!(matches!(err, HarvestError::InvalidSearchAttribute { .. }));
+    }
+
+    #[test]
+    fn upsert_search_attrs_rejects_object_value() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .upsert_search_attrs([(
+                "meta".to_string(),
+                Some(serde_json::json!({"nested": "object"})),
+            )])
+            .expect_err("object value must be rejected");
+        assert!(matches!(err, HarvestError::InvalidSearchAttribute { .. }));
+    }
+
+    #[test]
+    fn upsert_search_attrs_rejects_array_value() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .upsert_search_attrs([("tags".to_string(), Some(serde_json::json!(["a", "b"])))])
+            .expect_err("array value must be rejected");
+        assert!(matches!(err, HarvestError::InvalidSearchAttribute { .. }));
+    }
+
+    #[test]
+    fn upsert_search_attrs_accepts_primitive_values() {
+        let ctx = WorkflowContext::new_test();
+        ctx.upsert_search_attrs([
+            (
+                "str_key".to_string(),
+                Some(Value::String("hello".to_string())),
+            ),
+            ("num_key".to_string(), Some(serde_json::json!(42))),
+            ("bool_key".to_string(), Some(Value::Bool(false))),
+            ("null_removal".to_string(), None),
+        ])
+        .expect("primitives and None should be accepted");
+
+        let cmds = ctx.drain_commands();
+        assert_eq!(cmds.len(), 1);
+        match &cmds[0] {
+            WorkflowCommand::UpsertSearchAttributes { patch } => {
+                assert!(patch.contains_key("str_key"));
+                assert!(patch.contains_key("num_key"));
+                assert!(patch.contains_key("bool_key"));
+                assert!(patch.contains_key("null_removal"));
+                assert_eq!(patch["null_removal"], None);
+            }
+            other => panic!("expected UpsertSearchAttributes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn upsert_search_attrs_empty_patch_is_noop() {
+        let ctx = WorkflowContext::new_test();
+        ctx.upsert_search_attrs(std::iter::empty::<(String, Option<Value>)>())
+            .expect("empty patch should succeed");
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "empty patch emits no command"
+        );
     }
 }

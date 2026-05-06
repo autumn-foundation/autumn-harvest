@@ -265,6 +265,7 @@ const fn workflow_command_name(command: &WorkflowCommand) -> &'static str {
         WorkflowCommand::ContinueAsNew { .. } => "ContinueAsNew",
         WorkflowCommand::RunLocalActivity { .. } => "RunLocalActivity",
         WorkflowCommand::RecordUpdateResult { .. } => "RecordUpdateResult",
+        WorkflowCommand::UpsertSearchAttributes { .. } => "UpsertSearchAttributes",
     }
 }
 
@@ -300,14 +301,15 @@ fn should_requeue_signal_wait(commands: &[WorkflowCommand]) -> bool {
     let has_wait = commands
         .iter()
         .any(|cmd| matches!(cmd, WorkflowCommand::WaitForSignal { .. }));
-    // RecordUpdateResult commands are bookkeeping already handled before this
-    // check; they don't affect the signal-wait decision.
+    // RecordUpdateResult and UpsertSearchAttributes are bookkeeping already
+    // handled before this check; they don't affect the signal-wait decision.
     let only_wait_or_bookkeeping = commands.iter().all(|cmd| {
         matches!(
             cmd,
             WorkflowCommand::WaitForSignal { .. }
                 | WorkflowCommand::RecordMarker { .. }
                 | WorkflowCommand::RecordUpdateResult { .. }
+                | WorkflowCommand::UpsertSearchAttributes { .. }
         )
     });
 
@@ -407,13 +409,15 @@ fn extract_single_command<T>(
     commands: &[WorkflowCommand],
     extractor: impl Fn(&WorkflowCommand) -> Option<T>,
 ) -> Option<T> {
-    // RecordUpdateResult and RecordMarker are bookkeeping commands that have
-    // already been (or are about to be) persisted; they do not count toward
-    // the suspension-type determination.
+    // RecordUpdateResult, RecordMarker, and UpsertSearchAttributes are
+    // bookkeeping commands that have already been (or are about to be)
+    // processed; they do not count toward the suspension-type determination.
     let mut iter = commands.iter().filter(|cmd| {
         !matches!(
             cmd,
-            WorkflowCommand::RecordMarker { .. } | WorkflowCommand::RecordUpdateResult { .. }
+            WorkflowCommand::RecordMarker { .. }
+                | WorkflowCommand::RecordUpdateResult { .. }
+                | WorkflowCommand::UpsertSearchAttributes { .. }
         )
     });
 
@@ -482,7 +486,9 @@ fn extract_all_started_child_workflows(
         .filter(|c| {
             !matches!(
                 c,
-                WorkflowCommand::RecordMarker { .. } | WorkflowCommand::RecordUpdateResult { .. }
+                WorkflowCommand::RecordMarker { .. }
+                    | WorkflowCommand::RecordUpdateResult { .. }
+                    | WorkflowCommand::UpsertSearchAttributes { .. }
             )
         })
         .collect();
@@ -1068,6 +1074,32 @@ async fn persist_update_result_commands(
     store::append_events(conn, exec_id, &events, *next_event_id).await?;
     *next_event_id = next_event_id.saturating_add(i32::try_from(events.len()).unwrap_or(i32::MAX));
     Ok(())
+}
+
+/// Apply `UpsertSearchAttributes` commands from a command list to the DB.
+///
+/// Multiple `UpsertSearchAttributes` commands are merged left-to-right before
+/// the single DB update so the final result is one round-trip regardless of
+/// how many `upsert_search_attrs` calls the workflow made in this cycle.
+async fn persist_search_attrs_from_commands(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    commands: &[WorkflowCommand],
+) -> HarvestResult<()> {
+    let mut merged: std::collections::HashMap<String, Option<serde_json::Value>> =
+        std::collections::HashMap::new();
+
+    for cmd in commands {
+        if let WorkflowCommand::UpsertSearchAttributes { patch } = cmd {
+            merged.extend(patch.iter().map(|(k, v)| (k.clone(), v.clone())));
+        }
+    }
+
+    if merged.is_empty() {
+        return Ok(());
+    }
+
+    store::update_search_attrs(conn, exec_id, &merged).await
 }
 
 async fn persist_signal_wait_park(
@@ -2079,6 +2111,19 @@ async fn handle_suspended_workflow(
         .await;
     }
 
+    // Apply any search-attribute merge-patches before recording the suspension.
+    if let Err(e) =
+        persist_search_attrs_from_commands(conn, context.persistence.exec_id, commands).await
+    {
+        return fail_execution_on_error(
+            conn,
+            context.persistence.task,
+            context.persistence.worker_id,
+            Err(e),
+        )
+        .await;
+    }
+
     let sticky = context.persistence.sticky_hint();
 
     let result = if should_requeue_signal_wait(commands) {
@@ -2586,6 +2631,10 @@ async fn process_workflow_task(
                     .iter()
                     .any(|c| matches!(c, WorkflowCommand::RunLocalActivity { .. })) =>
             {
+                // Apply any search-attribute patches before running the local
+                // activity so that attributes are visible even if the worker
+                // crashes during inline execution.
+                persist_search_attrs_from_commands(conn, prepared.exec_id, &commands).await?;
                 // Local-activity re-run: drop this iteration's execute span
                 // so the OTel span closes before we start inline execution.
                 drop(execute_span);
@@ -2621,14 +2670,15 @@ async fn process_workflow_task(
         status,
     );
 
-    // Append UpdateCompleted/UpdateFailed events for any update handlers that
-    // ran during this live execution cycle before the terminal event.  For
-    // Suspended outcomes these commands are inside the variant and are handled
-    // inside handle_suspended_workflow; pending_cmds is only non-empty for
-    // Completed/Failed outcomes.
+    // Append UpdateCompleted/UpdateFailed events and apply search-attribute
+    // patches for any commands emitted during this live execution cycle before
+    // the terminal event.  For Suspended outcomes these commands are inside the
+    // variant and are handled inside handle_suspended_workflow; pending_cmds is
+    // only non-empty for Completed/Failed outcomes.
     if !pending_cmds.is_empty() {
         persist_update_result_commands(conn, prepared.exec_id, &pending_cmds, &mut next_event_id)
             .await?;
+        persist_search_attrs_from_commands(conn, prepared.exec_id, &pending_cmds).await?;
     }
 
     persist_workflow_outcome(
