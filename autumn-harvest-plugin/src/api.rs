@@ -3375,15 +3375,33 @@ async fn retention_run_now(
     Extension(api_state): Extension<HarvestApiState>,
     headers: axum::http::HeaderMap,
 ) -> Result<Json<BasicAck>, AutumnError> {
-    let runtime = api_state.runtime().map_err(map_error)?;
-    let trigger = runtime.retention.trigger.as_ref().ok_or_else(|| {
-        AutumnError::service_unavailable_msg(
-            "retention run-now unavailable: no local retention runtime owner",
-        )
-    })?;
-
     let (actor, source, request_id) = audit_context(&headers, &api_state);
     let route = "POST /admin/retention/run-now";
+
+    let runtime = api_state.runtime().map_err(map_error)?;
+    let Some(trigger) = runtime.retention.trigger.as_ref() else {
+        if let Ok(pool) = api_state.storage_pool()
+            && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+        {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_RETENTION_RUN_NOW,
+                target_type: TARGET_RETENTION,
+                target_id: None,
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_FAILED,
+                error_summary: Some("no local retention runtime owner"),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+        }
+        return Err(AutumnError::service_unavailable_msg(
+            "retention run-now unavailable: no local retention runtime owner",
+        ));
+    };
 
     let send_result = trigger.try_send(());
 
