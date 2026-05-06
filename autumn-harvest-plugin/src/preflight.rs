@@ -324,6 +324,9 @@ const HARVEST_WRITE_PRIVILEGE_REQUIREMENTS: &[(&str, &[&str])] = &[
     ("harvest_audit_log", &["INSERT", "DELETE"]),
 ];
 
+const HARVEST_SEQUENCE_PRIVILEGE_REQUIREMENTS: &[(&str, &[&str])] =
+    &[("harvest_events_id_seq", &["USAGE"])];
+
 #[derive(diesel::QueryableByName, Debug, Clone)]
 struct TablePrivilegeRow {
     #[diesel(sql_type = diesel::sql_types::Text)]
@@ -337,6 +340,22 @@ struct TablePrivilegeRow {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct MissingWritePrivilege {
     table: String,
+    privileges: Vec<String>,
+}
+
+#[derive(diesel::QueryableByName, Debug, Clone)]
+struct SequencePrivilegeRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    sequence_name: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    privilege: String,
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    granted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct MissingSequencePrivilege {
+    sequence: String,
     privileges: Vec<String>,
 }
 
@@ -371,6 +390,37 @@ fn harvest_write_privilege_query() -> String {
     )
 }
 
+fn harvest_sequence_privilege_query() -> String {
+    let mut values = String::new();
+    for (sequence, privileges) in HARVEST_SEQUENCE_PRIVILEGE_REQUIREMENTS {
+        for privilege in *privileges {
+            if !values.is_empty() {
+                values.push_str(", ");
+            }
+            values.push_str("('");
+            values.push_str(sequence);
+            values.push_str("', '");
+            values.push_str(privilege);
+            values.push_str("')");
+        }
+    }
+
+    format!(
+        "WITH required(sequence_name, privilege) AS (VALUES {values}) \
+         SELECT sequence_name::TEXT AS sequence_name, \
+                privilege::TEXT AS privilege, \
+                COALESCE( \
+                    has_sequence_privilege( \
+                        to_regclass(sequence_name::TEXT), \
+                        privilege::TEXT \
+                    ), \
+                    false \
+                ) AS granted \
+         FROM required \
+         ORDER BY sequence_name, privilege"
+    )
+}
+
 fn missing_write_privileges(rows: Vec<TablePrivilegeRow>) -> Vec<MissingWritePrivilege> {
     let mut by_table = BTreeMap::<String, Vec<String>>::new();
     for row in rows {
@@ -390,6 +440,28 @@ fn missing_write_privileges(rows: Vec<TablePrivilegeRow>) -> Vec<MissingWritePri
         .collect()
 }
 
+fn missing_sequence_privileges(rows: Vec<SequencePrivilegeRow>) -> Vec<MissingSequencePrivilege> {
+    let mut by_sequence = BTreeMap::<String, Vec<String>>::new();
+    for row in rows {
+        if !row.granted {
+            by_sequence
+                .entry(row.sequence_name)
+                .or_default()
+                .push(row.privilege);
+        }
+    }
+    for privileges in by_sequence.values_mut() {
+        privileges.sort();
+    }
+    by_sequence
+        .into_iter()
+        .map(|(sequence, privileges)| MissingSequencePrivilege {
+            sequence,
+            privileges,
+        })
+        .collect()
+}
+
 async fn missing_harvest_write_privileges(
     conn: &mut diesel_async::AsyncPgConnection,
 ) -> Result<Vec<MissingWritePrivilege>, diesel::result::Error> {
@@ -397,6 +469,15 @@ async fn missing_harvest_write_privileges(
         .load::<TablePrivilegeRow>(conn)
         .await?;
     Ok(missing_write_privileges(rows))
+}
+
+async fn missing_harvest_sequence_privileges(
+    conn: &mut diesel_async::AsyncPgConnection,
+) -> Result<Vec<MissingSequencePrivilege>, diesel::result::Error> {
+    let rows = diesel::sql_query(harvest_sequence_privilege_query())
+        .load::<SequencePrivilegeRow>(conn)
+        .await?;
+    Ok(missing_sequence_privileges(rows))
 }
 
 async fn check_shard_availability(api_state: &HarvestApiState) -> PreflightCheckResult {
@@ -436,7 +517,7 @@ async fn check_shard_availability(api_state: &HarvestApiState) -> PreflightCheck
             "one or more configured shards are not readable and writable by the Harvest role"
         },
         (status == PreflightStatus::Fail).then_some(
-            "Fix the affected shard connection, promote a writable primary, or grant the Harvest role required table write privileges before deployment.",
+            "Fix the affected shard connection, promote a writable primary, or grant the Harvest role required table and sequence privileges before deployment.",
         ),
         affected,
         json!({ "shards": shards }),
@@ -465,47 +546,68 @@ async fn observe_shard_availability(shard_id: i32, shard_pool: &DbPool) -> Shard
     let recovery = diesel::sql_query("SELECT pg_is_in_recovery() AS in_recovery")
         .get_result::<RecoveryRow>(&mut conn)
         .await;
-    let missing_privileges = missing_harvest_write_privileges(&mut conn).await;
-    match (read_only, recovery, missing_privileges) {
-        (Ok(read_only), Ok(recovery), Ok(missing_privileges))
-            if read_only.transaction_read_only == "off"
-                && !recovery.in_recovery
-                && missing_privileges.is_empty() =>
-        {
-            ShardObservation {
-                passed: true,
-                details: json!({
-                    "shard_id": shard_id,
-                    "status": "pass",
-                    "readable": true,
-                    "writable": true,
-                }),
+    match (read_only, recovery) {
+        (Ok(read_only), Ok(recovery)) => {
+            let missing_write_privileges = missing_harvest_write_privileges(&mut conn).await;
+            let missing_sequence_privileges = missing_harvest_sequence_privileges(&mut conn).await;
+            match (missing_write_privileges, missing_sequence_privileges) {
+                (Ok(missing_write_privileges), Ok(missing_sequence_privileges))
+                    if read_only.transaction_read_only == "off"
+                        && !recovery.in_recovery
+                        && missing_write_privileges.is_empty()
+                        && missing_sequence_privileges.is_empty() =>
+                {
+                    ShardObservation {
+                        passed: true,
+                        details: json!({
+                            "shard_id": shard_id,
+                            "status": "pass",
+                            "readable": true,
+                            "writable": true,
+                        }),
+                    }
+                }
+                (Ok(missing_write_privileges), Ok(missing_sequence_privileges)) => {
+                    ShardObservation {
+                        passed: false,
+                        details: json!({
+                            "shard_id": shard_id,
+                            "status": "fail",
+                            "readable": true,
+                            "writable": false,
+                            "transaction_read_only": read_only.transaction_read_only,
+                            "in_recovery": recovery.in_recovery,
+                            "missing_write_privileges": missing_write_privileges,
+                            "missing_sequence_privileges": missing_sequence_privileges,
+                        }),
+                    }
+                }
+                (Err(_), _) => ShardObservation {
+                    passed: false,
+                    details: json!({
+                        "shard_id": shard_id,
+                        "status": "fail",
+                        "readable": true,
+                        "writable": false,
+                        "transaction_read_only": read_only.transaction_read_only,
+                        "in_recovery": recovery.in_recovery,
+                        "error": "write privilege probe failed",
+                    }),
+                },
+                (_, Err(_)) => ShardObservation {
+                    passed: false,
+                    details: json!({
+                        "shard_id": shard_id,
+                        "status": "fail",
+                        "readable": true,
+                        "writable": false,
+                        "transaction_read_only": read_only.transaction_read_only,
+                        "in_recovery": recovery.in_recovery,
+                        "error": "sequence privilege probe failed",
+                    }),
+                },
             }
         }
-        (Ok(read_only), Ok(recovery), Ok(missing_privileges)) => ShardObservation {
-            passed: false,
-            details: json!({
-                "shard_id": shard_id,
-                "status": "fail",
-                "readable": true,
-                "writable": false,
-                "transaction_read_only": read_only.transaction_read_only,
-                "in_recovery": recovery.in_recovery,
-                "missing_write_privileges": missing_privileges,
-            }),
-        },
-        (Ok(read_only), Ok(recovery), Err(_)) => ShardObservation {
-            passed: false,
-            details: json!({
-                "shard_id": shard_id,
-                "status": "fail",
-                "readable": true,
-                "writable": false,
-                "transaction_read_only": read_only.transaction_read_only,
-                "in_recovery": recovery.in_recovery,
-                "error": "write privilege probe failed",
-            }),
-        },
         _ => ShardObservation {
             passed: false,
             details: json!({
@@ -1120,6 +1222,18 @@ mod tests {
         }
     }
 
+    fn sequence_privilege_row(
+        sequence_name: &str,
+        privilege: &str,
+        granted: bool,
+    ) -> SequencePrivilegeRow {
+        SequencePrivilegeRow {
+            sequence_name: sequence_name.to_string(),
+            privilege: privilege.to_string(),
+            granted,
+        }
+    }
+
     #[test]
     fn missing_write_privileges_groups_denied_privileges_by_table() {
         let missing = missing_write_privileges(vec![
@@ -1166,5 +1280,41 @@ mod tests {
         assert!(sql.contains("INSERT"));
         assert!(sql.contains("UPDATE"));
         assert!(sql.contains("DELETE"));
+    }
+
+    #[test]
+    fn missing_sequence_privileges_groups_denied_privileges_by_sequence() {
+        let missing = missing_sequence_privileges(vec![
+            sequence_privilege_row("harvest_events_id_seq", "USAGE", false),
+            sequence_privilege_row("harvest_events_id_seq", "SELECT", true),
+        ]);
+
+        assert_eq!(
+            missing,
+            vec![MissingSequencePrivilege {
+                sequence: "harvest_events_id_seq".to_string(),
+                privileges: vec!["USAGE".to_string()],
+            }]
+        );
+    }
+
+    #[test]
+    fn missing_sequence_privileges_is_empty_when_every_probe_is_granted() {
+        let missing = missing_sequence_privileges(vec![sequence_privilege_row(
+            "harvest_events_id_seq",
+            "USAGE",
+            true,
+        )]);
+
+        assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn sequence_privilege_query_checks_harvest_event_id_sequence() {
+        let sql = harvest_sequence_privilege_query();
+
+        assert!(sql.contains("has_sequence_privilege"));
+        assert!(sql.contains("harvest_events_id_seq"));
+        assert!(sql.contains("USAGE"));
     }
 }

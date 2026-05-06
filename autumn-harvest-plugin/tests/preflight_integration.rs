@@ -32,6 +32,7 @@ use tower::ServiceExt;
 type HarvestApiApp = axum::Router;
 
 const READ_ONLY_TEST_PASSWORD: &str = "harvest_readonly_password";
+const WRITE_NO_SEQUENCE_TEST_PASSWORD: &str = "harvest_write_no_sequence_password";
 
 fn build_test_pool(database_url: &str) -> DbPool {
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(database_url);
@@ -91,6 +92,31 @@ async fn create_read_only_harvest_role(database_url: &str) -> String {
     .expect("failed to grant table reads to read-only role");
 
     database_url_with_credentials(database_url, &role, READ_ONLY_TEST_PASSWORD)
+}
+
+async fn create_harvest_role_without_sequence_usage(database_url: &str) -> String {
+    let role = format!("harvest_no_seq_{}", uuid::Uuid::new_v4().simple());
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("failed to connect as migration owner");
+    diesel::sql_query(format!(
+        "CREATE ROLE {role} LOGIN PASSWORD '{WRITE_NO_SEQUENCE_TEST_PASSWORD}'"
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("failed to create no-sequence role");
+    diesel::sql_query(format!("GRANT USAGE ON SCHEMA public TO {role}"))
+        .execute(&mut conn)
+        .await
+        .expect("failed to grant schema usage to no-sequence role");
+    diesel::sql_query(format!(
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO {role}"
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("failed to grant table writes to no-sequence role");
+
+    database_url_with_credentials(database_url, &role, WRITE_NO_SEQUENCE_TEST_PASSWORD)
 }
 
 async fn setup_two_shards_with_migrations() -> ((String, String), ContainerAsync<Postgres>) {
@@ -443,6 +469,51 @@ async fn shard_availability_fails_when_role_lacks_harvest_table_write_privileges
             .expect("missing privileges should be reported")
             .iter()
             .any(|entry| entry["table"] == "harvest_task_queue")
+    );
+}
+
+#[tokio::test]
+async fn shard_availability_fails_when_role_lacks_harvest_sequence_usage() {
+    let (database_url, _container) = setup_database_url_with_migrations().await;
+    let admin_pool = build_test_pool(&database_url);
+    register_active_worker(
+        &admin_pool,
+        "preflight-worker",
+        &["default".to_string(), "email".to_string()],
+        &[0],
+    )
+    .await;
+    let no_sequence_url = create_harvest_role_without_sequence_usage(&database_url).await;
+    let state = api_state(
+        HarvestDbPool::from(build_test_pool(&no_sequence_url)),
+        runtime_for(
+            &["default", "email"],
+            Vec::new(),
+            ShardRouter::single(),
+            SchedulerMonitor::offline(),
+        ),
+        "prod",
+        true,
+    );
+
+    let report = build_preflight_report(&state).await;
+
+    let shard = report
+        .checks
+        .iter()
+        .find(|check| check.name == "shard_availability")
+        .expect("shard availability check should exist");
+    assert_eq!(shard.status, PreflightStatus::Fail);
+    assert_eq!(shard.affected_shards, vec![0]);
+    let observed = &shard.details["shards"].as_array().unwrap()[0];
+    assert_eq!(observed["readable"], true);
+    assert_eq!(observed["writable"], false);
+    assert!(
+        observed["missing_sequence_privileges"]
+            .as_array()
+            .expect("missing sequence privileges should be reported")
+            .iter()
+            .any(|entry| entry["sequence"] == "harvest_events_id_seq")
     );
 }
 
