@@ -3824,7 +3824,7 @@ mod tests {
     fn upsert_search_attrs_rejects_empty_key() {
         let ctx = WorkflowContext::new_test();
         let err = ctx
-            .upsert_search_attrs([("".to_string(), Some(Value::Bool(true)))])
+            .upsert_search_attrs([(String::new(), Some(Value::Bool(true)))])
             .expect_err("empty key must be rejected");
         assert!(matches!(err, HarvestError::InvalidSearchAttribute { .. }));
     }
