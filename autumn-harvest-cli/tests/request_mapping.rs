@@ -3,6 +3,17 @@ use clap::Parser;
 use serde_json::json;
 
 #[test]
+fn preflight_maps_to_management_api_request() {
+    let cli = Cli::try_parse_from(["harvest", "preflight"]).expect("preflight args should parse");
+
+    let request = cli.api_request().expect("preflight request should build");
+
+    assert_eq!(request.method, ApiMethod::Get);
+    assert_eq!(request.path, "/admin/preflight");
+    assert_eq!(request.body, None);
+}
+
+#[test]
 fn workflow_start_maps_to_management_api_request() {
     let cli = Cli::try_parse_from([
         "harvest",

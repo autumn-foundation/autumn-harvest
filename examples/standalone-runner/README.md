@@ -26,6 +26,12 @@ The raw Axum process listens on `http://localhost:8082`.
 - Harvest API: `GET /api/harvest/health`
 - Start workflow: `POST /api/harvest/workflows/standalone_order/start`
 
+Run the deployment preflight before starting work:
+
+```bash
+cargo run -p autumn-harvest-cli -- --base-url http://localhost:8082/api/harvest preflight
+```
+
 ```bash
 curl -s -X POST http://localhost:8082/api/harvest/workflows/standalone_order/start \
   -H 'Content-Type: application/json' \

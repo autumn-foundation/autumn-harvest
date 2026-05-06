@@ -73,6 +73,7 @@ use autumn_harvest::{
     StartWorkflowParams, cancel_workflow_execution, start_or_load_workflow_execution,
 };
 
+use crate::preflight::{PreflightReport, build_preflight_report};
 use crate::state::HarvestDbPool;
 
 #[derive(Clone)]
@@ -180,6 +181,10 @@ pub struct HarvestApiState {
     actor_extractor: Arc<Mutex<Option<ActorExtractorFn>>>,
     /// Audit log retention in days (default: 90).
     audit_retention_days: Arc<Mutex<Option<i64>>>,
+    /// Runtime profile used to decide whether unauthenticated admin routes are acceptable.
+    deployment_profile: Arc<Mutex<String>>,
+    /// Whether the management API was mounted behind an embedder-provided auth boundary.
+    admin_auth_boundary: Arc<Mutex<bool>>,
 }
 
 impl Default for HarvestApiState {
@@ -190,6 +195,8 @@ impl Default for HarvestApiState {
             worker_stale_threshold: Arc::new(Mutex::new(std::time::Duration::from_secs(10))),
             actor_extractor: Arc::default(),
             audit_retention_days: Arc::new(Mutex::new(None)),
+            deployment_profile: Arc::new(Mutex::new("unknown".to_string())),
+            admin_auth_boundary: Arc::new(Mutex::new(false)),
         }
     }
 }
@@ -255,11 +262,55 @@ impl HarvestApiState {
             .expect("harvest api state lock poisoned") = Some(days);
     }
 
+    /// Record the host application's deployment profile for preflight checks.
+    ///
+    /// `dev` allows an unauthenticated local management API; every other
+    /// profile is treated as non-dev and must have an auth boundary.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    pub fn set_deployment_profile(&self, profile: impl Into<String>) {
+        *self
+            .deployment_profile
+            .lock()
+            .expect("harvest api state lock poisoned") = profile.into();
+    }
+
+    /// Mark whether the Harvest management API is mounted behind auth.
+    ///
+    /// This reports the boundary provided via [`HarvestPlugin::api_with_auth`]
+    /// or an equivalent standalone integration. It does not implement RBAC.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    pub fn set_admin_auth_boundary(&self, present: bool) {
+        *self
+            .admin_auth_boundary
+            .lock()
+            .expect("harvest api state lock poisoned") = present;
+    }
+
     /// Returns `Some(days)` only when explicitly set via [`set_audit_retention_days`];
     /// `None` means "use the builder's retention config unchanged".
     pub(crate) fn audit_retention_days(&self) -> Option<i64> {
         *self
             .audit_retention_days
+            .lock()
+            .expect("harvest api state lock poisoned")
+    }
+
+    pub(crate) fn deployment_profile(&self) -> String {
+        self.deployment_profile
+            .lock()
+            .expect("harvest api state lock poisoned")
+            .clone()
+    }
+
+    pub(crate) fn admin_auth_boundary(&self) -> bool {
+        *self
+            .admin_auth_boundary
             .lock()
             .expect("harvest api state lock poisoned")
     }
@@ -331,7 +382,7 @@ impl HarvestApiState {
             .expect("harvest api state lock poisoned") = None;
     }
 
-    fn runtime(&self) -> HarvestResult<HarvestApiRuntime> {
+    pub(crate) fn runtime(&self) -> HarvestResult<HarvestApiRuntime> {
         self.runtime
             .lock()
             .expect("harvest api state lock poisoned")
@@ -347,6 +398,28 @@ impl HarvestApiState {
             .ok_or_else(|| {
                 HarvestError::Config("harvest storage pool is not configured".to_string())
             })
+    }
+}
+
+impl HarvestApiRuntime {
+    pub(crate) const fn registry(&self) -> &Arc<HandlerRegistry> {
+        &self.registry
+    }
+
+    pub(crate) const fn dags(&self) -> &Arc<DagCatalog> {
+        &self.dags
+    }
+
+    pub(crate) fn queues(&self) -> &[String] {
+        &self.queues
+    }
+
+    pub(crate) fn scheduler_snapshot(&self) -> SchedulerSnapshot {
+        self.scheduler.snapshot()
+    }
+
+    pub(crate) const fn retention_config(&self) -> &RetentionConfig {
+        &self.retention.config
     }
 }
 
@@ -730,6 +803,7 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         )
         .route("/dead-letters/{id}/replay", post(replay_dead_letter))
         .route("/health", get(health))
+        .route("/admin/preflight", get(preflight))
         .route("/admin/retention", get(retention_status))
         .route("/admin/retention/run-now", post(retention_run_now))
         .route("/admin/concurrency", get(concurrency_status))
@@ -768,6 +842,14 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         // API mutations. See `audit::ALL_MUTATION_ROUTES` for covered paths.
         .route("/admin/audit", get(list_audit_records))
         .layer(Extension(api_state))
+}
+
+async fn preflight(
+    Extension(api_state): Extension<HarvestApiState>,
+    axum::extract::State(autumn_state): axum::extract::State<AppState>,
+) -> Json<PreflightReport> {
+    api_state.set_deployment_profile(autumn_state.profile().to_string());
+    Json(build_preflight_report(&api_state).await)
 }
 
 #[derive(Debug, Deserialize)]

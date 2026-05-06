@@ -180,6 +180,7 @@ impl Plugin for HarvestPlugin {
             runtime: None,
         }));
         let api_state = HarvestApiState::new();
+        api_state.set_admin_auth_boundary(api_middleware.is_some());
 
         let startup_slot = Arc::clone(&slot);
         let shutdown_slot = Arc::clone(&slot);
@@ -218,6 +219,7 @@ fn start_harvest_runtime(
     slot: &Arc<Mutex<HarvestRuntimeSlot>>,
     api_state: &HarvestApiState,
 ) -> autumn_web::AutumnResult<()> {
+    api_state.set_deployment_profile(state.profile().to_string());
     let app_config = AutumnConfig::load()
         .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
     let harvest_config = HarvestRuntimeConfig::load()

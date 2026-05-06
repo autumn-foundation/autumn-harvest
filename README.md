@@ -133,6 +133,7 @@ runtime-owned behavior stay behind the same API surface your service exposes.
 
 ```bash
 cargo run -p autumn-harvest-cli -- health
+cargo run -p autumn-harvest-cli -- preflight
 cargo run -p autumn-harvest-cli -- workflow list --limit 25
 cargo run -p autumn-harvest-cli -- workflow list --state RUNNING --search-attr tenant=acme
 cargo run -p autumn-harvest-cli -- workflow get <execution-id>
@@ -162,6 +163,28 @@ a bearer token. Successful responses are printed as pretty JSON by default; use
 `--output json` for compact script-friendly output. JSON request payloads accept
 inline `--*-json` values or `--*-file PATH`; use `-` as the file path to read
 from stdin.
+
+### Deployment preflight
+
+Run preflight before promoting a Harvest-backed service:
+
+```bash
+cargo run -p autumn-harvest-cli -- --base-url http://localhost:3000/api/harvest preflight
+cargo run -p autumn-harvest-cli -- --base-url http://localhost:3000/api/harvest --output json preflight
+```
+
+`harvest preflight` calls `GET /api/harvest/admin/preflight` and performs only
+read-only checks. It reports API/runtime readiness, Harvest migrations on every
+configured shard, shard read/write availability, catalog and schedule
+resolvability, worker queue coverage and freshness, DLQ read access, retention
+visibility, and whether the admin API has an auth boundary in non-dev profiles.
+The default output is a compact table; `--output json` returns the same response
+shape as the API for CI and release scripts.
+
+Exit codes are deploy-gate friendly: `0` means `overall_status = pass`, `2`
+means `warn`, and `1` means `fail` or a transport/API error. Use warning exit
+code `2` when your release process allows a separate "promote with caution"
+branch; otherwise treat any nonzero exit as a failed gate.
 
 ### Controlling duplicate workflow starts
 

@@ -171,12 +171,33 @@ pub enum CliError {
         /// Original CLI argument value.
         value: String,
     },
+
+    /// Preflight completed but reported a non-passing deploy-gate status.
+    #[error("preflight overall_status={status}")]
+    PreflightGate {
+        /// Reported preflight status.
+        status: String,
+    },
+}
+
+impl CliError {
+    /// Process exit code associated with this error.
+    #[must_use]
+    pub fn exit_code(&self) -> i32 {
+        if matches!(self, Self::PreflightGate { status } if status == "warn") {
+            2
+        } else {
+            1
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
 enum Commands {
     /// Check management API health.
     Health,
+    /// Run read-only deployment readiness checks.
+    Preflight,
     /// Manage workflow executions.
     Workflow {
         #[command(subcommand)]
@@ -622,6 +643,7 @@ impl Cli {
     pub fn api_request(&self) -> Result<ApiRequest, CliError> {
         match &self.command {
             Commands::Health => Ok(ApiRequest::get("/health")),
+            Commands::Preflight => Ok(ApiRequest::get("/admin/preflight")),
             Commands::Workflow { command } => workflow_request(command),
             Commands::Dag { command } => dag_request(command),
             Commands::Schedule { command } => schedule_request(command),
@@ -677,6 +699,17 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
     let response = execute(&cli).await?;
     let rendered = render_response(&cli, &response)?;
     println!("{rendered}");
+    if matches!(cli.command, Commands::Preflight) {
+        let exit_code = preflight_exit_code(&response);
+        if exit_code != 0 {
+            let status = response
+                .get("overall_status")
+                .and_then(Value::as_str)
+                .unwrap_or("fail")
+                .to_string();
+            return Err(CliError::PreflightGate { status });
+        }
+    }
     Ok(())
 }
 
@@ -749,6 +782,9 @@ pub fn format_output(value: &Value, output: OutputFormat) -> Result<String, CliE
 }
 
 fn render_response(cli: &Cli, value: &Value) -> Result<String, CliError> {
+    if preflight_wants_table(cli) {
+        return Ok(format_preflight_table(value));
+    }
     if workflow_children_wants_table(cli) {
         return Ok(format_workflow_children_table(value));
     }
@@ -762,6 +798,85 @@ fn render_response(cli: &Cli, value: &Value) -> Result<String, CliError> {
         cli.output
     };
     format_output(value, output)
+}
+
+fn preflight_wants_table(cli: &Cli) -> bool {
+    matches!(&cli.command, Commands::Preflight) && cli.output == OutputFormat::PrettyJson
+}
+
+fn preflight_exit_code(value: &Value) -> i32 {
+    match value.get("overall_status").and_then(Value::as_str) {
+        Some("pass") => 0,
+        Some("warn") => 2,
+        _ => 1,
+    }
+}
+
+fn format_preflight_table(value: &Value) -> String {
+    let overall = value
+        .get("overall_status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let observed_at = value
+        .get("observed_at")
+        .and_then(Value::as_str)
+        .unwrap_or("-");
+    let Some(checks) = value.get("checks").and_then(Value::as_array) else {
+        return format!(
+            "overall_status: {overall}\nobserved_at: {observed_at}\nNo checks returned."
+        );
+    };
+
+    let mut rows = Vec::with_capacity(checks.len() + 1);
+    rows.push(vec![
+        "STATUS".to_string(),
+        "CHECK".to_string(),
+        "SCOPE".to_string(),
+        "SUMMARY".to_string(),
+    ]);
+    for check in checks {
+        let shards = check
+            .get("affected_shards")
+            .and_then(Value::as_array)
+            .filter(|values| !values.is_empty())
+            .map_or_else(
+                || "-".to_string(),
+                |values| {
+                    let ids = values
+                        .iter()
+                        .filter_map(Value::as_i64)
+                        .map(|id| id.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    format!("shards={ids}")
+                },
+            );
+        rows.push(vec![
+            cell_str(check.get("status")),
+            cell_str(check.get("name")),
+            shards,
+            cell_str(check.get("summary")),
+        ]);
+    }
+
+    let widths = (0..rows[0].len())
+        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
+        .collect::<Vec<_>>();
+    let table = rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .enumerate()
+                .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
+                .collect::<Vec<_>>()
+                .join("  ")
+                .trim_end()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!("overall_status: {overall}\nobserved_at: {observed_at}\n\n{table}")
 }
 
 fn audit_list_wants_table(cli: &Cli) -> bool {
@@ -1668,5 +1783,63 @@ mod reuse_policy_tests {
         let rendered = render_response(&cli, &payload).expect("json output should render");
 
         assert_eq!(rendered, r#"{"items":[],"next_cursor":null}"#);
+    }
+
+    #[test]
+    fn preflight_default_output_renders_compact_table() {
+        let cli = parse(&["preflight"]);
+        let payload = json!({
+            "overall_status": "warn",
+            "observed_at": "2026-05-06T12:00:00Z",
+            "version": {
+                "package": "autumn-harvest-plugin",
+                "version": "0.2.0",
+                "core_version": "0.2.0"
+            },
+            "checks": [{
+                "name": "worker_coverage",
+                "status": "warn",
+                "summary": "queue coverage exists but one worker is stale",
+                "remediation": "Restart or replace stale workers before promotion.",
+                "affected_shards": [0],
+                "details": {}
+            }]
+        });
+
+        let rendered = render_response(&cli, &payload).expect("table output should render");
+
+        assert!(rendered.contains("STATUS"));
+        assert!(rendered.contains("worker_coverage"));
+        assert!(rendered.contains("warn"));
+        assert!(!rendered.trim_start().starts_with('{'));
+    }
+
+    #[test]
+    fn preflight_json_output_preserves_raw_payload_shape() {
+        let cli = parse(&["--output", "json", "preflight"]);
+        let payload = json!({
+            "overall_status": "pass",
+            "observed_at": "2026-05-06T12:00:00Z",
+            "version": {
+                "package": "autumn-harvest-plugin",
+                "version": "0.2.0",
+                "core_version": "0.2.0"
+            },
+            "checks": []
+        });
+
+        let rendered = render_response(&cli, &payload).expect("json output should render");
+
+        assert_eq!(
+            rendered,
+            r#"{"checks":[],"observed_at":"2026-05-06T12:00:00Z","overall_status":"pass","version":{"core_version":"0.2.0","package":"autumn-harvest-plugin","version":"0.2.0"}}"#
+        );
+    }
+
+    #[test]
+    fn preflight_exit_codes_match_deploy_gate_status() {
+        assert_eq!(preflight_exit_code(&json!({ "overall_status": "pass" })), 0);
+        assert_eq!(preflight_exit_code(&json!({ "overall_status": "warn" })), 2);
+        assert_eq!(preflight_exit_code(&json!({ "overall_status": "fail" })), 1);
     }
 }
