@@ -165,6 +165,20 @@ pub enum HarvestError {
     /// Surfaces as `404 Not Found` at the management API layer.
     #[error("update handler not found: {0}")]
     UpdateHandlerNotFound(String),
+
+    /// A search attribute key or value violated a documented constraint.
+    ///
+    /// Returned by [`WorkflowContext::upsert_search_attrs`] when:
+    /// - The key is empty or longer than 64 characters.
+    /// - The key contains characters outside `[a-zA-Z0-9_-]`.
+    /// - The key is engine-reserved (`exec_id`, `workflow_name`, `shard_id`,
+    ///   `status`, `run_id`) or starts with the `_harvest` prefix.
+    /// - The value is a JSON object or array (only primitives and null allowed).
+    #[error("invalid search attribute: {reason}")]
+    InvalidSearchAttribute {
+        /// Human-readable description of the constraint that was violated.
+        reason: String,
+    },
 }
 
 /// Standard result type for internal harvest engine operations.

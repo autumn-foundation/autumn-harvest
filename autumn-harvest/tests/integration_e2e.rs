@@ -4330,6 +4330,304 @@ async fn workflow_schedule_dag_only_deployment_unaffected() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Search-attribute lifecycle tests (issue #159, AC #11 and #12)
+// ---------------------------------------------------------------------------
+
+/// Workflow used by search-attribute tests.
+///
+/// - Immediately sets `phase=awaiting_approval`.
+/// - Suspends on a `charge` signal.
+/// - On receipt, overwrites `phase=charged`.
+/// - Completes.
+fn approval_search_attrs_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        ctx.upsert_search_attrs([(
+            "phase".to_string(),
+            Some(serde_json::json!("awaiting_approval")),
+        )])
+        .map_err(|e| e.to_string())?;
+
+        ctx.wait_for_signal("charge")
+            .await
+            .map_err(|e| e.to_string())?;
+
+        ctx.upsert_search_attrs([("phase".to_string(), Some(serde_json::json!("charged")))])
+            .map_err(|e| e.to_string())?;
+
+        Ok(serde_json::json!({"status": "charged"}))
+    })
+}
+
+/// Query `harvest_workflow_executions` rows whose `search_attrs` contains all
+/// key-value pairs in `predicate` (Postgres `@>` containment operator).
+async fn find_by_search_attrs(
+    database_url: &str,
+    predicate: serde_json::Value,
+) -> Vec<WorkflowExecution> {
+    use diesel::dsl::sql;
+    use diesel::sql_types::{Bool, Jsonb};
+
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(database_url)
+        .await
+        .expect("fresh connection for search_attrs query");
+
+    harvest_workflow_executions::table
+        .filter(sql::<Bool>("search_attrs @> ").bind::<Jsonb, _>(predicate))
+        .select(WorkflowExecution::as_select())
+        .load(&mut conn)
+        .await
+        .expect("search_attrs containment query failed")
+}
+
+/// AC #11 — mutable search-attribute lifecycle:
+///
+/// 1. Workflow starts with `tenant=acme`.
+/// 2. First execution cycle: `upsert_search_attrs` sets `phase=awaiting_approval`.
+/// 3. Workflow suspends on the `charge` signal.
+/// 4. DB query with `tenant=acme AND phase=awaiting_approval` finds the execution.
+/// 5. `charge` signal is delivered; second cycle sets `phase=charged`.
+/// 6. `phase=awaiting_approval` filter returns nothing; `phase=charged` filter finds it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn search_attrs_upsert_visible_after_update_and_filterable() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+        .await
+        .expect("connect to test DB");
+
+    let exec_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+
+    // Start the workflow with tenant=acme in initial search_attrs.
+    let start = start_or_load_workflow_execution(
+        &mut conn,
+        StartWorkflowParams {
+            workflow_name: "approval_search_attrs_workflow",
+            workflow_id: "acme-approval-001",
+            exec_id,
+            input: serde_json::json!({}),
+            parent_id: None,
+            queue_name: "default",
+            execution_timeout: None,
+            memo: None,
+            search_attrs: Some(serde_json::json!({"tenant": "acme"})),
+            reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
+            trace_context: None,
+        },
+    )
+    .await
+    .expect("start_or_load_workflow_execution failed");
+    assert!(start.created);
+
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![WorkflowInfo {
+            name: "approval_search_attrs_workflow",
+            module: "integration_e2e",
+            handler: approval_search_attrs_workflow,
+        }],
+        vec![],
+    ));
+    let worker = build_runtime_worker("worker-sa-lifecycle", 1, 1, registry);
+    let pool = build_test_pool(&database_url);
+    let handle = spawn_test_worker(Arc::clone(&worker), pool);
+
+    // Wait for the workflow to reach the signal-wait suspension (phase should
+    // now be awaiting_approval in the DB).
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let rows = find_by_search_attrs(
+                &database_url,
+                serde_json::json!({"tenant": "acme", "phase": "awaiting_approval"}),
+            )
+            .await;
+            if !rows.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("search_attrs should show phase=awaiting_approval within timeout");
+
+    // Confirm the old filter now has a hit.
+    let awaiting = find_by_search_attrs(
+        &database_url,
+        serde_json::json!({"tenant": "acme", "phase": "awaiting_approval"}),
+    )
+    .await;
+    assert_eq!(
+        awaiting.len(),
+        1,
+        "should find one execution awaiting approval"
+    );
+    assert_eq!(awaiting[0].id, exec_id.as_uuid());
+
+    // Confirm it is NOT yet in the charged filter.
+    let charged_before = find_by_search_attrs(
+        &database_url,
+        serde_json::json!({"tenant": "acme", "phase": "charged"}),
+    )
+    .await;
+    assert!(
+        charged_before.is_empty(),
+        "should not appear in charged filter before signal"
+    );
+
+    // Deliver the charge signal and wake the task.
+    autumn_harvest::signal::send_signal(&mut conn, exec_id, "charge", serde_json::json!({}))
+        .await
+        .expect("send_signal failed");
+    queue::wake_workflow_task(&mut conn, exec_id)
+        .await
+        .expect("wake_workflow_task failed");
+
+    // Wait for completion.
+    wait_for_execution_state(&database_url, exec_id, "COMPLETED").await;
+
+    worker.shutdown();
+    handle.await.expect("worker task should join");
+
+    // After completion: phase=awaiting_approval filter returns nothing.
+    let awaiting_after = find_by_search_attrs(
+        &database_url,
+        serde_json::json!({"tenant": "acme", "phase": "awaiting_approval"}),
+    )
+    .await;
+    assert!(
+        awaiting_after.is_empty(),
+        "awaiting_approval filter must be empty after phase update"
+    );
+
+    // phase=charged filter now finds the execution.
+    let charged_after = find_by_search_attrs(
+        &database_url,
+        serde_json::json!({"tenant": "acme", "phase": "charged"}),
+    )
+    .await;
+    assert_eq!(
+        charged_after.len(),
+        1,
+        "charged filter should find the execution after phase update"
+    );
+    assert_eq!(charged_after[0].id, exec_id.as_uuid());
+}
+
+/// AC #12 — search attributes survive a worker crash and resume:
+///
+/// 1. Worker runs the first cycle, sets `phase=awaiting_approval`, suspends.
+/// 2. Worker is shut down (simulating a crash).
+/// 3. A fresh query confirms the attribute is still in the DB.
+/// 4. A new worker picks up the task from where it left off.
+/// 5. Signal is delivered; workflow completes with `phase=charged` in the DB.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn search_attrs_survive_worker_crash_and_resume() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+        .await
+        .expect("connect to test DB");
+
+    let exec_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+
+    start_or_load_workflow_execution(
+        &mut conn,
+        StartWorkflowParams {
+            workflow_name: "approval_search_attrs_workflow",
+            workflow_id: "acme-crash-resume-001",
+            exec_id,
+            input: serde_json::json!({}),
+            parent_id: None,
+            queue_name: "default",
+            execution_timeout: None,
+            memo: None,
+            search_attrs: Some(serde_json::json!({"tenant": "acme"})),
+            reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
+            trace_context: None,
+        },
+    )
+    .await
+    .expect("start_or_load_workflow_execution failed");
+
+    let make_registry = || {
+        Arc::new(HandlerRegistry::new(
+            vec![WorkflowInfo {
+                name: "approval_search_attrs_workflow",
+                module: "integration_e2e",
+                handler: approval_search_attrs_workflow,
+            }],
+            vec![],
+        ))
+    };
+    let pool = build_test_pool(&database_url);
+
+    // --- First worker: run until phase=awaiting_approval is persisted ---
+    let worker1 = build_runtime_worker("worker-crash-1", 1, 1, make_registry());
+    let handle1 = spawn_test_worker(Arc::clone(&worker1), pool.clone());
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let rows = find_by_search_attrs(
+                &database_url,
+                serde_json::json!({"phase": "awaiting_approval"}),
+            )
+            .await;
+            if !rows.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("phase=awaiting_approval should be visible within timeout");
+
+    // Simulate crash: shut down the first worker.
+    worker1.shutdown();
+    handle1.await.expect("worker1 join");
+
+    // Confirm the attribute is durable after the crash.
+    let after_crash = find_by_search_attrs(
+        &database_url,
+        serde_json::json!({"tenant": "acme", "phase": "awaiting_approval"}),
+    )
+    .await;
+    assert_eq!(
+        after_crash.len(),
+        1,
+        "search_attrs must survive worker crash"
+    );
+
+    // --- Second worker: resume and complete ---
+    let worker2 = build_runtime_worker("worker-crash-2", 1, 1, make_registry());
+    let handle2 = spawn_test_worker(Arc::clone(&worker2), pool.clone());
+
+    // Wait for the task to be re-claimed by the new worker (sticky timeout
+    // elapses or the task is re-enqueued after the signal below).
+    autumn_harvest::signal::send_signal(&mut conn, exec_id, "charge", serde_json::json!({}))
+        .await
+        .expect("send_signal failed");
+    queue::wake_workflow_task(&mut conn, exec_id)
+        .await
+        .expect("wake_workflow_task failed");
+
+    wait_for_execution_state(&database_url, exec_id, "COMPLETED").await;
+
+    worker2.shutdown();
+    handle2.await.expect("worker2 join");
+
+    // Final check: phase=charged is now in the DB.
+    let final_state = find_by_search_attrs(
+        &database_url,
+        serde_json::json!({"tenant": "acme", "phase": "charged"}),
+    )
+    .await;
+    assert_eq!(
+        final_state.len(),
+        1,
+        "phase=charged must be set after resume and completion"
+    );
+}
+
 /// (e) Builder validation: scheduling an unregistered workflow name fails at
 /// `build()` with `HarvestBuilderError::UnknownWorkflowSchedule`.
 #[test]
