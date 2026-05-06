@@ -1,6 +1,6 @@
 //! Read-only deployment preflight checks for the Harvest management API.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use autumn_harvest::dlq;
 use autumn_harvest::models::HarvestSchedule;
@@ -306,6 +306,99 @@ struct RecoveryRow {
     in_recovery: bool,
 }
 
+const HARVEST_WRITE_PRIVILEGE_REQUIREMENTS: &[(&str, &[&str])] = &[
+    (
+        "harvest_workflow_executions",
+        &["INSERT", "UPDATE", "DELETE"],
+    ),
+    ("harvest_events", &["INSERT"]),
+    ("harvest_task_queue", &["INSERT", "UPDATE"]),
+    ("harvest_dag_runs", &["INSERT", "UPDATE"]),
+    ("harvest_schedules", &["INSERT", "UPDATE"]),
+    ("harvest_signals", &["INSERT", "UPDATE"]),
+    ("harvest_timers", &["INSERT", "UPDATE", "DELETE"]),
+    ("harvest_dead_letters", &["INSERT", "DELETE"]),
+    ("harvest_external_tasks", &["INSERT", "UPDATE"]),
+    ("harvest_workers", &["INSERT", "UPDATE"]),
+    ("harvest_batch_jobs", &["INSERT", "UPDATE"]),
+    ("harvest_audit_log", &["INSERT", "DELETE"]),
+];
+
+#[derive(diesel::QueryableByName, Debug, Clone)]
+struct TablePrivilegeRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    table_name: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    privilege: String,
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    granted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct MissingWritePrivilege {
+    table: String,
+    privileges: Vec<String>,
+}
+
+fn harvest_write_privilege_query() -> String {
+    let mut values = String::new();
+    for (table, privileges) in HARVEST_WRITE_PRIVILEGE_REQUIREMENTS {
+        for privilege in *privileges {
+            if !values.is_empty() {
+                values.push_str(", ");
+            }
+            values.push_str("('");
+            values.push_str(table);
+            values.push_str("', '");
+            values.push_str(privilege);
+            values.push_str("')");
+        }
+    }
+
+    format!(
+        "WITH required(table_name, privilege) AS (VALUES {values}) \
+         SELECT table_name::TEXT AS table_name, \
+                privilege::TEXT AS privilege, \
+                COALESCE( \
+                    has_table_privilege( \
+                        to_regclass(table_name::TEXT), \
+                        privilege::TEXT \
+                    ), \
+                    false \
+                ) AS granted \
+         FROM required \
+         ORDER BY table_name, privilege"
+    )
+}
+
+fn missing_write_privileges(rows: Vec<TablePrivilegeRow>) -> Vec<MissingWritePrivilege> {
+    let mut by_table = BTreeMap::<String, Vec<String>>::new();
+    for row in rows {
+        if !row.granted {
+            by_table
+                .entry(row.table_name)
+                .or_default()
+                .push(row.privilege);
+        }
+    }
+    for privileges in by_table.values_mut() {
+        privileges.sort();
+    }
+    by_table
+        .into_iter()
+        .map(|(table, privileges)| MissingWritePrivilege { table, privileges })
+        .collect()
+}
+
+async fn missing_harvest_write_privileges(
+    conn: &mut diesel_async::AsyncPgConnection,
+) -> Result<Vec<MissingWritePrivilege>, diesel::result::Error> {
+    let rows = diesel::sql_query(harvest_write_privilege_query())
+        .load::<TablePrivilegeRow>(conn)
+        .await?;
+    Ok(missing_write_privileges(rows))
+}
+
 async fn check_shard_availability(api_state: &HarvestApiState) -> PreflightCheckResult {
     let Ok(pool) = api_state.storage_pool() else {
         return check(
@@ -338,12 +431,12 @@ async fn check_shard_availability(api_state: &HarvestApiState) -> PreflightCheck
         "shard_availability",
         status,
         if status == PreflightStatus::Pass {
-            "every configured shard is readable and writable"
+            "every configured shard is readable and writable by the Harvest role"
         } else {
-            "one or more configured shards are not readable and writable"
+            "one or more configured shards are not readable and writable by the Harvest role"
         },
         (status == PreflightStatus::Fail).then_some(
-            "Fix the affected shard connection or promote a writable primary before deployment.",
+            "Fix the affected shard connection, promote a writable primary, or grant the Harvest role required table write privileges before deployment.",
         ),
         affected,
         json!({ "shards": shards }),
@@ -372,9 +465,12 @@ async fn observe_shard_availability(shard_id: i32, shard_pool: &DbPool) -> Shard
     let recovery = diesel::sql_query("SELECT pg_is_in_recovery() AS in_recovery")
         .get_result::<RecoveryRow>(&mut conn)
         .await;
-    match (read_only, recovery) {
-        (Ok(read_only), Ok(recovery))
-            if read_only.transaction_read_only == "off" && !recovery.in_recovery =>
+    let missing_privileges = missing_harvest_write_privileges(&mut conn).await;
+    match (read_only, recovery, missing_privileges) {
+        (Ok(read_only), Ok(recovery), Ok(missing_privileges))
+            if read_only.transaction_read_only == "off"
+                && !recovery.in_recovery
+                && missing_privileges.is_empty() =>
         {
             ShardObservation {
                 passed: true,
@@ -386,7 +482,7 @@ async fn observe_shard_availability(shard_id: i32, shard_pool: &DbPool) -> Shard
                 }),
             }
         }
-        (Ok(read_only), Ok(recovery)) => ShardObservation {
+        (Ok(read_only), Ok(recovery), Ok(missing_privileges)) => ShardObservation {
             passed: false,
             details: json!({
                 "shard_id": shard_id,
@@ -395,6 +491,19 @@ async fn observe_shard_availability(shard_id: i32, shard_pool: &DbPool) -> Shard
                 "writable": false,
                 "transaction_read_only": read_only.transaction_read_only,
                 "in_recovery": recovery.in_recovery,
+                "missing_write_privileges": missing_privileges,
+            }),
+        },
+        (Ok(read_only), Ok(recovery), Err(_)) => ShardObservation {
+            passed: false,
+            details: json!({
+                "shard_id": shard_id,
+                "status": "fail",
+                "readable": true,
+                "writable": false,
+                "transaction_read_only": read_only.transaction_read_only,
+                "in_recovery": recovery.in_recovery,
+                "error": "write privilege probe failed",
             }),
         },
         _ => ShardObservation {
@@ -997,4 +1106,65 @@ fn check_admin_auth_boundary(api_state: &HarvestApiState) -> PreflightCheckResul
             "auth_boundary_present": has_boundary,
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn privilege_row(table_name: &str, privilege: &str, granted: bool) -> TablePrivilegeRow {
+        TablePrivilegeRow {
+            table_name: table_name.to_string(),
+            privilege: privilege.to_string(),
+            granted,
+        }
+    }
+
+    #[test]
+    fn missing_write_privileges_groups_denied_privileges_by_table() {
+        let missing = missing_write_privileges(vec![
+            privilege_row("harvest_task_queue", "INSERT", true),
+            privilege_row("harvest_task_queue", "UPDATE", false),
+            privilege_row("harvest_dead_letters", "INSERT", false),
+            privilege_row("harvest_dead_letters", "DELETE", false),
+        ]);
+
+        assert_eq!(
+            missing,
+            vec![
+                MissingWritePrivilege {
+                    table: "harvest_dead_letters".to_string(),
+                    privileges: vec!["DELETE".to_string(), "INSERT".to_string()],
+                },
+                MissingWritePrivilege {
+                    table: "harvest_task_queue".to_string(),
+                    privileges: vec!["UPDATE".to_string()],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn missing_write_privileges_is_empty_when_every_probe_is_granted() {
+        let missing = missing_write_privileges(vec![
+            privilege_row("harvest_task_queue", "INSERT", true),
+            privilege_row("harvest_task_queue", "UPDATE", true),
+        ]);
+
+        assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn write_privilege_query_checks_harvest_runtime_write_tables() {
+        let sql = harvest_write_privilege_query();
+
+        assert!(sql.contains("has_table_privilege"));
+        assert!(sql.contains("harvest_workflow_executions"));
+        assert!(sql.contains("harvest_task_queue"));
+        assert!(sql.contains("harvest_dead_letters"));
+        assert!(sql.contains("harvest_workers"));
+        assert!(sql.contains("INSERT"));
+        assert!(sql.contains("UPDATE"));
+        assert!(sql.contains("DELETE"));
+    }
 }

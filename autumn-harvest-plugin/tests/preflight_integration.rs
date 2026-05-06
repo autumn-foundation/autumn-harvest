@@ -31,6 +31,8 @@ use tower::ServiceExt;
 
 type HarvestApiApp = axum::Router;
 
+const READ_ONLY_TEST_PASSWORD: &str = "harvest_readonly_password";
+
 fn build_test_pool(database_url: &str) -> DbPool {
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(database_url);
     deadpool::managed::Pool::builder(manager)
@@ -56,6 +58,39 @@ async fn setup_database_url_with_migrations() -> (String, ContainerAsync<Postgre
     autumn_web::migrate::run_pending(&url, autumn_harvest::MIGRATIONS)
         .expect("failed to run Harvest migrations");
     (url, container)
+}
+
+fn database_url_with_credentials(database_url: &str, user: &str, password: &str) -> String {
+    database_url.replacen(
+        "postgres://postgres:postgres@",
+        &format!("postgres://{user}:{password}@"),
+        1,
+    )
+}
+
+async fn create_read_only_harvest_role(database_url: &str) -> String {
+    let role = format!("harvest_ro_{}", uuid::Uuid::new_v4().simple());
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("failed to connect as migration owner");
+    diesel::sql_query(format!(
+        "CREATE ROLE {role} LOGIN PASSWORD '{READ_ONLY_TEST_PASSWORD}'"
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("failed to create read-only role");
+    diesel::sql_query(format!("GRANT USAGE ON SCHEMA public TO {role}"))
+        .execute(&mut conn)
+        .await
+        .expect("failed to grant schema usage to read-only role");
+    diesel::sql_query(format!(
+        "GRANT SELECT ON ALL TABLES IN SCHEMA public TO {role}"
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("failed to grant table reads to read-only role");
+
+    database_url_with_credentials(database_url, &role, READ_ONLY_TEST_PASSWORD)
 }
 
 async fn setup_two_shards_with_migrations() -> ((String, String), ContainerAsync<Postgres>) {
@@ -364,6 +399,51 @@ async fn unreachable_shard_is_reported_without_hiding_healthy_shard() {
     assert_eq!(shard.status, PreflightStatus::Fail);
     assert_eq!(shard.affected_shards, vec![1]);
     assert!(shard.details["shards"].as_array().unwrap().len() >= 2);
+}
+
+#[tokio::test]
+async fn shard_availability_fails_when_role_lacks_harvest_table_write_privileges() {
+    let (database_url, _container) = setup_database_url_with_migrations().await;
+    let admin_pool = build_test_pool(&database_url);
+    register_active_worker(
+        &admin_pool,
+        "preflight-worker",
+        &["default".to_string(), "email".to_string()],
+        &[0],
+    )
+    .await;
+    let read_only_url = create_read_only_harvest_role(&database_url).await;
+    let state = api_state(
+        HarvestDbPool::from(build_test_pool(&read_only_url)),
+        runtime_for(
+            &["default", "email"],
+            Vec::new(),
+            ShardRouter::single(),
+            SchedulerMonitor::offline(),
+        ),
+        "prod",
+        true,
+    );
+
+    let report = build_preflight_report(&state).await;
+
+    let shard = report
+        .checks
+        .iter()
+        .find(|check| check.name == "shard_availability")
+        .expect("shard availability check should exist");
+    assert_eq!(shard.status, PreflightStatus::Fail);
+    assert_eq!(shard.affected_shards, vec![0]);
+    let observed = &shard.details["shards"].as_array().unwrap()[0];
+    assert_eq!(observed["readable"], true);
+    assert_eq!(observed["writable"], false);
+    assert!(
+        observed["missing_write_privileges"]
+            .as_array()
+            .expect("missing privileges should be reported")
+            .iter()
+            .any(|entry| entry["table"] == "harvest_task_queue")
+    );
 }
 
 #[tokio::test]
