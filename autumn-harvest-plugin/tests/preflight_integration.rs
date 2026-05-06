@@ -373,9 +373,103 @@ async fn registered_queue_without_active_worker_fails_preflight() {
 }
 
 #[tokio::test]
-async fn stale_worker_is_warning_not_failure_when_queue_coverage_exists() {
+async fn stale_worker_only_coverage_fails_preflight() {
     let (database_url, _container) = setup_database_url_with_migrations().await;
     let pool = build_test_pool(&database_url);
+    register_active_worker(
+        &pool,
+        "stale-worker",
+        &["default".to_string(), "email".to_string()],
+        &[0],
+    )
+    .await;
+    let mut conn = pool.get().await.expect("stale update connection");
+    diesel::sql_query(
+        "UPDATE harvest_workers
+         SET last_heartbeat_at = NOW() - INTERVAL '10 minutes',
+             status = $1
+         WHERE worker_id = 'stale-worker'",
+    )
+    .bind::<diesel::sql_types::Text, _>(WorkerStatus::Active.as_str())
+    .execute(&mut conn)
+    .await
+    .expect("worker should be marked stale");
+
+    let state = api_state(
+        HarvestDbPool::from(pool),
+        runtime_for(
+            &["default", "email"],
+            Vec::new(),
+            ShardRouter::single(),
+            SchedulerMonitor::offline(),
+        ),
+        "prod",
+        true,
+    );
+
+    let report = build_preflight_report(&state).await;
+
+    assert_eq!(report.overall_status, PreflightStatus::Fail);
+    assert_eq!(
+        check_status(&report, "worker_coverage"),
+        PreflightStatus::Fail
+    );
+}
+
+#[tokio::test]
+async fn draining_worker_only_coverage_fails_preflight() {
+    let (database_url, _container) = setup_database_url_with_migrations().await;
+    let pool = build_test_pool(&database_url);
+    register_active_worker(
+        &pool,
+        "draining-worker",
+        &["default".to_string(), "email".to_string()],
+        &[0],
+    )
+    .await;
+    let mut conn = pool.get().await.expect("draining update connection");
+    diesel::sql_query(
+        "UPDATE harvest_workers
+         SET status = $1
+         WHERE worker_id = 'draining-worker'",
+    )
+    .bind::<diesel::sql_types::Text, _>(WorkerStatus::Draining.as_str())
+    .execute(&mut conn)
+    .await
+    .expect("worker should be marked draining");
+
+    let state = api_state(
+        HarvestDbPool::from(pool),
+        runtime_for(
+            &["default", "email"],
+            Vec::new(),
+            ShardRouter::single(),
+            SchedulerMonitor::offline(),
+        ),
+        "prod",
+        true,
+    );
+
+    let report = build_preflight_report(&state).await;
+
+    assert_eq!(report.overall_status, PreflightStatus::Fail);
+    assert_eq!(
+        check_status(&report, "worker_coverage"),
+        PreflightStatus::Fail
+    );
+}
+
+#[tokio::test]
+async fn degraded_worker_is_warning_when_healthy_active_coverage_exists() {
+    let (database_url, _container) = setup_database_url_with_migrations().await;
+    let pool = build_test_pool(&database_url);
+    register_active_worker(
+        &pool,
+        "healthy-worker",
+        &["default".to_string(), "email".to_string()],
+        &[0],
+    )
+    .await;
     register_active_worker(
         &pool,
         "stale-worker",

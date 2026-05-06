@@ -698,7 +698,9 @@ async fn check_worker_coverage(api_state: &HarvestApiState) -> PreflightCheckRes
             PreflightStatus::Warn => {
                 "worker coverage exists but at least one matching worker is stale or draining"
             }
-            PreflightStatus::Fail => "at least one referenced queue has no active worker coverage",
+            PreflightStatus::Fail => {
+                "at least one referenced queue has no healthy active worker coverage"
+            }
         },
         match status {
             PreflightStatus::Pass => None,
@@ -706,7 +708,7 @@ async fn check_worker_coverage(api_state: &HarvestApiState) -> PreflightCheckRes
                 "Restart stale workers or wait for draining workers to be replaced before promotion.",
             ),
             PreflightStatus::Fail => Some(
-                "Start at least one active worker for every referenced queue on each affected shard.",
+                "Start at least one healthy active worker for every referenced queue on each affected shard.",
             ),
         },
         affected,
@@ -753,12 +755,16 @@ async fn observe_worker_coverage_shard(
             .iter()
             .filter(|worker| worker_can_cover(worker, queue, shard_id))
             .collect::<Vec<_>>();
-        if matching.is_empty() {
+        let has_healthy_active_worker = matching.iter().any(|worker| {
+            worker.health == WorkerHealth::Healthy
+                && worker.worker.status == WorkerStatus::Active.as_str()
+        });
+        if !has_healthy_active_worker {
             affected = true;
             hard_failures.push(json!({
                 "queue": queue,
                 "shard_id": shard_id,
-                "reason": "no active worker registration covers this queue and shard",
+                "reason": "no healthy active worker registration covers this queue and shard",
             }));
             observations.push(json!({
                 "queue": queue,
