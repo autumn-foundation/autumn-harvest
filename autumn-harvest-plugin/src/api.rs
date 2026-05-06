@@ -1762,13 +1762,55 @@ async fn start_workflow(
         Ok(r) => r,
         Err(e) => return map_error(e).into_response(),
     };
+
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+    let route = "POST /workflows/{workflow_name}/start";
+
     if !runtime.registry.workflows.contains_key(&workflow_name) {
+        if let Ok(pool) = api_state.storage_pool()
+            && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+        {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_START,
+                target_type: TARGET_WORKFLOW,
+                target_id: Some(workflow_name.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_FAILED,
+                error_summary: Some("workflow not registered"),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+        }
         return AutumnError::not_found_msg(format!("workflow '{workflow_name}'")).into_response();
     }
 
     let reuse_policy = match parse_reuse_policy(request.reuse_policy.as_deref()) {
         Ok(p) => p,
-        Err(e) => return e.into_response(),
+        Err(e) => {
+            if let Ok(pool) = api_state.storage_pool()
+                && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+            {
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_START,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: Some(workflow_name.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: None,
+                    status: STATUS_FAILED,
+                    error_summary: Some("invalid reuse policy"),
+                    shard_id: None,
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+            }
+            return e.into_response();
+        }
     };
     let workflow_id = request
         .workflow_id
@@ -1820,9 +1862,6 @@ async fn start_workflow(
         },
     )
     .await;
-
-    let (actor, source, request_id) = audit_context(&headers, &api_state);
-    let route = "POST /workflows/{workflow_name}/start";
 
     match result {
         Err(HarvestError::AlreadyExists {
