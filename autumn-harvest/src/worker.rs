@@ -2678,6 +2678,12 @@ async fn process_workflow_task(
                 // activity so that attributes are visible even if the worker
                 // crashes during inline execution.
                 persist_search_attrs_from_commands(conn, prepared.exec_id, &commands).await?;
+                // Sync in-memory snapshot so a subsequent continue_as_new in the
+                // same task copies the patched attrs to the successor row.
+                prepared.execution.search_attrs = apply_search_attrs_patch_in_memory(
+                    prepared.execution.search_attrs.take(),
+                    &commands,
+                );
                 // Local-activity re-run: drop this iteration's execute span
                 // so the OTel span closes before we start inline execution.
                 drop(execute_span);
