@@ -2333,7 +2333,23 @@ async fn patch_dag(
             let _ = audit::insert_audit(&mut conn, &ar).await;
             Err(map_error(e))
         }
-        Ok(0) => Err(AutumnError::not_found_msg(format!("dag '{dag_name}'"))),
+        Ok(0) => {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_DAG_PATCH,
+                target_type: TARGET_DAG,
+                target_id: Some(dag_name.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_FAILED,
+                error_summary: Some("dag not found"),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+            Err(AutumnError::not_found_msg(format!("dag '{dag_name}'")))
+        }
         Ok(_) => {
             let schedule = dsl::harvest_schedules
                 .filter(dsl::dag_name.eq(&dag_name))
