@@ -809,14 +809,25 @@ async fn submit_batch_operation(
     headers: axum::http::HeaderMap,
     Json(request): Json<SubmitBatchOperationRequest>,
 ) -> Result<(axum::http::StatusCode, Json<SubmitBatchOperationResponse>), AutumnError> {
-    let action: BatchAction = request
-        .action
-        .parse()
-        .map_err(AutumnError::bad_request_msg)?;
-
     let (actor, source, request_id) = audit_context(&headers, &api_state);
     let route = "POST /batch-operations";
     let idempotency_key = request.idempotency_key.clone();
+
+    let action: BatchAction = match request.action.parse() {
+        Ok(a) => a,
+        Err(err_msg) => {
+            batch_submit_audit_failed(
+                &api_state,
+                &actor,
+                &source,
+                request_id.as_deref(),
+                idempotency_key.as_deref(),
+                &err_msg,
+            )
+            .await;
+            return Err(AutumnError::bad_request_msg(err_msg));
+        }
+    };
 
     // Reject `state=` values outside the canonical list before we hit the DB
     // — otherwise the executor would silently match nothing and look like a
@@ -824,24 +835,15 @@ async fn submit_batch_operation(
     for state in &request.filter.states {
         if !KNOWN_WORKFLOW_STATES.contains(&state.as_str()) {
             let err_msg = format!("unknown workflow state '{state}' in batch filter");
-            if let Ok(pool) = api_state.storage_pool()
-                && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
-            {
-                let ar = NewAuditRecord {
-                    actor: &actor,
-                    operation: OP_BATCH_SUBMIT,
-                    target_type: TARGET_BATCH,
-                    target_id: None,
-                    route_or_command: route,
-                    request_id: request_id.as_deref(),
-                    idempotency_key: idempotency_key.as_deref(),
-                    status: STATUS_FAILED,
-                    error_summary: Some(err_msg.as_str()),
-                    shard_id: None,
-                    source: &source,
-                };
-                let _ = audit::insert_audit(&mut conn, &ar).await;
-            }
+            batch_submit_audit_failed(
+                &api_state,
+                &actor,
+                &source,
+                request_id.as_deref(),
+                idempotency_key.as_deref(),
+                &err_msg,
+            )
+            .await;
             return Err(AutumnError::bad_request_msg(err_msg));
         }
     }
@@ -2746,6 +2748,66 @@ async fn set_schedule_paused(
     Ok(Json(BasicAck { ok: true }))
 }
 
+async fn batch_submit_audit_failed(
+    api_state: &HarvestApiState,
+    actor: &str,
+    source: &str,
+    request_id: Option<&str>,
+    idempotency_key: Option<&str>,
+    error_summary: &str,
+) {
+    let Ok(pool) = api_state.storage_pool() else {
+        return;
+    };
+    let Ok(mut conn) = acquire_conn(pool.default_pool()).await else {
+        return;
+    };
+    let ar = NewAuditRecord {
+        actor,
+        operation: OP_BATCH_SUBMIT,
+        target_type: TARGET_BATCH,
+        target_id: None,
+        route_or_command: "POST /batch-operations",
+        request_id,
+        idempotency_key,
+        status: STATUS_FAILED,
+        error_summary: Some(error_summary),
+        shard_id: None,
+        source,
+    };
+    let _ = audit::insert_audit(&mut conn, &ar).await;
+}
+
+async fn dlq_bulk_audit_reject_empty_filter(
+    api_state: &HarvestApiState,
+    actor: &str,
+    source: &str,
+    request_id: Option<&str>,
+    operation: &'static str,
+    route: &'static str,
+) {
+    let Ok(pool) = api_state.storage_pool() else {
+        return;
+    };
+    let Ok(mut conn) = acquire_conn(pool.default_pool()).await else {
+        return;
+    };
+    let ar = NewAuditRecord {
+        actor,
+        operation,
+        target_type: TARGET_DEAD_LETTER,
+        target_id: None,
+        route_or_command: route,
+        request_id,
+        idempotency_key: None,
+        status: STATUS_FAILED,
+        error_summary: Some("empty bulk filter"),
+        shard_id: None,
+        source,
+    };
+    let _ = audit::insert_audit(&mut conn, &ar).await;
+}
+
 async fn schedule_delete_audit_failed(
     pool: &HarvestDbPool,
     actor: &str,
@@ -2991,7 +3053,19 @@ async fn bulk_replay_dead_letters_handler(
 ) -> axum::response::Response {
     use axum::response::IntoResponse as _;
 
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+    let route = "POST /dead-letters/replay";
+
     if filter.is_empty() {
+        dlq_bulk_audit_reject_empty_filter(
+            &api_state,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            OP_DLQ_REPLAY_BULK,
+            route,
+        )
+        .await;
         return (
             axum::http::StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
@@ -3009,9 +3083,6 @@ async fn bulk_replay_dead_letters_handler(
             Err(e) => map_error(e).into_response(),
         };
     }
-
-    let (actor, source, request_id) = audit_context(&headers, &api_state);
-    let route = "POST /dead-letters/replay";
 
     let replay_result = bulk_replay_from_shards(&api_state, &filter).await;
     let pool = match api_state.storage_pool() {
@@ -3088,7 +3159,19 @@ async fn bulk_discard_dead_letters_handler(
 ) -> axum::response::Response {
     use axum::response::IntoResponse as _;
 
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+    let route = "POST /dead-letters/discard";
+
     if filter.is_empty() {
+        dlq_bulk_audit_reject_empty_filter(
+            &api_state,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            OP_DLQ_DISCARD_BULK,
+            route,
+        )
+        .await;
         return (
             axum::http::StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
@@ -3106,9 +3189,6 @@ async fn bulk_discard_dead_letters_handler(
             Err(e) => map_error(e).into_response(),
         };
     }
-
-    let (actor, source, request_id) = audit_context(&headers, &api_state);
-    let route = "POST /dead-letters/discard";
 
     let discard_result = bulk_discard_from_shards(&api_state, &filter).await;
     let pool = match api_state.storage_pool() {
