@@ -2389,44 +2389,54 @@ async fn persist_workflow_outcome(
 }
 
 #[allow(clippy::too_many_lines)]
-#[allow(clippy::too_many_arguments)]
+struct WorkflowLoopContext<'a> {
+    task: &'a TaskQueueItem,
+    history_events: Vec<WorkflowEvent>,
+    next_event_id: i32,
+    workflow: &'a WorkflowInfo,
+    max_local_activity_start_to_close: Duration,
+    trace_carrier: Option<&'a TraceContextCarrier>,
+    exec_id: ExecutionId,
+    workflow_name: &'a str,
+    shard_id: i32,
+}
+
+struct WorkflowLoopResult {
+    outcome: WorkflowOutcome,
+    pending_cmds: Vec<WorkflowCommand>,
+    execute_span: tracing::Span,
+    next_event_id: i32,
+}
+
 async fn run_workflow_task_loop(
     conn: &mut AsyncPgConnection,
     registry: &HandlerRegistry,
-    task: &TaskQueueItem,
-    mut history_events: Vec<WorkflowEvent>,
-    mut next_event_id: i32,
-    workflow: &WorkflowInfo,
-    max_local_activity_start_to_close: Duration,
-    trace_carrier: Option<&TraceContextCarrier>,
-    exec_id: ExecutionId,
-    workflow_name: &str,
-    shard_id: i32,
-) -> HarvestResult<(WorkflowOutcome, Vec<WorkflowCommand>, tracing::Span, i32)> {
+    mut ctx: WorkflowLoopContext<'_>,
+) -> HarvestResult<WorkflowLoopResult> {
     let telemetry = registry.telemetry().clone();
 
-    let loop_result = loop {
-        let is_replay = history_events.len() > 1;
+    let (outcome, pending_cmds, execute_span) = loop {
+        let is_replay = ctx.history_events.len() > 1;
 
-        let _iter_parent_guard = trace_carrier
+        let _iter_parent_guard = ctx.trace_carrier
             .filter(|_| !is_replay)
             .map(|c| telemetry.install_trace_context(c));
 
         let span_meta = WorkflowExecuteSpanMeta {
-            workflow_name: workflow_name.to_string(),
-            shard_id: i64::from(shard_id),
-            queue_name: task.queue_name.clone(),
+            workflow_name: ctx.workflow_name.to_string(),
+            shard_id: i64::from(ctx.shard_id),
+            queue_name: ctx.task.queue_name.clone(),
             is_replay,
-            link_traceparent: trace_carrier
+            link_traceparent: ctx.trace_carrier
                 .filter(|_| is_replay)
                 .and_then(|c| c.link_traceparent.clone().or_else(|| c.traceparent.clone())),
         };
 
         let (run_outcome, pending_cmds, execute_span) = run_workflow_with_state(
-            exec_id,
-            history_events.clone(),
-            workflow.handler,
-            task.input.clone(),
+            ctx.exec_id,
+            ctx.history_events.clone(),
+            ctx.workflow.handler,
+            ctx.task.input.clone(),
             registry.shared_state(),
             Some(&span_meta),
         )
@@ -2443,20 +2453,25 @@ async fn run_workflow_task_loop(
                 let new_events = run_local_activity_inline(
                     conn,
                     registry,
-                    exec_id,
+                    ctx.exec_id,
                     markers,
                     local_run,
-                    max_local_activity_start_to_close,
-                    &mut next_event_id,
+                    ctx.max_local_activity_start_to_close,
+                    &mut ctx.next_event_id,
                 )
                 .await?;
-                history_events.extend(new_events);
+                ctx.history_events.extend(new_events);
             }
-            other => break (other, pending_cmds, execute_span, next_event_id),
+            other => break (other, pending_cmds, execute_span),
         }
     };
 
-    Ok(loop_result)
+    Ok(WorkflowLoopResult {
+        outcome,
+        pending_cmds,
+        execute_span,
+        next_event_id: ctx.next_event_id,
+    })
 }
 
 async fn process_workflow_task(
@@ -2544,20 +2559,24 @@ async fn process_workflow_task(
     // is executed here, its events are appended to history, and the workflow
     // is re-run with the extended history. Any other suspension (regular
     // activity, timer, signal wait, …) breaks out of the loop.
-    let (outcome, pending_cmds, execute_span, mut next_event_id) = run_workflow_task_loop(
-        conn,
-        registry,
+    let loop_ctx = WorkflowLoopContext {
         task,
-        prepared.history_events,
-        prepared.next_event_id,
+        history_events: prepared.history_events,
+        next_event_id: prepared.next_event_id,
         workflow,
         max_local_activity_start_to_close,
-        trace_carrier.as_ref(),
-        prepared.exec_id,
-        &prepared.execution.workflow_name,
-        prepared.execution.shard_id,
-    )
-    .await?;
+        trace_carrier: trace_carrier.as_ref(),
+        exec_id: prepared.exec_id,
+        workflow_name: &prepared.execution.workflow_name,
+        shard_id: prepared.execution.shard_id,
+    };
+
+    let WorkflowLoopResult {
+        outcome,
+        pending_cmds,
+        execute_span,
+        mut next_event_id,
+    } = run_workflow_task_loop(conn, registry, loop_ctx).await?;
 
     let status = match &outcome {
         WorkflowOutcome::Completed { .. } => WorkflowStatus::Completed,
