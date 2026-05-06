@@ -2090,13 +2090,29 @@ async fn signal_workflow(
 ) -> Result<(axum::http::StatusCode, Json<BasicAck>), AutumnError> {
     let exec_id = parse_execution_id(&id)?;
     let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
-    load_execution(&mut conn, exec_id)
-        .await
-        .map_err(map_error)?;
 
     let (actor, source, request_id) = audit_context(&headers, &api_state);
     let route = "POST /workflows/{id}/signal/{signal_name}";
     let exec_id_str = exec_id.to_string();
+
+    if let Err(e) = load_execution(&mut conn, exec_id).await {
+        let err_str = e.to_string();
+        let ar = NewAuditRecord {
+            actor: &actor,
+            operation: OP_WORKFLOW_SIGNAL,
+            target_type: TARGET_WORKFLOW,
+            target_id: Some(exec_id_str.as_str()),
+            route_or_command: route,
+            request_id: request_id.as_deref(),
+            idempotency_key: None,
+            status: STATUS_FAILED,
+            error_summary: Some(err_str.as_str()),
+            shard_id: None,
+            source: &source,
+        };
+        let _ = audit::insert_audit(&mut conn, &ar).await;
+        return Err(map_error(e));
+    }
 
     // Signal payload is intentionally not stored in the audit record (no PII).
     let signal_result = signal::send_signal(&mut conn, exec_id, &signal_name, payload).await;
