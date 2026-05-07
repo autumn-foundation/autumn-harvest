@@ -211,6 +211,7 @@ SELECT
                 SELECT vm2.workflow_exec_id::TEXT AS eid
                 FROM version_markers vm2
                 WHERE vm2.workflow_name = vm.workflow_name
+                  AND vm2.change_id = vm.change_id
                   AND vm2.recorded_version = vm.recorded_version
                   AND vm2.shard_id = vm.shard_id
                   AND vm2.state NOT IN (
