@@ -24,7 +24,7 @@ pub struct VersionUsageQuery {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum VersionUsageReportStatus {
     Complete,
     NoMatches,
@@ -441,6 +441,14 @@ mod tests {
             unavailable.shards[0].status,
             VersionUsageShardInspectionStatus::Unavailable
         );
+    }
+
+    #[test]
+    fn no_matches_status_serializes_as_snake_case() {
+        let value = serde_json::to_value(VersionUsageReportStatus::NoMatches)
+            .expect("status should serialize");
+
+        assert_eq!(value, serde_json::json!("no_matches"));
     }
 
     #[test]
