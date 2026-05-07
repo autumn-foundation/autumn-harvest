@@ -1972,6 +1972,21 @@ async fn start_workflow(
     )
     .in_scope(|| runtime.registry.telemetry().capture_trace_context());
 
+    let execution_timeout = match request
+        .execution_timeout_secs
+        .map(|secs| {
+            chrono::Duration::try_seconds(secs).ok_or_else(|| {
+                AutumnError::bad_request_msg(format!(
+                    "execution_timeout_secs {secs} is out of bounds"
+                ))
+            })
+        })
+        .transpose()
+    {
+        Ok(t) => t,
+        Err(e) => return e.into_response(),
+    };
+
     let result = start_or_load_workflow_execution(
         &mut conn,
         StartWorkflowParams {
@@ -1981,9 +1996,7 @@ async fn start_workflow(
             input,
             parent_id: None,
             queue_name: &queue_name,
-            execution_timeout: request
-                .execution_timeout_secs
-                .map(chrono::Duration::seconds),
+            execution_timeout,
             memo: request.memo.clone(),
             search_attrs: request.search_attrs.clone(),
             reuse_policy,

@@ -68,6 +68,19 @@ async fn eris_unauthenticated_health_is_accessible() {
 }
 
 #[tokio::test]
+async fn eris_start_workflow_overflow_does_not_panic() {
+    let app = unauthenticated_app();
+    let res = app
+        .oneshot(post_json(
+            "/workflows/my-workflow/start",
+            r#"{"execution_timeout_secs": 9223372036854775807}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn eris_unauthenticated_list_workflows_is_accessible() {
     let app = unauthenticated_app();
     let res = app.oneshot(get("/workflows")).await.unwrap();

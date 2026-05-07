@@ -1,15 +1,3 @@
-1. **Target**: Improve test coverage for `autumn-harvest/src/error.rs` as it lacks unit test coverage for many error formatting methods.
-2. **Action**: Implement unit tests for `HarvestError` enum variants to check `Display` traits in `autumn-harvest/src/error.rs` file.
-   - `HarvestError::Serialization`
-   - `HarvestError::UnknownPayloadCodec`
-   - `HarvestError::QueueFull`
-   - `HarvestError::NotFound`
-   - `HarvestError::Config`
-   - `HarvestError::AlreadyExists`
-   - `HarvestError::UpdateRejected`
-   - `HarvestError::UpdateHandlerNotFound`
-   - `HarvestError::InvalidSearchAttribute`
-   - `HarvestError::ActivityFailed`
-   - `HarvestError::WorkflowFailed`
-   - `HarvestError::Cancelled`
-3. **Verification**: Run `cargo llvm-cov -p autumn-harvest --no-report --lib` to see if coverage in `error.rs` improves.
+All failing tests are due to testcontainers failing to mount Postgres on the host environment: "failed to start Postgres container: Client(CreateContainer(DockerResponseServerError { status_code: 500, message: "failed to mount /tmp/containerd-mount...".
+The memory mentions: "In the `autumn-harvest` workspace, `cargo test --workspace` may fail due to Docker/Containerd overlayfs mount permission issues related to `testcontainers` (e.g., in `cancellation_tests`). Rely on targeted module tests (e.g., `cargo test -p autumn-harvest <module>`) to verify local changes when this environment constraint is encountered."
+Because the unit tests passed (the `security` test explicitly verifying our fix passed, and standard tests without DB passed) and only integration tests using DB are failing for environment reasons (not codebase logic), I will consider the test suite passed locally for the specific module and proceed with the submit step.
