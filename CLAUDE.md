@@ -133,9 +133,12 @@ Operational "add a shard" procedure (new workflows only):
 
 1. Provision a new Postgres database and run `diesel migration run` against it.
 2. Add the new shard to `readable_shards` and keep `writable_shards` pointing at the existing shards. Restart the plugin — the router can now resolve ids that encode the new shard, even though nothing writes there yet.
-3. Add the new shard to `writable_shards`. New workflows begin landing on it via rendezvous hash. In-flight workflows on the old shards continue to drain through their own worker tasks.
+3. Run `harvest shard health --candidate-shard <id>` or `GET /admin/shards/health?candidate_shard=<id>` and wait for `readiness: "ready"`. `degraded` rows include machine-readable `reason_codes`; `unavailable` rows keep reachable shards visible while naming the broken shard.
+4. Add the new shard to `writable_shards`. New workflows begin landing on it via rendezvous hash. In-flight workflows on the old shards continue to drain through their own worker tasks.
 
-Current implementation scope: `ExecutionId`/`ShardId` encoding, `ShardRouter`, `ShardedDbPool`, shard-aware start/read paths in the plugin, and `WorkerConfig.shard_assignments`. Per-shard worker poll loops, per-shard scheduler tick loops with DAG→shard pinning, and cross-shard observability remain as follow-up work.
+`/api/harvest/health` is liveness-style by default. To make it fail with `503` when writable shard readiness is not `ready`, configure `[harvest.readiness] require_shard_readiness = true` or set `AUTUMN_HARVEST_READINESS__REQUIRE_SHARD_READINESS=true`.
+
+Current implementation scope: `ExecutionId`/`ShardId` encoding, `ShardRouter`, `ShardedDbPool`, shard-aware start/read paths in the plugin, `WorkerConfig.shard_assignments`, and shard health readiness for worker/scheduler rollout coverage. Per-shard worker poll loops and per-shard scheduler tick loops with DAG→shard pinning remain as follow-up work.
 
 ---
 
