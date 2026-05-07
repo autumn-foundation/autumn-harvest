@@ -121,6 +121,7 @@ pub struct DlqSummary {
 struct ScheduleProbe {
     schedule_expr: Option<String>,
     is_paused: bool,
+    workflow_name: Option<String>,
     queue_name: Option<String>,
 }
 
@@ -790,6 +791,8 @@ struct ScheduleProbeRow {
     #[diesel(sql_type = diesel::sql_types::Bool)]
     is_paused: bool,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    workflow_name: Option<String>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     queue_name: Option<String>,
 }
 
@@ -797,6 +800,7 @@ async fn load_schedule_probes(conn: &mut AsyncPgConnection) -> Result<Vec<Schedu
     let rows = diesel::sql_query(
         "SELECT schedule_expr::TEXT AS schedule_expr, \
                 is_paused, \
+                workflow_name::TEXT AS workflow_name, \
                 queue_name::TEXT AS queue_name \
          FROM harvest_schedules",
     )
@@ -809,6 +813,7 @@ async fn load_schedule_probes(conn: &mut AsyncPgConnection) -> Result<Vec<Schedu
         .map(|row| ScheduleProbe {
             schedule_expr: row.schedule_expr,
             is_paused: row.is_paused,
+            workflow_name: row.workflow_name,
             queue_name: row.queue_name,
         })
         .collect())
@@ -837,12 +842,23 @@ fn required_queues(
         for schedule in schedules {
             if let Some(queue) = &schedule.queue_name {
                 queues.insert(queue.clone());
+            } else if persisted_workflow_schedule_uses_default_queue(schedule) {
+                queues.insert("default".to_string());
             }
         }
     }
     queues.retain(|queue| !queue.trim().is_empty());
 
     queues
+}
+
+fn persisted_workflow_schedule_uses_default_queue(schedule: &ScheduleProbe) -> bool {
+    !schedule.is_paused
+        && schedule.workflow_name.is_some()
+        && schedule
+            .schedule_expr
+            .as_deref()
+            .is_some_and(|expr| !expr.eq_ignore_ascii_case("manual"))
 }
 
 fn scheduler_coverage(
@@ -939,4 +955,50 @@ fn schedule_count_for_shard(
             .count();
     }
     count
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn persisted_schedule(
+        schedule_expr: Option<&str>,
+        is_paused: bool,
+        workflow_name: Option<&str>,
+        queue_name: Option<&str>,
+    ) -> ScheduleProbe {
+        ScheduleProbe {
+            schedule_expr: schedule_expr.map(ToOwned::to_owned),
+            is_paused,
+            workflow_name: workflow_name.map(ToOwned::to_owned),
+            queue_name: queue_name.map(ToOwned::to_owned),
+        }
+    }
+
+    #[test]
+    fn required_queues_includes_default_for_persisted_workflow_schedule_without_queue() {
+        let schedules = [persisted_schedule(
+            Some("interval:60"),
+            false,
+            Some("billing_workflow"),
+            None,
+        )];
+
+        let queues = required_queues(None, Some(&schedules));
+
+        assert!(queues.contains("default"));
+    }
+
+    #[test]
+    fn required_queues_does_not_infer_default_for_paused_manual_or_dag_schedule_rows() {
+        let schedules = [
+            persisted_schedule(Some("interval:60"), true, Some("paused_workflow"), None),
+            persisted_schedule(Some("manual"), false, Some("manual_workflow"), None),
+            persisted_schedule(Some("interval:60"), false, None, None),
+        ];
+
+        let queues = required_queues(None, Some(&schedules));
+
+        assert!(!queues.contains("default"));
+    }
 }

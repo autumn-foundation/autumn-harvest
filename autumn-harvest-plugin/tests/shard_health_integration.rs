@@ -524,6 +524,41 @@ async fn health_endpoint_can_enforce_writable_shard_readiness() {
 }
 
 #[tokio::test]
+async fn health_endpoint_enforces_unavailable_writable_shard_readiness() {
+    let (shard0_url, _container) = setup_database_url_with_migrations().await;
+    let pool = build_two_shard_pool(&shard0_url, "postgres://postgres:postgres@127.0.0.1:1/nope");
+    register_active_worker(
+        pool.pool_for(ShardId::new(0)),
+        "ready-worker-0",
+        &["default"],
+        &[0],
+    )
+    .await;
+    let router = ShardRouter::new(
+        vec![ShardId::new(0), ShardId::new(1)],
+        vec![ShardId::new(0), ShardId::new(1)],
+        ShardId::new(0),
+    );
+    let state = api_state(
+        pool,
+        runtime_for(
+            &["default"],
+            None,
+            Vec::new(),
+            router,
+            SchedulerMonitor::offline(),
+        ),
+    );
+    state.set_health_requires_shard_readiness(true);
+    let app = harvest_api_router(state).with_state(AppState::for_test().with_profile("prod"));
+
+    let (status, body) = get_json(&app, "/health").await;
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["shard_readiness"]["overall_readiness"], "unavailable");
+}
+
+#[tokio::test]
 async fn readable_only_candidate_without_workers_lists_promotion_blockers() {
     let ((shard0_url, shard1_url), _container) = setup_two_shards_with_migrations().await;
     let pool = build_two_shard_pool(&shard0_url, &shard1_url);

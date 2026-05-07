@@ -16,7 +16,7 @@ pub fn standalone_runtime_config(database_url: String) -> HarvestRuntimeConfig {
             enabled: false,
             ..HarvestOutboxConfig::default()
         },
-        batch: autumn_harvest_plugin::config::HarvestBatchConfig::default(),
+        ..HarvestRuntimeConfig::default()
     }
 }
 
