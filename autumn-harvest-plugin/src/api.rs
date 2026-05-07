@@ -79,6 +79,7 @@ use crate::preflight::{PreflightReport, build_preflight_report};
 use crate::shard_health::{ShardHealthReport, ShardReadiness, build_shard_health_report};
 use crate::state::HarvestDbPool;
 use crate::version_usage::{VersionUsageQuery, build_version_usage_report};
+use crate::version_gate_retirement::{RetirementCheckQuery, build_retirement_check_report};
 
 #[derive(Clone)]
 pub struct HarvestRetentionRuntime {
@@ -844,6 +845,10 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .route("/admin/preflight", get(preflight))
         .route("/admin/shards/health", get(shards_health))
         .route("/admin/version-gates/usage", get(version_usage))
+        .route(
+            "/admin/version-gates/retirement-check",
+            get(version_gate_retirement_check),
+        )
         .route("/admin/retention", get(retention_status))
         .route("/admin/retention/run-now", post(retention_run_now))
         .route("/admin/concurrency", get(concurrency_status))
@@ -904,6 +909,16 @@ async fn version_usage(
     Query(query): Query<VersionUsageQuery>,
 ) -> axum::response::Response {
     match build_version_usage_report(&api_state, query).await {
+        Ok(report) => Json(report).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn version_gate_retirement_check(
+    Extension(api_state): Extension<HarvestApiState>,
+    Query(query): Query<RetirementCheckQuery>,
+) -> axum::response::Response {
+    match build_retirement_check_report(&api_state, query).await {
         Ok(report) => Json(report).into_response(),
         Err(error) => error.into_response(),
     }
