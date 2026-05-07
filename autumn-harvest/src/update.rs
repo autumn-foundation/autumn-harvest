@@ -85,6 +85,16 @@ impl UpdateRegistry {
         Ok(())
     }
 
+    /// Retrieve the validator for `name`.
+    ///
+    /// Returns `None` if `name` is not registered.
+    /// Returns `Some(None)` if `name` is registered but has no validator.
+    /// Returns `Some(Some(validator))` if `name` is registered and has a validator.
+    #[must_use]
+    pub fn get_validator(&self, name: &str) -> Option<Option<BoxUpdateValidator>> {
+        self.entries.get(name).map(|e| e.validator.clone())
+    }
+
     /// Invoke the handler for `name` with `input`.
     ///
     /// Returns `None` if `name` is not registered.

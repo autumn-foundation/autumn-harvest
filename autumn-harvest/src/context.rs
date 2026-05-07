@@ -1707,18 +1707,22 @@ impl WorkflowContext {
     ///
     /// Panics if the internal update registry mutex is poisoned.
     pub fn validate_update(&self, name: &str, input: &Value) -> HarvestResult<()> {
-        let registry = self
-            .update_registry
-            .lock()
-            .expect("update_registry lock poisoned");
-        // Check existence structurally so validator errors are never confused
-        // with a missing handler, regardless of the error message text.
-        if !registry.contains(name) {
-            return Err(HarvestError::UpdateHandlerNotFound(name.to_string()));
+        let validator_opt = {
+            let registry = self
+                .update_registry
+                .lock()
+                .expect("update_registry lock poisoned");
+
+            registry.get_validator(name)
+        };
+
+        match validator_opt {
+            Some(Some(validator)) => {
+                validator(input).map_err(|reason| HarvestError::UpdateRejected { reason })
+            }
+            Some(None) => Ok(()), // Registered but no validator
+            None => Err(HarvestError::UpdateHandlerNotFound(name.to_string())),
         }
-        registry
-            .validate(name, input)
-            .map_err(|reason| HarvestError::UpdateRejected { reason })
     }
 
     /// Execute an already-admitted update by `update_id`.
@@ -3903,5 +3907,40 @@ mod tests {
             ctx.drain_commands().is_empty(),
             "empty patch emits no command"
         );
+    }
+
+    #[test]
+    fn validate_update_does_not_deadlock_on_reentrant_call() {
+        // Havoc: verify that validate_update drops its lock before invoking the validator
+        let ctx = Arc::new(WorkflowContext::new_test());
+
+        let ctx_clone = Arc::clone(&ctx);
+        ctx.register_update_handler(
+            "test_deadlock",
+            move |_| {
+                // Re-entrant call! This will deadlock if the lock is still held.
+                let _ = ctx_clone.validate_update("another_update", &Value::Null);
+                Ok(())
+            },
+            |_| async { Ok(Value::Null) },
+        );
+
+        ctx.register_update_handler(
+            "another_update",
+            |_| Ok(()),
+            |_| async { Ok(Value::Null) },
+        );
+
+        // Run validation in a thread with a short timeout to catch the deadlock
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx_run = Arc::clone(&ctx);
+
+        std::thread::spawn(move || {
+            let _ = ctx_run.validate_update("test_deadlock", &Value::Null);
+            tx.send(()).unwrap();
+        });
+
+        rx.recv_timeout(std::time::Duration::from_millis(500))
+            .expect("validate_update deadlocked!");
     }
 }
