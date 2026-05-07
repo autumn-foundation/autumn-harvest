@@ -168,6 +168,182 @@ impl HistoryMatcher {
 
     /// Prepares for matching by advancing past consumed events and draining early signals.
     /// Returns `true` if there are still events to replay.
+    fn scan_activity_terminal(
+        &mut self,
+        activity_id: ActivityExecId,
+        mut scan_cursor: usize,
+    ) -> HistoryMatch {
+        let mut first_interleaved_child_start = None;
+
+        // Scan forward for Completed or Failed with matching activity_id,
+        // skipping Started, Heartbeat, and other intermediate events.
+        while scan_cursor < self.events.len() {
+            if self.is_consumed(scan_cursor) {
+                scan_cursor += 1;
+                continue;
+            }
+
+            match &self.events[scan_cursor] {
+                WorkflowEvent::ActivityCompleted {
+                    activity_id: id,
+                    output,
+                } if *id == activity_id => {
+                    let result = HistoryMatch::Matched {
+                        output: output.clone(),
+                    };
+                    return self.settle_terminal(
+                        scan_cursor,
+                        first_interleaved_child_start,
+                        result,
+                    );
+                }
+                WorkflowEvent::ActivityFailed {
+                    activity_id: id,
+                    error,
+                    attempt,
+                } if *id == activity_id => {
+                    let result = HistoryMatch::Failed {
+                        error: error.clone(),
+                        attempt: *attempt,
+                    };
+                    return self.settle_terminal(
+                        scan_cursor,
+                        first_interleaved_child_start,
+                        result,
+                    );
+                }
+                WorkflowEvent::ActivityTimedOut {
+                    activity_id: id,
+                    timeout_type,
+                } if *id == activity_id => {
+                    let result = HistoryMatch::TimedOut {
+                        timeout_type: timeout_type.clone(),
+                    };
+                    return self.settle_terminal(
+                        scan_cursor,
+                        first_interleaved_child_start,
+                        result,
+                    );
+                }
+                // Skip heartbeats and started events for this activity.
+                WorkflowEvent::ActivityHeartbeat {
+                    activity_id: id, ..
+                }
+                | WorkflowEvent::ActivityStarted {
+                    activity_id: id, ..
+                } if *id == activity_id => {
+                    scan_cursor += 1;
+                }
+                // Child workflows can run concurrently with activities.
+                // Preserve replay by scanning past interleaved child starts.
+                WorkflowEvent::ChildWorkflowStarted { .. } => {
+                    first_interleaved_child_start.get_or_insert(scan_cursor);
+                    scan_cursor += 1;
+                }
+                // Signals can arrive at any time; stash them for later
+                // wait_for_signal calls and continue scanning.
+                WorkflowEvent::SignalReceived {
+                    signal_name,
+                    payload,
+                } => {
+                    let signal_name = signal_name.clone();
+                    let payload = payload.clone();
+                    self.stash_signal(scan_cursor, signal_name, payload);
+                    scan_cursor += 1;
+                }
+                // Update events are transparent to the activity scan.
+                ev if Self::is_update_event(ev) => {
+                    scan_cursor += 1;
+                }
+                // Any other event type is unexpected mid-activity
+                _ => break,
+            }
+        }
+
+        // We found the Scheduled event but no terminal event — treat as
+        // incomplete history (the activity was scheduled but never finished).
+        HistoryMatch::NoMatch
+    }
+
+    fn scan_local_activity_terminal(
+        &mut self,
+        activity_id: ActivityExecId,
+        mut scan_cursor: usize,
+    ) -> HistoryMatch {
+        let mut failed_attempts: u32 = 0;
+        let mut last_error: Option<String> = None;
+
+        while scan_cursor < self.events.len() {
+            if self.is_consumed(scan_cursor) {
+                scan_cursor += 1;
+                continue;
+            }
+
+            match &self.events[scan_cursor] {
+                WorkflowEvent::LocalActivityCompleted {
+                    activity_id: id,
+                    output,
+                } if *id == activity_id => {
+                    let output = output.clone();
+                    self.cursor = scan_cursor + 1;
+                    self.advance_to_next_unconsumed_event();
+                    return HistoryMatch::Matched { output };
+                }
+                // Terminal: all retries exhausted. This event is always
+                // authoritative regardless of the current retry policy.
+                WorkflowEvent::LocalActivityExhausted {
+                    activity_id: id,
+                    error,
+                    attempt,
+                } if *id == activity_id => {
+                    let error = error.clone();
+                    let attempt = *attempt;
+                    self.cursor = scan_cursor + 1;
+                    self.advance_to_next_unconsumed_event();
+                    return HistoryMatch::Failed { error, attempt };
+                }
+                WorkflowEvent::LocalActivityFailed {
+                    activity_id: id,
+                    error,
+                    attempt: _,
+                } if *id == activity_id => {
+                    failed_attempts += 1;
+                    last_error = Some(error.clone());
+                    scan_cursor += 1;
+                }
+                // Signals can be ingested while a local activity is retrying
+                WorkflowEvent::SignalReceived {
+                    signal_name,
+                    payload,
+                } => {
+                    let signal_name = signal_name.clone();
+                    let payload = payload.clone();
+                    self.stash_signal(scan_cursor, signal_name, payload);
+                    scan_cursor += 1;
+                }
+                ev if Self::is_update_event(ev) => {
+                    scan_cursor += 1;
+                }
+                _ => break,
+            }
+        }
+
+        // No LocalActivityCompleted or LocalActivityExhausted found. The worker
+        // either crashed before the first attempt or between retry attempts.
+        // Return InProgress so the worker can resume from the right attempt.
+        if failed_attempts > 0 {
+            // Advance the cursor past the recorded failure events so the next
+            // match picks up from the right position on the next worker call.
+            self.cursor = scan_cursor;
+            self.advance_to_next_unconsumed_event();
+        }
+        HistoryMatch::LocalActivityInProgress {
+            activity_id,
+            failed_attempts,
+            last_error,
+        }
+    }
+
     fn prepare_match(&mut self) -> bool {
         self.advance_to_next_unconsumed_event();
         self.drain_early_signals();
@@ -339,97 +515,7 @@ impl HistoryMatcher {
 
         // Advance past the Scheduled event
         self.cursor += 1;
-        let mut scan_cursor = self.cursor;
-        let mut first_interleaved_child_start = None;
-
-        // Scan forward for Completed or Failed with matching activity_id,
-        // skipping Started, Heartbeat, and other intermediate events.
-        while scan_cursor < self.events.len() {
-            if self.is_consumed(scan_cursor) {
-                scan_cursor += 1;
-                continue;
-            }
-
-            match &self.events[scan_cursor] {
-                WorkflowEvent::ActivityCompleted {
-                    activity_id: id,
-                    output,
-                } if *id == activity_id => {
-                    let result = HistoryMatch::Matched {
-                        output: output.clone(),
-                    };
-                    return self.settle_terminal(
-                        scan_cursor,
-                        first_interleaved_child_start,
-                        result,
-                    );
-                }
-                WorkflowEvent::ActivityFailed {
-                    activity_id: id,
-                    error,
-                    attempt,
-                } if *id == activity_id => {
-                    let result = HistoryMatch::Failed {
-                        error: error.clone(),
-                        attempt: *attempt,
-                    };
-                    return self.settle_terminal(
-                        scan_cursor,
-                        first_interleaved_child_start,
-                        result,
-                    );
-                }
-                WorkflowEvent::ActivityTimedOut {
-                    activity_id: id,
-                    timeout_type,
-                } if *id == activity_id => {
-                    let result = HistoryMatch::TimedOut {
-                        timeout_type: timeout_type.clone(),
-                    };
-                    return self.settle_terminal(
-                        scan_cursor,
-                        first_interleaved_child_start,
-                        result,
-                    );
-                }
-                // Skip heartbeats and started events for this activity.
-                WorkflowEvent::ActivityHeartbeat {
-                    activity_id: id, ..
-                }
-                | WorkflowEvent::ActivityStarted {
-                    activity_id: id, ..
-                } if *id == activity_id => {
-                    scan_cursor += 1;
-                }
-                // Child workflows can run concurrently with activities.
-                // Preserve replay by scanning past interleaved child starts.
-                WorkflowEvent::ChildWorkflowStarted { .. } => {
-                    first_interleaved_child_start.get_or_insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                // Signals can arrive at any time; stash them for later
-                // wait_for_signal calls and continue scanning.
-                WorkflowEvent::SignalReceived {
-                    signal_name,
-                    payload,
-                } => {
-                    let signal_name = signal_name.clone();
-                    let payload = payload.clone();
-                    self.stash_signal(scan_cursor, signal_name, payload);
-                    scan_cursor += 1;
-                }
-                // Update events are transparent to the activity scan.
-                ev if Self::is_update_event(ev) => {
-                    scan_cursor += 1;
-                }
-                // Any other event type is unexpected mid-activity
-                _ => break,
-            }
-        }
-
-        // We found the Scheduled event but no terminal event — treat as
-        // incomplete history (the activity was scheduled but never finished).
-        HistoryMatch::NoMatch
+        self.scan_activity_terminal(activity_id, self.cursor)
     }
 
     /// Like [`match_activity`](Self::match_activity) but also verifies the input payload.
@@ -477,85 +563,7 @@ impl HistoryMatcher {
         };
 
         self.cursor += 1;
-        let mut scan_cursor = self.cursor;
-        let mut first_interleaved_child_start = None;
-
-        while scan_cursor < self.events.len() {
-            if self.is_consumed(scan_cursor) {
-                scan_cursor += 1;
-                continue;
-            }
-            match &self.events[scan_cursor] {
-                WorkflowEvent::ActivityCompleted {
-                    activity_id: id,
-                    output,
-                } if *id == activity_id => {
-                    let result = HistoryMatch::Matched {
-                        output: output.clone(),
-                    };
-                    return self.settle_terminal(
-                        scan_cursor,
-                        first_interleaved_child_start,
-                        result,
-                    );
-                }
-                WorkflowEvent::ActivityFailed {
-                    activity_id: id,
-                    error,
-                    attempt,
-                } if *id == activity_id => {
-                    let result = HistoryMatch::Failed {
-                        error: error.clone(),
-                        attempt: *attempt,
-                    };
-                    return self.settle_terminal(
-                        scan_cursor,
-                        first_interleaved_child_start,
-                        result,
-                    );
-                }
-                WorkflowEvent::ActivityTimedOut {
-                    activity_id: id,
-                    timeout_type,
-                } if *id == activity_id => {
-                    let result = HistoryMatch::TimedOut {
-                        timeout_type: timeout_type.clone(),
-                    };
-                    return self.settle_terminal(
-                        scan_cursor,
-                        first_interleaved_child_start,
-                        result,
-                    );
-                }
-                WorkflowEvent::ActivityHeartbeat {
-                    activity_id: id, ..
-                }
-                | WorkflowEvent::ActivityStarted {
-                    activity_id: id, ..
-                } if *id == activity_id => {
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ChildWorkflowStarted { .. } => {
-                    first_interleaved_child_start.get_or_insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::SignalReceived {
-                    signal_name,
-                    payload,
-                } => {
-                    let signal_name = signal_name.clone();
-                    let payload = payload.clone();
-                    self.stash_signal(scan_cursor, signal_name, payload);
-                    scan_cursor += 1;
-                }
-                ev if Self::is_update_event(ev) => {
-                    scan_cursor += 1;
-                }
-                _ => break,
-            }
-        }
-
-        HistoryMatch::NoMatch
+        self.scan_activity_terminal(activity_id, self.cursor)
     }
 
     /// Match an `execute_activity_external` command against history.
@@ -1013,79 +1021,7 @@ impl HistoryMatcher {
 
         // Advance past LocalActivityScheduled
         self.cursor += 1;
-        let mut scan_cursor = self.cursor;
-        let mut failed_attempts: u32 = 0;
-        let mut last_error: Option<String> = None;
-
-        while scan_cursor < self.events.len() {
-            if self.is_consumed(scan_cursor) {
-                scan_cursor += 1;
-                continue;
-            }
-
-            match &self.events[scan_cursor] {
-                WorkflowEvent::LocalActivityCompleted {
-                    activity_id: id,
-                    output,
-                } if *id == activity_id => {
-                    let output = output.clone();
-                    self.cursor = scan_cursor + 1;
-                    self.advance_to_next_unconsumed_event();
-                    return HistoryMatch::Matched { output };
-                }
-                // Terminal: all retries exhausted. This event is always
-                // authoritative regardless of the current retry policy.
-                WorkflowEvent::LocalActivityExhausted {
-                    activity_id: id,
-                    error,
-                    attempt,
-                } if *id == activity_id => {
-                    let error = error.clone();
-                    let attempt = *attempt;
-                    self.cursor = scan_cursor + 1;
-                    self.advance_to_next_unconsumed_event();
-                    return HistoryMatch::Failed { error, attempt };
-                }
-                WorkflowEvent::LocalActivityFailed {
-                    activity_id: id,
-                    error,
-                    attempt: _,
-                } if *id == activity_id => {
-                    failed_attempts += 1;
-                    last_error = Some(error.clone());
-                    scan_cursor += 1;
-                }
-                // Signals can be ingested while a local activity is retrying
-                WorkflowEvent::SignalReceived {
-                    signal_name,
-                    payload,
-                } => {
-                    let signal_name = signal_name.clone();
-                    let payload = payload.clone();
-                    self.stash_signal(scan_cursor, signal_name, payload);
-                    scan_cursor += 1;
-                }
-                ev if Self::is_update_event(ev) => {
-                    scan_cursor += 1;
-                }
-                _ => break,
-            }
-        }
-
-        // No LocalActivityCompleted or LocalActivityExhausted found. The worker
-        // either crashed before the first attempt or between retry attempts.
-        // Return InProgress so the worker can resume from the right attempt.
-        if failed_attempts > 0 {
-            // Advance the cursor past the recorded failure events so the next
-            // match picks up from the right position on the next worker call.
-            self.cursor = scan_cursor;
-            self.advance_to_next_unconsumed_event();
-        }
-        HistoryMatch::LocalActivityInProgress {
-            activity_id,
-            failed_attempts,
-            last_error,
-        }
+        self.scan_local_activity_terminal(activity_id, self.cursor)
     }
 
     /// Like [`match_local_activity`](Self::match_local_activity) but also verifies the input payload.
