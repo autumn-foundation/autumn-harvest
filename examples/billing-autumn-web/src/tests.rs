@@ -163,10 +163,7 @@ async fn billing_checkout_compensates_when_capture_id_missing() {
                 Ok(json!({ "deleted": true }))
             })
             .mock_activity("void_invoice", |_| Ok(json!({ "voided": true })))
-            .send_signal(
-                "payment_captured",
-                json!({ "captured": true }),
-            )
+            .send_signal("payment_captured", json!({ "captured": true }))
             .run(json!(checkout()))
             .await;
 
