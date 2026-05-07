@@ -308,7 +308,7 @@ impl std::fmt::Debug for WorkflowCommand {
                 .finish_non_exhaustive(),
             Self::UpsertSearchAttributes { patch } => f
                 .debug_struct("UpsertSearchAttributes")
-                .field("keys", &patch.keys().collect::<Vec<_>>())
+                .field("keys", &patch.keys())
                 .finish(),
             Self::RecordUpdateResult { update_id, result } => f
                 .debug_struct("RecordUpdateResult")
