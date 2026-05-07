@@ -74,6 +74,7 @@ use autumn_harvest::{
 };
 
 use crate::preflight::{PreflightReport, build_preflight_report};
+use crate::shard_health::{ShardHealthReport, build_shard_health_report};
 use crate::state::HarvestDbPool;
 
 #[derive(Clone)]
@@ -546,6 +547,11 @@ struct HarvestHealth {
     scheduler: SchedulerSnapshot,
 }
 
+#[derive(Debug, Deserialize)]
+struct ShardHealthQuery {
+    candidate_shard: Option<i32>,
+}
+
 #[derive(Debug, Serialize)]
 struct ReplayDeadLetterResponse {
     ok: bool,
@@ -804,6 +810,7 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .route("/dead-letters/{id}/replay", post(replay_dead_letter))
         .route("/health", get(health))
         .route("/admin/preflight", get(preflight))
+        .route("/admin/shards/health", get(shards_health))
         .route("/admin/retention", get(retention_status))
         .route("/admin/retention/run-now", post(retention_run_now))
         .route("/admin/concurrency", get(concurrency_status))
@@ -850,6 +857,13 @@ async fn preflight(
 ) -> Json<PreflightReport> {
     api_state.set_deployment_profile(autumn_state.profile().to_string());
     Json(build_preflight_report(&api_state).await)
+}
+
+async fn shards_health(
+    Extension(api_state): Extension<HarvestApiState>,
+    Query(query): Query<ShardHealthQuery>,
+) -> Json<ShardHealthReport> {
+    Json(build_shard_health_report(&api_state, query.candidate_shard).await)
 }
 
 #[derive(Debug, Deserialize)]

@@ -699,7 +699,19 @@ assert_eq!(exec_id.shard(), shard);
 ```
 
 Adding a shard (new workflows only): provision and migrate the new database,
-add it to `readable_shards`, restart the plugin, then flip it into
+add it to `readable_shards`, restart the plugin, then run the readiness gate
+before promotion:
+
+```bash
+cargo run -p autumn-harvest-cli -- shard health --candidate-shard 1 --fail-on-unready
+cargo run -p autumn-harvest-cli -- --output json shard health --candidate-shard 1 --fail-on-unready
+```
+
+The matching management API endpoint is `GET /api/harvest/admin/shards/health`.
+It returns one row per configured shard, including shard roles, reachability,
+schema readiness, worker queue coverage, scheduler freshness when schedules are
+enabled, queue/DLQ pressure, and explicit promotion blockers. Only after the
+candidate row reports `readiness: "ready"` should you flip it into
 `writable_shards`. In-flight workflows drain on their original shard.
 
 ## Testing workflow code changes with the replayer

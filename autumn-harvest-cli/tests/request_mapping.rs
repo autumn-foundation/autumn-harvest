@@ -14,6 +14,41 @@ fn preflight_maps_to_management_api_request() {
 }
 
 #[test]
+fn shard_health_maps_to_management_api_request() {
+    let cli = Cli::try_parse_from(["harvest", "shard", "health"])
+        .expect("shard health args should parse");
+
+    let request = cli
+        .api_request()
+        .expect("shard health request should build");
+
+    assert_eq!(request.method, ApiMethod::Get);
+    assert_eq!(request.path, "/admin/shards/health");
+    assert_eq!(request.body, None);
+}
+
+#[test]
+fn shard_health_candidate_maps_to_query_string() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "shard",
+        "health",
+        "--candidate-shard",
+        "2",
+        "--fail-on-unready",
+    ])
+    .expect("shard health candidate args should parse");
+
+    let request = cli
+        .api_request()
+        .expect("shard health request should build");
+
+    assert_eq!(request.method, ApiMethod::Get);
+    assert_eq!(request.path, "/admin/shards/health?candidate_shard=2");
+    assert_eq!(request.body, None);
+}
+
+#[test]
 fn workflow_start_maps_to_management_api_request() {
     let cli = Cli::try_parse_from([
         "harvest",
