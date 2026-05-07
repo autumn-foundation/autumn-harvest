@@ -189,6 +189,7 @@ async fn billing_checkout_compensates_when_capture_id_missing() {
     assert!(scheduled.contains(&"cancel_subscription_record"));
     assert!(scheduled.contains(&"void_payment_authorization"));
     assert!(scheduled.contains(&"delete_customer_profile"));
+    assert!(scheduled.contains(&"void_invoice"));
 }
 
 #[tokio::test]
