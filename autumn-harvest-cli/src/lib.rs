@@ -2192,11 +2192,7 @@ fn retirement_check_exit_code(value: &Value) -> i32 {
         .and_then(Value::as_str)
         .unwrap_or("unavailable");
     // Non-zero on any non-safe outcome
-    if matches!(status, "safe") {
-        0
-    } else {
-        1
-    }
+    if matches!(status, "safe") { 0 } else { 1 }
 }
 
 fn retirement_check_request(

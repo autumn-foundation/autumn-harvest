@@ -35,6 +35,13 @@ pub struct RetirementCheckFilters {
 ///
 /// A row exists for each `(workflow_name, recorded_version, shard_id)` triple
 /// where `recorded_version < min_safe_version`.
+///
+/// When a non-identity [`PayloadCodec`] is configured, the `details` field of a
+/// `MarkerRecorded` event is stored as a codec envelope object rather than a bare
+/// integer.  Those rows cannot be decoded in SQL, so they are included
+/// conservatively with `recorded_version = 0` — always below any meaningful
+/// `min_safe_version`.  Operators should treat `recorded_version == 0` as
+/// *version unknown (opaque codec envelope)* and investigate before retiring.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 pub struct RetirementCheckShardRow {
     pub workflow_name: String,
@@ -84,15 +91,29 @@ WITH version_markers AS (
         w.started_at,
         w.shard_id,
         substring(e.event_data #>> '{data,name}' FROM 9) AS change_id,
-        (e.event_data #>> '{data,details}')::BIGINT AS recorded_version
+        CASE
+            WHEN e.event_data #>> '{data,details,_harvest_codec_envelope}' IS NOT NULL
+            THEN 0
+            ELSE (e.event_data #>> '{data,details}')::BIGINT
+        END AS recorded_version
     FROM harvest_events e
     INNER JOIN harvest_workflow_executions w
         ON w.id = e.workflow_exec_id
     WHERE e.event_type = 'MarkerRecorded'
       AND e.event_data #>> '{data,name}' = $1
-      AND e.event_data #>> '{data,details}' ~ '^[0-9]{1,19}$'
-      AND (e.event_data #>> '{data,details}')::NUMERIC <= 4294967295
-      AND (e.event_data #>> '{data,details}')::BIGINT < $2
+      AND (
+          -- Plain numeric details: must be a valid u32 below the safe threshold.
+          (
+              e.event_data #>> '{data,details}' ~ '^[0-9]{1,19}$'
+              AND (e.event_data #>> '{data,details}')::NUMERIC <= 4294967295
+              AND (e.event_data #>> '{data,details}')::BIGINT < $2
+          )
+          OR
+          -- Codec-envelope details: version is opaque; include conservatively
+          -- (mapped to recorded_version = 0 above) so they are never silently
+          -- excluded from the blocker set.
+          e.event_data #>> '{data,details,_harvest_codec_envelope}' IS NOT NULL
+      )
       AND ($3::TEXT IS NULL OR w.workflow_name = $3::TEXT)
       AND (
           $4::TEXT = 'all'
@@ -192,10 +213,8 @@ pub async fn load_retirement_check(
                     row.recorded_version
                 ))
             })?;
-            let sample_active_execution_ids =
-                parse_sample_ids(&row.sample_active_execution_ids).map_err(|e| {
-                    HarvestError::Database(format!("failed to parse sample ids: {e}"))
-                })?;
+            let sample_active_execution_ids = parse_sample_ids(&row.sample_active_execution_ids)
+                .map_err(|e| HarvestError::Database(format!("failed to parse sample ids: {e}")))?;
             Ok(RetirementCheckShardRow {
                 workflow_name: row.workflow_name,
                 change_id: row.change_id,
@@ -212,8 +231,7 @@ pub async fn load_retirement_check(
 }
 
 fn parse_sample_ids(json_text: &str) -> Result<Vec<Uuid>, String> {
-    let value: serde_json::Value =
-        serde_json::from_str(json_text).map_err(|e| e.to_string())?;
+    let value: serde_json::Value = serde_json::from_str(json_text).map_err(|e| e.to_string())?;
     let arr = value
         .as_array()
         .ok_or_else(|| "expected JSON array".to_string())?;
@@ -266,5 +284,16 @@ mod tests {
             shard_id: None,
         };
         assert_eq!(filters.state_group.as_str(), "all");
+    }
+
+    #[test]
+    fn sql_contains_codec_envelope_branch() {
+        // Verify that the SQL guard against opaque codec-envelope details is
+        // present so that non-identity PayloadCodec deployments are never
+        // silently excluded from the blocker set.
+        assert!(
+            RETIREMENT_CHECK_SQL.contains("_harvest_codec_envelope"),
+            "SQL must detect codec-envelope details to avoid false-safe reports"
+        );
     }
 }

@@ -287,7 +287,10 @@ async fn retirement_check_blocked_while_v1_running_safe_after_terminal() {
     .await;
 
     assert_eq!(status, StatusCode::OK, "body: {body}");
-    assert_eq!(body["status"], "blocked", "v1 running should block retirement");
+    assert_eq!(
+        body["status"], "blocked",
+        "v1 running should block retirement"
+    );
     assert_eq!(body["safe_to_retire"], false);
 
     let blockers = body["blockers"].as_array().expect("blockers array");
@@ -318,8 +321,7 @@ async fn retirement_check_blocked_while_v1_running_safe_after_terminal() {
     )
     .set((
         autumn_harvest::schema::harvest_workflow_executions::state.eq("COMPLETED"),
-        autumn_harvest::schema::harvest_workflow_executions::completed_at
-            .eq(Some(Utc::now())),
+        autumn_harvest::schema::harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
     ))
     .execute(&mut conn)
     .await

@@ -329,10 +329,7 @@ fn build_report_from_observations(
         .collect::<Vec<_>>();
 
     let status = compute_status(
-        blockers
-            .iter()
-            .map(|b| b.active_executions)
-            .sum::<i64>(),
+        blockers.iter().map(|b| b.active_executions).sum::<i64>(),
         inspected_shards.is_empty(),
         unavailable_shards.is_empty(),
     );
@@ -528,7 +525,10 @@ mod tests {
         );
         assert_eq!(report.status, RetirementCheckStatus::Partial);
         assert!(!report.safe_to_retire);
-        assert_eq!(report.blockers[0].shard_coverage.unavailable_shards, vec![1]);
+        assert_eq!(
+            report.blockers[0].shard_coverage.unavailable_shards,
+            vec![1]
+        );
     }
 
     #[test]
@@ -568,10 +568,7 @@ mod tests {
         assert_eq!(report.blockers.len(), 1);
         assert_eq!(report.blockers[0].active_executions, 6);
         assert_eq!(report.blockers[0].terminal_executions, 4);
-        assert_eq!(
-            report.blockers[0].shard_coverage.matched_shards,
-            vec![0, 1]
-        );
+        assert_eq!(report.blockers[0].shard_coverage.matched_shards, vec![0, 1]);
     }
 
     #[test]
