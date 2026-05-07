@@ -207,6 +207,10 @@ pub enum CliError {
     /// Version-gate guard found active usage or incomplete shard inspection.
     #[error("version usage guard failed")]
     VersionUsageGate,
+
+    /// Retirement check found active old-version executions or an unavailable shard.
+    #[error("version-gate retirement check failed")]
+    RetirementCheckGate,
 }
 
 impl CliError {
@@ -293,6 +297,32 @@ enum Commands {
         /// Exit non-zero if any active execution still matches the filtered version gate.
         #[arg(long, requires = "change_id", requires = "recorded_version")]
         guard: bool,
+    },
+    /// Check whether a version-gate change id is safe to retire below a version threshold.
+    ///
+    /// Exits non-zero when `--check` is passed and any non-terminal execution still carries
+    /// a recorded version below `--min-safe-version`, or when any shard is unavailable.
+    #[command(alias = "version-gate-check")]
+    VersionGateRetirement {
+        /// Version-gate change id to inspect (required).
+        #[arg(long)]
+        change_id: String,
+        /// Versions strictly below this value are considered old branches to retire.
+        #[arg(long, value_parser = clap::value_parser!(u32))]
+        min_safe_version: u32,
+        /// Narrow results to this workflow name.
+        #[arg(long)]
+        workflow_name: Option<String>,
+        /// Filter by execution state group.
+        #[arg(long, value_enum)]
+        state_group: Option<VersionUsageStateGroup>,
+        /// Restrict inspection to one shard.
+        #[arg(long)]
+        shard_id: Option<i32>,
+        /// Exit non-zero while any non-terminal execution still uses an old version,
+        /// or while any shard is unavailable.
+        #[arg(long)]
+        check: bool,
     },
     /// Open the TUI dashboard to monitor workflows.
     Tui,
@@ -735,6 +765,20 @@ impl Cli {
                 *shard_id,
                 *guard,
             )),
+            Commands::VersionGateRetirement {
+                change_id,
+                min_safe_version,
+                workflow_name,
+                state_group,
+                shard_id,
+                check: _,
+            } => Ok(retirement_check_request(
+                change_id,
+                *min_safe_version,
+                workflow_name.as_deref(),
+                *state_group,
+                *shard_id,
+            )),
             Commands::Tui => unreachable!("Tui command handles its own requests"),
         }
     }
@@ -798,6 +842,9 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
     }
     if version_usage_should_guard(&cli) && version_usage_guard_exit_code(&response) != 0 {
         return Err(CliError::VersionUsageGate);
+    }
+    if retirement_check_should_check(&cli) && retirement_check_exit_code(&response) != 0 {
+        return Err(CliError::RetirementCheckGate);
     }
     Ok(())
 }
@@ -885,6 +932,9 @@ fn render_response(cli: &Cli, value: &Value) -> Result<String, CliError> {
     }
     if version_usage_wants_table(cli) {
         return Ok(format_version_usage_table(value));
+    }
+    if retirement_check_wants_table(cli) {
+        return Ok(format_retirement_check_table(value));
     }
 
     let output = if workflow_children_wants_raw_json(cli) {
@@ -2122,6 +2172,154 @@ fn query_encode(input: &str) -> String {
     out
 }
 
+// ─── Version-gate retirement check helpers ────────────────────────────────────
+
+const fn retirement_check_should_check(cli: &Cli) -> bool {
+    matches!(
+        &cli.command,
+        Commands::VersionGateRetirement { check: true, .. }
+    )
+}
+
+fn retirement_check_wants_table(cli: &Cli) -> bool {
+    matches!(&cli.command, Commands::VersionGateRetirement { .. })
+        && cli.output == OutputFormat::PrettyJson
+}
+
+fn retirement_check_exit_code(value: &Value) -> i32 {
+    let status = value
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unavailable");
+    // Non-zero on any non-safe outcome
+    i32::from(!matches!(status, "safe"))
+}
+
+fn retirement_check_request(
+    change_id: &str,
+    min_safe_version: u32,
+    workflow_name: Option<&str>,
+    state_group: Option<VersionUsageStateGroup>,
+    shard_id: Option<i32>,
+) -> ApiRequest {
+    let mut params: Vec<(&'static str, String)> = Vec::new();
+    params.push(("change_id", change_id.to_string()));
+    params.push(("min_safe_version", min_safe_version.to_string()));
+    if let Some(name) = workflow_name {
+        params.push(("workflow_name", name.to_string()));
+    }
+    if let Some(sg) = state_group {
+        params.push(("state_group", sg.as_wire().to_string()));
+    }
+    if let Some(sid) = shard_id {
+        params.push(("shard_id", sid.to_string()));
+    }
+    let encoded = params
+        .iter()
+        .map(|(key, value)| format!("{key}={}", query_encode(value)))
+        .collect::<Vec<_>>()
+        .join("&");
+    ApiRequest::get(format!("/admin/version-gates/retirement-check?{encoded}"))
+}
+
+fn format_retirement_check_table(value: &Value) -> String {
+    let status = value
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let safe = value
+        .get("safe_to_retire")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let observed_at = value
+        .get("observed_at")
+        .and_then(Value::as_str)
+        .unwrap_or("-");
+    let change_id = value
+        .get("filters")
+        .and_then(|f| f.get("change_id"))
+        .and_then(Value::as_str)
+        .unwrap_or("-");
+    let min_safe = value
+        .get("filters")
+        .and_then(|f| f.get("min_safe_version"))
+        .and_then(Value::as_i64)
+        .map_or_else(|| "-".to_string(), |v| v.to_string());
+    let safe_str = if safe { "yes" } else { "no" };
+    let header = format!(
+        "status: {status}  safe_to_retire: {safe_str}  change_id: {change_id}  min_safe_version: {min_safe}\nobserved_at: {observed_at}"
+    );
+
+    let Some(blockers) = value.get("blockers").and_then(Value::as_array) else {
+        return format!("{header}\nNo blockers returned.");
+    };
+    if blockers.is_empty() {
+        return format!("{header}\nNo old-version executions found.");
+    }
+
+    let mut rows: Vec<Vec<String>> = Vec::with_capacity(blockers.len() + 1);
+    rows.push(vec![
+        "WORKFLOW".to_string(),
+        "VERSION".to_string(),
+        "ACTIVE".to_string(),
+        "TERMINAL".to_string(),
+        "OLDEST_AGE_S".to_string(),
+        "NEWEST_AGE_S".to_string(),
+        "SHARDS".to_string(),
+        "UNAVAILABLE".to_string(),
+    ]);
+    for blocker in blockers {
+        rows.push(vec![
+            cell_str(blocker.get("workflow_name")),
+            cell_number(blocker.get("recorded_version")),
+            cell_number(blocker.get("active_executions")),
+            cell_number(blocker.get("terminal_executions")),
+            cell_number(blocker.get("oldest_blocker_age_secs")),
+            cell_number(blocker.get("newest_blocker_age_secs")),
+            retirement_shard_array_cell(blocker, "matched_shards"),
+            retirement_shard_array_cell(blocker, "unavailable_shards"),
+        ]);
+    }
+
+    let widths = (0..rows[0].len())
+        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
+        .collect::<Vec<_>>();
+    let table = rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .enumerate()
+                .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
+                .collect::<Vec<_>>()
+                .join("  ")
+                .trim_end()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!("{header}\n\n{table}")
+}
+
+fn retirement_shard_array_cell(item: &Value, field: &str) -> String {
+    let Some(values) = item
+        .get("shard_coverage")
+        .and_then(|coverage| coverage.get(field))
+        .and_then(Value::as_array)
+    else {
+        return "-".to_string();
+    };
+    if values.is_empty() {
+        return "-".to_string();
+    }
+    values
+        .iter()
+        .filter_map(Value::as_i64)
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 #[cfg(test)]
 mod reuse_policy_tests {
     use super::*;
@@ -2558,5 +2756,198 @@ mod reuse_policy_tests {
             "items": []
         });
         assert_eq!(version_usage_guard_exit_code(&partial), 1);
+    }
+
+    // ─── VersionGateRetirement CLI tests ─────────────────────────────────────
+
+    #[test]
+    fn version_gate_retirement_builds_correct_api_request() {
+        let cli = parse(&[
+            "version-gate-retirement",
+            "--change-id",
+            "tax_v2",
+            "--min-safe-version",
+            "2",
+        ]);
+        let req = cli.api_request().expect("request should build");
+        assert_eq!(req.method, ApiMethod::Get);
+        assert!(
+            req.path
+                .starts_with("/admin/version-gates/retirement-check"),
+            "path should target retirement-check endpoint; got {}",
+            req.path
+        );
+        assert!(req.path.contains("change_id=tax_v2"));
+        assert!(req.path.contains("min_safe_version=2"));
+    }
+
+    #[test]
+    fn version_gate_retirement_includes_optional_workflow_name() {
+        let cli = parse(&[
+            "version-gate-retirement",
+            "--change-id",
+            "tax_v2",
+            "--min-safe-version",
+            "3",
+            "--workflow-name",
+            "billing_checkout",
+        ]);
+        let req = cli.api_request().expect("request should build");
+        assert!(req.path.contains("workflow_name=billing_checkout"));
+    }
+
+    #[test]
+    fn retirement_check_exit_code_zero_on_safe() {
+        let safe = json!({ "status": "safe", "safe_to_retire": true, "blockers": [] });
+        assert_eq!(retirement_check_exit_code(&safe), 0);
+    }
+
+    #[test]
+    fn retirement_check_exit_code_nonzero_on_blocked() {
+        let blocked = json!({
+            "status": "blocked",
+            "safe_to_retire": false,
+            "blockers": [{ "active_executions": 3 }]
+        });
+        assert_eq!(retirement_check_exit_code(&blocked), 1);
+    }
+
+    #[test]
+    fn retirement_check_exit_code_nonzero_on_partial() {
+        let partial = json!({ "status": "partial", "safe_to_retire": false });
+        assert_eq!(retirement_check_exit_code(&partial), 1);
+    }
+
+    #[test]
+    fn retirement_check_exit_code_nonzero_on_unavailable() {
+        let unavailable = json!({ "status": "unavailable", "safe_to_retire": false });
+        assert_eq!(retirement_check_exit_code(&unavailable), 1);
+    }
+
+    #[test]
+    fn version_gate_retirement_check_flag_not_set_by_default() {
+        let cli = parse(&[
+            "version-gate-retirement",
+            "--change-id",
+            "tax_v2",
+            "--min-safe-version",
+            "2",
+        ]);
+        assert!(!retirement_check_should_check(&cli));
+    }
+
+    #[test]
+    fn version_gate_retirement_check_flag_set_when_passed() {
+        let cli = parse(&[
+            "version-gate-retirement",
+            "--change-id",
+            "tax_v2",
+            "--min-safe-version",
+            "2",
+            "--check",
+        ]);
+        assert!(retirement_check_should_check(&cli));
+    }
+
+    #[test]
+    fn version_gate_retirement_default_output_renders_table() {
+        let cli = parse(&[
+            "version-gate-retirement",
+            "--change-id",
+            "tax_v2",
+            "--min-safe-version",
+            "2",
+        ]);
+        let payload = json!({
+            "status": "blocked",
+            "safe_to_retire": false,
+            "observed_at": "2026-05-07T12:00:00Z",
+            "filters": {
+                "change_id": "tax_v2",
+                "min_safe_version": 2,
+                "workflow_name": null,
+                "state_group": "all",
+                "shard_id": null
+            },
+            "blockers": [{
+                "workflow_name": "billing_checkout",
+                "change_id": "tax_v2",
+                "recorded_version": 1,
+                "active_executions": 2,
+                "terminal_executions": 5,
+                "oldest_blocker_age_secs": 3600,
+                "newest_blocker_age_secs": 60,
+                "sample_active_execution_ids": [],
+                "shard_coverage": {
+                    "inspected_shards": [0],
+                    "matched_shards": [0],
+                    "unavailable_shards": []
+                }
+            }],
+            "shards": [{ "shard_id": 0, "status": "inspected", "matched_groups": 1, "error": null }]
+        });
+
+        let rendered = render_response(&cli, &payload).expect("table should render");
+
+        assert!(rendered.contains("WORKFLOW"));
+        assert!(rendered.contains("billing_checkout"));
+        assert!(rendered.contains("blocked"));
+        assert!(rendered.contains("tax_v2"));
+        assert!(!rendered.trim_start().starts_with('{'));
+    }
+
+    #[test]
+    fn version_gate_retirement_json_output_preserves_raw_payload() {
+        let cli = parse(&[
+            "--output",
+            "json",
+            "version-gate-retirement",
+            "--change-id",
+            "tax_v2",
+            "--min-safe-version",
+            "2",
+        ]);
+        let payload = json!({
+            "status": "safe",
+            "safe_to_retire": true,
+            "observed_at": "2026-05-07T12:00:00Z",
+            "filters": {},
+            "blockers": [],
+            "shards": []
+        });
+
+        let rendered = render_response(&cli, &payload).expect("json output should render");
+
+        assert!(rendered.trim_start().starts_with('{'));
+        assert!(rendered.contains("\"safe_to_retire\":true"));
+    }
+
+    #[test]
+    fn version_gate_retirement_empty_blockers_shows_no_old_version_message() {
+        let cli = parse(&[
+            "version-gate-retirement",
+            "--change-id",
+            "tax_v2",
+            "--min-safe-version",
+            "2",
+        ]);
+        let payload = json!({
+            "status": "safe",
+            "safe_to_retire": true,
+            "observed_at": "2026-05-07T12:00:00Z",
+            "filters": {
+                "change_id": "tax_v2",
+                "min_safe_version": 2,
+                "workflow_name": null,
+                "state_group": "all",
+                "shard_id": null
+            },
+            "blockers": [],
+            "shards": [{ "shard_id": 0, "status": "inspected", "matched_groups": 0, "error": null }]
+        });
+
+        let rendered = render_response(&cli, &payload).expect("table should render");
+
+        assert!(rendered.contains("No old-version executions found"));
     }
 }

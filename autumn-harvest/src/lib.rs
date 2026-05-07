@@ -76,6 +76,8 @@ pub mod testing;
 pub mod types;
 pub mod update;
 #[cfg(feature = "db")]
+pub mod version_gate_retirement;
+#[cfg(feature = "db")]
 pub mod version_usage;
 
 #[cfg(feature = "db")]
