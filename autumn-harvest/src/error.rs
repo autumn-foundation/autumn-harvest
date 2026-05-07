@@ -264,4 +264,115 @@ mod tests {
             _ => panic!("Expected Database error"),
         }
     }
+
+    #[test]
+    fn harvest_error_activity_failed_display() {
+        let e = HarvestError::ActivityFailed {
+            name: "test_activity".into(),
+            attempt: 3,
+            source: Box::new(std::io::Error::other("io error")),
+        };
+        let msg = e.to_string();
+        assert!(msg.contains("test_activity"));
+        assert!(msg.contains("attempt 3"));
+        assert!(msg.contains("io error"));
+    }
+
+    #[test]
+    fn harvest_error_workflow_failed_display() {
+        let e = HarvestError::WorkflowFailed {
+            name: "test_workflow".into(),
+            reason: "logic error".into(),
+        };
+        let msg = e.to_string();
+        assert!(msg.contains("test_workflow"));
+        assert!(msg.contains("logic error"));
+    }
+
+    #[test]
+    fn harvest_error_cancelled_display() {
+        let e = HarvestError::Cancelled("user requested".into());
+        let msg = e.to_string();
+        assert!(msg.contains("user requested"));
+    }
+
+    #[test]
+    fn harvest_error_serialization_display() {
+        let serde_err = serde_json::from_str::<serde_json::Value>("invalid json").unwrap_err();
+        let e = HarvestError::Serialization(serde_err);
+        let msg = e.to_string();
+        assert!(msg.contains("serialization error"));
+    }
+
+    #[test]
+    fn harvest_error_unknown_payload_codec_display() {
+        let e = HarvestError::UnknownPayloadCodec {
+            id: "custom_codec".into(),
+        };
+        let msg = e.to_string();
+        assert!(msg.contains("custom_codec"));
+    }
+
+    #[test]
+    fn harvest_error_queue_full_display() {
+        let e = HarvestError::QueueFull {
+            queue: "fast_queue".into(),
+            depth: 1000,
+        };
+        let msg = e.to_string();
+        assert!(msg.contains("fast_queue"));
+        assert!(msg.contains("1000"));
+    }
+
+    #[test]
+    fn harvest_error_not_found_display() {
+        let e = HarvestError::NotFound("some_id".into());
+        let msg = e.to_string();
+        assert!(msg.contains("some_id"));
+    }
+
+    #[test]
+    fn harvest_error_config_display() {
+        let e = HarvestError::Config("bad value".into());
+        let msg = e.to_string();
+        assert!(msg.contains("bad value"));
+    }
+
+    #[test]
+    fn harvest_error_already_exists_display() {
+        use crate::types::{ExecutionId, ShardId};
+        let exec_id = ExecutionId::new_for_shard(ShardId::new(1));
+        let e = HarvestError::AlreadyExists {
+            existing_exec_id: exec_id,
+            existing_state: "RUNNING".into(),
+        };
+        let msg = e.to_string();
+        assert!(msg.contains(&exec_id.to_string()));
+        assert!(msg.contains("RUNNING"));
+    }
+
+    #[test]
+    fn harvest_error_update_rejected_display() {
+        let e = HarvestError::UpdateRejected {
+            reason: "validation failed".into(),
+        };
+        let msg = e.to_string();
+        assert!(msg.contains("validation failed"));
+    }
+
+    #[test]
+    fn harvest_error_update_handler_not_found_display() {
+        let e = HarvestError::UpdateHandlerNotFound("handler1".into());
+        let msg = e.to_string();
+        assert!(msg.contains("handler1"));
+    }
+
+    #[test]
+    fn harvest_error_invalid_search_attribute_display() {
+        let e = HarvestError::InvalidSearchAttribute {
+            reason: "key too long".into(),
+        };
+        let msg = e.to_string();
+        assert!(msg.contains("key too long"));
+    }
 }
