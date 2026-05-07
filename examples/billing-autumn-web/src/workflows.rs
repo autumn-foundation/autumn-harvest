@@ -109,14 +109,20 @@ pub async fn billing_checkout(
         .await?;
 
     if checkout.requires_manual_review() {
-        ctx.execute_activity_external(
-            "approve_high_value_subscription",
-            json!({
-                "subscription": subscription_record,
-                "authorization": authorization,
-            }),
-            OPS_QUEUE,
-            24 * 60 * 60,
+        saga.step(
+            || async {
+                ctx.execute_activity_external(
+                    "approve_high_value_subscription",
+                    json!({
+                        "subscription": subscription_record,
+                        "authorization": authorization,
+                    }),
+                    OPS_QUEUE,
+                    24 * 60 * 60,
+                )
+                .await
+            },
+            |_| async { Ok::<(), HarvestError>(()) },
         )
         .await?;
     }
