@@ -540,7 +540,7 @@ async fn retirement_check_degraded_when_one_shard_unavailable() {
 /// Executions that started before a version gate was inserted carry no
 /// `MarkerRecorded` event for that change id.  When the gate is later added to
 /// the code and `workflow_name` is supplied to the retirement check, these
-/// pre-gate executions must appear as blockers (recorded_version = 0) so that
+/// pre-gate executions must appear as blockers (`recorded_version` = 0) so that
 /// operators are not misled into retiring the old branch prematurely.
 #[tokio::test]
 async fn retirement_check_includes_pre_gate_executions_as_blockers() {
