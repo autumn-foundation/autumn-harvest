@@ -7,6 +7,7 @@ pub mod plugin;
 pub mod preflight;
 pub mod prelude;
 pub mod runner;
+pub mod shard_health;
 pub mod state;
 pub mod ui;
 

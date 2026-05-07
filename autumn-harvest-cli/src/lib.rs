@@ -178,16 +178,19 @@ pub enum CliError {
         /// Reported preflight status.
         status: String,
     },
+
+    /// Shard health completed but the deploy gate found an unready target.
+    #[error("shard health readiness gate failed")]
+    ShardHealthGate,
 }
 
 impl CliError {
     /// Process exit code associated with this error.
     #[must_use]
     pub fn exit_code(&self) -> i32 {
-        if matches!(self, Self::PreflightGate { status } if status == "warn") {
-            2
-        } else {
-            1
+        match self {
+            Self::PreflightGate { status } if status == "warn" => 2,
+            _ => 1,
         }
     }
 }
@@ -198,6 +201,11 @@ enum Commands {
     Health,
     /// Run read-only deployment readiness checks.
     Preflight,
+    /// Inspect shard rollout readiness.
+    Shard {
+        #[command(subcommand)]
+        command: ShardCommand,
+    },
     /// Manage workflow executions.
     Workflow {
         #[command(subcommand)]
@@ -272,6 +280,19 @@ enum AuditCommand {
         /// Maximum number of records to return [1–500].
         #[arg(long, value_parser = clap::value_parser!(i64).range(1..=500))]
         limit: Option<i64>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ShardCommand {
+    /// Show per-shard readiness and rollout blockers.
+    Health {
+        /// Evaluate this readable shard as a promotion candidate.
+        #[arg(long)]
+        candidate_shard: Option<i32>,
+        /// Exit non-zero if any writable shard or named candidate is unready.
+        #[arg(long)]
+        fail_on_unready: bool,
     },
 }
 
@@ -644,6 +665,7 @@ impl Cli {
         match &self.command {
             Commands::Health => Ok(ApiRequest::get("/health")),
             Commands::Preflight => Ok(ApiRequest::get("/admin/preflight")),
+            Commands::Shard { command } => Ok(shard_request(command)),
             Commands::Workflow { command } => workflow_request(command),
             Commands::Dag { command } => dag_request(command),
             Commands::Schedule { command } => schedule_request(command),
@@ -709,6 +731,9 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
                 .to_string();
             return Err(CliError::PreflightGate { status });
         }
+    }
+    if shard_health_fail_on_unready(&cli) && shard_health_exit_code(&response) != 0 {
+        return Err(CliError::ShardHealthGate);
     }
     Ok(())
 }
@@ -785,6 +810,9 @@ fn render_response(cli: &Cli, value: &Value) -> Result<String, CliError> {
     if preflight_wants_table(cli) {
         return Ok(format_preflight_table(value));
     }
+    if shard_health_wants_table(cli) {
+        return Ok(format_shard_health_table(value));
+    }
     if workflow_children_wants_table(cli) {
         return Ok(format_workflow_children_table(value));
     }
@@ -804,12 +832,55 @@ fn preflight_wants_table(cli: &Cli) -> bool {
     matches!(&cli.command, Commands::Preflight) && cli.output == OutputFormat::PrettyJson
 }
 
+fn shard_health_wants_table(cli: &Cli) -> bool {
+    matches!(
+        &cli.command,
+        Commands::Shard {
+            command: ShardCommand::Health { .. }
+        }
+    ) && cli.output == OutputFormat::PrettyJson
+}
+
+const fn shard_health_fail_on_unready(cli: &Cli) -> bool {
+    matches!(
+        &cli.command,
+        Commands::Shard {
+            command: ShardCommand::Health {
+                fail_on_unready: true,
+                ..
+            }
+        }
+    )
+}
+
 fn preflight_exit_code(value: &Value) -> i32 {
     match value.get("overall_status").and_then(Value::as_str) {
         Some("pass") => 0,
         Some("warn") => 2,
         _ => 1,
     }
+}
+
+fn shard_health_exit_code(value: &Value) -> i32 {
+    let Some(shards) = value.get("shards").and_then(Value::as_array) else {
+        return 1;
+    };
+    let has_unready_gate_target = shards.iter().any(|shard| {
+        let readiness = shard.get("readiness").and_then(Value::as_str);
+        if readiness == Some("ready") {
+            return false;
+        }
+        let candidate = shard
+            .get("candidate")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let writable = shard
+            .get("roles")
+            .and_then(Value::as_array)
+            .is_some_and(|roles| roles.iter().any(|role| role.as_str() == Some("writable")));
+        candidate || writable
+    });
+    i32::from(has_unready_gate_target)
 }
 
 fn format_preflight_table(value: &Value) -> String {
@@ -877,6 +948,73 @@ fn format_preflight_table(value: &Value) -> String {
         .join("\n");
 
     format!("overall_status: {overall}\nobserved_at: {observed_at}\n\n{table}")
+}
+
+fn format_shard_health_table(value: &Value) -> String {
+    let overall = value
+        .get("overall_readiness")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let observed_at = value
+        .get("observed_at")
+        .and_then(Value::as_str)
+        .unwrap_or("-");
+    let Some(shards) = value.get("shards").and_then(Value::as_array) else {
+        return format!(
+            "overall_readiness: {overall}\nobserved_at: {observed_at}\nNo shard rows returned."
+        );
+    };
+
+    let mut rows = Vec::with_capacity(shards.len() + 1);
+    rows.push(vec![
+        "SHARD".to_string(),
+        "ROLES".to_string(),
+        "READY".to_string(),
+        "REACH".to_string(),
+        "SCHEMA".to_string(),
+        "WORKERS".to_string(),
+        "SCHED".to_string(),
+        "QUEUE".to_string(),
+        "DLQ".to_string(),
+        "BLOCKERS".to_string(),
+    ]);
+    for shard in shards {
+        rows.push(vec![
+            cell_number(shard.get("shard_id")),
+            roles_cell(shard),
+            cell_str(shard.get("readiness")),
+            bool_cell(shard.get("reachable")),
+            bool_cell(shard.get("schema").and_then(|schema| schema.get("ready"))),
+            worker_coverage_cell(shard),
+            scheduler_cell(shard),
+            cell_number(
+                shard
+                    .get("queue_depth")
+                    .and_then(|summary| summary.get("total_pending")),
+            ),
+            cell_optional_number(shard.get("dlq").and_then(|summary| summary.get("count"))),
+            blockers_cell(shard),
+        ]);
+    }
+
+    let widths = (0..rows[0].len())
+        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
+        .collect::<Vec<_>>();
+    let table = rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .enumerate()
+                .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
+                .collect::<Vec<_>>()
+                .join("  ")
+                .trim_end()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!("overall_readiness: {overall}\nobserved_at: {observed_at}\n\n{table}")
 }
 
 fn audit_list_wants_table(cli: &Cli) -> bool {
@@ -1026,6 +1164,115 @@ fn cell_number(value: Option<&Value>) -> String {
     value
         .and_then(Value::as_i64)
         .map_or_else(String::new, |number| number.to_string())
+}
+
+fn cell_optional_number(value: Option<&Value>) -> String {
+    value
+        .and_then(Value::as_i64)
+        .map_or_else(|| "-".to_string(), |number| number.to_string())
+}
+
+fn bool_cell(value: Option<&Value>) -> String {
+    match value.and_then(Value::as_bool) {
+        Some(true) => "yes".to_string(),
+        Some(false) => "no".to_string(),
+        None => "-".to_string(),
+    }
+}
+
+fn roles_cell(shard: &Value) -> String {
+    let mut roles = shard
+        .get("roles")
+        .and_then(Value::as_array)
+        .map_or_else(Vec::new, |roles| {
+            roles
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        });
+    if shard
+        .get("candidate")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        roles.push("candidate".to_string());
+    }
+    if roles.is_empty() {
+        "-".to_string()
+    } else {
+        roles.join(",")
+    }
+}
+
+fn worker_coverage_cell(shard: &Value) -> String {
+    let Some(coverage) = shard.get("worker_coverage").and_then(Value::as_array) else {
+        return "-".to_string();
+    };
+    if coverage.is_empty() {
+        return "-".to_string();
+    }
+    coverage
+        .iter()
+        .map(|queue| {
+            let name = queue.get("queue").and_then(Value::as_str).unwrap_or("?");
+            let healthy = queue
+                .get("healthy_active")
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            let ready = queue.get("ready").and_then(Value::as_bool).unwrap_or(false);
+            let mark = if ready { "ok" } else { "miss" };
+            format!("{name}:{healthy}/{mark}")
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn scheduler_cell(shard: &Value) -> String {
+    let Some(scheduler) = shard.get("scheduler") else {
+        return "-".to_string();
+    };
+    if !scheduler
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return "off".to_string();
+    }
+    if scheduler
+        .get("ready")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        "ok".to_string()
+    } else {
+        "stale".to_string()
+    }
+}
+
+fn blockers_cell(shard: &Value) -> String {
+    let Some(reasons) = shard.get("blocking_reasons").and_then(Value::as_array) else {
+        return "-".to_string();
+    };
+    if reasons.is_empty() {
+        return "-".to_string();
+    }
+    reasons
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn shard_request(command: &ShardCommand) -> ApiRequest {
+    match command {
+        ShardCommand::Health {
+            candidate_shard, ..
+        } => candidate_shard.as_ref().map_or_else(
+            || ApiRequest::get("/admin/shards/health"),
+            |shard| ApiRequest::get(format!("/admin/shards/health?candidate_shard={shard}")),
+        ),
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1841,5 +2088,109 @@ mod reuse_policy_tests {
         assert_eq!(preflight_exit_code(&json!({ "overall_status": "pass" })), 0);
         assert_eq!(preflight_exit_code(&json!({ "overall_status": "warn" })), 2);
         assert_eq!(preflight_exit_code(&json!({ "overall_status": "fail" })), 1);
+    }
+
+    #[test]
+    fn shard_health_default_output_renders_compact_table() {
+        let cli = parse(&["shard", "health"]);
+        let payload = json!({
+            "overall_readiness": "unready",
+            "observed_at": "2026-05-06T12:00:00Z",
+            "shards": [{
+                "shard_id": 1,
+                "roles": ["readable"],
+                "candidate": true,
+                "readiness": "unready",
+                "reachable": true,
+                "schema": { "ready": true },
+                "worker_coverage": [{
+                    "queue": "default",
+                    "healthy_active": 0,
+                    "stale": 0,
+                    "draining": 0,
+                    "ready": false
+                }],
+                "scheduler": {
+                    "enabled": false,
+                    "ready": true,
+                    "last_tick_at": null
+                },
+                "queue_depth": {
+                    "total_pending": 0,
+                    "by_queue": {}
+                },
+                "dlq": { "count": 0 },
+                "blocking_reasons": [
+                    "no healthy active worker covers required queue 'default'"
+                ],
+                "error_summary": null
+            }]
+        });
+
+        let rendered = render_response(&cli, &payload).expect("table output should render");
+
+        assert!(rendered.contains("SHARD"));
+        assert!(rendered.contains("readable"));
+        assert!(rendered.contains("unready"));
+        assert!(rendered.contains("default"));
+        assert!(!rendered.trim_start().starts_with('{'));
+    }
+
+    #[test]
+    fn shard_health_json_output_preserves_raw_payload_shape() {
+        let cli = parse(&["--output", "json", "shard", "health"]);
+        let payload = json!({
+            "overall_readiness": "ready",
+            "observed_at": "2026-05-06T12:00:00Z",
+            "shards": []
+        });
+
+        let rendered = render_response(&cli, &payload).expect("json output should render");
+
+        assert_eq!(
+            rendered,
+            r#"{"observed_at":"2026-05-06T12:00:00Z","overall_readiness":"ready","shards":[]}"#
+        );
+    }
+
+    #[test]
+    fn shard_health_gate_fails_on_unready_writable_or_candidate_shards_only() {
+        let payload = json!({
+            "shards": [
+                {
+                    "shard_id": 0,
+                    "roles": ["readable", "writable", "default"],
+                    "candidate": false,
+                    "readiness": "ready"
+                },
+                {
+                    "shard_id": 1,
+                    "roles": ["readable"],
+                    "candidate": false,
+                    "readiness": "unready"
+                }
+            ]
+        });
+        assert_eq!(shard_health_exit_code(&payload), 0);
+
+        let writable_unready = json!({
+            "shards": [{
+                "shard_id": 0,
+                "roles": ["readable", "writable", "default"],
+                "candidate": false,
+                "readiness": "unready"
+            }]
+        });
+        assert_eq!(shard_health_exit_code(&writable_unready), 1);
+
+        let candidate_unready = json!({
+            "shards": [{
+                "shard_id": 2,
+                "roles": ["readable"],
+                "candidate": true,
+                "readiness": "unready"
+            }]
+        });
+        assert_eq!(shard_health_exit_code(&candidate_unready), 1);
     }
 }
