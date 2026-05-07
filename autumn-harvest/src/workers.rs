@@ -27,13 +27,23 @@ use crate::error::{HarvestError, HarvestResult};
 
 /// Static fields that identify a worker process, used for initial registration
 /// and heartbeat self-healing.
+///
+/// **Why does this exist?**
+/// Provides all the essential static identity and capability information required
+/// to register a worker against the central scheduler database.
 #[derive(Debug, Clone)]
 pub struct WorkerRegistration {
+    /// A unique identifier for this specific worker instance (e.g., UUID or hostname + PID).
     pub worker_id: String,
+    /// The list of task queues this worker is polling.
     pub queues: Vec<String>,
+    /// Optional assigned shards if using sticky or deterministic routing.
     pub shard_assignments: Vec<i32>,
+    /// The maximum number of concurrent tasks this worker will execute.
     pub max_concurrency: i32,
+    /// The host name or IP address of the machine running the worker.
     pub host: String,
+    /// The version of the `autumn-harvest` crate or worker software.
     pub version: Option<String>,
 }
 use crate::models::{HarvestWorker, NewHarvestWorker};
@@ -45,14 +55,22 @@ use crate::worker::DbPool;
 // ---------------------------------------------------------------------------
 
 /// Lifecycle status of a worker process.
+///
+/// **Why does this exist?**
+/// Tracks whether a worker is actively picking up tasks, finishing its current tasks before
+/// shutdown, or completely halted. This affects routing decisions by the scheduler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkerStatus {
+    /// The worker is actively polling queues and accepting new tasks.
     Active,
+    /// The worker is finishing existing tasks but not accepting new ones.
     Draining,
+    /// The worker has stopped polling completely.
     Stopped,
 }
 
 impl WorkerStatus {
+    /// Converts the enum variant to its exact canonical string identifier used by the database API.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -62,6 +80,7 @@ impl WorkerStatus {
         }
     }
 
+    /// Safely attempts to match an incoming string from an API request to a known `WorkerStatus` state.
     #[must_use]
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
@@ -85,10 +104,17 @@ impl std::fmt::Display for WorkerStatus {
 // ---------------------------------------------------------------------------
 
 /// Health classification derived from `last_heartbeat_at`.
+///
+/// **Why does this exist?**
+/// Allows the scheduler to differentiate between workers that are currently
+/// connected and functioning normally versus those that might have crashed
+/// or disconnected silently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum WorkerHealth {
+    /// The worker has sent a heartbeat recently enough to be considered active.
     Healthy,
+    /// The worker has not sent a heartbeat within the expected threshold.
     Stale,
 }
 
@@ -119,19 +145,31 @@ impl WorkerHealth {
 // ---------------------------------------------------------------------------
 
 /// Filters for `list_workers` queries from the management API.
+///
+/// **Why does this exist?**
+/// Provides structured search criteria when requesting lists of workers from the database,
+/// allowing operators to filter by queue, shard, or current health status.
 #[derive(Debug, Default, Clone)]
 pub struct WorkerFilters {
+    /// Filter workers that are polling this specific queue.
     pub queue: Option<String>,
+    /// Filter workers that are assigned to this shard.
     pub shard_id: Option<i32>,
+    /// Filter workers by their current lifecycle status (e.g., "Active").
     pub status: Option<String>,
+    /// Filter workers by their derived health classification.
     pub health: Option<WorkerHealth>,
+    /// The maximum number of workers to return in the result set.
     pub limit: i64,
 }
 
 impl WorkerFilters {
+    /// Protects the API layer against runaway unbounded queries by setting a safe baseline limit.
     pub const DEFAULT_LIMIT: i64 = 100;
+    /// Prevent abusive or excessively large requests from crashing the database worker.
     pub const MAX_LIMIT: i64 = 500;
 
+    /// Initializes a blank query filter that inherits the safe system baseline `DEFAULT_LIMIT`.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -480,10 +518,16 @@ pub async fn fleet_health(
 // ---------------------------------------------------------------------------
 
 /// A worker row enriched with the derived health classification.
+///
+/// **Why does this exist?**
+/// Provides a unified API response model that combines the raw database row (`HarvestWorker`)
+/// with the dynamically computed `WorkerHealth` status and currently active task IDs.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct WorkerRow {
+    /// The raw worker record from the database.
     #[serde(flatten)]
     pub worker: HarvestWorker,
+    /// The computed health status of the worker based on its last heartbeat.
     pub health: WorkerHealth,
     /// IDs of task-queue items currently claimed by this worker (`state = RUNNING`).
     /// Populated only by `get_worker`; the list endpoint returns an empty vec.
@@ -491,12 +535,21 @@ pub struct WorkerRow {
 }
 
 /// Aggregated fleet health roll-up.
+///
+/// **Why does this exist?**
+/// Summarizes the current state of the entire worker fleet, providing a high-level
+/// dashboard view of cluster capacity and potential issues (like too many stale workers).
 #[derive(Debug, serde::Serialize)]
 pub struct FleetHealth {
+    /// Total count of workers considered healthy.
     pub healthy: usize,
+    /// Total count of workers considered stale (missing heartbeats).
     pub stale: usize,
+    /// Total count of workers currently in the draining state.
     pub draining: usize,
+    /// A breakdown of total active worker counts per task queue.
     pub by_queue: std::collections::HashMap<String, usize>,
+    /// A breakdown of total active worker counts per assigned shard.
     pub by_shard: std::collections::HashMap<i32, usize>,
 }
 
