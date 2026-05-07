@@ -208,6 +208,64 @@ async fn insert_versioned_execution(
     exec_id
 }
 
+/// Insert a workflow execution with NO version marker (pre-gate execution).
+async fn insert_execution_without_marker(
+    database_url: &str,
+    shard: ShardId,
+    workflow_name: &str,
+    workflow_id: &str,
+    state: &str,
+) -> ExecutionId {
+    let exec_id = ExecutionId::new_for_shard(shard);
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("failed to connect to test database");
+    let row = NewWorkflowExecution {
+        id: exec_id.as_uuid(),
+        workflow_name,
+        workflow_id,
+        run_id: uuid::Uuid::new_v4(),
+        shard_id: shard.as_i32(),
+        input: json!({}),
+        parent_id: None,
+        queue_name: "default",
+        execution_timeout: None,
+        memo: None,
+        search_attrs: None,
+    };
+    diesel::insert_into(autumn_harvest::schema::harvest_workflow_executions::table)
+        .values(&row)
+        .execute(&mut conn)
+        .await
+        .expect("failed to insert workflow execution");
+
+    let completed_at = if state == "RUNNING" {
+        None
+    } else {
+        Some(Utc::now())
+    };
+    diesel::update(
+        autumn_harvest::schema::harvest_workflow_executions::table.find(exec_id.as_uuid()),
+    )
+    .set((
+        autumn_harvest::schema::harvest_workflow_executions::state.eq(state),
+        autumn_harvest::schema::harvest_workflow_executions::completed_at.eq(completed_at),
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("failed to update workflow state");
+
+    // Only append WorkflowStarted — no MarkerRecorded event for any change id.
+    let events = vec![WorkflowEvent::WorkflowStarted {
+        input: json!({}),
+        timestamp: Utc::now(),
+    }];
+    store::append_events(&mut conn, exec_id, &events, 0)
+        .await
+        .expect("failed to append start event");
+    exec_id
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -477,4 +535,92 @@ async fn retirement_check_degraded_when_one_shard_unavailable() {
         .find(|s| s["status"] == "unavailable")
         .expect("exactly one unavailable shard");
     assert_eq!(unavailable_shard["shard_id"], 1);
+}
+
+/// Executions that started before a version gate was inserted carry no
+/// `MarkerRecorded` event for that change id.  When the gate is later added to
+/// the code and `workflow_name` is supplied to the retirement check, these
+/// pre-gate executions must appear as blockers (recorded_version = 0) so that
+/// operators are not misled into retiring the old branch prematurely.
+#[tokio::test]
+async fn retirement_check_includes_pre_gate_executions_as_blockers() {
+    let (database_url, _container) = setup_database_url_with_migrations().await;
+
+    // Insert an execution that has no version marker for "billing_v3_tax" at all.
+    let pre_gate_id = insert_execution_without_marker(
+        &database_url,
+        ShardId::new(0),
+        "billing_checkout",
+        "pre-gate-run",
+        "RUNNING",
+    )
+    .await;
+
+    // Also insert a properly-gated v1 execution for the same workflow.
+    insert_versioned_execution(
+        &database_url,
+        ShardId::new(0),
+        "billing_checkout",
+        "gated-v1",
+        "RUNNING",
+        "billing_v3_tax",
+        1,
+    )
+    .await;
+
+    let app = build_api_app(
+        HarvestDbPool::single(build_test_pool(&database_url)),
+        ShardRouter::single(),
+    );
+
+    // Without workflow_name: pre-gate execution is invisible (no marker to match).
+    let (status_no_wf, body_no_wf) = get_json(
+        &app,
+        "/admin/version-gates/retirement-check?change_id=billing_v3_tax&min_safe_version=2",
+    )
+    .await;
+    assert_eq!(status_no_wf, StatusCode::OK, "body: {body_no_wf}");
+    let total_active_no_wf: i64 = body_no_wf["blockers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|b| b["active_executions"].as_i64())
+        .sum();
+    assert_eq!(
+        total_active_no_wf, 1,
+        "without workflow_name filter only the gated v1 execution is visible"
+    );
+
+    // With workflow_name: pre-gate execution must appear as a blocker.
+    let (status, body) = get_json(
+        &app,
+        "/admin/version-gates/retirement-check?change_id=billing_v3_tax&min_safe_version=2&workflow_name=billing_checkout",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["status"], "blocked");
+    assert_eq!(body["safe_to_retire"], false);
+
+    // There must be a blocker row with recorded_version=0 for pre-gate executions.
+    let blockers = body["blockers"].as_array().expect("blockers array");
+    let pre_gate_row = blockers
+        .iter()
+        .find(|b| b["recorded_version"] == 0)
+        .expect("pre-gate blocker row with recorded_version=0 must be present");
+    assert!(
+        pre_gate_row["active_executions"].as_i64().unwrap() >= 1,
+        "pre-gate row must count the markerless running execution"
+    );
+
+    // The pre-gate execution id should appear in sample_active_execution_ids.
+    let sample_ids: Vec<String> = pre_gate_row["sample_active_execution_ids"]
+        .as_array()
+        .expect("sample ids")
+        .iter()
+        .filter_map(|v| v.as_str().map(ToString::to_string))
+        .collect();
+    assert!(
+        sample_ids.contains(&pre_gate_id.as_uuid().to_string()),
+        "pre-gate execution must be listed in sample ids; got {sample_ids:?}"
+    );
 }

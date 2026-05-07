@@ -36,12 +36,20 @@ pub struct RetirementCheckFilters {
 /// A row exists for each `(workflow_name, recorded_version, shard_id)` triple
 /// where `recorded_version < min_safe_version`.
 ///
-/// When a non-identity [`PayloadCodec`] is configured, the `details` field of a
-/// `MarkerRecorded` event is stored as a codec envelope object rather than a bare
-/// integer.  Those rows cannot be decoded in SQL, so they are included
-/// conservatively with `recorded_version = 0` — always below any meaningful
-/// `min_safe_version`.  Operators should treat `recorded_version == 0` as
-/// *version unknown (opaque codec envelope)* and investigate before retiring.
+/// **`recorded_version = 0` sentinel** — used in two conservative cases where
+/// the true version cannot be determined from stored events alone:
+///
+/// 1. *Codec-envelope details* — when a non-identity [`PayloadCodec`] is
+///    configured, the `MarkerRecorded.details` field is stored as an opaque
+///    envelope object rather than a bare integer.
+/// 2. *Pre-gate executions* — executions that began before the version gate was
+///    inserted carry no `MarkerRecorded` event for the gate at all.  When they
+///    replay through the newly-inserted call to `ctx.version()` they receive
+///    `min` without writing a marker, so their effective version is unknown.
+///    Only surfaced when [`RetirementCheckFilters::workflow_name`] is set.
+///
+/// Operators must treat `recorded_version == 0` as "version unknown — investigate
+/// before retiring the old branch."
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 pub struct RetirementCheckShardRow {
     pub workflow_name: String,
@@ -133,6 +141,50 @@ WITH version_markers AS (
           )
       )
       AND ($5::INT4 IS NULL OR w.shard_id = $5::INT4)
+    UNION ALL
+    -- Pre-gate executions: workflow_name rows that have NO MarkerRecorded event
+    -- for this change id.  When they replay through the newly-inserted gate they
+    -- receive `min` without writing a marker, so their effective version is
+    -- unknown.  Included conservatively as recorded_version = 0.
+    --
+    -- Only emitted when workflow_name is provided ($3 IS NOT NULL) to avoid a
+    -- full-table scan across every workflow in the shard.
+    SELECT
+        w.id            AS workflow_exec_id,
+        w.workflow_name AS workflow_name,
+        w.state         AS state,
+        w.started_at    AS started_at,
+        w.shard_id      AS shard_id,
+        substring($1 FROM 9)::TEXT AS change_id,
+        0::BIGINT       AS recorded_version
+    FROM harvest_workflow_executions w
+    WHERE $3::TEXT IS NOT NULL
+      AND w.workflow_name = $3::TEXT
+      AND (
+          $4::TEXT = 'all'
+          OR (
+              $4::TEXT = 'active'
+              AND w.state NOT IN (
+                  'COMPLETED', 'FAILED', 'CANCELLED',
+                  'TIMED_OUT', 'CONTINUED_AS_NEW', 'TERMINATED'
+              )
+          )
+          OR (
+              $4::TEXT = 'terminal'
+              AND w.state IN (
+                  'COMPLETED', 'FAILED', 'CANCELLED',
+                  'TIMED_OUT', 'CONTINUED_AS_NEW', 'TERMINATED'
+              )
+          )
+      )
+      AND ($5::INT4 IS NULL OR w.shard_id = $5::INT4)
+      AND NOT EXISTS (
+          SELECT 1
+          FROM harvest_events e2
+          WHERE e2.workflow_exec_id = w.id
+            AND e2.event_type = 'MarkerRecorded'
+            AND e2.event_data #>> '{data,name}' = $1
+      )
 )
 SELECT
     workflow_name::TEXT AS workflow_name,
@@ -181,8 +233,14 @@ ORDER BY workflow_name, change_id, recorded_version, shard_id
 ///
 /// Returns one row per `(workflow_name, recorded_version, shard_id)` triple
 /// where `recorded_version < filters.min_safe_version`.  An empty `Vec`
-/// signals that no old-version markers exist on this shard under the given
-/// filters — a safe result when combined with a fully-inspected shard set.
+/// signals that no old-version markers (and no pre-gate executions, when
+/// `workflow_name` is set) exist on this shard — a safe result when combined
+/// with a fully-inspected shard set.
+///
+/// When [`RetirementCheckFilters::workflow_name`] is provided, the query also
+/// includes active executions for that workflow that carry **no** `MarkerRecorded`
+/// event for the given `change_id` (pre-gate executions).  Those rows appear
+/// with `recorded_version = 0`; see [`RetirementCheckShardRow`] for details.
 ///
 /// # Errors
 ///
@@ -294,6 +352,18 @@ mod tests {
         assert!(
             RETIREMENT_CHECK_SQL.contains("_harvest_codec_envelope"),
             "SQL must detect codec-envelope details to avoid false-safe reports"
+        );
+    }
+
+    #[test]
+    fn sql_contains_pre_gate_not_exists_branch() {
+        // Verify that the UNION ALL anti-join for pre-gate executions is present.
+        // Without it, executions that started before a version gate was inserted
+        // (and therefore have no MarkerRecorded event) are invisible to the check,
+        // causing a false-safe result.
+        assert!(
+            RETIREMENT_CHECK_SQL.contains("NOT EXISTS"),
+            "SQL must include pre-gate anti-join to catch executions with no marker"
         );
     }
 }
