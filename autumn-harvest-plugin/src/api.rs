@@ -78,6 +78,7 @@ use autumn_harvest::{
 use crate::preflight::{PreflightReport, build_preflight_report};
 use crate::shard_health::{ShardHealthReport, ShardReadiness, build_shard_health_report};
 use crate::state::HarvestDbPool;
+use crate::version_usage::{VersionUsageQuery, build_version_usage_report};
 
 #[derive(Clone)]
 pub struct HarvestRetentionRuntime {
@@ -842,6 +843,7 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .route("/health", get(health))
         .route("/admin/preflight", get(preflight))
         .route("/admin/shards/health", get(shards_health))
+        .route("/admin/version-gates/usage", get(version_usage))
         .route("/admin/retention", get(retention_status))
         .route("/admin/retention/run-now", post(retention_run_now))
         .route("/admin/concurrency", get(concurrency_status))
@@ -895,6 +897,16 @@ async fn shards_health(
     Query(query): Query<ShardHealthQuery>,
 ) -> Json<ShardHealthReport> {
     Json(build_shard_health_report(&api_state, query.candidate_shard).await)
+}
+
+async fn version_usage(
+    Extension(api_state): Extension<HarvestApiState>,
+    Query(query): Query<VersionUsageQuery>,
+) -> axum::response::Response {
+    match build_version_usage_report(&api_state, query).await {
+        Ok(report) => Json(report).into_response(),
+        Err(error) => error.into_response(),
+    }
 }
 
 #[derive(Debug, Deserialize)]
