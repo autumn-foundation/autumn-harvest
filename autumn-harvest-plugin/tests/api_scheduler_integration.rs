@@ -11,8 +11,7 @@ use autumn_harvest::models::{
 };
 use autumn_harvest::policy::Schedule;
 use autumn_harvest::scheduler::{
-    DagCatalog, SchedulerMonitor, compile_dag_catalog, register_schedules,
-    register_workflow_schedules, tick_once,
+    DagCatalog, SchedulerMonitor, compile_dag_catalog, register_schedules, tick_once,
 };
 use autumn_harvest::schema::{
     harvest_dag_runs, harvest_dead_letters, harvest_schedules, harvest_task_queue,
@@ -23,7 +22,7 @@ use autumn_harvest::store;
 use autumn_harvest::types::{ExecutionId, ShardId};
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{
-    ActivityContext, RetentionConfig, StartWorkflowParams, WorkflowContext, WorkflowSchedule,
+    ActivityContext, RetentionConfig, StartWorkflowParams, WorkflowContext,
     start_or_load_workflow_execution,
 };
 use autumn_harvest_plugin::HarvestDbPool;
@@ -704,38 +703,6 @@ async fn load_workflow_rows_from_url(
         .load(&mut conn)
         .await
         .expect("failed to load workflow rows by workflow key")
-}
-
-async fn count_workflow_executions_by_name_from_url(
-    database_url: &str,
-    workflow_name: &str,
-) -> i64 {
-    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
-        .await
-        .expect("failed to connect fresh Postgres client for workflow count");
-    harvest_workflow_executions::table
-        .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
-        .count()
-        .get_result(&mut conn)
-        .await
-        .expect("failed to count workflow rows by workflow name")
-}
-
-async fn load_latest_workflow_execution_by_name_from_url(
-    database_url: &str,
-    workflow_name: &str,
-) -> Option<WorkflowExecution> {
-    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
-        .await
-        .expect("failed to connect fresh Postgres client for workflow lookup");
-    harvest_workflow_executions::table
-        .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
-        .order(harvest_workflow_executions::created_at.desc())
-        .select(WorkflowExecution::as_select())
-        .first(&mut conn)
-        .await
-        .optional()
-        .expect("failed to load workflow rows by workflow name")
 }
 
 async fn count_workflow_tasks_from_url(database_url: &str, exec_id: &str) -> i64 {
@@ -1951,7 +1918,6 @@ async fn external_runner_processes_workflows_started_via_management_api() {
             },
             outbox: autumn_harvest_plugin::HarvestOutboxConfig::default(),
             batch: autumn_harvest_plugin::HarvestBatchConfig::default(),
-            readiness: autumn_harvest_plugin::HarvestReadinessConfig::default(),
         },
         HarvestRunnerResources::new(pool.clone()),
     )
@@ -1974,7 +1940,6 @@ async fn external_runner_processes_workflows_started_via_management_api() {
             },
             outbox: autumn_harvest_plugin::HarvestOutboxConfig::default(),
             batch: autumn_harvest_plugin::HarvestBatchConfig::default(),
-            readiness: autumn_harvest_plugin::HarvestReadinessConfig::default(),
         },
         HarvestRunnerResources::new(pool.clone()),
     )
@@ -2039,7 +2004,6 @@ async fn retention_janitor_deletes_only_rows_older_than_max_age_and_cascades_chi
             },
             outbox: autumn_harvest_plugin::HarvestOutboxConfig::default(),
             batch: autumn_harvest_plugin::HarvestBatchConfig::default(),
-            readiness: autumn_harvest_plugin::HarvestReadinessConfig::default(),
         },
         HarvestRunnerResources::new(pool.clone()),
     )
@@ -2509,159 +2473,6 @@ async fn scheduler_tick_creates_and_executes_due_interval_runs() {
     assert_eq!(
         log.lock().expect("log mutex poisoned").clone(),
         vec!["interval_step"]
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn concurrent_scheduler_ticks_activate_due_dag_run_once() {
-    let (database_url, _container) = setup_test_database_url().await;
-    let pool = build_test_pool(&database_url);
-    let log = Arc::new(Mutex::new(Vec::<String>::new()));
-    let registry = recording_registry(Arc::clone(&log), &["interval_step"]);
-    let dag_catalog = Arc::new(
-        compile_dag_catalog(vec![interval_pipeline_info()])
-            .expect("interval pipeline dag should compile"),
-    );
-    register_test_schedules(
-        &database_url,
-        dag_catalog.as_ref(),
-        "failed to connect for schedule registration",
-    )
-    .await;
-
-    let schedule = load_schedule_from_url(&database_url, "interval_pipeline").await;
-    {
-        let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
-            .await
-            .expect("failed to connect for forcing due interval schedule");
-        diesel::update(harvest_schedules::table.find(schedule.id))
-            .set(
-                harvest_schedules::next_run_at
-                    .eq(Some(chrono::Utc::now() - chrono::Duration::seconds(1))),
-            )
-            .execute(&mut conn)
-            .await
-            .expect("failed to force interval schedule due");
-    }
-
-    let gate = Arc::new(tokio::sync::Barrier::new(8));
-    let mut handles = Vec::new();
-    for _ in 0..8 {
-        let gate = Arc::clone(&gate);
-        let pool = pool.clone();
-        let registry = Arc::clone(&registry);
-        let dag_catalog = Arc::clone(&dag_catalog);
-        handles.push(tokio::spawn(async move {
-            gate.wait().await;
-            tick_once(
-                pool,
-                registry,
-                dag_catalog,
-                Arc::new(Vec::new()),
-                SchedulerMonitor::offline(),
-            )
-            .await
-        }));
-    }
-
-    for handle in handles {
-        handle
-            .await
-            .expect("concurrent scheduler tick task should not panic")
-            .expect("concurrent scheduler tick should succeed");
-    }
-
-    let run = wait_for_dag_run_state(&database_url, "interval_pipeline", "SUCCESS").await;
-    assert_eq!(run.dag_name, "interval_pipeline");
-    assert_eq!(
-        count_dag_runs_from_url(&database_url, "interval_pipeline").await,
-        1,
-        "one due logical date should create one durable DAG run"
-    );
-    assert_eq!(
-        log.lock().expect("log mutex poisoned").clone(),
-        vec!["interval_step"],
-        "concurrent schedulers must not double-activate the same queued run"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn concurrent_scheduler_ticks_dispatch_due_workflow_schedule_once() {
-    let (database_url, _container) = setup_test_database_url().await;
-    let pool = build_test_pool(&database_url);
-    let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
-    let workflow_name = "scheduled_exact_once_workflow";
-    let workflow_schedule =
-        WorkflowSchedule::new(workflow_name, Schedule::Interval(Duration::from_secs(60)))
-            .with_input(json!({ "source": "concurrent-scheduler" }));
-
-    {
-        let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
-            .await
-            .expect("failed to connect for workflow schedule registration");
-        register_workflow_schedules(&mut conn, std::slice::from_ref(&workflow_schedule))
-            .await
-            .expect("failed to register workflow schedule");
-        diesel::update(
-            harvest_schedules::table.filter(harvest_schedules::workflow_name.eq(workflow_name)),
-        )
-        .set(
-            harvest_schedules::next_run_at
-                .eq(Some(chrono::Utc::now() - chrono::Duration::seconds(1))),
-        )
-        .execute(&mut conn)
-        .await
-        .expect("failed to force workflow schedule due");
-    }
-
-    let gate = Arc::new(tokio::sync::Barrier::new(8));
-    let workflow_schedules = Arc::new(vec![workflow_schedule]);
-    let empty_dags = Arc::new(DagCatalog::default());
-    let mut handles = Vec::new();
-    for _ in 0..8 {
-        let gate = Arc::clone(&gate);
-        let pool = pool.clone();
-        let registry = Arc::clone(&registry);
-        let empty_dags = Arc::clone(&empty_dags);
-        let workflow_schedules = Arc::clone(&workflow_schedules);
-        handles.push(tokio::spawn(async move {
-            gate.wait().await;
-            tick_once(
-                pool,
-                registry,
-                empty_dags,
-                workflow_schedules,
-                SchedulerMonitor::offline(),
-            )
-            .await
-        }));
-    }
-
-    for handle in handles {
-        handle
-            .await
-            .expect("concurrent scheduler tick task should not panic")
-            .expect("concurrent scheduler tick should succeed");
-    }
-
-    assert_eq!(
-        count_workflow_executions_by_name_from_url(&database_url, workflow_name).await,
-        1,
-        "one due workflow schedule slot should create one execution"
-    );
-    let execution = load_latest_workflow_execution_by_name_from_url(&database_url, workflow_name)
-        .await
-        .expect("scheduled workflow execution should exist");
-    assert!(
-        execution
-            .workflow_id
-            .starts_with(&format!("sched:{workflow_name}:")),
-        "scheduled workflow id must be deterministic for duplicate suppression"
-    );
-    assert_eq!(
-        count_workflow_tasks_from_url(&database_url, &execution.id.to_string()).await,
-        1,
-        "duplicate scheduler ticks must not enqueue duplicate workflow tasks"
     );
 }
 

@@ -29,7 +29,6 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tower::ServiceExt;
 
 type HarvestApiApp = axum::Router;
-type ThreeShardUrls = (String, String, String);
 
 fn build_test_pool(database_url: &str) -> DbPool {
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(database_url);
@@ -96,57 +95,10 @@ async fn setup_two_shards_with_migrations() -> ((String, String), ContainerAsync
     ((shard0_url, shard1_url), container)
 }
 
-async fn setup_three_shards_with_migrations() -> (ThreeShardUrls, ContainerAsync<Postgres>) {
-    let container = Postgres::default()
-        .start()
-        .await
-        .expect("failed to start Postgres container");
-    let host = container
-        .get_host()
-        .await
-        .expect("failed to get container host");
-    let port = container
-        .get_host_port_ipv4(5432)
-        .await
-        .expect("failed to get container port");
-    let admin_url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
-    let shard0_db = format!("harvest_shard_health_0_{}", uuid::Uuid::new_v4().simple());
-    let shard1_db = format!("harvest_shard_health_1_{}", uuid::Uuid::new_v4().simple());
-    let shard2_db = format!("harvest_shard_health_2_{}", uuid::Uuid::new_v4().simple());
-
-    let mut admin_conn = <AsyncPgConnection as AsyncConnection>::establish(&admin_url)
-        .await
-        .expect("failed to connect to admin database");
-    for db_name in [&shard0_db, &shard1_db, &shard2_db] {
-        diesel::sql_query(format!("CREATE DATABASE {db_name}"))
-            .execute(&mut admin_conn)
-            .await
-            .expect("failed to create shard database");
-    }
-
-    let shard0_url = format!("postgres://postgres:postgres@{host}:{port}/{shard0_db}");
-    let shard1_url = format!("postgres://postgres:postgres@{host}:{port}/{shard1_db}");
-    let shard2_url = format!("postgres://postgres:postgres@{host}:{port}/{shard2_db}");
-    for shard_url in [&shard0_url, &shard1_url, &shard2_url] {
-        autumn_web::migrate::run_pending(shard_url, autumn_harvest::MIGRATIONS)
-            .expect("failed to migrate shard");
-    }
-
-    ((shard0_url, shard1_url, shard2_url), container)
-}
-
 fn build_two_shard_pool(shard0_url: &str, shard1_url: &str) -> HarvestDbPool {
     let mut pools = BTreeMap::new();
     pools.insert(ShardId::new(0), build_test_pool(shard0_url));
     pools.insert(ShardId::new(1), build_test_pool(shard1_url));
-    HarvestDbPool::sharded(ShardedDbPool::from_map(pools, ShardId::new(0)))
-}
-
-fn build_three_shard_pool(shard0_url: &str, shard1_url: &str, shard2_url: &str) -> HarvestDbPool {
-    let mut pools = BTreeMap::new();
-    pools.insert(ShardId::new(0), build_test_pool(shard0_url));
-    pools.insert(ShardId::new(1), build_test_pool(shard1_url));
-    pools.insert(ShardId::new(2), build_test_pool(shard2_url));
     HarvestDbPool::sharded(ShardedDbPool::from_map(pools, ShardId::new(0)))
 }
 
@@ -286,20 +238,6 @@ fn blocking_reasons(row: &Value) -> Vec<String> {
         .collect()
 }
 
-fn reason_codes(row: &Value) -> Vec<String> {
-    row["reason_codes"]
-        .as_array()
-        .expect("reason codes should be an array")
-        .iter()
-        .map(|reason| {
-            reason
-                .as_str()
-                .expect("reason code should be a string")
-                .to_string()
-        })
-        .collect()
-}
-
 fn find_shard(body: &Value, shard_id: i64) -> &Value {
     body["shards"]
         .as_array()
@@ -307,83 +245,6 @@ fn find_shard(body: &Value, shard_id: i64) -> &Value {
         .iter()
         .find(|row| row["shard_id"] == shard_id)
         .unwrap_or_else(|| panic!("missing shard {shard_id}: {body}"))
-}
-
-#[tokio::test]
-async fn three_shard_rollout_gate_tracks_missing_added_and_stale_worker_coverage() {
-    let ((shard0_url, shard1_url, shard2_url), _container) =
-        setup_three_shards_with_migrations().await;
-    let pool = build_three_shard_pool(&shard0_url, &shard1_url, &shard2_url);
-    register_active_worker(
-        pool.pool_for(ShardId::new(0)),
-        "ready-worker-0",
-        &["default"],
-        &[0],
-    )
-    .await;
-    register_active_worker(
-        pool.pool_for(ShardId::new(1)),
-        "ready-worker-1",
-        &["default"],
-        &[1],
-    )
-    .await;
-    let router = ShardRouter::new(
-        vec![ShardId::new(0), ShardId::new(1), ShardId::new(2)],
-        vec![ShardId::new(0), ShardId::new(1), ShardId::new(2)],
-        ShardId::new(0),
-    );
-    let state = api_state(
-        pool.clone(),
-        runtime_for(
-            &["default"],
-            None,
-            Vec::new(),
-            router,
-            SchedulerMonitor::offline(),
-        ),
-    );
-    let app = harvest_api_router(state).with_state(AppState::for_test().with_profile("test"));
-
-    let (status, body) = get_json(&app, "/admin/shards/health").await;
-
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["overall_readiness"], "degraded");
-    let uncovered = find_shard(&body, 2);
-    assert_eq!(uncovered["readiness"], "degraded");
-    assert!(
-        reason_codes(uncovered)
-            .iter()
-            .any(|reason| reason == "worker_queue_uncovered"),
-        "missing shard 2 worker coverage should gate rollout: {uncovered}"
-    );
-
-    register_active_worker(
-        pool.pool_for(ShardId::new(2)),
-        "ready-worker-2",
-        &["default"],
-        &[2],
-    )
-    .await;
-    let (status, body) = get_json(&app, "/admin/shards/health").await;
-
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["overall_readiness"], "ready");
-    assert_eq!(find_shard(&body, 2)["readiness"], "ready");
-
-    mark_worker_stale(pool.pool_for(ShardId::new(1)), "ready-worker-1").await;
-    let (status, body) = get_json(&app, "/admin/shards/health").await;
-
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["overall_readiness"], "degraded");
-    let stale_shard = find_shard(&body, 1);
-    assert_eq!(stale_shard["stale_worker_count"], 1);
-    assert!(
-        reason_codes(stale_shard)
-            .iter()
-            .any(|reason| reason == "worker_health_stale"),
-        "stale shard 1 worker should degrade the shard within the heartbeat window: {stale_shard}"
-    );
 }
 
 #[tokio::test]
@@ -425,105 +286,6 @@ async fn single_shard_ready_state_uses_shard_zero_response_shape() {
 }
 
 #[tokio::test]
-async fn writable_shard_reports_degraded_codes_and_worker_counts() {
-    let (database_url, _container) = setup_database_url_with_migrations().await;
-    let pool = build_test_pool(&database_url);
-    register_active_worker(&pool, "default-worker", &["default"], &[0]).await;
-    let state = api_state(
-        HarvestDbPool::from(pool),
-        runtime_for(
-            &["default", "email"],
-            Some("email"),
-            Vec::new(),
-            ShardRouter::single(),
-            SchedulerMonitor::offline(),
-        ),
-    );
-    let app = harvest_api_router(state).with_state(AppState::for_test().with_profile("test"));
-
-    let (status, body) = get_json(&app, "/admin/shards/health").await;
-
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["overall_readiness"], "degraded");
-    let shard = find_shard(&body, 0);
-    assert_eq!(shard["readiness"], "degraded");
-    assert_eq!(shard["active_worker_count"], 1);
-    assert_eq!(shard["stale_worker_count"], 0);
-    assert!(
-        reason_codes(shard)
-            .iter()
-            .any(|reason| reason == "worker_queue_uncovered"),
-        "missing queue coverage should expose a machine reason code: {shard}"
-    );
-}
-
-#[tokio::test]
-async fn unreachable_writable_shard_reports_unavailable_reason_code() {
-    let (shard0_url, _container) = setup_database_url_with_migrations().await;
-    let pool = build_two_shard_pool(&shard0_url, "postgres://postgres:postgres@127.0.0.1:1/nope");
-    register_active_worker(
-        pool.pool_for(ShardId::new(0)),
-        "ready-worker-0",
-        &["default"],
-        &[0],
-    )
-    .await;
-    let router = ShardRouter::new(
-        vec![ShardId::new(0), ShardId::new(1)],
-        vec![ShardId::new(0), ShardId::new(1)],
-        ShardId::new(0),
-    );
-    let state = api_state(
-        pool,
-        runtime_for(
-            &["default"],
-            None,
-            Vec::new(),
-            router,
-            SchedulerMonitor::offline(),
-        ),
-    );
-    let app = harvest_api_router(state).with_state(AppState::for_test().with_profile("test"));
-
-    let (status, body) = get_json(&app, "/admin/shards/health").await;
-
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["overall_readiness"], "unavailable");
-    let shard = find_shard(&body, 1);
-    assert_eq!(shard["readiness"], "unavailable");
-    assert!(
-        reason_codes(shard)
-            .iter()
-            .any(|reason| reason == "shard_unreachable"),
-        "unreachable shard should expose a machine reason code: {shard}"
-    );
-}
-
-#[tokio::test]
-async fn health_endpoint_can_enforce_writable_shard_readiness() {
-    let (database_url, _container) = setup_database_url_with_migrations().await;
-    let state = api_state(
-        HarvestDbPool::from(build_test_pool(&database_url)),
-        runtime_for(
-            &["default"],
-            None,
-            Vec::new(),
-            ShardRouter::single(),
-            SchedulerMonitor::offline(),
-        ),
-    );
-    state.set_health_requires_shard_readiness(true);
-    let app = harvest_api_router(state).with_state(AppState::for_test().with_profile("prod"));
-
-    let (status, body) = get_json(&app, "/health").await;
-
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(body["runtime_ready"], true);
-    assert_eq!(body["shard_readiness_enforced"], true);
-    assert_eq!(body["shard_readiness"]["overall_readiness"], "degraded");
-}
-
-#[tokio::test]
 async fn readable_only_candidate_without_workers_lists_promotion_blockers() {
     let ((shard0_url, shard1_url), _container) = setup_two_shards_with_migrations().await;
     let pool = build_two_shard_pool(&shard0_url, &shard1_url);
@@ -556,7 +318,7 @@ async fn readable_only_candidate_without_workers_lists_promotion_blockers() {
     assert_eq!(status, StatusCode::OK);
     let candidate = find_shard(&body, 1);
     assert_eq!(candidate["candidate"], true);
-    assert_eq!(candidate["readiness"], "degraded");
+    assert_eq!(candidate["readiness"], "unready");
     assert_eq!(roles(candidate), vec!["readable".to_string()]);
     assert!(
         blocking_reasons(candidate)
@@ -568,7 +330,7 @@ async fn readable_only_candidate_without_workers_lists_promotion_blockers() {
 }
 
 #[tokio::test]
-async fn writable_shard_with_missing_queue_coverage_is_degraded() {
+async fn writable_shard_with_missing_queue_coverage_is_unready() {
     let (database_url, _container) = setup_database_url_with_migrations().await;
     let pool = build_test_pool(&database_url);
     register_active_worker(&pool, "default-worker", &["default"], &[0]).await;
@@ -588,7 +350,7 @@ async fn writable_shard_with_missing_queue_coverage_is_degraded() {
 
     assert_eq!(status, StatusCode::OK);
     let shard = find_shard(&body, 0);
-    assert_eq!(shard["readiness"], "degraded");
+    assert_eq!(shard["readiness"], "unready");
     assert!(
         blocking_reasons(shard)
             .iter()
@@ -598,7 +360,7 @@ async fn writable_shard_with_missing_queue_coverage_is_degraded() {
 }
 
 #[tokio::test]
-async fn stale_worker_coverage_makes_writable_shard_degraded() {
+async fn stale_worker_coverage_makes_writable_shard_unready() {
     let (database_url, _container) = setup_database_url_with_migrations().await;
     let pool = build_test_pool(&database_url);
     register_active_worker(&pool, "stale-worker", &["default"], &[0]).await;
@@ -619,7 +381,7 @@ async fn stale_worker_coverage_makes_writable_shard_degraded() {
 
     assert_eq!(status, StatusCode::OK);
     let shard = find_shard(&body, 0);
-    assert_eq!(shard["readiness"], "degraded");
+    assert_eq!(shard["readiness"], "unready");
     assert!(
         blocking_reasons(shard)
             .iter()
@@ -630,7 +392,7 @@ async fn stale_worker_coverage_makes_writable_shard_degraded() {
 }
 
 #[tokio::test]
-async fn stale_scheduler_coverage_makes_scheduled_writable_shard_degraded() {
+async fn stale_scheduler_coverage_makes_scheduled_writable_shard_unready() {
     let (database_url, _container) = setup_database_url_with_migrations().await;
     let pool = build_test_pool(&database_url);
     register_active_worker(&pool, "ready-worker", &["default"], &[0]).await;
@@ -652,7 +414,7 @@ async fn stale_scheduler_coverage_makes_scheduled_writable_shard_degraded() {
 
     assert_eq!(status, StatusCode::OK);
     let shard = find_shard(&body, 0);
-    assert_eq!(shard["readiness"], "degraded");
+    assert_eq!(shard["readiness"], "unready");
     assert!(
         blocking_reasons(shard)
             .iter()
@@ -696,7 +458,7 @@ async fn unreachable_shard_returns_partial_health_for_reachable_shards() {
     let degraded = find_shard(&body, 1);
     assert_eq!(healthy["reachable"], true);
     assert_eq!(degraded["reachable"], false);
-    assert_eq!(degraded["readiness"], "unavailable");
+    assert_eq!(degraded["readiness"], "unready");
     assert!(
         degraded["error_summary"]
             .as_str()
@@ -706,7 +468,7 @@ async fn unreachable_shard_returns_partial_health_for_reachable_shards() {
 }
 
 #[tokio::test]
-async fn migration_mismatch_marks_only_affected_shard_degraded() {
+async fn migration_mismatch_marks_only_affected_shard_unready() {
     let ((shard0_url, shard1_url), _container) = setup_two_shards_with_migrations().await;
     let mut shard1_conn = <AsyncPgConnection as AsyncConnection>::establish(&shard1_url)
         .await
@@ -756,7 +518,7 @@ async fn migration_mismatch_marks_only_affected_shard_degraded() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(find_shard(&body, 0)["readiness"], "ready");
     let mismatched = find_shard(&body, 1);
-    assert_eq!(mismatched["readiness"], "degraded");
+    assert_eq!(mismatched["readiness"], "unready");
     assert_eq!(mismatched["schema"]["ready"], false);
     assert!(
         mismatched["schema"]["missing_migrations"]
@@ -767,7 +529,7 @@ async fn migration_mismatch_marks_only_affected_shard_degraded() {
 }
 
 #[tokio::test]
-async fn router_only_writable_shard_is_reported_unavailable() {
+async fn router_only_writable_shard_is_reported_unready() {
     let mut pools = BTreeMap::new();
     pools.insert(
         ShardId::new(0),
@@ -794,10 +556,10 @@ async fn router_only_writable_shard_is_reported_unavailable() {
     let (status, body) = get_json(&app, "/admin/shards/health").await;
 
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["overall_readiness"], "unavailable");
+    assert_eq!(body["overall_readiness"], "unready");
     let router_only = find_shard(&body, 1);
     assert_eq!(router_only["reachable"], false);
-    assert_eq!(router_only["readiness"], "unavailable");
+    assert_eq!(router_only["readiness"], "unready");
     assert_eq!(
         roles(router_only),
         vec!["readable".to_string(), "writable".to_string()]

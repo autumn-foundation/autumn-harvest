@@ -224,7 +224,6 @@ fn start_harvest_runtime(
         .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
     let harvest_config = HarvestRuntimeConfig::load()
         .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
-    api_state.set_health_requires_shard_readiness(harvest_config.readiness.require_shard_readiness);
     ensure_runtime_migrations(state.profile(), &app_config, &harvest_config)?;
 
     let runtime_state = state.clone();
@@ -613,7 +612,6 @@ mod tests {
             },
             outbox: HarvestOutboxConfig::default(),
             batch: crate::config::HarvestBatchConfig::default(),
-            readiness: crate::config::HarvestReadinessConfig::default(),
         };
 
         let harvest_pool = resolve_harvest_pool(&state, &config)

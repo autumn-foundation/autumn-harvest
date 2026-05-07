@@ -24,8 +24,7 @@ use crate::api::{HarvestApiRuntime, HarvestApiState};
 #[serde(rename_all = "lowercase")]
 pub enum ShardReadiness {
     Ready,
-    Degraded,
-    Unavailable,
+    Unready,
 }
 
 /// Operational role for a configured shard.
@@ -54,8 +53,6 @@ pub struct ShardHealthRow {
     pub roles: Vec<ShardRole>,
     pub candidate: bool,
     pub reachable: bool,
-    pub active_worker_count: usize,
-    pub stale_worker_count: usize,
     pub schema: ShardSchemaHealth,
     pub worker_coverage: Vec<QueueWorkerCoverage>,
     pub scheduler: ShardSchedulerCoverage,
@@ -63,7 +60,6 @@ pub struct ShardHealthRow {
     pub dlq: DlqSummary,
     pub last_health_sample_time: Option<DateTime<Utc>>,
     pub readiness: ShardReadiness,
-    pub reason_codes: Vec<String>,
     pub blocking_reasons: Vec<String>,
     pub error_summary: Option<String>,
 }
@@ -126,25 +122,10 @@ struct ScheduleProbe {
 
 struct WorkerReadiness {
     coverage: Vec<QueueWorkerCoverage>,
-    active_worker_count: usize,
-    stale_worker_count: usize,
     last_health_sample_time: Option<DateTime<Utc>>,
-    reason_codes: Vec<String>,
     blocking_reasons: Vec<String>,
     error_summary: Option<String>,
 }
-
-const REASON_CANDIDATE_SHARD_MISSING: &str = "candidate_shard_missing";
-const REASON_SCHEDULER_NOT_RUNNING: &str = "scheduler_not_running";
-const REASON_SCHEDULER_STALE: &str = "scheduler_stale";
-const REASON_SCHEMA_MIGRATION_MISSING: &str = "schema_migration_missing";
-const REASON_SCHEMA_UNREADABLE: &str = "schema_unreadable";
-const REASON_SHARD_POOL_MISSING: &str = "shard_pool_missing";
-const REASON_SHARD_UNREACHABLE: &str = "shard_unreachable";
-const REASON_STORAGE_POOL_MISSING: &str = "storage_pool_missing";
-const REASON_WORKER_COVERAGE_UNREADABLE: &str = "worker_coverage_unreadable";
-const REASON_WORKER_HEALTH_STALE: &str = "worker_health_stale";
-const REASON_WORKER_QUEUE_UNCOVERED: &str = "worker_queue_uncovered";
 
 /// Build the shard readiness report without mutating workflow state.
 pub async fn build_shard_health_report(
@@ -185,7 +166,6 @@ pub async fn build_shard_health_report(
                         roles_for_shard(shard_id, Some(runtime)),
                         candidate_shard == Some(shard_id),
                         freshness_window,
-                        REASON_SHARD_POOL_MISSING,
                         format!(
                             "shard {shard_id} is configured in router but has no installed pool"
                         ),
@@ -211,7 +191,6 @@ pub async fn build_shard_health_report(
                 roles_for_shard(shard_id, runtime.as_ref()),
                 candidate_shard == Some(shard_id),
                 freshness_window,
-                REASON_STORAGE_POOL_MISSING,
                 "harvest storage pool is not configured".to_string(),
             ));
         }
@@ -225,17 +204,16 @@ pub async fn build_shard_health_report(
             roles_for_shard(candidate, runtime.as_ref()),
             true,
             freshness_window,
-            REASON_CANDIDATE_SHARD_MISSING,
             format!("candidate shard {candidate} is not configured"),
         ));
     }
 
     rows.sort_by_key(|row| row.shard_id);
-    let overall_readiness = rows
-        .iter()
-        .filter(|row| gated_row(row))
-        .map(|row| row.readiness)
-        .fold(ShardReadiness::Ready, worst_readiness);
+    let overall_readiness = if rows.iter().any(gated_row_is_unready) {
+        ShardReadiness::Unready
+    } else {
+        ShardReadiness::Ready
+    };
 
     ShardHealthReport {
         overall_readiness,
@@ -246,30 +224,9 @@ pub async fn build_shard_health_report(
     }
 }
 
-fn gated_row(row: &ShardHealthRow) -> bool {
-    row.candidate || row.roles.contains(&ShardRole::Writable)
-}
-
-const fn readiness_rank(readiness: ShardReadiness) -> u8 {
-    match readiness {
-        ShardReadiness::Ready => 0,
-        ShardReadiness::Degraded => 1,
-        ShardReadiness::Unavailable => 2,
-    }
-}
-
-const fn worst_readiness(left: ShardReadiness, right: ShardReadiness) -> ShardReadiness {
-    if readiness_rank(right) > readiness_rank(left) {
-        right
-    } else {
-        left
-    }
-}
-
-fn push_reason_code(reason_codes: &mut Vec<String>, reason_code: &'static str) {
-    if !reason_codes.iter().any(|existing| existing == reason_code) {
-        reason_codes.push(reason_code.to_string());
-    }
+fn gated_row_is_unready(row: &ShardHealthRow) -> bool {
+    (row.candidate || row.roles.contains(&ShardRole::Writable))
+        && row.readiness == ShardReadiness::Unready
 }
 
 async fn observe_shard(
@@ -289,7 +246,6 @@ async fn observe_shard(
             roles,
             candidate,
             freshness_window,
-            REASON_SHARD_UNREACHABLE,
             "database connection could not be acquired".to_string(),
         );
     };
@@ -302,16 +258,13 @@ async fn observe_shard(
     let dlq = load_dlq(&mut conn).await;
 
     let mut blocking_reasons = Vec::new();
-    let mut reason_codes = Vec::new();
     let mut error_summary = None;
 
     if !schema.ready {
         if let Some(error) = &schema.error {
-            push_reason_code(&mut reason_codes, REASON_SCHEMA_UNREADABLE);
             blocking_reasons.push(format!("schema readiness could not be confirmed: {error}"));
             error_summary.get_or_insert_with(|| error.clone());
         } else {
-            push_reason_code(&mut reason_codes, REASON_SCHEMA_MIGRATION_MISSING);
             blocking_reasons.push(format!(
                 "schema is missing required migrations: {}",
                 schema.missing_migrations.join(", ")
@@ -326,7 +279,6 @@ async fn observe_shard(
         freshness_window,
         observed_at,
     );
-    reason_codes.append(&mut worker_readiness.reason_codes);
     blocking_reasons.append(&mut worker_readiness.blocking_reasons);
     if let Some(error) = worker_readiness.error_summary {
         error_summary.get_or_insert(error);
@@ -340,11 +292,6 @@ async fn observe_shard(
         observed_at,
     );
     if !scheduler_status.ready {
-        if scheduler_status.running {
-            push_reason_code(&mut reason_codes, REASON_SCHEDULER_STALE);
-        } else {
-            push_reason_code(&mut reason_codes, REASON_SCHEDULER_NOT_RUNNING);
-        }
         blocking_reasons.push(
             scheduler_status
                 .error
@@ -364,7 +311,7 @@ async fn observe_shard(
     let readiness = if blocking_reasons.is_empty() {
         ShardReadiness::Ready
     } else {
-        ShardReadiness::Degraded
+        ShardReadiness::Unready
     };
 
     ShardHealthRow {
@@ -372,8 +319,6 @@ async fn observe_shard(
         roles,
         candidate,
         reachable,
-        active_worker_count: worker_readiness.active_worker_count,
-        stale_worker_count: worker_readiness.stale_worker_count,
         schema,
         worker_coverage: worker_readiness.coverage,
         scheduler: scheduler_status,
@@ -381,7 +326,6 @@ async fn observe_shard(
         dlq,
         last_health_sample_time: worker_readiness.last_health_sample_time,
         readiness,
-        reason_codes,
         blocking_reasons,
         error_summary,
     }
@@ -392,7 +336,6 @@ fn unavailable_row(
     roles: Vec<ShardRole>,
     candidate: bool,
     freshness_window: Duration,
-    reason_code: &'static str,
     error_summary: String,
 ) -> ShardHealthRow {
     ShardHealthRow {
@@ -400,8 +343,6 @@ fn unavailable_row(
         roles,
         candidate,
         reachable: false,
-        active_worker_count: 0,
-        stale_worker_count: 0,
         schema: ShardSchemaHealth {
             ready: false,
             applied_count: None,
@@ -429,8 +370,7 @@ fn unavailable_row(
             error: Some(error_summary.clone()),
         },
         last_health_sample_time: None,
-        readiness: ShardReadiness::Unavailable,
-        reason_codes: vec![reason_code.to_string()],
+        readiness: ShardReadiness::Unready,
         blocking_reasons: vec![error_summary.clone()],
         error_summary: Some(error_summary),
     }
@@ -567,12 +507,8 @@ fn worker_readiness(
     match workers {
         Ok(workers) => {
             let coverage = worker_coverage_by_queue(shard_id, required_queues, &workers);
-            let active_worker_count = active_worker_count_for_shard(shard_id, &workers);
-            let stale_worker_count = stale_worker_count_for_shard(shard_id, &workers);
-            let mut reason_codes = Vec::new();
             for queue in &coverage {
                 if !queue.ready {
-                    push_reason_code(&mut reason_codes, REASON_WORKER_QUEUE_UNCOVERED);
                     blocking_reasons.push(format!(
                         "no healthy active worker covers required queue '{}' on shard {shard_id}",
                         queue.queue
@@ -581,7 +517,6 @@ fn worker_readiness(
             }
             let last_seen = workers
                 .iter()
-                .filter(|worker| worker_assigned_to_shard(worker, shard_id))
                 .map(|worker| worker.worker.last_heartbeat_at)
                 .max();
             if !required_queues.is_empty() {
@@ -589,29 +524,21 @@ fn worker_readiness(
                     last_seen,
                     freshness_window,
                     observed_at,
-                    &mut reason_codes,
                     &mut blocking_reasons,
                 );
             }
             WorkerReadiness {
                 coverage,
-                active_worker_count,
-                stale_worker_count,
                 last_health_sample_time: last_seen,
-                reason_codes,
                 blocking_reasons,
                 error_summary: None,
             }
         }
         Err(error) => {
-            let reason_codes = vec![REASON_WORKER_COVERAGE_UNREADABLE.to_string()];
             blocking_reasons.push(format!("worker coverage could not be read: {error}"));
             WorkerReadiness {
                 coverage: Vec::new(),
-                active_worker_count: 0,
-                stale_worker_count: 0,
                 last_health_sample_time: None,
-                reason_codes,
                 blocking_reasons,
                 error_summary: Some(error),
             }
@@ -623,11 +550,9 @@ fn push_health_freshness_blocker(
     last_seen: Option<DateTime<Utc>>,
     freshness_window: Duration,
     observed_at: DateTime<Utc>,
-    reason_codes: &mut Vec<String>,
     blocking_reasons: &mut Vec<String>,
 ) {
     let Some(last_seen) = last_seen else {
-        push_reason_code(reason_codes, REASON_WORKER_HEALTH_STALE);
         blocking_reasons.push("no worker health data recorded on shard".to_string());
         return;
     };
@@ -636,7 +561,6 @@ fn push_health_freshness_blocker(
         .to_std()
         .unwrap_or(Duration::ZERO);
     if elapsed > freshness_window {
-        push_reason_code(reason_codes, REASON_WORKER_HEALTH_STALE);
         blocking_reasons.push(format!(
             "health data is stale; latest worker heartbeat exceeds {}s freshness window",
             freshness_window.as_secs()
@@ -688,36 +612,13 @@ fn worker_coverage_by_queue(
         .collect()
 }
 
-fn active_worker_count_for_shard(shard_id: i32, workers: &[WorkerRow]) -> usize {
-    workers
-        .iter()
-        .filter(|worker| {
-            worker_assigned_to_shard(worker, shard_id)
-                && worker.worker.status == WorkerStatus::Active.as_str()
-        })
-        .count()
-}
-
-fn stale_worker_count_for_shard(shard_id: i32, workers: &[WorkerRow]) -> usize {
-    workers
-        .iter()
-        .filter(|worker| {
-            worker_assigned_to_shard(worker, shard_id) && worker.health == WorkerHealth::Stale
-        })
-        .count()
-}
-
 fn worker_can_cover(worker: &WorkerRow, queue: &str, shard_id: i32) -> bool {
     let has_queue = worker
         .worker
         .queues
         .as_array()
         .is_some_and(|queues| queues.iter().any(|value| value.as_str() == Some(queue)));
-    has_queue && worker_assigned_to_shard(worker, shard_id)
-}
-
-fn worker_assigned_to_shard(worker: &WorkerRow, shard_id: i32) -> bool {
-    worker
+    let has_shard = worker
         .worker
         .shard_assignments
         .as_array()
@@ -725,7 +626,8 @@ fn worker_assigned_to_shard(worker: &WorkerRow, shard_id: i32) -> bool {
             shards
                 .iter()
                 .any(|value| value.as_i64() == Some(i64::from(shard_id)))
-        })
+        });
+    has_queue && has_shard
 }
 
 #[derive(diesel::QueryableByName)]

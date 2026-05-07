@@ -39,13 +39,6 @@ pub struct HarvestBatchConfig {
     pub tick_interval_ms: u64,
 }
 
-/// Readiness and health endpoint behavior.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct HarvestReadinessConfig {
-    /// When true, `/health` returns 503 unless writable/candidate shards are ready.
-    pub require_shard_readiness: bool,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HarvestRuntimeConfig {
     pub mode: HarvestMode,
@@ -54,7 +47,6 @@ pub struct HarvestRuntimeConfig {
     pub database: HarvestDatabaseConfig,
     pub outbox: HarvestOutboxConfig,
     pub batch: HarvestBatchConfig,
-    pub readiness: HarvestReadinessConfig,
 }
 
 impl HarvestRuntimeConfig {
@@ -134,9 +126,6 @@ impl HarvestRuntimeConfig {
         if let Some(tick_interval_ms) = partial.batch.tick_interval_ms {
             self.batch.tick_interval_ms = tick_interval_ms;
         }
-        if let Some(require_shard_readiness) = partial.readiness.require_shard_readiness {
-            self.readiness.require_shard_readiness = require_shard_readiness;
-        }
     }
 
     fn apply_env_overrides(&mut self, env: &dyn Env) -> Result<(), ConfigError> {
@@ -197,14 +186,6 @@ impl HarvestRuntimeConfig {
         if let Ok(tick_interval_ms) = env.var("AUTUMN_HARVEST_BATCH__TICK_INTERVAL_MS") {
             self.batch.tick_interval_ms =
                 parse_u64("AUTUMN_HARVEST_BATCH__TICK_INTERVAL_MS", &tick_interval_ms)?;
-        }
-        if let Ok(require_shard_readiness) =
-            env.var("AUTUMN_HARVEST_READINESS__REQUIRE_SHARD_READINESS")
-        {
-            self.readiness.require_shard_readiness = parse_bool(
-                "AUTUMN_HARVEST_READINESS__REQUIRE_SHARD_READINESS",
-                &require_shard_readiness,
-            )?;
         }
 
         Ok(())
@@ -276,7 +257,6 @@ impl Default for HarvestRuntimeConfig {
             database: HarvestDatabaseConfig::default(),
             outbox: HarvestOutboxConfig::default(),
             batch: HarvestBatchConfig::default(),
-            readiness: HarvestReadinessConfig::default(),
         }
     }
 }
@@ -321,8 +301,6 @@ struct PartialHarvestRuntimeConfig {
     outbox: PartialHarvestOutboxConfig,
     #[serde(default)]
     batch: PartialHarvestBatchConfig,
-    #[serde(default)]
-    readiness: PartialHarvestReadinessConfig,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -348,11 +326,6 @@ struct PartialHarvestBatchConfig {
     /// is the issue's canonical name.
     batch_concurrency: Option<u32>,
     tick_interval_ms: Option<u64>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct PartialHarvestReadinessConfig {
-    require_shard_readiness: Option<bool>,
 }
 
 fn find_config_file_named(filename: &str, env: &dyn Env) -> PathBuf {
@@ -614,50 +587,6 @@ mode = "embedded"
             error.to_string().contains("outbox"),
             "expected outbox validation error, got {error}"
         );
-    }
-
-    #[test]
-    fn harvest_config_readiness_defaults_do_not_gate_health() {
-        let env = MockEnv::new();
-        let config = HarvestRuntimeConfig::load_with_env(&env).expect("harvest config should load");
-
-        assert!(!config.readiness.require_shard_readiness);
-    }
-
-    #[test]
-    fn harvest_config_readiness_toml_can_gate_health() {
-        let dir = unique_temp_dir("harvest-config-readiness-toml");
-        write_file(
-            &dir.join("autumn.toml"),
-            r"
-[harvest.readiness]
-require_shard_readiness = true
-",
-        );
-        let env = MockEnv::new().with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref());
-
-        let config = HarvestRuntimeConfig::load_with_env(&env).expect("harvest config should load");
-
-        assert!(config.readiness.require_shard_readiness);
-    }
-
-    #[test]
-    fn harvest_config_readiness_env_overrides_toml() {
-        let dir = unique_temp_dir("harvest-config-readiness-env");
-        write_file(
-            &dir.join("autumn.toml"),
-            r"
-[harvest.readiness]
-require_shard_readiness = false
-",
-        );
-        let env = MockEnv::new()
-            .with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref())
-            .with("AUTUMN_HARVEST_READINESS__REQUIRE_SHARD_READINESS", "true");
-
-        let config = HarvestRuntimeConfig::load_with_env(&env).expect("harvest config should load");
-
-        assert!(config.readiness.require_shard_readiness);
     }
 
     fn unique_temp_dir(label: &str) -> PathBuf {

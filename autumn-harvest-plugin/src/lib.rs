@@ -14,7 +14,7 @@ pub mod ui;
 pub use api::{HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router};
 pub use config::{
     HarvestBatchConfig, HarvestDatabaseConfig, HarvestMode, HarvestOutboxConfig,
-    HarvestReadinessConfig, HarvestRuntimeConfig,
+    HarvestRuntimeConfig,
 };
 pub use outbox::{
     WorkflowStartRequest, drain_workflow_start_outbox_once, enqueue_workflow_start_outbox,

@@ -12,8 +12,6 @@ use axum::Extension;
 use axum::Json;
 use axum::Router;
 use axum::extract::{Path, Query};
-use axum::http::StatusCode;
-use axum::response::IntoResponse;
 use axum::routing::{delete, get, patch, post};
 use diesel::ExpressionMethods;
 use diesel::OptionalExtension;
@@ -76,7 +74,7 @@ use autumn_harvest::{
 };
 
 use crate::preflight::{PreflightReport, build_preflight_report};
-use crate::shard_health::{ShardHealthReport, ShardReadiness, build_shard_health_report};
+use crate::shard_health::{ShardHealthReport, build_shard_health_report};
 use crate::state::HarvestDbPool;
 
 #[derive(Clone)]
@@ -188,8 +186,6 @@ pub struct HarvestApiState {
     deployment_profile: Arc<Mutex<String>>,
     /// Whether the management API was mounted behind an embedder-provided auth boundary.
     admin_auth_boundary: Arc<Mutex<bool>>,
-    /// When enabled, `/health` returns 503 until writable shards are ready.
-    health_requires_shard_readiness: Arc<Mutex<bool>>,
 }
 
 impl Default for HarvestApiState {
@@ -202,7 +198,6 @@ impl Default for HarvestApiState {
             audit_retention_days: Arc::new(Mutex::new(None)),
             deployment_profile: Arc::new(Mutex::new("unknown".to_string())),
             admin_auth_boundary: Arc::new(Mutex::new(false)),
-            health_requires_shard_readiness: Arc::new(Mutex::new(false)),
         }
     }
 }
@@ -298,23 +293,6 @@ impl HarvestApiState {
             .expect("harvest api state lock poisoned") = present;
     }
 
-    /// Configure `/health` to fail when writable shard rollout readiness is not `ready`.
-    ///
-    /// The default is `false` so local single-shard development keeps a cheap
-    /// liveness-style health check. Production deployments can enable this to
-    /// make readiness probes and rollout pipelines gate on worker and scheduler
-    /// coverage before accepting starts.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
-    pub fn set_health_requires_shard_readiness(&self, required: bool) {
-        *self
-            .health_requires_shard_readiness
-            .lock()
-            .expect("harvest api state lock poisoned") = required;
-    }
-
     /// Returns `Some(days)` only when explicitly set via [`set_audit_retention_days`];
     /// `None` means "use the builder's retention config unchanged".
     pub(crate) fn audit_retention_days(&self) -> Option<i64> {
@@ -334,13 +312,6 @@ impl HarvestApiState {
     pub(crate) fn admin_auth_boundary(&self) -> bool {
         *self
             .admin_auth_boundary
-            .lock()
-            .expect("harvest api state lock poisoned")
-    }
-
-    fn health_requires_shard_readiness(&self) -> bool {
-        *self
-            .health_requires_shard_readiness
             .lock()
             .expect("harvest api state lock poisoned")
     }
@@ -574,8 +545,6 @@ struct HarvestHealth {
     queues: Vec<String>,
     dag_count: usize,
     scheduler: SchedulerSnapshot,
-    shard_readiness_enforced: bool,
-    shard_readiness: Option<ShardHealthReport>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3743,7 +3712,9 @@ async fn concurrency_status(
     Ok(Json(result))
 }
 
-async fn health(Extension(api_state): Extension<HarvestApiState>) -> axum::response::Response {
+async fn health(
+    Extension(api_state): Extension<HarvestApiState>,
+) -> Result<Json<HarvestHealth>, AutumnError> {
     let runtime = api_state.runtime().ok();
     let scheduler = runtime
         .as_ref()
@@ -3751,39 +3722,18 @@ async fn health(Extension(api_state): Extension<HarvestApiState>) -> axum::respo
             runtime.scheduler.clone()
         })
         .snapshot();
-    let shard_readiness_enforced = api_state.health_requires_shard_readiness();
-    let shard_readiness = if shard_readiness_enforced {
-        Some(build_shard_health_report(&api_state, None).await)
-    } else {
-        None
-    };
-    let status = if shard_readiness_enforced
-        && shard_readiness
-            .as_ref()
-            .is_some_and(|report| report.overall_readiness != ShardReadiness::Ready)
-    {
-        StatusCode::SERVICE_UNAVAILABLE
-    } else {
-        StatusCode::OK
-    };
 
-    (
-        status,
-        Json(HarvestHealth {
-            runtime_ready: runtime.is_some(),
-            worker_id: runtime
-                .as_ref()
-                .and_then(|runtime| runtime.worker_id.clone()),
-            queues: runtime
-                .as_ref()
-                .map_or_else(Vec::new, |runtime| runtime.queues.clone()),
-            dag_count: runtime.as_ref().map_or(0, |runtime| runtime.dags.len()),
-            scheduler,
-            shard_readiness_enforced,
-            shard_readiness,
-        }),
-    )
-        .into_response()
+    Ok(Json(HarvestHealth {
+        runtime_ready: runtime.is_some(),
+        worker_id: runtime
+            .as_ref()
+            .and_then(|runtime| runtime.worker_id.clone()),
+        queues: runtime
+            .as_ref()
+            .map_or_else(Vec::new, |runtime| runtime.queues.clone()),
+        dag_count: runtime.as_ref().map_or(0, |runtime| runtime.dags.len()),
+        scheduler,
+    }))
 }
 
 pub(crate) async fn load_execution(
