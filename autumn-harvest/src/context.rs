@@ -1741,14 +1741,10 @@ impl WorkflowContext {
                 .update_registry
                 .lock()
                 .expect("update_registry lock poisoned");
-            // Check existence structurally so validator errors are never confused
-            // with a missing handler, regardless of the error message text.
-            if !registry.contains(name) {
-                return Err(HarvestError::UpdateHandlerNotFound(name.to_string()));
+            match registry.get_validator(name) {
+                Some(validator) => validator,
+                None => return Err(HarvestError::UpdateHandlerNotFound(name.to_string())),
             }
-            registry
-                .get_validator(name)
-                .map_err(|reason| HarvestError::UpdateRejected { reason })?
         };
 
         if let Some(validator) = validator_opt {
