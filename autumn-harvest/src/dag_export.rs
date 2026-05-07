@@ -4,6 +4,11 @@
 //! and tool-compatible diagram formats such as Mermaid.js and Graphviz DOT.
 //! This is useful for debugging, documentation, and visualizing dependencies.
 use crate::dag::DagDefinition;
+#[cfg(feature = "testing")]
+use crate::dag_profiler::{DagProfile, ProfilerEventKind};
+#[cfg(feature = "testing")]
+use std::collections::HashMap;
+
 use std::fmt::Write;
 
 /// Exports the DAG definition to a Mermaid.js flowchart.
@@ -153,5 +158,100 @@ digraph DAG {
 }
 ";
         assert_eq!(dot, expected_dot);
+    }
+}
+
+/// Exports a DAG execution profile to a Mermaid.js Gantt chart.
+///
+/// # Examples
+///
+/// ```rust
+/// use std::time::Duration;
+/// use autumn_harvest::dag_profiler::{DagProfile, ProfilerEvent, ProfilerEventKind};
+/// use autumn_harvest::dag_export::export_mermaid_gantt;
+///
+/// let profile = DagProfile {
+///     total_duration: Duration::from_secs(5),
+///     peak_concurrency: 1,
+///     timeline: vec![
+///         ProfilerEvent { time: Duration::from_secs(0), kind: ProfilerEventKind::TaskStarted(0, "task_a".to_string()) },
+///         ProfilerEvent { time: Duration::from_secs(5), kind: ProfilerEventKind::TaskCompleted(0, "task_a".to_string()) },
+///     ]
+/// };
+///
+/// let gantt = export_mermaid_gantt(&profile).unwrap();
+/// assert!(gantt.contains("gantt"));
+/// assert!(gantt.contains("task_a"));
+/// ```
+///
+/// # Errors
+/// Returns `std::fmt::Error` if string formatting fails.
+#[cfg(feature = "testing")]
+pub fn export_mermaid_gantt(profile: &DagProfile) -> Result<String, std::fmt::Error> {
+    let mut out = String::new();
+    writeln!(out, "gantt")?;
+    writeln!(
+        out,
+        "    title DAG Execution Profile (Peak Concurrency: {})",
+        profile.peak_concurrency
+    )?;
+    writeln!(out, "    dateFormat X")?;
+    writeln!(out, "    axisFormat %M:%S")?;
+    writeln!(out, "    section Tasks")?;
+
+    let mut start_times = HashMap::new();
+
+    for event in &profile.timeline {
+        match &event.kind {
+            ProfilerEventKind::TaskStarted(id, _name) => {
+                start_times.insert(*id, event.time.as_secs());
+            }
+            ProfilerEventKind::TaskCompleted(id, name) => {
+                if let Some(start) = start_times.remove(id) {
+                    let end = event.time.as_secs();
+                    writeln!(out, "    {name} : {start}, {end}")?;
+                }
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+#[cfg(test)]
+#[cfg(feature = "testing")]
+mod testing_tests {
+    use super::*;
+    use crate::dag_profiler::{DagProfile, ProfilerEvent, ProfilerEventKind};
+    use std::time::Duration;
+
+    #[test]
+    fn test_export_mermaid_gantt() {
+        let profile = DagProfile {
+            total_duration: Duration::from_secs(5),
+            peak_concurrency: 2,
+            timeline: vec![
+                ProfilerEvent {
+                    time: Duration::from_secs(0),
+                    kind: ProfilerEventKind::TaskStarted(0, "task_a".to_string()),
+                },
+                ProfilerEvent {
+                    time: Duration::from_secs(2),
+                    kind: ProfilerEventKind::TaskCompleted(0, "task_a".to_string()),
+                },
+                ProfilerEvent {
+                    time: Duration::from_secs(2),
+                    kind: ProfilerEventKind::TaskStarted(1, "task_b".to_string()),
+                },
+                ProfilerEvent {
+                    time: Duration::from_secs(5),
+                    kind: ProfilerEventKind::TaskCompleted(1, "task_b".to_string()),
+                },
+            ],
+        };
+
+        let gantt = export_mermaid_gantt(&profile).unwrap();
+        let expected = "gantt\n    title DAG Execution Profile (Peak Concurrency: 2)\n    dateFormat X\n    axisFormat %M:%S\n    section Tasks\n    task_a : 0, 2\n    task_b : 2, 5\n";
+        assert_eq!(gantt, expected);
     }
 }

@@ -123,6 +123,8 @@ pub use cache::{CachedWorkflowState, WorkflowCache};
 pub use context::{ActivityContext, WorkflowCommand, WorkflowContext};
 pub use critical_path::{CriticalPathAnalyzer, CriticalPathResult};
 pub use dag::{DagBuildError, DagBuilder, DagDefinition, DagTask, DagTaskRef};
+#[cfg(feature = "testing")]
+pub use dag_export::export_mermaid_gantt;
 pub use dag_export::{export_dot, export_mermaid};
 pub use dag_linter::{
     DagLinter, DagRule, DagWarning, ExcessiveParallelismRule, MissingRetryPolicyRule,
