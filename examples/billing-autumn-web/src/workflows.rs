@@ -156,11 +156,14 @@ pub async fn billing_checkout(
             reason: "payment capture was rejected".to_owned(),
         });
     }
-    let capture_id = capture
-        .get("capture_id")
-        .and_then(Value::as_str)
-        .unwrap_or("capture-missing")
-        .to_owned();
+    let Some(capture_id) = capture.get("capture_id").and_then(Value::as_str) else {
+        saga.compensate_all().await?;
+        return Err(HarvestError::WorkflowFailed {
+            name: "billing_checkout".to_owned(),
+            reason: "payment_captured signal missing capture_id".to_owned(),
+        });
+    };
+    let capture_id = capture_id.to_owned();
 
     ctx.execute_activity_raw(
         "record_payment_capture",
