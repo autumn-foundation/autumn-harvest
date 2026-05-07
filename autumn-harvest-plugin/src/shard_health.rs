@@ -158,10 +158,30 @@ pub async fn build_shard_health_report(
             seen.insert(row.shard_id);
             rows.push(row);
         }
+        if let Some(runtime) = runtime.as_ref() {
+            for shard_id in router_shard_ids(runtime) {
+                if seen.insert(shard_id) {
+                    rows.push(unavailable_row(
+                        shard_id,
+                        roles_for_shard(shard_id, Some(runtime)),
+                        candidate_shard == Some(shard_id),
+                        freshness_window,
+                        format!(
+                            "shard {shard_id} is configured in router but has no installed pool"
+                        ),
+                    ));
+                }
+            }
+        }
     } else {
         let fallback = runtime.as_ref().map_or_else(
             || vec![ShardId::new(0)],
-            |runtime| runtime.router().readable_shards().to_vec(),
+            |runtime| {
+                router_shard_ids(runtime)
+                    .into_iter()
+                    .map(ShardId::new)
+                    .collect()
+            },
         );
         for shard in fallback {
             let shard_id = shard.as_i32();
@@ -243,7 +263,7 @@ async fn observe_shard(
     if !schema.ready {
         if let Some(error) = &schema.error {
             blocking_reasons.push(format!("schema readiness could not be confirmed: {error}"));
-            error_summary = Some(error.clone());
+            error_summary.get_or_insert_with(|| error.clone());
         } else {
             blocking_reasons.push(format!(
                 "schema is missing required migrations: {}",
@@ -377,6 +397,26 @@ fn roles_for_shard(shard_id: i32, runtime: Option<&HarvestApiRuntime>) -> Vec<Sh
         roles.push(ShardRole::Default);
     }
     roles
+}
+
+fn router_shard_ids(runtime: &HarvestApiRuntime) -> BTreeSet<i32> {
+    let mut shards = BTreeSet::new();
+    shards.extend(
+        runtime
+            .router()
+            .readable_shards()
+            .iter()
+            .map(|shard| shard.as_i32()),
+    );
+    shards.extend(
+        runtime
+            .router()
+            .writable_shards()
+            .iter()
+            .map(|shard| shard.as_i32()),
+    );
+    shards.insert(runtime.router().default_shard().as_i32());
+    shards
 }
 
 #[derive(diesel::QueryableByName)]

@@ -527,3 +527,47 @@ async fn migration_mismatch_marks_only_affected_shard_unready() {
         "schema mismatch should list missing migrations: {mismatched}"
     );
 }
+
+#[tokio::test]
+async fn router_only_writable_shard_is_reported_unready() {
+    let mut pools = BTreeMap::new();
+    pools.insert(
+        ShardId::new(0),
+        build_test_pool("postgres://postgres:postgres@127.0.0.1:1/shard0"),
+    );
+    let pool = HarvestDbPool::sharded(ShardedDbPool::from_map(pools, ShardId::new(0)));
+    let router = ShardRouter::new(
+        vec![ShardId::new(0), ShardId::new(1)],
+        vec![ShardId::new(0), ShardId::new(1)],
+        ShardId::new(0),
+    );
+    let state = api_state(
+        pool,
+        runtime_for(
+            &["default"],
+            None,
+            Vec::new(),
+            router,
+            SchedulerMonitor::offline(),
+        ),
+    );
+    let app = harvest_api_router(state).with_state(AppState::for_test().with_profile("test"));
+
+    let (status, body) = get_json(&app, "/admin/shards/health").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["overall_readiness"], "unready");
+    let router_only = find_shard(&body, 1);
+    assert_eq!(router_only["reachable"], false);
+    assert_eq!(router_only["readiness"], "unready");
+    assert_eq!(
+        roles(router_only),
+        vec!["readable".to_string(), "writable".to_string()]
+    );
+    assert!(
+        router_only["error_summary"].as_str().is_some_and(
+            |summary| summary.contains("configured in router but has no installed pool")
+        ),
+        "router-only shard should explain missing pool: {router_only}"
+    );
+}
