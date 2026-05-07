@@ -19,11 +19,12 @@ use tokio_util::sync::CancellationToken;
 
 use crate::context::ActivityContext;
 use crate::error::{HarvestError, HarvestResult};
+use crate::execution::StartedWorkflowExecution;
 use crate::info::DagInfo;
 use crate::models::{DagRun, HarvestSchedule, NewDagRun, NewHarvestSchedule};
 use crate::policy::{RetryPolicy, Schedule, TaskStatus, WorkflowSchedule};
 use crate::schema::{harvest_dag_runs, harvest_schedules, harvest_workflow_executions};
-use crate::types::{ActivityExecId, IdempotencyKey};
+use crate::types::{ActivityExecId, ExecutionId, IdempotencyKey, WorkflowIdReusePolicy};
 use crate::worker::{DbPool, HandlerRegistry};
 
 const DEFAULT_SCHEDULER_TICK_INTERVAL: Duration = Duration::from_secs(1);
@@ -673,10 +674,61 @@ async fn activate_queued_runs<'a>(
 /// Derive a deterministic, idempotent `workflow_id` for a scheduled run.
 ///
 /// The id is stable across retries: if the scheduler ticks twice before
-/// updating `last_run_at`, `start_or_load_workflow_execution` returns the
-/// existing execution rather than starting a duplicate.
+/// updating `last_run_at`, `RejectDuplicate` reports the already-created
+/// execution and the scheduler treats that slot as dispatched.
 fn scheduled_workflow_id(workflow_name: &str, scheduled_for: DateTime<Utc>) -> String {
     format!("sched:{}:{}", workflow_name, scheduled_for.timestamp())
+}
+
+const fn scheduled_workflow_reuse_policy() -> WorkflowIdReusePolicy {
+    WorkflowIdReusePolicy::RejectDuplicate
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ScheduledStartOutcome {
+    Created { exec_id: ExecutionId, state: String },
+    Duplicate { exec_id: ExecutionId, state: String },
+}
+
+impl ScheduledStartOutcome {
+    const fn created(&self) -> bool {
+        matches!(self, Self::Created { .. })
+    }
+
+    const fn exec_id(&self) -> ExecutionId {
+        match self {
+            Self::Created { exec_id, .. } | Self::Duplicate { exec_id, .. } => *exec_id,
+        }
+    }
+
+    fn state(&self) -> &str {
+        match self {
+            Self::Created { state, .. } | Self::Duplicate { state, .. } => state,
+        }
+    }
+}
+
+fn scheduled_start_outcome(
+    result: HarvestResult<StartedWorkflowExecution>,
+) -> HarvestResult<ScheduledStartOutcome> {
+    match result {
+        Ok(started) if started.created => Ok(ScheduledStartOutcome::Created {
+            exec_id: started.exec_id,
+            state: started.state,
+        }),
+        Ok(started) => Ok(ScheduledStartOutcome::Duplicate {
+            exec_id: started.exec_id,
+            state: started.state,
+        }),
+        Err(HarvestError::AlreadyExists {
+            existing_exec_id,
+            existing_state,
+        }) => Ok(ScheduledStartOutcome::Duplicate {
+            exec_id: existing_exec_id,
+            state: existing_state,
+        }),
+        Err(error) => Err(error),
+    }
 }
 
 /// Process due workflow-schedule rows and dispatch workflow starts.
@@ -765,7 +817,6 @@ async fn tick_one_workflow_schedule(
 ) -> HarvestResult<()> {
     use crate::execution::StartWorkflowParams;
     use crate::schema::harvest_schedules::dsl;
-    use crate::types::{ExecutionId, WorkflowIdReusePolicy};
 
     let running: i64 = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::workflow_name.eq(wf_name))
@@ -829,7 +880,7 @@ async fn tick_one_workflow_schedule(
             workflow_name = %wf_name, workflow_id = %workflow_id,
             scheduled_for = %scheduled_for, "harvest: dispatching scheduled workflow run"
         );
-        match crate::execution::start_or_load_workflow_execution(
+        let start_result = crate::execution::start_or_load_workflow_execution(
             conn,
             StartWorkflowParams {
                 workflow_name: wf_name,
@@ -841,22 +892,24 @@ async fn tick_one_workflow_schedule(
                 execution_timeout: None,
                 memo: None,
                 search_attrs: None,
-                // TODO(#87): switch to RejectDuplicate once #87 lands.
-                reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
+                reuse_policy: scheduled_workflow_reuse_policy(),
                 trace_context: None,
             },
         )
-        .await
-        {
-            Ok(started) => {
+        .await;
+        match scheduled_start_outcome(start_result) {
+            Ok(outcome) => {
                 dispatched += 1;
                 last_dispatched_at = Some(*scheduled_for);
-                if started.created {
+                if outcome.created() {
                     metrics.record_schedule_run("workflow", wf_name);
                 }
                 tracing::info!(
-                    workflow_name = %wf_name, execution_id = %started.exec_id,
-                    created = started.created, "harvest: scheduled workflow run dispatched"
+                    workflow_name = %wf_name,
+                    execution_id = %outcome.exec_id(),
+                    state = %outcome.state(),
+                    created = outcome.created(),
+                    "harvest: scheduled workflow run dispatched"
                 );
             }
             Err(error) => {
@@ -1228,5 +1281,33 @@ mod tests {
     fn create_new_dag_runs_returns_empty_for_no_dates() {
         let rows = create_new_dag_runs("test_dag", &[]);
         assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn scheduled_workflow_starts_use_reject_duplicate_policy() {
+        assert_eq!(
+            scheduled_workflow_reuse_policy(),
+            crate::types::WorkflowIdReusePolicy::RejectDuplicate
+        );
+    }
+
+    #[test]
+    fn scheduled_start_already_exists_counts_as_duplicate_slot() {
+        let existing_exec_id = ExecutionId::new();
+
+        let outcome = scheduled_start_outcome(Err(HarvestError::AlreadyExists {
+            existing_exec_id,
+            existing_state: "RUNNING".to_string(),
+        }))
+        .expect("scheduled duplicate should be treated as an already dispatched slot");
+
+        assert_eq!(
+            outcome,
+            ScheduledStartOutcome::Duplicate {
+                exec_id: existing_exec_id,
+                state: "RUNNING".to_string(),
+            }
+        );
+        assert!(!outcome.created());
     }
 }
