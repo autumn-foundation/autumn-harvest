@@ -178,6 +178,7 @@ pub enum WorkflowResetError {
     },
     #[error("continue-as-new histories cannot be reset in v1")]
     ContinueAsNew,
+    /// An underlying storage or database error occurred during the reset operation.
     #[error(transparent)]
     Harvest(#[from] HarvestError),
 }

@@ -40,11 +40,36 @@ const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const DEFAULT_BATCH_SIZE: usize = 1_000;
 const MIN_MAX_AGE: Duration = Duration::from_secs(1);
 const MAX_MAX_AGE: Duration = Duration::from_secs(60 * 60 * 24 * 365 * 10);
+
+/// Configuration for the background retention job.
+///
+/// **Why does this exist?**
+/// Workflow histories and audit logs can grow unbounded. This configuration allows operators
+/// to define constraints for automatically pruning old, closed workflows and stale audit events
+/// to prevent storage exhaustion.
+///
+/// ## Examples
+///
+/// ```rust
+/// use autumn_harvest::retention::RetentionConfig;
+/// use std::time::Duration;
+///
+/// let config = RetentionConfig::with_max_age(Duration::from_secs(86400))
+///     .with_audit_retention_days(30);
+///
+/// assert!(config.enabled());
+/// ```
 #[derive(Debug, Clone, Serialize)]
 pub struct RetentionConfig {
+    /// Maximum age in seconds for closed workflows before they are eligible for deletion.
+    /// If `None`, workflow history retention is disabled.
     pub max_age_secs: Option<u64>,
+    /// How often the background retention job wakes up to scan for expired data.
     pub tick_interval_secs: u64,
+    /// The maximum number of records to process in a single transaction/batch.
     pub batch_size: usize,
+    /// If `true`, the retention job simulates deletions and logs what would have been deleted
+    /// without actually modifying the database.
     pub dry_run: bool,
     /// Audit log retention in days, independent of workflow-history retention.
     /// Defaults to 90 days (3 months). Set to 0 to disable audit purging.
@@ -64,6 +89,7 @@ impl Default for RetentionConfig {
 }
 
 impl RetentionConfig {
+    /// Bootstraps a fresh configuration template that explicitly opts-in to the workflow retention features.
     #[must_use]
     pub fn with_max_age(max_age: Duration) -> Self {
         Self {
@@ -79,11 +105,14 @@ impl RetentionConfig {
         self
     }
 
+    /// Safely unpacks the raw configuration integer into a standard rust [`Duration`], gracefully
+    /// handling systems where the feature is entirely turned off.
     #[must_use]
     pub fn max_age(&self) -> Option<Duration> {
         self.max_age_secs.map(Duration::from_secs)
     }
 
+    /// Translates the raw numeric tick value into a standard [`Duration`] for the scheduler loop.
     #[must_use]
     pub const fn tick_interval(&self) -> Duration {
         Duration::from_secs(self.tick_interval_secs)
@@ -112,35 +141,64 @@ impl RetentionConfig {
         Ok(())
     }
 
+    /// Returns `true` if any retention features (workflow history or audit log purging) are enabled.
     #[must_use]
     pub const fn enabled(&self) -> bool {
         self.max_age_secs.is_some() || self.audit_retention_days > 0
     }
 }
 
+/// The result of a single execution tick of the retention job on a specific shard.
+///
+/// **Why does this exist?**
+/// Provides observability into the retention job's performance and impact. It captures
+/// how many records were evaluated, how many were deleted, and any errors encountered,
+/// allowing operators to monitor the health of the background cleanup process.
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct RetentionTickResult {
+    /// The ID of the shard this retention tick operated on.
     pub shard: u16,
+    /// The timestamp when this retention tick started.
     pub ran_at: Option<DateTime<Utc>>,
+    /// The number of expired candidate records identified during the tick.
     pub candidate_count: usize,
+    /// The actual number of records successfully deleted during the tick.
     pub deleted_count: usize,
+    /// The age (in seconds) of the oldest closed workflow that was skipped (not yet expired).
+    /// Used for tuning the `max_age_secs` configuration.
     pub oldest_age_secs_skipped: Option<u64>,
+    /// The duration of the retention tick in milliseconds.
     pub duration_ms: u128,
+    /// The last error encountered during the tick, if any.
     pub last_error: Option<String>,
 }
 
+/// The current overall status of the retention subsystem.
+///
+/// **Why does this exist?**
+/// Aggregates the static configuration and the dynamic runtime state (per-shard results)
+/// to provide a comprehensive snapshot of the retention process for diagnostic APIs.
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct RetentionStatus {
+    /// The active retention configuration.
     pub config: RetentionConfig,
+    /// The latest execution results for each active shard.
     pub per_shard: Vec<RetentionTickResult>,
 }
 
+/// A thread-safe monitor for observing the background retention process.
+///
+/// **Why does this exist?**
+/// Enables the background retention job to asynchronously report its progress and results,
+/// while allowing external components (like administrative APIs or telemetry systems)
+/// to safely query the latest status without blocking or tearing.
 #[derive(Debug, Clone)]
 pub struct RetentionMonitor {
     inner: Arc<Mutex<RetentionStatus>>,
 }
 
 impl RetentionMonitor {
+    /// Boots up a clean monitoring tracker that acts as the initial blank canvas before shards report results.
     #[must_use]
     pub fn new(config: RetentionConfig, shards: impl Iterator<Item = ShardId>) -> Self {
         let per_shard = shards
@@ -178,6 +236,12 @@ impl RetentionMonitor {
     }
 }
 
+/// Represents the running background task that processes retention policies.
+///
+/// **Why does this exist?**
+/// Provides a handle to control and monitor the active background retention job.
+/// It encapsulates the background tokio task, the cancellation token for graceful shutdown,
+/// and the channel used to force immediate retention sweeps.
 #[cfg(feature = "db")]
 pub struct RetentionRuntime {
     shutdown: CancellationToken,
@@ -308,20 +372,25 @@ impl RetentionRuntime {
         })
     }
 
+    /// Shares a snapshot interface allowing telemetry dashboards to safely peek at the process.
     #[must_use]
     pub fn monitor(&self) -> RetentionMonitor {
         self.monitor.clone()
     }
 
+    /// Forces the background worker to wake up and aggressively prune immediately without waiting
+    /// for the next interval loop.
     pub fn run_now(&self) {
         let _ = self.trigger_tx.try_send(());
     }
 
+    /// Exposes a direct channel to bypass scheduling and command the worker to act right now.
     #[must_use]
     pub fn trigger_sender(&self) -> mpsc::Sender<()> {
         self.trigger_tx.clone()
     }
 
+    /// Triggers the emergency stop sequence to abort any running operations gracefully.
     pub fn shutdown(&self) {
         self.shutdown.cancel();
     }
