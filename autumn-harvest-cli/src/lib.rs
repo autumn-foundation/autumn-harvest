@@ -179,7 +179,7 @@ pub enum CliError {
         status: String,
     },
 
-    /// Shard health completed but the deploy gate found an unready target.
+    /// Shard health completed but the deploy gate found a non-ready target.
     #[error("shard health readiness gate failed")]
     ShardHealthGate,
 }
@@ -290,7 +290,7 @@ enum ShardCommand {
         /// Evaluate this readable shard as a promotion candidate.
         #[arg(long)]
         candidate_shard: Option<i32>,
-        /// Exit non-zero if any writable shard or named candidate is unready.
+        /// Deprecated compatibility flag; shard health gates writable shards by default.
         #[arg(long)]
         fail_on_unready: bool,
     },
@@ -732,7 +732,7 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
             return Err(CliError::PreflightGate { status });
         }
     }
-    if shard_health_fail_on_unready(&cli) && shard_health_exit_code(&response) != 0 {
+    if shard_health_should_gate(&cli) && shard_health_exit_code(&response) != 0 {
         return Err(CliError::ShardHealthGate);
     }
     Ok(())
@@ -841,14 +841,11 @@ fn shard_health_wants_table(cli: &Cli) -> bool {
     ) && cli.output == OutputFormat::PrettyJson
 }
 
-const fn shard_health_fail_on_unready(cli: &Cli) -> bool {
+const fn shard_health_should_gate(cli: &Cli) -> bool {
     matches!(
         &cli.command,
         Commands::Shard {
-            command: ShardCommand::Health {
-                fail_on_unready: true,
-                ..
-            }
+            command: ShardCommand::Health { .. }
         }
     )
 }
@@ -865,7 +862,7 @@ fn shard_health_exit_code(value: &Value) -> i32 {
     let Some(shards) = value.get("shards").and_then(Value::as_array) else {
         return 1;
     };
-    let has_unready_gate_target = shards.iter().any(|shard| {
+    let has_non_ready_gate_target = shards.iter().any(|shard| {
         let readiness = shard.get("readiness").and_then(Value::as_str);
         if readiness == Some("ready") {
             return false;
@@ -880,7 +877,7 @@ fn shard_health_exit_code(value: &Value) -> i32 {
             .is_some_and(|roles| roles.iter().any(|role| role.as_str() == Some("writable")));
         candidate || writable
     });
-    i32::from(has_unready_gate_target)
+    i32::from(has_non_ready_gate_target)
 }
 
 fn format_preflight_table(value: &Value) -> String {
@@ -1206,13 +1203,14 @@ fn roles_cell(shard: &Value) -> String {
 }
 
 fn worker_coverage_cell(shard: &Value) -> String {
+    let worker_counts = shard_worker_counts_cell(shard);
     let Some(coverage) = shard.get("worker_coverage").and_then(Value::as_array) else {
-        return "-".to_string();
+        return worker_counts.unwrap_or_else(|| "-".to_string());
     };
     if coverage.is_empty() {
-        return "-".to_string();
+        return worker_counts.unwrap_or_else(|| "-".to_string());
     }
-    coverage
+    let queue_coverage = coverage
         .iter()
         .map(|queue| {
             let name = queue.get("queue").and_then(Value::as_str).unwrap_or("?");
@@ -1225,7 +1223,18 @@ fn worker_coverage_cell(shard: &Value) -> String {
             format!("{name}:{healthy}/{mark}")
         })
         .collect::<Vec<_>>()
-        .join(",")
+        .join(",");
+    if let Some(counts) = worker_counts {
+        format!("{counts} {queue_coverage}")
+    } else {
+        queue_coverage
+    }
+}
+
+fn shard_worker_counts_cell(shard: &Value) -> Option<String> {
+    let active = shard.get("active_worker_count").and_then(Value::as_i64)?;
+    let stale = shard.get("stale_worker_count").and_then(Value::as_i64)?;
+    Some(format!("active={active} stale={stale}"))
 }
 
 fn scheduler_cell(shard: &Value) -> String {
@@ -2094,14 +2103,16 @@ mod reuse_policy_tests {
     fn shard_health_default_output_renders_compact_table() {
         let cli = parse(&["shard", "health"]);
         let payload = json!({
-            "overall_readiness": "unready",
+            "overall_readiness": "degraded",
             "observed_at": "2026-05-06T12:00:00Z",
             "shards": [{
                 "shard_id": 1,
                 "roles": ["readable"],
                 "candidate": true,
-                "readiness": "unready",
+                "readiness": "degraded",
                 "reachable": true,
+                "active_worker_count": 0,
+                "stale_worker_count": 0,
                 "schema": { "ready": true },
                 "worker_coverage": [{
                     "queue": "default",
@@ -2131,7 +2142,9 @@ mod reuse_policy_tests {
 
         assert!(rendered.contains("SHARD"));
         assert!(rendered.contains("readable"));
-        assert!(rendered.contains("unready"));
+        assert!(rendered.contains("degraded"));
+        assert!(rendered.contains("active=0"));
+        assert!(rendered.contains("stale=0"));
         assert!(rendered.contains("default"));
         assert!(!rendered.trim_start().starts_with('{'));
     }
@@ -2154,7 +2167,7 @@ mod reuse_policy_tests {
     }
 
     #[test]
-    fn shard_health_gate_fails_on_unready_writable_or_candidate_shards_only() {
+    fn shard_health_gate_fails_on_non_ready_writable_or_candidate_shards_only() {
         let payload = json!({
             "shards": [
                 {
@@ -2167,30 +2180,92 @@ mod reuse_policy_tests {
                     "shard_id": 1,
                     "roles": ["readable"],
                     "candidate": false,
-                    "readiness": "unready"
+                    "readiness": "degraded"
                 }
             ]
         });
         assert_eq!(shard_health_exit_code(&payload), 0);
 
-        let writable_unready = json!({
+        let writable_degraded = json!({
             "shards": [{
                 "shard_id": 0,
                 "roles": ["readable", "writable", "default"],
                 "candidate": false,
-                "readiness": "unready"
+                "readiness": "degraded"
             }]
         });
-        assert_eq!(shard_health_exit_code(&writable_unready), 1);
+        assert_eq!(shard_health_exit_code(&writable_degraded), 1);
 
-        let candidate_unready = json!({
+        let candidate_degraded = json!({
             "shards": [{
                 "shard_id": 2,
                 "roles": ["readable"],
                 "candidate": true,
-                "readiness": "unready"
+                "readiness": "degraded"
             }]
         });
-        assert_eq!(shard_health_exit_code(&candidate_unready), 1);
+        assert_eq!(shard_health_exit_code(&candidate_degraded), 1);
+    }
+
+    #[test]
+    fn shard_health_gate_is_enabled_by_default() {
+        let cli = parse(&["shard", "health"]);
+
+        assert!(
+            shard_health_should_gate(&cli),
+            "shard health is a rollout gate by default"
+        );
+    }
+
+    #[test]
+    fn shard_health_gate_treats_degraded_and_unavailable_as_failures() {
+        let degraded = json!({
+            "shards": [{
+                "shard_id": 0,
+                "roles": ["readable", "writable", "default"],
+                "candidate": false,
+                "readiness": "degraded"
+            }]
+        });
+        let unavailable = json!({
+            "shards": [{
+                "shard_id": 1,
+                "roles": ["readable", "writable"],
+                "candidate": false,
+                "readiness": "unavailable"
+            }]
+        });
+
+        assert_eq!(shard_health_exit_code(&degraded), 1);
+        assert_eq!(shard_health_exit_code(&unavailable), 1);
+    }
+
+    #[test]
+    fn shard_health_gate_fails_three_shard_rollout_with_uncovered_writable_shard() {
+        let payload = json!({
+            "shards": [
+                {
+                    "shard_id": 0,
+                    "roles": ["readable", "writable", "default"],
+                    "candidate": false,
+                    "readiness": "ready"
+                },
+                {
+                    "shard_id": 1,
+                    "roles": ["readable", "writable"],
+                    "candidate": false,
+                    "readiness": "ready"
+                },
+                {
+                    "shard_id": 2,
+                    "roles": ["readable", "writable"],
+                    "candidate": false,
+                    "readiness": "degraded",
+                    "reason_codes": ["worker_queue_uncovered"]
+                }
+            ]
+        });
+
+        assert_eq!(shard_health_exit_code(&payload), 1);
     }
 }
