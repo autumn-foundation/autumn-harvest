@@ -49,6 +49,62 @@ fn shard_health_candidate_maps_to_query_string() {
 }
 
 #[test]
+fn version_usage_report_maps_filters_to_management_api_request() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "version-usage",
+        "--workflow-name",
+        "billing_checkout",
+        "--change-id",
+        "billing_checkout_v2_tax",
+        "--version",
+        "1",
+        "--state-group",
+        "active",
+        "--shard-id",
+        "2",
+    ])
+    .expect("version usage args should parse");
+
+    let request = cli
+        .api_request()
+        .expect("version usage request should build");
+
+    assert_eq!(request.method, ApiMethod::Get);
+    assert_eq!(
+        request.path,
+        "/admin/version-gates/usage?workflow_name=billing_checkout\
+         &change_id=billing_checkout_v2_tax&recorded_version=1&state_group=active&shard_id=2"
+    );
+    assert_eq!(request.body, None);
+}
+
+#[test]
+fn version_usage_guard_maps_to_active_state_group() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "version-usage",
+        "--change-id",
+        "billing_checkout_v2_tax",
+        "--version",
+        "1",
+        "--guard",
+    ])
+    .expect("version usage guard args should parse");
+
+    let request = cli
+        .api_request()
+        .expect("version usage guard request should build");
+
+    assert_eq!(request.method, ApiMethod::Get);
+    assert_eq!(
+        request.path,
+        "/admin/version-gates/usage?change_id=billing_checkout_v2_tax&recorded_version=1&state_group=active"
+    );
+    assert_eq!(request.body, None);
+}
+
+#[test]
 fn workflow_start_maps_to_management_api_request() {
     let cli = Cli::try_parse_from([
         "harvest",

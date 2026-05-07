@@ -75,6 +75,8 @@ pub mod test_generator;
 pub mod testing;
 pub mod types;
 pub mod update;
+#[cfg(feature = "db")]
+pub mod version_usage;
 
 #[cfg(feature = "db")]
 #[doc(hidden)]
@@ -181,6 +183,10 @@ pub use types::{
     WorkflowId, WorkflowIdReusePolicy,
 };
 pub use update::UpdateRegistry;
+#[cfg(feature = "db")]
+pub use version_usage::{
+    VersionExecutionStateGroup, VersionUsageFilters, VersionUsageShardRow, load_version_usage,
+};
 
 #[cfg(feature = "db")]
 pub use store::EventHistory;

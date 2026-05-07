@@ -851,6 +851,48 @@ Use `ctx.version("change_id", 1, 2)` and guard the new code path behind the
 returned version number; old histories replay with version 1 and skip the new
 path.
 
+### Retiring a version-gated branch
+
+Use the version-gate usage report before deleting an old branch from workflow
+code. The report is read-only: it scans existing `version:{change_id}` marker
+events and never starts, cancels, signals, resets, replays, rewrites, or deletes
+workflow executions.
+
+Migration playbook:
+
+1. Introduce `ctx.version("billing_checkout_v2_tax", 1, 2)` and branch on the
+   returned version.
+2. Deploy the gated workflow code.
+3. Verify replay safety against representative histories with
+   `WorkflowReplayer`.
+4. Wait for active version-1 executions to drain.
+5. Run the guard:
+
+```bash
+cargo run -p autumn-harvest-cli -- version-usage \
+  --change-id billing_checkout_v2_tax \
+  --version 1 \
+  --guard
+```
+
+6. Remove the version-1 branch only after the guard exits successfully.
+
+For release automation, use compact JSON:
+
+```bash
+cargo run -p autumn-harvest-cli -- --output json version-usage \
+  --change-id billing_checkout_v2_tax \
+  --version 1 \
+  --state-group active
+```
+
+The management API endpoint is `GET /admin/version-gates/usage`. It supports
+`workflow_name`, `change_id`, `recorded_version`, `state_group` (`active`,
+`terminal`, or `all`), and `shard_id` filters. Response `status` is
+machine-readable: `complete`, `no_matches`, `partial`, or `unavailable`.
+Treat `partial` and `unavailable` as deploy blockers because one or more shards
+could not be inspected and a false zero would be worse than noisy code.
+
 ## Telemetry
 
 Harvest emits [OpenTelemetry](https://opentelemetry.io/)-compatible spans via the [`tracing`](https://docs.rs/tracing) crate. Eight named spans cover every durable boundary:

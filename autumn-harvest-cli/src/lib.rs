@@ -90,6 +90,27 @@ impl ResetSignalReapply {
     }
 }
 
+/// Execution-state scope for version-gate usage reports.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum VersionUsageStateGroup {
+    /// Include only executions that may still replay old branches.
+    Active,
+    /// Include only terminal executions.
+    Terminal,
+    /// Include active and terminal executions.
+    All,
+}
+
+impl VersionUsageStateGroup {
+    const fn as_wire(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Terminal => "terminal",
+            Self::All => "all",
+        }
+    }
+}
+
 /// HTTP method used by a management API request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ApiMethod {
@@ -182,6 +203,10 @@ pub enum CliError {
     /// Shard health completed but the deploy gate found a non-ready target.
     #[error("shard health readiness gate failed")]
     ShardHealthGate,
+
+    /// Version-gate guard found active usage or incomplete shard inspection.
+    #[error("version usage guard failed")]
+    VersionUsageGate,
 }
 
 impl CliError {
@@ -247,6 +272,27 @@ enum Commands {
     Audit {
         #[command(subcommand)]
         command: AuditCommand,
+    },
+    /// Report recorded workflow version-gate usage.
+    VersionUsage {
+        /// Filter by registered workflow name.
+        #[arg(long)]
+        workflow_name: Option<String>,
+        /// Filter by version-gate change id.
+        #[arg(long)]
+        change_id: Option<String>,
+        /// Filter by recorded version.
+        #[arg(long = "version", value_parser = clap::value_parser!(u32))]
+        recorded_version: Option<u32>,
+        /// Filter by execution state group.
+        #[arg(long, value_enum)]
+        state_group: Option<VersionUsageStateGroup>,
+        /// Filter by shard id.
+        #[arg(long)]
+        shard_id: Option<i32>,
+        /// Exit non-zero if any active execution still matches the filtered version gate.
+        #[arg(long, requires = "change_id", requires = "recorded_version")]
+        guard: bool,
     },
     /// Open the TUI dashboard to monitor workflows.
     Tui,
@@ -674,6 +720,21 @@ impl Cli {
             Commands::Concurrency { command } => Ok(concurrency_request(command)),
             Commands::Batch { command } => batch_request(command),
             Commands::Audit { command } => Ok(audit_request(command)),
+            Commands::VersionUsage {
+                workflow_name,
+                change_id,
+                recorded_version,
+                state_group,
+                shard_id,
+                guard,
+            } => Ok(version_usage_request(
+                workflow_name.as_deref(),
+                change_id.as_deref(),
+                *recorded_version,
+                *state_group,
+                *shard_id,
+                *guard,
+            )),
             Commands::Tui => unreachable!("Tui command handles its own requests"),
         }
     }
@@ -734,6 +795,9 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
     }
     if shard_health_should_gate(&cli) && shard_health_exit_code(&response) != 0 {
         return Err(CliError::ShardHealthGate);
+    }
+    if version_usage_should_guard(&cli) && version_usage_guard_exit_code(&response) != 0 {
+        return Err(CliError::VersionUsageGate);
     }
     Ok(())
 }
@@ -819,6 +883,9 @@ fn render_response(cli: &Cli, value: &Value) -> Result<String, CliError> {
     if audit_list_wants_table(cli) {
         return Ok(format_audit_table(value));
     }
+    if version_usage_wants_table(cli) {
+        return Ok(format_version_usage_table(value));
+    }
 
     let output = if workflow_children_wants_raw_json(cli) {
         OutputFormat::Json
@@ -878,6 +945,34 @@ fn shard_health_exit_code(value: &Value) -> i32 {
         candidate || writable
     });
     i32::from(has_non_ready_gate_target)
+}
+
+const fn version_usage_should_guard(cli: &Cli) -> bool {
+    matches!(&cli.command, Commands::VersionUsage { guard: true, .. })
+}
+
+fn version_usage_wants_table(cli: &Cli) -> bool {
+    matches!(&cli.command, Commands::VersionUsage { .. }) && cli.output == OutputFormat::PrettyJson
+}
+
+fn version_usage_guard_exit_code(value: &Value) -> i32 {
+    let status = value
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unavailable");
+    if matches!(status, "partial" | "unavailable") {
+        return 1;
+    }
+    let active = value
+        .get("items")
+        .and_then(Value::as_array)
+        .map_or(0, |items| {
+            items
+                .iter()
+                .filter_map(|item| item.get("active_executions").and_then(Value::as_i64))
+                .sum::<i64>()
+        });
+    i32::from(active > 0)
 }
 
 fn format_preflight_table(value: &Value) -> String {
@@ -1012,6 +1107,72 @@ fn format_shard_health_table(value: &Value) -> String {
         .join("\n");
 
     format!("overall_readiness: {overall}\nobserved_at: {observed_at}\n\n{table}")
+}
+
+fn format_version_usage_table(value: &Value) -> String {
+    let status = value
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let observed_at = value
+        .get("observed_at")
+        .and_then(Value::as_str)
+        .unwrap_or("-");
+    let Some(items) = value.get("items").and_then(Value::as_array) else {
+        return format!(
+            "status: {status}\nobserved_at: {observed_at}\nNo version usage rows returned."
+        );
+    };
+    if items.is_empty() {
+        return format!(
+            "status: {status}\nobserved_at: {observed_at}\nNo version usage rows found."
+        );
+    }
+
+    let mut rows = Vec::with_capacity(items.len() + 1);
+    rows.push(vec![
+        "WORKFLOW".to_string(),
+        "CHANGE ID".to_string(),
+        "VERSION".to_string(),
+        "ACTIVE".to_string(),
+        "TERMINAL".to_string(),
+        "OLDEST_AGE_S".to_string(),
+        "NEWEST_AGE_S".to_string(),
+        "SHARDS".to_string(),
+        "UNAVAILABLE".to_string(),
+    ]);
+    for item in items {
+        rows.push(vec![
+            cell_str(item.get("workflow_name")),
+            cell_str(item.get("change_id")),
+            cell_number(item.get("recorded_version")),
+            cell_number(item.get("active_executions")),
+            cell_number(item.get("terminal_executions")),
+            cell_number(item.get("oldest_matching_execution_age_secs")),
+            cell_number(item.get("newest_matching_execution_age_secs")),
+            shard_array_cell(item, "matched_shards"),
+            shard_array_cell(item, "unavailable_shards"),
+        ]);
+    }
+
+    let widths = (0..rows[0].len())
+        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
+        .collect::<Vec<_>>();
+    let table = rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .enumerate()
+                .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
+                .collect::<Vec<_>>()
+                .join("  ")
+                .trim_end()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!("status: {status}\nobserved_at: {observed_at}\n\n{table}")
 }
 
 fn audit_list_wants_table(cli: &Cli) -> bool {
@@ -1169,6 +1330,25 @@ fn cell_optional_number(value: Option<&Value>) -> String {
         .map_or_else(|| "-".to_string(), |number| number.to_string())
 }
 
+fn shard_array_cell(item: &Value, field: &str) -> String {
+    let Some(values) = item
+        .get("shard_coverage")
+        .and_then(|coverage| coverage.get(field))
+        .and_then(Value::as_array)
+    else {
+        return "-".to_string();
+    };
+    if values.is_empty() {
+        return "-".to_string();
+    }
+    values
+        .iter()
+        .filter_map(Value::as_i64)
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn bool_cell(value: Option<&Value>) -> String {
     match value.and_then(Value::as_bool) {
         Some(true) => "yes".to_string(),
@@ -1282,6 +1462,47 @@ fn shard_request(command: &ShardCommand) -> ApiRequest {
             |shard| ApiRequest::get(format!("/admin/shards/health?candidate_shard={shard}")),
         ),
     }
+}
+
+fn version_usage_request(
+    workflow_name: Option<&str>,
+    change_id: Option<&str>,
+    recorded_version: Option<u32>,
+    state_group: Option<VersionUsageStateGroup>,
+    shard_id: Option<i32>,
+    guard: bool,
+) -> ApiRequest {
+    let state_group = if guard {
+        VersionUsageStateGroup::Active
+    } else {
+        state_group.unwrap_or(VersionUsageStateGroup::All)
+    };
+    let mut params: Vec<(&'static str, String)> = Vec::new();
+    if let Some(value) = workflow_name {
+        params.push(("workflow_name", value.to_string()));
+    }
+    if let Some(value) = change_id {
+        params.push(("change_id", value.to_string()));
+    }
+    if let Some(value) = recorded_version {
+        params.push(("recorded_version", value.to_string()));
+    }
+    if state_group != VersionUsageStateGroup::All {
+        params.push(("state_group", state_group.as_wire().to_string()));
+    }
+    if let Some(value) = shard_id {
+        params.push(("shard_id", value.to_string()));
+    }
+
+    if params.is_empty() {
+        return ApiRequest::get("/admin/version-gates/usage");
+    }
+    let encoded = params
+        .iter()
+        .map(|(key, value)| format!("{key}={}", query_encode(value)))
+        .collect::<Vec<_>>()
+        .join("&");
+    ApiRequest::get(format!("/admin/version-gates/usage?{encoded}"))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -2267,5 +2488,75 @@ mod reuse_policy_tests {
         });
 
         assert_eq!(shard_health_exit_code(&payload), 1);
+    }
+
+    #[test]
+    fn version_usage_default_output_renders_compact_table() {
+        let cli = parse(&["version-usage"]);
+        let payload = json!({
+            "status": "complete",
+            "observed_at": "2026-05-07T12:00:00Z",
+            "items": [{
+                "workflow_name": "billing_checkout",
+                "change_id": "billing_checkout_v2_tax",
+                "recorded_version": 1,
+                "active_executions": 1,
+                "terminal_executions": 2,
+                "oldest_matching_execution_age_secs": 3600,
+                "newest_matching_execution_age_secs": 60,
+                "shard_coverage": {
+                    "inspected_shards": [0, 1],
+                    "matched_shards": [0],
+                    "unavailable_shards": []
+                }
+            }],
+            "shards": []
+        });
+
+        let rendered = render_response(&cli, &payload).expect("table output should render");
+
+        assert!(rendered.contains("WORKFLOW"));
+        assert!(rendered.contains("billing_checkout"));
+        assert!(rendered.contains("billing_checkout_v2_tax"));
+        assert!(!rendered.trim_start().starts_with('{'));
+    }
+
+    #[test]
+    fn version_usage_json_output_preserves_raw_payload_shape() {
+        let cli = parse(&["--output", "json", "version-usage"]);
+        let payload = json!({
+            "status": "no_matches",
+            "observed_at": "2026-05-07T12:00:00Z",
+            "items": [],
+            "shards": []
+        });
+
+        let rendered = render_response(&cli, &payload).expect("json output should render");
+
+        assert_eq!(
+            rendered,
+            r#"{"items":[],"observed_at":"2026-05-07T12:00:00Z","shards":[],"status":"no_matches"}"#
+        );
+    }
+
+    #[test]
+    fn version_usage_guard_fails_on_active_usage_or_incomplete_shards() {
+        let active = json!({
+            "status": "complete",
+            "items": [{ "active_executions": 1 }]
+        });
+        assert_eq!(version_usage_guard_exit_code(&active), 1);
+
+        let drained = json!({
+            "status": "complete",
+            "items": [{ "active_executions": 0, "terminal_executions": 4 }]
+        });
+        assert_eq!(version_usage_guard_exit_code(&drained), 0);
+
+        let partial = json!({
+            "status": "partial",
+            "items": []
+        });
+        assert_eq!(version_usage_guard_exit_code(&partial), 1);
     }
 }
