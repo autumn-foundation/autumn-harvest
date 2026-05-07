@@ -703,16 +703,30 @@ add it to `readable_shards`, restart the plugin, then run the readiness gate
 before promotion:
 
 ```bash
-cargo run -p autumn-harvest-cli -- shard health --candidate-shard 1 --fail-on-unready
-cargo run -p autumn-harvest-cli -- --output json shard health --candidate-shard 1 --fail-on-unready
+cargo run -p autumn-harvest-cli -- shard health --candidate-shard 1
+cargo run -p autumn-harvest-cli -- --output json shard health --candidate-shard 1
 ```
 
 The matching management API endpoint is `GET /api/harvest/admin/shards/health`.
 It returns one row per configured shard, including shard roles, reachability,
-schema readiness, worker queue coverage, scheduler freshness when schedules are
-enabled, queue/DLQ pressure, and explicit promotion blockers. Only after the
-candidate row reports `readiness: "ready"` should you flip it into
-`writable_shards`. In-flight workflows drain on their original shard.
+schema readiness, active/stale worker counts, worker queue coverage, scheduler
+freshness when schedules are enabled, queue/DLQ pressure, and machine-readable
+reason codes. The CLI exits non-zero when any writable shard or named candidate
+reports `degraded` or `unavailable`. Only after the candidate row reports
+`readiness: "ready"` should you flip it into `writable_shards`. In-flight
+workflows drain on their original shard.
+
+By default `/api/harvest/health` stays a cheap liveness check for local
+single-shard development. To make it a rollout/readiness probe that returns
+`503` until writable shard readiness is `ready`, enable:
+
+```toml
+[harvest.readiness]
+require_shard_readiness = true
+```
+
+The equivalent environment override is
+`AUTUMN_HARVEST_READINESS__REQUIRE_SHARD_READINESS=true`.
 
 ## Testing workflow code changes with the replayer
 

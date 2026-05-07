@@ -640,8 +640,12 @@ async fn activate_queued_runs<'a>(
         }
         let queued_ids: Vec<_> = queued.iter().map(|r| r.id).collect();
 
+        // Keep the state predicate in the claim update so a second scheduler
+        // that selected stale QUEUED rows cannot reactivate the same run.
         let mut updated_runs = diesel::update(
-            dag_runs_dsl::harvest_dag_runs.filter(dag_runs_dsl::id.eq_any(queued_ids)),
+            dag_runs_dsl::harvest_dag_runs
+                .filter(dag_runs_dsl::id.eq_any(queued_ids))
+                .filter(dag_runs_dsl::state.eq("QUEUED")),
         )
         .set((
             dag_runs_dsl::state.eq("RUNNING"),
@@ -847,7 +851,9 @@ async fn tick_one_workflow_schedule(
             Ok(started) => {
                 dispatched += 1;
                 last_dispatched_at = Some(*scheduled_for);
-                metrics.record_schedule_run("workflow", wf_name);
+                if started.created {
+                    metrics.record_schedule_run("workflow", wf_name);
+                }
                 tracing::info!(
                     workflow_name = %wf_name, execution_id = %started.exec_id,
                     created = started.created, "harvest: scheduled workflow run dispatched"
