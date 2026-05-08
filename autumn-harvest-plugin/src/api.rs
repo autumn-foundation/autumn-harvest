@@ -192,6 +192,9 @@ pub struct HarvestApiState {
     admin_auth_boundary: Arc<Mutex<bool>>,
     /// When enabled, `/health` returns 503 until writable shards are ready.
     health_requires_shard_readiness: Arc<Mutex<bool>>,
+    /// Default drain deadline offset used when `POST /workers/{id}/drain` omits `deadline_at`.
+    /// Set from `WorkerConfig::shutdown_timeout` at startup; defaults to 30 s.
+    worker_shutdown_timeout: Arc<Mutex<std::time::Duration>>,
 }
 
 impl Default for HarvestApiState {
@@ -205,6 +208,7 @@ impl Default for HarvestApiState {
             deployment_profile: Arc::new(Mutex::new("unknown".to_string())),
             admin_auth_boundary: Arc::new(Mutex::new(false)),
             health_requires_shard_readiness: Arc::new(Mutex::new(false)),
+            worker_shutdown_timeout: Arc::new(Mutex::new(std::time::Duration::from_secs(30))),
         }
     }
 }
@@ -343,6 +347,27 @@ impl HarvestApiState {
     fn health_requires_shard_readiness(&self) -> bool {
         *self
             .health_requires_shard_readiness
+            .lock()
+            .expect("harvest api state lock poisoned")
+    }
+
+    /// Override the default deadline applied when `POST /workers/{id}/drain` does not
+    /// supply a `deadline_at`. Defaults to 30 s (the `WorkerConfig::shutdown_timeout`
+    /// default). Set this at startup from the actual `WorkerConfig`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    pub fn set_worker_shutdown_timeout(&self, timeout: std::time::Duration) {
+        *self
+            .worker_shutdown_timeout
+            .lock()
+            .expect("harvest api state lock poisoned") = timeout;
+    }
+
+    pub(crate) fn worker_shutdown_timeout(&self) -> std::time::Duration {
+        *self
+            .worker_shutdown_timeout
             .lock()
             .expect("harvest api state lock poisoned")
     }
@@ -4866,21 +4891,33 @@ async fn request_drain_handler(
         })?;
         Some(dt.with_timezone(&chrono::Utc))
     } else {
-        None
+        // Compute a default deadline from the configured worker shutdown timeout so
+        // operators always get a finite drain window even when they omit the field.
+        let timeout = api_state.worker_shutdown_timeout();
+        chrono::Duration::from_std(timeout)
+            .ok()
+            .map(|d| chrono::Utc::now() + d)
     };
 
     // Search every shard for the worker — workers are registered on exactly
-    // one shard, so the first hit wins.
+    // one shard, so the first hit wins. Connection failures on individual shards
+    // are recorded as unavailable rather than aborting the whole request (AC #8).
+    let mut unavailable_shards: Vec<i32> = Vec::new();
     for (shard_id, shard_pool) in pool.iter_shards() {
-        let mut conn = acquire_conn(shard_pool).await?;
+        let Ok(mut conn) = acquire_conn(shard_pool).await else {
+            unavailable_shards.push(shard_id.as_i32());
+            continue;
+        };
 
-        let response = request_drain(&mut conn, &worker_id, deadline_at, stale_threshold)
+        let mut response = request_drain(&mut conn, &worker_id, deadline_at, stale_threshold)
             .await
             .map_err(map_error)?;
 
         if response.outcome == autumn_harvest::workers::DrainOutcome::NotFound {
             continue;
         }
+
+        response.unavailable_shards = std::mem::take(&mut unavailable_shards);
 
         let ar = NewAuditRecord {
             actor: &actor,
@@ -4898,6 +4935,19 @@ async fn request_drain_handler(
         let _ = audit::insert_audit(&mut conn, &ar).await;
 
         return Ok(Json(response));
+    }
+
+    // Worker not found on any reachable shard. If some shards were unavailable
+    // the worker may live there — return a degraded 200 rather than 404.
+    if !unavailable_shards.is_empty() {
+        return Ok(Json(DrainResponse {
+            worker_id: worker_id.clone(),
+            outcome: autumn_harvest::workers::DrainOutcome::NotFound,
+            in_flight_count: 0,
+            drain_deadline_at: None,
+            shard_ids: vec![],
+            unavailable_shards,
+        }));
     }
 
     Err(AutumnError::not_found_msg(format!("worker '{worker_id}'")))
@@ -5520,6 +5570,27 @@ mod tests {
         assert_eq!(
             state.worker_stale_threshold(),
             std::time::Duration::from_secs(20)
+        );
+    }
+
+    // -- Drain: AC #2 -- default deadline from shutdown timeout
+
+    #[test]
+    fn harvest_api_state_shutdown_timeout_defaults_to_30s() {
+        let state = HarvestApiState::new();
+        assert_eq!(
+            state.worker_shutdown_timeout(),
+            std::time::Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn harvest_api_state_shutdown_timeout_can_be_overridden() {
+        let state = HarvestApiState::new();
+        state.set_worker_shutdown_timeout(std::time::Duration::from_secs(60));
+        assert_eq!(
+            state.worker_shutdown_timeout(),
+            std::time::Duration::from_secs(60)
         );
     }
 }

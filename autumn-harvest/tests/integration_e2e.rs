@@ -71,6 +71,10 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260508000000_harvest_external_task_updated_at/up.sql"),
     "\n",
     include_str!("../migrations/20260506000000_harvest_audit_log/up.sql"),
+    "\n",
+    include_str!("../migrations/20260501000000_harvest_workers/up.sql"),
+    "\n",
+    include_str!("../migrations/20260508010000_harvest_workers_drain_deadline/up.sql"),
 );
 
 /// The minimal "legacy" migration set used by the upgrade-path regression
@@ -4658,4 +4662,193 @@ fn workflow_schedule_builder_rejects_unregistered_workflow() {
         ),
         "expected UnknownWorkflowSchedule error, got: {result:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Worker drain controls (issue #170)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn drain_accepted_sets_status_to_draining() {
+    use autumn_harvest::workers::{DrainOutcome, register_worker, request_drain};
+
+    let (mut conn, _container) = setup_test_db().await;
+    let stale_threshold = Duration::from_secs(10);
+
+    register_worker(
+        &mut conn,
+        "w-drain-1",
+        &["default".to_string()],
+        &[0],
+        4,
+        "test-host",
+        None,
+    )
+    .await
+    .unwrap();
+
+    let resp = request_drain(&mut conn, "w-drain-1", None, stale_threshold)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.outcome,
+        DrainOutcome::Accepted,
+        "first drain must be Accepted"
+    );
+    assert!(
+        resp.drain_deadline_at.is_some(),
+        "drain_deadline_at must be set when none supplied"
+    );
+    assert_eq!(resp.worker_id, "w-drain-1");
+    assert!(resp.unavailable_shards.is_empty());
+}
+
+#[tokio::test]
+async fn drain_already_draining_on_second_call() {
+    use autumn_harvest::workers::{DrainOutcome, register_worker, request_drain};
+
+    let (mut conn, _container) = setup_test_db().await;
+    let stale_threshold = Duration::from_secs(10);
+
+    register_worker(
+        &mut conn,
+        "w-drain-2",
+        &["default".to_string()],
+        &[],
+        2,
+        "test-host",
+        None,
+    )
+    .await
+    .unwrap();
+
+    request_drain(&mut conn, "w-drain-2", None, stale_threshold)
+        .await
+        .unwrap();
+
+    let resp2 = request_drain(&mut conn, "w-drain-2", None, stale_threshold)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp2.outcome,
+        DrainOutcome::AlreadyDraining,
+        "second drain on already-draining worker must return AlreadyDraining"
+    );
+}
+
+#[tokio::test]
+async fn drain_already_stopped_after_transition() {
+    use autumn_harvest::workers::{
+        DrainOutcome, WorkerStatus, register_worker, request_drain, transition_status,
+    };
+
+    let (mut conn, _container) = setup_test_db().await;
+    let stale_threshold = Duration::from_secs(10);
+
+    register_worker(&mut conn, "w-drain-3", &[], &[], 1, "test-host", None)
+        .await
+        .unwrap();
+    transition_status(&mut conn, "w-drain-3", WorkerStatus::Stopped)
+        .await
+        .unwrap();
+
+    let resp = request_drain(&mut conn, "w-drain-3", None, stale_threshold)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.outcome,
+        DrainOutcome::AlreadyStopped,
+        "draining a stopped worker must return AlreadyStopped"
+    );
+}
+
+#[tokio::test]
+async fn drain_not_found_for_unknown_worker() {
+    use autumn_harvest::workers::request_drain;
+
+    let (mut conn, _container) = setup_test_db().await;
+    let stale_threshold = Duration::from_secs(10);
+
+    let resp = request_drain(&mut conn, "w-does-not-exist", None, stale_threshold)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.outcome,
+        autumn_harvest::workers::DrainOutcome::NotFound,
+        "unknown worker must return NotFound"
+    );
+}
+
+#[tokio::test]
+async fn drain_with_explicit_deadline_is_stored() {
+    use autumn_harvest::workers::{DrainOutcome, register_worker, request_drain};
+
+    let (mut conn, _container) = setup_test_db().await;
+    let stale_threshold = Duration::from_secs(10);
+
+    register_worker(
+        &mut conn,
+        "w-drain-deadline",
+        &[],
+        &[],
+        1,
+        "test-host",
+        None,
+    )
+    .await
+    .unwrap();
+
+    let explicit_deadline = Utc::now() + chrono::Duration::minutes(5);
+    let resp = request_drain(
+        &mut conn,
+        "w-drain-deadline",
+        Some(explicit_deadline),
+        stale_threshold,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(resp.outcome, DrainOutcome::Accepted);
+    let stored = resp.drain_deadline_at.expect("deadline must be set");
+    let diff = (stored - explicit_deadline).num_seconds().abs();
+    assert!(diff <= 2, "stored deadline differs by {diff}s");
+}
+
+#[tokio::test]
+async fn drain_preview_returns_active_workers() {
+    use autumn_harvest::workers::{WorkerFilters, drain_preview, register_worker};
+
+    let (mut conn, _container) = setup_test_db().await;
+    let stale_threshold = Duration::from_secs(10);
+
+    for i in 0..3_u8 {
+        register_worker(
+            &mut conn,
+            &format!("w-preview-{i}"),
+            &["default".to_string()],
+            &[],
+            4,
+            "test-host",
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    let filters = WorkerFilters {
+        queue: Some("default".to_string()),
+        ..WorkerFilters::default()
+    };
+    let items = drain_preview(&mut conn, &filters, stale_threshold)
+        .await
+        .unwrap();
+
+    assert_eq!(items.len(), 3, "drain-preview should return all 3 workers");
+    for item in &items {
+        assert_eq!(item.status, "Active");
+    }
 }

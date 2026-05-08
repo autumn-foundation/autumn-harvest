@@ -596,6 +596,10 @@ pub struct DrainResponse {
     pub drain_deadline_at: Option<DateTime<Utc>>,
     /// Shard IDs this worker was serving at drain time.
     pub shard_ids: Vec<i32>,
+    /// Shards that could not be contacted during this request.
+    /// When non-empty the result is **degraded**: the worker may exist on an
+    /// unavailable shard and operators should verify before re-routing traffic.
+    pub unavailable_shards: Vec<i32>,
 }
 
 /// One entry in a dry-run drain preview — what *would* be drained.
@@ -711,6 +715,7 @@ pub async fn request_drain(
             in_flight_count: 0,
             drain_deadline_at: None,
             shard_ids: vec![],
+            unavailable_shards: vec![],
         });
     };
 
@@ -752,6 +757,7 @@ pub async fn request_drain(
         in_flight_count: worker.in_flight_count,
         drain_deadline_at: deadline_at,
         shard_ids,
+        unavailable_shards: vec![],
     })
 }
 
@@ -1243,6 +1249,7 @@ mod tests {
             in_flight_count: 3,
             drain_deadline_at: Some(Utc::now()),
             shard_ids: vec![0, 1],
+            unavailable_shards: vec![],
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert!(json.get("worker_id").is_some(), "missing worker_id");
@@ -1256,6 +1263,10 @@ mod tests {
             "missing drain_deadline_at"
         );
         assert!(json.get("shard_ids").is_some(), "missing shard_ids");
+        assert!(
+            json.get("unavailable_shards").is_some(),
+            "missing unavailable_shards"
+        );
     }
 
     #[test]
@@ -1266,10 +1277,29 @@ mod tests {
             in_flight_count: 0,
             drain_deadline_at: None,
             shard_ids: vec![],
+            unavailable_shards: vec![],
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert!(json["drain_deadline_at"].is_null());
         assert_eq!(json["shard_ids"].as_array().unwrap().len(), 0);
+        assert_eq!(json["unavailable_shards"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn drain_response_with_unavailable_shards_serializes() {
+        let resp = DrainResponse {
+            worker_id: "w-abc".to_string(),
+            outcome: DrainOutcome::NotFound,
+            in_flight_count: 0,
+            drain_deadline_at: None,
+            shard_ids: vec![],
+            unavailable_shards: vec![2, 3],
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        let shards = json["unavailable_shards"].as_array().unwrap();
+        assert_eq!(shards.len(), 2);
+        assert_eq!(shards[0].as_i64().unwrap(), 2);
+        assert_eq!(shards[1].as_i64().unwrap(), 3);
     }
 
     // -- preview_item_from_row --

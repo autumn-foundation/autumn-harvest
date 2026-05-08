@@ -211,6 +211,15 @@ pub enum CliError {
     /// Retirement check found active old-version executions or an unavailable shard.
     #[error("version-gate retirement check failed")]
     RetirementCheckGate,
+
+    /// `--wait` timed out before the worker reached `Stopped`.
+    #[error("timed out waiting for worker '{worker_id}' to stop (last status: {last_status})")]
+    DrainWaitTimeout {
+        /// Worker ID that did not reach `Stopped`.
+        worker_id: String,
+        /// Last observed lifecycle status.
+        last_status: String,
+    },
 }
 
 impl CliError {
@@ -863,6 +872,13 @@ enum WorkerCommand {
         /// When omitted the server uses its configured shutdown timeout.
         #[arg(long)]
         deadline: Option<String>,
+        /// Block until the worker reaches `Stopped` or the deadline elapses.
+        /// Polls `GET /workers/{id}` every 2 s; exits 1 on timeout.
+        #[arg(long)]
+        wait: bool,
+        /// Maximum seconds to wait when `--wait` is set (default: 120).
+        #[arg(long, default_value = "120")]
+        wait_timeout_secs: u64,
     },
     /// Preview which workers would be targeted by a drain, without draining them.
     #[command(name = "drain-preview")]
@@ -1002,6 +1018,20 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
         return tui::run_tui(&cli).await;
     }
 
+    // --wait mode: issue drain then poll until Stopped or timeout.
+    if let Commands::Worker {
+        command:
+            WorkerCommand::Drain {
+                worker_id,
+                wait: true,
+                wait_timeout_secs,
+                ..
+            },
+    } = &cli.command
+    {
+        return run_worker_drain_wait(&cli, worker_id, *wait_timeout_secs).await;
+    }
+
     let response = execute(&cli).await?;
     let rendered = render_response(&cli, &response)?;
     println!("{rendered}");
@@ -1080,6 +1110,59 @@ pub async fn execute(cli: &Cli) -> Result<Value, CliError> {
     }
 
     serde_json::from_str(&body).map_err(CliError::ParseResponse)
+}
+
+/// Issue drain then poll `GET /workers/{id}` until status reaches `Stopped`
+/// or `wait_timeout_secs` elapses. Prints each poll result as it arrives.
+async fn run_worker_drain_wait(
+    cli: &Cli,
+    worker_id: &str,
+    wait_timeout_secs: u64,
+) -> Result<(), CliError> {
+    // Kick off the drain.
+    let response = execute(cli).await?;
+    let rendered = render_response(cli, &response)?;
+    println!("{rendered}");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait_timeout_secs);
+    let poll_interval = std::time::Duration::from_secs(2);
+
+    loop {
+        tokio::time::sleep(poll_interval).await;
+
+        let poll_cli = Cli {
+            base_url: cli.base_url.clone(),
+            token: cli.token.clone(),
+            actor: cli.actor.clone(),
+            request_id: cli.request_id.clone(),
+            output: cli.output,
+            command: Commands::Worker {
+                command: WorkerCommand::Get {
+                    worker_id: worker_id.to_string(),
+                },
+            },
+        };
+        let worker_value = execute(&poll_cli).await?;
+        let status = worker_value
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("Unknown")
+            .to_string();
+
+        let rendered = render_response(cli, &worker_value)?;
+        println!("{rendered}");
+
+        if status == "Stopped" {
+            return Ok(());
+        }
+
+        if std::time::Instant::now() >= deadline {
+            return Err(CliError::DrainWaitTimeout {
+                worker_id: worker_id.to_string(),
+                last_status: status,
+            });
+        }
+    }
 }
 
 /// Render a successful response.
@@ -2483,6 +2566,8 @@ fn worker_request(command: &WorkerCommand) -> ApiRequest {
         WorkerCommand::Drain {
             worker_id,
             deadline,
+            wait: _,
+            wait_timeout_secs: _,
         } => {
             let mut body = Map::new();
             if let Some(d) = deadline {
@@ -3689,6 +3774,68 @@ mod reuse_policy_tests {
         let req = parse(&["worker", "health"]).api_request().unwrap();
         assert_eq!(req.method, ApiMethod::Get);
         assert_eq!(req.path, "/workers/health");
+    }
+
+    // -- Drain wait mode (AC #6) --
+
+    #[test]
+    fn worker_drain_with_wait_flag_still_builds_drain_post_request() {
+        let req = parse(&["worker", "drain", "w-abc", "--wait"])
+            .api_request()
+            .unwrap();
+        assert_eq!(req.method, ApiMethod::Post);
+        assert_eq!(req.path, "/workers/w-abc/drain");
+    }
+
+    #[test]
+    fn worker_drain_wait_and_deadline_are_independent_flags() {
+        let req = parse(&[
+            "worker",
+            "drain",
+            "w-abc",
+            "--wait",
+            "--deadline",
+            "2026-05-09T12:00:00Z",
+        ])
+        .api_request()
+        .unwrap();
+        let body = req.body.as_ref().unwrap();
+        assert_eq!(
+            body["deadline_at"].as_str().unwrap(),
+            "2026-05-09T12:00:00Z"
+        );
+    }
+
+    #[test]
+    fn worker_drain_wait_timeout_secs_default_is_120() {
+        let cli = parse(&["worker", "drain", "w-abc", "--wait"]);
+        if let Commands::Worker {
+            command:
+                WorkerCommand::Drain {
+                    wait,
+                    wait_timeout_secs,
+                    ..
+                },
+        } = &cli.command
+        {
+            assert!(*wait);
+            assert_eq!(*wait_timeout_secs, 120);
+        } else {
+            panic!("expected Worker::Drain command");
+        }
+    }
+
+    #[test]
+    fn worker_drain_without_wait_flag_wait_is_false() {
+        let cli = parse(&["worker", "drain", "w-abc"]);
+        if let Commands::Worker {
+            command: WorkerCommand::Drain { wait, .. },
+        } = &cli.command
+        {
+            assert!(!*wait);
+        } else {
+            panic!("expected Worker::Drain command");
+        }
     }
 
     #[test]
