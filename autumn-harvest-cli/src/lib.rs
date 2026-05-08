@@ -111,6 +111,45 @@ impl VersionUsageStateGroup {
     }
 }
 
+/// Payload policy for history exports.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum HistoryExportPayloadPolicy {
+    /// Redact payload-bearing fields and emit deterministic summaries.
+    Redacted,
+    /// Emit raw payloads for private replay fixtures. Sensitive.
+    Full,
+}
+
+impl HistoryExportPayloadPolicy {
+    const fn as_wire(self) -> &'static str {
+        match self {
+            Self::Redacted => "redacted",
+            Self::Full => "full",
+        }
+    }
+}
+
+/// Execution-state scope for batch history exports.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum HistoryExportStateGroup {
+    /// Include only executions that can still run or replay.
+    Active,
+    /// Include only terminal executions.
+    Terminal,
+    /// Include active and terminal executions.
+    All,
+}
+
+impl HistoryExportStateGroup {
+    const fn as_wire(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Terminal => "terminal",
+            Self::All => "all",
+        }
+    }
+}
+
 /// HTTP method used by a management API request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ApiMethod {
@@ -152,6 +191,15 @@ pub enum CliError {
     ReadJson {
         /// User-facing source label.
         label: &'static str,
+        /// Path displayed to the user.
+        path: String,
+        /// I/O failure.
+        source: std::io::Error,
+    },
+
+    /// Output could not be written to the requested file.
+    #[error("failed to write output to {path}: {source}")]
+    WriteOutput {
         /// Path displayed to the user.
         path: String,
         /// I/O failure.
@@ -239,6 +287,11 @@ enum Commands {
     Workflow {
         #[command(subcommand)]
         command: WorkflowCommand,
+    },
+    /// Export workflow histories for replay fixtures and diagnostics.
+    History {
+        #[command(subcommand)]
+        command: HistoryCommand,
     },
     /// Inspect and resolve external activity handoffs.
     #[command(
@@ -336,6 +389,54 @@ enum Commands {
     },
     /// Open the TUI dashboard to monitor workflows.
     Tui,
+}
+
+#[derive(Debug, Subcommand)]
+enum HistoryCommand {
+    /// Export one workflow execution history.
+    Export {
+        /// Workflow execution ID.
+        execution_id: String,
+        /// Payload policy. `full` emits sensitive replay fixtures; `redacted` is safer for sharing.
+        #[arg(long, value_enum, default_value = "redacted")]
+        payload_policy: HistoryExportPayloadPolicy,
+        /// Maximum serialized export size in bytes.
+        #[arg(long)]
+        max_bytes: Option<usize>,
+        /// Write the JSON export to a file instead of stdout.
+        #[arg(long, value_name = "PATH")]
+        output_file: Option<PathBuf>,
+    },
+    /// Export a bounded batch of workflow histories.
+    ExportBatch {
+        /// Filter by registered workflow name.
+        #[arg(long)]
+        workflow_name: Option<String>,
+        /// Filter by execution state group.
+        #[arg(long, value_enum)]
+        state_group: Option<HistoryExportStateGroup>,
+        /// Lower bound on execution update time, RFC 3339.
+        #[arg(long)]
+        updated_after: Option<String>,
+        /// Upper bound on execution update time, RFC 3339.
+        #[arg(long)]
+        updated_before: Option<String>,
+        /// Restrict inspection to one shard.
+        #[arg(long)]
+        shard_id: Option<i32>,
+        /// Maximum histories to export.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Payload policy. `full` emits sensitive replay fixtures; `redacted` is safer for sharing.
+        #[arg(long, value_enum, default_value = "redacted")]
+        payload_policy: HistoryExportPayloadPolicy,
+        /// Maximum serialized size per exported history in bytes.
+        #[arg(long)]
+        max_bytes: Option<usize>,
+        /// Write the JSON export to a file instead of stdout.
+        #[arg(long, value_name = "PATH")]
+        output_file: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -854,6 +955,7 @@ impl Cli {
             Commands::Preflight => Ok(ApiRequest::get("/admin/preflight")),
             Commands::Shard { command } => Ok(shard_request(command)),
             Commands::Workflow { command } => workflow_request(command),
+            Commands::History { command } => Ok(history_request(command)),
             Commands::Handoff { command } => handoff_request(command),
             Commands::Dag { command } => dag_request(command),
             Commands::Schedule { command } => schedule_request(command),
@@ -937,7 +1039,14 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
 
     let response = execute(&cli).await?;
     let rendered = render_response(&cli, &response)?;
-    println!("{rendered}");
+    if let Some(path) = history_output_file(&cli) {
+        fs::write(path, &rendered).map_err(|source| CliError::WriteOutput {
+            path: path.display().to_string(),
+            source,
+        })?;
+    } else {
+        println!("{rendered}");
+    }
     if matches!(cli.command, Commands::Preflight) {
         let exit_code = preflight_exit_code(&response);
         if exit_code != 0 {
@@ -959,6 +1068,18 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
         return Err(CliError::RetirementCheckGate);
     }
     Ok(())
+}
+
+fn history_output_file(cli: &Cli) -> Option<&Path> {
+    match &cli.command {
+        Commands::History {
+            command: HistoryCommand::Export { output_file, .. },
+        }
+        | Commands::History {
+            command: HistoryCommand::ExportBatch { output_file, .. },
+        } => output_file.as_deref(),
+        _ => None,
+    }
 }
 
 /// Execute the API request represented by the CLI arguments.
@@ -2001,6 +2122,67 @@ fn workflow_request(command: &WorkflowCommand) -> Result<ApiRequest, CliError> {
     }
 }
 
+fn history_request(command: &HistoryCommand) -> ApiRequest {
+    match command {
+        HistoryCommand::Export {
+            execution_id,
+            payload_policy,
+            max_bytes,
+            output_file: _,
+        } => {
+            let mut params = vec![("payload_policy", payload_policy.as_wire().to_string())];
+            if let Some(value) = max_bytes {
+                params.push(("max_bytes", value.to_string()));
+            }
+            ApiRequest::get(format!(
+                "/workflows/{}/history/export?{}",
+                path_segment(execution_id),
+                encode_query_params(&params)
+            ))
+        }
+        HistoryCommand::ExportBatch {
+            workflow_name,
+            state_group,
+            updated_after,
+            updated_before,
+            shard_id,
+            limit,
+            payload_policy,
+            max_bytes,
+            output_file: _,
+        } => {
+            let mut params: Vec<(&'static str, String)> = Vec::new();
+            if let Some(value) = workflow_name {
+                params.push(("workflow_name", value.clone()));
+            }
+            if let Some(value) = state_group {
+                params.push(("state_group", value.as_wire().to_string()));
+            }
+            if let Some(value) = updated_after {
+                params.push(("updated_after", value.clone()));
+            }
+            if let Some(value) = updated_before {
+                params.push(("updated_before", value.clone()));
+            }
+            if let Some(value) = shard_id {
+                params.push(("shard_id", value.to_string()));
+            }
+            if let Some(value) = limit {
+                params.push(("limit", value.to_string()));
+            }
+            params.push(("payload_policy", payload_policy.as_wire().to_string()));
+            if let Some(value) = max_bytes {
+                params.push(("max_bytes", value.to_string()));
+            }
+
+            ApiRequest::get(format!(
+                "/admin/history/exports?{}",
+                encode_query_params(&params)
+            ))
+        }
+    }
+}
+
 fn handoff_request(command: &HandoffCommand) -> Result<ApiRequest, CliError> {
     match command {
         HandoffCommand::List {
@@ -2605,6 +2787,14 @@ fn build_workflow_children_path(
         .collect::<Vec<_>>()
         .join("&");
     format!("{base}?{encoded}")
+}
+
+fn encode_query_params(params: &[(&str, String)]) -> String {
+    params
+        .iter()
+        .map(|(key, value)| format!("{key}={}", query_encode(value)))
+        .collect::<Vec<_>>()
+        .join("&")
 }
 
 fn query_encode(input: &str) -> String {

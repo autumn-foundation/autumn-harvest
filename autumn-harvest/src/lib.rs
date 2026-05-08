@@ -143,7 +143,11 @@ pub use execution::{
     cancel_workflow_execution, start_or_load_workflow_execution, terminate_workflow_execution,
 };
 pub use executor::{WorkflowOutcome, run_workflow};
-pub use history_export::export_mermaid_sequence;
+pub use history_export::{
+    DEFAULT_HISTORY_EXPORT_MAX_BYTES, HISTORY_EXPORT_SCHEMA, HISTORY_EXPORT_VERSION,
+    HistoryExportDocument, HistoryExportError, HistoryExportRequest, HistoryExportSizeLimit,
+    HistoryExportStatus, HistoryPayloadPolicy, export_history, export_mermaid_sequence,
+};
 pub use info::{ActivityHandlerFn, ActivityInfo, DagInfo, WorkflowHandlerFn, WorkflowInfo};
 pub use payload_codec::{CodecError, IdentityCodec, PayloadCodec, PayloadCodecs};
 pub use policy::validate_schedule;
