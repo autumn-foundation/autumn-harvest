@@ -2726,7 +2726,7 @@ async fn harvest_api_start_workflow_overflow_does_not_panic() {
         "execution_timeout_secs": 9_223_372_036_854_775_807_i64
     });
 
-    let (status, _body) = post_json(&app, "/workflows/approval_process/start", payload).await;
+    let (status, _body) = post_json(&app, "/workflows/approval_workflow/start", payload).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 
     let payload_negative = serde_json::json!({
@@ -2736,6 +2736,6 @@ async fn harvest_api_start_workflow_overflow_does_not_panic() {
     });
 
     let (status, _body) =
-        post_json(&app, "/workflows/approval_process/start", payload_negative).await;
+        post_json(&app, "/workflows/approval_workflow/start", payload_negative).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
