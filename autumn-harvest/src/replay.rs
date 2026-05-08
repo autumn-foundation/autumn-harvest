@@ -1069,72 +1069,7 @@ impl HistoryMatcher {
         };
 
         self.cursor += 1;
-        let mut scan_cursor = self.cursor;
-        let mut failed_attempts: u32 = 0;
-        let mut last_error: Option<String> = None;
-
-        while scan_cursor < self.events.len() {
-            if self.is_consumed(scan_cursor) {
-                scan_cursor += 1;
-                continue;
-            }
-            match &self.events[scan_cursor] {
-                WorkflowEvent::LocalActivityCompleted {
-                    activity_id: id,
-                    output,
-                } if *id == activity_id => {
-                    let output = output.clone();
-                    self.cursor = scan_cursor + 1;
-                    self.advance_to_next_unconsumed_event();
-                    return HistoryMatch::Matched { output };
-                }
-                WorkflowEvent::LocalActivityExhausted {
-                    activity_id: id,
-                    error,
-                    attempt,
-                } if *id == activity_id => {
-                    let error = error.clone();
-                    let attempt = *attempt;
-                    self.cursor = scan_cursor + 1;
-                    self.advance_to_next_unconsumed_event();
-                    return HistoryMatch::Failed { error, attempt };
-                }
-                WorkflowEvent::LocalActivityFailed {
-                    activity_id: id,
-                    error,
-                    attempt: _,
-                } if *id == activity_id => {
-                    failed_attempts += 1;
-                    last_error = Some(error.clone());
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::SignalReceived {
-                    signal_name,
-                    payload,
-                } => {
-                    let signal_name = signal_name.clone();
-                    let payload = payload.clone();
-                    self.stash_signal(scan_cursor, signal_name, payload);
-                    scan_cursor += 1;
-                }
-                ev if Self::is_update_event(ev) => {
-                    scan_cursor += 1;
-                }
-                _ => break,
-            }
-        }
-
-        if failed_attempts > 0 {
-            self.cursor = scan_cursor;
-            self.advance_to_next_unconsumed_event();
-            return HistoryMatch::LocalActivityInProgress {
-                activity_id,
-                failed_attempts,
-                last_error,
-            };
-        }
-
-        HistoryMatch::NoMatch
+        self.scan_local_activity_terminal(activity_id, self.cursor)
     }
 
     /// Versioning mechanism for safe workflow code changes.
