@@ -28,6 +28,9 @@ pub mod critical_path;
 pub mod dag;
 /// Export format types for Directed Acyclic Graphs (DAGs) representing workflows.
 pub mod dag_export;
+/// Export DAG profiles to Mermaid Gantt charts.
+#[cfg(feature = "testing")]
+pub mod dag_gantt;
 pub mod dag_linter;
 #[cfg(feature = "testing")]
 pub mod dag_profiler;
@@ -126,6 +129,8 @@ pub use context::{ActivityContext, WorkflowCommand, WorkflowContext};
 pub use critical_path::{CriticalPathAnalyzer, CriticalPathResult};
 pub use dag::{DagBuildError, DagBuilder, DagDefinition, DagTask, DagTaskRef};
 pub use dag_export::{export_dot, export_mermaid};
+#[cfg(feature = "testing")]
+pub use dag_gantt::export_mermaid_gantt;
 pub use dag_linter::{
     DagLinter, DagRule, DagWarning, ExcessiveParallelismRule, MissingRetryPolicyRule,
     MissingTimeoutRule,
