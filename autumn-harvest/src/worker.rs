@@ -12,7 +12,7 @@
 
 use std::any::{Any, TypeId};
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use diesel::{ExpressionMethods, OptionalExtension, QueryDsl, SelectableHelper};
@@ -2990,6 +2990,10 @@ pub struct Worker {
     activity_semaphore: Arc<Semaphore>,
     /// Cancellation token for graceful shutdown.
     shutdown: CancellationToken,
+    /// Set by the heartbeat task when a remote drain is detected; holds the
+    /// remaining time until the operator-supplied `drain_deadline_at` so that
+    /// `drain_in_flight` honours it instead of the static `shutdown_timeout`.
+    remote_drain_deadline: Arc<Mutex<Option<Duration>>>,
 }
 
 impl Worker {
@@ -3010,6 +3014,7 @@ impl Worker {
             workflow_semaphore,
             activity_semaphore,
             shutdown: CancellationToken::new(),
+            remote_drain_deadline: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -3150,6 +3155,7 @@ impl Worker {
             self.config.worker_heartbeat_interval,
             heartbeat_cancel.clone(),
             self.shutdown.clone(),
+            Arc::clone(&self.remote_drain_deadline),
         );
 
         while !self.shutdown.is_cancelled() {
@@ -3414,9 +3420,23 @@ impl Worker {
     ///
     /// We wait until all semaphore permits are available again, meaning all
     /// spawned tasks have completed and dropped their permits.
+    ///
+    /// When a remote drain set a deadline via `remote_drain_deadline`, we use
+    /// the remaining time from that deadline as the timeout.  This ensures that
+    /// a longer operator-supplied window is actually honoured rather than being
+    /// capped by the static `shutdown_timeout` (P2-B fix).
     async fn drain_in_flight(&self) {
         let total_permits =
             self.config.max_concurrent_workflows + self.config.max_concurrent_activities;
+
+        // Prefer the deadline received from the remote drain request; fall back
+        // to the statically-configured shutdown_timeout for local shutdowns.
+        let timeout = self
+            .remote_drain_deadline
+            .lock()
+            .ok()
+            .and_then(|g| *g)
+            .unwrap_or(self.config.shutdown_timeout);
 
         let drain = async {
             // Try to acquire ALL permits — when we can, all in-flight tasks are done.
@@ -3438,10 +3458,7 @@ impl Worker {
                 .await;
         };
 
-        if tokio::time::timeout(self.config.shutdown_timeout, drain)
-            .await
-            .is_err()
-        {
+        if tokio::time::timeout(timeout, drain).await.is_err() {
             tracing::warn!(
                 worker_id = %self.config.worker_id,
                 total_permits,

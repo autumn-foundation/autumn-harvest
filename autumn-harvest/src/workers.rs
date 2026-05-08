@@ -7,7 +7,7 @@
 //! The API layer queries this table (per-shard) to surface fleet status to
 //! operators via the management HTTP routes.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -677,6 +677,25 @@ pub async fn read_worker_status(
     Ok(status)
 }
 
+/// Read the `drain_deadline_at` timestamp for a worker, if it exists.
+///
+/// # Errors
+///
+/// Returns [`HarvestError`] on database failure.
+pub async fn read_worker_drain_deadline(
+    conn: &mut AsyncPgConnection,
+    worker_id: &str,
+) -> HarvestResult<Option<DateTime<Utc>>> {
+    let row: Option<Option<DateTime<Utc>>> = harvest_workers::table
+        .find(worker_id)
+        .select(harvest_workers::drain_deadline_at)
+        .first(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?;
+    Ok(row.flatten())
+}
+
 /// Request a graceful drain for the worker identified by `worker_id`.
 ///
 /// The function classifies the current worker state and, if appropriate,
@@ -838,6 +857,9 @@ pub fn spawn_worker_heartbeat(
     interval: Duration,
     cancel: CancellationToken,
     worker_shutdown: CancellationToken,
+    // Populated when a remote drain is detected: remaining time until the
+    // operator-supplied drain_deadline_at so drain_in_flight can honour it.
+    remote_drain_deadline: Arc<Mutex<Option<Duration>>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -888,6 +910,23 @@ pub fn spawn_worker_heartbeat(
                                             worker_id = %registration.worker_id,
                                             "remote drain detected; triggering graceful shutdown"
                                         );
+                                        // Read the operator-supplied deadline so
+                                        // drain_in_flight can honour it instead of
+                                        // the static shutdown_timeout (P2-B).
+                                        if let Ok(Some(deadline)) = read_worker_drain_deadline(
+                                            &mut conn,
+                                            &registration.worker_id,
+                                        )
+                                        .await
+                                        {
+                                            let remaining = deadline
+                                                .signed_duration_since(Utc::now())
+                                                .to_std()
+                                                .unwrap_or(Duration::ZERO);
+                                            if let Ok(mut guard) = remote_drain_deadline.lock() {
+                                                *guard = Some(remaining);
+                                            }
+                                        }
                                         worker_shutdown.cancel();
                                     }
                                     _ => {}

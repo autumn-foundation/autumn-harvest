@@ -5524,6 +5524,29 @@ async fn request_drain_handler(
         }));
     }
 
+    // All shards reachable but the worker ID was absent on every one.
+    // Write an audit record on any available shard so that
+    // `harvest audit list --operation worker.drain --target-id <id>`
+    // shows the attempted drain even for a 404 response.
+    'audit: for (_shard_id, shard_pool) in pool.iter_shards() {
+        if let Ok(mut conn) = acquire_conn(shard_pool).await {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                source: &source,
+                operation: OP_WORKER_DRAIN,
+                target_type: TARGET_WORKER,
+                target_id: Some(worker_id.as_str()),
+                route_or_command: "POST /workers/{worker_id}/drain",
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_FAILED,
+                error_summary: Some("worker not found"),
+                shard_id: None,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+            break 'audit;
+        }
+    }
     Err(AutumnError::not_found_msg(format!("worker '{worker_id}'")))
 }
 
