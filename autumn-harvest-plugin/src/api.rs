@@ -895,6 +895,41 @@ struct HistoryExportCandidate {
     last_history_event_at: chrono::DateTime<chrono::Utc>,
 }
 
+#[derive(Debug, Default)]
+struct HistoryBatchExportWork {
+    candidates: Vec<HistoryExportCandidate>,
+    exports: Vec<HistoryExportDocument>,
+    failures: Vec<HistoryExportFailure>,
+    inspected_shards: Vec<i32>,
+    matched_shards: Vec<i32>,
+    unavailable_shards: Vec<UnavailableShard>,
+    saw_requested_shard: bool,
+}
+
+impl HistoryBatchExportWork {
+    fn note_unavailable(&mut self, shard_id: i32, reason: String) {
+        self.unavailable_shards
+            .push(UnavailableShard { shard_id, reason });
+    }
+
+    fn normalize_coverage(&mut self) {
+        self.inspected_shards.sort_unstable();
+        self.inspected_shards.dedup();
+        self.matched_shards.sort_unstable();
+        self.matched_shards.dedup();
+        self.unavailable_shards.sort_by_key(|shard| shard.shard_id);
+    }
+
+    fn status(&self) -> String {
+        if self.unavailable_shards.is_empty() && self.failures.is_empty() {
+            "complete"
+        } else {
+            "partial"
+        }
+        .to_string()
+    }
+}
+
 #[derive(Debug, Clone)]
 struct WorkflowChildrenFilters {
     limit: usize,
@@ -4600,129 +4635,129 @@ async fn load_history_exports_from_shards(
     query: &HistoryBatchExportQuery,
 ) -> Result<HistoryBatchExportResponse, AutumnError> {
     let pool = api_state.storage_pool().map_err(map_error)?;
-    let mut candidates = Vec::new();
-    let mut exports = Vec::new();
-    let mut failures = Vec::new();
-    let mut inspected_shards = Vec::new();
-    let mut matched_shards = Vec::new();
-    let mut unavailable_shards = Vec::new();
-    let mut saw_requested_shard = false;
+    let mut work = HistoryBatchExportWork::default();
 
+    collect_history_export_candidates_from_shards(&pool, query, &mut work).await;
+    export_selected_history_candidates(&pool, query, &mut work).await;
+    if let Some(shard_id) = query.shard_id
+        && !work.saw_requested_shard
+    {
+        work.note_unavailable(shard_id, "shard pool is not configured".to_string());
+    }
+    work.normalize_coverage();
+    Ok(history_batch_export_response(query, work))
+}
+
+async fn collect_history_export_candidates_from_shards(
+    pool: &HarvestDbPool,
+    query: &HistoryBatchExportQuery,
+    work: &mut HistoryBatchExportWork,
+) {
     for (shard, shard_pool) in pool.iter_shards() {
         let shard_id = shard.as_i32();
         if query.shard_id.is_some_and(|target| target != shard_id) {
             continue;
         }
-        saw_requested_shard = true;
+        work.saw_requested_shard = true;
 
         let mut conn = match acquire_conn(shard_pool).await {
             Ok(conn) => conn,
             Err(error) => {
-                unavailable_shards.push(UnavailableShard {
-                    shard_id,
-                    reason: error.to_string(),
-                });
+                work.note_unavailable(shard_id, error.to_string());
                 continue;
             }
         };
-        inspected_shards.push(shard_id);
+        work.inspected_shards.push(shard_id);
 
         let rows = match load_history_export_candidates(&mut conn, query).await {
             Ok(rows) => rows,
             Err(error) => {
-                unavailable_shards.push(UnavailableShard {
-                    shard_id,
-                    reason: error.to_string(),
-                });
+                work.note_unavailable(shard_id, error.to_string());
                 continue;
             }
         };
         if !rows.is_empty() {
-            matched_shards.push(shard_id);
+            work.matched_shards.push(shard_id);
         }
-        candidates.extend(rows);
+        work.candidates.extend(rows);
     }
+}
 
-    sort_history_export_candidates(&mut candidates);
+async fn export_selected_history_candidates(
+    pool: &HarvestDbPool,
+    query: &HistoryBatchExportQuery,
+    work: &mut HistoryBatchExportWork,
+) {
+    sort_history_export_candidates(&mut work.candidates);
     let single_query = HistoryExportQuery {
         payload_policy: query.payload_policy,
         max_bytes: query.max_bytes,
     };
+    let candidates = std::mem::take(&mut work.candidates);
     for candidate in candidates {
-        if exports.len() >= query.limit {
+        if work.exports.len() >= query.limit {
             break;
         }
-        let shard_id = candidate.shard_id;
-        let exec_id = ExecutionId::from_uuid(candidate.id);
-        let mut conn = match acquire_conn(pool.pool_for(ShardId::new(shard_id))).await {
-            Ok(conn) => conn,
-            Err(error) => {
-                unavailable_shards.push(UnavailableShard {
-                    shard_id,
-                    reason: error.to_string(),
-                });
-                continue;
-            }
-        };
-        let history = match store::load_history(&mut conn, exec_id).await {
-            Ok(history) => history,
-            Err(error) => {
-                failures.push(HistoryExportFailure {
-                    execution_id: Some(exec_id.to_string()),
-                    shard_id,
-                    reason: error.to_string(),
-                    actual_bytes: None,
-                    max_bytes: None,
-                });
-                continue;
-            }
-        };
-        match export_history_for_candidate(&candidate, history.events, &single_query) {
-            Ok(document) => exports.push(document),
-            Err(HistoryExportError::SizeLimitExceeded {
-                actual_bytes,
-                max_bytes,
-            }) => failures.push(HistoryExportFailure {
-                execution_id: Some(exec_id.to_string()),
-                shard_id,
-                reason: "history export exceeds max_bytes".to_string(),
-                actual_bytes: Some(actual_bytes),
-                max_bytes: Some(max_bytes),
-            }),
-            Err(error) => failures.push(HistoryExportFailure {
+        export_history_candidate(pool, &candidate, &single_query, work).await;
+    }
+}
+
+async fn export_history_candidate(
+    pool: &HarvestDbPool,
+    candidate: &HistoryExportCandidate,
+    query: &HistoryExportQuery,
+    work: &mut HistoryBatchExportWork,
+) {
+    let shard_id = candidate.shard_id;
+    let exec_id = ExecutionId::from_uuid(candidate.id);
+    let mut conn = match acquire_conn(pool.pool_for(ShardId::new(shard_id))).await {
+        Ok(conn) => conn,
+        Err(error) => {
+            work.note_unavailable(shard_id, error.to_string());
+            return;
+        }
+    };
+    let history = match store::load_history(&mut conn, exec_id).await {
+        Ok(history) => history,
+        Err(error) => {
+            work.failures.push(HistoryExportFailure {
                 execution_id: Some(exec_id.to_string()),
                 shard_id,
                 reason: error.to_string(),
                 actual_bytes: None,
                 max_bytes: None,
-            }),
+            });
+            return;
         }
-    }
-
-    if let Some(shard_id) = query.shard_id
-        && !saw_requested_shard
-    {
-        unavailable_shards.push(UnavailableShard {
+    };
+    match export_history_for_candidate(candidate, history.events, query) {
+        Ok(document) => work.exports.push(document),
+        Err(HistoryExportError::SizeLimitExceeded {
+            actual_bytes,
+            max_bytes,
+        }) => work.failures.push(HistoryExportFailure {
+            execution_id: Some(exec_id.to_string()),
             shard_id,
-            reason: "shard pool is not configured".to_string(),
-        });
+            reason: "history export exceeds max_bytes".to_string(),
+            actual_bytes: Some(actual_bytes),
+            max_bytes: Some(max_bytes),
+        }),
+        Err(error) => work.failures.push(HistoryExportFailure {
+            execution_id: Some(exec_id.to_string()),
+            shard_id,
+            reason: error.to_string(),
+            actual_bytes: None,
+            max_bytes: None,
+        }),
     }
+}
 
-    inspected_shards.sort_unstable();
-    inspected_shards.dedup();
-    matched_shards.sort_unstable();
-    matched_shards.dedup();
-    unavailable_shards.sort_by_key(|shard| shard.shard_id);
-
-    let status = if unavailable_shards.is_empty() && failures.is_empty() {
-        "complete"
-    } else {
-        "partial"
-    }
-    .to_string();
-
-    Ok(HistoryBatchExportResponse {
-        status,
+fn history_batch_export_response(
+    query: &HistoryBatchExportQuery,
+    work: HistoryBatchExportWork,
+) -> HistoryBatchExportResponse {
+    HistoryBatchExportResponse {
+        status: work.status(),
         observed_at: chrono::Utc::now(),
         payload_policy: query.payload_policy,
         filters: HistoryBatchExportFiltersResponse {
@@ -4734,14 +4769,14 @@ async fn load_history_exports_from_shards(
             limit: query.limit,
             max_bytes: query.max_bytes,
         },
-        exports,
-        failures,
+        exports: work.exports,
+        failures: work.failures,
         shard_coverage: ExternalHandoffShardCoverage {
-            inspected: inspected_shards,
-            matched: matched_shards,
-            unavailable: unavailable_shards,
+            inspected: work.inspected_shards,
+            matched: work.matched_shards,
+            unavailable: work.unavailable_shards,
         },
-    })
+    }
 }
 
 const HISTORY_EXPORT_CANDIDATES_SQL: &str = r"
