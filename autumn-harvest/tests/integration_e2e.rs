@@ -3272,7 +3272,7 @@ mod reuse_policy_helpers {
             execution_timeout: None,
             memo: None,
             search_attrs: None,
-        assigned_build_id: None,
+            assigned_build_id: None,
             reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
             trace_context: None,
         }
@@ -4787,9 +4787,19 @@ async fn drain_already_stopped_after_transition() {
     let (mut conn, _container) = setup_test_db().await;
     let stale_threshold = Duration::from_secs(10);
 
-    register_worker(&mut conn, "w-drain-3", &[], &[], 1, "test-host", None, "", None)
-        .await
-        .unwrap();
+    register_worker(
+        &mut conn,
+        "w-drain-3",
+        &[],
+        &[],
+        1,
+        "test-host",
+        None,
+        "",
+        None,
+    )
+    .await
+    .unwrap();
     transition_status(&mut conn, "w-drain-3", WorkerStatus::Stopped)
         .await
         .unwrap();

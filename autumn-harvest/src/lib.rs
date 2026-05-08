@@ -16,14 +16,14 @@ pub const MIGRATIONS: diesel_migrations::EmbeddedMigrations =
 
 /// History analyzer and linter.
 pub mod analyzer;
-/// Worker build-id routing for safe rolling deploys (issue #171).
-#[cfg(feature = "db")]
-pub mod build_routing;
 /// Audit trail for management API mutations (issue #158).
 #[cfg(feature = "db")]
 pub mod audit;
 /// Batch operations for fleet-wide workflow cancel/terminate/signal (issue #102).
 pub mod batch;
+/// Worker build-id routing for safe rolling deploys (issue #171).
+#[cfg(feature = "db")]
+pub mod build_routing;
 pub mod builder;
 pub mod cache;
 pub mod context;
