@@ -93,3 +93,94 @@ impl UpdateRegistry {
         self.entries.get(name).map(|e| (e.handler)(input))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_register_and_invoke_update_handler_successfully() {
+        let mut registry = UpdateRegistry::new();
+        assert!(
+            !registry.contains("my_update"),
+            "registry should be initially empty"
+        );
+
+        let validator = Arc::new(|val: &Value| {
+            if val == &serde_json::json!("valid") {
+                Ok(())
+            } else {
+                Err("invalid input".to_string())
+            }
+        });
+
+        let handler = Arc::new(|val: Value| {
+            Box::pin(async move {
+                if val == serde_json::json!("valid") {
+                    Ok(serde_json::json!("success"))
+                } else {
+                    Err("handler error".to_string())
+                }
+            }) as UpdateHandlerFuture
+        });
+
+        registry.register("my_update", Some(validator.clone()), handler.clone());
+        assert!(
+            registry.contains("my_update"),
+            "registry should contain my_update after registration"
+        );
+
+        // Second registration is a no-op
+        registry.register("my_update", None, handler.clone());
+
+        // Test validate
+        assert_eq!(
+            registry
+                .validate("unknown", &serde_json::json!("valid"))
+                .unwrap_err(),
+            "update handler 'unknown' not found",
+            "validation should fail for unknown handler"
+        );
+        assert_eq!(
+            registry
+                .validate("my_update", &serde_json::json!("invalid"))
+                .unwrap_err(),
+            "invalid input",
+            "validation should fail when validator rejects"
+        );
+        assert!(
+            registry
+                .validate("my_update", &serde_json::json!("valid"))
+                .is_ok(),
+            "validation should succeed when validator accepts"
+        );
+
+        // Test invoke
+        assert!(
+            registry
+                .invoke("unknown", serde_json::json!("valid"))
+                .is_none(),
+            "invocation should return None for unknown handler"
+        );
+
+        let _future = registry
+            .invoke("my_update", serde_json::json!("valid"))
+            .expect("handler should exist");
+    }
+
+    #[test]
+    fn should_succeed_validation_when_no_validator_provided() {
+        let mut registry = UpdateRegistry::new();
+
+        let handler =
+            Arc::new(|val: Value| Box::pin(async move { Ok(val) }) as UpdateHandlerFuture);
+
+        registry.register("my_update", None, handler);
+        assert!(
+            registry
+                .validate("my_update", &serde_json::json!("valid"))
+                .is_ok(),
+            "validation should trivially succeed if no validator is provided"
+        );
+    }
+}

@@ -210,3 +210,48 @@ pub async fn load_version_usage(
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_version_execution_state_group_as_str() {
+        assert_eq!(VersionExecutionStateGroup::Active.as_str(), "active");
+        assert_eq!(VersionExecutionStateGroup::Terminal.as_str(), "terminal");
+        assert_eq!(VersionExecutionStateGroup::All.as_str(), "all");
+    }
+
+    #[test]
+    fn test_version_execution_state_group_from_str() {
+        use std::str::FromStr;
+
+        assert_eq!(
+            VersionExecutionStateGroup::from_str("active").expect("should succeed"),
+            VersionExecutionStateGroup::Active
+        );
+        assert_eq!(
+            VersionExecutionStateGroup::from_str("Active").expect("should succeed"),
+            VersionExecutionStateGroup::Active
+        );
+        assert_eq!(
+            VersionExecutionStateGroup::from_str("terminal").expect("should succeed"),
+            VersionExecutionStateGroup::Terminal
+        );
+        assert_eq!(
+            VersionExecutionStateGroup::from_str("TERMINAL").expect("should succeed"),
+            VersionExecutionStateGroup::Terminal
+        );
+        assert_eq!(
+            VersionExecutionStateGroup::from_str("all").expect("should succeed"),
+            VersionExecutionStateGroup::All
+        );
+        assert_eq!(
+            VersionExecutionStateGroup::from_str("ALL").expect("should succeed"),
+            VersionExecutionStateGroup::All
+        );
+
+        let err = VersionExecutionStateGroup::from_str("invalid").expect_err("should fail");
+        assert!(matches!(err, HarvestError::Config(_)));
+    }
+}
