@@ -24,20 +24,20 @@ Run from the workspace root. `AUTUMN_PROFILE=dev` enables automatic migration ap
 AUTUMN_MANIFEST_DIR=examples/quickstart AUTUMN_PROFILE=dev cargo run -p quickstart
 ```
 
-The app starts on **http://localhost:8080**.  
-The management API is at **http://localhost:8080/api/harvest**.  
-The workflow dashboard is at **http://localhost:8080/api/harvest/ui**.
+The app starts on **http://localhost:3000**.  
+The management API is at **http://localhost:3000/api/harvest**.  
+The workflow dashboard is at **http://localhost:3000/api/harvest/ui**.
 
 ## Step 3 — Run preflight
 
 ```bash
-cargo run -p autumn-harvest-cli -- --base-url http://localhost:8080/api/harvest preflight
+cargo run -p autumn-harvest-cli -- --base-url http://localhost:3000/api/harvest preflight
 ```
 
 ## Step 4 — Trigger a workflow execution
 
 ```bash
-curl -s -X POST http://localhost:8080/api/harvest/workflows/greeting/start \
+curl -s -X POST http://localhost:3000/api/harvest/workflows/greeting/start \
   -H 'Content-Type: application/json' \
   -d '{"workflow_id":"demo-1","input":"World"}' | jq .
 ```
@@ -51,7 +51,7 @@ The `greeting` workflow will:
 
 ## Step 5 — Observe in the dashboard
 
-Open **http://localhost:8080/api/harvest/ui** in your browser to watch the execution progress through each step in real time.
+Open **http://localhost:3000/api/harvest/ui** in your browser to watch the execution progress through each step in real time.
 
 ## The durability promise: Kill it and restart
 

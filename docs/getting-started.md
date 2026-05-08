@@ -38,8 +38,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-autumn-harvest = "0.1"
-autumn-harvest-plugin = "0.1"
+autumn-harvest = "0.2"
+autumn-harvest-plugin = "0.2"
 autumn-web = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -86,11 +86,11 @@ AUTUMN_PROFILE=dev cargo run
 
 `AUTUMN_PROFILE=dev` runs `diesel migration run` automatically on startup so
 you don't need `diesel-cli` for the dev loop. The app will start on
-`http://localhost:8080`. Hit the health endpoint to confirm the plugin
+`http://localhost:3000`. Hit the health endpoint to confirm the plugin
 mounted:
 
 ```bash
-curl -s http://localhost:8080/api/harvest/health | jq .
+curl -s http://localhost:3000/api/harvest/health | jq .
 ```
 
 ---
@@ -148,12 +148,12 @@ HarvestPlugin::new()
 Restart, then start a workflow over HTTP:
 
 ```bash
-curl -s -X POST http://localhost:8080/api/harvest/workflows/onboarding/start \
+curl -s -X POST http://localhost:3000/api/harvest/workflows/onboarding/start \
   -H 'Content-Type: application/json' \
   -d '{"workflow_id":"user-42","input":42}' | jq .
 ```
 
-Open `http://localhost:8080/api/harvest/ui` to watch it transition through
+Open `http://localhost:3000/api/harvest/ui` to watch it transition through
 `RUNNING → COMPLETED` with the activity call recorded in the event history.
 
 ### What `#[activity]` accepts
@@ -255,7 +255,7 @@ async fn checkout(ctx: &WorkflowContext, order_id: String) -> HarvestResult<Stri
 Start the workflow:
 
 ```bash
-curl -s -X POST http://localhost:8080/api/harvest/workflows/checkout/start \
+curl -s -X POST http://localhost:3000/api/harvest/workflows/checkout/start \
   -H 'Content-Type: application/json' \
   -d '{"workflow_id":"order-42","input":"order-42"}' | jq .
 ```
@@ -266,7 +266,7 @@ signal:
 
 ```bash
 curl -s -X POST \
-  http://localhost:8080/api/harvest/workflows/<EXECUTION_ID>/signal/payment_captured \
+  http://localhost:3000/api/harvest/workflows/<EXECUTION_ID>/signal/payment_captured \
   -H 'Content-Type: application/json' \
   -d '{"capture_id":"cap_demo_123"}' | jq .
 ```
@@ -440,7 +440,7 @@ Before promoting a Harvest service, run the deploy gate:
 
 ```bash
 cargo run -p autumn-harvest-cli -- \
-  --base-url http://localhost:8080/api/harvest preflight
+  --base-url http://localhost:3000/api/harvest preflight
 ```
 
 Exit codes are CI-friendly: `0 = pass`, `2 = warn`, `1 = fail`. The same
@@ -449,7 +449,7 @@ scripts.
 
 ### Dashboard
 
-`http://localhost:8080/api/harvest/ui` shows live executions, event histories,
+`http://localhost:3000/api/harvest/ui` shows live executions, event histories,
 the DLQ, schedules, and the worker fleet. It's served by the plugin — no
 separate process.
 
@@ -512,11 +512,11 @@ the drain deadline, and which shards the worker owns. The same surface is
 available over HTTP for orchestration systems:
 
 ```bash
-curl -s -X POST http://localhost:8080/api/harvest/workers/<worker-id>/drain \
+curl -s -X POST http://localhost:3000/api/harvest/workers/<worker-id>/drain \
   -H 'Content-Type: application/json' \
   -d '{"deadline_at":"2026-05-08T15:00:00Z"}' | jq .
 
-curl -s 'http://localhost:8080/api/harvest/workers/drain-preview?queue=email-workers' | jq .
+curl -s 'http://localhost:3000/api/harvest/workers/drain-preview?queue=email-workers' | jq .
 ```
 
 Drain requests are recorded in the audit log under the `worker.drain`
