@@ -25,7 +25,7 @@ Try it end-to-end: `cargo run -p quickstart` (see [`examples/quickstart/`](examp
 
 For a chapter-by-chapter walkthrough — first workflow, durable timers, signals,
 child workflows, idempotency, and operating the service — read
-[`docs/getting-started.md`](docs/getting-started.md).
+[`docs/getting-started/`](docs/getting-started/).
 
 Need a real reference instead of the tiny hello-world path? See:
 
