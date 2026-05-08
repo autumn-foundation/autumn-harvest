@@ -1069,7 +1069,10 @@ impl HistoryMatcher {
         };
 
         self.cursor += 1;
-        self.scan_local_activity_terminal(activity_id, self.cursor)
+        match self.scan_local_activity_terminal(activity_id, self.cursor) {
+            HistoryMatch::LocalActivityInProgress { failed_attempts: 0, .. } => HistoryMatch::NoMatch,
+            other => other,
+        }
     }
 
     /// Versioning mechanism for safe workflow code changes.
