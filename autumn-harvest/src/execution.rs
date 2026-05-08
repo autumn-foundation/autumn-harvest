@@ -14,6 +14,7 @@ use diesel_async::RunQueryDsl;
 use scoped_futures::ScopedFutureExt;
 use uuid::Uuid;
 
+use crate::build_routing;
 use crate::error::{HarvestError, HarvestResult, database_error};
 use crate::event::WorkflowEvent;
 use crate::models::{NewWorkflowExecution, WorkflowExecution};
@@ -181,6 +182,11 @@ pub async fn start_or_load_workflow_execution(
         }
     }
 
+    // Look up the active build policy for this queue. If a policy exists, new
+    // executions are stamped with its build_id so workers can enforce routing.
+    let policy = build_routing::get_build_policy(conn, request.queue_name).await?;
+    let assigned_build = policy.map(|p| p.build_id);
+
     let row = NewWorkflowExecution {
         id: exec_id.as_uuid(),
         workflow_name: request.workflow_name,
@@ -193,6 +199,7 @@ pub async fn start_or_load_workflow_execution(
         execution_timeout: request.execution_timeout,
         memo: request.memo.clone(),
         search_attrs: request.search_attrs.clone(),
+        assigned_build_id: assigned_build.clone(),
     };
     let mut enqueue = EnqueueParams::new(
         request.queue_name.to_owned(),
@@ -200,6 +207,7 @@ pub async fn start_or_load_workflow_execution(
         request.input.clone(),
     );
     enqueue.workflow_exec_id = Some(exec_id.as_uuid());
+    enqueue.required_build_id = assigned_build.clone();
     // ADR-0001 §3: store the caller's trace context so the worker can restore it.
     enqueue.trace_context.clone_from(&request.trace_context);
 

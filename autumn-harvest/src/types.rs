@@ -714,6 +714,88 @@ impl fmt::Display for IdempotencyKey {
     }
 }
 
+// ── BuildId ───────────────────────────────────────────────────────────────────
+
+/// Immutable build identifier advertised by a worker process.
+///
+/// Operators choose a stable string for each deployable binary (e.g. a Git SHA,
+/// a semantic version, or a CI job ID). Harvest uses this to ensure in-flight
+/// workflow executions are only resumed by workers running a compatible build.
+///
+/// The empty string `""` is the **legacy sentinel**: workers that pre-date
+/// build routing (or operators who have not opted in) advertise an empty
+/// `BuildId` and retain the ability to claim any task regardless of the task's
+/// `required_build_id`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct BuildId(String);
+
+impl BuildId {
+    /// Create a new `BuildId` from any string-like value.
+    #[must_use]
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    /// The legacy sentinel used by workers that pre-date build routing.
+    ///
+    /// Legacy workers advertise an empty build id and are allowed to claim any
+    /// task, including those with an explicit `required_build_id`. This
+    /// preserves backward compatibility for operators who have not yet adopted
+    /// build-aware routing.
+    #[must_use]
+    pub const fn legacy() -> Self {
+        Self(String::new())
+    }
+
+    /// Returns `true` when this is the legacy empty-string sentinel.
+    #[must_use]
+    pub const fn is_legacy(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Returns the underlying string slice.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for BuildId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+// ── DeploymentName ────────────────────────────────────────────────────────────
+
+/// Optional human-readable deployment name for a worker (e.g. `"prod-blue"`).
+///
+/// Deployment names are purely for operator observability — Harvest does not
+/// use them for routing decisions. They are stored alongside `BuildId` in the
+/// fleet table and surfaced in worker list/detail responses.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct DeploymentName(String);
+
+impl DeploymentName {
+    /// Create a new `DeploymentName`.
+    #[must_use]
+    pub fn new(name: impl Into<String>) -> Self {
+        Self(name.into())
+    }
+
+    /// Returns the underlying string slice.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for DeploymentName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -825,5 +907,20 @@ mod tests {
         assert!(invalid_uuid.parse::<ExecutionId>().is_err());
         assert!(invalid_uuid.parse::<ActivityExecId>().is_err());
         assert!(invalid_uuid.parse::<ExternalActivityToken>().is_err());
+    }
+
+    #[test]
+    fn build_id_legacy_sentinel() {
+        let legacy = BuildId::legacy();
+        assert!(legacy.is_legacy());
+        assert!(!BuildId::new("v1").is_legacy());
+    }
+
+    #[test]
+    fn deployment_name_round_trip() {
+        let n = DeploymentName::new("canary");
+        let json = serde_json::to_string(&n).unwrap();
+        let back: DeploymentName = serde_json::from_str(&json).unwrap();
+        assert_eq!(n, back);
     }
 }

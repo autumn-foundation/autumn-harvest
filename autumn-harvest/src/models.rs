@@ -10,9 +10,10 @@ use diesel::prelude::*;
 use uuid::Uuid;
 
 use crate::schema::{
-    harvest_audit_log, harvest_batch_jobs, harvest_dag_runs, harvest_dead_letters, harvest_events,
-    harvest_external_tasks, harvest_schedules, harvest_signals, harvest_task_queue, harvest_timers,
-    harvest_workers, harvest_workflow_executions,
+    harvest_audit_log, harvest_batch_jobs, harvest_build_compat, harvest_build_policies,
+    harvest_dag_runs, harvest_dead_letters, harvest_events, harvest_external_tasks,
+    harvest_schedules, harvest_signals, harvest_task_queue, harvest_timers, harvest_workers,
+    harvest_workflow_executions,
 };
 
 // ── WorkflowExecution ─────────────────────────────────────────────────────────
@@ -42,6 +43,8 @@ pub struct WorkflowExecution {
     pub memo: Option<serde_json::Value>,
     pub search_attrs: Option<serde_json::Value>,
     pub created_at: DateTime<Utc>,
+    /// Build ID assigned at workflow start time (issue #171). `None` = pre-policy.
+    pub assigned_build_id: Option<String>,
 }
 
 /// Insert struct for creating a new workflow execution.
@@ -59,6 +62,8 @@ pub struct NewWorkflowExecution<'a> {
     pub execution_timeout: Option<chrono::Duration>,
     pub memo: Option<serde_json::Value>,
     pub search_attrs: Option<serde_json::Value>,
+    /// Build ID from the active build policy for this queue at start time.
+    pub assigned_build_id: Option<String>,
 }
 
 // ── HarvestEvent ──────────────────────────────────────────────────────────────
@@ -134,6 +139,8 @@ pub struct TaskQueueItem {
     pub concurrency_key: Option<String>,
     /// Maximum concurrent RUNNING tasks allowed for this `concurrency_key`.
     pub concurrency_cap: Option<i32>,
+    /// Build ID required to claim this task (issue #171). NULL = any worker.
+    pub required_build_id: Option<String>,
 }
 
 /// Insert struct for enqueuing a new task.
@@ -160,6 +167,8 @@ pub struct NewTaskQueueItem<'a> {
     pub trace_context: Option<serde_json::Value>,
     pub concurrency_key: Option<&'a str>,
     pub concurrency_cap: Option<i32>,
+    /// Build ID required to claim this task. `None` = any worker may claim.
+    pub required_build_id: Option<&'a str>,
 }
 
 // ── DagRun ────────────────────────────────────────────────────────────────────
@@ -393,6 +402,10 @@ pub struct HarvestWorker {
     pub status: String,
     /// When set, the deadline by which this worker must have finished draining.
     pub drain_deadline_at: Option<DateTime<Utc>>,
+    /// Immutable build identifier advertised by this worker (issue #171).
+    pub build_id: String,
+    /// Optional human-readable deployment name (issue #171).
+    pub deployment_name: Option<String>,
 }
 
 /// Insert struct for registering a new worker process.
@@ -405,6 +418,10 @@ pub struct NewHarvestWorker<'a> {
     pub max_concurrency: i32,
     pub host: &'a str,
     pub version: Option<&'a str>,
+    /// Build ID advertised by this worker (empty string = legacy/unset).
+    pub build_id: &'a str,
+    /// Optional deployment name for operator observability.
+    pub deployment_name: Option<&'a str>,
 }
 
 // ── BatchJob ──────────────────────────────────────────────────────────────────
@@ -488,4 +505,55 @@ pub struct NewAuditRecord<'a> {
     pub error_summary: Option<&'a str>,
     pub shard_id: Option<i32>,
     pub source: &'a str,
+}
+
+// ── BuildPolicy ───────────────────────────────────────────────────────────────
+
+/// Active build policy for a task queue (issue #171).
+#[derive(
+    Debug, Clone, Queryable, Selectable, Identifiable, serde::Serialize, serde::Deserialize,
+)]
+#[diesel(table_name = harvest_build_policies)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct HarvestBuildPolicy {
+    pub id: Uuid,
+    pub queue_name: String,
+    pub build_id: String,
+    pub deployment_name: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Insert struct for a new build policy.
+#[derive(Debug, Insertable)]
+#[diesel(table_name = harvest_build_policies)]
+pub struct NewHarvestBuildPolicy<'a> {
+    pub id: Uuid,
+    pub queue_name: &'a str,
+    pub build_id: &'a str,
+    pub deployment_name: Option<&'a str>,
+}
+
+// ── BuildCompatEntry ──────────────────────────────────────────────────────────
+
+/// A build compatibility declaration (issue #171).
+#[derive(
+    Debug, Clone, Queryable, Selectable, Identifiable, serde::Serialize, serde::Deserialize,
+)]
+#[diesel(table_name = harvest_build_compat)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct HarvestBuildCompat {
+    pub id: Uuid,
+    pub build_id: String,
+    pub compatible_with: String,
+    pub declared_at: DateTime<Utc>,
+}
+
+/// Insert struct for a new compatibility declaration.
+#[derive(Debug, Insertable)]
+#[diesel(table_name = harvest_build_compat)]
+pub struct NewHarvestBuildCompat<'a> {
+    pub id: Uuid,
+    pub build_id: &'a str,
+    pub compatible_with: &'a str,
 }

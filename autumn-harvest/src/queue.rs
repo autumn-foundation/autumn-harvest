@@ -94,6 +94,12 @@ pub struct EnqueueParams {
     /// Stored on each row so the claim query can enforce the cap without
     /// application-layer input per poll.
     pub max_concurrent: Option<u32>,
+    /// Build ID required to claim this task (issue #171).
+    ///
+    /// Workers whose `build_id` does not match (or is not declared compatible)
+    /// will skip this task. `None` = any worker may claim (pre-policy / legacy
+    /// executions).
+    pub required_build_id: Option<String>,
 }
 
 impl EnqueueParams {
@@ -124,6 +130,7 @@ impl EnqueueParams {
             trace_context: None,
             concurrency_key: None,
             max_concurrent: None,
+            required_build_id: None,
         }
     }
 
@@ -204,6 +211,7 @@ pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> Ha
             .and_then(TraceContextCarrier::to_json),
         concurrency_key: params.concurrency_key.as_deref(),
         concurrency_cap,
+        required_build_id: params.required_build_id.as_deref(),
     };
 
     diesel::insert_into(harvest_task_queue::table)
@@ -253,6 +261,7 @@ pub async fn claim_task(
     conn: &mut AsyncPgConnection,
     queues: &[String],
     worker_id: &str,
+    worker_build_id: &str,
 ) -> HarvestResult<Option<TaskQueueItem>> {
     // Two-phase claim using a CTE to avoid holding advisory locks during
     // broad WHERE filtering.
@@ -275,6 +284,10 @@ pub async fn claim_task(
     //
     // The partial index harvest_task_queue_concurrency_key_running makes the
     // scalar subquery fast: it only scans RUNNING rows with a non-NULL key.
+    //
+    // Build routing filter (issue #171): a task with required_build_id can only
+    // be claimed by a worker whose build_id matches, is declared compatible, OR
+    // the worker has an empty build_id (legacy worker — can claim anything).
     let result: Vec<TaskQueueItem> = diesel::sql_query(
         "WITH candidate AS ( \
              SELECT id, concurrency_key, concurrency_cap \
@@ -296,6 +309,16 @@ pub async fn claim_task(
                        WHERE inner_q.concurrency_key = harvest_task_queue.concurrency_key \
                          AND inner_q.state = 'RUNNING' \
                    ) < harvest_task_queue.concurrency_cap \
+               ) \
+               AND ( \
+                   required_build_id IS NULL \
+                   OR $3 = '' \
+                   OR required_build_id = $3 \
+                   OR EXISTS ( \
+                       SELECT 1 FROM harvest_build_compat \
+                       WHERE build_id = $3 \
+                         AND compatible_with = harvest_task_queue.required_build_id \
+                   ) \
                ) \
              ORDER BY \
                  CASE \
@@ -328,6 +351,7 @@ pub async fn claim_task(
     )
     .bind::<diesel::sql_types::Text, _>(worker_id)
     .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
+    .bind::<diesel::sql_types::Text, _>(worker_build_id)
     .load(conn)
     .await
     .map_err(crate::error::database_error)?;

@@ -90,6 +90,10 @@ pub struct WorkerRuntimeConfig {
     /// Heartbeat interval for worker liveness records in `harvest_workers`.
     /// Defaults to 5 seconds. Stale threshold is `2 × heartbeat_interval`.
     pub worker_heartbeat_interval: Duration,
+    /// Immutable build identifier for this worker (issue #171).
+    pub build_id: String,
+    /// Optional deployment name for operator observability (issue #171).
+    pub deployment_name: Option<String>,
 }
 
 impl WorkerRuntimeConfig {
@@ -123,6 +127,8 @@ impl From<WorkerConfig> for WorkerRuntimeConfig {
             max_local_activity_start_to_close: cfg.max_local_activity_start_to_close,
             shard_assignments: cfg.shard_assignments,
             worker_heartbeat_interval: cfg.worker_heartbeat_interval,
+            build_id: cfg.build_id,
+            deployment_name: cfg.deployment_name,
         }
     }
 }
@@ -1193,6 +1199,7 @@ async fn persist_scheduled_activity(
     scheduled: &ScheduledActivityCommand,
     sticky: Option<queue::StickyHint<'_>>,
     execute_span: &tracing::Span,
+    assigned_build_id: Option<&str>,
 ) -> HarvestResult<()> {
     let activity = registry.activities.get(&scheduled.name).ok_or_else(|| {
         HarvestError::Config(format!(
@@ -1215,6 +1222,7 @@ async fn persist_scheduled_activity(
     );
     params.workflow_exec_id = Some(exec_id.as_uuid());
     params.activity_name = Some(scheduled.name.clone());
+    params.required_build_id = assigned_build_id.map(str::to_string);
     // trace_context is set below, inside the harvest.activity.schedule span,
     // so the downstream worker's harvest.activity.execute span is stitched to
     // the producer span rather than the parent workflow-execute context.
@@ -1466,6 +1474,7 @@ async fn persist_all_started_child_workflows(
                     execution_timeout: None,
                     memo: None,
                     search_attrs: None,
+                    assigned_build_id: parent_execution.assigned_build_id.clone(),
                 };
                 let child_started_event = WorkflowEvent::WorkflowStarted {
                     input: child.input.clone(),
@@ -1477,6 +1486,7 @@ async fn persist_all_started_child_workflows(
                     child.input.clone(),
                 );
                 params.workflow_exec_id = Some(child.child_id.as_uuid());
+                params.required_build_id = parent_execution.assigned_build_id.clone();
                 params.trace_context = child_trace_ctxs
                     .get(&child.child_id.as_uuid())
                     .cloned()
@@ -2191,6 +2201,7 @@ async fn handle_suspended_workflow(
             &scheduled,
             sticky,
             context.execute_span,
+            context.execution.assigned_build_id.as_deref(),
         )
         .await
     } else if let Some(timer) = extract_single_started_timer(commands) {
@@ -2398,10 +2409,12 @@ async fn persist_workflow_continue_as_new(
         execution_timeout: execution.execution_timeout,
         memo: execution.memo.clone(),
         search_attrs: execution.search_attrs.clone(),
+        assigned_build_id: execution.assigned_build_id.clone(),
     };
     let mut enqueue =
         queue::EnqueueParams::new(execution.queue_name.clone(), TaskType::Workflow, input);
     enqueue.workflow_exec_id = Some(new_exec_id.as_uuid());
+    enqueue.required_build_id = execution.assigned_build_id.clone();
 
     conn.transaction::<(), HarvestError, _>(|conn| {
         async move {
@@ -3192,6 +3205,8 @@ impl Worker {
                 max_concurrency,
                 host: crate::workers::local_hostname(),
                 version: Some(env!("CARGO_PKG_VERSION").to_string()),
+                build_id: self.config.build_id.clone(),
+                deployment_name: self.config.deployment_name.clone(),
             },
             Arc::clone(&self.workflow_semaphore),
             self.config.max_concurrent_workflows,
@@ -3309,6 +3324,8 @@ impl Worker {
                     max_concurrency,
                     &host,
                     Some(version),
+                    &self.config.build_id,
+                    self.config.deployment_name.as_deref(),
                 )
                 .await
                 {
@@ -3375,7 +3392,14 @@ impl Worker {
             }
         };
 
-        match queue::claim_task(&mut conn, &self.config.queues, &self.config.worker_id).await {
+        match queue::claim_task(
+            &mut conn,
+            &self.config.queues,
+            &self.config.worker_id,
+            &self.config.build_id,
+        )
+        .await
+        {
             Ok(Some(task)) => {
                 tracing::debug!(
                     task_id = %task.id,
@@ -3565,6 +3589,8 @@ mod tests {
             max_local_activity_start_to_close: Duration::from_secs(60),
             shard_assignments: vec![crate::types::ShardId::new(0)],
             worker_heartbeat_interval: Duration::from_secs(5),
+            build_id: String::new(),
+            deployment_name: None,
         }
     }
 
@@ -3619,6 +3645,8 @@ mod tests {
             shard_assignments: vec![crate::types::ShardId::new(0)],
             max_local_activity_start_to_close: Duration::from_secs(60),
             worker_heartbeat_interval: Duration::from_secs(5),
+            build_id: String::new(),
+            deployment_name: None,
         };
 
         let runtime_cfg: WorkerRuntimeConfig = builder_cfg.into();

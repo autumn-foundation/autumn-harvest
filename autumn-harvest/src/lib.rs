@@ -21,6 +21,9 @@ pub mod analyzer;
 pub mod audit;
 /// Batch operations for fleet-wide workflow cancel/terminate/signal (issue #102).
 pub mod batch;
+/// Worker build-id routing for safe rolling deploys (issue #171).
+#[cfg(feature = "db")]
+pub mod build_routing;
 pub mod builder;
 pub mod cache;
 pub mod context;
@@ -185,8 +188,8 @@ pub use testing::{
     HistorySnapshot, NonDeterminismKind, ReplayReport, ReplayStatus, WorkflowReplayer,
 };
 pub use types::{
-    ActivityExecId, ExecutionId, ExternalActivityToken, ShardId, TimerId, UpdateId, WorkerId,
-    WorkflowId, WorkflowIdReusePolicy,
+    ActivityExecId, BuildId, DeploymentName, ExecutionId, ExternalActivityToken, ShardId, TimerId,
+    UpdateId, WorkerId, WorkflowId, WorkflowIdReusePolicy,
 };
 pub use update::UpdateRegistry;
 #[cfg(feature = "db")]

@@ -721,6 +721,7 @@ async fn insert_fork_execution(
         execution_timeout: source.execution_timeout,
         memo: source.memo.clone(),
         search_attrs: source.search_attrs.clone(),
+        assigned_build_id: source.assigned_build_id.clone(),
     };
 
     diesel::insert_into(harvest_workflow_executions::table)
@@ -906,6 +907,7 @@ async fn enqueue_fork_workflow_task(
         fork.input.clone(),
     );
     enqueue.workflow_exec_id = Some(new_exec_id.as_uuid());
+    enqueue.required_build_id = fork.assigned_build_id.clone();
     queue::enqueue(conn, &enqueue).await?;
     Ok(())
 }

@@ -29,6 +29,8 @@ diesel::table! {
         memo -> Nullable<Jsonb>,
         search_attrs -> Nullable<Jsonb>,
         created_at -> Timestamptz,
+        /// Build ID assigned to this execution at start time (issue #171).
+        assigned_build_id -> Nullable<Text>,
     }
 }
 
@@ -77,6 +79,8 @@ diesel::table! {
         trace_context -> Nullable<Jsonb>,
         concurrency_key -> Nullable<Text>,
         concurrency_cap -> Nullable<Int4>,
+        /// Build ID required to claim this task (issue #171). NULL = any worker.
+        required_build_id -> Nullable<Text>,
     }
 }
 
@@ -194,6 +198,34 @@ diesel::table! {
         version -> Nullable<Text>,
         status -> Text,
         drain_deadline_at -> Nullable<Timestamptz>,
+        /// Immutable build identifier advertised by this worker (issue #171).
+        build_id -> Text,
+        /// Optional human-readable deployment name (issue #171).
+        deployment_name -> Nullable<Text>,
+    }
+}
+
+diesel::table! {
+    use diesel::sql_types::*;
+
+    harvest_build_policies (id) {
+        id -> Uuid,
+        queue_name -> Text,
+        build_id -> Text,
+        deployment_name -> Nullable<Text>,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    use diesel::sql_types::*;
+
+    harvest_build_compat (id) {
+        id -> Uuid,
+        build_id -> Text,
+        compatible_with -> Text,
+        declared_at -> Timestamptz,
     }
 }
 
@@ -261,4 +293,6 @@ diesel::allow_tables_to_appear_in_same_query!(
     harvest_workers,
     harvest_batch_jobs,
     harvest_audit_log,
+    harvest_build_policies,
+    harvest_build_compat,
 );

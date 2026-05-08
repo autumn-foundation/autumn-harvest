@@ -23,7 +23,8 @@ pub use crate::telemetry::{
     TraceContextCarrier, TraceContextPropagator, WorkflowStatus,
 };
 pub use crate::types::{
-    ActivityExecId, ExecutionId, IdempotencyKey, TimerId, WorkerId, WorkflowId,
+    ActivityExecId, BuildId, DeploymentName, ExecutionId, IdempotencyKey, TimerId, WorkerId,
+    WorkflowId,
 };
 
 // Re-export macros from autumn-harvest-macros.

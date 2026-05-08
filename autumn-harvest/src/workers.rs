@@ -45,6 +45,14 @@ pub struct WorkerRegistration {
     pub host: String,
     /// The version of the `autumn-harvest` crate or worker software.
     pub version: Option<String>,
+    /// Immutable build identifier for this worker binary (issue #171).
+    ///
+    /// Empty string = legacy worker that can claim any task regardless of
+    /// `required_build_id`. Operators should set this to a stable per-build
+    /// token (Git SHA, semver, CI job ID, etc.) to enable build-aware routing.
+    pub build_id: String,
+    /// Optional human-readable deployment name, e.g. `"prod-blue"` (issue #171).
+    pub deployment_name: Option<String>,
 }
 use crate::models::{HarvestWorker, NewHarvestWorker};
 use crate::schema::{harvest_task_queue, harvest_workers};
@@ -161,6 +169,10 @@ pub struct WorkerFilters {
     pub health: Option<WorkerHealth>,
     /// The maximum number of workers to return in the result set.
     pub limit: i64,
+    /// Filter workers by build ID (issue #171).
+    pub build_id: Option<String>,
+    /// Filter workers by deployment name (issue #171).
+    pub deployment_name: Option<String>,
 }
 
 impl WorkerFilters {
@@ -238,6 +250,18 @@ pub fn parse_worker_filters(pairs: &[(String, String)]) -> Result<WorkerFilters,
                     .map_err(|_| format!("invalid limit '{value}'; expected integer"))?;
                 limit_raw = Some(parsed);
             }
+            "build_id" => {
+                let trimmed = value.trim();
+                if !trimmed.is_empty() {
+                    filters.build_id = Some(trimmed.to_string());
+                }
+            }
+            "deployment_name" => {
+                let trimmed = value.trim();
+                if !trimmed.is_empty() {
+                    filters.deployment_name = Some(trimmed.to_string());
+                }
+            }
             _ => {}
         }
     }
@@ -260,6 +284,7 @@ pub fn parse_worker_filters(pairs: &[(String, String)]) -> Result<WorkerFilters,
 /// # Errors
 ///
 /// Returns [`HarvestError`] on serialization or database failure.
+#[allow(clippy::too_many_arguments)]
 pub async fn register_worker(
     conn: &mut AsyncPgConnection,
     worker_id: &str,
@@ -268,6 +293,8 @@ pub async fn register_worker(
     max_concurrency: i32,
     host: &str,
     version: Option<&str>,
+    build_id: &str,
+    deployment_name: Option<&str>,
 ) -> HarvestResult<()> {
     use diesel::pg::upsert::excluded;
 
@@ -282,6 +309,8 @@ pub async fn register_worker(
         max_concurrency,
         host,
         version,
+        build_id,
+        deployment_name,
     };
 
     diesel::insert_into(harvest_workers::table)
@@ -297,6 +326,8 @@ pub async fn register_worker(
             harvest_workers::in_flight_count.eq(0_i32),
             harvest_workers::host.eq(excluded(harvest_workers::host)),
             harvest_workers::version.eq(excluded(harvest_workers::version)),
+            harvest_workers::build_id.eq(excluded(harvest_workers::build_id)),
+            harvest_workers::deployment_name.eq(excluded(harvest_workers::deployment_name)),
             harvest_workers::status.eq(WorkerStatus::Active.as_str()),
         ))
         .execute(conn)
@@ -373,6 +404,12 @@ fn apply_worker_filters(mut results: Vec<WorkerRow>, filters: &WorkerFilters) ->
     }
     if let Some(health_filter) = filters.health {
         results.retain(|r| r.health == health_filter);
+    }
+    if let Some(ref build_id) = filters.build_id {
+        results.retain(|r| &r.worker.build_id == build_id);
+    }
+    if let Some(ref deployment_name) = filters.deployment_name {
+        results.retain(|r| r.worker.deployment_name.as_deref() == Some(deployment_name.as_str()));
     }
     results.truncate(usize::try_from(filters.limit).unwrap_or(usize::MAX));
     results
@@ -900,6 +937,8 @@ pub fn spawn_worker_heartbeat(
                                 registration.max_concurrency,
                                 &registration.host,
                                 registration.version.as_deref(),
+                                &registration.build_id,
+                                registration.deployment_name.as_deref(),
                             )
                             .await
                             {
@@ -1196,6 +1235,8 @@ mod tests {
             max_concurrency: 10,
             host: "localhost".to_string(),
             version: Some("0.2.0".to_string()),
+            build_id: String::new(),
+            deployment_name: None,
         };
         assert_eq!(reg.worker_id, "w1");
         assert_eq!(reg.queues, vec!["default"]);
@@ -1219,6 +1260,8 @@ mod tests {
                 version: None,
                 status: "Active".to_string(),
                 drain_deadline_at: None,
+                build_id: String::new(),
+                deployment_name: None,
             },
             health: WorkerHealth::Healthy,
             active_task_ids: vec![],
@@ -1285,6 +1328,8 @@ mod tests {
                 version: None,
                 status: "Active".to_string(),
                 drain_deadline_at: None,
+                build_id: String::new(),
+                deployment_name: None,
             },
             health: WorkerHealth::Healthy,
             active_task_ids,
@@ -1466,6 +1511,8 @@ mod tests {
                 version: None,
                 status: status.to_string(),
                 drain_deadline_at: None,
+                build_id: String::new(),
+                deployment_name: None,
             },
             health: WorkerHealth::Healthy,
             active_task_ids: vec![],
