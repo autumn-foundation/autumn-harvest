@@ -5483,7 +5483,9 @@ async fn request_drain_handler(
             error_summary: None,
             shard_id: Some(shard_id.as_i32()),
         };
-        let _ = audit::insert_audit(&mut conn, &ar).await;
+        audit::insert_audit(&mut conn, &ar)
+            .await
+            .map_err(map_error)?;
 
         return Ok(Json(response));
     }

@@ -3431,17 +3431,18 @@ impl Worker {
         let total_permits =
             self.config.max_concurrent_workflows + self.config.max_concurrent_activities;
 
-        // Returns the current deadline as a tokio Instant, falling back to the
-        // statically-configured shutdown_timeout for local (non-remote) shutdowns.
+        // Fixed fallback for local (non-remote) shutdowns: computed once so that
+        // the 1-second tick in the loop cannot keep sliding it forward.
+        let local_deadline = tokio::time::Instant::now() + self.config.shutdown_timeout;
+
+        // Returns the current deadline: remote (refreshable) when set, otherwise
+        // the fixed local_deadline computed above.
         let snapshot_deadline = || -> tokio::time::Instant {
             self.remote_drain_deadline
                 .lock()
                 .ok()
                 .and_then(|g| *g)
-                .map_or_else(
-                    || tokio::time::Instant::now() + self.config.shutdown_timeout,
-                    tokio::time::Instant::from_std,
-                )
+                .map_or(local_deadline, tokio::time::Instant::from_std)
         };
 
         let sleep = tokio::time::sleep_until(snapshot_deadline());
