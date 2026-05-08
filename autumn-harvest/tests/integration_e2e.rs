@@ -4691,9 +4691,15 @@ async fn drain_accepted_sets_status_to_draining() {
     // layer, not request_drain itself. The integration test verifies the DB
     // round-trip for a caller-supplied deadline.
     let deadline = Utc::now() + chrono::Duration::minutes(1);
-    let resp = request_drain(&mut conn, "w-drain-1", Some(deadline), stale_threshold)
-        .await
-        .unwrap();
+    let resp = request_drain(
+        &mut conn,
+        "w-drain-1",
+        Some(deadline),
+        true,
+        stale_threshold,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(
         resp.outcome,
@@ -4732,6 +4738,7 @@ async fn drain_already_draining_on_second_call() {
         &mut conn,
         "w-drain-2",
         Some(first_deadline),
+        true,
         stale_threshold,
     )
     .await
@@ -4740,9 +4747,15 @@ async fn drain_already_draining_on_second_call() {
     // Re-drain with a new deadline — should return AlreadyDraining and
     // persist the updated deadline (operators extending a drain window).
     let new_deadline = Utc::now() + chrono::Duration::minutes(5);
-    let resp2 = request_drain(&mut conn, "w-drain-2", Some(new_deadline), stale_threshold)
-        .await
-        .unwrap();
+    let resp2 = request_drain(
+        &mut conn,
+        "w-drain-2",
+        Some(new_deadline),
+        true,
+        stale_threshold,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(
         resp2.outcome,
@@ -4771,7 +4784,7 @@ async fn drain_already_stopped_after_transition() {
         .await
         .unwrap();
 
-    let resp = request_drain(&mut conn, "w-drain-3", None, stale_threshold)
+    let resp = request_drain(&mut conn, "w-drain-3", None, false, stale_threshold)
         .await
         .unwrap();
 
@@ -4789,7 +4802,7 @@ async fn drain_not_found_for_unknown_worker() {
     let (mut conn, _container) = setup_test_db().await;
     let stale_threshold = Duration::from_secs(10);
 
-    let resp = request_drain(&mut conn, "w-does-not-exist", None, stale_threshold)
+    let resp = request_drain(&mut conn, "w-does-not-exist", None, false, stale_threshold)
         .await
         .unwrap();
 
@@ -4824,6 +4837,7 @@ async fn drain_with_explicit_deadline_is_stored() {
         &mut conn,
         "w-drain-deadline",
         Some(explicit_deadline),
+        true,
         stale_threshold,
     )
     .await

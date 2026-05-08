@@ -717,6 +717,9 @@ pub async fn request_drain(
     conn: &mut AsyncPgConnection,
     worker_id: &str,
     deadline_at: Option<DateTime<Utc>>,
+    // true = operator supplied an explicit value; false = computed default.
+    // AlreadyDraining only refreshes the stored deadline for explicit values.
+    deadline_is_explicit: bool,
     stale_threshold: Duration,
 ) -> HarvestResult<DrainResponse> {
     let row = harvest_workers::table
@@ -786,21 +789,31 @@ pub async fn request_drain(
                 unavailable_shards: vec![],
             });
         }
-    } else if outcome == DrainOutcome::AlreadyDraining {
-        // Worker is already Draining — only refresh the deadline so operators
-        // can extend or correct it without re-triggering the status transition.
+    } else if outcome == DrainOutcome::AlreadyDraining && deadline_is_explicit {
+        // Worker is already Draining and the caller supplied an explicit deadline
+        // — refresh it so operators can extend or correct the window without
+        // re-triggering the status transition.
         diesel::update(harvest_workers::table.find(worker_id))
             .set(harvest_workers::drain_deadline_at.eq(deadline_at))
             .execute(conn)
             .await
             .map_err(crate::error::database_error)?;
     }
+    // AlreadyDraining + !deadline_is_explicit: preserve the stored deadline.
+
+    // Echo whichever deadline is now in effect: the parameter for new drains
+    // or explicit refreshes; the pre-existing row value when preserving.
+    let effective_deadline = if outcome == DrainOutcome::AlreadyDraining && !deadline_is_explicit {
+        worker.drain_deadline_at
+    } else {
+        deadline_at
+    };
 
     Ok(DrainResponse {
         worker_id: worker_id.to_string(),
         outcome,
         in_flight_count: worker.in_flight_count,
-        drain_deadline_at: deadline_at,
+        drain_deadline_at: effective_deadline,
         shard_ids,
         unavailable_shards: vec![],
     })

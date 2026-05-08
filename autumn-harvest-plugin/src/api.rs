@@ -5424,6 +5424,7 @@ struct DrainWorkerRequest {
     deadline_at: Option<String>,
 }
 
+#[allow(clippy::too_many_lines)]
 async fn request_drain_handler(
     Extension(api_state): Extension<HarvestApiState>,
     headers: axum::http::HeaderMap,
@@ -5434,20 +5435,23 @@ async fn request_drain_handler(
     let stale_threshold = api_state.worker_stale_threshold();
     let pool = api_state.storage_pool().map_err(map_error)?;
 
-    let deadline_at = if let Some(raw) = &request.deadline_at {
+    // Track whether the deadline is operator-supplied so we can avoid
+    // shortening an existing window when re-draining without --deadline.
+    let (deadline_at, deadline_is_explicit) = if let Some(raw) = &request.deadline_at {
         let dt = chrono::DateTime::parse_from_rfc3339(raw).map_err(|_| {
             AutumnError::bad_request_msg(format!(
                 "invalid deadline_at '{raw}'; expected RFC 3339 (e.g. 2026-05-09T12:00:00Z)"
             ))
         })?;
-        Some(dt.with_timezone(&chrono::Utc))
+        (Some(dt.with_timezone(&chrono::Utc)), true)
     } else {
         // Compute a default deadline from the configured worker shutdown timeout so
         // operators always get a finite drain window even when they omit the field.
         let timeout = api_state.worker_shutdown_timeout();
-        chrono::Duration::from_std(timeout)
+        let computed = chrono::Duration::from_std(timeout)
             .ok()
-            .map(|d| chrono::Utc::now() + d)
+            .map(|d| chrono::Utc::now() + d);
+        (computed, false)
     };
 
     // Search every shard for the worker — workers are registered on exactly
@@ -5460,9 +5464,15 @@ async fn request_drain_handler(
             continue;
         };
 
-        let mut response = request_drain(&mut conn, &worker_id, deadline_at, stale_threshold)
-            .await
-            .map_err(map_error)?;
+        let mut response = request_drain(
+            &mut conn,
+            &worker_id,
+            deadline_at,
+            deadline_is_explicit,
+            stale_threshold,
+        )
+        .await
+        .map_err(map_error)?;
 
         if response.outcome == autumn_harvest::workers::DrainOutcome::NotFound {
             continue;
