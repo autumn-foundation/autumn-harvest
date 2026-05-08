@@ -4687,7 +4687,11 @@ async fn drain_accepted_sets_status_to_draining() {
     .await
     .unwrap();
 
-    let resp = request_drain(&mut conn, "w-drain-1", None, stale_threshold)
+    // Supply an explicit deadline; the default is computed by the HTTP handler
+    // layer, not request_drain itself. The integration test verifies the DB
+    // round-trip for a caller-supplied deadline.
+    let deadline = Utc::now() + chrono::Duration::minutes(1);
+    let resp = request_drain(&mut conn, "w-drain-1", Some(deadline), stale_threshold)
         .await
         .unwrap();
 
@@ -4698,7 +4702,7 @@ async fn drain_accepted_sets_status_to_draining() {
     );
     assert!(
         resp.drain_deadline_at.is_some(),
-        "drain_deadline_at must be set when none supplied"
+        "drain_deadline_at must be set when a deadline is supplied"
     );
     assert_eq!(resp.worker_id, "w-drain-1");
     assert!(resp.unavailable_shards.is_empty());
@@ -4841,7 +4845,7 @@ async fn drain_preview_returns_active_workers() {
 
     let filters = WorkerFilters {
         queue: Some("default".to_string()),
-        ..WorkerFilters::default()
+        ..WorkerFilters::new()
     };
     let items = drain_preview(&mut conn, &filters, stale_threshold)
         .await

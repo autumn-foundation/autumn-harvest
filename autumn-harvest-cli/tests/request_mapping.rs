@@ -265,6 +265,69 @@ fn workflow_children_maps_to_management_api_request() {
 }
 
 #[test]
+fn history_export_maps_single_execution_to_read_only_route() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "history",
+        "export",
+        "00000000-0000-0000-0000-000000000001",
+        "--payload-policy",
+        "full",
+        "--max-bytes",
+        "1048576",
+        "--output-file",
+        "fixtures/billing.json",
+    ])
+    .expect("history export args should parse");
+    let request = cli
+        .api_request()
+        .expect("history export request should build");
+
+    assert_eq!(request.method, ApiMethod::Get);
+    assert_eq!(
+        request.path,
+        "/workflows/00000000-0000-0000-0000-000000000001/history/export?payload_policy=full&max_bytes=1048576"
+    );
+    assert_eq!(request.body, None);
+}
+
+#[test]
+fn history_export_batch_maps_filters_to_admin_route() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "history",
+        "export-batch",
+        "--workflow-name",
+        "billing_checkout",
+        "--state-group",
+        "terminal",
+        "--updated-after",
+        "2026-05-01T00:00:00Z",
+        "--updated-before",
+        "2026-05-08T00:00:00Z",
+        "--shard-id",
+        "2",
+        "--limit",
+        "1000",
+        "--payload-policy",
+        "redacted",
+    ])
+    .expect("batch history export args should parse");
+    let request = cli
+        .api_request()
+        .expect("batch history export request should build");
+
+    assert_eq!(request.method, ApiMethod::Get);
+    assert_eq!(
+        request.path,
+        "/admin/history/exports?workflow_name=billing_checkout&state_group=terminal\
+         &updated_after=2026-05-01T00:00:00Z&updated_before=2026-05-08T00:00:00Z\
+         &shard_id=2&limit=1000&payload_policy=redacted"
+    );
+    assert_eq!(request.body, None);
+}
+
+#[test]
 fn handoff_list_maps_filters_to_management_api_request() {
     let cli = Cli::try_parse_from([
         "harvest",

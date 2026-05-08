@@ -59,10 +59,14 @@ deterministic:
 cargo test -p my-app --test replay_tests
 ```
 
-or with `WorkflowReplayer` in a staging environment pointed at real histories:
+or with fixtures exported from a staging/production management API:
 
 ```bash
-harvest workflow get <exec_id> | jq .events > fixtures/billing_v1.json
+harvest history export-batch \
+    --workflow-name billing \
+    --state-group terminal \
+    --payload-policy full \
+    --output-file fixtures/billing_v1.json
 cargo test --features testing -- replayer
 ```
 
