@@ -2997,6 +2997,13 @@ pub struct Worker {
     remote_drain_deadline: Arc<Mutex<Option<std::time::Instant>>>,
 }
 
+struct WorkerMonitoringHandles {
+    queue_depth_sampler: tokio::task::JoinHandle<()>,
+    concurrency_sampler: tokio::task::JoinHandle<()>,
+    dlq_depth_samplers: Vec<tokio::task::JoinHandle<()>>,
+    timeout_checker: tokio::task::JoinHandle<()>,
+}
+
 impl Worker {
     /// Create a new worker from validated config and a handler registry.
     ///
@@ -3055,11 +3062,10 @@ impl Worker {
     ///
     /// This lets callers separate listener startup from task polling when they
     /// need tighter control over startup sequencing.
-    #[allow(clippy::too_many_lines)]
     pub async fn run_with_listener(
         &self,
         pool: &DbPool,
-        mut listener: Option<crate::notify::QueueListener>,
+        listener: Option<crate::notify::QueueListener>,
     ) {
         tracing::info!(
             worker_id = %self.config.worker_id,
@@ -3070,6 +3076,32 @@ impl Worker {
         // Register this worker in the fleet table.
         self.register_in_fleet(pool).await;
 
+        let monitors = self.spawn_monitoring_tasks(pool);
+        let heartbeat_cancel = CancellationToken::new();
+        let heartbeat_handle = self.spawn_heartbeat_task(pool, heartbeat_cancel.clone());
+
+        self.run_poll_loop(pool, listener).await;
+
+        tracing::info!(worker_id = %self.config.worker_id, "shutdown signal received");
+
+        // Transition to Draining before waiting for in-flight tasks.
+        self.transition_fleet_status(pool, crate::workers::WorkerStatus::Draining)
+            .await;
+
+        tracing::info!(worker_id = %self.config.worker_id, "draining in-flight tasks");
+        self.drain_in_flight().await;
+
+        // All tasks complete — mark Stopped, then stop the heartbeat task.
+        self.transition_fleet_status(pool, crate::workers::WorkerStatus::Stopped)
+            .await;
+        heartbeat_cancel.cancel();
+
+        self.shutdown_and_cleanup(heartbeat_handle, monitors).await;
+
+        tracing::info!(worker_id = %self.config.worker_id, "worker stopped");
+    }
+
+    fn spawn_monitoring_tasks(&self, pool: &DbPool) -> WorkerMonitoringHandles {
         let queue_depth_sampler = spawn_queue_depth_sampler(
             pool.clone(),
             self.shutdown.clone(),
@@ -3125,10 +3157,22 @@ impl Worker {
             self.config.poll_interval,
         );
 
+        WorkerMonitoringHandles {
+            queue_depth_sampler,
+            concurrency_sampler,
+            dlq_depth_samplers,
+            timeout_checker,
+        }
+    }
+
+    fn spawn_heartbeat_task(
+        &self,
+        pool: &DbPool,
+        heartbeat_cancel: CancellationToken,
+    ) -> tokio::task::JoinHandle<()> {
         // Spawn the heartbeat background task with a dedicated cancel token so
         // that liveness updates continue during the Draining phase and only stop
         // after the Stopped transition is written.
-        let heartbeat_cancel = CancellationToken::new();
         let shard_ids: Vec<i32> = self
             .config
             .shard_assignments
@@ -3139,7 +3183,7 @@ impl Worker {
             self.config.max_concurrent_workflows + self.config.max_concurrent_activities,
         )
         .unwrap_or(i32::MAX);
-        let heartbeat_handle = crate::workers::spawn_worker_heartbeat(
+        crate::workers::spawn_worker_heartbeat(
             pool.clone(),
             crate::workers::WorkerRegistration {
                 worker_id: self.config.worker_id.clone(),
@@ -3154,11 +3198,17 @@ impl Worker {
             Arc::clone(&self.activity_semaphore),
             self.config.max_concurrent_activities,
             self.config.worker_heartbeat_interval,
-            heartbeat_cancel.clone(),
+            heartbeat_cancel,
             self.shutdown.clone(),
             Arc::clone(&self.remote_drain_deadline),
-        );
+        )
+    }
 
+    async fn run_poll_loop(
+        &self,
+        pool: &DbPool,
+        mut listener: Option<crate::notify::QueueListener>,
+    ) {
         while !self.shutdown.is_cancelled() {
             if self.poll_once(pool).await {
                 continue;
@@ -3188,21 +3238,13 @@ impl Worker {
                 tokio::time::sleep(self.config.poll_interval).await;
             }
         }
+    }
 
-        tracing::info!(worker_id = %self.config.worker_id, "shutdown signal received");
-
-        // Transition to Draining before waiting for in-flight tasks.
-        self.transition_fleet_status(pool, crate::workers::WorkerStatus::Draining)
-            .await;
-
-        tracing::info!(worker_id = %self.config.worker_id, "draining in-flight tasks");
-        self.drain_in_flight().await;
-
-        // All tasks complete — mark Stopped, then stop the heartbeat task.
-        self.transition_fleet_status(pool, crate::workers::WorkerStatus::Stopped)
-            .await;
-        heartbeat_cancel.cancel();
-
+    async fn shutdown_and_cleanup(
+        &self,
+        heartbeat_handle: tokio::task::JoinHandle<()>,
+        monitors: WorkerMonitoringHandles,
+    ) {
         if let Err(error) = heartbeat_handle.await {
             tracing::warn!(
                 worker_id = %self.config.worker_id,
@@ -3210,28 +3252,28 @@ impl Worker {
                 "worker heartbeat task failed during shutdown"
             );
         }
-        if let Err(error) = timeout_checker.await {
+        if let Err(error) = monitors.timeout_checker.await {
             tracing::warn!(
                 worker_id = %self.config.worker_id,
                 error = %error,
                 "timeout checker task failed during shutdown"
             );
         }
-        if let Err(error) = queue_depth_sampler.await {
+        if let Err(error) = monitors.queue_depth_sampler.await {
             tracing::warn!(
                 worker_id = %self.config.worker_id,
                 error = %error,
                 "queue depth sampler failed during shutdown"
             );
         }
-        if let Err(error) = concurrency_sampler.await {
+        if let Err(error) = monitors.concurrency_sampler.await {
             tracing::warn!(
                 worker_id = %self.config.worker_id,
                 error = %error,
                 "concurrency sampler failed during shutdown"
             );
         }
-        for sampler in dlq_depth_samplers {
+        for sampler in monitors.dlq_depth_samplers {
             if let Err(error) = sampler.await {
                 tracing::warn!(
                     worker_id = %self.config.worker_id,
@@ -3240,7 +3282,6 @@ impl Worker {
                 );
             }
         }
-        tracing::info!(worker_id = %self.config.worker_id, "worker stopped");
     }
 
     /// Register or re-register this worker in the fleet table.
