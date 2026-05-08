@@ -209,6 +209,15 @@ declare_compat(&mut conn, "sha-new123", "sha-old456").await?;
 // "workers running sha-new123 may process executions assigned to sha-old456"
 ```
 
+> **Sharded deployments:** `harvest_build_compat` lives on every shard.
+> Fan the write out to all shards:
+> ```rust
+> for (_, pool) in sharded_pool.iter_shards() {
+>     let mut conn = pool.get().await?;
+>     declare_compat(&mut conn, "sha-new123", "sha-old456").await?;
+> }
+> ```
+
 **Step 3 — Advance the build policy so new starts land on the new build.**
 
 ```rust
@@ -216,6 +225,15 @@ use autumn_harvest::build_routing::set_build_policy;
 
 set_build_policy(&mut conn, "default", "sha-new123", Some("v2.3.0")).await?;
 ```
+
+> **Sharded deployments:** `harvest_build_policies` lives on every shard.
+> Fan the write out to all shards:
+> ```rust
+> for (_, pool) in sharded_pool.iter_shards() {
+>     let mut conn = pool.get().await?;
+>     set_build_policy(&mut conn, "default", "sha-new123", Some("v2.3.0")).await?;
+> }
+> ```
 
 New executions now get `assigned_build_id = "sha-new123"` and old-build
 workers are ineligible to claim them.
@@ -301,16 +319,31 @@ New-build executions that were in-flight will be retried and, if the build polic
 is back to `sha-old456`, picked up by old-build workers — but only if a compat
 declaration exists (or the new executions have no `required_build_id`).
 
-**Step 3 — Revoke compat declarations if the new build is being abandoned.**
+**Step 3 — Declare compat so old-build workers can resume in-flight new-build executions.**
+
+New-build executions that were in-flight when the workers were drained have
+`assigned_build_id = "sha-new123"`. For old-build workers to claim those tasks,
+declare the reverse compat direction:
+
+```rust
+use autumn_harvest::build_routing::declare_compat;
+
+declare_compat(&mut conn, "sha-old456", "sha-new123").await?;
+// "workers running sha-old456 may process executions assigned to sha-new123"
+```
+
+Optionally revoke the original forward compat to prevent any surviving
+new-build workers from claiming old tasks while they finish draining:
 
 ```rust
 use autumn_harvest::build_routing::revoke_compat;
 
 revoke_compat(&mut conn, "sha-new123", "sha-old456").await?;
+// "workers running sha-new123 may NO LONGER process executions assigned to sha-old456"
 ```
 
-After revocation, old-build workers cannot claim new-build tasks. This is the
-desired state if the new build is being rolled back entirely.
+> **Sharded deployments:** fan both calls out over `ShardedDbPool::iter_shards()`
+> as shown in Scenario A Steps 2–3 above.
 
 ---
 
