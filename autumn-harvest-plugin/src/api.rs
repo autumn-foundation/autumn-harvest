@@ -287,7 +287,7 @@ impl HarvestApiState {
 
     /// Mark whether the Harvest management API is mounted behind auth.
     ///
-    /// This reports the boundary provided via [`HarvestPlugin::api_with_auth`]
+    /// This reports the boundary provided via [`crate::plugin::HarvestPlugin::api_with_auth`]
     /// or an equivalent standalone integration. It does not implement RBAC.
     ///
     /// # Panics

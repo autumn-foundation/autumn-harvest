@@ -16,7 +16,7 @@
 //!
 //! Health checks, all list/get/query routes, worker heartbeats, activity
 //! heartbeats, read-only UI page loads, worker fleet reads, and the audit
-//! list endpoint itself. See [`EXCLUDED_ROUTES`] for the full list.
+//! list endpoint itself. See [`crate::audit::EXCLUDED_ROUTES`] for the full list.
 
 use chrono::{DateTime, Utc};
 use diesel::ExpressionMethods;
@@ -277,7 +277,7 @@ impl Default for AuditFilters {
 ///
 /// # Errors
 ///
-/// Returns [`HarvestError::Database`] if the insert fails.
+/// Returns [`crate::error::HarvestError::Database`] if the insert fails.
 pub async fn insert_audit(
     conn: &mut AsyncPgConnection,
     record: &NewAuditRecord<'_>,
@@ -297,7 +297,7 @@ pub async fn insert_audit(
 ///
 /// # Errors
 ///
-/// Returns [`HarvestError::Database`] if the query fails.
+/// Returns [`crate::error::HarvestError::Database`] if the query fails.
 pub async fn list_audit(
     conn: &mut AsyncPgConnection,
     filters: &AuditFilters,
@@ -345,7 +345,7 @@ pub async fn list_audit(
 ///
 /// # Errors
 ///
-/// Returns [`HarvestError::Database`] if the delete fails.
+/// Returns [`crate::error::HarvestError::Database`] if the delete fails.
 pub async fn purge_old_audit_records(
     conn: &mut AsyncPgConnection,
     retention_days: i64,

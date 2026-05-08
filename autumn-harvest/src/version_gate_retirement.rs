@@ -39,7 +39,7 @@ pub struct RetirementCheckFilters {
 /// **`recorded_version = 0` sentinel** — used in two conservative cases where
 /// the true version cannot be determined from stored events alone:
 ///
-/// 1. *Codec-envelope details* — when a non-identity [`PayloadCodec`] is
+/// 1. *Codec-envelope details* — when a non-identity [`crate::payload_codec::PayloadCodec`] is
 ///    configured, the `MarkerRecorded.details` field is stored as an opaque
 ///    envelope object rather than a bare integer.
 /// 2. *Pre-gate executions* — executions that began before the version gate was
