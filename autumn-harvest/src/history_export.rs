@@ -888,7 +888,9 @@ mod tests {
                 assert!(actual_bytes > max_bytes);
                 assert_eq!(max_bytes, 128);
             }
-            other => panic!("unexpected export error: {other:?}"),
+            HistoryExportError::Serialization(error) => {
+                panic!("unexpected serialization error: {error}")
+            }
         }
     }
 
