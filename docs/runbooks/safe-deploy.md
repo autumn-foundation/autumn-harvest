@@ -238,6 +238,15 @@ set_build_policy(&mut conn, "default", "sha-new123", Some("v2.3.0")).await?;
 New executions now get `assigned_build_id = "sha-new123"` and old-build
 workers are ineligible to claim them.
 
+> **First-adoption prerequisite:** this exclusion only applies to workers
+> that advertise a non-empty `build_id`. Workers using the default
+> `WorkerConfig` have `build_id = ""` (the legacy sentinel) and the claim
+> filter allows them to pick up **any** task regardless of
+> `required_build_id`. Before advancing the build policy, ensure the entire
+> old fleet is already running with `with_build_id("sha-old456")` — or drain
+> all legacy workers first. A mixed fleet with even one legacy worker
+> invalidates the routing guarantee.
+
 **Step 4 — Drain and retire old-build workers.**
 
 Check reachability first:
