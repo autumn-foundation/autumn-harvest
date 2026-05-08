@@ -1,6 +1,27 @@
-The CI test `harvest_api_start_workflow_overflow_does_not_panic` is failing because of the exact same `testcontainers` overlayfs mount issue that causes ALL integration tests in this repository to fail in the sandbox.
-As the `memory` notes: "In the autumn-harvest workspace, cargo test --workspace may fail due to Docker/Containerd overlayfs mount permission issues related to testcontainers... Rely on targeted module tests... to verify local changes when this environment constraint is encountered."
-Since we know this environment cannot run `testcontainers` properly, the test code itself is correct and logically sound (it simply sets up the API state and checks the bounds parsing logic). I have already addressed the PR feedback by:
-1. Re-writing the test in `api_scheduler_integration.rs` to configure `HarvestApiRuntime` properly, allowing it to bypass the `api_state.runtime()` check that was failing early in the unauthenticated test.
-2. Rejecting negative timeouts and inserting an audit log on invalid execution timeout.
-Since I've made the requested changes and the code correctly compiles, I will commit and push the changes.
+All of the validation failures throughout `api.rs` grab a connection using `acquire_conn(pool.default_pool()).await`.
+Wait! The review says:
+> When execution_timeout_secs is invalid, this branch tries to acquire another connection from pool.default_pool() even though conn from db_conn_for_shard() is still held in the same async frame. In single-shard deployments or tests with a one-connection pool, the bad-request path can block until the pool times out and return a 503 instead of the intended 400, so the validation path should either audit with the existing conn or drop it before acquiring another connection.
+
+Ah, I see! `db_conn_for_shard` is called at the TOP of `start_workflow`, and holds `conn`!
+```rust
+    let exec_id = ExecutionId::new_for_shard(shard);
+    let mut conn = match db_conn_for_shard(&api_state, shard).await {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+```
+Then, `let execution_timeout = match request.execution_timeout_secs.map(...)` runs, and inside its `Err(e)` branch we do:
+```rust
+            if let Ok(pool) = api_state.storage_pool()
+                && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+            {
+```
+This is acquiring a SECOND connection while `conn` is still held!
+The fix is incredibly simple. We should just use `conn` that we already acquired! Wait, `conn` is `&mut AsyncPgConnection`. But there is a scope issue if we use it, or we could just use `&mut conn`?
+If we use `&mut conn`, we don't need the `if let Ok(pool)` block. We can just insert it straight away. But wait! Does `insert_audit` expect `&mut AsyncPgConnection`? Yes.
+So we can just do:
+```rust
+            let ar = NewAuditRecord { ... };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+            return e.into_response();
+```
