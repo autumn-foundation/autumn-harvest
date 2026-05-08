@@ -123,6 +123,105 @@ fn compat_set_can_remove_a_declaration() {
     assert!(!compat.is_eligible("v2.0", Some("v1.0")));
 }
 
+// ── merge_reachability (cross-shard aggregation, no DB required) ───────────
+
+#[test]
+fn merge_reachability_sums_counters_across_shards() {
+    use autumn_harvest::build_routing::{BuildReachability, merge_reachability};
+
+    let shard_0 = vec![
+        BuildReachability {
+            build_id: "v1.0".into(),
+            open_executions: 3,
+            pending_tasks: 2,
+            active_workers: 1,
+            stale_workers: 0,
+            safe_to_retire: false,
+        },
+        BuildReachability {
+            build_id: "v2.0".into(),
+            open_executions: 1,
+            pending_tasks: 1,
+            active_workers: 1,
+            stale_workers: 0,
+            safe_to_retire: false,
+        },
+    ];
+    let shard_1 = vec![
+        BuildReachability {
+            build_id: "v1.0".into(),
+            open_executions: 2,
+            pending_tasks: 1,
+            active_workers: 0,
+            stale_workers: 1,
+            safe_to_retire: false,
+        },
+        // v3.0 only on shard 1
+        BuildReachability {
+            build_id: "v3.0".into(),
+            open_executions: 0,
+            pending_tasks: 0,
+            active_workers: 2,
+            stale_workers: 0,
+            safe_to_retire: true,
+        },
+    ];
+
+    let merged = merge_reachability(vec![shard_0, shard_1]);
+    assert_eq!(merged.len(), 3, "v1.0, v2.0, v3.0");
+
+    let v1 = merged.iter().find(|r| r.build_id == "v1.0").unwrap();
+    assert_eq!(v1.open_executions, 5);
+    assert_eq!(v1.pending_tasks, 3);
+    assert_eq!(v1.active_workers, 1);
+    assert_eq!(v1.stale_workers, 1);
+    assert!(!v1.safe_to_retire, "has open executions");
+
+    let v2 = merged.iter().find(|r| r.build_id == "v2.0").unwrap();
+    assert_eq!(v2.open_executions, 1);
+    assert!(!v2.safe_to_retire);
+
+    let v3 = merged.iter().find(|r| r.build_id == "v3.0").unwrap();
+    assert_eq!(v3.open_executions, 0);
+    assert_eq!(v3.pending_tasks, 0);
+    assert!(v3.safe_to_retire, "no open work on any shard");
+}
+
+#[test]
+fn merge_reachability_recomputes_safe_to_retire_from_totals() {
+    use autumn_harvest::build_routing::{BuildReachability, merge_reachability};
+
+    // Shard 0 says safe (0/0), shard 1 has pending tasks — merged must be false.
+    let shard_0 = vec![BuildReachability {
+        build_id: "v1.0".into(),
+        open_executions: 0,
+        pending_tasks: 0,
+        active_workers: 0,
+        stale_workers: 0,
+        safe_to_retire: true,
+    }];
+    let shard_1 = vec![BuildReachability {
+        build_id: "v1.0".into(),
+        open_executions: 0,
+        pending_tasks: 5,
+        active_workers: 1,
+        stale_workers: 0,
+        safe_to_retire: false,
+    }];
+
+    let merged = merge_reachability(vec![shard_0, shard_1]);
+    let v1 = merged.iter().find(|r| r.build_id == "v1.0").unwrap();
+    assert_eq!(v1.pending_tasks, 5);
+    assert!(!v1.safe_to_retire, "pending tasks on shard 1 must flip safe_to_retire to false");
+}
+
+#[test]
+fn merge_reachability_empty_input_returns_empty() {
+    use autumn_harvest::build_routing::merge_reachability;
+    assert!(merge_reachability(vec![]).is_empty());
+    assert!(merge_reachability(vec![vec![]]).is_empty());
+}
+
 // ── WorkerFilters build filtering ──────────────────────────────────────────
 
 #[cfg(feature = "db")]

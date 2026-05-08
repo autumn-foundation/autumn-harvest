@@ -30,7 +30,7 @@
 //! 4. There is an explicit compatibility declaration: worker build is declared
 //!    compatible with the task's `required_build_id`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -511,7 +511,11 @@ pub async fn build_reachability(
 }
 
 /// Return reachability snapshots for all distinct build IDs present across
-/// `harvest_workflow_executions`, `harvest_task_queue`, and `harvest_workers`.
+/// `harvest_workflow_executions`, `harvest_task_queue`, and `harvest_workers`
+/// on a **single shard**.
+///
+/// For multi-shard deployments prefer [`all_build_reachability_sharded`], which
+/// fans out to every shard and merges the per-build counters.
 ///
 /// # Errors
 ///
@@ -553,4 +557,79 @@ pub async fn all_build_reachability(
         result.push(build_reachability(conn, &row.build_id, stale_threshold).await?);
     }
     Ok(result)
+}
+
+/// Return reachability snapshots for all distinct build IDs, aggregated across
+/// every shard in `pool`.
+///
+/// Each shard is queried concurrently. Per-build counters
+/// (`open_executions`, `pending_tasks`, `active_workers`, `stale_workers`) are
+/// summed across shards; `safe_to_retire` is recomputed from the merged totals.
+///
+/// Single-shard deployments produce identical results to [`all_build_reachability`]
+/// called directly; the extra indirection costs one pool connection checkout.
+///
+/// # Errors
+///
+/// Returns `HarvestError::Database` on the first shard that fails. Errors from
+/// unreachable shards bubble up rather than being silently skipped so that
+/// callers get an honest picture of fleet state (a failed shard means the
+/// reachability data is incomplete).
+#[cfg(feature = "db")]
+pub async fn all_build_reachability_sharded(
+    pool: &crate::shard::ShardedDbPool,
+    stale_threshold: Duration,
+) -> HarvestResult<Vec<BuildReachability>> {
+    use futures::future::try_join_all;
+
+    // Fan out to all shards concurrently.
+    let shard_futures: Vec<_> = pool
+        .iter_shards()
+        .map(|(_, shard_pool)| {
+            let shard_pool = shard_pool.clone();
+            async move {
+                let mut conn = shard_pool
+                    .get()
+                    .await
+                    .map_err(|e| crate::error::HarvestError::Database(e.to_string()))?;
+                all_build_reachability(&mut conn, stale_threshold).await
+            }
+        })
+        .collect();
+
+    let per_shard: Vec<Vec<BuildReachability>> = try_join_all(shard_futures).await?;
+
+    Ok(merge_reachability(per_shard))
+}
+
+/// Merge per-shard reachability vectors into a single list.
+///
+/// Numeric counters are summed per `build_id`; `safe_to_retire` is
+/// recomputed from the merged totals. The result is sorted by `build_id`.
+pub fn merge_reachability(per_shard: Vec<Vec<BuildReachability>>) -> Vec<BuildReachability> {
+    let mut merged: BTreeMap<String, BuildReachability> = BTreeMap::new();
+    for shard_results in per_shard {
+        for r in shard_results {
+            let entry = merged.entry(r.build_id.clone()).or_insert(BuildReachability {
+                build_id: r.build_id.clone(),
+                open_executions: 0,
+                pending_tasks: 0,
+                active_workers: 0,
+                stale_workers: 0,
+                safe_to_retire: false,
+            });
+            entry.open_executions += r.open_executions;
+            entry.pending_tasks += r.pending_tasks;
+            entry.active_workers += r.active_workers;
+            entry.stale_workers += r.stale_workers;
+        }
+    }
+
+    merged
+        .into_values()
+        .map(|mut r| {
+            r.safe_to_retire = r.open_executions == 0 && r.pending_tasks == 0;
+            r
+        })
+        .collect()
 }
