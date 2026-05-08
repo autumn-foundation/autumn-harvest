@@ -1,0 +1,2 @@
+The `test_havoc...` test failed because `testcontainers` fails to mount `Postgres` on the test environment. But wait, I have already updated `tests/security.rs` and the original test `eris_start_workflow_overflow_does_not_panic` which passes successfully without Postgres since it is purely an API request with an unauthenticated context.
+I need to add audit logging and reject negative numbers as the comment suggested in `src/api.rs`.

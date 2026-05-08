@@ -1975,6 +1975,11 @@ async fn start_workflow(
     let execution_timeout = match request
         .execution_timeout_secs
         .map(|secs| {
+            if secs < 0 {
+                return Err(AutumnError::bad_request_msg(format!(
+                    "execution_timeout_secs {secs} must be non-negative"
+                )));
+            }
             chrono::Duration::try_seconds(secs).ok_or_else(|| {
                 AutumnError::bad_request_msg(format!(
                     "execution_timeout_secs {secs} is out of bounds"
@@ -1984,7 +1989,27 @@ async fn start_workflow(
         .transpose()
     {
         Ok(t) => t,
-        Err(e) => return e.into_response(),
+        Err(e) => {
+            if let Ok(pool) = api_state.storage_pool()
+                && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+            {
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_START,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: Some(workflow_name.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: None,
+                    status: STATUS_FAILED,
+                    error_summary: Some("invalid execution timeout"),
+                    shard_id: None,
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+            }
+            return e.into_response();
+        }
     };
 
     let result = start_or_load_workflow_execution(

@@ -2700,3 +2700,42 @@ async fn register_schedules_recomputes_next_run_when_schedule_changes() {
         "changing an automatic schedule to manual should clear stale next_run_at"
     );
 }
+
+#[tokio::test]
+async fn harvest_api_start_workflow_overflow_does_not_panic() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let registry = approval_registry();
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
+    api_state.install(HarvestApiRuntime::new(
+        Arc::clone(&registry),
+        Arc::new(std::collections::HashMap::new()),
+        Arc::new(Vec::new()),
+        Some("test-worker".to_string()),
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::single(),
+    ));
+    let app = harvest_api_router(api_state).with_state(test_app_state(pool));
+
+    let payload = serde_json::json!({
+        "workflow_id": "approval-overflow",
+        "input": { "request_id": "overflow-1" },
+        "execution_timeout_secs": 9_223_372_036_854_775_807_i64
+    });
+
+    let (status, _body) = post_json(&app, "/workflows/approval_process/start", payload).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let payload_negative = serde_json::json!({
+        "workflow_id": "approval-overflow2",
+        "input": { "request_id": "overflow-2" },
+        "execution_timeout_secs": -10i64
+    });
+
+    let (status, _body) =
+        post_json(&app, "/workflows/approval_process/start", payload_negative).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
