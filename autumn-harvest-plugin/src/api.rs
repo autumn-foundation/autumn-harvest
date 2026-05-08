@@ -5490,7 +5490,30 @@ async fn request_drain_handler(
 
     // Worker not found on any reachable shard. If some shards were unavailable
     // the worker may live there — return a degraded 200 rather than 404.
+    // Write an audit record on any reachable shard so the attempt is traceable
+    // even when the owning shard is down.
     if !unavailable_shards.is_empty() {
+        'audit: for (_shard_id, shard_pool) in pool.iter_shards() {
+            if let Ok(mut conn) = acquire_conn(shard_pool).await {
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    source: &source,
+                    operation: OP_WORKER_DRAIN,
+                    target_type: TARGET_WORKER,
+                    target_id: Some(worker_id.as_str()),
+                    route_or_command: "POST /workers/{worker_id}/drain",
+                    request_id: request_id.as_deref(),
+                    idempotency_key: None,
+                    status: STATUS_FAILED,
+                    error_summary: Some(
+                        "degraded: worker not found on reachable shards; may exist on unavailable shard",
+                    ),
+                    shard_id: None,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+                break 'audit;
+            }
+        }
         return Ok(Json(DrainResponse {
             worker_id: worker_id.clone(),
             outcome: autumn_harvest::workers::DrainOutcome::NotFound,
