@@ -265,6 +265,136 @@ fn workflow_children_maps_to_management_api_request() {
 }
 
 #[test]
+fn handoff_list_maps_filters_to_management_api_request() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "handoff",
+        "list",
+        "--state",
+        "PENDING,FAILED",
+        "--workflow-name",
+        "billing_checkout",
+        "--execution-id",
+        "00000000-0000-0000-0000-000000000001",
+        "--activity-name",
+        "manager_approval",
+        "--token",
+        "11111111-1111-4111-8111-111111111111",
+        "--shard-id",
+        "2",
+        "--due-before",
+        "2026-05-08T12:00:00Z",
+        "--updated-before",
+        "2026-05-08T13:00:00Z",
+        "--limit",
+        "25",
+    ])
+    .expect("handoff list args should parse");
+    let request = cli
+        .api_request()
+        .expect("handoff list request should build");
+
+    assert_eq!(request.method, ApiMethod::Get);
+    assert_eq!(
+        request.path,
+        "/admin/external-handoffs?state=PENDING,FAILED&workflow_name=billing_checkout\
+         &execution_id=00000000-0000-0000-0000-000000000001&activity_name=manager_approval\
+         &token=11111111-1111-4111-8111-111111111111&shard_id=2\
+         &due_before=2026-05-08T12:00:00Z&updated_before=2026-05-08T13:00:00Z&limit=25"
+    );
+    assert_eq!(request.body, None);
+}
+
+#[test]
+fn handoff_inspect_maps_to_detail_request() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "handoff",
+        "inspect",
+        "11111111-1111-4111-8111-111111111111",
+    ])
+    .expect("handoff inspect args should parse");
+    let request = cli
+        .api_request()
+        .expect("handoff inspect request should build");
+
+    assert_eq!(request.method, ApiMethod::Get);
+    assert_eq!(
+        request.path,
+        "/admin/external-handoffs/11111111-1111-4111-8111-111111111111"
+    );
+    assert_eq!(request.body, None);
+}
+
+#[test]
+fn handoff_mutations_map_to_token_completion_routes() {
+    let complete = Cli::try_parse_from([
+        "harvest",
+        "handoff",
+        "complete",
+        "11111111-1111-4111-8111-111111111111",
+        "--output-json",
+        r#"{"approved":true}"#,
+    ])
+    .expect("handoff complete args should parse");
+    let complete_request = complete
+        .api_request()
+        .expect("complete request should build");
+    assert_eq!(complete_request.method, ApiMethod::Post);
+    assert_eq!(
+        complete_request.path,
+        "/activities/external/11111111-1111-4111-8111-111111111111/complete"
+    );
+    assert_eq!(
+        complete_request.body,
+        Some(json!({ "output": { "approved": true } }))
+    );
+
+    let fail = Cli::try_parse_from([
+        "harvest",
+        "handoff",
+        "fail",
+        "11111111-1111-4111-8111-111111111111",
+        "--error",
+        "manager rejected",
+        "--retryable",
+    ])
+    .expect("handoff fail args should parse");
+    let fail_request = fail.api_request().expect("fail request should build");
+    assert_eq!(fail_request.method, ApiMethod::Post);
+    assert_eq!(
+        fail_request.path,
+        "/activities/external/11111111-1111-4111-8111-111111111111/fail"
+    );
+    assert_eq!(
+        fail_request.body,
+        Some(json!({ "error": "manager rejected", "retryable": true }))
+    );
+
+    let heartbeat = Cli::try_parse_from([
+        "harvest",
+        "handoff",
+        "heartbeat",
+        "11111111-1111-4111-8111-111111111111",
+        "--extend-by-secs",
+        "3600",
+    ])
+    .expect("handoff heartbeat args should parse");
+    let heartbeat_request = heartbeat
+        .api_request()
+        .expect("heartbeat request should build");
+    assert_eq!(heartbeat_request.method, ApiMethod::Post);
+    assert_eq!(
+        heartbeat_request.path,
+        "/activities/external/11111111-1111-4111-8111-111111111111/heartbeat"
+    );
+    assert_eq!(
+        heartbeat_request.body,
+        Some(json!({ "extend_by_secs": 3600 }))
+    );
+}
+
+#[test]
 fn workflow_list_rejects_search_attr_without_equals() {
     let list = Cli::try_parse_from(["harvest", "workflow", "list", "--search-attr", "tenant"])
         .expect("malformed search-attr args should still parse at clap level");

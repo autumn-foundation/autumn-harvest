@@ -55,8 +55,8 @@ use autumn_harvest::scheduler::{
     DagCatalog, RegisteredDag, SchedulerMonitor, SchedulerSnapshot, trigger_dag,
 };
 use autumn_harvest::schema::{
-    harvest_dag_runs, harvest_events, harvest_external_tasks, harvest_schedules, harvest_signals,
-    harvest_task_queue, harvest_timers, harvest_workflow_executions,
+    harvest_dag_runs, harvest_events, harvest_schedules, harvest_signals, harvest_task_queue,
+    harvest_timers, harvest_workflow_executions,
 };
 use autumn_harvest::shard::ShardRouter;
 use autumn_harvest::signal;
@@ -460,6 +460,7 @@ struct WorkflowDetailsResponse {
     parent_id: Option<uuid::Uuid>,
     execution: WorkflowExecution,
     history: Vec<Value>,
+    external_handoffs: Vec<ExternalHandoffResponse>,
 }
 
 #[derive(Debug, Serialize)]
@@ -470,6 +471,7 @@ struct WorkflowStackResponse {
     state: String,
     is_terminal: bool,
     pending_activities: Vec<PendingActivity>,
+    pending_external_handoffs: Vec<ExternalHandoffResponse>,
     pending_local_activities: Vec<PendingLocalActivity>,
     pending_timers: Vec<PendingTimer>,
     pending_signals: Vec<PendingSignal>,
@@ -536,6 +538,71 @@ struct PendingChildWorkflow {
     child_exec_id: String,
     child_workflow_name: String,
     state: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ExternalHandoffListResponse {
+    status: String,
+    items: Vec<ExternalHandoffResponse>,
+    shard_coverage: ExternalHandoffShardCoverage,
+}
+
+#[derive(Debug, Serialize)]
+struct ExternalHandoffDetailResponse {
+    status: String,
+    item: ExternalHandoffResponse,
+    shard_coverage: ExternalHandoffShardCoverage,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct ExternalHandoffShardCoverage {
+    #[serde(rename = "inspected_shards")]
+    inspected: Vec<i32>,
+    #[serde(rename = "matched_shards")]
+    matched: Vec<i32>,
+    #[serde(rename = "unavailable_shards")]
+    unavailable: Vec<UnavailableShard>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct UnavailableShard {
+    shard_id: i32,
+    reason: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ExternalHandoffResponse {
+    token: String,
+    workflow: ExternalHandoffWorkflow,
+    activity: ExternalHandoffActivity,
+    state: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+    deadline_at: chrono::DateTime<chrono::Utc>,
+    complete_path: String,
+    fail_path: String,
+    heartbeat_path: String,
+    payloads: RedactedPayloadSummary,
+}
+
+#[derive(Debug, Serialize)]
+struct ExternalHandoffWorkflow {
+    execution_id: String,
+    workflow_id: String,
+    workflow_name: String,
+    shard_id: i32,
+}
+
+#[derive(Debug, Serialize)]
+struct ExternalHandoffActivity {
+    activity_id: String,
+    activity_name: String,
+}
+
+#[derive(Debug, Serialize)]
+struct RedactedPayloadSummary {
+    redacted: bool,
+    summary: &'static str,
 }
 
 fn is_terminal_state(state: &str) -> bool {
@@ -741,6 +808,8 @@ const MAX_WORKFLOW_LIMIT: i64 = 200;
 const DEFAULT_WORKFLOW_CHILDREN_LIMIT: usize = 50;
 const MAX_WORKFLOW_CHILDREN_LIMIT: usize = 500;
 const MAX_WORKFLOW_CHILDREN_DEPTH: u8 = 5;
+const DEFAULT_EXTERNAL_HANDOFF_LIMIT: i64 = 100;
+const MAX_EXTERNAL_HANDOFF_LIMIT: i64 = 500;
 
 #[derive(Debug, Default, Clone)]
 pub(crate) struct WorkflowFilters {
@@ -852,6 +921,11 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .route("/admin/retention", get(retention_status))
         .route("/admin/retention/run-now", post(retention_run_now))
         .route("/admin/concurrency", get(concurrency_status))
+        .route("/admin/external-handoffs", get(list_external_handoffs))
+        .route(
+            "/admin/external-handoffs/{token}",
+            get(get_external_handoff),
+        )
         // Schedule management (issue #91): unified list + workflow-schedule CRUD.
         .route("/admin/schedules", get(list_schedules))
         .route("/admin/schedules/workflow", post(create_workflow_schedule))
@@ -1368,11 +1442,24 @@ async fn get_workflow(
         .map(|event| serde_json::to_value(event).map_err(HarvestError::from))
         .collect::<HarvestResult<Vec<_>>>()
         .map_err(map_error)?;
+    let handoff_filters = external_task::ExternalHandoffFilters {
+        states: vec!["PENDING".to_string()],
+        execution_id: Some(exec_id),
+        limit: MAX_EXTERNAL_HANDOFF_LIMIT,
+        ..external_task::ExternalHandoffFilters::default()
+    };
+    let external_handoffs = external_task::list_external_handoffs(&mut conn, &handoff_filters)
+        .await
+        .map_err(map_error)?
+        .into_iter()
+        .map(ExternalHandoffResponse::from)
+        .collect();
 
     Ok(Json(WorkflowDetailsResponse {
         parent_id: execution.parent_id,
         execution,
         history: events,
+        external_handoffs,
     }))
 }
 
@@ -1663,6 +1750,295 @@ impl From<store::WorkflowChildRow> for WorkflowChildResponse {
     }
 }
 
+impl From<external_task::ExternalHandoffRow> for ExternalHandoffResponse {
+    fn from(row: external_task::ExternalHandoffRow) -> Self {
+        let token = row.token.to_string();
+        Self {
+            complete_path: format!("/activities/external/{token}/complete"),
+            fail_path: format!("/activities/external/{token}/fail"),
+            heartbeat_path: format!("/activities/external/{token}/heartbeat"),
+            token,
+            workflow: ExternalHandoffWorkflow {
+                execution_id: row.workflow_exec_id.to_string(),
+                workflow_id: row.workflow_id,
+                workflow_name: row.workflow_name,
+                shard_id: row.shard_id,
+            },
+            activity: ExternalHandoffActivity {
+                activity_id: row.activity_id.to_string(),
+                activity_name: row.activity_name,
+            },
+            state: row.state,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+            deadline_at: row.deadline_at,
+            payloads: RedactedPayloadSummary {
+                redacted: true,
+                summary: "raw workflow inputs, activity inputs, outputs, signals, and secrets are redacted",
+            },
+        }
+    }
+}
+
+async fn list_external_handoffs(
+    Extension(api_state): Extension<HarvestApiState>,
+    Query(pairs): Query<Vec<(String, String)>>,
+) -> Result<Json<ExternalHandoffListResponse>, AutumnError> {
+    let filters = parse_external_handoff_filters(&pairs)?;
+    let limit = filters.limit;
+    let (mut rows, coverage) = load_external_handoffs_from_shards(&api_state, &filters).await?;
+    sort_external_handoff_rows(&mut rows);
+    rows.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+    let status = external_handoff_status(&coverage);
+
+    Ok(Json(ExternalHandoffListResponse {
+        status,
+        items: rows
+            .into_iter()
+            .map(ExternalHandoffResponse::from)
+            .collect(),
+        shard_coverage: coverage,
+    }))
+}
+
+async fn get_external_handoff(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(token_str): Path<String>,
+) -> Result<Json<ExternalHandoffDetailResponse>, AutumnError> {
+    let token = parse_external_token(&token_str)?;
+    let filters = external_task::ExternalHandoffFilters {
+        token: Some(token),
+        limit: 1,
+        ..external_task::ExternalHandoffFilters::default()
+    };
+    let (mut rows, coverage) = load_external_handoffs_from_shards(&api_state, &filters).await?;
+    sort_external_handoff_rows(&mut rows);
+
+    let Some(row) = rows.into_iter().next() else {
+        if coverage.unavailable.is_empty() {
+            return Err(AutumnError::not_found_msg(format!(
+                "external handoff token {token}"
+            )));
+        }
+        return Err(AutumnError::service_unavailable_msg(format!(
+            "external handoff token {token} was not found on inspected shards; unavailable shards: {}",
+            unavailable_shards_summary(&coverage.unavailable)
+        )));
+    };
+
+    Ok(Json(ExternalHandoffDetailResponse {
+        status: external_handoff_status(&coverage),
+        item: ExternalHandoffResponse::from(row),
+        shard_coverage: coverage,
+    }))
+}
+
+fn parse_external_handoff_filters(
+    pairs: &[(String, String)],
+) -> Result<external_task::ExternalHandoffFilters, AutumnError> {
+    let mut limit_raw = None;
+    let mut filters =
+        external_task::ExternalHandoffFilters::default().with_limit(DEFAULT_EXTERNAL_HANDOFF_LIMIT);
+
+    for (key, value) in pairs {
+        match key.as_str() {
+            "state" => {
+                for raw in value.split(',') {
+                    let trimmed = raw.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    let state = parse_external_handoff_state(trimmed)?;
+                    if !filters.states.contains(&state) {
+                        filters.states.push(state);
+                    }
+                }
+            }
+            "workflow_name" => {
+                let trimmed = value.trim();
+                if !trimmed.is_empty() {
+                    filters.workflow_name = Some(trimmed.to_string());
+                }
+            }
+            "execution_id" => {
+                filters.execution_id = Some(parse_execution_id(value)?);
+            }
+            "activity_name" => {
+                let trimmed = value.trim();
+                if !trimmed.is_empty() {
+                    filters.activity_name = Some(trimmed.to_string());
+                }
+            }
+            "token" => {
+                filters.token = Some(parse_external_token(value)?);
+            }
+            "shard_id" | "shard" => {
+                let shard_id = value.parse::<i32>().map_err(|_| {
+                    AutumnError::bad_request_msg(format!("invalid shard_id '{value}'"))
+                })?;
+                filters.shard_id = Some(shard_id);
+            }
+            "due_before" => {
+                filters.due_before = Some(parse_external_handoff_datetime(value, "due_before")?);
+            }
+            "updated_before" => {
+                filters.updated_before =
+                    Some(parse_external_handoff_datetime(value, "updated_before")?);
+            }
+            "limit" => {
+                let parsed = value.parse::<i64>().map_err(|_| {
+                    AutumnError::bad_request_msg(format!("invalid limit '{value}'"))
+                })?;
+                limit_raw = Some(parsed);
+            }
+            _ => {}
+        }
+    }
+
+    let limit = limit_raw
+        .unwrap_or(DEFAULT_EXTERNAL_HANDOFF_LIMIT)
+        .clamp(1, MAX_EXTERNAL_HANDOFF_LIMIT);
+    Ok(filters.with_limit(limit))
+}
+
+fn parse_external_handoff_state(raw: &str) -> Result<String, AutumnError> {
+    let normalized = raw
+        .chars()
+        .filter(|ch| *ch != '_' && *ch != '-')
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    let state = match normalized.as_str() {
+        "pending" => "PENDING",
+        "completed" => "COMPLETED",
+        "failed" => "FAILED",
+        "timedout" => "TIMED_OUT",
+        "cancelled" | "canceled" => "CANCELLED",
+        _ => {
+            return Err(AutumnError::bad_request_msg(format!(
+                "unknown external handoff state '{raw}'; expected one of {:?}",
+                external_task::KNOWN_EXTERNAL_TASK_STATES
+            )));
+        }
+    };
+    Ok(state.to_string())
+}
+
+fn parse_external_handoff_datetime(
+    raw: &str,
+    label: &str,
+) -> Result<chrono::DateTime<chrono::Utc>, AutumnError> {
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .map_err(|_| {
+            AutumnError::bad_request_msg(format!(
+                "invalid {label} '{raw}'; expected RFC 3339 format, e.g. 2026-05-08T00:00:00Z"
+            ))
+        })
+}
+
+async fn load_external_handoffs_from_shards(
+    api_state: &HarvestApiState,
+    filters: &external_task::ExternalHandoffFilters,
+) -> Result<
+    (
+        Vec<external_task::ExternalHandoffRow>,
+        ExternalHandoffShardCoverage,
+    ),
+    AutumnError,
+> {
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    let mut rows = Vec::new();
+    let mut inspected_shards = Vec::new();
+    let mut matched_shards = Vec::new();
+    let mut unavailable_shards = Vec::new();
+    let mut matched_target = false;
+
+    for (shard, shard_pool) in pool.iter_shards() {
+        let shard_id = shard.as_i32();
+        if filters.shard_id.is_some_and(|target| target != shard_id) {
+            continue;
+        }
+        matched_target = true;
+
+        let mut conn = match acquire_conn(shard_pool).await {
+            Ok(conn) => conn,
+            Err(error) => {
+                unavailable_shards.push(UnavailableShard {
+                    shard_id,
+                    reason: error.to_string(),
+                });
+                continue;
+            }
+        };
+        inspected_shards.push(shard_id);
+
+        match external_task::list_external_handoffs(&mut conn, filters).await {
+            Ok(mut shard_rows) => {
+                if !shard_rows.is_empty() {
+                    matched_shards.push(shard_id);
+                }
+                rows.append(&mut shard_rows);
+            }
+            Err(error) => unavailable_shards.push(UnavailableShard {
+                shard_id,
+                reason: error.to_string(),
+            }),
+        }
+    }
+
+    if let Some(shard_id) = filters.shard_id
+        && !matched_target
+    {
+        unavailable_shards.push(UnavailableShard {
+            shard_id,
+            reason: "shard pool is not configured".to_string(),
+        });
+    }
+
+    inspected_shards.sort_unstable();
+    inspected_shards.dedup();
+    matched_shards.sort_unstable();
+    matched_shards.dedup();
+    unavailable_shards.sort_by_key(|shard| shard.shard_id);
+
+    Ok((
+        rows,
+        ExternalHandoffShardCoverage {
+            inspected: inspected_shards,
+            matched: matched_shards,
+            unavailable: unavailable_shards,
+        },
+    ))
+}
+
+fn sort_external_handoff_rows(rows: &mut [external_task::ExternalHandoffRow]) {
+    rows.sort_by(|left, right| {
+        left.deadline_at
+            .cmp(&right.deadline_at)
+            .then_with(|| right.updated_at.cmp(&left.updated_at))
+            .then_with(|| left.token.as_uuid().cmp(&right.token.as_uuid()))
+    });
+}
+
+fn external_handoff_status(coverage: &ExternalHandoffShardCoverage) -> String {
+    if coverage.unavailable.is_empty() {
+        "ok"
+    } else if coverage.inspected.is_empty() {
+        "unavailable"
+    } else {
+        "partial"
+    }
+    .to_string()
+}
+
+fn unavailable_shards_summary(shards: &[UnavailableShard]) -> String {
+    shards
+        .iter()
+        .map(|shard| format!("{} ({})", shard.shard_id, shard.reason))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 #[allow(clippy::too_many_lines)]
 async fn get_workflow_stack(
     Extension(api_state): Extension<HarvestApiState>,
@@ -1690,6 +2066,7 @@ async fn get_workflow_stack(
             state: execution.state,
             is_terminal,
             pending_activities: Vec::new(),
+            pending_external_handoffs: Vec::new(),
             pending_local_activities: Vec::new(),
             pending_timers: Vec::new(),
             pending_signals: Vec::new(),
@@ -1728,29 +2105,36 @@ async fn get_workflow_stack(
                 .map(|(h, d)| h + d),
         })
         .collect::<Vec<_>>();
-    let external_pending = harvest_external_tasks::table
-        .filter(harvest_external_tasks::workflow_exec_id.eq(exec_uuid))
-        .filter(harvest_external_tasks::state.eq("PENDING"))
-        .select(autumn_harvest::models::ExternalTask::as_select())
-        .load::<autumn_harvest::models::ExternalTask>(&mut conn)
+    let handoff_filters = external_task::ExternalHandoffFilters {
+        states: vec!["PENDING".to_string()],
+        execution_id: Some(exec_id),
+        limit: MAX_EXTERNAL_HANDOFF_LIMIT,
+        ..external_task::ExternalHandoffFilters::default()
+    };
+    let external_handoff_rows = external_task::list_external_handoffs(&mut conn, &handoff_filters)
         .await
-        .map_err(database_error)?
-        .into_iter()
+        .map_err(map_error)?;
+    let external_pending = external_handoff_rows
+        .iter()
         .map(|task| PendingActivity {
             activity_exec_id: task.activity_id.to_string(),
-            activity_name: task.name,
-            queue: task.queue,
+            activity_name: task.activity_name.clone(),
+            queue: "external".to_string(),
             scheduled_at: task.created_at,
             attempt: 1,
             max_attempts: 1,
-            task_status: "PENDING".to_string(),
+            task_status: task.state.clone(),
             claimed_by_worker_id: None,
             last_heartbeat_at: None,
             next_retry_at: None,
             schedule_to_start_deadline: None,
-            start_to_close_deadline: Some(task.schedule_to_close_at),
+            start_to_close_deadline: Some(task.deadline_at),
             heartbeat_deadline: None,
         })
+        .collect::<Vec<_>>();
+    let pending_external_handoffs = external_handoff_rows
+        .into_iter()
+        .map(ExternalHandoffResponse::from)
         .collect::<Vec<_>>();
     let mut pending_activities = pending_activities;
     pending_activities.extend(external_pending);
@@ -1896,6 +2280,7 @@ async fn get_workflow_stack(
         state: execution.state,
         is_terminal,
         pending_activities,
+        pending_external_handoffs,
         pending_local_activities,
         pending_timers,
         pending_signals,
@@ -4073,6 +4458,8 @@ struct HeartbeatExternalActivityRequest {
 struct ExternalActivityAck {
     ok: bool,
     newly_resolved: bool,
+    status: String,
+    current_state: String,
 }
 
 async fn complete_external_activity(
@@ -4155,10 +4542,17 @@ async fn complete_external_activity(
         }
     }
 
-    let newly_resolved = complete_result?;
+    let (newly_resolved, current_state) = complete_result?;
     Ok(Json(ExternalActivityAck {
         ok: true,
         newly_resolved,
+        status: if newly_resolved {
+            "completed"
+        } else {
+            "already_terminal"
+        }
+        .to_string(),
+        current_state,
     }))
 }
 
@@ -4242,10 +4636,17 @@ async fn fail_external_activity(
         }
     }
 
-    let newly_resolved = fail_result?;
+    let (newly_resolved, current_state) = fail_result?;
     Ok(Json(ExternalActivityAck {
         ok: true,
         newly_resolved,
+        status: if newly_resolved {
+            "failed"
+        } else {
+            "already_terminal"
+        }
+        .to_string(),
+        current_state,
     }))
 }
 
@@ -4253,7 +4654,7 @@ async fn heartbeat_external_activity(
     Extension(api_state): Extension<HarvestApiState>,
     Path(token_str): Path<String>,
     Json(request): Json<HeartbeatExternalActivityRequest>,
-) -> Result<Json<BasicAck>, AutumnError> {
+) -> Result<Json<ExternalActivityAck>, AutumnError> {
     let token = parse_external_token(&token_str)?;
     let pool = api_state.storage_pool().map_err(map_error)?;
 
@@ -4263,6 +4664,14 @@ async fn heartbeat_external_activity(
             .await
             .map_err(map_error)?
         {
+            if task.state != "PENDING" {
+                return Ok(Json(ExternalActivityAck {
+                    ok: true,
+                    newly_resolved: false,
+                    status: "already_terminal".to_string(),
+                    current_state: task.state,
+                }));
+            }
             // Default to the original configured duration so that omitting
             // extend_by_secs resets the deadline by the same fixed window every
             // time, regardless of how many heartbeats have already fired.
@@ -4271,7 +4680,12 @@ async fn heartbeat_external_activity(
             external_task::extend_deadline(&mut conn, token, extend_by)
                 .await
                 .map_err(map_error)?;
-            return Ok(Json(BasicAck { ok: true }));
+            return Ok(Json(ExternalActivityAck {
+                ok: true,
+                newly_resolved: false,
+                status: "extended".to_string(),
+                current_state: "PENDING".to_string(),
+            }));
         }
     }
 
@@ -4287,12 +4701,12 @@ fn parse_external_token(raw: &str) -> Result<ExternalActivityToken, AutumnError>
 
 /// Scan all shards for the external task identified by `token`, then invoke
 /// `action` on the shard that owns it.  Returns `true` if the state transition
-/// happened, `false` if the token was already in a terminal state (idempotent).
+/// happened, plus the current durable handoff state.
 async fn resolve_external_on_shards<F>(
     api_state: &HarvestApiState,
     token: ExternalActivityToken,
     action: F,
-) -> Result<bool, AutumnError>
+) -> Result<(bool, String), AutumnError>
 where
     F: for<'c> Fn(
         &'c mut diesel_async::AsyncPgConnection,
@@ -4311,7 +4725,11 @@ where
             .is_some()
         {
             let result = action(&mut conn, token).await.map_err(map_error)?;
-            return Ok(result);
+            let current_state = external_task::find_by_token(&mut conn, token)
+                .await
+                .map_err(map_error)?
+                .map_or_else(|| "UNKNOWN".to_string(), |task| task.state);
+            return Ok((result, current_state));
         }
     }
 
@@ -4774,6 +5192,39 @@ mod tests {
         let err = parse_workflow_filters(&pairs(&[("limit", "abc")]))
             .expect_err("non-numeric limit must error");
         assert!(err.to_string().contains("invalid limit"));
+    }
+
+    #[test]
+    fn parse_external_handoff_filters_accepts_all_filters() {
+        let filters = parse_external_handoff_filters(&pairs(&[
+            ("state", "pending,failed"),
+            ("workflow_name", "billing_checkout"),
+            ("execution_id", "00000000-0000-0000-0000-000000000001"),
+            ("activity_name", "manager_approval"),
+            ("token", "11111111-1111-4111-8111-111111111111"),
+            ("shard_id", "2"),
+            ("due_before", "2026-05-08T12:00:00Z"),
+            ("updated_before", "2026-05-08T13:00:00Z"),
+            ("limit", "9001"),
+        ]))
+        .expect("handoff filters should parse");
+
+        assert_eq!(filters.states, vec!["PENDING", "FAILED"]);
+        assert_eq!(filters.workflow_name.as_deref(), Some("billing_checkout"));
+        assert!(filters.execution_id.is_some());
+        assert_eq!(filters.activity_name.as_deref(), Some("manager_approval"));
+        assert!(filters.token.is_some());
+        assert_eq!(filters.shard_id, Some(2));
+        assert!(filters.due_before.is_some());
+        assert!(filters.updated_before.is_some());
+        assert_eq!(filters.limit, MAX_EXTERNAL_HANDOFF_LIMIT);
+    }
+
+    #[test]
+    fn parse_external_handoff_filters_rejects_unknown_state() {
+        let err = parse_external_handoff_filters(&pairs(&[("state", "zombie")]))
+            .expect_err("unknown handoff state must error");
+        assert!(err.to_string().contains("unknown external handoff state"));
     }
 
     #[test]

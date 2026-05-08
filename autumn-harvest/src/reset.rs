@@ -818,7 +818,10 @@ async fn cancel_pending_external_tasks(
             .filter(harvest_external_tasks::workflow_exec_id.eq(exec_id.as_uuid()))
             .filter(harvest_external_tasks::state.eq("PENDING")),
     )
-    .set(harvest_external_tasks::state.eq("CANCELLED"))
+    .set((
+        harvest_external_tasks::state.eq("CANCELLED"),
+        harvest_external_tasks::updated_at.eq(chrono::Utc::now()),
+    ))
     .execute(conn)
     .await
     .map_err(database_error)

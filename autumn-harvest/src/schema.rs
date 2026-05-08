@@ -175,6 +175,7 @@ diesel::table! {
         schedule_to_close_at -> Timestamptz,
         schedule_to_close_secs -> Int8,
         created_at -> Timestamptz,
+        updated_at -> Timestamptz,
     }
 }
 
