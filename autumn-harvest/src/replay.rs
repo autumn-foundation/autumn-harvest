@@ -1070,7 +1070,9 @@ impl HistoryMatcher {
 
         self.cursor += 1;
         match self.scan_local_activity_terminal(activity_id, self.cursor) {
-            HistoryMatch::LocalActivityInProgress { failed_attempts: 0, .. } => HistoryMatch::NoMatch,
+            HistoryMatch::LocalActivityInProgress {
+                failed_attempts: 0, ..
+            } => HistoryMatch::NoMatch,
             other => other,
         }
     }
