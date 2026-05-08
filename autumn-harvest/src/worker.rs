@@ -275,11 +275,17 @@ fn suspended_workflow_error(commands: &[WorkflowCommand]) -> String {
             .to_string();
     }
 
-    let command_names = commands
-        .iter()
-        .map(workflow_command_name)
-        .collect::<Vec<_>>()
-        .join(", ");
+    // ⚡ Bolt: Construct the comma-separated string directly without collecting
+    // into an intermediate `Vec`. This eliminates a heap allocation and reduces
+    // memory overhead on this error path.
+    let command_names = commands.iter().fold(String::new(), |mut acc, cmd| {
+        if !acc.is_empty() {
+            acc.push_str(", ");
+        }
+        acc.push_str(workflow_command_name(cmd));
+        acc
+    });
+
     format!(
         "workflow task suspended with unsupported commands ({command_names}); this command set is not implemented yet"
     )
