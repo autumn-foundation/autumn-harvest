@@ -49,7 +49,7 @@ Useful filters:
 | `--workflow-name` | Limit to one workflow type. |
 | `--state-group active` | Sample histories that may still replay after deploy. |
 | `--state-group terminal` | Sample completed/failed/cancelled histories for regression CI. |
-| `--updated-after` / `--updated-before` | Bound by execution update time. |
+| `--updated-after` / `--updated-before` | Bound by latest history event timestamp, falling back to execution row time only when no event exists. |
 | `--shard-id` | Re-export one shard after a partial batch. |
 | `--limit` | Cap the number of exported histories. |
 

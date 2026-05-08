@@ -881,6 +881,20 @@ struct HistoryExportFailure {
     max_bytes: Option<usize>,
 }
 
+#[derive(Debug, Clone, diesel::QueryableByName)]
+struct HistoryExportCandidate {
+    #[diesel(sql_type = diesel::sql_types::Uuid)]
+    id: uuid::Uuid,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    workflow_name: String,
+    #[diesel(sql_type = diesel::sql_types::Int4)]
+    shard_id: i32,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    state: String,
+    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+    last_history_event_at: chrono::DateTime<chrono::Utc>,
+}
+
 #[derive(Debug, Clone)]
 struct WorkflowChildrenFilters {
     limit: usize,
@@ -4564,11 +4578,29 @@ fn export_history_for_execution(
     })
 }
 
+fn export_history_for_candidate(
+    candidate: &HistoryExportCandidate,
+    events: Vec<WorkflowEvent>,
+    query: &HistoryExportQuery,
+) -> Result<HistoryExportDocument, HistoryExportError> {
+    export_history(HistoryExportRequest {
+        workflow_name: candidate.workflow_name.clone(),
+        execution_id: ExecutionId::from_uuid(candidate.id),
+        shard_id: candidate.shard_id,
+        state: candidate.state.clone(),
+        events,
+        exported_at: chrono::Utc::now(),
+        payload_policy: query.payload_policy,
+        max_bytes: Some(query.max_bytes),
+    })
+}
+
 async fn load_history_exports_from_shards(
     api_state: &HarvestApiState,
     query: &HistoryBatchExportQuery,
 ) -> Result<HistoryBatchExportResponse, AutumnError> {
     let pool = api_state.storage_pool().map_err(map_error)?;
+    let mut candidates = Vec::new();
     let mut exports = Vec::new();
     let mut failures = Vec::new();
     let mut inspected_shards = Vec::new();
@@ -4608,49 +4640,62 @@ async fn load_history_exports_from_shards(
         if !rows.is_empty() {
             matched_shards.push(shard_id);
         }
+        candidates.extend(rows);
+    }
 
-        for execution in rows {
-            if exports.len() >= query.limit {
-                break;
-            }
-            let exec_id = ExecutionId::from_uuid(execution.id);
-            let history = match store::load_history(&mut conn, exec_id).await {
-                Ok(history) => history,
-                Err(error) => {
-                    failures.push(HistoryExportFailure {
-                        execution_id: Some(exec_id.to_string()),
-                        shard_id,
-                        reason: error.to_string(),
-                        actual_bytes: None,
-                        max_bytes: None,
-                    });
-                    continue;
-                }
-            };
-            let single_query = HistoryExportQuery {
-                payload_policy: query.payload_policy,
-                max_bytes: query.max_bytes,
-            };
-            match export_history_for_execution(&execution, history.events, &single_query) {
-                Ok(document) => exports.push(document),
-                Err(HistoryExportError::SizeLimitExceeded {
-                    actual_bytes,
-                    max_bytes,
-                }) => failures.push(HistoryExportFailure {
-                    execution_id: Some(exec_id.to_string()),
+    sort_history_export_candidates(&mut candidates);
+    let single_query = HistoryExportQuery {
+        payload_policy: query.payload_policy,
+        max_bytes: query.max_bytes,
+    };
+    for candidate in candidates {
+        if exports.len() >= query.limit {
+            break;
+        }
+        let shard_id = candidate.shard_id;
+        let exec_id = ExecutionId::from_uuid(candidate.id);
+        let mut conn = match acquire_conn(pool.pool_for(ShardId::new(shard_id))).await {
+            Ok(conn) => conn,
+            Err(error) => {
+                unavailable_shards.push(UnavailableShard {
                     shard_id,
-                    reason: "history export exceeds max_bytes".to_string(),
-                    actual_bytes: Some(actual_bytes),
-                    max_bytes: Some(max_bytes),
-                }),
-                Err(error) => failures.push(HistoryExportFailure {
+                    reason: error.to_string(),
+                });
+                continue;
+            }
+        };
+        let history = match store::load_history(&mut conn, exec_id).await {
+            Ok(history) => history,
+            Err(error) => {
+                failures.push(HistoryExportFailure {
                     execution_id: Some(exec_id.to_string()),
                     shard_id,
                     reason: error.to_string(),
                     actual_bytes: None,
                     max_bytes: None,
-                }),
+                });
+                continue;
             }
+        };
+        match export_history_for_candidate(&candidate, history.events, &single_query) {
+            Ok(document) => exports.push(document),
+            Err(HistoryExportError::SizeLimitExceeded {
+                actual_bytes,
+                max_bytes,
+            }) => failures.push(HistoryExportFailure {
+                execution_id: Some(exec_id.to_string()),
+                shard_id,
+                reason: "history export exceeds max_bytes".to_string(),
+                actual_bytes: Some(actual_bytes),
+                max_bytes: Some(max_bytes),
+            }),
+            Err(error) => failures.push(HistoryExportFailure {
+                execution_id: Some(exec_id.to_string()),
+                shard_id,
+                reason: error.to_string(),
+                actual_bytes: None,
+                max_bytes: None,
+            }),
         }
     }
 
@@ -4663,8 +4708,6 @@ async fn load_history_exports_from_shards(
         });
     }
 
-    sort_history_exports(&mut exports);
-    exports.truncate(query.limit);
     inspected_shards.sort_unstable();
     inspected_shards.dedup();
     matched_shards.sort_unstable();
@@ -4701,53 +4744,57 @@ async fn load_history_exports_from_shards(
     })
 }
 
+const HISTORY_EXPORT_CANDIDATES_SQL: &str = r"
+SELECT
+    w.id AS id,
+    w.workflow_name AS workflow_name,
+    w.shard_id AS shard_id,
+    w.state AS state,
+    COALESCE(MAX(e.timestamp), w.completed_at, w.started_at, w.created_at) AS last_history_event_at
+FROM harvest_workflow_executions w
+LEFT JOIN harvest_events e
+    ON e.workflow_exec_id = w.id
+WHERE ($1::TEXT IS NULL OR w.workflow_name = $1::TEXT)
+  AND (cardinality($2::TEXT[]) = 0 OR w.state = ANY($2::TEXT[]))
+GROUP BY w.id, w.workflow_name, w.shard_id, w.state, w.completed_at, w.started_at, w.created_at
+HAVING ($3::TIMESTAMPTZ IS NULL OR COALESCE(MAX(e.timestamp), w.completed_at, w.started_at, w.created_at) >= $3::TIMESTAMPTZ)
+   AND ($4::TIMESTAMPTZ IS NULL OR COALESCE(MAX(e.timestamp), w.completed_at, w.started_at, w.created_at) < $4::TIMESTAMPTZ)
+ORDER BY last_history_event_at DESC, w.id DESC
+LIMIT $5
+";
+
+const fn history_export_candidates_sql() -> &'static str {
+    HISTORY_EXPORT_CANDIDATES_SQL
+}
+
 async fn load_history_export_candidates(
     conn: &mut AsyncPgConnection,
     filters: &HistoryBatchExportQuery,
-) -> HarvestResult<Vec<WorkflowExecution>> {
-    use diesel::dsl::sql;
-    use diesel::sql_types::{Bool, Timestamptz};
-
+) -> HarvestResult<Vec<HistoryExportCandidate>> {
     let limit = i64::try_from(filters.limit).unwrap_or(i64::MAX);
-    let mut query = harvest_workflow_executions::table
-        .into_boxed()
-        .order(harvest_workflow_executions::created_at.desc())
-        .limit(limit);
-
-    if !filters.states.is_empty() {
-        query = query.filter(harvest_workflow_executions::state.eq_any(filters.states.clone()));
-    }
-    if let Some(name) = &filters.workflow_name {
-        query = query.filter(harvest_workflow_executions::workflow_name.eq(name.clone()));
-    }
-    if let Some(after) = filters.updated_after {
-        query = query.filter(
-            sql::<Bool>("COALESCE(completed_at, started_at, created_at) >= ")
-                .bind::<Timestamptz, _>(after),
-        );
-    }
-    if let Some(before) = filters.updated_before {
-        query = query.filter(
-            sql::<Bool>("COALESCE(completed_at, started_at, created_at) < ")
-                .bind::<Timestamptz, _>(before),
-        );
-    }
-
-    query
-        .select(WorkflowExecution::as_select())
+    diesel::sql_query(history_export_candidates_sql())
+        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
+            filters.workflow_name.clone(),
+        )
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(filters.states.clone())
+        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(
+            filters.updated_after,
+        )
+        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(
+            filters.updated_before,
+        )
+        .bind::<diesel::sql_types::BigInt, _>(limit)
         .load(conn)
         .await
         .map_err(database_error)
 }
 
-fn sort_history_exports(exports: &mut [HistoryExportDocument]) {
-    exports.sort_by(|left, right| {
-        right.exported_at.cmp(&left.exported_at).then_with(|| {
-            right
-                .execution_id
-                .to_string()
-                .cmp(&left.execution_id.to_string())
-        })
+fn sort_history_export_candidates(candidates: &mut [HistoryExportCandidate]) {
+    candidates.sort_by(|left, right| {
+        right
+            .last_history_event_at
+            .cmp(&left.last_history_event_at)
+            .then_with(|| right.id.cmp(&left.id))
     });
 }
 
@@ -5952,5 +5999,58 @@ mod tests {
         assert!(query.updated_before.is_some());
         assert_eq!(query.shard_id, Some(2));
         assert_eq!(query.limit, 1000);
+    }
+
+    fn test_history_export_candidate(
+        id: uuid::Uuid,
+        shard_id: i32,
+        last_history_event_at: chrono::DateTime<chrono::Utc>,
+    ) -> HistoryExportCandidate {
+        HistoryExportCandidate {
+            id,
+            workflow_name: "billing_checkout".to_string(),
+            shard_id,
+            state: "COMPLETED".to_string(),
+            last_history_event_at,
+        }
+    }
+
+    #[test]
+    fn sort_history_export_candidates_orders_globally_before_limit() {
+        let base = chrono::DateTime::parse_from_rfc3339("2026-05-08T00:00:00Z")
+            .expect("valid timestamp")
+            .with_timezone(&chrono::Utc);
+        let older_shard0 =
+            uuid::Uuid::parse_str("00000000-0000-4000-8000-000000000001").expect("valid uuid");
+        let newer_shard0 =
+            uuid::Uuid::parse_str("00000000-0000-4000-8000-000000000002").expect("valid uuid");
+        let newest_shard1 =
+            uuid::Uuid::parse_str("00000000-0000-4000-8000-000000000003").expect("valid uuid");
+        let mut candidates = vec![
+            test_history_export_candidate(older_shard0, 0, base),
+            test_history_export_candidate(newer_shard0, 0, base + chrono::Duration::minutes(1)),
+            test_history_export_candidate(newest_shard1, 1, base + chrono::Duration::minutes(2)),
+        ];
+
+        sort_history_export_candidates(&mut candidates);
+        let selected = candidates
+            .into_iter()
+            .take(2)
+            .map(|candidate| candidate.id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(selected, vec![newest_shard1, newer_shard0]);
+    }
+
+    #[test]
+    fn history_export_candidate_query_filters_updated_window_by_latest_event_timestamp() {
+        let sql = history_export_candidates_sql();
+
+        assert!(sql.contains("MAX(e.timestamp)"));
+        assert!(sql.contains("HAVING"));
+        assert!(
+            !sql.contains("COALESCE(completed_at, started_at, created_at) >="),
+            "updated windows must not be based only on workflow row timestamps"
+        );
     }
 }

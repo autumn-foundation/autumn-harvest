@@ -415,10 +415,10 @@ enum HistoryCommand {
         /// Filter by execution state group.
         #[arg(long, value_enum)]
         state_group: Option<HistoryExportStateGroup>,
-        /// Lower bound on execution update time, RFC 3339.
+        /// Lower bound on latest history event time, RFC 3339.
         #[arg(long)]
         updated_after: Option<String>,
-        /// Upper bound on execution update time, RFC 3339.
+        /// Upper bound on latest history event time, RFC 3339.
         #[arg(long)]
         updated_before: Option<String>,
         /// Restrict inspection to one shard.

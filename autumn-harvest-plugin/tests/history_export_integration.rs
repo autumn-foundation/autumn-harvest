@@ -20,7 +20,7 @@ use autumn_harvest_plugin::api::{
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use chrono::Utc;
+use chrono::{Duration, Utc};
 use diesel::{ExpressionMethods, QueryDsl};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
@@ -223,6 +223,70 @@ async fn insert_execution(
     exec_id
 }
 
+async fn set_execution_and_event_times(
+    database_url: &str,
+    exec_id: ExecutionId,
+    row_time: chrono::DateTime<Utc>,
+    event_time: chrono::DateTime<Utc>,
+) {
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("failed to connect to test database");
+    diesel::update(
+        autumn_harvest::schema::harvest_workflow_executions::table.find(exec_id.as_uuid()),
+    )
+    .set((
+        autumn_harvest::schema::harvest_workflow_executions::started_at.eq(row_time),
+        autumn_harvest::schema::harvest_workflow_executions::created_at.eq(row_time),
+        autumn_harvest::schema::harvest_workflow_executions::completed_at.eq(Some(row_time)),
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("failed to backdate workflow execution row");
+
+    diesel::update(
+        autumn_harvest::schema::harvest_events::table
+            .filter(autumn_harvest::schema::harvest_events::workflow_exec_id.eq(exec_id.as_uuid())),
+    )
+    .set(autumn_harvest::schema::harvest_events::timestamp.eq(event_time))
+    .execute(&mut conn)
+    .await
+    .expect("failed to set history event timestamp");
+}
+
+async fn set_running_execution_and_event_times(
+    database_url: &str,
+    exec_id: ExecutionId,
+    row_time: chrono::DateTime<Utc>,
+    event_time: chrono::DateTime<Utc>,
+) {
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("failed to connect to test database");
+    diesel::update(
+        autumn_harvest::schema::harvest_workflow_executions::table.find(exec_id.as_uuid()),
+    )
+    .set((
+        autumn_harvest::schema::harvest_workflow_executions::state.eq("RUNNING"),
+        autumn_harvest::schema::harvest_workflow_executions::started_at.eq(row_time),
+        autumn_harvest::schema::harvest_workflow_executions::created_at.eq(row_time),
+        autumn_harvest::schema::harvest_workflow_executions::completed_at
+            .eq(None::<chrono::DateTime<Utc>>),
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("failed to backdate running workflow execution row");
+
+    diesel::update(
+        autumn_harvest::schema::harvest_events::table
+            .filter(autumn_harvest::schema::harvest_events::workflow_exec_id.eq(exec_id.as_uuid())),
+    )
+    .set(autumn_harvest::schema::harvest_events::timestamp.eq(event_time))
+    .execute(&mut conn)
+    .await
+    .expect("failed to set history event timestamp");
+}
+
 #[tokio::test]
 async fn single_full_history_export_returns_replay_fixture_shape() {
     let Some((database_url, _container)) = setup_database_url_with_migrations().await else {
@@ -355,4 +419,138 @@ async fn batch_redacted_history_export_filters_and_reports_shard_coverage() {
     assert_eq!(json["shard_coverage"]["inspected_shards"], json!([0, 1]));
     assert_eq!(json["shard_coverage"]["matched_shards"], json!([0]));
     assert_eq!(json["shard_coverage"]["unavailable_shards"], json!([]));
+}
+
+#[tokio::test]
+async fn batch_limit_is_applied_after_global_history_timestamp_ordering() {
+    let Some(((shard0_url, shard1_url), _container)) = setup_two_shards_with_migrations().await
+    else {
+        return;
+    };
+    let base = Utc::now() - Duration::days(7);
+    let older_shard0 = insert_execution(
+        &shard0_url,
+        ShardId::new(0),
+        "billing_checkout",
+        "older-shard0",
+        "COMPLETED",
+        vec![WorkflowEvent::WorkflowStarted {
+            input: json!({ "case": "older-shard0" }),
+            timestamp: Utc::now(),
+        }],
+    )
+    .await;
+    let newer_shard0 = insert_execution(
+        &shard0_url,
+        ShardId::new(0),
+        "billing_checkout",
+        "newer-shard0",
+        "COMPLETED",
+        vec![WorkflowEvent::WorkflowStarted {
+            input: json!({ "case": "newer-shard0" }),
+            timestamp: Utc::now(),
+        }],
+    )
+    .await;
+    let newest_shard1 = insert_execution(
+        &shard1_url,
+        ShardId::new(1),
+        "billing_checkout",
+        "newest-shard1",
+        "COMPLETED",
+        vec![WorkflowEvent::WorkflowStarted {
+            input: json!({ "case": "newest-shard1" }),
+            timestamp: Utc::now(),
+        }],
+    )
+    .await;
+    set_execution_and_event_times(&shard0_url, older_shard0, base, base).await;
+    set_execution_and_event_times(&shard0_url, newer_shard0, base, base + Duration::minutes(1))
+        .await;
+    set_execution_and_event_times(
+        &shard1_url,
+        newest_shard1,
+        base,
+        base + Duration::minutes(2),
+    )
+    .await;
+
+    let app = build_api_app(
+        build_two_shard_pool(&shard0_url, &shard1_url),
+        two_shard_router(),
+    );
+    let (status, json) = get_json(
+        &app,
+        "/admin/history/exports?workflow_name=billing_checkout&state_group=terminal&limit=2&payload_policy=redacted",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let exported_ids = json["exports"]
+        .as_array()
+        .expect("exports array")
+        .iter()
+        .map(|export| {
+            export["execution_id"]
+                .as_str()
+                .expect("execution id")
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        exported_ids,
+        vec![newest_shard1.to_string(), newer_shard0.to_string()]
+    );
+}
+
+#[tokio::test]
+async fn batch_updated_window_uses_latest_history_event_timestamp() {
+    let Some((database_url, _container)) = setup_database_url_with_migrations().await else {
+        return;
+    };
+    let old_row_time = Utc::now() - Duration::days(30);
+    let recent_event_time = Utc::now();
+    let exec_id = insert_execution(
+        &database_url,
+        ShardId::new(0),
+        "billing_checkout",
+        "recent-event-old-row",
+        "RUNNING",
+        vec![WorkflowEvent::WorkflowStarted {
+            input: json!({ "case": "recent-event-old-row" }),
+            timestamp: Utc::now(),
+        }],
+    )
+    .await;
+    set_running_execution_and_event_times(&database_url, exec_id, old_row_time, recent_event_time)
+        .await;
+
+    let app = build_api_app(
+        HarvestDbPool::from(build_test_pool(&database_url)),
+        ShardRouter::single(),
+    );
+    let updated_after = (recent_event_time - Duration::hours(1)).to_rfc3339();
+    let (status, json) = get_json(
+        &app,
+        format!(
+            "/admin/history/exports?workflow_name=billing_checkout&state_group=active&updated_after={updated_after}&payload_policy=redacted"
+        ),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let exported_ids = json["exports"]
+        .as_array()
+        .expect("exports array")
+        .iter()
+        .map(|export| {
+            export["execution_id"]
+                .as_str()
+                .expect("execution id")
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(exported_ids, vec![exec_id.to_string()]);
 }
