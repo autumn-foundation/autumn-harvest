@@ -480,6 +480,49 @@ shows up on the DLQ tab. Inspect the failure context, then either replay
 (`harvest dlq bulk-discard --activity-name ...`) when the work is no longer
 relevant.
 
+### Worker fleet and graceful drain
+
+Every worker process registers itself in `harvest_workers` and heartbeats on
+a schedule. Inspect the fleet from the CLI:
+
+```bash
+harvest worker list                       # all workers
+harvest worker list --status active --health stale
+harvest worker get <worker-id>
+harvest worker health                     # rollup: active / draining / stale
+```
+
+When you need to roll a node — deploy, autoscale-down, drain a host before
+maintenance — request a remote drain instead of sending `SIGTERM`. The
+worker stops claiming new tasks within two heartbeat intervals and finishes
+its in-flight work before exiting:
+
+```bash
+# Dry run first: who would be affected, what's in-flight, on which shards.
+harvest worker drain-preview --queue email-workers
+
+# Then drain a specific worker, optionally with a deadline.
+harvest worker drain <worker-id>
+harvest worker drain <worker-id> --deadline 2026-05-08T15:00:00Z
+```
+
+The response echoes `outcome` (`accepted`, `already_draining`,
+`already_stopped`, `stale_worker`, `not_found`), the in-flight task count,
+the drain deadline, and which shards the worker owns. The same surface is
+available over HTTP for orchestration systems:
+
+```bash
+curl -s -X POST http://localhost:8080/api/harvest/workers/<worker-id>/drain \
+  -H 'Content-Type: application/json' \
+  -d '{"deadline_at":"2026-05-08T15:00:00Z"}' | jq .
+
+curl -s 'http://localhost:8080/api/harvest/workers/drain-preview?queue=email-workers' | jq .
+```
+
+Drain requests are recorded in the audit log under the `worker.drain`
+operation, so you have a "who quiesced this node, when" record without
+correlating shell history across machines.
+
 ### Reuse policies
 
 By default, starting a workflow with an existing `(name, workflow_id)` pair
