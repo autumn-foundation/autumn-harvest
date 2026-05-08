@@ -1199,6 +1199,7 @@ async fn persist_scheduled_activity(
     scheduled: &ScheduledActivityCommand,
     sticky: Option<queue::StickyHint<'_>>,
     execute_span: &tracing::Span,
+    assigned_build_id: Option<&str>,
 ) -> HarvestResult<()> {
     let activity = registry.activities.get(&scheduled.name).ok_or_else(|| {
         HarvestError::Config(format!(
@@ -1221,6 +1222,7 @@ async fn persist_scheduled_activity(
     );
     params.workflow_exec_id = Some(exec_id.as_uuid());
     params.activity_name = Some(scheduled.name.clone());
+    params.required_build_id = assigned_build_id.map(str::to_string);
     // trace_context is set below, inside the harvest.activity.schedule span,
     // so the downstream worker's harvest.activity.execute span is stitched to
     // the producer span rather than the parent workflow-execute context.
@@ -2199,6 +2201,7 @@ async fn handle_suspended_workflow(
             &scheduled,
             sticky,
             context.execute_span,
+            context.execution.assigned_build_id.as_deref(),
         )
         .await
     } else if let Some(timer) = extract_single_started_timer(commands) {
