@@ -721,6 +721,7 @@ async fn insert_fork_execution(
         execution_timeout: source.execution_timeout,
         memo: source.memo.clone(),
         search_attrs: source.search_attrs.clone(),
+        assigned_build_id: None,
     };
 
     diesel::insert_into(harvest_workflow_executions::table)

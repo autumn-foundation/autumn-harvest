@@ -193,6 +193,7 @@ pub async fn start_or_load_workflow_execution(
         execution_timeout: request.execution_timeout,
         memo: request.memo.clone(),
         search_attrs: request.search_attrs.clone(),
+        assigned_build_id: None,
     };
     let mut enqueue = EnqueueParams::new(
         request.queue_name.to_owned(),

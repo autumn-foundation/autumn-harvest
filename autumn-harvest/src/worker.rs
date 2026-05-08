@@ -90,6 +90,10 @@ pub struct WorkerRuntimeConfig {
     /// Heartbeat interval for worker liveness records in `harvest_workers`.
     /// Defaults to 5 seconds. Stale threshold is `2 × heartbeat_interval`.
     pub worker_heartbeat_interval: Duration,
+    /// Immutable build identifier for this worker (issue #171).
+    pub build_id: String,
+    /// Optional deployment name for operator observability (issue #171).
+    pub deployment_name: Option<String>,
 }
 
 impl WorkerRuntimeConfig {
@@ -123,6 +127,8 @@ impl From<WorkerConfig> for WorkerRuntimeConfig {
             max_local_activity_start_to_close: cfg.max_local_activity_start_to_close,
             shard_assignments: cfg.shard_assignments,
             worker_heartbeat_interval: cfg.worker_heartbeat_interval,
+            build_id: cfg.build_id,
+            deployment_name: cfg.deployment_name,
         }
     }
 }
@@ -1466,6 +1472,7 @@ async fn persist_all_started_child_workflows(
                     execution_timeout: None,
                     memo: None,
                     search_attrs: None,
+        assigned_build_id: None,
                 };
                 let child_started_event = WorkflowEvent::WorkflowStarted {
                     input: child.input.clone(),
@@ -2398,6 +2405,7 @@ async fn persist_workflow_continue_as_new(
         execution_timeout: execution.execution_timeout,
         memo: execution.memo.clone(),
         search_attrs: execution.search_attrs.clone(),
+        assigned_build_id: None,
     };
     let mut enqueue =
         queue::EnqueueParams::new(execution.queue_name.clone(), TaskType::Workflow, input);
@@ -3148,6 +3156,8 @@ impl Worker {
                 max_concurrency,
                 host: crate::workers::local_hostname(),
                 version: Some(env!("CARGO_PKG_VERSION").to_string()),
+                build_id: self.config.build_id.clone(),
+                deployment_name: self.config.deployment_name.clone(),
             },
             Arc::clone(&self.workflow_semaphore),
             self.config.max_concurrent_workflows,
@@ -3268,6 +3278,8 @@ impl Worker {
                     max_concurrency,
                     &host,
                     Some(version),
+                    &self.config.build_id,
+                    self.config.deployment_name.as_deref(),
                 )
                 .await
                 {
@@ -3334,7 +3346,7 @@ impl Worker {
             }
         };
 
-        match queue::claim_task(&mut conn, &self.config.queues, &self.config.worker_id).await {
+        match queue::claim_task(&mut conn, &self.config.queues, &self.config.worker_id, &self.config.build_id).await {
             Ok(Some(task)) => {
                 tracing::debug!(
                     task_id = %task.id,

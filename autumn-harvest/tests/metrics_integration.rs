@@ -305,6 +305,7 @@ async fn workflow_and_activity_metrics_are_recorded() {
         execution_timeout: None,
         memo: None,
         search_attrs: None,
+        assigned_build_id: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&exec_row)

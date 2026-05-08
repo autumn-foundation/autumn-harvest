@@ -291,6 +291,8 @@ async fn register_active_worker(pool: &DbPool, worker_id: &str, queues: &[String
         10,
         "localhost",
         Some(env!("CARGO_PKG_VERSION")),
+        "",
+        None,
     )
     .await
     .expect("worker registration should succeed");

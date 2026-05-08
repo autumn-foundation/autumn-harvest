@@ -67,6 +67,10 @@ required-features = ["testing"]
 name = "replayer_integration_tests"
 required-features = ["testing", "db"]
 
+[[test]]
+name = "build_routing_tests"
+required-features = ["db"]
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 testcontainers = { workspace = true }

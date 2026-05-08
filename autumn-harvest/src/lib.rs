@@ -16,6 +16,9 @@ pub const MIGRATIONS: diesel_migrations::EmbeddedMigrations =
 
 /// History analyzer and linter.
 pub mod analyzer;
+/// Worker build-id routing for safe rolling deploys (issue #171).
+#[cfg(feature = "db")]
+pub mod build_routing;
 /// Audit trail for management API mutations (issue #158).
 #[cfg(feature = "db")]
 pub mod audit;
@@ -185,8 +188,8 @@ pub use testing::{
     HistorySnapshot, NonDeterminismKind, ReplayReport, ReplayStatus, WorkflowReplayer,
 };
 pub use types::{
-    ActivityExecId, ExecutionId, ExternalActivityToken, ShardId, TimerId, UpdateId, WorkerId,
-    WorkflowId, WorkflowIdReusePolicy,
+    ActivityExecId, BuildId, DeploymentName, ExecutionId, ExternalActivityToken, ShardId, TimerId,
+    UpdateId, WorkerId, WorkflowId, WorkflowIdReusePolicy,
 };
 pub use update::UpdateRegistry;
 #[cfg(feature = "db")]

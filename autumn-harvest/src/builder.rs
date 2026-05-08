@@ -666,6 +666,15 @@ pub struct WorkerConfig {
     /// Defaults to **5 seconds**. The API classifies a worker as stale after
     /// `2 × worker_heartbeat_interval` without a heartbeat.
     pub worker_heartbeat_interval: Duration,
+    /// Immutable build identifier for this worker binary (issue #171).
+    ///
+    /// Set to a stable per-build token (Git SHA, semver tag, CI job ID, etc.)
+    /// to enable build-aware task routing. Empty string = legacy behaviour
+    /// where the worker can claim any task regardless of `required_build_id`.
+    pub build_id: String,
+    /// Optional human-readable deployment name for operator observability
+    /// (issue #171), e.g. `"prod-blue"` or `"canary"`.
+    pub deployment_name: Option<String>,
 }
 
 impl Default for WorkerConfig {
@@ -682,6 +691,8 @@ impl Default for WorkerConfig {
             shard_assignments: vec![ShardId::new(0)],
             max_local_activity_start_to_close: Duration::from_secs(60),
             worker_heartbeat_interval: Duration::from_secs(5),
+            build_id: String::new(),
+            deployment_name: None,
         }
     }
 }
@@ -746,6 +757,27 @@ impl WorkerConfig {
     #[must_use]
     pub const fn with_worker_heartbeat_interval(mut self, interval: Duration) -> Self {
         self.worker_heartbeat_interval = interval;
+        self
+    }
+
+    /// Set the immutable build identifier for this worker (issue #171).
+    ///
+    /// Use a stable per-build token — a Git SHA, semver tag, or CI job ID.
+    /// Workers without a build ID (the default empty string) behave as legacy
+    /// workers and can claim any task regardless of build routing policy.
+    #[must_use]
+    pub fn with_build_id(mut self, build_id: impl Into<String>) -> Self {
+        self.build_id = build_id.into();
+        self
+    }
+
+    /// Set an optional human-readable deployment name (issue #171).
+    ///
+    /// For operator observability only — e.g. `"prod-blue"`, `"canary"`.
+    /// Harvest does not use the deployment name for routing decisions.
+    #[must_use]
+    pub fn with_deployment_name(mut self, name: impl Into<String>) -> Self {
+        self.deployment_name = Some(name.into());
         self
     }
 }

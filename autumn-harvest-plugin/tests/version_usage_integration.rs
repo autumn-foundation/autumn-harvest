@@ -187,6 +187,7 @@ async fn insert_version_execution_with_markers(
         execution_timeout: None,
         memo: None,
         search_attrs: None,
+        assigned_build_id: None,
     };
     diesel::insert_into(autumn_harvest::schema::harvest_workflow_executions::table)
         .values(&row)

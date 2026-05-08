@@ -75,6 +75,8 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260501000000_harvest_workers/up.sql"),
     "\n",
     include_str!("../migrations/20260508010000_harvest_workers_drain_deadline/up.sql"),
+    "\n",
+    include_str!("../migrations/20260509000000_harvest_build_routing/up.sql"),
 );
 
 /// The minimal "legacy" migration set used by the upgrade-path regression
@@ -269,6 +271,7 @@ async fn insert_workflow_execution(conn: &mut AsyncPgConnection) -> ExecutionId 
         execution_timeout: None,
         memo: None,
         search_attrs: None,
+        assigned_build_id: None,
     };
 
     diesel::insert_into(harvest_workflow_executions::table)
@@ -310,6 +313,7 @@ async fn legacy_workflow_uniqueness_schema_can_be_upgraded_for_idempotent_starts
         execution_timeout: None,
         memo: None,
         search_attrs: None,
+        assigned_build_id: None,
         reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
         trace_context: None,
     };
@@ -835,7 +839,7 @@ async fn full_workflow_lifecycle() {
 
     // 4. Claim the task
     let queues = vec!["default".to_string()];
-    let claimed = queue::claim_task(&mut conn, &queues, "worker-e2e-1")
+    let claimed = queue::claim_task(&mut conn, &queues, "worker-e2e-1", "")
         .await
         .expect("claim_task failed");
     let claimed = claimed.expect("no task claimed");
@@ -909,7 +913,7 @@ async fn claim_task_returns_none_on_empty_queue() {
     let (mut conn, _container) = setup_test_db().await;
 
     let queues = vec!["default".to_string()];
-    let claimed = queue::claim_task(&mut conn, &queues, "worker-empty-1")
+    let claimed = queue::claim_task(&mut conn, &queues, "worker-empty-1", "")
         .await
         .expect("claim_task failed");
     assert!(
@@ -1470,7 +1474,7 @@ async fn timeout_enforcement_fails_pending_activity_and_wakes_workflow() {
         .expect("enqueue parked workflow task failed");
 
     let default_queues = vec!["default".to_string()];
-    let claimed_workflow = queue::claim_task(&mut conn, &default_queues, "parked-worker")
+    let claimed_workflow = queue::claim_task(&mut conn, &default_queues, "parked-worker", "")
         .await
         .expect("claim parked workflow task failed")
         .expect("workflow task should be claimable");
@@ -2223,7 +2227,7 @@ async fn wake_workflow_task_emits_notification() {
         .expect("enqueue should succeed");
 
     let queues = vec!["default".to_string()];
-    let claimed = queue::claim_task(&mut conn, &queues, "wake-test-worker")
+    let claimed = queue::claim_task(&mut conn, &queues, "wake-test-worker", "")
         .await
         .expect("claim should succeed")
         .expect("workflow task should be claimable");
@@ -2269,7 +2273,7 @@ async fn wake_workflow_task_does_not_requeue_active_running_task() {
         .await
         .expect("enqueue should succeed");
     let queues = vec!["default".to_string()];
-    let claimed = queue::claim_task(&mut conn, &queues, "active-worker")
+    let claimed = queue::claim_task(&mut conn, &queues, "active-worker", "")
         .await
         .expect("claim should succeed")
         .expect("workflow task should be claimable");
@@ -2309,7 +2313,7 @@ async fn reschedule_task_clears_stale_heartbeat_timestamp() {
         .await
         .expect("enqueue should succeed");
     let queues = vec!["default".to_string()];
-    let claimed = queue::claim_task(&mut conn, &queues, "retry-worker")
+    let claimed = queue::claim_task(&mut conn, &queues, "retry-worker", "")
         .await
         .expect("claim should succeed")
         .expect("activity task should be claimable");
@@ -2777,6 +2781,7 @@ async fn insert_named_workflow_execution(
         execution_timeout: None,
         memo: None,
         search_attrs: None,
+        assigned_build_id: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&row)
@@ -2811,7 +2816,7 @@ async fn claim_task_prefers_sticky_worker_within_window() {
         .expect("enqueue pinned task failed");
 
     let queues = vec!["default".to_string()];
-    let claimed = queue::claim_task(&mut conn, &queues, "sticky-worker")
+    let claimed = queue::claim_task(&mut conn, &queues, "sticky-worker", "")
         .await
         .expect("claim should succeed")
         .expect("sticky worker should get its pinned task");
@@ -2820,7 +2825,7 @@ async fn claim_task_prefers_sticky_worker_within_window() {
         "sticky worker should claim its pinned task ahead of the higher-priority free task",
     );
 
-    let claimed_other = queue::claim_task(&mut conn, &queues, "other-worker")
+    let claimed_other = queue::claim_task(&mut conn, &queues, "other-worker", "")
         .await
         .expect("second claim should succeed")
         .expect("other worker should pick up the free task");
@@ -2845,7 +2850,7 @@ async fn claim_task_excludes_other_workers_while_sticky_active() {
 
     let queues = vec!["default".to_string()];
     // Different worker must not steal a fresh sticky pin.
-    let claimed = queue::claim_task(&mut conn, &queues, "interloper")
+    let claimed = queue::claim_task(&mut conn, &queues, "interloper", "")
         .await
         .expect("claim should succeed");
     assert!(
@@ -2854,7 +2859,7 @@ async fn claim_task_excludes_other_workers_while_sticky_active() {
     );
 
     // The owner can still claim it.
-    let owner_claim = queue::claim_task(&mut conn, &queues, "owner-worker")
+    let owner_claim = queue::claim_task(&mut conn, &queues, "owner-worker", "")
         .await
         .expect("owner claim should succeed")
         .expect("owner should be able to claim its pinned task");
@@ -2883,7 +2888,7 @@ async fn claim_task_falls_back_to_any_worker_after_sticky_expires() {
     tokio::time::sleep(Duration::from_millis(800)).await;
 
     let queues = vec!["default".to_string()];
-    let claimed = queue::claim_task(&mut conn, &queues, "rescue-worker")
+    let claimed = queue::claim_task(&mut conn, &queues, "rescue-worker", "")
         .await
         .expect("claim should succeed")
         .expect("any worker may claim after sticky_until expires");
@@ -2926,7 +2931,7 @@ async fn claim_task_treats_expired_sticky_rows_like_unpinned_rows() {
         .expect("enqueue free task failed");
 
     let queues = vec!["default".to_string()];
-    let claimed = queue::claim_task(&mut conn, &queues, "rescue-worker")
+    let claimed = queue::claim_task(&mut conn, &queues, "rescue-worker", "")
         .await
         .expect("claim should succeed")
         .expect("one of the eligible tasks should be claimed");
@@ -2948,7 +2953,7 @@ async fn park_workflow_task_with_sticky_hint_pins_to_worker() {
         .await
         .expect("enqueue should succeed");
     let queues = vec!["default".to_string()];
-    let _claimed = queue::claim_task(&mut conn, &queues, "park-worker")
+    let _claimed = queue::claim_task(&mut conn, &queues, "park-worker", "")
         .await
         .expect("claim should succeed")
         .expect("row should be claimable");
@@ -2991,7 +2996,7 @@ async fn wake_workflow_task_refreshes_sticky_until() {
         .await
         .expect("enqueue should succeed");
     let queues = vec!["default".to_string()];
-    let _claimed = queue::claim_task(&mut conn, &queues, "wake-refresh-worker")
+    let _claimed = queue::claim_task(&mut conn, &queues, "wake-refresh-worker", "")
         .await
         .expect("claim should succeed");
     // Use a 5s window so both the park's sticky_until and the wake's refreshed
@@ -3267,6 +3272,7 @@ mod reuse_policy_helpers {
             execution_timeout: None,
             memo: None,
             search_attrs: None,
+        assigned_build_id: None,
             reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
             trace_context: None,
         }
@@ -3735,17 +3741,17 @@ async fn concurrency_cap_limits_concurrent_claims_cluster_wide() {
             .expect("enqueue failed");
     }
 
-    let t1 = queue::claim_task(&mut conn, &queues, "worker-cc-1")
+    let t1 = queue::claim_task(&mut conn, &queues, "worker-cc-1", "")
         .await
         .expect("claim 1 query failed");
-    let t2 = queue::claim_task(&mut conn, &queues, "worker-cc-1")
+    let t2 = queue::claim_task(&mut conn, &queues, "worker-cc-1", "")
         .await
         .expect("claim 2 query failed");
     assert!(t1.is_some(), "first claim should succeed");
     assert!(t2.is_some(), "second claim should succeed");
 
     // Cap is now saturated — third claim must be deferred.
-    let t3 = queue::claim_task(&mut conn, &queues, "worker-cc-1")
+    let t3 = queue::claim_task(&mut conn, &queues, "worker-cc-1", "")
         .await
         .expect("claim 3 query failed");
     assert!(
@@ -3759,7 +3765,7 @@ async fn concurrency_cap_limits_concurrent_claims_cluster_wide() {
         .expect("complete_task failed");
 
     // Now a slot is free; one more task should be claimable.
-    let t4 = queue::claim_task(&mut conn, &queues, "worker-cc-1")
+    let t4 = queue::claim_task(&mut conn, &queues, "worker-cc-1", "")
         .await
         .expect("claim after complete query failed");
     assert!(
@@ -3811,7 +3817,7 @@ async fn concurrency_cap_shared_key_budget_is_not_doubled() {
     // Attempt to claim all 6; the shared budget of 3 should cap the total.
     let mut claimed = 0usize;
     for _ in 0..6 {
-        if queue::claim_task(&mut conn, &queues, "worker-sk-1")
+        if queue::claim_task(&mut conn, &queues, "worker-sk-1", "")
             .await
             .expect("claim query failed")
             .is_some()
@@ -3846,17 +3852,17 @@ async fn concurrency_cap_failure_frees_slot_and_does_not_wedge_queue() {
     }
 
     // Claim 2 (saturating the cap).
-    let t1 = queue::claim_task(&mut conn, &queues, "worker-fp-1")
+    let t1 = queue::claim_task(&mut conn, &queues, "worker-fp-1", "")
         .await
         .expect("claim 1 query failed")
         .expect("first task should be claimable");
-    let t2 = queue::claim_task(&mut conn, &queues, "worker-fp-1")
+    let t2 = queue::claim_task(&mut conn, &queues, "worker-fp-1", "")
         .await
         .expect("claim 2 query failed")
         .expect("second task should be claimable");
 
     // Cap is now saturated.
-    let t3 = queue::claim_task(&mut conn, &queues, "worker-fp-1")
+    let t3 = queue::claim_task(&mut conn, &queues, "worker-fp-1", "")
         .await
         .expect("claim 3 query failed");
     assert!(t3.is_none(), "cap must be saturated after 2 claims");
@@ -3870,10 +3876,10 @@ async fn concurrency_cap_failure_frees_slot_and_does_not_wedge_queue() {
         .expect("fail t2 failed");
 
     // The queue must not be wedged; the remaining pending tasks must be claimable.
-    let t4 = queue::claim_task(&mut conn, &queues, "worker-fp-1")
+    let t4 = queue::claim_task(&mut conn, &queues, "worker-fp-1", "")
         .await
         .expect("claim after fail query failed");
-    let t5 = queue::claim_task(&mut conn, &queues, "worker-fp-1")
+    let t5 = queue::claim_task(&mut conn, &queues, "worker-fp-1", "")
         .await
         .expect("claim 5 query failed");
     assert!(
@@ -3906,13 +3912,13 @@ async fn concurrency_cap_null_key_tasks_are_unaffected_by_saturated_key() {
             .await
             .expect("enqueue capped task failed");
         // Immediately claim each to put it in RUNNING state.
-        queue::claim_task(&mut conn, &queues, "worker-bc-1")
+        queue::claim_task(&mut conn, &queues, "worker-bc-1", "")
             .await
             .expect("claim capped task failed");
     }
 
     // Verify the key is saturated (third claim returns None).
-    let saturated_check = queue::claim_task(&mut conn, &queues, "worker-bc-1")
+    let saturated_check = queue::claim_task(&mut conn, &queues, "worker-bc-1", "")
         .await
         .expect("saturation check query failed");
     assert!(
@@ -3936,7 +3942,7 @@ async fn concurrency_cap_null_key_tasks_are_unaffected_by_saturated_key() {
     // is at its cap — the NULL check-path must not be constrained by other keys.
     let mut claimed = 0usize;
     for _ in 0..3 {
-        if queue::claim_task(&mut conn, &queues, "worker-bc-1")
+        if queue::claim_task(&mut conn, &queues, "worker-bc-1", "")
             .await
             .expect("uncapped claim query failed")
             .is_some()
@@ -4683,6 +4689,8 @@ async fn drain_accepted_sets_status_to_draining() {
         4,
         "test-host",
         None,
+        "",
+        None,
     )
     .await
     .unwrap();
@@ -4728,6 +4736,8 @@ async fn drain_already_draining_on_second_call() {
         &[],
         2,
         "test-host",
+        None,
+        "",
         None,
     )
     .await
@@ -4777,7 +4787,7 @@ async fn drain_already_stopped_after_transition() {
     let (mut conn, _container) = setup_test_db().await;
     let stale_threshold = Duration::from_secs(10);
 
-    register_worker(&mut conn, "w-drain-3", &[], &[], 1, "test-host", None)
+    register_worker(&mut conn, "w-drain-3", &[], &[], 1, "test-host", None, "", None)
         .await
         .unwrap();
     transition_status(&mut conn, "w-drain-3", WorkerStatus::Stopped)
@@ -4828,6 +4838,8 @@ async fn drain_with_explicit_deadline_is_stored() {
         1,
         "test-host",
         None,
+        "",
+        None,
     )
     .await
     .unwrap();
@@ -4864,6 +4876,8 @@ async fn drain_preview_returns_active_workers() {
             &[],
             4,
             "test-host",
+            None,
+            "",
             None,
         )
         .await
