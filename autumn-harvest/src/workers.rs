@@ -740,15 +740,33 @@ pub async fn request_drain(
         .unwrap_or_default();
 
     // Persist the Draining transition (and deadline) for accepted / stale drains.
+    // The UPDATE is guarded by `status != 'Stopped'` so a concurrent self-shutdown
+    // that already wrote Stopped is not overwritten (P2).
     if outcome.is_accepted() {
-        diesel::update(harvest_workers::table.find(worker_id))
-            .set((
-                harvest_workers::status.eq(WorkerStatus::Draining.as_str()),
-                harvest_workers::drain_deadline_at.eq(deadline_at),
-            ))
-            .execute(conn)
-            .await
-            .map_err(crate::error::database_error)?;
+        let rows = diesel::update(
+            harvest_workers::table
+                .find(worker_id)
+                .filter(harvest_workers::status.ne(WorkerStatus::Stopped.as_str())),
+        )
+        .set((
+            harvest_workers::status.eq(WorkerStatus::Draining.as_str()),
+            harvest_workers::drain_deadline_at.eq(deadline_at),
+        ))
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+        if rows == 0 {
+            // Worker self-stopped between our read and this update; report as stopped.
+            return Ok(DrainResponse {
+                worker_id: worker_id.to_string(),
+                outcome: DrainOutcome::AlreadyStopped,
+                in_flight_count: worker.in_flight_count,
+                drain_deadline_at: None,
+                shard_ids,
+                unavailable_shards: vec![],
+            });
+        }
     }
 
     Ok(DrainResponse {
@@ -798,6 +816,7 @@ pub fn spawn_worker_heartbeat(
     act_max: usize,
     interval: Duration,
     cancel: CancellationToken,
+    worker_shutdown: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -836,18 +855,19 @@ pub fn spawn_worker_heartbeat(
                         }
                         Ok(_) => {
                             // Heartbeat succeeded; check whether a remote drain
-                            // request has changed this worker's status to
-                            // Draining. If so, trigger local graceful shutdown
-                            // so the poll loop stops accepting new work within
-                            // the next heartbeat interval.
-                            if !cancel.is_cancelled() {
+                            // request has changed this worker's status to Draining.
+                            // Cancel the worker's poll-loop shutdown token (not the
+                            // heartbeat token) so the poll loop stops accepting new
+                            // work within the next heartbeat interval while heartbeats
+                            // continue until the worker is fully stopped (P1).
+                            if !worker_shutdown.is_cancelled() {
                                 match read_worker_status(&mut conn, &registration.worker_id).await {
                                     Ok(Some(ref s)) if s == WorkerStatus::Draining.as_str() => {
                                         tracing::info!(
                                             worker_id = %registration.worker_id,
                                             "remote drain detected; triggering graceful shutdown"
                                         );
-                                        cancel.cancel();
+                                        worker_shutdown.cancel();
                                     }
                                     _ => {}
                                 }

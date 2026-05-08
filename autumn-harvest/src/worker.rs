@@ -3149,6 +3149,7 @@ impl Worker {
             self.config.max_concurrent_activities,
             self.config.worker_heartbeat_interval,
             heartbeat_cancel.clone(),
+            self.shutdown.clone(),
         );
 
         while !self.shutdown.is_cancelled() {
