@@ -49,6 +49,7 @@ pub const OP_BATCH_SUBMIT: &str = "batch.submit";
 pub const OP_RETENTION_RUN_NOW: &str = "retention.run_now";
 pub const OP_EXTERNAL_ACTIVITY_COMPLETE: &str = "external_activity.complete";
 pub const OP_EXTERNAL_ACTIVITY_FAIL: &str = "external_activity.fail";
+pub const OP_WORKER_DRAIN: &str = "worker.drain";
 
 // ── Target type constants ─────────────────────────────────────────────────────
 
@@ -59,6 +60,7 @@ pub const TARGET_DEAD_LETTER: &str = "dead_letter";
 pub const TARGET_BATCH: &str = "batch";
 pub const TARGET_RETENTION: &str = "retention";
 pub const TARGET_EXTERNAL_ACTIVITY: &str = "external_activity";
+pub const TARGET_WORKER: &str = "worker";
 
 // ── Status constants ──────────────────────────────────────────────────────────
 
@@ -119,6 +121,7 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
     OP_RETENTION_RUN_NOW,
     OP_EXTERNAL_ACTIVITY_COMPLETE,
     OP_EXTERNAL_ACTIVITY_FAIL,
+    OP_WORKER_DRAIN,
 ];
 
 /// Routes explicitly excluded from audit.
@@ -148,6 +151,7 @@ pub const EXCLUDED_ROUTES: &[&str] = &[
     "GET /workers",
     "GET /workers/health",
     "GET /workers/{worker_id}",
+    "GET /workers/drain-preview",
     "GET /batch-operations",
     "GET /batch-operations/{id}",
     // The audit list endpoint itself is read-only.
@@ -216,10 +220,12 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
         Some(OP_EXTERNAL_ACTIVITY_FAIL),
     ),
     ("POST /activities/external/{token}/heartbeat", None),
-    // Worker fleet (read-only)
+    // Worker fleet
     ("GET /workers/health", None),
     ("GET /workers", None),
     ("GET /workers/{worker_id}", None),
+    ("GET /workers/drain-preview", None),
+    ("POST /workers/{worker_id}/drain", Some(OP_WORKER_DRAIN)),
     // Batch operations
     ("GET /batch-operations", None),
     ("POST /batch-operations", Some(OP_BATCH_SUBMIT)),

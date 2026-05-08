@@ -336,6 +336,12 @@ enum Commands {
     },
     /// Open the TUI dashboard to monitor workflows.
     Tui,
+    /// Inspect and drain worker fleet (issue #170).
+    #[command(alias = "workers")]
+    Worker {
+        #[command(subcommand)]
+        command: WorkerCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -841,6 +847,66 @@ enum DeadLetterCommand {
     },
 }
 
+/// Subcommands for `harvest worker` (issue #170).
+#[derive(Debug, Subcommand)]
+enum WorkerCommand {
+    /// Request a graceful drain for a specific worker.
+    ///
+    /// Sets the worker status to `Draining` so it stops accepting new tasks.
+    /// The worker itself will complete in-flight tasks and then transition to
+    /// `Stopped`. Use `--wait` to block until the worker reaches a terminal
+    /// state before the deadline.
+    Drain {
+        /// Worker ID to drain.
+        worker_id: String,
+        /// Drain-by deadline (RFC 3339, e.g. `2026-05-09T12:00:00Z`).
+        /// When omitted the server uses its configured shutdown timeout.
+        #[arg(long)]
+        deadline: Option<String>,
+    },
+    /// Preview which workers would be targeted by a drain, without draining them.
+    #[command(name = "drain-preview")]
+    DrainPreview {
+        /// Filter by task queue name.
+        #[arg(long)]
+        queue: Option<String>,
+        /// Filter by shard id.
+        #[arg(long)]
+        shard_id: Option<i32>,
+        /// Filter by lifecycle status (`Active`, `Draining`, `Stopped`).
+        #[arg(long)]
+        status: Option<String>,
+        /// Maximum number of workers to return [1–500].
+        #[arg(long, value_parser = clap::value_parser!(i64).range(1..=500))]
+        limit: Option<i64>,
+    },
+    /// List registered workers.
+    List {
+        /// Filter by task queue name.
+        #[arg(long)]
+        queue: Option<String>,
+        /// Filter by shard id.
+        #[arg(long)]
+        shard_id: Option<i32>,
+        /// Filter by lifecycle status (`Active`, `Draining`, `Stopped`).
+        #[arg(long)]
+        status: Option<String>,
+        /// Filter by health (`healthy` or `stale`).
+        #[arg(long)]
+        health: Option<String>,
+        /// Maximum number of workers to return [1–500].
+        #[arg(long, value_parser = clap::value_parser!(i64).range(1..=500))]
+        limit: Option<i64>,
+    },
+    /// Show details for a single worker.
+    Get {
+        /// Worker ID.
+        worker_id: String,
+    },
+    /// Show aggregated fleet health statistics.
+    Health,
+}
+
 impl Cli {
     /// Build the management API request represented by these CLI arguments.
     ///
@@ -862,6 +928,7 @@ impl Cli {
             Commands::Concurrency { command } => Ok(concurrency_request(command)),
             Commands::Batch { command } => batch_request(command),
             Commands::Audit { command } => Ok(audit_request(command)),
+            Commands::Worker { command } => Ok(worker_request(command)),
             Commands::VersionUsage {
                 workflow_name,
                 change_id,
@@ -2411,6 +2478,90 @@ fn build_bulk_dlq_body(
     Value::Object(body)
 }
 
+fn worker_request(command: &WorkerCommand) -> ApiRequest {
+    match command {
+        WorkerCommand::Drain {
+            worker_id,
+            deadline,
+        } => {
+            let mut body = Map::new();
+            if let Some(d) = deadline {
+                body.insert("deadline_at".to_string(), json!(d));
+            }
+            ApiRequest::post(
+                format!("/workers/{}/drain", path_segment(worker_id)),
+                Some(Value::Object(body)),
+            )
+        }
+        WorkerCommand::DrainPreview {
+            queue,
+            shard_id,
+            status,
+            limit,
+        } => {
+            let mut params: Vec<(&'static str, String)> = Vec::new();
+            if let Some(q) = queue {
+                params.push(("queue", q.clone()));
+            }
+            if let Some(s) = shard_id {
+                params.push(("shard_id", s.to_string()));
+            }
+            if let Some(s) = status {
+                params.push(("status", s.clone()));
+            }
+            if let Some(l) = limit {
+                params.push(("limit", l.to_string()));
+            }
+            if params.is_empty() {
+                return ApiRequest::get("/workers/drain-preview");
+            }
+            let qs = params
+                .iter()
+                .map(|(k, v)| format!("{k}={}", query_encode(v)))
+                .collect::<Vec<_>>()
+                .join("&");
+            ApiRequest::get(format!("/workers/drain-preview?{qs}"))
+        }
+        WorkerCommand::List {
+            queue,
+            shard_id,
+            status,
+            health,
+            limit,
+        } => {
+            let mut params: Vec<(&'static str, String)> = Vec::new();
+            if let Some(q) = queue {
+                params.push(("queue", q.clone()));
+            }
+            if let Some(s) = shard_id {
+                params.push(("shard_id", s.to_string()));
+            }
+            if let Some(s) = status {
+                params.push(("status", s.clone()));
+            }
+            if let Some(h) = health {
+                params.push(("health", h.clone()));
+            }
+            if let Some(l) = limit {
+                params.push(("limit", l.to_string()));
+            }
+            if params.is_empty() {
+                return ApiRequest::get("/workers");
+            }
+            let qs = params
+                .iter()
+                .map(|(k, v)| format!("{k}={}", query_encode(v)))
+                .collect::<Vec<_>>()
+                .join("&");
+            ApiRequest::get(format!("/workers?{qs}"))
+        }
+        WorkerCommand::Get { worker_id } => {
+            ApiRequest::get(format!("/workers/{}", path_segment(worker_id)))
+        }
+        WorkerCommand::Health => ApiRequest::get("/workers/health"),
+    }
+}
+
 fn parse_json_source(
     inline: Option<&str>,
     file: Option<&Path>,
@@ -3429,6 +3580,115 @@ mod reuse_policy_tests {
 
         assert!(rendered.trim_start().starts_with('{'));
         assert!(rendered.contains("\"safe_to_retire\":true"));
+    }
+
+    // -- Worker subcommand (issue #170) --
+
+    #[test]
+    fn worker_drain_builds_post_request() {
+        let req = parse(&["worker", "drain", "w-abc"]).api_request().unwrap();
+        assert_eq!(req.method, ApiMethod::Post);
+        assert_eq!(req.path, "/workers/w-abc/drain");
+        assert!(req.body.is_some());
+    }
+
+    #[test]
+    fn worker_drain_without_deadline_sends_empty_body() {
+        let req = parse(&["worker", "drain", "w-abc"]).api_request().unwrap();
+        let body = req.body.as_ref().unwrap();
+        assert!(body.get("deadline_at").is_none());
+    }
+
+    #[test]
+    fn worker_drain_with_deadline_includes_deadline_in_body() {
+        let req = parse(&[
+            "worker",
+            "drain",
+            "w-abc",
+            "--deadline",
+            "2026-05-09T12:00:00Z",
+        ])
+        .api_request()
+        .unwrap();
+        let body = req.body.as_ref().unwrap();
+        assert_eq!(
+            body["deadline_at"].as_str().unwrap(),
+            "2026-05-09T12:00:00Z"
+        );
+    }
+
+    #[test]
+    fn worker_drain_preview_builds_get_request() {
+        let req = parse(&["worker", "drain-preview"]).api_request().unwrap();
+        assert_eq!(req.method, ApiMethod::Get);
+        assert_eq!(req.path, "/workers/drain-preview");
+        assert!(req.body.is_none());
+    }
+
+    #[test]
+    fn worker_drain_preview_with_queue_filter_sends_param() {
+        let req = parse(&["worker", "drain-preview", "--queue", "email-workers"])
+            .api_request()
+            .unwrap();
+        assert_eq!(req.method, ApiMethod::Get);
+        assert!(
+            req.path.contains("queue=email-workers"),
+            "path: {}",
+            req.path
+        );
+    }
+
+    #[test]
+    fn worker_drain_preview_with_shard_filter_sends_param() {
+        let req = parse(&["worker", "drain-preview", "--shard-id", "2"])
+            .api_request()
+            .unwrap();
+        assert!(req.path.contains("shard_id=2"), "path: {}", req.path);
+    }
+
+    #[test]
+    fn worker_drain_preview_with_status_filter_sends_param() {
+        let req = parse(&["worker", "drain-preview", "--status", "Active"])
+            .api_request()
+            .unwrap();
+        assert!(req.path.contains("status=Active"), "path: {}", req.path);
+    }
+
+    #[test]
+    fn worker_list_builds_get_request() {
+        let req = parse(&["worker", "list"]).api_request().unwrap();
+        assert_eq!(req.method, ApiMethod::Get);
+        assert_eq!(req.path, "/workers");
+    }
+
+    #[test]
+    fn worker_list_with_status_filter_sends_param() {
+        let req = parse(&["worker", "list", "--status", "Draining"])
+            .api_request()
+            .unwrap();
+        assert!(req.path.contains("status=Draining"), "path: {}", req.path);
+    }
+
+    #[test]
+    fn worker_list_with_queue_filter_sends_param() {
+        let req = parse(&["worker", "list", "--queue", "default"])
+            .api_request()
+            .unwrap();
+        assert!(req.path.contains("queue=default"), "path: {}", req.path);
+    }
+
+    #[test]
+    fn worker_get_builds_get_request() {
+        let req = parse(&["worker", "get", "w-xyz"]).api_request().unwrap();
+        assert_eq!(req.method, ApiMethod::Get);
+        assert_eq!(req.path, "/workers/w-xyz");
+    }
+
+    #[test]
+    fn worker_health_builds_get_request() {
+        let req = parse(&["worker", "health"]).api_request().unwrap();
+        assert_eq!(req.method, ApiMethod::Get);
+        assert_eq!(req.path, "/workers/health");
     }
 
     #[test]

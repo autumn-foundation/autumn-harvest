@@ -391,6 +391,8 @@ pub struct HarvestWorker {
     pub version: Option<String>,
     /// Lifecycle status: `Active`, `Draining`, or `Stopped`.
     pub status: String,
+    /// When set, the deadline by which this worker must have finished draining.
+    pub drain_deadline_at: Option<DateTime<Utc>>,
 }
 
 /// Insert struct for registering a new worker process.
