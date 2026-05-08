@@ -857,9 +857,10 @@ pub fn spawn_worker_heartbeat(
     interval: Duration,
     cancel: CancellationToken,
     worker_shutdown: CancellationToken,
-    // Populated when a remote drain is detected: remaining time until the
-    // operator-supplied drain_deadline_at so drain_in_flight can honour it.
-    remote_drain_deadline: Arc<Mutex<Option<Duration>>>,
+    // Populated when a remote drain is detected: absolute Instant of the
+    // operator-supplied drain_deadline_at, refreshed on every heartbeat tick
+    // so that extended deadlines are picked up by drain_in_flight.
+    remote_drain_deadline: Arc<Mutex<Option<std::time::Instant>>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -897,36 +898,40 @@ pub fn spawn_worker_heartbeat(
                             }
                         }
                         Ok(_) => {
-                            // Heartbeat succeeded; check whether a remote drain
-                            // request has changed this worker's status to Draining.
-                            // Cancel the worker's poll-loop shutdown token (not the
-                            // heartbeat token) so the poll loop stops accepting new
-                            // work within the next heartbeat interval while heartbeats
-                            // continue until the worker is fully stopped (P1).
-                            if !worker_shutdown.is_cancelled() {
+                            if worker_shutdown.is_cancelled() {
+                                // Already draining — refresh the stored deadline on
+                                // every heartbeat so an operator-extended window (via
+                                // a second POST .../drain with a later deadline_at)
+                                // is picked up by drain_in_flight without restarting
+                                // the worker.
+                                sync_drain_deadline(
+                                    &mut conn,
+                                    &registration.worker_id,
+                                    &remote_drain_deadline,
+                                )
+                                .await;
+                            } else {
+                                // Heartbeat succeeded; check whether a remote drain
+                                // request has changed this worker's status to Draining.
+                                // Cancel the worker's poll-loop shutdown token (not the
+                                // heartbeat token) so the poll loop stops accepting new
+                                // work within the next heartbeat interval while heartbeats
+                                // continue until the worker is fully stopped (P1).
                                 match read_worker_status(&mut conn, &registration.worker_id).await {
                                     Ok(Some(ref s)) if s == WorkerStatus::Draining.as_str() => {
                                         tracing::info!(
                                             worker_id = %registration.worker_id,
                                             "remote drain detected; triggering graceful shutdown"
                                         );
-                                        // Read the operator-supplied deadline so
-                                        // drain_in_flight can honour it instead of
-                                        // the static shutdown_timeout (P2-B).
-                                        if let Ok(Some(deadline)) = read_worker_drain_deadline(
+                                        // Store the operator-supplied deadline as an
+                                        // absolute Instant so drain_in_flight can
+                                        // honour it (P2-B).
+                                        sync_drain_deadline(
                                             &mut conn,
                                             &registration.worker_id,
+                                            &remote_drain_deadline,
                                         )
-                                        .await
-                                        {
-                                            let remaining = deadline
-                                                .signed_duration_since(Utc::now())
-                                                .to_std()
-                                                .unwrap_or(Duration::ZERO);
-                                            if let Ok(mut guard) = remote_drain_deadline.lock() {
-                                                *guard = Some(remaining);
-                                            }
-                                        }
+                                        .await;
                                         worker_shutdown.cancel();
                                     }
                                     _ => {}
@@ -952,6 +957,27 @@ pub fn spawn_worker_heartbeat(
             }
         }
     })
+}
+
+/// Fetch `drain_deadline_at` from the DB and write it as an absolute
+/// `std::time::Instant` into the shared cell used by `drain_in_flight`.
+/// Called both on first drain detection and on every subsequent heartbeat
+/// tick while the worker is draining, so that an operator-extended deadline
+/// is reflected without a restart.
+async fn sync_drain_deadline(
+    conn: &mut AsyncPgConnection,
+    worker_id: &str,
+    cell: &Mutex<Option<std::time::Instant>>,
+) {
+    if let Ok(Some(deadline)) = read_worker_drain_deadline(conn, worker_id).await {
+        let remaining = deadline
+            .signed_duration_since(Utc::now())
+            .to_std()
+            .unwrap_or(Duration::ZERO);
+        if let Ok(mut guard) = cell.lock() {
+            *guard = Some(std::time::Instant::now() + remaining);
+        }
+    }
 }
 
 /// Compute the number of tasks currently in flight from semaphore permits.

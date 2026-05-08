@@ -2990,10 +2990,11 @@ pub struct Worker {
     activity_semaphore: Arc<Semaphore>,
     /// Cancellation token for graceful shutdown.
     shutdown: CancellationToken,
-    /// Set by the heartbeat task when a remote drain is detected; holds the
-    /// remaining time until the operator-supplied `drain_deadline_at` so that
-    /// `drain_in_flight` honours it instead of the static `shutdown_timeout`.
-    remote_drain_deadline: Arc<Mutex<Option<Duration>>>,
+    /// Set (and refreshed on every heartbeat) by the heartbeat task while the
+    /// worker is draining.  Holds the absolute deadline from the operator's
+    /// `drain_deadline_at` so that `drain_in_flight` can honour an extended
+    /// window even after it has already started waiting.
+    remote_drain_deadline: Arc<Mutex<Option<std::time::Instant>>>,
 }
 
 impl Worker {
@@ -3416,27 +3417,35 @@ impl Worker {
         });
     }
 
-    /// Wait for all in-flight tasks to finish (or timeout).
+    /// Wait for all in-flight tasks to finish (or the drain deadline expires).
     ///
     /// We wait until all semaphore permits are available again, meaning all
     /// spawned tasks have completed and dropped their permits.
     ///
-    /// When a remote drain set a deadline via `remote_drain_deadline`, we use
-    /// the remaining time from that deadline as the timeout.  This ensures that
-    /// a longer operator-supplied window is actually honoured rather than being
-    /// capped by the static `shutdown_timeout` (P2-B fix).
+    /// The deadline is read from `remote_drain_deadline` (set by the heartbeat
+    /// task) rather than being snapshotted once.  The heartbeat task refreshes
+    /// that cell on every tick while draining, so an operator-extended deadline
+    /// (via a second POST .../drain with a later `deadline_at`) is picked up
+    /// here without restarting the worker.
     async fn drain_in_flight(&self) {
         let total_permits =
             self.config.max_concurrent_workflows + self.config.max_concurrent_activities;
 
-        // Prefer the deadline received from the remote drain request; fall back
-        // to the statically-configured shutdown_timeout for local shutdowns.
-        let timeout = self
-            .remote_drain_deadline
-            .lock()
-            .ok()
-            .and_then(|g| *g)
-            .unwrap_or(self.config.shutdown_timeout);
+        // Returns the current deadline as a tokio Instant, falling back to the
+        // statically-configured shutdown_timeout for local (non-remote) shutdowns.
+        let snapshot_deadline = || -> tokio::time::Instant {
+            self.remote_drain_deadline
+                .lock()
+                .ok()
+                .and_then(|g| *g)
+                .map_or_else(
+                    || tokio::time::Instant::now() + self.config.shutdown_timeout,
+                    tokio::time::Instant::from_std,
+                )
+        };
+
+        let sleep = tokio::time::sleep_until(snapshot_deadline());
+        tokio::pin!(sleep);
 
         let drain = async {
             // Try to acquire ALL permits — when we can, all in-flight tasks are done.
@@ -3457,13 +3466,31 @@ impl Worker {
                 )
                 .await;
         };
+        tokio::pin!(drain);
 
-        if tokio::time::timeout(timeout, drain).await.is_err() {
-            tracing::warn!(
-                worker_id = %self.config.worker_id,
-                total_permits,
-                "shutdown timeout elapsed — some tasks may still be running"
-            );
+        // Poll for a refreshed deadline once per second so an extended window
+        // updates the sleep timer without requiring a worker restart.
+        let mut check = tokio::time::interval_at(
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            Duration::from_secs(1),
+        );
+
+        loop {
+            tokio::select! {
+                biased;
+                () = &mut drain => return,
+                () = &mut sleep => {
+                    tracing::warn!(
+                        worker_id = %self.config.worker_id,
+                        total_permits,
+                        "shutdown timeout elapsed — some tasks may still be running"
+                    );
+                    return;
+                }
+                _ = check.tick() => {
+                    sleep.as_mut().reset(snapshot_deadline());
+                }
+            }
         }
     }
 
