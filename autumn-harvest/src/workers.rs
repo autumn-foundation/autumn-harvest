@@ -739,9 +739,9 @@ pub async fn request_drain(
         })
         .unwrap_or_default();
 
-    // Persist the Draining transition (and deadline) for accepted / stale drains.
+    // Persist the status transition and deadline for new drains (Accepted / StaleWorker).
     // The UPDATE is guarded by `status != 'Stopped'` so a concurrent self-shutdown
-    // that already wrote Stopped is not overwritten (P2).
+    // that already wrote Stopped is not overwritten.
     if outcome.is_accepted() {
         let rows = diesel::update(
             harvest_workers::table
@@ -767,6 +767,14 @@ pub async fn request_drain(
                 unavailable_shards: vec![],
             });
         }
+    } else if outcome == DrainOutcome::AlreadyDraining {
+        // Worker is already Draining — only refresh the deadline so operators
+        // can extend or correct it without re-triggering the status transition.
+        diesel::update(harvest_workers::table.find(worker_id))
+            .set(harvest_workers::drain_deadline_at.eq(deadline_at))
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?;
     }
 
     Ok(DrainResponse {
@@ -1320,6 +1328,15 @@ mod tests {
         assert_eq!(shards.len(), 2);
         assert_eq!(shards[0].as_i64().unwrap(), 2);
         assert_eq!(shards[1].as_i64().unwrap(), 3);
+    }
+
+    #[test]
+    fn drain_outcome_already_draining_is_not_accepted() {
+        // AlreadyDraining must NOT be treated as accepted (status transition),
+        // but the deadline refresh path covers it separately.
+        assert!(!DrainOutcome::AlreadyDraining.is_accepted());
+        assert!(DrainOutcome::Accepted.is_accepted());
+        assert!(DrainOutcome::StaleWorker.is_accepted());
     }
 
     // -- preview_item_from_row --

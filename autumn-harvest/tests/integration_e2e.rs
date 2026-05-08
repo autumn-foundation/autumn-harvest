@@ -4727,11 +4727,15 @@ async fn drain_already_draining_on_second_call() {
     .await
     .unwrap();
 
-    request_drain(&mut conn, "w-drain-2", None, stale_threshold)
+    let first_deadline = Utc::now() + chrono::Duration::minutes(1);
+    request_drain(&mut conn, "w-drain-2", Some(first_deadline), stale_threshold)
         .await
         .unwrap();
 
-    let resp2 = request_drain(&mut conn, "w-drain-2", None, stale_threshold)
+    // Re-drain with a new deadline — should return AlreadyDraining and
+    // persist the updated deadline (operators extending a drain window).
+    let new_deadline = Utc::now() + chrono::Duration::minutes(5);
+    let resp2 = request_drain(&mut conn, "w-drain-2", Some(new_deadline), stale_threshold)
         .await
         .unwrap();
 
@@ -4740,6 +4744,10 @@ async fn drain_already_draining_on_second_call() {
         DrainOutcome::AlreadyDraining,
         "second drain on already-draining worker must return AlreadyDraining"
     );
+    // Deadline must reflect the refreshed value, not the original.
+    let stored = resp2.drain_deadline_at.expect("deadline must be echoed");
+    let diff = (stored - new_deadline).num_seconds().abs();
+    assert!(diff <= 2, "refreshed deadline differs by {diff}s");
 }
 
 #[tokio::test]
