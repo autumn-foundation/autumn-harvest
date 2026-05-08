@@ -1170,10 +1170,9 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
 fn history_output_file(cli: &Cli) -> Option<&Path> {
     match &cli.command {
         Commands::History {
-            command: HistoryCommand::Export { output_file, .. },
-        }
-        | Commands::History {
-            command: HistoryCommand::ExportBatch { output_file, .. },
+            command:
+                HistoryCommand::Export { output_file, .. }
+                | HistoryCommand::ExportBatch { output_file, .. },
         } => output_file.as_deref(),
         _ => None,
     }

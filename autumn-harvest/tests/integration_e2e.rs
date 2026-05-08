@@ -4728,9 +4728,14 @@ async fn drain_already_draining_on_second_call() {
     .unwrap();
 
     let first_deadline = Utc::now() + chrono::Duration::minutes(1);
-    request_drain(&mut conn, "w-drain-2", Some(first_deadline), stale_threshold)
-        .await
-        .unwrap();
+    request_drain(
+        &mut conn,
+        "w-drain-2",
+        Some(first_deadline),
+        stale_threshold,
+    )
+    .await
+    .unwrap();
 
     // Re-drain with a new deadline — should return AlreadyDraining and
     // persist the updated deadline (operators extending a drain window).
