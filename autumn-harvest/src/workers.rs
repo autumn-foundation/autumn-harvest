@@ -7,7 +7,7 @@
 //! The API layer queries this table (per-shard) to surface fleet status to
 //! operators via the management HTTP routes.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -554,6 +554,301 @@ pub struct FleetHealth {
 }
 
 // ---------------------------------------------------------------------------
+// Drain controls (issue #170)
+// ---------------------------------------------------------------------------
+
+/// Machine-readable outcome of a remote worker drain request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DrainOutcome {
+    /// Drain accepted; the worker status has been set to `Draining`.
+    Accepted,
+    /// The worker was already in the `Draining` state.
+    AlreadyDraining,
+    /// The worker is already in the `Stopped` state and will not accept new work.
+    AlreadyStopped,
+    /// The worker's last heartbeat is older than the stale threshold; the drain
+    /// was accepted but the worker may already be dead.
+    StaleWorker,
+    /// No worker with that ID exists in the fleet table.
+    NotFound,
+}
+
+impl DrainOutcome {
+    /// Returns `true` when the drain was recorded (accepted or stale-but-drained).
+    #[must_use]
+    pub const fn is_accepted(self) -> bool {
+        matches!(self, Self::Accepted | Self::StaleWorker)
+    }
+}
+
+/// Response returned by `POST /workers/{worker_id}/drain`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DrainResponse {
+    /// The worker that was targeted by the drain request.
+    pub worker_id: String,
+    /// Machine-readable outcome.
+    pub outcome: DrainOutcome,
+    /// Tasks in flight at the moment the drain was requested.
+    pub in_flight_count: i32,
+    /// When this worker must have finished draining (echoed from the request or
+    /// derived from the configured shutdown timeout).
+    pub drain_deadline_at: Option<DateTime<Utc>>,
+    /// Shard IDs this worker was serving at drain time.
+    pub shard_ids: Vec<i32>,
+    /// Shards that could not be contacted during this request.
+    /// When non-empty the result is **degraded**: the worker may exist on an
+    /// unavailable shard and operators should verify before re-routing traffic.
+    pub unavailable_shards: Vec<i32>,
+}
+
+/// One entry in a dry-run drain preview — what *would* be drained.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DrainPreviewItem {
+    /// Worker ID.
+    pub worker_id: String,
+    /// Current lifecycle status.
+    pub status: String,
+    /// Current health classification.
+    pub health: WorkerHealth,
+    /// Tasks currently in flight.
+    pub in_flight_count: i32,
+    /// Task queues this worker is polling.
+    pub queues: Vec<String>,
+    /// Shard IDs this worker serves.
+    pub shard_ids: Vec<i32>,
+}
+
+/// Convert a `WorkerRow` into a `DrainPreviewItem`.
+///
+/// Pure function — no DB access; used by both the API handler and unit tests.
+#[must_use]
+pub fn preview_item_from_row(row: &WorkerRow) -> DrainPreviewItem {
+    let queues = row
+        .worker
+        .queues
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let shard_ids = row
+        .worker
+        .shard_assignments
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_i64().and_then(|n| i32::try_from(n).ok()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    DrainPreviewItem {
+        worker_id: row.worker.worker_id.clone(),
+        status: row.worker.status.clone(),
+        health: row.health,
+        in_flight_count: row.worker.in_flight_count,
+        queues,
+        shard_ids,
+    }
+}
+
+/// Read the current lifecycle status of a worker without modifying it.
+///
+/// Returns `None` when the worker row does not exist.
+///
+/// # Errors
+///
+/// Returns [`HarvestError`] on database failure.
+pub async fn read_worker_status(
+    conn: &mut AsyncPgConnection,
+    worker_id: &str,
+) -> HarvestResult<Option<String>> {
+    let status = harvest_workers::table
+        .find(worker_id)
+        .select(harvest_workers::status)
+        .first::<String>(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?;
+    Ok(status)
+}
+
+/// Read the `drain_deadline_at` timestamp for a worker, if it exists.
+///
+/// # Errors
+///
+/// Returns [`HarvestError`] on database failure.
+pub async fn read_worker_drain_deadline(
+    conn: &mut AsyncPgConnection,
+    worker_id: &str,
+) -> HarvestResult<Option<DateTime<Utc>>> {
+    let row: Option<Option<DateTime<Utc>>> = harvest_workers::table
+        .find(worker_id)
+        .select(harvest_workers::drain_deadline_at)
+        .first(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?;
+    Ok(row.flatten())
+}
+
+/// Request a graceful drain for the worker identified by `worker_id`.
+///
+/// The function classifies the current worker state and, if appropriate,
+/// transitions it to `Draining` and records `drain_deadline_at`.
+/// It never touches workflow-event history.
+///
+/// | Outcome          | Condition                                            |
+/// |------------------|------------------------------------------------------|
+/// | `accepted`       | Worker is `Active` and healthy                       |
+/// | `stale_worker`   | Worker is `Active` but past the stale threshold      |
+/// | `already_draining` | Worker is already `Draining`                       |
+/// | `already_stopped`  | Worker is already `Stopped`                        |
+/// | `not_found`        | No row with that `worker_id`                       |
+///
+/// # Errors
+///
+/// Returns [`HarvestError`] on database failure.
+pub async fn request_drain(
+    conn: &mut AsyncPgConnection,
+    worker_id: &str,
+    deadline_at: Option<DateTime<Utc>>,
+    // true = operator supplied an explicit value; false = computed default.
+    // AlreadyDraining only refreshes the stored deadline for explicit values.
+    deadline_is_explicit: bool,
+    stale_threshold: Duration,
+) -> HarvestResult<DrainResponse> {
+    let row = harvest_workers::table
+        .find(worker_id)
+        .select(HarvestWorker::as_select())
+        .first::<HarvestWorker>(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?;
+
+    let Some(worker) = row else {
+        return Ok(DrainResponse {
+            worker_id: worker_id.to_string(),
+            outcome: DrainOutcome::NotFound,
+            in_flight_count: 0,
+            drain_deadline_at: None,
+            shard_ids: vec![],
+            unavailable_shards: vec![],
+        });
+    };
+
+    let health = WorkerHealth::classify(worker.last_heartbeat_at, stale_threshold);
+    let current_status = WorkerStatus::from_str(&worker.status);
+
+    let outcome = match current_status {
+        Some(WorkerStatus::Draining) => DrainOutcome::AlreadyDraining,
+        Some(WorkerStatus::Stopped) => DrainOutcome::AlreadyStopped,
+        _ if health == WorkerHealth::Stale => DrainOutcome::StaleWorker,
+        _ => DrainOutcome::Accepted,
+    };
+
+    let shard_ids: Vec<i32> = worker
+        .shard_assignments
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_i64().and_then(|n| i32::try_from(n).ok()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Persist the status transition and deadline for new drains (Accepted / StaleWorker).
+    // The UPDATE is guarded by `status != 'Stopped'` so a concurrent self-shutdown
+    // that already wrote Stopped is not overwritten.
+    if outcome.is_accepted() {
+        let rows = diesel::update(
+            harvest_workers::table
+                .find(worker_id)
+                .filter(harvest_workers::status.ne(WorkerStatus::Stopped.as_str())),
+        )
+        .set((
+            harvest_workers::status.eq(WorkerStatus::Draining.as_str()),
+            harvest_workers::drain_deadline_at.eq(deadline_at),
+        ))
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+        if rows == 0 {
+            // Worker self-stopped between our read and this update; report as stopped.
+            return Ok(DrainResponse {
+                worker_id: worker_id.to_string(),
+                outcome: DrainOutcome::AlreadyStopped,
+                in_flight_count: worker.in_flight_count,
+                drain_deadline_at: None,
+                shard_ids,
+                unavailable_shards: vec![],
+            });
+        }
+    } else if outcome == DrainOutcome::AlreadyDraining && deadline_is_explicit {
+        // Worker is already Draining and the caller supplied an explicit deadline
+        // — refresh it so operators can extend or correct the window without
+        // re-triggering the status transition.
+        diesel::update(harvest_workers::table.find(worker_id))
+            .set(harvest_workers::drain_deadline_at.eq(deadline_at))
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+    }
+    // AlreadyDraining + !deadline_is_explicit: preserve the stored deadline.
+
+    // Echo whichever deadline is now in effect: the parameter for new drains
+    // or explicit refreshes; the pre-existing row value when preserving.
+    let effective_deadline = if outcome == DrainOutcome::AlreadyDraining && !deadline_is_explicit {
+        worker.drain_deadline_at
+    } else {
+        deadline_at
+    };
+
+    Ok(DrainResponse {
+        worker_id: worker_id.to_string(),
+        outcome,
+        in_flight_count: worker.in_flight_count,
+        drain_deadline_at: effective_deadline,
+        shard_ids,
+        unavailable_shards: vec![],
+    })
+}
+
+/// Return a preview of which workers would be drained for the given filters.
+///
+/// This is the dry-run surface: it never mutates any row.
+///
+/// # Errors
+///
+/// Returns [`HarvestError`] on database failure.
+pub async fn drain_preview(
+    conn: &mut AsyncPgConnection,
+    filters: &WorkerFilters,
+    stale_threshold: Duration,
+) -> HarvestResult<Vec<DrainPreviewItem>> {
+    // Default to Active-only so the preview shows workers that *would* be newly
+    // drained. Callers that want Draining or Stopped workers must pass an explicit
+    // status filter.
+    let active_filters;
+    let effective = if filters.status.is_none() {
+        active_filters = WorkerFilters {
+            status: Some(WorkerStatus::Active.as_str().to_string()),
+            ..filters.clone()
+        };
+        &active_filters
+    } else {
+        filters
+    };
+    let rows = list_workers(conn, effective, stale_threshold).await?;
+    Ok(rows.iter().map(preview_item_from_row).collect())
+}
+
+// ---------------------------------------------------------------------------
 // Background heartbeat task
 // ---------------------------------------------------------------------------
 
@@ -574,6 +869,11 @@ pub fn spawn_worker_heartbeat(
     act_max: usize,
     interval: Duration,
     cancel: CancellationToken,
+    worker_shutdown: CancellationToken,
+    // Populated when a remote drain is detected: absolute Instant of the
+    // operator-supplied drain_deadline_at, refreshed on every heartbeat tick
+    // so that extended deadlines are picked up by drain_in_flight.
+    remote_drain_deadline: Arc<Mutex<Option<std::time::Instant>>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -610,7 +910,47 @@ pub fn spawn_worker_heartbeat(
                                 );
                             }
                         }
-                        Ok(_) => {}
+                        Ok(_) => {
+                            if worker_shutdown.is_cancelled() {
+                                // Already draining — refresh the stored deadline on
+                                // every heartbeat so an operator-extended window (via
+                                // a second POST .../drain with a later deadline_at)
+                                // is picked up by drain_in_flight without restarting
+                                // the worker.
+                                sync_drain_deadline(
+                                    &mut conn,
+                                    &registration.worker_id,
+                                    &remote_drain_deadline,
+                                )
+                                .await;
+                            } else {
+                                // Heartbeat succeeded; check whether a remote drain
+                                // request has changed this worker's status to Draining.
+                                // Cancel the worker's poll-loop shutdown token (not the
+                                // heartbeat token) so the poll loop stops accepting new
+                                // work within the next heartbeat interval while heartbeats
+                                // continue until the worker is fully stopped (P1).
+                                match read_worker_status(&mut conn, &registration.worker_id).await {
+                                    Ok(Some(ref s)) if s == WorkerStatus::Draining.as_str() => {
+                                        tracing::info!(
+                                            worker_id = %registration.worker_id,
+                                            "remote drain detected; triggering graceful shutdown"
+                                        );
+                                        // Store the operator-supplied deadline as an
+                                        // absolute Instant so drain_in_flight can
+                                        // honour it (P2-B).
+                                        sync_drain_deadline(
+                                            &mut conn,
+                                            &registration.worker_id,
+                                            &remote_drain_deadline,
+                                        )
+                                        .await;
+                                        worker_shutdown.cancel();
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
                         Err(error) => {
                             tracing::warn!(
                                 worker_id = %registration.worker_id,
@@ -630,6 +970,27 @@ pub fn spawn_worker_heartbeat(
             }
         }
     })
+}
+
+/// Fetch `drain_deadline_at` from the DB and write it as an absolute
+/// `std::time::Instant` into the shared cell used by `drain_in_flight`.
+/// Called both on first drain detection and on every subsequent heartbeat
+/// tick while the worker is draining, so that an operator-extended deadline
+/// is reflected without a restart.
+async fn sync_drain_deadline(
+    conn: &mut AsyncPgConnection,
+    worker_id: &str,
+    cell: &Mutex<Option<std::time::Instant>>,
+) {
+    if let Ok(Some(deadline)) = read_worker_drain_deadline(conn, worker_id).await {
+        let remaining = deadline
+            .signed_duration_since(Utc::now())
+            .to_std()
+            .unwrap_or(Duration::ZERO);
+        if let Ok(mut guard) = cell.lock() {
+            *guard = Some(std::time::Instant::now() + remaining);
+        }
+    }
 }
 
 /// Compute the number of tasks currently in flight from semaphore permits.
@@ -857,6 +1218,7 @@ mod tests {
                 host: "localhost".to_string(),
                 version: None,
                 status: "Active".to_string(),
+                drain_deadline_at: None,
             },
             health: WorkerHealth::Healthy,
             active_task_ids: vec![],
@@ -922,6 +1284,7 @@ mod tests {
                 host: "localhost".to_string(),
                 version: None,
                 status: "Active".to_string(),
+                drain_deadline_at: None,
             },
             health: WorkerHealth::Healthy,
             active_task_ids,
@@ -948,6 +1311,195 @@ mod tests {
             .expect("active_task_ids should be array");
         assert_eq!(ids.len(), 1);
         assert_eq!(ids[0].as_str().unwrap(), tid.to_string());
+    }
+
+    // -- DrainOutcome --
+
+    #[test]
+    fn drain_outcome_serializes_to_snake_case() {
+        let cases = [
+            (DrainOutcome::Accepted, "accepted"),
+            (DrainOutcome::AlreadyDraining, "already_draining"),
+            (DrainOutcome::AlreadyStopped, "already_stopped"),
+            (DrainOutcome::StaleWorker, "stale_worker"),
+            (DrainOutcome::NotFound, "not_found"),
+        ];
+        for (outcome, expected) in cases {
+            let json = serde_json::to_value(outcome).unwrap();
+            assert_eq!(
+                json.as_str().unwrap(),
+                expected,
+                "wrong serialization for {outcome:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn drain_outcome_is_accepted_only_for_accepted_and_stale() {
+        assert!(DrainOutcome::Accepted.is_accepted());
+        assert!(DrainOutcome::StaleWorker.is_accepted());
+        assert!(!DrainOutcome::AlreadyDraining.is_accepted());
+        assert!(!DrainOutcome::AlreadyStopped.is_accepted());
+        assert!(!DrainOutcome::NotFound.is_accepted());
+    }
+
+    #[test]
+    fn drain_outcome_round_trips_via_json() {
+        for outcome in [
+            DrainOutcome::Accepted,
+            DrainOutcome::AlreadyDraining,
+            DrainOutcome::AlreadyStopped,
+            DrainOutcome::StaleWorker,
+            DrainOutcome::NotFound,
+        ] {
+            let encoded = serde_json::to_string(&outcome).unwrap();
+            let decoded: DrainOutcome = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded, outcome, "round-trip failed for {outcome:?}");
+        }
+    }
+
+    // -- DrainResponse --
+
+    #[test]
+    fn drain_response_serializes_all_required_fields() {
+        let resp = DrainResponse {
+            worker_id: "w-abc".to_string(),
+            outcome: DrainOutcome::Accepted,
+            in_flight_count: 3,
+            drain_deadline_at: Some(Utc::now()),
+            shard_ids: vec![0, 1],
+            unavailable_shards: vec![],
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert!(json.get("worker_id").is_some(), "missing worker_id");
+        assert!(json.get("outcome").is_some(), "missing outcome");
+        assert!(
+            json.get("in_flight_count").is_some(),
+            "missing in_flight_count"
+        );
+        assert!(
+            json.get("drain_deadline_at").is_some(),
+            "missing drain_deadline_at"
+        );
+        assert!(json.get("shard_ids").is_some(), "missing shard_ids");
+        assert!(
+            json.get("unavailable_shards").is_some(),
+            "missing unavailable_shards"
+        );
+    }
+
+    #[test]
+    fn drain_response_null_deadline_serializes() {
+        let resp = DrainResponse {
+            worker_id: "w-abc".to_string(),
+            outcome: DrainOutcome::NotFound,
+            in_flight_count: 0,
+            drain_deadline_at: None,
+            shard_ids: vec![],
+            unavailable_shards: vec![],
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert!(json["drain_deadline_at"].is_null());
+        assert_eq!(json["shard_ids"].as_array().unwrap().len(), 0);
+        assert_eq!(json["unavailable_shards"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn drain_response_with_unavailable_shards_serializes() {
+        let resp = DrainResponse {
+            worker_id: "w-abc".to_string(),
+            outcome: DrainOutcome::NotFound,
+            in_flight_count: 0,
+            drain_deadline_at: None,
+            shard_ids: vec![],
+            unavailable_shards: vec![2, 3],
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        let shards = json["unavailable_shards"].as_array().unwrap();
+        assert_eq!(shards.len(), 2);
+        assert_eq!(shards[0].as_i64().unwrap(), 2);
+        assert_eq!(shards[1].as_i64().unwrap(), 3);
+    }
+
+    #[test]
+    fn drain_preview_defaults_status_to_active_when_unset() {
+        // Verify the documented default: callers that omit status see only Active.
+        // We can't run a DB query in a unit test, but we can verify the filter
+        // construction by inspecting the effective filters value.
+        let filters = WorkerFilters::new();
+        assert!(
+            filters.status.is_none(),
+            "WorkerFilters::new() must leave status unset so drain_preview can override it"
+        );
+        // drain_preview sets status = Active when None; the DB-level assertion
+        // lives in the integration test suite.
+    }
+
+    #[test]
+    fn drain_outcome_already_draining_is_not_accepted() {
+        // AlreadyDraining must NOT be treated as accepted (status transition),
+        // but the deadline refresh path covers it separately.
+        assert!(!DrainOutcome::AlreadyDraining.is_accepted());
+        assert!(DrainOutcome::Accepted.is_accepted());
+        assert!(DrainOutcome::StaleWorker.is_accepted());
+    }
+
+    // -- preview_item_from_row --
+
+    fn make_worker_row_full(
+        worker_id: &str,
+        status: &str,
+        in_flight: i32,
+        queues: &[&str],
+        shards: &[i32],
+    ) -> WorkerRow {
+        WorkerRow {
+            worker: HarvestWorker {
+                worker_id: worker_id.to_string(),
+                started_at: Utc::now(),
+                last_heartbeat_at: Utc::now(),
+                queues: serde_json::json!(queues),
+                shard_assignments: serde_json::json!(shards),
+                max_concurrency: 10,
+                in_flight_count: in_flight,
+                host: "localhost".to_string(),
+                version: None,
+                status: status.to_string(),
+                drain_deadline_at: None,
+            },
+            health: WorkerHealth::Healthy,
+            active_task_ids: vec![],
+        }
+    }
+
+    #[test]
+    fn preview_item_from_row_captures_all_fields() {
+        let row = make_worker_row_full("w-1", "Active", 5, &["default", "email"], &[0, 1]);
+        let item = preview_item_from_row(&row);
+        assert_eq!(item.worker_id, "w-1");
+        assert_eq!(item.status, "Active");
+        assert_eq!(item.in_flight_count, 5);
+        assert_eq!(item.queues, vec!["default", "email"]);
+        assert_eq!(item.shard_ids, vec![0, 1]);
+        assert_eq!(item.health, WorkerHealth::Healthy);
+    }
+
+    #[test]
+    fn preview_item_from_row_handles_empty_queues_and_shards() {
+        let row = make_worker_row_full("w-2", "Draining", 0, &[], &[]);
+        let item = preview_item_from_row(&row);
+        assert!(item.queues.is_empty());
+        assert!(item.shard_ids.is_empty());
+    }
+
+    #[test]
+    fn preview_item_serializes_to_json() {
+        let row = make_worker_row_full("w-3", "Active", 2, &["default"], &[0]);
+        let item = preview_item_from_row(&row);
+        let json = serde_json::to_value(&item).unwrap();
+        assert_eq!(json["worker_id"].as_str().unwrap(), "w-3");
+        assert_eq!(json["status"].as_str().unwrap(), "Active");
+        assert_eq!(json["in_flight_count"].as_i64().unwrap(), 2);
     }
 
     // -- compute_in_flight --

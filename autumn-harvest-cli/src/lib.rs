@@ -259,6 +259,15 @@ pub enum CliError {
     /// Retirement check found active old-version executions or an unavailable shard.
     #[error("version-gate retirement check failed")]
     RetirementCheckGate,
+
+    /// `--wait` timed out before the worker reached `Stopped`.
+    #[error("timed out waiting for worker '{worker_id}' to stop (last status: {last_status})")]
+    DrainWaitTimeout {
+        /// Worker ID that did not reach `Stopped`.
+        worker_id: String,
+        /// Last observed lifecycle status.
+        last_status: String,
+    },
 }
 
 impl CliError {
@@ -389,6 +398,12 @@ enum Commands {
     },
     /// Open the TUI dashboard to monitor workflows.
     Tui,
+    /// Inspect and drain worker fleet (issue #170).
+    #[command(alias = "workers")]
+    Worker {
+        #[command(subcommand)]
+        command: WorkerCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -942,6 +957,73 @@ enum DeadLetterCommand {
     },
 }
 
+/// Subcommands for `harvest worker` (issue #170).
+#[derive(Debug, Subcommand)]
+enum WorkerCommand {
+    /// Request a graceful drain for a specific worker.
+    ///
+    /// Sets the worker status to `Draining` so it stops accepting new tasks.
+    /// The worker itself will complete in-flight tasks and then transition to
+    /// `Stopped`. Use `--wait` to block until the worker reaches a terminal
+    /// state before the deadline.
+    Drain {
+        /// Worker ID to drain.
+        worker_id: String,
+        /// Drain-by deadline (RFC 3339, e.g. `2026-05-09T12:00:00Z`).
+        /// When omitted the server uses its configured shutdown timeout.
+        #[arg(long)]
+        deadline: Option<String>,
+        /// Block until the worker reaches `Stopped` or the deadline elapses.
+        /// Polls `GET /workers/{id}` every 2 s; exits 1 on timeout.
+        #[arg(long)]
+        wait: bool,
+        /// Maximum seconds to wait when `--wait` is set (default: 120).
+        #[arg(long, default_value = "120")]
+        wait_timeout_secs: u64,
+    },
+    /// Preview which workers would be targeted by a drain, without draining them.
+    #[command(name = "drain-preview")]
+    DrainPreview {
+        /// Filter by task queue name.
+        #[arg(long)]
+        queue: Option<String>,
+        /// Filter by shard id.
+        #[arg(long)]
+        shard_id: Option<i32>,
+        /// Filter by lifecycle status (`Active`, `Draining`, `Stopped`).
+        #[arg(long)]
+        status: Option<String>,
+        /// Maximum number of workers to return [1–500].
+        #[arg(long, value_parser = clap::value_parser!(i64).range(1..=500))]
+        limit: Option<i64>,
+    },
+    /// List registered workers.
+    List {
+        /// Filter by task queue name.
+        #[arg(long)]
+        queue: Option<String>,
+        /// Filter by shard id.
+        #[arg(long)]
+        shard_id: Option<i32>,
+        /// Filter by lifecycle status (`Active`, `Draining`, `Stopped`).
+        #[arg(long)]
+        status: Option<String>,
+        /// Filter by health (`healthy` or `stale`).
+        #[arg(long)]
+        health: Option<String>,
+        /// Maximum number of workers to return [1–500].
+        #[arg(long, value_parser = clap::value_parser!(i64).range(1..=500))]
+        limit: Option<i64>,
+    },
+    /// Show details for a single worker.
+    Get {
+        /// Worker ID.
+        worker_id: String,
+    },
+    /// Show aggregated fleet health statistics.
+    Health,
+}
+
 impl Cli {
     /// Build the management API request represented by these CLI arguments.
     ///
@@ -964,6 +1046,7 @@ impl Cli {
             Commands::Concurrency { command } => Ok(concurrency_request(command)),
             Commands::Batch { command } => batch_request(command),
             Commands::Audit { command } => Ok(audit_request(command)),
+            Commands::Worker { command } => Ok(worker_request(command)),
             Commands::VersionUsage {
                 workflow_name,
                 change_id,
@@ -1037,6 +1120,20 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
         return tui::run_tui(&cli).await;
     }
 
+    // --wait mode: issue drain then poll until Stopped or timeout.
+    if let Commands::Worker {
+        command:
+            WorkerCommand::Drain {
+                worker_id,
+                wait: true,
+                wait_timeout_secs,
+                ..
+            },
+    } = &cli.command
+    {
+        return run_worker_drain_wait(&cli, worker_id, *wait_timeout_secs).await;
+    }
+
     let response = execute(&cli).await?;
     let rendered = render_response(&cli, &response)?;
     if let Some(path) = history_output_file(&cli) {
@@ -1073,10 +1170,9 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
 fn history_output_file(cli: &Cli) -> Option<&Path> {
     match &cli.command {
         Commands::History {
-            command: HistoryCommand::Export { output_file, .. },
-        }
-        | Commands::History {
-            command: HistoryCommand::ExportBatch { output_file, .. },
+            command:
+                HistoryCommand::Export { output_file, .. }
+                | HistoryCommand::ExportBatch { output_file, .. },
         } => output_file.as_deref(),
         _ => None,
     }
@@ -1134,6 +1230,59 @@ pub async fn execute(cli: &Cli) -> Result<Value, CliError> {
     }
 
     serde_json::from_str(&body).map_err(CliError::ParseResponse)
+}
+
+/// Issue drain then poll `GET /workers/{id}` until status reaches `Stopped`
+/// or `wait_timeout_secs` elapses. Prints each poll result as it arrives.
+async fn run_worker_drain_wait(
+    cli: &Cli,
+    worker_id: &str,
+    wait_timeout_secs: u64,
+) -> Result<(), CliError> {
+    // Kick off the drain.
+    let response = execute(cli).await?;
+    let rendered = render_response(cli, &response)?;
+    println!("{rendered}");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait_timeout_secs);
+    let poll_interval = std::time::Duration::from_secs(2);
+
+    loop {
+        tokio::time::sleep(poll_interval).await;
+
+        let poll_cli = Cli {
+            base_url: cli.base_url.clone(),
+            token: cli.token.clone(),
+            actor: cli.actor.clone(),
+            request_id: cli.request_id.clone(),
+            output: cli.output,
+            command: Commands::Worker {
+                command: WorkerCommand::Get {
+                    worker_id: worker_id.to_string(),
+                },
+            },
+        };
+        let worker_value = execute(&poll_cli).await?;
+        let status = worker_value
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("Unknown")
+            .to_string();
+
+        let rendered = render_response(cli, &worker_value)?;
+        println!("{rendered}");
+
+        if status == "Stopped" {
+            return Ok(());
+        }
+
+        if std::time::Instant::now() >= deadline {
+            return Err(CliError::DrainWaitTimeout {
+                worker_id: worker_id.to_string(),
+                last_status: status,
+            });
+        }
+    }
 }
 
 /// Render a successful response.
@@ -2593,6 +2742,92 @@ fn build_bulk_dlq_body(
     Value::Object(body)
 }
 
+fn worker_request(command: &WorkerCommand) -> ApiRequest {
+    match command {
+        WorkerCommand::Drain {
+            worker_id,
+            deadline,
+            wait: _,
+            wait_timeout_secs: _,
+        } => {
+            let mut body = Map::new();
+            if let Some(d) = deadline {
+                body.insert("deadline_at".to_string(), json!(d));
+            }
+            ApiRequest::post(
+                format!("/workers/{}/drain", path_segment(worker_id)),
+                Some(Value::Object(body)),
+            )
+        }
+        WorkerCommand::DrainPreview {
+            queue,
+            shard_id,
+            status,
+            limit,
+        } => {
+            let mut params: Vec<(&'static str, String)> = Vec::new();
+            if let Some(q) = queue {
+                params.push(("queue", q.clone()));
+            }
+            if let Some(s) = shard_id {
+                params.push(("shard_id", s.to_string()));
+            }
+            if let Some(s) = status {
+                params.push(("status", s.clone()));
+            }
+            if let Some(l) = limit {
+                params.push(("limit", l.to_string()));
+            }
+            if params.is_empty() {
+                return ApiRequest::get("/workers/drain-preview");
+            }
+            let qs = params
+                .iter()
+                .map(|(k, v)| format!("{k}={}", query_encode(v)))
+                .collect::<Vec<_>>()
+                .join("&");
+            ApiRequest::get(format!("/workers/drain-preview?{qs}"))
+        }
+        WorkerCommand::List {
+            queue,
+            shard_id,
+            status,
+            health,
+            limit,
+        } => {
+            let mut params: Vec<(&'static str, String)> = Vec::new();
+            if let Some(q) = queue {
+                params.push(("queue", q.clone()));
+            }
+            if let Some(s) = shard_id {
+                params.push(("shard_id", s.to_string()));
+            }
+            if let Some(s) = status {
+                params.push(("status", s.clone()));
+            }
+            if let Some(h) = health {
+                params.push(("health", h.clone()));
+            }
+            if let Some(l) = limit {
+                params.push(("limit", l.to_string()));
+            }
+            if params.is_empty() {
+                return ApiRequest::get("/workers");
+            }
+            let qs = params
+                .iter()
+                .map(|(k, v)| format!("{k}={}", query_encode(v)))
+                .collect::<Vec<_>>()
+                .join("&");
+            ApiRequest::get(format!("/workers?{qs}"))
+        }
+        WorkerCommand::Get { worker_id } => {
+            ApiRequest::get(format!("/workers/{}", path_segment(worker_id)))
+        }
+        WorkerCommand::Health => ApiRequest::get("/workers/health"),
+    }
+}
+
 fn parse_json_source(
     inline: Option<&str>,
     file: Option<&Path>,
@@ -3619,6 +3854,177 @@ mod reuse_policy_tests {
 
         assert!(rendered.trim_start().starts_with('{'));
         assert!(rendered.contains("\"safe_to_retire\":true"));
+    }
+
+    // -- Worker subcommand (issue #170) --
+
+    #[test]
+    fn worker_drain_builds_post_request() {
+        let req = parse(&["worker", "drain", "w-abc"]).api_request().unwrap();
+        assert_eq!(req.method, ApiMethod::Post);
+        assert_eq!(req.path, "/workers/w-abc/drain");
+        assert!(req.body.is_some());
+    }
+
+    #[test]
+    fn worker_drain_without_deadline_sends_empty_body() {
+        let req = parse(&["worker", "drain", "w-abc"]).api_request().unwrap();
+        let body = req.body.as_ref().unwrap();
+        assert!(body.get("deadline_at").is_none());
+    }
+
+    #[test]
+    fn worker_drain_with_deadline_includes_deadline_in_body() {
+        let req = parse(&[
+            "worker",
+            "drain",
+            "w-abc",
+            "--deadline",
+            "2026-05-09T12:00:00Z",
+        ])
+        .api_request()
+        .unwrap();
+        let body = req.body.as_ref().unwrap();
+        assert_eq!(
+            body["deadline_at"].as_str().unwrap(),
+            "2026-05-09T12:00:00Z"
+        );
+    }
+
+    #[test]
+    fn worker_drain_preview_builds_get_request() {
+        let req = parse(&["worker", "drain-preview"]).api_request().unwrap();
+        assert_eq!(req.method, ApiMethod::Get);
+        assert_eq!(req.path, "/workers/drain-preview");
+        assert!(req.body.is_none());
+    }
+
+    #[test]
+    fn worker_drain_preview_with_queue_filter_sends_param() {
+        let req = parse(&["worker", "drain-preview", "--queue", "email-workers"])
+            .api_request()
+            .unwrap();
+        assert_eq!(req.method, ApiMethod::Get);
+        assert!(
+            req.path.contains("queue=email-workers"),
+            "path: {}",
+            req.path
+        );
+    }
+
+    #[test]
+    fn worker_drain_preview_with_shard_filter_sends_param() {
+        let req = parse(&["worker", "drain-preview", "--shard-id", "2"])
+            .api_request()
+            .unwrap();
+        assert!(req.path.contains("shard_id=2"), "path: {}", req.path);
+    }
+
+    #[test]
+    fn worker_drain_preview_with_status_filter_sends_param() {
+        let req = parse(&["worker", "drain-preview", "--status", "Active"])
+            .api_request()
+            .unwrap();
+        assert!(req.path.contains("status=Active"), "path: {}", req.path);
+    }
+
+    #[test]
+    fn worker_list_builds_get_request() {
+        let req = parse(&["worker", "list"]).api_request().unwrap();
+        assert_eq!(req.method, ApiMethod::Get);
+        assert_eq!(req.path, "/workers");
+    }
+
+    #[test]
+    fn worker_list_with_status_filter_sends_param() {
+        let req = parse(&["worker", "list", "--status", "Draining"])
+            .api_request()
+            .unwrap();
+        assert!(req.path.contains("status=Draining"), "path: {}", req.path);
+    }
+
+    #[test]
+    fn worker_list_with_queue_filter_sends_param() {
+        let req = parse(&["worker", "list", "--queue", "default"])
+            .api_request()
+            .unwrap();
+        assert!(req.path.contains("queue=default"), "path: {}", req.path);
+    }
+
+    #[test]
+    fn worker_get_builds_get_request() {
+        let req = parse(&["worker", "get", "w-xyz"]).api_request().unwrap();
+        assert_eq!(req.method, ApiMethod::Get);
+        assert_eq!(req.path, "/workers/w-xyz");
+    }
+
+    #[test]
+    fn worker_health_builds_get_request() {
+        let req = parse(&["worker", "health"]).api_request().unwrap();
+        assert_eq!(req.method, ApiMethod::Get);
+        assert_eq!(req.path, "/workers/health");
+    }
+
+    // -- Drain wait mode (AC #6) --
+
+    #[test]
+    fn worker_drain_with_wait_flag_still_builds_drain_post_request() {
+        let req = parse(&["worker", "drain", "w-abc", "--wait"])
+            .api_request()
+            .unwrap();
+        assert_eq!(req.method, ApiMethod::Post);
+        assert_eq!(req.path, "/workers/w-abc/drain");
+    }
+
+    #[test]
+    fn worker_drain_wait_and_deadline_are_independent_flags() {
+        let req = parse(&[
+            "worker",
+            "drain",
+            "w-abc",
+            "--wait",
+            "--deadline",
+            "2026-05-09T12:00:00Z",
+        ])
+        .api_request()
+        .unwrap();
+        let body = req.body.as_ref().unwrap();
+        assert_eq!(
+            body["deadline_at"].as_str().unwrap(),
+            "2026-05-09T12:00:00Z"
+        );
+    }
+
+    #[test]
+    fn worker_drain_wait_timeout_secs_default_is_120() {
+        let cli = parse(&["worker", "drain", "w-abc", "--wait"]);
+        if let Commands::Worker {
+            command:
+                WorkerCommand::Drain {
+                    wait,
+                    wait_timeout_secs,
+                    ..
+                },
+        } = &cli.command
+        {
+            assert!(*wait);
+            assert_eq!(*wait_timeout_secs, 120);
+        } else {
+            panic!("expected Worker::Drain command");
+        }
+    }
+
+    #[test]
+    fn worker_drain_without_wait_flag_wait_is_false() {
+        let cli = parse(&["worker", "drain", "w-abc"]);
+        if let Commands::Worker {
+            command: WorkerCommand::Drain { wait, .. },
+        } = &cli.command
+        {
+            assert!(!*wait);
+        } else {
+            panic!("expected Worker::Drain command");
+        }
     }
 
     #[test]

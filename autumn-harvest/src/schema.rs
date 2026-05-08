@@ -193,6 +193,7 @@ diesel::table! {
         host -> Text,
         version -> Nullable<Text>,
         status -> Text,
+        drain_deadline_at -> Nullable<Timestamptz>,
     }
 }
 

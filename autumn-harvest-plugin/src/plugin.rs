@@ -255,6 +255,9 @@ fn start_harvest_runtime(
     // Derive the API stale threshold from the worker heartbeat interval so that
     // /workers correctly classifies workers under non-default configurations.
     api_state.set_worker_stale_threshold(built.worker_config().worker_heartbeat_interval * 2);
+    // Mirror the configured shutdown timeout so drain requests can compute a
+    // sensible default deadline without the caller having to supply one.
+    api_state.set_worker_shutdown_timeout(built.worker_config().shutdown_timeout);
 
     // Apply the api_state audit retention override only when explicitly set,
     // so that builder-level retention config is not silently clobbered.
