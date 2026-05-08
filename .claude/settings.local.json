@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(gh label *)",
-      "Skill(update-config)",
-      "Skill(update-config:*)"
-    ]
-  }
-}
