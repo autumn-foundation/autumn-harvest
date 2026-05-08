@@ -1707,18 +1707,24 @@ impl WorkflowContext {
     ///
     /// Panics if the internal update registry mutex is poisoned.
     pub fn validate_update(&self, name: &str, input: &Value) -> HarvestResult<()> {
-        let registry = self
-            .update_registry
-            .lock()
-            .expect("update_registry lock poisoned");
-        // Check existence structurally so validator errors are never confused
-        // with a missing handler, regardless of the error message text.
-        if !registry.contains(name) {
-            return Err(HarvestError::UpdateHandlerNotFound(name.to_string()));
-        }
-        registry
-            .validate(name, input)
-            .map_err(|reason| HarvestError::UpdateRejected { reason })
+        // Drop the lock before executing the validator closure to prevent re-entrant deadlocks.
+        let validator = {
+            let registry = self
+                .update_registry
+                .lock()
+                .expect("update_registry lock poisoned");
+            // Check existence structurally so validator errors are never confused
+            // with a missing handler, regardless of the error message text.
+            if !registry.contains(name) {
+                return Err(HarvestError::UpdateHandlerNotFound(name.to_string()));
+            }
+            registry.get_validator(name)
+        };
+
+        validator.map_or_else(
+            || Ok(()),
+            |validator| validator(input).map_err(|reason| HarvestError::UpdateRejected { reason }),
+        )
     }
 
     /// Execute an already-admitted update by `update_id`.
@@ -1763,16 +1769,16 @@ impl WorkflowContext {
         }
 
         // Live path: invoke the registered handler.
-        let future = {
+        let handler = {
             let registry = self
                 .update_registry
                 .lock()
                 .expect("update_registry lock poisoned");
-            registry.invoke(name, input)
+            registry.get_handler(name)
         };
 
-        let result = match future {
-            Some(fut) => fut.await,
+        let result = match handler {
+            Some(h) => h(input).await,
             None => Err(format!("update handler '{name}' not found")),
         };
 

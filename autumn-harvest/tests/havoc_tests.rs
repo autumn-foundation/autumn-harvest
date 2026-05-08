@@ -60,3 +60,105 @@ fn test_havoc_external_task_duration_panic() {
     });
     assert!(res.is_ok());
 }
+
+#[cfg(feature = "testing")]
+#[tokio::test]
+async fn test_havoc_deadlock_in_query() {
+    use autumn_harvest::context::WorkflowContext;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let ctx = Arc::new(WorkflowContext::new_test());
+
+    let ctx_clone = ctx.clone();
+
+    ctx.register_query("test", move || {
+        // This will attempt to lock `query_registry` while it is already locked
+        // by the outer `execute_query` call.
+        let _ = ctx_clone.execute_query("another");
+        serde_json::json!(1)
+    });
+
+    ctx.register_query("another", || serde_json::json!(2));
+
+    let handle = tokio::spawn(async move {
+        let _ = ctx.execute_query("test");
+    });
+
+    let res = tokio::time::timeout(Duration::from_millis(500), handle).await;
+    assert!(res.is_ok(), "Test should NOT timeout due to deadlock");
+}
+
+#[cfg(feature = "testing")]
+#[tokio::test]
+async fn test_havoc_deadlock_in_update_validation() {
+    use autumn_harvest::context::WorkflowContext;
+    use std::sync::Arc;
+    use serde_json::json;
+    use std::time::Duration;
+
+    let ctx = Arc::new(WorkflowContext::new_test());
+
+    let ctx_clone = ctx.clone();
+
+    ctx.register_update_handler(
+        "test",
+        move |input| {
+            // This will deadlock if validate_update holds the lock
+            let _ = ctx_clone.validate_update("another", input);
+            Ok(())
+        },
+        |input| async move { Ok(input) }
+    );
+
+    ctx.register_update_handler(
+        "another",
+        |_| Ok(()),
+        |input| async move { Ok(input) }
+    );
+
+    let handle = tokio::spawn(async move {
+        let _ = ctx.validate_update("test", &json!(1));
+    });
+
+    let res = tokio::time::timeout(Duration::from_millis(500), handle).await;
+    assert!(res.is_ok(), "Test should NOT timeout due to deadlock");
+}
+
+#[cfg(feature = "testing")]
+#[tokio::test]
+async fn test_havoc_deadlock_in_update_execution() {
+    use autumn_harvest::context::WorkflowContext;
+    use std::sync::Arc;
+    use serde_json::json;
+    use std::time::Duration;
+    use autumn_harvest::types::UpdateId;
+
+    let ctx = Arc::new(WorkflowContext::new_test());
+    let ctx_clone = ctx.clone();
+
+    ctx.register_update_handler(
+        "test",
+        |_| Ok(()),
+        move |input| {
+            let ctx_inner = ctx_clone.clone();
+            async move {
+                let _ = ctx_inner.execute_admitted_update(UpdateId::new(), "another", input.clone()).await;
+                Ok(input)
+            }
+        }
+    );
+
+    ctx.register_update_handler(
+        "another",
+        |_| Ok(()),
+        |input| async move { Ok(input) }
+    );
+
+    let handle = tokio::spawn(async move {
+        let _ = ctx.execute_admitted_update(UpdateId::new(), "test", json!(1)).await;
+    });
+
+    let res = tokio::time::timeout(Duration::from_millis(500), handle).await;
+    assert!(res.is_ok(), "Test should NOT timeout due to deadlock");
+}

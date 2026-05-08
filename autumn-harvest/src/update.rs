@@ -92,4 +92,20 @@ impl UpdateRegistry {
     pub fn invoke(&self, name: &str, input: Value) -> Option<UpdateHandlerFuture> {
         self.entries.get(name).map(|e| (e.handler)(input))
     }
+
+    /// Get the validator for `name`.
+    ///
+    /// Returns `None` if `name` is not registered or has no validator.
+    #[must_use]
+    pub fn get_validator(&self, name: &str) -> Option<BoxUpdateValidator> {
+        self.entries.get(name).and_then(|e| e.validator.clone())
+    }
+
+    /// Get the handler for `name`.
+    ///
+    /// Returns `None` if `name` is not registered.
+    #[must_use]
+    pub fn get_handler(&self, name: &str) -> Option<BoxUpdateHandler> {
+        self.entries.get(name).map(|e| e.handler.clone())
+    }
 }
