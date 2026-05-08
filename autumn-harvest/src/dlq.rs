@@ -249,6 +249,20 @@ pub async fn replay_dead_letter(
             params.activity_name = entry.activity_name;
             params.max_attempts = entry.attempts.max(1);
 
+            // Restore required_build_id from the owning execution so the
+            // replayed task is only claimable by a compatible worker build.
+            if let Some(exec_id) = params.workflow_exec_id {
+                use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
+                let build_id: Option<Option<String>> = exec_dsl::harvest_workflow_executions
+                    .find(exec_id)
+                    .select(exec_dsl::assigned_build_id)
+                    .first(conn)
+                    .await
+                    .optional()
+                    .map_err(crate::error::database_error)?;
+                params.required_build_id = build_id.flatten();
+            }
+
             let task_id = crate::queue::enqueue(conn, &params).await?;
             let deleted = diesel::delete(dsl::harvest_dead_letters.find(dead_letter_id))
                 .execute(conn)
