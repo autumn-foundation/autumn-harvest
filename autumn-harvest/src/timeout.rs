@@ -391,7 +391,10 @@ pub async fn enforce_external_task_timeouts(conn: &mut AsyncPgConnection) -> Har
                             .filter(harvest_external_tasks::state.eq("PENDING"))
                             .filter(harvest_external_tasks::schedule_to_close_at.lt(Utc::now())),
                     )
-                    .set(harvest_external_tasks::state.eq("TIMED_OUT"))
+                    .set((
+                        harvest_external_tasks::state.eq("TIMED_OUT"),
+                        harvest_external_tasks::updated_at.eq(Utc::now()),
+                    ))
                     .execute(conn)
                     .await
                     .map_err(crate::error::database_error)?;

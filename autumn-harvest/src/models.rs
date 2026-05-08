@@ -350,6 +350,7 @@ pub struct ExternalTask {
     pub schedule_to_close_at: DateTime<Utc>,
     pub schedule_to_close_secs: i64,
     pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 /// Insert struct for registering a new external activity task.

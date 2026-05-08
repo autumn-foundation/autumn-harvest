@@ -240,6 +240,16 @@ enum Commands {
         #[command(subcommand)]
         command: WorkflowCommand,
     },
+    /// Inspect and resolve external activity handoffs.
+    #[command(
+        alias = "handoffs",
+        alias = "external-handoff",
+        alias = "external-handoffs"
+    )]
+    Handoff {
+        #[command(subcommand)]
+        command: HandoffCommand,
+    },
     /// Manage DAG schedules and runs.
     Dag {
         #[command(subcommand)]
@@ -541,6 +551,107 @@ enum WorkflowCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum HandoffCommand {
+    /// List external activity handoffs.
+    List {
+        /// Filter by handoff state. Repeat the flag or pass a comma-separated list.
+        #[arg(long, value_delimiter = ',')]
+        state: Vec<String>,
+        /// Filter by registered workflow name.
+        #[arg(long)]
+        workflow_name: Option<String>,
+        /// Filter by workflow execution ID.
+        #[arg(long)]
+        execution_id: Option<String>,
+        /// Filter by registered activity name.
+        #[arg(long)]
+        activity_name: Option<String>,
+        /// Filter by external activity token.
+        #[arg(long)]
+        token: Option<String>,
+        /// Restrict inspection to one shard.
+        #[arg(long)]
+        shard_id: Option<i32>,
+        /// Return handoffs due before this RFC3339 timestamp.
+        #[arg(long)]
+        due_before: Option<String>,
+        /// Return handoffs last updated before this RFC3339 timestamp.
+        #[arg(long)]
+        updated_before: Option<String>,
+        /// Maximum number of rows to return.
+        #[arg(long, value_parser = clap::value_parser!(i64).range(1..=500))]
+        limit: Option<i64>,
+        /// Print the raw JSON API payload instead of a human table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect one external activity handoff by token.
+    #[command(alias = "get")]
+    Inspect {
+        /// External activity token.
+        token: String,
+        /// Print the raw JSON API payload instead of a human table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Complete an external activity handoff by token.
+    Complete {
+        /// External activity token.
+        token: String,
+        /// JSON value to send as the activity output.
+        #[arg(long, conflicts_with = "output_file")]
+        output_json: Option<String>,
+        /// File containing JSON output. Use `-` for stdin.
+        #[arg(long, value_name = "PATH", conflicts_with = "output_json")]
+        output_file: Option<PathBuf>,
+        /// Full JSON request body. Use this to send `{ "output": ... }` directly.
+        #[arg(long, conflicts_with = "request_file")]
+        request_json: Option<String>,
+        /// File containing the full JSON request body. Use `-` for stdin.
+        #[arg(long, value_name = "PATH", conflicts_with = "request_json")]
+        request_file: Option<PathBuf>,
+    },
+    /// Fail an external activity handoff by token.
+    Fail {
+        /// External activity token.
+        token: String,
+        /// String error to record on the external activity.
+        #[arg(long)]
+        error: Option<String>,
+        /// JSON error details, compacted into the recorded error string.
+        #[arg(long, conflicts_with = "error_file")]
+        error_json: Option<String>,
+        /// File containing JSON error details. Use `-` for stdin.
+        #[arg(long, value_name = "PATH", conflicts_with = "error_json")]
+        error_file: Option<PathBuf>,
+        /// Full JSON request body. Use this to send `{ "error": "...", "retryable": false }`.
+        #[arg(long, conflicts_with = "request_file")]
+        request_json: Option<String>,
+        /// File containing the full JSON request body. Use `-` for stdin.
+        #[arg(long, value_name = "PATH", conflicts_with = "request_json")]
+        request_file: Option<PathBuf>,
+        /// Mark the external failure as retryable for workflow replay.
+        #[arg(long)]
+        retryable: bool,
+    },
+    /// Heartbeat an external activity handoff and optionally extend its deadline.
+    #[command(alias = "extend")]
+    Heartbeat {
+        /// External activity token.
+        token: String,
+        /// Seconds to extend the deadline from now.
+        #[arg(long)]
+        extend_by_secs: Option<u64>,
+        /// Full JSON request body. Use this to send `{ "extend_by_secs": 3600 }`.
+        #[arg(long, conflicts_with = "request_file")]
+        request_json: Option<String>,
+        /// File containing the full JSON request body. Use `-` for stdin.
+        #[arg(long, value_name = "PATH", conflicts_with = "request_json")]
+        request_file: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum DagCommand {
     /// List DAG schedules.
     List,
@@ -743,6 +854,7 @@ impl Cli {
             Commands::Preflight => Ok(ApiRequest::get("/admin/preflight")),
             Commands::Shard { command } => Ok(shard_request(command)),
             Commands::Workflow { command } => workflow_request(command),
+            Commands::Handoff { command } => handoff_request(command),
             Commands::Dag { command } => dag_request(command),
             Commands::Schedule { command } => schedule_request(command),
             Commands::Dlq { command } => Ok(dead_letter_request(command)),
@@ -927,6 +1039,9 @@ fn render_response(cli: &Cli, value: &Value) -> Result<String, CliError> {
     if workflow_children_wants_table(cli) {
         return Ok(format_workflow_children_table(value));
     }
+    if handoff_wants_table(cli) {
+        return Ok(format_handoff_table(value));
+    }
     if audit_list_wants_table(cli) {
         return Ok(format_audit_table(value));
     }
@@ -937,7 +1052,7 @@ fn render_response(cli: &Cli, value: &Value) -> Result<String, CliError> {
         return Ok(format_retirement_check_table(value));
     }
 
-    let output = if workflow_children_wants_raw_json(cli) {
+    let output = if workflow_children_wants_raw_json(cli) || handoff_wants_raw_json(cli) {
         OutputFormat::Json
     } else {
         cli.output
@@ -1250,6 +1365,143 @@ const fn workflow_children_wants_raw_json(cli: &Cli) -> bool {
             command: WorkflowCommand::Children { json: true, .. }
         }
     )
+}
+
+fn handoff_wants_table(cli: &Cli) -> bool {
+    matches!(
+        &cli.command,
+        Commands::Handoff {
+            command:
+                HandoffCommand::List { json: false, .. }
+                    | HandoffCommand::Inspect { json: false, .. }
+        } if cli.output == OutputFormat::PrettyJson
+    )
+}
+
+const fn handoff_wants_raw_json(cli: &Cli) -> bool {
+    matches!(
+        &cli.command,
+        Commands::Handoff {
+            command: HandoffCommand::List { json: true, .. }
+                | HandoffCommand::Inspect { json: true, .. }
+        }
+    )
+}
+
+fn format_handoff_table(value: &Value) -> String {
+    let (status, items, coverage) =
+        if let Some(items) = value.get("items").and_then(Value::as_array) {
+            (
+                value
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown"),
+                items.clone(),
+                value.get("shard_coverage"),
+            )
+        } else if let Some(item) = value.get("item") {
+            (
+                value
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown"),
+                vec![item.clone()],
+                value.get("shard_coverage"),
+            )
+        } else {
+            return "No external handoffs found.".to_string();
+        };
+
+    if items.is_empty() {
+        return format!("status: {status}\nNo external handoffs found.");
+    }
+
+    let mut rows = Vec::with_capacity(items.len() + 1);
+    rows.push(vec![
+        "STATE".to_string(),
+        "DEADLINE".to_string(),
+        "UPDATED".to_string(),
+        "WORKFLOW".to_string(),
+        "EXEC ID".to_string(),
+        "ACTIVITY".to_string(),
+        "SHARD".to_string(),
+        "TOKEN".to_string(),
+    ]);
+    for item in items {
+        rows.push(vec![
+            cell_str(item.get("state")),
+            cell_str(item.get("deadline_at")),
+            cell_str(item.get("updated_at")),
+            cell_str(
+                item.get("workflow")
+                    .and_then(|workflow| workflow.get("workflow_name")),
+            ),
+            cell_str(
+                item.get("workflow")
+                    .and_then(|workflow| workflow.get("execution_id")),
+            ),
+            cell_str(
+                item.get("activity")
+                    .and_then(|activity| activity.get("activity_name")),
+            ),
+            cell_number(
+                item.get("workflow")
+                    .and_then(|workflow| workflow.get("shard_id")),
+            ),
+            cell_str(item.get("token")),
+        ]);
+    }
+
+    let widths = (0..rows[0].len())
+        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
+        .collect::<Vec<_>>();
+    let table = rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .enumerate()
+                .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
+                .collect::<Vec<_>>()
+                .join("  ")
+                .trim_end()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let coverage = coverage.map_or_else(String::new, handoff_coverage_summary);
+    if coverage.is_empty() {
+        format!("status: {status}\n\n{table}")
+    } else {
+        format!("status: {status}\n{coverage}\n\n{table}")
+    }
+}
+
+fn handoff_coverage_summary(value: &Value) -> String {
+    let unavailable = value
+        .get("unavailable_shards")
+        .and_then(Value::as_array)
+        .map_or_else(String::new, |shards| {
+            if shards.is_empty() {
+                return String::new();
+            }
+            let cells = shards
+                .iter()
+                .map(|shard| {
+                    let id = cell_number(shard.get("shard_id"));
+                    let reason = cell_str(shard.get("reason"));
+                    format!("{id}:{reason}")
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("unavailable_shards: {cells}")
+        });
+    let inspected = shard_array_cell(value, "inspected_shards");
+    if unavailable.is_empty() {
+        format!("inspected_shards: {inspected}")
+    } else {
+        format!("inspected_shards: {inspected}\n{unavailable}")
+    }
 }
 
 fn format_workflow_children_table(value: &Value) -> String {
@@ -1749,6 +2001,152 @@ fn workflow_request(command: &WorkflowCommand) -> Result<ApiRequest, CliError> {
     }
 }
 
+fn handoff_request(command: &HandoffCommand) -> Result<ApiRequest, CliError> {
+    match command {
+        HandoffCommand::List {
+            state,
+            workflow_name,
+            execution_id,
+            activity_name,
+            token,
+            shard_id,
+            due_before,
+            updated_before,
+            limit,
+            json: _,
+        } => Ok(ApiRequest::get(build_handoff_list_path(
+            state,
+            workflow_name.as_deref(),
+            execution_id.as_deref(),
+            activity_name.as_deref(),
+            token.as_deref(),
+            *shard_id,
+            due_before.as_deref(),
+            updated_before.as_deref(),
+            *limit,
+        ))),
+        HandoffCommand::Inspect { token, json: _ } => Ok(ApiRequest::get(format!(
+            "/admin/external-handoffs/{}",
+            path_segment(token)
+        ))),
+        HandoffCommand::Complete {
+            token,
+            output_json,
+            output_file,
+            request_json,
+            request_file,
+        } => complete_handoff_request(
+            token,
+            output_json.as_deref(),
+            output_file.as_deref(),
+            request_json.as_deref(),
+            request_file.as_deref(),
+        ),
+        HandoffCommand::Fail {
+            token,
+            error,
+            error_json,
+            error_file,
+            request_json,
+            request_file,
+            retryable,
+        } => fail_handoff_request(
+            token,
+            error.as_deref(),
+            error_json.as_deref(),
+            error_file.as_deref(),
+            request_json.as_deref(),
+            request_file.as_deref(),
+            *retryable,
+        ),
+        HandoffCommand::Heartbeat {
+            token,
+            extend_by_secs,
+            request_json,
+            request_file,
+        } => heartbeat_handoff_request(
+            token,
+            *extend_by_secs,
+            request_json.as_deref(),
+            request_file.as_deref(),
+        ),
+    }
+}
+
+fn complete_handoff_request(
+    token: &str,
+    output_json: Option<&str>,
+    output_file: Option<&Path>,
+    request_json: Option<&str>,
+    request_file: Option<&Path>,
+) -> Result<ApiRequest, CliError> {
+    let request_body = parse_json_source(request_json, request_file, "handoff complete request")?;
+    let body = if let Some(request_body) = request_body {
+        request_body
+    } else {
+        let output = parse_json_source(output_json, output_file, "handoff completion output")?
+            .unwrap_or(Value::Null);
+        json!({ "output": output })
+    };
+    Ok(ApiRequest::post(
+        format!("/activities/external/{}/complete", path_segment(token)),
+        Some(body),
+    ))
+}
+
+fn fail_handoff_request(
+    token: &str,
+    error: Option<&str>,
+    error_json: Option<&str>,
+    error_file: Option<&Path>,
+    request_json: Option<&str>,
+    request_file: Option<&Path>,
+    retryable: bool,
+) -> Result<ApiRequest, CliError> {
+    let request = parse_json_source(request_json, request_file, "handoff fail request")?;
+    let body = if let Some(request) = request {
+        request
+    } else {
+        let error_value = parse_json_source(error_json, error_file, "handoff error")?;
+        let error = error_value.map_or_else(
+            || error.unwrap_or("external handoff failed").to_string(),
+            stringify_handoff_error,
+        );
+        json!({ "error": error, "retryable": retryable })
+    };
+    Ok(ApiRequest::post(
+        format!("/activities/external/{}/fail", path_segment(token)),
+        Some(body),
+    ))
+}
+
+fn stringify_handoff_error(value: Value) -> String {
+    match value {
+        Value::String(raw) => raw,
+        other => serde_json::to_string(&other).unwrap_or_else(|_| other.to_string()),
+    }
+}
+
+fn heartbeat_handoff_request(
+    token: &str,
+    extend_by_secs: Option<u64>,
+    request_json: Option<&str>,
+    request_file: Option<&Path>,
+) -> Result<ApiRequest, CliError> {
+    let body = parse_json_source(request_json, request_file, "handoff heartbeat request")?
+        .unwrap_or_else(|| {
+            let mut body = Map::new();
+            if let Some(secs) = extend_by_secs {
+                body.insert("extend_by_secs".to_string(), json!(secs));
+            }
+            Value::Object(body)
+        });
+    Ok(ApiRequest::post(
+        format!("/activities/external/{}/heartbeat", path_segment(token)),
+        Some(body),
+    ))
+}
+
 fn dag_request(command: &DagCommand) -> Result<ApiRequest, CliError> {
     match command {
         DagCommand::List => Ok(ApiRequest::get("/dags")),
@@ -2082,6 +2480,58 @@ fn path_with_limit(base: &str, limit: Option<(&str, i64)>) -> String {
         .collect::<Vec<_>>()
         .join("&");
     format!("{base}?{query}")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_handoff_list_path(
+    states: &[String],
+    workflow_name: Option<&str>,
+    execution_id: Option<&str>,
+    activity_name: Option<&str>,
+    token: Option<&str>,
+    shard_id: Option<i32>,
+    due_before: Option<&str>,
+    updated_before: Option<&str>,
+    limit: Option<i64>,
+) -> String {
+    let mut params: Vec<(&'static str, String)> = Vec::new();
+    if !states.is_empty() {
+        params.push(("state", states.join(",")));
+    }
+    if let Some(value) = workflow_name {
+        params.push(("workflow_name", value.to_string()));
+    }
+    if let Some(value) = execution_id {
+        params.push(("execution_id", value.to_string()));
+    }
+    if let Some(value) = activity_name {
+        params.push(("activity_name", value.to_string()));
+    }
+    if let Some(value) = token {
+        params.push(("token", value.to_string()));
+    }
+    if let Some(value) = shard_id {
+        params.push(("shard_id", value.to_string()));
+    }
+    if let Some(value) = due_before {
+        params.push(("due_before", value.to_string()));
+    }
+    if let Some(value) = updated_before {
+        params.push(("updated_before", value.to_string()));
+    }
+    if let Some(value) = limit {
+        params.push(("limit", value.to_string()));
+    }
+
+    if params.is_empty() {
+        return "/admin/external-handoffs".to_string();
+    }
+    let query = params
+        .iter()
+        .map(|(key, value)| format!("{key}={}", query_encode(value)))
+        .collect::<Vec<_>>()
+        .join("&");
+    format!("/admin/external-handoffs?{query}")
 }
 
 fn build_workflow_list_path(
@@ -2458,6 +2908,65 @@ mod reuse_policy_tests {
         let rendered = render_response(&cli, &payload).expect("json output should render");
 
         assert_eq!(rendered, r#"{"items":[],"next_cursor":null}"#);
+    }
+
+    #[test]
+    fn handoff_list_default_output_renders_human_table() {
+        let cli = parse(&["handoff", "list"]);
+        let payload = json!({
+            "status": "ok",
+            "shard_coverage": {
+                "inspected_shards": [0],
+                "matched_shards": [0],
+                "unavailable_shards": []
+            },
+            "items": [{
+                "token": "11111111-1111-4111-8111-111111111111",
+                "workflow": {
+                    "execution_id": "00000000-0000-0000-0000-000000000001",
+                    "workflow_id": "invoice-42",
+                    "workflow_name": "billing_checkout",
+                    "shard_id": 0
+                },
+                "activity": {
+                    "activity_id": "22222222-2222-4222-8222-222222222222",
+                    "activity_name": "manager_approval"
+                },
+                "state": "PENDING",
+                "created_at": "2026-05-08T11:00:00Z",
+                "updated_at": "2026-05-08T11:05:00Z",
+                "deadline_at": "2026-05-08T12:00:00Z"
+            }]
+        });
+
+        let rendered = render_response(&cli, &payload).expect("table output should render");
+
+        assert!(rendered.contains("status: ok"));
+        assert!(rendered.contains("STATE"));
+        assert!(rendered.contains("manager_approval"));
+        assert!(rendered.contains("11111111-1111-4111-8111-111111111111"));
+        assert!(!rendered.trim_start().starts_with('{'));
+    }
+
+    #[test]
+    fn handoff_json_flag_renders_raw_payload() {
+        let cli = parse(&["handoff", "list", "--json"]);
+        let payload = json!({
+            "status": "ok",
+            "items": [],
+            "shard_coverage": {
+                "inspected_shards": [0],
+                "matched_shards": [],
+                "unavailable_shards": []
+            }
+        });
+
+        let rendered = render_response(&cli, &payload).expect("json output should render");
+
+        assert_eq!(
+            rendered,
+            r#"{"items":[],"shard_coverage":{"inspected_shards":[0],"matched_shards":[],"unavailable_shards":[]},"status":"ok"}"#
+        );
     }
 
     #[test]

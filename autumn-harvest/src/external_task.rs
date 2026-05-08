@@ -14,9 +14,112 @@ use scoped_futures::ScopedFutureExt;
 use crate::error::{HarvestError, HarvestResult, database_error};
 use crate::event::WorkflowEvent;
 use crate::models::{ExternalTask, NewExternalTask};
-use crate::schema::harvest_external_tasks;
+use crate::schema::{harvest_external_tasks, harvest_workflow_executions};
 use crate::store;
 use crate::types::{ActivityExecId, ExecutionId, ExternalActivityToken};
+
+/// External activity states persisted in `harvest_external_tasks`.
+pub const KNOWN_EXTERNAL_TASK_STATES: &[&str] =
+    &["PENDING", "COMPLETED", "FAILED", "TIMED_OUT", "CANCELLED"];
+
+/// Filters for operator-facing external activity handoff queries.
+#[derive(Debug, Clone)]
+pub struct ExternalHandoffFilters {
+    pub states: Vec<String>,
+    pub workflow_name: Option<String>,
+    pub execution_id: Option<ExecutionId>,
+    pub activity_name: Option<String>,
+    pub token: Option<ExternalActivityToken>,
+    pub shard_id: Option<i32>,
+    pub due_before: Option<chrono::DateTime<Utc>>,
+    pub updated_before: Option<chrono::DateTime<Utc>>,
+    pub limit: i64,
+}
+
+impl Default for ExternalHandoffFilters {
+    fn default() -> Self {
+        Self {
+            states: Vec::new(),
+            workflow_name: None,
+            execution_id: None,
+            activity_name: None,
+            token: None,
+            shard_id: None,
+            due_before: None,
+            updated_before: None,
+            limit: 100,
+        }
+    }
+}
+
+impl ExternalHandoffFilters {
+    #[must_use]
+    pub const fn with_limit(mut self, limit: i64) -> Self {
+        self.limit = limit;
+        self
+    }
+}
+
+/// Redacted, operator-facing external handoff row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalHandoffRow {
+    pub token: ExternalActivityToken,
+    pub workflow_exec_id: ExecutionId,
+    pub workflow_id: String,
+    pub workflow_name: String,
+    pub activity_id: ActivityExecId,
+    pub activity_name: String,
+    pub state: String,
+    pub created_at: chrono::DateTime<Utc>,
+    pub updated_at: chrono::DateTime<Utc>,
+    pub deadline_at: chrono::DateTime<Utc>,
+    pub shard_id: i32,
+}
+
+type ExternalHandoffProjection = (
+    uuid::Uuid,
+    uuid::Uuid,
+    String,
+    String,
+    uuid::Uuid,
+    String,
+    String,
+    chrono::DateTime<Utc>,
+    chrono::DateTime<Utc>,
+    chrono::DateTime<Utc>,
+    i32,
+);
+
+impl From<ExternalHandoffProjection> for ExternalHandoffRow {
+    fn from(row: ExternalHandoffProjection) -> Self {
+        let (
+            token,
+            workflow_exec_id,
+            workflow_id,
+            workflow_name,
+            activity_id,
+            activity_name,
+            state,
+            created_at,
+            updated_at,
+            deadline_at,
+            shard_id,
+        ) = row;
+        Self {
+            token: ExternalActivityToken::from_uuid(token),
+            workflow_exec_id: ExecutionId::from_uuid(workflow_exec_id),
+            workflow_id,
+            workflow_name,
+            activity_id: ActivityExecId::from_uuid(activity_id),
+            activity_name,
+            state,
+            created_at,
+            updated_at,
+            deadline_at,
+            shard_id,
+        }
+    }
+}
 
 /// Insert a new external-task row, linking `token` → `(exec_id, activity_id)`.
 ///
@@ -85,6 +188,94 @@ pub async fn find_by_token(
         .map_err(database_error)
 }
 
+/// List external activity handoffs for operator read surfaces.
+///
+/// Rows intentionally expose only task identity, token, state, and timing
+/// metadata. Raw workflow/activity payloads remain in event history and are
+/// not selected here.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] if the query fails.
+pub async fn list_external_handoffs(
+    conn: &mut AsyncPgConnection,
+    filters: &ExternalHandoffFilters,
+) -> HarvestResult<Vec<ExternalHandoffRow>> {
+    let mut query = harvest_external_tasks::table
+        .inner_join(harvest_workflow_executions::table)
+        .select((
+            harvest_external_tasks::token,
+            harvest_external_tasks::workflow_exec_id,
+            harvest_workflow_executions::workflow_id,
+            harvest_workflow_executions::workflow_name,
+            harvest_external_tasks::activity_id,
+            harvest_external_tasks::name,
+            harvest_external_tasks::state,
+            harvest_external_tasks::created_at,
+            harvest_external_tasks::updated_at,
+            harvest_external_tasks::schedule_to_close_at,
+            harvest_workflow_executions::shard_id,
+        ))
+        .into_boxed::<diesel::pg::Pg>();
+
+    if !filters.states.is_empty() {
+        query = query.filter(harvest_external_tasks::state.eq_any(filters.states.clone()));
+    }
+    if let Some(workflow_name) = &filters.workflow_name {
+        query = query.filter(harvest_workflow_executions::workflow_name.eq(workflow_name));
+    }
+    if let Some(exec_id) = filters.execution_id {
+        query = query.filter(harvest_external_tasks::workflow_exec_id.eq(exec_id.as_uuid()));
+    }
+    if let Some(activity_name) = &filters.activity_name {
+        query = query.filter(harvest_external_tasks::name.eq(activity_name));
+    }
+    if let Some(token) = filters.token {
+        query = query.filter(harvest_external_tasks::token.eq(token.as_uuid()));
+    }
+    if let Some(shard_id) = filters.shard_id {
+        query = query.filter(harvest_workflow_executions::shard_id.eq(shard_id));
+    }
+    if let Some(due_before) = filters.due_before {
+        query = query.filter(harvest_external_tasks::schedule_to_close_at.le(due_before));
+    }
+    if let Some(updated_before) = filters.updated_before {
+        query = query.filter(harvest_external_tasks::updated_at.le(updated_before));
+    }
+
+    query
+        .order((
+            harvest_external_tasks::schedule_to_close_at.asc(),
+            harvest_external_tasks::updated_at.desc(),
+            harvest_external_tasks::token.asc(),
+        ))
+        .limit(filters.limit)
+        .load::<ExternalHandoffProjection>(conn)
+        .await
+        .map_err(database_error)
+        .map(|rows| rows.into_iter().map(ExternalHandoffRow::from).collect())
+}
+
+/// Look up one operator-facing external handoff by token.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] if the query fails.
+pub async fn find_handoff_by_token(
+    conn: &mut AsyncPgConnection,
+    token: ExternalActivityToken,
+) -> HarvestResult<Option<ExternalHandoffRow>> {
+    let filters = ExternalHandoffFilters {
+        token: Some(token),
+        limit: 1,
+        ..ExternalHandoffFilters::default()
+    };
+    Ok(list_external_handoffs(conn, &filters)
+        .await?
+        .into_iter()
+        .next())
+}
+
 /// Look up an external task by its opaque token, acquiring a row-level lock.
 ///
 /// Like [`find_by_token`] but uses `FOR UPDATE`, serializing the caller
@@ -136,7 +327,10 @@ pub async fn complete_externally(
             let activity_id = ActivityExecId::from_uuid(task.activity_id);
 
             diesel::update(harvest_external_tasks::table.find(task.id))
-                .set(harvest_external_tasks::state.eq("COMPLETED"))
+                .set((
+                    harvest_external_tasks::state.eq("COMPLETED"),
+                    harvest_external_tasks::updated_at.eq(Utc::now()),
+                ))
                 .execute(conn)
                 .await
                 .map_err(database_error)?;
@@ -183,7 +377,10 @@ pub async fn fail_externally(
             let activity_id = ActivityExecId::from_uuid(task.activity_id);
 
             diesel::update(harvest_external_tasks::table.find(task.id))
-                .set(harvest_external_tasks::state.eq("FAILED"))
+                .set((
+                    harvest_external_tasks::state.eq("FAILED"),
+                    harvest_external_tasks::updated_at.eq(Utc::now()),
+                ))
                 .execute(conn)
                 .await
                 .map_err(database_error)?;
@@ -242,7 +439,10 @@ pub async fn extend_deadline(
             })?;
 
             diesel::update(harvest_external_tasks::table.find(task.id))
-                .set(harvest_external_tasks::schedule_to_close_at.eq(new_deadline))
+                .set((
+                    harvest_external_tasks::schedule_to_close_at.eq(new_deadline),
+                    harvest_external_tasks::updated_at.eq(Utc::now()),
+                ))
                 .execute(conn)
                 .await
                 .map_err(database_error)?;
