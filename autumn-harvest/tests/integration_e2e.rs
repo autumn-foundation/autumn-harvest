@@ -87,6 +87,11 @@ const INIT_SQL: &str = concat!(
 /// The `concurrency_key` migration is included because `enqueue` (called by
 /// `start_or_load_workflow_execution`) writes the `concurrency_key` and
 /// `concurrency_cap` columns that it added; without them the INSERT fails.
+/// The `harvest_workers` and `harvest_build_routing` migrations are included
+/// because `start_or_load_workflow_execution` queries `harvest_build_policies`
+/// (created by build routing) and inserts `assigned_build_id` into
+/// `harvest_workflow_executions`; the build routing migration also alters
+/// `harvest_workers`, so that table must exist first.
 const LEGACY_INIT_SQL: &str = concat!(
     include_str!("../migrations/20260409000000_harvest_initial/up.sql"),
     "\n",
@@ -95,6 +100,10 @@ const LEGACY_INIT_SQL: &str = concat!(
     include_str!("../migrations/20260505000000_harvest_heartbeat_details/up.sql"),
     "\n",
     include_str!("../migrations/20260429000000_harvest_concurrency_key/up.sql"),
+    "\n",
+    include_str!("../migrations/20260501000000_harvest_workers/up.sql"),
+    "\n",
+    include_str!("../migrations/20260509000000_harvest_build_routing/up.sql"),
 );
 
 /// Start a Postgres container with the harvest schema applied and return
