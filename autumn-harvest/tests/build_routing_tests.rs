@@ -212,7 +212,10 @@ fn merge_reachability_recomputes_safe_to_retire_from_totals() {
     let merged = merge_reachability(vec![shard_0, shard_1]);
     let v1 = merged.iter().find(|r| r.build_id == "v1.0").unwrap();
     assert_eq!(v1.pending_tasks, 5);
-    assert!(!v1.safe_to_retire, "pending tasks on shard 1 must flip safe_to_retire to false");
+    assert!(
+        !v1.safe_to_retire,
+        "pending tasks on shard 1 must flip safe_to_retire to false"
+    );
 }
 
 #[test]
@@ -296,9 +299,7 @@ mod db_tests {
         let host = container.get_host().await.expect("host");
         let port = container.get_host_port_ipv4(5432).await.expect("port");
         let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
-        let conn = AsyncPgConnection::establish(&url)
-            .await
-            .expect("connect");
+        let conn = AsyncPgConnection::establish(&url).await.expect("connect");
         (conn, container)
     }
 
@@ -327,19 +328,42 @@ mod db_tests {
             .expect("list_workers");
         assert_eq!(workers.len(), 1);
         assert_eq!(workers[0].worker.build_id, "v1.0");
-        assert_eq!(workers[0].worker.deployment_name.as_deref(), Some("prod-blue"));
+        assert_eq!(
+            workers[0].worker.deployment_name.as_deref(),
+            Some("prod-blue")
+        );
     }
 
     #[tokio::test]
     async fn list_workers_filters_by_build_id() {
         let (mut conn, _c) = setup().await;
 
-        register_worker(&mut conn, "w-v1", &["q".to_string()], &[], 2, "h", None, "v1.0", None)
-            .await
-            .unwrap();
-        register_worker(&mut conn, "w-v2", &["q".to_string()], &[], 2, "h", None, "v2.0", None)
-            .await
-            .unwrap();
+        register_worker(
+            &mut conn,
+            "w-v1",
+            &["q".to_string()],
+            &[],
+            2,
+            "h",
+            None,
+            "v1.0",
+            None,
+        )
+        .await
+        .unwrap();
+        register_worker(
+            &mut conn,
+            "w-v2",
+            &["q".to_string()],
+            &[],
+            2,
+            "h",
+            None,
+            "v2.0",
+            None,
+        )
+        .await
+        .unwrap();
 
         let mut filters = WorkerFilters::new();
         filters.build_id = Some("v1.0".to_string());
@@ -456,7 +480,10 @@ mod db_tests {
         let task = queue::claim_task(&mut conn, &["default".to_string()], "worker-b", "v2.0")
             .await
             .expect("claim_task");
-        assert!(task.is_none(), "v2.0 worker must not claim v1.0 task without compat declaration");
+        assert!(
+            task.is_none(),
+            "v2.0 worker must not claim v1.0 task without compat declaration"
+        );
     }
 
     #[tokio::test]
@@ -471,7 +498,10 @@ mod db_tests {
         let task = queue::claim_task(&mut conn, &["default".to_string()], "worker-c", "v2.0")
             .await
             .expect("claim_task");
-        assert!(task.is_some(), "v2.0 worker with compat declaration should claim v1.0 task");
+        assert!(
+            task.is_some(),
+            "v2.0 worker with compat declaration should claim v1.0 task"
+        );
     }
 
     #[tokio::test]
@@ -485,7 +515,10 @@ mod db_tests {
         let task = queue::claim_task(&mut conn, &["default".to_string()], "worker-d", "v99.0")
             .await
             .expect("claim_task");
-        assert!(task.is_some(), "any worker should claim task with no required build");
+        assert!(
+            task.is_some(),
+            "any worker should claim task with no required build"
+        );
     }
 
     #[tokio::test]
@@ -499,7 +532,10 @@ mod db_tests {
         let task = queue::claim_task(&mut conn, &["default".to_string()], "worker-legacy", "")
             .await
             .expect("claim_task");
-        assert!(task.is_some(), "legacy worker should claim build-tagged task");
+        assert!(
+            task.is_some(),
+            "legacy worker should claim build-tagged task"
+        );
     }
 
     #[tokio::test]
@@ -515,8 +551,32 @@ mod db_tests {
         insert_exec_and_task(&mut conn, exec_id, Some("v2.0")).await;
 
         // Register one v1.0 worker, one v2.0 worker.
-        register_worker(&mut conn, "w-v1", &["default".to_string()], &[], 2, "h", None, "v1.0", None).await.unwrap();
-        register_worker(&mut conn, "w-v2", &["default".to_string()], &[], 2, "h", None, "v2.0", None).await.unwrap();
+        register_worker(
+            &mut conn,
+            "w-v1",
+            &["default".to_string()],
+            &[],
+            2,
+            "h",
+            None,
+            "v1.0",
+            None,
+        )
+        .await
+        .unwrap();
+        register_worker(
+            &mut conn,
+            "w-v2",
+            &["default".to_string()],
+            &[],
+            2,
+            "h",
+            None,
+            "v2.0",
+            None,
+        )
+        .await
+        .unwrap();
 
         let v1_reach = build_reachability(&mut conn, "v1.0", Duration::from_secs(60))
             .await
@@ -546,6 +606,9 @@ mod db_tests {
         assert_eq!(reach.open_executions, 0);
         assert_eq!(reach.pending_tasks, 0);
         assert_eq!(reach.active_workers, 0);
-        assert!(reach.safe_to_retire, "should be safe to retire with zero open work");
+        assert!(
+            reach.safe_to_retire,
+            "should be safe to retire with zero open work"
+        );
     }
 }

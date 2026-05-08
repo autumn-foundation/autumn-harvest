@@ -411,9 +411,7 @@ pub async fn revoke_compat(
 ///
 /// Returns `HarvestError::Database` on failure.
 #[cfg(feature = "db")]
-pub async fn load_compat_set(
-    conn: &mut AsyncPgConnection,
-) -> HarvestResult<BuildCompatibilitySet> {
+pub async fn load_compat_set(conn: &mut AsyncPgConnection) -> HarvestResult<BuildCompatibilitySet> {
     #[derive(diesel::QueryableByName, Debug)]
     struct Row {
         #[diesel(sql_type = diesel::sql_types::Text)]
@@ -422,12 +420,11 @@ pub async fn load_compat_set(
         compatible_with: String,
     }
 
-    let rows: Vec<Row> = diesel::sql_query(
-        "SELECT build_id, compatible_with FROM harvest_build_compat",
-    )
-    .load(conn)
-    .await
-    .map_err(database_error)?;
+    let rows: Vec<Row> =
+        diesel::sql_query("SELECT build_id, compatible_with FROM harvest_build_compat")
+            .load(conn)
+            .await
+            .map_err(database_error)?;
 
     let mut set = BuildCompatibilitySet::new();
     for row in rows {
@@ -611,14 +608,16 @@ pub fn merge_reachability(per_shard: Vec<Vec<BuildReachability>>) -> Vec<BuildRe
     let mut merged: BTreeMap<String, BuildReachability> = BTreeMap::new();
     for shard_results in per_shard {
         for r in shard_results {
-            let entry = merged.entry(r.build_id.clone()).or_insert_with(|| BuildReachability {
-                build_id: r.build_id.clone(),
-                open_executions: 0,
-                pending_tasks: 0,
-                active_workers: 0,
-                stale_workers: 0,
-                safe_to_retire: false,
-            });
+            let entry = merged
+                .entry(r.build_id.clone())
+                .or_insert_with(|| BuildReachability {
+                    build_id: r.build_id.clone(),
+                    open_executions: 0,
+                    pending_tasks: 0,
+                    active_workers: 0,
+                    stale_workers: 0,
+                    safe_to_retire: false,
+                });
             entry.open_executions += r.open_executions;
             entry.pending_tasks += r.pending_tasks;
             entry.active_workers += r.active_workers;

@@ -3348,7 +3348,14 @@ impl Worker {
             }
         };
 
-        match queue::claim_task(&mut conn, &self.config.queues, &self.config.worker_id, &self.config.build_id).await {
+        match queue::claim_task(
+            &mut conn,
+            &self.config.queues,
+            &self.config.worker_id,
+            &self.config.build_id,
+        )
+        .await
+        {
             Ok(Some(task)) => {
                 tracing::debug!(
                     task_id = %task.id,
