@@ -1344,7 +1344,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn drain_preview_defaults_status_to_active_when_unset() {
         // Verify the documented default: callers that omit status see only Active.
         // We can't run a DB query in a unit test, but we can verify the filter
@@ -1358,6 +1357,7 @@ mod tests {
         // lives in the integration test suite.
     }
 
+    #[test]
     fn drain_outcome_already_draining_is_not_accepted() {
         // AlreadyDraining must NOT be treated as accepted (status transition),
         // but the deadline refresh path covers it separately.
