@@ -201,22 +201,20 @@ Start the new workers alongside the existing fleet. They register in
 
 **Step 2 — Declare compat so new workers can resume old executions.**
 
-```bash
-# new workers (sha-new123) may resume executions started on sha-old456
-harvest build declare-compat --build sha-new123 --compatible-with sha-old456
-```
+```rust
+// In your deploy tooling or a one-off migration script:
+use autumn_harvest::build_routing::declare_compat;
 
-Or via the management API:
-
-```http
-POST /api/harvest/builds/compat
-{ "build_id": "sha-new123", "compatible_with": "sha-old456" }
+declare_compat(&mut conn, "sha-new123", "sha-old456").await?;
+// "workers running sha-new123 may process executions assigned to sha-old456"
 ```
 
 **Step 3 — Advance the build policy so new starts land on the new build.**
 
-```bash
-harvest build set-policy --queue default --build sha-new123
+```rust
+use autumn_harvest::build_routing::set_build_policy;
+
+set_build_policy(&mut conn, "default", "sha-new123", Some("v2.3.0")).await?;
 ```
 
 New executions now get `assigned_build_id = "sha-new123"` and old-build
@@ -226,11 +224,15 @@ workers are ineligible to claim them.
 
 Check reachability first:
 
-```bash
-harvest build reachability --build sha-old456
+```rust
+use autumn_harvest::build_routing::build_reachability;
+use std::time::Duration;
+
+let r = build_reachability(&mut conn, "sha-old456", Duration::from_secs(60)).await?;
+println!("safe_to_retire: {}", r.safe_to_retire);
 ```
 
-Wait until `safe_to_retire: true` (no open executions, no pending tasks), then
+Wait until `safe_to_retire == true` (no open executions, no pending tasks), then
 drain and stop the old workers using the drain runbook above.
 
 ---
@@ -247,7 +249,7 @@ the breaking branch.
 #[workflow]
 async fn my_workflow(ctx: &WorkflowContext, ...) -> Result<(), String> {
     if ctx.version("add-step-2", 1, 2).await? >= 2 {
-        // new code path — only runs on executions started on/after version 2
+        // new code path — runs for any execution that reaches this code for the first time
         ctx.schedule_activity(new_step, ...).await?;
     }
     // existing steps ...
@@ -265,8 +267,14 @@ old-build workers.
 
 **Step 3 — Wait for old-build executions to drain.**
 
-```bash
-watch -n 10 'harvest build reachability --build sha-old456 | jq .safe_to_retire'
+Poll until `safe_to_retire` flips:
+
+```rust
+loop {
+    let r = build_reachability(&mut conn, "sha-old456", Duration::from_secs(60)).await?;
+    if r.safe_to_retire { break; }
+    tokio::time::sleep(Duration::from_secs(10)).await;
+}
 ```
 
 Once `true`, retire the old workers.
@@ -279,8 +287,8 @@ When a bad deploy must be reversed immediately:
 
 **Step 1 — Advance the build policy back to the previous build.**
 
-```bash
-harvest build set-policy --queue default --build sha-old456
+```rust
+set_build_policy(&mut conn, "default", "sha-old456", None).await?;
 ```
 
 New starts immediately revert to the previous build. In-flight new-build
@@ -295,8 +303,10 @@ declaration exists (or the new executions have no `required_build_id`).
 
 **Step 3 — Revoke compat declarations if the new build is being abandoned.**
 
-```bash
-harvest build revoke-compat --build sha-new123 --compatible-with sha-old456
+```rust
+use autumn_harvest::build_routing::revoke_compat;
+
+revoke_compat(&mut conn, "sha-new123", "sha-old456").await?;
 ```
 
 After revocation, old-build workers cannot claim new-build tasks. This is the
@@ -306,17 +316,15 @@ desired state if the new build is being rolled back entirely.
 
 ## Build reachability reference
 
-```bash
-# Single build
-harvest build reachability --build sha-old456
+```rust
+use autumn_harvest::build_routing::{build_reachability, all_build_reachability_sharded};
+use std::time::Duration;
 
-# All builds
-harvest build reachability --all
-```
+// Single build, single shard
+let r = build_reachability(&mut conn, "sha-old456", Duration::from_secs(60)).await?;
 
-```http
-GET /api/harvest/builds/sha-old456/reachability
-GET /api/harvest/builds/reachability
+// All builds across all shards
+let all = all_build_reachability_sharded(&pool, Duration::from_secs(60)).await?;
 ```
 
 Response fields:

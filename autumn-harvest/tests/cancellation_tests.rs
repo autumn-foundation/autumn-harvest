@@ -409,6 +409,8 @@ async fn running_activity_heartbeat_observes_workflow_cancellation() {
                 max_local_activity_start_to_close: Duration::from_secs(60),
                 shard_assignments: vec![autumn_harvest::types::ShardId::new(0)],
                 worker_heartbeat_interval: Duration::from_secs(5),
+                build_id: String::new(),
+                deployment_name: None,
             },
             registry,
         )
@@ -565,6 +567,8 @@ async fn uncooperative_activity_is_hard_aborted_after_grace_period() {
                 max_local_activity_start_to_close: Duration::from_secs(60),
                 shard_assignments: vec![autumn_harvest::types::ShardId::new(0)],
                 worker_heartbeat_interval: Duration::from_secs(5),
+                build_id: String::new(),
+                deployment_name: None,
             },
             registry,
         )

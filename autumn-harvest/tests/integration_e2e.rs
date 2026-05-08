@@ -313,7 +313,6 @@ async fn legacy_workflow_uniqueness_schema_can_be_upgraded_for_idempotent_starts
         execution_timeout: None,
         memo: None,
         search_attrs: None,
-        assigned_build_id: None,
         reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
         trace_context: None,
     };
@@ -431,6 +430,8 @@ fn build_runtime_worker(
                 max_local_activity_start_to_close: Duration::from_secs(60),
                 shard_assignments: vec![autumn_harvest::types::ShardId::new(0)],
                 worker_heartbeat_interval: Duration::from_secs(5),
+                build_id: String::new(),
+                deployment_name: None,
             },
             registry,
         )
@@ -971,6 +972,8 @@ async fn worker_completes_workflow_task_and_persists_result() {
                 max_local_activity_start_to_close: Duration::from_secs(60),
                 shard_assignments: vec![autumn_harvest::types::ShardId::new(0)],
                 worker_heartbeat_interval: Duration::from_secs(5),
+                build_id: String::new(),
+                deployment_name: None,
             },
             registry,
         )
@@ -1065,6 +1068,8 @@ async fn worker_marks_workflow_failed_when_handler_errors() {
                 max_local_activity_start_to_close: Duration::from_secs(60),
                 shard_assignments: vec![autumn_harvest::types::ShardId::new(0)],
                 worker_heartbeat_interval: Duration::from_secs(5),
+                build_id: String::new(),
+                deployment_name: None,
             },
             registry,
         )
@@ -1120,6 +1125,7 @@ async fn worker_marks_workflow_failed_when_handler_errors() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
 async fn worker_completes_workflow_with_activity_round_trip() {
     let (database_url, _container) = setup_test_database_url().await;
     let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
@@ -1184,6 +1190,8 @@ async fn worker_completes_workflow_with_activity_round_trip() {
                 max_local_activity_start_to_close: Duration::from_secs(60),
                 shard_assignments: vec![autumn_harvest::types::ShardId::new(0)],
                 worker_heartbeat_interval: Duration::from_secs(5),
+                build_id: String::new(),
+                deployment_name: None,
             },
             registry,
         )
@@ -1364,6 +1372,8 @@ async fn worker_fails_orphaned_activity_task_without_scheduled_event() {
                 max_local_activity_start_to_close: Duration::from_secs(60),
                 shard_assignments: vec![autumn_harvest::types::ShardId::new(0)],
                 worker_heartbeat_interval: Duration::from_secs(5),
+                build_id: String::new(),
+                deployment_name: None,
             },
             Arc::new(HandlerRegistry::new(
                 vec![],
@@ -1573,6 +1583,8 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
                 max_local_activity_start_to_close: Duration::from_secs(60),
                 shard_assignments: vec![autumn_harvest::types::ShardId::new(0)],
                 worker_heartbeat_interval: Duration::from_secs(5),
+                build_id: String::new(),
+                deployment_name: None,
             },
             Arc::new(HandlerRegistry::new(
                 vec![WorkflowInfo {
@@ -1693,6 +1705,8 @@ async fn worker_completes_workflow_with_timer_round_trip() {
                 max_local_activity_start_to_close: Duration::from_secs(60),
                 shard_assignments: vec![autumn_harvest::types::ShardId::new(0)],
                 worker_heartbeat_interval: Duration::from_secs(5),
+                build_id: String::new(),
+                deployment_name: None,
             },
             Arc::new(HandlerRegistry::new(
                 vec![WorkflowInfo {
@@ -3272,7 +3286,6 @@ mod reuse_policy_helpers {
             execution_timeout: None,
             memo: None,
             search_attrs: None,
-            assigned_build_id: None,
             reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
             trace_context: None,
         }
@@ -4059,6 +4072,8 @@ async fn workflow_schedule_baseline_dispatches_multiple_runs() {
                 max_local_activity_start_to_close: Duration::from_secs(60),
                 shard_assignments: vec![autumn_harvest::types::ShardId::new(0)],
                 worker_heartbeat_interval: Duration::from_secs(5),
+                build_id: String::new(),
+                deployment_name: None,
             },
             Arc::clone(&registry),
         )
@@ -4152,6 +4167,8 @@ async fn workflow_schedule_max_active_runs_enforced() {
                 max_local_activity_start_to_close: Duration::from_secs(60),
                 shard_assignments: vec![autumn_harvest::types::ShardId::new(0)],
                 worker_heartbeat_interval: Duration::from_secs(5),
+                build_id: String::new(),
+                deployment_name: None,
             },
             Arc::clone(&registry),
         )
@@ -4233,6 +4250,8 @@ async fn workflow_schedule_pause_and_resume() {
                 max_local_activity_start_to_close: Duration::from_secs(60),
                 shard_assignments: vec![autumn_harvest::types::ShardId::new(0)],
                 worker_heartbeat_interval: Duration::from_secs(5),
+                build_id: String::new(),
+                deployment_name: None,
             },
             Arc::clone(&registry),
         )

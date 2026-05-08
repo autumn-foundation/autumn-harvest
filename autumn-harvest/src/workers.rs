@@ -1235,6 +1235,8 @@ mod tests {
             max_concurrency: 10,
             host: "localhost".to_string(),
             version: Some("0.2.0".to_string()),
+            build_id: String::new(),
+            deployment_name: None,
         };
         assert_eq!(reg.worker_id, "w1");
         assert_eq!(reg.queues, vec!["default"]);
@@ -1258,6 +1260,8 @@ mod tests {
                 version: None,
                 status: "Active".to_string(),
                 drain_deadline_at: None,
+                build_id: String::new(),
+                deployment_name: None,
             },
             health: WorkerHealth::Healthy,
             active_task_ids: vec![],
@@ -1324,6 +1328,8 @@ mod tests {
                 version: None,
                 status: "Active".to_string(),
                 drain_deadline_at: None,
+                build_id: String::new(),
+                deployment_name: None,
             },
             health: WorkerHealth::Healthy,
             active_task_ids,
@@ -1505,6 +1511,8 @@ mod tests {
                 version: None,
                 status: status.to_string(),
                 drain_deadline_at: None,
+                build_id: String::new(),
+                deployment_name: None,
             },
             health: WorkerHealth::Healthy,
             active_task_ids: vec![],

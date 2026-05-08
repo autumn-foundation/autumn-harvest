@@ -245,6 +245,8 @@ fn build_worker(worker_id: &str, registry: Arc<HandlerRegistry>) -> Arc<Worker> 
                 max_local_activity_start_to_close: Duration::from_secs(60),
                 shard_assignments: vec![ShardId::new(0)],
                 worker_heartbeat_interval: Duration::from_secs(30),
+                build_id: String::new(),
+                deployment_name: None,
             },
             registry,
         )

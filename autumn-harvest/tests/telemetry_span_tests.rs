@@ -303,6 +303,8 @@ fn all_adr_0001_span_kinds_are_emitted() {
                         max_local_activity_start_to_close: Duration::from_secs(60),
                         shard_assignments: vec![ShardId::new(0)],
                         worker_heartbeat_interval: Duration::from_secs(5),
+                        build_id: String::new(),
+                        deployment_name: None,
                     },
                     registry,
                 )

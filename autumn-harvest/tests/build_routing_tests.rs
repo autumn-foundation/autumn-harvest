@@ -263,8 +263,6 @@ mod db_tests {
     use autumn_harvest::queue::{self, EnqueueParams, TaskType};
     use autumn_harvest::schema::harvest_workflow_executions;
     use autumn_harvest::workers::{WorkerFilters, list_workers, register_worker};
-    use chrono::Utc;
-    use diesel::prelude::*;
     use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
     use std::time::Duration;
     use testcontainers::ContainerAsync;

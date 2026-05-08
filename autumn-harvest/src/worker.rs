@@ -3545,6 +3545,8 @@ mod tests {
             max_local_activity_start_to_close: Duration::from_secs(60),
             shard_assignments: vec![crate::types::ShardId::new(0)],
             worker_heartbeat_interval: Duration::from_secs(5),
+            build_id: String::new(),
+            deployment_name: None,
         }
     }
 
@@ -3599,6 +3601,8 @@ mod tests {
             shard_assignments: vec![crate::types::ShardId::new(0)],
             max_local_activity_start_to_close: Duration::from_secs(60),
             worker_heartbeat_interval: Duration::from_secs(5),
+            build_id: String::new(),
+            deployment_name: None,
         };
 
         let runtime_cfg: WorkerRuntimeConfig = builder_cfg.into();
