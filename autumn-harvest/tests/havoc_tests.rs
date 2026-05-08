@@ -93,8 +93,8 @@ async fn test_havoc_deadlock_in_query() {
 #[tokio::test]
 async fn test_havoc_deadlock_in_update_validation() {
     use autumn_harvest::context::WorkflowContext;
-    use std::sync::Arc;
     use serde_json::json;
+    use std::sync::Arc;
     use std::time::Duration;
 
     let ctx = Arc::new(WorkflowContext::new_test());
@@ -108,14 +108,10 @@ async fn test_havoc_deadlock_in_update_validation() {
             let _ = ctx_clone.validate_update("another", input);
             Ok(())
         },
-        |input| async move { Ok(input) }
+        |input| async move { Ok(input) },
     );
 
-    ctx.register_update_handler(
-        "another",
-        |_| Ok(()),
-        |input| async move { Ok(input) }
-    );
+    ctx.register_update_handler("another", |_| Ok(()), |input| async move { Ok(input) });
 
     let handle = tokio::spawn(async move {
         let _ = ctx.validate_update("test", &json!(1));
@@ -129,10 +125,10 @@ async fn test_havoc_deadlock_in_update_validation() {
 #[tokio::test]
 async fn test_havoc_deadlock_in_update_execution() {
     use autumn_harvest::context::WorkflowContext;
-    use std::sync::Arc;
-    use serde_json::json;
-    use std::time::Duration;
     use autumn_harvest::types::UpdateId;
+    use serde_json::json;
+    use std::sync::Arc;
+    use std::time::Duration;
 
     let ctx = Arc::new(WorkflowContext::new_test());
     let ctx_clone = ctx.clone();
@@ -143,20 +139,20 @@ async fn test_havoc_deadlock_in_update_execution() {
         move |input| {
             let ctx_inner = ctx_clone.clone();
             async move {
-                let _ = ctx_inner.execute_admitted_update(UpdateId::new(), "another", input.clone()).await;
+                let _ = ctx_inner
+                    .execute_admitted_update(UpdateId::new(), "another", input.clone())
+                    .await;
                 Ok(input)
             }
-        }
+        },
     );
 
-    ctx.register_update_handler(
-        "another",
-        |_| Ok(()),
-        |input| async move { Ok(input) }
-    );
+    ctx.register_update_handler("another", |_| Ok(()), |input| async move { Ok(input) });
 
     let handle = tokio::spawn(async move {
-        let _ = ctx.execute_admitted_update(UpdateId::new(), "test", json!(1)).await;
+        let _ = ctx
+            .execute_admitted_update(UpdateId::new(), "test", json!(1))
+            .await;
     });
 
     let res = tokio::time::timeout(Duration::from_millis(500), handle).await;
