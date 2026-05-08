@@ -765,19 +765,36 @@ async fn onboarding_is_replay_safe() {
 
 ### Exporting a history fixture
 
-Serialise a `HistorySnapshot` to JSON and check it in as a test fixture:
+Use the read-only history export API or CLI to capture a fixture directly from
+stored workflow history. Redacted exports are the default and are suitable for
+support/debugging. CI replay fixtures must use `full` payloads and should be
+stored only in private fixture storage because activity inputs, outputs, signal
+payloads, and tokens may be present.
 
-```rust
-use autumn_harvest::testing::HistorySnapshot;
-
-let snapshot = HistorySnapshot {
-    workflow_name: "onboarding".to_string(),
-    execution_id: exec_id,
-    events,  // Vec<WorkflowEvent> loaded from harvest_events
-};
-let json = serde_json::to_string_pretty(&snapshot).unwrap();
-std::fs::write("fixtures/onboarding_history.json", json).unwrap();
+```sh
+cargo run -p autumn-harvest-cli -- history export <execution-id> \
+  --payload-policy full \
+  --output-file fixtures/onboarding_history.json
 ```
+
+For release gates, export a bounded batch from recent production histories:
+
+```sh
+cargo run -p autumn-harvest-cli -- history export-batch \
+  --workflow-name onboarding \
+  --state-group terminal \
+  --updated-after 2026-05-01T00:00:00Z \
+  --limit 1000 \
+  --payload-policy full \
+  --output-file fixtures/onboarding_batch.json
+```
+
+Batch responses include `schema`, `version`, `status`, `exports`, `failures`,
+and `shard_coverage`. A `partial` status means at least one shard could not be
+read; treat that as a blocked release gate until the missing shard is exported
+or explicitly waived.
+
+See `docs/runbooks/replay-fixture-export.md` for the release-safety playbook.
 
 ### CLI validator
 

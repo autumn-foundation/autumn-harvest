@@ -41,6 +41,10 @@ use autumn_harvest::context::WorkflowContext;
 use autumn_harvest::dlq;
 use autumn_harvest::error::{HarvestError, HarvestResult, database_error};
 use autumn_harvest::external_task;
+use autumn_harvest::history_export::{
+    DEFAULT_HISTORY_EXPORT_MAX_BYTES, HistoryExportDocument, HistoryExportError,
+    HistoryExportRequest, HistoryPayloadPolicy, export_history,
+};
 use autumn_harvest::models::{
     AuditRecord, DagRun, DeadLetter, HarvestSchedule, NewAuditRecord, WorkflowExecution,
 };
@@ -810,6 +814,8 @@ const MAX_WORKFLOW_CHILDREN_LIMIT: usize = 500;
 const MAX_WORKFLOW_CHILDREN_DEPTH: u8 = 5;
 const DEFAULT_EXTERNAL_HANDOFF_LIMIT: i64 = 100;
 const MAX_EXTERNAL_HANDOFF_LIMIT: i64 = 500;
+const DEFAULT_HISTORY_BATCH_EXPORT_LIMIT: usize = 100;
+const MAX_HISTORY_BATCH_EXPORT_LIMIT: usize = 1_000;
 
 #[derive(Debug, Default, Clone)]
 pub(crate) struct WorkflowFilters {
@@ -823,6 +829,104 @@ impl WorkflowFilters {
     pub(crate) const fn with_limit(mut self, limit: i64) -> Self {
         self.limit = limit;
         self
+    }
+}
+
+#[derive(Debug, Clone)]
+struct HistoryExportQuery {
+    payload_policy: HistoryPayloadPolicy,
+    max_bytes: usize,
+}
+
+#[derive(Debug, Clone)]
+struct HistoryBatchExportQuery {
+    payload_policy: HistoryPayloadPolicy,
+    max_bytes: usize,
+    workflow_name: Option<String>,
+    states: Vec<String>,
+    updated_after: Option<chrono::DateTime<chrono::Utc>>,
+    updated_before: Option<chrono::DateTime<chrono::Utc>>,
+    shard_id: Option<i32>,
+    limit: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct HistoryBatchExportResponse {
+    status: String,
+    observed_at: chrono::DateTime<chrono::Utc>,
+    payload_policy: HistoryPayloadPolicy,
+    filters: HistoryBatchExportFiltersResponse,
+    exports: Vec<HistoryExportDocument>,
+    failures: Vec<HistoryExportFailure>,
+    shard_coverage: ExternalHandoffShardCoverage,
+}
+
+#[derive(Debug, Serialize)]
+struct HistoryBatchExportFiltersResponse {
+    workflow_name: Option<String>,
+    states: Vec<String>,
+    updated_after: Option<chrono::DateTime<chrono::Utc>>,
+    updated_before: Option<chrono::DateTime<chrono::Utc>>,
+    shard_id: Option<i32>,
+    limit: usize,
+    max_bytes: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct HistoryExportFailure {
+    execution_id: Option<String>,
+    shard_id: i32,
+    reason: String,
+    actual_bytes: Option<usize>,
+    max_bytes: Option<usize>,
+}
+
+#[derive(Debug, Clone, diesel::QueryableByName)]
+struct HistoryExportCandidate {
+    #[diesel(sql_type = diesel::sql_types::Uuid)]
+    id: uuid::Uuid,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    workflow_name: String,
+    #[diesel(sql_type = diesel::sql_types::Int4)]
+    shard_id: i32,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    state: String,
+    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+    last_history_event_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Default)]
+struct HistoryBatchExportWork {
+    candidates: Vec<HistoryExportCandidate>,
+    exports: Vec<HistoryExportDocument>,
+    failures: Vec<HistoryExportFailure>,
+    inspected_shards: Vec<i32>,
+    matched_shards: Vec<i32>,
+    unavailable_shards: Vec<UnavailableShard>,
+    saw_requested_shard: bool,
+}
+
+impl HistoryBatchExportWork {
+    fn note_unavailable(&mut self, shard_id: i32, reason: String) {
+        self.unavailable_shards
+            .push(UnavailableShard { shard_id, reason });
+    }
+
+    fn normalize_coverage(&mut self) {
+        self.inspected_shards.sort_unstable();
+        self.inspected_shards.dedup();
+        self.matched_shards.sort_unstable();
+        self.matched_shards.dedup();
+        self.unavailable_shards.sort_by_key(|shard| shard.shard_id);
+    }
+
+    fn status(&self) -> String {
+        if self.unavailable_shards.is_empty() && self.failures.is_empty() {
+            "complete"
+        } else {
+            "partial"
+        }
+        .to_string()
     }
 }
 
@@ -879,6 +983,10 @@ struct DeadLetterListQuery {
 pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
     Router::new()
         .route("/workflows", get(list_workflows))
+        .route(
+            "/workflows/{id}/history/export",
+            get(export_workflow_history),
+        )
         .route("/workflows/{id}", get(get_workflow))
         .route("/workflows/{id}/children", get(list_workflow_children))
         .route("/workflows/{id}/stack", get(get_workflow_stack))
@@ -921,6 +1029,7 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .route("/admin/retention", get(retention_status))
         .route("/admin/retention/run-now", post(retention_run_now))
         .route("/admin/concurrency", get(concurrency_status))
+        .route("/admin/history/exports", get(export_workflow_histories))
         .route("/admin/external-handoffs", get(list_external_handoffs))
         .route(
             "/admin/external-handoffs/{token}",
@@ -1422,6 +1531,190 @@ pub(crate) fn parse_workflow_filters(
         .unwrap_or(DEFAULT_WORKFLOW_LIMIT)
         .clamp(1, MAX_WORKFLOW_LIMIT);
     Ok(filters.with_limit(limit))
+}
+
+fn parse_history_export_query(
+    pairs: &[(String, String)],
+) -> Result<HistoryExportQuery, AutumnError> {
+    let mut payload_policy = HistoryPayloadPolicy::Redacted;
+    let mut max_bytes = DEFAULT_HISTORY_EXPORT_MAX_BYTES;
+
+    for (key, value) in pairs {
+        match key.as_str() {
+            "payload_policy" | "payload-policy" => {
+                payload_policy = value.parse().map_err(AutumnError::bad_request_msg)?;
+            }
+            "max_bytes" | "max-bytes" => {
+                max_bytes = parse_history_max_bytes(value)?;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(HistoryExportQuery {
+        payload_policy,
+        max_bytes,
+    })
+}
+
+fn parse_history_batch_export_query(
+    pairs: &[(String, String)],
+) -> Result<HistoryBatchExportQuery, AutumnError> {
+    let mut query = HistoryBatchExportQuery {
+        payload_policy: HistoryPayloadPolicy::Redacted,
+        max_bytes: DEFAULT_HISTORY_EXPORT_MAX_BYTES,
+        workflow_name: None,
+        states: Vec::new(),
+        updated_after: None,
+        updated_before: None,
+        shard_id: None,
+        limit: DEFAULT_HISTORY_BATCH_EXPORT_LIMIT,
+    };
+
+    for (key, value) in pairs {
+        match key.as_str() {
+            "payload_policy" | "payload-policy" => {
+                query.payload_policy = value.parse().map_err(AutumnError::bad_request_msg)?;
+            }
+            "max_bytes" | "max-bytes" => {
+                query.max_bytes = parse_history_max_bytes(value)?;
+            }
+            "workflow_name" | "workflow-name" => {
+                let trimmed = value.trim();
+                if !trimmed.is_empty() {
+                    query.workflow_name = Some(trimmed.to_string());
+                }
+            }
+            "state_group" | "state-group" => {
+                query.states = states_for_history_state_group(value)?;
+            }
+            "state" => {
+                for raw in value.split(',') {
+                    let trimmed = raw.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    if !KNOWN_WORKFLOW_STATES.contains(&trimmed) {
+                        return Err(AutumnError::bad_request_msg(format!(
+                            "unknown workflow state '{trimmed}'; expected one of {KNOWN_WORKFLOW_STATES:?}"
+                        )));
+                    }
+                    let owned = trimmed.to_string();
+                    if !query.states.contains(&owned) {
+                        query.states.push(owned);
+                    }
+                }
+            }
+            "updated_after" | "updated-after" => {
+                query.updated_after = Some(parse_history_datetime(value)?);
+            }
+            "updated_before" | "updated-before" => {
+                query.updated_before = Some(parse_history_datetime(value)?);
+            }
+            "shard_id" | "shard-id" | "shard" => {
+                query.shard_id = Some(value.parse::<i32>().map_err(|_| {
+                    AutumnError::bad_request_msg(format!("invalid shard_id '{value}'"))
+                })?);
+            }
+            "limit" => {
+                let parsed = value.parse::<usize>().map_err(|_| {
+                    AutumnError::bad_request_msg(format!("invalid limit '{value}'"))
+                })?;
+                query.limit = parsed.clamp(1, MAX_HISTORY_BATCH_EXPORT_LIMIT);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(query)
+}
+
+fn parse_history_max_bytes(value: &str) -> Result<usize, AutumnError> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| AutumnError::bad_request_msg(format!("invalid max_bytes '{value}'")))?;
+    if parsed == 0 {
+        return Err(AutumnError::bad_request_msg(
+            "max_bytes must be greater than 0",
+        ));
+    }
+    Ok(parsed)
+}
+
+fn parse_history_datetime(value: &str) -> Result<chrono::DateTime<chrono::Utc>, AutumnError> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .map_err(|_| {
+            AutumnError::bad_request_msg(format!(
+                "invalid datetime '{value}'; expected RFC 3339 format, e.g. 2026-05-06T00:00:00Z"
+            ))
+        })
+}
+
+fn states_for_history_state_group(value: &str) -> Result<Vec<String>, AutumnError> {
+    match value {
+        "active" => Ok(vec!["RUNNING".to_string()]),
+        "terminal" => Ok(terminal_workflow_states()),
+        "all" => Ok(Vec::new()),
+        other => Err(AutumnError::bad_request_msg(format!(
+            "unknown state_group '{other}'; expected active, terminal, or all"
+        ))),
+    }
+}
+
+fn terminal_workflow_states() -> Vec<String> {
+    KNOWN_WORKFLOW_STATES
+        .iter()
+        .copied()
+        .filter(|state| is_terminal_state(state))
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+async fn export_workflow_history(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id): Path<String>,
+    Query(pairs): Query<Vec<(String, String)>>,
+) -> axum::response::Response {
+    let exec_id = match parse_execution_id(&id) {
+        Ok(id) => id,
+        Err(error) => return error.into_response(),
+    };
+    let query = match parse_history_export_query(&pairs) {
+        Ok(query) => query,
+        Err(error) => return error.into_response(),
+    };
+    let mut conn = match db_conn_for_execution(&api_state, exec_id).await {
+        Ok(conn) => conn,
+        Err(error) => return error.into_response(),
+    };
+    let execution = match load_execution(&mut conn, exec_id).await {
+        Ok(execution) => execution,
+        Err(error) => return map_error(error).into_response(),
+    };
+    let history = match store::load_history(&mut conn, exec_id).await {
+        Ok(history) => history,
+        Err(error) => return map_error(error).into_response(),
+    };
+
+    match export_history_for_execution(&execution, history.events, &query) {
+        Ok(document) => Json(document).into_response(),
+        Err(error) => history_export_error_response(error),
+    }
+}
+
+async fn export_workflow_histories(
+    Extension(api_state): Extension<HarvestApiState>,
+    Query(pairs): Query<Vec<(String, String)>>,
+) -> axum::response::Response {
+    let query = match parse_history_batch_export_query(&pairs) {
+        Ok(query) => query,
+        Err(error) => return error.into_response(),
+    };
+    match load_history_exports_from_shards(&api_state, &query).await {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => error.into_response(),
+    }
 }
 
 async fn get_workflow(
@@ -4303,6 +4596,264 @@ pub(crate) async fn load_workflows_from_shards(
     Ok(workflows)
 }
 
+fn export_history_for_execution(
+    execution: &WorkflowExecution,
+    events: Vec<WorkflowEvent>,
+    query: &HistoryExportQuery,
+) -> Result<HistoryExportDocument, HistoryExportError> {
+    export_history(HistoryExportRequest {
+        workflow_name: execution.workflow_name.clone(),
+        execution_id: ExecutionId::from_uuid(execution.id),
+        shard_id: execution.shard_id,
+        state: execution.state.clone(),
+        events,
+        exported_at: chrono::Utc::now(),
+        payload_policy: query.payload_policy,
+        max_bytes: Some(query.max_bytes),
+    })
+}
+
+fn export_history_for_candidate(
+    candidate: &HistoryExportCandidate,
+    events: Vec<WorkflowEvent>,
+    query: &HistoryExportQuery,
+) -> Result<HistoryExportDocument, HistoryExportError> {
+    export_history(HistoryExportRequest {
+        workflow_name: candidate.workflow_name.clone(),
+        execution_id: ExecutionId::from_uuid(candidate.id),
+        shard_id: candidate.shard_id,
+        state: candidate.state.clone(),
+        events,
+        exported_at: chrono::Utc::now(),
+        payload_policy: query.payload_policy,
+        max_bytes: Some(query.max_bytes),
+    })
+}
+
+async fn load_history_exports_from_shards(
+    api_state: &HarvestApiState,
+    query: &HistoryBatchExportQuery,
+) -> Result<HistoryBatchExportResponse, AutumnError> {
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    let mut work = HistoryBatchExportWork::default();
+
+    collect_history_export_candidates_from_shards(&pool, query, &mut work).await;
+    export_selected_history_candidates(&pool, query, &mut work).await;
+    if let Some(shard_id) = query.shard_id
+        && !work.saw_requested_shard
+    {
+        work.note_unavailable(shard_id, "shard pool is not configured".to_string());
+    }
+    work.normalize_coverage();
+    Ok(history_batch_export_response(query, work))
+}
+
+async fn collect_history_export_candidates_from_shards(
+    pool: &HarvestDbPool,
+    query: &HistoryBatchExportQuery,
+    work: &mut HistoryBatchExportWork,
+) {
+    for (shard, shard_pool) in pool.iter_shards() {
+        let shard_id = shard.as_i32();
+        if query.shard_id.is_some_and(|target| target != shard_id) {
+            continue;
+        }
+        work.saw_requested_shard = true;
+
+        let mut conn = match acquire_conn(shard_pool).await {
+            Ok(conn) => conn,
+            Err(error) => {
+                work.note_unavailable(shard_id, error.to_string());
+                continue;
+            }
+        };
+        work.inspected_shards.push(shard_id);
+
+        let rows = match load_history_export_candidates(&mut conn, query).await {
+            Ok(rows) => rows,
+            Err(error) => {
+                work.note_unavailable(shard_id, error.to_string());
+                continue;
+            }
+        };
+        if !rows.is_empty() {
+            work.matched_shards.push(shard_id);
+        }
+        work.candidates.extend(rows);
+    }
+}
+
+async fn export_selected_history_candidates(
+    pool: &HarvestDbPool,
+    query: &HistoryBatchExportQuery,
+    work: &mut HistoryBatchExportWork,
+) {
+    sort_history_export_candidates(&mut work.candidates);
+    let single_query = HistoryExportQuery {
+        payload_policy: query.payload_policy,
+        max_bytes: query.max_bytes,
+    };
+    let candidates = std::mem::take(&mut work.candidates);
+    for candidate in candidates {
+        if work.exports.len() >= query.limit {
+            break;
+        }
+        export_history_candidate(pool, &candidate, &single_query, work).await;
+    }
+}
+
+async fn export_history_candidate(
+    pool: &HarvestDbPool,
+    candidate: &HistoryExportCandidate,
+    query: &HistoryExportQuery,
+    work: &mut HistoryBatchExportWork,
+) {
+    let shard_id = candidate.shard_id;
+    let exec_id = ExecutionId::from_uuid(candidate.id);
+    let mut conn = match acquire_conn(pool.pool_for(ShardId::new(shard_id))).await {
+        Ok(conn) => conn,
+        Err(error) => {
+            work.note_unavailable(shard_id, error.to_string());
+            return;
+        }
+    };
+    let history = match store::load_history(&mut conn, exec_id).await {
+        Ok(history) => history,
+        Err(error) => {
+            work.failures.push(HistoryExportFailure {
+                execution_id: Some(exec_id.to_string()),
+                shard_id,
+                reason: error.to_string(),
+                actual_bytes: None,
+                max_bytes: None,
+            });
+            return;
+        }
+    };
+    match export_history_for_candidate(candidate, history.events, query) {
+        Ok(document) => work.exports.push(document),
+        Err(HistoryExportError::SizeLimitExceeded {
+            actual_bytes,
+            max_bytes,
+        }) => work.failures.push(HistoryExportFailure {
+            execution_id: Some(exec_id.to_string()),
+            shard_id,
+            reason: "history export exceeds max_bytes".to_string(),
+            actual_bytes: Some(actual_bytes),
+            max_bytes: Some(max_bytes),
+        }),
+        Err(error) => work.failures.push(HistoryExportFailure {
+            execution_id: Some(exec_id.to_string()),
+            shard_id,
+            reason: error.to_string(),
+            actual_bytes: None,
+            max_bytes: None,
+        }),
+    }
+}
+
+fn history_batch_export_response(
+    query: &HistoryBatchExportQuery,
+    work: HistoryBatchExportWork,
+) -> HistoryBatchExportResponse {
+    HistoryBatchExportResponse {
+        status: work.status(),
+        observed_at: chrono::Utc::now(),
+        payload_policy: query.payload_policy,
+        filters: HistoryBatchExportFiltersResponse {
+            workflow_name: query.workflow_name.clone(),
+            states: query.states.clone(),
+            updated_after: query.updated_after,
+            updated_before: query.updated_before,
+            shard_id: query.shard_id,
+            limit: query.limit,
+            max_bytes: query.max_bytes,
+        },
+        exports: work.exports,
+        failures: work.failures,
+        shard_coverage: ExternalHandoffShardCoverage {
+            inspected: work.inspected_shards,
+            matched: work.matched_shards,
+            unavailable: work.unavailable_shards,
+        },
+    }
+}
+
+const HISTORY_EXPORT_CANDIDATES_SQL: &str = r"
+SELECT
+    w.id AS id,
+    w.workflow_name AS workflow_name,
+    w.shard_id AS shard_id,
+    w.state AS state,
+    COALESCE(MAX(e.timestamp), w.completed_at, w.started_at, w.created_at) AS last_history_event_at
+FROM harvest_workflow_executions w
+LEFT JOIN harvest_events e
+    ON e.workflow_exec_id = w.id
+WHERE ($1::TEXT IS NULL OR w.workflow_name = $1::TEXT)
+  AND (cardinality($2::TEXT[]) = 0 OR w.state = ANY($2::TEXT[]))
+GROUP BY w.id, w.workflow_name, w.shard_id, w.state, w.completed_at, w.started_at, w.created_at
+HAVING ($3::TIMESTAMPTZ IS NULL OR COALESCE(MAX(e.timestamp), w.completed_at, w.started_at, w.created_at) >= $3::TIMESTAMPTZ)
+   AND ($4::TIMESTAMPTZ IS NULL OR COALESCE(MAX(e.timestamp), w.completed_at, w.started_at, w.created_at) < $4::TIMESTAMPTZ)
+ORDER BY last_history_event_at DESC, w.id DESC
+LIMIT $5
+";
+
+const fn history_export_candidates_sql() -> &'static str {
+    HISTORY_EXPORT_CANDIDATES_SQL
+}
+
+async fn load_history_export_candidates(
+    conn: &mut AsyncPgConnection,
+    filters: &HistoryBatchExportQuery,
+) -> HarvestResult<Vec<HistoryExportCandidate>> {
+    let limit = i64::try_from(filters.limit).unwrap_or(i64::MAX);
+    diesel::sql_query(history_export_candidates_sql())
+        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
+            filters.workflow_name.clone(),
+        )
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(filters.states.clone())
+        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(
+            filters.updated_after,
+        )
+        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(
+            filters.updated_before,
+        )
+        .bind::<diesel::sql_types::BigInt, _>(limit)
+        .load(conn)
+        .await
+        .map_err(database_error)
+}
+
+fn sort_history_export_candidates(candidates: &mut [HistoryExportCandidate]) {
+    candidates.sort_by(|left, right| {
+        right
+            .last_history_event_at
+            .cmp(&left.last_history_event_at)
+            .then_with(|| right.id.cmp(&left.id))
+    });
+}
+
+fn history_export_error_response(error: HistoryExportError) -> axum::response::Response {
+    match error {
+        HistoryExportError::SizeLimitExceeded {
+            actual_bytes,
+            max_bytes,
+        } => (
+            axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({
+                "message": "history export exceeds max_bytes",
+                "actual_bytes": actual_bytes,
+                "max_bytes": max_bytes,
+                "truncation_behavior": "fail"
+            })),
+        )
+            .into_response(),
+        HistoryExportError::Serialization(error) => {
+            map_error(HarvestError::from(error)).into_response()
+        }
+    }
+}
+
 async fn load_schedules_from_shards(
     api_state: &HarvestApiState,
 ) -> Result<Vec<HarvestSchedule>, AutumnError> {
@@ -5422,6 +5973,119 @@ mod tests {
         assert_eq!(
             state.worker_stale_threshold(),
             std::time::Duration::from_secs(20)
+        );
+    }
+
+    #[test]
+    fn parse_history_export_query_defaults_to_redacted_policy_and_size_limit() {
+        let query = parse_history_export_query(&[]).expect("empty history export query");
+
+        assert_eq!(
+            query.payload_policy,
+            autumn_harvest::HistoryPayloadPolicy::Redacted
+        );
+        assert_eq!(
+            query.max_bytes,
+            autumn_harvest::DEFAULT_HISTORY_EXPORT_MAX_BYTES
+        );
+    }
+
+    #[test]
+    fn parse_history_export_query_accepts_full_policy_and_limit() {
+        let query = parse_history_export_query(&pairs(&[
+            ("payload_policy", "full"),
+            ("max_bytes", "1048576"),
+        ]))
+        .expect("full payload query should parse");
+
+        assert_eq!(
+            query.payload_policy,
+            autumn_harvest::HistoryPayloadPolicy::Full
+        );
+        assert_eq!(query.max_bytes, 1_048_576);
+    }
+
+    #[test]
+    fn parse_history_export_query_rejects_unknown_policy() {
+        let error = parse_history_export_query(&pairs(&[("payload_policy", "leaky")]))
+            .expect_err("unknown payload policy must fail");
+
+        assert!(
+            error.to_string().contains("unknown payload_policy"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn parse_history_batch_export_query_maps_state_group_to_states() {
+        let query = parse_history_batch_export_query(&pairs(&[
+            ("workflow_name", "billing_checkout"),
+            ("state_group", "terminal"),
+            ("updated_after", "2026-05-01T00:00:00Z"),
+            ("updated_before", "2026-05-08T00:00:00Z"),
+            ("shard_id", "2"),
+            ("limit", "1000"),
+        ]))
+        .expect("batch export query should parse");
+
+        assert_eq!(query.workflow_name.as_deref(), Some("billing_checkout"));
+        assert_eq!(query.states, terminal_workflow_states());
+        assert!(query.updated_after.is_some());
+        assert!(query.updated_before.is_some());
+        assert_eq!(query.shard_id, Some(2));
+        assert_eq!(query.limit, 1000);
+    }
+
+    fn test_history_export_candidate(
+        id: uuid::Uuid,
+        shard_id: i32,
+        last_history_event_at: chrono::DateTime<chrono::Utc>,
+    ) -> HistoryExportCandidate {
+        HistoryExportCandidate {
+            id,
+            workflow_name: "billing_checkout".to_string(),
+            shard_id,
+            state: "COMPLETED".to_string(),
+            last_history_event_at,
+        }
+    }
+
+    #[test]
+    fn sort_history_export_candidates_orders_globally_before_limit() {
+        let base = chrono::DateTime::parse_from_rfc3339("2026-05-08T00:00:00Z")
+            .expect("valid timestamp")
+            .with_timezone(&chrono::Utc);
+        let older_shard0 =
+            uuid::Uuid::parse_str("00000000-0000-4000-8000-000000000001").expect("valid uuid");
+        let newer_shard0 =
+            uuid::Uuid::parse_str("00000000-0000-4000-8000-000000000002").expect("valid uuid");
+        let newest_shard1 =
+            uuid::Uuid::parse_str("00000000-0000-4000-8000-000000000003").expect("valid uuid");
+        let mut candidates = vec![
+            test_history_export_candidate(older_shard0, 0, base),
+            test_history_export_candidate(newer_shard0, 0, base + chrono::Duration::minutes(1)),
+            test_history_export_candidate(newest_shard1, 1, base + chrono::Duration::minutes(2)),
+        ];
+
+        sort_history_export_candidates(&mut candidates);
+        let selected = candidates
+            .into_iter()
+            .take(2)
+            .map(|candidate| candidate.id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(selected, vec![newest_shard1, newer_shard0]);
+    }
+
+    #[test]
+    fn history_export_candidate_query_filters_updated_window_by_latest_event_timestamp() {
+        let sql = history_export_candidates_sql();
+
+        assert!(sql.contains("MAX(e.timestamp)"));
+        assert!(sql.contains("HAVING"));
+        assert!(
+            !sql.contains("COALESCE(completed_at, started_at, created_at) >="),
+            "updated windows must not be based only on workflow row timestamps"
         );
     }
 }
