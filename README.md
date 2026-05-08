@@ -23,6 +23,10 @@ the same shape with one fewer service to operate.
 
 Try it end-to-end: `cargo run -p quickstart` (see [`examples/quickstart/`](examples/quickstart/)).
 
+For a chapter-by-chapter walkthrough — first workflow, durable timers, signals,
+child workflows, idempotency, and operating the service — read
+[`docs/getting-started.md`](docs/getting-started.md).
+
 Need a real reference instead of the tiny hello-world path? See:
 
 - [`examples/billing-autumn-web/`](examples/billing-autumn-web/) for a full Autumn web billing
