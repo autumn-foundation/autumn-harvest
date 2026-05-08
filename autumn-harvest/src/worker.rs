@@ -1472,7 +1472,7 @@ async fn persist_all_started_child_workflows(
                     execution_timeout: None,
                     memo: None,
                     search_attrs: None,
-        assigned_build_id: None,
+                    assigned_build_id: parent_execution.assigned_build_id.clone(),
                 };
                 let child_started_event = WorkflowEvent::WorkflowStarted {
                     input: child.input.clone(),
@@ -1484,6 +1484,7 @@ async fn persist_all_started_child_workflows(
                     child.input.clone(),
                 );
                 params.workflow_exec_id = Some(child.child_id.as_uuid());
+                params.required_build_id = parent_execution.assigned_build_id.clone();
                 params.trace_context = child_trace_ctxs
                     .get(&child.child_id.as_uuid())
                     .cloned()
@@ -2405,11 +2406,12 @@ async fn persist_workflow_continue_as_new(
         execution_timeout: execution.execution_timeout,
         memo: execution.memo.clone(),
         search_attrs: execution.search_attrs.clone(),
-        assigned_build_id: None,
+        assigned_build_id: execution.assigned_build_id.clone(),
     };
     let mut enqueue =
         queue::EnqueueParams::new(execution.queue_name.clone(), TaskType::Workflow, input);
     enqueue.workflow_exec_id = Some(new_exec_id.as_uuid());
+    enqueue.required_build_id = execution.assigned_build_id.clone();
 
     conn.transaction::<(), HarvestError, _>(|conn| {
         async move {

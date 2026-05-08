@@ -743,13 +743,13 @@ impl BuildId {
     /// preserves backward compatibility for operators who have not yet adopted
     /// build-aware routing.
     #[must_use]
-    pub fn legacy() -> Self {
+    pub const fn legacy() -> Self {
         Self(String::new())
     }
 
     /// Returns `true` when this is the legacy empty-string sentinel.
     #[must_use]
-    pub fn is_legacy(&self) -> bool {
+    pub const fn is_legacy(&self) -> bool {
         self.0.is_empty()
     }
 

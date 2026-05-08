@@ -284,6 +284,7 @@ pub fn parse_worker_filters(pairs: &[(String, String)]) -> Result<WorkerFilters,
 /// # Errors
 ///
 /// Returns [`HarvestError`] on serialization or database failure.
+#[allow(clippy::too_many_arguments)]
 pub async fn register_worker(
     conn: &mut AsyncPgConnection,
     worker_id: &str,

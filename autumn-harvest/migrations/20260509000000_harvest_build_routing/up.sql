@@ -19,12 +19,12 @@ ALTER TABLE harvest_task_queue
     ADD COLUMN required_build_id TEXT;
 
 -- Index for build-aware claiming (partial: only non-NULL rows need it).
-CREATE INDEX CONCURRENTLY IF NOT EXISTS harvest_task_queue_required_build_id_pending
+CREATE INDEX IF NOT EXISTS harvest_task_queue_required_build_id_pending
     ON harvest_task_queue (required_build_id)
     WHERE state = 'PENDING' AND required_build_id IS NOT NULL;
 
 -- Index for reachability queries on executions.
-CREATE INDEX CONCURRENTLY IF NOT EXISTS harvest_wfe_assigned_build_id
+CREATE INDEX IF NOT EXISTS harvest_wfe_assigned_build_id
     ON harvest_workflow_executions (assigned_build_id)
     WHERE assigned_build_id IS NOT NULL;
 

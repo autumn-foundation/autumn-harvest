@@ -105,7 +105,7 @@ impl BuildCompatibilitySet {
                 // Explicit declaration.
                 self.declarations
                     .get(worker_build)
-                    .map_or(false, |set| set.contains(req))
+                    .is_some_and(|set| set.contains(req))
             }
         }
     }
@@ -454,8 +454,6 @@ pub async fn build_reachability(
     build_id: &str,
     stale_threshold: Duration,
 ) -> HarvestResult<BuildReachability> {
-    let threshold_secs = i64::try_from(stale_threshold.as_secs()).unwrap_or(i64::MAX);
-
     #[derive(diesel::QueryableByName, Debug)]
     struct ReachRow {
         #[diesel(sql_type = diesel::sql_types::BigInt)]
@@ -468,11 +466,13 @@ pub async fn build_reachability(
         stale_workers: i64,
     }
 
+    let threshold_secs = i64::try_from(stale_threshold.as_secs()).unwrap_or(i64::MAX);
+
     let rows: Vec<ReachRow> = diesel::sql_query(
         "SELECT \
              (SELECT COUNT(*) FROM harvest_workflow_executions \
               WHERE assigned_build_id = $1 \
-                AND state NOT IN ('COMPLETED', 'FAILED', 'CANCELLED', 'TERMINATED')) \
+                AND state NOT IN ('COMPLETED', 'FAILED', 'CANCELLED', 'TERMINATED', 'TIMED_OUT', 'CONTINUED_AS_NEW')) \
              AS open_executions, \
              (SELECT COUNT(*) FROM harvest_task_queue \
               WHERE required_build_id = $1 AND state = 'PENDING') \
@@ -606,11 +606,12 @@ pub async fn all_build_reachability_sharded(
 ///
 /// Numeric counters are summed per `build_id`; `safe_to_retire` is
 /// recomputed from the merged totals. The result is sorted by `build_id`.
+#[must_use]
 pub fn merge_reachability(per_shard: Vec<Vec<BuildReachability>>) -> Vec<BuildReachability> {
     let mut merged: BTreeMap<String, BuildReachability> = BTreeMap::new();
     for shard_results in per_shard {
         for r in shard_results {
-            let entry = merged.entry(r.build_id.clone()).or_insert(BuildReachability {
+            let entry = merged.entry(r.build_id.clone()).or_insert_with(|| BuildReachability {
                 build_id: r.build_id.clone(),
                 open_executions: 0,
                 pending_tasks: 0,
