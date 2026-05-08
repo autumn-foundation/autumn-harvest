@@ -150,3 +150,195 @@ and `request_id`.
 | Forgetting `--deadline` on a slow worker | The default deadline is `shutdown_timeout` (30 s); set a longer deadline for workers with large in-flight batches |
 | Draining the wrong shard | Use `--shard-id` with `drain-preview` to scope the preview first |
 | Ignoring `unavailable_shards` in the response | The worker may be on an unreachable shard; retry after shard recovers |
+
+---
+
+# Runbook: Build-Id Routing for Safe Rolling Deploys
+
+Use Harvest's build-id routing to gate which workers may resume specific
+workflow executions. This prevents a worker running an incompatible binary from
+replaying history in a way that causes non-determinism.
+
+**When to use:** deployments that add or change workflow logic (new
+`ctx.schedule_activity` calls, reordered steps, removed branches) where replay
+safety cannot be proven by inspection alone.
+
+**When _not_ to use:** purely additive changes that do not alter execution
+order (new unrelated workflows, configuration changes, dependency bumps with no
+behaviour change). Those deploys can use the plain drain runbook above.
+
+---
+
+## Concepts
+
+| Term | Meaning |
+|------|---------|
+| `build_id` | Immutable string (Git SHA, semver tag, CI job ID) advertised by a worker at startup via `WorkerConfig::with_build_id("sha-abc123")`. Empty string = legacy worker that can claim any task. |
+| Build policy | Per-queue row in `harvest_build_policies`. New workflow starts on the queue receive `assigned_build_id = policy.build_id`. Updated by operators when a new build ships. |
+| Compat declaration | Row in `harvest_build_compat`. Means "workers running build B may process executions assigned to build A". Added after replay tests confirm safety. |
+| `required_build_id` | Denormalized onto `harvest_task_queue`. Workers skip tasks whose `required_build_id` they are not eligible for. |
+| Build reachability | Per-build snapshot: `open_executions`, `pending_tasks`, `active_workers`, `stale_workers`, `safe_to_retire`. Used to decide when old-build workers can be retired. |
+
+---
+
+## Scenario A: Backward-compatible deploy (new code can replay old history)
+
+Use this when your replay test suite (e.g. `WorkflowReplayer`) confirms the new
+build handles all in-flight histories safely.
+
+**Step 1 — Deploy new workers with the new build id.**
+
+In your `WorkerConfig`:
+
+```rust
+WorkerConfig::default()
+    .with_build_id("sha-new123")
+    .with_deployment_name("v2.3.0")   // optional human label
+```
+
+Start the new workers alongside the existing fleet. They register in
+`harvest_workers` with `build_id = "sha-new123"`.
+
+**Step 2 — Declare compat so new workers can resume old executions.**
+
+```bash
+# new workers (sha-new123) may resume executions started on sha-old456
+harvest build declare-compat --build sha-new123 --compatible-with sha-old456
+```
+
+Or via the management API:
+
+```http
+POST /api/harvest/builds/compat
+{ "build_id": "sha-new123", "compatible_with": "sha-old456" }
+```
+
+**Step 3 — Advance the build policy so new starts land on the new build.**
+
+```bash
+harvest build set-policy --queue default --build sha-new123
+```
+
+New executions now get `assigned_build_id = "sha-new123"` and old-build
+workers are ineligible to claim them.
+
+**Step 4 — Drain and retire old-build workers.**
+
+Check reachability first:
+
+```bash
+harvest build reachability --build sha-old456
+```
+
+Wait until `safe_to_retire: true` (no open executions, no pending tasks), then
+drain and stop the old workers using the drain runbook above.
+
+---
+
+## Scenario B: Breaking deploy (new code cannot replay old history)
+
+Use this when the new binary changes execution order in a way that would corrupt
+in-flight workflows if replayed. Requires using `ctx.version()` gates to guard
+the breaking branch.
+
+**Step 1 — Gate the breaking code branch in the workflow with `ctx.version()`.**
+
+```rust
+#[workflow]
+async fn my_workflow(ctx: &WorkflowContext, ...) -> Result<(), String> {
+    if ctx.version("add-step-2", 1, 2).await? >= 2 {
+        // new code path — only runs on executions started on/after version 2
+        ctx.schedule_activity(new_step, ...).await?;
+    }
+    // existing steps ...
+}
+```
+
+`ctx.version()` emits a `VersionMarker` event on first call and replays the
+recorded marker on re-entry, so the branch is stable across replays.
+
+**Step 2 — Deploy new workers and set the policy (same as Scenario A steps 1 and 3).**
+
+Do **not** declare compat. Old-build workers will stop receiving new tasks; new
+tasks go only to new-build workers. In-flight old-build executions drain on
+old-build workers.
+
+**Step 3 — Wait for old-build executions to drain.**
+
+```bash
+watch -n 10 'harvest build reachability --build sha-old456 | jq .safe_to_retire'
+```
+
+Once `true`, retire the old workers.
+
+---
+
+## Scenario C: Emergency rollback
+
+When a bad deploy must be reversed immediately:
+
+**Step 1 — Advance the build policy back to the previous build.**
+
+```bash
+harvest build set-policy --queue default --build sha-old456
+```
+
+New starts immediately revert to the previous build. In-flight new-build
+executions continue on new-build workers.
+
+**Step 2 — If the new build is unsafe to continue, drain new-build workers.**
+
+Use the drain runbook to quiesce all workers advertising `build_id = "sha-new123"`.
+New-build executions that were in-flight will be retried and, if the build policy
+is back to `sha-old456`, picked up by old-build workers — but only if a compat
+declaration exists (or the new executions have no `required_build_id`).
+
+**Step 3 — Revoke compat declarations if the new build is being abandoned.**
+
+```bash
+harvest build revoke-compat --build sha-new123 --compatible-with sha-old456
+```
+
+After revocation, old-build workers cannot claim new-build tasks. This is the
+desired state if the new build is being rolled back entirely.
+
+---
+
+## Build reachability reference
+
+```bash
+# Single build
+harvest build reachability --build sha-old456
+
+# All builds
+harvest build reachability --all
+```
+
+```http
+GET /api/harvest/builds/sha-old456/reachability
+GET /api/harvest/builds/reachability
+```
+
+Response fields:
+
+| Field | Meaning |
+|-------|---------|
+| `open_executions` | Non-terminal executions with this `assigned_build_id` |
+| `pending_tasks` | Tasks in PENDING state with this `required_build_id` |
+| `active_workers` | Workers with this `build_id` and a recent heartbeat |
+| `stale_workers` | Workers with this `build_id` whose heartbeat has expired |
+| `safe_to_retire` | `true` when `open_executions == 0` and `pending_tasks == 0` |
+
+**Old-build workers are safe to stop once `safe_to_retire` is `true`.**
+
+---
+
+## Common mistakes
+
+| Mistake | Fix |
+|---------|-----|
+| Retiring old workers before `safe_to_retire` | Check reachability; in-flight executions will be orphaned |
+| Forgetting to declare compat in Scenario A | New workers skip old-build tasks; old-build executions stall |
+| Breaking deploy without `ctx.version()` gate | New workers corrupt in-flight histories on replay; use version gates |
+| Rollback without updating the build policy | New starts continue landing on the bad build; set policy back first |
+| Empty `build_id` on new workers | Legacy sentinel — the worker claims any task, bypassing all routing |
