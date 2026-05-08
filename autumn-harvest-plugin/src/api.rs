@@ -5362,7 +5362,12 @@ async fn get_worker_handler(
     let pool = api_state.storage_pool().map_err(map_error)?;
 
     for (_shard, shard_pool) in pool.iter_shards() {
-        let mut conn = acquire_conn(shard_pool).await?;
+        // Skip unavailable shards rather than returning 500; the worker may
+        // live on a reachable shard even when others are down, and the --wait
+        // poll loop must not abort just because an unrelated shard is offline.
+        let Ok(mut conn) = acquire_conn(shard_pool).await else {
+            continue;
+        };
         if let Some(row) = get_worker(&mut conn, &worker_id, stale_threshold)
             .await
             .map_err(map_error)?
