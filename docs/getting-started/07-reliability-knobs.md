@@ -1,6 +1,6 @@
 # Chapter 7 — Reliability knobs you'll reach for
 
-[← Idempotency](06-idempotency.md) · [Index](README.md) · [Next: Operating the service →](08-operations.md)
+[← Idempotency](06-idempotency.md) · [Index](README.md) · [Next: DAGs and schedules →](08-dags-and-schedules.md)
 
 ---
 
@@ -45,9 +45,10 @@ if ctx.version("v2-tax-flow", 1, 2) >= 2 {
 }
 ```
 
-**Cron / interval schedules.** Register any workflow on a schedule with
-`HarvestPlugin::schedule(...)`. For dependency-graph fan-out across multiple
-activities, use `DagBuilder` and the `#[dag]` macro instead.
+**Cron / interval schedules for workflows.** Register any workflow on a
+schedule with `HarvestPlugin::schedule(...)`. When you need a graph of
+activities instead of a single workflow on a schedule, jump to
+[Chapter 8 — DAGs and schedules](08-dags-and-schedules.md).
 
 **Search attributes.** Tag executions with structured fields
 (`tenant_id`, `customer_id`) at start time so you can filter the dashboard
@@ -55,4 +56,4 @@ and the CLI by them: `harvest workflow list --search-attr tenant=acme`.
 
 ---
 
-[← Idempotency](06-idempotency.md) · [Index](README.md) · [Next: Operating the service →](08-operations.md)
+[← Idempotency](06-idempotency.md) · [Index](README.md) · [Next: DAGs and schedules →](08-dags-and-schedules.md)

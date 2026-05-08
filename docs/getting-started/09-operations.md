@@ -1,6 +1,6 @@
-# Chapter 8 — Operating the service
+# Chapter 9 — Operating the service
 
-[← Reliability knobs](07-reliability-knobs.md) · [Index](README.md) · [Next: Testing your workflow code →](09-testing.md)
+[← DAGs and schedules](08-dags-and-schedules.md) · [Index](README.md) · [Next: Testing your workflow code →](10-testing.md)
 
 ---
 
@@ -108,4 +108,4 @@ start. When you need stricter semantics, pass `reuse_policy`:
 
 ---
 
-[← Reliability knobs](07-reliability-knobs.md) · [Index](README.md) · [Next: Testing your workflow code →](09-testing.md)
+[← DAGs and schedules](08-dags-and-schedules.md) · [Index](README.md) · [Next: Testing your workflow code →](10-testing.md)

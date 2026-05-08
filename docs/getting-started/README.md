@@ -31,9 +31,10 @@ Stop at any chapter — each one ends in a runnable state.
 4. [Signals](04-signals.md) — `wait_for_signal` for human / webhook / cross-system handoffs.
 5. [Child workflows](05-child-workflows.md) — composing orchestrations with `spawn_child_workflow_raw`.
 6. [Idempotency](06-idempotency.md) — `ctx.idempotency_key()` and subkeys for at-least-once safety.
-7. [Reliability knobs](07-reliability-knobs.md) — retries, concurrency caps, local activities, queues, versioning, schedules, search attributes.
-8. [Operating the service](08-operations.md) — preflight, dashboard, CLI, DLQ, worker drain, reuse policies.
-9. [Testing your workflow code](09-testing.md) — unit tests and `WorkflowReplayer` regression coverage.
+7. [Reliability knobs](07-reliability-knobs.md) — retries, concurrency caps, local activities, queues, versioning, search attributes.
+8. [DAGs and schedules](08-dags-and-schedules.md) — `#[dag]`, `DagBuilder`, trigger rules, cron schedules, manual triggers, offline lint/sim/profile.
+9. [Operating the service](09-operations.md) — preflight, dashboard, CLI, DLQ, worker drain, reuse policies.
+10. [Testing your workflow code](10-testing.md) — unit tests and `WorkflowReplayer` regression coverage.
 
 Start with [Chapter 1 →](01-project-skeleton.md)
 

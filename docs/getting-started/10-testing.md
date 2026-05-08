@@ -1,6 +1,6 @@
-# Chapter 9 — Testing your workflow code
+# Chapter 10 — Testing your workflow code
 
-[← Operating the service](08-operations.md) · [Index](README.md)
+[← Operating the service](09-operations.md) · [Index](README.md)
 
 ---
 
@@ -44,7 +44,7 @@ for capturing fixtures from a running service.
 
 ---
 
-[← Operating the service](08-operations.md) · [Index](README.md)
+[← Operating the service](09-operations.md) · [Index](README.md)
 
 You've reached the end of the guide. Head back to the [index](README.md) for
 links to the reference example, runbooks, and architecture docs.
