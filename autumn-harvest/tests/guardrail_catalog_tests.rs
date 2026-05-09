@@ -136,10 +136,7 @@ fn catalog_alternative_guidance_mentions_harvest_concepts() {
     let mut found_harvest_guidance = false;
     for entry in entries {
         let alt_lower = entry.alternative.to_lowercase();
-        if harvest_keywords
-            .iter()
-            .any(|kw| alt_lower.contains(*kw))
-        {
+        if harvest_keywords.iter().any(|kw| alt_lower.contains(*kw)) {
             found_harvest_guidance = true;
         }
     }
@@ -222,10 +219,7 @@ fn guardrail_finding_is_debug_and_clone() {
 #[test]
 fn suppression_requires_nonempty_reason() {
     let result = GuardrailSuppression::new("HVG001", "");
-    assert!(
-        result.is_err(),
-        "empty reason string should be rejected"
-    );
+    assert!(result.is_err(), "empty reason string should be rejected");
     match result {
         Err(GuardrailSuppressionError::EmptyReason) => {}
         other => panic!("expected EmptyReason, got {other:?}"),
@@ -234,8 +228,11 @@ fn suppression_requires_nonempty_reason() {
 
 #[test]
 fn suppression_accepts_nonempty_reason() {
-    let suppression = GuardrailSuppression::new("HVG001", "Seeded PRNG, determinism verified by replay test suite")
-        .expect("non-empty reason must succeed");
+    let suppression = GuardrailSuppression::new(
+        "HVG001",
+        "Seeded PRNG, determinism verified by replay test suite",
+    )
+    .expect("non-empty reason must succeed");
     assert_eq!(suppression.rule_id(), "HVG001");
     assert!(!suppression.reason().is_empty());
 }
@@ -243,16 +240,31 @@ fn suppression_accepts_nonempty_reason() {
 #[test]
 fn suppression_whitespace_only_reason_is_rejected() {
     let result = GuardrailSuppression::new("HVG002", "   ");
+    assert!(result.is_err(), "whitespace-only reason should be rejected");
+}
+
+#[test]
+fn suppression_empty_rule_id_is_rejected() {
+    let result = GuardrailSuppression::new("", "valid reason");
+    assert!(result.is_err(), "empty rule ID should be rejected");
+    match result {
+        Err(GuardrailSuppressionError::EmptyRuleId) => {}
+        other => panic!("expected EmptyRuleId, got {other:?}"),
+    }
+}
+
+#[test]
+fn suppression_whitespace_rule_id_is_rejected() {
+    let result = GuardrailSuppression::new("   ", "valid reason");
     assert!(
         result.is_err(),
-        "whitespace-only reason should be rejected"
+        "whitespace-only rule ID should be rejected"
     );
 }
 
 #[test]
 fn suppression_exposes_rule_id_and_reason() {
-    let s = GuardrailSuppression::new("HVG003", "CI fixture, not a real workflow")
-        .unwrap();
+    let s = GuardrailSuppression::new("HVG003", "CI fixture, not a real workflow").unwrap();
     assert_eq!(s.rule_id(), "HVG003");
     assert_eq!(s.reason(), "CI fixture, not a real workflow");
 }

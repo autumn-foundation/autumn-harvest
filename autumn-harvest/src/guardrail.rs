@@ -23,7 +23,7 @@
 //! | HVG007 | ProcessGlobal | HardBlocker  | Process-global state mutation        |
 
 /// Severity of a guardrail rule violation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Severity {
     /// Fails CI by default. Workflow replay is at risk.
     HardBlocker,
@@ -32,7 +32,7 @@ pub enum Severity {
 }
 
 /// The determinism category a rule belongs to.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RuleCategory {
     /// Direct reads of wall-clock time (`SystemTime`, `Instant`, `chrono::Utc::now()`).
     WallClock,
@@ -51,6 +51,7 @@ pub enum RuleCategory {
 }
 
 /// A single entry in the guardrail rule catalog.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuleEntry {
     /// Stable rule identifier (`HVGxxx`).
     pub id: &'static str,
@@ -181,7 +182,7 @@ pub fn rule_by_id(id: &str) -> Option<&'static RuleEntry> {
 // ── GuardrailFinding ──────────────────────────────────────────────────────────
 
 /// A machine-readable finding produced by a guardrail checker.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GuardrailFinding {
     /// Stable rule identifier.
     pub rule_id: String,
@@ -222,15 +223,19 @@ impl GuardrailFinding {
 
 // ── GuardrailSuppression ──────────────────────────────────────────────────────
 
-/// Error returned when a suppression is constructed with an invalid reason.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Error returned when a suppression is constructed with invalid arguments.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum GuardrailSuppressionError {
     /// The reason string was empty or contained only whitespace.
+    #[error("suppression reason cannot be empty")]
     EmptyReason,
+    /// The rule ID was empty or contained only whitespace.
+    #[error("suppression rule ID cannot be empty")]
+    EmptyRuleId,
 }
 
 /// An auditable suppression of a guardrail finding. Requires a non-empty reason.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GuardrailSuppression {
     rule_id: String,
     reason: String,
@@ -241,19 +246,21 @@ impl GuardrailSuppression {
     ///
     /// # Errors
     ///
-    /// Returns `Err(GuardrailSuppressionError::EmptyReason)` if `reason` is empty or whitespace.
+    /// Returns `Err(EmptyRuleId)` if `rule_id` is empty or whitespace.
+    /// Returns `Err(EmptyReason)` if `reason` is empty or whitespace.
     pub fn new(
         rule_id: impl Into<String>,
         reason: impl Into<String>,
     ) -> Result<Self, GuardrailSuppressionError> {
+        let rule_id = rule_id.into();
         let reason = reason.into();
+        if rule_id.trim().is_empty() {
+            return Err(GuardrailSuppressionError::EmptyRuleId);
+        }
         if reason.trim().is_empty() {
             return Err(GuardrailSuppressionError::EmptyReason);
         }
-        Ok(Self {
-            rule_id: rule_id.into(),
-            reason,
-        })
+        Ok(Self { rule_id, reason })
     }
 
     /// The rule ID this suppression covers.

@@ -16,8 +16,6 @@ pub const MIGRATIONS: diesel_migrations::EmbeddedMigrations =
 
 /// History analyzer and linter.
 pub mod analyzer;
-/// Deterministic workflow guardrail rule catalog (issue #173).
-pub mod guardrail;
 /// Audit trail for management API mutations (issue #158).
 #[cfg(feature = "db")]
 pub mod audit;
@@ -47,6 +45,8 @@ pub mod execution;
 pub mod executor;
 #[cfg(feature = "db")]
 pub mod external_task;
+/// Deterministic workflow guardrail rule catalog (issue #173).
+pub mod guardrail;
 pub mod history_export;
 pub mod info;
 /// `metrics` crate adapter for [`telemetry::MetricsRecorder`].
@@ -125,10 +125,6 @@ pub use analyzer::{
     AnalyzerRule, AnalyzerWarning, ExcessiveRetriesRule, HistoryAnalyzer, LargePayloadRule,
     SuspiciousTimerRule,
 };
-pub use guardrail::{
-    GuardrailFinding, GuardrailSuppression, GuardrailSuppressionError, RuleCategory, RuleEntry,
-    Severity, catalog as guardrail_catalog, rule_by_id as guardrail_rule_by_id,
-};
 pub use builder::{BuiltHarvest, HarvestBuilder, HarvestBuilderError, WorkerConfig};
 pub use cache::{CachedWorkflowState, WorkflowCache};
 pub use context::{ActivityContext, WorkflowCommand, WorkflowContext};
@@ -152,6 +148,10 @@ pub use execution::{
     cancel_workflow_execution, start_or_load_workflow_execution, terminate_workflow_execution,
 };
 pub use executor::{WorkflowOutcome, run_workflow};
+pub use guardrail::{
+    GuardrailFinding, GuardrailSuppression, GuardrailSuppressionError, RuleCategory, RuleEntry,
+    Severity, catalog as guardrail_catalog, rule_by_id as guardrail_rule_by_id,
+};
 pub use history_export::{
     DEFAULT_HISTORY_EXPORT_MAX_BYTES, HISTORY_EXPORT_SCHEMA, HISTORY_EXPORT_VERSION,
     HistoryExportDocument, HistoryExportError, HistoryExportRequest, HistoryExportSizeLimit,
