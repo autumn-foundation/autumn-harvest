@@ -67,30 +67,76 @@ all CLI-compatible endpoints are wrapped together because `harvest_ui_router` is
 nested into the same Axum router before the middleware layer is added (see
 `HarvestPlugin::build` in the plugin source).
 
-```rust
-use autumn_web::auth::RequireAuth;
+Pass any Tower `Layer`-compatible middleware. Two common shapes are shown below.
 
-HarvestPlugin::new()
-    .api_with_auth("/api/harvest", RequireAuth::new("harvest-admin"))
-```
+**Session-based (web UI users)**
 
-Replace `RequireAuth::new("harvest-admin")` with whatever middleware your
-application uses (bearer token validation, session check, mTLS, etc.). The
-`RequireAuth` type shown is `autumn_web`'s built-in guard; any Tower
-`Layer`-compatible middleware works.
-
-If you want `/health` to bypass authentication (for load-balancer probes) while
-protecting all other routes, split the mounts:
+`autumn_web::auth::RequireAuth` checks for a named key in the session cookie.
+It does **not** read the `Authorization` header and will not admit CLI bearer
+tokens.
 
 ```rust
 use autumn_web::auth::RequireAuth;
 
-// Public health probe — no auth
-app.route("/api/harvest/health", get(harvest_health_handler))
-// Everything else — requires auth
 HarvestPlugin::new()
+    // Rejects requests whose session does not contain "harvest-admin"
     .api_with_auth("/api/harvest", RequireAuth::new("harvest-admin"))
 ```
+
+**Bearer-token (CLI / API clients)**
+
+The Harvest CLI sends `Authorization: Bearer <token>` (via `--token` /
+`HARVEST_TOKEN`). To validate that header, supply a Tower middleware that reads
+`Authorization` rather than the session:
+
+```rust
+use axum::{extract::Request, middleware::Next, response::IntoResponse, response::Response};
+use http::StatusCode;
+
+async fn bearer_auth(req: Request, next: Next) -> Response {
+    let token = req
+        .headers()
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+
+    match token {
+        Some(t) if t == std::env::var("HARVEST_ADMIN_TOKEN").unwrap_or_default() => {
+            next.run(req).await
+        }
+        _ => StatusCode::UNAUTHORIZED.into_response(),
+    }
+}
+
+HarvestPlugin::new()
+    .api_with_auth("/api/harvest", axum::middleware::from_fn(bearer_auth))
+```
+
+Replace the static token comparison with your actual validation logic (JWT
+verification, database lookup, etc.).
+
+**Unauthenticated `/health` for probe traffic**
+
+The `health` handler is internal to the plugin and cannot be re-mounted
+separately. To let load-balancer probes reach `/health` without credentials,
+use a selective middleware that skips auth for that path:
+
+```rust
+async fn harvest_auth(req: Request, next: Next) -> Response {
+    if req.uri().path().ends_with("/health") {
+        return next.run(req).await;  // allow probe traffic through
+    }
+    // your bearer or session check here
+    // ...
+    StatusCode::UNAUTHORIZED.into_response()
+}
+
+HarvestPlugin::new()
+    .api_with_auth("/api/harvest", axum::middleware::from_fn(harvest_auth))
+```
+
+Alternatively, configure your reverse proxy or ingress controller to bypass
+authentication for `GET /api/harvest/health` at the infrastructure layer.
 
 ---
 
@@ -99,20 +145,27 @@ HarvestPlugin::new()
 The Harvest CLI supports `--token <value>` and the `HARVEST_TOKEN` environment
 variable. **This only sends credentials — it does not secure the server.**
 
-When the CLI sends a request with `--token`, it adds the token as a bearer
-credential in the `Authorization` header. Whether that header is validated is
-entirely determined by the middleware the embedder configures on the server.
+When the CLI sends a request with `--token`, it sets the `Authorization: Bearer
+<token>` header on every request via `reqwest::RequestBuilder::bearer_auth`.
+Whether that header is validated depends entirely on the middleware the embedder
+configures on the server.
 
 Without authentication middleware:
 
-- The CLI token is sent but ignored.
+- The CLI token is sent but ignored by the server.
 - Any caller can reach mutating endpoints without credentials.
 
-With `RequireAuth` or equivalent middleware:
+With `RequireAuth` (session guard):
 
-- The server validates the bearer token.
-- Unauthenticated requests (including token-less CLI calls) are rejected with
-  `401 Unauthorized`.
+- **CLI bearer tokens are not validated** — `RequireAuth` checks a session
+  cookie, not the `Authorization` header. CLI calls will always get `401`.
+- Use the bearer-token middleware recipe above if CLI access is required.
+
+With a bearer-token middleware:
+
+- The server validates the `Authorization: Bearer` value.
+- Unauthenticated requests (no token or wrong token) receive `401 Unauthorized`.
+- CLI calls with a valid `--token` are admitted.
 
 ---
 
