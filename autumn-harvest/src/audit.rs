@@ -151,15 +151,19 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     // Kubernetes liveness/readiness probes and load-balancer health checks
     // require /health to be reachable without credentials.
     ("GET /health", RouteClass::PublicSafe),
-
     // ── ReadOnly ── reads state, does not modify workflow execution ───────────
     ("GET /workflows", RouteClass::ReadOnly),
     ("GET /workflows/{id}", RouteClass::ReadOnly),
     ("GET /workflows/{id}/children", RouteClass::ReadOnly),
     ("GET /workflows/{id}/stack", RouteClass::ReadOnly),
-    ("GET /workflows/{id}/query/{query_name}", RouteClass::ReadOnly),
-    ("POST /workflows/{id}/update/{update_name}", RouteClass::ReadOnly),
-    ("GET /workflows/{id}/update/{update_id}/result", RouteClass::ReadOnly),
+    (
+        "GET /workflows/{id}/query/{query_name}",
+        RouteClass::ReadOnly,
+    ),
+    (
+        "GET /workflows/{id}/update/{update_id}/result",
+        RouteClass::ReadOnly,
+    ),
     ("GET /workflows/{id}/history/export", RouteClass::ReadOnly),
     ("GET /dags", RouteClass::ReadOnly),
     ("GET /dags/{dag_name}/runs", RouteClass::ReadOnly),
@@ -167,7 +171,10 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     ("GET /admin/preflight", RouteClass::ReadOnly),
     ("GET /admin/shards/health", RouteClass::ReadOnly),
     ("GET /admin/version-gates/usage", RouteClass::ReadOnly),
-    ("GET /admin/version-gates/retirement-check", RouteClass::ReadOnly),
+    (
+        "GET /admin/version-gates/retirement-check",
+        RouteClass::ReadOnly,
+    ),
     ("GET /admin/retention", RouteClass::ReadOnly),
     ("GET /admin/concurrency", RouteClass::ReadOnly),
     ("GET /admin/history/exports", RouteClass::ReadOnly),
@@ -181,14 +188,25 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     ("GET /workers/{worker_id}", RouteClass::ReadOnly),
     ("GET /batch-operations", RouteClass::ReadOnly),
     ("GET /batch-operations/{id}", RouteClass::ReadOnly),
-
     // ── Mutating ── modifies workflow execution or system configuration ───────
     // All of these are covered by the audit trail (harvest_audit_log) or are
     // explicitly listed in EXCLUDED_ROUTES with an audit disposition note.
-    ("POST /workflows/{workflow_name}/start", RouteClass::Mutating),
+    (
+        "POST /workflows/{workflow_name}/start",
+        RouteClass::Mutating,
+    ),
     ("POST /workflows/{id}/cancel", RouteClass::Mutating),
     ("POST /workflows/{id}/reset", RouteClass::Mutating),
-    ("POST /workflows/{id}/signal/{signal_name}", RouteClass::Mutating),
+    (
+        "POST /workflows/{id}/signal/{signal_name}",
+        RouteClass::Mutating,
+    ),
+    // Update appends UpdateAdmitted to history and wakes the workflow — mutating.
+    // Audit disposition: excluded (synchronous RPC; the event history is the record).
+    (
+        "POST /workflows/{id}/update/{update_name}",
+        RouteClass::Mutating,
+    ),
     ("POST /dags/{dag_name}/trigger", RouteClass::Mutating),
     ("PATCH /dags/{dag_name}", RouteClass::Mutating),
     ("POST /dead-letters/replay", RouteClass::Mutating),
@@ -200,11 +218,20 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     ("POST /admin/schedules/{id}/resume", RouteClass::Mutating),
     ("DELETE /admin/schedules/{id}", RouteClass::Mutating),
     // External activity completion — task-token callbacks from remote workers.
-    ("POST /activities/external/{token}/complete", RouteClass::Mutating),
-    ("POST /activities/external/{token}/fail", RouteClass::Mutating),
+    (
+        "POST /activities/external/{token}/complete",
+        RouteClass::Mutating,
+    ),
+    (
+        "POST /activities/external/{token}/fail",
+        RouteClass::Mutating,
+    ),
     // Heartbeat writes liveness state but is intentionally excluded from audit
     // (high-volume, not a control-plane mutation). See EXCLUDED_ROUTES.
-    ("POST /activities/external/{token}/heartbeat", RouteClass::Mutating),
+    (
+        "POST /activities/external/{token}/heartbeat",
+        RouteClass::Mutating,
+    ),
     ("POST /workers/{worker_id}/drain", RouteClass::Mutating),
     ("POST /batch-operations", RouteClass::Mutating),
 ];
