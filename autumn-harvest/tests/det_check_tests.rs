@@ -600,6 +600,51 @@ fn billing_example_workflows_have_no_hard_blockers() {
     );
 }
 
+// ── single-line workflow body ──────────────────────────────────────────────
+
+#[test]
+fn single_line_workflow_body_is_scanned() {
+    // Compact single-line form: `fn wf() { stmt }` — body after `{` must be checked.
+    let src = "#[workflow]\nasync fn wf(ctx: &WorkflowContext) -> Result<(), String> { let _ = std::time::SystemTime::now(); Ok(()) }\n";
+    let report = check_source(src, "test.rs");
+    assert!(
+        report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "single-line workflow body must be scanned, got: {report:?}"
+    );
+}
+
+// ── string literal false-positive guard ───────────────────────────────────
+
+#[test]
+fn string_literal_not_flagged_as_violation() {
+    // A string value that happens to contain a rule pattern must not cause a finding.
+    let src = wf(r#"let msg = "std::fs::read is documented here";"#);
+    let report = check_source(&src, "test.rs");
+    assert!(
+        !report.has_hard_blockers(),
+        "pattern inside string literal must not cause a hard blocker, got: {report:?}"
+    );
+}
+
+// ── same-line suppression ──────────────────────────────────────────────────
+
+#[test]
+fn same_line_suppression_works() {
+    // Suppression comment placed on the SAME line as the violation (trailing comment).
+    let src = format!(
+        "#[workflow]\nasync fn test_wf(ctx: &WorkflowContext) -> Result<(), String> {{\n    let _t = std::time::SystemTime::now(); // harvest-suppress: DET001 \"same-line reason\"\n    Ok(())\n}}\n"
+    );
+    let report = check_source(&src, "test.rs");
+    assert!(
+        !report.has_hard_blockers(),
+        "same-line suppression must suppress the finding"
+    );
+    assert!(
+        !report.suppressions.is_empty(),
+        "same-line suppression must appear in report.suppressions"
+    );
+}
+
 // ── regression fixtures ────────────────────────────────────────────────────
 // These fixtures each embed exactly one violation of the target rule.
 // They serve as regression tests: if the rule is removed or its ID changes,

@@ -258,8 +258,8 @@ pub fn check_source(source: &str, file: &str) -> DetCheckReport {
     let mut report = DetCheckReport::default();
     let lines: Vec<&str> = source.lines().collect();
 
-    for (wf_name, body_start, body_lines) in extract_workflow_bodies(&lines) {
-        report.merge(check_body(&wf_name, body_start, &body_lines, file));
+    for (wf_name, body) in extract_workflow_bodies(&lines) {
+        report.merge(check_body(&wf_name, &body, file));
     }
 
     report
@@ -300,10 +300,10 @@ fn collect_rs_files(dir: &Path, report: &mut DetCheckReport) -> std::io::Result<
 
 // ── Workflow body extraction ───────────────────────────────────────────────────
 
-/// Returns `(workflow_name, body_start_1indexed, body_lines)` for every
-/// `#[workflow]`-annotated `async fn` in the source.  `#[activity]` bodies are
-/// not returned.
-fn extract_workflow_bodies<'a>(lines: &[&'a str]) -> Vec<(String, usize, Vec<&'a str>)> {
+/// Returns `(workflow_name, body_lines)` for every `#[workflow]`-annotated
+/// `async fn` in the source.  Each body line carries its 1-indexed line number.
+/// `#[activity]` bodies are not returned.
+fn extract_workflow_bodies<'a>(lines: &[&'a str]) -> Vec<(String, Vec<(u32, &'a str)>)> {
     let mut result = Vec::new();
     let mut i = 0;
 
@@ -354,34 +354,39 @@ fn extract_workflow_bodies<'a>(lines: &[&'a str]) -> Vec<(String, usize, Vec<&'a
             continue;
         }
 
-        // Body starts on the line immediately after the opening brace.
-        // brace_line is 0-indexed; first body line is 0-indexed brace_line+1,
-        // which is 1-indexed brace_line+2.
-        let body_start_1indexed = brace_line + 2;
-        j = brace_line + 1;
-
-        // Collect body lines until the matching closing brace (depth → 0).
+        // Start collecting from brace_line itself so that code on the same line
+        // as `{` is included (e.g. single-line `fn wf() { expr }`).
+        let brace_pos = lines[brace_line].find('{').unwrap_or(0);
         let mut depth = 1u32;
-        let mut body: Vec<&'a str> = Vec::new();
+        let mut body: Vec<(u32, &'a str)> = Vec::new(); // (1-indexed line, text)
+
+        j = brace_line;
+        let mut on_brace_line = true;
 
         while j < lines.len() && depth > 0 {
-            let line = lines[j];
-            let closing_brace_pos = scan_braces_outside_literals(line, &mut depth);
+            // On the opening-brace line only scan content after the `{`.
+            let line: &'a str = if on_brace_line {
+                on_brace_line = false;
+                &lines[j][brace_pos + 1..]
+            } else {
+                lines[j]
+            };
+            let line_num = u32::try_from(j + 1).unwrap_or(u32::MAX);
 
-            if let Some(pos) = closing_brace_pos {
+            if let Some(pos) = scan_braces_outside_literals(line, &mut depth) {
                 // Include any code on the closing-brace line that precedes the `}`
                 let before = &line[..pos];
                 if !before.trim().is_empty() {
-                    body.push(before);
+                    body.push((line_num, before));
                 }
-            } else {
-                body.push(line);
+            } else if !line.trim().is_empty() {
+                body.push((line_num, line));
             }
 
             j += 1;
         }
 
-        result.push((name, body_start_1indexed, body));
+        result.push((name, body));
         i = j;
     }
 
@@ -406,21 +411,15 @@ fn extract_fn_name(line: &str) -> Option<String> {
 
 // ── Body checker ──────────────────────────────────────────────────────────────
 
-fn check_body(
-    wf_name: &str,
-    body_start_1indexed: usize,
-    body_lines: &[&str],
-    file: &str,
-) -> DetCheckReport {
+fn check_body(wf_name: &str, body_lines: &[(u32, &str)], file: &str) -> DetCheckReport {
     let mut report = DetCheckReport::default();
 
-    for (idx, &line) in body_lines.iter().enumerate() {
-        let source_line = u32::try_from(body_start_1indexed + idx).unwrap_or(u32::MAX);
-
-        // The code portion of the line (before any `//` comment).
-        let code_part = strip_line_comment(line);
-        // Previous body line (used for preceding suppression comments).
-        let prev_line = if idx > 0 { body_lines[idx - 1] } else { "" };
+    for (idx, &(source_line, line)) in body_lines.iter().enumerate() {
+        // Code portion with string literals and line comments stripped to
+        // prevent false positives from patterns appearing in string data or comments.
+        let code_part = strip_unparseable_content(line);
+        // Previous body line — checked for a preceding suppression comment.
+        let prev_line = if idx > 0 { body_lines[idx - 1].1 } else { "" };
 
         'rules: for rule in RULES {
             for &pattern in rule.patterns {
@@ -461,6 +460,8 @@ fn check_body(
 
     report
 }
+
+// ── Lexer helpers ─────────────────────────────────────────────────────────────
 
 /// Returns the portion of `line` that precedes the first `//` (if any).
 /// This avoids flagging patterns that appear only inside comments.
@@ -655,6 +656,37 @@ fn raw_string_end(line: &str, start: usize) -> Option<usize> {
     Some(line.len())
 }
 
+/// Returns a copy of `line` with string literal and char literal content removed
+/// and everything from the first `//` comment stripped.
+/// This prevents pattern matches inside string data or comments.
+fn strip_unparseable_content(line: &str) -> String {
+    let code = strip_line_comment(line);
+    let mut result = String::with_capacity(code.len());
+    let mut pos = 0;
+
+    while pos < code.len() {
+        if let Some(end) = raw_string_end(code, pos) {
+            pos = end;
+            continue;
+        }
+
+        let Some((ch, next_pos)) = next_char(code, pos) else {
+            break;
+        };
+
+        match ch {
+            '"' => pos = normal_string_end(code, pos),
+            '\'' => pos = char_literal_end(code, pos).unwrap_or(next_pos),
+            _ => {
+                result.push(ch);
+                pos = next_pos;
+            }
+        }
+    }
+
+    result
+}
+
 /// Returns the suppression reason if either `line` or `prev_line` contains a
 /// valid `// harvest-suppress: RULE_ID "reason"` comment for `rule_id`.
 fn find_suppression(rule_id: &str, line: &str, prev_line: &str) -> Option<String> {
@@ -663,6 +695,8 @@ fn find_suppression(rule_id: &str, line: &str, prev_line: &str) -> Option<String
 }
 
 /// Parses `// harvest-suppress: RULE_ID "reason string"` from a line.
+/// The marker may appear anywhere in the line (supports both standalone comment
+/// lines and trailing inline comments such as `let x = foo(); // harvest-suppress: …`).
 /// Returns the reason string if valid and non-empty, `None` otherwise.
 fn parse_suppression_comment(rule_id: &str, line: &str) -> Option<String> {
     let comment_start = line_comment_start(line)?;
@@ -670,7 +704,6 @@ fn parse_suppression_comment(rule_id: &str, line: &str) -> Option<String> {
     let rest = rest.strip_prefix("harvest-suppress:")?;
     let rest = rest.trim_start();
     let rest = rest.strip_prefix(rule_id)?.trim_start();
-    // Require a quoted reason string.
     let inner = rest.strip_prefix('"')?;
     let end = inner.find('"')?;
     let reason = &inner[..end];
@@ -737,10 +770,35 @@ mod tests {
     }
 
     #[test]
-    fn strip_line_comment_removes_trailing_comment() {
-        assert_eq!(strip_line_comment("let x = 1; // comment"), "let x = 1; ");
-        assert_eq!(strip_line_comment("let x = 1;"), "let x = 1;");
-        assert_eq!(strip_line_comment("// full comment"), "");
+    fn strip_unparseable_content_removes_comments_and_strings() {
+        assert_eq!(
+            strip_unparseable_content("let x = 1; // comment"),
+            "let x = 1; "
+        );
+        assert_eq!(strip_unparseable_content("let x = 1;"), "let x = 1;");
+        assert_eq!(strip_unparseable_content("// full comment"), "");
+        // String literal content is silently removed.
+        assert_eq!(
+            strip_unparseable_content(r#"let s = "std::fs::read";"#),
+            "let s = ;"
+        );
+        // Escaped quote inside string does not prematurely close it.
+        assert_eq!(
+            strip_unparseable_content(r#"let s = "say \"hi\"";"#),
+            "let s = ;"
+        );
+    }
+
+    #[test]
+    fn parse_suppression_comment_handles_inline_trailing_comment() {
+        // Same-line trailing suppression comment.
+        assert_eq!(
+            parse_suppression_comment(
+                "DET001",
+                r#"let _ = SystemTime::now(); // harvest-suppress: DET001 "safe""#
+            ),
+            Some("safe".to_string())
+        );
     }
 
     #[test]
