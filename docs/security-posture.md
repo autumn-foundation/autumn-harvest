@@ -100,12 +100,13 @@ async fn bearer_auth(req: Request, next: Next) -> Response {
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "));
 
-    match token {
-        Some(t) if t == std::env::var("HARVEST_ADMIN_TOKEN").unwrap_or_default() => {
-            next.run(req).await
-        }
-        _ => StatusCode::UNAUTHORIZED.into_response(),
+    // Fail closed: reject if the env var is unset or empty, or if the token
+    // doesn't match. unwrap_or_default() would make "" a valid token.
+    let expected = std::env::var("HARVEST_ADMIN_TOKEN").unwrap_or_default();
+    if expected.is_empty() || token != Some(expected.as_str()) {
+        return StatusCode::UNAUTHORIZED.into_response();
     }
+    next.run(req).await
 }
 
 HarvestPlugin::new()
