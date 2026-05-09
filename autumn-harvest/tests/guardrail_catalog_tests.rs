@@ -263,6 +263,44 @@ fn suppression_whitespace_rule_id_is_rejected() {
 }
 
 #[test]
+fn suppression_deserialize_rejects_empty_reason() {
+    let json = r#"{"rule_id":"HVG001","reason":""}"#;
+    let result: Result<GuardrailSuppression, _> = serde_json::from_str(json);
+    assert!(
+        result.is_err(),
+        "deserialization must enforce non-empty reason invariant"
+    );
+}
+
+#[test]
+fn suppression_deserialize_rejects_whitespace_reason() {
+    let json = r#"{"rule_id":"HVG001","reason":"   "}"#;
+    let result: Result<GuardrailSuppression, _> = serde_json::from_str(json);
+    assert!(
+        result.is_err(),
+        "deserialization must enforce non-whitespace reason invariant"
+    );
+}
+
+#[test]
+fn suppression_deserialize_rejects_empty_rule_id() {
+    let json = r#"{"rule_id":"","reason":"valid reason"}"#;
+    let result: Result<GuardrailSuppression, _> = serde_json::from_str(json);
+    assert!(
+        result.is_err(),
+        "deserialization must enforce non-empty rule_id invariant"
+    );
+}
+
+#[test]
+fn suppression_deserialize_roundtrip_valid() {
+    let original = GuardrailSuppression::new("HVG001", "covered by replay fixture").unwrap();
+    let json = serde_json::to_string(&original).unwrap();
+    let restored: GuardrailSuppression = serde_json::from_str(&json).unwrap();
+    assert_eq!(original, restored);
+}
+
+#[test]
 fn suppression_exposes_rule_id_and_reason() {
     let s = GuardrailSuppression::new("HVG003", "CI fixture, not a real workflow").unwrap();
     assert_eq!(s.rule_id(), "HVG003");

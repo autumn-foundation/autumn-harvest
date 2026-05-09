@@ -235,8 +235,26 @@ pub enum GuardrailSuppressionError {
     EmptyRuleId,
 }
 
+/// Wire type used only for deserialization so the custom `TryFrom` path runs.
+#[derive(serde::Deserialize)]
+struct GuardrailSuppressionRaw {
+    rule_id: String,
+    reason: String,
+}
+
+impl TryFrom<GuardrailSuppressionRaw> for GuardrailSuppression {
+    type Error = GuardrailSuppressionError;
+    fn try_from(raw: GuardrailSuppressionRaw) -> Result<Self, Self::Error> {
+        Self::new(raw.rule_id, raw.reason)
+    }
+}
+
 /// An auditable suppression of a guardrail finding. Requires a non-empty reason.
+///
+/// Deserialization enforces the same invariants as [`GuardrailSuppression::new`]:
+/// both `rule_id` and `reason` must be non-empty non-whitespace strings.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "GuardrailSuppressionRaw")]
 pub struct GuardrailSuppression {
     rule_id: String,
     reason: String,
