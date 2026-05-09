@@ -124,7 +124,10 @@ use a selective middleware that skips auth for that path:
 
 ```rust
 async fn harvest_auth(req: Request, next: Next) -> Response {
-    if req.uri().path().ends_with("/health") {
+    // Exact match — ends_with("/health") would also bypass /workers/health,
+    // which is ReadOnly, not PublicSafe. Update the literal if you change
+    // the HarvestPlugin mount point.
+    if req.uri().path() == "/api/harvest/health" {
         return next.run(req).await;  // allow probe traffic through
     }
     // your bearer or session check here
