@@ -17,9 +17,7 @@ use tracing::Instrument;
 use crate::context::{SharedState, WorkflowCommand, WorkflowContext, empty_shared_state};
 use crate::event::WorkflowEvent;
 use crate::info::WorkflowHandlerFn;
-use crate::telemetry::{
-    ATTR_EXECUTION_ID, ATTR_QUEUE, ATTR_REPLAY, ATTR_SHARD_ID, ATTR_WORKFLOW_ID,
-};
+use crate::telemetry::{ATTR_QUEUE, ATTR_REPLAY, ATTR_SHARD_ID, ATTR_WORKFLOW_ID};
 use crate::types::ExecutionId;
 
 /// The outcome of running a workflow function through the executor.
@@ -115,8 +113,12 @@ pub async fn run_workflow_strict(
     let span = tracing::info_span!(
         "harvest.workflow.execute",
         "otel.kind" = "internal",
-        { ATTR_EXECUTION_ID } = %exec_id,
-        { ATTR_REPLAY } = true,
+        "harvest.execution.id" = %exec_id,
+        "harvest.replay" = true,
+        "harvest.workflow.id" = tracing::field::Empty,
+        "harvest.shard.id" = tracing::field::Empty,
+        "harvest.queue" = tracing::field::Empty,
+        "link.traceparent" = tracing::field::Empty,
     );
 
     async {
@@ -196,11 +198,11 @@ pub async fn run_workflow_with_state(
     let span = tracing::info_span!(
         "harvest.workflow.execute",
         "otel.kind" = "internal",
-        { ATTR_EXECUTION_ID } = %exec_id,
-        { ATTR_REPLAY } = false,
-        { ATTR_WORKFLOW_ID } = tracing::field::Empty,
-        { ATTR_SHARD_ID } = tracing::field::Empty,
-        { ATTR_QUEUE } = tracing::field::Empty,
+        "harvest.execution.id" = %exec_id,
+        "harvest.replay" = false,
+        "harvest.workflow.id" = tracing::field::Empty,
+        "harvest.shard.id" = tracing::field::Empty,
+        "harvest.queue" = tracing::field::Empty,
         "link.traceparent" = tracing::field::Empty,
     );
     if let Some(meta) = span_meta {
