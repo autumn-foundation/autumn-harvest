@@ -67,29 +67,15 @@ impl UpdateRegistry {
         self.entries.contains_key(name)
     }
 
-    /// Run the validator for `name` against `input`.
-    ///
-    /// # Errors
-    ///
-    /// - Returns `Err("update handler 'name' not found")` if `name` is unknown.
-    /// - Returns `Err(reason)` if the validator rejects.
-    pub fn validate(&self, name: &str, input: &Value) -> Result<(), String> {
-        let entry = self
-            .entries
-            .get(name)
-            .ok_or_else(|| format!("update handler '{name}' not found"))?;
-
-        if let Some(validator) = &entry.validator {
-            validator(input)?;
-        }
-        Ok(())
+    /// Returns the validator for `name`, if registered and present.
+    #[must_use]
+    pub fn get_validator(&self, name: &str) -> Option<BoxUpdateValidator> {
+        self.entries.get(name).and_then(|e| e.validator.clone())
     }
 
-    /// Invoke the handler for `name` with `input`.
-    ///
-    /// Returns `None` if `name` is not registered.
+    /// Returns the handler for `name`, if registered.
     #[must_use]
-    pub fn invoke(&self, name: &str, input: Value) -> Option<UpdateHandlerFuture> {
-        self.entries.get(name).map(|e| (e.handler)(input))
+    pub fn get_handler(&self, name: &str) -> Option<BoxUpdateHandler> {
+        self.entries.get(name).map(|e| e.handler.clone())
     }
 }

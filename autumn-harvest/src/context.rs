@@ -1707,18 +1707,23 @@ impl WorkflowContext {
     ///
     /// Panics if the internal update registry mutex is poisoned.
     pub fn validate_update(&self, name: &str, input: &Value) -> HarvestResult<()> {
-        let registry = self
-            .update_registry
-            .lock()
-            .expect("update_registry lock poisoned");
-        // Check existence structurally so validator errors are never confused
-        // with a missing handler, regardless of the error message text.
-        if !registry.contains(name) {
-            return Err(HarvestError::UpdateHandlerNotFound(name.to_string()));
+        let validator_opt = {
+            let registry = self
+                .update_registry
+                .lock()
+                .expect("update_registry lock poisoned");
+            // Check existence structurally so validator errors are never confused
+            // with a missing handler, regardless of the error message text.
+            if !registry.contains(name) {
+                return Err(HarvestError::UpdateHandlerNotFound(name.to_string()));
+            }
+            registry.get_validator(name)
+        };
+
+        if let Some(validator) = validator_opt {
+            validator(input).map_err(|reason| HarvestError::UpdateRejected { reason })?;
         }
-        registry
-            .validate(name, input)
-            .map_err(|reason| HarvestError::UpdateRejected { reason })
+        Ok(())
     }
 
     /// Execute an already-admitted update by `update_id`.
@@ -1763,16 +1768,16 @@ impl WorkflowContext {
         }
 
         // Live path: invoke the registered handler.
-        let future = {
+        let handler_opt = {
             let registry = self
                 .update_registry
                 .lock()
                 .expect("update_registry lock poisoned");
-            registry.invoke(name, input)
+            registry.get_handler(name)
         };
 
-        let result = match future {
-            Some(fut) => fut.await,
+        let result = match handler_opt {
+            Some(handler) => handler(input).await,
             None => Err(format!("update handler '{name}' not found")),
         };
 
