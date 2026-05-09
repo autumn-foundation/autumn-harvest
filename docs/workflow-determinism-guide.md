@@ -41,10 +41,10 @@ let rule = rule_by_id("HVG001").unwrap();
 | **Disallowed** | `let now = std::time::SystemTime::now();` |
 | **Disallowed** | `let ts = chrono::Utc::now();` |
 | **Disallowed** | `let t = std::time::Instant::now();` |
-| **Allowed** | `let now = ctx.current_time();` |
+| **Allowed** | `let now = ctx.now();` |
 | **Allowed** | Move the timestamp read inside an `#[activity]` and return it as the result |
 
-Each replay produces a different "now", causing the workflow to diverge from its recorded history.
+Each replay produces a different "now", causing the workflow to diverge from its recorded history. `ctx.now()` returns the `WorkflowStarted` timestamp, which is recorded once and replayed identically on every subsequent run.
 
 **Migration example:**
 
@@ -59,7 +59,7 @@ async fn billing(ctx: &WorkflowContext, user_id: i64) -> Result<(), String> {
 // After — deterministic
 #[workflow]
 async fn billing(ctx: &WorkflowContext, user_id: i64) -> Result<(), String> {
-    let invoice_date = ctx.current_time();  // recorded in history
+    let invoice_date = ctx.now(); // recorded as WorkflowStarted timestamp, replays identically
     // ...
 }
 ```
@@ -75,7 +75,9 @@ async fn billing(ctx: &WorkflowContext, user_id: i64) -> Result<(), String> {
 | **Disallowed** | `use rand::Rng; rng.gen::<f64>()` |
 | **Allowed** | Pass randomness as a workflow input parameter |
 | **Allowed** | Generate randomness inside an `#[activity]` and return it |
-| **Allowed** | `ctx.execution_id()` for a replay-safe unique identifier |
+| **Allowed** | `ctx.random_uuid(id)` for a replay-safe unique identifier |
+
+`ctx.random_uuid(id)` generates a UUID on first execution, records it in history under the given stable `id`, and replays the same UUID on every subsequent run.
 
 **Migration example:**
 
@@ -87,15 +89,26 @@ async fn process(ctx: &WorkflowContext) -> Result<String, String> {
     Ok(trace_id)
 }
 
-// After — deterministic
+// After — deterministic (option A: ctx.random_uuid)
+#[workflow]
+async fn process(ctx: &WorkflowContext) -> Result<String, String> {
+    let trace_id = ctx.random_uuid("trace-id")
+        .map_err(|e| e.to_string())?
+        .to_string();
+    Ok(trace_id)
+}
+
+// After — deterministic (option B: activity)
 #[activity]
 async fn generate_trace_id(_ctx: &ActivityContext) -> Result<String, String> {
-    Ok(uuid::Uuid::new_v4().to_string()) // fine in an activity
+    Ok(uuid::Uuid::new_v4().to_string()) // fine inside an activity
 }
 
 #[workflow]
 async fn process(ctx: &WorkflowContext) -> Result<String, String> {
-    let trace_id = ctx.execute_activity_raw("generate_trace_id", serde_json::Value::Null).await?;
+    let trace_id = ctx
+        .execute_activity_raw("generate_trace_id", serde_json::Value::Null, "default")
+        .await?;
     Ok(trace_id.to_string())
 }
 ```
@@ -122,10 +135,10 @@ Environment variables may differ between the original worker and a replay worker
 |---|---|
 | **Disallowed** | `std::thread::sleep(Duration::from_secs(60))` |
 | **Disallowed** | `tokio::time::sleep(Duration::from_secs(60)).await` |
-| **Allowed** | `ctx.sleep(Duration::from_secs(60)).await` |
+| **Allowed** | `ctx.timer("my-timer", 60).await` |
 | **Allowed** | `DagBuilder` with `Schedule::Interval(...)` for periodic workflows |
 
-Direct sleeps block the worker task and write nothing to `harvest_events`. After a worker restart the sleep is gone and timing changes.
+Direct sleeps block the worker task and write nothing to `harvest_events`. After a worker restart the sleep is gone and timing changes. `ctx.timer(timer_id, duration_secs)` emits a `TimerStarted` event into durable history and is enforced by the harvest timeout scanner across restarts.
 
 ---
 
@@ -135,7 +148,7 @@ Direct sleeps block the worker task and write nothing to `harvest_events`. After
 |---|---|
 | **Disallowed** | `tokio::spawn(async { do_work().await });` |
 | **Disallowed** | `std::thread::spawn(|| heavy_computation());` |
-| **Allowed** | `futures::join!(ctx.execute_activity_raw(...), ctx.execute_activity_raw(...))` |
+| **Allowed** | `futures::join!(ctx.execute_activity_raw("a", input, "q"), ctx.execute_activity_raw("b", input, "q"))` |
 | **Allowed** | `#[activity(local = true)]` for lightweight in-process work |
 
 Spawned tasks run outside Harvest supervision: they are not retried, not recorded, and are silently abandoned on worker restart.
@@ -162,7 +175,7 @@ I/O is non-idempotent: replaying it sends duplicate requests, corrupts database 
 |---|---|
 | **Disallowed** | `static COUNTER: AtomicU64 = AtomicU64::new(0); COUNTER.fetch_add(1, Ordering::Relaxed);` |
 | **Disallowed** | `lazy_static! { static ref REGISTRY: Mutex<Vec<String>> = ...; } REGISTRY.lock().push(...)` |
-| **Allowed** | Accumulate state in local variables across `ctx.sleep()` and activity boundaries |
+| **Allowed** | Accumulate state in local variables across `ctx.timer()` and activity boundaries |
 | **Allowed** | Emit metrics/updates inside activities, not in workflow code |
 
 Global mutations are re-applied on every replay, causing double-counting or inconsistent state across workers.
@@ -171,7 +184,7 @@ Global mutations are re-applied on every replay, causing double-counting or inco
 
 ## Machine-readable findings and suppressions
 
-A future checker will emit `GuardrailFinding` values. Each finding is serializable and carries the rule ID, severity, category, message, alternative, workflow name (if known), and source location (if available).
+`GuardrailFinding` and `GuardrailSuppression` both implement `serde::Serialize`/`Deserialize` and can be serialized to JSON for CI reports or external tooling.
 
 ```rust
 use autumn_harvest::guardrail::{GuardrailFinding, RuleCategory, Severity, rule_by_id};
@@ -186,11 +199,14 @@ let finding = GuardrailFinding::from_rule(
 
 assert!(matches!(finding.severity, Severity::HardBlocker));
 assert!(matches!(finding.category, RuleCategory::WallClock));
+
+// Serialize to JSON for CI output
+let json = serde_json::to_string_pretty(&finding).unwrap();
 ```
 
 ### Suppressing a finding
 
-Suppressions require an explicit, non-empty reason string. Empty or whitespace-only reasons are rejected at construction time so suppressions are always auditable.
+Suppressions require an explicit, non-empty reason string and a non-empty rule ID. Empty or whitespace-only values are rejected at construction time so suppressions are always auditable.
 
 ```rust
 use autumn_harvest::guardrail::{GuardrailSuppression, GuardrailSuppressionError};
@@ -204,6 +220,10 @@ let s = GuardrailSuppression::new(
 // Rejected — reason is empty
 let err = GuardrailSuppression::new("HVG001", "").unwrap_err();
 assert_eq!(err, GuardrailSuppressionError::EmptyReason);
+
+// Rejected — rule ID is empty
+let err = GuardrailSuppression::new("", "some reason").unwrap_err();
+assert_eq!(err, GuardrailSuppressionError::EmptyRuleId);
 ```
 
 ---

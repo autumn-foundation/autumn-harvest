@@ -77,10 +77,10 @@ static CATALOG: &[RuleEntry] = &[
             replay. The workflow engine re-executes the function body deterministically against \
             recorded history; a fresh timestamp breaks that contract and causes a \
             non-determinism error.",
-        alternative: "Use ctx.current_time() (WorkflowContext) to read the workflow-logical \
-            clock, which is recorded in the first live execution and replayed identically on \
-            subsequent runs. If you need a real timestamp as a side-effect, wrap it in an \
-            activity and pass the result back as a workflow input or activity output.",
+        alternative: "Use ctx.now() (WorkflowContext) to read the workflow-logical clock, \
+            which returns the WorkflowStarted timestamp and replays identically on every \
+            subsequent run. If you need a real wall-clock timestamp as a side-effect, wrap it \
+            in an activity and return it as the activity output.",
     },
     RuleEntry {
         id: "HVG002",
@@ -92,8 +92,8 @@ static CATALOG: &[RuleEntry] = &[
             random sequence diverges from what was recorded in harvest_events.",
         alternative: "Generate random values inside an activity (ActivityContext) and return them \
             as the activity result, which is durably recorded. Alternatively, pass pre-generated \
-            values as workflow input. For UUIDs specifically, ExecutionId already provides a \
-            replay-safe unique identifier via ctx.execution_id().",
+            values as workflow input. For replay-safe UUIDs, use ctx.random_uuid(id) which \
+            records the generated UUID in history and replays it deterministically.",
     },
     RuleEntry {
         id: "HVG003",
@@ -116,10 +116,10 @@ static CATALOG: &[RuleEntry] = &[
             or any OS/runtime sleep primitive in a workflow body does not record a durable timer. \
             The workflow worker's task is blocked but no timer event is appended to harvest_events. \
             After a worker restart the sleep is replayed as a no-op, changing observable timing.",
-        alternative: "Use ctx.sleep(duration) (WorkflowContext) which emits a TimerStarted event \
-            into the durable history. The timer is enforced by the harvest timeout scanner and \
-            survives worker restarts. For periodic scheduling, use the DagBuilder with an Interval \
-            or Cron schedule.",
+        alternative: "Use ctx.timer(timer_id, duration_secs) (WorkflowContext) which emits a \
+            TimerStarted event into the durable history. The timer is enforced by the harvest \
+            timeout scanner and survives worker restarts. For periodic scheduling, use DagBuilder \
+            with an Interval or Cron schedule.",
     },
     RuleEntry {
         id: "HVG005",
@@ -131,7 +131,7 @@ static CATALOG: &[RuleEntry] = &[
             completion is not recorded in harvest_events, it is not retried on failure, and it \
             is silently abandoned on worker restart.",
         alternative: "Model concurrent work as parallel activity branches using \
-            ctx.execute_activity_raw() calls combined with futures::join! or \
+            ctx.execute_activity_raw(name, input, queue) calls combined with futures::join! or \
             futures::try_join!. Harvest records each branch's result durably and re-joins them \
             correctly on replay. For fire-and-forget side-effects, use a local activity \
             (#[activity(local = true)]) so the result is at least logged to history.",
@@ -148,7 +148,8 @@ static CATALOG: &[RuleEntry] = &[
         alternative: "Wrap all I/O in activities (#[activity]). Activities are the unit of \
             durable, retryable side-effect in Harvest. Their inputs and outputs are recorded in \
             harvest_events so the workflow can replay without re-executing I/O. Use \
-            ctx.execute_activity_raw() from the workflow body to schedule the activity.",
+            ctx.execute_activity_raw(name, input, queue) from the workflow body to schedule \
+            the activity.",
     },
     RuleEntry {
         id: "HVG007",
@@ -160,7 +161,7 @@ static CATALOG: &[RuleEntry] = &[
             that is not recorded in harvest_events. On replay the mutation is re-applied, \
             producing double-counting or inconsistent global state across worker processes.",
         alternative: "Keep workflow execution stateless with respect to process globals. \
-            Accumulate workflow-local state in local variables returned across ctx.sleep() or \
+            Accumulate workflow-local state in local variables across ctx.timer() and \
             ctx.execute_activity_raw() boundaries. If you need to emit metrics or update a \
             registry, do so inside an activity where the side-effect is bounded to a single \
             retryable execution unit and is not re-applied on replay.",
