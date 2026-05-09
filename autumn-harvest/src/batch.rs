@@ -655,7 +655,11 @@ mod db {
         };
 
         // Walk every shard, collect targets, dispatch with bounded fan-out.
-        let mut all_targets: Vec<ExecutionId> = Vec::new();
+        // Bolt: Pre-calculate total shards to hint the initial capacity of `all_targets`.
+        // While we don't know exactly how many executions exist on each shard,
+        // pre-allocating an estimated batch size prevents continuous reallocations
+        // when concatenating results from 256 default shards.
+        let mut all_targets: Vec<ExecutionId> = Vec::with_capacity(pool.iter_shards().count() * 10);
         for (_, shard_pool) in pool.iter_shards() {
             let mut conn = shard_pool
                 .get()
