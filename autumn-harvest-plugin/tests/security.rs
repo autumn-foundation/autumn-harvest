@@ -53,6 +53,14 @@ fn patch_json(uri: &str, body: &str) -> Request<Body> {
         .unwrap()
 }
 
+fn delete(uri: &str) -> Request<Body> {
+    Request::builder()
+        .method(Method::DELETE)
+        .uri(uri)
+        .body(Body::empty())
+        .unwrap()
+}
+
 // ── Without authentication middleware ────────────────────────────────────────
 //
 // When `harvest_api_router` is mounted without any auth layer the API is
@@ -336,6 +344,269 @@ async fn eris_require_auth_blocks_replay_dead_letter() {
             "/dead-letters/00000000-0000-0000-0000-000000000001/replay",
             "{}",
         ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+// ── Additional unauthenticated-accessible checks ──────────────────────────────
+//
+// Documents that mutating routes which are NOT covered by the earlier
+// unauthenticated section are also open without middleware. Completes the
+// "no route has built-in auth" invariant for AC5 / issue #174.
+
+#[tokio::test]
+async fn eris_unauthenticated_reset_workflow_is_accessible() {
+    let app = unauthenticated_app();
+    let res = app
+        .oneshot(post_json(
+            "/workflows/00000000-0000-0000-0000-000000000001/reset",
+            "{}",
+        ))
+        .await
+        .unwrap();
+    assert_ne!(res.status(), StatusCode::UNAUTHORIZED);
+    assert_ne!(res.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn eris_unauthenticated_bulk_replay_dead_letters_is_accessible() {
+    let app = unauthenticated_app();
+    let res = app
+        .oneshot(post_json("/dead-letters/replay", r#"{"ids": []}"#))
+        .await
+        .unwrap();
+    assert_ne!(res.status(), StatusCode::UNAUTHORIZED);
+    assert_ne!(res.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn eris_unauthenticated_bulk_discard_dead_letters_is_accessible() {
+    let app = unauthenticated_app();
+    let res = app
+        .oneshot(post_json("/dead-letters/discard", r#"{"ids": []}"#))
+        .await
+        .unwrap();
+    assert_ne!(res.status(), StatusCode::UNAUTHORIZED);
+    assert_ne!(res.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn eris_unauthenticated_retention_run_now_is_accessible() {
+    let app = unauthenticated_app();
+    let res = app
+        .oneshot(post_json("/admin/retention/run-now", "{}"))
+        .await
+        .unwrap();
+    assert_ne!(res.status(), StatusCode::UNAUTHORIZED);
+    assert_ne!(res.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn eris_unauthenticated_create_schedule_is_accessible() {
+    let app = unauthenticated_app();
+    let res = app
+        .oneshot(post_json("/admin/schedules/workflow", "{}"))
+        .await
+        .unwrap();
+    assert_ne!(res.status(), StatusCode::UNAUTHORIZED);
+    assert_ne!(res.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn eris_unauthenticated_submit_batch_operation_is_accessible() {
+    let app = unauthenticated_app();
+    let res = app
+        .oneshot(post_json("/batch-operations", "{}"))
+        .await
+        .unwrap();
+    assert_ne!(res.status(), StatusCode::UNAUTHORIZED);
+    assert_ne!(res.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn eris_unauthenticated_worker_drain_is_accessible() {
+    let app = unauthenticated_app();
+    let res = app
+        .oneshot(post_json(
+            "/workers/worker-abc/drain",
+            r#"{"deadline_secs": 60}"#,
+        ))
+        .await
+        .unwrap();
+    assert_ne!(res.status(), StatusCode::UNAUTHORIZED);
+    assert_ne!(res.status(), StatusCode::FORBIDDEN);
+}
+
+// ── RequireAuth blocks all mutating routes (AC5) ──────────────────────────────
+//
+// Proves that every route in the "Mutating" security class returns 401 when
+// the RequireAuth middleware is applied. Covers: workflow start/signal/cancel
+// (existing), workflow reset, DLQ replay/discard (bulk + single, existing),
+// schedule mutation, batch submission, retention run-now, external activity
+// completion, and worker drain.
+
+#[tokio::test]
+async fn eris_require_auth_blocks_reset_workflow() {
+    let app = authenticated_app();
+    let res = app
+        .oneshot(post_json(
+            "/workflows/00000000-0000-0000-0000-000000000001/reset",
+            "{}",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn eris_require_auth_blocks_admit_update() {
+    let app = authenticated_app();
+    let res = app
+        .oneshot(post_json(
+            "/workflows/00000000-0000-0000-0000-000000000001/update/approve",
+            "{}",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn eris_require_auth_blocks_bulk_replay_dead_letters() {
+    let app = authenticated_app();
+    let res = app
+        .oneshot(post_json("/dead-letters/replay", r#"{"ids": []}"#))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn eris_require_auth_blocks_bulk_discard_dead_letters() {
+    let app = authenticated_app();
+    let res = app
+        .oneshot(post_json("/dead-letters/discard", r#"{"ids": []}"#))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn eris_require_auth_blocks_retention_run_now() {
+    let app = authenticated_app();
+    let res = app
+        .oneshot(post_json("/admin/retention/run-now", "{}"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn eris_require_auth_blocks_create_schedule() {
+    let app = authenticated_app();
+    let res = app
+        .oneshot(post_json("/admin/schedules/workflow", "{}"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn eris_require_auth_blocks_pause_schedule() {
+    let app = authenticated_app();
+    let res = app
+        .oneshot(post_json(
+            "/admin/schedules/00000000-0000-0000-0000-000000000001/pause",
+            "{}",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn eris_require_auth_blocks_resume_schedule() {
+    let app = authenticated_app();
+    let res = app
+        .oneshot(post_json(
+            "/admin/schedules/00000000-0000-0000-0000-000000000001/resume",
+            "{}",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn eris_require_auth_blocks_delete_schedule() {
+    let app = authenticated_app();
+    let res = app
+        .oneshot(delete(
+            "/admin/schedules/00000000-0000-0000-0000-000000000001",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn eris_require_auth_blocks_complete_external_activity() {
+    let app = authenticated_app();
+    let res = app
+        .oneshot(post_json(
+            "/activities/external/some-task-token/complete",
+            r#"{"result": null}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn eris_require_auth_blocks_fail_external_activity() {
+    let app = authenticated_app();
+    let res = app
+        .oneshot(post_json(
+            "/activities/external/some-task-token/fail",
+            r#"{"error": "timeout"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn eris_require_auth_blocks_heartbeat_external_activity() {
+    let app = authenticated_app();
+    let res = app
+        .oneshot(post_json(
+            "/activities/external/some-task-token/heartbeat",
+            "{}",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn eris_require_auth_blocks_worker_drain() {
+    let app = authenticated_app();
+    let res = app
+        .oneshot(post_json(
+            "/workers/worker-abc/drain",
+            r#"{"deadline_secs": 60}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn eris_require_auth_blocks_submit_batch_operation() {
+    let app = authenticated_app();
+    let res = app
+        .oneshot(post_json("/batch-operations", "{}"))
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);

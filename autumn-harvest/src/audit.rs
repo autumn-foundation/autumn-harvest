@@ -96,6 +96,146 @@ pub const HEADER_SOURCE: &str = "x-harvest-source";
 /// can override this via `HarvestApiState::set_audit_retention_days`.
 pub const DEFAULT_AUDIT_RETENTION_DAYS: i64 = 90;
 
+// ── Security classification ───────────────────────────────────────────────────
+
+/// Three-tier security classification for every Harvest management API route.
+///
+/// Embedders use this to decide which protection level applies to each route
+/// category. The recommended production posture gates all three tiers behind
+/// the host application's authentication middleware; the distinction matters
+/// for graduated roll-out and for documenting intentional exposure choices.
+///
+/// See `docs/security-posture.md` for the full mounting recipe, CLI/token
+/// semantics, and a production-readiness checklist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteClass {
+    /// Always safe to expose without authentication.
+    ///
+    /// Currently only `GET /health`. Kubernetes liveness/readiness probes and
+    /// load-balancer health checks commonly require this endpoint to be
+    /// reachable without credentials. Exposing it is an explicit product
+    /// decision, not an oversight.
+    PublicSafe,
+
+    /// Reads operator state but does not modify workflow execution.
+    ///
+    /// List, get, query, and export routes. These do not trigger side effects
+    /// but may expose sensitive operational data (execution IDs, input/output
+    /// payloads, schedule definitions). Protect these in production with the
+    /// same middleware layer as mutating routes.
+    ReadOnly,
+
+    /// Modifies workflow execution or system configuration.
+    ///
+    /// Includes workflow start/signal/cancel/reset, DLQ replay/discard,
+    /// schedule mutation, batch submission, retention run-now, external
+    /// activity completion, and worker drain. Every route in this class that
+    /// carries production risk is covered by the audit trail (`harvest_audit_log`).
+    /// These routes MUST be protected by authentication middleware in any
+    /// non-local deployment.
+    Mutating,
+}
+
+/// Security classification for every route registered in `harvest_api_router`.
+///
+/// Each entry is `(route_template, RouteClass)`. The exhaustiveness guard test
+/// (`route_classification_covers_all_known_routes`) verifies that this slice
+/// and [`ALL_MUTATION_ROUTES`] contain exactly the same route set, so adding a
+/// new route to `harvest_api_router` without classifying it here causes a
+/// compile-time-visible test failure.
+///
+/// **When you add a new route to `harvest_api_router`, you MUST add an entry
+/// here AND in [`ALL_MUTATION_ROUTES`].**
+pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
+    // ── PublicSafe ── always safe to expose, even without auth ───────────────
+    // Kubernetes liveness/readiness probes and load-balancer health checks
+    // require /health to be reachable without credentials.
+    ("GET /health", RouteClass::PublicSafe),
+    // ── ReadOnly ── reads state, does not modify workflow execution ───────────
+    ("GET /workflows", RouteClass::ReadOnly),
+    ("GET /workflows/{id}", RouteClass::ReadOnly),
+    ("GET /workflows/{id}/children", RouteClass::ReadOnly),
+    ("GET /workflows/{id}/stack", RouteClass::ReadOnly),
+    (
+        "GET /workflows/{id}/query/{query_name}",
+        RouteClass::ReadOnly,
+    ),
+    (
+        "GET /workflows/{id}/update/{update_id}/result",
+        RouteClass::ReadOnly,
+    ),
+    ("GET /workflows/{id}/history/export", RouteClass::ReadOnly),
+    ("GET /dags", RouteClass::ReadOnly),
+    ("GET /dags/{dag_name}/runs", RouteClass::ReadOnly),
+    ("GET /dead-letters", RouteClass::ReadOnly),
+    ("GET /admin/preflight", RouteClass::ReadOnly),
+    ("GET /admin/shards/health", RouteClass::ReadOnly),
+    ("GET /admin/version-gates/usage", RouteClass::ReadOnly),
+    (
+        "GET /admin/version-gates/retirement-check",
+        RouteClass::ReadOnly,
+    ),
+    ("GET /admin/retention", RouteClass::ReadOnly),
+    ("GET /admin/concurrency", RouteClass::ReadOnly),
+    ("GET /admin/history/exports", RouteClass::ReadOnly),
+    ("GET /admin/external-handoffs", RouteClass::ReadOnly),
+    ("GET /admin/external-handoffs/{token}", RouteClass::ReadOnly),
+    ("GET /admin/schedules", RouteClass::ReadOnly),
+    ("GET /admin/audit", RouteClass::ReadOnly),
+    ("GET /workers/health", RouteClass::ReadOnly),
+    ("GET /workers/drain-preview", RouteClass::ReadOnly),
+    ("GET /workers", RouteClass::ReadOnly),
+    ("GET /workers/{worker_id}", RouteClass::ReadOnly),
+    ("GET /batch-operations", RouteClass::ReadOnly),
+    ("GET /batch-operations/{id}", RouteClass::ReadOnly),
+    // ── Mutating ── modifies workflow execution or system configuration ───────
+    // All of these are covered by the audit trail (harvest_audit_log) or are
+    // explicitly listed in EXCLUDED_ROUTES with an audit disposition note.
+    (
+        "POST /workflows/{workflow_name}/start",
+        RouteClass::Mutating,
+    ),
+    ("POST /workflows/{id}/cancel", RouteClass::Mutating),
+    ("POST /workflows/{id}/reset", RouteClass::Mutating),
+    (
+        "POST /workflows/{id}/signal/{signal_name}",
+        RouteClass::Mutating,
+    ),
+    // Update appends UpdateAdmitted to history and wakes the workflow — mutating.
+    // Audit disposition: excluded (synchronous RPC; the event history is the record).
+    (
+        "POST /workflows/{id}/update/{update_name}",
+        RouteClass::Mutating,
+    ),
+    ("POST /dags/{dag_name}/trigger", RouteClass::Mutating),
+    ("PATCH /dags/{dag_name}", RouteClass::Mutating),
+    ("POST /dead-letters/replay", RouteClass::Mutating),
+    ("POST /dead-letters/discard", RouteClass::Mutating),
+    ("POST /dead-letters/{id}/replay", RouteClass::Mutating),
+    ("POST /admin/retention/run-now", RouteClass::Mutating),
+    ("POST /admin/schedules/workflow", RouteClass::Mutating),
+    ("POST /admin/schedules/{id}/pause", RouteClass::Mutating),
+    ("POST /admin/schedules/{id}/resume", RouteClass::Mutating),
+    ("DELETE /admin/schedules/{id}", RouteClass::Mutating),
+    // External activity completion — task-token callbacks from remote workers.
+    (
+        "POST /activities/external/{token}/complete",
+        RouteClass::Mutating,
+    ),
+    (
+        "POST /activities/external/{token}/fail",
+        RouteClass::Mutating,
+    ),
+    // Heartbeat writes liveness state but is intentionally excluded from audit
+    // (high-volume, not a control-plane mutation). See EXCLUDED_ROUTES.
+    (
+        "POST /activities/external/{token}/heartbeat",
+        RouteClass::Mutating,
+    ),
+    ("POST /workers/{worker_id}/drain", RouteClass::Mutating),
+    ("POST /batch-operations", RouteClass::Mutating),
+];
+
 // ── Declarative route manifest ────────────────────────────────────────────────
 
 /// Every operation name covered by the audit trail.
@@ -139,12 +279,20 @@ pub const EXCLUDED_ROUTES: &[&str] = &[
     // Updates are synchronous request/response, not tracked as operator
     // audit events in this slice; they appear in the workflow event history.
     "POST /workflows/{id}/update/{update_name}",
+    "GET /workflows/{id}/history/export",
     "GET /dags",
     "GET /dags/{dag_name}/runs",
     "GET /dead-letters",
     "GET /health",
+    "GET /admin/preflight",
+    "GET /admin/shards/health",
+    "GET /admin/version-gates/usage",
+    "GET /admin/version-gates/retirement-check",
     "GET /admin/retention",
     "GET /admin/concurrency",
+    "GET /admin/history/exports",
+    "GET /admin/external-handoffs",
+    "GET /admin/external-handoffs/{token}",
     "GET /admin/schedules",
     // Heartbeats are high-volume liveness pings, not operator mutations.
     "POST /activities/external/{token}/heartbeat",
@@ -186,6 +334,7 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ("GET /workflows/{id}/query/{query_name}", None),
     ("POST /workflows/{id}/update/{update_name}", None),
     ("GET /workflows/{id}/update/{update_id}/result", None),
+    ("GET /workflows/{id}/history/export", None),
     // DAG management
     ("GET /dags", None),
     ("GET /dags/{dag_name}/runs", None),
@@ -198,9 +347,16 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ("POST /dead-letters/{id}/replay", Some(OP_DLQ_REPLAY)),
     // Health / observability (read-only)
     ("GET /health", None),
+    ("GET /admin/preflight", None),
+    ("GET /admin/shards/health", None),
+    ("GET /admin/version-gates/usage", None),
+    ("GET /admin/version-gates/retirement-check", None),
     ("GET /admin/retention", None),
     ("POST /admin/retention/run-now", Some(OP_RETENTION_RUN_NOW)),
     ("GET /admin/concurrency", None),
+    ("GET /admin/history/exports", None),
+    ("GET /admin/external-handoffs", None),
+    ("GET /admin/external-handoffs/{token}", None),
     // Schedule management
     ("GET /admin/schedules", None),
     ("POST /admin/schedules/workflow", Some(OP_SCHEDULE_CREATE)),
@@ -432,5 +588,96 @@ mod tests {
     #[test]
     fn default_retention_is_90_days() {
         assert_eq!(DEFAULT_AUDIT_RETENTION_DAYS, 90);
+    }
+
+    // ── Route classification exhaustiveness guards ────────────────────────────
+    //
+    // These tests enforce that CLASSIFIED_ROUTES and ALL_MUTATION_ROUTES stay
+    // in sync. Adding a route to harvest_api_router without classifying it
+    // causes one of these tests to fail.
+
+    #[test]
+    fn route_classification_covers_all_known_routes() {
+        let classified: std::collections::HashSet<&str> =
+            CLASSIFIED_ROUTES.iter().map(|(r, _)| *r).collect();
+
+        for (route, _) in ALL_MUTATION_ROUTES {
+            assert!(
+                classified.contains(route),
+                "route '{route}' is in ALL_MUTATION_ROUTES but has no entry in \
+                 CLASSIFIED_ROUTES — add it with the correct RouteClass"
+            );
+        }
+    }
+
+    #[test]
+    fn all_classified_routes_are_in_route_manifest() {
+        let manifest: std::collections::HashSet<&str> =
+            ALL_MUTATION_ROUTES.iter().map(|(r, _)| *r).collect();
+
+        for (route, _) in CLASSIFIED_ROUTES {
+            assert!(
+                manifest.contains(route),
+                "route '{route}' is in CLASSIFIED_ROUTES but missing from \
+                 ALL_MUTATION_ROUTES — add it to both slices"
+            );
+        }
+    }
+
+    #[test]
+    fn classified_routes_has_no_duplicates() {
+        let mut seen = std::collections::HashSet::new();
+        for (route, _) in CLASSIFIED_ROUTES {
+            assert!(
+                seen.insert(*route),
+                "duplicate route in CLASSIFIED_ROUTES: '{route}'"
+            );
+        }
+    }
+
+    #[test]
+    fn classified_routes_count_matches_route_manifest() {
+        assert_eq!(
+            CLASSIFIED_ROUTES.len(),
+            ALL_MUTATION_ROUTES.len(),
+            "CLASSIFIED_ROUTES has {} entries but ALL_MUTATION_ROUTES has {} — \
+             the two slices must cover exactly the same route set",
+            CLASSIFIED_ROUTES.len(),
+            ALL_MUTATION_ROUTES.len()
+        );
+    }
+
+    #[test]
+    fn public_safe_routes_are_excluded_from_audit() {
+        let excluded: std::collections::HashSet<&str> = EXCLUDED_ROUTES.iter().copied().collect();
+        for (route, class) in CLASSIFIED_ROUTES {
+            if *class == RouteClass::PublicSafe {
+                assert!(
+                    excluded.contains(route),
+                    "PublicSafe route '{route}' should be in EXCLUDED_ROUTES \
+                     since it is never a mutation that needs auditing"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mutating_routes_are_audited_or_explicitly_excluded() {
+        let audited: std::collections::HashSet<&str> = ALL_MUTATION_ROUTES
+            .iter()
+            .filter_map(|(r, op)| op.map(|_| *r))
+            .collect();
+        let excluded: std::collections::HashSet<&str> = EXCLUDED_ROUTES.iter().copied().collect();
+
+        for (route, class) in CLASSIFIED_ROUTES {
+            if *class == RouteClass::Mutating {
+                assert!(
+                    audited.contains(route) || excluded.contains(route),
+                    "Mutating route '{route}' is neither audited (Some(op) in \
+                     ALL_MUTATION_ROUTES) nor listed in EXCLUDED_ROUTES — \
+                     explicitly declare its audit disposition"
+                );
+            }
+        }
     }
 }
