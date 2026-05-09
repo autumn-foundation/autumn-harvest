@@ -61,8 +61,11 @@ HarvestPlugin::new()
 ### Production (host-app authentication)
 
 Mount the API with the host application's authentication middleware. The
-`api_with_auth` method applies any Tower middleware layer to the entire router —
-all 48 routes, including `/health`, are wrapped.
+`api_with_auth` method applies any Tower middleware layer to the **entire**
+router — all 48 management API routes, the embedded Vantage UI (`/ui/*`), and
+all CLI-compatible endpoints are wrapped together because `harvest_ui_router` is
+nested into the same Axum router before the middleware layer is added (see
+`HarvestPlugin::build` in the plugin source).
 
 ```rust
 use autumn_web::auth::RequireAuth;
