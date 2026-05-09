@@ -366,29 +366,13 @@ fn extract_workflow_bodies<'a>(lines: &[&'a str]) -> Vec<(String, usize, Vec<&'a
 
         while j < lines.len() && depth > 0 {
             let line = lines[j];
-            let mut closed_here = false;
+            let closing_brace_pos = scan_braces_outside_literals(line, &mut depth);
 
-            for ch in line.chars() {
-                match ch {
-                    '{' => depth += 1,
-                    '}' => {
-                        depth = depth.saturating_sub(1);
-                        if depth == 0 {
-                            closed_here = true;
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-
-            if closed_here {
+            if let Some(pos) = closing_brace_pos {
                 // Include any code on the closing-brace line that precedes the `}`
-                if let Some(pos) = line.rfind('}') {
-                    let before = &line[..pos];
-                    if !before.trim().is_empty() {
-                        body.push(before);
-                    }
+                let before = &line[..pos];
+                if !before.trim().is_empty() {
+                    body.push(before);
                 }
             } else {
                 body.push(line);
@@ -481,7 +465,194 @@ fn check_body(
 /// Returns the portion of `line` that precedes the first `//` (if any).
 /// This avoids flagging patterns that appear only inside comments.
 fn strip_line_comment(line: &str) -> &str {
-    line.find("//").map_or(line, |pos| &line[..pos])
+    line_comment_start(line).map_or(line, |pos| &line[..pos])
+}
+
+/// Updates `depth` for braces in code, ignoring braces inside simple Rust
+/// string/character literals and line comments. Returns the byte position of
+/// the closing brace that returns the depth to zero, if present.
+fn scan_braces_outside_literals(line: &str, depth: &mut u32) -> Option<usize> {
+    let mut pos = 0;
+
+    while pos < line.len() {
+        if let Some(end) = raw_string_end(line, pos) {
+            pos = end;
+            continue;
+        }
+
+        let Some((ch, next_pos)) = next_char(line, pos) else {
+            break;
+        };
+
+        match ch {
+            '"' => pos = normal_string_end(line, pos),
+            '\'' => {
+                pos = char_literal_end(line, pos).unwrap_or(next_pos);
+            }
+            '/' if line[next_pos..].starts_with('/') => break,
+            '{' => {
+                *depth = depth.saturating_add(1);
+                pos = next_pos;
+            }
+            '}' => {
+                *depth = depth.saturating_sub(1);
+                if *depth == 0 {
+                    return Some(pos);
+                }
+                pos = next_pos;
+            }
+            _ => pos = next_pos,
+        }
+    }
+
+    None
+}
+
+/// Returns the byte position of the first `//` outside simple Rust
+/// string/character literals.
+fn line_comment_start(line: &str) -> Option<usize> {
+    let mut pos = 0;
+
+    while pos < line.len() {
+        if let Some(end) = raw_string_end(line, pos) {
+            pos = end;
+            continue;
+        }
+
+        let Some((ch, next_pos)) = next_char(line, pos) else {
+            break;
+        };
+
+        match ch {
+            '"' => pos = normal_string_end(line, pos),
+            '\'' => {
+                pos = char_literal_end(line, pos).unwrap_or(next_pos);
+            }
+            '/' if line[next_pos..].starts_with('/') => return Some(pos),
+            _ => pos = next_pos,
+        }
+    }
+
+    None
+}
+
+fn next_char(line: &str, pos: usize) -> Option<(char, usize)> {
+    let ch = line[pos..].chars().next()?;
+    Some((ch, pos + ch.len_utf8()))
+}
+
+fn normal_string_end(line: &str, start: usize) -> usize {
+    let mut pos = start + 1;
+    let mut escaped = false;
+
+    while pos < line.len() {
+        let Some((ch, next_pos)) = next_char(line, pos) else {
+            break;
+        };
+
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == '"' {
+            return next_pos;
+        }
+
+        pos = next_pos;
+    }
+
+    line.len()
+}
+
+fn char_literal_end(line: &str, start: usize) -> Option<usize> {
+    let content_start = start + 1;
+    let (first, first_end) = next_char(line, content_start)?;
+
+    if is_lifetime_start(first) {
+        let ident_end = consume_lifetime_ident(line, first_end);
+        if !line[ident_end..].starts_with('\'') {
+            return None;
+        }
+    }
+
+    let mut pos = content_start;
+    let mut escaped = false;
+
+    while pos < line.len() {
+        let (ch, next_pos) = next_char(line, pos)?;
+
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == '\'' && pos != content_start {
+            return Some(next_pos);
+        }
+
+        pos = next_pos;
+    }
+
+    None
+}
+
+const fn is_lifetime_start(ch: char) -> bool {
+    ch == '_' || ch.is_ascii_alphabetic()
+}
+
+const fn is_lifetime_continue(ch: char) -> bool {
+    ch == '_' || ch.is_ascii_alphanumeric()
+}
+
+fn consume_lifetime_ident(line: &str, mut pos: usize) -> usize {
+    while pos < line.len() {
+        let Some((ch, next_pos)) = next_char(line, pos) else {
+            break;
+        };
+        if !is_lifetime_continue(ch) {
+            break;
+        }
+        pos = next_pos;
+    }
+    pos
+}
+
+fn raw_string_end(line: &str, start: usize) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let mut pos = start;
+
+    match bytes.get(pos).copied()? {
+        b'r' => pos += 1,
+        b'b' | b'c' if bytes.get(pos + 1).copied() == Some(b'r') => pos += 2,
+        _ => return None,
+    }
+
+    let hash_start = pos;
+    while bytes.get(pos).copied() == Some(b'#') {
+        pos += 1;
+    }
+    if bytes.get(pos).copied() != Some(b'"') {
+        return None;
+    }
+
+    let hashes = pos - hash_start;
+    pos += 1;
+
+    while pos < bytes.len() {
+        if bytes[pos] == b'"' {
+            let marker_start = pos + 1;
+            let marker_end = marker_start + hashes;
+            if marker_end <= bytes.len()
+                && bytes[marker_start..marker_end]
+                    .iter()
+                    .all(|&byte| byte == b'#')
+            {
+                return Some(marker_end);
+            }
+        }
+        pos += 1;
+    }
+
+    Some(line.len())
 }
 
 /// Returns the suppression reason if either `line` or `prev_line` contains a
@@ -494,8 +665,8 @@ fn find_suppression(rule_id: &str, line: &str, prev_line: &str) -> Option<String
 /// Parses `// harvest-suppress: RULE_ID "reason string"` from a line.
 /// Returns the reason string if valid and non-empty, `None` otherwise.
 fn parse_suppression_comment(rule_id: &str, line: &str) -> Option<String> {
-    let trimmed = line.trim();
-    let rest = trimmed.strip_prefix("//")?.trim_start();
+    let comment_start = line_comment_start(line)?;
+    let rest = line[comment_start + 2..].trim_start();
     let rest = rest.strip_prefix("harvest-suppress:")?;
     let rest = rest.trim_start();
     let rest = rest.strip_prefix(rule_id)?.trim_start();

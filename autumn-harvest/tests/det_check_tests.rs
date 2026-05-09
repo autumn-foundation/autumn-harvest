@@ -2,7 +2,7 @@
 //!
 //! These tests drive the design and must all pass after the green phase.
 //! Run with:
-//!   cargo test -p autumn-harvest --test det_check_tests --no-default-features
+//!   cargo test -p autumn-harvest --test `det_check_tests` --no-default-features
 
 use autumn_harvest::det_check::{DetSeverity, check_source};
 
@@ -352,6 +352,24 @@ fn non_annotated_functions_are_not_flagged() {
     );
 }
 
+#[test]
+fn workflow_body_extraction_ignores_braces_inside_string_and_char_literals() {
+    let src = r#"
+#[workflow]
+async fn test_wf(ctx: &WorkflowContext) -> Result<(), String> {
+    let _string_marker = "}";
+    let _char_marker = '}';
+    let _t = std::time::SystemTime::now();
+    Ok(())
+}
+"#;
+    let report = check_source(src, "test.rs");
+    assert!(
+        report.findings.iter().any(|f| f.rule_id == "DET001"),
+        "literal braces must not truncate workflow body scanning, got: {report:?}"
+    );
+}
+
 // ── finding metadata ───────────────────────────────────────────────────────
 
 #[test]
@@ -445,10 +463,15 @@ fn report_passes_for_clean_workflow() {
 
 #[test]
 fn suppressed_finding_is_not_a_hard_blocker() {
-    let src = format!(
-        "#[workflow]\nasync fn test_wf(ctx: &WorkflowContext) -> Result<(), String> {{\n    // harvest-suppress: DET001 \"recorded in signal payload\"\n    let _t = std::time::SystemTime::now();\n    Ok(())\n}}\n"
-    );
-    let report = check_source(&src, "test.rs");
+    let src = r#"
+#[workflow]
+async fn test_wf(ctx: &WorkflowContext) -> Result<(), String> {
+    // harvest-suppress: DET001 "recorded in signal payload"
+    let _t = std::time::SystemTime::now();
+    Ok(())
+}
+"#;
+    let report = check_source(src, "test.rs");
     assert!(
         !report.has_hard_blockers(),
         "suppressed DET001 must not be a hard blocker"
@@ -456,12 +479,35 @@ fn suppressed_finding_is_not_a_hard_blocker() {
 }
 
 #[test]
+fn same_line_suppression_is_not_a_hard_blocker() {
+    let src = r#"
+#[workflow]
+async fn test_wf(ctx: &WorkflowContext) -> Result<(), String> {
+    let _t = std::time::SystemTime::now(); // harvest-suppress: DET001 "recorded in signal payload"
+    Ok(())
+}
+"#;
+    let report = check_source(src, "test.rs");
+    assert!(
+        !report.has_hard_blockers(),
+        "same-line harvest-suppress comment must suppress DET001, got: {report:?}"
+    );
+    assert_eq!(report.suppressions.len(), 1);
+    assert_eq!(report.suppressions[0].rule_id, "DET001");
+}
+
+#[test]
 fn suppression_requires_reason_string() {
     // Suppression without a quoted reason is not valid and does NOT suppress
-    let src = format!(
-        "#[workflow]\nasync fn test_wf(ctx: &WorkflowContext) -> Result<(), String> {{\n    // harvest-suppress: DET001\n    let _t = std::time::SystemTime::now();\n    Ok(())\n}}\n"
-    );
-    let report = check_source(&src, "test.rs");
+    let src = r"
+#[workflow]
+async fn test_wf(ctx: &WorkflowContext) -> Result<(), String> {
+    // harvest-suppress: DET001
+    let _t = std::time::SystemTime::now();
+    Ok(())
+}
+";
+    let report = check_source(src, "test.rs");
     assert!(
         report.has_hard_blockers(),
         "suppression without a reason must not suppress the finding"
@@ -470,10 +516,15 @@ fn suppression_requires_reason_string() {
 
 #[test]
 fn suppression_is_reported_in_output() {
-    let src = format!(
-        "#[workflow]\nasync fn test_wf(ctx: &WorkflowContext) -> Result<(), String> {{\n    // harvest-suppress: DET001 \"recorded in signal payload\"\n    let _t = std::time::SystemTime::now();\n    Ok(())\n}}\n"
-    );
-    let report = check_source(&src, "test.rs");
+    let src = r#"
+#[workflow]
+async fn test_wf(ctx: &WorkflowContext) -> Result<(), String> {
+    // harvest-suppress: DET001 "recorded in signal payload"
+    let _t = std::time::SystemTime::now();
+    Ok(())
+}
+"#;
+    let report = check_source(src, "test.rs");
     assert!(
         !report.suppressions.is_empty(),
         "active suppressions must appear in report output"
@@ -485,10 +536,16 @@ fn suppression_is_reported_in_output() {
 #[test]
 fn suppression_only_applies_to_its_rule_id() {
     // Suppress DET001 but DET003 is also present — DET003 must still block
-    let src = format!(
-        "#[workflow]\nasync fn test_wf(ctx: &WorkflowContext) -> Result<(), String> {{\n    // harvest-suppress: DET001 \"known safe\"\n    let _t = std::time::SystemTime::now();\n    let _id = uuid::Uuid::new_v4();\n    Ok(())\n}}\n"
-    );
-    let report = check_source(&src, "test.rs");
+    let src = r#"
+#[workflow]
+async fn test_wf(ctx: &WorkflowContext) -> Result<(), String> {
+    // harvest-suppress: DET001 "known safe"
+    let _t = std::time::SystemTime::now();
+    let _id = uuid::Uuid::new_v4();
+    Ok(())
+}
+"#;
+    let report = check_source(src, "test.rs");
     assert!(
         report.has_hard_blockers(),
         "DET003 is not suppressed and must still block"
@@ -499,11 +556,11 @@ fn suppression_only_applies_to_its_rule_id() {
 
 #[test]
 fn multiple_violations_are_all_reported() {
-    let src = wf(r#"
+    let src = wf(r"
     let _t = std::time::SystemTime::now();
     let _n: u64 = rand::random();
     let _id = uuid::Uuid::new_v4();
-"#);
+");
     let report = check_source(&src, "test.rs");
     let rule_ids: Vec<&str> = report.findings.iter().map(|f| f.rule_id).collect();
     assert!(rule_ids.contains(&"DET001"), "DET001 must be reported");
