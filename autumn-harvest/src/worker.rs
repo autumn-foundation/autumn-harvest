@@ -2623,6 +2623,7 @@ async fn move_workflow_to_dlq_for_history_cap(
     exec_id: ExecutionId,
     next_event_id: i32,
     worker_id: &str,
+    parent_exec_id: Option<ExecutionId>,
     reason: DeadLetterReason,
 ) -> HarvestResult<()> {
     let reason = reason.to_string();
@@ -2654,10 +2655,55 @@ async fn move_workflow_to_dlq_for_history_cap(
             )
             .await?;
             update_workflow_execution_failed(conn, exec_id, worker_id, &reason).await?;
-            queue::fail_task(conn, task.id, &reason).await
+            queue::fail_task(conn, task.id, &reason).await?;
+            if let Some(parent_exec_id) = parent_exec_id {
+                wake_parent_for_child_failure(conn, parent_exec_id, exec_id, &reason).await?;
+            }
+            Ok(())
         }
         .scope_boxed()
     })
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn fail_workflow_for_history_cap(
+    conn: &mut AsyncPgConnection,
+    telemetry: &crate::telemetry::TelemetryConfig,
+    task: &TaskQueueItem,
+    execution: &WorkflowExecution,
+    exec_id: ExecutionId,
+    next_event_id: i32,
+    worker_id: &str,
+    started_at: std::time::Instant,
+    event_count: u64,
+    cap: u64,
+) -> HarvestResult<()> {
+    let terminal_count = event_count.saturating_add(1);
+    telemetry.metrics.record_workflow_completed(
+        &execution.workflow_name,
+        &task.queue_name,
+        started_at.elapsed().as_secs_f64(),
+        WorkflowStatus::Failed,
+    );
+    telemetry
+        .metrics
+        .record_workflow_history_size(&execution.workflow_name, terminal_count);
+
+    let reason = DeadLetterReason::HistoryCapExceeded {
+        count: event_count,
+        cap,
+        workflow_type: execution.workflow_name.clone(),
+    };
+    move_workflow_to_dlq_for_history_cap(
+        conn,
+        task,
+        exec_id,
+        next_event_id,
+        worker_id,
+        execution.parent_id.map(execution_id_from_uuid),
+        reason,
+    )
     .await
 }
 
@@ -2822,41 +2868,50 @@ async fn process_workflow_task(
                 )
                 .await?;
                 history_events.extend(new_events);
+                let current_history_event_count =
+                    u64::try_from(history_events.len()).unwrap_or(u64::MAX);
+                if let Some(cap) = registry.history_policy().event_hard_cap()
+                    && current_history_event_count >= cap
+                {
+                    return fail_workflow_for_history_cap(
+                        conn,
+                        &telemetry,
+                        task,
+                        &prepared.execution,
+                        prepared.exec_id,
+                        next_event_id,
+                        worker_id,
+                        started_at,
+                        current_history_event_count,
+                        cap,
+                    )
+                    .await;
+                }
             }
             other => break (other, pending_cmds, execute_span),
         }
     };
 
     let (outcome, pending_cmds, execute_span) = loop_result;
-    let current_history_event_count = u64::try_from(history_events.len()).unwrap_or(u64::MAX);
+    let current_history_event_count = u64::try_from(history_events.len())
+        .unwrap_or(u64::MAX)
+        .saturating_add(pending_update_result_event_count(&pending_cmds));
 
     if let Some(cap) = registry.history_policy().event_hard_cap()
         && current_history_event_count >= cap
         && !matches!(&outcome, WorkflowOutcome::ContinuedAsNew { .. })
     {
-        let terminal_count = current_history_event_count.saturating_add(1);
-        telemetry.metrics.record_workflow_completed(
-            &prepared.execution.workflow_name,
-            &task.queue_name,
-            started_at.elapsed().as_secs_f64(),
-            WorkflowStatus::Failed,
-        );
-        telemetry
-            .metrics
-            .record_workflow_history_size(&prepared.execution.workflow_name, terminal_count);
-
-        let reason = DeadLetterReason::HistoryCapExceeded {
-            count: current_history_event_count,
-            cap,
-            workflow_type: prepared.execution.workflow_name.clone(),
-        };
-        return move_workflow_to_dlq_for_history_cap(
+        return fail_workflow_for_history_cap(
             conn,
+            &telemetry,
             task,
+            &prepared.execution,
             prepared.exec_id,
             next_event_id,
             worker_id,
-            reason,
+            started_at,
+            current_history_event_count,
+            cap,
         )
         .await;
     }
