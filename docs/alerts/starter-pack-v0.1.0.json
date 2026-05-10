@@ -306,7 +306,8 @@
       "management_checks": [
         "harvest retention status",
         "harvest retention run-now",
-        "GET /api/harvest/admin/retention/status"
+        "GET /api/harvest/admin/retention",
+        "POST /api/harvest/admin/retention/run-now"
       ],
       "runbook": "docs/runbooks/harvest-alerts.md#harvest_retention_lag"
     },

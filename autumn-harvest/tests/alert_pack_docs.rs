@@ -203,12 +203,47 @@ fn non_prometheus_path_documents_cli_and_api_checks() {
         "GET /api/harvest/admin/concurrency",
         "harvest workflow stack",
         "GET /api/harvest/workflows/{execution_id}/stack",
+        "GET /api/harvest/admin/retention",
+        "POST /api/harvest/admin/retention/run-now",
     ] {
         assert!(
             guide.contains(required),
             "non-Prometheus alert guide must document {required}"
         );
     }
+    assert!(
+        !guide.contains("GET /api/harvest/admin/retention/status"),
+        "non-Prometheus alert guide must not document the nonexistent retention /status endpoint"
+    );
+}
+
+#[test]
+fn retention_alert_uses_mounted_management_api_paths() {
+    let pack = read_pack();
+    let rules = pack["rules"].as_array().expect("rules must be an array");
+    let retention = rules
+        .iter()
+        .find(|rule| rule["id"].as_str() == Some("harvest_retention_lag"))
+        .expect("retention alert must exist");
+    let checks: Vec<&str> = retention["management_checks"]
+        .as_array()
+        .expect("management_checks must be an array")
+        .iter()
+        .map(|check| check.as_str().expect("management check must be a string"))
+        .collect();
+
+    assert!(
+        checks.contains(&"GET /api/harvest/admin/retention"),
+        "retention status check must use mounted GET /admin/retention endpoint"
+    );
+    assert!(
+        checks.contains(&"POST /api/harvest/admin/retention/run-now"),
+        "retention run-now check must use mounted POST /admin/retention/run-now endpoint"
+    );
+    assert!(
+        !checks.contains(&"GET /api/harvest/admin/retention/status"),
+        "retention alert must not point at nonexistent /admin/retention/status endpoint"
+    );
 }
 
 fn read_pack() -> Value {

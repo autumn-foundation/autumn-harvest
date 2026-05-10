@@ -73,7 +73,7 @@ action in every rule points at a CLI or API check.
 | Schedules | `harvest schedule list --output json` | `GET /api/harvest/admin/schedules` |
 | Concurrency saturation | `harvest concurrency status --output json` | `GET /api/harvest/admin/concurrency` |
 | Workflow wait state | `harvest workflow stack <execution_id>` | `GET /api/harvest/workflows/{execution_id}/stack` |
-| Retention | `harvest retention status` | `GET /api/harvest/admin/retention/status` |
+| Retention | `harvest retention status`; `harvest retention run-now` | `GET /api/harvest/admin/retention`; `POST /api/harvest/admin/retention/run-now` |
 
 Recommended check cadence:
 
