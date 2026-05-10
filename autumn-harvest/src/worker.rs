@@ -608,6 +608,20 @@ struct LocalActivityRun {
     last_error: Option<String>,
 }
 
+enum LocalActivityInlineOutcome {
+    Complete(Vec<WorkflowEvent>),
+    HistoryCapReached {
+        events: Vec<WorkflowEvent>,
+        event_count: u64,
+    },
+}
+
+fn local_activity_history_cap_reached(next_event_id: i32, cap: Option<u64>) -> Option<u64> {
+    let cap = cap?;
+    let count = u64::try_from(next_event_id).unwrap_or(u64::MAX);
+    (count >= cap).then_some(count)
+}
+
 /// Extract a `RunLocalActivity` command from an owned command list.
 ///
 /// Marker (`RecordMarker`) events are also extracted and returned so the
@@ -673,10 +687,11 @@ async fn run_local_activity_inline(
     run: LocalActivityRun,
     max_start_to_close: Duration,
     next_event_id: &mut i32,
-) -> HarvestResult<Vec<WorkflowEvent>> {
+) -> HarvestResult<LocalActivityInlineOutcome> {
     let activity = registry.activities.get(&run.name).ok_or_else(|| {
         HarvestError::Config(format!("no activity handler registered for '{}'", run.name))
     })?;
+    let history_event_hard_cap = registry.history_policy().event_hard_cap();
 
     let per_attempt_timeout = run
         .start_to_close_secs
@@ -702,6 +717,15 @@ async fn run_local_activity_inline(
     }
 
     let mut all_new_events = prefix_events;
+    if let Some(event_count) =
+        local_activity_history_cap_reached(*next_event_id, history_event_hard_cap)
+    {
+        return Ok(LocalActivityInlineOutcome::HistoryCapReached {
+            events: all_new_events,
+            event_count,
+        });
+    }
+
     let handler = activity.handler;
     let local_idempotency_key = IdempotencyKey::from_activity_exec_id(run.activity_id);
 
@@ -753,7 +777,15 @@ async fn run_local_activity_inline(
                 .await?;
                 *next_event_id += 1;
                 all_new_events.push(completed_event);
-                return Ok(all_new_events);
+                if let Some(event_count) =
+                    local_activity_history_cap_reached(*next_event_id, history_event_hard_cap)
+                {
+                    return Ok(LocalActivityInlineOutcome::HistoryCapReached {
+                        events: all_new_events,
+                        event_count,
+                    });
+                }
+                return Ok(LocalActivityInlineOutcome::Complete(all_new_events));
             }
             Err(error) => {
                 let failed_event = WorkflowEvent::LocalActivityFailed {
@@ -763,6 +795,26 @@ async fn run_local_activity_inline(
                 };
 
                 if attempt == max_attempts {
+                    let current_count = u64::try_from(*next_event_id).unwrap_or(u64::MAX);
+                    let final_pair_would_exceed_cap = history_event_hard_cap
+                        .is_some_and(|cap| current_count.saturating_add(2) > cap);
+                    if final_pair_would_exceed_cap {
+                        store::append_events(
+                            conn,
+                            exec_id,
+                            std::slice::from_ref(&failed_event),
+                            *next_event_id,
+                        )
+                        .await?;
+                        *next_event_id += 1;
+                        all_new_events.push(failed_event);
+                        let event_count = u64::try_from(*next_event_id).unwrap_or(u64::MAX);
+                        return Ok(LocalActivityInlineOutcome::HistoryCapReached {
+                            events: all_new_events,
+                            event_count,
+                        });
+                    }
+
                     // Final attempt: append LocalActivityFailed and
                     // LocalActivityExhausted atomically so a crash between the
                     // two cannot leave history without the terminal marker,
@@ -777,6 +829,14 @@ async fn run_local_activity_inline(
                     *next_event_id += i32::try_from(terminal_pair.len())
                         .map_err(|_| HarvestError::Config("event count overflow".into()))?;
                     all_new_events.extend(terminal_pair);
+                    if let Some(event_count) =
+                        local_activity_history_cap_reached(*next_event_id, history_event_hard_cap)
+                    {
+                        return Ok(LocalActivityInlineOutcome::HistoryCapReached {
+                            events: all_new_events,
+                            event_count,
+                        });
+                    }
                 } else {
                     store::append_events(
                         conn,
@@ -787,6 +847,14 @@ async fn run_local_activity_inline(
                     .await?;
                     *next_event_id += 1;
                     all_new_events.push(failed_event);
+                    if let Some(event_count) =
+                        local_activity_history_cap_reached(*next_event_id, history_event_hard_cap)
+                    {
+                        return Ok(LocalActivityInlineOutcome::HistoryCapReached {
+                            events: all_new_events,
+                            event_count,
+                        });
+                    }
 
                     if let Some(delay) = run
                         .retry_policy
@@ -800,7 +868,7 @@ async fn run_local_activity_inline(
         }
     }
 
-    Ok(all_new_events)
+    Ok(LocalActivityInlineOutcome::Complete(all_new_events))
 }
 
 fn chrono_duration_from_std(
@@ -2924,7 +2992,7 @@ async fn process_workflow_task(
                 // so the OTel span closes before we start inline execution.
                 drop(execute_span);
                 let (markers, local_run) = extract_run_local_activity(commands);
-                let new_events = run_local_activity_inline(
+                let inline_outcome = run_local_activity_inline(
                     conn,
                     registry,
                     prepared.exec_id,
@@ -2934,6 +3002,31 @@ async fn process_workflow_task(
                     &mut next_event_id,
                 )
                 .await?;
+                let new_events = match inline_outcome {
+                    LocalActivityInlineOutcome::Complete(events) => events,
+                    LocalActivityInlineOutcome::HistoryCapReached {
+                        events,
+                        event_count,
+                    } => {
+                        history_events.extend(events);
+                        return fail_workflow_for_history_cap(
+                            conn,
+                            &telemetry,
+                            task,
+                            &prepared.execution,
+                            prepared.exec_id,
+                            next_event_id,
+                            worker_id,
+                            started_at,
+                            event_count,
+                            registry
+                                .history_policy()
+                                .event_hard_cap()
+                                .expect("HistoryCapReached requires a configured hard cap"),
+                        )
+                        .await;
+                    }
+                };
                 history_events.extend(new_events);
                 let current_history_event_count =
                     u64::try_from(history_events.len()).unwrap_or(u64::MAX);

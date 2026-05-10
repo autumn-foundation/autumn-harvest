@@ -31,7 +31,7 @@ use autumn_harvest::telemetry::{
 };
 use autumn_harvest::types::{ExecutionId, ShardId};
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
-use autumn_harvest::{ActivityContext, WorkflowContext, WorkflowHistoryPolicy};
+use autumn_harvest::{ActivityContext, RetryPolicy, WorkflowContext, WorkflowHistoryPolicy};
 use chrono::Utc;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
@@ -421,6 +421,38 @@ fn history_cap_never_finishing_child<'a>(
             .map_err(|error| error.to_string())?;
         Ok(serde_json::json!({"unreachable": true}))
     })
+}
+
+fn local_activity_retry_reaches_history_cap<'a>(
+    ctx: &'a WorkflowContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let _: serde_json::Value = ctx
+            .side_effect(
+                "near-cap-local-retry",
+                || serde_json::json!({"counted": true}),
+            )
+            .map_err(|error| error.to_string())?;
+
+        ctx.execute_local_activity_raw(
+            "history_cap_always_failing_local",
+            serde_json::json!({"blocked": true}),
+            Some(RetryPolicy::fixed(5, Duration::ZERO)),
+            Some(5),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+
+        Ok(serde_json::json!({"unreachable": true}))
+    })
+}
+
+fn history_cap_always_failing_local<'a>(
+    _ctx: &'a ActivityContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move { Err("intentional local failure".into()) })
 }
 
 fn parent_with_history_capped_child<'a>(
@@ -1039,6 +1071,145 @@ async fn suspended_commands_that_reach_hard_cap_move_to_dlq_immediately() {
             );
         }
     }
+}
+
+#[allow(clippy::too_many_lines)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_activity_retries_stop_when_hard_cap_is_reached() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = AsyncPgConnection::establish(&database_url)
+        .await
+        .expect("failed to connect");
+
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    let workflow_input = serde_json::json!({});
+    let workflow_id = format!("local-retry-cap-{}", Uuid::new_v4());
+
+    diesel::insert_into(harvest_workflow_executions::table)
+        .values(NewWorkflowExecution {
+            id: exec_id.as_uuid(),
+            workflow_name: "local_activity_retry_reaches_history_cap",
+            workflow_id: &workflow_id,
+            run_id: Uuid::new_v4(),
+            shard_id: 0,
+            input: workflow_input.clone(),
+            parent_id: None,
+            queue_name: "default",
+            execution_timeout: None,
+            memo: None,
+            search_attrs: None,
+            assigned_build_id: None,
+        })
+        .execute(&mut conn)
+        .await
+        .expect("failed to insert workflow execution row");
+
+    store::append_events(
+        &mut conn,
+        exec_id,
+        &[
+            WorkflowEvent::WorkflowStarted {
+                input: workflow_input.clone(),
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "side_effect:near-cap-local-retry".into(),
+                details: serde_json::json!({"counted": true}),
+            },
+        ],
+        0,
+    )
+    .await
+    .expect("append initial history failed");
+
+    let mut enqueue_params =
+        EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
+    enqueue_params.workflow_exec_id = Some(exec_id.as_uuid());
+    enqueue_params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+    queue_mod::enqueue(&mut conn, &enqueue_params)
+        .await
+        .expect("enqueue failed");
+
+    let recording = Arc::new(RecordingMetrics::default());
+    let telemetry = Arc::new(
+        TelemetryConfig::builder()
+            .metrics(Arc::clone(&recording) as Arc<dyn MetricsRecorder>)
+            .build(),
+    );
+    let policy = WorkflowHistoryPolicy::default().with_event_hard_cap(4);
+    let registry = Arc::new(HandlerRegistry::with_state_telemetry_and_history_policy(
+        vec![WorkflowInfo {
+            name: "local_activity_retry_reaches_history_cap",
+            module: "metrics_integration",
+            handler: local_activity_retry_reaches_history_cap,
+        }],
+        vec![ActivityInfo {
+            name: "history_cap_always_failing_local",
+            module: "metrics_integration",
+            default_retry_policy: None,
+            default_start_to_close: Some(Duration::from_secs(5)),
+            default_heartbeat_timeout: None,
+            default_schedule_to_start: None,
+            default_queue: None,
+            max_concurrent: None,
+            concurrency_key: None,
+            is_local: true,
+            handler: history_cap_always_failing_local,
+        }],
+        autumn_harvest::context::empty_shared_state(),
+        telemetry,
+        policy,
+    ));
+
+    let worker = build_worker("metrics-worker-local-retry-cap", registry);
+    let pool = build_test_pool(&database_url);
+    let runner = Arc::clone(&worker);
+    let pool_for_run = pool.clone();
+    let handle = tokio::spawn(async move {
+        runner.run(&pool_for_run).await;
+    });
+
+    let execution = wait_for_state(&database_url, exec_id, "FAILED").await;
+
+    worker.shutdown();
+    handle.await.expect("worker task should join cleanly");
+
+    let error = execution.error.expect("hard cap should fail execution");
+    assert!(
+        error.contains("HistoryCapExceeded"),
+        "execution error should identify hard cap reason, got: {error}"
+    );
+
+    let history = load_history(&database_url, exec_id).await;
+    let failed_local_attempts = history
+        .events
+        .iter()
+        .filter(|event| matches!(event, WorkflowEvent::LocalActivityFailed { .. }))
+        .count();
+    assert_eq!(
+        failed_local_attempts, 1,
+        "hard cap should stop before running local activity retry attempts; got {:?}",
+        history.events
+    );
+    assert!(
+        !history
+            .events
+            .iter()
+            .any(|event| matches!(event, WorkflowEvent::LocalActivityExhausted { .. })),
+        "hard cap should preempt local activity retry exhaustion; got {:?}",
+        history.events
+    );
+
+    let dead_letters = dlq::list_dead_letters(&mut conn, 10)
+        .await
+        .expect("failed to list DLQ rows");
+    assert!(
+        dead_letters.iter().any(|row| {
+            row.workflow_exec_id == Some(exec_id.as_uuid())
+                && row.error.contains("HistoryCapExceeded")
+        }),
+        "workflow should have a typed DLQ row; got: {dead_letters:?}"
+    );
 }
 
 #[allow(clippy::too_many_lines)]
