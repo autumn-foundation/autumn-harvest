@@ -1,6 +1,7 @@
 //! Command-line client for the autumn-harvest management API.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -1341,6 +1342,9 @@ fn render_response(cli: &Cli, value: &Value) -> Result<String, CliError> {
     if retirement_check_wants_table(cli) {
         return Ok(format_retirement_check_table(value));
     }
+    if backfill_wants_table(cli) {
+        return Ok(format_backfill_table(value));
+    }
 
     let output = if workflow_children_wants_raw_json(cli) || handoff_wants_raw_json(cli) {
         OutputFormat::Json
@@ -1348,6 +1352,77 @@ fn render_response(cli: &Cli, value: &Value) -> Result<String, CliError> {
         cli.output
     };
     format_output(value, output)
+}
+
+fn backfill_wants_table(cli: &Cli) -> bool {
+    matches!(
+        &cli.command,
+        Commands::Schedule {
+            command: ScheduleCommand::Backfill { .. }
+        }
+    ) && cli.output == OutputFormat::PrettyJson
+}
+
+fn format_backfill_table(value: &Value) -> String {
+    let status = value.get("status").and_then(Value::as_str).unwrap_or("-");
+    let name = value.get("name").and_then(Value::as_str).unwrap_or("-");
+    let kind = value.get("kind").and_then(Value::as_str).unwrap_or("-");
+    let from = value.get("from").and_then(Value::as_str).unwrap_or("-");
+    let to = value.get("to").and_then(Value::as_str).unwrap_or("-");
+    let total = value.get("total").and_then(Value::as_u64).unwrap_or(0);
+    let dispatched = value.get("dispatched").and_then(Value::as_u64).unwrap_or(0);
+    let skipped = value.get("skipped").and_then(Value::as_u64).unwrap_or(0);
+    let failed = value.get("failed").and_then(Value::as_u64).unwrap_or(0);
+
+    let mut out = String::new();
+    let _ = writeln!(out, "status: {status}  kind: {kind}  name: {name}");
+    let _ = writeln!(out, "window: {from} \u{2192} {to}");
+    let _ = writeln!(
+        out,
+        "total: {total}  dispatched: {dispatched}  skipped: {skipped}  failed: {failed}"
+    );
+
+    // Skipped reasons
+    if let Some(reasons) = value
+        .get("skipped_reasons")
+        .and_then(Value::as_object)
+        .filter(|r| !r.is_empty())
+    {
+        let parts: Vec<String> = reasons
+            .iter()
+            .map(|(k, v)| format!("{k}={}", v.as_u64().unwrap_or(0)))
+            .collect();
+        let _ = writeln!(out, "skipped reasons: {}", parts.join(", "));
+    }
+
+    // Planned timestamps
+    if let Some(timestamps) = value.get("planned_timestamps").and_then(Value::as_array) {
+        if timestamps.is_empty() {
+            out.push_str("\nNo timestamps planned.\n");
+        } else {
+            let _ = writeln!(out, "\nPlanned timestamps ({}):", timestamps.len());
+            for ts in timestamps {
+                let ts_str = ts.as_str().unwrap_or("-");
+                let _ = writeln!(out, "  {ts_str}");
+            }
+        }
+    }
+
+    // Partial shard failures
+    if let Some(failures) = value
+        .get("partial_shard_failures")
+        .and_then(Value::as_array)
+        .filter(|f| !f.is_empty())
+    {
+        out.push_str("\nShard failures:\n");
+        for f in failures {
+            let shard_id = f.get("shard_id").and_then(Value::as_i64).unwrap_or(-1);
+            let reason = f.get("reason").and_then(Value::as_str).unwrap_or("-");
+            let _ = writeln!(out, "  shard {shard_id}: {reason}");
+        }
+    }
+
+    out
 }
 
 fn preflight_wants_table(cli: &Cli) -> bool {

@@ -1931,7 +1931,19 @@
       "request_body": null,
       "success_response": {
         "status": 200,
-        "free_form": true
+        "free_form": false,
+        "fields": [
+          { "name": "id", "type": "string", "description": "Schedule UUID." },
+          { "name": "kind", "type": "string", "description": "workflow | dag" },
+          { "name": "name", "type": "string", "description": "Workflow or DAG name." },
+          { "name": "schedule_expr", "type": "string", "description": "Cron or interval expression. Null for manual schedules." },
+          { "name": "is_paused", "type": "boolean", "description": "Whether the schedule is currently paused." },
+          { "name": "next_run_at", "type": "string", "description": "Next scheduled firing time (RFC 3339). Null if paused or unscheduled." },
+          { "name": "last_run_at", "type": "string", "description": "Most recent automatic firing time (RFC 3339). Null if never run." },
+          { "name": "max_active_runs", "type": "integer", "description": "Maximum concurrently running executions for this schedule." },
+          { "name": "catchup", "type": "boolean", "description": "Whether the scheduler catches up missed runs on restart." },
+          { "name": "last_backfill", "type": "object", "description": "Most recent backfill request for this schedule, or null if none. Fields: id, actor, from, to, dry_run, total, dispatched, skipped, failed, status, error_summary, started_at, completed_at." }
+        ]
       },
       "error_responses": [
         {
@@ -2178,7 +2190,22 @@
       },
       "success_response": {
         "status": 200,
-        "free_form": true
+        "free_form": false,
+        "fields": [
+          { "name": "status", "type": "string", "description": "dry_run | complete | partial" },
+          { "name": "schedule_id", "type": "string", "description": "UUID of the schedule." },
+          { "name": "kind", "type": "string", "description": "workflow | dag" },
+          { "name": "name", "type": "string", "description": "Workflow or DAG name." },
+          { "name": "from", "type": "string", "description": "Window start (RFC 3339)." },
+          { "name": "to", "type": "string", "description": "Window end (RFC 3339)." },
+          { "name": "planned_timestamps", "type": "array", "description": "Ordered list of planned firing timestamps." },
+          { "name": "total", "type": "integer", "description": "Total planned timestamps." },
+          { "name": "dispatched", "type": "integer", "description": "Runs created (or estimated for dry_run)." },
+          { "name": "skipped", "type": "integer", "description": "Timestamps skipped (idempotent or max_active_runs). Estimated for dry_run." },
+          { "name": "failed", "type": "integer", "description": "Timestamps that failed to dispatch due to shard errors." },
+          { "name": "skipped_reasons", "type": "object", "description": "Machine-readable breakdown of skip causes. Keys: already_exists, max_active_runs." },
+          { "name": "partial_shard_failures", "type": "array", "description": "Shards that could not be reached. Each item has shard_id and reason." }
+        ]
       },
       "error_responses": [
         {
