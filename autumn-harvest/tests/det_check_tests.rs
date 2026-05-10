@@ -631,10 +631,8 @@ fn string_literal_not_flagged_as_violation() {
 #[test]
 fn same_line_suppression_works() {
     // Suppression comment placed on the SAME line as the violation (trailing comment).
-    let src = format!(
-        "#[workflow]\nasync fn test_wf(ctx: &WorkflowContext) -> Result<(), String> {{\n    let _t = std::time::SystemTime::now(); // harvest-suppress: DET001 \"same-line reason\"\n    Ok(())\n}}\n"
-    );
-    let report = check_source(&src, "test.rs");
+    let src = "#[workflow]\nasync fn test_wf(ctx: &WorkflowContext) -> Result<(), String> {\n    let _t = std::time::SystemTime::now(); // harvest-suppress: DET001 \"same-line reason\"\n    Ok(())\n}\n";
+    let report = check_source(src, "test.rs");
     assert!(
         !report.has_hard_blockers(),
         "same-line suppression must suppress the finding"
