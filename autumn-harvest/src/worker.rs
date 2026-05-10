@@ -1078,7 +1078,8 @@ async fn persist_update_result_commands(
     }
 
     store::append_events(conn, exec_id, &events, *next_event_id).await?;
-    *next_event_id = next_event_id.saturating_add(i32::try_from(events.len()).unwrap_or(i32::MAX));
+    *next_event_id = next_event_id.checked_add(i32::try_from(events.len()).unwrap_or(i32::MAX))
+        .ok_or_else(|| crate::error::database_error("event ID overflow in worker update"))?;
     Ok(())
 }
 

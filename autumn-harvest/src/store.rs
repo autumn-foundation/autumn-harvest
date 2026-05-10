@@ -208,7 +208,7 @@ pub async fn append_single_event(
         .await
         .map_err(crate::error::database_error)?;
 
-    let next_id = max_id.map_or(0, |id| id.saturating_add(1));
+    let next_id = max_id.map_or(Ok(0), |id| id.checked_add(1).ok_or_else(|| crate::error::database_error("event ID overflow")))?;
     append_events(conn, exec_id, &[event], next_id).await?;
     Ok(())
 }
@@ -272,7 +272,7 @@ pub async fn admit_update_event(
                 .await
                 .map_err(crate::error::database_error)?;
 
-            let next_id = max_id.map_or(0, |id| id.saturating_add(1));
+            let next_id = max_id.map_or(Ok(0), |id| id.checked_add(1).ok_or_else(|| crate::error::database_error("event ID overflow")))?;
             let event = WorkflowEvent::UpdateAdmitted {
                 update_id,
                 name,
@@ -590,6 +590,26 @@ mod tests {
         let rows = events_to_insert_rows_from(exec_id, &events, 5).unwrap();
         assert_eq!(rows[0].event_id, 5);
         assert_eq!(rows[1].event_id, 6);
+    }
+
+    #[test]
+    fn events_to_insert_rows_from_handles_max_event_id() {
+        use crate::types::{ActivityExecId, ExecutionId};
+        use crate::event::WorkflowEvent;
+        let exec_id = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::ActivityCompleted {
+                activity_id: ActivityExecId::new(),
+                output: serde_json::json!("ok"),
+            },
+            WorkflowEvent::WorkflowCompleted {
+                output: serde_json::json!(null),
+            },
+        ];
+
+        let result = events_to_insert_rows_from(exec_id, &events, i32::MAX);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Event ID overflow"));
     }
 
     #[test]

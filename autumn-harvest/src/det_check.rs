@@ -513,7 +513,7 @@ fn scan_braces_outside_literals(line: &str, depth: &mut u32) -> Option<usize> {
                 pos = block_comment_end(line, next_pos + 1);
             }
             '{' => {
-                *depth = depth.saturating_add(1);
+                *depth = depth.checked_add(1)?;
                 pos = next_pos;
             }
             '}' => {

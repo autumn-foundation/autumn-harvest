@@ -496,7 +496,7 @@ pub async fn reset_workflow_execution(
             let plan = validate_reset_point(&events, request.reset_to_event_id)?;
 
             let new_exec_id = ExecutionId::new_for_shard(ShardId::new(source.shard_id));
-            let source_next_event_id = rows.last().map_or(0, |row| row.event_id.saturating_add(1));
+            let source_next_event_id = rows.last().map_or(Ok(0), |row| row.event_id.checked_add(1).ok_or_else(|| crate::error::database_error("event ID overflow")))?;
 
             terminate_source_execution(conn, exec_id, new_exec_id, &request, source_next_event_id)
                 .await?;
@@ -636,7 +636,7 @@ async fn count_open_task_rows(
         .get_result::<i64>(conn)
         .await
         .map_err(database_error)?;
-    Ok(usize::try_from(queued.saturating_add(external)).unwrap_or(usize::MAX))
+    Ok(usize::try_from(queued.checked_add(external).unwrap_or(i64::MAX)).unwrap_or(usize::MAX))
 }
 
 async fn count_pending_timers(

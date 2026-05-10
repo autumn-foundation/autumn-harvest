@@ -1,0 +1,25 @@
+<<<<<<< SEARCH
+    #[test]
+    fn events_to_rows_sets_exec_id_on_every_row() {
+=======
+    #[test]
+    fn events_to_insert_rows_from_handles_max_event_id() {
+        let exec_id = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::ActivityCompleted {
+                activity_id: ActivityExecId::new(),
+                output: serde_json::json!("ok"),
+            },
+            WorkflowEvent::WorkflowCompleted {
+                output: serde_json::json!(null),
+            },
+        ];
+
+        let result = events_to_insert_rows_from(exec_id, &events, i32::MAX);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("database error: event ID overflow"));
+    }
+
+    #[test]
+    fn events_to_rows_sets_exec_id_on_every_row() {
+>>>>>>> REPLACE
