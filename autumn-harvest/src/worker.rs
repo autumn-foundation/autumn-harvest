@@ -2617,6 +2617,73 @@ fn terminal_history_event_count(next_event_id: i32, pending_cmds: &[WorkflowComm
         .saturating_add(1)
 }
 
+fn marker_event_count(commands: &[WorkflowCommand]) -> u64 {
+    u64::try_from(
+        commands
+            .iter()
+            .filter(|cmd| matches!(cmd, WorkflowCommand::RecordMarker { .. }))
+            .count(),
+    )
+    .unwrap_or(u64::MAX)
+}
+
+async fn new_child_workflow_event_count(
+    conn: &mut AsyncPgConnection,
+    children: &[StartedChildWorkflowCommand],
+) -> HarvestResult<u64> {
+    let requested_ids: Vec<uuid::Uuid> = children
+        .iter()
+        .map(|child| child.child_id.as_uuid())
+        .collect();
+    if requested_ids.is_empty() {
+        return Ok(0);
+    }
+
+    let existing_ids: HashSet<uuid::Uuid> = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::id.eq_any(&requested_ids))
+        .select(harvest_workflow_executions::id)
+        .load::<uuid::Uuid>(conn)
+        .await
+        .map_err(crate::error::database_error)?
+        .into_iter()
+        .collect();
+    let requested = u64::try_from(children.len()).unwrap_or(u64::MAX);
+    let existing = u64::try_from(existing_ids.len()).unwrap_or(u64::MAX);
+    Ok(requested.saturating_sub(existing))
+}
+
+async fn suspended_command_event_count(
+    conn: &mut AsyncPgConnection,
+    commands: &[WorkflowCommand],
+) -> HarvestResult<u64> {
+    let update_events = pending_update_result_event_count(commands);
+    let marker_events = marker_event_count(commands);
+    let bookkeeping_events = update_events.saturating_add(marker_events);
+
+    if should_requeue_signal_wait(commands) {
+        return Ok(bookkeeping_events);
+    }
+    if extract_single_schedule_activity(commands).is_some()
+        || extract_single_started_timer(commands).is_some()
+    {
+        return Ok(bookkeeping_events.saturating_add(1));
+    }
+    if let Some(children) = extract_all_started_child_workflows(commands) {
+        return Ok(bookkeeping_events
+            .saturating_add(new_child_workflow_event_count(conn, &children).await?));
+    }
+    if let Some(scheduled) = extract_single_schedule_external_activity(commands) {
+        let awaiting_event = u64::from(
+            external_task::find_by_token(conn, scheduled.token)
+                .await?
+                .is_none(),
+        );
+        return Ok(bookkeeping_events.saturating_add(awaiting_event));
+    }
+
+    Ok(update_events.saturating_add(1))
+}
+
 async fn move_workflow_to_dlq_for_history_cap(
     conn: &mut AsyncPgConnection,
     task: &TaskQueueItem,
@@ -2679,7 +2746,7 @@ async fn fail_workflow_for_history_cap(
     event_count: u64,
     cap: u64,
 ) -> HarvestResult<()> {
-    let terminal_count = event_count.saturating_add(1);
+    let terminal_count = u64::try_from(next_event_id).unwrap_or(0).saturating_add(1);
     telemetry.metrics.record_workflow_completed(
         &execution.workflow_name,
         &task.queue_name,
@@ -2893,9 +2960,21 @@ async fn process_workflow_task(
     };
 
     let (outcome, pending_cmds, execute_span) = loop_result;
+    let pending_durable_event_count = match &outcome {
+        WorkflowOutcome::Suspended { commands } => {
+            match suspended_command_event_count(conn, commands).await {
+                Ok(count) => count,
+                Err(error) => {
+                    return fail_execution_on_error(conn, task, worker_id, Err::<(), _>(error))
+                        .await;
+                }
+            }
+        }
+        _ => pending_update_result_event_count(&pending_cmds),
+    };
     let current_history_event_count = u64::try_from(history_events.len())
         .unwrap_or(u64::MAX)
-        .saturating_add(pending_update_result_event_count(&pending_cmds));
+        .saturating_add(pending_durable_event_count);
 
     if let Some(cap) = registry.history_policy().event_hard_cap()
         && current_history_event_count >= cap

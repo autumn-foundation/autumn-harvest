@@ -371,13 +371,58 @@ fn history_cap_violator<'a>(
     })
 }
 
-// ---------------------------------------------------------------------------
-// Test 1 — workflow.started / workflow.completed / activity.completed
-// ---------------------------------------------------------------------------
+// History-cap regression workflow handlers.
+fn suspended_command_reaches_history_cap<'a>(
+    ctx: &'a WorkflowContext,
+    input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let _: serde_json::Value = ctx
+            .side_effect("near-cap", || serde_json::json!({"counted": true}))
+            .map_err(|error| error.to_string())?;
 
-/// Runs a real workflow (with one activity) end-to-end through the worker and
-/// verifies that `harvest.workflow.started`, `harvest.workflow.duration`, and
-/// `harvest.activity.duration` metrics are emitted with the correct labels.
+        match input.get("kind").and_then(serde_json::Value::as_str) {
+            Some("timer") => {
+                ctx.timer("history-cap-long-timer", 3_600)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            Some("activity") => {
+                ctx.execute_activity_raw(
+                    "history_cap_never_polled_activity",
+                    serde_json::json!({"blocked": true}),
+                    "unpolled",
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            }
+            Some("child") => {
+                ctx.spawn_child_workflow_raw(
+                    "history_cap_never_finishing_child",
+                    serde_json::json!({"blocked": true}),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            }
+            other => return Err(format!("unknown suspended-command kind: {other:?}")),
+        }
+
+        Ok(serde_json::json!({"unreachable": true}))
+    })
+}
+
+fn history_cap_never_finishing_child<'a>(
+    ctx: &'a WorkflowContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        ctx.timer("child-history-cap-long-timer", 3_600)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(serde_json::json!({"unreachable": true}))
+    })
+}
+
 fn parent_with_history_capped_child<'a>(
     ctx: &'a WorkflowContext,
     input: serde_json::Value,
@@ -424,6 +469,13 @@ fn history_cap_local_step<'a>(
     Box::pin(async move { Ok(input) })
 }
 
+// ---------------------------------------------------------------------------
+// Test 1 — workflow.started / workflow.completed / activity.completed
+// ---------------------------------------------------------------------------
+
+/// Runs a real workflow (with one activity) end-to-end through the worker and
+/// verifies that `harvest.workflow.started`, `harvest.workflow.duration`, and
+/// `harvest.activity.duration` metrics are emitted with the correct labels.
 #[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn workflow_and_activity_metrics_are_recorded() {
@@ -820,6 +872,175 @@ async fn workflow_hard_cap_moves_offender_to_dlq() {
 /// Inserts a dead-letter entry, starts the worker (which spawns the DLQ
 /// depth sampler), waits for at least one sampler tick, and asserts that
 /// `harvest.dlq.entries` was recorded with depth >= 1.
+#[allow(clippy::too_many_lines)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn suspended_commands_that_reach_hard_cap_move_to_dlq_immediately() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = AsyncPgConnection::establish(&database_url)
+        .await
+        .expect("failed to connect");
+
+    let cases = ["timer", "activity", "child"];
+    let mut exec_ids = Vec::new();
+
+    for kind in cases {
+        let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+        let workflow_input = serde_json::json!({"kind": kind});
+        let workflow_id = format!("suspended-cap-{kind}-{}", Uuid::new_v4());
+
+        diesel::insert_into(harvest_workflow_executions::table)
+            .values(NewWorkflowExecution {
+                id: exec_id.as_uuid(),
+                workflow_name: "suspended_command_reaches_history_cap",
+                workflow_id: &workflow_id,
+                run_id: Uuid::new_v4(),
+                shard_id: 0,
+                input: workflow_input.clone(),
+                parent_id: None,
+                queue_name: "default",
+                execution_timeout: None,
+                memo: None,
+                search_attrs: None,
+                assigned_build_id: None,
+            })
+            .execute(&mut conn)
+            .await
+            .expect("failed to insert workflow execution row");
+
+        store::append_events(
+            &mut conn,
+            exec_id,
+            &[
+                WorkflowEvent::WorkflowStarted {
+                    input: workflow_input.clone(),
+                    timestamp: Utc::now(),
+                },
+                WorkflowEvent::MarkerRecorded {
+                    name: "side_effect:near-cap".into(),
+                    details: serde_json::json!({"counted": true}),
+                },
+            ],
+            0,
+        )
+        .await
+        .expect("append initial history failed");
+
+        let mut enqueue_params =
+            EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
+        enqueue_params.workflow_exec_id = Some(exec_id.as_uuid());
+        enqueue_params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+        queue_mod::enqueue(&mut conn, &enqueue_params)
+            .await
+            .expect("enqueue failed");
+
+        exec_ids.push((kind, exec_id));
+    }
+
+    let recording = Arc::new(RecordingMetrics::default());
+    let telemetry = Arc::new(
+        TelemetryConfig::builder()
+            .metrics(Arc::clone(&recording) as Arc<dyn MetricsRecorder>)
+            .build(),
+    );
+    let policy = WorkflowHistoryPolicy::default().with_event_hard_cap(3);
+    let registry = Arc::new(HandlerRegistry::with_state_telemetry_and_history_policy(
+        vec![
+            WorkflowInfo {
+                name: "suspended_command_reaches_history_cap",
+                module: "metrics_integration",
+                handler: suspended_command_reaches_history_cap,
+            },
+            WorkflowInfo {
+                name: "history_cap_never_finishing_child",
+                module: "metrics_integration",
+                handler: history_cap_never_finishing_child,
+            },
+        ],
+        vec![ActivityInfo {
+            name: "history_cap_never_polled_activity",
+            module: "metrics_integration",
+            default_retry_policy: None,
+            default_start_to_close: None,
+            default_heartbeat_timeout: None,
+            default_schedule_to_start: None,
+            default_queue: Some("unpolled"),
+            max_concurrent: None,
+            concurrency_key: None,
+            is_local: false,
+            handler: metrics_activity,
+        }],
+        autumn_harvest::context::empty_shared_state(),
+        telemetry,
+        policy,
+    ));
+
+    let worker = build_worker("metrics-worker-suspended-cap", registry);
+    let pool = build_test_pool(&database_url);
+    let runner = Arc::clone(&worker);
+    let pool_for_run = pool.clone();
+    let handle = tokio::spawn(async move {
+        runner.run(&pool_for_run).await;
+    });
+
+    for (_, exec_id) in &exec_ids {
+        wait_for_state(&database_url, *exec_id, "FAILED").await;
+    }
+
+    worker.shutdown();
+    handle.await.expect("worker task should join cleanly");
+
+    let dead_letters = dlq::list_dead_letters(&mut conn, 10)
+        .await
+        .expect("failed to list DLQ rows");
+
+    for (kind, exec_id) in exec_ids {
+        let execution = load_execution(&database_url, exec_id).await;
+        let error = execution.error.expect("hard cap should fail execution");
+        assert!(
+            error.contains("HistoryCapExceeded"),
+            "{kind} execution error should identify hard cap, got: {error}"
+        );
+
+        let history = load_history(&database_url, exec_id).await;
+        assert!(
+            history
+                .events
+                .iter()
+                .any(|event| matches!(event, WorkflowEvent::WorkflowFailed { .. })),
+            "{kind} execution should record terminal failure; got: {:?}",
+            history.events
+        );
+
+        let appended_suspension_event = history.events.iter().any(|event| match kind {
+            "timer" => matches!(event, WorkflowEvent::TimerStarted { .. }),
+            "activity" => matches!(event, WorkflowEvent::ActivityScheduled { .. }),
+            "child" => matches!(event, WorkflowEvent::ChildWorkflowStarted { .. }),
+            _ => false,
+        });
+        assert!(
+            !appended_suspension_event,
+            "{kind} suspension event should not be persisted after the cap is reached; got: {:?}",
+            history.events
+        );
+
+        assert!(
+            dead_letters.iter().any(|row| {
+                row.workflow_exec_id == Some(exec_id.as_uuid())
+                    && row.error.contains("HistoryCapExceeded")
+            }),
+            "{kind} execution should have a typed DLQ row; got: {dead_letters:?}"
+        );
+
+        if kind == "child" {
+            let children = load_child_executions(&database_url, exec_id).await;
+            assert!(
+                children.is_empty(),
+                "child-start command should not create child executions after cap breach; got: {children:?}"
+            );
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn child_hard_cap_dlq_notifies_parent_and_stops_inline_growth() {
