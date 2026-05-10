@@ -795,6 +795,33 @@
       ]
     },
     {
+      "method": "GET",
+      "path": "/dags/{dag_name}/export",
+      "category": "dag",
+      "read_only": true,
+      "description": "Export a DAG definition to a visualization format (Mermaid or Graphviz DOT).",
+      "params": [
+        {
+          "name": "dag_name",
+          "in": "path",
+          "required": true,
+          "description": "Registered DAG name."
+        },
+        {
+          "name": "format",
+          "in": "query",
+          "required": false,
+          "description": "Output format: 'mermaid' (default) or 'dot'."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "free_form": true
+      },
+      "error_responses": []
+    },
+    {
       "method": "PATCH",
       "path": "/dags/{dag_name}",
       "category": "dag",

@@ -1157,6 +1157,7 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .route("/dags", get(list_dags))
         .route("/dags/{dag_name}/runs", get(list_dag_runs))
         .route("/dags/{dag_name}/trigger", post(trigger_dag_run))
+        .route("/dags/{dag_name}/export", get(export_dag))
         .route("/dags/{dag_name}", patch(patch_dag))
         .route("/dead-letters", get(list_dead_letters))
         .route(
@@ -1252,6 +1253,7 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/dags"),
         ("GET", "/dags/{dag_name}/runs"),
         ("POST", "/dags/{dag_name}/trigger"),
+        ("GET", "/dags/{dag_name}/export"),
         ("PATCH", "/dags/{dag_name}"),
         // ── dead-letter queue ─────────────────────────────────────────────────
         ("GET", "/dead-letters"),
@@ -1511,6 +1513,7 @@ pub const fn management_api_response_fields()
         ("GET", "/dags", None),                     // Vec<DagSummary>
         ("GET", "/dags/{dag_name}/runs", None),     // Vec<DagRun> (external model)
         ("POST", "/dags/{dag_name}/trigger", None), // DagRun (external model)
+        ("GET", "/dags/{dag_name}/export", None),   // String (text/plain)
         ("PATCH", "/dags/{dag_name}", None),        // HarvestSchedule (external model)
         // ── dead-letter queue ─────────────────────────────────────────────────
         ("GET", "/dead-letters", None), // Vec<DeadLetter> (external model)
@@ -1648,7 +1651,22 @@ pub const fn management_api_response_fields()
             Some(&["status", "item", "shard_coverage"]),
         ),
         // ── schedules ─────────────────────────────────────────────────────────
-        ("GET", "/admin/schedules", None), // Vec<ScheduleEntry>
+        (
+            "GET",
+            "/admin/schedules",
+            Some(&[
+                "id",
+                "kind",
+                "name",
+                "schedule_expr",
+                "is_paused",
+                "next_run_at",
+                "last_run_at",
+                "max_active_runs",
+                "catchup",
+                "last_backfill",
+            ]),
+        ), // Vec<ScheduleEntry>
         (
             "POST",
             "/admin/schedules/workflow",
@@ -3929,6 +3947,42 @@ async fn trigger_dag_run(
             Ok((axum::http::StatusCode::CREATED, Json(run)))
         }
     }
+}
+
+async fn export_dag(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(dag_name): Path<String>,
+    Query(pairs): Query<Vec<(String, String)>>,
+) -> Result<axum::response::Response, AutumnError> {
+    let runtime = api_state.runtime().map_err(map_error)?;
+    let dag = runtime.dags.get(&dag_name).ok_or_else(|| {
+        AutumnError::not_found_msg(format!("DAG {dag_name} not found in registry"))
+    })?;
+
+    let format = pairs
+        .iter()
+        .find(|(k, _)| k == "format")
+        .map_or("mermaid", |(_, v)| v.as_str());
+
+    let output = match format {
+        "mermaid" => autumn_harvest::dag_export::export_mermaid(&dag.definition).map_err(|_| {
+            AutumnError::internal_server_error_msg("Failed to format Mermaid output")
+        })?,
+        "dot" => autumn_harvest::dag_export::export_dot(&dag.definition).map_err(|_| {
+            AutumnError::internal_server_error_msg("Failed to format Graphviz DOT output")
+        })?,
+        other => {
+            return Err(AutumnError::bad_request_msg(format!(
+                "Unknown format '{other}'. Supported: 'mermaid', 'dot'."
+            )));
+        }
+    };
+    Ok((
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "text/plain")],
+        output,
+    )
+        .into_response())
 }
 
 async fn patch_dag(
