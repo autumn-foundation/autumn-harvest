@@ -1422,6 +1422,11 @@ fn format_backfill_table(value: &Value) -> String {
         }
     }
 
+    // Paused schedule warning (DAG backfill with include_paused=true)
+    if let Some(warning) = value.get("paused_schedule_warning").and_then(Value::as_str) {
+        let _ = writeln!(out, "\nWARNING: {warning}");
+    }
+
     out
 }
 
