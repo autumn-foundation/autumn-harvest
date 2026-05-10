@@ -1089,16 +1089,15 @@ fn apply_search_attrs_patch_in_memory(
     base: Option<serde_json::Value>,
     commands: &[WorkflowCommand],
 ) -> Option<serde_json::Value> {
-    let mut patch: std::collections::HashMap<String, Option<serde_json::Value>> =
-        std::collections::HashMap::new();
-    for cmd in commands {
-        if let WorkflowCommand::UpsertSearchAttributes { patch: p } = cmd {
-            patch.extend(p.iter().map(|(k, v)| (k.clone(), v.clone())));
-        }
-    }
-    if patch.is_empty() {
+    // ⚡ Bolt: Check for patches first to avoid unnecessary allocations
+    let has_patches = commands
+        .iter()
+        .any(|cmd| matches!(cmd, WorkflowCommand::UpsertSearchAttributes { .. }));
+    if !has_patches {
         return base;
     }
+
+    // ⚡ Bolt: Apply patches directly to the JSON object instead of building an intermediate HashMap
     let mut obj = base
         .and_then(|v| {
             if let serde_json::Value::Object(m) = v {
@@ -1108,16 +1107,22 @@ fn apply_search_attrs_patch_in_memory(
             }
         })
         .unwrap_or_default();
-    for (k, v) in patch {
-        match v {
-            Some(val) => {
-                obj.insert(k, val);
-            }
-            None => {
-                obj.remove(&k);
+
+    for cmd in commands {
+        if let WorkflowCommand::UpsertSearchAttributes { patch } = cmd {
+            for (k, v) in patch {
+                match v {
+                    Some(val) => {
+                        obj.insert(k.clone(), val.clone());
+                    }
+                    None => {
+                        obj.remove(k);
+                    }
+                }
             }
         }
     }
+
     if obj.is_empty() {
         None
     } else {
@@ -1135,18 +1140,22 @@ async fn persist_search_attrs_from_commands(
     exec_id: ExecutionId,
     commands: &[WorkflowCommand],
 ) -> HarvestResult<()> {
-    let mut merged: std::collections::HashMap<String, Option<serde_json::Value>> =
-        std::collections::HashMap::new();
+    // ⚡ Bolt: Lazily allocate the merged map only if there are patch commands
+    let mut merged: Option<std::collections::HashMap<String, Option<serde_json::Value>>> = None;
 
     for cmd in commands {
         if let WorkflowCommand::UpsertSearchAttributes { patch } = cmd {
-            merged.extend(patch.iter().map(|(k, v)| (k.clone(), v.clone())));
+            let m = merged.get_or_insert_with(std::collections::HashMap::new);
+            for (k, v) in patch {
+                m.insert(k.clone(), v.clone());
+            }
         }
     }
 
-    if merged.is_empty() {
-        return Ok(());
-    }
+    let merged = match merged {
+        Some(m) if !m.is_empty() => m,
+        _ => return Ok(()),
+    };
 
     store::update_search_attrs(conn, exec_id, &merged).await
 }
