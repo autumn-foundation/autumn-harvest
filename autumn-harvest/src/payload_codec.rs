@@ -1,3 +1,36 @@
+//! Interfaces for transforming event payloads before they are persisted.
+//!
+//! **Why does this exist?**
+//! By default, harvest workflow inputs, outputs, and parameters are stored in the database
+//! as plain JSON. If a workflow processes sensitive data (like PII, secrets, or financial data),
+//! storing it in plain text is a security risk. Payload codecs solve this by providing a hook
+//! to intercept and transform these JSON values (typically encrypting or compressing them)
+//! *before* they hit the database, and reversing the process when they are read back.
+//!
+//! ## Examples
+//!
+//! Implementing a simple rot13 "encryption" codec:
+//!
+//! ```rust
+//! use autumn_harvest::payload_codec::{PayloadCodec, CodecError};
+//!
+//! struct Rot13Codec;
+//!
+//! impl PayloadCodec for Rot13Codec {
+//!     fn codec_id(&self) -> &'static str { "rot13" }
+//!     fn encode(&self, raw: &[u8]) -> Result<Vec<u8>, CodecError> {
+//!         Ok(raw.iter().map(|&b| if b.is_ascii_alphabetic() {
+//!             let base = if b.is_ascii_lowercase() { b'a' } else { b'A' };
+//!             (b - base + 13) % 26 + base
+//!         } else { b }).collect())
+//!     }
+//!     fn decode(&self, encoded: &[u8]) -> Result<Vec<u8>, CodecError> {
+//!         // rot13 is its own inverse
+//!         self.encode(encoded)
+//!     }
+//! }
+//! ```
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -6,7 +39,16 @@ use serde_json::Value;
 
 use crate::error::{HarvestError, HarvestResult};
 
+/// A trait for intercepting and transforming raw payload bytes.
+///
+/// Implementations of this trait are used by the [`PayloadCodecs`] registry
+/// to encode and decode fields (such as inputs and outputs) before they are
+/// written to or after they are read from the database.
 pub trait PayloadCodec: Send + Sync {
+    /// Returns a unique identifier for this codec.
+    ///
+    /// This ID is stored alongside encoded data to ensure that the correct codec
+    /// is used when decoding. It must be unique across all registered codecs.
     fn codec_id(&self) -> &'static str;
     /// Encode raw payload bytes for persistence.
     ///
@@ -22,10 +64,42 @@ pub trait PayloadCodec: Send + Sync {
     fn decode(&self, encoded: &[u8]) -> Result<Vec<u8>, CodecError>;
 }
 
+/// Represents an error that occurred during encoding or decoding.
+///
+/// This error is returned by implementations of the [`PayloadCodec`] trait when a transformation fails.
+/// For example, if a decryption codec fails due to a bad key, it should return this error.
+///
+/// ## Examples
+///
+/// ```rust
+/// use autumn_harvest::payload_codec::CodecError;
+///
+/// let error = CodecError("decryption failed: bad key".to_string());
+/// assert_eq!(error.to_string(), "payload codec error: decryption failed: bad key");
+/// ```
 #[derive(Debug, thiserror::Error)]
 #[error("payload codec error: {0}")]
 pub struct CodecError(pub String);
 
+/// A pass-through codec that performs no transformation.
+///
+/// **Why does this exist?**
+/// By default, the system uses the `IdentityCodec`. This ensures that payloads are written
+/// to the database exactly as they are passed to the workflow APIs (as raw JSON). It also
+/// provides a safe fallback when no other codec is explicitly configured.
+///
+/// ## Examples
+///
+/// ```rust
+/// use autumn_harvest::payload_codec::{PayloadCodec, IdentityCodec};
+///
+/// let codec = IdentityCodec;
+/// assert_eq!(codec.codec_id(), "identity");
+///
+/// let raw_data = b"hello world";
+/// let encoded = codec.encode(raw_data).unwrap();
+/// assert_eq!(encoded, raw_data); // Identity changes nothing!
+/// ```
 #[derive(Debug, Default)]
 pub struct IdentityCodec;
 
@@ -41,6 +115,28 @@ impl PayloadCodec for IdentityCodec {
     }
 }
 
+/// A registry of available payload codecs and the configured default.
+///
+/// **Why does this exist?**
+/// When decoding a payload, the system needs to know which codec to use. Because
+/// a workflow's history might span a long period, it may contain payloads encoded
+/// with different codecs (e.g., if you migrated from "encryption-v1" to "encryption-v2").
+/// The `PayloadCodecs` struct holds all known codecs so it can dynamically look up
+/// the right one based on the `codec_id` stored alongside the data.
+///
+/// The `default` codec is the one used for encoding *new* payloads.
+///
+/// ## Examples
+///
+/// ```rust
+/// use autumn_harvest::payload_codec::{PayloadCodecs, IdentityCodec};
+/// use std::sync::Arc;
+///
+/// let mut codecs = PayloadCodecs::default();
+/// // The default is automatically IdentityCodec.
+/// // But you can change the default for encoding new payloads:
+/// codecs.set_default(Arc::new(IdentityCodec));
+/// ```
 #[derive(Clone)]
 pub struct PayloadCodecs {
     default: Arc<dyn PayloadCodec>,
@@ -60,10 +156,19 @@ impl Default for PayloadCodecs {
 }
 
 impl PayloadCodecs {
+    /// Registers a codec so it can be used for decoding.
+    ///
+    /// The codec will only be used if an incoming payload is marked with its `codec_id`.
+    /// Registering a codec does not make it the default for new payloads (use [`PayloadCodecs::set_default`] for that).
     pub fn register(&mut self, codec: Arc<dyn PayloadCodec>) {
         self.codecs.insert(codec.codec_id(), codec);
     }
 
+    /// Sets the default codec used for encoding new payloads.
+    ///
+    /// The codec will also be implicitly registered for decoding.
+    /// You should typically call this when starting up your Harvest worker
+    /// or server to ensure all newly written payloads use this codec.
     pub fn set_default(&mut self, codec: Arc<dyn PayloadCodec>) {
         self.register(codec.clone());
         self.default = codec;
