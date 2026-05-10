@@ -2324,25 +2324,37 @@ async fn get_workflow_result(
         Ok(wait) => wait,
         Err(error) => return error.into_response(),
     };
+
+    if wait.is_zero() {
+        let snapshot = match workflow_result_snapshot(&api_state, exec_id).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => return error.into_response(),
+        };
+        return workflow_result_response(snapshot);
+    }
+
     let client = match api_state.workflow_handle_client() {
         Ok(client) => client,
         Err(error) => return map_error(error).into_response(),
     };
     let handle = client.handle(exec_id);
 
-    if wait.is_zero() {
-        let snapshot = match handle.result_snapshot().await {
-            Ok(snapshot) => snapshot,
-            Err(error) => return map_error(error).into_response(),
-        };
-        return workflow_result_response(snapshot);
-    }
-
     match handle.result_snapshot_with_wait(wait).await {
         Ok(Some(snapshot)) => workflow_result_response(snapshot),
         Ok(None) => workflow_result_pending_response(),
         Err(error) => map_error(error).into_response(),
     }
+}
+
+async fn workflow_result_snapshot(
+    api_state: &HarvestApiState,
+    exec_id: ExecutionId,
+) -> Result<WorkflowResult, AutumnError> {
+    let mut conn = db_conn_for_execution(api_state, exec_id).await?;
+    let execution = load_execution(&mut conn, exec_id)
+        .await
+        .map_err(map_error)?;
+    Ok(WorkflowResult::from_execution(&execution))
 }
 
 fn workflow_result_response(result: WorkflowResult) -> axum::response::Response {
@@ -6477,6 +6489,9 @@ async fn get_update_result(
 mod tests {
     use super::*;
     use autumn_harvest::workers::WorkerHealth;
+    use testcontainers::ContainerAsync;
+    use testcontainers_modules::postgres::Postgres;
+    use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
     fn pairs(values: &[(&str, &str)]) -> Vec<(String, String)> {
         values
@@ -6899,6 +6914,86 @@ mod tests {
         let response = workflow_result_response(WorkflowResult::running());
 
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn workflow_result_immediate_snapshot_does_not_require_listener_config() {
+        let Some((database_url, _container)) = setup_workflow_result_database().await else {
+            return;
+        };
+        let exec_id = ExecutionId::new();
+        let mut conn =
+            <diesel_async::AsyncPgConnection as diesel_async::AsyncConnection>::establish(
+                &database_url,
+            )
+            .await
+            .expect("failed to connect to workflow result database");
+        autumn_harvest::start_or_load_workflow_execution(
+            &mut conn,
+            autumn_harvest::StartWorkflowParams {
+                workflow_name: "snapshot_listenerless",
+                workflow_id: "snapshot-listenerless-1",
+                exec_id,
+                input: serde_json::json!({ "ok": true }),
+                parent_id: None,
+                queue_name: "default",
+                execution_timeout: None,
+                memo: None,
+                search_attrs: None,
+                reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
+                trace_context: None,
+            },
+        )
+        .await
+        .expect("workflow execution should be seeded");
+
+        let state = HarvestApiState::new();
+        state.install_storage_pool(crate::state::HarvestDbPool::single(
+            workflow_result_test_pool(&database_url),
+        ));
+
+        let response = get_workflow_result(
+            Extension(state),
+            Path(exec_id.to_string()),
+            Query(Vec::new()),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    fn workflow_result_test_pool(database_url: &str) -> autumn_harvest::worker::DbPool {
+        let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+            diesel_async::AsyncPgConnection,
+        >::new(database_url);
+        deadpool::managed::Pool::builder(manager)
+            .max_size(4)
+            .build()
+            .expect("failed to build workflow result test pool")
+    }
+
+    async fn setup_workflow_result_database() -> Option<(String, ContainerAsync<Postgres>)> {
+        let container = match Postgres::default().start().await {
+            Ok(container) => container,
+            Err(error) => {
+                eprintln!(
+                    "skipping workflow result listenerless snapshot test; Postgres container unavailable: {error}"
+                );
+                return None;
+            }
+        };
+        let host = container
+            .get_host()
+            .await
+            .expect("failed to get container host");
+        let port = container
+            .get_host_port_ipv4(5432)
+            .await
+            .expect("failed to get container port");
+        let database_url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+        autumn_web::migrate::run_pending(&database_url, autumn_harvest::MIGRATIONS)
+            .expect("failed to run Harvest migrations");
+        Some((database_url, container))
     }
 
     #[test]
