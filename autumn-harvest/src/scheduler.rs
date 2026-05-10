@@ -29,6 +29,95 @@ use crate::worker::{DbPool, HandlerRegistry};
 
 const DEFAULT_SCHEDULER_TICK_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Default upper bound on the number of timestamps a single backfill request may plan.
+///
+/// Chosen to cover a 7-day hourly window (168 slots) with comfortable headroom.
+pub const DEFAULT_BACKFILL_MAX_COUNT: usize = 1_000;
+
+/// Errors returned when backfill planning cannot complete.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackfillPlanError {
+    /// The window contains more timestamps than the caller-supplied limit.
+    LimitExceeded { limit: usize },
+}
+
+impl std::fmt::Display for BackfillPlanError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LimitExceeded { limit } => {
+                write!(f, "backfill would exceed the {limit}-timestamp limit")
+            }
+        }
+    }
+}
+
+/// Compute the timestamps a schedule would fire between `from` (inclusive) and `to` (inclusive).
+///
+/// - For `Cron` schedules the first occurrence at or after `from` is included; subsequent
+///   occurrences are stepped through until they exceed `to`.
+/// - For `Interval` schedules `from` is treated as the first backfill timestamp and slots are
+///   spaced by the interval duration.
+/// - `Manual` schedules and `None` return an empty list (no automatic firing times).
+///
+/// # Errors
+///
+/// Returns `Err(BackfillPlanError::LimitExceeded)` if the number of planned timestamps
+/// would exceed `max_count` before the window is fully enumerated.  Callers should pass
+/// [`DEFAULT_BACKFILL_MAX_COUNT`] unless a tighter bound is required.
+pub fn plan_backfill_timestamps(
+    schedule: Option<&Schedule>,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+    max_count: usize,
+) -> Result<Vec<DateTime<Utc>>, BackfillPlanError> {
+    if to < from {
+        return Ok(vec![]);
+    }
+
+    match schedule {
+        None | Some(Schedule::Manual) => Ok(vec![]),
+        Some(Schedule::Cron(_)) => {
+            // Find the first cron occurrence at or after `from` by searching from 1 ms before
+            // it (cron fires on whole-second boundaries; 1 ms is a safe undercut).
+            let reference = from - chrono::Duration::milliseconds(1);
+            let Some(mut cursor) = next_run_after(schedule, reference) else {
+                return Ok(vec![]);
+            };
+            let mut timestamps = Vec::new();
+            loop {
+                if cursor > to {
+                    break;
+                }
+                if timestamps.len() >= max_count {
+                    return Err(BackfillPlanError::LimitExceeded { limit: max_count });
+                }
+                timestamps.push(cursor);
+                let Some(next) = next_run_after(schedule, cursor) else {
+                    break;
+                };
+                cursor = next;
+            }
+            Ok(timestamps)
+        }
+        Some(Schedule::Interval(interval)) => {
+            let dur = chrono::Duration::from_std(*interval).unwrap_or(chrono::Duration::MAX);
+            let mut timestamps = Vec::new();
+            let mut cursor = from;
+            loop {
+                if cursor > to {
+                    break;
+                }
+                if timestamps.len() >= max_count {
+                    return Err(BackfillPlanError::LimitExceeded { limit: max_count });
+                }
+                timestamps.push(cursor);
+                cursor += dur;
+            }
+            Ok(timestamps)
+        }
+    }
+}
+
 /// Represents a fully registered and compiled DAG definition.
 #[derive(Debug, Clone)]
 pub struct RegisteredDag {
@@ -680,6 +769,12 @@ fn scheduled_workflow_id(workflow_name: &str, scheduled_for: DateTime<Utc>) -> S
     format!("sched:{}:{}", workflow_name, scheduled_for.timestamp())
 }
 
+/// Public re-export of `scheduled_workflow_id` for use in the backfill handler.
+#[must_use]
+pub fn scheduled_workflow_id_pub(workflow_name: &str, scheduled_for: DateTime<Utc>) -> String {
+    scheduled_workflow_id(workflow_name, scheduled_for)
+}
+
 const fn scheduled_workflow_reuse_policy() -> WorkflowIdReusePolicy {
     WorkflowIdReusePolicy::RejectDuplicate
 }
@@ -734,9 +829,14 @@ fn scheduled_start_outcome(
 /// Process due workflow-schedule rows and dispatch workflow starts.
 /// Parse a stored `schedule_expr` string back into a [`Schedule`] variant.
 ///
-/// The format written by [`schedule_expr`] is `"cron:<expr>"`, `"interval:<secs>"`,
+/// The format written by `schedule_expr` is `"cron:<expr>"`, `"interval:<secs>"`,
 /// or `"manual"`. Unrecognised strings return `None` and the row is treated as
 /// `Schedule::Manual` (no automatic `next_run_at`).
+#[must_use]
+pub fn parse_schedule_from_expr_pub(expr: &str) -> Option<Schedule> {
+    parse_schedule_from_expr(expr)
+}
+
 fn parse_schedule_from_expr(expr: &str) -> Option<Schedule> {
     expr.strip_prefix("cron:").map_or_else(
         || {
@@ -1309,5 +1409,110 @@ mod tests {
             }
         );
         assert!(!outcome.created());
+    }
+
+    // ── plan_backfill_timestamps ──────────────────────────────────────────────
+
+    #[test]
+    fn plan_backfill_timestamps_hourly_cron_inclusive_bounds() {
+        let schedule = Schedule::Cron("0 * * * *".to_string()); // fires at :00 every hour
+        let from = parse_utc("2026-04-01T10:00:00Z");
+        let to = parse_utc("2026-04-01T13:00:00Z");
+
+        let timestamps = plan_backfill_timestamps(Some(&schedule), from, to, 100)
+            .expect("hourly cron backfill over 3-hour window should succeed");
+
+        assert_eq!(
+            timestamps,
+            vec![
+                parse_utc("2026-04-01T10:00:00Z"),
+                parse_utc("2026-04-01T11:00:00Z"),
+                parse_utc("2026-04-01T12:00:00Z"),
+                parse_utc("2026-04-01T13:00:00Z"),
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_backfill_timestamps_to_before_from_returns_empty() {
+        let schedule = Schedule::Cron("0 * * * *".to_string());
+        let from = parse_utc("2026-04-08T00:00:00Z");
+        let to = parse_utc("2026-04-01T00:00:00Z");
+
+        let timestamps = plan_backfill_timestamps(Some(&schedule), from, to, 100)
+            .expect("inverted window should return empty without error");
+
+        assert!(timestamps.is_empty());
+    }
+
+    #[test]
+    fn plan_backfill_timestamps_manual_schedule_returns_empty() {
+        let from = parse_utc("2026-04-01T00:00:00Z");
+        let to = parse_utc("2026-04-08T00:00:00Z");
+
+        let timestamps = plan_backfill_timestamps(None, from, to, 100)
+            .expect("unset schedule backfill should succeed with empty plan");
+
+        assert!(timestamps.is_empty());
+
+        let timestamps = plan_backfill_timestamps(Some(&Schedule::Manual), from, to, 100)
+            .expect("manual schedule backfill should succeed with empty plan");
+
+        assert!(timestamps.is_empty());
+    }
+
+    #[test]
+    fn plan_backfill_timestamps_enforces_max_count() {
+        // Every-minute interval over a 2-hour window = 120 timestamps > limit of 10
+        let schedule = Schedule::Interval(Duration::from_secs(60));
+        let from = parse_utc("2026-04-01T00:00:00Z");
+        let to = parse_utc("2026-04-01T02:00:00Z");
+
+        let result = plan_backfill_timestamps(Some(&schedule), from, to, 10);
+
+        assert_eq!(result, Err(BackfillPlanError::LimitExceeded { limit: 10 }));
+    }
+
+    #[test]
+    fn plan_backfill_timestamps_interval_from_is_first_slot() {
+        let schedule = Schedule::Interval(Duration::from_secs(3600)); // 1-hour interval
+        let from = parse_utc("2026-04-01T10:00:00Z");
+        let to = parse_utc("2026-04-01T12:00:00Z");
+
+        let timestamps = plan_backfill_timestamps(Some(&schedule), from, to, 100)
+            .expect("interval backfill should succeed");
+
+        assert_eq!(
+            timestamps,
+            vec![
+                parse_utc("2026-04-01T10:00:00Z"),
+                parse_utc("2026-04-01T11:00:00Z"),
+                parse_utc("2026-04-01T12:00:00Z"),
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_backfill_timestamps_equal_from_and_to_returns_single_slot() {
+        let schedule = Schedule::Interval(Duration::from_secs(3600));
+        let ts = parse_utc("2026-04-01T10:00:00Z");
+
+        let timestamps = plan_backfill_timestamps(Some(&schedule), ts, ts, 100)
+            .expect("single-point window should succeed");
+
+        assert_eq!(timestamps, vec![ts]);
+    }
+
+    #[test]
+    fn plan_backfill_timestamps_7_day_hourly_cron_within_default_limit() {
+        let schedule = Schedule::Cron("0 * * * *".to_string());
+        let from = parse_utc("2026-04-01T00:00:00Z");
+        let to = parse_utc("2026-04-08T00:00:00Z");
+
+        let timestamps =
+            plan_backfill_timestamps(Some(&schedule), from, to, DEFAULT_BACKFILL_MAX_COUNT)
+                .expect("168-timestamp 7-day backfill should succeed under default limit");
+
+        assert_eq!(timestamps.len(), 169); // 0h..168h inclusive = 169 slots
     }
 }

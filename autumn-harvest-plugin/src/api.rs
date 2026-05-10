@@ -28,10 +28,11 @@ use autumn_harvest::audit::{
     self, AuditFilters, HEADER_ACTOR, HEADER_REQUEST_ID, HEADER_SOURCE, OP_BATCH_SUBMIT,
     OP_DAG_PATCH, OP_DAG_TRIGGER, OP_DLQ_DISCARD_BULK, OP_DLQ_REPLAY, OP_DLQ_REPLAY_BULK,
     OP_EXTERNAL_ACTIVITY_COMPLETE, OP_EXTERNAL_ACTIVITY_FAIL, OP_RETENTION_RUN_NOW,
-    OP_SCHEDULE_CREATE, OP_SCHEDULE_DELETE, OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_WORKER_DRAIN,
-    OP_WORKFLOW_CANCEL, OP_WORKFLOW_RESET, OP_WORKFLOW_SIGNAL, OP_WORKFLOW_START, SOURCE_API,
-    STATUS_FAILED, STATUS_SUCCEEDED, TARGET_BATCH, TARGET_DAG, TARGET_DEAD_LETTER,
-    TARGET_EXTERNAL_ACTIVITY, TARGET_RETENTION, TARGET_SCHEDULE, TARGET_WORKER, TARGET_WORKFLOW,
+    OP_SCHEDULE_BACKFILL, OP_SCHEDULE_CREATE, OP_SCHEDULE_DELETE, OP_SCHEDULE_PAUSE,
+    OP_SCHEDULE_RESUME, OP_WORKER_DRAIN, OP_WORKFLOW_CANCEL, OP_WORKFLOW_RESET, OP_WORKFLOW_SIGNAL,
+    OP_WORKFLOW_START, SOURCE_API, STATUS_FAILED, STATUS_SUCCEEDED, TARGET_BATCH, TARGET_DAG,
+    TARGET_DEAD_LETTER, TARGET_EXTERNAL_ACTIVITY, TARGET_RETENTION, TARGET_SCHEDULE, TARGET_WORKER,
+    TARGET_WORKFLOW,
 };
 use autumn_harvest::batch::{
     self, BatchAction, BatchExecutorConfig, BatchFilter, BatchJobStatus, BatchJobView,
@@ -46,7 +47,8 @@ use autumn_harvest::history_export::{
     HistoryExportRequest, HistoryPayloadPolicy, export_history,
 };
 use autumn_harvest::models::{
-    AuditRecord, DagRun, DeadLetter, HarvestSchedule, NewAuditRecord, WorkflowExecution,
+    AuditRecord, BackfillLogRow, DagRun, DeadLetter, HarvestSchedule, NewAuditRecord,
+    NewBackfillLogRow, WorkflowExecution,
 };
 use autumn_harvest::policy::WorkflowSchedule;
 use autumn_harvest::queue::{self, ConcurrencyKeyStats};
@@ -56,11 +58,13 @@ use autumn_harvest::reset::{
 };
 use autumn_harvest::retention::{RetentionConfig, RetentionMonitor, RetentionStatus};
 use autumn_harvest::scheduler::{
-    DagCatalog, RegisteredDag, SchedulerMonitor, SchedulerSnapshot, trigger_dag,
+    BackfillPlanError, DEFAULT_BACKFILL_MAX_COUNT, DagCatalog, RegisteredDag, SchedulerMonitor,
+    SchedulerSnapshot, parse_schedule_from_expr_pub, plan_backfill_timestamps,
+    scheduled_workflow_id_pub, trigger_dag,
 };
 use autumn_harvest::schema::{
-    harvest_dag_runs, harvest_events, harvest_schedules, harvest_signals, harvest_task_queue,
-    harvest_timers, harvest_workflow_executions,
+    harvest_backfill_log, harvest_dag_runs, harvest_events, harvest_schedules, harvest_signals,
+    harvest_task_queue, harvest_timers, harvest_workflow_executions,
 };
 use autumn_harvest::shard::ShardRouter;
 use autumn_harvest::signal;
@@ -774,11 +778,49 @@ struct DagPauseRequest {
 }
 
 /// Kind tag on a schedule entry returned by `GET /admin/schedules`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 enum ScheduleKind {
     Dag,
     Workflow,
+}
+
+/// Summary of the most recent backfill for a schedule (surfaced in `GET /admin/schedules`).
+#[derive(Debug, Serialize)]
+struct BackfillSummary {
+    id: uuid::Uuid,
+    actor: String,
+    from: chrono::DateTime<chrono::Utc>,
+    to: chrono::DateTime<chrono::Utc>,
+    dry_run: bool,
+    total: i32,
+    dispatched: i32,
+    skipped: i32,
+    failed: i32,
+    status: String,
+    error_summary: Option<String>,
+    started_at: chrono::DateTime<chrono::Utc>,
+    completed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl From<BackfillLogRow> for BackfillSummary {
+    fn from(r: BackfillLogRow) -> Self {
+        Self {
+            id: r.id,
+            actor: r.actor,
+            from: r.from_ts,
+            to: r.to_ts,
+            dry_run: r.dry_run,
+            total: r.total,
+            dispatched: r.dispatched,
+            skipped: r.skipped,
+            failed: r.failed,
+            status: r.status,
+            error_summary: r.error_summary,
+            started_at: r.started_at,
+            completed_at: r.completed_at,
+        }
+    }
 }
 
 /// A single schedule entry in the `GET /admin/schedules` list.
@@ -793,6 +835,7 @@ struct ScheduleEntry {
     last_run_at: Option<chrono::DateTime<chrono::Utc>>,
     max_active_runs: i32,
     catchup: bool,
+    last_backfill: Option<BackfillSummary>,
 }
 
 /// Request body for `POST /admin/schedules/workflow`.
@@ -1061,10 +1104,12 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             get(get_external_handoff),
         )
         // Schedule management (issue #91): unified list + workflow-schedule CRUD.
+        // Schedule backfill (issue #177): bounded missed-run recovery.
         .route("/admin/schedules", get(list_schedules))
         .route("/admin/schedules/workflow", post(create_workflow_schedule))
         .route("/admin/schedules/{id}/pause", post(pause_schedule))
         .route("/admin/schedules/{id}/resume", post(resume_schedule))
+        .route("/admin/schedules/{id}/backfill", post(schedule_backfill))
         .route("/admin/schedules/{id}", delete(delete_schedule))
         // External activity completion (issue #92): async task-token API.
         .route(
@@ -1156,11 +1201,12 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/admin/history/exports"),
         ("GET", "/admin/external-handoffs"),
         ("GET", "/admin/external-handoffs/{token}"),
-        // ── schedules (issue #91) ─────────────────────────────────────────────
+        // ── schedules (issues #91, #177) ──────────────────────────────────────
         ("GET", "/admin/schedules"),
         ("POST", "/admin/schedules/workflow"),
         ("POST", "/admin/schedules/{id}/pause"),
         ("POST", "/admin/schedules/{id}/resume"),
+        ("POST", "/admin/schedules/{id}/backfill"),
         ("DELETE", "/admin/schedules/{id}"),
         // ── audit (issue #158) ────────────────────────────────────────────────
         ("GET", "/admin/audit"),
@@ -3825,6 +3871,11 @@ async fn list_schedules(
     Extension(api_state): Extension<HarvestApiState>,
 ) -> Result<Json<Vec<ScheduleEntry>>, AutumnError> {
     let schedules = load_schedules_from_shards(&api_state).await?;
+    let schedule_ids: Vec<uuid::Uuid> = schedules.iter().map(|s| s.id).collect();
+
+    // Best-effort: load the most recent backfill log row for each schedule.
+    let recent_backfills = load_recent_backfills(&api_state, &schedule_ids).await;
+
     let entries = schedules
         .into_iter()
         .map(|s| {
@@ -3836,6 +3887,10 @@ async fn list_schedules(
                 // Should not occur given the CHECK constraint, but handle gracefully.
                 (ScheduleKind::Dag, String::new())
             };
+            let last_backfill = recent_backfills
+                .get(&s.id)
+                .cloned()
+                .map(BackfillSummary::from);
             ScheduleEntry {
                 id: s.id,
                 kind,
@@ -3846,10 +3901,47 @@ async fn list_schedules(
                 last_run_at: s.last_run_at,
                 max_active_runs: s.max_active_runs,
                 catchup: s.catchup,
+                last_backfill,
             }
         })
         .collect();
     Ok(Json(entries))
+}
+
+/// Load the most recent backfill log row for each of the given schedule IDs.
+/// Returns a map from `schedule_id` to row. Silently returns empty map on any error.
+async fn load_recent_backfills(
+    api_state: &HarvestApiState,
+    schedule_ids: &[uuid::Uuid],
+) -> std::collections::HashMap<uuid::Uuid, BackfillLogRow> {
+    use autumn_harvest::schema::harvest_backfill_log::dsl;
+
+    if schedule_ids.is_empty() {
+        return std::collections::HashMap::new();
+    }
+    let Ok(pool) = api_state.storage_pool() else {
+        return std::collections::HashMap::new();
+    };
+    let Ok(mut conn) = acquire_conn(pool.default_pool()).await else {
+        return std::collections::HashMap::new();
+    };
+
+    // Load all recent backfill rows for these schedules in one query, ordered by
+    // started_at DESC, then de-duplicate keeping only the most recent per schedule.
+    let rows: Vec<BackfillLogRow> = dsl::harvest_backfill_log
+        .filter(dsl::schedule_id.eq_any(schedule_ids))
+        .order((dsl::schedule_id, dsl::started_at.desc()))
+        .select(BackfillLogRow::as_select())
+        .load(&mut conn)
+        .await
+        .unwrap_or_default();
+
+    let mut map: std::collections::HashMap<uuid::Uuid, BackfillLogRow> =
+        std::collections::HashMap::new();
+    for row in rows {
+        map.entry(row.schedule_id).or_insert(row);
+    }
+    map
 }
 
 async fn schedule_create_audit_failed(
@@ -3907,6 +3999,7 @@ async fn upsert_workflow_schedule_and_read_back(
         last_run_at: row.last_run_at,
         max_active_runs: row.max_active_runs,
         catchup: row.catchup,
+        last_backfill: None, // newly created; no backfill history yet
     })
 }
 
@@ -4344,6 +4437,621 @@ async fn delete_schedule(
         return Err(AutumnError::not_found_msg(format!("schedule {id}")));
     }
     Ok(Json(BasicAck { ok: true }))
+}
+
+// ── Schedule backfill (issue #177) ────────────────────────────────────────────
+
+/// Request body for `POST /admin/schedules/{id}/backfill`.
+#[derive(Debug, Deserialize)]
+struct ScheduleBackfillRequest {
+    from: chrono::DateTime<chrono::Utc>,
+    to: chrono::DateTime<chrono::Utc>,
+    #[serde(default)]
+    dry_run: bool,
+    #[serde(default)]
+    include_paused: bool,
+    max_count: Option<usize>,
+}
+
+/// A shard that could not be reached or dispatched during a backfill.
+#[derive(Debug, Serialize)]
+struct BackfillShardFailure {
+    shard_id: i32,
+    reason: String,
+}
+
+/// Response for `POST /admin/schedules/{id}/backfill`.
+#[derive(Debug, Serialize)]
+struct ScheduleBackfillResponse {
+    /// `"dry_run"`, `"complete"`, or `"partial"`.
+    status: String,
+    schedule_id: uuid::Uuid,
+    kind: ScheduleKind,
+    name: String,
+    from: chrono::DateTime<chrono::Utc>,
+    to: chrono::DateTime<chrono::Utc>,
+    planned_timestamps: Vec<chrono::DateTime<chrono::Utc>>,
+    total: usize,
+    dispatched: usize,
+    skipped: usize,
+    failed: usize,
+    /// Machine-readable breakdown of why timestamps were skipped.
+    /// Keys: `"already_exists"`, `"max_active_runs"`.
+    skipped_reasons: std::collections::HashMap<String, usize>,
+    partial_shard_failures: Vec<BackfillShardFailure>,
+    /// Set when a DAG schedule is paused and `include_paused=true`: inserted
+    /// QUEUED runs will not execute until the schedule is resumed because
+    /// `activate_queued_runs` skips paused schedules.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    paused_schedule_warning: Option<String>,
+}
+
+#[allow(clippy::too_many_lines)]
+async fn schedule_backfill(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+    Json(request): Json<ScheduleBackfillRequest>,
+) -> Result<Json<ScheduleBackfillResponse>, AutumnError> {
+    use autumn_harvest::models::NewDagRun;
+
+    let (actor, source, req_id) = audit_context(&headers, &api_state);
+    let route = "POST /admin/schedules/{id}/backfill";
+    let started_at = chrono::Utc::now();
+
+    let schedule_id = parse_uuid(&id, "schedule id")?;
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    let runtime = api_state.runtime().map_err(map_error)?;
+
+    if request.to < request.from {
+        return Err(AutumnError::bad_request_msg(
+            "backfill 'to' must be at or after 'from'",
+        ));
+    }
+
+    // Load the schedule row (fan out across shards; schedule rows are not shard-assigned).
+    let schedule = load_schedule_by_id(&api_state, schedule_id).await?;
+
+    // Respect paused state unless the caller explicitly opts in.
+    if schedule.is_paused && !request.include_paused {
+        return Err(AutumnError::bad_request_msg(format!(
+            "schedule {schedule_id} is paused; pass include_paused=true to backfill a paused schedule"
+        )));
+    }
+
+    let parsed_schedule = schedule
+        .schedule_expr
+        .as_deref()
+        .and_then(parse_schedule_from_expr_pub);
+
+    let max_count = request.max_count.unwrap_or(DEFAULT_BACKFILL_MAX_COUNT);
+
+    let timestamps = plan_backfill_timestamps(
+        parsed_schedule.as_ref(),
+        request.from,
+        request.to,
+        max_count,
+    )
+    .map_err(|e| match e {
+        BackfillPlanError::LimitExceeded { limit } => AutumnError::bad_request_msg(format!(
+            "backfill window contains more than {limit} timestamps; lower the window or pass a higher max_count"
+        )),
+    })?;
+
+    let total = timestamps.len();
+    let (kind, name) = if let Some(ref dag_name) = schedule.dag_name {
+        (ScheduleKind::Dag, dag_name.clone())
+    } else if let Some(ref wf_name) = schedule.workflow_name {
+        (ScheduleKind::Workflow, wf_name.clone())
+    } else {
+        return Err(AutumnError::service_unavailable_msg(
+            "schedule row has neither dag_name nor workflow_name",
+        ));
+    };
+
+    let max_active = i64::from(schedule.max_active_runs);
+
+    // Dry-run: query current running count and project what would happen.
+    if request.dry_run {
+        let running = query_running_count(&pool, &kind, &name).await;
+        let already_exists = count_existing_in_window(&pool, &kind, &name, &timestamps).await;
+        let remaining = total.saturating_sub(already_exists);
+        let available_slots = usize::try_from((max_active - running).max(0)).unwrap_or(0);
+        let would_dispatch = remaining.min(available_slots);
+        let would_skip_max = remaining - would_dispatch;
+
+        let mut skipped_reasons = std::collections::HashMap::new();
+        if already_exists > 0 {
+            skipped_reasons.insert("already_exists".to_string(), already_exists);
+        }
+        if would_skip_max > 0 {
+            skipped_reasons.insert("max_active_runs".to_string(), would_skip_max);
+        }
+
+        let paused_schedule_warning = (schedule.is_paused
+            && request.include_paused
+            && kind == ScheduleKind::Dag)
+            .then(|| {
+                "Schedule is paused; backfilled DAG runs are QUEUED but will not \
+                 execute until the schedule is resumed (`harvest schedule resume`)."
+                    .to_string()
+            });
+
+        let would_skip = already_exists + would_skip_max;
+        write_backfill_log(
+            &pool,
+            schedule_id,
+            &actor,
+            &source,
+            request.from,
+            request.to,
+            true,
+            total,
+            would_dispatch,
+            would_skip,
+            0,
+            "dry_run",
+            None,
+            started_at,
+        )
+        .await;
+        write_audit(
+            &pool,
+            &actor,
+            &source,
+            req_id.as_deref(),
+            route,
+            &id,
+            STATUS_SUCCEEDED,
+            None,
+        )
+        .await;
+        return Ok(Json(ScheduleBackfillResponse {
+            status: "dry_run".to_string(),
+            schedule_id,
+            kind,
+            name,
+            from: request.from,
+            to: request.to,
+            planned_timestamps: timestamps,
+            total,
+            dispatched: would_dispatch,
+            skipped: would_skip,
+            failed: 0,
+            skipped_reasons,
+            partial_shard_failures: vec![],
+            paused_schedule_warning,
+        }));
+    }
+
+    // Non-dry-run: dispatch each timestamp idempotently, respecting max_active_runs.
+    let dispatch_queue = schedule.queue_name.as_deref().unwrap_or("default");
+    let mut dispatched = 0usize;
+    let mut skipped = 0usize;
+    let mut failed = 0usize;
+    let mut shard_failures: Vec<BackfillShardFailure> = Vec::new();
+    let mut skipped_reasons: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+
+    // Warn when the operator uses include_paused=true for a paused DAG schedule.
+    // `activate_queued_runs` skips paused schedules, so the inserted QUEUED runs
+    // will not execute until the schedule is resumed.
+    let paused_schedule_warning =
+        (schedule.is_paused && request.include_paused && kind == ScheduleKind::Dag).then(|| {
+            "Schedule is paused; backfilled DAG runs are QUEUED but will not \
+             execute until the schedule is resumed (`harvest schedule resume`)."
+                .to_string()
+        });
+
+    // Count running executions once before the loop; track dispatched_this_call separately
+    // so we don't re-query on every timestamp.
+    let running_at_start = query_running_count(&pool, &kind, &name).await;
+    let mut dispatched_this_call: i64 = 0;
+
+    match kind {
+        ScheduleKind::Workflow => {
+            let wf_name = name.clone();
+            // Workflow schedules are always dispatched through the scheduler's own
+            // connection, which uses `ExecutionId::new()` (ShardId::UNENCODED → default
+            // shard). The backfill must write to the same shard so that the partial
+            // unique index on (workflow_name, workflow_id) prevents the scheduler from
+            // creating a second run for the same timestamp after the backfill window.
+            let wf_shard_pool = pool.default_pool();
+            for scheduled_for in &timestamps {
+                // Respect max_active_runs: skip if we've already saturated the limit.
+                if running_at_start + dispatched_this_call >= max_active {
+                    skipped += 1;
+                    *skipped_reasons
+                        .entry("max_active_runs".to_string())
+                        .or_insert(0) += 1;
+                    continue;
+                }
+
+                let workflow_id = scheduled_workflow_id_pub(&wf_name, *scheduled_for);
+                // Match the scheduler: ExecutionId::new() encodes ShardId::UNENCODED so
+                // the execution lands on the default shard, same as tick_one_workflow_schedule.
+                let exec_id = ExecutionId::new();
+                let input = schedule
+                    .workflow_input
+                    .clone()
+                    .unwrap_or(serde_json::Value::Null);
+
+                let Ok(mut conn) = acquire_conn(wf_shard_pool).await else {
+                    shard_failures.push(BackfillShardFailure {
+                        shard_id: 0,
+                        reason: "failed to acquire connection".to_string(),
+                    });
+                    failed += 1;
+                    continue;
+                };
+
+                // Pre-check across ALL states including CONTINUED_AS_NEW / TERMINATED.
+                // `start_or_load_workflow_execution` uses a partial unique index that
+                // excludes sealed rows, so a sealed prior execution does not conflict
+                // and would allow a duplicate to be created. Backfill must not reuse
+                // sealed workflow IDs because the timestamp was already dispatched.
+                let prior: i64 = harvest_workflow_executions::table
+                    .filter(harvest_workflow_executions::workflow_name.eq(&wf_name))
+                    .filter(harvest_workflow_executions::workflow_id.eq(&workflow_id))
+                    .count()
+                    .get_result::<i64>(&mut conn)
+                    .await
+                    .unwrap_or(0);
+                if prior > 0 {
+                    skipped += 1;
+                    *skipped_reasons
+                        .entry("already_exists".to_string())
+                        .or_insert(0) += 1;
+                    continue;
+                }
+
+                let result = start_or_load_workflow_execution(
+                    &mut conn,
+                    StartWorkflowParams {
+                        workflow_name: &wf_name,
+                        workflow_id: &workflow_id,
+                        exec_id,
+                        input: input.clone(),
+                        parent_id: None,
+                        queue_name: dispatch_queue,
+                        execution_timeout: None,
+                        memo: None,
+                        search_attrs: None,
+                        reuse_policy: WorkflowIdReusePolicy::RejectDuplicate,
+                        trace_context: None,
+                    },
+                )
+                .await;
+                match result {
+                    Ok(started) if started.created => {
+                        dispatched += 1;
+                        dispatched_this_call += 1;
+                    }
+                    Ok(_) | Err(HarvestError::AlreadyExists { .. }) => {
+                        skipped += 1;
+                        *skipped_reasons
+                            .entry("already_exists".to_string())
+                            .or_insert(0) += 1;
+                    }
+                    Err(e) => {
+                        shard_failures.push(BackfillShardFailure {
+                            shard_id: 0,
+                            reason: e.to_string(),
+                        });
+                        failed += 1;
+                    }
+                }
+            }
+        }
+        ScheduleKind::Dag => {
+            let dag_name = name.clone();
+            // DAG runs are pinned to a single shard by dag_name (same rendezvous hash
+            // as the scheduler tick), so ON CONFLICT DO NOTHING is effective across retries.
+            let shard_id = runtime.router().pick_for_dag(&dag_name);
+            let shard_pool = pool.pool_for(shard_id);
+
+            for scheduled_for in &timestamps {
+                // Respect max_active_runs for DAGs.
+                if running_at_start + dispatched_this_call >= max_active {
+                    skipped += 1;
+                    *skipped_reasons
+                        .entry("max_active_runs".to_string())
+                        .or_insert(0) += 1;
+                    continue;
+                }
+
+                let Ok(mut conn) = acquire_conn(shard_pool).await else {
+                    shard_failures.push(BackfillShardFailure {
+                        shard_id: shard_id.as_i32(),
+                        reason: "failed to acquire connection".to_string(),
+                    });
+                    failed += 1;
+                    continue;
+                };
+                let row = NewDagRun {
+                    id: uuid::Uuid::new_v4(),
+                    dag_name: &dag_name,
+                    workflow_exec_id: None,
+                    logical_date: *scheduled_for,
+                    data_interval_start: *scheduled_for,
+                    data_interval_end: *scheduled_for,
+                    conf: Some(serde_json::json!({"_harvest_run_source": "backfill"})),
+                };
+                let insert_result = diesel::insert_into(harvest_dag_runs::table)
+                    .values(&row)
+                    .on_conflict((harvest_dag_runs::dag_name, harvest_dag_runs::logical_date))
+                    .do_nothing()
+                    .execute(&mut conn)
+                    .await;
+                match insert_result {
+                    Ok(1) => {
+                        dispatched += 1;
+                        dispatched_this_call += 1;
+                    }
+                    Ok(_) => {
+                        // ON CONFLICT DO NOTHING → already exists
+                        skipped += 1;
+                        *skipped_reasons
+                            .entry("already_exists".to_string())
+                            .or_insert(0) += 1;
+                    }
+                    Err(e) => {
+                        shard_failures.push(BackfillShardFailure {
+                            shard_id: shard_id.as_i32(),
+                            reason: e.to_string(),
+                        });
+                        failed += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    let status = if shard_failures.is_empty() && failed == 0 {
+        "complete"
+    } else {
+        "partial"
+    };
+    let error_summary = if status == "partial" {
+        Some("one or more shard failures")
+    } else {
+        None
+    };
+
+    write_backfill_log(
+        &pool,
+        schedule_id,
+        &actor,
+        &source,
+        request.from,
+        request.to,
+        false,
+        total,
+        dispatched,
+        skipped,
+        failed,
+        status,
+        error_summary,
+        started_at,
+    )
+    .await;
+    let id_str = schedule_id.to_string();
+    write_audit(
+        &pool,
+        &actor,
+        &source,
+        req_id.as_deref(),
+        route,
+        &id_str,
+        if status == "complete" {
+            STATUS_SUCCEEDED
+        } else {
+            STATUS_FAILED
+        },
+        error_summary,
+    )
+    .await;
+
+    Ok(Json(ScheduleBackfillResponse {
+        status: status.to_string(),
+        schedule_id,
+        kind,
+        name,
+        from: request.from,
+        to: request.to,
+        planned_timestamps: timestamps,
+        total,
+        dispatched,
+        skipped,
+        failed,
+        skipped_reasons,
+        partial_shard_failures: shard_failures,
+        paused_schedule_warning,
+    }))
+}
+
+/// Count RUNNING workflow executions or DAG runs for the named entity.
+/// Returns the total count across all shards. Returns 0 on any DB error (safe: just
+/// means we don't artificially cap the backfill).
+async fn query_running_count(pool: &HarvestDbPool, kind: &ScheduleKind, name: &str) -> i64 {
+    let mut total = 0i64;
+    for (_, shard_pool) in pool.iter_shards() {
+        let Ok(mut conn) = acquire_conn(shard_pool).await else {
+            continue;
+        };
+        let count = match kind {
+            ScheduleKind::Workflow => harvest_workflow_executions::table
+                .filter(harvest_workflow_executions::workflow_name.eq(name))
+                .filter(harvest_workflow_executions::state.eq("RUNNING"))
+                .count()
+                .get_result::<i64>(&mut conn)
+                .await
+                .unwrap_or(0),
+            ScheduleKind::Dag => harvest_dag_runs::table
+                .filter(harvest_dag_runs::dag_name.eq(name))
+                .filter(harvest_dag_runs::state.eq("RUNNING"))
+                .count()
+                .get_result::<i64>(&mut conn)
+                .await
+                .unwrap_or(0),
+        };
+        total += count;
+    }
+    total
+}
+
+/// Count how many of the planned timestamps already have an execution or DAG run.
+/// Used in dry-run mode to improve the accuracy of the would-dispatch estimate.
+/// Returns 0 on any DB error (safe: slightly over-estimates would-dispatch).
+async fn count_existing_in_window(
+    pool: &HarvestDbPool,
+    kind: &ScheduleKind,
+    name: &str,
+    timestamps: &[chrono::DateTime<chrono::Utc>],
+) -> usize {
+    if timestamps.is_empty() {
+        return 0;
+    }
+    let mut total = 0usize;
+    match kind {
+        ScheduleKind::Workflow => {
+            let workflow_ids: Vec<String> = timestamps
+                .iter()
+                .map(|ts| scheduled_workflow_id_pub(name, *ts))
+                .collect();
+            for (_, shard_pool) in pool.iter_shards() {
+                let Ok(mut conn) = acquire_conn(shard_pool).await else {
+                    continue;
+                };
+                let count: i64 = harvest_workflow_executions::table
+                    .filter(harvest_workflow_executions::workflow_name.eq(name))
+                    .filter(harvest_workflow_executions::workflow_id.eq_any(&workflow_ids))
+                    .count()
+                    .get_result(&mut conn)
+                    .await
+                    .unwrap_or(0);
+                total += usize::try_from(count).unwrap_or(0);
+            }
+        }
+        ScheduleKind::Dag => {
+            for (_, shard_pool) in pool.iter_shards() {
+                let Ok(mut conn) = acquire_conn(shard_pool).await else {
+                    continue;
+                };
+                let count: i64 = harvest_dag_runs::table
+                    .filter(harvest_dag_runs::dag_name.eq(name))
+                    .filter(harvest_dag_runs::logical_date.eq_any(timestamps))
+                    .count()
+                    .get_result(&mut conn)
+                    .await
+                    .unwrap_or(0);
+                total += usize::try_from(count).unwrap_or(0);
+            }
+        }
+    }
+    total
+}
+
+/// Write a backfill log row; silently swallows errors (best-effort durability).
+#[allow(clippy::too_many_arguments)]
+async fn write_backfill_log(
+    pool: &HarvestDbPool,
+    schedule_id: uuid::Uuid,
+    actor: &str,
+    source: &str,
+    from: chrono::DateTime<chrono::Utc>,
+    to: chrono::DateTime<chrono::Utc>,
+    dry_run: bool,
+    total: usize,
+    dispatched: usize,
+    skipped: usize,
+    failed: usize,
+    status: &str,
+    error_summary: Option<&str>,
+    started_at: chrono::DateTime<chrono::Utc>,
+) {
+    let Ok(mut conn) = acquire_conn(pool.default_pool()).await else {
+        return;
+    };
+    let row = NewBackfillLogRow {
+        id: uuid::Uuid::new_v4(),
+        schedule_id,
+        actor: actor.to_string(),
+        source: source.to_string(),
+        from_ts: from,
+        to_ts: to,
+        dry_run,
+        total: i32::try_from(total).unwrap_or(i32::MAX),
+        dispatched: i32::try_from(dispatched).unwrap_or(i32::MAX),
+        skipped: i32::try_from(skipped).unwrap_or(i32::MAX),
+        failed: i32::try_from(failed).unwrap_or(i32::MAX),
+        status: status.to_string(),
+        error_summary: error_summary.map(str::to_string),
+        started_at,
+        completed_at: Some(chrono::Utc::now()),
+    };
+    let _ = diesel::insert_into(harvest_backfill_log::table)
+        .values(&row)
+        .execute(&mut conn)
+        .await;
+}
+
+/// Write an audit record; silently swallows errors.
+#[allow(clippy::too_many_arguments)]
+async fn write_audit(
+    pool: &HarvestDbPool,
+    actor: &str,
+    source: &str,
+    request_id: Option<&str>,
+    route: &str,
+    target_id: &str,
+    status: &str,
+    error_summary: Option<&str>,
+) {
+    let Ok(mut conn) = acquire_conn(pool.default_pool()).await else {
+        return;
+    };
+    let ar = NewAuditRecord {
+        actor,
+        operation: OP_SCHEDULE_BACKFILL,
+        target_type: TARGET_SCHEDULE,
+        target_id: Some(target_id),
+        route_or_command: route,
+        request_id,
+        idempotency_key: None,
+        status,
+        error_summary,
+        shard_id: None,
+        source,
+    };
+    let _ = audit::insert_audit(&mut conn, &ar).await;
+}
+
+/// Load a schedule row by UUID across all shards.
+async fn load_schedule_by_id(
+    api_state: &HarvestApiState,
+    schedule_id: uuid::Uuid,
+) -> Result<HarvestSchedule, AutumnError> {
+    use autumn_harvest::schema::harvest_schedules::dsl;
+
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    for (_shard, shard_pool) in pool.iter_shards() {
+        let mut conn = acquire_conn(shard_pool).await?;
+        let row = dsl::harvest_schedules
+            .find(schedule_id)
+            .select(HarvestSchedule::as_select())
+            .first(&mut conn)
+            .await
+            .optional()
+            .map_err(database_error)
+            .map_err(map_error)?;
+        if let Some(r) = row {
+            return Ok(r);
+        }
+    }
+    Err(AutumnError::not_found_msg(format!(
+        "schedule {schedule_id}"
+    )))
 }
 
 fn parse_schedule_expr(expr: &str) -> Result<autumn_harvest::policy::Schedule, String> {

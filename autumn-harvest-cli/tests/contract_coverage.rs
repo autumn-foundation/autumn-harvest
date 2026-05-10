@@ -423,6 +423,19 @@ fn schedule_delete_is_covered() {
     assert_covered(&["schedule", "delete", "00000000-0000-0000-0000-000000000001"]);
 }
 
+#[test]
+fn schedule_backfill_is_covered() {
+    assert_covered(&[
+        "schedule",
+        "backfill",
+        "00000000-0000-0000-0000-000000000001",
+        "--from",
+        "2026-04-01T00:00:00Z",
+        "--to",
+        "2026-04-08T00:00:00Z",
+    ]);
+}
+
 // ── retention ─────────────────────────────────────────────────────────────────
 
 #[test]
@@ -726,5 +739,22 @@ fn schedule_create_workflow_body_fields_are_documented() {
         "3",
         "--catchup",
         "--paused",
+    ]);
+}
+
+#[test]
+fn schedule_backfill_body_fields_are_documented() {
+    assert_body_fields_documented(&[
+        "schedule",
+        "backfill",
+        "00000000-0000-0000-0000-000000000001",
+        "--from",
+        "2026-04-01T00:00:00Z",
+        "--to",
+        "2026-04-08T00:00:00Z",
+        "--dry-run",
+        "--max-count",
+        "50",
+        "--include-paused",
     ]);
 }

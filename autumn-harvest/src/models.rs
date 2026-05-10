@@ -10,10 +10,10 @@ use diesel::prelude::*;
 use uuid::Uuid;
 
 use crate::schema::{
-    harvest_audit_log, harvest_batch_jobs, harvest_build_compat, harvest_build_policies,
-    harvest_dag_runs, harvest_dead_letters, harvest_events, harvest_external_tasks,
-    harvest_schedules, harvest_signals, harvest_task_queue, harvest_timers, harvest_workers,
-    harvest_workflow_executions,
+    harvest_audit_log, harvest_backfill_log, harvest_batch_jobs, harvest_build_compat,
+    harvest_build_policies, harvest_dag_runs, harvest_dead_letters, harvest_events,
+    harvest_external_tasks, harvest_schedules, harvest_signals, harvest_task_queue, harvest_timers,
+    harvest_workers, harvest_workflow_executions,
 };
 
 // ── WorkflowExecution ─────────────────────────────────────────────────────────
@@ -556,4 +556,49 @@ pub struct NewHarvestBuildCompat<'a> {
     pub id: Uuid,
     pub build_id: &'a str,
     pub compatible_with: &'a str,
+}
+
+// ── BackfillLog ───────────────────────────────────────────────────────────────
+
+/// One row in `harvest_backfill_log`: durable record of a single backfill request.
+#[derive(Debug, Clone, Queryable, Selectable, serde::Serialize, serde::Deserialize)]
+#[diesel(table_name = harvest_backfill_log)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct BackfillLogRow {
+    pub id: Uuid,
+    pub schedule_id: Uuid,
+    pub actor: String,
+    pub source: String,
+    pub from_ts: DateTime<Utc>,
+    pub to_ts: DateTime<Utc>,
+    pub dry_run: bool,
+    pub total: i32,
+    pub dispatched: i32,
+    pub skipped: i32,
+    pub failed: i32,
+    pub status: String,
+    pub error_summary: Option<String>,
+    pub started_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+/// Insert struct for a new backfill log entry.
+#[derive(Debug, Insertable)]
+#[diesel(table_name = harvest_backfill_log)]
+pub struct NewBackfillLogRow {
+    pub id: Uuid,
+    pub schedule_id: Uuid,
+    pub actor: String,
+    pub source: String,
+    pub from_ts: DateTime<Utc>,
+    pub to_ts: DateTime<Utc>,
+    pub dry_run: bool,
+    pub total: i32,
+    pub dispatched: i32,
+    pub skipped: i32,
+    pub failed: i32,
+    pub status: String,
+    pub error_summary: Option<String>,
+    pub started_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
 }

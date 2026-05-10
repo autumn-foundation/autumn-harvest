@@ -273,6 +273,28 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    use diesel::sql_types::*;
+
+    harvest_backfill_log (id) {
+        id -> Uuid,
+        schedule_id -> Uuid,
+        actor -> Text,
+        source -> Text,
+        from_ts -> Timestamptz,
+        to_ts -> Timestamptz,
+        dry_run -> Bool,
+        total -> Int4,
+        dispatched -> Int4,
+        skipped -> Int4,
+        failed -> Int4,
+        status -> Text,
+        error_summary -> Nullable<Text>,
+        started_at -> Timestamptz,
+        completed_at -> Nullable<Timestamptz>,
+    }
+}
+
 diesel::joinable!(harvest_events -> harvest_workflow_executions (workflow_exec_id));
 diesel::joinable!(harvest_task_queue -> harvest_workflow_executions (workflow_exec_id));
 diesel::joinable!(harvest_dag_runs -> harvest_workflow_executions (workflow_exec_id));
@@ -295,4 +317,5 @@ diesel::allow_tables_to_appear_in_same_query!(
     harvest_audit_log,
     harvest_build_policies,
     harvest_build_compat,
+    harvest_backfill_log,
 );
