@@ -190,6 +190,24 @@ means `warn`, and `1` means `fail` or a transport/API error. Use warning exit
 code `2` when your release process allows a separate "promote with caution"
 branch; otherwise treat any nonzero exit as a failed gate.
 
+### Starter alert rules and runbooks
+
+Harvest ships a versioned starter alert pack for first production deployments:
+[`docs/alerts/starter-pack-v0.1.0.json`](docs/alerts/starter-pack-v0.1.0.json).
+The pack covers preflight failure, missing worker coverage, stale/draining
+worker saturation, queue backlog growth, activity failures, DLQ growth, missed
+schedules, retention lag, shard readiness, and the pending
+`no_compatible_worker` build-routing signal. Pair it with
+[`docs/runbooks/harvest-alerts.md`](docs/runbooks/harvest-alerts.md) and the
+synthetic drills in
+[`docs/runbooks/synthetic-incident-drills.md`](docs/runbooks/synthetic-incident-drills.md).
+
+The thresholds are starter defaults, not universal SLOs. Tune them to workload
+volume, downstream SLAs, shard count, queue topology, and schedule cadence. The
+Prometheus examples use only ADR-0001/#138 metric names and bounded labels;
+operators without Prometheus can run the equivalent CLI/API checks documented
+in [`docs/alerts/README.md`](docs/alerts/README.md).
+
 ### Controlling duplicate workflow starts
 
 By default, starting a workflow with a `(workflow_name, workflow_id)` pair that already exists returns the existing execution. This "allow duplicate" behaviour is correct for upstream services that retry a start whose response was lost. It is **not** correct when you need at-most-one, retry-after-failure, or terminate-and-replace semantics.
