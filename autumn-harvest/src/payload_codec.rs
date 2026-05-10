@@ -5,10 +5,10 @@
 //! This might not be desirable for sensitive data (like PII or credentials), or for large payloads that could benefit
 //! from compression.
 //!
-//! The Payload Codec system intercepts data at the database boundary. Before an event is saved, its payload fields
-//! (like `input`, `output`, `payload`, `details`) are passed through the default codec to be encoded (e.g., encrypted
-//! into a byte array). When the event is read back from the database, it's passed through the corresponding codec to be
-//! decoded back into its original JSON form.
+//! The Payload Codec system allows you to manually encode payload fields
+//! (like `input`, `output`, `payload`, `details`) before passing them to the database. When an event is read back from the database,
+//! it can be manually passed through the corresponding codec to be
+//! decoded back into its original JSON form using the `_with_codecs` helpers.
 //!
 //! # Codec Envelopes
 //! When a payload is encoded, it is wrapped in a "Codec Envelope" - a specific JSON structure that tells `autumn-harvest`
