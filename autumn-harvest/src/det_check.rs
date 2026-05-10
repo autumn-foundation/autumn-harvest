@@ -471,9 +471,25 @@ fn strip_line_comment(line: &str) -> &str {
     line_comment_start(line).map_or(line, |pos| &line[..pos])
 }
 
+/// Returns the byte position immediately after the closing `*/` of a block
+/// comment, scanning from `start` (the position right after the opening `/*`).
+/// Returns `line.len()` if the comment is not closed on this line.
+/// Nested block comments are not supported.
+fn block_comment_end(line: &str, start: usize) -> usize {
+    let bytes = line.as_bytes();
+    let mut pos = start;
+    while pos < bytes.len() {
+        if bytes[pos] == b'*' && pos + 1 < bytes.len() && bytes[pos + 1] == b'/' {
+            return pos + 2;
+        }
+        pos += 1;
+    }
+    line.len()
+}
+
 /// Updates `depth` for braces in code, ignoring braces inside simple Rust
-/// string/character literals and line comments. Returns the byte position of
-/// the closing brace that returns the depth to zero, if present.
+/// string/character literals, line comments, and block comments. Returns the
+/// byte position of the closing brace that returns the depth to zero, if present.
 fn scan_braces_outside_literals(line: &str, depth: &mut u32) -> Option<usize> {
     let mut pos = 0;
 
@@ -493,6 +509,9 @@ fn scan_braces_outside_literals(line: &str, depth: &mut u32) -> Option<usize> {
                 pos = char_literal_end(line, pos).unwrap_or(next_pos);
             }
             '/' if line[next_pos..].starts_with('/') => break,
+            '/' if line[next_pos..].starts_with('*') => {
+                pos = block_comment_end(line, next_pos + 1);
+            }
             '{' => {
                 *depth = depth.saturating_add(1);
                 pos = next_pos;
@@ -512,7 +531,7 @@ fn scan_braces_outside_literals(line: &str, depth: &mut u32) -> Option<usize> {
 }
 
 /// Returns the byte position of the first `//` outside simple Rust
-/// string/character literals.
+/// string/character literals and block comments.
 fn line_comment_start(line: &str) -> Option<usize> {
     let mut pos = 0;
 
@@ -532,6 +551,9 @@ fn line_comment_start(line: &str) -> Option<usize> {
                 pos = char_literal_end(line, pos).unwrap_or(next_pos);
             }
             '/' if line[next_pos..].starts_with('/') => return Some(pos),
+            '/' if line[next_pos..].starts_with('*') => {
+                pos = block_comment_end(line, next_pos + 1);
+            }
             _ => pos = next_pos,
         }
     }
@@ -679,6 +701,9 @@ fn strip_unparseable_content(line: &str) -> String {
         match ch {
             '"' => pos = normal_string_end(code, pos),
             '\'' => pos = char_literal_end(code, pos).unwrap_or(next_pos),
+            '/' if code[next_pos..].starts_with('*') => {
+                pos = block_comment_end(code, next_pos + 1);
+            }
             _ => {
                 result.push(ch);
                 pos = next_pos;
@@ -810,6 +835,25 @@ mod tests {
                 r#"let _ = SystemTime::now(); // harvest-suppress: DET001 "safe""#
             ),
             Some("safe".to_string())
+        );
+    }
+
+    #[test]
+    fn strip_unparseable_content_removes_block_comments() {
+        // Block comment content is stripped.
+        assert_eq!(
+            strip_unparseable_content("let x = /* std::fs::read */ 5;"),
+            "let x =  5;"
+        );
+        // Block comment with `}` inside must not confuse callers.
+        assert_eq!(
+            strip_unparseable_content("foo() /* } */ .bar()"),
+            "foo()  .bar()"
+        );
+        // `/* // */` must not trick line_comment_start into discarding real code.
+        assert_eq!(
+            strip_unparseable_content("/* // */ let x = 1;"),
+            " let x = 1;"
         );
     }
 

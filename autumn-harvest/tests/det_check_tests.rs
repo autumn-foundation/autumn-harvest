@@ -671,6 +671,30 @@ fn inline_suppression_does_not_carry_to_next_line() {
     );
 }
 
+// ── block comment handling ────────────────────────────────────────────────
+
+#[test]
+fn block_comment_brace_does_not_end_body_early() {
+    // A `}` inside `/* */` must not terminate workflow body extraction early.
+    let src = wf("let x = /* } */ 5;\n    let _ = std::time::SystemTime::now();");
+    let report = check_source(&src, "test.rs");
+    assert!(
+        report.has_hard_blockers(),
+        "violation after a block-comment `}}` must still be flagged"
+    );
+}
+
+#[test]
+fn block_comment_pattern_is_not_flagged() {
+    // A DET pattern inside `/* */` must not produce a finding.
+    let src = wf("let x = /* std::fs::read */ 5;");
+    let report = check_source(&src, "test.rs");
+    assert!(
+        !report.has_hard_blockers(),
+        "DET pattern inside block comment must not be flagged"
+    );
+}
+
 // ── regression fixtures ────────────────────────────────────────────────────
 // These fixtures each embed exactly one violation of the target rule.
 // They serve as regression tests: if the rule is removed or its ID changes,
