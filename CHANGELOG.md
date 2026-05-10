@@ -5,6 +5,36 @@ All notable changes to autumn-harvest will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Versioned management API contract** (`docs/api-contract.json`, issue #175):
+  machine-readable JSON describing every route's method, path, category,
+  `read_only` flag, request-body field schema, success/error responses,
+  pagination params, and idempotency semantics. Contract version `"1"`,
+  aligned with crate version `"0.2.0"`.
+- `management_api_request_fields()` in `autumn_harvest_plugin::api`: canonical
+  registry of request-body field names per mutating route. Compared against the
+  contract by the regression test suite; update both together when adding or
+  renaming fields.
+- Contract regression tests (`autumn-harvest-plugin/tests/contract_regression.rs`):
+  six tests assert route-set parity, required metadata fields, version/compat
+  metadata, structured `request_body` on all mutating routes, field-registry
+  parity, and read-only/method consistency.
+- CLI body-field coverage tests (`autumn-harvest-cli/tests/contract_coverage.rs`):
+  every CLI subcommand is exercised to confirm (a) it maps to a documented
+  contract route and (b) every key it sends in the request body is declared in
+  the contract's `fields` list.
+- Embedder guide `docs/api-contract-guide.md` with jq inspection recipes,
+  compatibility rules, client generation workflow, and developer update checklist.
+
+### Non-breaking
+
+This release adds documentation artefacts and test scaffolding only.  No route,
+event, or schema was removed or renamed.  Adding the contract is classified as
+non-breaking per the compatibility rules stated in `docs/api-contract.json`.
+
 ## [0.2.0] - 2026-04-27
 
 ### Added

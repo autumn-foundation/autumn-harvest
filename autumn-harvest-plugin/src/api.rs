@@ -1100,6 +1100,444 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .layer(Extension(api_state))
 }
 
+/// Canonical `(METHOD, path-template)` list for every route in `harvest_api_router`.
+///
+/// The contract regression test compares this list against `docs/api-contract.json`;
+/// update both together whenever routes change.
+#[must_use]
+pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] {
+    &[
+        // ── workflows ────────────────────────────────────────────────────────
+        ("GET", "/workflows"),
+        ("GET", "/workflows/{id}"),
+        ("GET", "/workflows/{id}/history/export"),
+        ("GET", "/workflows/{id}/children"),
+        ("GET", "/workflows/{id}/stack"),
+        ("POST", "/workflows/{workflow_name}/start"),
+        ("POST", "/workflows/{id}/cancel"),
+        ("POST", "/workflows/{id}/reset"),
+        ("POST", "/workflows/{id}/signal/{signal_name}"),
+        ("GET", "/workflows/{id}/query/{query_name}"),
+        ("POST", "/workflows/{id}/update/{update_name}"),
+        ("GET", "/workflows/{id}/update/{update_id}/result"),
+        // ── DAGs ─────────────────────────────────────────────────────────────
+        ("GET", "/dags"),
+        ("GET", "/dags/{dag_name}/runs"),
+        ("POST", "/dags/{dag_name}/trigger"),
+        ("PATCH", "/dags/{dag_name}"),
+        // ── dead-letter queue ─────────────────────────────────────────────────
+        ("GET", "/dead-letters"),
+        ("POST", "/dead-letters/replay"),
+        ("POST", "/dead-letters/discard"),
+        ("POST", "/dead-letters/{id}/replay"),
+        // ── external activity handoff (issue #92) ────────────────────────────
+        ("POST", "/activities/external/{token}/complete"),
+        ("POST", "/activities/external/{token}/fail"),
+        ("POST", "/activities/external/{token}/heartbeat"),
+        // ── workers (issues #100, #170) ───────────────────────────────────────
+        ("GET", "/workers"),
+        ("GET", "/workers/{worker_id}"),
+        ("GET", "/workers/health"),
+        ("GET", "/workers/drain-preview"),
+        ("POST", "/workers/{worker_id}/drain"),
+        // ── batch operations (issue #102) ─────────────────────────────────────
+        ("GET", "/batch-operations"),
+        ("POST", "/batch-operations"),
+        ("GET", "/batch-operations/{id}"),
+        // ── health & admin ────────────────────────────────────────────────────
+        ("GET", "/health"),
+        ("GET", "/admin/preflight"),
+        ("GET", "/admin/shards/health"),
+        ("GET", "/admin/version-gates/usage"),
+        ("GET", "/admin/version-gates/retirement-check"),
+        ("GET", "/admin/retention"),
+        ("POST", "/admin/retention/run-now"),
+        ("GET", "/admin/concurrency"),
+        ("GET", "/admin/history/exports"),
+        ("GET", "/admin/external-handoffs"),
+        ("GET", "/admin/external-handoffs/{token}"),
+        // ── schedules (issue #91) ─────────────────────────────────────────────
+        ("GET", "/admin/schedules"),
+        ("POST", "/admin/schedules/workflow"),
+        ("POST", "/admin/schedules/{id}/pause"),
+        ("POST", "/admin/schedules/{id}/resume"),
+        ("DELETE", "/admin/schedules/{id}"),
+        // ── audit (issue #158) ────────────────────────────────────────────────
+        ("GET", "/admin/audit"),
+    ]
+}
+
+/// Canonical request-body field registry for every mutating management route.
+///
+/// Each entry is `(method, path_template, fields)` where `fields` is
+/// `Some(&[...])` for a structured body or `None` for a free-form body.
+/// Compared against `docs/api-contract.json` by the regression test; update
+/// both together when adding, removing, or renaming a request field.
+#[must_use]
+#[allow(clippy::too_many_lines)]
+pub const fn management_api_request_fields()
+-> &'static [(&'static str, &'static str, Option<&'static [&'static str]>)] {
+    &[
+        // ── workflows ────────────────────────────────────────────────────────
+        (
+            "POST",
+            "/workflows/{workflow_name}/start",
+            Some(&[
+                "workflow_id",
+                "input",
+                "queue",
+                "memo",
+                "search_attrs",
+                "execution_timeout_secs",
+                "reuse_policy",
+            ]),
+        ),
+        ("POST", "/workflows/{id}/cancel", Some(&["reason"])),
+        (
+            "POST",
+            "/workflows/{id}/reset",
+            Some(&[
+                "reset_to_event_id",
+                "reason",
+                "operator_id",
+                "signal_reapply",
+            ]),
+        ),
+        ("POST", "/workflows/{id}/signal/{signal_name}", None), // free-form
+        (
+            "POST",
+            "/workflows/{id}/update/{update_name}",
+            Some(&["input"]),
+        ),
+        // ── DAGs ─────────────────────────────────────────────────────────────
+        ("POST", "/dags/{dag_name}/trigger", Some(&["conf"])),
+        ("PATCH", "/dags/{dag_name}", Some(&["paused"])),
+        // ── dead-letter queue ─────────────────────────────────────────────────
+        (
+            "POST",
+            "/dead-letters/replay",
+            Some(&[
+                "activity_name",
+                "workflow_name",
+                "failed_after",
+                "failed_before",
+                "limit",
+                "dry_run",
+            ]),
+        ),
+        (
+            "POST",
+            "/dead-letters/discard",
+            Some(&[
+                "activity_name",
+                "workflow_name",
+                "failed_after",
+                "failed_before",
+                "limit",
+                "dry_run",
+            ]),
+        ),
+        ("POST", "/dead-letters/{id}/replay", Some(&[])),
+        // ── external activity handoff ─────────────────────────────────────────
+        (
+            "POST",
+            "/activities/external/{token}/complete",
+            Some(&["output"]),
+        ),
+        (
+            "POST",
+            "/activities/external/{token}/fail",
+            Some(&["error", "retryable"]),
+        ),
+        (
+            "POST",
+            "/activities/external/{token}/heartbeat",
+            Some(&["extend_by_secs"]),
+        ),
+        // ── workers ───────────────────────────────────────────────────────────
+        ("POST", "/workers/{worker_id}/drain", Some(&["deadline_at"])),
+        // ── batch operations ──────────────────────────────────────────────────
+        (
+            "POST",
+            "/batch-operations",
+            Some(&[
+                "action",
+                "filter",
+                "signal_name",
+                "signal_payload",
+                "idempotency_key",
+                "created_by",
+            ]),
+        ),
+        // ── admin ─────────────────────────────────────────────────────────────
+        ("POST", "/admin/retention/run-now", Some(&[])),
+        (
+            "POST",
+            "/admin/schedules/workflow",
+            Some(&[
+                "workflow_name",
+                "schedule_expr",
+                "input",
+                "max_active_runs",
+                "catchup",
+                "paused",
+                "queue_name",
+            ]),
+        ),
+        ("POST", "/admin/schedules/{id}/pause", Some(&[])),
+        ("POST", "/admin/schedules/{id}/resume", Some(&[])),
+        ("DELETE", "/admin/schedules/{id}", Some(&[])),
+    ]
+}
+
+/// Canonical success-response field registry for every management route.
+///
+/// Each entry is `(method, path_template, fields)` where `fields` is
+/// `Some(&[...])` for a structured object response or `None` for a free-form
+/// response (array, external model, or polymorphic).  Compared against
+/// `docs/api-contract.json` by the regression test; update both together when
+/// adding, removing, or renaming a top-level response field.
+#[must_use]
+#[allow(clippy::too_many_lines)]
+pub const fn management_api_response_fields()
+-> &'static [(&'static str, &'static str, Option<&'static [&'static str]>)] {
+    &[
+        // ── workflows ────────────────────────────────────────────────────────
+        ("GET", "/workflows", None), // Vec<WorkflowExecution>
+        (
+            "GET",
+            "/workflows/{id}",
+            Some(&["parent_id", "execution", "history", "external_handoffs"]),
+        ),
+        ("GET", "/workflows/{id}/history/export", None), // HistoryExportDocument (external)
+        (
+            "GET",
+            "/workflows/{id}/children",
+            Some(&["items", "next_cursor"]),
+        ),
+        (
+            "GET",
+            "/workflows/{id}/stack",
+            Some(&[
+                "exec_id",
+                "workflow_id",
+                "workflow_name",
+                "state",
+                "is_terminal",
+                "pending_activities",
+                "pending_external_handoffs",
+                "pending_local_activities",
+                "pending_timers",
+                "pending_signals",
+                "buffered_signals",
+                "pending_child_workflows",
+                "last_event_id",
+            ]),
+        ),
+        (
+            "POST",
+            "/workflows/{workflow_name}/start",
+            Some(&["execution_id", "workflow_name", "workflow_id", "state"]),
+        ),
+        (
+            "POST",
+            "/workflows/{id}/cancel",
+            Some(&[
+                "ok",
+                "execution_id",
+                "state",
+                "reason",
+                "newly_cancelled",
+                "failed_task_count",
+            ]),
+        ),
+        (
+            "POST",
+            "/workflows/{id}/reset",
+            Some(&[
+                "new_exec_id",
+                "reset_from_exec_id",
+                "reset_to_event_id",
+                "events_carried_over",
+                "source_tasks_cancelled",
+                "source_timers_removed",
+                "source_signals_dropped",
+                "source_signals_buffered",
+            ]),
+        ),
+        (
+            "POST",
+            "/workflows/{id}/signal/{signal_name}",
+            Some(&["ok"]),
+        ),
+        ("GET", "/workflows/{id}/query/{query_name}", None), // opaque handler return
+        ("POST", "/workflows/{id}/update/{update_name}", None), // polymorphic admitted/completed/failed
+        ("GET", "/workflows/{id}/update/{update_id}/result", None), // polymorphic completed/failed
+        // ── DAGs ─────────────────────────────────────────────────────────────
+        ("GET", "/dags", None),                     // Vec<DagSummary>
+        ("GET", "/dags/{dag_name}/runs", None),     // Vec<DagRun> (external model)
+        ("POST", "/dags/{dag_name}/trigger", None), // DagRun (external model)
+        ("PATCH", "/dags/{dag_name}", None),        // HarvestSchedule (external model)
+        // ── dead-letter queue ─────────────────────────────────────────────────
+        ("GET", "/dead-letters", None), // Vec<DeadLetter> (external model)
+        (
+            "POST",
+            "/dead-letters/replay",
+            Some(&[
+                "matched", "acted_on", "skipped", "ids", "dry_run", "failures",
+            ]),
+        ),
+        (
+            "POST",
+            "/dead-letters/discard",
+            Some(&[
+                "matched", "acted_on", "skipped", "ids", "dry_run", "failures",
+            ]),
+        ),
+        (
+            "POST",
+            "/dead-letters/{id}/replay",
+            Some(&["ok", "dead_letter_id", "task_id"]),
+        ),
+        // ── external activity handoff ─────────────────────────────────────────
+        (
+            "POST",
+            "/activities/external/{token}/complete",
+            Some(&["ok", "newly_resolved", "status", "current_state"]),
+        ),
+        (
+            "POST",
+            "/activities/external/{token}/fail",
+            Some(&["ok", "newly_resolved", "status", "current_state"]),
+        ),
+        (
+            "POST",
+            "/activities/external/{token}/heartbeat",
+            Some(&["ok", "newly_resolved", "status", "current_state"]),
+        ),
+        // ── workers ───────────────────────────────────────────────────────────
+        ("GET", "/workers", None), // Vec<WorkerRow> (external model)
+        ("GET", "/workers/{worker_id}", None), // WorkerRow (external model)
+        (
+            "GET",
+            "/workers/health",
+            Some(&["healthy", "stale", "draining", "by_queue", "by_shard"]),
+        ),
+        ("GET", "/workers/drain-preview", None), // Vec<DrainPreviewItem>
+        (
+            "POST",
+            "/workers/{worker_id}/drain",
+            Some(&[
+                "worker_id",
+                "outcome",
+                "in_flight_count",
+                "drain_deadline_at",
+                "shard_ids",
+                "unavailable_shards",
+            ]),
+        ),
+        // ── batch operations ──────────────────────────────────────────────────
+        ("GET", "/batch-operations", None), // Vec<BatchJobView> (external model)
+        ("POST", "/batch-operations", Some(&["batch_job_id"])),
+        ("GET", "/batch-operations/{id}", None), // BatchJobView (external model)
+        // ── health & admin ────────────────────────────────────────────────────
+        (
+            "GET",
+            "/health",
+            Some(&[
+                "runtime_ready",
+                "worker_id",
+                "queues",
+                "dag_count",
+                "scheduler",
+                "shard_readiness_enforced",
+                "shard_readiness",
+            ]),
+        ),
+        (
+            "GET",
+            "/admin/preflight",
+            Some(&["overall_status", "observed_at", "version", "checks"]),
+        ),
+        (
+            "GET",
+            "/admin/shards/health",
+            Some(&[
+                "overall_readiness",
+                "observed_at",
+                "freshness_window_secs",
+                "candidate_shard",
+                "shards",
+            ]),
+        ),
+        (
+            "GET",
+            "/admin/version-gates/usage",
+            Some(&["status", "observed_at", "filters", "items", "shards"]),
+        ),
+        (
+            "GET",
+            "/admin/version-gates/retirement-check",
+            Some(&[
+                "status",
+                "safe_to_retire",
+                "observed_at",
+                "filters",
+                "blockers",
+                "shards",
+            ]),
+        ),
+        ("GET", "/admin/retention", None), // RetentionStatus (external model)
+        ("POST", "/admin/retention/run-now", Some(&["ok"])),
+        ("GET", "/admin/concurrency", None), // Vec<ConcurrencyKeyStats> (external model)
+        (
+            "GET",
+            "/admin/history/exports",
+            Some(&[
+                "status",
+                "observed_at",
+                "payload_policy",
+                "filters",
+                "exports",
+                "failures",
+                "shard_coverage",
+            ]),
+        ),
+        (
+            "GET",
+            "/admin/external-handoffs",
+            Some(&["status", "items", "shard_coverage"]),
+        ),
+        (
+            "GET",
+            "/admin/external-handoffs/{token}",
+            Some(&["status", "item", "shard_coverage"]),
+        ),
+        // ── schedules ─────────────────────────────────────────────────────────
+        ("GET", "/admin/schedules", None), // Vec<ScheduleEntry>
+        (
+            "POST",
+            "/admin/schedules/workflow",
+            Some(&[
+                "id",
+                "kind",
+                "name",
+                "schedule_expr",
+                "is_paused",
+                "next_run_at",
+                "last_run_at",
+                "max_active_runs",
+                "catchup",
+            ]),
+        ),
+        ("POST", "/admin/schedules/{id}/pause", Some(&["ok"])),
+        ("POST", "/admin/schedules/{id}/resume", Some(&["ok"])),
+        ("DELETE", "/admin/schedules/{id}", Some(&["ok"])),
+        // ── audit ─────────────────────────────────────────────────────────────
+        ("GET", "/admin/audit", None), // Vec<AuditRecord> (external model)
+    ]
+}
+
 async fn preflight(
     Extension(api_state): Extension<HarvestApiState>,
     axum::extract::State(autumn_state): axum::extract::State<AppState>,
