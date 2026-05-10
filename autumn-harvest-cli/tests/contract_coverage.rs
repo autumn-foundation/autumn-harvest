@@ -357,7 +357,7 @@ fn retention_run_now_is_covered() {
 
 #[test]
 fn concurrency_status_is_covered() {
-    assert_covered(&["concurrency"]);
+    assert_covered(&["concurrency", "status"]);
 }
 
 // ── audit ─────────────────────────────────────────────────────────────────────

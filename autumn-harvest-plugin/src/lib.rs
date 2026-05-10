@@ -13,7 +13,10 @@ pub mod ui;
 pub mod version_gate_retirement;
 pub mod version_usage;
 
-pub use api::{HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router};
+pub use api::{
+    HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
+    management_api_routes,
+};
 pub use config::{
     HarvestBatchConfig, HarvestDatabaseConfig, HarvestMode, HarvestOutboxConfig,
     HarvestReadinessConfig, HarvestRuntimeConfig,

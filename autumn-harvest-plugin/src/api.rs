@@ -1100,6 +1100,71 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .layer(Extension(api_state))
 }
 
+/// Returns the canonical list of all `(METHOD, path-template)` pairs registered
+/// by `harvest_api_router`.  The contract regression test compares this list
+/// against `docs/api-contract.json`; update both together whenever routes change.
+pub fn management_api_routes() -> &'static [(&'static str, &'static str)] {
+    &[
+        // ── workflows ────────────────────────────────────────────────────────
+        ("GET", "/workflows"),
+        ("GET", "/workflows/{id}"),
+        ("GET", "/workflows/{id}/history/export"),
+        ("GET", "/workflows/{id}/children"),
+        ("GET", "/workflows/{id}/stack"),
+        ("POST", "/workflows/{workflow_name}/start"),
+        ("POST", "/workflows/{id}/cancel"),
+        ("POST", "/workflows/{id}/reset"),
+        ("POST", "/workflows/{id}/signal/{signal_name}"),
+        ("GET", "/workflows/{id}/query/{query_name}"),
+        ("POST", "/workflows/{id}/update/{update_name}"),
+        ("GET", "/workflows/{id}/update/{update_id}/result"),
+        // ── DAGs ─────────────────────────────────────────────────────────────
+        ("GET", "/dags"),
+        ("GET", "/dags/{dag_name}/runs"),
+        ("POST", "/dags/{dag_name}/trigger"),
+        ("PATCH", "/dags/{dag_name}"),
+        // ── dead-letter queue ─────────────────────────────────────────────────
+        ("GET", "/dead-letters"),
+        ("POST", "/dead-letters/replay"),
+        ("POST", "/dead-letters/discard"),
+        ("POST", "/dead-letters/{id}/replay"),
+        // ── external activity handoff (issue #92) ────────────────────────────
+        ("POST", "/activities/external/{token}/complete"),
+        ("POST", "/activities/external/{token}/fail"),
+        ("POST", "/activities/external/{token}/heartbeat"),
+        // ── workers (issues #100, #170) ───────────────────────────────────────
+        ("GET", "/workers"),
+        ("GET", "/workers/{worker_id}"),
+        ("GET", "/workers/health"),
+        ("GET", "/workers/drain-preview"),
+        ("POST", "/workers/{worker_id}/drain"),
+        // ── batch operations (issue #102) ─────────────────────────────────────
+        ("GET", "/batch-operations"),
+        ("POST", "/batch-operations"),
+        ("GET", "/batch-operations/{id}"),
+        // ── health & admin ────────────────────────────────────────────────────
+        ("GET", "/health"),
+        ("GET", "/admin/preflight"),
+        ("GET", "/admin/shards/health"),
+        ("GET", "/admin/version-gates/usage"),
+        ("GET", "/admin/version-gates/retirement-check"),
+        ("GET", "/admin/retention"),
+        ("POST", "/admin/retention/run-now"),
+        ("GET", "/admin/concurrency"),
+        ("GET", "/admin/history/exports"),
+        ("GET", "/admin/external-handoffs"),
+        ("GET", "/admin/external-handoffs/{token}"),
+        // ── schedules (issue #91) ─────────────────────────────────────────────
+        ("GET", "/admin/schedules"),
+        ("POST", "/admin/schedules/workflow"),
+        ("POST", "/admin/schedules/{id}/pause"),
+        ("POST", "/admin/schedules/{id}/resume"),
+        ("DELETE", "/admin/schedules/{id}"),
+        // ── audit (issue #158) ────────────────────────────────────────────────
+        ("GET", "/admin/audit"),
+    ]
+}
+
 async fn preflight(
     Extension(api_state): Extension<HarvestApiState>,
     axum::extract::State(autumn_state): axum::extract::State<AppState>,
