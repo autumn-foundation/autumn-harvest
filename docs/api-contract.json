@@ -11,11 +11,14 @@
       "Removing a route",
       "Renaming a route (path or method change)",
       "Changing a query parameter from optional to required",
+      "Removing a request body field",
+      "Renaming a request body field",
       "Adding a new mutating route without classifying it in this contract"
     ],
     "non_breaking_changes": [
       "Adding a new optional response field",
       "Adding a new optional query parameter",
+      "Adding a new optional request body field",
       "Adding a new read-only route",
       "Narrowing an existing error response to be more specific"
     ]
@@ -36,6 +39,7 @@
         { "name": "limit", "in": "query", "required": false, "description": "Maximum number of results to return." },
         { "name": "cursor", "in": "query", "required": false, "description": "Opaque pagination cursor from a previous response." }
       ],
+      "request_body": null,
       "success_response": { "status": 200, "schema": "Array of WorkflowExecution summaries with pagination cursor." },
       "error_responses": [
         { "status": 400, "description": "Invalid filter value." },
@@ -51,6 +55,7 @@
       "params": [
         { "name": "id", "in": "path", "required": true, "description": "Execution UUID." }
       ],
+      "request_body": null,
       "success_response": { "status": 200, "schema": "WorkflowExecution with full event list." },
       "error_responses": [
         { "status": 404, "description": "Execution not found." },
@@ -68,6 +73,7 @@
         { "name": "payload_policy", "in": "query", "required": false, "description": "Payload inclusion policy: full (default), redacted, or omit." },
         { "name": "max_bytes", "in": "query", "required": false, "description": "Soft byte cap on total payload size." }
       ],
+      "request_body": null,
       "success_response": { "status": 200, "schema": "HistoryExportDocument (JSON)." },
       "error_responses": [
         { "status": 404, "description": "Execution not found." },
@@ -89,6 +95,7 @@
         { "name": "cursor", "in": "query", "required": false, "description": "Pagination cursor." },
         { "name": "depth", "in": "query", "required": false, "description": "Maximum recursion depth for nested children." }
       ],
+      "request_body": null,
       "success_response": { "status": 200, "schema": "Array of child WorkflowExecution summaries." },
       "error_responses": [
         { "status": 404, "description": "Parent execution not found." },
@@ -104,6 +111,7 @@
       "params": [
         { "name": "id", "in": "path", "required": true, "description": "Execution UUID." }
       ],
+      "request_body": null,
       "success_response": { "status": 200, "schema": "WorkflowStack describing the current suspension point." },
       "error_responses": [
         { "status": 404, "description": "Execution not found." },
@@ -116,18 +124,22 @@
       "category": "workflow",
       "read_only": false,
       "description": "Start a new workflow execution. Idempotent when workflow_id is provided: returns the existing execution if one with the same workflow_id is already running.",
-      "idempotency": "Idempotent by workflow_id when id_reuse_policy is reject_duplicate or allow_duplicate_failed_only.",
+      "idempotency": "Idempotent by workflow_id when reuse_policy is reject_duplicate or allow_duplicate_failed_only.",
+      "params": [
+        { "name": "workflow_name", "in": "path", "required": true, "description": "Registered workflow function name." }
+      ],
       "request_body": {
         "required": false,
-        "schema": {
-          "workflow_id": "Optional string — stable identifier for idempotent starts.",
-          "input": "Optional JSON — workflow input payload.",
-          "queue": "Optional string — task queue name.",
-          "memo": "Optional JSON object — non-indexed metadata.",
-          "search_attrs": "Optional JSON object — indexed search attributes.",
-          "execution_timeout_secs": "Optional integer — overall execution timeout.",
-          "id_reuse_policy": "Optional string — duplicate-id policy."
-        }
+        "free_form": false,
+        "fields": [
+          { "name": "workflow_id", "required": false, "description": "Stable identifier for idempotent starts." },
+          { "name": "input", "required": false, "description": "Workflow input payload (any JSON value)." },
+          { "name": "queue", "required": false, "description": "Task queue name." },
+          { "name": "memo", "required": false, "description": "Non-indexed metadata (JSON object)." },
+          { "name": "search_attrs", "required": false, "description": "Indexed search attributes (JSON object)." },
+          { "name": "execution_timeout_secs", "required": false, "description": "Overall execution timeout in seconds." },
+          { "name": "reuse_policy", "required": false, "description": "Duplicate-id policy: allow_duplicate, reject_duplicate, allow_duplicate_failed_only, or terminate_if_running." }
+        ]
       },
       "success_response": { "status": 200, "schema": "Started or existing WorkflowExecution." },
       "error_responses": [
@@ -142,11 +154,15 @@
       "category": "workflow",
       "read_only": false,
       "description": "Cancel a running workflow execution.",
+      "params": [
+        { "name": "id", "in": "path", "required": true, "description": "Execution UUID." }
+      ],
       "request_body": {
         "required": false,
-        "schema": {
-          "reason": "Optional string — human-readable cancellation reason recorded in audit log."
-        }
+        "free_form": false,
+        "fields": [
+          { "name": "reason", "required": false, "description": "Human-readable cancellation reason recorded in audit log." }
+        ]
       },
       "success_response": { "status": 200, "schema": "Cancellation acknowledgement." },
       "error_responses": [
@@ -162,16 +178,18 @@
       "read_only": false,
       "description": "Fork a workflow execution at a specific event boundary, replaying from that point with a new execution ID.",
       "params": [
+        { "name": "id", "in": "path", "required": true, "description": "Execution UUID." },
         { "name": "dry_run", "in": "query", "required": false, "description": "When true, return the preview without creating a new execution." }
       ],
       "request_body": {
         "required": true,
-        "schema": {
-          "reset_to_event_id": "Integer — event sequence number to reset to.",
-          "reason": "String — reason for the reset, recorded in audit log.",
-          "operator_id": "Optional string — identity of the operator.",
-          "signal_reapply": "Optional string — how to handle buffered signals: drop or buffer."
-        }
+        "free_form": false,
+        "fields": [
+          { "name": "reset_to_event_id", "required": true, "description": "Event sequence number to reset to." },
+          { "name": "reason", "required": true, "description": "Reason for the reset, recorded in audit log." },
+          { "name": "operator_id", "required": false, "description": "Identity of the operator." },
+          { "name": "signal_reapply", "required": false, "description": "How to handle buffered signals: drop or buffer." }
+        ]
       },
       "success_response": { "status": 200, "schema": "ResetResult with new execution ID or dry-run preview." },
       "error_responses": [
@@ -185,10 +203,16 @@
       "path": "/workflows/{id}/signal/{signal_name}",
       "category": "workflow",
       "read_only": false,
-      "description": "Send a named signal to a running workflow execution.",
+      "description": "Send a named signal to a running workflow execution. The request body is the signal payload itself (free-form JSON).",
+      "params": [
+        { "name": "id", "in": "path", "required": true, "description": "Execution UUID." },
+        { "name": "signal_name", "in": "path", "required": true, "description": "Registered signal handler name." }
+      ],
       "request_body": {
         "required": false,
-        "schema": "Optional JSON payload for the signal handler."
+        "free_form": true,
+        "description": "Optional signal payload — the entire body is passed verbatim to the signal handler.",
+        "fields": []
       },
       "success_response": { "status": 200, "schema": "Signal delivery acknowledgement." },
       "error_responses": [
@@ -206,6 +230,7 @@
         { "name": "id", "in": "path", "required": true, "description": "Execution UUID." },
         { "name": "query_name", "in": "path", "required": true, "description": "Registered query handler name." }
       ],
+      "request_body": null,
       "success_response": { "status": 200, "schema": "JSON result from the query handler." },
       "error_responses": [
         { "status": 404, "description": "Execution not found or query handler not registered." },
@@ -219,14 +244,17 @@
       "read_only": false,
       "description": "Submit a synchronous update request to a running workflow. Blocks until admitted or completed depending on the wait parameter.",
       "params": [
-        { "name": "wait", "in": "query", "required": false, "description": "admitted — return when the update is validated and accepted; completed — block until the update handler returns (default)." },
-        { "name": "timeout_secs", "in": "query", "required": false, "description": "Maximum seconds to wait for the update to reach the requested state." }
+        { "name": "id", "in": "path", "required": true, "description": "Execution UUID." },
+        { "name": "update_name", "in": "path", "required": true, "description": "Registered update handler name." },
+        { "name": "wait", "in": "query", "required": false, "description": "admitted — return when validated; completed — block until handler returns (default)." },
+        { "name": "timeout_secs", "in": "query", "required": false, "description": "Maximum seconds to wait." }
       ],
       "request_body": {
         "required": false,
-        "schema": {
-          "input": "Optional JSON — payload passed to the update handler."
-        }
+        "free_form": false,
+        "fields": [
+          { "name": "input", "required": false, "description": "Payload passed to the update handler (any JSON value)." }
+        ]
       },
       "success_response": { "status": 200, "schema": "UpdateResult with update_id and outcome." },
       "error_responses": [
@@ -246,6 +274,7 @@
         { "name": "id", "in": "path", "required": true, "description": "Execution UUID." },
         { "name": "update_id", "in": "path", "required": true, "description": "Update UUID returned by POST …/update/{name}." }
       ],
+      "request_body": null,
       "success_response": { "status": 200, "schema": "UpdateResult: status (admitted | completed | failed) and output or error." },
       "error_responses": [
         { "status": 404, "description": "Update not found." },
@@ -259,6 +288,7 @@
       "read_only": true,
       "description": "List all registered DAGs and their current pause/enabled state.",
       "params": [],
+      "request_body": null,
       "success_response": { "status": 200, "schema": "Array of RegisteredDag summaries." },
       "error_responses": [
         { "status": 500, "description": "Internal error." }
@@ -274,6 +304,7 @@
         { "name": "dag_name", "in": "path", "required": true, "description": "Registered DAG name." },
         { "name": "limit", "in": "query", "required": false, "description": "Maximum number of runs to return." }
       ],
+      "request_body": null,
       "success_response": { "status": 200, "schema": "Array of DagRun records." },
       "error_responses": [
         { "status": 404, "description": "DAG not found." },
@@ -286,11 +317,15 @@
       "category": "dag",
       "read_only": false,
       "description": "Manually trigger a DAG run outside its schedule.",
+      "params": [
+        { "name": "dag_name", "in": "path", "required": true, "description": "Registered DAG name." }
+      ],
       "request_body": {
         "required": false,
-        "schema": {
-          "conf": "Optional JSON object — run configuration passed to the DAG."
-        }
+        "free_form": false,
+        "fields": [
+          { "name": "conf", "required": false, "description": "Run configuration passed to the DAG (any JSON value)." }
+        ]
       },
       "success_response": { "status": 200, "schema": "DagRun record for the newly triggered run." },
       "error_responses": [
@@ -305,11 +340,15 @@
       "category": "dag",
       "read_only": false,
       "description": "Update mutable DAG configuration fields (currently: pause/unpause).",
+      "params": [
+        { "name": "dag_name", "in": "path", "required": true, "description": "Registered DAG name." }
+      ],
       "request_body": {
         "required": true,
-        "schema": {
-          "paused": "Boolean — true to pause the DAG, false to resume it."
-        }
+        "free_form": false,
+        "fields": [
+          { "name": "paused", "required": true, "description": "true to pause the DAG, false to resume it." }
+        ]
       },
       "success_response": { "status": 200, "schema": "Updated RegisteredDag." },
       "error_responses": [
@@ -327,6 +366,7 @@
         { "name": "limit", "in": "query", "required": false, "description": "Maximum number of entries to return." },
         { "name": "cursor", "in": "query", "required": false, "description": "Pagination cursor." }
       ],
+      "request_body": null,
       "success_response": { "status": 200, "schema": "Array of DeadLetter records with pagination cursor." },
       "error_responses": [
         { "status": 500, "description": "Database error." }
@@ -340,14 +380,15 @@
       "description": "Bulk-replay dead-lettered tasks matching the provided filters by re-enqueuing them.",
       "request_body": {
         "required": false,
-        "schema": {
-          "activity_name": "Optional string — filter by activity function name.",
-          "workflow_name": "Optional string — filter by workflow name.",
-          "failed_after": "Optional RFC 3339 timestamp — only replay entries failed after this time.",
-          "failed_before": "Optional RFC 3339 timestamp — only replay entries failed before this time.",
-          "limit": "Optional integer — maximum entries to replay.",
-          "dry_run": "Optional boolean — when true, return a preview without re-enqueuing."
-        }
+        "free_form": false,
+        "fields": [
+          { "name": "activity_name", "required": false, "description": "Filter by activity function name." },
+          { "name": "workflow_name", "required": false, "description": "Filter by workflow name." },
+          { "name": "failed_after", "required": false, "description": "RFC 3339 timestamp — only replay entries failed after this time." },
+          { "name": "failed_before", "required": false, "description": "RFC 3339 timestamp — only replay entries failed before this time." },
+          { "name": "limit", "required": false, "description": "Maximum number of entries to replay." },
+          { "name": "dry_run", "required": false, "description": "When true, return a preview without re-enqueuing." }
+        ]
       },
       "success_response": { "status": 200, "schema": "BulkReplayResult: replayed count, skipped count, dry_run flag." },
       "error_responses": [
@@ -363,14 +404,15 @@
       "description": "Bulk-discard dead-lettered tasks matching the provided filters, removing them from the DLQ permanently.",
       "request_body": {
         "required": false,
-        "schema": {
-          "activity_name": "Optional string — filter by activity function name.",
-          "workflow_name": "Optional string — filter by workflow name.",
-          "failed_after": "Optional RFC 3339 timestamp — only discard entries failed after this time.",
-          "failed_before": "Optional RFC 3339 timestamp — only discard entries failed before this time.",
-          "limit": "Optional integer — maximum entries to discard.",
-          "dry_run": "Optional boolean — when true, return a preview without deleting."
-        }
+        "free_form": false,
+        "fields": [
+          { "name": "activity_name", "required": false, "description": "Filter by activity function name." },
+          { "name": "workflow_name", "required": false, "description": "Filter by workflow name." },
+          { "name": "failed_after", "required": false, "description": "RFC 3339 timestamp — only discard entries failed after this time." },
+          { "name": "failed_before", "required": false, "description": "RFC 3339 timestamp — only discard entries failed before this time." },
+          { "name": "limit", "required": false, "description": "Maximum number of entries to discard." },
+          { "name": "dry_run", "required": false, "description": "When true, return a preview without deleting." }
+        ]
       },
       "success_response": { "status": 200, "schema": "BulkDiscardResult: discarded count, dry_run flag." },
       "error_responses": [
@@ -387,7 +429,11 @@
       "params": [
         { "name": "id", "in": "path", "required": true, "description": "DeadLetter UUID." }
       ],
-      "request_body": { "required": false, "schema": null },
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": []
+      },
       "success_response": { "status": 200, "schema": "Replay acknowledgement." },
       "error_responses": [
         { "status": 404, "description": "Dead letter not found." },
@@ -405,9 +451,10 @@
       ],
       "request_body": {
         "required": false,
-        "schema": {
-          "output": "Optional JSON — result value passed back to the workflow."
-        }
+        "free_form": false,
+        "fields": [
+          { "name": "output", "required": false, "description": "Result value passed back to the workflow (any JSON value)." }
+        ]
       },
       "success_response": { "status": 200, "schema": "Completion acknowledgement." },
       "error_responses": [
@@ -426,10 +473,11 @@
       ],
       "request_body": {
         "required": true,
-        "schema": {
-          "error": "String — error message.",
-          "retryable": "Optional boolean — true to schedule a retry (default: false)."
-        }
+        "free_form": false,
+        "fields": [
+          { "name": "error", "required": true, "description": "Error message string." },
+          { "name": "retryable", "required": false, "description": "true to schedule a retry (default: false)." }
+        ]
       },
       "success_response": { "status": 200, "schema": "Failure acknowledgement." },
       "error_responses": [
@@ -448,9 +496,10 @@
       ],
       "request_body": {
         "required": false,
-        "schema": {
-          "extend_by_secs": "Optional integer — seconds to extend the activity deadline."
-        }
+        "free_form": false,
+        "fields": [
+          { "name": "extend_by_secs", "required": false, "description": "Seconds to extend the activity deadline." }
+        ]
       },
       "success_response": { "status": 200, "schema": "Heartbeat acknowledgement." },
       "error_responses": [
@@ -471,6 +520,7 @@
         { "name": "health", "in": "query", "required": false, "description": "Filter by health: healthy or stale." },
         { "name": "limit", "in": "query", "required": false, "description": "Maximum number of workers to return [1–500]." }
       ],
+      "request_body": null,
       "success_response": { "status": 200, "schema": "Array of WorkerRow records." },
       "error_responses": [
         { "status": 500, "description": "Database error." }
@@ -485,6 +535,7 @@
       "params": [
         { "name": "worker_id", "in": "path", "required": true, "description": "Worker process identifier." }
       ],
+      "request_body": null,
       "success_response": { "status": 200, "schema": "WorkerRow record." },
       "error_responses": [
         { "status": 404, "description": "Worker not found." },
@@ -498,6 +549,7 @@
       "read_only": true,
       "description": "Return aggregated fleet health statistics (active, stale, draining, stopped counts per shard).",
       "params": [],
+      "request_body": null,
       "success_response": { "status": 200, "schema": "FleetHealth summary." },
       "error_responses": [
         { "status": 500, "description": "Database error." }
@@ -515,6 +567,7 @@
         { "name": "status", "in": "query", "required": false, "description": "Filter by lifecycle status." },
         { "name": "limit", "in": "query", "required": false, "description": "Maximum number of workers to preview." }
       ],
+      "request_body": null,
       "success_response": { "status": 200, "schema": "Array of DrainPreviewItem records." },
       "error_responses": [
         { "status": 500, "description": "Database error." }
@@ -525,15 +578,16 @@
       "path": "/workers/{worker_id}/drain",
       "category": "worker",
       "read_only": false,
-      "description": "Request a graceful drain for a specific worker. Sets its status to Draining so it stops accepting new tasks. The worker transitions to Stopped once all in-flight tasks complete.",
+      "description": "Request a graceful drain for a specific worker. Sets its status to Draining so it stops accepting new tasks.",
       "params": [
         { "name": "worker_id", "in": "path", "required": true, "description": "Worker process identifier." }
       ],
       "request_body": {
         "required": false,
-        "schema": {
-          "deadline_at": "Optional RFC 3339 timestamp — drain-by deadline. When omitted the server uses its configured shutdown timeout."
-        }
+        "free_form": false,
+        "fields": [
+          { "name": "deadline_at", "required": false, "description": "RFC 3339 drain-by deadline. Omit to use the server's configured shutdown timeout." }
+        ]
       },
       "success_response": { "status": 200, "schema": "DrainResponse with updated worker status." },
       "error_responses": [
@@ -551,6 +605,7 @@
       "params": [
         { "name": "limit", "in": "query", "required": false, "description": "Maximum number of operations to return." }
       ],
+      "request_body": null,
       "success_response": { "status": 200, "schema": "Array of BatchJobView records." },
       "error_responses": [
         { "status": 500, "description": "Database error." }
@@ -564,12 +619,13 @@
       "description": "Submit a fleet-wide batch operation (Cancel, Terminate, or Signal) targeting workflows matching a filter.",
       "request_body": {
         "required": true,
-        "schema": {
-          "action": "String — batch action: Cancel, Terminate, or Signal.",
-          "filter": "JSON object — workflow filter (states, workflow_name, search attributes).",
-          "signal_name": "Optional string — required when action is Signal.",
-          "signal_payload": "Optional JSON — payload for Signal actions."
-        }
+        "free_form": false,
+        "fields": [
+          { "name": "action", "required": true, "description": "Batch action: Cancel, Terminate, or Signal." },
+          { "name": "filter", "required": true, "description": "Workflow filter (JSON object with states, workflow_name, search attributes)." },
+          { "name": "signal_name", "required": false, "description": "Signal name — required when action is Signal." },
+          { "name": "signal_payload", "required": false, "description": "Signal payload for Signal actions (any JSON value)." }
+        ]
       },
       "success_response": { "status": 202, "schema": "BatchSubmissionResult with job_id." },
       "error_responses": [
@@ -586,6 +642,7 @@
       "params": [
         { "name": "id", "in": "path", "required": true, "description": "Batch job UUID." }
       ],
+      "request_body": null,
       "success_response": { "status": 200, "schema": "BatchJobView with status, progress counts, and error summary." },
       "error_responses": [
         { "status": 404, "description": "Batch job not found." },
@@ -599,6 +656,7 @@
       "read_only": true,
       "description": "Liveness health check. Returns 200 when the plugin is reachable. Does not probe the database.",
       "params": [],
+      "request_body": null,
       "success_response": { "status": 200, "schema": "{ status: string }" },
       "error_responses": []
     },
@@ -609,6 +667,7 @@
       "read_only": true,
       "description": "Run deployment readiness preflight checks: database connectivity, migration status, shard health, and worker coverage.",
       "params": [],
+      "request_body": null,
       "success_response": { "status": 200, "schema": "PreflightReport with per-check results and overall pass/fail." },
       "error_responses": [
         { "status": 500, "description": "Unable to connect to database." }
@@ -619,11 +678,12 @@
       "path": "/admin/shards/health",
       "category": "admin",
       "read_only": true,
-      "description": "Return per-shard readiness: ready, degraded, or unavailable. Optionally probe a candidate shard before adding it to writable_shards.",
+      "description": "Return per-shard readiness: ready, degraded, or unavailable.",
       "params": [
         { "name": "candidate_shard", "in": "query", "required": false, "description": "Shard ID of a new shard to probe before enabling writes." },
         { "name": "fail_on_unready", "in": "query", "required": false, "description": "When true, the response uses HTTP 503 if any shard is not ready." }
       ],
+      "request_body": null,
       "success_response": { "status": 200, "schema": "ShardHealthReport with per-shard readiness." },
       "error_responses": [
         { "status": 503, "description": "One or more shards not ready (only when fail_on_unready is true)." }
@@ -634,7 +694,7 @@
       "path": "/admin/version-gates/usage",
       "category": "admin",
       "read_only": true,
-      "description": "Report recorded workflow version-gate usage: how many executions carry each (change_id, version) pair.",
+      "description": "Report recorded workflow version-gate usage.",
       "params": [
         { "name": "workflow_name", "in": "query", "required": false, "description": "Filter by registered workflow name." },
         { "name": "change_id", "in": "query", "required": false, "description": "Filter by version-gate change ID." },
@@ -642,6 +702,7 @@
         { "name": "state_group", "in": "query", "required": false, "description": "Execution state group: active or terminal." },
         { "name": "shard_id", "in": "query", "required": false, "description": "Restrict to a single shard." }
       ],
+      "request_body": null,
       "success_response": { "status": 200, "schema": "Array of VersionUsageRow records." },
       "error_responses": [
         { "status": 500, "description": "Database error." }
@@ -652,7 +713,7 @@
       "path": "/admin/version-gates/retirement-check",
       "category": "admin",
       "read_only": true,
-      "description": "Check whether a version-gate change ID is safe to retire: no non-terminal executions carry a version below the specified threshold.",
+      "description": "Check whether a version-gate change ID is safe to retire.",
       "params": [
         { "name": "change_id", "in": "query", "required": true, "description": "Version-gate change ID to inspect." },
         { "name": "min_safe_version", "in": "query", "required": true, "description": "Versions strictly below this value are considered old branches." },
@@ -660,6 +721,7 @@
         { "name": "state_group", "in": "query", "required": false, "description": "Execution state group filter." },
         { "name": "shard_id", "in": "query", "required": false, "description": "Restrict to a single shard." }
       ],
+      "request_body": null,
       "success_response": { "status": 200, "schema": "RetirementCheckReport: safe (bool), blocking_count, per-shard breakdown." },
       "error_responses": [
         { "status": 400, "description": "Missing required parameters." },
@@ -671,8 +733,9 @@
       "path": "/admin/retention",
       "category": "admin",
       "read_only": true,
-      "description": "Return the current status of the retention janitor: last run time, records deleted, and configured TTL.",
+      "description": "Return the current status of the retention janitor.",
       "params": [],
+      "request_body": null,
       "success_response": { "status": 200, "schema": "RetentionStatus." },
       "error_responses": []
     },
@@ -682,7 +745,11 @@
       "category": "admin",
       "read_only": false,
       "description": "Trigger the retention janitor to run immediately outside its scheduled interval.",
-      "request_body": { "required": false, "schema": null },
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": []
+      },
       "success_response": { "status": 200, "schema": "Trigger acknowledgement." },
       "error_responses": [
         { "status": 500, "description": "Internal error." }
@@ -695,6 +762,7 @@
       "read_only": true,
       "description": "Return per-activity concurrency statistics: configured cap, currently in-flight, and queued counts for each concurrency key.",
       "params": [],
+      "request_body": null,
       "success_response": { "status": 200, "schema": "Array of ConcurrencyKeyStats records." },
       "error_responses": [
         { "status": 500, "description": "Database error." }
@@ -705,7 +773,7 @@
       "path": "/admin/history/exports",
       "category": "admin",
       "read_only": true,
-      "description": "Batch-export event histories for multiple executions matching the provided filters. Useful for replay fixture generation and compliance archiving.",
+      "description": "Batch-export event histories for multiple executions matching the provided filters.",
       "params": [
         { "name": "workflow_name", "in": "query", "required": false, "description": "Filter by workflow name." },
         { "name": "state_group", "in": "query", "required": false, "description": "Execution state group: active or terminal." },
@@ -715,6 +783,7 @@
         { "name": "limit", "in": "query", "required": false, "description": "Maximum number of histories to export." },
         { "name": "payload_policy", "in": "query", "required": false, "description": "Payload inclusion: full, redacted, or omit." }
       ],
+      "request_body": null,
       "success_response": { "status": 200, "schema": "Array of HistoryExportDocument records." },
       "error_responses": [
         { "status": 400, "description": "Invalid filter values." },
@@ -738,6 +807,7 @@
         { "name": "updated_before", "in": "query", "required": false, "description": "RFC 3339 timestamp — only return handoffs last updated before this time." },
         { "name": "limit", "in": "query", "required": false, "description": "Maximum number of results." }
       ],
+      "request_body": null,
       "success_response": { "status": 200, "schema": "Array of ExternalHandoff records." },
       "error_responses": [
         { "status": 500, "description": "Database error." }
@@ -752,6 +822,7 @@
       "params": [
         { "name": "token", "in": "path", "required": true, "description": "Task token UUID." }
       ],
+      "request_body": null,
       "success_response": { "status": 200, "schema": "ExternalHandoff record." },
       "error_responses": [
         { "status": 404, "description": "Token not found." },
@@ -765,6 +836,7 @@
       "read_only": true,
       "description": "List all workflow and DAG schedules.",
       "params": [],
+      "request_body": null,
       "success_response": { "status": 200, "schema": "Array of HarvestSchedule records." },
       "error_responses": [
         { "status": 500, "description": "Database error." }
@@ -778,14 +850,15 @@
       "description": "Create a new cron or interval schedule for a workflow.",
       "request_body": {
         "required": true,
-        "schema": {
-          "workflow_name": "String — registered workflow name.",
-          "schedule_expr": "String — cron expression (e.g. '0 * * * *').",
-          "input": "Optional JSON — workflow input payload.",
-          "max_active_runs": "Optional integer — maximum concurrent scheduled runs.",
-          "catchup": "Optional boolean — whether to backfill missed runs.",
-          "paused": "Optional boolean — create the schedule in paused state."
-        }
+        "free_form": false,
+        "fields": [
+          { "name": "workflow_name", "required": true, "description": "Registered workflow name." },
+          { "name": "schedule_expr", "required": true, "description": "Cron expression (e.g. '0 * * * *')." },
+          { "name": "input", "required": false, "description": "Workflow input payload (any JSON value)." },
+          { "name": "max_active_runs", "required": false, "description": "Maximum concurrent scheduled runs." },
+          { "name": "catchup", "required": false, "description": "Whether to backfill missed runs." },
+          { "name": "paused", "required": false, "description": "Create the schedule in paused state." }
+        ]
       },
       "success_response": { "status": 200, "schema": "Created HarvestSchedule record." },
       "error_responses": [
@@ -802,7 +875,11 @@
       "params": [
         { "name": "id", "in": "path", "required": true, "description": "Schedule UUID." }
       ],
-      "request_body": { "required": false, "schema": null },
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": []
+      },
       "success_response": { "status": 200, "schema": "Updated HarvestSchedule." },
       "error_responses": [
         { "status": 404, "description": "Schedule not found." },
@@ -818,7 +895,11 @@
       "params": [
         { "name": "id", "in": "path", "required": true, "description": "Schedule UUID." }
       ],
-      "request_body": { "required": false, "schema": null },
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": []
+      },
       "success_response": { "status": 200, "schema": "Updated HarvestSchedule." },
       "error_responses": [
         { "status": 404, "description": "Schedule not found." },
@@ -834,7 +915,11 @@
       "params": [
         { "name": "id", "in": "path", "required": true, "description": "Schedule UUID." }
       ],
-      "request_body": { "required": false, "schema": null },
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": []
+      },
       "success_response": { "status": 200, "schema": "Deletion acknowledgement." },
       "error_responses": [
         { "status": 404, "description": "Schedule not found." },
@@ -857,6 +942,7 @@
         { "name": "before", "in": "query", "required": false, "description": "RFC 3339 timestamp — only return records before this time." },
         { "name": "limit", "in": "query", "required": false, "description": "Maximum number of records to return." }
       ],
+      "request_body": null,
       "success_response": { "status": 200, "schema": "Array of AuditRecord entries." },
       "error_responses": [
         { "status": 500, "description": "Database error." }

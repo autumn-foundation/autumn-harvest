@@ -1165,6 +1165,60 @@ pub fn management_api_routes() -> &'static [(&'static str, &'static str)] {
     ]
 }
 
+/// Canonical request-body field registry for every mutating management route.
+///
+/// Each entry is `(method, path_template, fields)` where `fields` is:
+/// - `Some(&[...])` — structured body with these named top-level JSON keys
+/// - `None`         — free-form body (opaque payload, e.g. signal)
+///
+/// This registry is compared against `docs/api-contract.json` by the contract
+/// regression test.  Update this list and the contract together whenever you
+/// add, remove, or rename a request field.
+pub fn management_api_request_fields() -> &'static [(&'static str, &'static str, Option<&'static [&'static str]>)] {
+    &[
+        // ── workflows ────────────────────────────────────────────────────────
+        ("POST", "/workflows/{workflow_name}/start", Some(&[
+            "workflow_id", "input", "queue", "memo", "search_attrs",
+            "execution_timeout_secs", "reuse_policy",
+        ])),
+        ("POST", "/workflows/{id}/cancel", Some(&["reason"])),
+        ("POST", "/workflows/{id}/reset", Some(&[
+            "reset_to_event_id", "reason", "operator_id", "signal_reapply",
+        ])),
+        ("POST", "/workflows/{id}/signal/{signal_name}", None), // free-form
+        ("POST", "/workflows/{id}/update/{update_name}", Some(&["input"])),
+        // ── DAGs ─────────────────────────────────────────────────────────────
+        ("POST", "/dags/{dag_name}/trigger", Some(&["conf"])),
+        ("PATCH", "/dags/{dag_name}", Some(&["paused"])),
+        // ── dead-letter queue ─────────────────────────────────────────────────
+        ("POST", "/dead-letters/replay", Some(&[
+            "activity_name", "workflow_name", "failed_after", "failed_before", "limit", "dry_run",
+        ])),
+        ("POST", "/dead-letters/discard", Some(&[
+            "activity_name", "workflow_name", "failed_after", "failed_before", "limit", "dry_run",
+        ])),
+        ("POST", "/dead-letters/{id}/replay", Some(&[])),
+        // ── external activity handoff ─────────────────────────────────────────
+        ("POST", "/activities/external/{token}/complete", Some(&["output"])),
+        ("POST", "/activities/external/{token}/fail", Some(&["error", "retryable"])),
+        ("POST", "/activities/external/{token}/heartbeat", Some(&["extend_by_secs"])),
+        // ── workers ───────────────────────────────────────────────────────────
+        ("POST", "/workers/{worker_id}/drain", Some(&["deadline_at"])),
+        // ── batch operations ──────────────────────────────────────────────────
+        ("POST", "/batch-operations", Some(&[
+            "action", "filter", "signal_name", "signal_payload",
+        ])),
+        // ── admin ─────────────────────────────────────────────────────────────
+        ("POST", "/admin/retention/run-now", Some(&[])),
+        ("POST", "/admin/schedules/workflow", Some(&[
+            "workflow_name", "schedule_expr", "input", "max_active_runs", "catchup", "paused",
+        ])),
+        ("POST", "/admin/schedules/{id}/pause", Some(&[])),
+        ("POST", "/admin/schedules/{id}/resume", Some(&[])),
+        ("DELETE", "/admin/schedules/{id}", Some(&[])),
+    ]
+}
+
 async fn preflight(
     Extension(api_state): Extension<HarvestApiState>,
     axum::extract::State(autumn_state): axum::extract::State<AppState>,
