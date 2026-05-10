@@ -40,7 +40,7 @@
         { "name": "cursor", "in": "query", "required": false, "description": "Opaque pagination cursor from a previous response." }
       ],
       "request_body": null,
-      "success_response": { "status": 200, "schema": "Array of WorkflowExecution summaries with pagination cursor." },
+      "success_response": { "status": 200, "free_form": true },
       "error_responses": [
         { "status": 400, "description": "Invalid filter value." },
         { "status": 500, "description": "Database error." }
@@ -56,7 +56,7 @@
         { "name": "id", "in": "path", "required": true, "description": "Execution UUID." }
       ],
       "request_body": null,
-      "success_response": { "status": 200, "schema": "WorkflowExecution with full event list." },
+      "success_response": { "status": 200, "fields": ["parent_id", "execution", "history", "external_handoffs"] },
       "error_responses": [
         { "status": 404, "description": "Execution not found." },
         { "status": 500, "description": "Database error." }
@@ -74,7 +74,7 @@
         { "name": "max_bytes", "in": "query", "required": false, "description": "Soft byte cap on total payload size." }
       ],
       "request_body": null,
-      "success_response": { "status": 200, "schema": "HistoryExportDocument (JSON)." },
+      "success_response": { "status": 200, "free_form": true },
       "error_responses": [
         { "status": 404, "description": "Execution not found." },
         { "status": 413, "description": "History exceeds max_bytes cap." },
@@ -96,7 +96,7 @@
         { "name": "depth", "in": "query", "required": false, "description": "Maximum recursion depth for nested children." }
       ],
       "request_body": null,
-      "success_response": { "status": 200, "schema": "Array of child WorkflowExecution summaries." },
+      "success_response": { "status": 200, "fields": ["items", "next_cursor"] },
       "error_responses": [
         { "status": 404, "description": "Parent execution not found." },
         { "status": 500, "description": "Database error." }
@@ -112,7 +112,7 @@
         { "name": "id", "in": "path", "required": true, "description": "Execution UUID." }
       ],
       "request_body": null,
-      "success_response": { "status": 200, "schema": "WorkflowStack describing the current suspension point." },
+      "success_response": { "status": 200, "fields": ["exec_id", "workflow_id", "workflow_name", "state", "is_terminal", "pending_activities", "pending_external_handoffs", "pending_local_activities", "pending_timers", "pending_signals", "buffered_signals", "pending_child_workflows", "last_event_id"] },
       "error_responses": [
         { "status": 404, "description": "Execution not found." },
         { "status": 500, "description": "Database error." }
@@ -141,7 +141,7 @@
           { "name": "reuse_policy", "required": false, "description": "Duplicate-id policy: allow_duplicate, reject_duplicate, allow_duplicate_failed_only, or terminate_if_running." }
         ]
       },
-      "success_response": { "status": 200, "schema": "Started or existing WorkflowExecution." },
+      "success_response": { "status": 200, "fields": ["execution_id", "workflow_name", "workflow_id", "state"] },
       "error_responses": [
         { "status": 400, "description": "Invalid request body or workflow name." },
         { "status": 409, "description": "Duplicate workflow_id with conflicting reuse policy." },
@@ -154,6 +154,7 @@
       "category": "workflow",
       "read_only": false,
       "description": "Cancel a running workflow execution.",
+      "idempotency": "Idempotent: cancelling an already-cancelled or terminal execution is a no-op.",
       "params": [
         { "name": "id", "in": "path", "required": true, "description": "Execution UUID." }
       ],
@@ -164,7 +165,7 @@
           { "name": "reason", "required": false, "description": "Human-readable cancellation reason recorded in audit log." }
         ]
       },
-      "success_response": { "status": 200, "schema": "Cancellation acknowledgement." },
+      "success_response": { "status": 200, "fields": ["ok", "execution_id", "state", "reason", "newly_cancelled", "failed_task_count"] },
       "error_responses": [
         { "status": 404, "description": "Execution not found." },
         { "status": 409, "description": "Execution is already in a terminal state." },
@@ -177,6 +178,7 @@
       "category": "workflow",
       "read_only": false,
       "description": "Fork a workflow execution at a specific event boundary, replaying from that point with a new execution ID.",
+      "idempotency": "Not idempotent: each call forks the execution and creates a distinct new execution ID.",
       "params": [
         { "name": "id", "in": "path", "required": true, "description": "Execution UUID." },
         { "name": "dry_run", "in": "query", "required": false, "description": "When true, return the preview without creating a new execution." }
@@ -191,7 +193,7 @@
           { "name": "signal_reapply", "required": false, "description": "How to handle buffered signals: drop or buffer." }
         ]
       },
-      "success_response": { "status": 200, "schema": "ResetResult with new execution ID or dry-run preview." },
+      "success_response": { "status": 200, "fields": ["new_exec_id", "reset_from_exec_id", "reset_to_event_id", "events_carried_over", "source_tasks_cancelled", "source_timers_removed", "source_signals_dropped", "source_signals_buffered"] },
       "error_responses": [
         { "status": 400, "description": "Invalid reset point or request body." },
         { "status": 404, "description": "Execution not found." },
@@ -204,6 +206,7 @@
       "category": "workflow",
       "read_only": false,
       "description": "Send a named signal to a running workflow execution. The request body is the signal payload itself (free-form JSON).",
+      "idempotency": "Not idempotent: each call delivers a distinct signal event to the workflow.",
       "params": [
         { "name": "id", "in": "path", "required": true, "description": "Execution UUID." },
         { "name": "signal_name", "in": "path", "required": true, "description": "Registered signal handler name." }
@@ -214,7 +217,7 @@
         "description": "Optional signal payload — the entire body is passed verbatim to the signal handler.",
         "fields": []
       },
-      "success_response": { "status": 200, "schema": "Signal delivery acknowledgement." },
+      "success_response": { "status": 200, "fields": ["ok"] },
       "error_responses": [
         { "status": 404, "description": "Execution not found." },
         { "status": 500, "description": "Database error." }
@@ -231,7 +234,7 @@
         { "name": "query_name", "in": "path", "required": true, "description": "Registered query handler name." }
       ],
       "request_body": null,
-      "success_response": { "status": 200, "schema": "JSON result from the query handler." },
+      "success_response": { "status": 200, "free_form": true },
       "error_responses": [
         { "status": 404, "description": "Execution not found or query handler not registered." },
         { "status": 500, "description": "Query execution error." }
@@ -243,6 +246,7 @@
       "category": "workflow",
       "read_only": false,
       "description": "Submit a synchronous update request to a running workflow. Blocks until admitted or completed depending on the wait parameter.",
+      "idempotency": "Not idempotent: each call appends a distinct UpdateAdmitted event with a new update_id.",
       "params": [
         { "name": "id", "in": "path", "required": true, "description": "Execution UUID." },
         { "name": "update_name", "in": "path", "required": true, "description": "Registered update handler name." },
@@ -256,7 +260,7 @@
           { "name": "input", "required": false, "description": "Payload passed to the update handler (any JSON value)." }
         ]
       },
-      "success_response": { "status": 200, "schema": "UpdateResult with update_id and outcome." },
+      "success_response": { "status": 200, "free_form": true },
       "error_responses": [
         { "status": 400, "description": "Update rejected by the validator." },
         { "status": 404, "description": "Execution not found or update handler not registered." },
@@ -275,7 +279,7 @@
         { "name": "update_id", "in": "path", "required": true, "description": "Update UUID returned by POST …/update/{name}." }
       ],
       "request_body": null,
-      "success_response": { "status": 200, "schema": "UpdateResult: status (admitted | completed | failed) and output or error." },
+      "success_response": { "status": 200, "free_form": true },
       "error_responses": [
         { "status": 404, "description": "Update not found." },
         { "status": 500, "description": "Database error." }
@@ -289,7 +293,7 @@
       "description": "List all registered DAGs and their current pause/enabled state.",
       "params": [],
       "request_body": null,
-      "success_response": { "status": 200, "schema": "Array of RegisteredDag summaries." },
+      "success_response": { "status": 200, "free_form": true },
       "error_responses": [
         { "status": 500, "description": "Internal error." }
       ]
@@ -305,7 +309,7 @@
         { "name": "limit", "in": "query", "required": false, "description": "Maximum number of runs to return." }
       ],
       "request_body": null,
-      "success_response": { "status": 200, "schema": "Array of DagRun records." },
+      "success_response": { "status": 200, "free_form": true },
       "error_responses": [
         { "status": 404, "description": "DAG not found." },
         { "status": 500, "description": "Database error." }
@@ -317,6 +321,7 @@
       "category": "dag",
       "read_only": false,
       "description": "Manually trigger a DAG run outside its schedule.",
+      "idempotency": "Not idempotent: each call starts a new DAG run.",
       "params": [
         { "name": "dag_name", "in": "path", "required": true, "description": "Registered DAG name." }
       ],
@@ -327,7 +332,7 @@
           { "name": "conf", "required": false, "description": "Run configuration passed to the DAG (any JSON value)." }
         ]
       },
-      "success_response": { "status": 200, "schema": "DagRun record for the newly triggered run." },
+      "success_response": { "status": 200, "free_form": true },
       "error_responses": [
         { "status": 404, "description": "DAG not found." },
         { "status": 409, "description": "DAG is paused or at max_active_runs." },
@@ -340,6 +345,7 @@
       "category": "dag",
       "read_only": false,
       "description": "Update mutable DAG configuration fields (currently: pause/unpause).",
+      "idempotency": "Idempotent: applying the same pause state twice is a no-op.",
       "params": [
         { "name": "dag_name", "in": "path", "required": true, "description": "Registered DAG name." }
       ],
@@ -350,7 +356,7 @@
           { "name": "paused", "required": true, "description": "true to pause the DAG, false to resume it." }
         ]
       },
-      "success_response": { "status": 200, "schema": "Updated RegisteredDag." },
+      "success_response": { "status": 200, "free_form": true },
       "error_responses": [
         { "status": 404, "description": "DAG not found." },
         { "status": 500, "description": "Database error." }
@@ -367,7 +373,7 @@
         { "name": "cursor", "in": "query", "required": false, "description": "Pagination cursor." }
       ],
       "request_body": null,
-      "success_response": { "status": 200, "schema": "Array of DeadLetter records with pagination cursor." },
+      "success_response": { "status": 200, "free_form": true },
       "error_responses": [
         { "status": 500, "description": "Database error." }
       ]
@@ -378,6 +384,8 @@
       "category": "dlq",
       "read_only": false,
       "description": "Bulk-replay dead-lettered tasks matching the provided filters by re-enqueuing them.",
+      "idempotency": "Idempotent by filter: already-replayed or already-pending entries are skipped.",
+      "params": [],
       "request_body": {
         "required": false,
         "free_form": false,
@@ -390,7 +398,7 @@
           { "name": "dry_run", "required": false, "description": "When true, return a preview without re-enqueuing." }
         ]
       },
-      "success_response": { "status": 200, "schema": "BulkReplayResult: replayed count, skipped count, dry_run flag." },
+      "success_response": { "status": 200, "fields": ["matched", "acted_on", "skipped", "ids", "dry_run", "failures"] },
       "error_responses": [
         { "status": 400, "description": "Invalid filter values." },
         { "status": 500, "description": "Database error." }
@@ -402,6 +410,8 @@
       "category": "dlq",
       "read_only": false,
       "description": "Bulk-discard dead-lettered tasks matching the provided filters, removing them from the DLQ permanently.",
+      "idempotency": "Idempotent by filter: already-discarded entries are skipped.",
+      "params": [],
       "request_body": {
         "required": false,
         "free_form": false,
@@ -414,7 +424,7 @@
           { "name": "dry_run", "required": false, "description": "When true, return a preview without deleting." }
         ]
       },
-      "success_response": { "status": 200, "schema": "BulkDiscardResult: discarded count, dry_run flag." },
+      "success_response": { "status": 200, "fields": ["matched", "acted_on", "skipped", "ids", "dry_run", "failures"] },
       "error_responses": [
         { "status": 400, "description": "Invalid filter values." },
         { "status": 500, "description": "Database error." }
@@ -426,6 +436,7 @@
       "category": "dlq",
       "read_only": false,
       "description": "Replay a single dead-lettered task by re-enqueuing it.",
+      "idempotency": "Idempotent: replaying an already-replayed entry is a no-op.",
       "params": [
         { "name": "id", "in": "path", "required": true, "description": "DeadLetter UUID." }
       ],
@@ -434,7 +445,7 @@
         "free_form": false,
         "fields": []
       },
-      "success_response": { "status": 200, "schema": "Replay acknowledgement." },
+      "success_response": { "status": 200, "fields": ["ok", "dead_letter_id", "task_id"] },
       "error_responses": [
         { "status": 404, "description": "Dead letter not found." },
         { "status": 500, "description": "Database error." }
@@ -446,6 +457,7 @@
       "category": "external_activity",
       "read_only": false,
       "description": "Complete an external activity identified by its task token, supplying the success output.",
+      "idempotency": "Not idempotent: completing an already-resolved token returns 404.",
       "params": [
         { "name": "token", "in": "path", "required": true, "description": "Opaque task token issued when the activity was scheduled." }
       ],
@@ -456,7 +468,7 @@
           { "name": "output", "required": false, "description": "Result value passed back to the workflow (any JSON value)." }
         ]
       },
-      "success_response": { "status": 200, "schema": "Completion acknowledgement." },
+      "success_response": { "status": 200, "fields": ["ok", "newly_resolved", "status", "current_state"] },
       "error_responses": [
         { "status": 404, "description": "Token not found or already completed." },
         { "status": 500, "description": "Database error." }
@@ -468,6 +480,7 @@
       "category": "external_activity",
       "read_only": false,
       "description": "Fail an external activity, optionally marking the error as retryable.",
+      "idempotency": "Not idempotent: failing an already-resolved token returns 404.",
       "params": [
         { "name": "token", "in": "path", "required": true, "description": "Opaque task token." }
       ],
@@ -479,7 +492,7 @@
           { "name": "retryable", "required": false, "description": "true to schedule a retry (default: false)." }
         ]
       },
-      "success_response": { "status": 200, "schema": "Failure acknowledgement." },
+      "success_response": { "status": 200, "fields": ["ok", "newly_resolved", "status", "current_state"] },
       "error_responses": [
         { "status": 404, "description": "Token not found." },
         { "status": 500, "description": "Database error." }
@@ -491,6 +504,7 @@
       "category": "external_activity",
       "read_only": false,
       "description": "Send a liveness heartbeat for an in-progress external activity, optionally extending the deadline.",
+      "idempotency": "Idempotent: repeated heartbeats extend or maintain the deadline.",
       "params": [
         { "name": "token", "in": "path", "required": true, "description": "Opaque task token." }
       ],
@@ -501,7 +515,7 @@
           { "name": "extend_by_secs", "required": false, "description": "Seconds to extend the activity deadline." }
         ]
       },
-      "success_response": { "status": 200, "schema": "Heartbeat acknowledgement." },
+      "success_response": { "status": 200, "fields": ["ok", "newly_resolved", "status", "current_state"] },
       "error_responses": [
         { "status": 404, "description": "Token not found." },
         { "status": 500, "description": "Database error." }
@@ -521,7 +535,7 @@
         { "name": "limit", "in": "query", "required": false, "description": "Maximum number of workers to return [1–500]." }
       ],
       "request_body": null,
-      "success_response": { "status": 200, "schema": "Array of WorkerRow records." },
+      "success_response": { "status": 200, "free_form": true },
       "error_responses": [
         { "status": 500, "description": "Database error." }
       ]
@@ -536,7 +550,7 @@
         { "name": "worker_id", "in": "path", "required": true, "description": "Worker process identifier." }
       ],
       "request_body": null,
-      "success_response": { "status": 200, "schema": "WorkerRow record." },
+      "success_response": { "status": 200, "free_form": true },
       "error_responses": [
         { "status": 404, "description": "Worker not found." },
         { "status": 500, "description": "Database error." }
@@ -550,7 +564,7 @@
       "description": "Return aggregated fleet health statistics (active, stale, draining, stopped counts per shard).",
       "params": [],
       "request_body": null,
-      "success_response": { "status": 200, "schema": "FleetHealth summary." },
+      "success_response": { "status": 200, "fields": ["healthy", "stale", "draining", "by_queue", "by_shard"] },
       "error_responses": [
         { "status": 500, "description": "Database error." }
       ]
@@ -568,7 +582,7 @@
         { "name": "limit", "in": "query", "required": false, "description": "Maximum number of workers to preview." }
       ],
       "request_body": null,
-      "success_response": { "status": 200, "schema": "Array of DrainPreviewItem records." },
+      "success_response": { "status": 200, "free_form": true },
       "error_responses": [
         { "status": 500, "description": "Database error." }
       ]
@@ -579,6 +593,7 @@
       "category": "worker",
       "read_only": false,
       "description": "Request a graceful drain for a specific worker. Sets its status to Draining so it stops accepting new tasks.",
+      "idempotency": "Idempotent: re-draining an already-draining worker extends the deadline if the new one is later.",
       "params": [
         { "name": "worker_id", "in": "path", "required": true, "description": "Worker process identifier." }
       ],
@@ -589,7 +604,7 @@
           { "name": "deadline_at", "required": false, "description": "RFC 3339 drain-by deadline. Omit to use the server's configured shutdown timeout." }
         ]
       },
-      "success_response": { "status": 200, "schema": "DrainResponse with updated worker status." },
+      "success_response": { "status": 200, "fields": ["worker_id", "outcome", "in_flight_count", "drain_deadline_at", "shard_ids", "unavailable_shards"] },
       "error_responses": [
         { "status": 404, "description": "Worker not found." },
         { "status": 409, "description": "Worker is already Stopped." },
@@ -606,7 +621,7 @@
         { "name": "limit", "in": "query", "required": false, "description": "Maximum number of operations to return." }
       ],
       "request_body": null,
-      "success_response": { "status": 200, "schema": "Array of BatchJobView records." },
+      "success_response": { "status": 200, "free_form": true },
       "error_responses": [
         { "status": 500, "description": "Database error." }
       ]
@@ -617,6 +632,8 @@
       "category": "batch",
       "read_only": false,
       "description": "Submit a fleet-wide batch operation (Cancel, Terminate, or Signal) targeting workflows matching a filter.",
+      "idempotency": "Idempotent by idempotency_key when provided: re-submitting with the same key returns the existing batch_job_id.",
+      "params": [],
       "request_body": {
         "required": true,
         "free_form": false,
@@ -624,10 +641,12 @@
           { "name": "action", "required": true, "description": "Batch action: Cancel, Terminate, or Signal." },
           { "name": "filter", "required": true, "description": "Workflow filter (JSON object with states, workflow_name, search attributes)." },
           { "name": "signal_name", "required": false, "description": "Signal name — required when action is Signal." },
-          { "name": "signal_payload", "required": false, "description": "Signal payload for Signal actions (any JSON value)." }
+          { "name": "signal_payload", "required": false, "description": "Signal payload for Signal actions (any JSON value)." },
+          { "name": "idempotency_key", "required": false, "description": "Operator-supplied idempotency token; re-submitting with the same key returns the existing job." },
+          { "name": "created_by", "required": false, "description": "Optional caller identity for audit." }
         ]
       },
-      "success_response": { "status": 202, "schema": "BatchSubmissionResult with job_id." },
+      "success_response": { "status": 202, "fields": ["batch_job_id"] },
       "error_responses": [
         { "status": 400, "description": "Invalid action or missing required fields." },
         { "status": 500, "description": "Database error." }
@@ -643,7 +662,7 @@
         { "name": "id", "in": "path", "required": true, "description": "Batch job UUID." }
       ],
       "request_body": null,
-      "success_response": { "status": 200, "schema": "BatchJobView with status, progress counts, and error summary." },
+      "success_response": { "status": 200, "free_form": true },
       "error_responses": [
         { "status": 404, "description": "Batch job not found." },
         { "status": 500, "description": "Database error." }
@@ -657,7 +676,7 @@
       "description": "Liveness health check. Returns 200 when the plugin is reachable. Does not probe the database.",
       "params": [],
       "request_body": null,
-      "success_response": { "status": 200, "schema": "{ status: string }" },
+      "success_response": { "status": 200, "fields": ["runtime_ready", "worker_id", "queues", "dag_count", "scheduler", "shard_readiness_enforced", "shard_readiness"] },
       "error_responses": []
     },
     {
@@ -668,7 +687,7 @@
       "description": "Run deployment readiness preflight checks: database connectivity, migration status, shard health, and worker coverage.",
       "params": [],
       "request_body": null,
-      "success_response": { "status": 200, "schema": "PreflightReport with per-check results and overall pass/fail." },
+      "success_response": { "status": 200, "fields": ["overall_status", "observed_at", "version", "checks"] },
       "error_responses": [
         { "status": 500, "description": "Unable to connect to database." }
       ]
@@ -684,7 +703,7 @@
         { "name": "fail_on_unready", "in": "query", "required": false, "description": "When true, the response uses HTTP 503 if any shard is not ready." }
       ],
       "request_body": null,
-      "success_response": { "status": 200, "schema": "ShardHealthReport with per-shard readiness." },
+      "success_response": { "status": 200, "fields": ["overall_readiness", "observed_at", "freshness_window_secs", "candidate_shard", "shards"] },
       "error_responses": [
         { "status": 503, "description": "One or more shards not ready (only when fail_on_unready is true)." }
       ]
@@ -703,7 +722,7 @@
         { "name": "shard_id", "in": "query", "required": false, "description": "Restrict to a single shard." }
       ],
       "request_body": null,
-      "success_response": { "status": 200, "schema": "Array of VersionUsageRow records." },
+      "success_response": { "status": 200, "fields": ["status", "observed_at", "filters", "items", "shards"] },
       "error_responses": [
         { "status": 500, "description": "Database error." }
       ]
@@ -722,7 +741,7 @@
         { "name": "shard_id", "in": "query", "required": false, "description": "Restrict to a single shard." }
       ],
       "request_body": null,
-      "success_response": { "status": 200, "schema": "RetirementCheckReport: safe (bool), blocking_count, per-shard breakdown." },
+      "success_response": { "status": 200, "fields": ["status", "safe_to_retire", "observed_at", "filters", "blockers", "shards"] },
       "error_responses": [
         { "status": 400, "description": "Missing required parameters." },
         { "status": 500, "description": "Database error." }
@@ -736,7 +755,7 @@
       "description": "Return the current status of the retention janitor.",
       "params": [],
       "request_body": null,
-      "success_response": { "status": 200, "schema": "RetentionStatus." },
+      "success_response": { "status": 200, "free_form": true },
       "error_responses": []
     },
     {
@@ -745,12 +764,14 @@
       "category": "admin",
       "read_only": false,
       "description": "Trigger the retention janitor to run immediately outside its scheduled interval.",
+      "idempotency": "Idempotent: triggering an already-running retention janitor is a no-op.",
+      "params": [],
       "request_body": {
         "required": false,
         "free_form": false,
         "fields": []
       },
-      "success_response": { "status": 200, "schema": "Trigger acknowledgement." },
+      "success_response": { "status": 200, "fields": ["ok"] },
       "error_responses": [
         { "status": 500, "description": "Internal error." }
       ]
@@ -763,7 +784,7 @@
       "description": "Return per-activity concurrency statistics: configured cap, currently in-flight, and queued counts for each concurrency key.",
       "params": [],
       "request_body": null,
-      "success_response": { "status": 200, "schema": "Array of ConcurrencyKeyStats records." },
+      "success_response": { "status": 200, "free_form": true },
       "error_responses": [
         { "status": 500, "description": "Database error." }
       ]
@@ -784,7 +805,7 @@
         { "name": "payload_policy", "in": "query", "required": false, "description": "Payload inclusion: full, redacted, or omit." }
       ],
       "request_body": null,
-      "success_response": { "status": 200, "schema": "Array of HistoryExportDocument records." },
+      "success_response": { "status": 200, "fields": ["status", "observed_at", "payload_policy", "filters", "exports", "failures", "shard_coverage"] },
       "error_responses": [
         { "status": 400, "description": "Invalid filter values." },
         { "status": 500, "description": "Database error." }
@@ -808,7 +829,7 @@
         { "name": "limit", "in": "query", "required": false, "description": "Maximum number of results." }
       ],
       "request_body": null,
-      "success_response": { "status": 200, "schema": "Array of ExternalHandoff records." },
+      "success_response": { "status": 200, "fields": ["status", "items", "shard_coverage"] },
       "error_responses": [
         { "status": 500, "description": "Database error." }
       ]
@@ -823,7 +844,7 @@
         { "name": "token", "in": "path", "required": true, "description": "Task token UUID." }
       ],
       "request_body": null,
-      "success_response": { "status": 200, "schema": "ExternalHandoff record." },
+      "success_response": { "status": 200, "fields": ["status", "item", "shard_coverage"] },
       "error_responses": [
         { "status": 404, "description": "Token not found." },
         { "status": 500, "description": "Database error." }
@@ -837,7 +858,7 @@
       "description": "List all workflow and DAG schedules.",
       "params": [],
       "request_body": null,
-      "success_response": { "status": 200, "schema": "Array of HarvestSchedule records." },
+      "success_response": { "status": 200, "free_form": true },
       "error_responses": [
         { "status": 500, "description": "Database error." }
       ]
@@ -848,6 +869,8 @@
       "category": "schedule",
       "read_only": false,
       "description": "Create a new cron or interval schedule for a workflow.",
+      "idempotency": "Not idempotent: each call creates a new schedule row.",
+      "params": [],
       "request_body": {
         "required": true,
         "free_form": false,
@@ -860,7 +883,7 @@
           { "name": "paused", "required": false, "description": "Create the schedule in paused state." }
         ]
       },
-      "success_response": { "status": 200, "schema": "Created HarvestSchedule record." },
+      "success_response": { "status": 200, "fields": ["id", "kind", "name", "schedule_expr", "is_paused", "next_run_at", "last_run_at", "max_active_runs", "catchup"] },
       "error_responses": [
         { "status": 400, "description": "Invalid cron expression or missing required fields." },
         { "status": 500, "description": "Database error." }
@@ -872,6 +895,7 @@
       "category": "schedule",
       "read_only": false,
       "description": "Pause a schedule, preventing it from triggering new runs.",
+      "idempotency": "Idempotent: pausing an already-paused schedule is a no-op.",
       "params": [
         { "name": "id", "in": "path", "required": true, "description": "Schedule UUID." }
       ],
@@ -880,7 +904,7 @@
         "free_form": false,
         "fields": []
       },
-      "success_response": { "status": 200, "schema": "Updated HarvestSchedule." },
+      "success_response": { "status": 200, "fields": ["ok"] },
       "error_responses": [
         { "status": 404, "description": "Schedule not found." },
         { "status": 500, "description": "Database error." }
@@ -892,6 +916,7 @@
       "category": "schedule",
       "read_only": false,
       "description": "Resume a paused schedule.",
+      "idempotency": "Idempotent: resuming an already-active schedule is a no-op.",
       "params": [
         { "name": "id", "in": "path", "required": true, "description": "Schedule UUID." }
       ],
@@ -900,7 +925,7 @@
         "free_form": false,
         "fields": []
       },
-      "success_response": { "status": 200, "schema": "Updated HarvestSchedule." },
+      "success_response": { "status": 200, "fields": ["ok"] },
       "error_responses": [
         { "status": 404, "description": "Schedule not found." },
         { "status": 500, "description": "Database error." }
@@ -912,6 +937,7 @@
       "category": "schedule",
       "read_only": false,
       "description": "Delete a schedule. In-flight runs started by this schedule continue to completion.",
+      "idempotency": "Not idempotent: a second call after successful deletion returns 404.",
       "params": [
         { "name": "id", "in": "path", "required": true, "description": "Schedule UUID." }
       ],
@@ -920,7 +946,7 @@
         "free_form": false,
         "fields": []
       },
-      "success_response": { "status": 200, "schema": "Deletion acknowledgement." },
+      "success_response": { "status": 200, "fields": ["ok"] },
       "error_responses": [
         { "status": 404, "description": "Schedule not found." },
         { "status": 500, "description": "Database error." }
@@ -943,7 +969,7 @@
         { "name": "limit", "in": "query", "required": false, "description": "Maximum number of records to return." }
       ],
       "request_body": null,
-      "success_response": { "status": 200, "schema": "Array of AuditRecord entries." },
+      "success_response": { "status": 200, "free_form": true },
       "error_responses": [
         { "status": 500, "description": "Database error." }
       ]

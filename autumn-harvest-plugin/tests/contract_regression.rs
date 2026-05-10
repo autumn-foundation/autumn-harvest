@@ -9,7 +9,9 @@
 ///   - Adding response fields is non-breaking.
 ///   - Removing, renaming, or changing the type of a response field is breaking.
 ///   - New mutating routes must be classified (read_only = false) in the contract.
-use autumn_harvest_plugin::api::{management_api_request_fields, management_api_routes};
+use autumn_harvest_plugin::api::{
+    management_api_request_fields, management_api_response_fields, management_api_routes,
+};
 use std::collections::{HashMap, HashSet};
 
 const CONTRACT_JSON: &str = include_str!("../../docs/api-contract.json");
@@ -236,5 +238,107 @@ fn contract_read_only_classification_is_consistent() {
                 "route {method} {path} uses a mutating HTTP method but is marked read_only:true"
             );
         }
+    }
+}
+
+/// Every contract route that has a structured success_response (i.e. a `fields`
+/// array rather than `free_form: true`) must have its top-level response field
+/// names listed in `management_api_response_fields()`, and vice-versa.
+///
+/// Update management_api_response_fields() AND the `success_response.fields`
+/// array in docs/api-contract.json together whenever you add, remove, or rename
+/// a top-level response field on any management route.
+#[test]
+fn contract_response_fields_match_code_registry() {
+    let contract = load_contract();
+
+    // Build (method, path) → field names from the contract's success_response.
+    let mut contract_resp: HashMap<(String, String), Option<Vec<String>>> = HashMap::new();
+    for route in contract["routes"].as_array().unwrap() {
+        let method = route["method"].as_str().unwrap().to_string();
+        let path = route["path"].as_str().unwrap().to_string();
+        let sr = &route["success_response"];
+        if !sr.is_object() {
+            continue;
+        }
+        if sr["free_form"].as_bool().unwrap_or(false) {
+            contract_resp.insert((method, path), None);
+        } else if let Some(arr) = sr["fields"].as_array() {
+            let names: Vec<String> = arr
+                .iter()
+                .filter_map(|f| {
+                    // fields may be plain strings or {name: ...} objects
+                    f.as_str()
+                        .map(|s| s.to_string())
+                        .or_else(|| f["name"].as_str().map(|s| s.to_string()))
+                })
+                .collect();
+            contract_resp.insert((method, path), Some(names));
+        }
+    }
+
+    for (method, path, code_fields) in management_api_response_fields() {
+        let key = (method.to_string(), path.to_string());
+        match (code_fields, contract_resp.get(&key)) {
+            (None, Some(None)) => {}
+            (Some(cf), Some(Some(contract_f))) => {
+                let mut code_set: Vec<&str> = cf.iter().copied().collect();
+                let mut contract_set: Vec<&str> =
+                    contract_f.iter().map(|s| s.as_str()).collect();
+                code_set.sort_unstable();
+                contract_set.sort_unstable();
+                assert_eq!(
+                    code_set, contract_set,
+                    "Response field mismatch for {method} {path}: \
+                     code registry has {code_set:?} but contract has {contract_set:?}. \
+                     Update both management_api_response_fields() and docs/api-contract.json."
+                );
+            }
+            (None, Some(Some(_))) => panic!(
+                "{method} {path}: code registry says free-form but contract has structured fields"
+            ),
+            (Some(_), Some(None)) => panic!(
+                "{method} {path}: code registry has structured fields but contract says free-form"
+            ),
+            (_, None) => panic!(
+                "{method} {path}: in code response registry but missing from contract \
+                 success_response (add 'fields' or 'free_form: true' to the route)"
+            ),
+        }
+    }
+}
+
+/// Every contract route must document an `idempotency` field so embedders
+/// know which operations are safe to retry.
+#[test]
+fn contract_mutating_routes_have_idempotency_field() {
+    let contract = load_contract();
+    let mutating_methods = ["POST", "PUT", "PATCH", "DELETE"];
+
+    for route in contract["routes"].as_array().unwrap() {
+        let method = route["method"].as_str().unwrap_or("");
+        let path = route["path"].as_str().unwrap_or("");
+        if !mutating_methods.contains(&method) {
+            continue;
+        }
+        assert!(
+            route["idempotency"].is_string(),
+            "mutating route {method} {path}: missing required 'idempotency' string field \
+             (state whether the operation is idempotent and under what conditions)"
+        );
+    }
+}
+
+/// Every route in the contract must have a `params` array (may be empty).
+#[test]
+fn contract_routes_have_params_array() {
+    let contract = load_contract();
+    for route in contract["routes"].as_array().unwrap() {
+        let method = route["method"].as_str().unwrap_or("?");
+        let path = route["path"].as_str().unwrap_or("?");
+        assert!(
+            route["params"].is_array(),
+            "route {method} {path}: missing 'params' array (use [] when the route has no parameters)"
+        );
     }
 }
