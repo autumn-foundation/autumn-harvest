@@ -915,7 +915,6 @@ async fn tick_one_workflow_schedule(
     now: DateTime<Utc>,
     metrics: &Arc<dyn crate::telemetry::MetricsRecorder>,
 ) -> HarvestResult<()> {
-    use crate::execution::StartWorkflowParams;
     use crate::schema::harvest_schedules::dsl;
 
     let running: i64 = harvest_workflow_executions::table
@@ -955,12 +954,53 @@ async fn tick_one_workflow_schedule(
         due_run_plan(parsed_schedule, logical_date, now, catchup);
     let dispatch_queue = schedule.queue_name.as_deref().unwrap_or("default");
 
+    let (_dispatched, last_dispatched_at, deferred_next_run_at) = dispatch_scheduled_workflow_runs(
+        conn,
+        wf_name,
+        schedule,
+        &run_dates,
+        running,
+        dispatch_queue,
+        metrics,
+    )
+    .await?;
+
+    // Deferred catchup slots become next_run_at so the next tick retries them.
+    // last_run_at only advances to the last slot actually started.
+    let effective_last_run_at = last_dispatched_at.or(schedule.last_run_at);
+    let effective_next_run_at = deferred_next_run_at.or(next_run_after_plan);
+    diesel::update(dsl::harvest_schedules.find(schedule.id))
+        .set((
+            dsl::last_run_at.eq(effective_last_run_at),
+            dsl::next_run_at.eq(effective_next_run_at),
+            dsl::updated_at.eq(now),
+        ))
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments, clippy::cognitive_complexity)]
+async fn dispatch_scheduled_workflow_runs(
+    conn: &mut AsyncPgConnection,
+    wf_name: &str,
+    schedule: &HarvestSchedule,
+    run_dates: &[DateTime<Utc>],
+    running: i64,
+    dispatch_queue: &str,
+    metrics: &Arc<dyn crate::telemetry::MetricsRecorder>,
+) -> HarvestResult<(u32, Option<DateTime<Utc>>, Option<DateTime<Utc>>)> {
+    use crate::execution::StartWorkflowParams;
+
     let mut dispatched: u32 = 0;
     let mut last_dispatched_at: Option<DateTime<Utc>> = None;
     // Set to the first slot we could not dispatch due to max_active_runs; if Some,
     // it becomes next_run_at so catchup slots are not silently dropped.
     let mut deferred_next_run_at: Option<DateTime<Utc>> = None;
-    for scheduled_for in &run_dates {
+
+    for scheduled_for in run_dates {
         if running + i64::from(dispatched) >= i64::from(schedule.max_active_runs) {
             deferred_next_run_at = Some(*scheduled_for);
             tracing::info!(
@@ -1024,21 +1064,7 @@ async fn tick_one_workflow_schedule(
         }
     }
 
-    // Deferred catchup slots become next_run_at so the next tick retries them.
-    // last_run_at only advances to the last slot actually started.
-    let effective_last_run_at = last_dispatched_at.or(schedule.last_run_at);
-    let effective_next_run_at = deferred_next_run_at.or(next_run_after_plan);
-    diesel::update(dsl::harvest_schedules.find(schedule.id))
-        .set((
-            dsl::last_run_at.eq(effective_last_run_at),
-            dsl::next_run_at.eq(effective_next_run_at),
-            dsl::updated_at.eq(now),
-        ))
-        .execute(conn)
-        .await
-        .map_err(crate::error::database_error)?;
-
-    Ok(())
+    Ok((dispatched, last_dispatched_at, deferred_next_run_at))
 }
 
 async fn execute_dag_run(

@@ -622,15 +622,12 @@ mod db {
         Ok(())
     }
 
-    #[allow(clippy::too_many_lines)]
-    async fn process_job(
-        pool: &ShardedDbPool,
+    async fn parse_batch_action(
+        job: &BatchJob,
         owning_shard_pool: &DbPool,
-        job: BatchJob,
-        config: &BatchExecutorConfig,
-    ) -> HarvestResult<()> {
-        let action: BatchAction = match job.action.parse() {
-            Ok(a) => a,
+    ) -> HarvestResult<Option<BatchAction>> {
+        match job.action.parse() {
+            Ok(a) => Ok(Some(a)),
             Err(reason) => {
                 tracing::warn!(job_id = %job.id, reason, "batch job has unknown action; failing");
                 let mut conn = owning_shard_pool
@@ -638,11 +635,17 @@ mod db {
                     .await
                     .map_err(|e| HarvestError::Database(e.to_string()))?;
                 let _ = mark_failed(&mut conn, job.id, &reason).await;
-                return Ok(());
+                Ok(None)
             }
-        };
-        let filter: BatchFilter = match serde_json::from_value(job.filter.clone()) {
-            Ok(f) => f,
+        }
+    }
+
+    async fn parse_batch_filter(
+        job: &BatchJob,
+        owning_shard_pool: &DbPool,
+    ) -> HarvestResult<Option<BatchFilter>> {
+        match serde_json::from_value(job.filter.clone()) {
+            Ok(f) => Ok(Some(f)),
             Err(error) => {
                 tracing::warn!(job_id = %job.id, %error, "batch job filter is malformed");
                 let mut conn = owning_shard_pool
@@ -650,8 +653,85 @@ mod db {
                     .await
                     .map_err(|e| HarvestError::Database(e.to_string()))?;
                 let _ = mark_failed(&mut conn, job.id, &error.to_string()).await;
-                return Ok(());
+                Ok(None)
             }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn dispatch_batch_targets(
+        pool: &ShardedDbPool,
+        owning_conn: &mut AsyncPgConnection,
+        job_id: Uuid,
+        action: BatchAction,
+        targets_to_dispatch: Vec<ExecutionId>,
+        signal_name: Option<String>,
+        signal_payload: Option<serde_json::Value>,
+        concurrency: usize,
+    ) -> HarvestResult<()> {
+        for chunk in targets_to_dispatch.chunks(concurrency) {
+            let mut tasks: FuturesUnordered<_> = FuturesUnordered::new();
+            for target in chunk.iter().copied() {
+                let pool_for_target = pool.pool_for_execution(target).clone();
+                let signal_name = signal_name.clone();
+                let signal_payload = signal_payload.clone();
+                tasks.push(async move {
+                    let mut conn = match pool_for_target.get().await {
+                        Ok(c) => c,
+                        Err(e) => return (target, Err(e.to_string())),
+                    };
+                    let result = dispatch_target(
+                        &mut conn,
+                        action,
+                        signal_name.as_deref(),
+                        signal_payload.as_ref(),
+                        target,
+                    )
+                    .await;
+                    (target, result)
+                });
+            }
+            let mut completed_delta = 0i64;
+            let mut failed_delta = 0i64;
+            let mut new_errors: Vec<BatchTargetError> = Vec::with_capacity(chunk.len());
+            let mut dispatched_ids: Vec<Uuid> = Vec::with_capacity(chunk.len());
+            while let Some((target, outcome)) = tasks.next().await {
+                dispatched_ids.push(target.as_uuid());
+                match outcome {
+                    Ok(()) => completed_delta += 1,
+                    Err(reason) => {
+                        failed_delta += 1;
+                        new_errors.push(BatchTargetError {
+                            execution_id: target.to_string(),
+                            reason,
+                        });
+                    }
+                }
+            }
+            record_progress(
+                owning_conn,
+                job_id,
+                completed_delta,
+                failed_delta,
+                &new_errors,
+                &dispatched_ids,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn process_job(
+        pool: &ShardedDbPool,
+        owning_shard_pool: &DbPool,
+        job: BatchJob,
+        config: &BatchExecutorConfig,
+    ) -> HarvestResult<()> {
+        let Some(action) = parse_batch_action(&job, owning_shard_pool).await? else {
+            return Ok(());
+        };
+        let Some(filter) = parse_batch_filter(&job, owning_shard_pool).await? else {
+            return Ok(());
         };
 
         // Walk every shard, collect targets, dispatch with bounded fan-out.
@@ -709,56 +789,17 @@ mod db {
         let signal_payload = job.signal_payload.clone();
         let concurrency = usize::try_from(config.concurrency.max(1)).unwrap_or(1);
 
-        // Dispatch in chunks of `concurrency` to bound in-flight ops.
-        for chunk in targets_to_dispatch.chunks(concurrency) {
-            let mut tasks: FuturesUnordered<_> = FuturesUnordered::new();
-            for target in chunk.iter().copied() {
-                let pool_for_target = pool.pool_for_execution(target).clone();
-                let signal_name = signal_name.clone();
-                let signal_payload = signal_payload.clone();
-                tasks.push(async move {
-                    let mut conn = match pool_for_target.get().await {
-                        Ok(c) => c,
-                        Err(e) => return (target, Err(e.to_string())),
-                    };
-                    let result = dispatch_target(
-                        &mut conn,
-                        action,
-                        signal_name.as_deref(),
-                        signal_payload.as_ref(),
-                        target,
-                    )
-                    .await;
-                    (target, result)
-                });
-            }
-            let mut completed_delta = 0i64;
-            let mut failed_delta = 0i64;
-            let mut new_errors: Vec<BatchTargetError> = Vec::with_capacity(chunk.len());
-            let mut dispatched_ids: Vec<Uuid> = Vec::with_capacity(chunk.len());
-            while let Some((target, outcome)) = tasks.next().await {
-                dispatched_ids.push(target.as_uuid());
-                match outcome {
-                    Ok(()) => completed_delta += 1,
-                    Err(reason) => {
-                        failed_delta += 1;
-                        new_errors.push(BatchTargetError {
-                            execution_id: target.to_string(),
-                            reason,
-                        });
-                    }
-                }
-            }
-            record_progress(
-                &mut owning_conn,
-                job.id,
-                completed_delta,
-                failed_delta,
-                &new_errors,
-                &dispatched_ids,
-            )
-            .await?;
-        }
+        dispatch_batch_targets(
+            pool,
+            &mut owning_conn,
+            job.id,
+            action,
+            targets_to_dispatch,
+            signal_name,
+            signal_payload,
+            concurrency,
+        )
+        .await?;
 
         mark_completed(&mut owning_conn, job.id).await?;
         Ok(())

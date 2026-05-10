@@ -3088,6 +3088,7 @@ impl Worker {
     ///
     /// This lets callers separate listener startup from task polling when they
     /// need tighter control over startup sequencing.
+    #[allow(clippy::cognitive_complexity)]
     pub async fn run_with_listener(
         &self,
         pool: &DbPool,
@@ -3142,41 +3143,7 @@ impl Worker {
             self.config.queues.clone(),
             self.config.poll_interval,
         );
-        // DLQ depth gauge — one sampler per shard assignment so every shard
-        // this worker owns is reported.  Single-shard deployments get one
-        // sampler for shard 0; multi-shard workers (rare) get one per entry.
-        let dlq_depth_samplers: Vec<_> = {
-            let assignments = &self.config.shard_assignments;
-            let shards: &[_] = if assignments.is_empty() {
-                // Fallback: if no explicit assignments, sample with shard 0.
-                &[]
-            } else {
-                assignments.as_slice()
-            };
-            let mut handles: Vec<_> = shards
-                .iter()
-                .map(|shard| {
-                    let shard_id = u16::try_from(shard.as_i32()).unwrap_or(0);
-                    spawn_dlq_depth_sampler(
-                        pool.clone(),
-                        self.shutdown.clone(),
-                        self.registry.telemetry().clone(),
-                        shard_id,
-                        self.config.poll_interval,
-                    )
-                })
-                .collect();
-            if handles.is_empty() {
-                handles.push(spawn_dlq_depth_sampler(
-                    pool.clone(),
-                    self.shutdown.clone(),
-                    self.registry.telemetry().clone(),
-                    0u16,
-                    self.config.poll_interval,
-                ));
-            }
-            handles
-        };
+        let dlq_depth_samplers = self.spawn_dlq_samplers(pool);
         let timeout_checker = crate::timeout::spawn_timeout_checker(
             pool.clone(),
             self.shutdown.clone(),
@@ -3189,6 +3156,42 @@ impl Worker {
             dlq_depth_samplers,
             timeout_checker,
         }
+    }
+
+    fn spawn_dlq_samplers(&self, pool: &DbPool) -> Vec<tokio::task::JoinHandle<()>> {
+        // DLQ depth gauge — one sampler per shard assignment so every shard
+        // this worker owns is reported.  Single-shard deployments get one
+        // sampler for shard 0; multi-shard workers (rare) get one per entry.
+        let assignments = &self.config.shard_assignments;
+        let shards: &[_] = if assignments.is_empty() {
+            // Fallback: if no explicit assignments, sample with shard 0.
+            &[]
+        } else {
+            assignments.as_slice()
+        };
+        let mut handles: Vec<_> = shards
+            .iter()
+            .map(|shard| {
+                let shard_id = u16::try_from(shard.as_i32()).unwrap_or(0);
+                spawn_dlq_depth_sampler(
+                    pool.clone(),
+                    self.shutdown.clone(),
+                    self.registry.telemetry().clone(),
+                    shard_id,
+                    self.config.poll_interval,
+                )
+            })
+            .collect();
+        if handles.is_empty() {
+            handles.push(spawn_dlq_depth_sampler(
+                pool.clone(),
+                self.shutdown.clone(),
+                self.registry.telemetry().clone(),
+                0u16,
+                self.config.poll_interval,
+            ));
+        }
+        handles
     }
 
     fn spawn_heartbeat_task(
@@ -3280,28 +3283,47 @@ impl Worker {
                 "worker heartbeat task failed during shutdown"
             );
         }
-        if let Err(error) = monitors.timeout_checker.await {
+        self.cleanup_timeouts(monitors.timeout_checker).await;
+        self.cleanup_samplers(
+            monitors.queue_depth_sampler,
+            monitors.concurrency_sampler,
+            monitors.dlq_depth_samplers,
+        )
+        .await;
+    }
+
+    async fn cleanup_timeouts(&self, timeout_checker: tokio::task::JoinHandle<()>) {
+        if let Err(error) = timeout_checker.await {
             tracing::warn!(
                 worker_id = %self.config.worker_id,
                 error = %error,
                 "timeout checker task failed during shutdown"
             );
         }
-        if let Err(error) = monitors.queue_depth_sampler.await {
+    }
+
+    #[allow(clippy::cognitive_complexity)]
+    async fn cleanup_samplers(
+        &self,
+        queue_depth_sampler: tokio::task::JoinHandle<()>,
+        concurrency_sampler: tokio::task::JoinHandle<()>,
+        dlq_depth_samplers: Vec<tokio::task::JoinHandle<()>>,
+    ) {
+        if let Err(error) = queue_depth_sampler.await {
             tracing::warn!(
                 worker_id = %self.config.worker_id,
                 error = %error,
                 "queue depth sampler failed during shutdown"
             );
         }
-        if let Err(error) = monitors.concurrency_sampler.await {
+        if let Err(error) = concurrency_sampler.await {
             tracing::warn!(
                 worker_id = %self.config.worker_id,
                 error = %error,
                 "concurrency sampler failed during shutdown"
             );
         }
-        for sampler in monitors.dlq_depth_samplers {
+        for sampler in dlq_depth_samplers {
             if let Err(error) = sampler.await {
                 tracing::warn!(
                     worker_id = %self.config.worker_id,
@@ -3313,6 +3335,7 @@ impl Worker {
     }
 
     /// Register or re-register this worker in the fleet table.
+    #[allow(clippy::cognitive_complexity)]
     async fn register_in_fleet(&self, pool: &DbPool) {
         let shard_ids: Vec<i32> = self
             .config
@@ -3396,6 +3419,7 @@ impl Worker {
     ///
     /// Gets a connection from the pool, tries to claim a task, dispatches it
     /// if found, or sleeps for `poll_interval` if the queue was empty.
+    #[allow(clippy::cognitive_complexity)]
     async fn poll_once(&self, pool: &DbPool) -> bool {
         let mut conn = match pool.get().await {
             Ok(conn) => conn,
