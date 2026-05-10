@@ -78,6 +78,32 @@ async fn main() {
 }
 ```
 
+## Request/response embedding
+
+For short workflows behind an HTTP route, the plugin installs a shard-aware
+`WorkflowHandleClient` into `AppState`. Start the workflow through the normal
+storage pool, keep the returned handle, and await the terminal JSON result:
+
+```rust
+let started = workflow_handle_client
+    .start_or_load(&mut conn, start_params)
+    .await?;
+
+let result = started.handle.result_raw().await?;
+```
+
+`result_raw()` blocks on Postgres LISTEN/NOTIFY wakeups from the event log, not
+sleep polling. Successful workflows return their `output`; failed, cancelled,
+timed-out, and terminated workflows return typed `HarvestError` variants.
+
+Avoid the old polling anti-pattern of repeatedly calling
+`GET /api/harvest/workflows/{id}` and scanning the returned full event history
+for terminal events. That endpoint is for inspection. For HTTP clients that
+already know an execution ID, use
+`GET /api/harvest/workflows/{id}/result?wait=5s` instead. It returns only the
+compact terminal body with `state`, `output`/`error`, and `completed_at`, or
+`204 No Content` with `Retry-After` while the workflow is still running.
+
 ## What you get
 
 - **Event-sourced execution.** Workflows are deterministic functions; their
