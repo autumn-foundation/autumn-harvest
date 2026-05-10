@@ -4651,6 +4651,12 @@ async fn schedule_backfill(
     match kind {
         ScheduleKind::Workflow => {
             let wf_name = name.clone();
+            // Workflow schedules are always dispatched through the scheduler's own
+            // connection, which uses `ExecutionId::new()` (ShardId::UNENCODED → default
+            // shard). The backfill must write to the same shard so that the partial
+            // unique index on (workflow_name, workflow_id) prevents the scheduler from
+            // creating a second run for the same timestamp after the backfill window.
+            let wf_shard_pool = pool.default_pool();
             for scheduled_for in &timestamps {
                 // Respect max_active_runs: skip if we've already saturated the limit.
                 if running_at_start + dispatched_this_call >= max_active {
@@ -4662,21 +4668,17 @@ async fn schedule_backfill(
                 }
 
                 let workflow_id = scheduled_workflow_id_pub(&wf_name, *scheduled_for);
-                // Use the same rendezvous-hash routing as normal workflow starts so the
-                // backfill lands on the same shard that owns this (workflow_name, workflow_id).
-                let shard_id = runtime
-                    .router()
-                    .pick_for_new_workflow(&wf_name, &workflow_id);
-                let exec_id = ExecutionId::new_for_shard(shard_id);
+                // Match the scheduler: ExecutionId::new() encodes ShardId::UNENCODED so
+                // the execution lands on the default shard, same as tick_one_workflow_schedule.
+                let exec_id = ExecutionId::new();
                 let input = schedule
                     .workflow_input
                     .clone()
                     .unwrap_or(serde_json::Value::Null);
-                let shard_pool = pool.pool_for(shard_id);
 
-                let Ok(mut conn) = acquire_conn(shard_pool).await else {
+                let Ok(mut conn) = acquire_conn(wf_shard_pool).await else {
                     shard_failures.push(BackfillShardFailure {
-                        shard_id: shard_id.as_i32(),
+                        shard_id: 0,
                         reason: "failed to acquire connection".to_string(),
                     });
                     failed += 1;
@@ -4733,7 +4735,7 @@ async fn schedule_backfill(
                     }
                     Err(e) => {
                         shard_failures.push(BackfillShardFailure {
-                            shard_id: shard_id.as_i32(),
+                            shard_id: 0,
                             reason: e.to_string(),
                         });
                         failed += 1;
