@@ -28,6 +28,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the contract's `fields` list.
 - Embedder guide `docs/api-contract-guide.md` with jq inspection recipes,
   compatibility rules, client generation workflow, and developer update checklist.
+- Request/response workflow embedding (issue #224): in-process
+  `WorkflowHandleClient`/`WorkflowHandle`, compact
+  `GET /workflows/{id}/result?wait=...`, and quickstart coverage for awaiting
+  `handle.result_raw().await?` from an HTTP route.
 
 ### Non-breaking
 

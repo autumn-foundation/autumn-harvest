@@ -158,11 +158,23 @@ pub async fn append_events(
 
     let rows = events_to_insert_rows_from(exec_id, events, start_id)?;
 
-    diesel::insert_into(harvest_events::table)
+    let inserted = diesel::insert_into(harvest_events::table)
         .values(&rows)
         .execute(conn)
         .await
-        .map_err(crate::error::database_error)
+        .map_err(crate::error::database_error)?;
+
+    if let Some(last_event) = events.last() {
+        crate::notify::notify_workflow_events_appended(
+            conn,
+            exec_id.as_uuid(),
+            inserted,
+            last_event.type_name(),
+        )
+        .await?;
+    }
+
+    Ok(inserted)
 }
 
 /// Append a single event to a workflow's history without loading the full log.

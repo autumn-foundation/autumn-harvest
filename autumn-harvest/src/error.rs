@@ -84,6 +84,10 @@ pub enum HarvestError {
     #[error("workflow cancelled: {0}")]
     Cancelled(String),
 
+    /// The workflow was forcibly terminated.
+    #[error("workflow terminated: {0}")]
+    Terminated(String),
+
     /// A Saga compensation sequence failed while trying to rollback.
     #[error(
         "saga compensation failed after original error: {original}; compensation errors: {compensation_errors:?}"

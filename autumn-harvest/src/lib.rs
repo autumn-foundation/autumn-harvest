@@ -49,6 +49,8 @@ pub mod executor;
 pub mod external_task;
 /// Deterministic workflow guardrail rule catalog (issue #173).
 pub mod guardrail;
+#[cfg(feature = "db")]
+pub mod handle;
 pub mod history_export;
 pub mod info;
 /// `metrics` crate adapter for [`telemetry::MetricsRecorder`].
@@ -157,6 +159,11 @@ pub use executor::{WorkflowOutcome, run_workflow};
 pub use guardrail::{
     GuardrailFinding, GuardrailSuppression, GuardrailSuppressionError, RuleCategory, RuleEntry,
     Severity, catalog as guardrail_catalog, rule_by_id as guardrail_rule_by_id,
+};
+#[cfg(feature = "db")]
+pub use handle::{
+    StartedWorkflowHandle, WorkflowHandle, WorkflowHandleClient, WorkflowResult,
+    WorkflowResultState, start_or_load_workflow_execution_with_handle,
 };
 pub use history_export::{
     DEFAULT_HISTORY_EXPORT_MAX_BYTES, HISTORY_EXPORT_SCHEMA, HISTORY_EXPORT_VERSION,

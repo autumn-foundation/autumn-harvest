@@ -1,7 +1,7 @@
 //! Axum management routes for Harvest workflows and DAGs.
 #![allow(clippy::literal_string_with_formatting_args)]
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -76,7 +76,8 @@ use autumn_harvest::workers::{
 };
 use autumn_harvest::{HistoryMatch, HistoryMatcher, WorkflowEvent};
 use autumn_harvest::{
-    StartWorkflowParams, cancel_workflow_execution, start_or_load_workflow_execution,
+    StartWorkflowParams, WorkflowHandleClient, WorkflowResult, cancel_workflow_execution,
+    start_or_load_workflow_execution,
 };
 
 use crate::preflight::{PreflightReport, build_preflight_report};
@@ -199,6 +200,10 @@ pub struct HarvestApiState {
     /// Default drain deadline offset used when `POST /workers/{id}/drain` omits `deadline_at`.
     /// Set from `WorkerConfig::shutdown_timeout` at startup; defaults to 30 s.
     worker_shutdown_timeout: Arc<Mutex<std::time::Duration>>,
+    /// Per-shard Postgres URLs used by workflow result LISTEN/NOTIFY waits.
+    workflow_result_notification_urls: Arc<Mutex<BTreeMap<ShardId, String>>>,
+    /// Maximum wait accepted by `GET /workflows/{id}/result?wait=...`.
+    workflow_result_max_wait: Arc<Mutex<std::time::Duration>>,
 }
 
 impl Default for HarvestApiState {
@@ -213,6 +218,8 @@ impl Default for HarvestApiState {
             admin_auth_boundary: Arc::new(Mutex::new(false)),
             health_requires_shard_readiness: Arc::new(Mutex::new(false)),
             worker_shutdown_timeout: Arc::new(Mutex::new(std::time::Duration::from_secs(30))),
+            workflow_result_notification_urls: Arc::default(),
+            workflow_result_max_wait: Arc::new(Mutex::new(std::time::Duration::from_secs(30))),
         }
     }
 }
@@ -374,6 +381,80 @@ impl HarvestApiState {
             .worker_shutdown_timeout
             .lock()
             .expect("harvest api state lock poisoned")
+    }
+
+    /// Configure the default-shard database URL used by workflow result waits.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    pub fn set_workflow_result_notification_database_url(&self, url: impl Into<String>) {
+        self.set_workflow_result_notification_database_urls([(ShardId::new(0), url)]);
+    }
+
+    /// Configure per-shard database URLs used by workflow result waits.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    pub fn set_workflow_result_notification_database_urls<I, S>(&self, urls: I)
+    where
+        I: IntoIterator<Item = (ShardId, S)>,
+        S: Into<String>,
+    {
+        *self
+            .workflow_result_notification_urls
+            .lock()
+            .expect("harvest api state lock poisoned") = urls
+            .into_iter()
+            .map(|(shard, url)| (shard, url.into()))
+            .collect();
+    }
+
+    /// Override the maximum long-poll wait for workflow result requests.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    pub fn set_workflow_result_max_wait(&self, max_wait: std::time::Duration) {
+        *self
+            .workflow_result_max_wait
+            .lock()
+            .expect("harvest api state lock poisoned") = max_wait;
+    }
+
+    pub(crate) fn workflow_result_max_wait(&self) -> std::time::Duration {
+        *self
+            .workflow_result_max_wait
+            .lock()
+            .expect("harvest api state lock poisoned")
+    }
+
+    fn workflow_result_notification_database_urls(
+        &self,
+    ) -> HarvestResult<BTreeMap<ShardId, String>> {
+        let urls = self
+            .workflow_result_notification_urls
+            .lock()
+            .expect("harvest api state lock poisoned")
+            .clone();
+        if urls.is_empty() {
+            return Err(HarvestError::Config(
+                "workflow result notification database URL is not configured".to_string(),
+            ));
+        }
+        Ok(urls)
+    }
+
+    fn workflow_handle_client(&self) -> HarvestResult<WorkflowHandleClient> {
+        let pool = self.storage_pool()?;
+        let runtime = self.runtime()?;
+        let urls = self.workflow_result_notification_database_urls()?;
+        Ok(WorkflowHandleClient::new(
+            pool.sharded_pool().clone(),
+            runtime.router().clone(),
+            urls,
+        ))
     }
 
     /// Extract the actor identity from request headers using the configured
@@ -1013,6 +1094,7 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             get(export_workflow_history),
         )
         .route("/workflows/{id}", get(get_workflow))
+        .route("/workflows/{id}/result", get(get_workflow_result))
         .route("/workflows/{id}/children", get(list_workflow_children))
         .route("/workflows/{id}/stack", get(get_workflow_stack))
         .route("/workflows/{workflow_name}/start", post(start_workflow))
@@ -1110,6 +1192,7 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         // ── workflows ────────────────────────────────────────────────────────
         ("GET", "/workflows"),
         ("GET", "/workflows/{id}"),
+        ("GET", "/workflows/{id}/result"),
         ("GET", "/workflows/{id}/history/export"),
         ("GET", "/workflows/{id}/children"),
         ("GET", "/workflows/{id}/stack"),
@@ -1308,6 +1391,11 @@ pub const fn management_api_response_fields()
             "GET",
             "/workflows/{id}",
             Some(&["parent_id", "execution", "history", "external_handoffs"]),
+        ),
+        (
+            "GET",
+            "/workflows/{id}/result",
+            Some(&["state", "output", "error", "completed_at"]),
         ),
         ("GET", "/workflows/{id}/history/export", None), // HistoryExportDocument (external)
         (
@@ -2220,6 +2308,58 @@ async fn get_workflow(
         history: events,
         external_handoffs,
     }))
+}
+
+async fn get_workflow_result(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id): Path<String>,
+    Query(pairs): Query<Vec<(String, String)>>,
+) -> axum::response::Response {
+    let exec_id = match parse_execution_id(&id) {
+        Ok(id) => id,
+        Err(error) => return error.into_response(),
+    };
+    let wait = match parse_workflow_result_wait_query(&pairs, api_state.workflow_result_max_wait())
+    {
+        Ok(wait) => wait,
+        Err(error) => return error.into_response(),
+    };
+    let client = match api_state.workflow_handle_client() {
+        Ok(client) => client,
+        Err(error) => return map_error(error).into_response(),
+    };
+    let handle = client.handle(exec_id);
+
+    if wait.is_zero() {
+        let snapshot = match handle.result_snapshot().await {
+            Ok(snapshot) => snapshot,
+            Err(error) => return map_error(error).into_response(),
+        };
+        return workflow_result_response(snapshot);
+    }
+
+    match handle.result_snapshot_with_wait(wait).await {
+        Ok(Some(snapshot)) => workflow_result_response(snapshot),
+        Ok(None) => workflow_result_pending_response(),
+        Err(error) => map_error(error).into_response(),
+    }
+}
+
+fn workflow_result_response(result: WorkflowResult) -> axum::response::Response {
+    if result.is_terminal() {
+        (StatusCode::OK, Json(result)).into_response()
+    } else {
+        workflow_result_pending_response()
+    }
+}
+
+fn workflow_result_pending_response() -> axum::response::Response {
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    response.headers_mut().insert(
+        axum::http::header::RETRY_AFTER,
+        axum::http::HeaderValue::from_static("1"),
+    );
+    response
 }
 
 async fn list_workflow_children(
@@ -5414,6 +5554,65 @@ fn parse_reuse_policy(raw: Option<&str>) -> Result<WorkflowIdReusePolicy, Autumn
     }
 }
 
+fn parse_workflow_result_wait_query(
+    pairs: &[(String, String)],
+    max_wait: Duration,
+) -> Result<Duration, AutumnError> {
+    let mut wait = Duration::ZERO;
+    for (key, value) in pairs {
+        match key.as_str() {
+            "wait" => wait = parse_workflow_result_wait_duration(value)?,
+            other => {
+                return Err(AutumnError::bad_request_msg(format!(
+                    "unknown workflow result query parameter '{other}'"
+                )));
+            }
+        }
+    }
+    Ok(wait.min(max_wait))
+}
+
+fn parse_workflow_result_wait_duration(raw: &str) -> Result<Duration, AutumnError> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return Err(AutumnError::bad_request_msg(
+            "invalid wait duration ''; expected milliseconds, seconds, minutes, or hours",
+        ));
+    }
+
+    if let Some(ms) = value.strip_suffix("ms") {
+        return parse_duration_amount(ms, "wait", Duration::from_millis);
+    }
+    if let Some(seconds) = value.strip_suffix('s') {
+        return parse_duration_amount(seconds, "wait", Duration::from_secs);
+    }
+    if let Some(minutes) = value.strip_suffix('m') {
+        return parse_duration_amount(minutes, "wait", |amount| {
+            Duration::from_secs(amount.saturating_mul(60))
+        });
+    }
+    if let Some(hours) = value.strip_suffix('h') {
+        return parse_duration_amount(hours, "wait", |amount| {
+            Duration::from_secs(amount.saturating_mul(60 * 60))
+        });
+    }
+
+    parse_duration_amount(value, "wait", Duration::from_secs)
+}
+
+fn parse_duration_amount(
+    raw: &str,
+    label: &str,
+    build: impl FnOnce(u64) -> Duration,
+) -> Result<Duration, AutumnError> {
+    let amount = raw.trim().parse::<u64>().map_err(|_| {
+        AutumnError::bad_request_msg(format!(
+            "invalid {label} duration '{raw}'; expected milliseconds, seconds, minutes, or hours"
+        ))
+    })?;
+    Ok(build(amount))
+}
+
 pub(crate) fn parse_execution_id(raw: &str) -> Result<ExecutionId, AutumnError> {
     raw.parse::<ExecutionId>()
         .map_err(|_| AutumnError::bad_request_msg(format!("invalid execution id '{raw}'")))
@@ -6644,6 +6843,62 @@ mod tests {
             state.worker_shutdown_timeout(),
             std::time::Duration::from_secs(60)
         );
+    }
+
+    #[test]
+    fn workflow_result_wait_query_defaults_to_zero() {
+        let wait =
+            parse_workflow_result_wait_query(&[], std::time::Duration::from_secs(30)).unwrap();
+        assert_eq!(wait, std::time::Duration::ZERO);
+    }
+
+    #[test]
+    fn workflow_result_wait_query_accepts_ms_and_caps_to_configured_max() {
+        let wait = parse_workflow_result_wait_query(
+            &pairs(&[("wait", "250ms")]),
+            std::time::Duration::from_secs(30),
+        )
+        .unwrap();
+        assert_eq!(wait, std::time::Duration::from_millis(250));
+
+        let wait = parse_workflow_result_wait_query(
+            &pairs(&[("wait", "45s")]),
+            std::time::Duration::from_secs(2),
+        )
+        .unwrap();
+        assert_eq!(wait, std::time::Duration::from_secs(2));
+    }
+
+    #[test]
+    fn workflow_result_wait_query_rejects_invalid_duration() {
+        let error = parse_workflow_result_wait_query(
+            &pairs(&[("wait", "forever")]),
+            std::time::Duration::from_secs(30),
+        )
+        .expect_err("invalid wait duration must fail");
+
+        assert!(
+            error.to_string().contains("invalid wait"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn workflow_result_pending_response_is_204_with_retry_after() {
+        let response = workflow_result_pending_response();
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            response.headers().get(axum::http::header::RETRY_AFTER),
+            Some(&axum::http::HeaderValue::from_static("1"))
+        );
+    }
+
+    #[test]
+    fn workflow_result_response_returns_204_for_running_snapshot() {
+        let response = workflow_result_response(WorkflowResult::running());
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
     }
 
     #[test]

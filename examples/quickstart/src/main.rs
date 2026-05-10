@@ -5,9 +5,15 @@
 //!   AUTUMN_MANIFEST_DIR=examples/quickstart AUTUMN_PROFILE=dev cargo run -p quickstart
 
 use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use autumn_harvest::prelude::*;
-use autumn_harvest_plugin::HarvestPlugin;
+use autumn_harvest::{
+    ExecutionId, ShardRouter, StartWorkflowParams, WorkflowHandleClient, WorkflowIdReusePolicy,
+};
+use autumn_harvest_plugin::{HarvestDbPool, HarvestPlugin};
+use autumn_web::prelude::*;
+use autumn_web::reexports::axum::extract::State;
 
 /// Greets `name` with a welcome activity, pauses for 30 seconds on a durable
 /// timer, then delivers a farewell activity.
@@ -45,6 +51,23 @@ async fn greeting(ctx: &WorkflowContext, name: String) -> HarvestResult<String> 
     ))
 }
 
+/// Fast request/response variant used by `POST /greet`.
+#[workflow]
+async fn instant_greeting(ctx: &WorkflowContext, name: String) -> HarvestResult<String> {
+    let greeting = ctx
+        .execute_activity_raw(
+            "send_greeting",
+            serde_json::json!({ "name": name, "kind": "hello" }),
+            "default",
+        )
+        .await?;
+
+    Ok(greeting["message"]
+        .as_str()
+        .unwrap_or("hello from Harvest")
+        .to_string())
+}
+
 /// Logs a greeting step and returns a confirmation message.
 #[activity(start_to_close = "30s", retry = RetryPolicy::exponential(3, Duration::from_secs(1)))]
 async fn send_greeting(
@@ -58,12 +81,74 @@ async fn send_greeting(
     Ok(serde_json::json!({ "message": message }))
 }
 
+#[post("/greet")]
+async fn greet(
+    State(state): State<autumn_web::AppState>,
+    Json(request): Json<serde_json::Value>,
+) -> AutumnResult<Json<serde_json::Value>> {
+    let name = request["name"].as_str().unwrap_or("world").to_string();
+    let workflow_id = request_response_workflow_id()?;
+    let router = state
+        .extension::<ShardRouter>()
+        .map(|router| router.as_ref().clone())
+        .unwrap_or_default();
+    let shard = router.pick_for_new_workflow("instant_greeting", &workflow_id);
+    let exec_id = ExecutionId::new_for_shard(shard);
+    let harvest_pool = state.extension::<HarvestDbPool>().ok_or_else(|| {
+        AutumnError::service_unavailable_msg("HarvestDbPool extension is not installed")
+    })?;
+    let client = state.extension::<WorkflowHandleClient>().ok_or_else(|| {
+        AutumnError::service_unavailable_msg("WorkflowHandleClient extension is not installed")
+    })?;
+    let mut conn = harvest_pool
+        .pool_for(shard)
+        .get()
+        .await
+        .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
+
+    let started = client
+        .start_or_load(
+            &mut conn,
+            StartWorkflowParams {
+                workflow_name: "instant_greeting",
+                workflow_id: &workflow_id,
+                exec_id,
+                input: serde_json::json!(name),
+                parent_id: None,
+                queue_name: "default",
+                execution_timeout: None,
+                memo: None,
+                search_attrs: None,
+                reuse_policy: WorkflowIdReusePolicy::RejectDuplicate,
+                trace_context: None,
+            },
+        )
+        .await
+        .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
+    let result = started
+        .handle
+        .result_raw()
+        .await
+        .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
+
+    Ok(Json(result))
+}
+
+fn request_response_workflow_id() -> AutumnResult<String> {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?
+        .as_nanos();
+    Ok(format!("quickstart-greet-{nanos}"))
+}
+
 #[autumn_web::main]
 async fn main() {
     autumn_web::app()
+        .routes(routes![greet])
         .plugin(
             HarvestPlugin::new()
-                .workflows(workflows![greeting])
+                .workflows(workflows![greeting, instant_greeting])
                 .activities(activities![send_greeting])
                 .worker(WorkerConfig::default())
                 .api("/api/harvest"),
@@ -79,8 +164,10 @@ mod tests {
     #[test]
     fn quickstart_components_compile_and_register() {
         let wf = __autumn_workflow_info_greeting();
+        let instant = __autumn_workflow_info_instant_greeting();
         let act = __autumn_activity_info_send_greeting();
         assert_eq!(wf.name, "greeting");
+        assert_eq!(instant.name, "instant_greeting");
         assert_eq!(act.name, "send_greeting");
         // The default worker listens on "default", matching execute_activity_raw's queue arg.
         assert!(

@@ -64,6 +64,24 @@
     },
     {
       "method": "GET",
+      "path": "/workflows/{id}/result",
+      "category": "workflow",
+      "read_only": true,
+      "description": "Return a compact terminal result for a workflow execution, optionally long-polling without returning event history.",
+      "params": [
+        { "name": "id", "in": "path", "required": true, "description": "Execution UUID." },
+        { "name": "wait", "in": "query", "required": false, "description": "Optional wait duration such as 250ms, 5s, or 1m. Defaults to 0s and is capped by the server, default 30s." }
+      ],
+      "request_body": null,
+      "success_response": { "status": 200, "note": "Returns 204 No Content with Retry-After when the execution is still running after the wait window.", "fields": ["state", "output", "error", "completed_at"] },
+      "error_responses": [
+        { "status": 400, "description": "Invalid execution ID or wait duration." },
+        { "status": 404, "description": "Execution not found." },
+        { "status": 500, "description": "Database or listener error." }
+      ]
+    },
+    {
+      "method": "GET",
       "path": "/workflows/{id}/history/export",
       "category": "workflow",
       "read_only": true,
