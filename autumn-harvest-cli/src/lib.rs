@@ -827,6 +827,26 @@ enum ScheduleCommand {
         #[arg(long)]
         paused: bool,
     },
+    /// Backfill missed scheduled runs over an explicit time window.
+    Backfill {
+        /// Schedule row ID (UUID).
+        id: String,
+        /// Start of the backfill window, RFC 3339 (e.g. 2026-04-01T00:00:00Z). Required.
+        #[arg(long, required = true)]
+        from: String,
+        /// End of the backfill window, RFC 3339 (e.g. 2026-04-08T00:00:00Z). Required.
+        #[arg(long, required = true)]
+        to: String,
+        /// Preview planned timestamps without dispatching any runs.
+        #[arg(long)]
+        dry_run: bool,
+        /// Maximum number of timestamps to plan (default: server-side limit of 1000).
+        #[arg(long)]
+        max_count: Option<u64>,
+        /// Backfill even if the schedule is currently paused.
+        #[arg(long)]
+        include_paused: bool,
+    },
     /// Pause a schedule (works for both DAG and workflow schedules).
     Pause {
         /// Schedule row ID (UUID).
@@ -2515,6 +2535,27 @@ fn dag_request(command: &DagCommand) -> Result<ApiRequest, CliError> {
 fn schedule_request(command: &ScheduleCommand) -> Result<ApiRequest, CliError> {
     match command {
         ScheduleCommand::List => Ok(ApiRequest::get("/admin/schedules")),
+        ScheduleCommand::Backfill {
+            id,
+            from,
+            to,
+            dry_run,
+            max_count,
+            include_paused,
+        } => {
+            let mut body = Map::new();
+            body.insert("from".to_string(), Value::String(from.clone()));
+            body.insert("to".to_string(), Value::String(to.clone()));
+            body.insert("dry_run".to_string(), json!(dry_run));
+            body.insert("include_paused".to_string(), json!(include_paused));
+            if let Some(count) = max_count {
+                body.insert("max_count".to_string(), json!(count));
+            }
+            Ok(ApiRequest::post(
+                format!("/admin/schedules/{}/backfill", path_segment(id)),
+                Some(Value::Object(body)),
+            ))
+        }
         ScheduleCommand::CreateWorkflow {
             name,
             cron,

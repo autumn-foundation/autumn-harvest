@@ -42,6 +42,7 @@ pub const OP_SCHEDULE_CREATE: &str = "schedule.create";
 pub const OP_SCHEDULE_PAUSE: &str = "schedule.pause";
 pub const OP_SCHEDULE_RESUME: &str = "schedule.resume";
 pub const OP_SCHEDULE_DELETE: &str = "schedule.delete";
+pub const OP_SCHEDULE_BACKFILL: &str = "schedule.backfill";
 pub const OP_DLQ_REPLAY: &str = "dlq.replay";
 pub const OP_DLQ_REPLAY_BULK: &str = "dlq.replay.bulk";
 pub const OP_DLQ_DISCARD_BULK: &str = "dlq.discard.bulk";
@@ -216,6 +217,7 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     ("POST /admin/schedules/workflow", RouteClass::Mutating),
     ("POST /admin/schedules/{id}/pause", RouteClass::Mutating),
     ("POST /admin/schedules/{id}/resume", RouteClass::Mutating),
+    ("POST /admin/schedules/{id}/backfill", RouteClass::Mutating),
     ("DELETE /admin/schedules/{id}", RouteClass::Mutating),
     // External activity completion — task-token callbacks from remote workers.
     (
@@ -254,6 +256,7 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
     OP_SCHEDULE_PAUSE,
     OP_SCHEDULE_RESUME,
     OP_SCHEDULE_DELETE,
+    OP_SCHEDULE_BACKFILL,
     OP_DLQ_REPLAY,
     OP_DLQ_REPLAY_BULK,
     OP_DLQ_DISCARD_BULK,
@@ -366,6 +369,10 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
         Some(OP_SCHEDULE_RESUME),
     ),
     ("DELETE /admin/schedules/{id}", Some(OP_SCHEDULE_DELETE)),
+    (
+        "POST /admin/schedules/{id}/backfill",
+        Some(OP_SCHEDULE_BACKFILL),
+    ),
     // External activity completion
     (
         "POST /activities/external/{token}/complete",

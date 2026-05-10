@@ -910,3 +910,135 @@ fn audit_list_partial_filters() {
     assert!(request.path.contains("limit=10"));
     assert!(!request.path.contains("actor="), "actor should be absent");
 }
+
+// ── schedule backfill (issue #177) ──────────────────────────────────────────
+
+#[test]
+fn schedule_backfill_maps_to_post_backfill_route() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "schedule",
+        "backfill",
+        "00000000-0000-0000-0000-000000000042",
+        "--from",
+        "2026-04-01T00:00:00Z",
+        "--to",
+        "2026-04-08T00:00:00Z",
+    ])
+    .expect("schedule backfill args should parse");
+
+    let request = cli
+        .api_request()
+        .expect("schedule backfill request should build");
+
+    assert_eq!(request.method, ApiMethod::Post);
+    assert_eq!(
+        request.path,
+        "/admin/schedules/00000000-0000-0000-0000-000000000042/backfill"
+    );
+    let body = request.body.expect("backfill request must have a body");
+    assert_eq!(body["from"], "2026-04-01T00:00:00Z");
+    assert_eq!(body["to"], "2026-04-08T00:00:00Z");
+    assert_eq!(body["dry_run"], false);
+    assert_eq!(body["include_paused"], false);
+}
+
+#[test]
+fn schedule_backfill_dry_run_flag_sets_body_field() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "schedule",
+        "backfill",
+        "00000000-0000-0000-0000-000000000099",
+        "--from",
+        "2026-04-01T00:00:00Z",
+        "--to",
+        "2026-04-08T00:00:00Z",
+        "--dry-run",
+    ])
+    .expect("backfill --dry-run args should parse");
+
+    let request = cli
+        .api_request()
+        .expect("backfill dry-run request should build");
+    let body = request.body.expect("dry-run request must have a body");
+
+    assert_eq!(body["dry_run"], true);
+    assert_eq!(body["from"], "2026-04-01T00:00:00Z");
+    assert_eq!(body["to"], "2026-04-08T00:00:00Z");
+}
+
+#[test]
+fn schedule_backfill_max_count_appears_in_body() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "schedule",
+        "backfill",
+        "00000000-0000-0000-0000-000000000001",
+        "--from",
+        "2026-04-01T00:00:00Z",
+        "--to",
+        "2026-04-08T00:00:00Z",
+        "--max-count",
+        "50",
+    ])
+    .expect("backfill --max-count args should parse");
+
+    let request = cli.api_request().expect("request should build");
+    let body = request.body.expect("request must have a body");
+
+    assert_eq!(body["max_count"], json!(50u64));
+}
+
+#[test]
+fn schedule_backfill_include_paused_appears_in_body() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "schedule",
+        "backfill",
+        "00000000-0000-0000-0000-000000000001",
+        "--from",
+        "2026-04-01T00:00:00Z",
+        "--to",
+        "2026-04-08T00:00:00Z",
+        "--include-paused",
+    ])
+    .expect("backfill --include-paused args should parse");
+
+    let request = cli.api_request().expect("request should build");
+    let body = request.body.expect("request must have a body");
+
+    assert_eq!(body["include_paused"], true);
+}
+
+#[test]
+fn schedule_backfill_missing_from_is_rejected_by_clap() {
+    let result = Cli::try_parse_from([
+        "harvest",
+        "schedule",
+        "backfill",
+        "00000000-0000-0000-0000-000000000001",
+        "--to",
+        "2026-04-08T00:00:00Z",
+    ]);
+    assert!(
+        result.is_err(),
+        "--from is required and its absence should be rejected"
+    );
+}
+
+#[test]
+fn schedule_backfill_missing_to_is_rejected_by_clap() {
+    let result = Cli::try_parse_from([
+        "harvest",
+        "schedule",
+        "backfill",
+        "00000000-0000-0000-0000-000000000001",
+        "--from",
+        "2026-04-01T00:00:00Z",
+    ]);
+    assert!(
+        result.is_err(),
+        "--to is required and its absence should be rejected"
+    );
+}
