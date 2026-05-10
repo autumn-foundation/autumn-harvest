@@ -4,9 +4,13 @@
 /// is documented in `docs/api-contract.json`.  If a CLI command maps to a path
 /// that is not in the contract, either the contract is incomplete or the CLI
 /// has drifted from the documented API surface.
+///
+/// The body-field tests additionally verify that every JSON key the CLI sends
+/// in a request body is listed in the contract's `request_body.fields` array,
+/// enforcing AC 4: "uses the documented request shape."
 use autumn_harvest_cli::{ApiMethod, Cli};
 use clap::Parser;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 const CONTRACT_JSON: &str = include_str!("../../docs/api-contract.json");
 
@@ -79,6 +83,104 @@ fn assert_covered(args: &[&str]) {
         "CLI command {args:?} maps to {method} {path} \
          which is not covered by docs/api-contract.json"
     );
+}
+
+// ── Body-field helpers (AC 4) ─────────────────────────────────────────────────
+
+/// Returns a map of (METHOD, path-template) → documented field names extracted
+/// from the contract's structured `request_body.fields` array.
+/// `None` means the body is free-form (no fixed schema).
+/// Panics if a mutating route is missing the required `fields` array.
+fn contract_route_request_fields() -> HashMap<(String, String), Option<Vec<String>>> {
+    let contract: serde_json::Value =
+        serde_json::from_str(CONTRACT_JSON).expect("api-contract.json must be valid JSON");
+    let mutating = ["POST", "PUT", "PATCH", "DELETE"];
+    let mut map: HashMap<(String, String), Option<Vec<String>>> = HashMap::new();
+
+    for route in contract["routes"].as_array().unwrap() {
+        let method = route["method"].as_str().unwrap().to_string();
+        let path = route["path"].as_str().unwrap().to_string();
+        if !mutating.contains(&method.as_str()) {
+            continue;
+        }
+        let rb = &route["request_body"];
+        assert!(
+            rb.is_object(),
+            "mutating route {method} {path} must have a 'request_body' object in the contract"
+        );
+        if rb["free_form"].as_bool().unwrap_or(false) {
+            map.insert((method, path), None);
+        } else {
+            let fields: Vec<String> = rb["fields"]
+                .as_array()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{method} {path}: contract request_body must have a 'fields' array \
+                         (set free_form:true for routes whose body is an opaque payload)"
+                    )
+                })
+                .iter()
+                .filter_map(|f| f["name"].as_str().map(|s| s.to_string()))
+                .collect();
+            map.insert((method, path), Some(fields));
+        }
+    }
+    map
+}
+
+/// Asserts that every JSON key the CLI sends in a request body is listed in
+/// the contract's `request_body.fields` for the matching route.
+/// Skips GET requests and `None` bodies.  Free-form routes are also skipped.
+#[track_caller]
+fn assert_body_fields_documented(args: &[&str]) {
+    let all: Vec<&str> = std::iter::once("harvest").chain(args.iter().copied()).collect();
+    let cli = Cli::try_parse_from(&all)
+        .unwrap_or_else(|e| panic!("CLI args {args:?} should parse: {e}"));
+    let req = cli
+        .api_request()
+        .unwrap_or_else(|e| panic!("api_request() should succeed for {args:?}: {e}"));
+
+    // GET requests never have a body — nothing to validate.
+    let method = method_str(&req.method);
+    if method == "GET" {
+        return;
+    }
+
+    let Some(body) = req.body else { return };
+    let Some(body_obj) = body.as_object() else {
+        return; // free-form non-object body — skip
+    };
+    if body_obj.is_empty() {
+        return; // empty body — nothing to validate
+    }
+
+    let path = bare_path(&req.path);
+    let fields_map = contract_route_request_fields();
+
+    // Find the matching contract entry by template matching.
+    let entry = fields_map
+        .iter()
+        .find(|((m, t), _)| m == method && path_matches_template(path, t));
+
+    let Some((_, field_spec)) = entry else {
+        // Route not in fields map — covered by the route-membership test.
+        return;
+    };
+
+    let Some(contract_fields) = field_spec else {
+        // Free-form body — no per-field validation possible.
+        return;
+    };
+
+    let documented: HashSet<&str> = contract_fields.iter().map(|s| s.as_str()).collect();
+    for key in body_obj.keys() {
+        assert!(
+            documented.contains(key.as_str()),
+            "CLI command {args:?} sends body field '{key}' for {method} {path} \
+             but '{key}' is not documented in docs/api-contract.json. \
+             Add it to request_body.fields and management_api_request_fields()."
+        );
+    }
 }
 
 // ── health / admin ────────────────────────────────────────────────────────────
@@ -437,4 +539,212 @@ fn worker_drain_preview_is_covered() {
 #[test]
 fn worker_drain_is_covered() {
     assert_covered(&["worker", "drain", "worker-abc"]);
+}
+
+// ── Body-field validation tests (AC 4) ───────────────────────────────────────
+//
+// For every mutating CLI command that sends a structured request body, verify
+// that each body field is listed in the contract's request_body.fields.
+
+#[test]
+fn workflow_start_body_fields_are_documented() {
+    assert_body_fields_documented(&[
+        "workflow",
+        "start",
+        "my_workflow",
+        "--workflow-id",
+        "wf-1",
+        "--queue",
+        "critical",
+        "--input-json",
+        r#"{"x":1}"#,
+        "--memo-json",
+        r#"{"note":"test"}"#,
+        "--search-attrs-json",
+        r#"{"tenant":"acme"}"#,
+        "--execution-timeout-secs",
+        "30",
+        "--reuse-policy",
+        "reject_duplicate",
+    ]);
+}
+
+#[test]
+fn workflow_cancel_body_fields_are_documented() {
+    assert_body_fields_documented(&[
+        "workflow",
+        "cancel",
+        "00000000-0000-0000-0000-000000000001",
+        "--reason",
+        "test",
+    ]);
+}
+
+#[test]
+fn workflow_reset_body_fields_are_documented() {
+    assert_body_fields_documented(&[
+        "workflow",
+        "reset",
+        "00000000-0000-0000-0000-000000000001",
+        "--to-event",
+        "50",
+        "--reason",
+        "bad deploy",
+        "--operator-id",
+        "ops",
+        "--signal-reapply",
+        "buffer",
+    ]);
+}
+
+#[test]
+fn workflow_update_body_fields_are_documented() {
+    assert_body_fields_documented(&[
+        "workflow",
+        "update",
+        "00000000-0000-0000-0000-000000000001",
+        "my_update",
+        "--input-json",
+        r#"{"approved":true}"#,
+    ]);
+}
+
+#[test]
+fn dag_trigger_body_fields_are_documented() {
+    assert_body_fields_documented(&[
+        "dag",
+        "trigger",
+        "my_dag",
+        "--conf-json",
+        r#"{"date":"2026-01-01"}"#,
+    ]);
+}
+
+#[test]
+fn dag_pause_body_fields_are_documented() {
+    assert_body_fields_documented(&["dag", "pause", "my_dag"]);
+}
+
+#[test]
+fn dag_unpause_body_fields_are_documented() {
+    assert_body_fields_documented(&["dag", "unpause", "my_dag"]);
+}
+
+#[test]
+fn dlq_bulk_replay_body_fields_are_documented() {
+    assert_body_fields_documented(&[
+        "dlq",
+        "bulk-replay",
+        "--activity-name",
+        "send_email",
+        "--workflow-name",
+        "billing",
+        "--failed-after",
+        "2026-01-01T00:00:00Z",
+        "--failed-before",
+        "2026-02-01T00:00:00Z",
+        "--limit",
+        "100",
+        "--dry-run",
+    ]);
+}
+
+#[test]
+fn dlq_bulk_discard_body_fields_are_documented() {
+    assert_body_fields_documented(&[
+        "dlq",
+        "bulk-discard",
+        "--activity-name",
+        "send_email",
+        "--dry-run",
+    ]);
+}
+
+#[test]
+fn handoff_complete_body_fields_are_documented() {
+    assert_body_fields_documented(&[
+        "handoff",
+        "complete",
+        "11111111-1111-4111-8111-111111111111",
+        "--output-json",
+        r#"{"approved":true}"#,
+    ]);
+}
+
+#[test]
+fn handoff_fail_body_fields_are_documented() {
+    assert_body_fields_documented(&[
+        "handoff",
+        "fail",
+        "11111111-1111-4111-8111-111111111111",
+        "--error",
+        "rejected",
+        "--retryable",
+    ]);
+}
+
+#[test]
+fn handoff_heartbeat_body_fields_are_documented() {
+    assert_body_fields_documented(&[
+        "handoff",
+        "heartbeat",
+        "11111111-1111-4111-8111-111111111111",
+        "--extend-by-secs",
+        "3600",
+    ]);
+}
+
+#[test]
+fn worker_drain_body_fields_are_documented() {
+    assert_body_fields_documented(&[
+        "worker",
+        "drain",
+        "worker-abc",
+        "--deadline",
+        "2026-06-01T12:00:00Z",
+    ]);
+}
+
+#[test]
+fn batch_submit_cancel_body_fields_are_documented() {
+    assert_body_fields_documented(&[
+        "batch",
+        "submit",
+        "Cancel",
+        "--filter-json",
+        r#"{"states":["RUNNING"]}"#,
+    ]);
+}
+
+#[test]
+fn batch_submit_signal_body_fields_are_documented() {
+    assert_body_fields_documented(&[
+        "batch",
+        "submit",
+        "Signal",
+        "--filter-json",
+        r#"{"states":["RUNNING"]}"#,
+        "--signal-name",
+        "my_signal",
+        "--signal-payload-json",
+        r#"{"key":"val"}"#,
+    ]);
+}
+
+#[test]
+fn schedule_create_workflow_body_fields_are_documented() {
+    assert_body_fields_documented(&[
+        "schedule",
+        "create-workflow",
+        "--name",
+        "nightly",
+        "--cron",
+        "0 0 * * *",
+        "--input-json",
+        r#"{"env":"prod"}"#,
+        "--max-active-runs",
+        "3",
+        "--catchup",
+        "--paused",
+    ]);
 }
