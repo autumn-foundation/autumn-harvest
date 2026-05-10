@@ -92,6 +92,18 @@ impl UpdateRegistry {
     pub fn invoke(&self, name: &str, input: Value) -> Option<UpdateHandlerFuture> {
         self.entries.get(name).map(|e| (e.handler)(input))
     }
+
+    /// Returns the validator for `name`, if registered and present.
+    #[must_use]
+    pub fn get_validator(&self, name: &str) -> Option<BoxUpdateValidator> {
+        self.entries.get(name).and_then(|e| e.validator.clone())
+    }
+
+    /// Returns the handler for `name`, if registered.
+    #[must_use]
+    pub fn get_handler(&self, name: &str) -> Option<BoxUpdateHandler> {
+        self.entries.get(name).map(|e| e.handler.clone())
+    }
 }
 
 #[cfg(test)]
