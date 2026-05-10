@@ -4496,6 +4496,7 @@ async fn schedule_backfill(
 
     let schedule_id = parse_uuid(&id, "schedule id")?;
     let pool = api_state.storage_pool().map_err(map_error)?;
+    let runtime = api_state.runtime().map_err(map_error)?;
 
     if request.to < request.from {
         return Err(AutumnError::bad_request_msg(
@@ -4630,63 +4631,71 @@ async fn schedule_backfill(
                 }
 
                 let workflow_id = scheduled_workflow_id_pub(&wf_name, *scheduled_for);
-                let exec_id = autumn_harvest::types::ExecutionId::new();
+                // Use the same rendezvous-hash routing as normal workflow starts so the
+                // backfill lands on the same shard that owns this (workflow_name, workflow_id).
+                let shard_id = runtime
+                    .router()
+                    .pick_for_new_workflow(&wf_name, &workflow_id);
+                let exec_id = ExecutionId::new_for_shard(shard_id);
                 let input = schedule
                     .workflow_input
                     .clone()
                     .unwrap_or(serde_json::Value::Null);
+                let shard_pool = pool.pool_for(shard_id);
 
-                for (shard_id, shard_pool) in pool.iter_shards() {
-                    let Ok(mut conn) = acquire_conn(shard_pool).await else {
+                let Ok(mut conn) = acquire_conn(shard_pool).await else {
+                    shard_failures.push(BackfillShardFailure {
+                        shard_id: shard_id.as_i32(),
+                        reason: "failed to acquire connection".to_string(),
+                    });
+                    failed += 1;
+                    continue;
+                };
+                let result = start_or_load_workflow_execution(
+                    &mut conn,
+                    StartWorkflowParams {
+                        workflow_name: &wf_name,
+                        workflow_id: &workflow_id,
+                        exec_id,
+                        input: input.clone(),
+                        parent_id: None,
+                        queue_name: dispatch_queue,
+                        execution_timeout: None,
+                        memo: None,
+                        search_attrs: None,
+                        reuse_policy: WorkflowIdReusePolicy::RejectDuplicate,
+                        trace_context: None,
+                    },
+                )
+                .await;
+                match result {
+                    Ok(started) if started.created => {
+                        dispatched += 1;
+                        dispatched_this_call += 1;
+                    }
+                    Ok(_) | Err(HarvestError::AlreadyExists { .. }) => {
+                        skipped += 1;
+                        *skipped_reasons
+                            .entry("already_exists".to_string())
+                            .or_insert(0) += 1;
+                    }
+                    Err(e) => {
                         shard_failures.push(BackfillShardFailure {
                             shard_id: shard_id.as_i32(),
-                            reason: "failed to acquire connection".to_string(),
+                            reason: e.to_string(),
                         });
                         failed += 1;
-                        continue;
-                    };
-                    let result = start_or_load_workflow_execution(
-                        &mut conn,
-                        StartWorkflowParams {
-                            workflow_name: &wf_name,
-                            workflow_id: &workflow_id,
-                            exec_id,
-                            input: input.clone(),
-                            parent_id: None,
-                            queue_name: dispatch_queue,
-                            execution_timeout: None,
-                            memo: None,
-                            search_attrs: None,
-                            reuse_policy: WorkflowIdReusePolicy::RejectDuplicate,
-                            trace_context: None,
-                        },
-                    )
-                    .await;
-                    match result {
-                        Ok(started) if started.created => {
-                            dispatched += 1;
-                            dispatched_this_call += 1;
-                        }
-                        Ok(_) | Err(HarvestError::AlreadyExists { .. }) => {
-                            skipped += 1;
-                            *skipped_reasons
-                                .entry("already_exists".to_string())
-                                .or_insert(0) += 1;
-                        }
-                        Err(e) => {
-                            shard_failures.push(BackfillShardFailure {
-                                shard_id: shard_id.as_i32(),
-                                reason: e.to_string(),
-                            });
-                            failed += 1;
-                        }
                     }
-                    break; // workflow executions go to a single shard
                 }
             }
         }
         ScheduleKind::Dag => {
             let dag_name = name.clone();
+            // DAG runs are pinned to a single shard by dag_name (same rendezvous hash
+            // as the scheduler tick), so ON CONFLICT DO NOTHING is effective across retries.
+            let shard_id = runtime.router().pick_for_dag(&dag_name);
+            let shard_pool = pool.pool_for(shard_id);
+
             for scheduled_for in &timestamps {
                 // Respect max_active_runs for DAGs.
                 if running_at_start + dispatched_this_call >= max_active {
@@ -4697,51 +4706,48 @@ async fn schedule_backfill(
                     continue;
                 }
 
-                for (shard_id, shard_pool) in pool.iter_shards() {
-                    let Ok(mut conn) = acquire_conn(shard_pool).await else {
+                let Ok(mut conn) = acquire_conn(shard_pool).await else {
+                    shard_failures.push(BackfillShardFailure {
+                        shard_id: shard_id.as_i32(),
+                        reason: "failed to acquire connection".to_string(),
+                    });
+                    failed += 1;
+                    continue;
+                };
+                let row = NewDagRun {
+                    id: uuid::Uuid::new_v4(),
+                    dag_name: &dag_name,
+                    workflow_exec_id: None,
+                    logical_date: *scheduled_for,
+                    data_interval_start: *scheduled_for,
+                    data_interval_end: *scheduled_for,
+                    conf: Some(serde_json::json!({"_harvest_run_source": "backfill"})),
+                };
+                let insert_result = diesel::insert_into(harvest_dag_runs::table)
+                    .values(&row)
+                    .on_conflict((harvest_dag_runs::dag_name, harvest_dag_runs::logical_date))
+                    .do_nothing()
+                    .execute(&mut conn)
+                    .await;
+                match insert_result {
+                    Ok(1) => {
+                        dispatched += 1;
+                        dispatched_this_call += 1;
+                    }
+                    Ok(_) => {
+                        // ON CONFLICT DO NOTHING → already exists
+                        skipped += 1;
+                        *skipped_reasons
+                            .entry("already_exists".to_string())
+                            .or_insert(0) += 1;
+                    }
+                    Err(e) => {
                         shard_failures.push(BackfillShardFailure {
                             shard_id: shard_id.as_i32(),
-                            reason: "failed to acquire connection".to_string(),
+                            reason: e.to_string(),
                         });
                         failed += 1;
-                        continue;
-                    };
-                    let row = NewDagRun {
-                        id: uuid::Uuid::new_v4(),
-                        dag_name: &dag_name,
-                        workflow_exec_id: None,
-                        logical_date: *scheduled_for,
-                        data_interval_start: *scheduled_for,
-                        data_interval_end: *scheduled_for,
-                        conf: Some(serde_json::json!({"_harvest_run_source": "backfill"})),
-                    };
-                    let insert_result = diesel::insert_into(harvest_dag_runs::table)
-                        .values(&row)
-                        .on_conflict((harvest_dag_runs::dag_name, harvest_dag_runs::logical_date))
-                        .do_nothing()
-                        .execute(&mut conn)
-                        .await;
-                    match insert_result {
-                        Ok(1) => {
-                            dispatched += 1;
-                            dispatched_this_call += 1;
-                        }
-                        Ok(_) => {
-                            // ON CONFLICT DO NOTHING → already exists
-                            skipped += 1;
-                            *skipped_reasons
-                                .entry("already_exists".to_string())
-                                .or_insert(0) += 1;
-                        }
-                        Err(e) => {
-                            shard_failures.push(BackfillShardFailure {
-                                shard_id: shard_id.as_i32(),
-                                reason: e.to_string(),
-                            });
-                            failed += 1;
-                        }
                     }
-                    break;
                 }
             }
         }
@@ -4810,32 +4816,33 @@ async fn schedule_backfill(
 }
 
 /// Count RUNNING workflow executions or DAG runs for the named entity.
-/// Returns 0 on any DB error (safe: just means we don't artificially cap the backfill).
+/// Returns the total count across all shards. Returns 0 on any DB error (safe: just
+/// means we don't artificially cap the backfill).
 async fn query_running_count(pool: &HarvestDbPool, kind: &ScheduleKind, name: &str) -> i64 {
-    match pool.iter_shards().next() {
-        None => 0,
-        Some((_, shard_pool)) => {
-            let Ok(mut conn) = acquire_conn(shard_pool).await else {
-                return 0;
-            };
-            match kind {
-                ScheduleKind::Workflow => harvest_workflow_executions::table
-                    .filter(harvest_workflow_executions::workflow_name.eq(name))
-                    .filter(harvest_workflow_executions::state.eq("RUNNING"))
-                    .count()
-                    .get_result::<i64>(&mut conn)
-                    .await
-                    .unwrap_or(0),
-                ScheduleKind::Dag => harvest_dag_runs::table
-                    .filter(harvest_dag_runs::dag_name.eq(name))
-                    .filter(harvest_dag_runs::state.eq("RUNNING"))
-                    .count()
-                    .get_result::<i64>(&mut conn)
-                    .await
-                    .unwrap_or(0),
-            }
-        }
+    let mut total = 0i64;
+    for (_, shard_pool) in pool.iter_shards() {
+        let Ok(mut conn) = acquire_conn(shard_pool).await else {
+            continue;
+        };
+        let count = match kind {
+            ScheduleKind::Workflow => harvest_workflow_executions::table
+                .filter(harvest_workflow_executions::workflow_name.eq(name))
+                .filter(harvest_workflow_executions::state.eq("RUNNING"))
+                .count()
+                .get_result::<i64>(&mut conn)
+                .await
+                .unwrap_or(0),
+            ScheduleKind::Dag => harvest_dag_runs::table
+                .filter(harvest_dag_runs::dag_name.eq(name))
+                .filter(harvest_dag_runs::state.eq("RUNNING"))
+                .count()
+                .get_result::<i64>(&mut conn)
+                .await
+                .unwrap_or(0),
+        };
+        total += count;
     }
+    total
 }
 
 /// Write a backfill log row; silently swallows errors (best-effort durability).
