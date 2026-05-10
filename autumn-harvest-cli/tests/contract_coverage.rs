@@ -63,9 +63,11 @@ fn path_matches_template(actual: &str, template: &str) -> bool {
 /// are covered by the contract.
 #[track_caller]
 fn assert_covered(args: &[&str]) {
-    let all: Vec<&str> = std::iter::once("harvest").chain(args.iter().copied()).collect();
-    let cli = Cli::try_parse_from(&all)
-        .unwrap_or_else(|e| panic!("CLI args {args:?} should parse: {e}"));
+    let all: Vec<&str> = std::iter::once("harvest")
+        .chain(args.iter().copied())
+        .collect();
+    let cli =
+        Cli::try_parse_from(&all).unwrap_or_else(|e| panic!("CLI args {args:?} should parse: {e}"));
     let req = cli
         .api_request()
         .unwrap_or_else(|e| panic!("api_request() should succeed for {args:?}: {e}"));
@@ -133,9 +135,11 @@ fn contract_route_request_fields() -> HashMap<(String, String), Option<Vec<Strin
 /// Skips GET requests and `None` bodies.  Free-form routes are also skipped.
 #[track_caller]
 fn assert_body_fields_documented(args: &[&str]) {
-    let all: Vec<&str> = std::iter::once("harvest").chain(args.iter().copied()).collect();
-    let cli = Cli::try_parse_from(&all)
-        .unwrap_or_else(|e| panic!("CLI args {args:?} should parse: {e}"));
+    let all: Vec<&str> = std::iter::once("harvest")
+        .chain(args.iter().copied())
+        .collect();
+    let cli =
+        Cli::try_parse_from(&all).unwrap_or_else(|e| panic!("CLI args {args:?} should parse: {e}"));
     let req = cli
         .api_request()
         .unwrap_or_else(|e| panic!("api_request() should succeed for {args:?}: {e}"));
@@ -249,11 +253,7 @@ fn workflow_start_is_covered() {
 
 #[test]
 fn workflow_cancel_is_covered() {
-    assert_covered(&[
-        "workflow",
-        "cancel",
-        "00000000-0000-0000-0000-000000000001",
-    ]);
+    assert_covered(&["workflow", "cancel", "00000000-0000-0000-0000-000000000001"]);
 }
 
 #[test]
@@ -313,11 +313,7 @@ fn workflow_update_result_is_covered() {
 
 #[test]
 fn history_export_single_is_covered() {
-    assert_covered(&[
-        "history",
-        "export",
-        "00000000-0000-0000-0000-000000000001",
-    ]);
+    assert_covered(&["history", "export", "00000000-0000-0000-0000-000000000001"]);
 }
 
 #[test]
@@ -334,11 +330,7 @@ fn handoff_list_is_covered() {
 
 #[test]
 fn handoff_inspect_is_covered() {
-    assert_covered(&[
-        "handoff",
-        "inspect",
-        "11111111-1111-4111-8111-111111111111",
-    ]);
+    assert_covered(&["handoff", "inspect", "11111111-1111-4111-8111-111111111111"]);
 }
 
 #[test]
@@ -418,29 +410,17 @@ fn schedule_create_workflow_is_covered() {
 
 #[test]
 fn schedule_pause_is_covered() {
-    assert_covered(&[
-        "schedule",
-        "pause",
-        "00000000-0000-0000-0000-000000000001",
-    ]);
+    assert_covered(&["schedule", "pause", "00000000-0000-0000-0000-000000000001"]);
 }
 
 #[test]
 fn schedule_resume_is_covered() {
-    assert_covered(&[
-        "schedule",
-        "resume",
-        "00000000-0000-0000-0000-000000000001",
-    ]);
+    assert_covered(&["schedule", "resume", "00000000-0000-0000-0000-000000000001"]);
 }
 
 #[test]
 fn schedule_delete_is_covered() {
-    assert_covered(&[
-        "schedule",
-        "delete",
-        "00000000-0000-0000-0000-000000000001",
-    ]);
+    assert_covered(&["schedule", "delete", "00000000-0000-0000-0000-000000000001"]);
 }
 
 // ── retention ─────────────────────────────────────────────────────────────────

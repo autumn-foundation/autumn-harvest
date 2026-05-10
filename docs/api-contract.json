@@ -141,7 +141,7 @@
           { "name": "reuse_policy", "required": false, "description": "Duplicate-id policy: allow_duplicate, reject_duplicate, allow_duplicate_failed_only, or terminate_if_running." }
         ]
       },
-      "success_response": { "status": 200, "fields": ["execution_id", "workflow_name", "workflow_id", "state"] },
+      "success_response": { "status": 201, "note": "Returns 200 when an existing execution is returned via reuse_policy instead of creating a new one.", "fields": ["execution_id", "workflow_name", "workflow_id", "state"] },
       "error_responses": [
         { "status": 400, "description": "Invalid request body or workflow name." },
         { "status": 409, "description": "Duplicate workflow_id with conflicting reuse policy." },
@@ -193,7 +193,7 @@
           { "name": "signal_reapply", "required": false, "description": "How to handle buffered signals: drop or buffer." }
         ]
       },
-      "success_response": { "status": 200, "fields": ["new_exec_id", "reset_from_exec_id", "reset_to_event_id", "events_carried_over", "source_tasks_cancelled", "source_timers_removed", "source_signals_dropped", "source_signals_buffered"] },
+      "success_response": { "status": 201, "fields": ["new_exec_id", "reset_from_exec_id", "reset_to_event_id", "events_carried_over", "source_tasks_cancelled", "source_timers_removed", "source_signals_dropped", "source_signals_buffered"] },
       "error_responses": [
         { "status": 400, "description": "Invalid reset point or request body." },
         { "status": 404, "description": "Execution not found." },
@@ -332,7 +332,7 @@
           { "name": "conf", "required": false, "description": "Run configuration passed to the DAG (any JSON value)." }
         ]
       },
-      "success_response": { "status": 200, "free_form": true },
+      "success_response": { "status": 201, "free_form": true },
       "error_responses": [
         { "status": 404, "description": "DAG not found." },
         { "status": 409, "description": "DAG is paused or at max_active_runs." },
@@ -880,10 +880,11 @@
           { "name": "input", "required": false, "description": "Workflow input payload (any JSON value)." },
           { "name": "max_active_runs", "required": false, "description": "Maximum concurrent scheduled runs." },
           { "name": "catchup", "required": false, "description": "Whether to backfill missed runs." },
-          { "name": "paused", "required": false, "description": "Create the schedule in paused state." }
+          { "name": "paused", "required": false, "description": "Create the schedule in paused state." },
+          { "name": "queue_name", "required": false, "description": "Task queue name for scheduled runs (default: 'default')." }
         ]
       },
-      "success_response": { "status": 200, "fields": ["id", "kind", "name", "schedule_expr", "is_paused", "next_run_at", "last_run_at", "max_active_runs", "catchup"] },
+      "success_response": { "status": 201, "fields": ["id", "kind", "name", "schedule_expr", "is_paused", "next_run_at", "last_run_at", "max_active_runs", "catchup"] },
       "error_responses": [
         { "status": 400, "description": "Invalid cron expression or missing required fields." },
         { "status": 500, "description": "Database error." }

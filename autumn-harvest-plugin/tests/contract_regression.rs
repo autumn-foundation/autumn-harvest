@@ -196,8 +196,7 @@ fn contract_request_fields_match_code_registry() {
             (None, Some(None)) => {} // both free-form ✓
             (Some(cf), Some(Some(contract_f))) => {
                 let mut code_set: Vec<&str> = cf.iter().copied().collect();
-                let mut contract_set: Vec<&str> =
-                    contract_f.iter().map(|s| s.as_str()).collect();
+                let mut contract_set: Vec<&str> = contract_f.iter().map(|s| s.as_str()).collect();
                 code_set.sort_unstable();
                 contract_set.sort_unstable();
                 assert_eq!(
@@ -219,7 +218,6 @@ fn contract_request_fields_match_code_registry() {
         }
     }
 }
-
 
 /// No contract route may be both read_only:true and use a mutating HTTP method.
 #[test]
@@ -283,8 +281,7 @@ fn contract_response_fields_match_code_registry() {
             (None, Some(None)) => {}
             (Some(cf), Some(Some(contract_f))) => {
                 let mut code_set: Vec<&str> = cf.iter().copied().collect();
-                let mut contract_set: Vec<&str> =
-                    contract_f.iter().map(|s| s.as_str()).collect();
+                let mut contract_set: Vec<&str> = contract_f.iter().map(|s| s.as_str()).collect();
                 code_set.sort_unstable();
                 contract_set.sort_unstable();
                 assert_eq!(
