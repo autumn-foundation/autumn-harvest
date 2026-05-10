@@ -157,9 +157,11 @@ const RULES: &[Rule] = &[
             "Uuid::new_v4(",
             "Uuid::new_v7(",
             "Uuid::new_v1(",
+            "Uuid::now_v7(",
             "uuid::Uuid::new_v4",
             "uuid::Uuid::new_v7",
             "uuid::Uuid::new_v1",
+            "uuid::Uuid::now_v7",
         ],
         message: "Ad-hoc UUID generation inside a workflow function is non-deterministic. \
                   A new random UUID is produced on every replay, breaking event correlation.",
@@ -689,9 +691,19 @@ fn strip_unparseable_content(line: &str) -> String {
 
 /// Returns the suppression reason if either `line` or `prev_line` contains a
 /// valid `// harvest-suppress: RULE_ID "reason"` comment for `rule_id`.
+///
+/// `prev_line` is only eligible when it is a *standalone* comment line
+/// (no code before `//`). A trailing inline comment on `prev_line` is
+/// scoped to that line only and must not suppress violations on the next line.
 fn find_suppression(rule_id: &str, line: &str, prev_line: &str) -> Option<String> {
-    parse_suppression_comment(rule_id, prev_line)
-        .or_else(|| parse_suppression_comment(rule_id, line))
+    let prev_is_standalone =
+        line_comment_start(prev_line).is_some_and(|pos| prev_line[..pos].trim().is_empty());
+    if prev_is_standalone {
+        parse_suppression_comment(rule_id, prev_line)
+    } else {
+        None
+    }
+    .or_else(|| parse_suppression_comment(rule_id, line))
 }
 
 /// Parses `// harvest-suppress: RULE_ID "reason string"` from a line.

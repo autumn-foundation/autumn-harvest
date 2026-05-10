@@ -125,6 +125,16 @@ fn det003_flags_uuid_new_v7() {
 }
 
 #[test]
+fn det003_flags_uuid_now_v7() {
+    let src = wf("let _id = Uuid::now_v7();");
+    let report = check_source(&src, "test.rs");
+    assert!(
+        report.findings.iter().any(|f| f.rule_id == "DET003"),
+        "Uuid::now_v7() uses current system time and must be flagged as DET003"
+    );
+}
+
+#[test]
 fn det003_is_hard_blocker() {
     let src = wf("let _id = uuid::Uuid::new_v4();");
     let report = check_source(&src, "test.rs");
@@ -640,6 +650,24 @@ fn same_line_suppression_works() {
     assert!(
         !report.suppressions.is_empty(),
         "same-line suppression must appear in report.suppressions"
+    );
+}
+
+#[test]
+fn inline_suppression_does_not_carry_to_next_line() {
+    // A trailing `// harvest-suppress:` on line N must NOT suppress a violation
+    // on line N+1 — it is scoped to the same line only.
+    let src = wf(
+        "let _a = std::time::SystemTime::now(); // harvest-suppress: DET001 \"first\"\n    let _b = std::time::SystemTime::now();",
+    );
+    let report = check_source(&src, "test.rs");
+    assert!(
+        report.has_hard_blockers(),
+        "second SystemTime::now() on the next line must still be a hard blocker"
+    );
+    assert!(
+        !report.suppressions.is_empty(),
+        "the first line's inline suppression must still be recorded"
     );
 }
 
