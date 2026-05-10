@@ -264,7 +264,7 @@
       "error_responses": [
         { "status": 400, "description": "Update rejected by the validator." },
         { "status": 404, "description": "Execution not found or update handler not registered." },
-        { "status": 408, "description": "Timed out waiting for completion." },
+        { "status": 504, "description": "Timed out waiting for completion (wait=completed exceeded the timeout)." },
         { "status": 500, "description": "Internal error." }
       ]
     },
@@ -280,7 +280,12 @@
       ],
       "request_body": null,
       "success_response": { "status": 200, "free_form": true },
+      "additional_responses": [
+        { "status": 202, "description": "Update admitted but not yet completed (still in-flight)." },
+        { "status": 409, "description": "Update failed or was rejected by the handler." }
+      ],
       "error_responses": [
+        { "status": 400, "description": "Invalid update_id format." },
         { "status": 404, "description": "Update not found." },
         { "status": 500, "description": "Database error." }
       ]
@@ -868,7 +873,7 @@
       "category": "schedule",
       "read_only": false,
       "description": "Create a new cron or interval schedule for a workflow.",
-      "idempotency": "Not idempotent: each call creates a new schedule row.",
+      "idempotency": "Upsert keyed by workflow_name: if a schedule already exists for that name the expression, input, and queue are updated; is_paused is preserved. Safe to retry.",
       "params": [],
       "request_body": {
         "required": true,
