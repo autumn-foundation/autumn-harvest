@@ -32,7 +32,7 @@ fn contract_route_set() -> HashSet<(String, String)> {
 }
 
 /// Returns the HTTP method string for an `ApiMethod`.
-fn method_str(m: &ApiMethod) -> &'static str {
+const fn method_str(m: ApiMethod) -> &'static str {
     match m {
         ApiMethod::Get => "GET",
         ApiMethod::Post => "POST",
@@ -72,7 +72,7 @@ fn assert_covered(args: &[&str]) {
         .api_request()
         .unwrap_or_else(|e| panic!("api_request() should succeed for {args:?}: {e}"));
 
-    let method = method_str(&req.method);
+    let method = method_str(req.method);
     let path = bare_path(&req.path);
     let routes = contract_route_set();
 
@@ -122,7 +122,7 @@ fn contract_route_request_fields() -> HashMap<(String, String), Option<Vec<Strin
                     )
                 })
                 .iter()
-                .filter_map(|f| f["name"].as_str().map(|s| s.to_string()))
+                .filter_map(|f| f["name"].as_str().map(ToString::to_string))
                 .collect();
             map.insert((method, path), Some(fields));
         }
@@ -145,7 +145,7 @@ fn assert_body_fields_documented(args: &[&str]) {
         .unwrap_or_else(|e| panic!("api_request() should succeed for {args:?}: {e}"));
 
     // GET requests never have a body — nothing to validate.
-    let method = method_str(&req.method);
+    let method = method_str(req.method);
     if method == "GET" {
         return;
     }
@@ -176,7 +176,7 @@ fn assert_body_fields_documented(args: &[&str]) {
         return;
     };
 
-    let documented: HashSet<&str> = contract_fields.iter().map(|s| s.as_str()).collect();
+    let documented: HashSet<&str> = contract_fields.iter().map(String::as_str).collect();
     for key in body_obj.keys() {
         assert!(
             documented.contains(key.as_str()),

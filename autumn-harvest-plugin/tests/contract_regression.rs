@@ -8,7 +8,7 @@
 /// Compatibility rules (stated in the contract):
 ///   - Adding response fields is non-breaking.
 ///   - Removing, renaming, or changing the type of a response field is breaking.
-///   - New mutating routes must be classified (read_only = false) in the contract.
+///   - New mutating routes must be classified (`read_only = false`) in the contract.
 use autumn_harvest_plugin::api::{
     management_api_request_fields, management_api_response_fields, management_api_routes,
 };
@@ -164,7 +164,7 @@ fn contract_mutating_routes_have_structured_request_body() {
 }
 
 /// The request field registry in code must match the structured field list in the contract.
-/// Update management_api_request_fields() AND docs/api-contract.json together.
+/// Update `management_api_request_fields()` AND `docs/api-contract.json` together.
 #[test]
 fn contract_request_fields_match_code_registry() {
     let contract = load_contract();
@@ -183,7 +183,7 @@ fn contract_request_fields_match_code_registry() {
         } else if let Some(arr) = rb["fields"].as_array() {
             let names: Vec<String> = arr
                 .iter()
-                .filter_map(|f| f["name"].as_str().map(|s| s.to_string()))
+                .filter_map(|f| f["name"].as_str().map(ToString::to_string))
                 .collect();
             contract_fields.insert((method, path), Some(names));
         }
@@ -193,17 +193,16 @@ fn contract_request_fields_match_code_registry() {
     for (method, path, code_fields) in management_api_request_fields() {
         let key = (method.to_string(), path.to_string());
         match (code_fields, contract_fields.get(&key)) {
-            (None, Some(None)) => {} // both free-form ✓
             (Some(cf), Some(Some(contract_f))) => {
-                let mut code_set: Vec<&str> = cf.iter().copied().collect();
-                let mut contract_set: Vec<&str> = contract_f.iter().map(|s| s.as_str()).collect();
+                let mut code_set: Vec<&str> = cf.to_vec();
+                let mut contract_set: Vec<&str> = contract_f.iter().map(String::as_str).collect();
                 code_set.sort_unstable();
                 contract_set.sort_unstable();
                 assert_eq!(
                     code_set, contract_set,
                     "Request field mismatch for {method} {path}: \
                      code registry has {code_set:?} but contract has {contract_set:?}. \
-                     Update both management_api_request_fields() and docs/api-contract.json."
+                     Update both `management_api_request_fields()` and docs/api-contract.json."
                 );
             }
             (None, Some(Some(_))) => panic!(
@@ -212,14 +211,13 @@ fn contract_request_fields_match_code_registry() {
             (Some(_), Some(None)) => panic!(
                 "{method} {path}: code registry has structured fields but contract says free-form"
             ),
-            (_, None) => {
-                // Route is read-only or has no body — not in contract_fields map, skip.
-            }
+            // both free-form, or route has no body in contract — skip
+            (None, Some(None)) | (_, None) => {}
         }
     }
 }
 
-/// No contract route may be both read_only:true and use a mutating HTTP method.
+/// No contract route may be both `read_only:true` and use a mutating HTTP method.
 #[test]
 fn contract_read_only_classification_is_consistent() {
     let contract = load_contract();
@@ -239,11 +237,11 @@ fn contract_read_only_classification_is_consistent() {
     }
 }
 
-/// Every contract route that has a structured success_response (i.e. a `fields`
+/// Every contract route that has a structured `success_response` (i.e. a `fields`
 /// array rather than `free_form: true`) must have its top-level response field
 /// names listed in `management_api_response_fields()`, and vice-versa.
 ///
-/// Update management_api_response_fields() AND the `success_response.fields`
+/// Update `management_api_response_fields()` AND the `success_response.fields`
 /// array in docs/api-contract.json together whenever you add, remove, or rename
 /// a top-level response field on any management route.
 #[test]
@@ -267,8 +265,8 @@ fn contract_response_fields_match_code_registry() {
                 .filter_map(|f| {
                     // fields may be plain strings or {name: ...} objects
                     f.as_str()
-                        .map(|s| s.to_string())
-                        .or_else(|| f["name"].as_str().map(|s| s.to_string()))
+                        .map(ToString::to_string)
+                        .or_else(|| f["name"].as_str().map(ToString::to_string))
                 })
                 .collect();
             contract_resp.insert((method, path), Some(names));
@@ -280,8 +278,8 @@ fn contract_response_fields_match_code_registry() {
         match (code_fields, contract_resp.get(&key)) {
             (None, Some(None)) => {}
             (Some(cf), Some(Some(contract_f))) => {
-                let mut code_set: Vec<&str> = cf.iter().copied().collect();
-                let mut contract_set: Vec<&str> = contract_f.iter().map(|s| s.as_str()).collect();
+                let mut code_set: Vec<&str> = cf.to_vec();
+                let mut contract_set: Vec<&str> = contract_f.iter().map(String::as_str).collect();
                 code_set.sort_unstable();
                 contract_set.sort_unstable();
                 assert_eq!(

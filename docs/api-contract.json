@@ -260,7 +260,7 @@
           { "name": "input", "required": false, "description": "Payload passed to the update handler (any JSON value)." }
         ]
       },
-      "success_response": { "status": 200, "free_form": true },
+      "success_response": { "status": 202, "note": "Returns 202 Accepted when wait=admitted (update durably recorded); returns 200 OK with outcome when wait=completed (default).", "free_form": true },
       "error_responses": [
         { "status": 400, "description": "Update rejected by the validator." },
         { "status": 404, "description": "Execution not found or update handler not registered." },
@@ -699,13 +699,12 @@
       "read_only": true,
       "description": "Return per-shard readiness: ready, degraded, or unavailable.",
       "params": [
-        { "name": "candidate_shard", "in": "query", "required": false, "description": "Shard ID of a new shard to probe before enabling writes." },
-        { "name": "fail_on_unready", "in": "query", "required": false, "description": "When true, the response uses HTTP 503 if any shard is not ready." }
+        { "name": "candidate_shard", "in": "query", "required": false, "description": "Shard ID of a new shard to probe before enabling writes." }
       ],
       "request_body": null,
       "success_response": { "status": 200, "fields": ["overall_readiness", "observed_at", "freshness_window_secs", "candidate_shard", "shards"] },
       "error_responses": [
-        { "status": 503, "description": "One or more shards not ready (only when fail_on_unready is true)." }
+        { "status": 503, "description": "Database or shard connectivity error." }
       ]
     },
     {
