@@ -3909,4 +3909,21 @@ mod tests {
             "empty patch emits no command"
         );
     }
+
+    #[test]
+    fn context_state_returns_none_for_missing_type() {
+        struct MissingState;
+        let ctx = WorkflowContext::new_test();
+        assert!(ctx.state::<MissingState>().is_none());
+    }
+
+    #[test]
+    fn execute_query_returns_error_when_handler_missing() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx.execute_query("missing_query").unwrap_err();
+        match err {
+            crate::error::HarvestError::NotFound(_msg) => {}
+            _ => panic!("Expected NotFound error"),
+        }
+    }
 }
