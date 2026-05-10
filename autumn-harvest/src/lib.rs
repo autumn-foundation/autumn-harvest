@@ -131,7 +131,10 @@ pub use analyzer::{
 };
 pub use builder::{BuiltHarvest, HarvestBuilder, HarvestBuilderError, WorkerConfig};
 pub use cache::{CachedWorkflowState, WorkflowCache};
-pub use context::{ActivityContext, WorkflowCommand, WorkflowContext};
+pub use context::{
+    ActivityContext, DEFAULT_HISTORY_CONTINUE_AS_NEW_THRESHOLD, WorkflowCommand, WorkflowContext,
+    WorkflowHistoryPolicy,
+};
 pub use critical_path::{CriticalPathAnalyzer, CriticalPathResult};
 pub use dag::{DagBuildError, DagBuilder, DagDefinition, DagTask, DagTaskRef};
 pub use dag_export::{export_dot, export_mermaid};

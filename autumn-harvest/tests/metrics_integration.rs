@@ -26,12 +26,12 @@ use autumn_harvest::schema::harvest_workflow_executions;
 use autumn_harvest::store;
 use autumn_harvest::telemetry::{
     ActivityStatus, METRIC_ACTIVITY_DURATION, METRIC_DLQ_ENTRIES, METRIC_QUEUE_DEPTH,
-    METRIC_WORKFLOW_DURATION, METRIC_WORKFLOW_STARTED, MetricsRecorder, TelemetryConfig,
-    WorkflowStatus,
+    METRIC_WORKFLOW_CONTINUE_AS_NEW, METRIC_WORKFLOW_DURATION, METRIC_WORKFLOW_HISTORY_SIZE,
+    METRIC_WORKFLOW_STARTED, MetricsRecorder, TelemetryConfig, WorkflowStatus,
 };
 use autumn_harvest::types::{ExecutionId, ShardId};
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
-use autumn_harvest::{ActivityContext, WorkflowContext};
+use autumn_harvest::{ActivityContext, WorkflowContext, WorkflowHistoryPolicy};
 use chrono::Utc;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
@@ -58,9 +58,13 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../migrations/20260508000000_harvest_external_task_updated_at/up.sql"),
     "\n",
+    include_str!("../migrations/20260506000000_harvest_audit_log/up.sql"),
+    "\n",
     include_str!("../migrations/20260501000000_harvest_workers/up.sql"),
     "\n",
     include_str!("../migrations/20260508010000_harvest_workers_drain_deadline/up.sql"),
+    "\n",
+    include_str!("../migrations/20260509000000_harvest_build_routing/up.sql"),
 );
 
 // ---------------------------------------------------------------------------
@@ -134,6 +138,23 @@ impl MetricsRecorder for RecordingMetrics {
                 ("status", status.as_str().to_owned()),
                 ("workflow", workflow_name.to_owned()),
             ],
+        );
+    }
+
+    fn record_workflow_history_size(&self, workflow_name: &str, event_count: u64) {
+        self.push(
+            METRIC_WORKFLOW_HISTORY_SIZE,
+            vec![
+                ("count", event_count.to_string()),
+                ("workflow.type", workflow_name.to_owned()),
+            ],
+        );
+    }
+
+    fn record_workflow_continue_as_new(&self, workflow_name: &str) {
+        self.push(
+            METRIC_WORKFLOW_CONTINUE_AS_NEW,
+            vec![("workflow.type", workflow_name.to_owned())],
         );
     }
 
@@ -229,6 +250,24 @@ async fn wait_for_completed(database_url: &str, exec_id: ExecutionId) -> Workflo
     .expect("workflow did not reach COMPLETED within timeout")
 }
 
+async fn wait_for_state(
+    database_url: &str,
+    exec_id: ExecutionId,
+    expected: &str,
+) -> WorkflowExecution {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let ex = load_execution(database_url, exec_id).await;
+            if ex.state == expected {
+                break ex;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("workflow did not reach {expected} within timeout"))
+}
+
 fn build_worker(worker_id: &str, registry: Arc<HandlerRegistry>) -> Arc<Worker> {
     Arc::new(
         Worker::new(
@@ -274,6 +313,37 @@ fn metrics_activity<'a>(
     input: serde_json::Value,
 ) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
     Box::pin(async move { Ok(input) })
+}
+
+fn continue_metric_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        if input
+            .get("rotated")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            return Ok(serde_json::json!({"done": true}));
+        }
+
+        ctx.continue_as_new(serde_json::json!({"rotated": true}))
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(serde_json::Value::Null)
+    })
+}
+
+fn history_cap_violator<'a>(
+    ctx: &'a WorkflowContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        assert_eq!(ctx.history_event_count(), 2);
+        assert!(!ctx.should_continue_as_new());
+        Ok(serde_json::json!({"ignored": true}))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -405,6 +475,11 @@ async fn workflow_and_activity_metrics_are_recorded() {
     );
 
     assert!(
+        names.contains(&METRIC_WORKFLOW_HISTORY_SIZE),
+        "harvest.workflow.history_size must be emitted; got: {names:?}"
+    );
+
+    assert!(
         names.contains(&METRIC_ACTIVITY_DURATION),
         "harvest.activity.duration must be emitted; got: {names:?}"
     );
@@ -445,6 +520,225 @@ async fn workflow_and_activity_metrics_are_recorded() {
             .contains("status=completed"),
         "workflow.duration label must have status=completed; got: {}",
         wf_duration_emission.labels_debug
+    );
+
+    let history_size_emission = emissions
+        .iter()
+        .find(|e| e.name == METRIC_WORKFLOW_HISTORY_SIZE)
+        .expect("workflow.history_size emission must exist");
+    assert!(
+        history_size_emission
+            .labels_debug
+            .contains("workflow.type=metrics_test_workflow"),
+        "workflow.history_size label must include workflow.type; got: {}",
+        history_size_emission.labels_debug
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn continue_as_new_records_history_size_and_rotation_metrics() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = AsyncPgConnection::establish(&database_url)
+        .await
+        .expect("failed to connect");
+
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    let workflow_input = serde_json::json!({"rotated": false});
+    let workflow_id = format!("continue-metrics-{}", Uuid::new_v4());
+
+    diesel::insert_into(harvest_workflow_executions::table)
+        .values(NewWorkflowExecution {
+            id: exec_id.as_uuid(),
+            workflow_name: "continue_metric_workflow",
+            workflow_id: &workflow_id,
+            run_id: Uuid::new_v4(),
+            shard_id: 0,
+            input: workflow_input.clone(),
+            parent_id: None,
+            queue_name: "default",
+            execution_timeout: None,
+            memo: None,
+            search_attrs: None,
+            assigned_build_id: None,
+        })
+        .execute(&mut conn)
+        .await
+        .expect("failed to insert workflow execution row");
+
+    store::append_events(
+        &mut conn,
+        exec_id,
+        &[WorkflowEvent::WorkflowStarted {
+            input: workflow_input.clone(),
+            timestamp: Utc::now(),
+        }],
+        0,
+    )
+    .await
+    .expect("append WorkflowStarted failed");
+
+    let mut enqueue_params =
+        EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
+    enqueue_params.workflow_exec_id = Some(exec_id.as_uuid());
+    enqueue_params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+    queue_mod::enqueue(&mut conn, &enqueue_params)
+        .await
+        .expect("enqueue failed");
+
+    let recording = Arc::new(RecordingMetrics::default());
+    let telemetry = Arc::new(
+        TelemetryConfig::builder()
+            .metrics(Arc::clone(&recording) as Arc<dyn MetricsRecorder>)
+            .build(),
+    );
+    let registry = Arc::new(HandlerRegistry::with_state_and_telemetry(
+        vec![WorkflowInfo {
+            name: "continue_metric_workflow",
+            module: "metrics_integration",
+            handler: continue_metric_workflow,
+        }],
+        vec![],
+        autumn_harvest::context::empty_shared_state(),
+        telemetry,
+    ));
+
+    let worker = build_worker("metrics-worker-can", registry);
+    let pool = build_test_pool(&database_url);
+    let runner = Arc::clone(&worker);
+    let pool_for_run = pool.clone();
+    let handle = tokio::spawn(async move {
+        runner.run(&pool_for_run).await;
+    });
+
+    wait_for_state(&database_url, exec_id, "CONTINUED_AS_NEW").await;
+
+    worker.shutdown();
+    handle.await.expect("worker task should join cleanly");
+
+    let emissions = recording.drain();
+    assert!(
+        emissions
+            .iter()
+            .any(|e| e.name == METRIC_WORKFLOW_CONTINUE_AS_NEW
+                && e.labels_debug
+                    .contains("workflow.type=continue_metric_workflow")),
+        "continue_as_new metric must be emitted once with workflow.type label; got: {emissions:?}"
+    );
+    assert!(
+        emissions
+            .iter()
+            .any(|e| e.name == METRIC_WORKFLOW_HISTORY_SIZE
+                && e.labels_debug
+                    .contains("workflow.type=continue_metric_workflow")),
+        "history_size metric must be emitted for continued-as-new execution; got: {emissions:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workflow_hard_cap_moves_offender_to_dlq() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = AsyncPgConnection::establish(&database_url)
+        .await
+        .expect("failed to connect");
+
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    let workflow_input = serde_json::json!({});
+    let workflow_id = format!("hard-cap-{}", Uuid::new_v4());
+
+    diesel::insert_into(harvest_workflow_executions::table)
+        .values(NewWorkflowExecution {
+            id: exec_id.as_uuid(),
+            workflow_name: "history_cap_violator",
+            workflow_id: &workflow_id,
+            run_id: Uuid::new_v4(),
+            shard_id: 0,
+            input: workflow_input.clone(),
+            parent_id: None,
+            queue_name: "default",
+            execution_timeout: None,
+            memo: None,
+            search_attrs: None,
+            assigned_build_id: None,
+        })
+        .execute(&mut conn)
+        .await
+        .expect("failed to insert workflow execution row");
+
+    store::append_events(
+        &mut conn,
+        exec_id,
+        &[
+            WorkflowEvent::WorkflowStarted {
+                input: workflow_input.clone(),
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "already-large".into(),
+                details: serde_json::json!({}),
+            },
+        ],
+        0,
+    )
+    .await
+    .expect("append initial history failed");
+
+    let mut enqueue_params =
+        EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
+    enqueue_params.workflow_exec_id = Some(exec_id.as_uuid());
+    enqueue_params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+    queue_mod::enqueue(&mut conn, &enqueue_params)
+        .await
+        .expect("enqueue failed");
+
+    let recording = Arc::new(RecordingMetrics::default());
+    let telemetry = Arc::new(
+        TelemetryConfig::builder()
+            .metrics(Arc::clone(&recording) as Arc<dyn MetricsRecorder>)
+            .build(),
+    );
+    let policy = WorkflowHistoryPolicy::default().with_event_hard_cap(2);
+    let registry = Arc::new(HandlerRegistry::with_state_telemetry_and_history_policy(
+        vec![WorkflowInfo {
+            name: "history_cap_violator",
+            module: "metrics_integration",
+            handler: history_cap_violator,
+        }],
+        vec![],
+        autumn_harvest::context::empty_shared_state(),
+        telemetry,
+        policy,
+    ));
+
+    let worker = build_worker("metrics-worker-hard-cap", registry);
+    let pool = build_test_pool(&database_url);
+    let runner = Arc::clone(&worker);
+    let pool_for_run = pool.clone();
+    let handle = tokio::spawn(async move {
+        runner.run(&pool_for_run).await;
+    });
+
+    let execution = wait_for_state(&database_url, exec_id, "FAILED").await;
+
+    worker.shutdown();
+    handle.await.expect("worker task should join cleanly");
+
+    let error = execution.error.expect("hard cap should fail execution");
+    assert!(
+        error.contains("HistoryCapExceeded"),
+        "execution error should identify hard cap reason, got: {error}"
+    );
+
+    let dead_letters = dlq::list_dead_letters(&mut conn, 10)
+        .await
+        .expect("failed to list DLQ rows");
+    let dlq_row = dead_letters
+        .iter()
+        .find(|row| row.workflow_exec_id == Some(exec_id.as_uuid()))
+        .expect("hard-cap offender must be moved to DLQ");
+    assert!(
+        dlq_row.error.contains("HistoryCapExceeded"),
+        "DLQ reason should identify hard cap, got: {}",
+        dlq_row.error
     );
 }
 

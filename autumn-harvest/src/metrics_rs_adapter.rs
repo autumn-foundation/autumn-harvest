@@ -47,9 +47,10 @@ use crate::telemetry::{
     ActivityStatus, METRIC_ACTIVITY_DURATION, METRIC_DLQ_ENTRIES, METRIC_LABEL_ACTIVITY,
     METRIC_LABEL_KEY, METRIC_LABEL_KIND, METRIC_LABEL_NAME, METRIC_LABEL_QUEUE,
     METRIC_LABEL_REASON, METRIC_LABEL_SHARD, METRIC_LABEL_STATUS, METRIC_LABEL_WORKFLOW,
-    METRIC_QUEUE_DEPTH, METRIC_RETENTION_DELETED, METRIC_SCHEDULE_RUNS, METRIC_SCHEDULE_SKIPPED,
-    METRIC_TIMER_DURATION, METRIC_TIMER_STARTED, METRIC_WORKFLOW_DURATION, METRIC_WORKFLOW_STARTED,
-    MetricsRecorder, WorkflowStatus,
+    METRIC_LABEL_WORKFLOW_TYPE, METRIC_QUEUE_DEPTH, METRIC_RETENTION_DELETED, METRIC_SCHEDULE_RUNS,
+    METRIC_SCHEDULE_SKIPPED, METRIC_TIMER_DURATION, METRIC_TIMER_STARTED,
+    METRIC_WORKFLOW_CONTINUE_AS_NEW, METRIC_WORKFLOW_DURATION, METRIC_WORKFLOW_HISTORY_SIZE,
+    METRIC_WORKFLOW_STARTED, MetricsRecorder, WorkflowStatus,
 };
 
 /// [`MetricsRecorder`] implementation that forwards every sample to the
@@ -84,6 +85,23 @@ impl MetricsRecorder for MetricsRsRecorder {
             METRIC_LABEL_STATUS => status.as_str(),
         )
         .record(duration_secs);
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn record_workflow_history_size(&self, workflow_name: &str, event_count: u64) {
+        histogram!(
+            METRIC_WORKFLOW_HISTORY_SIZE,
+            METRIC_LABEL_WORKFLOW_TYPE => workflow_name.to_owned(),
+        )
+        .record(event_count as f64);
+    }
+
+    fn record_workflow_continue_as_new(&self, workflow_name: &str) {
+        counter!(
+            METRIC_WORKFLOW_CONTINUE_AS_NEW,
+            METRIC_LABEL_WORKFLOW_TYPE => workflow_name.to_owned(),
+        )
+        .increment(1);
     }
 
     fn record_activity_completed(
@@ -210,6 +228,8 @@ mod tests {
         let rec = MetricsRsRecorder;
         rec.record_workflow_started("wf", "q");
         rec.record_workflow_completed("wf", "q", 1.0, WorkflowStatus::Completed);
+        rec.record_workflow_history_size("wf", 2);
+        rec.record_workflow_continue_as_new("wf");
         rec.record_activity_completed("act", "q", 0.5, ActivityStatus::Completed);
         rec.record_timer_started(30.0);
         rec.record_queue_depth("q", 5);

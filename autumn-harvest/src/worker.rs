@@ -22,10 +22,15 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use crate::builder::WorkerConfig;
-use crate::context::{ActivityContext, SharedState, WorkflowCommand, empty_shared_state};
+use crate::context::{
+    ActivityContext, SharedState, WorkflowCommand, WorkflowHistoryPolicy, empty_shared_state,
+};
+use crate::dlq::{self, DeadLetterReason, NewDeadLetterEntry};
 use crate::error::{HarvestError, HarvestResult};
 use crate::event::WorkflowEvent;
-use crate::executor::{WorkflowExecuteSpanMeta, WorkflowOutcome, run_workflow_with_state};
+use crate::executor::{
+    WorkflowExecuteSpanMeta, WorkflowOutcome, run_workflow_with_state_and_history_policy,
+};
 use crate::external_task;
 use crate::info::{ActivityInfo, WorkflowInfo};
 use crate::models::{
@@ -151,6 +156,8 @@ pub struct HandlerRegistry {
     /// Telemetry bundle (trace-context propagator + metrics recorder) applied
     /// around every dispatch.
     telemetry: Arc<crate::telemetry::TelemetryConfig>,
+    /// History-size thresholds visible to workflow contexts.
+    history_policy: WorkflowHistoryPolicy,
 }
 
 impl HandlerRegistry {
@@ -201,7 +208,28 @@ impl HandlerRegistry {
             activities,
             state,
             telemetry,
+            history_policy: WorkflowHistoryPolicy::default(),
         }
+    }
+
+    /// Create a new registry with shared state, telemetry, and history guardrails.
+    #[must_use]
+    pub fn with_state_telemetry_and_history_policy(
+        workflows: Vec<WorkflowInfo>,
+        activities: Vec<ActivityInfo>,
+        state: SharedState,
+        telemetry: Arc<crate::telemetry::TelemetryConfig>,
+        history_policy: WorkflowHistoryPolicy,
+    ) -> Self {
+        Self::with_state_and_telemetry(workflows, activities, state, telemetry)
+            .with_history_policy(history_policy)
+    }
+
+    /// Override the history guardrails carried by this registry.
+    #[must_use]
+    pub const fn with_history_policy(mut self, history_policy: WorkflowHistoryPolicy) -> Self {
+        self.history_policy = history_policy;
+        self
     }
 
     /// Clone the shared state reference for runtime contexts.
@@ -221,6 +249,12 @@ impl HandlerRegistry {
     pub const fn telemetry(&self) -> &Arc<crate::telemetry::TelemetryConfig> {
         &self.telemetry
     }
+
+    /// History-size guardrails applied to workflow contexts run by this registry.
+    #[must_use]
+    pub const fn history_policy(&self) -> WorkflowHistoryPolicy {
+        self.history_policy
+    }
 }
 
 impl std::fmt::Debug for HandlerRegistry {
@@ -230,6 +264,7 @@ impl std::fmt::Debug for HandlerRegistry {
             .field("activities", &self.activities.keys())
             .field("state_count", &self.state.len())
             .field("telemetry", &self.telemetry)
+            .field("history_policy", &self.history_policy)
             .finish()
     }
 }
@@ -2565,6 +2600,67 @@ async fn persist_workflow_outcome(
     }
 }
 
+fn pending_update_result_event_count(commands: &[WorkflowCommand]) -> u64 {
+    u64::try_from(
+        commands
+            .iter()
+            .filter(|cmd| matches!(cmd, WorkflowCommand::RecordUpdateResult { .. }))
+            .count(),
+    )
+    .unwrap_or(u64::MAX)
+}
+
+fn terminal_history_event_count(next_event_id: i32, pending_cmds: &[WorkflowCommand]) -> u64 {
+    u64::try_from(next_event_id)
+        .unwrap_or(0)
+        .saturating_add(pending_update_result_event_count(pending_cmds))
+        .saturating_add(1)
+}
+
+async fn move_workflow_to_dlq_for_history_cap(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+    exec_id: ExecutionId,
+    next_event_id: i32,
+    worker_id: &str,
+    reason: DeadLetterReason,
+) -> HarvestResult<()> {
+    let reason = reason.to_string();
+
+    conn.transaction::<(), HarvestError, _>(|conn| {
+        let reason = reason.clone();
+        async move {
+            dlq::dead_letter(
+                conn,
+                &NewDeadLetterEntry {
+                    original_task_id: task.id,
+                    queue_name: task.queue_name.clone(),
+                    task_type: task.task_type.clone(),
+                    workflow_exec_id: task.workflow_exec_id,
+                    activity_name: task.activity_name.clone(),
+                    input: task.input.clone(),
+                    error: reason.clone(),
+                    attempts: task.attempt,
+                },
+            )
+            .await?;
+            store::append_events(
+                conn,
+                exec_id,
+                &[WorkflowEvent::WorkflowFailed {
+                    error: reason.clone(),
+                }],
+                next_event_id,
+            )
+            .await?;
+            update_workflow_execution_failed(conn, exec_id, worker_id, &reason).await?;
+            queue::fail_task(conn, task.id, &reason).await
+        }
+        .scope_boxed()
+    })
+    .await
+}
+
 #[allow(clippy::too_many_lines)]
 async fn process_workflow_task(
     conn: &mut AsyncPgConnection,
@@ -2684,12 +2780,13 @@ async fn process_workflow_task(
                 .and_then(|c| c.link_traceparent.clone().or_else(|| c.traceparent.clone())),
         };
 
-        let (run_outcome, pending_cmds, execute_span) = run_workflow_with_state(
+        let (run_outcome, pending_cmds, execute_span) = run_workflow_with_state_and_history_policy(
             prepared.exec_id,
             history_events.clone(),
             workflow.handler,
             task.input.clone(),
             registry.shared_state(),
+            registry.history_policy(),
             Some(&span_meta),
         )
         .await;
@@ -2731,6 +2828,38 @@ async fn process_workflow_task(
     };
 
     let (outcome, pending_cmds, execute_span) = loop_result;
+    let current_history_event_count = u64::try_from(history_events.len()).unwrap_or(u64::MAX);
+
+    if let Some(cap) = registry.history_policy().event_hard_cap()
+        && current_history_event_count >= cap
+        && !matches!(&outcome, WorkflowOutcome::ContinuedAsNew { .. })
+    {
+        let terminal_count = current_history_event_count.saturating_add(1);
+        telemetry.metrics.record_workflow_completed(
+            &prepared.execution.workflow_name,
+            &task.queue_name,
+            started_at.elapsed().as_secs_f64(),
+            WorkflowStatus::Failed,
+        );
+        telemetry
+            .metrics
+            .record_workflow_history_size(&prepared.execution.workflow_name, terminal_count);
+
+        let reason = DeadLetterReason::HistoryCapExceeded {
+            count: current_history_event_count,
+            cap,
+            workflow_type: prepared.execution.workflow_name.clone(),
+        };
+        return move_workflow_to_dlq_for_history_cap(
+            conn,
+            task,
+            prepared.exec_id,
+            next_event_id,
+            worker_id,
+            reason,
+        )
+        .await;
+    }
 
     let status = match &outcome {
         WorkflowOutcome::Completed { .. } => WorkflowStatus::Completed,
@@ -2744,6 +2873,17 @@ async fn process_workflow_task(
         started_at.elapsed().as_secs_f64(),
         status,
     );
+    if !matches!(&outcome, WorkflowOutcome::Suspended { .. }) {
+        telemetry.metrics.record_workflow_history_size(
+            &prepared.execution.workflow_name,
+            terminal_history_event_count(next_event_id, &pending_cmds),
+        );
+    }
+    if matches!(&outcome, WorkflowOutcome::ContinuedAsNew { .. }) {
+        telemetry
+            .metrics
+            .record_workflow_continue_as_new(&prepared.execution.workflow_name);
+    }
 
     // Append UpdateCompleted/UpdateFailed events and apply search-attribute
     // patches for any commands emitted during this live execution cycle before

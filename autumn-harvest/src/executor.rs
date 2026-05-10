@@ -14,7 +14,9 @@ use std::time::Duration;
 use serde_json::Value;
 use tracing::Instrument;
 
-use crate::context::{SharedState, WorkflowCommand, WorkflowContext, empty_shared_state};
+use crate::context::{
+    SharedState, WorkflowCommand, WorkflowContext, WorkflowHistoryPolicy, empty_shared_state,
+};
 use crate::event::WorkflowEvent;
 use crate::info::WorkflowHandlerFn;
 use crate::telemetry::{
@@ -185,7 +187,35 @@ pub async fn run_workflow_with_state(
     state: SharedState,
     span_meta: Option<&WorkflowExecuteSpanMeta>,
 ) -> (WorkflowOutcome, Vec<WorkflowCommand>, tracing::Span) {
-    let ctx = WorkflowContext::for_replay_with_state(exec_id, history, state);
+    run_workflow_with_state_and_history_policy(
+        exec_id,
+        history,
+        handler,
+        input,
+        state,
+        WorkflowHistoryPolicy::default(),
+        span_meta,
+    )
+    .await
+}
+
+/// Like [`run_workflow_with_state`] but installs explicit history guardrails
+/// into the [`WorkflowContext`].
+pub async fn run_workflow_with_state_and_history_policy(
+    exec_id: ExecutionId,
+    history: Vec<WorkflowEvent>,
+    handler: WorkflowHandlerFn,
+    input: Value,
+    state: SharedState,
+    history_policy: WorkflowHistoryPolicy,
+    span_meta: Option<&WorkflowExecuteSpanMeta>,
+) -> (WorkflowOutcome, Vec<WorkflowCommand>, tracing::Span) {
+    let ctx = WorkflowContext::for_replay_with_state_and_history_policy(
+        exec_id,
+        history,
+        state,
+        history_policy,
+    );
 
     // ADR-0001 §2.1: emit harvest.workflow.execute for every executor cycle.
     // harvest.replay defaults to false at span creation so subscribers that only

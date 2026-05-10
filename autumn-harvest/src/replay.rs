@@ -360,10 +360,16 @@ impl HistoryMatcher {
         cursor < self.events.len()
     }
 
+    /// Number of events loaded into this replay matcher.
+    #[must_use]
+    pub fn event_count(&self) -> u64 {
+        u64::try_from(self.events.len()).unwrap_or(u64::MAX)
+    }
+
     /// Returns `true` if there are unconsumed events that are not terminal
     /// lifecycle events (`WorkflowCompleted`, `WorkflowFailed`,
-    /// `WorkflowCancelled`), or if there are buffered signals that were never
-    /// delivered via `wait_for_signal`.
+    /// `WorkflowCancelled`, `WorkflowContinuedAsNew`), or if there are buffered
+    /// signals that were never delivered via `wait_for_signal`.
     ///
     /// Used by [`crate::context::WorkflowContext::history_has_unconsumed_events`] to avoid
     /// false non-determinism reports when replaying full histories that include
