@@ -778,7 +778,7 @@ struct DagPauseRequest {
 }
 
 /// Kind tag on a schedule entry returned by `GET /admin/schedules`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 enum ScheduleKind {
     Dag,
@@ -4479,6 +4479,11 @@ struct ScheduleBackfillResponse {
     /// Keys: `"already_exists"`, `"max_active_runs"`.
     skipped_reasons: std::collections::HashMap<String, usize>,
     partial_shard_failures: Vec<BackfillShardFailure>,
+    /// Set when a DAG schedule is paused and `include_paused=true`: inserted
+    /// QUEUED runs will not execute until the schedule is resumed because
+    /// `activate_queued_runs` skips paused schedules.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    paused_schedule_warning: Option<String>,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -4549,15 +4554,30 @@ async fn schedule_backfill(
     // Dry-run: query current running count and project what would happen.
     if request.dry_run {
         let running = query_running_count(&pool, &kind, &name).await;
+        let already_exists = count_existing_in_window(&pool, &kind, &name, &timestamps).await;
+        let remaining = total.saturating_sub(already_exists);
         let available_slots = usize::try_from((max_active - running).max(0)).unwrap_or(0);
-        let would_dispatch = total.min(available_slots);
-        let would_skip_max = total - would_dispatch;
+        let would_dispatch = remaining.min(available_slots);
+        let would_skip_max = remaining - would_dispatch;
 
         let mut skipped_reasons = std::collections::HashMap::new();
+        if already_exists > 0 {
+            skipped_reasons.insert("already_exists".to_string(), already_exists);
+        }
         if would_skip_max > 0 {
             skipped_reasons.insert("max_active_runs".to_string(), would_skip_max);
         }
 
+        let paused_schedule_warning = (schedule.is_paused
+            && request.include_paused
+            && kind == ScheduleKind::Dag)
+            .then(|| {
+                "Schedule is paused; backfilled DAG runs are QUEUED but will not \
+                 execute until the schedule is resumed (`harvest schedule resume`)."
+                    .to_string()
+            });
+
+        let would_skip = already_exists + would_skip_max;
         write_backfill_log(
             &pool,
             schedule_id,
@@ -4568,7 +4588,7 @@ async fn schedule_backfill(
             true,
             total,
             would_dispatch,
-            would_skip_max,
+            would_skip,
             0,
             "dry_run",
             None,
@@ -4596,10 +4616,11 @@ async fn schedule_backfill(
             planned_timestamps: timestamps,
             total,
             dispatched: would_dispatch,
-            skipped: would_skip_max,
+            skipped: would_skip,
             failed: 0,
             skipped_reasons,
             partial_shard_failures: vec![],
+            paused_schedule_warning,
         }));
     }
 
@@ -4611,6 +4632,16 @@ async fn schedule_backfill(
     let mut shard_failures: Vec<BackfillShardFailure> = Vec::new();
     let mut skipped_reasons: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
+
+    // Warn when the operator uses include_paused=true for a paused DAG schedule.
+    // `activate_queued_runs` skips paused schedules, so the inserted QUEUED runs
+    // will not execute until the schedule is resumed.
+    let paused_schedule_warning =
+        (schedule.is_paused && request.include_paused && kind == ScheduleKind::Dag).then(|| {
+            "Schedule is paused; backfilled DAG runs are QUEUED but will not \
+             execute until the schedule is resumed (`harvest schedule resume`)."
+                .to_string()
+        });
 
     // Count running executions once before the loop; track dispatched_this_call separately
     // so we don't re-query on every timestamp.
@@ -4833,6 +4864,7 @@ async fn schedule_backfill(
         failed,
         skipped_reasons,
         partial_shard_failures: shard_failures,
+        paused_schedule_warning,
     }))
 }
 
@@ -4862,6 +4894,58 @@ async fn query_running_count(pool: &HarvestDbPool, kind: &ScheduleKind, name: &s
                 .unwrap_or(0),
         };
         total += count;
+    }
+    total
+}
+
+/// Count how many of the planned timestamps already have an execution or DAG run.
+/// Used in dry-run mode to improve the accuracy of the would-dispatch estimate.
+/// Returns 0 on any DB error (safe: slightly over-estimates would-dispatch).
+async fn count_existing_in_window(
+    pool: &HarvestDbPool,
+    kind: &ScheduleKind,
+    name: &str,
+    timestamps: &[chrono::DateTime<chrono::Utc>],
+) -> usize {
+    if timestamps.is_empty() {
+        return 0;
+    }
+    let mut total = 0usize;
+    match kind {
+        ScheduleKind::Workflow => {
+            let workflow_ids: Vec<String> = timestamps
+                .iter()
+                .map(|ts| scheduled_workflow_id_pub(name, *ts))
+                .collect();
+            for (_, shard_pool) in pool.iter_shards() {
+                let Ok(mut conn) = acquire_conn(shard_pool).await else {
+                    continue;
+                };
+                let count: i64 = harvest_workflow_executions::table
+                    .filter(harvest_workflow_executions::workflow_name.eq(name))
+                    .filter(harvest_workflow_executions::workflow_id.eq_any(&workflow_ids))
+                    .count()
+                    .get_result(&mut conn)
+                    .await
+                    .unwrap_or(0);
+                total += usize::try_from(count).unwrap_or(0);
+            }
+        }
+        ScheduleKind::Dag => {
+            for (_, shard_pool) in pool.iter_shards() {
+                let Ok(mut conn) = acquire_conn(shard_pool).await else {
+                    continue;
+                };
+                let count: i64 = harvest_dag_runs::table
+                    .filter(harvest_dag_runs::dag_name.eq(name))
+                    .filter(harvest_dag_runs::logical_date.eq_any(timestamps))
+                    .count()
+                    .get_result(&mut conn)
+                    .await
+                    .unwrap_or(0);
+                total += usize::try_from(count).unwrap_or(0);
+            }
+        }
     }
     total
 }
