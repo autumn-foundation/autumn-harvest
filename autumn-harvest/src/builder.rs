@@ -4,7 +4,7 @@ use std::any::{Any, TypeId};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::context::SharedStateMap;
+use crate::context::{SharedStateMap, WorkflowHistoryPolicy};
 use crate::info::{ActivityInfo, DagInfo, WorkflowInfo};
 use crate::payload_codec::{PayloadCodec, PayloadCodecs};
 use crate::policy::WorkflowSchedule;
@@ -47,6 +47,7 @@ pub struct HarvestBuilder {
     telemetry: Option<TelemetryConfig>,
     retention: RetentionConfig,
     payload_codecs: PayloadCodecs,
+    history_policy: WorkflowHistoryPolicy,
 }
 
 impl std::fmt::Debug for HarvestBuilder {
@@ -61,6 +62,7 @@ impl std::fmt::Debug for HarvestBuilder {
             .field("telemetry_configured", &self.telemetry.is_some())
             .field("retention", &self.retention)
             .field("payload_codecs", &"configured")
+            .field("history_policy", &self.history_policy)
             .finish()
     }
 }
@@ -76,6 +78,7 @@ pub struct BuiltHarvest {
     telemetry: Arc<TelemetryConfig>,
     retention: RetentionConfig,
     payload_codecs: PayloadCodecs,
+    history_policy: WorkflowHistoryPolicy,
 }
 
 impl std::fmt::Debug for BuiltHarvest {
@@ -90,6 +93,7 @@ impl std::fmt::Debug for BuiltHarvest {
             .field("telemetry", &self.telemetry)
             .field("retention", &self.retention)
             .field("payload_codecs", &"configured")
+            .field("history_policy", &self.history_policy)
             .finish()
     }
 }
@@ -200,6 +204,12 @@ impl BuiltHarvest {
         &self.payload_codecs
     }
 
+    /// History-size guardrails applied to workflow contexts and workers.
+    #[must_use]
+    pub const fn history_policy(&self) -> WorkflowHistoryPolicy {
+        self.history_policy
+    }
+
     /// Number of registered workflows.
     #[must_use]
     pub const fn workflow_count(&self) -> usize {
@@ -285,7 +295,8 @@ impl BuiltHarvest {
                 self.activities,
                 Arc::new(self.state),
                 self.telemetry,
-            ),
+            )
+            .with_history_policy(self.history_policy),
             self.dags,
             self.workflow_schedules,
             self.worker_config,
@@ -312,7 +323,8 @@ impl BuiltHarvest {
                 self.activities,
                 Arc::new(self.state),
                 self.telemetry,
-            ),
+            )
+            .with_history_policy(self.history_policy),
             self.dags,
             self.workflow_schedules,
             self.worker_config,
@@ -431,6 +443,23 @@ impl HarvestBuilder {
         self
     }
 
+    /// Override the soft history-size threshold used by
+    /// [`crate::context::WorkflowContext::should_continue_as_new`].
+    #[must_use]
+    pub const fn history_continue_as_new_threshold(mut self, threshold: u64) -> Self {
+        self.history_policy = self
+            .history_policy
+            .with_continue_as_new_threshold(threshold);
+        self
+    }
+
+    /// Configure an opt-in hard cap for workflow history event counts.
+    #[must_use]
+    pub const fn history_event_hard_cap(mut self, cap: u64) -> Self {
+        self.history_policy = self.history_policy.with_event_hard_cap(cap);
+        self
+    }
+
     /// Number of registered workflows (used in tests and diagnostics).
     #[must_use]
     pub const fn workflow_count(&self) -> usize {
@@ -503,6 +532,7 @@ impl HarvestBuilder {
             telemetry: Arc::new(self.telemetry.unwrap_or_default()),
             retention: self.retention,
             payload_codecs: self.payload_codecs.clone(),
+            history_policy: self.history_policy,
         })
     }
 }
@@ -887,6 +917,41 @@ mod tests {
         let built = HarvestBuilder::new().build();
         // Default is a safe no-op: capturing yields nothing.
         assert!(built.telemetry().capture_trace_context().is_none());
+    }
+
+    #[test]
+    fn harvest_builder_defaults_history_guardrails() {
+        let built = HarvestBuilder::new().build();
+        let policy = built.history_policy();
+
+        assert_eq!(policy.continue_as_new_threshold(), 10_000);
+        assert_eq!(policy.event_hard_cap(), None);
+    }
+
+    #[test]
+    fn harvest_builder_accepts_history_guardrail_overrides() {
+        let built = HarvestBuilder::new()
+            .history_continue_as_new_threshold(128)
+            .history_event_hard_cap(256)
+            .build();
+        let policy = built.history_policy();
+
+        assert_eq!(policy.continue_as_new_threshold(), 128);
+        assert_eq!(policy.event_hard_cap(), Some(256));
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn harvest_builder_passes_history_policy_to_worker_registry() {
+        let built = HarvestBuilder::new()
+            .history_continue_as_new_threshold(9)
+            .history_event_hard_cap(11)
+            .build();
+
+        let (registry, _dags, _workflow_schedules, _worker_config) = built.into_worker_parts();
+
+        assert_eq!(registry.history_policy().continue_as_new_threshold(), 9);
+        assert_eq!(registry.history_policy().event_hard_cap(), Some(11));
     }
 
     #[test]

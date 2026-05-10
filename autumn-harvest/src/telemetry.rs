@@ -66,6 +66,12 @@ pub const METRIC_WORKFLOW_STARTED: &str = "harvest.workflow.started";
 /// Histogram: wall-clock seconds a workflow executor cycle took.
 pub const METRIC_WORKFLOW_DURATION: &str = "harvest.workflow.duration";
 
+/// Histogram: number of durable events in a terminal workflow execution history.
+pub const METRIC_WORKFLOW_HISTORY_SIZE: &str = "harvest.workflow.history_size";
+
+/// Counter: incremented once for each continue-as-new rotation.
+pub const METRIC_WORKFLOW_CONTINUE_AS_NEW: &str = "harvest.workflow.continue_as_new";
+
 /// Histogram: wall-clock seconds an activity invocation took (success or failure).
 pub const METRIC_ACTIVITY_DURATION: &str = "harvest.activity.duration";
 
@@ -100,6 +106,8 @@ pub const METRIC_RETENTION_DELETED: &str = "harvest.retention.deleted";
 
 /// Metric label: the workflow name.
 pub const METRIC_LABEL_WORKFLOW: &str = "workflow";
+/// Metric label: the low-cardinality workflow type.
+pub const METRIC_LABEL_WORKFLOW_TYPE: &str = "workflow.type";
 /// Metric label: the activity name.
 pub const METRIC_LABEL_ACTIVITY: &str = "activity";
 /// Metric label: the task queue name.
@@ -358,6 +366,16 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = (workflow_name, queue, duration_secs, status);
     }
 
+    /// A workflow reached a terminal state with this durable history size.
+    fn record_workflow_history_size(&self, workflow_name: &str, event_count: u64) {
+        let _ = (workflow_name, event_count);
+    }
+
+    /// A workflow execution rotated using continue-as-new.
+    fn record_workflow_continue_as_new(&self, workflow_name: &str) {
+        let _ = workflow_name;
+    }
+
     /// An activity invocation finished.
     fn record_activity_completed(
         &self,
@@ -583,6 +601,14 @@ mod tests {
         // OTel semantic naming: instrument.noun (dot-separated).
         assert_eq!(METRIC_WORKFLOW_STARTED, "harvest.workflow.started");
         assert_eq!(METRIC_WORKFLOW_DURATION, "harvest.workflow.duration");
+        assert_eq!(
+            METRIC_WORKFLOW_HISTORY_SIZE,
+            "harvest.workflow.history_size"
+        );
+        assert_eq!(
+            METRIC_WORKFLOW_CONTINUE_AS_NEW,
+            "harvest.workflow.continue_as_new"
+        );
         assert_eq!(METRIC_ACTIVITY_DURATION, "harvest.activity.duration");
         assert_eq!(METRIC_TIMER_STARTED, "harvest.timer.started");
         assert_eq!(METRIC_QUEUE_DEPTH, "harvest.queue.depth");
@@ -590,6 +616,14 @@ mod tests {
         assert_eq!(METRIC_SCHEDULE_RUNS, "harvest.schedule.runs");
         assert_eq!(METRIC_SCHEDULE_SKIPPED, "harvest.schedule.skipped");
         assert_eq!(METRIC_RETENTION_DELETED, "harvest.retention.deleted");
+    }
+
+    #[test]
+    fn metric_label_constants_have_correct_names() {
+        assert_eq!(METRIC_LABEL_WORKFLOW, "workflow");
+        assert_eq!(METRIC_LABEL_WORKFLOW_TYPE, "workflow.type");
+        assert_eq!(METRIC_LABEL_ACTIVITY, "activity");
+        assert_eq!(METRIC_LABEL_QUEUE, "queue");
     }
 
     #[test]
@@ -739,6 +773,8 @@ mod tests {
         // no ExecutionId, no raw UUID params that could smuggle one in.
         rec.record_workflow_started("onboarding", "default");
         rec.record_workflow_completed("onboarding", "default", 1.23, WorkflowStatus::Completed);
+        rec.record_workflow_history_size("onboarding", 42);
+        rec.record_workflow_continue_as_new("onboarding");
         rec.record_activity_completed("send_email", "default", 0.5, ActivityStatus::Completed);
         rec.record_timer_started(60.0);
         rec.record_queue_depth("default", 7);
@@ -774,6 +810,8 @@ mod tests {
             0.01,
             WorkflowStatus::Completed,
         );
+        telemetry.metrics.record_workflow_history_size("demo", 2);
+        telemetry.metrics.record_workflow_continue_as_new("demo");
         telemetry.metrics.record_activity_completed(
             "send_email",
             "default",

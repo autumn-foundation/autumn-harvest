@@ -104,6 +104,72 @@ already know an execution ID, use
 compact terminal body with `state`, `output`/`error`, and `completed_at`, or
 `204 No Content` with `Retry-After` while the workflow is still running.
 
+## Long-running workflows
+
+Every workflow replay loads its durable event history. For pollers, monitors,
+and other workflows that may run for weeks, keep that history bounded by
+tail-calling `continue_as_new` once the loaded event count grows past the
+configured soft threshold:
+
+```rust
+use autumn_harvest::prelude::*;
+
+#[workflow]
+async fn polling_loop(ctx: &WorkflowContext, mut state: serde_json::Value)
+    -> HarvestResult<serde_json::Value>
+{
+    loop {
+        let cycle = state["cycle"].as_u64().unwrap_or(0);
+        let result = ctx
+            .execute_activity_raw("poll_remote_system", state.clone(), "pollers")
+            .await?;
+
+        if result["done"].as_bool().unwrap_or(false) {
+            return Ok(result);
+        }
+
+        let next_state = serde_json::json!({
+            "cycle": cycle + 1,
+            "cursor": result.get("next_cursor").cloned(),
+        });
+
+        if ctx.should_continue_as_new() {
+            ctx.continue_as_new(next_state).await?;
+        }
+
+        let timer_id = format!("poll-delay-{cycle}");
+        ctx.timer(&timer_id, 60).await?;
+        state = next_state;
+    }
+}
+```
+
+`ctx.history_event_count()` reports the number of loaded durable history events.
+`ctx.should_continue_as_new()` turns true once that count exceeds the
+`HarvestBuilder::history_continue_as_new_threshold(...)` soft threshold. The
+default threshold is `10_000` events.
+
+```rust
+let harvest = HarvestBuilder::new()
+    .workflows(workflows![polling_loop])
+    .history_continue_as_new_threshold(5_000)
+    .history_event_hard_cap(20_000)
+    .try_build()?;
+```
+
+The optional hard cap is a last-resort guardrail. If an execution reaches
+`history_event_hard_cap` and the workflow does not issue `continue_as_new`, the
+worker fails the execution and moves it to the DLQ with a typed
+`HistoryCapExceeded { count, cap, workflow_type }` reason. No new workflow event
+variant is used for this guardrail.
+
+Harvest emits `harvest.workflow.history_size` for terminal executions and
+`harvest.workflow.continue_as_new` when a workflow rotates. Both metrics use
+only the workflow type label to keep cardinality boring in the useful way.
+
+See [`autumn-harvest/examples/long_running.rs`](autumn-harvest/examples/long_running.rs)
+for a compile-checked polling loop that works with and without the `db` feature.
+
 ## What you get
 
 - **Event-sourced execution.** Workflows are deterministic functions; their

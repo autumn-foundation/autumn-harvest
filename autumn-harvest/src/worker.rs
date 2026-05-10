@@ -22,10 +22,15 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use crate::builder::WorkerConfig;
-use crate::context::{ActivityContext, SharedState, WorkflowCommand, empty_shared_state};
+use crate::context::{
+    ActivityContext, SharedState, WorkflowCommand, WorkflowHistoryPolicy, empty_shared_state,
+};
+use crate::dlq::{self, DeadLetterReason, NewDeadLetterEntry};
 use crate::error::{HarvestError, HarvestResult};
 use crate::event::WorkflowEvent;
-use crate::executor::{WorkflowExecuteSpanMeta, WorkflowOutcome, run_workflow_with_state};
+use crate::executor::{
+    WorkflowExecuteSpanMeta, WorkflowOutcome, run_workflow_with_state_and_history_policy,
+};
 use crate::external_task;
 use crate::info::{ActivityInfo, WorkflowInfo};
 use crate::models::{
@@ -151,6 +156,8 @@ pub struct HandlerRegistry {
     /// Telemetry bundle (trace-context propagator + metrics recorder) applied
     /// around every dispatch.
     telemetry: Arc<crate::telemetry::TelemetryConfig>,
+    /// History-size thresholds visible to workflow contexts.
+    history_policy: WorkflowHistoryPolicy,
 }
 
 impl HandlerRegistry {
@@ -201,7 +208,28 @@ impl HandlerRegistry {
             activities,
             state,
             telemetry,
+            history_policy: WorkflowHistoryPolicy::default(),
         }
+    }
+
+    /// Create a new registry with shared state, telemetry, and history guardrails.
+    #[must_use]
+    pub fn with_state_telemetry_and_history_policy(
+        workflows: Vec<WorkflowInfo>,
+        activities: Vec<ActivityInfo>,
+        state: SharedState,
+        telemetry: Arc<crate::telemetry::TelemetryConfig>,
+        history_policy: WorkflowHistoryPolicy,
+    ) -> Self {
+        Self::with_state_and_telemetry(workflows, activities, state, telemetry)
+            .with_history_policy(history_policy)
+    }
+
+    /// Override the history guardrails carried by this registry.
+    #[must_use]
+    pub const fn with_history_policy(mut self, history_policy: WorkflowHistoryPolicy) -> Self {
+        self.history_policy = history_policy;
+        self
     }
 
     /// Clone the shared state reference for runtime contexts.
@@ -221,6 +249,12 @@ impl HandlerRegistry {
     pub const fn telemetry(&self) -> &Arc<crate::telemetry::TelemetryConfig> {
         &self.telemetry
     }
+
+    /// History-size guardrails applied to workflow contexts run by this registry.
+    #[must_use]
+    pub const fn history_policy(&self) -> WorkflowHistoryPolicy {
+        self.history_policy
+    }
 }
 
 impl std::fmt::Debug for HandlerRegistry {
@@ -230,6 +264,7 @@ impl std::fmt::Debug for HandlerRegistry {
             .field("activities", &self.activities.keys())
             .field("state_count", &self.state.len())
             .field("telemetry", &self.telemetry)
+            .field("history_policy", &self.history_policy)
             .finish()
     }
 }
@@ -573,6 +608,20 @@ struct LocalActivityRun {
     last_error: Option<String>,
 }
 
+enum LocalActivityInlineOutcome {
+    Complete(Vec<WorkflowEvent>),
+    HistoryCapReached {
+        events: Vec<WorkflowEvent>,
+        event_count: u64,
+    },
+}
+
+fn local_activity_history_cap_reached(next_event_id: i32, cap: Option<u64>) -> Option<u64> {
+    let cap = cap?;
+    let count = u64::try_from(next_event_id).unwrap_or(u64::MAX);
+    (count >= cap).then_some(count)
+}
+
 /// Extract a `RunLocalActivity` command from an owned command list.
 ///
 /// Marker (`RecordMarker`) events are also extracted and returned so the
@@ -638,10 +687,11 @@ async fn run_local_activity_inline(
     run: LocalActivityRun,
     max_start_to_close: Duration,
     next_event_id: &mut i32,
-) -> HarvestResult<Vec<WorkflowEvent>> {
+) -> HarvestResult<LocalActivityInlineOutcome> {
     let activity = registry.activities.get(&run.name).ok_or_else(|| {
         HarvestError::Config(format!("no activity handler registered for '{}'", run.name))
     })?;
+    let history_event_hard_cap = registry.history_policy().event_hard_cap();
 
     let per_attempt_timeout = run
         .start_to_close_secs
@@ -667,6 +717,15 @@ async fn run_local_activity_inline(
     }
 
     let mut all_new_events = prefix_events;
+    if let Some(event_count) =
+        local_activity_history_cap_reached(*next_event_id, history_event_hard_cap)
+    {
+        return Ok(LocalActivityInlineOutcome::HistoryCapReached {
+            events: all_new_events,
+            event_count,
+        });
+    }
+
     let handler = activity.handler;
     let local_idempotency_key = IdempotencyKey::from_activity_exec_id(run.activity_id);
 
@@ -718,7 +777,15 @@ async fn run_local_activity_inline(
                 .await?;
                 *next_event_id += 1;
                 all_new_events.push(completed_event);
-                return Ok(all_new_events);
+                if let Some(event_count) =
+                    local_activity_history_cap_reached(*next_event_id, history_event_hard_cap)
+                {
+                    return Ok(LocalActivityInlineOutcome::HistoryCapReached {
+                        events: all_new_events,
+                        event_count,
+                    });
+                }
+                return Ok(LocalActivityInlineOutcome::Complete(all_new_events));
             }
             Err(error) => {
                 let failed_event = WorkflowEvent::LocalActivityFailed {
@@ -728,6 +795,26 @@ async fn run_local_activity_inline(
                 };
 
                 if attempt == max_attempts {
+                    let current_count = u64::try_from(*next_event_id).unwrap_or(u64::MAX);
+                    let final_pair_would_exceed_cap = history_event_hard_cap
+                        .is_some_and(|cap| current_count.saturating_add(2) > cap);
+                    if final_pair_would_exceed_cap {
+                        store::append_events(
+                            conn,
+                            exec_id,
+                            std::slice::from_ref(&failed_event),
+                            *next_event_id,
+                        )
+                        .await?;
+                        *next_event_id += 1;
+                        all_new_events.push(failed_event);
+                        let event_count = u64::try_from(*next_event_id).unwrap_or(u64::MAX);
+                        return Ok(LocalActivityInlineOutcome::HistoryCapReached {
+                            events: all_new_events,
+                            event_count,
+                        });
+                    }
+
                     // Final attempt: append LocalActivityFailed and
                     // LocalActivityExhausted atomically so a crash between the
                     // two cannot leave history without the terminal marker,
@@ -742,6 +829,14 @@ async fn run_local_activity_inline(
                     *next_event_id += i32::try_from(terminal_pair.len())
                         .map_err(|_| HarvestError::Config("event count overflow".into()))?;
                     all_new_events.extend(terminal_pair);
+                    if let Some(event_count) =
+                        local_activity_history_cap_reached(*next_event_id, history_event_hard_cap)
+                    {
+                        return Ok(LocalActivityInlineOutcome::HistoryCapReached {
+                            events: all_new_events,
+                            event_count,
+                        });
+                    }
                 } else {
                     store::append_events(
                         conn,
@@ -752,6 +847,14 @@ async fn run_local_activity_inline(
                     .await?;
                     *next_event_id += 1;
                     all_new_events.push(failed_event);
+                    if let Some(event_count) =
+                        local_activity_history_cap_reached(*next_event_id, history_event_hard_cap)
+                    {
+                        return Ok(LocalActivityInlineOutcome::HistoryCapReached {
+                            events: all_new_events,
+                            event_count,
+                        });
+                    }
 
                     if let Some(delay) = run
                         .retry_policy
@@ -765,7 +868,7 @@ async fn run_local_activity_inline(
         }
     }
 
-    Ok(all_new_events)
+    Ok(LocalActivityInlineOutcome::Complete(all_new_events))
 }
 
 fn chrono_duration_from_std(
@@ -2565,6 +2668,180 @@ async fn persist_workflow_outcome(
     }
 }
 
+fn pending_update_result_event_count(commands: &[WorkflowCommand]) -> u64 {
+    u64::try_from(
+        commands
+            .iter()
+            .filter(|cmd| matches!(cmd, WorkflowCommand::RecordUpdateResult { .. }))
+            .count(),
+    )
+    .unwrap_or(u64::MAX)
+}
+
+fn terminal_history_event_count(next_event_id: i32, pending_cmds: &[WorkflowCommand]) -> u64 {
+    u64::try_from(next_event_id)
+        .unwrap_or(0)
+        .saturating_add(pending_update_result_event_count(pending_cmds))
+        .saturating_add(1)
+}
+
+fn marker_event_count(commands: &[WorkflowCommand]) -> u64 {
+    u64::try_from(
+        commands
+            .iter()
+            .filter(|cmd| matches!(cmd, WorkflowCommand::RecordMarker { .. }))
+            .count(),
+    )
+    .unwrap_or(u64::MAX)
+}
+
+async fn new_child_workflow_event_count(
+    conn: &mut AsyncPgConnection,
+    children: &[StartedChildWorkflowCommand],
+) -> HarvestResult<u64> {
+    let requested_ids: Vec<uuid::Uuid> = children
+        .iter()
+        .map(|child| child.child_id.as_uuid())
+        .collect();
+    if requested_ids.is_empty() {
+        return Ok(0);
+    }
+
+    let existing_ids: HashSet<uuid::Uuid> = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::id.eq_any(&requested_ids))
+        .select(harvest_workflow_executions::id)
+        .load::<uuid::Uuid>(conn)
+        .await
+        .map_err(crate::error::database_error)?
+        .into_iter()
+        .collect();
+    let requested = u64::try_from(children.len()).unwrap_or(u64::MAX);
+    let existing = u64::try_from(existing_ids.len()).unwrap_or(u64::MAX);
+    Ok(requested.saturating_sub(existing))
+}
+
+async fn suspended_command_event_count(
+    conn: &mut AsyncPgConnection,
+    commands: &[WorkflowCommand],
+) -> HarvestResult<u64> {
+    let update_events = pending_update_result_event_count(commands);
+    let marker_events = marker_event_count(commands);
+    let bookkeeping_events = update_events.saturating_add(marker_events);
+
+    if should_requeue_signal_wait(commands) {
+        return Ok(bookkeeping_events);
+    }
+    if extract_single_schedule_activity(commands).is_some()
+        || extract_single_started_timer(commands).is_some()
+    {
+        return Ok(bookkeeping_events.saturating_add(1));
+    }
+    if let Some(children) = extract_all_started_child_workflows(commands) {
+        return Ok(bookkeeping_events
+            .saturating_add(new_child_workflow_event_count(conn, &children).await?));
+    }
+    if let Some(scheduled) = extract_single_schedule_external_activity(commands) {
+        let awaiting_event = u64::from(
+            external_task::find_by_token(conn, scheduled.token)
+                .await?
+                .is_none(),
+        );
+        return Ok(bookkeeping_events.saturating_add(awaiting_event));
+    }
+
+    Ok(update_events.saturating_add(1))
+}
+
+async fn move_workflow_to_dlq_for_history_cap(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+    exec_id: ExecutionId,
+    next_event_id: i32,
+    worker_id: &str,
+    parent_exec_id: Option<ExecutionId>,
+    reason: DeadLetterReason,
+) -> HarvestResult<()> {
+    let reason = reason.to_string();
+
+    conn.transaction::<(), HarvestError, _>(|conn| {
+        let reason = reason.clone();
+        async move {
+            dlq::dead_letter(
+                conn,
+                &NewDeadLetterEntry {
+                    original_task_id: task.id,
+                    queue_name: task.queue_name.clone(),
+                    task_type: task.task_type.clone(),
+                    workflow_exec_id: task.workflow_exec_id,
+                    activity_name: task.activity_name.clone(),
+                    input: task.input.clone(),
+                    error: reason.clone(),
+                    attempts: task.attempt,
+                },
+            )
+            .await?;
+            store::append_events(
+                conn,
+                exec_id,
+                &[WorkflowEvent::WorkflowFailed {
+                    error: reason.clone(),
+                }],
+                next_event_id,
+            )
+            .await?;
+            update_workflow_execution_failed(conn, exec_id, worker_id, &reason).await?;
+            queue::fail_task(conn, task.id, &reason).await?;
+            if let Some(parent_exec_id) = parent_exec_id {
+                wake_parent_for_child_failure(conn, parent_exec_id, exec_id, &reason).await?;
+            }
+            Ok(())
+        }
+        .scope_boxed()
+    })
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn fail_workflow_for_history_cap(
+    conn: &mut AsyncPgConnection,
+    telemetry: &crate::telemetry::TelemetryConfig,
+    task: &TaskQueueItem,
+    execution: &WorkflowExecution,
+    exec_id: ExecutionId,
+    next_event_id: i32,
+    worker_id: &str,
+    started_at: std::time::Instant,
+    event_count: u64,
+    cap: u64,
+) -> HarvestResult<()> {
+    let terminal_count = u64::try_from(next_event_id).unwrap_or(0).saturating_add(1);
+    telemetry.metrics.record_workflow_completed(
+        &execution.workflow_name,
+        &task.queue_name,
+        started_at.elapsed().as_secs_f64(),
+        WorkflowStatus::Failed,
+    );
+    telemetry
+        .metrics
+        .record_workflow_history_size(&execution.workflow_name, terminal_count);
+
+    let reason = DeadLetterReason::HistoryCapExceeded {
+        count: event_count,
+        cap,
+        workflow_type: execution.workflow_name.clone(),
+    };
+    move_workflow_to_dlq_for_history_cap(
+        conn,
+        task,
+        exec_id,
+        next_event_id,
+        worker_id,
+        execution.parent_id.map(execution_id_from_uuid),
+        reason,
+    )
+    .await
+}
+
 #[allow(clippy::too_many_lines)]
 async fn process_workflow_task(
     conn: &mut AsyncPgConnection,
@@ -2684,12 +2961,13 @@ async fn process_workflow_task(
                 .and_then(|c| c.link_traceparent.clone().or_else(|| c.traceparent.clone())),
         };
 
-        let (run_outcome, pending_cmds, execute_span) = run_workflow_with_state(
+        let (run_outcome, pending_cmds, execute_span) = run_workflow_with_state_and_history_policy(
             prepared.exec_id,
             history_events.clone(),
             workflow.handler,
             task.input.clone(),
             registry.shared_state(),
+            registry.history_policy(),
             Some(&span_meta),
         )
         .await;
@@ -2714,7 +2992,7 @@ async fn process_workflow_task(
                 // so the OTel span closes before we start inline execution.
                 drop(execute_span);
                 let (markers, local_run) = extract_run_local_activity(commands);
-                let new_events = run_local_activity_inline(
+                let inline_outcome = run_local_activity_inline(
                     conn,
                     registry,
                     prepared.exec_id,
@@ -2724,13 +3002,91 @@ async fn process_workflow_task(
                     &mut next_event_id,
                 )
                 .await?;
+                let new_events = match inline_outcome {
+                    LocalActivityInlineOutcome::Complete(events) => events,
+                    LocalActivityInlineOutcome::HistoryCapReached {
+                        events,
+                        event_count,
+                    } => {
+                        history_events.extend(events);
+                        return fail_workflow_for_history_cap(
+                            conn,
+                            &telemetry,
+                            task,
+                            &prepared.execution,
+                            prepared.exec_id,
+                            next_event_id,
+                            worker_id,
+                            started_at,
+                            event_count,
+                            registry
+                                .history_policy()
+                                .event_hard_cap()
+                                .expect("HistoryCapReached requires a configured hard cap"),
+                        )
+                        .await;
+                    }
+                };
                 history_events.extend(new_events);
+                let current_history_event_count =
+                    u64::try_from(history_events.len()).unwrap_or(u64::MAX);
+                if let Some(cap) = registry.history_policy().event_hard_cap()
+                    && current_history_event_count >= cap
+                {
+                    return fail_workflow_for_history_cap(
+                        conn,
+                        &telemetry,
+                        task,
+                        &prepared.execution,
+                        prepared.exec_id,
+                        next_event_id,
+                        worker_id,
+                        started_at,
+                        current_history_event_count,
+                        cap,
+                    )
+                    .await;
+                }
             }
             other => break (other, pending_cmds, execute_span),
         }
     };
 
     let (outcome, pending_cmds, execute_span) = loop_result;
+    let pending_durable_event_count = match &outcome {
+        WorkflowOutcome::Suspended { commands } => {
+            match suspended_command_event_count(conn, commands).await {
+                Ok(count) => count,
+                Err(error) => {
+                    return fail_execution_on_error(conn, task, worker_id, Err::<(), _>(error))
+                        .await;
+                }
+            }
+        }
+        _ => pending_update_result_event_count(&pending_cmds),
+    };
+    let current_history_event_count = u64::try_from(history_events.len())
+        .unwrap_or(u64::MAX)
+        .saturating_add(pending_durable_event_count);
+
+    if let Some(cap) = registry.history_policy().event_hard_cap()
+        && current_history_event_count >= cap
+        && !matches!(&outcome, WorkflowOutcome::ContinuedAsNew { .. })
+    {
+        return fail_workflow_for_history_cap(
+            conn,
+            &telemetry,
+            task,
+            &prepared.execution,
+            prepared.exec_id,
+            next_event_id,
+            worker_id,
+            started_at,
+            current_history_event_count,
+            cap,
+        )
+        .await;
+    }
 
     let status = match &outcome {
         WorkflowOutcome::Completed { .. } => WorkflowStatus::Completed,
@@ -2744,6 +3100,17 @@ async fn process_workflow_task(
         started_at.elapsed().as_secs_f64(),
         status,
     );
+    if !matches!(&outcome, WorkflowOutcome::Suspended { .. }) {
+        telemetry.metrics.record_workflow_history_size(
+            &prepared.execution.workflow_name,
+            terminal_history_event_count(next_event_id, &pending_cmds),
+        );
+    }
+    if matches!(&outcome, WorkflowOutcome::ContinuedAsNew { .. }) {
+        telemetry
+            .metrics
+            .record_workflow_continue_as_new(&prepared.execution.workflow_name);
+    }
 
     // Append UpdateCompleted/UpdateFailed events and apply search-attribute
     // patches for any commands emitted during this live execution cycle before

@@ -369,6 +369,7 @@ impl WorkflowEvent {
             Self::WorkflowCompleted { .. }
                 | Self::WorkflowFailed { .. }
                 | Self::WorkflowCancelled { .. }
+                | Self::WorkflowContinuedAsNew { .. }
                 | Self::WorkflowResetTerminated { .. }
         )
     }

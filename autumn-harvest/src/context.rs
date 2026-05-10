@@ -37,6 +37,53 @@ pub fn empty_shared_state() -> SharedState {
     Arc::new(HashMap::new())
 }
 
+/// Default soft history-size threshold for recommending `continue_as_new`.
+pub const DEFAULT_HISTORY_CONTINUE_AS_NEW_THRESHOLD: u64 = 10_000;
+
+/// Replay-safe history guardrails made available to workflow code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkflowHistoryPolicy {
+    continue_as_new_threshold: u64,
+    event_hard_cap: Option<u64>,
+}
+
+impl Default for WorkflowHistoryPolicy {
+    fn default() -> Self {
+        Self {
+            continue_as_new_threshold: DEFAULT_HISTORY_CONTINUE_AS_NEW_THRESHOLD,
+            event_hard_cap: None,
+        }
+    }
+}
+
+impl WorkflowHistoryPolicy {
+    /// Soft threshold used by [`WorkflowContext::should_continue_as_new`].
+    #[must_use]
+    pub const fn continue_as_new_threshold(self) -> u64 {
+        self.continue_as_new_threshold
+    }
+
+    /// Optional hard cap that moves an execution to the DLQ when exceeded.
+    #[must_use]
+    pub const fn event_hard_cap(self) -> Option<u64> {
+        self.event_hard_cap
+    }
+
+    /// Override the soft continue-as-new threshold.
+    #[must_use]
+    pub const fn with_continue_as_new_threshold(mut self, threshold: u64) -> Self {
+        self.continue_as_new_threshold = threshold;
+        self
+    }
+
+    /// Override the optional hard cap.
+    #[must_use]
+    pub const fn with_event_hard_cap(mut self, cap: u64) -> Self {
+        self.event_hard_cap = Some(cap);
+        self
+    }
+}
+
 #[cfg(feature = "db")]
 type ActivityCancellationPool =
     diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>;
@@ -421,6 +468,8 @@ pub struct WorkflowContext {
     commands: Mutex<Vec<WorkflowCommand>>,
     /// Deterministic "now" -- the timestamp from the `WorkflowStarted` event.
     start_time: DateTime<Utc>,
+    /// History-size thresholds visible to author code.
+    history_policy: WorkflowHistoryPolicy,
     /// Monotonically increasing counter for generating activity sequence IDs.
     activity_seq: Mutex<u32>,
     /// Shared typed state map (same `AppState` extras as the web server).
@@ -489,6 +538,20 @@ impl WorkflowContext {
         events: Vec<WorkflowEvent>,
         state: SharedState,
     ) -> Self {
+        Self::for_replay_with_state_and_history_policy(
+            exec_id,
+            events,
+            state,
+            WorkflowHistoryPolicy::default(),
+        )
+    }
+
+    pub(crate) fn for_replay_with_state_and_history_policy(
+        exec_id: ExecutionId,
+        events: Vec<WorkflowEvent>,
+        state: SharedState,
+        history_policy: WorkflowHistoryPolicy,
+    ) -> Self {
         // Extract the start_time from WorkflowStarted (first event).
         let start_time = events
             .first()
@@ -515,6 +578,7 @@ impl WorkflowContext {
             matcher: Mutex::new(matcher),
             commands: Mutex::new(Vec::new()),
             start_time,
+            history_policy,
             activity_seq: Mutex::new(0),
             state,
             query_registry: Mutex::new(QueryRegistry::new()),
@@ -577,6 +641,7 @@ impl WorkflowContext {
             matcher: Mutex::new(HistoryMatcher::new(vec![])),
             commands: Mutex::new(Vec::new()),
             start_time,
+            history_policy: WorkflowHistoryPolicy::default(),
             activity_seq: Mutex::new(0),
             state: empty_shared_state(),
             query_registry: Mutex::new(QueryRegistry::new()),
@@ -599,6 +664,23 @@ impl WorkflowContext {
     #[must_use]
     pub const fn execution_id(&self) -> ExecutionId {
         self.exec_id
+    }
+
+    /// Number of events currently loaded in this workflow execution history.
+    ///
+    /// This is replay-safe: it is computed from the in-memory history snapshot
+    /// loaded before the current workflow task, not from a side-effecting
+    /// counter maintained by author code.
+    #[must_use]
+    pub fn history_event_count(&self) -> u64 {
+        self.match_history(|matcher| matcher.event_count())
+    }
+
+    /// Returns `true` once [`Self::history_event_count`] exceeds the configured
+    /// soft continue-as-new threshold.
+    #[must_use]
+    pub fn should_continue_as_new(&self) -> bool {
+        self.history_event_count() > self.history_policy.continue_as_new_threshold()
     }
 
     /// Returns `true` if the context is currently replaying recorded history
@@ -2253,6 +2335,89 @@ mod tests {
     use crate::error::TimeoutType;
     use crate::types::ActivityExecId;
     use chrono::Utc;
+
+    #[test]
+    fn workflow_context_history_event_count_reports_loaded_history() {
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "poll_for_work".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: serde_json::json!({"work": false}),
+            },
+        ];
+
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+
+        assert_eq!(ctx.history_event_count(), 3);
+        assert!(
+            ctx.is_replaying(),
+            "counting history must not advance replay"
+        );
+    }
+
+    #[test]
+    fn workflow_context_should_continue_as_new_uses_soft_threshold() {
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "poll-cycle".into(),
+                details: serde_json::json!({"n": 1}),
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "poll-cycle".into(),
+                details: serde_json::json!({"n": 2}),
+            },
+        ];
+        let policy = WorkflowHistoryPolicy::default().with_continue_as_new_threshold(2);
+
+        let ctx = WorkflowContext::for_replay_with_state_and_history_policy(
+            ExecutionId::new(),
+            events,
+            empty_shared_state(),
+            policy,
+        );
+
+        assert_eq!(ctx.history_event_count(), 3);
+        assert!(ctx.should_continue_as_new());
+    }
+
+    #[test]
+    fn workflow_context_should_continue_as_new_is_false_at_threshold_boundary() {
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "poll-cycle".into(),
+                details: serde_json::json!({"n": 1}),
+            },
+        ];
+        let policy = WorkflowHistoryPolicy::default().with_continue_as_new_threshold(2);
+
+        let ctx = WorkflowContext::for_replay_with_state_and_history_policy(
+            ExecutionId::new(),
+            events,
+            empty_shared_state(),
+            policy,
+        );
+
+        assert_eq!(ctx.history_event_count(), 2);
+        assert!(!ctx.should_continue_as_new());
+    }
 
     #[tokio::test]
     async fn workflow_context_continue_as_new_pushes_terminal_command() {

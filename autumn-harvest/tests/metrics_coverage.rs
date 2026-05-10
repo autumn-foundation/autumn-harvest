@@ -13,8 +13,8 @@ use std::sync::{Arc, Mutex};
 use autumn_harvest::telemetry::{
     ActivityStatus, METRIC_ACTIVITY_DURATION, METRIC_DLQ_ENTRIES, METRIC_QUEUE_DEPTH,
     METRIC_RETENTION_DELETED, METRIC_SCHEDULE_RUNS, METRIC_SCHEDULE_SKIPPED, METRIC_TIMER_STARTED,
-    METRIC_WORKFLOW_DURATION, METRIC_WORKFLOW_STARTED, MetricsRecorder, NoOpMetrics,
-    WorkflowStatus,
+    METRIC_WORKFLOW_CONTINUE_AS_NEW, METRIC_WORKFLOW_DURATION, METRIC_WORKFLOW_HISTORY_SIZE,
+    METRIC_WORKFLOW_STARTED, MetricsRecorder, NoOpMetrics, WorkflowStatus,
 };
 
 // ---------------------------------------------------------------------------
@@ -69,6 +69,23 @@ impl MetricsRecorder for RecordingMetrics {
                 ("queue", queue.to_owned()),
                 ("status", status.as_str().to_owned()),
             ],
+        });
+    }
+
+    fn record_workflow_history_size(&self, workflow_name: &str, event_count: u64) {
+        self.samples.lock().unwrap().push(MetricSample {
+            name: METRIC_WORKFLOW_HISTORY_SIZE,
+            labels: vec![
+                ("workflow.type", workflow_name.to_owned()),
+                ("count", event_count.to_string()),
+            ],
+        });
+    }
+
+    fn record_workflow_continue_as_new(&self, workflow_name: &str) {
+        self.samples.lock().unwrap().push(MetricSample {
+            name: METRIC_WORKFLOW_CONTINUE_AS_NEW,
+            labels: vec![("workflow.type", workflow_name.to_owned())],
         });
     }
 
@@ -161,6 +178,8 @@ fn all_catalogue_metrics_are_reachable_via_trait() {
 
     rec.record_workflow_started("my_workflow", "default");
     rec.record_workflow_completed("my_workflow", "default", 1.0, WorkflowStatus::Completed);
+    rec.record_workflow_history_size("my_workflow", 42);
+    rec.record_workflow_continue_as_new("my_workflow");
     rec.record_activity_completed("my_activity", "default", 0.5, ActivityStatus::Completed);
     rec.record_timer_started(30.0);
     rec.record_queue_depth("default", 5);
@@ -180,6 +199,28 @@ fn all_catalogue_metrics_are_reachable_via_trait() {
         names.contains(&METRIC_WORKFLOW_DURATION),
         "harvest.workflow.duration not sampled"
     );
+    assert!(
+        names.contains(&METRIC_WORKFLOW_HISTORY_SIZE),
+        "harvest.workflow.history_size not sampled"
+    );
+    assert!(
+        names.contains(&METRIC_WORKFLOW_CONTINUE_AS_NEW),
+        "harvest.workflow.continue_as_new not sampled"
+    );
+    for sample in samples.iter().filter(|sample| {
+        matches!(
+            sample.name,
+            METRIC_WORKFLOW_HISTORY_SIZE | METRIC_WORKFLOW_CONTINUE_AS_NEW
+        )
+    }) {
+        assert!(
+            sample
+                .labels
+                .iter()
+                .any(|(key, value)| *key == "workflow.type" && value == "my_workflow"),
+            "new workflow-history metrics must use workflow.type only; got {sample:?}"
+        );
+    }
     assert!(
         names.contains(&METRIC_ACTIVITY_DURATION),
         "harvest.activity.duration not sampled"
@@ -219,6 +260,8 @@ fn cardinality_no_execution_id_label_on_any_metric() {
 
     rec.record_workflow_started("wf", "default");
     rec.record_workflow_completed("wf", "default", 1.0, WorkflowStatus::Failed);
+    rec.record_workflow_history_size("wf", 12);
+    rec.record_workflow_continue_as_new("wf");
     rec.record_activity_completed("act", "default", 0.5, ActivityStatus::Failed);
     rec.record_timer_started(10.0);
     rec.record_queue_depth("default", 0);
@@ -312,6 +355,8 @@ fn noop_metrics_implements_all_catalogue_methods() {
     let rec: Arc<dyn MetricsRecorder> = Arc::new(NoOpMetrics);
     rec.record_workflow_started("wf", "q");
     rec.record_workflow_completed("wf", "q", 1.0, WorkflowStatus::Completed);
+    rec.record_workflow_history_size("wf", 2);
+    rec.record_workflow_continue_as_new("wf");
     rec.record_activity_completed("act", "q", 0.5, ActivityStatus::Completed);
     rec.record_timer_started(5.0);
     rec.record_queue_depth("q", 0);

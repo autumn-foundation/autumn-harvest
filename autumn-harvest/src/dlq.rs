@@ -94,6 +94,28 @@ pub struct BulkDlqResult {
     pub failures: Vec<BulkDlqFailure>,
 }
 
+/// Typed dead-letter reason for engine-authored DLQ entries.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type")]
+pub enum DeadLetterReason {
+    /// Workflow history reached the operator-configured hard cap without
+    /// author code explicitly rotating via `continue_as_new`.
+    HistoryCapExceeded {
+        count: u64,
+        cap: u64,
+        workflow_type: String,
+    },
+}
+
+impl std::fmt::Display for DeadLetterReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match serde_json::to_string(self) {
+            Ok(json) => f.write_str(&json),
+            Err(_) => f.write_str("DeadLetterReasonSerializationFailed"),
+        }
+    }
+}
+
 fn dead_letter_task_type(dead_letter_id: Uuid, task_type: &str) -> HarvestResult<TaskType> {
     if task_type.eq_ignore_ascii_case("workflow") {
         Ok(TaskType::Workflow)
@@ -553,6 +575,22 @@ mod tests {
         assert!(
             matches!(error, HarvestError::Config(message) if message.contains("invalid task_type"))
         );
+    }
+
+    #[test]
+    fn dead_letter_reason_history_cap_is_typed_json() {
+        let reason = DeadLetterReason::HistoryCapExceeded {
+            count: 12_001,
+            cap: 12_000,
+            workflow_type: "billing_poll".into(),
+        };
+
+        let json = reason.to_string();
+        let back: DeadLetterReason =
+            serde_json::from_str(&json).expect("typed reason should deserialize");
+
+        assert_eq!(back, reason);
+        assert!(json.contains("HistoryCapExceeded"));
     }
 
     #[test]
