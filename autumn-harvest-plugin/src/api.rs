@@ -1100,10 +1100,12 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .layer(Extension(api_state))
 }
 
-/// Returns the canonical list of all `(METHOD, path-template)` pairs registered
-/// by `harvest_api_router`.  The contract regression test compares this list
-/// against `docs/api-contract.json`; update both together whenever routes change.
-pub fn management_api_routes() -> &'static [(&'static str, &'static str)] {
+/// Canonical `(METHOD, path-template)` list for every route in `harvest_api_router`.
+///
+/// The contract regression test compares this list against `docs/api-contract.json`;
+/// update both together whenever routes change.
+#[must_use]
+pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] {
     &[
         // ── workflows ────────────────────────────────────────────────────────
         ("GET", "/workflows"),
@@ -1167,14 +1169,12 @@ pub fn management_api_routes() -> &'static [(&'static str, &'static str)] {
 
 /// Canonical request-body field registry for every mutating management route.
 ///
-/// Each entry is `(method, path_template, fields)` where `fields` is:
-/// - `Some(&[...])` — structured body with these named top-level JSON keys
-/// - `None`         — free-form body (opaque payload, e.g. signal)
-///
-/// This registry is compared against `docs/api-contract.json` by the contract
-/// regression test.  Update this list and the contract together whenever you
-/// add, remove, or rename a request field.
-pub fn management_api_request_fields() -> &'static [(&'static str, &'static str, Option<&'static [&'static str]>)] {
+/// Each entry is `(method, path_template, fields)` where `fields` is
+/// `Some(&[...])` for a structured body or `None` for a free-form body.
+/// Compared against `docs/api-contract.json` by the regression test; update
+/// both together when adding, removing, or renaming a request field.
+#[must_use]
+pub const fn management_api_request_fields() -> &'static [(&'static str, &'static str, Option<&'static [&'static str]>)] {
     &[
         // ── workflows ────────────────────────────────────────────────────────
         ("POST", "/workflows/{workflow_name}/start", Some(&[
@@ -1222,15 +1222,13 @@ pub fn management_api_request_fields() -> &'static [(&'static str, &'static str,
 
 /// Canonical success-response field registry for every management route.
 ///
-/// Each entry is `(method, path_template, fields)` where `fields` is:
-/// - `Some(&[...])` — structured JSON object with these top-level keys
-/// - `None`         — free-form response (array, external model, or polymorphic)
-///
-/// This registry is compared against `docs/api-contract.json`
-/// (`success_response.fields` / `success_response.free_form`) by the contract
-/// regression test.  Update this list and the contract together whenever you
-/// add, remove, or rename a top-level response field.
-pub fn management_api_response_fields() -> &'static [(&'static str, &'static str, Option<&'static [&'static str]>)] {
+/// Each entry is `(method, path_template, fields)` where `fields` is
+/// `Some(&[...])` for a structured object response or `None` for a free-form
+/// response (array, external model, or polymorphic).  Compared against
+/// `docs/api-contract.json` by the regression test; update both together when
+/// adding, removing, or renaming a top-level response field.
+#[must_use]
+pub const fn management_api_response_fields() -> &'static [(&'static str, &'static str, Option<&'static [&'static str]>)] {
     &[
         // ── workflows ────────────────────────────────────────────────────────
         ("GET",  "/workflows",                            None), // Vec<WorkflowExecution>
