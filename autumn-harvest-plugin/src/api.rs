@@ -4651,6 +4651,27 @@ async fn schedule_backfill(
                     failed += 1;
                     continue;
                 };
+
+                // Pre-check across ALL states including CONTINUED_AS_NEW / TERMINATED.
+                // `start_or_load_workflow_execution` uses a partial unique index that
+                // excludes sealed rows, so a sealed prior execution does not conflict
+                // and would allow a duplicate to be created. Backfill must not reuse
+                // sealed workflow IDs because the timestamp was already dispatched.
+                let prior: i64 = harvest_workflow_executions::table
+                    .filter(harvest_workflow_executions::workflow_name.eq(&wf_name))
+                    .filter(harvest_workflow_executions::workflow_id.eq(&workflow_id))
+                    .count()
+                    .get_result::<i64>(&mut conn)
+                    .await
+                    .unwrap_or(0);
+                if prior > 0 {
+                    skipped += 1;
+                    *skipped_reasons
+                        .entry("already_exists".to_string())
+                        .or_insert(0) += 1;
+                    continue;
+                }
+
                 let result = start_or_load_workflow_execution(
                     &mut conn,
                     StartWorkflowParams {
