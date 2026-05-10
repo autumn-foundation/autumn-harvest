@@ -71,6 +71,10 @@ required-features = ["testing", "db"]
 name = "build_routing_tests"
 required-features = ["db"]
 
+[[test]]
+name = "workflow_handle_tests"
+required-features = ["db"]
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 testcontainers = { workspace = true }
