@@ -2,8 +2,8 @@
 //!
 //! Activities send heartbeat payloads via an mpsc channel. This module spawns
 //! a background Tokio task that receives those payloads, debounces them (keeping
-//! only the most recent), and periodically flushes the heartbeat timestamp to
-//! the database.
+//! only the most recent), and periodically flushes the heartbeat timestamp and
+//! payload to the database.
 //!
 //! The flusher runs every 1 second, draining all pending heartbeats and keeping
 //! only the last one. This avoids hammering Postgres with per-heartbeat writes
@@ -24,7 +24,7 @@ use diesel_async::pooled_connection::deadpool::Pool;
 ///
 /// 1. Wait up to 1 second for heartbeats to arrive.
 /// 2. Drain all pending heartbeats, keeping only the most recent.
-/// 3. Call `queue::record_heartbeat()` to update the DB timestamp.
+/// 3. Call `queue::record_heartbeat()` to update the DB timestamp and payload.
 /// 4. Repeat until the cancellation token is triggered.
 ///
 /// The returned sender has a buffer of 64 messages -- if the activity sends
@@ -71,10 +71,12 @@ async fn heartbeat_loop(
         }
 
         // If we got at least one heartbeat, flush to DB.
-        if latest.is_some() {
+        if let Some(payload) = latest {
             match pool.get().await {
                 Ok(mut conn) => {
-                    if let Err(e) = crate::queue::record_heartbeat(&mut conn, task_id).await {
+                    if let Err(e) =
+                        crate::queue::record_heartbeat(&mut conn, task_id, payload).await
+                    {
                         tracing::warn!(
                             task_id = %task_id,
                             error = %e,

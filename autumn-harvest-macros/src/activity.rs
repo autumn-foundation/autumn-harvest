@@ -2,7 +2,7 @@
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
-use syn::{Expr, ItemFn, LitStr, parse::Parser as _};
+use syn::{Expr, ItemFn, LitInt, LitStr, parse::Parser as _};
 
 struct ActivityAttrs {
     retry: Option<Expr>,
@@ -10,6 +10,9 @@ struct ActivityAttrs {
     heartbeat_timeout: Option<String>,
     schedule_to_start: Option<String>,
     queue: Option<String>,
+    max_concurrent: Option<u32>,
+    concurrency_key: Option<String>,
+    local: bool,
 }
 
 fn parse_attrs(attr: TokenStream) -> syn::Result<ActivityAttrs> {
@@ -19,6 +22,9 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<ActivityAttrs> {
         heartbeat_timeout: None,
         schedule_to_start: None,
         queue: None,
+        max_concurrent: None,
+        concurrency_key: None,
+        local: false,
     };
 
     syn::meta::parser(|meta| {
@@ -44,8 +50,24 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<ActivityAttrs> {
             let value: LitStr = meta.value()?.parse()?;
             result.queue = Some(value.value());
             Ok(())
+        } else if meta.path.is_ident("max_concurrent") {
+            let value: LitInt = meta.value()?.parse()?;
+            let n: u32 = value.base10_parse()?;
+            if n == 0 {
+                return Err(meta.error("max_concurrent must be greater than zero"));
+            }
+            result.max_concurrent = Some(n);
+            Ok(())
+        } else if meta.path.is_ident("concurrency_key") {
+            let value: LitStr = meta.value()?.parse()?;
+            result.concurrency_key = Some(value.value());
+            Ok(())
+        } else if meta.path.is_ident("local") {
+            let value: syn::LitBool = meta.value()?.parse()?;
+            result.local = value.value();
+            Ok(())
         } else {
-            Err(meta.error("unsupported attribute: expected retry, start_to_close, heartbeat_timeout, schedule_to_start, or queue"))
+            Err(meta.error("unsupported attribute: expected retry, start_to_close, heartbeat_timeout, schedule_to_start, queue, max_concurrent, concurrency_key, or local"))
         }
     })
     .parse2(attr)?;
@@ -81,6 +103,35 @@ pub fn activity_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             "#[activity] functions must be async",
         )
         .to_compile_error();
+    }
+
+    // Local activities may only use start_to_close. Emit a clear compile error
+    // for any unsupported option to prevent silent misconfiguration.
+    if attrs.local {
+        if attrs.heartbeat_timeout.is_some() {
+            return syn::Error::new_spanned(
+                input_fn.sig.fn_token,
+                "local activities do not support heartbeat_timeout; \
+                 use a regular activity if you need heartbeating",
+            )
+            .to_compile_error();
+        }
+        if attrs.schedule_to_start.is_some() {
+            return syn::Error::new_spanned(
+                input_fn.sig.fn_token,
+                "local activities do not support schedule_to_start; \
+                 local activities always run inline on the workflow worker",
+            )
+            .to_compile_error();
+        }
+        if attrs.queue.is_some() {
+            return syn::Error::new_spanned(
+                input_fn.sig.fn_token,
+                "local activities do not support queue; \
+                 local activities always run on the worker executing the workflow",
+            )
+            .to_compile_error();
+        }
     }
 
     let fn_name = &input_fn.sig.ident;
@@ -120,6 +171,24 @@ pub fn activity_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         .queue
         .as_deref()
         .map_or_else(|| quote! { None }, |q| quote! { Some(#q) });
+
+    let max_concurrent_expr = attrs
+        .max_concurrent
+        .map_or_else(|| quote! { None }, |n| quote! { Some(#n) });
+
+    // Default concurrency_key to the activity's own name when max_concurrent is
+    // set but no explicit key was provided. This ensures each activity caps
+    // itself independently unless the operator deliberately groups activities.
+    let concurrency_key_expr = match attrs.concurrency_key.as_deref() {
+        Some(key) => quote! { Some(#key) },
+        None => {
+            if attrs.max_concurrent.is_some() {
+                quote! { Some(#fn_name_str) }
+            } else {
+                quote! { None }
+            }
+        }
+    };
 
     let params: Vec<_> = input_fn.sig.inputs.iter().skip(1).collect();
     let param_names: Vec<_> = params
@@ -173,6 +242,8 @@ pub fn activity_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
+    let is_local = attrs.local;
+
     quote! {
         #input_fn
 
@@ -186,6 +257,9 @@ pub fn activity_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 default_heartbeat_timeout: #heartbeat_timeout_expr,
                 default_schedule_to_start: #schedule_to_start_expr,
                 default_queue: #queue_expr,
+                max_concurrent: #max_concurrent_expr,
+                concurrency_key: #concurrency_key_expr,
+                is_local: #is_local,
                 handler: |ctx, input| {
                     ::std::boxed::Box::pin(async move {
                         #dispatch

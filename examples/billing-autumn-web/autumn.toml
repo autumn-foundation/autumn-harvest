@@ -1,0 +1,15 @@
+[server]
+port = 8081
+
+[database]
+url = "postgres://billing:billing@localhost:5433/billing"
+
+[harvest]
+mode = "embedded"
+worker_enabled = true
+scheduler_enabled = true
+
+[harvest.outbox]
+enabled = true
+batch_size = 32
+poll_interval_ms = 500

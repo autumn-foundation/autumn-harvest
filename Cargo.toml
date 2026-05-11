@@ -5,6 +5,9 @@ members = [
     "autumn-harvest-macros",
     "autumn-harvest-cli",
     "autumn-harvest-redis",
+    "examples/billing-autumn-web",
+    "examples/quickstart",
+    "examples/standalone-runner",
 ]
 resolver = "3"
 
@@ -22,7 +25,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "1.1"
 thiserror = "2"
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
 futures = "0.3"

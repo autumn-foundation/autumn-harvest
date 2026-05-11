@@ -327,3 +327,252 @@ async fn replay_handles_failed_activity() {
         other => panic!("expected Failed, got {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Local activity replay tests
+// ---------------------------------------------------------------------------
+
+/// Workflow that uses one local activity (format) followed by one regular activity.
+fn mixed_local_regular_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let formatted = ctx
+            .execute_local_activity_raw("format_data", Value::Null, None, None)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let sent = ctx
+            .execute_activity_raw("send_email", formatted.clone(), "default")
+            .await
+            .map_err(|e| e.to_string())?;
+
+        Ok(serde_json::json!({"formatted": formatted, "sent": sent}))
+    })
+}
+
+/// Workflow that uses only local activities (no regular queue activities).
+fn all_local_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let r1 = ctx
+            .execute_local_activity_raw("step_1", Value::Null, None, None)
+            .await
+            .map_err(|e| e.to_string())?;
+        let r2 = ctx
+            .execute_local_activity_raw("step_2", r1.clone(), None, None)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({"first": r1, "second": r2}))
+    })
+}
+
+#[tokio::test]
+async fn local_activity_completes_from_full_history() {
+    let local_id = ActivityExecId::new();
+    let regular_id = ActivityExecId::new();
+    let local_out = serde_json::json!("formatted-text");
+    let regular_out = serde_json::json!({"email_id": "msg-999"});
+    let exec_id = ExecutionId::new();
+
+    let history = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+        },
+        WorkflowEvent::LocalActivityScheduled {
+            activity_id: local_id,
+            name: "format_data".into(),
+            input: Value::Null,
+        },
+        WorkflowEvent::LocalActivityCompleted {
+            activity_id: local_id,
+            output: local_out.clone(),
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: regular_id,
+            name: "send_email".into(),
+            input: local_out.clone(),
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: regular_id,
+            output: regular_out.clone(),
+        },
+    ];
+
+    let outcome = run_workflow(exec_id, history, mixed_local_regular_workflow, Value::Null).await;
+
+    match outcome {
+        WorkflowOutcome::Completed { output } => {
+            assert_eq!(output["formatted"], local_out);
+            assert_eq!(output["sent"], regular_out);
+        }
+        other => panic!("expected Completed, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn local_activity_suspends_when_not_in_history() {
+    let exec_id = ExecutionId::new();
+
+    // History has only WorkflowStarted — local activity is new.
+    let history = vec![WorkflowEvent::WorkflowStarted {
+        input: Value::Null,
+        timestamp: Utc::now(),
+    }];
+
+    let outcome = run_workflow(exec_id, history, mixed_local_regular_workflow, Value::Null).await;
+
+    match outcome {
+        WorkflowOutcome::Suspended { commands } => {
+            assert_eq!(commands.len(), 1);
+            assert!(
+                matches!(
+                    &commands[0],
+                    autumn_harvest::context::WorkflowCommand::RunLocalActivity { name, .. }
+                    if name == "format_data"
+                ),
+                "expected RunLocalActivity for format_data, got {commands:?}"
+            );
+        }
+        other => panic!("expected Suspended, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn local_activity_replays_correctly_across_simulated_worker_restart() {
+    let id1 = ActivityExecId::new();
+    let id2 = ActivityExecId::new();
+    let out1 = serde_json::json!("step1-result");
+    let out2 = serde_json::json!("step2-result");
+    let exec_id = ExecutionId::new();
+
+    // Full history: both local activities completed.
+    let history = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+        },
+        WorkflowEvent::LocalActivityScheduled {
+            activity_id: id1,
+            name: "step_1".into(),
+            input: Value::Null,
+        },
+        WorkflowEvent::LocalActivityCompleted {
+            activity_id: id1,
+            output: out1.clone(),
+        },
+        WorkflowEvent::LocalActivityScheduled {
+            activity_id: id2,
+            name: "step_2".into(),
+            input: out1.clone(),
+        },
+        WorkflowEvent::LocalActivityCompleted {
+            activity_id: id2,
+            output: out2.clone(),
+        },
+    ];
+
+    let outcome = run_workflow(exec_id, history, all_local_workflow, Value::Null).await;
+
+    match outcome {
+        WorkflowOutcome::Completed { output } => {
+            assert_eq!(output["first"], out1);
+            assert_eq!(output["second"], out2);
+        }
+        other => panic!("expected Completed, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn local_activity_with_retry_in_history_replays_final_success() {
+    let id1 = ActivityExecId::new();
+    let id2 = ActivityExecId::new();
+    let final_out = serde_json::json!("ok");
+    let exec_id = ExecutionId::new();
+
+    // History shows two failed attempts for step_1, then success, then step_2.
+    let history = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+        },
+        WorkflowEvent::LocalActivityScheduled {
+            activity_id: id1,
+            name: "step_1".into(),
+            input: Value::Null,
+        },
+        WorkflowEvent::LocalActivityFailed {
+            activity_id: id1,
+            error: "transient".into(),
+            attempt: 1,
+        },
+        WorkflowEvent::LocalActivityFailed {
+            activity_id: id1,
+            error: "still transient".into(),
+            attempt: 2,
+        },
+        WorkflowEvent::LocalActivityCompleted {
+            activity_id: id1,
+            output: final_out.clone(),
+        },
+        WorkflowEvent::LocalActivityScheduled {
+            activity_id: id2,
+            name: "step_2".into(),
+            input: final_out.clone(),
+        },
+        WorkflowEvent::LocalActivityCompleted {
+            activity_id: id2,
+            output: serde_json::json!("done"),
+        },
+    ];
+
+    let outcome = run_workflow(exec_id, history, all_local_workflow, Value::Null).await;
+
+    match outcome {
+        WorkflowOutcome::Completed { output } => {
+            assert_eq!(output["first"], final_out);
+        }
+        other => panic!("expected Completed, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn local_activity_exhausted_retries_fails_the_workflow() {
+    let id = ActivityExecId::new();
+    let exec_id = ExecutionId::new();
+
+    // History shows one failed attempt with no completion (retries exhausted).
+    let history = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+        },
+        WorkflowEvent::LocalActivityScheduled {
+            activity_id: id,
+            name: "step_1".into(),
+            input: Value::Null,
+        },
+        WorkflowEvent::LocalActivityFailed {
+            activity_id: id,
+            error: "permanent failure".into(),
+            attempt: 1,
+        },
+    ];
+
+    let outcome = run_workflow(exec_id, history, all_local_workflow, Value::Null).await;
+
+    match outcome {
+        WorkflowOutcome::Failed { error } => {
+            assert!(
+                error.contains("permanent failure") || error.contains("step_1"),
+                "error should mention failure, got: {error}"
+            );
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+}

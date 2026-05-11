@@ -4,8 +4,11 @@ use std::any::{Any, TypeId};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::context::SharedStateMap;
+use crate::context::{SharedStateMap, WorkflowHistoryPolicy};
 use crate::info::{ActivityInfo, DagInfo, WorkflowInfo};
+use crate::payload_codec::{PayloadCodec, PayloadCodecs};
+use crate::policy::WorkflowSchedule;
+use crate::retention::RetentionConfig;
 use crate::telemetry::TelemetryConfig;
 use crate::types::ShardId;
 
@@ -14,14 +17,37 @@ use crate::types::ShardId;
 /// In a full Autumn app, this is consumed by `HarvestPlugin` from the
 /// `autumn-harvest-plugin` crate. In tests or standalone use, call
 /// `.build()` directly.
+///
+/// ## Examples
+///
+/// ```rust
+/// use autumn_harvest::builder::{HarvestBuilder, WorkerConfig};
+///
+/// struct DatabasePool;
+///
+/// let built = HarvestBuilder::new()
+///     .workflows(vec![]) // usually from workflows![]
+///     .activities(vec![]) // usually from activities![]
+///     .dags(vec![]) // usually from dags![]
+///     .worker(WorkerConfig::default())
+///     .state(DatabasePool)
+///     .build();
+///
+/// assert_eq!(built.workflow_count(), 0);
+/// assert!(built.state::<DatabasePool>().is_some());
+/// ```
 #[derive(Default)]
 pub struct HarvestBuilder {
     workflows: Vec<WorkflowInfo>,
     activities: Vec<ActivityInfo>,
     dags: Vec<DagInfo>,
+    workflow_schedules: Vec<WorkflowSchedule>,
     worker_config: WorkerConfig,
     state: SharedStateMap,
     telemetry: Option<TelemetryConfig>,
+    retention: RetentionConfig,
+    payload_codecs: PayloadCodecs,
+    history_policy: WorkflowHistoryPolicy,
 }
 
 impl std::fmt::Debug for HarvestBuilder {
@@ -30,9 +56,13 @@ impl std::fmt::Debug for HarvestBuilder {
             .field("workflow_count", &self.workflows.len())
             .field("activity_count", &self.activities.len())
             .field("dag_count", &self.dags.len())
+            .field("workflow_schedule_count", &self.workflow_schedules.len())
             .field("worker_config", &self.worker_config)
             .field("state_count", &self.state.len())
             .field("telemetry_configured", &self.telemetry.is_some())
+            .field("retention", &self.retention)
+            .field("payload_codecs", &"configured")
+            .field("history_policy", &self.history_policy)
             .finish()
     }
 }
@@ -42,9 +72,13 @@ pub struct BuiltHarvest {
     workflows: Vec<WorkflowInfo>,
     activities: Vec<ActivityInfo>,
     dags: Vec<DagInfo>,
+    workflow_schedules: Vec<WorkflowSchedule>,
     worker_config: WorkerConfig,
     state: SharedStateMap,
     telemetry: Arc<TelemetryConfig>,
+    retention: RetentionConfig,
+    payload_codecs: PayloadCodecs,
+    history_policy: WorkflowHistoryPolicy,
 }
 
 impl std::fmt::Debug for BuiltHarvest {
@@ -53,14 +87,129 @@ impl std::fmt::Debug for BuiltHarvest {
             .field("workflow_count", &self.workflows.len())
             .field("activity_count", &self.activities.len())
             .field("dag_count", &self.dags.len())
+            .field("workflow_schedule_count", &self.workflow_schedules.len())
             .field("worker_config", &self.worker_config)
             .field("state_count", &self.state.len())
             .field("telemetry", &self.telemetry)
+            .field("retention", &self.retention)
+            .field("payload_codecs", &"configured")
+            .field("history_policy", &self.history_policy)
             .finish()
     }
 }
 
+/// Builder-time configuration errors.
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum HarvestBuilderError {
+    /// Retention configuration validation failed.
+    #[error("invalid retention configuration: {0}")]
+    InvalidRetention(String),
+
+    /// Two activities sharing a `concurrency_key` declare different
+    /// `max_concurrent` values. There is no silent precedence rule — the
+    /// operator must pick one value and apply it consistently.
+    ///
+    /// `activities` lists each `(activity_name, max_concurrent)` pair that
+    /// contributed to the conflict.
+    #[error(
+        "concurrency_key '{key}' has conflicting max_concurrent values across activities: {activities:?}"
+    )]
+    ConcurrencyKeyMismatch {
+        /// The shared concurrency key.
+        key: String,
+        /// Each `(activity_name, max_concurrent)` pair with a conflicting value.
+        activities: Vec<(String, u32)>,
+    },
+
+    /// An activity declares a `concurrency_key` but no `max_concurrent` cap.
+    /// Without a cap the key is written to the queue row but the saturation
+    /// predicate (`(SELECT COUNT(*) ...) < NULL`) is always null/unknown,
+    /// silently bypassing the intended shared budget.
+    #[error(
+        "activity '{activity}' sets concurrency_key = \"{key}\" but has no max_concurrent; \
+         either add max_concurrent or remove the concurrency_key"
+    )]
+    ConcurrencyKeyWithoutCap {
+        /// The activity name.
+        activity: String,
+        /// The orphaned concurrency key.
+        key: String,
+    },
+
+    /// An activity declares `max_concurrent = 0`, which makes the saturation
+    /// check `(SELECT COUNT(*) ...) < 0` always false, permanently deferring
+    /// every task for this activity.
+    #[error(
+        "activity '{activity}' has max_concurrent = 0; use max_concurrent >= 1 \
+         or omit max_concurrent entirely to disable the cap"
+    )]
+    ZeroConcurrencyCap {
+        /// The activity name.
+        activity: String,
+    },
+
+    /// A [`WorkflowSchedule`] names a workflow that was not registered via
+    /// `workflows![]`. The schedule is rejected at build time so the operator
+    /// sees a clear error rather than silent no-ops at scheduler tick time.
+    ///
+    /// `workflow_name` is the name that was not found. `registered` lists every
+    /// workflow name that was actually registered on this builder.
+    #[error(
+        "workflow_schedule references unknown workflow '{workflow_name}'; \
+         registered workflows: {registered:?}"
+    )]
+    UnknownWorkflowSchedule {
+        /// The unrecognised workflow name in the schedule.
+        workflow_name: String,
+        /// All workflow names currently registered on the builder.
+        registered: Vec<String>,
+    },
+
+    /// A local activity declares a `start_to_close` that exceeds the worker's
+    /// `max_local_activity_start_to_close` cap. Local activities run inline on
+    /// the workflow worker and must not block it indefinitely.
+    #[error(
+        "local activity '{activity}' start_to_close ({actual:?}) exceeds the worker cap \
+         ({cap:?}); lower start_to_close or raise WorkerConfig::max_local_activity_start_to_close"
+    )]
+    LocalActivityStartToCloseExceedsCap {
+        /// The local activity name.
+        activity: String,
+        /// The declared `start_to_close` on the activity.
+        actual: Duration,
+        /// The configured worker cap.
+        cap: Duration,
+    },
+
+    /// A [`WorkflowSchedule`] contains an invalid schedule value (malformed cron
+    /// expression, zero-length interval, etc.). Caught at build time so the
+    /// operator sees a clear error rather than silently-inert or wedging schedules.
+    #[error("workflow_schedule for '{workflow_name}' has an invalid schedule: {reason}")]
+    InvalidWorkflowSchedule {
+        /// The workflow name whose schedule is invalid.
+        workflow_name: String,
+        /// Human-readable reason the schedule was rejected.
+        reason: String,
+    },
+
+    /// A [`WorkerConfig`] field has an invalid value.
+    #[error("invalid worker configuration: {0}")]
+    InvalidWorkerConfig(String),
+}
+
 impl BuiltHarvest {
+    #[must_use]
+    pub const fn payload_codecs(&self) -> &PayloadCodecs {
+        &self.payload_codecs
+    }
+
+    /// History-size guardrails applied to workflow contexts and workers.
+    #[must_use]
+    pub const fn history_policy(&self) -> WorkflowHistoryPolicy {
+        self.history_policy
+    }
+
     /// Number of registered workflows.
     #[must_use]
     pub const fn workflow_count(&self) -> usize {
@@ -77,6 +226,18 @@ impl BuiltHarvest {
     #[must_use]
     pub const fn dag_count(&self) -> usize {
         self.dags.len()
+    }
+
+    /// Number of registered workflow schedules.
+    #[must_use]
+    pub const fn workflow_schedule_count(&self) -> usize {
+        self.workflow_schedules.len()
+    }
+
+    /// Registered workflow schedules.
+    #[must_use]
+    pub fn workflow_schedules(&self) -> &[WorkflowSchedule] {
+        &self.workflow_schedules
     }
 
     /// Access typed shared state registered on the builder.
@@ -103,18 +264,41 @@ impl BuiltHarvest {
         &self.telemetry
     }
 
+    /// Retention janitor configuration.
+    #[must_use]
+    pub const fn retention(&self) -> &RetentionConfig {
+        &self.retention
+    }
+
+    /// Override the audit log retention window after the build step.
+    ///
+    /// Use this to apply a runtime-configured value (e.g. from `HarvestApiState`)
+    /// without rebuilding the entire harvest configuration.
+    pub const fn set_audit_retention_days(&mut self, days: i64) {
+        self.retention.audit_retention_days = days;
+    }
+
     /// Convert the built harvest registration into worker-ready parts.
     #[cfg(feature = "db")]
     #[must_use]
-    pub fn into_worker_parts(self) -> (crate::worker::HandlerRegistry, Vec<DagInfo>, WorkerConfig) {
+    pub fn into_worker_parts(
+        self,
+    ) -> (
+        crate::worker::HandlerRegistry,
+        Vec<DagInfo>,
+        Vec<WorkflowSchedule>,
+        WorkerConfig,
+    ) {
         (
             crate::worker::HandlerRegistry::with_state_and_telemetry(
                 self.workflows,
                 self.activities,
                 Arc::new(self.state),
                 self.telemetry,
-            ),
+            )
+            .with_history_policy(self.history_policy),
             self.dags,
+            self.workflow_schedules,
             self.worker_config,
         )
     }
@@ -126,7 +310,12 @@ impl BuiltHarvest {
     pub fn into_worker_parts_with_extra_state(
         mut self,
         extra_state: SharedStateMap,
-    ) -> (crate::worker::HandlerRegistry, Vec<DagInfo>, WorkerConfig) {
+    ) -> (
+        crate::worker::HandlerRegistry,
+        Vec<DagInfo>,
+        Vec<WorkflowSchedule>,
+        WorkerConfig,
+    ) {
         self.state.extend(extra_state);
         (
             crate::worker::HandlerRegistry::with_state_and_telemetry(
@@ -134,8 +323,10 @@ impl BuiltHarvest {
                 self.activities,
                 Arc::new(self.state),
                 self.telemetry,
-            ),
+            )
+            .with_history_policy(self.history_policy),
             self.dags,
+            self.workflow_schedules,
             self.worker_config,
         )
     }
@@ -143,12 +334,18 @@ impl BuiltHarvest {
 
 impl HarvestBuilder {
     /// Create a new empty builder.
+    ///
+    /// This starts the fluent configuration chain for registering definitions
+    /// and options before finalizing them into a [`BuiltHarvest`] or worker.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Register workflow definitions (output of `workflows![]` macro).
+    ///
+    /// The runtime uses these definitions to route executions to the correct
+    /// handler functions.
     #[must_use]
     pub fn workflows(mut self, workflows: Vec<WorkflowInfo>) -> Self {
         self.workflows.extend(workflows);
@@ -156,6 +353,8 @@ impl HarvestBuilder {
     }
 
     /// Register activity definitions (output of `activities![]` macro).
+    ///
+    /// The runtime maps activity tasks to these definitions for execution.
     #[must_use]
     pub fn activities(mut self, activities: Vec<ActivityInfo>) -> Self {
         self.activities.extend(activities);
@@ -163,13 +362,44 @@ impl HarvestBuilder {
     }
 
     /// Register DAG definitions (output of `dags![]` macro).
+    ///
+    /// DAGs define graphs of steps that run according to a schedule.
     #[must_use]
     pub fn dags(mut self, dags: Vec<DagInfo>) -> Self {
         self.dags.extend(dags);
         self
     }
 
+    /// Register a per-workflow cron/interval schedule.
+    ///
+    /// The referenced `workflow_name` must appear in a prior (or subsequent)
+    /// `.workflows(workflows![...])` call. [`Self::try_build`] validates this
+    /// and returns [`HarvestBuilderError::UnknownWorkflowSchedule`] if the
+    /// workflow is missing.
+    ///
+    /// ## Examples
+    ///
+    /// ```rust
+    /// use autumn_harvest::builder::{HarvestBuilder, HarvestBuilderError};
+    /// use autumn_harvest::policy::{Schedule, WorkflowSchedule};
+    ///
+    /// // Referencing an unregistered workflow name is caught at try_build time.
+    /// let result = HarvestBuilder::new()
+    ///     .workflow_schedule(
+    ///         WorkflowSchedule::new("daily_billing_report", Schedule::Cron("0 3 * * *".to_string()))
+    ///     )
+    ///     .try_build();
+    /// assert!(matches!(result, Err(HarvestBuilderError::UnknownWorkflowSchedule { .. })));
+    /// ```
+    #[must_use]
+    pub fn workflow_schedule(mut self, schedule: WorkflowSchedule) -> Self {
+        self.workflow_schedules.push(schedule);
+        self
+    }
+
     /// Configure the worker (concurrency, queues, timeouts).
+    ///
+    /// See [`WorkerConfig`] for details on adjusting poll behavior.
     #[must_use]
     pub fn worker(mut self, config: WorkerConfig) -> Self {
         self.worker_config = config;
@@ -177,6 +407,10 @@ impl HarvestBuilder {
     }
 
     /// Register typed shared state visible to workflow and activity handlers.
+    ///
+    /// State injected here can be retrieved in your handlers by calling
+    /// `ctx.state::<T>()`. It is useful for sharing database connection pools,
+    /// email clients, or configuration structs across tasks.
     ///
     /// Registering the same type more than once replaces the previous value.
     #[must_use]
@@ -191,8 +425,38 @@ impl HarvestBuilder {
     ///
     /// When unset, the runtime uses safe no-op defaults — telemetry is opt-in.
     #[must_use]
+    pub fn payload_codec(mut self, codec: impl PayloadCodec + 'static) -> Self {
+        self.payload_codecs.set_default(Arc::new(codec));
+        self
+    }
+
+    #[must_use]
     pub fn telemetry(mut self, telemetry: TelemetryConfig) -> Self {
         self.telemetry = Some(telemetry);
+        self
+    }
+
+    /// Configure retention janitor behavior for completed workflow history.
+    #[must_use]
+    pub const fn retention(mut self, retention: RetentionConfig) -> Self {
+        self.retention = retention;
+        self
+    }
+
+    /// Override the soft history-size threshold used by
+    /// [`crate::context::WorkflowContext::should_continue_as_new`].
+    #[must_use]
+    pub const fn history_continue_as_new_threshold(mut self, threshold: u64) -> Self {
+        self.history_policy = self
+            .history_policy
+            .with_continue_as_new_threshold(threshold);
+        self
+    }
+
+    /// Configure an opt-in hard cap for workflow history event counts.
+    #[must_use]
+    pub const fn history_event_hard_cap(mut self, cap: u64) -> Self {
+        self.history_policy = self.history_policy.with_event_hard_cap(cap);
         self
     }
 
@@ -214,18 +478,180 @@ impl HarvestBuilder {
         self.dags.len()
     }
 
+    /// Number of registered workflow schedules.
+    #[must_use]
+    pub const fn workflow_schedule_count(&self) -> usize {
+        self.workflow_schedules.len()
+    }
+
     /// Finalize the builder into a reusable harvest registration set.
+    ///
+    /// # Panics
+    ///
+    /// Panics when retention settings are invalid. Prefer [`Self::try_build`]
+    /// if you want startup errors instead.
     #[must_use]
     pub fn build(self) -> BuiltHarvest {
-        BuiltHarvest {
+        self.try_build()
+            .expect("HarvestBuilder::build failed validation")
+    }
+
+    /// Finalize the builder into a reusable harvest registration set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestBuilderError`] when retention settings are invalid,
+    /// when activities sharing a `concurrency_key` declare different
+    /// `max_concurrent` values, or when a [`WorkflowSchedule`] references a
+    /// workflow name not registered on this builder.
+    pub fn try_build(self) -> Result<BuiltHarvest, HarvestBuilderError> {
+        self.retention
+            .validate()
+            .map_err(HarvestBuilderError::InvalidRetention)?;
+
+        if self.worker_config.worker_heartbeat_interval.is_zero() {
+            return Err(HarvestBuilderError::InvalidWorkerConfig(
+                "worker_heartbeat_interval must be greater than zero".to_string(),
+            ));
+        }
+
+        validate_concurrency_keys(&self.activities)?;
+        validate_workflow_schedules(&self.workflow_schedules, &self.workflows)?;
+        validate_local_activity_timeouts(
+            &self.activities,
+            self.worker_config.max_local_activity_start_to_close,
+        )?;
+
+        Ok(BuiltHarvest {
             workflows: self.workflows,
             activities: self.activities,
             dags: self.dags,
+            workflow_schedules: self.workflow_schedules,
             worker_config: self.worker_config,
             state: self.state,
             telemetry: Arc::new(self.telemetry.unwrap_or_default()),
+            retention: self.retention,
+            payload_codecs: self.payload_codecs.clone(),
+            history_policy: self.history_policy,
+        })
+    }
+}
+
+/// Verify that every [`WorkflowSchedule`] references a workflow name that is
+/// actually registered on the builder. Fails fast with
+/// [`HarvestBuilderError::UnknownWorkflowSchedule`] on the first mismatch.
+fn validate_workflow_schedules(
+    schedules: &[WorkflowSchedule],
+    workflows: &[crate::info::WorkflowInfo],
+) -> Result<(), HarvestBuilderError> {
+    if schedules.is_empty() {
+        return Ok(());
+    }
+    let registered: Vec<String> = workflows.iter().map(|w| w.name.to_string()).collect();
+    for schedule in schedules {
+        if !registered.contains(&schedule.workflow_name) {
+            return Err(HarvestBuilderError::UnknownWorkflowSchedule {
+                workflow_name: schedule.workflow_name.clone(),
+                registered,
+            });
+        }
+        // Reject zero-length intervals (would cause infinite loops in due_run_plan
+        // with catchup=true) and invalid cron expressions (would silently never fire).
+        if let crate::policy::Schedule::Interval(dur) = &schedule.schedule {
+            if dur.is_zero() {
+                return Err(HarvestBuilderError::InvalidWorkflowSchedule {
+                    workflow_name: schedule.workflow_name.clone(),
+                    reason: "interval must be at least 1 second".to_string(),
+                });
+            }
+        } else if let Err(reason) = crate::policy::validate_schedule(&schedule.schedule) {
+            return Err(HarvestBuilderError::InvalidWorkflowSchedule {
+                workflow_name: schedule.workflow_name.clone(),
+                reason,
+            });
         }
     }
+    Ok(())
+}
+
+/// Entry in the concurrency-key deduplication map.
+struct ConcurrencyKeyEntry {
+    first_cap: u32,
+    contributors: Vec<(String, u32)>,
+}
+
+/// Verify that all activities sharing a `concurrency_key` agree on
+/// `max_concurrent`. Fails fast with [`HarvestBuilderError::ConcurrencyKeyMismatch`]
+/// if any disagreement is found.
+fn validate_concurrency_keys(
+    activities: &[crate::info::ActivityInfo],
+) -> Result<(), HarvestBuilderError> {
+    use std::collections::HashMap;
+
+    let mut seen: HashMap<&str, ConcurrencyKeyEntry> = HashMap::new();
+
+    for activity in activities {
+        // max_concurrent = 0 makes the cap predicate always-true, permanently
+        // deferring every task for that activity. Reject at build time.
+        if activity.max_concurrent == Some(0) {
+            return Err(HarvestBuilderError::ZeroConcurrencyCap {
+                activity: activity.name.to_string(),
+            });
+        }
+
+        // concurrency_key without max_concurrent silently bypasses the cap — reject it.
+        if let (Some(key), None) = (activity.concurrency_key, activity.max_concurrent) {
+            return Err(HarvestBuilderError::ConcurrencyKeyWithoutCap {
+                activity: activity.name.to_string(),
+                key: key.to_string(),
+            });
+        }
+
+        // Activities with max_concurrent but no explicit concurrency_key use the
+        // activity name as the effective key at runtime (persist_scheduled_activity
+        // defaults it). Include them in the cross-activity cap consistency check.
+        let Some(cap) = activity.max_concurrent else {
+            continue;
+        };
+        let effective_key: &str = activity.concurrency_key.unwrap_or(activity.name);
+        let entry = seen
+            .entry(effective_key)
+            .or_insert_with(|| ConcurrencyKeyEntry {
+                first_cap: cap,
+                contributors: Vec::new(),
+            });
+        entry.contributors.push((activity.name.to_string(), cap));
+
+        if entry.first_cap != cap {
+            return Err(HarvestBuilderError::ConcurrencyKeyMismatch {
+                key: effective_key.to_string(),
+                activities: entry.contributors.clone(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+/// Reject local activities whose `default_start_to_close` exceeds the worker
+/// cap. Failing early gives operators a clear error instead of a runtime surprise.
+fn validate_local_activity_timeouts(
+    activities: &[crate::info::ActivityInfo],
+    cap: Duration,
+) -> Result<(), HarvestBuilderError> {
+    for activity in activities {
+        if !activity.is_local {
+            continue;
+        }
+        if activity.default_start_to_close.is_some_and(|stc| stc > cap) {
+            return Err(HarvestBuilderError::LocalActivityStartToCloseExceedsCap {
+                activity: activity.name.to_string(),
+                actual: activity.default_start_to_close.unwrap(),
+                cap,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Worker concurrency and queue configuration.
@@ -259,6 +685,26 @@ pub struct WorkerConfig {
     /// a `Vec` so future per-process multi-shard workers can list all shards
     /// they should poll without changing the config surface.
     pub shard_assignments: Vec<ShardId>,
+    /// Hard cap on `start_to_close` for local activities.
+    ///
+    /// Local activities run inline on the workflow worker task. An unbounded
+    /// timeout would block the worker indefinitely. Defaults to **60 seconds**.
+    /// Any local activity registered with `start_to_close > cap` is rejected
+    /// at builder `try_build()` time.
+    pub max_local_activity_start_to_close: Duration,
+    /// How often the worker upserts its liveness row in `harvest_workers`.
+    /// Defaults to **5 seconds**. The API classifies a worker as stale after
+    /// `2 × worker_heartbeat_interval` without a heartbeat.
+    pub worker_heartbeat_interval: Duration,
+    /// Immutable build identifier for this worker binary (issue #171).
+    ///
+    /// Set to a stable per-build token (Git SHA, semver tag, CI job ID, etc.)
+    /// to enable build-aware task routing. Empty string = legacy behaviour
+    /// where the worker can claim any task regardless of `required_build_id`.
+    pub build_id: String,
+    /// Optional human-readable deployment name for operator observability
+    /// (issue #171), e.g. `"prod-blue"` or `"canary"`.
+    pub deployment_name: Option<String>,
 }
 
 impl Default for WorkerConfig {
@@ -273,6 +719,10 @@ impl Default for WorkerConfig {
             sticky_timeout: Duration::from_secs(5),
             cancellation_grace_period: Duration::from_secs(5),
             shard_assignments: vec![ShardId::new(0)],
+            max_local_activity_start_to_close: Duration::from_secs(60),
+            worker_heartbeat_interval: Duration::from_secs(5),
+            build_id: String::new(),
+            deployment_name: None,
         }
     }
 }
@@ -329,6 +779,37 @@ impl WorkerConfig {
         };
         self
     }
+
+    /// Override the worker heartbeat interval (default 5 s).
+    ///
+    /// The management API classifies a worker as stale after
+    /// `2 × worker_heartbeat_interval` without a heartbeat write.
+    #[must_use]
+    pub const fn with_worker_heartbeat_interval(mut self, interval: Duration) -> Self {
+        self.worker_heartbeat_interval = interval;
+        self
+    }
+
+    /// Set the immutable build identifier for this worker (issue #171).
+    ///
+    /// Use a stable per-build token — a Git SHA, semver tag, or CI job ID.
+    /// Workers without a build ID (the default empty string) behave as legacy
+    /// workers and can claim any task regardless of build routing policy.
+    #[must_use]
+    pub fn with_build_id(mut self, build_id: impl Into<String>) -> Self {
+        self.build_id = build_id.into();
+        self
+    }
+
+    /// Set an optional human-readable deployment name (issue #171).
+    ///
+    /// For operator observability only — e.g. `"prod-blue"`, `"canary"`.
+    /// Harvest does not use the deployment name for routing decisions.
+    #[must_use]
+    pub fn with_deployment_name(mut self, name: impl Into<String>) -> Self {
+        self.deployment_name = Some(name.into());
+        self
+    }
 }
 
 #[cfg(test)]
@@ -364,6 +845,25 @@ mod tests {
     fn harvest_builder_collects_workflows() {
         let builder = HarvestBuilder::new().workflows(vec![fake_workflow_info()]);
         assert_eq!(builder.workflow_count(), 1);
+    }
+
+    #[test]
+    fn worker_heartbeat_interval_defaults_to_5s() {
+        assert_eq!(
+            WorkerConfig::default().worker_heartbeat_interval,
+            Duration::from_secs(5)
+        );
+    }
+
+    #[test]
+    fn worker_heartbeat_interval_zero_is_rejected() {
+        let result = HarvestBuilder::new()
+            .worker(WorkerConfig::default().with_worker_heartbeat_interval(Duration::ZERO))
+            .try_build();
+        assert!(
+            matches!(result, Err(HarvestBuilderError::InvalidWorkerConfig(_))),
+            "expected InvalidWorkerConfig but got {result:?}"
+        );
     }
 
     #[test]
@@ -420,6 +920,41 @@ mod tests {
     }
 
     #[test]
+    fn harvest_builder_defaults_history_guardrails() {
+        let built = HarvestBuilder::new().build();
+        let policy = built.history_policy();
+
+        assert_eq!(policy.continue_as_new_threshold(), 10_000);
+        assert_eq!(policy.event_hard_cap(), None);
+    }
+
+    #[test]
+    fn harvest_builder_accepts_history_guardrail_overrides() {
+        let built = HarvestBuilder::new()
+            .history_continue_as_new_threshold(128)
+            .history_event_hard_cap(256)
+            .build();
+        let policy = built.history_policy();
+
+        assert_eq!(policy.continue_as_new_threshold(), 128);
+        assert_eq!(policy.event_hard_cap(), Some(256));
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn harvest_builder_passes_history_policy_to_worker_registry() {
+        let built = HarvestBuilder::new()
+            .history_continue_as_new_threshold(9)
+            .history_event_hard_cap(11)
+            .build();
+
+        let (registry, _dags, _workflow_schedules, _worker_config) = built.into_worker_parts();
+
+        assert_eq!(registry.history_policy().continue_as_new_threshold(), 9);
+        assert_eq!(registry.history_policy().event_hard_cap(), Some(11));
+    }
+
+    #[test]
     fn harvest_builder_telemetry_override_is_propagated() {
         use crate::telemetry::{TelemetryConfig, TraceContextCarrier, TraceContextPropagator};
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -462,12 +997,15 @@ mod tests {
                 default_heartbeat_timeout: None,
                 default_schedule_to_start: None,
                 default_queue: None,
+                max_concurrent: None,
+                concurrency_key: None,
+                is_local: false,
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             }])
             .state(String::from("haunted"))
             .build();
 
-        let (registry, _dags, worker_config) = built.into_worker_parts();
+        let (registry, _dags, _workflow_schedules, worker_config) = built.into_worker_parts();
 
         assert_eq!(registry.state::<String>(), Some(&String::from("haunted")));
         assert!(worker_config.queues.contains(&"default".to_string()));
@@ -483,5 +1021,252 @@ mod tests {
     fn worker_config_with_empty_iterator_clears_queues() {
         let config = WorkerConfig::default().with_queues(Vec::<&str>::new());
         assert!(config.queues.is_empty());
+    }
+
+    fn make_activity(
+        name: &'static str,
+        max_concurrent: Option<u32>,
+        key: Option<&'static str>,
+    ) -> ActivityInfo {
+        ActivityInfo {
+            name,
+            module: "test",
+            default_retry_policy: None,
+            default_start_to_close: None,
+            default_heartbeat_timeout: None,
+            default_schedule_to_start: None,
+            default_queue: None,
+            max_concurrent,
+            concurrency_key: key,
+            is_local: false,
+            handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+        }
+    }
+
+    fn make_local_activity(name: &'static str, start_to_close: Option<Duration>) -> ActivityInfo {
+        ActivityInfo {
+            name,
+            module: "test",
+            default_retry_policy: None,
+            default_start_to_close: start_to_close,
+            default_heartbeat_timeout: None,
+            default_schedule_to_start: None,
+            default_queue: None,
+            max_concurrent: None,
+            concurrency_key: None,
+            is_local: true,
+            handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+        }
+    }
+
+    #[test]
+    fn builder_accepts_matching_concurrency_key_caps() {
+        let result = HarvestBuilder::new()
+            .activities(vec![
+                make_activity("act_a", Some(5), Some("stripe")),
+                make_activity("act_b", Some(5), Some("stripe")),
+            ])
+            .try_build();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn builder_rejects_mismatched_concurrency_key_caps() {
+        let result = HarvestBuilder::new()
+            .activities(vec![
+                make_activity("act_a", Some(5), Some("stripe")),
+                make_activity("act_b", Some(10), Some("stripe")),
+            ])
+            .try_build();
+        let err = result.unwrap_err();
+        assert!(matches!(
+            err,
+            HarvestBuilderError::ConcurrencyKeyMismatch { ref key, .. } if key == "stripe"
+        ));
+        assert!(err.to_string().contains("stripe"));
+    }
+
+    #[test]
+    fn builder_accepts_activities_without_concurrency_key() {
+        let result = HarvestBuilder::new()
+            .activities(vec![
+                make_activity("act_a", None, None),
+                make_activity("act_b", Some(3), Some("sendgrid")),
+            ])
+            .try_build();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn builder_rejects_concurrency_key_without_cap() {
+        // concurrency_key set but max_concurrent omitted — the cap predicate
+        // would silently never fire (NULL cap bypasses the saturation check).
+        let result = HarvestBuilder::new()
+            .activities(vec![make_activity("act_a", None, Some("stripe"))])
+            .try_build();
+        let err = result.unwrap_err();
+        assert!(matches!(
+            err,
+            HarvestBuilderError::ConcurrencyKeyWithoutCap { ref activity, ref key }
+                if activity == "act_a" && key == "stripe"
+        ));
+        assert!(err.to_string().contains("act_a"));
+        assert!(err.to_string().contains("stripe"));
+    }
+
+    #[test]
+    fn builder_rejects_implicit_key_cap_mismatch_with_explicit_key() {
+        // act_a uses max_concurrent=5 with no key (implicit key = "act_a").
+        // act_b explicitly declares key="act_a" with a different cap.
+        // Both would resolve to the same effective key at runtime, so caps must agree.
+        let result = HarvestBuilder::new()
+            .activities(vec![
+                make_activity("act_a", Some(5), None),
+                make_activity("act_b", Some(10), Some("act_a")),
+            ])
+            .try_build();
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, HarvestBuilderError::ConcurrencyKeyMismatch { ref key, .. } if key == "act_a"),
+            "expected ConcurrencyKeyMismatch for key 'act_a', got: {err}"
+        );
+    }
+
+    #[test]
+    fn builder_accepts_implicit_key_matching_explicit_key_same_cap() {
+        // act_a: implicit key = "act_a", cap = 5
+        // act_b: explicit key = "act_a", cap = 5 → same effective key and same cap → ok
+        let result = HarvestBuilder::new()
+            .activities(vec![
+                make_activity("act_a", Some(5), None),
+                make_activity("act_b", Some(5), Some("act_a")),
+            ])
+            .try_build();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn builder_rejects_zero_concurrency_cap() {
+        // max_concurrent = 0 makes the COUNT check always fail (0 running < 0 is
+        // never true), permanently deferring every task for this activity.
+        let result = HarvestBuilder::new()
+            .activities(vec![make_activity("act_a", Some(0), Some("stripe"))])
+            .try_build();
+        let err = result.unwrap_err();
+        assert!(matches!(
+            err,
+            HarvestBuilderError::ZeroConcurrencyCap { ref activity }
+                if activity == "act_a"
+        ));
+        assert!(err.to_string().contains("act_a"));
+    }
+
+    // ── Local activity cap tests ──────────────────────────────────────────
+
+    #[test]
+    fn worker_config_max_local_activity_start_to_close_defaults_to_60s() {
+        let config = WorkerConfig::default();
+        assert_eq!(
+            config.max_local_activity_start_to_close,
+            Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn builder_accepts_local_activity_within_cap() {
+        let result = HarvestBuilder::new()
+            .activities(vec![make_local_activity(
+                "compute_hash",
+                Some(Duration::from_secs(30)),
+            )])
+            .try_build();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn builder_accepts_local_activity_with_no_start_to_close() {
+        let result = HarvestBuilder::new()
+            .activities(vec![make_local_activity("compute_hash", None)])
+            .try_build();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn builder_rejects_local_activity_exceeding_cap() {
+        let result = HarvestBuilder::new()
+            .activities(vec![make_local_activity(
+                "slow_local",
+                Some(Duration::from_secs(120)),
+            )])
+            .try_build();
+        let err = result.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                HarvestBuilderError::LocalActivityStartToCloseExceedsCap {
+                    ref activity, ..
+                } if activity == "slow_local"
+            ),
+            "expected LocalActivityStartToCloseExceedsCap, got {err}"
+        );
+        assert!(err.to_string().contains("slow_local"));
+    }
+
+    #[test]
+    fn builder_rejects_local_activity_exactly_at_cap_boundary_when_exceeded() {
+        // Exactly 60s is fine; 61s should fail.
+        let at_cap = HarvestBuilder::new()
+            .activities(vec![make_local_activity(
+                "edge_case",
+                Some(Duration::from_secs(60)),
+            )])
+            .try_build();
+        assert!(at_cap.is_ok());
+
+        let over_cap = HarvestBuilder::new()
+            .activities(vec![make_local_activity(
+                "edge_case",
+                Some(Duration::from_secs(61)),
+            )])
+            .try_build();
+        assert!(over_cap.is_err());
+    }
+
+    #[test]
+    fn builder_accepts_custom_cap_that_fits_activity() {
+        let worker = WorkerConfig {
+            max_local_activity_start_to_close: Duration::from_secs(120),
+            ..WorkerConfig::default()
+        };
+        let result = HarvestBuilder::new()
+            .activities(vec![make_local_activity(
+                "slow_local",
+                Some(Duration::from_secs(90)),
+            )])
+            .worker(worker)
+            .try_build();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn regular_activity_is_not_subject_to_local_cap() {
+        // A regular activity with start_to_close > 60s should not be rejected
+        // by the local activity cap validator.
+        let result = HarvestBuilder::new()
+            .activities(vec![ActivityInfo {
+                name: "long_running",
+                module: "test",
+                default_retry_policy: None,
+                default_start_to_close: Some(Duration::from_secs(300)),
+                default_heartbeat_timeout: None,
+                default_schedule_to_start: None,
+                default_queue: None,
+                max_concurrent: None,
+                concurrency_key: None,
+                is_local: false,
+                handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            }])
+            .try_build();
+        assert!(result.is_ok());
     }
 }

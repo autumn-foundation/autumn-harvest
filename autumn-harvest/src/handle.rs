@@ -1,0 +1,524 @@
+//! In-process workflow result handles for request/response embedders.
+//!
+//! `WorkflowHandle` is the small client-side primitive for code that starts a
+//! workflow behind an HTTP route and wants to await the terminal result without
+//! polling the full event history.
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use diesel::OptionalExtension;
+use diesel::QueryDsl;
+use diesel::SelectableHelper;
+use diesel_async::AsyncPgConnection;
+use diesel_async::RunQueryDsl;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::error::{HarvestError, HarvestResult, TimeoutType, database_error};
+use crate::execution::{
+    StartWorkflowParams, StartedWorkflowExecution, start_or_load_workflow_execution,
+};
+use crate::models::WorkflowExecution;
+use crate::notify::{WorkflowEventListener, WorkflowEventWaitOutcome};
+use crate::schema::harvest_workflow_executions;
+use crate::shard::{ShardRouter, ShardedDbPool};
+use crate::types::{ExecutionId, ShardId};
+use crate::worker::DbPool;
+
+/// Compact public state for a workflow result response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowResultState {
+    /// Execution is still active.
+    Running,
+    /// Execution completed successfully and may have an output payload.
+    Completed,
+    /// Execution failed permanently.
+    Failed,
+    /// Execution was explicitly cancelled.
+    Cancelled,
+    /// Execution exceeded its workflow-level timeout.
+    TimedOut,
+    /// Execution was forcefully terminated.
+    Terminated,
+    /// Execution sealed itself and started a successor run.
+    ContinuedAsNew,
+}
+
+impl WorkflowResultState {
+    /// Convert a stored execution state into the compact API state.
+    #[must_use]
+    pub fn from_execution_state(state: &str) -> Self {
+        match state {
+            "COMPLETED" => Self::Completed,
+            "FAILED" => Self::Failed,
+            "CANCELLED" => Self::Cancelled,
+            "TIMED_OUT" => Self::TimedOut,
+            "TERMINATED" => Self::Terminated,
+            "CONTINUED_AS_NEW" => Self::ContinuedAsNew,
+            _ => Self::Running,
+        }
+    }
+
+    /// Whether this state is terminal for the current execution.
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        !matches!(self, Self::Running)
+    }
+}
+
+/// Compact workflow result payload.
+///
+/// This intentionally omits event history. The management API uses the same
+/// shape for `GET /workflows/{id}/result`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowResult {
+    /// Current compact state.
+    pub state: WorkflowResultState,
+    /// Present only for successful terminal states with a result payload.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<Value>,
+    /// Present only for failed/cancelled/timed-out/terminated states.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Timestamp when the execution entered a terminal state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl WorkflowResult {
+    /// Build a compact result from a workflow execution row.
+    #[must_use]
+    pub fn from_execution(execution: &WorkflowExecution) -> Self {
+        let state = WorkflowResultState::from_execution_state(&execution.state);
+        match state {
+            WorkflowResultState::Completed | WorkflowResultState::ContinuedAsNew => Self {
+                state,
+                output: execution.output.clone(),
+                error: None,
+                completed_at: execution.completed_at,
+            },
+            WorkflowResultState::Failed
+            | WorkflowResultState::Cancelled
+            | WorkflowResultState::TimedOut
+            | WorkflowResultState::Terminated => Self {
+                state,
+                output: None,
+                error: execution.error.clone(),
+                completed_at: execution.completed_at,
+            },
+            WorkflowResultState::Running => Self {
+                state,
+                output: None,
+                error: None,
+                completed_at: None,
+            },
+        }
+    }
+
+    /// Build a successful terminal result.
+    #[must_use]
+    pub const fn completed(
+        state: WorkflowResultState,
+        output: Value,
+        completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Self {
+        Self {
+            state,
+            output: Some(output),
+            error: None,
+            completed_at,
+        }
+    }
+
+    /// Build a non-terminal result.
+    #[must_use]
+    pub const fn running() -> Self {
+        Self {
+            state: WorkflowResultState::Running,
+            output: None,
+            error: None,
+            completed_at: None,
+        }
+    }
+
+    /// Whether this result represents a terminal execution state.
+    #[must_use]
+    pub const fn is_terminal(&self) -> bool {
+        self.state.is_terminal()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct WorkflowHandleClientInner {
+    pools: ShardedDbPool,
+    router: ShardRouter,
+    notification_database_urls: BTreeMap<ShardId, String>,
+}
+
+/// Factory for shard-aware workflow handles.
+///
+/// The client owns the storage pools, shard router, and per-shard database URLs
+/// used for LISTEN/NOTIFY. A handle cloned from this client routes reads through
+/// [`ShardRouter::shard_for_execution`] using its `ExecutionId`.
+#[derive(Debug, Clone)]
+pub struct WorkflowHandleClient {
+    inner: Arc<WorkflowHandleClientInner>,
+}
+
+impl WorkflowHandleClient {
+    /// Build a single-shard handle client.
+    #[must_use]
+    pub fn single(pool: DbPool, notification_database_url: impl Into<String>) -> Self {
+        Self::new(
+            ShardedDbPool::single(pool),
+            ShardRouter::single(),
+            [(ShardId::new(0), notification_database_url)],
+        )
+    }
+
+    /// Build a client for a sharded deployment.
+    ///
+    /// `notification_database_urls` must include every readable shard that may
+    /// be awaited. Missing entries are reported as [`HarvestError::Config`]
+    /// when a handle tries to wait on that shard.
+    #[must_use]
+    pub fn new<I, S>(
+        pools: ShardedDbPool,
+        router: ShardRouter,
+        notification_database_urls: I,
+    ) -> Self
+    where
+        I: IntoIterator<Item = (ShardId, S)>,
+        S: Into<String>,
+    {
+        Self {
+            inner: Arc::new(WorkflowHandleClientInner {
+                pools,
+                router,
+                notification_database_urls: notification_database_urls
+                    .into_iter()
+                    .map(|(shard, url)| (shard, url.into()))
+                    .collect(),
+            }),
+        }
+    }
+
+    /// Create a handle for an existing workflow execution.
+    #[must_use]
+    pub fn handle(&self, exec_id: ExecutionId) -> WorkflowHandle {
+        WorkflowHandle {
+            exec_id,
+            client: self.clone(),
+        }
+    }
+
+    /// Start or load a workflow, returning the normal start metadata and a
+    /// result handle for the resolved execution.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`start_or_load_workflow_execution`] failures.
+    pub async fn start_or_load(
+        &self,
+        conn: &mut AsyncPgConnection,
+        request: StartWorkflowParams<'_>,
+    ) -> HarvestResult<StartedWorkflowHandle> {
+        let started = start_or_load_workflow_execution(conn, request).await?;
+        let handle = self.handle(started.exec_id);
+        Ok(StartedWorkflowHandle { started, handle })
+    }
+}
+
+/// Result of starting/loading a workflow together with an awaitable handle.
+#[derive(Debug, Clone)]
+pub struct StartedWorkflowHandle {
+    /// Standard start/load metadata.
+    pub started: StartedWorkflowExecution,
+    /// Awaitable result handle for `started.exec_id`.
+    pub handle: WorkflowHandle,
+}
+
+/// Awaitable handle for one workflow execution.
+#[derive(Debug, Clone)]
+pub struct WorkflowHandle {
+    exec_id: ExecutionId,
+    client: WorkflowHandleClient,
+}
+
+impl WorkflowHandle {
+    /// Execution ID this handle awaits.
+    #[must_use]
+    pub const fn exec_id(&self) -> ExecutionId {
+        self.exec_id
+    }
+
+    /// Return the current compact result snapshot without waiting.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::NotFound`] when the execution row does not exist,
+    /// or [`HarvestError::Database`] for connection/query failures.
+    pub async fn result_snapshot(&self) -> HarvestResult<WorkflowResult> {
+        let execution = self.load_execution().await?;
+        Ok(WorkflowResult::from_execution(&execution))
+    }
+
+    /// Wait up to `timeout` for a terminal compact snapshot.
+    ///
+    /// Returns `Ok(None)` when the execution is still running after the wait
+    /// window elapses. This is the long-poll shape used by HTTP routes that
+    /// need to return `204 No Content` instead of treating an elapsed wait as a
+    /// workflow timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns database, listener setup, notification payload, or not-found
+    /// errors.
+    pub async fn result_snapshot_with_wait(
+        &self,
+        timeout: Duration,
+    ) -> HarvestResult<Option<WorkflowResult>> {
+        let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+            HarvestError::Config("workflow result wait duration overflowed".to_string())
+        })?;
+        let snapshot = self.result_snapshot().await?;
+        if snapshot.is_terminal() {
+            return Ok(Some(snapshot));
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+
+        let mut listener = self.connect_listener().await?;
+
+        loop {
+            let snapshot = self.result_snapshot().await?;
+            if snapshot.is_terminal() {
+                return Ok(Some(snapshot));
+            }
+
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(None);
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            match listener.wait_for_notification_timeout(remaining).await? {
+                WorkflowEventWaitOutcome::Notification(_payload) => {}
+                WorkflowEventWaitOutcome::TimedOut => {
+                    let snapshot = self.result_snapshot().await?;
+                    return if snapshot.is_terminal() {
+                        Ok(Some(snapshot))
+                    } else {
+                        Ok(None)
+                    };
+                }
+                WorkflowEventWaitOutcome::ChannelClosed => {
+                    listener = self.connect_listener().await?;
+                }
+            }
+        }
+    }
+
+    /// Wait until the workflow reaches a terminal state and return its raw JSON
+    /// output. Failure terminal states are returned as typed [`HarvestError`]
+    /// variants.
+    ///
+    /// # Errors
+    ///
+    /// Returns terminal workflow errors, database errors, listener setup errors,
+    /// or not-found errors.
+    pub async fn result_raw(&self) -> HarvestResult<Value> {
+        let execution = self.load_execution().await?;
+        if let Some(result) = terminal_raw_result(&execution) {
+            return result;
+        }
+
+        let mut listener = self.connect_listener().await?;
+
+        loop {
+            let execution = self.load_execution().await?;
+            if let Some(result) = terminal_raw_result(&execution) {
+                return result;
+            }
+
+            match listener.wait_for_notification().await? {
+                WorkflowEventWaitOutcome::Notification(_payload) => {}
+                WorkflowEventWaitOutcome::TimedOut => {}
+                WorkflowEventWaitOutcome::ChannelClosed => {
+                    listener = self.connect_listener().await?;
+                }
+            }
+        }
+    }
+
+    /// Wait until the workflow reaches a terminal state, returning
+    /// [`HarvestError::Timeout`] if the deadline elapses while it is still
+    /// running.
+    ///
+    /// # Errors
+    ///
+    /// Returns terminal workflow errors, timeout, database errors, listener
+    /// setup errors, or not-found errors.
+    pub async fn result_raw_with_timeout(&self, timeout: Duration) -> HarvestResult<Value> {
+        let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+            HarvestError::Config("workflow result timeout duration overflowed".to_string())
+        })?;
+        let execution = self.load_execution().await?;
+        if let Some(result) = terminal_raw_result(&execution) {
+            return result;
+        }
+        if Instant::now() >= deadline {
+            return Err(wait_timeout_error(&execution));
+        }
+
+        let mut listener = self.connect_listener().await?;
+
+        loop {
+            let execution = self.load_execution().await?;
+            if let Some(result) = terminal_raw_result(&execution) {
+                return result;
+            }
+
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(wait_timeout_error(&execution));
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            match listener.wait_for_notification_timeout(remaining).await? {
+                WorkflowEventWaitOutcome::Notification(_payload) => {}
+                WorkflowEventWaitOutcome::TimedOut => {
+                    let execution = self.load_execution().await?;
+                    if let Some(result) = terminal_raw_result(&execution) {
+                        return result;
+                    }
+                    return Err(wait_timeout_error(&execution));
+                }
+                WorkflowEventWaitOutcome::ChannelClosed => {
+                    listener = self.connect_listener().await?;
+                }
+            }
+        }
+    }
+
+    fn shard(&self) -> ShardId {
+        self.client.inner.router.shard_for_execution(self.exec_id)
+    }
+
+    fn notification_database_url(&self) -> HarvestResult<String> {
+        let shard = self.shard();
+        self.client
+            .inner
+            .notification_database_urls
+            .get(&shard)
+            .cloned()
+            .ok_or_else(|| {
+                HarvestError::Config(format!(
+                    "no workflow notification database URL configured for shard {shard}"
+                ))
+            })
+    }
+
+    async fn connect_listener(&self) -> HarvestResult<WorkflowEventListener> {
+        WorkflowEventListener::connect(&self.notification_database_url()?).await
+    }
+
+    async fn load_execution(&self) -> HarvestResult<WorkflowExecution> {
+        let shard = self.shard();
+        let mut conn = self
+            .client
+            .inner
+            .pools
+            .pool_for(shard)
+            .get()
+            .await
+            .map_err(|error| HarvestError::Database(error.to_string()))?;
+
+        harvest_workflow_executions::table
+            .find(self.exec_id.as_uuid())
+            .select(WorkflowExecution::as_select())
+            .first(&mut conn)
+            .await
+            .optional()
+            .map_err(database_error)?
+            .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {}", self.exec_id)))
+    }
+}
+
+fn terminal_raw_result(execution: &WorkflowExecution) -> Option<HarvestResult<Value>> {
+    match execution.state.as_str() {
+        "COMPLETED" | "CONTINUED_AS_NEW" => {
+            Some(Ok(execution.output.clone().unwrap_or(Value::Null)))
+        }
+        "FAILED" => Some(Err(HarvestError::WorkflowFailed {
+            name: execution.workflow_name.clone(),
+            reason: execution
+                .error
+                .clone()
+                .unwrap_or_else(|| "workflow failed".to_string()),
+        })),
+        "CANCELLED" => Some(Err(HarvestError::Cancelled(
+            execution
+                .error
+                .clone()
+                .unwrap_or_else(|| "workflow cancelled".to_string()),
+        ))),
+        "TIMED_OUT" => Some(Err(HarvestError::Timeout {
+            timeout_type: TimeoutType::ScheduleToClose,
+            task_name: execution.workflow_name.clone(),
+        })),
+        "TERMINATED" => Some(Err(HarvestError::Terminated(
+            execution
+                .error
+                .clone()
+                .unwrap_or_else(|| "workflow terminated".to_string()),
+        ))),
+        _ => None,
+    }
+}
+
+fn wait_timeout_error(execution: &WorkflowExecution) -> HarvestError {
+    HarvestError::Timeout {
+        timeout_type: TimeoutType::ScheduleToClose,
+        task_name: execution.workflow_name.clone(),
+    }
+}
+
+/// Start or load a workflow and return an awaitable [`WorkflowHandle`].
+///
+/// This free function mirrors [`start_or_load_workflow_execution`] for callers
+/// that prefer functions over [`WorkflowHandleClient::start_or_load`].
+///
+/// # Errors
+///
+/// Propagates [`start_or_load_workflow_execution`] failures.
+pub async fn start_or_load_workflow_execution_with_handle(
+    conn: &mut AsyncPgConnection,
+    request: StartWorkflowParams<'_>,
+    client: &WorkflowHandleClient,
+) -> HarvestResult<StartedWorkflowHandle> {
+    client.start_or_load(conn, request).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workflow_result_state_maps_database_states() {
+        assert_eq!(
+            WorkflowResultState::from_execution_state("COMPLETED"),
+            WorkflowResultState::Completed
+        );
+        assert_eq!(
+            WorkflowResultState::from_execution_state("CONTINUED_AS_NEW"),
+            WorkflowResultState::ContinuedAsNew
+        );
+        assert_eq!(
+            WorkflowResultState::from_execution_state("RUNNING"),
+            WorkflowResultState::Running
+        );
+    }
+}

@@ -29,6 +29,8 @@ diesel::table! {
         memo -> Nullable<Jsonb>,
         search_attrs -> Nullable<Jsonb>,
         created_at -> Timestamptz,
+        /// Build ID assigned to this execution at start time (issue #171).
+        assigned_build_id -> Nullable<Text>,
     }
 }
 
@@ -64,6 +66,7 @@ diesel::table! {
         started_at -> Nullable<Timestamptz>,
         completed_at -> Nullable<Timestamptz>,
         last_heartbeat_at -> Nullable<Timestamptz>,
+        heartbeat_details -> Nullable<Jsonb>,
         heartbeat_timeout -> Nullable<Interval>,
         start_to_close -> Nullable<Interval>,
         schedule_to_start -> Nullable<Interval>,
@@ -74,6 +77,10 @@ diesel::table! {
         sticky_until -> Nullable<Timestamptz>,
         sticky_timeout -> Nullable<Interval>,
         trace_context -> Nullable<Jsonb>,
+        concurrency_key -> Nullable<Text>,
+        concurrency_cap -> Nullable<Int4>,
+        /// Build ID required to claim this task (issue #171). NULL = any worker.
+        required_build_id -> Nullable<Text>,
     }
 }
 
@@ -100,7 +107,7 @@ diesel::table! {
 
     harvest_schedules (id) {
         id -> Uuid,
-        dag_name -> Text,
+        dag_name -> Nullable<Text>,
         schedule_expr -> Nullable<Text>,
         timezone -> Text,
         catchup -> Bool,
@@ -110,6 +117,9 @@ diesel::table! {
         next_run_at -> Nullable<Timestamptz>,
         created_at -> Timestamptz,
         updated_at -> Timestamptz,
+        workflow_name -> Nullable<Text>,
+        workflow_input -> Nullable<Jsonb>,
+        queue_name -> Nullable<Text>,
     }
 }
 
@@ -155,11 +165,142 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    use diesel::sql_types::*;
+
+    harvest_external_tasks (id) {
+        id -> Uuid,
+        token -> Uuid,
+        workflow_exec_id -> Uuid,
+        activity_id -> Uuid,
+        name -> Text,
+        queue -> Text,
+        state -> Text,
+        schedule_to_close_at -> Timestamptz,
+        schedule_to_close_secs -> Int8,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    use diesel::sql_types::*;
+
+    harvest_workers (worker_id) {
+        worker_id -> Text,
+        started_at -> Timestamptz,
+        last_heartbeat_at -> Timestamptz,
+        queues -> Jsonb,
+        shard_assignments -> Jsonb,
+        max_concurrency -> Int4,
+        in_flight_count -> Int4,
+        host -> Text,
+        version -> Nullable<Text>,
+        status -> Text,
+        drain_deadline_at -> Nullable<Timestamptz>,
+        /// Immutable build identifier advertised by this worker (issue #171).
+        build_id -> Text,
+        /// Optional human-readable deployment name (issue #171).
+        deployment_name -> Nullable<Text>,
+    }
+}
+
+diesel::table! {
+    use diesel::sql_types::*;
+
+    harvest_build_policies (id) {
+        id -> Uuid,
+        queue_name -> Text,
+        build_id -> Text,
+        deployment_name -> Nullable<Text>,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    use diesel::sql_types::*;
+
+    harvest_build_compat (id) {
+        id -> Uuid,
+        build_id -> Text,
+        compatible_with -> Text,
+        declared_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    use diesel::sql_types::*;
+
+    harvest_batch_jobs (id) {
+        id -> Uuid,
+        action -> Text,
+        filter -> Jsonb,
+        signal_name -> Nullable<Text>,
+        signal_payload -> Nullable<Jsonb>,
+        status -> Text,
+        total -> Int8,
+        completed -> Int8,
+        failed -> Int8,
+        errors -> Jsonb,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+        started_at -> Nullable<Timestamptz>,
+        completed_at -> Nullable<Timestamptz>,
+        idempotency_key -> Nullable<Text>,
+        created_by -> Nullable<Text>,
+        processed_ids -> Jsonb,
+    }
+}
+
+diesel::table! {
+    use diesel::sql_types::*;
+
+    harvest_audit_log (id) {
+        id -> Uuid,
+        occurred_at -> Timestamptz,
+        actor -> Text,
+        operation -> Text,
+        target_type -> Text,
+        target_id -> Nullable<Text>,
+        route_or_command -> Text,
+        request_id -> Nullable<Text>,
+        idempotency_key -> Nullable<Text>,
+        status -> Text,
+        error_summary -> Nullable<Text>,
+        shard_id -> Nullable<Int4>,
+        source -> Text,
+    }
+}
+
+diesel::table! {
+    use diesel::sql_types::*;
+
+    harvest_backfill_log (id) {
+        id -> Uuid,
+        schedule_id -> Uuid,
+        actor -> Text,
+        source -> Text,
+        from_ts -> Timestamptz,
+        to_ts -> Timestamptz,
+        dry_run -> Bool,
+        total -> Int4,
+        dispatched -> Int4,
+        skipped -> Int4,
+        failed -> Int4,
+        status -> Text,
+        error_summary -> Nullable<Text>,
+        started_at -> Timestamptz,
+        completed_at -> Nullable<Timestamptz>,
+    }
+}
+
 diesel::joinable!(harvest_events -> harvest_workflow_executions (workflow_exec_id));
 diesel::joinable!(harvest_task_queue -> harvest_workflow_executions (workflow_exec_id));
 diesel::joinable!(harvest_dag_runs -> harvest_workflow_executions (workflow_exec_id));
 diesel::joinable!(harvest_signals -> harvest_workflow_executions (workflow_exec_id));
 diesel::joinable!(harvest_timers -> harvest_workflow_executions (workflow_exec_id));
+diesel::joinable!(harvest_external_tasks -> harvest_workflow_executions (workflow_exec_id));
 
 diesel::allow_tables_to_appear_in_same_query!(
     harvest_workflow_executions,
@@ -170,4 +311,11 @@ diesel::allow_tables_to_appear_in_same_query!(
     harvest_signals,
     harvest_timers,
     harvest_dead_letters,
+    harvest_external_tasks,
+    harvest_workers,
+    harvest_batch_jobs,
+    harvest_audit_log,
+    harvest_build_policies,
+    harvest_build_compat,
+    harvest_backfill_log,
 );

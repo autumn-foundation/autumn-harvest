@@ -20,6 +20,20 @@ type Compensation<'ctx> = Box<dyn FnOnce() -> BoxFuture<'ctx, HarvestResult<()>>
 /// order. Compensation actions are ordinary workflow actions, so calling
 /// `ctx.execute_activity_raw(...)` inside a compensation records the activity in
 /// workflow history just like any other activity.
+///
+/// ## Examples
+///
+/// ```rust
+/// use autumn_harvest::context::WorkflowContext;
+/// use autumn_harvest::saga::Saga;
+/// use autumn_harvest::ExecutionId;
+///
+/// // Assuming ctx is a valid &WorkflowContext from your workflow function
+/// # let ctx = WorkflowContext::for_replay(ExecutionId::new(), vec![]);
+/// let mut saga = Saga::new(&ctx);
+///
+/// // You can now use `saga.step` to build compensated operations.
+/// ```
 pub struct Saga<'ctx> {
     ctx: &'ctx WorkflowContext,
     compensations: Vec<Compensation<'ctx>>,

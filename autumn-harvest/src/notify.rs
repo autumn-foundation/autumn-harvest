@@ -34,6 +34,16 @@ pub fn queue_channel(queue_name: &str) -> String {
     format!("harvest_queue_{}", queue_name.replace('-', "_"))
 }
 
+/// Postgres NOTIFY channel used when workflow event history advances.
+///
+/// `store::append_events` sends this notification after inserting one or more
+/// events, so embedders can LISTEN once and wake immediately when any workflow
+/// changes state.
+#[must_use]
+pub const fn workflow_events_channel() -> &'static str {
+    "harvest_events"
+}
+
 #[must_use]
 fn quote_pg_identifier(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
@@ -50,6 +60,17 @@ pub struct NotifyPayload {
     pub task_id: Uuid,
 }
 
+/// Payload sent on [`workflow_events_channel`] after events are appended.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WorkflowEventNotifyPayload {
+    /// Workflow execution whose history advanced.
+    pub workflow_exec_id: Uuid,
+    /// Number of events appended in this write.
+    pub event_count: usize,
+    /// Type name of the last appended event.
+    pub last_event_type: String,
+}
+
 /// Outcome of waiting on a queue listener.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueueWaitOutcome {
@@ -58,6 +79,17 @@ pub enum QueueWaitOutcome {
     /// No payload arrived before `poll_interval` elapsed.
     TimedOut,
     /// The listener channel closed because the underlying connection died.
+    ChannelClosed,
+}
+
+/// Outcome of waiting on the workflow event listener.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkflowEventWaitOutcome {
+    /// A workflow event notification arrived before the timeout elapsed.
+    Notification(WorkflowEventNotifyPayload),
+    /// No notification arrived before the caller's timeout elapsed.
+    TimedOut,
+    /// The LISTEN connection closed.
     ChannelClosed,
 }
 
@@ -84,6 +116,67 @@ pub async fn notify_task_enqueued(
 
     diesel::sql_query("SELECT pg_notify($1, $2)")
         .bind::<Text, _>(&channel)
+        .bind::<Text, _>(&payload)
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    Ok(())
+}
+
+/// Send a `NOTIFY` on the appropriate channels for multiple queues in a single roundtrip.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] if the `NOTIFY` SQL fails.
+pub async fn notify_tasks_enqueued(
+    conn: &mut AsyncPgConnection,
+    queue_names: &[String],
+    task_id: Uuid,
+) -> HarvestResult<()> {
+    if queue_names.is_empty() {
+        return Ok(());
+    }
+
+    let channels: Vec<String> = queue_names.iter().map(|q| queue_channel(q)).collect();
+    let payload = serde_json::to_string(&NotifyPayload { task_id })
+        .map_err(|e| HarvestError::Database(format!("failed to serialize notify payload: {e}")))?;
+
+    diesel::sql_query("SELECT pg_notify(channel, $2) FROM unnest($1) AS channel")
+        .bind::<diesel::sql_types::Array<Text>, _>(channels)
+        .bind::<Text, _>(&payload)
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    Ok(())
+}
+
+/// Send a notification that one or more workflow events were appended.
+///
+/// When called inside a transaction, Postgres delivers the notification only
+/// after the transaction commits, so listeners wake after the execution row and
+/// event rows are mutually visible.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] if payload serialization or `pg_notify`
+/// fails.
+pub async fn notify_workflow_events_appended(
+    conn: &mut AsyncPgConnection,
+    workflow_exec_id: Uuid,
+    event_count: usize,
+    last_event_type: &str,
+) -> HarvestResult<()> {
+    let payload = serde_json::to_string(&WorkflowEventNotifyPayload {
+        workflow_exec_id,
+        event_count,
+        last_event_type: last_event_type.to_string(),
+    })
+    .map_err(|e| HarvestError::Database(format!("failed to serialize notify payload: {e}")))?;
+
+    diesel::sql_query("SELECT pg_notify($1, $2)")
+        .bind::<Text, _>(workflow_events_channel())
         .bind::<Text, _>(&payload)
         .execute(conn)
         .await
@@ -227,6 +320,96 @@ impl QueueListener {
     }
 }
 
+/// Async listener for [`workflow_events_channel`] notifications.
+pub struct WorkflowEventListener {
+    /// Client handle kept alive so the LISTEN connection stays open.
+    _client: tokio_postgres::Client,
+    /// Receiver for notifications forwarded by the connection driver task.
+    rx: tokio::sync::mpsc::Receiver<tokio_postgres::Notification>,
+    /// Background connection driver handle kept alive for the connection's lifetime.
+    _connection_handle: tokio::task::JoinHandle<()>,
+}
+
+impl WorkflowEventListener {
+    /// Connect to Postgres and subscribe to the `harvest_events` channel.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Database`] if the connection or LISTEN fails.
+    pub async fn connect(database_url: &str) -> HarvestResult<Self> {
+        let (client, mut connection) = tokio_postgres::connect(database_url, tokio_postgres::NoTls)
+            .await
+            .map_err(|e| HarvestError::Database(format!("pg connect failed: {e}")))?;
+
+        let (tx, rx) = tokio::sync::mpsc::channel(128);
+        let handle = tokio::spawn(async move {
+            use futures::future::poll_fn;
+
+            loop {
+                let msg = poll_fn(|cx| connection.poll_message(cx)).await;
+                match msg {
+                    Some(Ok(tokio_postgres::AsyncMessage::Notification(n))) => {
+                        if tx.send(n).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(e)) => {
+                        tracing::error!(error = %e, "postgres workflow event listener error");
+                        break;
+                    }
+                    None => break,
+                }
+            }
+        });
+
+        let channel = quote_pg_identifier(workflow_events_channel());
+        client
+            .batch_execute(&format!("LISTEN {channel}"))
+            .await
+            .map_err(|e| HarvestError::Database(format!("LISTEN {channel} failed: {e}")))?;
+
+        Ok(Self {
+            _client: client,
+            rx,
+            _connection_handle: handle,
+        })
+    }
+
+    /// Wait indefinitely for the next workflow event notification.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Database`] if the notification payload is invalid.
+    pub async fn wait_for_notification(&mut self) -> HarvestResult<WorkflowEventWaitOutcome> {
+        match self.rx.recv().await {
+            Some(notification) => {
+                let payload: WorkflowEventNotifyPayload =
+                    serde_json::from_str(notification.payload()).map_err(|e| {
+                        HarvestError::Database(format!("bad workflow notify payload: {e}"))
+                    })?;
+                Ok(WorkflowEventWaitOutcome::Notification(payload))
+            }
+            None => Ok(WorkflowEventWaitOutcome::ChannelClosed),
+        }
+    }
+
+    /// Wait for a notification up to `timeout`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Database`] if the notification payload is invalid.
+    pub async fn wait_for_notification_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> HarvestResult<WorkflowEventWaitOutcome> {
+        match tokio::time::timeout(timeout, self.wait_for_notification()).await {
+            Ok(outcome) => outcome,
+            Err(_elapsed) => Ok(WorkflowEventWaitOutcome::TimedOut),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -270,5 +453,23 @@ mod tests {
             quote_pg_identifier("harvest_queue_priority\"queue"),
             "\"harvest_queue_priority\"\"queue\""
         );
+    }
+
+    #[test]
+    fn workflow_events_channel_is_stable() {
+        assert_eq!(workflow_events_channel(), "harvest_events");
+    }
+
+    #[test]
+    fn workflow_event_notify_payload_roundtrips() {
+        let original = WorkflowEventNotifyPayload {
+            workflow_exec_id: Uuid::new_v4(),
+            event_count: 2,
+            last_event_type: "WorkflowCompleted".to_string(),
+        };
+        let json = serde_json::to_string(&original).expect("serialize");
+        let deserialized: WorkflowEventNotifyPayload =
+            serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(original, deserialized);
     }
 }

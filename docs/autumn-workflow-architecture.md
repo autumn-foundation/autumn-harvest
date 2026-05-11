@@ -163,6 +163,39 @@ async fn send_bulk_email(ctx: &ActivityContext, batch: Vec<EmailRequest>) -> Aut
 }
 ```
 
+#### Per-activity concurrency caps
+
+Workflows commonly integrate with rate-limited downstream services (Stripe,
+OpenAI, SendGrid, etc.). Without a cap the cluster can fan out many parallel
+calls, hitting 429s or connection pool limits.
+
+Declare `max_concurrent = N` on the activity to enforce a cluster-wide cap:
+
+```rust
+// At most 5 Stripe calls in flight at any instant across the whole cluster.
+#[activity(start_to_close = "30s", max_concurrent = 5)]
+async fn charge_stripe(ctx: &ActivityContext, amount_cents: u64) -> HarvestResult<String> {
+    // …
+}
+```
+
+When multiple activities share a single rate-limited dependency, give them the
+same `concurrency_key` so the budget is shared rather than doubled:
+
+```rust
+#[activity(start_to_close = "30s", max_concurrent = 5, concurrency_key = "stripe")]
+async fn charge_stripe(ctx: &ActivityContext, amount_cents: u64) -> HarvestResult<String> { /* … */ }
+
+#[activity(start_to_close = "10s", max_concurrent = 5, concurrency_key = "stripe")]
+async fn refund_stripe(ctx: &ActivityContext, charge_id: String) -> HarvestResult<()> { /* … */ }
+```
+
+`HarvestBuilder::build()` fails fast with
+`HarvestBuilderError::ConcurrencyKeyMismatch` if activities sharing a key
+disagree on `max_concurrent`. The cap is enforced by the Postgres claim query
+without any extra table, background task, or dedicated worker process; tasks
+whose key is saturated are simply not claimed until a slot becomes free.
+
 ### 4.2 Defining Workflows (Durable Execution)
 
 Workflows are deterministic orchestration functions. They call activities, set timers, wait for signals, and maintain durable state through event sourcing. This is the Temporal-style model.
@@ -618,6 +651,62 @@ Level 3: [send_slack_notification]           ← waits for level 2
 
 Cycle detection happens at compile time (via the `#[dag]` macro). If the dependency graph contains a cycle, the macro emits a compile error.
 
+### 6.5 Per-Workflow Cron Schedules
+
+For the common case of "run this one workflow on a schedule," wrapping a single
+workflow in a DAG is unnecessary overhead. The scheduler tick has a parallel
+branch that processes `harvest_schedules` rows where `workflow_name IS NOT NULL`,
+dispatching each due run directly via `start_or_load_workflow_execution`.
+
+**Decision tree:**
+
+| You want… | Use… |
+|---|---|
+| One workflow, one cron string, one JSON input | `WorkflowSchedule` |
+| Fan-out across multiple activities with trigger rules and `AllSuccess` / `OneFailed` dependencies | `DagBuilder` |
+| Multi-step pipeline where step N waits for step N−1 | `DagBuilder` |
+| Dynamic input that changes per run | `DagBuilder` with a trigger via API |
+
+**Registration:**
+
+```rust
+use autumn_harvest::policy::{Schedule, WorkflowSchedule};
+
+let sched = WorkflowSchedule::new(
+    "daily_billing_report",           // must match a workflows![] registration
+    Schedule::Cron("0 3 * * *".to_string()),
+)
+.with_input(serde_json::json!({"region": "us-east"}))
+.with_max_active_runs(1)    // skip the next firing if the previous run is still RUNNING
+.with_catchup(false);       // drop missed firings instead of replaying them
+
+let app = autumn_web::app()
+    .workflows(workflows![daily_billing_report])
+    .workflow_schedule(sched)
+    .worker(WorkerConfig::default());
+```
+
+**Schema shape:** `harvest_schedules` uses a single-table design where exactly
+one of `dag_name` or `workflow_name` is set per row, enforced by a CHECK
+constraint. The scheduler's `create_due_runs` and `activate_queued_runs`
+helpers filter to `dag_name IS NOT NULL`; the `tick_workflow_schedules` branch
+filters to `workflow_name IS NOT NULL`. Existing DAG-only deployments see no
+behavioral change.
+
+**`workflow_id` derivation:** each scheduled dispatch uses
+`sched:{workflow_name}:{unix_seconds_of_logical_date}` as the `workflow_id`.
+This makes retries after a crashed tick idempotent under the current
+`AllowDuplicate` reuse policy. When issue #87 lands and
+`WorkflowIdReusePolicy::RejectDuplicate` is available, the scheduler will
+switch to it so a double-tick cannot start two executions for the same logical
+date.
+
+**`max_active_runs`:** enforced via a `COUNT(*)` query on
+`harvest_workflow_executions` filtered by `workflow_name = ? AND state = 'RUNNING'`.
+If the running count equals or exceeds the cap, the tick updates `next_run_at`
+and increments the `harvest_schedule_skipped_total{reason="max_active_runs_reached"}`
+metric without starting a new execution.
+
 ---
 
 ## 7. Worker Model
@@ -815,10 +904,16 @@ CREATE TABLE harvest_dag_runs (
 
 CREATE INDEX idx_harvest_dr_schedule ON harvest_dag_runs (dag_name, state, logical_date);
 
--- Schedules (registered DAG timetables)
+-- Schedules (registered DAG timetables and per-workflow cron schedules)
+--
+-- Single-table design: exactly one of dag_name or workflow_name is set per row.
+-- Enforced by a NOT VALID CHECK constraint applied online-safely after the
+-- 20260430000000_harvest_workflow_schedules migration.
 CREATE TABLE harvest_schedules (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    dag_name        TEXT NOT NULL UNIQUE,
+    dag_name        TEXT UNIQUE,            -- NULL for workflow-kind rows
+    workflow_name   TEXT,                   -- NULL for dag-kind rows
+    workflow_input  JSONB,                  -- per-firing input for workflow-kind rows
     schedule_expr   TEXT,                   -- cron expression or 'manual'
     timezone        TEXT NOT NULL DEFAULT 'UTC',
     catchup         BOOLEAN NOT NULL DEFAULT FALSE,
@@ -827,7 +922,11 @@ CREATE TABLE harvest_schedules (
     last_run_at     TIMESTAMPTZ,
     next_run_at     TIMESTAMPTZ,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT harvest_schedules_kind_check CHECK (
+        (dag_name IS NOT NULL AND workflow_name IS NULL) OR
+        (dag_name IS NULL    AND workflow_name IS NOT NULL)
+    )
 );
 
 -- Signals (pending signals for running workflows)
@@ -888,27 +987,15 @@ CREATE TABLE harvest_events_p1 PARTITION OF harvest_events FOR VALUES WITH (MODU
 
 The `harvest_task_queue` table is also partitioned by `queue_name` using list partitioning, enabling queue-specific vacuum and index tuning.
 
-### 8.3 History Archival
+### 8.3 History Retention
 
-Completed workflow histories should be archived to prevent unbounded table growth. A background janitor task (running on the scheduler tick) moves completed workflows older than `history_retention` (default: 30 days) to `harvest_archived_events` (or deletes them if `archive = false`).
+Harvest ships an opt-in retention janitor for completed workflow histories. Operators configure `RetentionConfig` on `HarvestBuilder`; default behavior is disabled (`max_age = None`), so upgrading does not delete any rows until explicitly enabled.
 
-```sql
--- Archive old completed events
-INSERT INTO harvest_archived_events
-SELECT * FROM harvest_events
-WHERE workflow_exec_id IN (
-    SELECT id FROM harvest_workflow_executions
-    WHERE state IN ('COMPLETED', 'FAILED', 'CANCELLED')
-      AND completed_at < NOW() - INTERVAL '30 days'
-);
+When enabled, each tick selects terminal workflow executions older than `max_age` and deletes them transactionally. Rows in `harvest_events`, `harvest_task_queue`, `harvest_timers`, and `harvest_signals` are removed by `ON DELETE CASCADE`; `harvest_dead_letters` rows are deleted explicitly in the same retention transaction because `workflow_exec_id` is not a foreign key.
 
-DELETE FROM harvest_events
-WHERE workflow_exec_id IN (
-    SELECT id FROM harvest_workflow_executions
-    WHERE state IN ('COMPLETED', 'FAILED', 'CANCELLED')
-      AND completed_at < NOW() - INTERVAL '30 days'
-);
-```
+In-flight workflows are never eligible because retention only targets terminal states with `completed_at` older than the configured window.
+
+The management API exposes retention introspection and control via `GET /admin/retention` and `POST /admin/retention/run-now`.
 
 ---
 
@@ -1310,11 +1397,9 @@ Activities that need their own connections use `ctx.db()` which draws from the s
 
 For long-running deployments, the event history table will be the largest table. Harvest provides three retention strategies:
 
-**Time-based deletion** (default): Completed workflow histories older than `history_retention` are deleted.
+**Time-based deletion** (implemented): Configure `RetentionConfig { max_age, tick_interval, batch_size, dry_run }` on `HarvestBuilder` to prune terminal workflow history older than a fixed age.
 
-**Archival to cold storage:** Completed histories are serialized to JSONL and written to a configurable storage backend (local filesystem, S3 via optional feature flag) before deletion.
-
-**Infinite retention:** No cleanup. Suitable for compliance-heavy workloads. Requires partitioning and pg_partman for automated partition management.
+**Infinite retention** (default): Leave `max_age = None` to keep append-only history forever.
 
 ---
 
@@ -1350,9 +1435,7 @@ default_retry_policy.backoff_coefficient = 2.0
 default_retry_policy.max_interval = "5m"
 
 # History management
-history_retention = "30d"
-archive_enabled = false
-archive_path = "./harvest-archive"
+# configured via `HarvestBuilder::retention(RetentionConfig { ... })`
 
 # Management API
 api_enabled = true

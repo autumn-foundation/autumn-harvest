@@ -1,0 +1,2316 @@
+{
+  "version": "0.2.0",
+  "contract_version": "1",
+  "description": "Versioned machine-readable contract for the Harvest management API. Update this file and CHANGELOG.md whenever a route is added, removed, renamed, or its request/response shape changes.",
+  "compatibility": {
+    "additive_response_fields_allowed": true,
+    "breaking_changes": [
+      "Removing a response field",
+      "Renaming a response field",
+      "Changing the type of a response field",
+      "Removing a route",
+      "Renaming a route (path or method change)",
+      "Changing a query parameter from optional to required",
+      "Removing a request body field",
+      "Renaming a request body field",
+      "Adding a new mutating route without classifying it in this contract"
+    ],
+    "non_breaking_changes": [
+      "Adding a new optional response field",
+      "Adding a new optional query parameter",
+      "Adding a new optional request body field",
+      "Adding a new read-only route",
+      "Narrowing an existing error response to be more specific"
+    ]
+  },
+  "auth_note": "Route authorization posture is classified in issue #174. This contract records the route surface and category; auth enforcement is separate.",
+  "audit_note": "Mutating routes (read_only: false) are covered by the audit trail (issue #158). The audit endpoint itself is read-only.",
+  "routes": [
+    {
+      "method": "GET",
+      "path": "/workflows",
+      "category": "workflow",
+      "read_only": true,
+      "description": "List workflow executions with optional filters.",
+      "params": [
+        {
+          "name": "state",
+          "in": "query",
+          "required": false,
+          "description": "Comma-separated execution states (e.g. RUNNING,FAILED)."
+        },
+        {
+          "name": "workflow_name",
+          "in": "query",
+          "required": false,
+          "description": "Filter by registered workflow name."
+        },
+        {
+          "name": "search_attr",
+          "in": "query",
+          "required": false,
+          "repeated": true,
+          "description": "Search attribute filter in key:value form. May be repeated."
+        },
+        {
+          "name": "limit",
+          "in": "query",
+          "required": false,
+          "description": "Maximum number of results to return."
+        },
+        {
+          "name": "cursor",
+          "in": "query",
+          "required": false,
+          "description": "Opaque pagination cursor from a previous response."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "free_form": true
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Invalid filter value."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/workflows/{id}",
+      "category": "workflow",
+      "read_only": true,
+      "description": "Get full details and event history for a single workflow execution.",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Execution UUID."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "parent_id",
+          "execution",
+          "history",
+          "external_handoffs"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 404,
+          "description": "Execution not found."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/workflows/{id}/result",
+      "category": "workflow",
+      "read_only": true,
+      "description": "Return a compact terminal result for a workflow execution, optionally long-polling without returning event history.",
+      "params": [
+        { "name": "id", "in": "path", "required": true, "description": "Execution UUID." },
+        { "name": "wait", "in": "query", "required": false, "description": "Optional wait duration such as 250ms, 5s, or 1m. Defaults to 0s and is capped by the server, default 30s." }
+      ],
+      "request_body": null,
+      "success_response": { "status": 200, "note": "Returns 204 No Content with Retry-After when the execution is still running after the wait window.", "fields": ["state", "output", "error", "completed_at"] },
+      "error_responses": [
+        { "status": 400, "description": "Invalid execution ID or wait duration." },
+        { "status": 404, "description": "Execution not found." },
+        { "status": 500, "description": "Database or listener error." }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/workflows/{id}/history/export",
+      "category": "workflow",
+      "read_only": true,
+      "description": "Export the complete event history for a single execution as a HistoryExportDocument suitable for use as a replay fixture.",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Execution UUID."
+        },
+        {
+          "name": "payload_policy",
+          "in": "query",
+          "required": false,
+          "description": "Payload inclusion policy: full (default), redacted, or omit."
+        },
+        {
+          "name": "max_bytes",
+          "in": "query",
+          "required": false,
+          "description": "Soft byte cap on total payload size."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "free_form": true
+      },
+      "error_responses": [
+        {
+          "status": 404,
+          "description": "Execution not found."
+        },
+        {
+          "status": 413,
+          "description": "History exceeds max_bytes cap."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/workflows/{id}/children",
+      "category": "workflow",
+      "read_only": true,
+      "description": "List child workflow executions spawned by a parent execution.",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Parent execution UUID."
+        },
+        {
+          "name": "status",
+          "in": "query",
+          "required": false,
+          "repeated": true,
+          "description": "Filter by child status (e.g. Running, Failed). May be repeated."
+        },
+        {
+          "name": "workflow_name",
+          "in": "query",
+          "required": false,
+          "description": "Filter by child workflow name."
+        },
+        {
+          "name": "limit",
+          "in": "query",
+          "required": false,
+          "description": "Maximum number of results."
+        },
+        {
+          "name": "cursor",
+          "in": "query",
+          "required": false,
+          "description": "Pagination cursor."
+        },
+        {
+          "name": "depth",
+          "in": "query",
+          "required": false,
+          "description": "Maximum recursion depth for nested children."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "items",
+          "next_cursor"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 404,
+          "description": "Parent execution not found."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/workflows/{id}/stack",
+      "category": "workflow",
+      "read_only": true,
+      "description": "Show the current wait state of a running workflow (what it is blocked on).",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Execution UUID."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "exec_id",
+          "workflow_id",
+          "workflow_name",
+          "state",
+          "is_terminal",
+          "pending_activities",
+          "pending_external_handoffs",
+          "pending_local_activities",
+          "pending_timers",
+          "pending_signals",
+          "buffered_signals",
+          "pending_child_workflows",
+          "last_event_id"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 404,
+          "description": "Execution not found."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/workflows/{workflow_name}/start",
+      "category": "workflow",
+      "read_only": false,
+      "description": "Start a new workflow execution. Idempotent when workflow_id is provided: returns the existing execution if one with the same workflow_id is already running.",
+      "idempotency": "Idempotent by workflow_id when reuse_policy is reject_duplicate or allow_duplicate_failed_only.",
+      "params": [
+        {
+          "name": "workflow_name",
+          "in": "path",
+          "required": true,
+          "description": "Registered workflow function name."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "workflow_id",
+            "required": false,
+            "description": "Stable identifier for idempotent starts."
+          },
+          {
+            "name": "input",
+            "required": false,
+            "description": "Workflow input payload (any JSON value)."
+          },
+          {
+            "name": "queue",
+            "required": false,
+            "description": "Task queue name."
+          },
+          {
+            "name": "memo",
+            "required": false,
+            "description": "Non-indexed metadata (JSON object)."
+          },
+          {
+            "name": "search_attrs",
+            "required": false,
+            "description": "Indexed search attributes (JSON object)."
+          },
+          {
+            "name": "execution_timeout_secs",
+            "required": false,
+            "description": "Overall execution timeout in seconds."
+          },
+          {
+            "name": "reuse_policy",
+            "required": false,
+            "description": "Duplicate-id policy: allow_duplicate, reject_duplicate, allow_duplicate_failed_only, or terminate_if_running."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 201,
+        "note": "Returns 200 when an existing execution is returned via reuse_policy instead of creating a new one.",
+        "fields": [
+          "execution_id",
+          "workflow_name",
+          "workflow_id",
+          "state"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Invalid request body or workflow name."
+        },
+        {
+          "status": 409,
+          "description": "Duplicate workflow_id with conflicting reuse policy."
+        },
+        {
+          "status": 500,
+          "description": "Database or scheduling error."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/workflows/{id}/cancel",
+      "category": "workflow",
+      "read_only": false,
+      "description": "Cancel a running workflow execution.",
+      "idempotency": "Idempotent: cancelling an already-cancelled or terminal execution is a no-op.",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Execution UUID."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "reason",
+            "required": false,
+            "description": "Human-readable cancellation reason recorded in audit log."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "ok",
+          "execution_id",
+          "state",
+          "reason",
+          "newly_cancelled",
+          "failed_task_count"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 404,
+          "description": "Execution not found."
+        },
+        {
+          "status": 409,
+          "description": "Execution is already in a terminal state."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/workflows/{id}/reset",
+      "category": "workflow",
+      "read_only": false,
+      "description": "Fork a workflow execution at a specific event boundary, replaying from that point with a new execution ID.",
+      "idempotency": "Not idempotent: each call forks the execution and creates a distinct new execution ID.",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Execution UUID."
+        },
+        {
+          "name": "dry_run",
+          "in": "query",
+          "required": false,
+          "description": "When true, return the preview without creating a new execution."
+        }
+      ],
+      "request_body": {
+        "required": true,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "reset_to_event_id",
+            "required": true,
+            "description": "Event sequence number to reset to."
+          },
+          {
+            "name": "reason",
+            "required": true,
+            "description": "Reason for the reset, recorded in audit log."
+          },
+          {
+            "name": "operator_id",
+            "required": false,
+            "description": "Identity of the operator."
+          },
+          {
+            "name": "signal_reapply",
+            "required": false,
+            "description": "How to handle buffered signals: drop or buffer."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 201,
+        "fields": [
+          "new_exec_id",
+          "reset_from_exec_id",
+          "reset_to_event_id",
+          "events_carried_over",
+          "source_tasks_cancelled",
+          "source_timers_removed",
+          "source_signals_dropped",
+          "source_signals_buffered"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Invalid reset point or request body."
+        },
+        {
+          "status": 404,
+          "description": "Execution not found."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/workflows/{id}/signal/{signal_name}",
+      "category": "workflow",
+      "read_only": false,
+      "description": "Send a named signal to a running workflow execution. The request body is the signal payload itself (free-form JSON).",
+      "idempotency": "Not idempotent: each call delivers a distinct signal event to the workflow.",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Execution UUID."
+        },
+        {
+          "name": "signal_name",
+          "in": "path",
+          "required": true,
+          "description": "Registered signal handler name."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": true,
+        "description": "Optional signal payload \u2014 the entire body is passed verbatim to the signal handler.",
+        "fields": []
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "ok"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 404,
+          "description": "Execution not found."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/workflows/{id}/query/{query_name}",
+      "category": "workflow",
+      "read_only": true,
+      "description": "Query the current state of a running workflow by invoking a registered query handler.",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Execution UUID."
+        },
+        {
+          "name": "query_name",
+          "in": "path",
+          "required": true,
+          "description": "Registered query handler name."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "free_form": true
+      },
+      "error_responses": [
+        {
+          "status": 404,
+          "description": "Execution not found or query handler not registered."
+        },
+        {
+          "status": 500,
+          "description": "Query execution error."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/workflows/{id}/update/{update_name}",
+      "category": "workflow",
+      "read_only": false,
+      "description": "Submit a synchronous update request to a running workflow. Blocks until admitted or completed depending on the wait parameter.",
+      "idempotency": "Not idempotent: each call appends a distinct UpdateAdmitted event with a new update_id.",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Execution UUID."
+        },
+        {
+          "name": "update_name",
+          "in": "path",
+          "required": true,
+          "description": "Registered update handler name."
+        },
+        {
+          "name": "wait",
+          "in": "query",
+          "required": false,
+          "description": "admitted \u2014 return when validated; completed \u2014 block until handler returns (default)."
+        },
+        {
+          "name": "timeout_secs",
+          "in": "query",
+          "required": false,
+          "description": "Maximum seconds to wait."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "input",
+            "required": false,
+            "description": "Payload passed to the update handler (any JSON value)."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 202,
+        "note": "Returns 202 Accepted when wait=admitted (update durably recorded); returns 200 OK with outcome when wait=completed (default).",
+        "free_form": true
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Update rejected by the validator."
+        },
+        {
+          "status": 404,
+          "description": "Execution not found or update handler not registered."
+        },
+        {
+          "status": 504,
+          "description": "Timed out waiting for completion (wait=completed exceeded the timeout)."
+        },
+        {
+          "status": 500,
+          "description": "Internal error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/workflows/{id}/update/{update_id}/result",
+      "category": "workflow",
+      "read_only": true,
+      "description": "Poll the result of a previously admitted workflow update.",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Execution UUID."
+        },
+        {
+          "name": "update_id",
+          "in": "path",
+          "required": true,
+          "description": "Update UUID returned by POST \u2026/update/{name}."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "free_form": true
+      },
+      "additional_responses": [
+        {
+          "status": 202,
+          "description": "Update admitted but not yet completed (still in-flight)."
+        },
+        {
+          "status": 409,
+          "description": "Update failed or was rejected by the handler."
+        }
+      ],
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Invalid update_id format."
+        },
+        {
+          "status": 404,
+          "description": "Update not found."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/dags",
+      "category": "dag",
+      "read_only": true,
+      "description": "List all registered DAGs and their current pause/enabled state.",
+      "params": [],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "free_form": true
+      },
+      "error_responses": [
+        {
+          "status": 500,
+          "description": "Internal error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/dags/{dag_name}/runs",
+      "category": "dag",
+      "read_only": true,
+      "description": "List run history for a specific DAG.",
+      "params": [
+        {
+          "name": "dag_name",
+          "in": "path",
+          "required": true,
+          "description": "Registered DAG name."
+        },
+        {
+          "name": "limit",
+          "in": "query",
+          "required": false,
+          "description": "Maximum number of runs to return."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "free_form": true
+      },
+      "error_responses": [
+        {
+          "status": 404,
+          "description": "DAG not found."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/dags/{dag_name}/trigger",
+      "category": "dag",
+      "read_only": false,
+      "description": "Manually trigger a DAG run outside its schedule.",
+      "idempotency": "Not idempotent: each call starts a new DAG run.",
+      "params": [
+        {
+          "name": "dag_name",
+          "in": "path",
+          "required": true,
+          "description": "Registered DAG name."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "conf",
+            "required": false,
+            "description": "Run configuration passed to the DAG (any JSON value)."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 201,
+        "free_form": true
+      },
+      "error_responses": [
+        {
+          "status": 404,
+          "description": "DAG not found."
+        },
+        {
+          "status": 409,
+          "description": "DAG is paused or at max_active_runs."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "PATCH",
+      "path": "/dags/{dag_name}",
+      "category": "dag",
+      "read_only": false,
+      "description": "Update mutable DAG configuration fields (currently: pause/unpause).",
+      "idempotency": "Idempotent: applying the same pause state twice is a no-op.",
+      "params": [
+        {
+          "name": "dag_name",
+          "in": "path",
+          "required": true,
+          "description": "Registered DAG name."
+        }
+      ],
+      "request_body": {
+        "required": true,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "paused",
+            "required": true,
+            "description": "true to pause the DAG, false to resume it."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 200,
+        "free_form": true
+      },
+      "error_responses": [
+        {
+          "status": 404,
+          "description": "DAG not found."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/dead-letters",
+      "category": "dlq",
+      "read_only": true,
+      "description": "List dead-lettered tasks that have exhausted all retry attempts.",
+      "params": [
+        {
+          "name": "limit",
+          "in": "query",
+          "required": false,
+          "description": "Maximum number of entries to return."
+        },
+        {
+          "name": "cursor",
+          "in": "query",
+          "required": false,
+          "description": "Pagination cursor."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "free_form": true
+      },
+      "error_responses": [
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/dead-letters/replay",
+      "category": "dlq",
+      "read_only": false,
+      "description": "Bulk-replay dead-lettered tasks matching the provided filters by re-enqueuing them.",
+      "idempotency": "Idempotent by filter: already-replayed or already-pending entries are skipped.",
+      "params": [],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "activity_name",
+            "required": false,
+            "description": "Filter by activity function name."
+          },
+          {
+            "name": "workflow_name",
+            "required": false,
+            "description": "Filter by workflow name."
+          },
+          {
+            "name": "failed_after",
+            "required": false,
+            "description": "RFC 3339 timestamp \u2014 only replay entries failed after this time."
+          },
+          {
+            "name": "failed_before",
+            "required": false,
+            "description": "RFC 3339 timestamp \u2014 only replay entries failed before this time."
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "description": "Maximum number of entries to replay."
+          },
+          {
+            "name": "dry_run",
+            "required": false,
+            "description": "When true, return a preview without re-enqueuing."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "matched",
+          "acted_on",
+          "skipped",
+          "ids",
+          "dry_run",
+          "failures"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Invalid filter values."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/dead-letters/discard",
+      "category": "dlq",
+      "read_only": false,
+      "description": "Bulk-discard dead-lettered tasks matching the provided filters, removing them from the DLQ permanently.",
+      "idempotency": "Idempotent by filter: already-discarded entries are skipped.",
+      "params": [],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "activity_name",
+            "required": false,
+            "description": "Filter by activity function name."
+          },
+          {
+            "name": "workflow_name",
+            "required": false,
+            "description": "Filter by workflow name."
+          },
+          {
+            "name": "failed_after",
+            "required": false,
+            "description": "RFC 3339 timestamp \u2014 only discard entries failed after this time."
+          },
+          {
+            "name": "failed_before",
+            "required": false,
+            "description": "RFC 3339 timestamp \u2014 only discard entries failed before this time."
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "description": "Maximum number of entries to discard."
+          },
+          {
+            "name": "dry_run",
+            "required": false,
+            "description": "When true, return a preview without deleting."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "matched",
+          "acted_on",
+          "skipped",
+          "ids",
+          "dry_run",
+          "failures"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Invalid filter values."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/dead-letters/{id}/replay",
+      "category": "dlq",
+      "read_only": false,
+      "description": "Replay a single dead-lettered task by re-enqueuing it.",
+      "idempotency": "Idempotent: replaying an already-replayed entry is a no-op.",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "DeadLetter UUID."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": []
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "ok",
+          "dead_letter_id",
+          "task_id"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 404,
+          "description": "Dead letter not found."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/activities/external/{token}/complete",
+      "category": "external_activity",
+      "read_only": false,
+      "description": "Complete an external activity identified by its task token, supplying the success output.",
+      "idempotency": "Not idempotent: completing an already-resolved token returns 404.",
+      "params": [
+        {
+          "name": "token",
+          "in": "path",
+          "required": true,
+          "description": "Opaque task token issued when the activity was scheduled."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "output",
+            "required": false,
+            "description": "Result value passed back to the workflow (any JSON value)."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "ok",
+          "newly_resolved",
+          "status",
+          "current_state"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 404,
+          "description": "Token not found or already completed."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/activities/external/{token}/fail",
+      "category": "external_activity",
+      "read_only": false,
+      "description": "Fail an external activity, optionally marking the error as retryable.",
+      "idempotency": "Not idempotent: failing an already-resolved token returns 404.",
+      "params": [
+        {
+          "name": "token",
+          "in": "path",
+          "required": true,
+          "description": "Opaque task token."
+        }
+      ],
+      "request_body": {
+        "required": true,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "error",
+            "required": true,
+            "description": "Error message string."
+          },
+          {
+            "name": "retryable",
+            "required": false,
+            "description": "true to schedule a retry (default: false)."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "ok",
+          "newly_resolved",
+          "status",
+          "current_state"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 404,
+          "description": "Token not found."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/activities/external/{token}/heartbeat",
+      "category": "external_activity",
+      "read_only": false,
+      "description": "Send a liveness heartbeat for an in-progress external activity, optionally extending the deadline.",
+      "idempotency": "Idempotent: repeated heartbeats extend or maintain the deadline.",
+      "params": [
+        {
+          "name": "token",
+          "in": "path",
+          "required": true,
+          "description": "Opaque task token."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "extend_by_secs",
+            "required": false,
+            "description": "Seconds to extend the activity deadline."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "ok",
+          "newly_resolved",
+          "status",
+          "current_state"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 404,
+          "description": "Token not found."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/workers",
+      "category": "worker",
+      "read_only": true,
+      "description": "List registered worker processes and their current lifecycle status.",
+      "params": [
+        {
+          "name": "queue",
+          "in": "query",
+          "required": false,
+          "description": "Filter by task queue name."
+        },
+        {
+          "name": "shard_id",
+          "in": "query",
+          "required": false,
+          "description": "Filter by shard ID."
+        },
+        {
+          "name": "status",
+          "in": "query",
+          "required": false,
+          "description": "Filter by lifecycle status: Active, Draining, or Stopped."
+        },
+        {
+          "name": "health",
+          "in": "query",
+          "required": false,
+          "description": "Filter by health: healthy or stale."
+        },
+        {
+          "name": "limit",
+          "in": "query",
+          "required": false,
+          "description": "Maximum number of workers to return [1\u2013500]."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "free_form": true
+      },
+      "error_responses": [
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/workers/{worker_id}",
+      "category": "worker",
+      "read_only": true,
+      "description": "Get details for a single worker process.",
+      "params": [
+        {
+          "name": "worker_id",
+          "in": "path",
+          "required": true,
+          "description": "Worker process identifier."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "free_form": true
+      },
+      "error_responses": [
+        {
+          "status": 404,
+          "description": "Worker not found."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/workers/health",
+      "category": "worker",
+      "read_only": true,
+      "description": "Return aggregated fleet health statistics (active, stale, draining, stopped counts per shard).",
+      "params": [],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "healthy",
+          "stale",
+          "draining",
+          "by_queue",
+          "by_shard"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/workers/drain-preview",
+      "category": "worker",
+      "read_only": true,
+      "description": "Preview which workers would be targeted by a drain request, without modifying anything.",
+      "params": [
+        {
+          "name": "queue",
+          "in": "query",
+          "required": false,
+          "description": "Filter by task queue name."
+        },
+        {
+          "name": "shard_id",
+          "in": "query",
+          "required": false,
+          "description": "Filter by shard ID."
+        },
+        {
+          "name": "status",
+          "in": "query",
+          "required": false,
+          "description": "Filter by lifecycle status."
+        },
+        {
+          "name": "limit",
+          "in": "query",
+          "required": false,
+          "description": "Maximum number of workers to preview."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "free_form": true
+      },
+      "error_responses": [
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/workers/{worker_id}/drain",
+      "category": "worker",
+      "read_only": false,
+      "description": "Request a graceful drain for a specific worker. Sets its status to Draining so it stops accepting new tasks.",
+      "idempotency": "Idempotent: re-draining an already-draining worker extends the deadline if the new one is later.",
+      "params": [
+        {
+          "name": "worker_id",
+          "in": "path",
+          "required": true,
+          "description": "Worker process identifier."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "deadline_at",
+            "required": false,
+            "description": "RFC 3339 drain-by deadline. Omit to use the server's configured shutdown timeout."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "worker_id",
+          "outcome",
+          "in_flight_count",
+          "drain_deadline_at",
+          "shard_ids",
+          "unavailable_shards"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 404,
+          "description": "Worker not found."
+        },
+        {
+          "status": 409,
+          "description": "Worker is already Stopped."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/batch-operations",
+      "category": "batch",
+      "read_only": true,
+      "description": "List submitted batch operations and their current progress.",
+      "params": [
+        {
+          "name": "limit",
+          "in": "query",
+          "required": false,
+          "description": "Maximum number of operations to return."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "free_form": true
+      },
+      "error_responses": [
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/batch-operations",
+      "category": "batch",
+      "read_only": false,
+      "description": "Submit a fleet-wide batch operation (Cancel, Terminate, or Signal) targeting workflows matching a filter.",
+      "idempotency": "Idempotent by idempotency_key when provided: re-submitting with the same key returns the existing batch_job_id.",
+      "params": [],
+      "request_body": {
+        "required": true,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "action",
+            "required": true,
+            "description": "Batch action: Cancel, Terminate, or Signal."
+          },
+          {
+            "name": "filter",
+            "required": true,
+            "description": "Workflow filter (JSON object with states, workflow_name, search attributes)."
+          },
+          {
+            "name": "signal_name",
+            "required": false,
+            "description": "Signal name \u2014 required when action is Signal."
+          },
+          {
+            "name": "signal_payload",
+            "required": false,
+            "description": "Signal payload for Signal actions (any JSON value)."
+          },
+          {
+            "name": "idempotency_key",
+            "required": false,
+            "description": "Operator-supplied idempotency token; re-submitting with the same key returns the existing job."
+          },
+          {
+            "name": "created_by",
+            "required": false,
+            "description": "Optional caller identity for audit."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 202,
+        "fields": [
+          "batch_job_id"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Invalid action or missing required fields."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/batch-operations/{id}",
+      "category": "batch",
+      "read_only": true,
+      "description": "Get the current status and progress of a batch operation.",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Batch job UUID."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "free_form": true
+      },
+      "error_responses": [
+        {
+          "status": 404,
+          "description": "Batch job not found."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/health",
+      "category": "health",
+      "read_only": true,
+      "description": "Liveness health check. Returns 200 when the plugin is reachable. Does not probe the database.",
+      "params": [],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "runtime_ready",
+          "worker_id",
+          "queues",
+          "dag_count",
+          "scheduler",
+          "shard_readiness_enforced",
+          "shard_readiness"
+        ]
+      },
+      "error_responses": []
+    },
+    {
+      "method": "GET",
+      "path": "/admin/preflight",
+      "category": "admin",
+      "read_only": true,
+      "description": "Run deployment readiness preflight checks: database connectivity, migration status, shard health, and worker coverage.",
+      "params": [],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "overall_status",
+          "observed_at",
+          "version",
+          "checks"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 500,
+          "description": "Unable to connect to database."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/admin/shards/health",
+      "category": "admin",
+      "read_only": true,
+      "description": "Return per-shard readiness: ready, degraded, or unavailable.",
+      "params": [
+        {
+          "name": "candidate_shard",
+          "in": "query",
+          "required": false,
+          "description": "Shard ID of a new shard to probe before enabling writes."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "overall_readiness",
+          "observed_at",
+          "freshness_window_secs",
+          "candidate_shard",
+          "shards"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 503,
+          "description": "Database or shard connectivity error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/admin/version-gates/usage",
+      "category": "admin",
+      "read_only": true,
+      "description": "Report recorded workflow version-gate usage.",
+      "params": [
+        {
+          "name": "workflow_name",
+          "in": "query",
+          "required": false,
+          "description": "Filter by registered workflow name."
+        },
+        {
+          "name": "change_id",
+          "in": "query",
+          "required": false,
+          "description": "Filter by version-gate change ID."
+        },
+        {
+          "name": "recorded_version",
+          "in": "query",
+          "required": false,
+          "description": "Filter by recorded version number."
+        },
+        {
+          "name": "state_group",
+          "in": "query",
+          "required": false,
+          "description": "Execution state group: active or terminal."
+        },
+        {
+          "name": "shard_id",
+          "in": "query",
+          "required": false,
+          "description": "Restrict to a single shard."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "status",
+          "observed_at",
+          "filters",
+          "items",
+          "shards"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/admin/version-gates/retirement-check",
+      "category": "admin",
+      "read_only": true,
+      "description": "Check whether a version-gate change ID is safe to retire.",
+      "params": [
+        {
+          "name": "change_id",
+          "in": "query",
+          "required": true,
+          "description": "Version-gate change ID to inspect."
+        },
+        {
+          "name": "min_safe_version",
+          "in": "query",
+          "required": true,
+          "description": "Versions strictly below this value are considered old branches."
+        },
+        {
+          "name": "workflow_name",
+          "in": "query",
+          "required": false,
+          "description": "Narrow to a specific workflow name."
+        },
+        {
+          "name": "state_group",
+          "in": "query",
+          "required": false,
+          "description": "Execution state group filter."
+        },
+        {
+          "name": "shard_id",
+          "in": "query",
+          "required": false,
+          "description": "Restrict to a single shard."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "status",
+          "safe_to_retire",
+          "observed_at",
+          "filters",
+          "blockers",
+          "shards"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Missing required parameters."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/admin/retention",
+      "category": "admin",
+      "read_only": true,
+      "description": "Return the current status of the retention janitor.",
+      "params": [],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "free_form": true
+      },
+      "error_responses": []
+    },
+    {
+      "method": "POST",
+      "path": "/admin/retention/run-now",
+      "category": "admin",
+      "read_only": false,
+      "description": "Trigger the retention janitor to run immediately outside its scheduled interval.",
+      "idempotency": "Idempotent: triggering an already-running retention janitor is a no-op.",
+      "params": [],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": []
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "ok"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 500,
+          "description": "Internal error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/admin/concurrency",
+      "category": "admin",
+      "read_only": true,
+      "description": "Return per-activity concurrency statistics: configured cap, currently in-flight, and queued counts for each concurrency key.",
+      "params": [],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "free_form": true
+      },
+      "error_responses": [
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/admin/history/exports",
+      "category": "admin",
+      "read_only": true,
+      "description": "Batch-export event histories for multiple executions matching the provided filters.",
+      "params": [
+        {
+          "name": "workflow_name",
+          "in": "query",
+          "required": false,
+          "description": "Filter by workflow name."
+        },
+        {
+          "name": "state_group",
+          "in": "query",
+          "required": false,
+          "description": "Execution state group: active or terminal."
+        },
+        {
+          "name": "updated_after",
+          "in": "query",
+          "required": false,
+          "description": "RFC 3339 timestamp \u2014 include executions updated after this time."
+        },
+        {
+          "name": "updated_before",
+          "in": "query",
+          "required": false,
+          "description": "RFC 3339 timestamp \u2014 include executions updated before this time."
+        },
+        {
+          "name": "shard_id",
+          "in": "query",
+          "required": false,
+          "description": "Restrict to a single shard."
+        },
+        {
+          "name": "limit",
+          "in": "query",
+          "required": false,
+          "description": "Maximum number of histories to export."
+        },
+        {
+          "name": "payload_policy",
+          "in": "query",
+          "required": false,
+          "description": "Payload inclusion: full, redacted, or omit."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "status",
+          "observed_at",
+          "payload_policy",
+          "filters",
+          "exports",
+          "failures",
+          "shard_coverage"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Invalid filter values."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/admin/external-handoffs",
+      "category": "external_activity",
+      "read_only": true,
+      "description": "List pending external activity handoffs with optional filters.",
+      "params": [
+        {
+          "name": "state",
+          "in": "query",
+          "required": false,
+          "description": "Filter by handoff state (e.g. PENDING,FAILED)."
+        },
+        {
+          "name": "workflow_name",
+          "in": "query",
+          "required": false,
+          "description": "Filter by workflow name."
+        },
+        {
+          "name": "execution_id",
+          "in": "query",
+          "required": false,
+          "description": "Filter by execution UUID."
+        },
+        {
+          "name": "activity_name",
+          "in": "query",
+          "required": false,
+          "description": "Filter by activity function name."
+        },
+        {
+          "name": "token",
+          "in": "query",
+          "required": false,
+          "description": "Filter by task token UUID."
+        },
+        {
+          "name": "shard_id",
+          "in": "query",
+          "required": false,
+          "description": "Restrict to a single shard."
+        },
+        {
+          "name": "due_before",
+          "in": "query",
+          "required": false,
+          "description": "RFC 3339 timestamp \u2014 only return handoffs due before this time."
+        },
+        {
+          "name": "updated_before",
+          "in": "query",
+          "required": false,
+          "description": "RFC 3339 timestamp \u2014 only return handoffs last updated before this time."
+        },
+        {
+          "name": "limit",
+          "in": "query",
+          "required": false,
+          "description": "Maximum number of results."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "status",
+          "items",
+          "shard_coverage"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/admin/external-handoffs/{token}",
+      "category": "external_activity",
+      "read_only": true,
+      "description": "Get the current state and metadata of a single external activity handoff.",
+      "params": [
+        {
+          "name": "token",
+          "in": "path",
+          "required": true,
+          "description": "Task token UUID."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "status",
+          "item",
+          "shard_coverage"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 404,
+          "description": "Token not found."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/admin/schedules",
+      "category": "schedule",
+      "read_only": true,
+      "description": "List all workflow and DAG schedules.",
+      "params": [],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "free_form": false,
+        "fields": [
+          { "name": "id", "type": "string", "description": "Schedule UUID." },
+          { "name": "kind", "type": "string", "description": "workflow | dag" },
+          { "name": "name", "type": "string", "description": "Workflow or DAG name." },
+          { "name": "schedule_expr", "type": "string", "description": "Cron or interval expression. Null for manual schedules." },
+          { "name": "is_paused", "type": "boolean", "description": "Whether the schedule is currently paused." },
+          { "name": "next_run_at", "type": "string", "description": "Next scheduled firing time (RFC 3339). Null if paused or unscheduled." },
+          { "name": "last_run_at", "type": "string", "description": "Most recent automatic firing time (RFC 3339). Null if never run." },
+          { "name": "max_active_runs", "type": "integer", "description": "Maximum concurrently running executions for this schedule." },
+          { "name": "catchup", "type": "boolean", "description": "Whether the scheduler catches up missed runs on restart." },
+          { "name": "last_backfill", "type": "object", "description": "Most recent backfill request for this schedule, or null if none. Fields: id, actor, from, to, dry_run, total, dispatched, skipped, failed, status, error_summary, started_at, completed_at." }
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/admin/schedules/workflow",
+      "category": "schedule",
+      "read_only": false,
+      "description": "Create a new cron or interval schedule for a workflow.",
+      "idempotency": "Upsert keyed by workflow_name: if a schedule already exists for that name the expression, input, and queue are updated; is_paused is preserved. Safe to retry.",
+      "params": [],
+      "request_body": {
+        "required": true,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "workflow_name",
+            "required": true,
+            "description": "Registered workflow name."
+          },
+          {
+            "name": "schedule_expr",
+            "required": true,
+            "description": "Cron expression (e.g. '0 * * * *')."
+          },
+          {
+            "name": "input",
+            "required": false,
+            "description": "Workflow input payload (any JSON value)."
+          },
+          {
+            "name": "max_active_runs",
+            "required": false,
+            "description": "Maximum concurrent scheduled runs."
+          },
+          {
+            "name": "catchup",
+            "required": false,
+            "description": "Whether to backfill missed runs."
+          },
+          {
+            "name": "paused",
+            "required": false,
+            "description": "Create the schedule in paused state."
+          },
+          {
+            "name": "queue_name",
+            "required": false,
+            "description": "Task queue name for scheduled runs (default: 'default')."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 201,
+        "fields": [
+          "id",
+          "kind",
+          "name",
+          "schedule_expr",
+          "is_paused",
+          "next_run_at",
+          "last_run_at",
+          "max_active_runs",
+          "catchup"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Invalid cron expression or missing required fields."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/admin/schedules/{id}/pause",
+      "category": "schedule",
+      "read_only": false,
+      "description": "Pause a schedule, preventing it from triggering new runs.",
+      "idempotency": "Idempotent: pausing an already-paused schedule is a no-op.",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Schedule UUID."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": []
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "ok"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 404,
+          "description": "Schedule not found."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/admin/schedules/{id}/resume",
+      "category": "schedule",
+      "read_only": false,
+      "description": "Resume a paused schedule.",
+      "idempotency": "Idempotent: resuming an already-active schedule is a no-op.",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Schedule UUID."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": []
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "ok"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 404,
+          "description": "Schedule not found."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "DELETE",
+      "path": "/admin/schedules/{id}",
+      "category": "schedule",
+      "read_only": false,
+      "description": "Delete a schedule. In-flight runs started by this schedule continue to completion.",
+      "idempotency": "Not idempotent: a second call after successful deletion returns 404.",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Schedule UUID."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": []
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "ok"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 404,
+          "description": "Schedule not found."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/admin/schedules/{id}/backfill",
+      "category": "schedule",
+      "read_only": false,
+      "description": "Backfill missed scheduled runs for a workflow or DAG schedule over an explicit time window.",
+      "idempotency": "Idempotent per timestamp: retrying the same backfill window never creates duplicate workflow executions or DAG runs for already-dispatched timestamps.",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Schedule UUID."
+        }
+      ],
+      "request_body": {
+        "required": true,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "from",
+            "type": "string",
+            "required": true,
+            "description": "Start of the backfill window (RFC 3339). Both from and to are required."
+          },
+          {
+            "name": "to",
+            "type": "string",
+            "required": true,
+            "description": "End of the backfill window (RFC 3339). Both from and to are required."
+          },
+          {
+            "name": "dry_run",
+            "type": "boolean",
+            "required": false,
+            "description": "If true, return the planned timestamps without dispatching any runs. Default: false."
+          },
+          {
+            "name": "include_paused",
+            "type": "boolean",
+            "required": false,
+            "description": "If true, backfill even if the schedule is currently paused. Default: false."
+          },
+          {
+            "name": "max_count",
+            "type": "integer",
+            "required": false,
+            "description": "Maximum number of timestamps to plan. Requests that would exceed this limit are rejected before dispatch. Default: server-side limit (1000)."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 200,
+        "free_form": false,
+        "fields": [
+          { "name": "status", "type": "string", "description": "dry_run | complete | partial" },
+          { "name": "schedule_id", "type": "string", "description": "UUID of the schedule." },
+          { "name": "kind", "type": "string", "description": "workflow | dag" },
+          { "name": "name", "type": "string", "description": "Workflow or DAG name." },
+          { "name": "from", "type": "string", "description": "Window start (RFC 3339)." },
+          { "name": "to", "type": "string", "description": "Window end (RFC 3339)." },
+          { "name": "planned_timestamps", "type": "array", "description": "Ordered list of planned firing timestamps." },
+          { "name": "total", "type": "integer", "description": "Total planned timestamps." },
+          { "name": "dispatched", "type": "integer", "description": "Runs created (or estimated for dry_run)." },
+          { "name": "skipped", "type": "integer", "description": "Timestamps skipped (idempotent or max_active_runs). Estimated for dry_run." },
+          { "name": "failed", "type": "integer", "description": "Timestamps that failed to dispatch due to shard errors." },
+          { "name": "skipped_reasons", "type": "object", "description": "Machine-readable breakdown of skip causes. Keys: already_exists, max_active_runs." },
+          { "name": "partial_shard_failures", "type": "array", "description": "Shards that could not be reached. Each item has shard_id and reason." }
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Missing or invalid time window, window inverted (to < from), or timestamp count exceeds max_count."
+        },
+        {
+          "status": 400,
+          "description": "Schedule is paused and include_paused was not set."
+        },
+        {
+          "status": 404,
+          "description": "Schedule not found."
+        },
+        {
+          "status": 500,
+          "description": "Database error or partial shard failure."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/admin/audit",
+      "category": "audit",
+      "read_only": true,
+      "description": "Browse the audit trail of management API mutations. Read-only \u2014 the audit log itself is never mutated through this surface.",
+      "params": [
+        {
+          "name": "actor",
+          "in": "query",
+          "required": false,
+          "description": "Filter by actor identity."
+        },
+        {
+          "name": "operation",
+          "in": "query",
+          "required": false,
+          "description": "Filter by operation name (e.g. workflow.cancel)."
+        },
+        {
+          "name": "target_type",
+          "in": "query",
+          "required": false,
+          "description": "Filter by target resource type (e.g. workflow, schedule)."
+        },
+        {
+          "name": "target_id",
+          "in": "query",
+          "required": false,
+          "description": "Filter by target resource ID."
+        },
+        {
+          "name": "status",
+          "in": "query",
+          "required": false,
+          "description": "Filter by outcome: succeeded or failed."
+        },
+        {
+          "name": "since",
+          "in": "query",
+          "required": false,
+          "description": "RFC 3339 timestamp \u2014 only return records after this time."
+        },
+        {
+          "name": "before",
+          "in": "query",
+          "required": false,
+          "description": "RFC 3339 timestamp \u2014 only return records before this time."
+        },
+        {
+          "name": "limit",
+          "in": "query",
+          "required": false,
+          "description": "Maximum number of records to return."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "free_form": true
+      },
+      "error_responses": [
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    }
+  ]
+}

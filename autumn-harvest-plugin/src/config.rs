@@ -27,6 +27,25 @@ pub struct HarvestOutboxConfig {
     pub max_retry_delay_ms: u64,
 }
 
+/// Tunables for the batch-operations executor (issue #102).
+///
+/// `concurrency` caps the number of in-flight per-target operations so a
+/// 10k-target batch can't monopolise the connection pool. `tick_interval_ms`
+/// is how often the background loop wakes up to scan for new open jobs;
+/// the same loop drains in-progress jobs synchronously within a tick.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HarvestBatchConfig {
+    pub concurrency: u32,
+    pub tick_interval_ms: u64,
+}
+
+/// Readiness and health endpoint behavior.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HarvestReadinessConfig {
+    /// When true, `/health` returns 503 unless writable/candidate shards are ready.
+    pub require_shard_readiness: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HarvestRuntimeConfig {
     pub mode: HarvestMode,
@@ -34,6 +53,8 @@ pub struct HarvestRuntimeConfig {
     pub scheduler_enabled: bool,
     pub database: HarvestDatabaseConfig,
     pub outbox: HarvestOutboxConfig,
+    pub batch: HarvestBatchConfig,
+    pub readiness: HarvestReadinessConfig,
 }
 
 impl HarvestRuntimeConfig {
@@ -104,6 +125,18 @@ impl HarvestRuntimeConfig {
         if let Some(max_retry_delay_ms) = partial.outbox.max_retry_delay_ms {
             self.outbox.max_retry_delay_ms = max_retry_delay_ms;
         }
+        if let Some(concurrency) = partial.batch.concurrency {
+            self.batch.concurrency = concurrency;
+        }
+        if let Some(concurrency) = partial.batch.batch_concurrency {
+            self.batch.concurrency = concurrency;
+        }
+        if let Some(tick_interval_ms) = partial.batch.tick_interval_ms {
+            self.batch.tick_interval_ms = tick_interval_ms;
+        }
+        if let Some(require_shard_readiness) = partial.readiness.require_shard_readiness {
+            self.readiness.require_shard_readiness = require_shard_readiness;
+        }
     }
 
     fn apply_env_overrides(&mut self, env: &dyn Env) -> Result<(), ConfigError> {
@@ -148,6 +181,29 @@ impl HarvestRuntimeConfig {
             self.outbox.max_retry_delay_ms = parse_u64(
                 "AUTUMN_HARVEST_OUTBOX__MAX_RETRY_DELAY_MS",
                 &max_retry_delay_ms,
+            )?;
+        }
+
+        // Issue #102 calls the knob `batch_concurrency`; we accept either
+        // spelling so operators can use whichever matches their habits and
+        // the AC name resolves verbatim.
+        if let Ok(concurrency) = env.var("AUTUMN_HARVEST_BATCH__CONCURRENCY") {
+            self.batch.concurrency = parse_u32("AUTUMN_HARVEST_BATCH__CONCURRENCY", &concurrency)?;
+        }
+        if let Ok(concurrency) = env.var("AUTUMN_HARVEST_BATCH__BATCH_CONCURRENCY") {
+            self.batch.concurrency =
+                parse_u32("AUTUMN_HARVEST_BATCH__BATCH_CONCURRENCY", &concurrency)?;
+        }
+        if let Ok(tick_interval_ms) = env.var("AUTUMN_HARVEST_BATCH__TICK_INTERVAL_MS") {
+            self.batch.tick_interval_ms =
+                parse_u64("AUTUMN_HARVEST_BATCH__TICK_INTERVAL_MS", &tick_interval_ms)?;
+        }
+        if let Ok(require_shard_readiness) =
+            env.var("AUTUMN_HARVEST_READINESS__REQUIRE_SHARD_READINESS")
+        {
+            self.readiness.require_shard_readiness = parse_bool(
+                "AUTUMN_HARVEST_READINESS__REQUIRE_SHARD_READINESS",
+                &require_shard_readiness,
             )?;
         }
 
@@ -196,6 +252,17 @@ impl HarvestRuntimeConfig {
             ));
         }
 
+        if self.batch.concurrency < 1 {
+            return Err(ConfigError::Validation(
+                "harvest.batch.concurrency must be at least 1".to_owned(),
+            ));
+        }
+        if self.batch.tick_interval_ms < 1 {
+            return Err(ConfigError::Validation(
+                "harvest.batch.tick_interval_ms must be at least 1".to_owned(),
+            ));
+        }
+
         Ok(())
     }
 }
@@ -208,6 +275,8 @@ impl Default for HarvestRuntimeConfig {
             scheduler_enabled: true,
             database: HarvestDatabaseConfig::default(),
             outbox: HarvestOutboxConfig::default(),
+            batch: HarvestBatchConfig::default(),
+            readiness: HarvestReadinessConfig::default(),
         }
     }
 }
@@ -221,6 +290,16 @@ impl Default for HarvestOutboxConfig {
             claim_ttl_ms: 30_000,
             base_retry_delay_ms: 1_000,
             max_retry_delay_ms: 60_000,
+        }
+    }
+}
+
+impl Default for HarvestBatchConfig {
+    fn default() -> Self {
+        Self {
+            // Matches the issue's default: cap fan-out at 32 in-flight ops.
+            concurrency: 32,
+            tick_interval_ms: 500,
         }
     }
 }
@@ -240,6 +319,10 @@ struct PartialHarvestRuntimeConfig {
     database: PartialHarvestDatabaseConfig,
     #[serde(default)]
     outbox: PartialHarvestOutboxConfig,
+    #[serde(default)]
+    batch: PartialHarvestBatchConfig,
+    #[serde(default)]
+    readiness: PartialHarvestReadinessConfig,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -255,6 +338,21 @@ struct PartialHarvestOutboxConfig {
     claim_ttl_ms: Option<u64>,
     base_retry_delay_ms: Option<u64>,
     max_retry_delay_ms: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PartialHarvestBatchConfig {
+    concurrency: Option<u32>,
+    /// Issue #102 spells the field `batch_concurrency`. Either key sets the
+    /// same field; if both are present, `batch_concurrency` wins because it
+    /// is the issue's canonical name.
+    batch_concurrency: Option<u32>,
+    tick_interval_ms: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PartialHarvestReadinessConfig {
+    require_shard_readiness: Option<bool>,
 }
 
 fn find_config_file_named(filename: &str, env: &dyn Env) -> PathBuf {
@@ -331,6 +429,12 @@ fn parse_i64(key: &str, value: &str) -> Result<i64, ConfigError> {
 fn parse_u64(key: &str, value: &str) -> Result<u64, ConfigError> {
     value
         .parse::<u64>()
+        .map_err(|_| ConfigError::Validation(format!("invalid integer for {key}: {value:?}")))
+}
+
+fn parse_u32(key: &str, value: &str) -> Result<u32, ConfigError> {
+    value
+        .parse::<u32>()
         .map_err(|_| ConfigError::Validation(format!("invalid integer for {key}: {value:?}")))
 }
 
@@ -510,6 +614,50 @@ mode = "embedded"
             error.to_string().contains("outbox"),
             "expected outbox validation error, got {error}"
         );
+    }
+
+    #[test]
+    fn harvest_config_readiness_defaults_do_not_gate_health() {
+        let env = MockEnv::new();
+        let config = HarvestRuntimeConfig::load_with_env(&env).expect("harvest config should load");
+
+        assert!(!config.readiness.require_shard_readiness);
+    }
+
+    #[test]
+    fn harvest_config_readiness_toml_can_gate_health() {
+        let dir = unique_temp_dir("harvest-config-readiness-toml");
+        write_file(
+            &dir.join("autumn.toml"),
+            r"
+[harvest.readiness]
+require_shard_readiness = true
+",
+        );
+        let env = MockEnv::new().with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref());
+
+        let config = HarvestRuntimeConfig::load_with_env(&env).expect("harvest config should load");
+
+        assert!(config.readiness.require_shard_readiness);
+    }
+
+    #[test]
+    fn harvest_config_readiness_env_overrides_toml() {
+        let dir = unique_temp_dir("harvest-config-readiness-env");
+        write_file(
+            &dir.join("autumn.toml"),
+            r"
+[harvest.readiness]
+require_shard_readiness = false
+",
+        );
+        let env = MockEnv::new()
+            .with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref())
+            .with("AUTUMN_HARVEST_READINESS__REQUIRE_SHARD_READINESS", "true");
+
+        let config = HarvestRuntimeConfig::load_with_env(&env).expect("harvest config should load");
+
+        assert!(config.readiness.require_shard_readiness);
     }
 
     fn unique_temp_dir(label: &str) -> PathBuf {
