@@ -5654,13 +5654,30 @@ fn dlq_form_redirect(return_to: Option<&str>, flash: &str) -> axum::response::Re
 fn dlq_redirect_location(return_to: Option<&str>, flash: &str) -> String {
     let base = return_to
         .map(str::trim)
-        .filter(|value| {
-            value.starts_with("ui/dead-letters")
-                || value.starts_with("/api/harvest/ui/dead-letters")
-        })
-        .unwrap_or("ui/dead-letters");
+        .and_then(safe_dlq_redirect_base)
+        .unwrap_or_else(|| "../ui/dead-letters".to_string());
     let separator = if base.contains('?') { '&' } else { '?' };
     format!("{base}{separator}flash={}", url_encode_for_redirect(flash))
+}
+
+fn safe_dlq_redirect_base(value: &str) -> Option<String> {
+    if is_dead_letter_ui_return_path(value, "../ui/dead-letters")
+        || is_dead_letter_ui_return_path(value, "/api/harvest/ui/dead-letters")
+    {
+        Some(value.to_string())
+    } else if is_dead_letter_ui_return_path(value, "ui/dead-letters") {
+        Some(format!("../{value}"))
+    } else {
+        None
+    }
+}
+
+fn is_dead_letter_ui_return_path(value: &str, prefix: &str) -> bool {
+    match value.strip_prefix(prefix) {
+        Some("") => true,
+        Some(rest) => rest.starts_with('?'),
+        None => false,
+    }
 }
 
 fn url_encode_for_redirect(input: &str) -> String {

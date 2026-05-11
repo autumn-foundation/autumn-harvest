@@ -1223,9 +1223,9 @@ fn dead_letter_return_to_path(
 ) -> String {
     let query = build_dead_letter_query_string(limit, filters, refresh);
     if query.is_empty() {
-        "ui/dead-letters".to_string()
+        "../ui/dead-letters".to_string()
     } else {
-        format!("ui/dead-letters?{}", &query[1..])
+        format!("../ui/dead-letters?{}", &query[1..])
     }
 }
 

@@ -754,6 +754,10 @@ async fn ui_dead_letters_lists_filters_and_replays_single_entry() {
     let (status, html) = fetch_html(&app, "/ui/dead-letters").await;
     assert_eq!(status, StatusCode::OK, "DLQ page should render: {html}");
     assert_dead_letter_list_html(&html, &seeded);
+    assert!(
+        html.contains("name=\"return_to\" value=\"../ui/dead-letters\""),
+        "DLQ forms should return relative to the bulk endpoint path: {html}"
+    );
 
     let (status, filtered_html) =
         fetch_html(&app, "/ui/dead-letters?workflow_name=invoice_workflow").await;
@@ -791,7 +795,10 @@ async fn ui_dead_letters_lists_filters_and_replays_single_entry() {
     let (status, headers, body) = post_form(
         &app,
         "/dead-letters/replay",
-        format!("dead_letter_id={}&return_to=ui%2Fdead-letters", target.id),
+        format!(
+            "dead_letter_id={}&return_to=..%2Fui%2Fdead-letters",
+            target.id
+        ),
     )
     .await;
     assert_eq!(
@@ -805,8 +812,8 @@ async fn ui_dead_letters_lists_filters_and_replays_single_entry() {
         .to_str()
         .expect("Location should be valid UTF-8");
     assert!(
-        location.contains("dead-letters") && location.contains("flash="),
-        "redirect should return to DLQ list with flash, got {location}"
+        location.starts_with("../ui/dead-letters?flash="),
+        "redirect should return to mounted DLQ UI with flash, got {location}"
     );
     assert_eq!(
         count_dead_letter_by_id(&target.shard_url, target.id).await,
