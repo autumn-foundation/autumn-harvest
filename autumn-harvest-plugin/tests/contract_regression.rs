@@ -189,6 +189,20 @@ fn contract_request_fields_match_code_registry() {
         }
     }
 
+    let registered_request_routes: HashSet<(String, String)> = management_api_request_fields()
+        .iter()
+        .map(|(method, path, _)| ((*method).to_string(), (*path).to_string()))
+        .collect();
+    for ((method, path), fields) in &contract_fields {
+        if fields.is_some() {
+            assert!(
+                registered_request_routes.contains(&(method.clone(), path.clone())),
+                "{method} {path}: contract has a structured request body but \
+                 management_api_request_fields() has no entry, so field drift is unchecked"
+            );
+        }
+    }
+
     // Compare against management_api_request_fields().
     for (method, path, code_fields) in management_api_request_fields() {
         let key = (method.to_string(), path.to_string());
@@ -270,6 +284,20 @@ fn contract_response_fields_match_code_registry() {
                 })
                 .collect();
             contract_resp.insert((method, path), Some(names));
+        }
+    }
+
+    let registered_response_routes: HashSet<(String, String)> = management_api_response_fields()
+        .iter()
+        .map(|(method, path, _)| ((*method).to_string(), (*path).to_string()))
+        .collect();
+    for ((method, path), fields) in &contract_resp {
+        if fields.is_some() {
+            assert!(
+                registered_response_routes.contains(&(method.clone(), path.clone())),
+                "{method} {path}: contract has a structured success_response but \
+                 management_api_response_fields() has no entry, so field drift is unchecked"
+            );
         }
     }
 
