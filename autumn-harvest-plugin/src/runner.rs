@@ -5,21 +5,17 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use autumn_harvest::BuiltHarvest;
-use autumn_harvest::batch::{BatchExecutorConfig, run_executor_once};
 use autumn_harvest::context::SharedStateMap;
-use autumn_harvest::policy::WorkflowSchedule;
-use autumn_harvest::retention::{RetentionConfig, RetentionRuntime};
 use autumn_harvest::scheduler::{
     DagCatalog, SchedulerMonitor, SchedulerRuntime, compile_dag_catalog,
 };
-use autumn_harvest::shard::{ShardRouter, ShardedDbPool};
+use autumn_harvest::shard::ShardRouter;
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use autumn_web::AppState;
 use autumn_web::error::AutumnError;
 use tokio::task::JoinHandle;
-use tokio_util::sync::CancellationToken;
 
-use crate::api::{HarvestApiRuntime, HarvestRetentionRuntime};
+use crate::api::HarvestApiRuntime;
 use crate::config::HarvestRuntimeConfig;
 use crate::state::{AppDbPool, HarvestDbPool};
 
@@ -77,11 +73,9 @@ impl HarvestRunnerResources {
 struct PreparedHarvestRuntime {
     registry: Arc<HandlerRegistry>,
     dag_catalog: Arc<DagCatalog>,
-    workflow_schedules: Arc<Vec<WorkflowSchedule>>,
     worker_runtime_config: WorkerRuntimeConfig,
     storage_pool: HarvestDbPool,
     shard_router: ShardRouter,
-    retention_config: RetentionConfig,
 }
 
 impl PreparedHarvestRuntime {
@@ -90,9 +84,7 @@ impl PreparedHarvestRuntime {
         resources: HarvestRunnerResources,
     ) -> autumn_web::AutumnResult<Self> {
         let shard_router = resources.shard_router.clone().unwrap_or_default();
-        let retention_config = built.retention().clone();
-        let workflow_schedules = Arc::new(built.workflow_schedules().to_vec());
-        let (registry, dags, _ws, worker_config) =
+        let (registry, dags, worker_config) =
             built.into_worker_parts_with_extra_state(injected_runtime_state(
                 resources.app_state,
                 resources.app_pool,
@@ -107,11 +99,9 @@ impl PreparedHarvestRuntime {
         Ok(Self {
             registry: Arc::new(registry),
             dag_catalog,
-            workflow_schedules,
             worker_runtime_config: WorkerRuntimeConfig::from(worker_config),
             storage_pool: HarvestDbPool::from(resources.harvest_pool),
             shard_router,
-            retention_config,
         })
     }
 }
@@ -127,52 +117,6 @@ pub struct HarvestRunner {
     worker: Option<Arc<Worker>>,
     worker_handle: Option<JoinHandle<()>>,
     scheduler: Option<SchedulerRuntime>,
-    retention: Option<RetentionRuntime>,
-    batch: Option<BatchRuntime>,
-}
-
-/// Background batch-operations executor handle (issue #102).
-struct BatchRuntime {
-    cancel: CancellationToken,
-    handle: JoinHandle<()>,
-}
-
-impl BatchRuntime {
-    /// Spawn a tick loop that drives every open batch job to terminal status.
-    ///
-    /// The loop sleeps `tick_interval` between scans; each tick walks every
-    /// shard and dispatches per-target actions with bounded concurrency. The
-    /// loop exits cleanly when the cancellation token fires.
-    fn spawn(
-        pool: ShardedDbPool,
-        executor_config: BatchExecutorConfig,
-        tick_interval: std::time::Duration,
-    ) -> Self {
-        let cancel = CancellationToken::new();
-        let cancel_for_task = cancel.clone();
-        let handle = tokio::spawn(async move {
-            loop {
-                if cancel_for_task.is_cancelled() {
-                    return;
-                }
-                if let Err(error) = run_executor_once(&pool, &executor_config).await {
-                    tracing::warn!(%error, "batch executor tick failed");
-                }
-                tokio::select! {
-                    () = cancel_for_task.cancelled() => return,
-                    () = tokio::time::sleep(tick_interval) => {}
-                }
-            }
-        });
-        Self { cancel, handle }
-    }
-
-    async fn shutdown(self) {
-        self.cancel.cancel();
-        if let Err(error) = self.handle.await {
-            tracing::warn!(error = %error, "harvest batch executor task failed during shutdown");
-        }
-    }
 }
 
 impl HarvestRunner {
@@ -192,7 +136,6 @@ impl HarvestRunner {
         let prepared = PreparedHarvestRuntime::build(built, resources)?;
         let registry = Arc::clone(&prepared.registry);
         let dag_catalog = Arc::clone(&prepared.dag_catalog);
-        let workflow_schedules = Arc::clone(&prepared.workflow_schedules);
         let queues = prepared.worker_runtime_config.queues.clone();
         let harvest_pool = prepared.storage_pool.clone_inner();
         let shard_router = prepared.shard_router.clone();
@@ -225,12 +168,11 @@ impl HarvestRunner {
                 worker.run(&pool).await;
             })
         });
-        let scheduler = if config.scheduler_enabled {
+        let scheduler = if config.scheduler_enabled && !dag_catalog.is_empty() {
             Some(SchedulerRuntime::spawn(
                 harvest_pool,
                 Arc::clone(&registry),
                 Arc::clone(&dag_catalog),
-                Arc::clone(&workflow_schedules),
             ))
         } else {
             None
@@ -238,48 +180,12 @@ impl HarvestRunner {
         let scheduler_monitor = scheduler
             .as_ref()
             .map_or_else(SchedulerMonitor::offline, SchedulerRuntime::monitor);
-        let retention = if prepared.retention_config.enabled() {
-            RetentionRuntime::spawn(
-                prepared.storage_pool.sharded_pool().clone(),
-                prepared.retention_config.clone(),
-                Arc::clone(&registry.telemetry().metrics),
-            )
-        } else {
-            tracing::info!(
-                mode = ?config.mode,
-                "harvest retention janitor not started on this runtime (retention disabled)"
-            );
-            None
-        };
-        let retention_monitor = retention.as_ref().map(RetentionRuntime::monitor);
-        let retention_trigger = retention.as_ref().map(RetentionRuntime::trigger_sender);
-        // Batch operations executor (issue #102): drive open `harvest_batch_jobs`
-        // rows to completion in the background. Only the worker-owning
-        // process spawns it so we don't run multiple competing executors
-        // against the same job rows.
-        let batch = if config.worker_enabled {
-            Some(BatchRuntime::spawn(
-                prepared.storage_pool.sharded_pool().clone(),
-                BatchExecutorConfig {
-                    concurrency: config.batch.concurrency,
-                },
-                std::time::Duration::from_millis(config.batch.tick_interval_ms),
-            ))
-        } else {
-            None
-        };
         let api_runtime = HarvestApiRuntime::new(
             registry,
             dag_catalog,
-            workflow_schedules,
             worker_id,
             queues,
             scheduler_monitor,
-            HarvestRetentionRuntime::new(
-                prepared.retention_config,
-                retention_monitor,
-                retention_trigger,
-            ),
             shard_router,
         );
 
@@ -289,8 +195,6 @@ impl HarvestRunner {
             worker,
             worker_handle,
             scheduler,
-            retention,
-            batch,
         })
     }
 
@@ -314,8 +218,6 @@ impl HarvestRunner {
             worker,
             worker_handle,
             scheduler,
-            retention,
-            batch,
         } = self;
 
         if let Some(worker) = worker {
@@ -326,15 +228,6 @@ impl HarvestRunner {
             if let Err(error) = scheduler.join().await {
                 tracing::warn!(error = %error, "harvest scheduler task failed during shutdown");
             }
-        }
-        if let Some(retention) = retention {
-            retention.shutdown();
-            if let Err(error) = retention.join().await {
-                tracing::warn!(error = %error, "harvest retention task failed during shutdown");
-            }
-        }
-        if let Some(batch) = batch {
-            batch.shutdown().await;
         }
         if let Some(worker_handle) = worker_handle
             && let Err(error) = worker_handle.await

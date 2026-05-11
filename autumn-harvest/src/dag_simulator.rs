@@ -81,7 +81,7 @@ impl DagSimulator {
                 let upstream_statuses: Vec<TaskStatus> = task
                     .upstreams
                     .iter()
-                    .map(|&up_idx| task_states[up_idx])
+                    .map(|&up_idx| task_states[up_idx].clone())
                     .collect();
 
                 // Evaluate trigger rule

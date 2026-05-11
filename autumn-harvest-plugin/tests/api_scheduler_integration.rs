@@ -11,25 +11,20 @@ use autumn_harvest::models::{
 };
 use autumn_harvest::policy::Schedule;
 use autumn_harvest::scheduler::{
-    DagCatalog, SchedulerMonitor, compile_dag_catalog, register_schedules,
-    register_workflow_schedules, tick_once,
+    DagCatalog, SchedulerMonitor, compile_dag_catalog, register_schedules, tick_once,
 };
 use autumn_harvest::schema::{
     harvest_dag_runs, harvest_dead_letters, harvest_schedules, harvest_task_queue,
     harvest_workflow_executions,
 };
 use autumn_harvest::shard::{ShardRouter, ShardedDbPool};
-use autumn_harvest::store;
 use autumn_harvest::types::{ExecutionId, ShardId};
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{
-    ActivityContext, RetentionConfig, StartWorkflowParams, WorkflowContext, WorkflowSchedule,
-    start_or_load_workflow_execution,
+    ActivityContext, StartWorkflowParams, WorkflowContext, start_or_load_workflow_execution,
 };
 use autumn_harvest_plugin::HarvestDbPool;
-use autumn_harvest_plugin::api::{
-    HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
-};
+use autumn_harvest_plugin::api::{HarvestApiRuntime, HarvestApiState, harvest_api_router};
 use autumn_harvest_plugin::{
     HarvestMode, HarvestRunner, HarvestRunnerResources, HarvestRuntimeConfig,
 };
@@ -58,48 +53,8 @@ const INIT_SQL: &str = concat!(
     include_str!("../../autumn-harvest/migrations/20260424000001_harvest_trace_context/up.sql"),
     "\n",
     include_str!("../../autumn-harvest/migrations/20260427000000_harvest_continue_as_new/up.sql"),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260429000000_harvest_concurrency_key/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260430000000_harvest_workflow_schedules/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260430000001_harvest_external_tasks/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260508000000_harvest_external_task_updated_at/up.sql"
-    ),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260504000000_harvest_workflow_parent_children/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260505000000_harvest_heartbeat_details/up.sql"),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260506000000_harvest_audit_log/up.sql"),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260501000000_harvest_workers/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260508010000_harvest_workers_drain_deadline/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260509000000_harvest_build_routing/up.sql"),
 );
 type HarvestApiApp = axum::Router;
-
-#[derive(diesel::QueryableByName)]
-struct CountByName {
-    #[diesel(sql_type = diesel::sql_types::BigInt)]
-    count: i64,
-}
-
-#[derive(diesel::QueryableByName)]
-struct ExistsByName {
-    #[diesel(sql_type = diesel::sql_types::Bool)]
-    exists: bool,
-}
 
 async fn setup_test_database_url() -> (String, ContainerAsync<Postgres>) {
     let container = Postgres::default()
@@ -237,14 +192,6 @@ async fn get_json(app: &HarvestApiApp, uri: impl Into<String>) -> (StatusCode, V
     (status, json)
 }
 
-async fn get_response(app: &HarvestApiApp, uri: impl Into<String>) -> axum::response::Response {
-    let uri = uri.into();
-    app.clone()
-        .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
-        .await
-        .expect("GET request failed")
-}
-
 async fn post_json(
     app: &HarvestApiApp,
     uri: impl Into<String>,
@@ -329,9 +276,6 @@ fn recording_activity_info(name: &'static str) -> ActivityInfo {
         default_heartbeat_timeout: None,
         default_schedule_to_start: None,
         default_queue: Some("default"),
-        max_concurrent: None,
-        concurrency_key: None,
-        is_local: false,
         handler: record_activity,
     }
 }
@@ -388,77 +332,10 @@ async fn insert_workflow_on_url(
             execution_timeout: None,
             memo: None,
             search_attrs: None,
-            reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
-            trace_context: None,
         },
     )
     .await
     .expect("workflow insert should succeed");
-    exec_id
-}
-
-struct ChildWorkflowFixture<'a> {
-    database_url: &'a str,
-    shard: ShardId,
-    parent_id: ExecutionId,
-    workflow_name: &'a str,
-    workflow_id: &'a str,
-    state: &'a str,
-    error: Option<&'a str>,
-    started_offset_secs: i64,
-}
-
-async fn insert_child_workflow_on_url(fixture: ChildWorkflowFixture<'_>) -> ExecutionId {
-    let ChildWorkflowFixture {
-        database_url,
-        shard,
-        parent_id,
-        workflow_name,
-        workflow_id,
-        state,
-        error,
-        started_offset_secs,
-    } = fixture;
-    let exec_id = ExecutionId::new_for_shard(shard);
-    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
-        .await
-        .expect("failed to connect fresh Postgres client for child workflow insert");
-    start_or_load_workflow_execution(
-        &mut conn,
-        StartWorkflowParams {
-            workflow_name,
-            workflow_id,
-            exec_id,
-            input: json!({ "workflow_id": workflow_id, "shard": shard.as_i32() }),
-            parent_id: Some(parent_id.as_uuid()),
-            queue_name: "default",
-            execution_timeout: None,
-            memo: None,
-            search_attrs: None,
-            reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
-            trace_context: None,
-        },
-    )
-    .await
-    .expect("child workflow insert should succeed");
-
-    let started_at = chrono::Utc::now() - chrono::Duration::seconds(started_offset_secs);
-    let completed_at = if state == "RUNNING" {
-        None
-    } else {
-        Some(started_at + chrono::Duration::seconds(5))
-    };
-    diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
-        .set((
-            harvest_workflow_executions::state.eq(state),
-            harvest_workflow_executions::error.eq(error.map(ToOwned::to_owned)),
-            harvest_workflow_executions::started_at.eq(started_at),
-            harvest_workflow_executions::completed_at.eq(completed_at),
-        ))
-        .execute(&mut conn)
-        .await
-        .expect("failed to update child workflow fixture state");
-
     exec_id
 }
 
@@ -591,11 +468,9 @@ fn build_sharded_dag_api_app(
     api_state.install(HarvestApiRuntime::new(
         registry,
         dag_catalog,
-        Arc::new(Vec::new()),
         Some("scheduler-sharded".to_string()),
         vec!["default".to_string()],
         SchedulerMonitor::offline(),
-        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         router,
     ));
     harvest_api_router(api_state).with_state(test_app_state_without_database())
@@ -718,38 +593,6 @@ async fn load_workflow_rows_from_url(
         .expect("failed to load workflow rows by workflow key")
 }
 
-async fn count_workflow_executions_by_name_from_url(
-    database_url: &str,
-    workflow_name: &str,
-) -> i64 {
-    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
-        .await
-        .expect("failed to connect fresh Postgres client for workflow count");
-    harvest_workflow_executions::table
-        .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
-        .count()
-        .get_result(&mut conn)
-        .await
-        .expect("failed to count workflow rows by workflow name")
-}
-
-async fn load_latest_workflow_execution_by_name_from_url(
-    database_url: &str,
-    workflow_name: &str,
-) -> Option<WorkflowExecution> {
-    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
-        .await
-        .expect("failed to connect fresh Postgres client for workflow lookup");
-    harvest_workflow_executions::table
-        .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
-        .order(harvest_workflow_executions::created_at.desc())
-        .select(WorkflowExecution::as_select())
-        .first(&mut conn)
-        .await
-        .optional()
-        .expect("failed to load workflow rows by workflow name")
-}
-
 async fn count_workflow_tasks_from_url(database_url: &str, exec_id: &str) -> i64 {
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
         .await
@@ -857,194 +700,6 @@ async fn wait_for_dag_run_state(
     }
 
     panic!("dag {dag_name} did not reach state {expected_state}");
-}
-
-async fn insert_retention_fixture_execution(
-    conn: &mut AsyncPgConnection,
-    exec_id: uuid::Uuid,
-    workflow_id: &str,
-    state: &str,
-    completed_at_expr: &str,
-) {
-    diesel::sql_query(format!(
-        "INSERT INTO harvest_workflow_executions (
-            id, workflow_name, workflow_id, run_id, shard_id, state, input, queue_name, started_at, completed_at, created_at
-        ) VALUES (
-            $1, 'retention_fixture', '{workflow_id}', gen_random_uuid(), 0, '{state}', '{{}}'::jsonb, 'default',
-            NOW() - INTERVAL '11 days', {completed_at_expr}, NOW() - INTERVAL '11 days'
-        )"
-    ))
-    .bind::<diesel::sql_types::Uuid, _>(exec_id)
-    .execute(conn)
-    .await
-    .expect("failed to insert fixture workflow execution");
-
-    if state == "RUNNING" {
-        return;
-    }
-
-    diesel::sql_query(
-        "INSERT INTO harvest_events (workflow_exec_id, event_id, event_type, event_data, timestamp)
-         VALUES ($1, 0, 'WorkflowCompleted', '{}'::jsonb, NOW() - INTERVAL '10 days')",
-    )
-    .bind::<diesel::sql_types::Uuid, _>(exec_id)
-    .execute(conn)
-    .await
-    .expect("failed to insert fixture event");
-
-    diesel::sql_query(
-        "INSERT INTO harvest_task_queue (
-            id, queue_name, task_type, workflow_exec_id, input, state, priority, max_attempts, scheduled_at
-         ) VALUES (
-            gen_random_uuid(), 'default', 'workflow', $1, '{}'::jsonb, 'COMPLETED', 0, 1, NOW() - INTERVAL '10 days'
-         )",
-    )
-    .bind::<diesel::sql_types::Uuid, _>(exec_id)
-    .execute(conn)
-    .await
-    .expect("failed to insert fixture task");
-
-    diesel::sql_query(
-        "INSERT INTO harvest_timers (workflow_exec_id, timer_id, fires_at, fired)
-         VALUES ($1, 'fixture-timer', NOW() - INTERVAL '10 days', TRUE)",
-    )
-    .bind::<diesel::sql_types::Uuid, _>(exec_id)
-    .execute(conn)
-    .await
-    .expect("failed to insert fixture timer");
-
-    diesel::sql_query(
-        "INSERT INTO harvest_signals (workflow_exec_id, signal_name, payload, consumed)
-         VALUES ($1, 'fixture-signal', '{}'::jsonb, TRUE)",
-    )
-    .bind::<diesel::sql_types::Uuid, _>(exec_id)
-    .execute(conn)
-    .await
-    .expect("failed to insert fixture signal");
-
-    diesel::sql_query(
-        "INSERT INTO harvest_dead_letters (
-            id, original_task_id, queue_name, task_type, workflow_exec_id, input, error, attempts, failed_at
-         ) VALUES (
-            gen_random_uuid(), gen_random_uuid(), 'default', 'workflow', $1, '{}'::jsonb, 'fixture', 1, NOW() - INTERVAL '10 days'
-         )",
-    )
-    .bind::<diesel::sql_types::Uuid, _>(exec_id)
-    .execute(conn)
-    .await
-    .expect("failed to insert fixture dead letter");
-}
-
-async fn seed_retention_fixtures(
-    conn: &mut AsyncPgConnection,
-    old_exec_a: uuid::Uuid,
-    old_exec_b: uuid::Uuid,
-    recent_exec: uuid::Uuid,
-    inflight_exec: uuid::Uuid,
-) {
-    for (exec_id, workflow_id, state, completed_at_expr) in [
-        (
-            old_exec_a,
-            "retention-old-a",
-            "COMPLETED",
-            "NOW() - INTERVAL '10 days'",
-        ),
-        (
-            old_exec_b,
-            "retention-old-b",
-            "FAILED",
-            "NOW() - INTERVAL '9 days'",
-        ),
-        (
-            recent_exec,
-            "retention-recent",
-            "COMPLETED",
-            "NOW() - INTERVAL '2 days'",
-        ),
-        (inflight_exec, "retention-inflight", "RUNNING", "NULL"),
-    ] {
-        insert_retention_fixture_execution(conn, exec_id, workflow_id, state, completed_at_expr)
-            .await;
-    }
-
-    diesel::sql_query(
-        "INSERT INTO harvest_dag_runs (
-            id, dag_name, workflow_exec_id, state, logical_date, data_interval_start, data_interval_end, created_at, started_at, completed_at
-         ) VALUES (
-            gen_random_uuid(), 'retention_fixture_dag', $1, 'SUCCESS',
-            NOW() - INTERVAL '10 days', NOW() - INTERVAL '10 days', NOW() - INTERVAL '9 days',
-            NOW() - INTERVAL '10 days', NOW() - INTERVAL '10 days', NOW() - INTERVAL '9 days'
-         )",
-    )
-    .bind::<diesel::sql_types::Uuid, _>(old_exec_b)
-    .execute(conn)
-    .await
-    .expect("failed to insert fixture dag run");
-}
-
-async fn trigger_retention_and_wait(app: &HarvestApiApp) {
-    let (run_now_status, run_now_json) =
-        post_json(app, "/admin/retention/run-now", json!({})).await;
-    assert_eq!(run_now_status, StatusCode::OK);
-    assert_eq!(run_now_json["ok"], true);
-
-    for _ in 0..40 {
-        let (_status, status_json) = get_json(app, "/admin/retention").await;
-        let deleted_total: u64 = status_json["per_shard"]
-            .as_array()
-            .unwrap_or(&Vec::new())
-            .iter()
-            .filter_map(|tick| tick["deleted_count"].as_u64())
-            .sum();
-        if deleted_total >= 1 {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
-
-async fn count_execution_rows(conn: &mut AsyncPgConnection, exec_id: uuid::Uuid) -> i64 {
-    diesel::sql_query("SELECT COUNT(*) AS count FROM harvest_workflow_executions WHERE id = $1")
-        .bind::<diesel::sql_types::Uuid, _>(exec_id)
-        .get_result::<CountByName>(conn)
-        .await
-        .expect("count query should succeed")
-        .count
-}
-
-async fn count_child_rows(conn: &mut AsyncPgConnection, table: &str, exec_id: uuid::Uuid) -> i64 {
-    diesel::sql_query(format!(
-        "SELECT COUNT(*) AS count FROM {table} WHERE workflow_exec_id = $1"
-    ))
-    .bind::<diesel::sql_types::Uuid, _>(exec_id)
-    .get_result::<CountByName>(conn)
-    .await
-    .expect("child count query should succeed")
-    .count
-}
-
-async fn assert_retention_cleanup_state(
-    conn: &mut AsyncPgConnection,
-    old_exec_a: uuid::Uuid,
-    old_exec_b: uuid::Uuid,
-    recent_exec: uuid::Uuid,
-    inflight_exec: uuid::Uuid,
-) {
-    assert_eq!(count_execution_rows(conn, old_exec_a).await, 0);
-    assert_eq!(count_execution_rows(conn, old_exec_b).await, 1);
-    assert_eq!(count_execution_rows(conn, recent_exec).await, 1);
-    assert_eq!(count_execution_rows(conn, inflight_exec).await, 1);
-
-    for table in [
-        "harvest_events",
-        "harvest_task_queue",
-        "harvest_timers",
-        "harvest_signals",
-        "harvest_dead_letters",
-    ] {
-        let count = count_child_rows(conn, table, old_exec_a).await;
-        assert_eq!(count, 0, "cascade should clear {table} for {old_exec_a}");
-    }
 }
 
 fn approval_workflow<'a>(
@@ -1179,11 +834,9 @@ async fn harvest_api_uses_installed_storage_pool_when_app_state_has_no_database(
     api_state.install(HarvestApiRuntime::new(
         Arc::clone(&registry),
         Arc::new(HashMap::new()),
-        Arc::new(Vec::new()),
         Some("test-worker".to_string()),
         vec!["default".to_string()],
         SchedulerMonitor::offline(),
-        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::single(),
     ));
 
@@ -1257,501 +910,6 @@ async fn harvest_api_uses_installed_storage_pool_when_app_state_has_no_database(
 }
 
 #[tokio::test]
-async fn harvest_api_workflow_details_include_parent_id_at_top_level() {
-    let (database_url, _container) = setup_test_database_url().await;
-    let pool = build_test_pool(&database_url);
-    let api_state = HarvestApiState::new();
-    api_state.install_storage_pool(HarvestDbPool::from(pool));
-    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
-
-    let parent = insert_workflow_on_url(
-        &database_url,
-        ShardId::new(0),
-        "fanout_parent",
-        "parent-details",
-    )
-    .await;
-    let child = insert_child_workflow_on_url(ChildWorkflowFixture {
-        database_url: &database_url,
-        shard: ShardId::new(0),
-        parent_id: parent,
-        workflow_name: "billing_child",
-        workflow_id: "child-details",
-        state: "RUNNING",
-        error: None,
-        started_offset_secs: 0,
-    })
-    .await;
-
-    let (status, details_json) = get_json(&app, format!("/workflows/{child}")).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(details_json["parent_id"], parent.to_string());
-}
-
-#[tokio::test]
-async fn harvest_api_lists_direct_workflow_children_with_filters() {
-    let (database_url, _container) = setup_test_database_url().await;
-    let pool = build_test_pool(&database_url);
-    let api_state = HarvestApiState::new();
-    api_state.install_storage_pool(HarvestDbPool::from(pool));
-    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
-
-    let parent = insert_workflow_on_url(
-        &database_url,
-        ShardId::new(0),
-        "fanout_parent",
-        "parent-children",
-    )
-    .await;
-    let failed_child = insert_child_workflow_on_url(ChildWorkflowFixture {
-        database_url: &database_url,
-        shard: ShardId::new(0),
-        parent_id: parent,
-        workflow_name: "billing_child",
-        workflow_id: "failed-child",
-        state: "FAILED",
-        error: Some("charge card failed\nstack trace omitted"),
-        started_offset_secs: 10,
-    })
-    .await;
-    insert_child_workflow_on_url(ChildWorkflowFixture {
-        database_url: &database_url,
-        shard: ShardId::new(0),
-        parent_id: parent,
-        workflow_name: "billing_child",
-        workflow_id: "running-child",
-        state: "RUNNING",
-        error: None,
-        started_offset_secs: 20,
-    })
-    .await;
-    insert_child_workflow_on_url(ChildWorkflowFixture {
-        database_url: &database_url,
-        shard: ShardId::new(0),
-        parent_id: parent,
-        workflow_name: "email_child",
-        workflow_id: "failed-other-name",
-        state: "FAILED",
-        error: Some("smtp failed"),
-        started_offset_secs: 30,
-    })
-    .await;
-
-    let response = get_response(
-        &app,
-        format!("/workflows/{parent}/children?status=Failed&workflow_name=billing_child"),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = read_json_response(response).await;
-    let items = body["items"]
-        .as_array()
-        .expect("children response must have an items array");
-
-    assert_eq!(items.len(), 1);
-    assert_eq!(items[0]["exec_id"], failed_child.to_string());
-    assert_eq!(items[0]["workflow_name"], "billing_child");
-    assert_eq!(items[0]["status"], "Failed");
-    assert_eq!(items[0]["error_summary"], "charge card failed");
-    assert_eq!(items[0]["shard_id"], 0);
-    assert_eq!(items[0]["depth"], 0);
-    assert!(items[0]["started_at"].is_string());
-    assert!(items[0]["completed_at"].is_string());
-    assert!(body["next_cursor"].is_null());
-}
-
-#[tokio::test]
-async fn harvest_api_filters_workflow_children_by_continued_as_new_status() {
-    let (database_url, _container) = setup_test_database_url().await;
-    let pool = build_test_pool(&database_url);
-    let api_state = HarvestApiState::new();
-    api_state.install_storage_pool(HarvestDbPool::from(pool));
-    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
-
-    let parent = insert_workflow_on_url(
-        &database_url,
-        ShardId::new(0),
-        "fanout_parent",
-        "parent-continued-as-new",
-    )
-    .await;
-    let continued_child = insert_child_workflow_on_url(ChildWorkflowFixture {
-        database_url: &database_url,
-        shard: ShardId::new(0),
-        parent_id: parent,
-        workflow_name: "billing_child",
-        workflow_id: "continued-child",
-        state: "CONTINUED_AS_NEW",
-        error: None,
-        started_offset_secs: 10,
-    })
-    .await;
-    insert_child_workflow_on_url(ChildWorkflowFixture {
-        database_url: &database_url,
-        shard: ShardId::new(0),
-        parent_id: parent,
-        workflow_name: "billing_child",
-        workflow_id: "failed-child",
-        state: "FAILED",
-        error: Some("not the requested state"),
-        started_offset_secs: 5,
-    })
-    .await;
-
-    let (status, body) = get_json(
-        &app,
-        format!("/workflows/{parent}/children?status=ContinuedAsNew"),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    let items = body["items"]
-        .as_array()
-        .expect("children response must have an items array");
-
-    assert_eq!(items.len(), 1);
-    assert_eq!(items[0]["exec_id"], continued_child.to_string());
-    assert_eq!(items[0]["status"], "ContinuedAsNew");
-}
-
-#[tokio::test]
-async fn load_workflow_children_applies_limit_and_cursor_before_returning_rows() {
-    let (database_url, _container) = setup_test_database_url().await;
-    let parent = insert_workflow_on_url(
-        &database_url,
-        ShardId::new(0),
-        "fanout_parent",
-        "store-page-parent",
-    )
-    .await;
-    let newest_child = insert_child_workflow_on_url(ChildWorkflowFixture {
-        database_url: &database_url,
-        shard: ShardId::new(0),
-        parent_id: parent,
-        workflow_name: "billing_child",
-        workflow_id: "store-page-newest",
-        state: "FAILED",
-        error: None,
-        started_offset_secs: 5,
-    })
-    .await;
-    let middle_child = insert_child_workflow_on_url(ChildWorkflowFixture {
-        database_url: &database_url,
-        shard: ShardId::new(0),
-        parent_id: parent,
-        workflow_name: "billing_child",
-        workflow_id: "store-page-middle",
-        state: "FAILED",
-        error: None,
-        started_offset_secs: 10,
-    })
-    .await;
-    let oldest_child = insert_child_workflow_on_url(ChildWorkflowFixture {
-        database_url: &database_url,
-        shard: ShardId::new(0),
-        parent_id: parent,
-        workflow_name: "billing_child",
-        workflow_id: "store-page-oldest",
-        state: "FAILED",
-        error: None,
-        started_offset_secs: 15,
-    })
-    .await;
-
-    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
-        .await
-        .expect("failed to connect for store page query");
-    let first_page = store::load_workflow_children(
-        &mut conn,
-        parent,
-        &store::WorkflowChildFilters {
-            statuses: Vec::new(),
-            workflow_name: None,
-            cursor: None,
-            limit: Some(2),
-        },
-        0,
-    )
-    .await
-    .expect("first child page should load");
-    assert_eq!(
-        first_page.iter().map(|row| row.exec_id).collect::<Vec<_>>(),
-        vec![newest_child, middle_child]
-    );
-
-    let cursor_row = first_page
-        .last()
-        .expect("first page should include a cursor row");
-    let second_page = store::load_workflow_children(
-        &mut conn,
-        parent,
-        &store::WorkflowChildFilters {
-            statuses: Vec::new(),
-            workflow_name: None,
-            cursor: Some(store::WorkflowChildCursor {
-                started_at: cursor_row.started_at,
-                exec_id: cursor_row.exec_id.as_uuid(),
-            }),
-            limit: Some(2),
-        },
-        0,
-    )
-    .await
-    .expect("second child page should load");
-
-    assert_eq!(
-        second_page
-            .iter()
-            .map(|row| row.exec_id)
-            .collect::<Vec<_>>(),
-        vec![oldest_child]
-    );
-}
-
-#[tokio::test]
-async fn harvest_api_lists_workflow_children_across_shards_and_paginates() {
-    let ((shard0_url, shard1_url), _container) = setup_sharded_test_database_urls().await;
-    let api_state = HarvestApiState::new();
-    api_state.install_storage_pool(build_two_shard_pool(&shard0_url, &shard1_url));
-    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
-
-    let mut shard0_conn = <AsyncPgConnection as AsyncConnection>::establish(&shard0_url)
-        .await
-        .expect("failed to connect to shard 0");
-    let index_exists: ExistsByName = diesel::sql_query(
-        "SELECT EXISTS (
-            SELECT 1 FROM pg_indexes
-            WHERE schemaname = 'public' AND indexname = 'idx_harvest_we_parent_id'
-         ) AS exists",
-    )
-    .get_result(&mut shard0_conn)
-    .await
-    .expect("failed to inspect parent_id index");
-    assert!(
-        index_exists.exists,
-        "parent_id lookup must have a per-shard index"
-    );
-
-    let parent = insert_workflow_on_url(
-        &shard0_url,
-        ShardId::new(0),
-        "fanout_parent",
-        "parent-cross-shard",
-    )
-    .await;
-    let newest_child = insert_child_workflow_on_url(ChildWorkflowFixture {
-        database_url: &shard1_url,
-        shard: ShardId::new(1),
-        parent_id: parent,
-        workflow_name: "billing_child",
-        workflow_id: "newest-cross-shard-child",
-        state: "FAILED",
-        error: Some("newest failed"),
-        started_offset_secs: 5,
-    })
-    .await;
-    let older_child = insert_child_workflow_on_url(ChildWorkflowFixture {
-        database_url: &shard0_url,
-        shard: ShardId::new(0),
-        parent_id: parent,
-        workflow_name: "billing_child",
-        workflow_id: "older-cross-shard-child",
-        state: "FAILED",
-        error: Some("older failed"),
-        started_offset_secs: 20,
-    })
-    .await;
-
-    let (first_status, first_page) =
-        get_json(&app, format!("/workflows/{parent}/children?limit=1")).await;
-    assert_eq!(first_status, StatusCode::OK);
-    let first_items = first_page["items"]
-        .as_array()
-        .expect("children response must have an items array");
-    assert_eq!(first_items.len(), 1);
-    assert_eq!(first_items[0]["exec_id"], newest_child.to_string());
-    assert_eq!(first_items[0]["shard_id"], 1);
-    let cursor = first_page["next_cursor"]
-        .as_str()
-        .expect("limited page should return a cursor");
-    let encoded_cursor = cursor.replace('|', "%7C");
-
-    let (second_status, second_page) = get_json(
-        &app,
-        format!("/workflows/{parent}/children?limit=1&cursor={encoded_cursor}"),
-    )
-    .await;
-    assert_eq!(second_status, StatusCode::OK);
-    let second_items = second_page["items"]
-        .as_array()
-        .expect("children response must have an items array");
-    assert_eq!(second_items.len(), 1);
-    assert_eq!(second_items[0]["exec_id"], older_child.to_string());
-    assert_eq!(second_items[0]["shard_id"], 0);
-    assert!(second_page["next_cursor"].is_null());
-}
-
-#[tokio::test]
-async fn harvest_api_recursive_children_traverse_across_shards() {
-    let ((shard0_url, shard1_url), _container) = setup_sharded_test_database_urls().await;
-    let api_state = HarvestApiState::new();
-    api_state.install_storage_pool(build_two_shard_pool(&shard0_url, &shard1_url));
-    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
-
-    let parent = insert_workflow_on_url(
-        &shard0_url,
-        ShardId::new(0),
-        "fanout_parent",
-        "cross-shard-recursive-parent",
-    )
-    .await;
-    let child = insert_child_workflow_on_url(ChildWorkflowFixture {
-        database_url: &shard1_url,
-        shard: ShardId::new(1),
-        parent_id: parent,
-        workflow_name: "middle_child",
-        workflow_id: "cross-shard-recursive-child",
-        state: "RUNNING",
-        error: None,
-        started_offset_secs: 10,
-    })
-    .await;
-    let grandchild = insert_child_workflow_on_url(ChildWorkflowFixture {
-        database_url: &shard0_url,
-        shard: ShardId::new(0),
-        parent_id: child,
-        workflow_name: "leaf_child",
-        workflow_id: "cross-shard-recursive-grandchild",
-        state: "FAILED",
-        error: Some("leaf failed across shards"),
-        started_offset_secs: 5,
-    })
-    .await;
-
-    let (status, body) = get_json(&app, format!("/workflows/{parent}/children?depth=1")).await;
-    assert_eq!(status, StatusCode::OK);
-    let items = body["items"]
-        .as_array()
-        .expect("children response must have an items array");
-
-    assert_eq!(items.len(), 2);
-    assert!(items.iter().any(|row| row["exec_id"] == child.to_string()
-        && row["depth"] == 0
-        && row["shard_id"] == 1));
-    assert!(
-        items
-            .iter()
-            .any(|row| row["exec_id"] == grandchild.to_string()
-                && row["depth"] == 1
-                && row["shard_id"] == 0)
-    );
-}
-
-#[tokio::test]
-async fn harvest_api_children_distinguishes_empty_parent_from_missing_parent() {
-    let (database_url, _container) = setup_test_database_url().await;
-    let pool = build_test_pool(&database_url);
-    let api_state = HarvestApiState::new();
-    api_state.install_storage_pool(HarvestDbPool::from(pool));
-    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
-
-    let parent = insert_workflow_on_url(
-        &database_url,
-        ShardId::new(0),
-        "fanout_parent",
-        "parent-without-children",
-    )
-    .await;
-
-    let (empty_status, empty_body) = get_json(&app, format!("/workflows/{parent}/children")).await;
-    assert_eq!(empty_status, StatusCode::OK);
-    assert_eq!(
-        empty_body["items"]
-            .as_array()
-            .expect("children response must have an items array")
-            .len(),
-        0
-    );
-    assert!(empty_body["next_cursor"].is_null());
-
-    let missing_parent = ExecutionId::new_for_shard(ShardId::new(0));
-    let missing_response =
-        get_response(&app, format!("/workflows/{missing_parent}/children")).await;
-    assert_eq!(missing_response.status(), StatusCode::NOT_FOUND);
-}
-
-#[tokio::test]
-async fn harvest_api_children_supports_recursive_depth_with_cap() {
-    let (database_url, _container) = setup_test_database_url().await;
-    let pool = build_test_pool(&database_url);
-    let api_state = HarvestApiState::new();
-    api_state.install_storage_pool(HarvestDbPool::from(pool));
-    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
-
-    let parent = insert_workflow_on_url(
-        &database_url,
-        ShardId::new(0),
-        "fanout_parent",
-        "recursive-parent",
-    )
-    .await;
-    let child = insert_child_workflow_on_url(ChildWorkflowFixture {
-        database_url: &database_url,
-        shard: ShardId::new(0),
-        parent_id: parent,
-        workflow_name: "middle_child",
-        workflow_id: "recursive-child",
-        state: "RUNNING",
-        error: None,
-        started_offset_secs: 10,
-    })
-    .await;
-    let grandchild = insert_child_workflow_on_url(ChildWorkflowFixture {
-        database_url: &database_url,
-        shard: ShardId::new(0),
-        parent_id: child,
-        workflow_name: "leaf_child",
-        workflow_id: "recursive-grandchild",
-        state: "FAILED",
-        error: Some("leaf failed"),
-        started_offset_secs: 5,
-    })
-    .await;
-
-    let (status, body) = get_json(&app, format!("/workflows/{parent}/children?depth=1")).await;
-    assert_eq!(status, StatusCode::OK);
-    let items = body["items"]
-        .as_array()
-        .expect("children response must have an items array");
-    assert_eq!(items.len(), 2);
-    assert!(items.iter().any(|row| row["exec_id"] == child.to_string()
-        && row["depth"] == 0
-        && row["workflow_name"] == "middle_child"));
-    assert!(
-        items
-            .iter()
-            .any(|row| row["exec_id"] == grandchild.to_string()
-                && row["depth"] == 1
-                && row["workflow_name"] == "leaf_child")
-    );
-
-    let (filtered_status, filtered_body) = get_json(
-        &app,
-        format!("/workflows/{parent}/children?depth=1&status=Failed"),
-    )
-    .await;
-    assert_eq!(filtered_status, StatusCode::OK);
-    let filtered_items = filtered_body["items"]
-        .as_array()
-        .expect("filtered children response must have an items array");
-    assert_eq!(filtered_items.len(), 1);
-    assert_eq!(filtered_items[0]["exec_id"], grandchild.to_string());
-    assert_eq!(filtered_items[0]["depth"], 1);
-
-    let too_deep = get_response(&app, format!("/workflows/{parent}/children?depth=6")).await;
-    assert_eq!(too_deep.status(), StatusCode::BAD_REQUEST);
-}
-
-#[tokio::test]
 async fn harvest_api_duplicate_start_reuses_existing_execution() {
     let (database_url, _container) = setup_test_database_url().await;
     let pool = build_test_pool(&database_url);
@@ -1761,11 +919,9 @@ async fn harvest_api_duplicate_start_reuses_existing_execution() {
     api_state.install(HarvestApiRuntime::new(
         Arc::clone(&registry),
         Arc::new(HashMap::new()),
-        Arc::new(Vec::new()),
         Some("test-worker".to_string()),
         vec!["default".to_string()],
         SchedulerMonitor::offline(),
-        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::single(),
     ));
     let app = harvest_api_router(api_state).with_state(test_app_state(pool));
@@ -1811,47 +967,6 @@ async fn harvest_api_duplicate_start_reuses_existing_execution() {
 }
 
 #[tokio::test]
-async fn harvest_api_stack_endpoint_returns_shape() {
-    let (database_url, _container) = setup_test_database_url().await;
-    let pool = build_test_pool(&database_url);
-    let registry = approval_registry();
-    let api_state = HarvestApiState::new();
-    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
-    api_state.install(HarvestApiRuntime::new(
-        Arc::clone(&registry),
-        Arc::new(HashMap::new()),
-        Arc::new(Vec::new()),
-        Some("test-worker".to_string()),
-        vec!["default".to_string()],
-        SchedulerMonitor::offline(),
-        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
-        ShardRouter::single(),
-    ));
-    let app = harvest_api_router(api_state).with_state(test_app_state(pool));
-
-    let (start_status, start_json) = post_json(
-        &app,
-        "/workflows/approval_workflow/start",
-        json!({"workflow_id":"stack-shape","input":{"request_id":"stack"}}),
-    )
-    .await;
-    assert_eq!(start_status, StatusCode::CREATED);
-    let exec_id = start_json["execution_id"].as_str().unwrap();
-
-    let (status, payload) = get_json(&app, format!("/workflows/{exec_id}/stack")).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(payload["exec_id"], exec_id);
-    assert_eq!(payload["workflow_name"], "approval_workflow");
-    assert!(payload["pending_activities"].is_array());
-    assert!(payload["pending_local_activities"].is_array());
-    assert!(payload["pending_timers"].is_array());
-    assert!(payload["pending_signals"].is_array());
-    assert!(payload["buffered_signals"].is_array());
-    assert!(payload["pending_child_workflows"].is_array());
-    assert!(payload["last_event_id"].is_number());
-}
-
-#[tokio::test]
 async fn harvest_api_cancels_workflows_and_rejects_late_signals() {
     let (database_url, _container) = setup_test_database_url().await;
     let pool = build_test_pool(&database_url);
@@ -1861,11 +976,9 @@ async fn harvest_api_cancels_workflows_and_rejects_late_signals() {
     api_state.install(HarvestApiRuntime::new(
         Arc::clone(&registry),
         Arc::new(HashMap::new()),
-        Arc::new(Vec::new()),
         Some("test-worker".to_string()),
         vec!["default".to_string()],
         SchedulerMonitor::offline(),
-        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::single(),
     ));
     let app = harvest_api_router(api_state).with_state(test_app_state(pool));
@@ -1962,8 +1075,6 @@ async fn external_runner_processes_workflows_started_via_management_api() {
                 url: Some(database_url.clone()),
             },
             outbox: autumn_harvest_plugin::HarvestOutboxConfig::default(),
-            batch: autumn_harvest_plugin::HarvestBatchConfig::default(),
-            readiness: autumn_harvest_plugin::HarvestReadinessConfig::default(),
         },
         HarvestRunnerResources::new(pool.clone()),
     )
@@ -1985,8 +1096,6 @@ async fn external_runner_processes_workflows_started_via_management_api() {
                 url: Some(database_url.clone()),
             },
             outbox: autumn_harvest_plugin::HarvestOutboxConfig::default(),
-            batch: autumn_harvest_plugin::HarvestBatchConfig::default(),
-            readiness: autumn_harvest_plugin::HarvestReadinessConfig::default(),
         },
         HarvestRunnerResources::new(pool.clone()),
     )
@@ -2027,74 +1136,6 @@ async fn external_runner_processes_workflows_started_via_management_api() {
 }
 
 #[tokio::test]
-async fn retention_janitor_deletes_only_rows_older_than_max_age_and_cascades_children() {
-    let (database_url, _container) = setup_test_database_url().await;
-    let pool = build_test_pool(&database_url);
-    let api_state = HarvestApiState::new();
-
-    let runner = HarvestRunner::start(
-        autumn_harvest::HarvestBuilder::new()
-            .retention(RetentionConfig {
-                max_age_secs: Some(7 * 24 * 60 * 60),
-                tick_interval_secs: 60 * 60,
-                batch_size: 1000,
-                dry_run: false,
-                audit_retention_days: 90,
-            })
-            .build(),
-        &HarvestRuntimeConfig {
-            mode: HarvestMode::External,
-            worker_enabled: false,
-            scheduler_enabled: false,
-            database: autumn_harvest_plugin::HarvestDatabaseConfig {
-                url: Some(database_url.clone()),
-            },
-            outbox: autumn_harvest_plugin::HarvestOutboxConfig::default(),
-            batch: autumn_harvest_plugin::HarvestBatchConfig::default(),
-            readiness: autumn_harvest_plugin::HarvestReadinessConfig::default(),
-        },
-        HarvestRunnerResources::new(pool.clone()),
-    )
-    .expect("runner with retention should start");
-
-    let old_exec_a = uuid::Uuid::new_v4();
-    let old_exec_b = uuid::Uuid::new_v4();
-    let recent_exec = uuid::Uuid::new_v4();
-    let inflight_exec = uuid::Uuid::new_v4();
-    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
-        .await
-        .expect("failed to connect for retention fixture");
-    seed_retention_fixtures(
-        &mut conn,
-        old_exec_a,
-        old_exec_b,
-        recent_exec,
-        inflight_exec,
-    )
-    .await;
-
-    api_state.install_storage_pool(runner.storage_pool());
-    api_state.install(runner.api_runtime());
-    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
-
-    trigger_retention_and_wait(&app).await;
-
-    let mut verify_conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
-        .await
-        .expect("failed to reconnect for verification");
-    assert_retention_cleanup_state(
-        &mut verify_conn,
-        old_exec_a,
-        old_exec_b,
-        recent_exec,
-        inflight_exec,
-    )
-    .await;
-
-    runner.stop().await;
-}
-
-#[tokio::test]
 async fn harvest_api_signal_does_not_wake_timer_waits_early() {
     let (database_url, _container) = setup_test_database_url().await;
     let pool = build_test_pool(&database_url);
@@ -2104,11 +1145,9 @@ async fn harvest_api_signal_does_not_wake_timer_waits_early() {
     api_state.install(HarvestApiRuntime::new(
         Arc::clone(&registry),
         Arc::new(HashMap::new()),
-        Arc::new(Vec::new()),
         Some("test-worker".to_string()),
         vec!["default".to_string()],
         SchedulerMonitor::offline(),
-        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::single(),
     ));
 
@@ -2374,11 +1413,9 @@ async fn harvest_api_lists_and_triggers_manual_dags() {
     api_state.install(HarvestApiRuntime::new(
         Arc::clone(&registry),
         Arc::clone(&dag_catalog),
-        Arc::new(Vec::new()),
         Some("scheduler-only".to_string()),
         vec!["default".to_string()],
         SchedulerMonitor::offline(),
-        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::single(),
     ));
     let app = harvest_api_router(api_state).with_state(test_app_state(pool.clone()));
@@ -2466,9 +1503,6 @@ async fn scheduler_tick_creates_and_executes_due_interval_runs() {
             default_heartbeat_timeout: None,
             default_schedule_to_start: None,
             default_queue: Some("default"),
-            max_concurrent: None,
-            concurrency_key: None,
-            is_local: false,
             handler: record_activity,
         }],
         Arc::new(state),
@@ -2510,7 +1544,6 @@ async fn scheduler_tick_creates_and_executes_due_interval_runs() {
         pool.clone(),
         Arc::clone(&registry),
         Arc::clone(&dag_catalog),
-        Arc::new(Vec::new()),
         SchedulerMonitor::offline(),
     )
     .await
@@ -2521,159 +1554,6 @@ async fn scheduler_tick_creates_and_executes_due_interval_runs() {
     assert_eq!(
         log.lock().expect("log mutex poisoned").clone(),
         vec!["interval_step"]
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn concurrent_scheduler_ticks_activate_due_dag_run_once() {
-    let (database_url, _container) = setup_test_database_url().await;
-    let pool = build_test_pool(&database_url);
-    let log = Arc::new(Mutex::new(Vec::<String>::new()));
-    let registry = recording_registry(Arc::clone(&log), &["interval_step"]);
-    let dag_catalog = Arc::new(
-        compile_dag_catalog(vec![interval_pipeline_info()])
-            .expect("interval pipeline dag should compile"),
-    );
-    register_test_schedules(
-        &database_url,
-        dag_catalog.as_ref(),
-        "failed to connect for schedule registration",
-    )
-    .await;
-
-    let schedule = load_schedule_from_url(&database_url, "interval_pipeline").await;
-    {
-        let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
-            .await
-            .expect("failed to connect for forcing due interval schedule");
-        diesel::update(harvest_schedules::table.find(schedule.id))
-            .set(
-                harvest_schedules::next_run_at
-                    .eq(Some(chrono::Utc::now() - chrono::Duration::seconds(1))),
-            )
-            .execute(&mut conn)
-            .await
-            .expect("failed to force interval schedule due");
-    }
-
-    let gate = Arc::new(tokio::sync::Barrier::new(8));
-    let mut handles = Vec::new();
-    for _ in 0..8 {
-        let gate = Arc::clone(&gate);
-        let pool = pool.clone();
-        let registry = Arc::clone(&registry);
-        let dag_catalog = Arc::clone(&dag_catalog);
-        handles.push(tokio::spawn(async move {
-            gate.wait().await;
-            tick_once(
-                pool,
-                registry,
-                dag_catalog,
-                Arc::new(Vec::new()),
-                SchedulerMonitor::offline(),
-            )
-            .await
-        }));
-    }
-
-    for handle in handles {
-        handle
-            .await
-            .expect("concurrent scheduler tick task should not panic")
-            .expect("concurrent scheduler tick should succeed");
-    }
-
-    let run = wait_for_dag_run_state(&database_url, "interval_pipeline", "SUCCESS").await;
-    assert_eq!(run.dag_name, "interval_pipeline");
-    assert_eq!(
-        count_dag_runs_from_url(&database_url, "interval_pipeline").await,
-        1,
-        "one due logical date should create one durable DAG run"
-    );
-    assert_eq!(
-        log.lock().expect("log mutex poisoned").clone(),
-        vec!["interval_step"],
-        "concurrent schedulers must not double-activate the same queued run"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn concurrent_scheduler_ticks_dispatch_due_workflow_schedule_once() {
-    let (database_url, _container) = setup_test_database_url().await;
-    let pool = build_test_pool(&database_url);
-    let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
-    let workflow_name = "scheduled_exact_once_workflow";
-    let workflow_schedule =
-        WorkflowSchedule::new(workflow_name, Schedule::Interval(Duration::from_secs(60)))
-            .with_input(json!({ "source": "concurrent-scheduler" }));
-
-    {
-        let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
-            .await
-            .expect("failed to connect for workflow schedule registration");
-        register_workflow_schedules(&mut conn, std::slice::from_ref(&workflow_schedule))
-            .await
-            .expect("failed to register workflow schedule");
-        diesel::update(
-            harvest_schedules::table.filter(harvest_schedules::workflow_name.eq(workflow_name)),
-        )
-        .set(
-            harvest_schedules::next_run_at
-                .eq(Some(chrono::Utc::now() - chrono::Duration::seconds(1))),
-        )
-        .execute(&mut conn)
-        .await
-        .expect("failed to force workflow schedule due");
-    }
-
-    let gate = Arc::new(tokio::sync::Barrier::new(8));
-    let workflow_schedules = Arc::new(vec![workflow_schedule]);
-    let empty_dags = Arc::new(DagCatalog::default());
-    let mut handles = Vec::new();
-    for _ in 0..8 {
-        let gate = Arc::clone(&gate);
-        let pool = pool.clone();
-        let registry = Arc::clone(&registry);
-        let empty_dags = Arc::clone(&empty_dags);
-        let workflow_schedules = Arc::clone(&workflow_schedules);
-        handles.push(tokio::spawn(async move {
-            gate.wait().await;
-            tick_once(
-                pool,
-                registry,
-                empty_dags,
-                workflow_schedules,
-                SchedulerMonitor::offline(),
-            )
-            .await
-        }));
-    }
-
-    for handle in handles {
-        handle
-            .await
-            .expect("concurrent scheduler tick task should not panic")
-            .expect("concurrent scheduler tick should succeed");
-    }
-
-    assert_eq!(
-        count_workflow_executions_by_name_from_url(&database_url, workflow_name).await,
-        1,
-        "one due workflow schedule slot should create one execution"
-    );
-    let execution = load_latest_workflow_execution_by_name_from_url(&database_url, workflow_name)
-        .await
-        .expect("scheduled workflow execution should exist");
-    assert!(
-        execution
-            .workflow_id
-            .starts_with(&format!("sched:{workflow_name}:")),
-        "scheduled workflow id must be deterministic for duplicate suppression"
-    );
-    assert_eq!(
-        count_workflow_tasks_from_url(&database_url, &execution.id.to_string()).await,
-        1,
-        "duplicate scheduler ticks must not enqueue duplicate workflow tasks"
     );
 }
 

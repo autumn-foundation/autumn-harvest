@@ -4,20 +4,15 @@
 //! The `UNIQUE(workflow_exec_id, event_id)` constraint guarantees
 //! that two workers can't append conflicting events to the same workflow.
 
-use diesel::BoolExpressionMethods;
 use diesel::ExpressionMethods;
-use diesel::OptionalExtension;
 use diesel::QueryDsl;
-use diesel::SelectableHelper;
-use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
-use scoped_futures::ScopedFutureExt as _;
 
 use crate::error::HarvestResult;
 use crate::event::WorkflowEvent;
 use crate::models::NewHarvestEvent;
-use crate::schema::{harvest_events, harvest_workflow_executions};
+use crate::schema::harvest_events;
 use crate::types::ExecutionId;
 
 /// Loaded event history for a single workflow execution.
@@ -31,45 +26,6 @@ pub struct EventHistory {
     pub next_event_id: i32,
 }
 
-/// Filters for loading child workflow execution rows under one parent.
-#[derive(Debug, Clone, Default)]
-pub struct WorkflowChildFilters {
-    pub statuses: Vec<String>,
-    pub workflow_name: Option<String>,
-    pub cursor: Option<WorkflowChildCursor>,
-    pub limit: Option<i64>,
-}
-
-/// Cursor anchor for paged child workflow queries.
-#[derive(Debug, Clone)]
-pub struct WorkflowChildCursor {
-    pub started_at: chrono::DateTime<chrono::Utc>,
-    pub exec_id: uuid::Uuid,
-}
-
-/// Operator-facing child workflow row used by management API read models.
-#[derive(Debug, Clone)]
-pub struct WorkflowChildRow {
-    pub exec_id: ExecutionId,
-    pub workflow_name: String,
-    pub status: String,
-    pub started_at: chrono::DateTime<chrono::Utc>,
-    pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub error_summary: Option<String>,
-    pub shard_id: i32,
-    pub depth: u8,
-}
-
-type WorkflowChildProjection = (
-    uuid::Uuid,
-    String,
-    String,
-    chrono::DateTime<chrono::Utc>,
-    Option<chrono::DateTime<chrono::Utc>>,
-    Option<String>,
-    i32,
-);
-
 /// Convert in-memory events to insertable rows with sequential event IDs
 /// starting from 0.
 ///
@@ -79,12 +35,7 @@ pub fn events_to_insert_rows(
     exec_id: ExecutionId,
     events: &[WorkflowEvent],
 ) -> Result<Vec<NewHarvestEvent<'_>>, crate::error::HarvestError> {
-    events_to_insert_rows_from_with_codecs(
-        exec_id,
-        events,
-        0,
-        &crate::payload_codec::PayloadCodecs::default(),
-    )
+    events_to_insert_rows_from(exec_id, events, 0)
 }
 
 /// Convert in-memory events to insertable rows with sequential event IDs
@@ -102,20 +53,6 @@ pub fn events_to_insert_rows_from(
     events: &[WorkflowEvent],
     start_id: i32,
 ) -> Result<Vec<NewHarvestEvent<'_>>, crate::error::HarvestError> {
-    events_to_insert_rows_from_with_codecs(
-        exec_id,
-        events,
-        start_id,
-        &crate::payload_codec::PayloadCodecs::default(),
-    )
-}
-
-pub fn events_to_insert_rows_from_with_codecs<'a>(
-    exec_id: ExecutionId,
-    events: &'a [WorkflowEvent],
-    start_id: i32,
-    codecs: &crate::payload_codec::PayloadCodecs,
-) -> Result<Vec<NewHarvestEvent<'a>>, crate::error::HarvestError> {
     events
         .iter()
         .enumerate()
@@ -129,7 +66,7 @@ pub fn events_to_insert_rows_from_with_codecs<'a>(
                 workflow_exec_id: exec_id.as_uuid(),
                 event_id,
                 event_type: event.type_name(),
-                event_data: codecs.encode_event(event)?,
+                event_data: serde_json::to_value(event).expect("WorkflowEvent must serialize"),
             })
         })
         .collect()
@@ -158,145 +95,11 @@ pub async fn append_events(
 
     let rows = events_to_insert_rows_from(exec_id, events, start_id)?;
 
-    let inserted = diesel::insert_into(harvest_events::table)
+    diesel::insert_into(harvest_events::table)
         .values(&rows)
         .execute(conn)
         .await
-        .map_err(crate::error::database_error)?;
-
-    if let Some(last_event) = events.last() {
-        crate::notify::notify_workflow_events_appended(
-            conn,
-            exec_id.as_uuid(),
-            inserted,
-            last_event.type_name(),
-        )
-        .await?;
-    }
-
-    Ok(inserted)
-}
-
-/// Append a single event to a workflow's history without loading the full log.
-///
-/// Acquires a row-level lock on the workflow execution before reading
-/// `MAX(event_id)`, serializing concurrent appenders (management API paths,
-/// timeout enforcement) so they never race to allocate the same event ID.
-/// Must be called inside a transaction; the lock is held until the transaction
-/// commits or rolls back.
-///
-/// # Errors
-///
-/// Returns [`crate::error::HarvestError::Database`] if the query or insert fails,
-/// or [`crate::error::HarvestError::NotFound`] if the execution does not exist.
-pub async fn append_single_event(
-    conn: &mut AsyncPgConnection,
-    exec_id: ExecutionId,
-    event: WorkflowEvent,
-) -> HarvestResult<()> {
-    use crate::models::WorkflowExecution;
-    use crate::schema::harvest_workflow_executions;
-    use diesel::dsl::max;
-
-    // Lock the parent execution row so that concurrent callers serialise their
-    // MAX(event_id) + INSERT pairs — preventing a duplicate-event-id collision
-    // on the UNIQUE(workflow_exec_id, event_id) constraint.
-    harvest_workflow_executions::table
-        .find(exec_id.as_uuid())
-        .for_update()
-        .select(WorkflowExecution::as_select())
-        .first(conn)
-        .await
-        .optional()
-        .map_err(crate::error::database_error)?
-        .ok_or_else(|| {
-            crate::error::HarvestError::NotFound(format!("workflow execution {exec_id}"))
-        })?;
-
-    let max_id: Option<i32> = harvest_events::table
-        .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
-        .select(max(harvest_events::event_id))
-        .first(conn)
-        .await
-        .map_err(crate::error::database_error)?;
-
-    let next_id = max_id.map_or(0, |id| id.saturating_add(1));
-    append_events(conn, exec_id, &[event], next_id).await?;
-    Ok(())
-}
-
-/// Durably admit an update into a workflow's event history.
-///
-/// Opens a transaction, acquires a row-level `FOR UPDATE` lock on the
-/// execution row, verifies the execution is still `RUNNING`, reads
-/// `MAX(event_id)`, and then appends the `UpdateAdmitted` event.  Doing
-/// the state check and the insert inside the same lock ensures that a
-/// concurrent state transition (e.g. `RUNNING → COMPLETED` from the worker)
-/// is fully visible before admission proceeds.
-///
-/// # Errors
-///
-/// Returns [`crate::error::HarvestError::NotFound`] if `exec_id` does not exist.
-/// Returns [`crate::error::HarvestError::UpdateRejected`] if the execution is
-/// not in the `RUNNING` state.
-/// Returns [`crate::error::HarvestError::Database`] on query or insert failure.
-pub async fn admit_update_event(
-    conn: &mut AsyncPgConnection,
-    exec_id: ExecutionId,
-    update_id: crate::types::UpdateId,
-    name: String,
-    input: serde_json::Value,
-) -> HarvestResult<()> {
-    use crate::models::WorkflowExecution;
-    use crate::schema::harvest_workflow_executions;
-    use diesel::dsl::max;
-
-    conn.transaction::<(), crate::error::HarvestError, _>(|conn| {
-        async move {
-            // Acquire a row-level lock so concurrent appenders serialize their
-            // MAX(event_id) + INSERT pairs and the state check is consistent.
-            let execution: WorkflowExecution = harvest_workflow_executions::table
-                .find(exec_id.as_uuid())
-                .for_update()
-                .select(WorkflowExecution::as_select())
-                .first(conn)
-                .await
-                .optional()
-                .map_err(crate::error::database_error)?
-                .ok_or_else(|| {
-                    crate::error::HarvestError::NotFound(format!("workflow execution {exec_id}"))
-                })?;
-
-            // Reject the update if the execution is no longer running.
-            if execution.state != "RUNNING" {
-                return Err(crate::error::HarvestError::UpdateRejected {
-                    reason: format!(
-                        "workflow {exec_id} is not RUNNING (state: {})",
-                        execution.state
-                    ),
-                });
-            }
-
-            let max_id: Option<i32> = harvest_events::table
-                .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
-                .select(max(harvest_events::event_id))
-                .first(conn)
-                .await
-                .map_err(crate::error::database_error)?;
-
-            let next_id = max_id.map_or(0, |id| id.saturating_add(1));
-            let event = WorkflowEvent::UpdateAdmitted {
-                update_id,
-                name,
-                input,
-                timestamp: chrono::Utc::now(),
-            };
-            append_events(conn, exec_id, &[event], next_id).await?;
-            Ok(())
-        }
-        .scope_boxed()
-    })
-    .await
+        .map_err(crate::error::database_error)
 }
 
 /// Load the full event history for a workflow execution, ordered by `event_id`.
@@ -315,19 +118,6 @@ pub async fn load_history(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
 ) -> HarvestResult<EventHistory> {
-    load_history_with_codecs(
-        conn,
-        exec_id,
-        &crate::payload_codec::PayloadCodecs::default(),
-    )
-    .await
-}
-
-pub async fn load_history_with_codecs(
-    conn: &mut AsyncPgConnection,
-    exec_id: ExecutionId,
-    codecs: &crate::payload_codec::PayloadCodecs,
-) -> HarvestResult<EventHistory> {
     use crate::models::HarvestEvent;
 
     let rows: Vec<HarvestEvent> = harvest_events::table
@@ -341,7 +131,7 @@ pub async fn load_history_with_codecs(
 
     let events = rows
         .into_iter()
-        .map(|row| codecs.decode_event(row.event_data))
+        .map(|row| serde_json::from_value(row.event_data))
         .collect::<Result<Vec<WorkflowEvent>, _>>()?;
 
     Ok(EventHistory {
@@ -349,168 +139,6 @@ pub async fn load_history_with_codecs(
         events,
         next_event_id,
     })
-}
-
-/// Load the direct children of `parent_id` from one shard.
-///
-/// Callers that need cross-shard discovery should call this once per shard and
-/// merge the rows after applying any global ordering/pagination.
-///
-/// # Errors
-///
-/// Returns [`crate::error::HarvestError::Database`] on query failure.
-pub async fn load_workflow_children(
-    conn: &mut AsyncPgConnection,
-    parent_id: ExecutionId,
-    filters: &WorkflowChildFilters,
-    depth: u8,
-) -> HarvestResult<Vec<WorkflowChildRow>> {
-    let mut query = harvest_workflow_executions::table
-        .into_boxed()
-        .filter(harvest_workflow_executions::parent_id.eq(Some(parent_id.as_uuid())))
-        .order((
-            harvest_workflow_executions::started_at.desc(),
-            harvest_workflow_executions::id.desc(),
-        ));
-
-    if !filters.statuses.is_empty() {
-        query = query.filter(harvest_workflow_executions::state.eq_any(filters.statuses.clone()));
-    }
-    if let Some(name) = &filters.workflow_name {
-        query = query.filter(harvest_workflow_executions::workflow_name.eq(name.clone()));
-    }
-    if let Some(cursor) = &filters.cursor {
-        query = query.filter(
-            harvest_workflow_executions::started_at
-                .lt(cursor.started_at)
-                .or(harvest_workflow_executions::started_at
-                    .eq(cursor.started_at)
-                    .and(harvest_workflow_executions::id.lt(cursor.exec_id))),
-        );
-    }
-    if let Some(limit) = filters.limit {
-        query = query.limit(limit);
-    }
-
-    query
-        .select((
-            harvest_workflow_executions::id,
-            harvest_workflow_executions::workflow_name,
-            harvest_workflow_executions::state,
-            harvest_workflow_executions::started_at,
-            harvest_workflow_executions::completed_at,
-            harvest_workflow_executions::error,
-            harvest_workflow_executions::shard_id,
-        ))
-        .load::<WorkflowChildProjection>(conn)
-        .await
-        .map_err(crate::error::database_error)
-        .map(|rows| {
-            rows.into_iter()
-                .map(
-                    |(id, workflow_name, state, started_at, completed_at, error, shard_id)| {
-                        workflow_child_row_from_parts(
-                            id,
-                            workflow_name,
-                            state,
-                            started_at,
-                            completed_at,
-                            error,
-                            shard_id,
-                            depth,
-                        )
-                    },
-                )
-                .collect()
-        })
-}
-
-#[allow(clippy::too_many_arguments)]
-fn workflow_child_row_from_parts(
-    id: uuid::Uuid,
-    workflow_name: String,
-    state: String,
-    started_at: chrono::DateTime<chrono::Utc>,
-    completed_at: Option<chrono::DateTime<chrono::Utc>>,
-    error: Option<String>,
-    shard_id: i32,
-    depth: u8,
-) -> WorkflowChildRow {
-    WorkflowChildRow {
-        exec_id: ExecutionId::from_uuid(id),
-        workflow_name,
-        status: state,
-        started_at,
-        completed_at,
-        error_summary: summarize_error(error),
-        shard_id,
-        depth,
-    }
-}
-
-/// Merge-patch the `search_attrs` JSONB column for a workflow execution.
-///
-/// `Some(value)` entries in `patch` overwrite the stored key; `None` entries
-/// remove the key. Keys absent from `patch` are preserved. The update is done
-/// as an atomic read-modify-write within the caller's transaction context so
-/// concurrent same-execution updates (which the task queue serialises) do not
-/// race.
-pub async fn update_search_attrs<S: std::hash::BuildHasher + Sync>(
-    conn: &mut AsyncPgConnection,
-    exec_id: crate::types::ExecutionId,
-    patch: &std::collections::HashMap<String, Option<serde_json::Value>, S>,
-) -> HarvestResult<()> {
-    use crate::schema::harvest_workflow_executions::dsl;
-
-    if patch.is_empty() {
-        return Ok(());
-    }
-
-    // Read the current value so we can apply the merge in Rust.  Workflow
-    // tasks are serialised per-execution by SKIP LOCKED, so no TOCTOU risk.
-    let current: Option<serde_json::Value> = dsl::harvest_workflow_executions
-        .find(exec_id.as_uuid())
-        .select(dsl::search_attrs)
-        .first::<Option<serde_json::Value>>(conn)
-        .await
-        .map_err(crate::error::database_error)?;
-
-    let mut merged: serde_json::Map<String, serde_json::Value> = match current {
-        Some(serde_json::Value::Object(m)) => m,
-        _ => serde_json::Map::new(),
-    };
-
-    for (key, value) in patch {
-        match value {
-            Some(v) => {
-                merged.insert(key.clone(), v.clone());
-            }
-            None => {
-                merged.remove(key.as_str());
-            }
-        }
-    }
-
-    let new_attrs = serde_json::Value::Object(merged);
-
-    diesel::update(dsl::harvest_workflow_executions.find(exec_id.as_uuid()))
-        .set(dsl::search_attrs.eq(Some(new_attrs)))
-        .execute(conn)
-        .await
-        .map_err(crate::error::database_error)?;
-
-    Ok(())
-}
-
-fn summarize_error(error: Option<String>) -> Option<String> {
-    const MAX_ERROR_SUMMARY_CHARS: usize = 240;
-
-    let first_line = error?.lines().next()?.trim().to_string();
-    if first_line.is_empty() {
-        return None;
-    }
-
-    Some(first_line.chars().take(MAX_ERROR_SUMMARY_CHARS).collect())
 }
 
 #[cfg(test)]

@@ -19,104 +19,13 @@ use tokio_util::sync::CancellationToken;
 
 use crate::context::ActivityContext;
 use crate::error::{HarvestError, HarvestResult};
-use crate::execution::StartedWorkflowExecution;
 use crate::info::DagInfo;
 use crate::models::{DagRun, HarvestSchedule, NewDagRun, NewHarvestSchedule};
-use crate::policy::{RetryPolicy, Schedule, TaskStatus, WorkflowSchedule};
-use crate::schema::{harvest_dag_runs, harvest_schedules, harvest_workflow_executions};
-use crate::types::{ActivityExecId, ExecutionId, IdempotencyKey, WorkflowIdReusePolicy};
+use crate::policy::{RetryPolicy, Schedule, TaskStatus};
+use crate::schema::{harvest_dag_runs, harvest_schedules};
 use crate::worker::{DbPool, HandlerRegistry};
 
 const DEFAULT_SCHEDULER_TICK_INTERVAL: Duration = Duration::from_secs(1);
-
-/// Default upper bound on the number of timestamps a single backfill request may plan.
-///
-/// Chosen to cover a 7-day hourly window (168 slots) with comfortable headroom.
-pub const DEFAULT_BACKFILL_MAX_COUNT: usize = 1_000;
-
-/// Errors returned when backfill planning cannot complete.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BackfillPlanError {
-    /// The window contains more timestamps than the caller-supplied limit.
-    LimitExceeded { limit: usize },
-}
-
-impl std::fmt::Display for BackfillPlanError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::LimitExceeded { limit } => {
-                write!(f, "backfill would exceed the {limit}-timestamp limit")
-            }
-        }
-    }
-}
-
-/// Compute the timestamps a schedule would fire between `from` (inclusive) and `to` (inclusive).
-///
-/// - For `Cron` schedules the first occurrence at or after `from` is included; subsequent
-///   occurrences are stepped through until they exceed `to`.
-/// - For `Interval` schedules `from` is treated as the first backfill timestamp and slots are
-///   spaced by the interval duration.
-/// - `Manual` schedules and `None` return an empty list (no automatic firing times).
-///
-/// # Errors
-///
-/// Returns `Err(BackfillPlanError::LimitExceeded)` if the number of planned timestamps
-/// would exceed `max_count` before the window is fully enumerated.  Callers should pass
-/// [`DEFAULT_BACKFILL_MAX_COUNT`] unless a tighter bound is required.
-pub fn plan_backfill_timestamps(
-    schedule: Option<&Schedule>,
-    from: DateTime<Utc>,
-    to: DateTime<Utc>,
-    max_count: usize,
-) -> Result<Vec<DateTime<Utc>>, BackfillPlanError> {
-    if to < from {
-        return Ok(vec![]);
-    }
-
-    match schedule {
-        None | Some(Schedule::Manual) => Ok(vec![]),
-        Some(Schedule::Cron(_)) => {
-            // Find the first cron occurrence at or after `from` by searching from 1 ms before
-            // it (cron fires on whole-second boundaries; 1 ms is a safe undercut).
-            let reference = from - chrono::Duration::milliseconds(1);
-            let Some(mut cursor) = next_run_after(schedule, reference) else {
-                return Ok(vec![]);
-            };
-            let mut timestamps = Vec::new();
-            loop {
-                if cursor > to {
-                    break;
-                }
-                if timestamps.len() >= max_count {
-                    return Err(BackfillPlanError::LimitExceeded { limit: max_count });
-                }
-                timestamps.push(cursor);
-                let Some(next) = next_run_after(schedule, cursor) else {
-                    break;
-                };
-                cursor = next;
-            }
-            Ok(timestamps)
-        }
-        Some(Schedule::Interval(interval)) => {
-            let dur = chrono::Duration::from_std(*interval).unwrap_or(chrono::Duration::MAX);
-            let mut timestamps = Vec::new();
-            let mut cursor = from;
-            loop {
-                if cursor > to {
-                    break;
-                }
-                if timestamps.len() >= max_count {
-                    return Err(BackfillPlanError::LimitExceeded { limit: max_count });
-                }
-                timestamps.push(cursor);
-                cursor += dur;
-            }
-            Ok(timestamps)
-        }
-    }
-}
 
 /// Represents a fully registered and compiled DAG definition.
 #[derive(Debug, Clone)]
@@ -225,7 +134,7 @@ impl SchedulerMonitor {
     }
 }
 
-/// The background runtime that drives DAG and workflow scheduling.
+/// The background runtime that drives DAG scheduling.
 pub struct SchedulerRuntime {
     shutdown: CancellationToken,
     handle: JoinHandle<()>,
@@ -237,35 +146,23 @@ impl SchedulerRuntime {
     ///
     /// It wakes up at a fixed interval to evaluate schedules and trigger runs.
     #[must_use]
-    pub fn spawn(
-        pool: DbPool,
-        registry: Arc<HandlerRegistry>,
-        dags: Arc<DagCatalog>,
-        workflow_schedules: Arc<Vec<WorkflowSchedule>>,
-    ) -> Self {
+    pub fn spawn(pool: DbPool, registry: Arc<HandlerRegistry>, dags: Arc<DagCatalog>) -> Self {
         let shutdown = CancellationToken::new();
         let shutdown_for_task = shutdown.clone();
-        let total = dags.len() + workflow_schedules.len();
-        let monitor = SchedulerMonitor::new(total);
+        let monitor = SchedulerMonitor::new(dags.len());
         let monitor_for_task = monitor.clone();
         let handle = tokio::spawn(async move {
             while !shutdown_for_task.is_cancelled() {
-                if let Ok(mut conn) = pool.get().await {
-                    if let Err(error) = register_schedules(&mut conn, dags.as_ref()).await {
-                        tracing::warn!(error = %error, "failed to register harvest DAG schedules");
-                    }
-                    if let Err(error) =
-                        register_workflow_schedules(&mut conn, workflow_schedules.as_ref()).await
-                    {
-                        tracing::warn!(error = %error, "failed to register harvest workflow schedules");
-                    }
+                if let Ok(mut conn) = pool.get().await
+                    && let Err(error) = register_schedules(&mut conn, dags.as_ref()).await
+                {
+                    tracing::warn!(error = %error, "failed to register harvest schedules");
                 }
 
                 if let Err(error) = tick_once(
                     pool.clone(),
                     Arc::clone(&registry),
                     Arc::clone(&dags),
-                    Arc::clone(&workflow_schedules),
                     monitor_for_task.clone(),
                 )
                 .await
@@ -279,8 +176,7 @@ impl SchedulerRuntime {
                 }
             }
 
-            let total = dags.len() + workflow_schedules.len();
-            monitor_for_task.mark_stopped(total);
+            monitor_for_task.mark_stopped(dags.len());
         });
 
         Self {
@@ -364,24 +260,8 @@ pub async fn register_schedules(
     Ok(())
 }
 
-/// Upsert the durable schedule rows for the provided workflow schedules.
-///
-/// # Errors
-///
-/// Returns [`HarvestError::Database`] if the schedule rows cannot be read or
-/// written.
-pub async fn register_workflow_schedules(
-    conn: &mut AsyncPgConnection,
-    schedules: &[WorkflowSchedule],
-) -> HarvestResult<()> {
-    for ws in schedules {
-        upsert_workflow_schedule(conn, ws).await?;
-    }
-    Ok(())
-}
-
-/// Run one scheduler tick: create due DAG runs, activate queued runs, execute
-/// runnable DAG runs, and dispatch due workflow-schedule runs.
+/// Run one scheduler tick: create due runs, activate queued runs, and execute
+/// any runs that became runnable.
 ///
 /// # Errors
 ///
@@ -391,26 +271,16 @@ pub async fn tick_once(
     pool: DbPool,
     registry: Arc<HandlerRegistry>,
     dags: Arc<DagCatalog>,
-    workflow_schedules: Arc<Vec<WorkflowSchedule>>,
     monitor: SchedulerMonitor,
 ) -> HarvestResult<()> {
-    let total = dags.len() + workflow_schedules.len();
-    monitor.mark_tick(total);
+    monitor.mark_tick(dags.len());
 
     let mut conn = pool
         .get()
         .await
         .map_err(|error| HarvestError::Database(error.to_string()))?;
-    let metrics = Arc::clone(&registry.telemetry().metrics);
     create_due_runs(&mut conn, dags.as_ref()).await?;
-    let runnable = activate_queued_runs(&mut conn, dags.as_ref(), &metrics).await?;
-
-    // Dispatch due workflow-schedule runs directly via start_or_load_workflow_execution.
-    // Always check the DB — API-created schedules are DB-only and won't appear in the
-    // in-memory workflow_schedules list.
-    if let Err(error) = tick_workflow_schedules(&mut conn, &metrics).await {
-        tracing::warn!(error = %error, "harvest workflow-schedule tick error");
-    }
+    let runnable = activate_queued_runs(&mut conn, dags.as_ref()).await?;
     drop(conn);
 
     for (run, dag) in runnable {
@@ -446,14 +316,7 @@ pub async fn trigger_dag(
     drop(db);
 
     tokio::spawn(async move {
-        let _ = tick_once(
-            pool,
-            registry,
-            dags,
-            Arc::new(Vec::new()), // no workflow schedules needed for a DAG trigger kick
-            monitor,
-        )
-        .await;
+        let _ = tick_once(pool, registry, dags, monitor).await;
     });
 
     Ok(run)
@@ -506,15 +369,11 @@ async fn upsert_schedule(
     } else {
         let row = NewHarvestSchedule {
             id: uuid::Uuid::new_v4(),
-            dag_name: Some(&dag.name),
+            dag_name: &dag.name,
             schedule_expr: expr.as_deref(),
             timezone: "UTC",
             catchup: dag.catchup,
             max_active_runs: i32::try_from(dag.max_active_runs).unwrap_or(i32::MAX),
-            is_paused: false,
-            workflow_name: None,
-            workflow_input: None,
-            queue_name: None,
         };
         diesel::insert_into(harvest_schedules::table)
             .values(&row)
@@ -544,91 +403,10 @@ async fn upsert_schedule(
     }
 }
 
-/// Upsert a `harvest_schedules` row for a [`WorkflowSchedule`].
-///
-/// The insert uses `ON CONFLICT (workflow_name) DO NOTHING` so that concurrent
-/// scheduler instances or API requests cannot produce duplicate rows even without
-/// a serialisable transaction. A subsequent `UPDATE` then refreshes all mutable
-/// fields, preserving `is_paused` (managed independently via pause/resume).
-async fn upsert_workflow_schedule(
-    conn: &mut AsyncPgConnection,
-    ws: &WorkflowSchedule,
-) -> HarvestResult<HarvestSchedule> {
-    use crate::schema::harvest_schedules::dsl;
-
-    let now = Utc::now();
-    let expr = schedule_expr(Some(&ws.schedule));
-
-    // Attempt an atomic insert. The UNIQUE constraint on workflow_name means a
-    // concurrent writer will hit DO NOTHING rather than inserting a duplicate.
-    let row = NewHarvestSchedule {
-        id: uuid::Uuid::new_v4(),
-        dag_name: None,
-        schedule_expr: expr.as_deref(),
-        timezone: "UTC",
-        catchup: ws.catchup,
-        max_active_runs: i32::try_from(ws.max_active_runs).unwrap_or(i32::MAX),
-        // is_paused is set on initial insert only; subsequent upserts preserve the
-        // current value so that pause/resume state is not accidentally overwritten.
-        is_paused: ws.paused,
-        workflow_name: Some(&ws.workflow_name),
-        workflow_input: Some(ws.input.clone()),
-        queue_name: Some(ws.queue_name.as_str()),
-    };
-    diesel::insert_into(harvest_schedules::table)
-        .values(&row)
-        .on_conflict(dsl::workflow_name)
-        .do_nothing()
-        .execute(conn)
-        .await
-        .map_err(crate::error::database_error)?;
-
-    // Read back whichever row now exists (just-inserted or pre-existing).
-    let existing: HarvestSchedule = dsl::harvest_schedules
-        .filter(dsl::workflow_name.eq(&ws.workflow_name))
-        .select(HarvestSchedule::as_select())
-        .first(conn)
-        .await
-        .map_err(crate::error::database_error)?;
-
-    // Recalculate next_run_at: reset on schedule-expression change, preserve otherwise.
-    let schedule_changed = existing.schedule_expr != expr;
-    let next_run_at = if schedule_changed {
-        next_run_after(Some(&ws.schedule), now)
-    } else {
-        existing
-            .next_run_at
-            .or_else(|| next_run_after(Some(&ws.schedule), now))
-    };
-    // is_paused is deliberately excluded — it is managed via pause/resume, not here.
-    diesel::update(dsl::harvest_schedules.find(existing.id))
-        .set((
-            dsl::schedule_expr.eq(expr),
-            dsl::timezone.eq("UTC"),
-            dsl::catchup.eq(ws.catchup),
-            dsl::max_active_runs.eq(i32::try_from(ws.max_active_runs).unwrap_or(i32::MAX)),
-            dsl::workflow_input.eq(Some(ws.input.clone())),
-            dsl::queue_name.eq(Some(ws.queue_name.as_str())),
-            dsl::updated_at.eq(now),
-            dsl::next_run_at.eq(next_run_at),
-        ))
-        .execute(conn)
-        .await
-        .map_err(crate::error::database_error)?;
-
-    dsl::harvest_schedules
-        .find(existing.id)
-        .select(HarvestSchedule::as_select())
-        .first(conn)
-        .await
-        .map_err(crate::error::database_error)
-}
-
 async fn create_due_runs(conn: &mut AsyncPgConnection, dags: &DagCatalog) -> HarvestResult<()> {
     use crate::schema::harvest_schedules::dsl;
 
     let schedules = dsl::harvest_schedules
-        .filter(dsl::dag_name.is_not_null()) // DAG-only rows
         .filter(dsl::is_paused.eq(false))
         .filter(dsl::next_run_at.is_not_null())
         .filter(dsl::next_run_at.le(Utc::now()))
@@ -639,10 +417,7 @@ async fn create_due_runs(conn: &mut AsyncPgConnection, dags: &DagCatalog) -> Har
         .map_err(crate::error::database_error)?;
 
     for schedule in schedules {
-        let Some(dag_name) = &schedule.dag_name else {
-            continue;
-        };
-        let Some(dag) = dags.get(dag_name) else {
+        let Some(dag) = dags.get(&schedule.dag_name) else {
             continue;
         };
         let Some(logical_date) = schedule.next_run_at else {
@@ -653,7 +428,7 @@ async fn create_due_runs(conn: &mut AsyncPgConnection, dags: &DagCatalog) -> Har
             due_run_plan(dag.schedule.as_ref(), logical_date, now, dag.catchup);
 
         if !created.is_empty() {
-            let rows = create_new_dag_runs(dag_name, &created);
+            let rows = create_new_dag_runs(&schedule.dag_name, &created);
             diesel::insert_into(harvest_dag_runs::table)
                 .values(&rows)
                 .on_conflict((harvest_dag_runs::dag_name, harvest_dag_runs::logical_date))
@@ -680,13 +455,11 @@ async fn create_due_runs(conn: &mut AsyncPgConnection, dags: &DagCatalog) -> Har
 async fn activate_queued_runs<'a>(
     conn: &mut AsyncPgConnection,
     dags: &'a DagCatalog,
-    metrics: &Arc<dyn crate::telemetry::MetricsRecorder>,
 ) -> HarvestResult<Vec<(DagRun, &'a RegisteredDag)>> {
     use crate::schema::harvest_dag_runs::dsl as dag_runs_dsl;
     use crate::schema::harvest_schedules::dsl as schedules_dsl;
 
     let schedules = schedules_dsl::harvest_schedules
-        .filter(schedules_dsl::dag_name.is_not_null()) // DAG-only rows
         .filter(schedules_dsl::is_paused.eq(false))
         .select(HarvestSchedule::as_select())
         .load(conn)
@@ -695,26 +468,26 @@ async fn activate_queued_runs<'a>(
     let mut runnable = Vec::with_capacity(schedules.len());
 
     for schedule in schedules {
-        let Some(dag_name) = &schedule.dag_name else {
-            continue;
-        };
-        let Some(dag) = dags.get(dag_name) else {
+        let Some(dag) = dags.get(&schedule.dag_name) else {
             continue;
         };
         let running_count = dag_runs_dsl::harvest_dag_runs
-            .filter(dag_runs_dsl::dag_name.eq(dag_name))
+            .filter(dag_runs_dsl::dag_name.eq(&schedule.dag_name))
             .filter(dag_runs_dsl::state.eq("RUNNING"))
             .count()
             .get_result::<i64>(conn)
             .await
             .map_err(crate::error::database_error)?;
         let available = i64::from(schedule.max_active_runs) - running_count;
+        if available <= 0 {
+            continue;
+        }
 
         let queued = dag_runs_dsl::harvest_dag_runs
-            .filter(dag_runs_dsl::dag_name.eq(dag_name))
+            .filter(dag_runs_dsl::dag_name.eq(&schedule.dag_name))
             .filter(dag_runs_dsl::state.eq("QUEUED"))
             .order(dag_runs_dsl::logical_date.asc())
-            .limit(available.max(1)) // load at least 1 to detect skip-worthy backlog
+            .limit(available)
             .select(DagRun::as_select())
             .load(conn)
             .await
@@ -723,19 +496,10 @@ async fn activate_queued_runs<'a>(
         if queued.is_empty() {
             continue;
         }
-
-        if available <= 0 {
-            metrics.record_schedule_skipped("dag", dag_name, "max_active_runs_reached");
-            continue;
-        }
         let queued_ids: Vec<_> = queued.iter().map(|r| r.id).collect();
 
-        // Keep the state predicate in the claim update so a second scheduler
-        // that selected stale QUEUED rows cannot reactivate the same run.
         let mut updated_runs = diesel::update(
-            dag_runs_dsl::harvest_dag_runs
-                .filter(dag_runs_dsl::id.eq_any(queued_ids))
-                .filter(dag_runs_dsl::state.eq("QUEUED")),
+            dag_runs_dsl::harvest_dag_runs.filter(dag_runs_dsl::id.eq_any(queued_ids)),
         )
         .set((
             dag_runs_dsl::state.eq("RUNNING"),
@@ -750,295 +514,11 @@ async fn activate_queued_runs<'a>(
         updated_runs.sort_by_key(|r| r.logical_date);
 
         for updated in updated_runs {
-            // Emit at activation, not at completion, so interrupted/failed runs
-            // are still counted — consistent with workflow schedule semantics.
-            metrics.record_schedule_run("dag", dag_name);
             runnable.push((updated, dag));
         }
     }
 
     Ok(runnable)
-}
-
-/// Derive a deterministic, idempotent `workflow_id` for a scheduled run.
-///
-/// The id is stable across retries: if the scheduler ticks twice before
-/// updating `last_run_at`, `RejectDuplicate` reports the already-created
-/// execution and the scheduler treats that slot as dispatched.
-fn scheduled_workflow_id(workflow_name: &str, scheduled_for: DateTime<Utc>) -> String {
-    format!("sched:{}:{}", workflow_name, scheduled_for.timestamp())
-}
-
-/// Public re-export of `scheduled_workflow_id` for use in the backfill handler.
-#[must_use]
-pub fn scheduled_workflow_id_pub(workflow_name: &str, scheduled_for: DateTime<Utc>) -> String {
-    scheduled_workflow_id(workflow_name, scheduled_for)
-}
-
-const fn scheduled_workflow_reuse_policy() -> WorkflowIdReusePolicy {
-    WorkflowIdReusePolicy::RejectDuplicate
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ScheduledStartOutcome {
-    Created { exec_id: ExecutionId, state: String },
-    Duplicate { exec_id: ExecutionId, state: String },
-}
-
-impl ScheduledStartOutcome {
-    const fn created(&self) -> bool {
-        matches!(self, Self::Created { .. })
-    }
-
-    const fn exec_id(&self) -> ExecutionId {
-        match self {
-            Self::Created { exec_id, .. } | Self::Duplicate { exec_id, .. } => *exec_id,
-        }
-    }
-
-    fn state(&self) -> &str {
-        match self {
-            Self::Created { state, .. } | Self::Duplicate { state, .. } => state,
-        }
-    }
-}
-
-fn scheduled_start_outcome(
-    result: HarvestResult<StartedWorkflowExecution>,
-) -> HarvestResult<ScheduledStartOutcome> {
-    match result {
-        Ok(started) if started.created => Ok(ScheduledStartOutcome::Created {
-            exec_id: started.exec_id,
-            state: started.state,
-        }),
-        Ok(started) => Ok(ScheduledStartOutcome::Duplicate {
-            exec_id: started.exec_id,
-            state: started.state,
-        }),
-        Err(HarvestError::AlreadyExists {
-            existing_exec_id,
-            existing_state,
-        }) => Ok(ScheduledStartOutcome::Duplicate {
-            exec_id: existing_exec_id,
-            state: existing_state,
-        }),
-        Err(error) => Err(error),
-    }
-}
-
-/// Process due workflow-schedule rows and dispatch workflow starts.
-/// Parse a stored `schedule_expr` string back into a [`Schedule`] variant.
-///
-/// The format written by `schedule_expr` is `"cron:<expr>"`, `"interval:<secs>"`,
-/// or `"manual"`. Unrecognised strings return `None` and the row is treated as
-/// `Schedule::Manual` (no automatic `next_run_at`).
-#[must_use]
-pub fn parse_schedule_from_expr_pub(expr: &str) -> Option<Schedule> {
-    parse_schedule_from_expr(expr)
-}
-
-fn parse_schedule_from_expr(expr: &str) -> Option<Schedule> {
-    expr.strip_prefix("cron:").map_or_else(
-        || {
-            expr.strip_prefix("interval:")
-                .and_then(|s| s.parse::<u64>().ok())
-                .map(|secs| Schedule::Interval(Duration::from_secs(secs)))
-        },
-        |cron| Some(Schedule::Cron(cron.to_string())),
-    )
-}
-
-async fn tick_workflow_schedules(
-    conn: &mut AsyncPgConnection,
-    metrics: &Arc<dyn crate::telemetry::MetricsRecorder>,
-) -> HarvestResult<()> {
-    use crate::schema::harvest_schedules::dsl;
-
-    let now = Utc::now();
-
-    let due: Vec<HarvestSchedule> = dsl::harvest_schedules
-        .filter(dsl::workflow_name.is_not_null())
-        .filter(dsl::is_paused.eq(false))
-        .filter(dsl::next_run_at.is_not_null())
-        .filter(dsl::next_run_at.le(now))
-        .order(dsl::next_run_at.asc())
-        .select(HarvestSchedule::as_select())
-        .load(conn)
-        .await
-        .map_err(crate::error::database_error)?;
-
-    for schedule in due {
-        let Some(ref wf_name) = schedule.workflow_name else {
-            continue;
-        };
-        let Some(logical_date) = schedule.next_run_at else {
-            continue;
-        };
-        // Parse the schedule expression stored in the DB row. This covers both
-        // in-process registered schedules and schedules created via the API
-        // (which are DB-only and do not appear in the in-memory list).
-        let parsed_schedule = schedule
-            .schedule_expr
-            .as_deref()
-            .and_then(parse_schedule_from_expr);
-        let catchup = schedule.catchup;
-        if let Err(error) = tick_one_workflow_schedule(
-            conn,
-            wf_name,
-            catchup,
-            parsed_schedule.as_ref(),
-            &schedule,
-            logical_date,
-            now,
-            metrics,
-        )
-        .await
-        {
-            tracing::warn!(
-                error = %error, workflow_name = %wf_name,
-                "harvest: workflow schedule tick failed; continuing to next schedule"
-            );
-        }
-    }
-
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-async fn tick_one_workflow_schedule(
-    conn: &mut AsyncPgConnection,
-    wf_name: &str,
-    catchup: bool,
-    parsed_schedule: Option<&Schedule>,
-    schedule: &HarvestSchedule,
-    logical_date: DateTime<Utc>,
-    now: DateTime<Utc>,
-    metrics: &Arc<dyn crate::telemetry::MetricsRecorder>,
-) -> HarvestResult<()> {
-    use crate::execution::StartWorkflowParams;
-    use crate::schema::harvest_schedules::dsl;
-
-    let running: i64 = harvest_workflow_executions::table
-        .filter(harvest_workflow_executions::workflow_name.eq(wf_name))
-        .filter(harvest_workflow_executions::state.eq("RUNNING"))
-        .count()
-        .get_result(conn)
-        .await
-        .map_err(crate::error::database_error)?;
-
-    if running >= i64::from(schedule.max_active_runs) {
-        tracing::info!(
-            workflow_name = %wf_name,
-            running,
-            max_active_runs = schedule.max_active_runs,
-            "harvest workflow schedule skipped: max_active_runs reached"
-        );
-        metrics.record_schedule_skipped("workflow", wf_name, "max_active_runs_reached");
-        // For catchup schedules keep next_run_at at logical_date so the
-        // overdue slot is retried on the next tick once a run slot opens.
-        // For non-catchup schedules advance past overdue slots to the next
-        // future firing so the scheduler doesn't spin on an old timestamp.
-        let next = if catchup {
-            Some(logical_date)
-        } else {
-            next_run_after(parsed_schedule, now)
-        };
-        diesel::update(dsl::harvest_schedules.find(schedule.id))
-            .set((dsl::next_run_at.eq(next), dsl::updated_at.eq(now)))
-            .execute(conn)
-            .await
-            .map_err(crate::error::database_error)?;
-        return Ok(());
-    }
-
-    let (run_dates, next_run_after_plan) =
-        due_run_plan(parsed_schedule, logical_date, now, catchup);
-    let dispatch_queue = schedule.queue_name.as_deref().unwrap_or("default");
-
-    let mut dispatched: u32 = 0;
-    let mut last_dispatched_at: Option<DateTime<Utc>> = None;
-    // Set to the first slot we could not dispatch due to max_active_runs; if Some,
-    // it becomes next_run_at so catchup slots are not silently dropped.
-    let mut deferred_next_run_at: Option<DateTime<Utc>> = None;
-    for scheduled_for in &run_dates {
-        if running + i64::from(dispatched) >= i64::from(schedule.max_active_runs) {
-            deferred_next_run_at = Some(*scheduled_for);
-            tracing::info!(
-                workflow_name = %wf_name,
-                max_active_runs = schedule.max_active_runs,
-                "harvest workflow schedule: max_active_runs reached during catchup; deferring remaining"
-            );
-            break;
-        }
-        let workflow_id = scheduled_workflow_id(wf_name, *scheduled_for);
-        let exec_id = ExecutionId::new();
-        let input = schedule
-            .workflow_input
-            .clone()
-            .unwrap_or(serde_json::Value::Null);
-        tracing::info!(
-            workflow_name = %wf_name, workflow_id = %workflow_id,
-            scheduled_for = %scheduled_for, "harvest: dispatching scheduled workflow run"
-        );
-        let start_result = crate::execution::start_or_load_workflow_execution(
-            conn,
-            StartWorkflowParams {
-                workflow_name: wf_name,
-                workflow_id: &workflow_id,
-                exec_id,
-                input,
-                parent_id: None,
-                queue_name: dispatch_queue,
-                execution_timeout: None,
-                memo: None,
-                search_attrs: None,
-                reuse_policy: scheduled_workflow_reuse_policy(),
-                trace_context: None,
-            },
-        )
-        .await;
-        match scheduled_start_outcome(start_result) {
-            Ok(outcome) => {
-                dispatched += 1;
-                last_dispatched_at = Some(*scheduled_for);
-                if outcome.created() {
-                    metrics.record_schedule_run("workflow", wf_name);
-                }
-                tracing::info!(
-                    workflow_name = %wf_name,
-                    execution_id = %outcome.exec_id(),
-                    state = %outcome.state(),
-                    created = outcome.created(),
-                    "harvest: scheduled workflow run dispatched"
-                );
-            }
-            Err(error) => {
-                // Propagate the error so last_run_at is not advanced — the next
-                // tick will retry the same firing rather than silently dropping it.
-                tracing::warn!(
-                    error = %error, workflow_name = %wf_name, workflow_id = %workflow_id,
-                    "harvest: failed to start scheduled workflow run"
-                );
-                return Err(error);
-            }
-        }
-    }
-
-    // Deferred catchup slots become next_run_at so the next tick retries them.
-    // last_run_at only advances to the last slot actually started.
-    let effective_last_run_at = last_dispatched_at.or(schedule.last_run_at);
-    let effective_next_run_at = deferred_next_run_at.or(next_run_after_plan);
-    diesel::update(dsl::harvest_schedules.find(schedule.id))
-        .set((
-            dsl::last_run_at.eq(effective_last_run_at),
-            dsl::next_run_at.eq(effective_next_run_at),
-            dsl::updated_at.eq(now),
-        ))
-        .execute(conn)
-        .await
-        .map_err(crate::error::database_error)?;
-
-    Ok(())
 }
 
 async fn execute_dag_run(
@@ -1055,30 +535,14 @@ async fn execute_dag_run(
         let tasks = level.iter().map(|task_index| {
             // Avoid an unnecessary heap allocation of `DagTask` per task when `&DagTask` works.
             let task = &dag.definition.tasks()[*task_index];
-            let registry = Arc::clone(&registry);
-            let task_input = Arc::clone(&run_input);
-
-            // ⚡ Bolt: Remove an intermediate `.collect::<Vec<_>>()` when fetching upstream
-            // statuses by passing an Iterator into `execute_dag_task`. This avoids an
-            // unnecessary heap allocation per DAG task inside this loop.
-            let statuses_ref = &statuses;
-            let upstream_statuses = task
+            let upstream_statuses: Vec<_> = task
                 .upstreams
                 .iter()
-                .map(move |upstream| &statuses_ref[*upstream]);
-            let dag_run_id = run.id;
-            let node_index = *task_index;
-            async move {
-                execute_dag_task(
-                    &registry,
-                    task,
-                    upstream_statuses,
-                    &task_input,
-                    dag_run_id,
-                    node_index,
-                )
-                .await
-            }
+                .map(|upstream| statuses[*upstream].clone())
+                .collect();
+            let registry = Arc::clone(&registry);
+            let task_input = Arc::clone(&run_input);
+            async move { execute_dag_task(&registry, task, &upstream_statuses, &task_input).await }
         });
         let results = futures::future::join_all(tasks).await;
         for (task_index, result) in level.iter().zip(results) {
@@ -1107,21 +571,11 @@ async fn execute_dag_run(
     Ok(())
 }
 
-/// Namespace UUID for deriving stable DAG task idempotency keys.
-///
-/// Keyed on (`dag_run_id`, `task_name`) so each logical DAG task invocation
-/// always produces the same [`ActivityExecId`] regardless of retry attempt.
-const DAG_TASK_KEY_NAMESPACE: uuid::Uuid = uuid::Uuid::from_bytes([
-    0x6b, 0xa7, 0xb8, 0x14, 0x9d, 0xad, 0x11, 0xd1, 0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8,
-]);
-
-async fn execute_dag_task<'a>(
+async fn execute_dag_task(
     registry: &HandlerRegistry,
     task: &crate::dag::DagTask,
-    upstream_statuses: impl IntoIterator<Item = &'a TaskStatus>,
+    upstream_statuses: &[TaskStatus],
     conf: &Value,
-    dag_run_id: uuid::Uuid,
-    node_index: usize,
 ) -> TaskStatus {
     if !task.trigger_rule.should_run(upstream_statuses) {
         return TaskStatus::Skipped;
@@ -1136,23 +590,11 @@ async fn execute_dag_task<'a>(
         .or_else(|| activity.default_retry_policy.clone());
     let timeout = task.start_to_close.or(activity.default_start_to_close);
     let input = task_input(conf, &task.activity_name);
-    let mut attempt = 1u32;
-
-    // Derive a stable ActivityExecId from the DAG run ID and task name so
-    // the idempotency key is the same across retries for this logical task.
-    // node_index is included so two nodes that share the same activity_name
-    // within a DAG run receive distinct keys.
-    let task_exec_id = ActivityExecId::from_uuid(uuid::Uuid::new_v5(
-        &DAG_TASK_KEY_NAMESPACE,
-        format!("{dag_run_id}:{node_index}:{}", task.activity_name).as_bytes(),
-    ));
-    let idempotency_key = IdempotencyKey::from_activity_exec_id(task_exec_id);
+    let mut attempt = 1;
 
     loop {
         let cancel = CancellationToken::new();
-        let ctx = ActivityContext::new(registry.shared_state(), None, cancel.clone())
-            .with_idempotency_key(idempotency_key.clone())
-            .with_attempt(attempt);
+        let ctx = ActivityContext::new(registry.shared_state(), None, cancel.clone());
         let future = (activity.handler)(&ctx, input.clone());
         let result = match timeout {
             Some(timeout) => tokio::time::timeout(timeout, future)
@@ -1256,15 +698,6 @@ async fn insert_dag_run(
         .map_err(crate::error::database_error)
 }
 
-/// Validate a [`Schedule`] at creation time.
-///
-/// Returns `Err` if the schedule is a `Cron` variant whose expression cannot be
-/// parsed by `croner`. `Interval` and `Manual` schedules are always valid.
-///
-// Re-exported so callers can reach it via the `scheduler` module path, which
-// is where it lived before being moved to `policy` for feature-gate reasons.
-pub use crate::policy::validate_schedule;
-
 fn schedule_expr(schedule: Option<&Schedule>) -> Option<String> {
     match schedule {
         Some(Schedule::Cron(expr)) => Some(format!("cron:{expr}")),
@@ -1277,7 +710,6 @@ fn schedule_expr(schedule: Option<&Schedule>) -> Option<String> {
 fn next_run_after(schedule: Option<&Schedule>, reference: DateTime<Utc>) -> Option<DateTime<Utc>> {
     match schedule {
         Some(Schedule::Cron(expr)) => Cron::new(expr)
-            .with_seconds_optional()
             .parse()
             .ok()
             .and_then(|cron| cron.find_next_occurrence(&reference, false).ok()),
@@ -1381,138 +813,5 @@ mod tests {
     fn create_new_dag_runs_returns_empty_for_no_dates() {
         let rows = create_new_dag_runs("test_dag", &[]);
         assert!(rows.is_empty());
-    }
-
-    #[test]
-    fn scheduled_workflow_starts_use_reject_duplicate_policy() {
-        assert_eq!(
-            scheduled_workflow_reuse_policy(),
-            crate::types::WorkflowIdReusePolicy::RejectDuplicate
-        );
-    }
-
-    #[test]
-    fn scheduled_start_already_exists_counts_as_duplicate_slot() {
-        let existing_exec_id = ExecutionId::new();
-
-        let outcome = scheduled_start_outcome(Err(HarvestError::AlreadyExists {
-            existing_exec_id,
-            existing_state: "RUNNING".to_string(),
-        }))
-        .expect("scheduled duplicate should be treated as an already dispatched slot");
-
-        assert_eq!(
-            outcome,
-            ScheduledStartOutcome::Duplicate {
-                exec_id: existing_exec_id,
-                state: "RUNNING".to_string(),
-            }
-        );
-        assert!(!outcome.created());
-    }
-
-    // ── plan_backfill_timestamps ──────────────────────────────────────────────
-
-    #[test]
-    fn plan_backfill_timestamps_hourly_cron_inclusive_bounds() {
-        let schedule = Schedule::Cron("0 * * * *".to_string()); // fires at :00 every hour
-        let from = parse_utc("2026-04-01T10:00:00Z");
-        let to = parse_utc("2026-04-01T13:00:00Z");
-
-        let timestamps = plan_backfill_timestamps(Some(&schedule), from, to, 100)
-            .expect("hourly cron backfill over 3-hour window should succeed");
-
-        assert_eq!(
-            timestamps,
-            vec![
-                parse_utc("2026-04-01T10:00:00Z"),
-                parse_utc("2026-04-01T11:00:00Z"),
-                parse_utc("2026-04-01T12:00:00Z"),
-                parse_utc("2026-04-01T13:00:00Z"),
-            ]
-        );
-    }
-
-    #[test]
-    fn plan_backfill_timestamps_to_before_from_returns_empty() {
-        let schedule = Schedule::Cron("0 * * * *".to_string());
-        let from = parse_utc("2026-04-08T00:00:00Z");
-        let to = parse_utc("2026-04-01T00:00:00Z");
-
-        let timestamps = plan_backfill_timestamps(Some(&schedule), from, to, 100)
-            .expect("inverted window should return empty without error");
-
-        assert!(timestamps.is_empty());
-    }
-
-    #[test]
-    fn plan_backfill_timestamps_manual_schedule_returns_empty() {
-        let from = parse_utc("2026-04-01T00:00:00Z");
-        let to = parse_utc("2026-04-08T00:00:00Z");
-
-        let timestamps = plan_backfill_timestamps(None, from, to, 100)
-            .expect("unset schedule backfill should succeed with empty plan");
-
-        assert!(timestamps.is_empty());
-
-        let timestamps = plan_backfill_timestamps(Some(&Schedule::Manual), from, to, 100)
-            .expect("manual schedule backfill should succeed with empty plan");
-
-        assert!(timestamps.is_empty());
-    }
-
-    #[test]
-    fn plan_backfill_timestamps_enforces_max_count() {
-        // Every-minute interval over a 2-hour window = 120 timestamps > limit of 10
-        let schedule = Schedule::Interval(Duration::from_secs(60));
-        let from = parse_utc("2026-04-01T00:00:00Z");
-        let to = parse_utc("2026-04-01T02:00:00Z");
-
-        let result = plan_backfill_timestamps(Some(&schedule), from, to, 10);
-
-        assert_eq!(result, Err(BackfillPlanError::LimitExceeded { limit: 10 }));
-    }
-
-    #[test]
-    fn plan_backfill_timestamps_interval_from_is_first_slot() {
-        let schedule = Schedule::Interval(Duration::from_secs(3600)); // 1-hour interval
-        let from = parse_utc("2026-04-01T10:00:00Z");
-        let to = parse_utc("2026-04-01T12:00:00Z");
-
-        let timestamps = plan_backfill_timestamps(Some(&schedule), from, to, 100)
-            .expect("interval backfill should succeed");
-
-        assert_eq!(
-            timestamps,
-            vec![
-                parse_utc("2026-04-01T10:00:00Z"),
-                parse_utc("2026-04-01T11:00:00Z"),
-                parse_utc("2026-04-01T12:00:00Z"),
-            ]
-        );
-    }
-
-    #[test]
-    fn plan_backfill_timestamps_equal_from_and_to_returns_single_slot() {
-        let schedule = Schedule::Interval(Duration::from_secs(3600));
-        let ts = parse_utc("2026-04-01T10:00:00Z");
-
-        let timestamps = plan_backfill_timestamps(Some(&schedule), ts, ts, 100)
-            .expect("single-point window should succeed");
-
-        assert_eq!(timestamps, vec![ts]);
-    }
-
-    #[test]
-    fn plan_backfill_timestamps_7_day_hourly_cron_within_default_limit() {
-        let schedule = Schedule::Cron("0 * * * *".to_string());
-        let from = parse_utc("2026-04-01T00:00:00Z");
-        let to = parse_utc("2026-04-08T00:00:00Z");
-
-        let timestamps =
-            plan_backfill_timestamps(Some(&schedule), from, to, DEFAULT_BACKFILL_MAX_COUNT)
-                .expect("168-timestamp 7-day backfill should succeed under default limit");
-
-        assert_eq!(timestamps.len(), 169); // 0h..168h inclusive = 169 slots
     }
 }

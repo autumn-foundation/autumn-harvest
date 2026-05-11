@@ -213,7 +213,7 @@ pub struct ShardedDbPool {
 impl std::fmt::Debug for ShardedDbPool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ShardedDbPool")
-            .field("shards", &self.pools.keys())
+            .field("shards", &self.pools.keys().collect::<Vec<_>>())
             .field("default_shard", &self.default_shard)
             .finish()
     }

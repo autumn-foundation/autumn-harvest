@@ -1,8 +1,6 @@
-use autumn_harvest::policy::RetryPolicy;
 #[cfg(feature = "db")]
 use autumn_harvest::store::events_to_insert_rows_from;
-#[cfg(feature = "db")]
-use autumn_harvest::{event::WorkflowEvent, types::ExecutionId};
+use autumn_harvest::{event::WorkflowEvent, policy::RetryPolicy, types::ExecutionId};
 use std::time::Duration;
 
 #[cfg(feature = "db")]
@@ -41,22 +39,4 @@ fn test_havoc_exponential_retry_delay() {
         res.is_ok(),
         "The system still crashes on large retry delay calculations!"
     );
-}
-
-#[test]
-fn test_havoc_external_task_duration_panic() {
-    let res = std::panic::catch_unwind(|| {
-        let schedule_to_close_secs = u64::MAX;
-        let dur = chrono::Duration::try_seconds(
-            i64::try_from(schedule_to_close_secs).unwrap_or(i64::MAX),
-        )
-        .ok_or_else(|| {
-            autumn_harvest::error::HarvestError::Database("Duration out of bounds".to_string())
-        });
-
-        if let Ok(d) = dur {
-            let _schedule_to_close_at = chrono::Utc::now().checked_add_signed(d);
-        }
-    });
-    assert!(res.is_ok());
 }

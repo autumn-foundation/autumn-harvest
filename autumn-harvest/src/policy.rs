@@ -2,7 +2,6 @@
 
 use std::time::Duration;
 
-use croner::Cron;
 use serde::{Deserialize, Serialize};
 
 /// Compute the next retry delay using exponential backoff.
@@ -145,7 +144,7 @@ impl Default for RetryPolicy {
 /// let status = TaskStatus::Succeeded;
 /// assert_eq!(status, TaskStatus::Succeeded);
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskStatus {
     /// The task executed and returned success.
     Succeeded,
@@ -185,7 +184,7 @@ pub enum TriggerRule {
 }
 
 impl TriggerRule {
-    /// Evaluates the trigger rule against a list (or iterator) of upstream task statuses.
+    /// Evaluates the trigger rule against a list of upstream task statuses.
     ///
     /// Returns `true` if the downstream task should be executed, `false` otherwise.
     ///
@@ -199,24 +198,17 @@ impl TriggerRule {
     /// assert!(rule.should_run(&statuses));
     /// ```
     #[must_use]
-    pub fn should_run<'a>(
-        &self,
-        upstream_statuses: impl IntoIterator<Item = &'a TaskStatus>,
-    ) -> bool {
+    pub fn should_run(&self, upstream_statuses: &[TaskStatus]) -> bool {
         match self {
             Self::AllSuccess => upstream_statuses
-                .into_iter()
+                .iter()
                 .all(|s| *s == TaskStatus::Succeeded),
             Self::AllDone => true,
-            Self::OneSuccess => upstream_statuses
-                .into_iter()
-                .any(|s| *s == TaskStatus::Succeeded),
-            Self::OneFailed => upstream_statuses
-                .into_iter()
-                .any(|s| *s == TaskStatus::Failed),
+            Self::OneSuccess => upstream_statuses.contains(&TaskStatus::Succeeded),
+            Self::OneFailed => upstream_statuses.contains(&TaskStatus::Failed),
             Self::AllFailed => {
-                let mut iter = upstream_statuses.into_iter().peekable();
-                iter.peek().is_some() && iter.all(|s| *s == TaskStatus::Failed)
+                !upstream_statuses.is_empty()
+                    && upstream_statuses.iter().all(|s| *s == TaskStatus::Failed)
             }
             Self::Manual => false,
         }
@@ -241,116 +233,6 @@ pub enum Schedule {
     Interval(Duration),
     /// Only runs when triggered manually via API.
     Manual,
-}
-
-/// Per-workflow cron/interval schedule — the lightweight alternative to a
-/// single-node DAG when all you need is "run this workflow on a schedule."
-///
-/// Register via [`crate::builder::HarvestBuilder::workflow_schedule`].
-///
-/// ## Examples
-///
-/// ```rust
-/// use autumn_harvest::policy::{Schedule, WorkflowSchedule};
-///
-/// let sched = WorkflowSchedule::new("daily_billing_report", Schedule::Cron("0 3 * * *".to_string()));
-/// assert_eq!(sched.max_active_runs, 1);
-/// assert!(!sched.catchup);
-/// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkflowSchedule {
-    /// The registered workflow name to start on each firing.
-    pub workflow_name: String,
-    /// Cron or interval schedule. `Schedule::Manual` is accepted but will
-    /// never fire automatically — use the API to trigger it instead.
-    pub schedule: Schedule,
-    /// Input JSON passed to every scheduled run.
-    ///
-    /// For multi-parameter workflows use the `[arg1, arg2, ...]` array form.
-    /// Defaults to `Value::Null`.
-    pub input: serde_json::Value,
-    /// Whether to back-fill missed runs when the scheduler was down.
-    /// Defaults to `false`.
-    pub catchup: bool,
-    /// Maximum number of concurrently running scheduled executions for this
-    /// workflow. Enforced cluster-wide against non-terminal
-    /// `harvest_workflow_executions` rows.
-    ///
-    /// Defaults to `1`.
-    pub max_active_runs: u32,
-    /// Initial paused state. Defaults to `false`.
-    pub paused: bool,
-    /// Task queue name for dispatched runs. Defaults to `"default"`.
-    pub queue_name: String,
-}
-
-impl WorkflowSchedule {
-    /// Create a new workflow schedule with sensible defaults.
-    ///
-    /// Defaults: `input = null`, `catchup = false`, `max_active_runs = 1`,
-    /// `paused = false`, `queue_name = "default"`.
-    #[must_use]
-    pub fn new(workflow_name: impl Into<String>, schedule: Schedule) -> Self {
-        Self {
-            workflow_name: workflow_name.into(),
-            schedule,
-            input: serde_json::Value::Null,
-            catchup: false,
-            max_active_runs: 1,
-            paused: false,
-            queue_name: "default".to_string(),
-        }
-    }
-
-    /// Set the JSON input passed to each scheduled run.
-    #[must_use]
-    pub fn with_input(mut self, input: serde_json::Value) -> Self {
-        self.input = input;
-        self
-    }
-
-    /// Enable or disable catchup for missed runs.
-    #[must_use]
-    pub const fn with_catchup(mut self, catchup: bool) -> Self {
-        self.catchup = catchup;
-        self
-    }
-
-    /// Override the maximum number of concurrent scheduled runs.
-    #[must_use]
-    pub const fn with_max_active_runs(mut self, max: u32) -> Self {
-        self.max_active_runs = max;
-        self
-    }
-
-    /// Set the initial paused state.
-    #[must_use]
-    pub const fn with_paused(mut self, paused: bool) -> Self {
-        self.paused = paused;
-        self
-    }
-}
-
-/// Validate a [`Schedule`] value, returning an error string if it is invalid.
-///
-/// For [`Schedule::Cron`] expressions this parses the expression using
-/// `croner` (5-field or 6-field with seconds). For other variants the schedule
-/// is always valid.
-///
-/// # Errors
-///
-/// Returns a human-readable error string if the cron expression is
-/// syntactically invalid.
-pub fn validate_schedule(schedule: &Schedule) -> Result<(), String> {
-    if let Schedule::Cron(expr) = schedule {
-        Cron::new(expr)
-            .with_seconds_optional()
-            .parse()
-            .map(|_| ())
-            .map_err(|e| format!("invalid cron expression '{expr}': {e}"))
-    } else {
-        Ok(())
-    }
 }
 
 #[cfg(test)]

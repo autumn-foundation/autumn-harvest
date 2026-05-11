@@ -1,2 +1,0 @@
-[database]
-url = "postgres://quickstart:quickstart@localhost:5432/quickstart"

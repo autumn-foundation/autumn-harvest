@@ -25,107 +25,6 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
-// Span attribute name constants
-// Defined by docs/adr/0001-otel-trace-contract.md
-// ---------------------------------------------------------------------------
-
-/// OpenTelemetry span attribute: the logical workflow name (e.g. `"onboarding"`).
-pub const ATTR_WORKFLOW_ID: &str = "harvest.workflow.id";
-
-/// OpenTelemetry span attribute: the unique execution UUID.
-pub const ATTR_EXECUTION_ID: &str = "harvest.execution.id";
-
-/// OpenTelemetry span attribute: the shard number that owns this execution.
-pub const ATTR_SHARD_ID: &str = "harvest.shard.id";
-
-/// OpenTelemetry span attribute: the activity function name (e.g. `"send_email"`).
-pub const ATTR_ACTIVITY_NAME: &str = "harvest.activity.name";
-
-/// OpenTelemetry span attribute: the 1-based attempt number for this activity invocation.
-pub const ATTR_ATTEMPT: &str = "harvest.attempt";
-
-/// OpenTelemetry span attribute: the task queue name the work item was pulled from.
-pub const ATTR_QUEUE: &str = "harvest.queue";
-
-/// OpenTelemetry span attribute for replay-mode spans.
-///
-/// Set to `true` when the span is emitted during deterministic replay rather
-/// than live execution. Consumers must treat such spans as reconstructed
-/// history, not live causality.
-pub const ATTR_REPLAY: &str = "harvest.replay";
-
-// ---------------------------------------------------------------------------
-// Metric name constants
-// Defined by docs/adr/0001-otel-trace-contract.md — OpenTelemetry semantic
-// naming: `harvest.<noun>.<instrument>` in dot-notation.
-// ---------------------------------------------------------------------------
-
-/// Counter: incremented once when a worker starts executing a workflow task.
-pub const METRIC_WORKFLOW_STARTED: &str = "harvest.workflow.started";
-
-/// Histogram: wall-clock seconds a workflow executor cycle took.
-pub const METRIC_WORKFLOW_DURATION: &str = "harvest.workflow.duration";
-
-/// Histogram: number of durable events in a terminal workflow execution history.
-pub const METRIC_WORKFLOW_HISTORY_SIZE: &str = "harvest.workflow.history_size";
-
-/// Counter: incremented once for each continue-as-new rotation.
-pub const METRIC_WORKFLOW_CONTINUE_AS_NEW: &str = "harvest.workflow.continue_as_new";
-
-/// Histogram: wall-clock seconds an activity invocation took (success or failure).
-pub const METRIC_ACTIVITY_DURATION: &str = "harvest.activity.duration";
-
-/// Counter: incremented when a durable timer is persisted.
-pub const METRIC_TIMER_STARTED: &str = "harvest.timer.started";
-
-/// Histogram: distribution of scheduled timer durations (seconds).
-pub const METRIC_TIMER_DURATION: &str = "harvest.timer.duration";
-
-/// Gauge: current number of pending (unclaimed) tasks in a queue.
-pub const METRIC_QUEUE_DEPTH: &str = "harvest.queue.depth";
-
-/// Gauge: current number of entries in the dead letter queue.
-pub const METRIC_DLQ_ENTRIES: &str = "harvest.dlq.entries";
-
-/// Counter: incremented each time a scheduled run is dispatched.
-pub const METRIC_SCHEDULE_RUNS: &str = "harvest.schedule.runs";
-
-/// Counter: incremented each time a scheduled run is skipped.
-pub const METRIC_SCHEDULE_SKIPPED: &str = "harvest.schedule.skipped";
-
-/// Counter: number of rows deleted by the retention janitor in one tick.
-pub const METRIC_RETENTION_DELETED: &str = "harvest.retention.deleted";
-
-// ---------------------------------------------------------------------------
-// Metric label key constants
-// Used by MetricsRecorder implementations to avoid string literals at call
-// sites. These are short Prometheus-compatible names; the forbidden label
-// (ATTR_EXECUTION_ID) deliberately has no entry here so it cannot be
-// accidentally used on a metric.
-// ---------------------------------------------------------------------------
-
-/// Metric label: the workflow name.
-pub const METRIC_LABEL_WORKFLOW: &str = "workflow";
-/// Metric label: the low-cardinality workflow type.
-pub const METRIC_LABEL_WORKFLOW_TYPE: &str = "workflow.type";
-/// Metric label: the activity name.
-pub const METRIC_LABEL_ACTIVITY: &str = "activity";
-/// Metric label: the task queue name.
-pub const METRIC_LABEL_QUEUE: &str = "queue";
-/// Metric label: terminal outcome status (e.g. `"completed"`, `"failed"`).
-pub const METRIC_LABEL_STATUS: &str = "status";
-/// Metric label: the shard number.
-pub const METRIC_LABEL_SHARD: &str = "shard";
-/// Metric label: schedule kind (`"dag"` or `"workflow"`).
-pub const METRIC_LABEL_KIND: &str = "kind";
-/// Metric label: the schedule or DAG name.
-pub const METRIC_LABEL_NAME: &str = "name";
-/// Metric label: reason a scheduled run was skipped.
-pub const METRIC_LABEL_REASON: &str = "reason";
-/// Metric label: the concurrency group key.
-pub const METRIC_LABEL_KEY: &str = "key";
-
-// ---------------------------------------------------------------------------
 // TraceContextCarrier
 // ---------------------------------------------------------------------------
 
@@ -136,41 +35,16 @@ pub const METRIC_LABEL_KEY: &str = "key";
 /// `traceparent` (required to join a trace) and `tracestate` (optional
 /// vendor-specific extensions). Storing them as JSONB keeps the schema
 /// flexible if the spec gains additional headers.
-///
-/// The two extra fields (`is_replay`, `link_traceparent`) implement the replay
-/// semantics defined in `docs/adr/0001-otel-trace-contract.md`: replay spans
-/// must NOT inherit the original trace as a parent (it may have long expired),
-/// but they SHOULD carry the original `traceparent` as an OpenTelemetry span
-/// *link* so operators can navigate from a replay span to the original trace
-/// in their APM tool.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TraceContextCarrier {
-    /// The W3C `traceparent` header for the *parent* span.
-    ///
-    /// During replay this field is `None` — the replay span roots itself and
-    /// links to [`link_traceparent`] instead.
-    ///
-    /// [`link_traceparent`]: TraceContextCarrier::link_traceparent
+    /// The W3C `traceparent` header, e.g.
+    /// `00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub traceparent: Option<String>,
 
     /// The optional W3C `tracestate` header.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tracestate: Option<String>,
-
-    /// When `true`, the worker must emit the span with attribute
-    /// `harvest.replay = true` and must NOT restore `traceparent` as the
-    /// parent context. Instead, it should create a new root span and attach a
-    /// span *link* pointing at [`TraceContextCarrier::link_traceparent`].
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub is_replay: bool,
-
-    /// The original `traceparent` preserved for use as a span *link*.
-    ///
-    /// Only populated when `is_replay == true`. Enables APM navigation from a
-    /// replay-emitted span back to the original (possibly expired) trace root.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub link_traceparent: Option<String>,
 }
 
 impl TraceContextCarrier {
@@ -180,36 +54,13 @@ impl TraceContextCarrier {
         Self {
             traceparent: Some(traceparent.into()),
             tracestate: None,
-            is_replay: false,
-            link_traceparent: None,
         }
     }
 
-    /// Convert this carrier into a replay carrier.
-    ///
-    /// Per the OpenTelemetry trace contract ADR (`docs/adr/0001-otel-trace-contract.md`):
-    /// - `traceparent` is cleared so the replay span becomes a new root.
-    /// - `link_traceparent` is set to the original `traceparent` so the worker
-    ///   can attach a span *link* for APM navigation.
-    /// - `is_replay` is set to `true` so workers know to emit
-    ///   `harvest.replay = true` and skip parent context installation.
-    #[must_use]
-    pub fn into_replay_context(self) -> Self {
-        Self {
-            link_traceparent: self.traceparent.or(self.link_traceparent),
-            traceparent: None,
-            tracestate: None,
-            is_replay: true,
-        }
-    }
-
-    /// Returns `true` when no context fields are set (ignoring the replay flag).
+    /// Returns `true` when neither `traceparent` nor `tracestate` is set.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.traceparent.is_none()
-            && self.tracestate.is_none()
-            && self.link_traceparent.is_none()
-            && !self.is_replay
+        self.traceparent.is_none() && self.tracestate.is_none()
     }
 
     /// Serialise to a JSONB-compatible [`serde_json::Value`] suitable for
@@ -366,16 +217,6 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = (workflow_name, queue, duration_secs, status);
     }
 
-    /// A workflow reached a terminal state with this durable history size.
-    fn record_workflow_history_size(&self, workflow_name: &str, event_count: u64) {
-        let _ = (workflow_name, event_count);
-    }
-
-    /// A workflow execution rotated using continue-as-new.
-    fn record_workflow_continue_as_new(&self, workflow_name: &str) {
-        let _ = workflow_name;
-    }
-
     /// An activity invocation finished.
     fn record_activity_completed(
         &self,
@@ -395,65 +236,6 @@ pub trait MetricsRecorder: Send + Sync {
     /// A periodic snapshot of queued pending task count.
     fn record_queue_depth(&self, queue_name: &str, depth: u64) {
         let _ = (queue_name, depth);
-    }
-
-    /// Results of one retention-janitor tick on a shard.
-    fn record_retention_tick(
-        &self,
-        shard: u16,
-        candidate_count: u64,
-        deleted_count: u64,
-        duration_secs: f64,
-    ) {
-        let _ = (shard, candidate_count, deleted_count, duration_secs);
-    }
-
-    /// Current number of RUNNING tasks for a concurrency group key.
-    ///
-    /// Emitted by the concurrency sampler on every sample interval. The value
-    /// is a gauge — operators should alert when it approaches `max_concurrent`.
-    fn record_concurrency_key_in_flight(&self, key: &str, in_flight: u64) {
-        let _ = (key, in_flight);
-    }
-
-    /// Number of PENDING tasks for a key that are being held back because the
-    /// cap is currently saturated (`in_flight >= max_concurrent`).
-    ///
-    /// Emitted alongside each `record_concurrency_key_in_flight` call when
-    /// there are deferred tasks waiting for a slot. Operators should monitor
-    /// this alongside queue depth to detect saturation-induced backlog.
-    fn record_concurrency_key_deferred(&self, key: &str, deferred: u64) {
-        let _ = (key, deferred);
-    }
-
-    /// Current number of entries in the dead-letter queue on one shard.
-    ///
-    /// Emitted by a periodic background sampler on the same cadence as
-    /// [`record_queue_depth`](Self::record_queue_depth). `shard` is the
-    /// `ShardId` as a `u16`; single-shard deployments always emit `shard = 0`.
-    ///
-    /// Maps to the gauge `harvest_dlq_entries{shard}`.
-    fn record_dlq_entries(&self, shard: u16, depth: u64) {
-        let _ = (shard, depth);
-    }
-
-    /// A scheduled run was dispatched (either a DAG run or a workflow start).
-    ///
-    /// `kind` is `"dag"` or `"workflow"`. `name` is the DAG or workflow name.
-    /// Maps to the metric `harvest_schedule_runs_total{kind, name}`.
-    fn record_schedule_run(&self, kind: &str, name: &str) {
-        let _ = (kind, name);
-    }
-
-    /// A scheduled run was skipped without dispatching.
-    ///
-    /// `kind` is `"dag"` or `"workflow"`. `name` is the DAG or workflow name.
-    /// `reason` is one of `"paused"`, `"max_active_runs_reached"`, or
-    /// `"catchup_disabled"`.
-    ///
-    /// Maps to the metric `harvest_schedule_skipped_total{kind, name, reason}`.
-    fn record_schedule_skipped(&self, kind: &str, name: &str, reason: &str) {
-        let _ = (kind, name, reason);
     }
 }
 
@@ -579,133 +361,6 @@ impl TelemetryConfigBuilder {
 mod tests {
     use super::*;
 
-    // -----------------------------------------------------------------------
-    // RED-phase tests: these assert the spec-mandated constants and
-    // replay-aware carrier shape defined in docs/adr/0001-otel-trace-contract.md
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn span_attribute_constants_have_correct_names() {
-        // The OTel trace contract ADR mandates these exact attribute keys.
-        assert_eq!(ATTR_WORKFLOW_ID, "harvest.workflow.id");
-        assert_eq!(ATTR_EXECUTION_ID, "harvest.execution.id");
-        assert_eq!(ATTR_SHARD_ID, "harvest.shard.id");
-        assert_eq!(ATTR_ACTIVITY_NAME, "harvest.activity.name");
-        assert_eq!(ATTR_ATTEMPT, "harvest.attempt");
-        assert_eq!(ATTR_QUEUE, "harvest.queue");
-        assert_eq!(ATTR_REPLAY, "harvest.replay");
-    }
-
-    #[test]
-    fn metric_name_constants_have_correct_names() {
-        // OTel semantic naming: instrument.noun (dot-separated).
-        assert_eq!(METRIC_WORKFLOW_STARTED, "harvest.workflow.started");
-        assert_eq!(METRIC_WORKFLOW_DURATION, "harvest.workflow.duration");
-        assert_eq!(
-            METRIC_WORKFLOW_HISTORY_SIZE,
-            "harvest.workflow.history_size"
-        );
-        assert_eq!(
-            METRIC_WORKFLOW_CONTINUE_AS_NEW,
-            "harvest.workflow.continue_as_new"
-        );
-        assert_eq!(METRIC_ACTIVITY_DURATION, "harvest.activity.duration");
-        assert_eq!(METRIC_TIMER_STARTED, "harvest.timer.started");
-        assert_eq!(METRIC_QUEUE_DEPTH, "harvest.queue.depth");
-        assert_eq!(METRIC_DLQ_ENTRIES, "harvest.dlq.entries");
-        assert_eq!(METRIC_SCHEDULE_RUNS, "harvest.schedule.runs");
-        assert_eq!(METRIC_SCHEDULE_SKIPPED, "harvest.schedule.skipped");
-        assert_eq!(METRIC_RETENTION_DELETED, "harvest.retention.deleted");
-    }
-
-    #[test]
-    fn metric_label_constants_have_correct_names() {
-        assert_eq!(METRIC_LABEL_WORKFLOW, "workflow");
-        assert_eq!(METRIC_LABEL_WORKFLOW_TYPE, "workflow.type");
-        assert_eq!(METRIC_LABEL_ACTIVITY, "activity");
-        assert_eq!(METRIC_LABEL_QUEUE, "queue");
-    }
-
-    #[test]
-    fn replay_carrier_strips_traceparent_and_preserves_link() {
-        // Per spec: replay spans MUST NOT be parented to the original
-        // (potentially expired) trace — they link to it instead.
-        let original = TraceContextCarrier::from_traceparent(
-            "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
-        );
-        let replay = original.into_replay_context();
-        assert!(
-            replay.traceparent.is_none(),
-            "replay carrier must not carry original traceparent as parent"
-        );
-        assert_eq!(
-            replay.link_traceparent.as_deref(),
-            Some("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"),
-            "replay carrier must preserve original as a span link"
-        );
-        assert!(
-            replay.is_replay,
-            "replay carrier must be flagged harvest.replay = true"
-        );
-    }
-
-    #[test]
-    fn non_replay_carrier_has_is_replay_false_and_no_link() {
-        let carrier = TraceContextCarrier::from_traceparent("00-abcd-ef01-01");
-        assert!(!carrier.is_replay);
-        assert!(carrier.link_traceparent.is_none());
-    }
-
-    #[test]
-    fn replay_carrier_from_empty_original_has_no_link() {
-        let empty = TraceContextCarrier::default();
-        let replay = empty.into_replay_context();
-        assert!(replay.traceparent.is_none());
-        assert!(
-            replay.link_traceparent.is_none(),
-            "no link when original had no traceparent"
-        );
-        assert!(replay.is_replay);
-    }
-
-    #[test]
-    fn replay_carrier_roundtrips_through_json() {
-        let original = TraceContextCarrier::from_traceparent(
-            "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
-        );
-        let replay = original.into_replay_context();
-        // A replay carrier must still serialise / deserialise so it can
-        // travel on harvest_task_queue.trace_context.
-        let json = replay.to_json().expect("replay carrier serialises");
-        let decoded = TraceContextCarrier::from_json(&json).expect("valid JSON roundtrips");
-        assert!(decoded.is_replay);
-        assert_eq!(
-            decoded.link_traceparent.as_deref(),
-            Some("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"),
-        );
-        assert!(decoded.traceparent.is_none());
-    }
-
-    #[test]
-    fn into_replay_context_on_already_replay_carrier_preserves_link() {
-        // If into_replay_context() is called defensively on a carrier that is
-        // already in replay form (traceparent=None, link_traceparent=Some),
-        // the existing link must not be erased.
-        let original = TraceContextCarrier::from_traceparent(
-            "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
-        );
-        let replay = original.into_replay_context();
-        // Call again — should be idempotent, link must survive.
-        let replay2 = replay.into_replay_context();
-        assert!(replay2.traceparent.is_none());
-        assert!(replay2.is_replay);
-        assert_eq!(
-            replay2.link_traceparent.as_deref(),
-            Some("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"),
-            "double-converting a replay carrier must not erase the original link"
-        );
-    }
-
     #[test]
     fn carrier_roundtrips_through_json() {
         let carrier = TraceContextCarrier {
@@ -713,7 +368,6 @@ mod tests {
                 "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01".to_string(),
             ),
             tracestate: Some("vendor=abc".to_string()),
-            ..Default::default()
         };
 
         let json = carrier.to_json().expect("non-empty carrier serialises");
@@ -747,44 +401,6 @@ mod tests {
         assert!(carrier.tracestate.is_none());
     }
 
-    // -----------------------------------------------------------------------
-    // RED-phase tests: record_dlq_entries and cardinality enforcement
-    // These tests fail until the implementation is complete.
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn dlq_entries_gauge_has_default_noop_impl() {
-        // record_dlq_entries must exist on MetricsRecorder with (shard: u16, depth: u64).
-        // METRIC_DLQ_ENTRIES is the registered constant; this verifies it's
-        // actually wired to a callable method with the right shape.
-        let rec = NoOpMetrics;
-        rec.record_dlq_entries(0, 0);
-        rec.record_dlq_entries(1, 42);
-    }
-
-    #[test]
-    fn all_metric_record_methods_compile_without_execution_id() {
-        // ADR-0001 §7: execution.id is span-only and FORBIDDEN as a metric label.
-        // This test verifies by construction that no record_* method on
-        // MetricsRecorder accepts an ExecutionId argument — the cardinality
-        // guard is enforced at the API surface, not just at call sites.
-        let rec: Arc<dyn MetricsRecorder> = Arc::new(NoOpMetrics);
-        // Each call compiles only if the method signature matches what we expect:
-        // no ExecutionId, no raw UUID params that could smuggle one in.
-        rec.record_workflow_started("onboarding", "default");
-        rec.record_workflow_completed("onboarding", "default", 1.23, WorkflowStatus::Completed);
-        rec.record_workflow_history_size("onboarding", 42);
-        rec.record_workflow_continue_as_new("onboarding");
-        rec.record_activity_completed("send_email", "default", 0.5, ActivityStatus::Completed);
-        rec.record_timer_started(60.0);
-        rec.record_queue_depth("default", 7);
-        rec.record_dlq_entries(0, 3);
-        rec.record_schedule_run("workflow", "daily_digest");
-        rec.record_schedule_skipped("workflow", "daily_digest", "paused");
-        rec.record_retention_tick(0, 100, 50, 0.02);
-        // If any method silently accepted execution.id we'd see it here.
-    }
-
     #[test]
     fn workflow_status_and_activity_status_stringify() {
         assert_eq!(WorkflowStatus::Completed.as_str(), "completed");
@@ -810,8 +426,6 @@ mod tests {
             0.01,
             WorkflowStatus::Completed,
         );
-        telemetry.metrics.record_workflow_history_size("demo", 2);
-        telemetry.metrics.record_workflow_continue_as_new("demo");
         telemetry.metrics.record_activity_completed(
             "send_email",
             "default",

@@ -85,21 +85,6 @@ pub struct EnqueueParams {
     /// W3C tracecontext carrier propagated across the queue boundary so the
     /// worker can resume the enqueuing process's trace.
     pub trace_context: Option<TraceContextCarrier>,
-    /// Cluster-wide concurrency group key. When set together with
-    /// [`Self::max_concurrent`], the claim query enforces that at most
-    /// `max_concurrent` tasks with this key are `RUNNING` at any instant.
-    /// `None` = no per-key cap; only the worker-level semaphore applies.
-    pub concurrency_key: Option<String>,
-    /// Maximum number of concurrent RUNNING tasks for the `concurrency_key`.
-    /// Stored on each row so the claim query can enforce the cap without
-    /// application-layer input per poll.
-    pub max_concurrent: Option<u32>,
-    /// Build ID required to claim this task (issue #171).
-    ///
-    /// Workers whose `build_id` does not match (or is not declared compatible)
-    /// will skip this task. `None` = any worker may claim (pre-policy / legacy
-    /// executions).
-    pub required_build_id: Option<String>,
 }
 
 impl EnqueueParams {
@@ -128,9 +113,6 @@ impl EnqueueParams {
             sticky_worker_id: None,
             sticky_timeout: None,
             trace_context: None,
-            concurrency_key: None,
-            max_concurrent: None,
-            required_build_id: None,
         }
     }
 
@@ -183,10 +165,6 @@ pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> Ha
         _ => None,
     };
 
-    let concurrency_cap = params
-        .max_concurrent
-        .map(|n| i32::try_from(n).unwrap_or(i32::MAX));
-
     let row = NewTaskQueueItem {
         id: task_id,
         queue_name: &params.queue_name,
@@ -201,7 +179,6 @@ pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> Ha
         start_to_close: params.start_to_close,
         schedule_to_start: params.schedule_to_start,
         retry_policy: params.retry_policy.clone(),
-        heartbeat_details: None,
         sticky_worker_id: None,
         sticky_until: None,
         sticky_timeout: None,
@@ -209,9 +186,6 @@ pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> Ha
             .trace_context
             .as_ref()
             .and_then(TraceContextCarrier::to_json),
-        concurrency_key: params.concurrency_key.as_deref(),
-        concurrency_cap,
-        required_build_id: params.required_build_id.as_deref(),
     };
 
     diesel::insert_into(harvest_task_queue::table)
@@ -261,37 +235,12 @@ pub async fn claim_task(
     conn: &mut AsyncPgConnection,
     queues: &[String],
     worker_id: &str,
-    worker_build_id: &str,
 ) -> HarvestResult<Option<TaskQueueItem>> {
-    // Two-phase claim using a CTE to avoid holding advisory locks during
-    // broad WHERE filtering.
-    //
-    // Phase 1 (CTE): select the best PENDING candidate using the cap check
-    // alone (no advisory lock). FOR UPDATE SKIP LOCKED prevents two workers
-    // from picking the same row.
-    //
-    // Phase 2 (UPDATE): for capped keys, acquire pg_try_advisory_xact_lock
-    // only for the single selected candidate and re-verify the cap. This
-    // closes the race window where two workers could both pass the cap check
-    // in the same poll cycle before either commits. If the advisory lock fails
-    // (another worker holds it) or the re-check shows the cap is now
-    // saturated, the UPDATE matches 0 rows and the transaction commits with no
-    // change; the PENDING row is immediately available for the next poll.
-    //
-    // Acquiring the lock only for the final candidate (not during broad
-    // filtering) means a worker never transiently holds locks for keys it will
-    // not actually claim, keeping throughput high under contention.
-    //
-    // The partial index harvest_task_queue_concurrency_key_running makes the
-    // scalar subquery fast: it only scans RUNNING rows with a non-NULL key.
-    //
-    // Build routing filter (issue #171): a task with required_build_id can only
-    // be claimed by a worker whose build_id matches, is declared compatible, OR
-    // the worker has an empty build_id (legacy worker — can claim anything).
     let result: Vec<TaskQueueItem> = diesel::sql_query(
-        "WITH candidate AS ( \
-             SELECT id, concurrency_key, concurrency_cap \
-             FROM harvest_task_queue \
+        "UPDATE harvest_task_queue \
+         SET state = 'RUNNING', worker_id = $1, started_at = NOW(), attempt = attempt + 1 \
+         WHERE id = ( \
+             SELECT id FROM harvest_task_queue \
              WHERE queue_name = ANY($2) \
                AND state = 'PENDING' \
                AND scheduled_at <= NOW() \
@@ -301,25 +250,6 @@ pub async fn claim_task(
                    OR sticky_until IS NULL \
                    OR sticky_until <= NOW() \
                ) \
-               AND ( \
-                   concurrency_key IS NULL \
-                   OR concurrency_cap IS NULL \
-                   OR ( \
-                       SELECT COUNT(*) FROM harvest_task_queue inner_q \
-                       WHERE inner_q.concurrency_key = harvest_task_queue.concurrency_key \
-                         AND inner_q.state = 'RUNNING' \
-                   ) < harvest_task_queue.concurrency_cap \
-               ) \
-               AND ( \
-                   required_build_id IS NULL \
-                   OR $3 = '' \
-                   OR required_build_id = $3 \
-                   OR EXISTS ( \
-                       SELECT 1 FROM harvest_build_compat \
-                       WHERE build_id = $3 \
-                         AND compatible_with = harvest_task_queue.required_build_id \
-                   ) \
-               ) \
              ORDER BY \
                  CASE \
                      WHEN sticky_worker_id = $1 AND sticky_until > NOW() THEN 1 \
@@ -328,30 +258,10 @@ pub async fn claim_task(
                  priority DESC, \
                  scheduled_at ASC \
              LIMIT 1 FOR UPDATE SKIP LOCKED \
-         ) \
-         UPDATE harvest_task_queue \
-         SET state = 'RUNNING', worker_id = $1, started_at = NOW(), attempt = attempt + 1 \
-         FROM candidate \
-         WHERE harvest_task_queue.id = candidate.id \
-           AND ( \
-               candidate.concurrency_key IS NULL \
-               OR ( \
-                   pg_try_advisory_xact_lock(hashtext(candidate.concurrency_key)::bigint) \
-                   AND ( \
-                       candidate.concurrency_cap IS NULL \
-                       OR ( \
-                           SELECT COUNT(*) FROM harvest_task_queue recheck \
-                           WHERE recheck.concurrency_key = candidate.concurrency_key \
-                             AND recheck.state = 'RUNNING' \
-                       ) < candidate.concurrency_cap \
-                   ) \
-               ) \
-           ) \
-         RETURNING harvest_task_queue.*",
+         ) RETURNING *",
     )
     .bind::<diesel::sql_types::Text, _>(worker_id)
     .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
-    .bind::<diesel::sql_types::Text, _>(worker_build_id)
     .load(conn)
     .await
     .map_err(crate::error::database_error)?;
@@ -359,81 +269,7 @@ pub async fn claim_task(
     Ok(result.into_iter().next())
 }
 
-// ---------------------------------------------------------------------------
-// Concurrency-key stats
-// ---------------------------------------------------------------------------
-
-/// Live stats for a single concurrency group key.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ConcurrencyKeyStats {
-    /// The concurrency group key.
-    pub key: String,
-    /// Declared maximum concurrent tasks for this key.
-    pub max_concurrent: i32,
-    /// Number of tasks currently in `RUNNING` state for this key.
-    pub in_flight: i64,
-    /// Number of tasks in `PENDING` state for this key (may be deferred by
-    /// the cap if `in_flight >= max_concurrent`).
-    pub pending: i64,
-}
-
-/// Return live concurrency stats for all keys visible in the given queues.
-///
-/// Only rows where `concurrency_key IS NOT NULL` contribute. Results are
-/// aggregated per key across all matching queues on this shard.
-///
-/// # Errors
-///
-/// Returns [`crate::error::HarvestError::Database`] on query failure.
-pub async fn concurrency_key_stats(
-    conn: &mut AsyncPgConnection,
-    queues: &[String],
-) -> HarvestResult<Vec<ConcurrencyKeyStats>> {
-    #[derive(diesel::QueryableByName)]
-    struct Row {
-        #[diesel(sql_type = diesel::sql_types::Text)]
-        key: String,
-        #[diesel(sql_type = diesel::sql_types::Integer)]
-        max_concurrent: i32,
-        #[diesel(sql_type = diesel::sql_types::BigInt)]
-        in_flight: i64,
-        #[diesel(sql_type = diesel::sql_types::BigInt)]
-        pending: i64,
-    }
-
-    let rows: Vec<Row> = diesel::sql_query(
-        "SELECT \
-             concurrency_key AS key, \
-             MAX(concurrency_cap)::INT4 AS max_concurrent, \
-             COUNT(*) FILTER (WHERE state = 'RUNNING') AS in_flight, \
-             COUNT(*) FILTER (WHERE state = 'PENDING') AS pending \
-         FROM harvest_task_queue \
-         WHERE concurrency_key IS NOT NULL \
-           AND concurrency_cap IS NOT NULL \
-           AND queue_name = ANY($1) \
-           AND state IN ('RUNNING', 'PENDING') \
-         GROUP BY concurrency_key",
-    )
-    .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
-    .load(conn)
-    .await
-    .map_err(crate::error::database_error)?;
-
-    Ok(rows
-        .into_iter()
-        .map(|r| ConcurrencyKeyStats {
-            key: r.key,
-            max_concurrent: r.max_concurrent,
-            in_flight: r.in_flight,
-            pending: r.pending,
-        })
-        .collect())
-}
-
 /// Mark a task as completed with the given output.
-///
-/// Terminal completion clears any heartbeat checkpoint payload so it cannot be
-/// observed after the activity has successfully finished.
 ///
 /// # Errors
 ///
@@ -453,7 +289,6 @@ pub async fn complete_task(
     .set((
         dsl::state.eq("COMPLETED"),
         dsl::output.eq(Some(output)),
-        dsl::heartbeat_details.eq(None::<serde_json::Value>),
         dsl::completed_at.eq(Some(Utc::now())),
     ))
     .execute(conn)
@@ -470,10 +305,6 @@ pub async fn complete_task(
 }
 
 /// Mark a task as failed with the given error message.
-///
-/// This is a terminal transition, so heartbeat checkpoint payloads are cleared.
-/// Retry rescheduling uses [`requeue_for_retry`] instead and preserves the
-/// payload for the next attempt.
 ///
 /// # Errors
 ///
@@ -493,7 +324,6 @@ pub async fn fail_task(
     .set((
         dsl::state.eq("FAILED"),
         dsl::error.eq(Some(error)),
-        dsl::heartbeat_details.eq(None::<serde_json::Value>),
         dsl::completed_at.eq(Some(Utc::now())),
     ))
     .execute(conn)
@@ -534,40 +364,6 @@ pub async fn fail_open_tasks_for_execution(
     .set((
         dsl::state.eq("FAILED"),
         dsl::error.eq(Some(error.to_string())),
-        dsl::heartbeat_details.eq(None::<serde_json::Value>),
-        dsl::completed_at.eq(Some(Utc::now())),
-    ))
-    .execute(conn)
-    .await
-    .map_err(crate::error::database_error)
-}
-
-/// Mark all pending or running task rows for a workflow execution as cancelled.
-///
-/// Reset uses this instead of failure so operators can distinguish work torn
-/// down by a fork from work that exhausted retries or crashed.
-///
-/// # Errors
-///
-/// Returns [`HarvestError::Database`](crate::error::HarvestError::Database) on
-/// update failure.
-pub async fn cancel_open_tasks_for_execution(
-    conn: &mut AsyncPgConnection,
-    exec_id: ExecutionId,
-    reason: &str,
-) -> HarvestResult<usize> {
-    use crate::schema::harvest_task_queue::dsl;
-
-    diesel::update(
-        dsl::harvest_task_queue
-            .filter(dsl::workflow_exec_id.eq(Some(exec_id.as_uuid())))
-            .filter(dsl::state.eq_any(["PENDING", "RUNNING"])),
-    )
-    .set((
-        dsl::state.eq("CANCELLED"),
-        dsl::worker_id.eq(None::<String>),
-        dsl::error.eq(Some(reason.to_string())),
-        dsl::heartbeat_details.eq(None::<serde_json::Value>),
         dsl::completed_at.eq(Some(Utc::now())),
     ))
     .execute(conn)
@@ -612,16 +408,12 @@ pub async fn queue_depths(
     Ok(rows.into_iter().map(|r| (r.queue_name, r.depth)).collect())
 }
 
-/// Update the `last_heartbeat_at` timestamp and checkpoint payload for a running task.
+/// Update the `last_heartbeat_at` timestamp for a running task.
 ///
 /// # Errors
 ///
 /// Returns [`crate::error::HarvestError::Database`] on update failure.
-pub async fn record_heartbeat(
-    conn: &mut AsyncPgConnection,
-    task_id: Uuid,
-    details: serde_json::Value,
-) -> HarvestResult<()> {
+pub async fn record_heartbeat(conn: &mut AsyncPgConnection, task_id: Uuid) -> HarvestResult<()> {
     use crate::schema::harvest_task_queue::dsl;
 
     let updated = diesel::update(
@@ -629,10 +421,7 @@ pub async fn record_heartbeat(
             .find(task_id)
             .filter(dsl::state.eq("RUNNING")),
     )
-    .set((
-        dsl::last_heartbeat_at.eq(Some(Utc::now())),
-        dsl::heartbeat_details.eq(Some(details)),
-    ))
+    .set(dsl::last_heartbeat_at.eq(Some(Utc::now())))
     .execute(conn)
     .await
     .map_err(crate::error::database_error)?;
@@ -661,10 +450,6 @@ pub async fn requeue_for_retry(
 }
 
 /// Reset a task to `PENDING` at an explicit timestamp.
-///
-/// Clears only the liveness timestamp for the failed attempt. The heartbeat
-/// details payload is intentionally preserved so the retry attempt can resume
-/// from the last flushed checkpoint.
 ///
 /// # Errors
 ///
@@ -919,7 +704,9 @@ pub async fn wake_workflow_task(
     queue_names.sort();
     queue_names.dedup();
 
-    crate::notify::notify_tasks_enqueued(conn, &queue_names, Uuid::nil()).await?;
+    for queue_name in queue_names {
+        crate::notify::notify_task_enqueued(conn, &queue_name, Uuid::nil()).await?;
+    }
 
     Ok(())
 }
@@ -1009,21 +796,5 @@ mod tests {
     fn sticky_hint_rejects_out_of_range_duration() {
         let hint = StickyHint::new("w1", StdDuration::from_secs(u64::MAX));
         assert!(hint.chrono_timeout().is_err());
-    }
-
-    #[test]
-    fn enqueue_params_concurrency_fields_default_to_none() {
-        let params = EnqueueParams::new("default", TaskType::Activity, serde_json::json!(null));
-        assert!(params.concurrency_key.is_none());
-        assert!(params.max_concurrent.is_none());
-    }
-
-    #[test]
-    fn enqueue_params_concurrency_fields_set_manually() {
-        let mut params = EnqueueParams::new("default", TaskType::Activity, serde_json::json!(null));
-        params.concurrency_key = Some("stripe".to_string());
-        params.max_concurrent = Some(5);
-        assert_eq!(params.concurrency_key.as_deref(), Some("stripe"));
-        assert_eq!(params.max_concurrent, Some(5));
     }
 }

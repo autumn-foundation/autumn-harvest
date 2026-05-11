@@ -22,7 +22,6 @@ db = [
     "dep:tokio-postgres",
 ]
 testing = []
-metrics-rs = ["dep:metrics"]
 
 [dependencies]
 autumn-harvest-macros = { version = "0.2.0", path = "../autumn-harvest-macros" }
@@ -30,7 +29,6 @@ tokio = { workspace = true }
 tokio-util = { version = "0.7", features = ["rt"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
-base64 = "0.22"
 thiserror = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
@@ -45,35 +43,6 @@ diesel-async = { workspace = true, optional = true }
 diesel_migrations = { workspace = true, optional = true }
 scoped-futures = { version = "0.1", optional = true }
 tokio-postgres = { version = "0.7", optional = true }
-metrics = { version = "0.24", optional = true }
-
-[[test]]
-name = "external_completion_tests"
-required-features = ["testing"]
-
-[[bench]]
-name = "metrics_noop"
-harness = false
-
-[[test]]
-name = "idempotency_tests"
-required-features = ["testing"]
-
-[[test]]
-name = "replayer_tests"
-required-features = ["testing"]
-
-[[test]]
-name = "replayer_integration_tests"
-required-features = ["testing", "db"]
-
-[[test]]
-name = "build_routing_tests"
-required-features = ["db"]
-
-[[test]]
-name = "workflow_handle_tests"
-required-features = ["db"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
@@ -81,13 +50,6 @@ testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
 proptest = "1.11.0"
 loom = "0.7.2"
-criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-[[bench]]
-name = "replay_bench"
-required-features = ["testing"]
-harness = false
 
 [lints]
 workspace = true

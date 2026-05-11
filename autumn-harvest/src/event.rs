@@ -12,9 +12,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::error::TimeoutType;
-use crate::types::{
-    ActivityExecId, ExecutionId, ExternalActivityToken, TimerId, UpdateId, WorkerId,
-};
+use crate::types::{ActivityExecId, ExecutionId, TimerId, WorkerId};
 
 /// All possible events in a workflow's history.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -161,162 +159,6 @@ pub enum WorkflowEvent {
         /// The JSON payload passed to the next iteration of the workflow.
         input: serde_json::Value,
     },
-
-    // ── Local activities (issue #98) ─────────────────────────────────────
-    /// A local activity was dispatched for inline execution on the workflow
-    /// worker. Unlike regular activities, local activities never write a row to
-    /// `harvest_task_queue`; the worker runs the handler in the same Tokio task
-    /// that drives the workflow loop.
-    LocalActivityScheduled {
-        /// Unique ID for this local activity attempt sequence.
-        activity_id: ActivityExecId,
-        /// The name of the registered activity handler.
-        name: String,
-        /// JSON input for the activity.
-        input: serde_json::Value,
-    },
-    /// A local activity finished executing successfully.
-    LocalActivityCompleted {
-        /// Unique ID matching the corresponding `LocalActivityScheduled`.
-        activity_id: ActivityExecId,
-        /// The JSON result returned by the activity handler.
-        output: serde_json::Value,
-    },
-    /// A local activity attempt returned an error or the handler panicked.
-    ///
-    /// Multiple `LocalActivityFailed` events may appear in sequence (one per
-    /// attempt) before a terminal `LocalActivityCompleted` (retry eventually
-    /// succeeded) or before the retry budget is exhausted (followed by a
-    /// `LocalActivityExhausted` event that marks the terminal state).
-    LocalActivityFailed {
-        /// Unique ID matching the corresponding `LocalActivityScheduled`.
-        activity_id: ActivityExecId,
-        /// String representation of the failure.
-        error: String,
-        /// How many attempts have been made so far (1-based).
-        attempt: u32,
-    },
-
-    // ── External activity completion (issue #92) ──────────────────────
-    /// An external activity was scheduled and is awaiting completion via the
-    /// management API task-token endpoint. The `token` is a single-use handle
-    /// that external systems round-trip through `/activities/external/{token}/complete`.
-    ActivityAwaitingExternal {
-        /// Unique ID for this specific activity attempt.
-        activity_id: ActivityExecId,
-        /// Opaque token that external systems use to complete or fail the activity.
-        token: ExternalActivityToken,
-        /// The name of the registered activity handler.
-        name: String,
-        /// JSON input for the activity.
-        input: serde_json::Value,
-        /// Target worker queue (informational; external activities don't occupy a slot).
-        queue: String,
-        /// Maximum seconds the external system has to deliver a result.
-        schedule_to_close_secs: u64,
-    },
-    /// An external system delivered a successful result via the management API.
-    ActivityCompletedExternally {
-        /// Unique ID for this specific activity attempt.
-        activity_id: ActivityExecId,
-        /// Token that was used to complete the activity.
-        token: ExternalActivityToken,
-        /// The JSON result returned by the external system.
-        output: serde_json::Value,
-    },
-    /// An external system reported a failure via the management API.
-    ActivityFailedExternally {
-        /// Unique ID for this specific activity attempt.
-        activity_id: ActivityExecId,
-        /// Token that was used to fail the activity.
-        token: ExternalActivityToken,
-        /// String representation of the failure.
-        error: String,
-        /// Whether the failure is retryable per the activity's `RetryPolicy`.
-        retryable: bool,
-    },
-    /// The schedule-to-close deadline for an external activity was extended via
-    /// the management API heartbeat endpoint.
-    ActivityExternalDeadlineExtended {
-        /// Unique ID for this specific activity attempt.
-        activity_id: ActivityExecId,
-        /// Token of the activity whose deadline was extended.
-        token: ExternalActivityToken,
-    },
-
-    // ── Updates (issue #140) ──────────────────────────────────────────────
-    /// An update request passed its validator and was durably admitted into
-    /// the workflow's event history. The `update_id` correlates with the
-    /// paired `UpdateCompleted` or `UpdateFailed` event.
-    ///
-    /// Validator failures leave **no trace** in history — only admitted updates
-    /// produce this event.
-    UpdateAdmitted {
-        /// Unique ID for this update invocation. Stable across worker restarts.
-        update_id: UpdateId,
-        /// The name of the registered update handler.
-        name: String,
-        /// JSON payload delivered with the update request.
-        input: serde_json::Value,
-        /// Time when the update was admitted.
-        timestamp: DateTime<Utc>,
-    },
-    /// The update handler ran to completion and returned a value.
-    UpdateCompleted {
-        /// Unique ID matching the corresponding `UpdateAdmitted`.
-        update_id: UpdateId,
-        /// The JSON result returned by the update handler.
-        output: serde_json::Value,
-    },
-    /// The update handler returned an error.
-    UpdateFailed {
-        /// Unique ID matching the corresponding `UpdateAdmitted`.
-        update_id: UpdateId,
-        /// String representation of the handler error.
-        error: String,
-    },
-
-    // ── Workflow reset (issue #148) ─────────────────────────────────────────
-    /// Marker appended to the forked execution after the carried-over history.
-    ///
-    /// Replay treats this as informational: it records why the fork exists
-    /// without corresponding to a workflow command.
-    WorkflowResetFork {
-        /// The source execution that was reset.
-        reset_from_exec_id: ExecutionId,
-        /// Last source event copied into this fork.
-        reset_to_event_id: i64,
-        /// Operator-supplied recovery reason.
-        reason: String,
-        /// Operator identity for audit.
-        operator_id: String,
-    },
-    /// Marker appended to the source execution when a reset fork supersedes it.
-    WorkflowResetTerminated {
-        /// The forked execution that should continue forward.
-        reset_to_exec_id: ExecutionId,
-        /// Operator-supplied recovery reason.
-        reason: String,
-        /// Operator identity for audit.
-        operator_id: String,
-    },
-    /// All retry attempts for a local activity were exhausted. Appended
-    /// immediately after the final `LocalActivityFailed` event so replay can
-    /// identify the terminal state without knowing the current retry policy.
-    ///
-    /// This makes the terminal-vs-in-progress distinction policy-invariant:
-    /// if this event is present the activity is unambiguously done; if only
-    /// `LocalActivityFailed` events are present (without a following
-    /// `LocalActivityExhausted`) the worker crashed between retries and must
-    /// continue from the next attempt.
-    LocalActivityExhausted {
-        /// Unique ID matching the corresponding `LocalActivityScheduled`.
-        activity_id: ActivityExecId,
-        /// Error from the final attempt.
-        error: String,
-        /// Total attempts that were made (equals `max_attempts`).
-        attempt: u32,
-    },
 }
 
 impl WorkflowEvent {
@@ -343,35 +185,7 @@ impl WorkflowEvent {
             Self::ChildWorkflowFailed { .. } => "ChildWorkflowFailed",
             Self::MarkerRecorded { .. } => "MarkerRecorded",
             Self::WorkflowContinuedAsNew { .. } => "WorkflowContinuedAsNew",
-            Self::LocalActivityScheduled { .. } => "LocalActivityScheduled",
-            Self::LocalActivityCompleted { .. } => "LocalActivityCompleted",
-            Self::LocalActivityFailed { .. } => "LocalActivityFailed",
-            Self::ActivityAwaitingExternal { .. } => "ActivityAwaitingExternal",
-            Self::ActivityCompletedExternally { .. } => "ActivityCompletedExternally",
-            Self::ActivityFailedExternally { .. } => "ActivityFailedExternally",
-            Self::ActivityExternalDeadlineExtended { .. } => "ActivityExternalDeadlineExtended",
-            Self::UpdateAdmitted { .. } => "UpdateAdmitted",
-            Self::UpdateCompleted { .. } => "UpdateCompleted",
-            Self::UpdateFailed { .. } => "UpdateFailed",
-            Self::WorkflowResetFork { .. } => "WorkflowResetFork",
-            Self::WorkflowResetTerminated { .. } => "WorkflowResetTerminated",
-            Self::LocalActivityExhausted { .. } => "LocalActivityExhausted",
         }
-    }
-
-    /// Returns `true` for terminal lifecycle events that are appended by the
-    /// executor after a workflow finishes and are never consumed by workflow
-    /// commands during replay.
-    #[must_use]
-    pub const fn is_terminal_lifecycle(&self) -> bool {
-        matches!(
-            self,
-            Self::WorkflowCompleted { .. }
-                | Self::WorkflowFailed { .. }
-                | Self::WorkflowCancelled { .. }
-                | Self::WorkflowContinuedAsNew { .. }
-                | Self::WorkflowResetTerminated { .. }
-        )
     }
 }
 
@@ -408,65 +222,6 @@ mod tests {
     }
 
     #[test]
-    fn local_activity_scheduled_round_trips() -> Result<(), serde_json::Error> {
-        let event = WorkflowEvent::LocalActivityScheduled {
-            activity_id: ActivityExecId::new(),
-            name: "format_data".into(),
-            input: serde_json::json!({"x": 1}),
-        };
-        let json = serde_json::to_string(&event)?;
-        let back: WorkflowEvent = serde_json::from_str(&json)?;
-        assert!(matches!(back, WorkflowEvent::LocalActivityScheduled { .. }));
-        Ok(())
-    }
-
-    #[test]
-    fn local_activity_completed_round_trips() -> Result<(), serde_json::Error> {
-        let event = WorkflowEvent::LocalActivityCompleted {
-            activity_id: ActivityExecId::new(),
-            output: serde_json::json!({"result": 42}),
-        };
-        let json = serde_json::to_string(&event)?;
-        let back: WorkflowEvent = serde_json::from_str(&json)?;
-        assert!(matches!(back, WorkflowEvent::LocalActivityCompleted { .. }));
-        Ok(())
-    }
-
-    #[test]
-    fn local_activity_failed_round_trips() -> Result<(), serde_json::Error> {
-        let event = WorkflowEvent::LocalActivityFailed {
-            activity_id: ActivityExecId::new(),
-            error: "db connection refused".into(),
-            attempt: 3,
-        };
-        let json = serde_json::to_string(&event)?;
-        let back: WorkflowEvent = serde_json::from_str(&json)?;
-        assert!(matches!(
-            back,
-            WorkflowEvent::LocalActivityFailed { attempt: 3, .. }
-        ));
-        Ok(())
-    }
-
-    #[test]
-    fn local_activity_exhausted_round_trips() -> Result<(), serde_json::Error> {
-        let id = ActivityExecId::new();
-        let event = WorkflowEvent::LocalActivityExhausted {
-            activity_id: id,
-            error: "always fails".into(),
-            attempt: 3,
-        };
-        let json = serde_json::to_string(&event)?;
-        let back: WorkflowEvent = serde_json::from_str(&json)?;
-        assert!(matches!(
-            back,
-            WorkflowEvent::LocalActivityExhausted { attempt: 3, .. }
-        ));
-        assert_eq!(event.type_name(), "LocalActivityExhausted");
-        Ok(())
-    }
-
-    #[test]
     fn event_type_name_is_stable() {
         let e = WorkflowEvent::WorkflowCompleted {
             output: serde_json::Value::Null,
@@ -475,7 +230,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::too_many_lines)]
     fn all_type_names_are_unique() {
         use crate::types::{ActivityExecId, ExecutionId, TimerId, WorkerId};
         use std::collections::HashSet;
@@ -549,106 +303,10 @@ mod tests {
                 new_exec_id: ExecutionId::new(),
                 input: serde_json::Value::Null,
             },
-            WorkflowEvent::ActivityAwaitingExternal {
-                activity_id: ActivityExecId::new(),
-                token: crate::types::ExternalActivityToken::new(),
-                name: "x".into(),
-                input: serde_json::Value::Null,
-                queue: "default".into(),
-                schedule_to_close_secs: 0,
-            },
-            WorkflowEvent::ActivityCompletedExternally {
-                activity_id: ActivityExecId::new(),
-                token: crate::types::ExternalActivityToken::new(),
-                output: serde_json::Value::Null,
-            },
-            WorkflowEvent::ActivityFailedExternally {
-                activity_id: ActivityExecId::new(),
-                token: crate::types::ExternalActivityToken::new(),
-                error: "x".into(),
-                retryable: false,
-            },
-            WorkflowEvent::ActivityExternalDeadlineExtended {
-                activity_id: ActivityExecId::new(),
-                token: crate::types::ExternalActivityToken::new(),
-            },
-            WorkflowEvent::LocalActivityScheduled {
-                activity_id: ActivityExecId::new(),
-                name: "format_data".into(),
-                input: serde_json::Value::Null,
-            },
-            WorkflowEvent::LocalActivityCompleted {
-                activity_id: ActivityExecId::new(),
-                output: serde_json::Value::Null,
-            },
-            WorkflowEvent::LocalActivityFailed {
-                activity_id: ActivityExecId::new(),
-                error: "transient".into(),
-                attempt: 1,
-            },
-            WorkflowEvent::UpdateAdmitted {
-                update_id: crate::types::UpdateId::new(),
-                name: "approve".into(),
-                input: serde_json::Value::Null,
-                timestamp: Utc::now(),
-            },
-            WorkflowEvent::UpdateCompleted {
-                update_id: crate::types::UpdateId::new(),
-                output: serde_json::Value::Null,
-            },
-            WorkflowEvent::UpdateFailed {
-                update_id: crate::types::UpdateId::new(),
-                error: "x".into(),
-            },
-            WorkflowEvent::WorkflowResetFork {
-                reset_from_exec_id: ExecutionId::new(),
-                reset_to_event_id: 1,
-                reason: "bad deploy".into(),
-                operator_id: "ops".into(),
-            },
-            WorkflowEvent::WorkflowResetTerminated {
-                reset_to_exec_id: ExecutionId::new(),
-                reason: "bad deploy".into(),
-                operator_id: "ops".into(),
-            },
         ];
 
-        assert_eq!(events.len(), 30);
+        assert_eq!(events.len(), 18);
         let names: HashSet<_> = events.iter().map(WorkflowEvent::type_name).collect();
-        assert_eq!(names.len(), 30, "duplicate type names detected");
-    }
-
-    #[test]
-    fn workflow_reset_events_round_trip_and_type_names_are_stable() -> Result<(), serde_json::Error>
-    {
-        let source = ExecutionId::new();
-        let fork = ExecutionId::new();
-        let fork_event = WorkflowEvent::WorkflowResetFork {
-            reset_from_exec_id: source,
-            reset_to_event_id: 42,
-            reason: "rolled back bad signal".into(),
-            operator_id: "oncall".into(),
-        };
-        let terminated_event = WorkflowEvent::WorkflowResetTerminated {
-            reset_to_exec_id: fork,
-            reason: "rolled back bad signal".into(),
-            operator_id: "oncall".into(),
-        };
-
-        assert_eq!(fork_event.type_name(), "WorkflowResetFork");
-        assert_eq!(terminated_event.type_name(), "WorkflowResetTerminated");
-
-        let json = serde_json::to_string(&fork_event)?;
-        let back: WorkflowEvent = serde_json::from_str(&json)?;
-        assert!(matches!(
-            back,
-            WorkflowEvent::WorkflowResetFork {
-                reset_from_exec_id,
-                reset_to_event_id: 42,
-                ..
-            } if reset_from_exec_id == source
-        ));
-
-        Ok(())
+        assert_eq!(names.len(), 18, "duplicate type names detected");
     }
 }

@@ -19,7 +19,6 @@ use crate::config::{HarvestMode, HarvestRuntimeConfig};
 use crate::outbox::spawn_workflow_start_outbox_relay;
 use crate::runner::{HarvestRunner, HarvestRunnerResources};
 use crate::ui::harvest_ui_router;
-use autumn_harvest::WorkflowHandleClient;
 use autumn_harvest::builder::{HarvestBuilder, WorkerConfig};
 use autumn_harvest::info::{ActivityInfo, DagInfo, WorkflowInfo};
 use autumn_harvest::shard::ShardRouter;
@@ -181,7 +180,6 @@ impl Plugin for HarvestPlugin {
             runtime: None,
         }));
         let api_state = HarvestApiState::new();
-        api_state.set_admin_auth_boundary(api_middleware.is_some());
 
         let startup_slot = Arc::clone(&slot);
         let shutdown_slot = Arc::clone(&slot);
@@ -220,15 +218,10 @@ fn start_harvest_runtime(
     slot: &Arc<Mutex<HarvestRuntimeSlot>>,
     api_state: &HarvestApiState,
 ) -> autumn_web::AutumnResult<()> {
-    api_state.set_deployment_profile(state.profile().to_string());
     let app_config = AutumnConfig::load()
         .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
     let harvest_config = HarvestRuntimeConfig::load()
         .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
-    let workflow_result_notification_url = harvest_database_url(&app_config, &harvest_config)?;
-    api_state.set_health_requires_shard_readiness(harvest_config.readiness.require_shard_readiness);
-    api_state
-        .set_workflow_result_notification_database_url(workflow_result_notification_url.clone());
     ensure_runtime_migrations(state.profile(), &app_config, &harvest_config)?;
 
     let runtime_state = state.clone();
@@ -252,23 +245,7 @@ fn start_harvest_runtime(
         ));
     };
 
-    let mut built = builder
-        .try_build()
-        .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
-
-    // Derive the API stale threshold from the worker heartbeat interval so that
-    // /workers correctly classifies workers under non-default configurations.
-    api_state.set_worker_stale_threshold(built.worker_config().worker_heartbeat_interval * 2);
-    // Mirror the configured shutdown timeout so drain requests can compute a
-    // sensible default deadline without the caller having to supply one.
-    api_state.set_worker_shutdown_timeout(built.worker_config().shutdown_timeout);
-
-    // Apply the api_state audit retention override only when explicitly set,
-    // so that builder-level retention config is not silently clobbered.
-    if let Some(days) = api_state.audit_retention_days() {
-        built.set_audit_retention_days(days);
-    }
-
+    let built = builder.build();
     state.insert_extension(harvest_config.outbox.clone());
     state.insert_extension(router.clone());
     let mut runner_resources = HarvestRunnerResources::new(harvest_pool)
@@ -279,16 +256,7 @@ fn start_harvest_runtime(
     }
     let runner = HarvestRunner::start(built, &harvest_config, runner_resources)?;
     let harvest_db_pool = runner.storage_pool();
-    let workflow_handle_client = WorkflowHandleClient::new(
-        harvest_db_pool.sharded_pool().clone(),
-        runner.api_runtime().router().clone(),
-        [(
-            autumn_harvest::ShardId::new(0),
-            workflow_result_notification_url,
-        )],
-    );
     state.insert_extension(harvest_db_pool.clone());
-    state.insert_extension(workflow_handle_client);
     api_state.install_storage_pool(harvest_db_pool);
     let outbox = app_pool.as_ref().and_then(|_| {
         if harvest_config.outbox.enabled {
@@ -330,24 +298,6 @@ fn resolve_harvest_pool(
                     )
                 })
         }
-    }
-}
-
-fn harvest_database_url(
-    app_config: &AutumnConfig,
-    config: &HarvestRuntimeConfig,
-) -> autumn_web::AutumnResult<String> {
-    match config.mode {
-        HarvestMode::Embedded => app_config.database.url.clone().ok_or_else(|| {
-            AutumnError::service_unavailable_msg(
-                "autumn-harvest requires database.url when harvest.mode is embedded",
-            )
-        }),
-        HarvestMode::Split | HarvestMode::External => config.database.url.clone().ok_or_else(|| {
-            AutumnError::service_unavailable_msg(
-                "harvest.database.url must be configured when harvest.mode is split or external",
-            )
-        }),
     }
 }
 
@@ -480,9 +430,6 @@ mod tests {
             default_heartbeat_timeout: None,
             default_schedule_to_start: None,
             default_queue: None,
-            max_concurrent: None,
-            concurrency_key: None,
-            is_local: false,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
         }
     }
@@ -646,8 +593,6 @@ mod tests {
                 url: Some("postgres://harvest:harvest@localhost:5432/harvest".to_owned()),
             },
             outbox: HarvestOutboxConfig::default(),
-            batch: crate::config::HarvestBatchConfig::default(),
-            readiness: crate::config::HarvestReadinessConfig::default(),
         };
 
         let harvest_pool = resolve_harvest_pool(&state, &config)

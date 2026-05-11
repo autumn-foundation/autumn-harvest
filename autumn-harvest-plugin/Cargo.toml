@@ -26,13 +26,10 @@ diesel = { workspace = true }
 diesel-async = { workspace = true }
 diesel_migrations = { workspace = true }
 deadpool = { workspace = true }
-futures = { workspace = true }
 scoped-futures = "0.1"
 tower = "0.5"
-maud = { version = "0.27", features = ["axum"] }
 
 [dev-dependencies]
-autumn-harvest = { version = "0.2.0", path = "../autumn-harvest", features = ["db", "testing"] }
 tower = "0.5"
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }

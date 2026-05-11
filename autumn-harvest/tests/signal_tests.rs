@@ -13,11 +13,7 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../migrations/20260424000001_harvest_trace_context/up.sql"),
     "\n",
-    include_str!("../migrations/20260505000000_harvest_heartbeat_details/up.sql"),
-    "\n",
     include_str!("../migrations/20260427000000_harvest_continue_as_new/up.sql"),
-    "\n",
-    include_str!("../migrations/20260429000000_harvest_concurrency_key/up.sql"),
 );
 
 async fn setup_test_db() -> (
@@ -67,7 +63,6 @@ async fn test_send_and_load_signals() {
         execution_timeout: None,
         memo: None,
         search_attrs: None,
-        assigned_build_id: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&new_exec)
@@ -111,7 +106,6 @@ async fn test_mark_signals_consumed() {
         execution_timeout: None,
         memo: None,
         search_attrs: None,
-        assigned_build_id: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&new_exec)

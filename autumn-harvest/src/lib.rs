@@ -16,62 +16,28 @@ pub const MIGRATIONS: diesel_migrations::EmbeddedMigrations =
 
 /// History analyzer and linter.
 pub mod analyzer;
-/// Audit trail for management API mutations (issue #158).
-#[cfg(feature = "db")]
-pub mod audit;
-/// Batch operations for fleet-wide workflow cancel/terminate/signal (issue #102).
-pub mod batch;
-/// Worker build-id routing for safe rolling deploys (issue #171).
-#[cfg(feature = "db")]
-pub mod build_routing;
 pub mod builder;
 pub mod cache;
 pub mod context;
-pub mod critical_path;
 pub mod dag;
 /// Export format types for Directed Acyclic Graphs (DAGs) representing workflows.
 pub mod dag_export;
-pub mod dag_linter;
-#[cfg(feature = "testing")]
-pub mod dag_profiler;
 #[cfg(any(test, feature = "testing"))]
 pub mod dag_simulator;
-/// Deterministic workflow guardrails: static source-level check for replay-breaking patterns.
-pub mod det_check;
-pub mod diagnostic;
 pub mod error;
 pub mod event;
 #[cfg(feature = "db")]
 #[doc(hidden)]
 pub mod execution;
 pub mod executor;
-#[cfg(feature = "db")]
-pub mod external_task;
-/// Deterministic workflow guardrail rule catalog (issue #173).
-pub mod guardrail;
-#[cfg(feature = "db")]
-pub mod handle;
 pub mod history_export;
 pub mod info;
-/// `metrics` crate adapter for [`telemetry::MetricsRecorder`].
-///
-/// Bridges every `record_*` call to the global [`metrics`] registry so
-/// applications using `metrics-exporter-prometheus` or another compatible
-/// backend get harvest engine metrics without any extra glue code.
-///
-/// Enabled by the `metrics-rs` cargo feature.
-#[cfg(feature = "metrics-rs")]
-pub mod metrics_rs_adapter;
-pub mod payload_codec;
 pub mod policy;
 pub mod pool;
 pub mod prelude;
 /// Types and definitions for querying workflow state and metadata.
 pub mod query;
 pub mod replay;
-#[cfg(feature = "db")]
-pub mod reset;
-pub mod retention;
 pub mod saga;
 pub mod shard;
 pub mod simulator;
@@ -79,15 +45,7 @@ pub mod simulator;
 pub mod telemetry;
 #[cfg(any(test, feature = "testing"))]
 pub mod test_generator;
-/// Replay test harness for verifying workflow determinism pre-deploy.
-#[cfg(any(test, feature = "testing"))]
-pub mod testing;
 pub mod types;
-pub mod update;
-#[cfg(feature = "db")]
-pub mod version_gate_retirement;
-#[cfg(feature = "db")]
-pub mod version_usage;
 
 #[cfg(feature = "db")]
 #[doc(hidden)]
@@ -122,78 +80,37 @@ pub mod timeout;
 #[cfg(feature = "db")]
 #[doc(hidden)]
 pub mod worker;
-#[cfg(feature = "db")]
-pub mod workers;
 
 pub use analyzer::{
     AnalyzerRule, AnalyzerWarning, ExcessiveRetriesRule, HistoryAnalyzer, LargePayloadRule,
     SuspiciousTimerRule,
 };
-pub use builder::{BuiltHarvest, HarvestBuilder, HarvestBuilderError, WorkerConfig};
+pub use builder::{BuiltHarvest, HarvestBuilder, WorkerConfig};
 pub use cache::{CachedWorkflowState, WorkflowCache};
-pub use context::{
-    ActivityContext, DEFAULT_HISTORY_CONTINUE_AS_NEW_THRESHOLD, WorkflowCommand, WorkflowContext,
-    WorkflowHistoryPolicy,
-};
-pub use critical_path::{CriticalPathAnalyzer, CriticalPathResult};
+pub use context::{ActivityContext, WorkflowCommand, WorkflowContext};
 pub use dag::{DagBuildError, DagBuilder, DagDefinition, DagTask, DagTaskRef};
 pub use dag_export::{export_dot, export_mermaid};
-pub use dag_linter::{
-    DagLinter, DagRule, DagWarning, ExcessiveParallelismRule, MissingRetryPolicyRule,
-    MissingTimeoutRule,
-};
-#[cfg(feature = "testing")]
-pub use dag_profiler::{DagProfile, DagProfiler, ProfilerEvent, ProfilerEventKind};
 #[cfg(any(test, feature = "testing"))]
 pub use dag_simulator::{DagSimulator, DagSimulatorResult};
-pub use det_check::{
-    DetCheckReport, DetFinding, DetLocation, DetSeverity, DetSuppression, check_dir, check_file,
-    check_source,
-};
-pub use diagnostic::{DiagnosticReport, SimulatorResultExt};
 pub use error::{HarvestError, HarvestResult, TimeoutType};
 pub use event::WorkflowEvent;
 #[cfg(feature = "db")]
 pub use execution::{
     CancelledWorkflowExecution, StartWorkflowParams, StartedWorkflowExecution,
-    cancel_workflow_execution, start_or_load_workflow_execution, terminate_workflow_execution,
+    cancel_workflow_execution, start_or_load_workflow_execution,
 };
 pub use executor::{WorkflowOutcome, run_workflow};
-pub use guardrail::{
-    GuardrailFinding, GuardrailSuppression, GuardrailSuppressionError, RuleCategory, RuleEntry,
-    Severity, catalog as guardrail_catalog, rule_by_id as guardrail_rule_by_id,
-};
-#[cfg(feature = "db")]
-pub use handle::{
-    StartedWorkflowHandle, WorkflowHandle, WorkflowHandleClient, WorkflowResult,
-    WorkflowResultState, start_or_load_workflow_execution_with_handle,
-};
-pub use history_export::{
-    DEFAULT_HISTORY_EXPORT_MAX_BYTES, HISTORY_EXPORT_SCHEMA, HISTORY_EXPORT_VERSION,
-    HistoryExportDocument, HistoryExportError, HistoryExportRequest, HistoryExportSizeLimit,
-    HistoryExportStatus, HistoryPayloadPolicy, export_history, export_mermaid_sequence,
-};
+pub use history_export::export_mermaid_sequence;
 pub use info::{ActivityHandlerFn, ActivityInfo, DagInfo, WorkflowHandlerFn, WorkflowInfo};
-pub use payload_codec::{CodecError, IdentityCodec, PayloadCodec, PayloadCodecs};
-pub use policy::validate_schedule;
-pub use policy::{RetryPolicy, Schedule, TaskStatus, TriggerRule, WorkflowSchedule};
+pub use policy::{RetryPolicy, Schedule, TaskStatus, TriggerRule};
 pub use pool::{HarvestPoolConfig, compute_pool_sizes};
 pub use query::QueryRegistry;
 pub use replay::{HistoryMatch, HistoryMatcher};
-#[cfg(feature = "db")]
-pub use reset::{
-    ResetInvalidPoint, ResetPlan, ResetResult, ResetSignalReapplyPolicy, ResetUnresolvedSideEffect,
-    WorkflowResetError, WorkflowResetRequest, preview_workflow_reset, reset_workflow_execution,
-    validate_reset_point,
-};
-pub use retention::RetentionConfig;
-#[cfg(feature = "db")]
-pub use retention::{RetentionMonitor, RetentionRuntime, RetentionStatus, RetentionTickResult};
 pub use saga::Saga;
 #[cfg(feature = "db")]
 pub use scheduler::{
     DagCatalog, RegisteredDag, SchedulerMonitor, SchedulerRuntime, compile_dag_catalog,
-    register_schedules, register_workflow_schedules, tick_once, trigger_dag,
+    register_schedules, tick_once, trigger_dag,
 };
 pub use shard::ShardRouter;
 #[cfg(feature = "db")]
@@ -205,28 +122,10 @@ pub use telemetry::{
 };
 #[cfg(any(test, feature = "testing"))]
 pub use test_generator::TestHarnessGenerator;
-#[cfg(any(test, feature = "testing"))]
-pub use testing::{
-    HistorySnapshot, NonDeterminismKind, ReplayReport, ReplayStatus, WorkflowReplayer,
-};
-pub use types::{
-    ActivityExecId, BuildId, DeploymentName, ExecutionId, ExternalActivityToken, ShardId, TimerId,
-    UpdateId, WorkerId, WorkflowId, WorkflowIdReusePolicy,
-};
-pub use update::UpdateRegistry;
-#[cfg(feature = "db")]
-pub use version_usage::{
-    VersionExecutionStateGroup, VersionUsageFilters, VersionUsageShardRow, load_version_usage,
-};
+pub use types::{ActivityExecId, ExecutionId, ShardId, TimerId, WorkerId, WorkflowId};
 
 #[cfg(feature = "db")]
 pub use store::EventHistory;
-
-#[cfg(feature = "db")]
-pub use models::{AuditRecord, NewAuditRecord};
-
-#[cfg(feature = "db")]
-pub use queue::ConcurrencyKeyStats;
 
 // Allow macro-generated code to use ::autumn_harvest::serde_json
 pub use serde_json;
@@ -242,12 +141,6 @@ pub fn task_duration(s: &str) -> Option<std::time::Duration> {
 
     for ch in s.chars() {
         if ch.is_ascii_digit() {
-            if current_num == "0" {
-                current_num.clear();
-            }
-            if current_num.len() > 20 {
-                return None;
-            }
             current_num.push(ch);
         } else if ch.is_ascii_alphabetic() {
             let num: u64 = current_num.parse().ok()?;
@@ -315,23 +208,5 @@ mod tests {
         assert_eq!(task_duration("18446744073709551615h"), None); // u64::MAX
         assert_eq!(task_duration("18446744073709551615m"), None); // u64::MAX
         assert_eq!(task_duration("18446744073709551614s 2s"), None); // Add overflow
-    }
-
-    #[test]
-    fn havoc_task_duration_oom_prevention() {
-        // Attack: Provide an excessively long string of digits.
-        // The implementation rejects it early instead of boundedly growing `current_num`.
-        let massive_input = "1".repeat(100);
-        let result = task_duration(&massive_input);
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn task_duration_allows_zero_padded_values() {
-        let zero_padded = format!("{}1s", "0".repeat(50));
-        assert_eq!(task_duration(&zero_padded), Some(Duration::from_secs(1)));
-        // 0s is rejected globally by task_duration, so we test None
-        assert_eq!(task_duration("000000000000s"), None);
-        assert_eq!(task_duration("0000010m"), Some(Duration::from_secs(600)));
     }
 }

@@ -35,11 +35,7 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../migrations/20260424000001_harvest_trace_context/up.sql"),
     "\n",
-    include_str!("../migrations/20260505000000_harvest_heartbeat_details/up.sql"),
-    "\n",
     include_str!("../migrations/20260427000000_harvest_continue_as_new/up.sql"),
-    "\n",
-    include_str!("../migrations/20260429000000_harvest_concurrency_key/up.sql"),
 );
 
 async fn setup_test_db() -> (AsyncPgConnection, ContainerAsync<Postgres>) {
@@ -107,8 +103,6 @@ async fn start_test_workflow(conn: &mut AsyncPgConnection) -> autumn_harvest::Ex
             execution_timeout: None,
             memo: None,
             search_attrs: None,
-            reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
-            trace_context: None,
         },
     )
     .await
@@ -199,9 +193,6 @@ fn heartbeat_registry(probe: HeartbeatCancellationProbe) -> Arc<HandlerRegistry>
             default_heartbeat_timeout: None,
             default_schedule_to_start: None,
             default_queue: Some("default"),
-            max_concurrent: None,
-            concurrency_key: None,
-            is_local: false,
             handler: heartbeat_activity,
         }],
         Arc::new(state),
@@ -406,11 +397,6 @@ async fn running_activity_heartbeat_observes_workflow_cancellation() {
                 shutdown_timeout: Duration::from_secs(1),
                 cancellation_grace_period: Duration::from_secs(1),
                 sticky_timeout: Duration::from_secs(5),
-                max_local_activity_start_to_close: Duration::from_secs(60),
-                shard_assignments: vec![autumn_harvest::types::ShardId::new(0)],
-                worker_heartbeat_interval: Duration::from_secs(5),
-                build_id: String::new(),
-                deployment_name: None,
             },
             registry,
         )
@@ -439,8 +425,6 @@ async fn running_activity_heartbeat_observes_workflow_cancellation() {
             execution_timeout: None,
             memo: None,
             search_attrs: None,
-            reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
-            trace_context: None,
         },
     )
     .await
@@ -533,9 +517,6 @@ fn uncooperative_registry(probe: UncooperativeActivityProbe) -> Arc<HandlerRegis
             default_heartbeat_timeout: None,
             default_schedule_to_start: None,
             default_queue: Some("default"),
-            max_concurrent: None,
-            concurrency_key: None,
-            is_local: false,
             handler: uncooperative_activity,
         }],
         Arc::new(state),
@@ -564,11 +545,6 @@ async fn uncooperative_activity_is_hard_aborted_after_grace_period() {
                 // Short grace period so the test completes quickly.
                 cancellation_grace_period: Duration::from_millis(500),
                 sticky_timeout: Duration::from_secs(5),
-                max_local_activity_start_to_close: Duration::from_secs(60),
-                shard_assignments: vec![autumn_harvest::types::ShardId::new(0)],
-                worker_heartbeat_interval: Duration::from_secs(5),
-                build_id: String::new(),
-                deployment_name: None,
             },
             registry,
         )
@@ -597,8 +573,6 @@ async fn uncooperative_activity_is_hard_aborted_after_grace_period() {
             execution_timeout: None,
             memo: None,
             search_attrs: None,
-            reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
-            trace_context: None,
         },
     )
     .await
