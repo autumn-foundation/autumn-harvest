@@ -1655,22 +1655,7 @@ pub const fn management_api_response_fields()
             Some(&["status", "item", "shard_coverage"]),
         ),
         // ── schedules ─────────────────────────────────────────────────────────
-        (
-            "GET",
-            "/admin/schedules",
-            Some(&[
-                "id",
-                "kind",
-                "name",
-                "schedule_expr",
-                "is_paused",
-                "next_run_at",
-                "last_run_at",
-                "max_active_runs",
-                "catchup",
-                "last_backfill",
-            ]),
-        ),
+        ("GET", "/admin/schedules", None), // Vec<ScheduleEntry>
         (
             "POST",
             "/admin/schedules/workflow",

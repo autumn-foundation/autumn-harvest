@@ -1977,59 +1977,8 @@
       "request_body": null,
       "success_response": {
         "status": 200,
-        "free_form": false,
-        "fields": [
-          {
-            "name": "id",
-            "type": "string",
-            "description": "Schedule UUID."
-          },
-          {
-            "name": "kind",
-            "type": "string",
-            "description": "workflow | dag"
-          },
-          {
-            "name": "name",
-            "type": "string",
-            "description": "Workflow or DAG name."
-          },
-          {
-            "name": "schedule_expr",
-            "type": "string",
-            "description": "Cron or interval expression. Null for manual schedules."
-          },
-          {
-            "name": "is_paused",
-            "type": "boolean",
-            "description": "Whether the schedule is currently paused."
-          },
-          {
-            "name": "next_run_at",
-            "type": "string",
-            "description": "Next scheduled firing time (RFC 3339). Null if paused or unscheduled."
-          },
-          {
-            "name": "last_run_at",
-            "type": "string",
-            "description": "Most recent automatic firing time (RFC 3339). Null if never run."
-          },
-          {
-            "name": "max_active_runs",
-            "type": "integer",
-            "description": "Maximum concurrently running executions for this schedule."
-          },
-          {
-            "name": "catchup",
-            "type": "boolean",
-            "description": "Whether the scheduler catches up missed runs on restart."
-          },
-          {
-            "name": "last_backfill",
-            "type": "object",
-            "description": "Most recent backfill request for this schedule, or null if none. Fields: id, actor, from, to, dry_run, total, dispatched, skipped, failed, status, error_summary, started_at, completed_at."
-          }
-        ]
+        "free_form": true,
+        "description": "Returns an array of schedule entries. Each item includes id, kind, name, schedule_expr, is_paused, next_run_at, last_run_at, max_active_runs, catchup, and last_backfill."
       },
       "error_responses": [
         {

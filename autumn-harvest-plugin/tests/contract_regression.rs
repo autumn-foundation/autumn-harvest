@@ -331,6 +331,40 @@ fn contract_response_fields_match_code_registry() {
     }
 }
 
+#[test]
+fn schedule_list_preserves_array_response_classification() {
+    let contract = load_contract();
+    let route = contract["routes"]
+        .as_array()
+        .expect("contract.routes must be a JSON array")
+        .iter()
+        .find(|route| {
+            route["method"].as_str() == Some("GET")
+                && route["path"].as_str() == Some("/admin/schedules")
+        })
+        .expect("GET /admin/schedules must be documented");
+
+    assert!(
+        route["success_response"]["free_form"]
+            .as_bool()
+            .unwrap_or(false),
+        "GET /admin/schedules returns a JSON array, so its top-level \
+         success_response must stay free_form/array instead of object fields"
+    );
+
+    let registry_fields = management_api_response_fields()
+        .iter()
+        .find(|(method, path, _)| *method == "GET" && *path == "/admin/schedules")
+        .map(|(_, _, fields)| *fields)
+        .expect("GET /admin/schedules must stay in the response registry");
+
+    assert!(
+        registry_fields.is_none(),
+        "GET /admin/schedules returns Json<Vec<ScheduleEntry>>, so the response \
+         registry must preserve array/free-form classification"
+    );
+}
+
 /// Every contract route must document an `idempotency` field so embedders
 /// know which operations are safe to retry.
 #[test]
