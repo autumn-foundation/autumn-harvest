@@ -646,7 +646,7 @@ async fn seed_dead_letter_ui_fixture(shard0_url: &str, shard1_url: &str) -> Vec<
                     "settlement_workflow"
                 },
                 &format!("dlq-shard0-{i}"),
-                "ACTIVITY",
+                "activity",
                 Some("charge_card"),
                 i,
             )
@@ -662,7 +662,7 @@ async fn seed_dead_letter_ui_fixture(shard0_url: &str, shard1_url: &str) -> Vec<
                     "settlement_workflow"
                 },
                 &format!("dlq-shard1-{i}"),
-                "WORKFLOW",
+                "workflow",
                 None,
                 i + 5,
             )
@@ -745,6 +745,23 @@ fn assert_dead_letter_filtered_html(filtered_html: &str) {
     );
 }
 
+fn assert_dead_letter_task_kind_filtered_html(
+    html: &str,
+    seeded: &[SeededDeadLetter],
+    include_activities: bool,
+) {
+    for row in seeded {
+        let should_include = row.activity_name.is_some() == include_activities;
+        assert_eq!(
+            html.contains(&row.id.to_string()),
+            should_include,
+            "task kind filter should {} row {} in HTML: {html}",
+            if should_include { "include" } else { "exclude" },
+            row.id
+        );
+    }
+}
+
 #[tokio::test]
 async fn ui_dead_letters_lists_filters_and_replays_single_entry() {
     let ((shard0_url, shard1_url), _container) = setup_sharded_test_database_urls().await;
@@ -763,6 +780,22 @@ async fn ui_dead_letters_lists_filters_and_replays_single_entry() {
         fetch_html(&app, "/ui/dead-letters?workflow_name=invoice_workflow").await;
     assert_eq!(status, StatusCode::OK, "filtered DLQ page should render");
     assert_dead_letter_filtered_html(&filtered_html);
+
+    let (status, activity_html) = fetch_html(&app, "/ui/dead-letters?task_kind=Activity").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "activity-filtered DLQ page should render"
+    );
+    assert_dead_letter_task_kind_filtered_html(&activity_html, &seeded, true);
+
+    let (status, workflow_html) = fetch_html(&app, "/ui/dead-letters?task_kind=Workflow").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "workflow-filtered DLQ page should render"
+    );
+    assert_dead_letter_task_kind_filtered_html(&workflow_html, &seeded, false);
 
     let target = seeded
         .iter()

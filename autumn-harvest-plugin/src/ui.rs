@@ -640,7 +640,11 @@ macro_rules! apply_dead_letter_ui_filters {
             );
         }
         if let Some(task_kind) = $filters.task_kind {
-            $query = $query.filter(harvest_dead_letters::task_type.eq(task_kind.as_db_value()));
+            $query = $query.filter(
+                sql::<Bool>("LOWER(task_type) = LOWER(")
+                    .bind::<Text, _>(task_kind.as_db_value().to_string())
+                    .sql(")"),
+            );
         }
         if let Some(failed_after) = $filters.failed_after {
             $query = $query.filter(harvest_dead_letters::failed_at.ge(failed_after));
