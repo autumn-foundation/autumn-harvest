@@ -1691,6 +1691,7 @@ pub const fn management_api_response_fields()
                 "failed",
                 "skipped_reasons",
                 "partial_shard_failures",
+                "paused_schedule_warning",
             ]),
         ),
         ("DELETE", "/admin/schedules/{id}", Some(&["ok"])),

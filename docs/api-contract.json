@@ -2292,6 +2292,12 @@
             "name": "partial_shard_failures",
             "type": "array",
             "description": "Shards that could not be reached. Each item has shard_id and reason."
+          },
+          {
+            "name": "paused_schedule_warning",
+            "type": "string",
+            "required": false,
+            "description": "Optional warning returned when include_paused=true backfills a paused DAG schedule; queued DAG runs will not execute until the schedule is resumed."
           }
         ]
       },

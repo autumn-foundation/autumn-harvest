@@ -332,6 +332,42 @@ fn contract_response_fields_match_code_registry() {
 }
 
 #[test]
+fn schedule_backfill_response_documents_paused_schedule_warning() {
+    let contract = load_contract();
+    let route = contract["routes"]
+        .as_array()
+        .expect("contract.routes must be a JSON array")
+        .iter()
+        .find(|route| {
+            route["method"].as_str() == Some("POST")
+                && route["path"].as_str() == Some("/admin/schedules/{id}/backfill")
+        })
+        .expect("POST /admin/schedules/{id}/backfill must be documented");
+
+    let contract_fields: HashSet<&str> = route["success_response"]["fields"]
+        .as_array()
+        .expect("schedule backfill success_response must list structured fields")
+        .iter()
+        .filter_map(|field| field["name"].as_str())
+        .collect();
+    assert!(
+        contract_fields.contains("paused_schedule_warning"),
+        "schedule backfill contract must document the optional warning emitted \
+         when include_paused=true backfills a paused DAG schedule"
+    );
+
+    let registry_fields = management_api_response_fields()
+        .iter()
+        .find(|(method, path, _)| *method == "POST" && *path == "/admin/schedules/{id}/backfill")
+        .and_then(|(_, _, fields)| *fields)
+        .expect("schedule backfill must have structured response registry fields");
+    assert!(
+        registry_fields.contains(&"paused_schedule_warning"),
+        "schedule backfill response registry must include paused_schedule_warning"
+    );
+}
+
+#[test]
 fn schedule_list_preserves_array_response_classification() {
     let contract = load_contract();
     let route = contract["routes"]
