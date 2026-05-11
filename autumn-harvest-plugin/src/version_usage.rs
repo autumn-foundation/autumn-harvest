@@ -13,76 +13,306 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::{HarvestApiState, map_error};
 
-/// Query string accepted by `GET /admin/version-gates/usage`.
+/// Defines the filters used when querying version gate usage via the management API.
+///
+/// This structure is typically deserialized from query parameters in a `GET` request to
+/// `/admin/version-gates/usage`. It allows operators to narrow down the usage report
+/// to specific workflows, changes, or database shards.
+///
+/// **Why does this exist?**
+/// When deprecating a version gate, you need to know if any active executions are still
+/// relying on the old behavior. This query provides the knobs to target that search
+/// efficiently across a distributed system.
+///
+/// ## Examples
+///
+/// Parsing a query string into a `VersionUsageQuery`:
+///
+/// ```rust
+/// use autumn_harvest_plugin::version_usage::VersionUsageQuery;
+///
+/// let query_str = "workflow_name=billing&state_group=active";
+/// let query: VersionUsageQuery = serde_urlencoded::from_str(query_str).unwrap();
+///
+/// assert_eq!(query.workflow_name.as_deref(), Some("billing"));
+/// assert_eq!(query.state_group.as_deref(), Some("active"));
+/// assert_eq!(query.shard_id, None);
+/// ```
 #[derive(Debug, Clone, Deserialize)]
 pub struct VersionUsageQuery {
+    /// Restricts the report to a specific workflow name (e.g. `"invoice_processing"`).
+    /// If omitted, usage across all registered workflows is returned.
     pub workflow_name: Option<String>,
+    /// Restricts the report to a specific version gate identifier (e.g. `"tax_calculation_v2"`).
     pub change_id: Option<String>,
+    /// Restricts the report to executions that recorded a specific version number for the gate.
     pub recorded_version: Option<u32>,
+    /// Defines which execution states to include in the aggregated counts.
+    /// Accepted values: `"active"`, `"terminal"`, or `"all"`. Defaults to `"all"`.
     pub state_group: Option<String>,
+    /// Restricts the database scan to a single physical shard.
+    /// Useful for debugging connection issues or localized usage spikes.
     pub shard_id: Option<i32>,
 }
 
+/// Represents the overall success and completeness of a distributed version usage query.
+///
+/// **Why does this exist?**
+/// Because Autumn Harvest shards execution data, a single report might be constructed
+/// from multiple database instances. If one database is unreachable, the report is
+/// "partial" rather than completely failed, allowing operators to still see *some* data.
+/// This enum strictly defines how reliable the returned rows are.
+///
+/// ## Examples
+///
+/// ```rust
+/// use autumn_harvest_plugin::version_usage::VersionUsageReportStatus;
+///
+/// let status = VersionUsageReportStatus::Partial;
+///
+/// match status {
+///     VersionUsageReportStatus::Complete => println!("Data is 100% accurate"),
+///     VersionUsageReportStatus::Partial => println!("Warning: Some shards failed!"),
+///     _ => {}
+/// }
+/// ```
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VersionUsageReportStatus {
+    /// Every expected shard was successfully queried, and at least one matching row was found.
     Complete,
+    /// Every expected shard was successfully queried, but zero rows matched the filters.
     NoMatches,
+    /// At least one shard failed to respond (e.g. connection timeout), but others succeeded.
+    /// The data in the report is incomplete and should not be used for strict retirement decisions.
     Partial,
+    /// Every single shard failed to respond. No usage data could be retrieved.
     Unavailable,
 }
 
+/// Represents the query success status for a single database shard.
+///
+/// **Why does this exist?**
+/// When a `VersionUsageReportStatus` is `Partial`, this enum is used in the shard
+/// breakdown to explicitly identify *which* shards failed, allowing operators to
+/// investigate specific database issues.
+///
+/// ## Examples
+///
+/// ```rust
+/// use autumn_harvest_plugin::version_usage::VersionUsageShardInspectionStatus;
+///
+/// let status = VersionUsageShardInspectionStatus::Inspected;
+/// assert_eq!(status, VersionUsageShardInspectionStatus::Inspected);
+/// ```
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum VersionUsageShardInspectionStatus {
+    /// The shard's database pool was acquired and the usage query executed successfully.
     Inspected,
+    /// The query failed, typically due to a connection error or missing connection pool.
     Unavailable,
 }
 
+/// The top-level payload returned by the `/admin/version-gates/usage` endpoint.
+///
+/// **Why does this exist?**
+/// Rather than just returning an array of raw database rows, this struct encapsulates
+/// the context of the query (filters, timestamp) and the health of the underlying
+/// distributed system (shard statuses). This prevents operators from making dangerous
+/// decisions based on incomplete data.
+///
+/// ## Examples
+///
+/// ```rust
+/// use autumn_harvest_plugin::version_usage::{
+///     VersionUsageReport, VersionUsageReportStatus, VersionUsageReportFilters,
+/// };
+/// use autumn_harvest::version_usage::VersionExecutionStateGroup;
+/// use chrono::Utc;
+///
+/// let report = VersionUsageReport {
+///     status: VersionUsageReportStatus::NoMatches,
+///     observed_at: Utc::now(),
+///     filters: VersionUsageReportFilters {
+///         workflow_name: None,
+///         change_id: None,
+///         recorded_version: None,
+///         state_group: VersionExecutionStateGroup::Active,
+///         shard_id: None,
+///     },
+///     items: vec![],
+///     shards: vec![],
+/// };
+/// ```
 #[derive(Debug, Clone, Serialize)]
 pub struct VersionUsageReport {
+    /// Indicates whether all shards were successfully queried, or if the report is partial.
     pub status: VersionUsageReportStatus,
+    /// The exact timestamp when this report was built. Useful for determining data staleness.
     pub observed_at: DateTime<Utc>,
+    /// An echo of the query filters used to generate this report.
     pub filters: VersionUsageReportFilters,
+    /// The aggregated usage rows. If a specific version gate is used across multiple shards,
+    /// it is aggregated into a single row here.
     pub items: Vec<VersionUsageReportRow>,
+    /// A breakdown of the health and inspection status of every configured shard.
     pub shards: Vec<VersionUsageShardInspection>,
 }
 
+/// Echoes the filters that were actually applied to generate a specific report.
+///
+/// **Why does this exist?**
+/// It ensures that whoever views a serialized JSON report has the full context of how
+/// the data was queried, avoiding mistakes where a filtered report is misinterpreted
+/// as a global report.
+///
+/// ## Examples
+///
+/// ```rust
+/// use autumn_harvest_plugin::version_usage::VersionUsageReportFilters;
+/// use autumn_harvest::version_usage::VersionExecutionStateGroup;
+///
+/// let filters = VersionUsageReportFilters {
+///     workflow_name: Some("billing".to_string()),
+///     change_id: None,
+///     recorded_version: None,
+///     state_group: VersionExecutionStateGroup::All,
+///     shard_id: None,
+/// };
+/// ```
 #[derive(Debug, Clone, Serialize)]
 pub struct VersionUsageReportFilters {
+    /// The workflow name that was filtered on, if any.
     pub workflow_name: Option<String>,
+    /// The specific change id that was queried, if any.
     pub change_id: Option<String>,
+    /// The exact recorded version that was targeted, if any.
     pub recorded_version: Option<u32>,
+    /// The execution state group (e.g. `Active`, `Terminal`) targeted by the query.
     pub state_group: VersionExecutionStateGroup,
+    /// The specific physical shard id targeted, if any.
     pub shard_id: Option<i32>,
 }
 
+/// Represents an aggregated usage count for a single `(workflow_name, change_id, version)` group.
+///
+/// **Why does this exist?**
+/// Rather than dumping thousands of individual executions that hit a version gate, this struct
+/// aggregates the data so operators can see high-level metrics (like total active executions
+/// and oldest age) to make a safe retirement decision.
+///
+/// ## Examples
+///
+/// ```rust
+/// use autumn_harvest_plugin::version_usage::{
+///     VersionUsageReportRow, VersionUsageShardCoverage
+/// };
+/// use chrono::Utc;
+///
+/// let row = VersionUsageReportRow {
+///     workflow_name: "billing".to_string(),
+///     change_id: "tax_v2".to_string(),
+///     recorded_version: 1,
+///     active_executions: 45,
+///     terminal_executions: 1002,
+///     oldest_matching_started_at: Utc::now(),
+///     newest_matching_started_at: Utc::now(),
+///     oldest_matching_execution_age_secs: 10,
+///     newest_matching_execution_age_secs: 1,
+///     shard_coverage: VersionUsageShardCoverage {
+///         inspected_shards: vec![0],
+///         matched_shards: vec![0],
+///         unavailable_shards: vec![],
+///     },
+/// };
+/// ```
 #[derive(Debug, Clone, Serialize)]
 pub struct VersionUsageReportRow {
+    /// The unique workflow identifier this gate was triggered in.
     pub workflow_name: String,
+    /// The string identifier for the version gate (e.g. `"stripe_api_v2"`).
     pub change_id: String,
+    /// The specific integer version number that was recorded by the executions.
     pub recorded_version: u32,
+    /// The number of currently running executions that recorded this version.
+    /// This is the most critical metric for safe retirement.
     pub active_executions: i64,
+    /// The number of completed or failed executions that recorded this version.
     pub terminal_executions: i64,
+    /// The timestamp of the oldest execution included in this row.
     pub oldest_matching_started_at: DateTime<Utc>,
+    /// The timestamp of the most recent execution included in this row.
     pub newest_matching_started_at: DateTime<Utc>,
+    /// Convenience field showing the age of the oldest execution in seconds.
     pub oldest_matching_execution_age_secs: i64,
+    /// Convenience field showing the age of the newest execution in seconds.
     pub newest_matching_execution_age_secs: i64,
+    /// Identifies exactly which shards contributed to this aggregated row.
     pub shard_coverage: VersionUsageShardCoverage,
 }
 
+/// Tracks which physical shards contributed to a specific aggregated row.
+///
+/// **Why does this exist?**
+/// If an operator sees `active_executions: 0` for a version gate, they might think
+/// it's safe to retire. However, if `unavailable_shards` is non-empty, that zero count
+/// is dangerous to act on because the missing shards might contain active executions.
+///
+/// ## Examples
+///
+/// ```rust
+/// use autumn_harvest_plugin::version_usage::VersionUsageShardCoverage;
+///
+/// let coverage = VersionUsageShardCoverage {
+///     inspected_shards: vec![0, 1],
+///     matched_shards: vec![1],
+///     unavailable_shards: vec![2],
+/// };
+///
+/// assert!(!coverage.unavailable_shards.is_empty(), "Unsafe to make decisions!");
+/// ```
 #[derive(Debug, Clone, Serialize)]
 pub struct VersionUsageShardCoverage {
+    /// The physical shard IDs that successfully responded to the query.
     pub inspected_shards: Vec<i32>,
+    /// The physical shard IDs that actually contained matching rows for this group.
     pub matched_shards: Vec<i32>,
+    /// The physical shard IDs that could not be queried (e.g. database down).
     pub unavailable_shards: Vec<i32>,
 }
 
+/// A health and summary report for a single database shard during the global query.
+///
+/// **Why does this exist?**
+/// Exposing connection errors and individual shard row counts allows operators
+/// to quickly debug misconfigured or overloaded database instances without digging
+/// through application logs.
+///
+/// ## Examples
+///
+/// ```rust
+/// use autumn_harvest_plugin::version_usage::{
+///     VersionUsageShardInspection, VersionUsageShardInspectionStatus
+/// };
+///
+/// let inspection = VersionUsageShardInspection {
+///     shard_id: 2,
+///     status: VersionUsageShardInspectionStatus::Unavailable,
+///     matched_groups: None,
+///     error: Some("connection pool exhausted".to_string()),
+/// };
+/// ```
 #[derive(Debug, Clone, Serialize)]
 pub struct VersionUsageShardInspection {
+    /// The physical identifier of the shard being inspected.
     pub shard_id: i32,
+    /// Indicates whether the query to this specific shard succeeded or failed.
     pub status: VersionUsageShardInspectionStatus,
+    /// If the query succeeded, the number of distinct `(workflow, change_id, version)`
+    /// groups returned by this shard.
     pub matched_groups: Option<usize>,
+    /// If the query failed, the stringified error reason (e.g. timeout, auth failure).
     pub error: Option<String>,
 }
 

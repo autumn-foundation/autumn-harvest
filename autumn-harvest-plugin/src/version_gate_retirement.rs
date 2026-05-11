@@ -88,37 +88,128 @@ pub struct RetirementCheckReportFilters {
     pub shard_id: Option<i32>,
 }
 
-/// Aggregated blocker row across all inspected shards.
+/// Represents an aggregated group of workflow executions that prevent retiring a version gate.
+///
+/// **Why does this exist?**
+/// When checking if it's safe to retire old code (by setting a `min_safe_version`), this struct
+/// isolates exactly *which* executions are blocking the retirement and *how old* they are. This
+/// prevents operators from accidentally bricking running workflows.
+///
+/// ## Examples
+///
+/// ```rust
+/// use autumn_harvest_plugin::version_gate_retirement::{
+///     RetirementBlockerReportRow, RetirementShardCoverage
+/// };
+/// use chrono::Utc;
+///
+/// let blocker = RetirementBlockerReportRow {
+///     workflow_name: "checkout_flow".to_string(),
+///     change_id: "payment_v1".to_string(),
+///     recorded_version: 1, // Below the `min_safe_version` of 2
+///     active_executions: 5,
+///     terminal_executions: 0,
+///     oldest_blocker_started_at: Utc::now(),
+///     newest_blocker_started_at: Utc::now(),
+///     oldest_blocker_age_secs: 3600,
+///     newest_blocker_age_secs: 60,
+///     sample_active_execution_ids: vec![],
+///     shard_coverage: RetirementShardCoverage {
+///         inspected_shards: vec![0],
+///         matched_shards: vec![0],
+///         unavailable_shards: vec![],
+///     },
+/// };
+/// ```
 #[derive(Debug, Clone, Serialize)]
 pub struct RetirementBlockerReportRow {
+    /// The unique workflow identifier containing the blocking executions.
     pub workflow_name: String,
+    /// The specific version gate identifier that is blocked from retirement.
     pub change_id: String,
+    /// The specific integer version number recorded by the blocking executions.
+    /// This will always be strictly less than the `min_safe_version` requested.
     pub recorded_version: u32,
+    /// The total count of active executions holding this version state.
     pub active_executions: i64,
+    /// The total count of terminal executions holding this version state.
     pub terminal_executions: i64,
+    /// The timestamp of the oldest blocking execution. Useful for identifying stuck workflows.
     pub oldest_blocker_started_at: DateTime<Utc>,
+    /// The timestamp of the most recent blocking execution.
     pub newest_blocker_started_at: DateTime<Utc>,
+    /// Convenience field showing the age of the oldest blocking execution in seconds.
     pub oldest_blocker_age_secs: i64,
+    /// Convenience field showing the age of the newest blocking execution in seconds.
     pub newest_blocker_age_secs: i64,
-    /// Sample of active execution IDs (up to 10 per shard, deduplicated).
+    /// A small random sample of execution IDs (UUIDs) blocking the retirement.
+    /// Useful for operators to look up specific runs in the UI or CLI to debug *why* they are still running.
     pub sample_active_execution_ids: Vec<Uuid>,
+    /// Identifies exactly which shards contributed to this aggregated blocker row.
     pub shard_coverage: RetirementShardCoverage,
 }
 
-/// Per-row shard coverage metadata.
+/// Tracks which physical shards contributed to a specific aggregated blocker row.
+///
+/// **Why does this exist?**
+/// If an operator sees `active_executions: 0` for a retirement check, they might think
+/// it's safe to delete the old code. However, if `unavailable_shards` is non-empty,
+/// that zero count is dangerous to act on because the missing shards might contain active blockers.
+///
+/// ## Examples
+///
+/// ```rust
+/// use autumn_harvest_plugin::version_gate_retirement::RetirementShardCoverage;
+///
+/// let coverage = RetirementShardCoverage {
+///     inspected_shards: vec![0, 1],
+///     matched_shards: vec![1],
+///     unavailable_shards: vec![2],
+/// };
+///
+/// assert!(!coverage.unavailable_shards.is_empty(), "Unsafe to make retirement decisions!");
+/// ```
 #[derive(Debug, Clone, Serialize)]
 pub struct RetirementShardCoverage {
+    /// The physical shard IDs that successfully responded to the retirement query.
     pub inspected_shards: Vec<i32>,
+    /// The physical shard IDs that actually contained matching blockers for this group.
     pub matched_shards: Vec<i32>,
+    /// The physical shard IDs that could not be queried (e.g. database down).
     pub unavailable_shards: Vec<i32>,
 }
 
-/// Per-shard inspection summary included in every report.
+/// A health and summary report for a single database shard during the global retirement query.
+///
+/// **Why does this exist?**
+/// Exposing connection errors and individual shard row counts allows operators
+/// to quickly debug misconfigured or overloaded database instances without digging
+/// through application logs when a retirement check returns a `Partial` status.
+///
+/// ## Examples
+///
+/// ```rust
+/// use autumn_harvest_plugin::version_gate_retirement::{
+///     RetirementShardInspection, RetirementShardInspectionStatus
+/// };
+///
+/// let inspection = RetirementShardInspection {
+///     shard_id: 2,
+///     status: RetirementShardInspectionStatus::Unavailable,
+///     matched_groups: None,
+///     error: Some("connection pool exhausted".to_string()),
+/// };
+/// ```
 #[derive(Debug, Clone, Serialize)]
 pub struct RetirementShardInspection {
+    /// The physical identifier of the shard being inspected.
     pub shard_id: i32,
+    /// Indicates whether the query to this specific shard succeeded or failed.
     pub status: RetirementShardInspectionStatus,
+    /// If the query succeeded, the number of distinct `(workflow, change_id, version)`
+    /// groups returned by this shard that are blocking retirement.
     pub matched_groups: Option<usize>,
+    /// If the query failed, the stringified error reason (e.g. timeout, auth failure).
     pub error: Option<String>,
 }
 
