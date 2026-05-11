@@ -4614,6 +4614,21 @@ struct BackfillShardFailure {
     reason: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BackfillPriorPrecheck {
+    NoPriorRun,
+    PriorRunExists,
+    PrecheckFailed(String),
+}
+
+fn classify_backfill_prior_count(result: diesel::QueryResult<i64>) -> BackfillPriorPrecheck {
+    match result {
+        Ok(count) if count > 0 => BackfillPriorPrecheck::PriorRunExists,
+        Ok(_) => BackfillPriorPrecheck::NoPriorRun,
+        Err(error) => BackfillPriorPrecheck::PrecheckFailed(error.to_string()),
+    }
+}
+
 /// Response for `POST /admin/schedules/{id}/backfill`.
 #[derive(Debug, Serialize)]
 struct ScheduleBackfillResponse {
@@ -4844,19 +4859,31 @@ async fn schedule_backfill(
                 // excludes sealed rows, so a sealed prior execution does not conflict
                 // and would allow a duplicate to be created. Backfill must not reuse
                 // sealed workflow IDs because the timestamp was already dispatched.
-                let prior: i64 = harvest_workflow_executions::table
+                let prior_check = harvest_workflow_executions::table
                     .filter(harvest_workflow_executions::workflow_name.eq(&wf_name))
                     .filter(harvest_workflow_executions::workflow_id.eq(&workflow_id))
                     .count()
                     .get_result::<i64>(&mut conn)
-                    .await
-                    .unwrap_or(0);
-                if prior > 0 {
-                    skipped += 1;
-                    *skipped_reasons
-                        .entry("already_exists".to_string())
-                        .or_insert(0) += 1;
-                    continue;
+                    .await;
+                match classify_backfill_prior_count(prior_check) {
+                    BackfillPriorPrecheck::PriorRunExists => {
+                        skipped += 1;
+                        *skipped_reasons
+                            .entry("already_exists".to_string())
+                            .or_insert(0) += 1;
+                        continue;
+                    }
+                    BackfillPriorPrecheck::NoPriorRun => {}
+                    BackfillPriorPrecheck::PrecheckFailed(reason) => {
+                        shard_failures.push(BackfillShardFailure {
+                            shard_id: 0,
+                            reason: format!(
+                                "failed to check prior workflow execution for {workflow_id}: {reason}"
+                            ),
+                        });
+                        failed += 1;
+                        continue;
+                    }
                 }
 
                 let result = start_or_load_workflow_execution(
@@ -7918,6 +7945,36 @@ mod tests {
         let err = parse_workflow_children_filters(&pairs(&[("status", "Zombie")]))
             .expect_err("unknown child status must error");
         assert!(err.to_string().contains("unknown workflow child status"));
+    }
+
+    #[test]
+    fn backfill_prior_precheck_treats_zero_as_no_prior_run() {
+        assert_eq!(
+            classify_backfill_prior_count(Ok(0)),
+            BackfillPriorPrecheck::NoPriorRun
+        );
+    }
+
+    #[test]
+    fn backfill_prior_precheck_treats_positive_count_as_existing_run() {
+        assert_eq!(
+            classify_backfill_prior_count(Ok(1)),
+            BackfillPriorPrecheck::PriorRunExists
+        );
+    }
+
+    #[test]
+    fn backfill_prior_precheck_treats_count_error_as_failure() {
+        let decision =
+            classify_backfill_prior_count(Err(diesel::result::Error::RollbackErrorOnCommit {
+                rollback_error: Box::new(diesel::result::Error::NotFound),
+                commit_error: Box::new(diesel::result::Error::NotFound),
+            }));
+
+        assert!(
+            matches!(decision, BackfillPriorPrecheck::PrecheckFailed(_)),
+            "count errors must not be interpreted as no prior run: {decision:?}"
+        );
     }
 
     #[test]
