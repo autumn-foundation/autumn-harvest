@@ -38,6 +38,7 @@ use crate::api::{
 const DEFAULT_PAGE_SIZE: i64 = 25;
 const DEFAULT_DLQ_PAGE_SIZE: i64 = 50;
 const MAX_PAGE_SIZE: i64 = 200;
+const DLQ_BULK_ACTION_LIMIT: usize = autumn_harvest::dlq::MAX_BULK_LIMIT as usize;
 
 const KNOWN_STATES: &[&str] = KNOWN_WORKFLOW_STATES;
 
@@ -994,25 +995,54 @@ fn render_dead_letter_bulk_actions(
     total_matching: usize,
 ) -> Markup {
     let return_to = dead_letter_return_to_path(filters, limit, refresh);
-    let replay_confirm = format!("Replay {total_matching} matching dead-letter entries?");
-    let discard_confirm = format!("Discard {total_matching} matching dead-letter entries?");
+    let action_limit = dead_letter_bulk_action_limit(total_matching);
+    let replay_label = dead_letter_bulk_action_label("Replay", action_limit, total_matching);
+    let discard_label = dead_letter_bulk_action_label("Discard", action_limit, total_matching);
+    let replay_confirm = dead_letter_bulk_action_confirm("Replay", action_limit, total_matching);
+    let discard_confirm = dead_letter_bulk_action_confirm("Discard", action_limit, total_matching);
     html! {
         div."bulk-actions" {
             form method="post" action="../dead-letters/replay" onsubmit={ "return confirm('" (replay_confirm) "')" } {
                 (render_dead_letter_hidden_filters(filters))
+                input type="hidden" name="limit" value=(action_limit);
                 input type="hidden" name="return_to" value=(return_to);
                 button type="submit" disabled[total_matching == 0 || filters.is_empty()] {
-                    "Replay all matching (" (total_matching) ")"
+                    (replay_label)
                 }
             }
             form method="post" action="../dead-letters/discard" onsubmit={ "return confirm('" (discard_confirm) "')" } {
                 (render_dead_letter_hidden_filters(filters))
+                input type="hidden" name="limit" value=(action_limit);
                 input type="hidden" name="return_to" value=(return_to);
                 button.danger type="submit" disabled[total_matching == 0 || filters.is_empty()] {
-                    "Discard all matching (" (total_matching) ")"
+                    (discard_label)
                 }
             }
         }
+    }
+}
+
+fn dead_letter_bulk_action_limit(total_matching: usize) -> usize {
+    total_matching.clamp(1, DLQ_BULK_ACTION_LIMIT)
+}
+
+fn dead_letter_bulk_action_label(verb: &str, action_limit: usize, total_matching: usize) -> String {
+    if total_matching > action_limit {
+        format!("{verb} first {action_limit} matching ({total_matching} total)")
+    } else {
+        format!("{verb} all matching ({total_matching})")
+    }
+}
+
+fn dead_letter_bulk_action_confirm(
+    verb: &str,
+    action_limit: usize,
+    total_matching: usize,
+) -> String {
+    if total_matching > action_limit {
+        format!("{verb} first {action_limit} of {total_matching} matching dead-letter entries?")
+    } else {
+        format!("{verb} {total_matching} matching dead-letter entries?")
     }
 }
 
@@ -1960,6 +1990,40 @@ mod tests {
             build_query_string(DEFAULT_PAGE_SIZE, None, None, Some(&pair)),
             "&search_attr_key=tenant&search_attr_value=acme"
         );
+    }
+
+    #[test]
+    fn dead_letter_bulk_actions_submit_explicit_limit_for_matching_rows() {
+        let filters = DeadLetterUiFilters {
+            workflow_name: Some("invoice_workflow".to_string()),
+            ..DeadLetterUiFilters::default()
+        };
+
+        let html = render_dead_letter_bulk_actions(&filters, DEFAULT_DLQ_PAGE_SIZE, None, 250)
+            .into_string();
+
+        assert!(html.contains("name=\"limit\" value=\"250\""));
+        assert!(html.contains("Replay all matching (250)"));
+        assert!(html.contains("Discard all matching (250)"));
+        assert!(html.contains("Replay 250 matching dead-letter entries?"));
+        assert!(html.contains("Discard 250 matching dead-letter entries?"));
+    }
+
+    #[test]
+    fn dead_letter_bulk_actions_label_when_limited_by_api_cap() {
+        let filters = DeadLetterUiFilters {
+            workflow_name: Some("invoice_workflow".to_string()),
+            ..DeadLetterUiFilters::default()
+        };
+
+        let html = render_dead_letter_bulk_actions(&filters, DEFAULT_DLQ_PAGE_SIZE, None, 1_200)
+            .into_string();
+
+        assert!(html.contains("name=\"limit\" value=\"1000\""));
+        assert!(html.contains("Replay first 1000 matching (1200 total)"));
+        assert!(html.contains("Discard first 1000 matching (1200 total)"));
+        assert!(html.contains("Replay first 1000 of 1200 matching dead-letter entries?"));
+        assert!(html.contains("Discard first 1000 of 1200 matching dead-letter entries?"));
     }
 
     #[test]

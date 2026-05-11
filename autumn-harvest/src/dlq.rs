@@ -19,7 +19,8 @@ use crate::models::{DeadLetter, NewDeadLetter};
 use crate::queue::{EnqueueParams, TaskType};
 
 pub const DEFAULT_BULK_LIMIT: u32 = 100;
-const MAX_BULK_LIMIT: u32 = 1000;
+/// Maximum number of DLQ rows a single bulk operation can act on.
+pub const MAX_BULK_LIMIT: u32 = 1000;
 
 /// Filter for bulk DLQ operations.
 ///
