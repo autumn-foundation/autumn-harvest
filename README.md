@@ -766,12 +766,13 @@ The embedded Vantage UI (`harvest_ui_router`, typically mounted at `/api/harvest
 
 ## Status
 
-Version 0.2.0 wraps the Phase 3 surface: DAG scheduling, `#[dag]`, trigger
-rules, signal delivery, `ctx.wait_for_signal`, query registration/dispatch, the
-management API, and dead-letter list/replay endpoints are implemented and
-covered by integration tests. Durable workflow cancellation is implemented with
-management API support and activity heartbeat cancellation checks. First-class
-Saga compensation is implemented through the `Saga` builder.
+Version 0.3.0 wraps the Phase 3 surface plus additive management API contract
+coverage: DAG scheduling, `#[dag]`, trigger rules, signal delivery,
+`ctx.wait_for_signal`, query registration/dispatch, the management API,
+workflow result polling, and dead-letter list/replay endpoints are implemented
+and covered by integration tests. Durable workflow cancellation is implemented
+with management API support and activity heartbeat cancellation checks.
+First-class Saga compensation is implemented through the `Saga` builder.
 
 API stability: pre-1.0. Breaking changes happen in minor versions per Cargo's
 0.x semver convention. Each release notes the migration where applicable.

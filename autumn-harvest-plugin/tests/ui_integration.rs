@@ -1212,7 +1212,17 @@ async fn ui_workers_perf_1k_workers_4_shards_under_500ms() {
     ));
     let app = harvest_ui_router(api_state).with_state(test_app_state_without_database());
 
-    // Measure wall-clock time for the page render.
+    // Warm the lazy shard pools before measuring. This test covers the workers
+    // page render/query budget, not first-use connection establishment against
+    // Docker-backed Postgres shards.
+    let (warm_status, _) = fetch_html(&app, "/workers?limit=200").await;
+    assert_eq!(
+        warm_status,
+        StatusCode::OK,
+        "perf test warm-up page must return 200",
+    );
+
+    // Measure wall-clock time for the warmed page render.
     let start = std::time::Instant::now();
     let (status, html) = fetch_html(&app, "/workers?limit=200").await;
     let elapsed = start.elapsed();

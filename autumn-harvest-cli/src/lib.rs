@@ -3523,8 +3523,8 @@ mod reuse_policy_tests {
             "observed_at": "2026-05-06T12:00:00Z",
             "version": {
                 "package": "autumn-harvest-plugin",
-                "version": "0.2.0",
-                "core_version": "0.2.0"
+                "version": "0.3.0",
+                "core_version": "0.3.0"
             },
             "checks": [{
                 "name": "worker_coverage",
@@ -3552,8 +3552,8 @@ mod reuse_policy_tests {
             "observed_at": "2026-05-06T12:00:00Z",
             "version": {
                 "package": "autumn-harvest-plugin",
-                "version": "0.2.0",
-                "core_version": "0.2.0"
+                "version": "0.3.0",
+                "core_version": "0.3.0"
             },
             "checks": []
         });
@@ -3562,7 +3562,7 @@ mod reuse_policy_tests {
 
         assert_eq!(
             rendered,
-            r#"{"checks":[],"observed_at":"2026-05-06T12:00:00Z","overall_status":"pass","version":{"core_version":"0.2.0","package":"autumn-harvest-plugin","version":"0.2.0"}}"#
+            r#"{"checks":[],"observed_at":"2026-05-06T12:00:00Z","overall_status":"pass","version":{"core_version":"0.3.0","package":"autumn-harvest-plugin","version":"0.3.0"}}"#
         );
     }
 

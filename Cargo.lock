@@ -169,7 +169,7 @@ checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
 name = "autumn-harvest"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "autumn-harvest-macros",
  "base64 0.22.1",
@@ -202,7 +202,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-harvest-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "autumn-harvest",
  "clap",
@@ -217,7 +217,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-harvest-macros"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -226,7 +226,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-harvest-plugin"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "autumn-harvest",
  "autumn-web",
@@ -252,7 +252,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-harvest-redis"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "autumn-harvest",
@@ -426,7 +426,7 @@ dependencies = [
 
 [[package]]
 name = "billing-autumn-web"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "autumn-harvest",
  "autumn-harvest-plugin",
@@ -3107,7 +3107,7 @@ checksum = "a1d01941d82fa2ab50be1e79e6714289dd7cde78eba4c074bc5a4374f650dfe0"
 
 [[package]]
 name = "quickstart"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "autumn-harvest",
  "autumn-harvest-plugin",
@@ -3978,7 +3978,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "standalone-runner"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "autumn-harvest",
  "autumn-harvest-plugin",

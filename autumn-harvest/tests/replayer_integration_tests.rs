@@ -49,6 +49,10 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260430000001_harvest_external_tasks/up.sql"),
     "\n",
     include_str!("../migrations/20260508000000_harvest_external_task_updated_at/up.sql"),
+    "\n",
+    include_str!("../migrations/20260501000000_harvest_workers/up.sql"),
+    "\n",
+    include_str!("../migrations/20260509000000_harvest_build_routing/up.sql"),
 );
 
 // ---------------------------------------------------------------------------

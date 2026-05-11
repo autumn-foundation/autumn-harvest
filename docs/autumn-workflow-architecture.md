@@ -5,7 +5,7 @@
 *Version 0.1 — Draft*
 *March 2026*
 
-**Release status note (0.2.0):** DAG scheduling, signals, queries, the
+**Release status note (0.3.0):** DAG scheduling, signals, queries, the
 management API, dead-letter list/replay endpoints, and durable workflow
 cancellation are implemented. Cancellation is currently a terminal workflow
 transition with activity heartbeat checks; workflow-level `ctx.cancelled()`

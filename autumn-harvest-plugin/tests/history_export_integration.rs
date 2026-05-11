@@ -20,7 +20,7 @@ use autumn_harvest_plugin::api::{
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use chrono::{Duration, Utc};
+use chrono::{Duration, SecondsFormat, Utc};
 use diesel::{ExpressionMethods, QueryDsl};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
@@ -531,7 +531,8 @@ async fn batch_updated_window_uses_latest_history_event_timestamp() {
         HarvestDbPool::from(build_test_pool(&database_url)),
         ShardRouter::single(),
     );
-    let updated_after = (recent_event_time - Duration::hours(1)).to_rfc3339();
+    let updated_after =
+        (recent_event_time - Duration::hours(1)).to_rfc3339_opts(SecondsFormat::Millis, true);
     let (status, json) = get_json(
         &app,
         format!(
