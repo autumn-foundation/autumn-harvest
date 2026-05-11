@@ -15,12 +15,17 @@ use axum::Extension;
 use axum::Router;
 use axum::routing::get;
 use chrono::{DateTime, Utc};
+use diesel::dsl::sql;
+use diesel::sql_types::{Bool, Text};
+use diesel::{ExpressionMethods, OptionalExtension, QueryDsl, SelectableHelper};
+use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use maud::{Markup, PreEscaped, html};
 use serde::Deserialize;
 use serde_json::Value;
 
-use autumn_harvest::error::{HarvestError, HarvestResult};
-use autumn_harvest::models::WorkflowExecution;
+use autumn_harvest::error::{HarvestError, HarvestResult, database_error};
+use autumn_harvest::models::{DeadLetter, HarvestEvent, WorkflowExecution};
+use autumn_harvest::schema::{harvest_dead_letters, harvest_events, harvest_workflow_executions};
 use autumn_harvest::store;
 use autumn_harvest::types::ShardId;
 use autumn_harvest::workers::{WorkerFilters, WorkerHealth, WorkerRow, list_workers};
@@ -31,6 +36,7 @@ use crate::api::{
 };
 
 const DEFAULT_PAGE_SIZE: i64 = 25;
+const DEFAULT_DLQ_PAGE_SIZE: i64 = 50;
 const MAX_PAGE_SIZE: i64 = 200;
 
 const KNOWN_STATES: &[&str] = KNOWN_WORKFLOW_STATES;
@@ -56,6 +62,17 @@ h3{font-size:14px;margin:24px 0 8px;color:#cbd5e1;text-transform:uppercase;lette
 .filters button{background:#2563eb;color:#fff;border:0;border-radius:6px;padding:8px 14px;font-size:13px;cursor:pointer;align-self:flex-end;height:32px}
 .filters button:hover{background:#1d4ed8}
 .filters .reset{background:transparent;color:#94a3b8;border:1px solid #334155}
+.actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.actions form{margin:0}
+.actions button{background:#2563eb;color:#fff;border:0;border-radius:6px;padding:6px 10px;font-size:12px;cursor:pointer}
+.actions button:hover{background:#1d4ed8}
+.actions button.danger{background:#991b1b}
+.actions button.danger:hover{background:#7f1d1d}
+.bulk-actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:0 0 16px}
+.bulk-actions form{margin:0}
+.bulk-actions button{background:#2563eb;color:#fff;border:0;border-radius:6px;padding:8px 12px;font-size:13px;cursor:pointer}
+.bulk-actions button.danger{background:#991b1b}
+.bulk-actions button:disabled{background:#334155;color:#64748b;cursor:not-allowed}
 table{width:100%;border-collapse:collapse;background:#1e293b;border-radius:8px;overflow:hidden;font-size:13px}
 th,td{padding:10px 14px;text-align:left;border-bottom:1px solid #334155;vertical-align:top}
 th{background:#0f172a;color:#94a3b8;font-weight:500;text-transform:uppercase;letter-spacing:.05em;font-size:11px}
@@ -78,6 +95,7 @@ td code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;c
 .banner.Healthy{background:#14532d;color:#bbf7d0;border:1px solid #166534}
 .banner.Degraded{background:#431407;color:#fed7aa;border:1px solid #92400e}
 .banner.Unhealthy{background:#450a0a;color:#fecaca;border:1px solid #991b1b}
+.flash{background:#172554;color:#bfdbfe;border:1px solid #1d4ed8;padding:10px 14px;border-radius:6px;margin-bottom:16px;font-size:13px}
 .shard-header{margin:20px 0 8px;font-size:13px;color:#94a3b8;font-weight:600;text-transform:uppercase;letter-spacing:.06em;border-bottom:1px solid #1e293b;padding-bottom:6px}
 .shard-error{background:#1c1917;border:1px solid #57534e;border-radius:6px;padding:12px 16px;color:#a8a29e;font-size:13px;margin-bottom:12px}
 .pagination{display:flex;gap:8px;align-items:center;margin-top:16px;font-size:13px;color:#94a3b8}
@@ -96,6 +114,7 @@ pre{background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:6px;
 .detail-row .back{color:#93c5fd;font-size:13px}
 details{margin-top:8px}
 details summary{cursor:pointer;color:#93c5fd;font-size:12px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+.detail-block{display:grid;gap:10px;margin-top:10px}
 footer{padding:20px 24px;color:#64748b;font-size:12px;text-align:center;border-top:1px solid #1e293b;margin-top:32px}
 "#;
 
@@ -135,11 +154,93 @@ pub(crate) struct WorkerListParams {
     refresh: Option<u64>,
 }
 
+#[derive(Debug, Deserialize)]
+pub(crate) struct DeadLetterListParams {
+    #[serde(default)]
+    page: Option<i64>,
+    #[serde(default)]
+    limit: Option<i64>,
+    #[serde(default)]
+    workflow_name: Option<String>,
+    #[serde(default)]
+    task_kind: Option<String>,
+    #[serde(default)]
+    failed_after: Option<String>,
+    #[serde(default)]
+    failed_before: Option<String>,
+    #[serde(default)]
+    shard_id: Option<i32>,
+    #[serde(default)]
+    refresh: Option<u64>,
+    #[serde(default)]
+    flash: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeadLetterTaskKind {
+    Activity,
+    Workflow,
+}
+
+impl DeadLetterTaskKind {
+    fn parse(raw: &str) -> Result<Self, AutumnError> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "activity" => Ok(Self::Activity),
+            "workflow" => Ok(Self::Workflow),
+            other => Err(AutumnError::bad_request_msg(format!(
+                "unknown task_kind '{other}'; expected Activity or Workflow"
+            ))),
+        }
+    }
+
+    const fn as_db_value(self) -> &'static str {
+        match self {
+            Self::Activity => "ACTIVITY",
+            Self::Workflow => "WORKFLOW",
+        }
+    }
+
+    const fn as_label(self) -> &'static str {
+        match self {
+            Self::Activity => "Activity",
+            Self::Workflow => "Workflow",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct DeadLetterUiFilters {
+    workflow_name: Option<String>,
+    task_kind: Option<DeadLetterTaskKind>,
+    failed_after: Option<DateTime<Utc>>,
+    failed_before: Option<DateTime<Utc>>,
+    shard_id: Option<i32>,
+}
+
+impl DeadLetterUiFilters {
+    const fn is_empty(&self) -> bool {
+        self.workflow_name.is_none()
+            && self.task_kind.is_none()
+            && self.failed_after.is_none()
+            && self.failed_before.is_none()
+            && self.shard_id.is_none()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DeadLetterUiRow {
+    shard_id: ShardId,
+    dead_letter: DeadLetter,
+    workflow_name: Option<String>,
+    events: Vec<HarvestEvent>,
+}
+
 // ---------------------------------------------------------------------------
 // Per-shard query result (Ok = rows, Err = error message)
 // ---------------------------------------------------------------------------
 
 type ShardWorkerResult = (ShardId, Result<Vec<WorkerRow>, String>);
+type ShardDeadLetterResult = (ShardId, Result<Vec<DeadLetterUiRow>, String>);
 
 // ---------------------------------------------------------------------------
 // Internal fleet stats computed from the full unfiltered worker list
@@ -242,6 +343,7 @@ pub fn harvest_ui_router(api_state: HarvestApiState) -> Router<AppState> {
         .route("/workflows", get(list_workflows_ui))
         .route("/workflows/{id}", get(workflow_detail_ui))
         .route("/workers", get(list_workers_ui))
+        .route("/dead-letters", get(list_dead_letters_ui))
         .layer(Extension(api_state))
 }
 
@@ -344,6 +446,270 @@ async fn workflow_detail_ui(
         .map_err(map_error)?;
 
     Ok(render_workflow_detail(&execution, &events))
+}
+
+// ---------------------------------------------------------------------------
+// Dead-letter UI
+// ---------------------------------------------------------------------------
+
+async fn list_dead_letters_ui(
+    Extension(api_state): Extension<HarvestApiState>,
+    Query(params): Query<DeadLetterListParams>,
+) -> Result<Markup, AutumnError> {
+    let limit = params
+        .limit
+        .unwrap_or(DEFAULT_DLQ_PAGE_SIZE)
+        .clamp(1, MAX_PAGE_SIZE);
+    let page = params.page.unwrap_or(0).max(0);
+    let offset = page.saturating_mul(limit);
+    let filters = parse_dead_letter_ui_filters(
+        params.workflow_name.as_deref(),
+        params.task_kind.as_deref(),
+        params.failed_after.as_deref(),
+        params.failed_before.as_deref(),
+        params.shard_id,
+    )?;
+
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    let fetch_limit = offset.saturating_add(limit).saturating_add(1);
+    let shard_results = load_dead_letters_from_shards_for_ui(&pool, &filters, fetch_limit).await;
+    let is_multi_shard = shard_results.len() > 1;
+
+    let mut all_rows: Vec<DeadLetterUiRow> = shard_results
+        .iter()
+        .flat_map(|(_, result)| result.iter().flat_map(|rows| rows.iter().cloned()))
+        .collect();
+    all_rows.sort_by(|left, right| {
+        right
+            .dead_letter
+            .failed_at
+            .cmp(&left.dead_letter.failed_at)
+            .then_with(|| right.dead_letter.id.cmp(&left.dead_letter.id))
+            .then_with(|| left.shard_id.as_i32().cmp(&right.shard_id.as_i32()))
+    });
+
+    let total_matching = count_dead_letters_from_shards_for_ui(&pool, &filters).await;
+    let total_for_pagination = total_matching.unwrap_or(all_rows.len());
+    let offset_usize = usize::try_from(offset).unwrap_or(usize::MAX);
+    let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
+    let has_next = total_for_pagination > offset_usize.saturating_add(limit_usize);
+    let page_rows = all_rows
+        .into_iter()
+        .skip(offset_usize)
+        .take(limit_usize)
+        .collect::<Vec<_>>();
+
+    let shard_errors: Vec<(ShardId, &str)> = shard_results
+        .iter()
+        .filter_map(|(shard_id, result)| result.as_ref().err().map(|e| (*shard_id, e.as_str())))
+        .collect();
+
+    Ok(render_dead_letters_page(
+        &filters,
+        &page_rows,
+        &shard_errors,
+        is_multi_shard,
+        page,
+        limit,
+        has_next,
+        total_for_pagination,
+        params.refresh,
+        params.flash.as_deref(),
+    ))
+}
+
+fn parse_dead_letter_ui_filters(
+    workflow_name: Option<&str>,
+    task_kind: Option<&str>,
+    failed_after: Option<&str>,
+    failed_before: Option<&str>,
+    shard_id: Option<i32>,
+) -> Result<DeadLetterUiFilters, AutumnError> {
+    let workflow_name = workflow_name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let task_kind = task_kind
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(DeadLetterTaskKind::parse)
+        .transpose()?;
+    let failed_after = parse_dead_letter_time_filter("failed_after", failed_after)?;
+    let failed_before = parse_dead_letter_time_filter("failed_before", failed_before)?;
+
+    Ok(DeadLetterUiFilters {
+        workflow_name,
+        task_kind,
+        failed_after,
+        failed_before,
+        shard_id,
+    })
+}
+
+fn parse_dead_letter_time_filter(
+    field: &str,
+    raw: Option<&str>,
+) -> Result<Option<DateTime<Utc>>, AutumnError> {
+    let Some(value) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let parsed = DateTime::parse_from_rfc3339(value)
+        .map_err(|_| {
+            AutumnError::bad_request_msg(format!("invalid {field}; expected RFC 3339 timestamp"))
+        })?
+        .with_timezone(&Utc);
+    Ok(Some(parsed))
+}
+
+async fn load_dead_letters_from_shards_for_ui(
+    pool: &crate::HarvestDbPool,
+    filters: &DeadLetterUiFilters,
+    limit: i64,
+) -> Vec<ShardDeadLetterResult> {
+    let futs: Vec<_> = pool
+        .iter_shards()
+        .map(|(shard_id, shard_pool)| async move {
+            if filters
+                .shard_id
+                .is_some_and(|wanted| wanted != shard_id.as_i32())
+            {
+                return (shard_id, Ok(Vec::new()));
+            }
+            let result = async {
+                let mut conn = acquire_conn(shard_pool).await.map_err(|e| e.to_string())?;
+                let rows = query_dead_letters_for_ui(&mut conn, filters, limit)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let mut out = Vec::with_capacity(rows.len());
+                for dead_letter in rows {
+                    let workflow_name = load_dead_letter_workflow_name(&mut conn, &dead_letter)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    let events = load_dead_letter_events(&mut conn, &dead_letter)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    out.push(DeadLetterUiRow {
+                        shard_id,
+                        dead_letter,
+                        workflow_name,
+                        events,
+                    });
+                }
+                Ok(out)
+            }
+            .await;
+            (shard_id, result)
+        })
+        .collect();
+    futures::future::join_all(futs).await
+}
+
+async fn count_dead_letters_from_shards_for_ui(
+    pool: &crate::HarvestDbPool,
+    filters: &DeadLetterUiFilters,
+) -> Result<usize, String> {
+    let futs: Vec<_> = pool
+        .iter_shards()
+        .map(|(shard_id, shard_pool)| async move {
+            if filters
+                .shard_id
+                .is_some_and(|wanted| wanted != shard_id.as_i32())
+            {
+                return Ok(0usize);
+            }
+            let mut conn = acquire_conn(shard_pool).await.map_err(|e| e.to_string())?;
+            count_dead_letters_for_ui(&mut conn, filters)
+                .await
+                .map(|count| usize::try_from(count).unwrap_or(0))
+                .map_err(|e| e.to_string())
+        })
+        .collect();
+    let counts = futures::future::join_all(futs).await;
+    counts.into_iter().try_fold(0usize, |acc, count| {
+        count.map(|count| acc.saturating_add(count))
+    })
+}
+
+macro_rules! apply_dead_letter_ui_filters {
+    ($query:ident, $filters:expr) => {
+        if let Some(ref workflow_name) = $filters.workflow_name {
+            $query = $query.filter(
+                sql::<Bool>("workflow_exec_id IN (SELECT id FROM harvest_workflow_executions WHERE workflow_name = ")
+                    .bind::<Text, _>(workflow_name.clone())
+                    .sql(")"),
+            );
+        }
+        if let Some(task_kind) = $filters.task_kind {
+            $query = $query.filter(harvest_dead_letters::task_type.eq(task_kind.as_db_value()));
+        }
+        if let Some(failed_after) = $filters.failed_after {
+            $query = $query.filter(harvest_dead_letters::failed_at.ge(failed_after));
+        }
+        if let Some(failed_before) = $filters.failed_before {
+            $query = $query.filter(harvest_dead_letters::failed_at.lt(failed_before));
+        }
+    };
+}
+
+async fn query_dead_letters_for_ui(
+    conn: &mut AsyncPgConnection,
+    filters: &DeadLetterUiFilters,
+    limit: i64,
+) -> HarvestResult<Vec<DeadLetter>> {
+    let mut query = harvest_dead_letters::table
+        .into_boxed()
+        .order(harvest_dead_letters::failed_at.desc())
+        .limit(limit);
+    apply_dead_letter_ui_filters!(query, filters);
+    query
+        .select(DeadLetter::as_select())
+        .load(conn)
+        .await
+        .map_err(database_error)
+}
+
+async fn count_dead_letters_for_ui(
+    conn: &mut AsyncPgConnection,
+    filters: &DeadLetterUiFilters,
+) -> HarvestResult<i64> {
+    let mut query = harvest_dead_letters::table.into_boxed();
+    apply_dead_letter_ui_filters!(query, filters);
+    query.count().get_result(conn).await.map_err(database_error)
+}
+
+async fn load_dead_letter_workflow_name(
+    conn: &mut AsyncPgConnection,
+    dead_letter: &DeadLetter,
+) -> HarvestResult<Option<String>> {
+    let Some(exec_id) = dead_letter.workflow_exec_id else {
+        return Ok(None);
+    };
+    harvest_workflow_executions::table
+        .find(exec_id)
+        .select(harvest_workflow_executions::workflow_name)
+        .first(conn)
+        .await
+        .optional()
+        .map_err(database_error)
+}
+
+async fn load_dead_letter_events(
+    conn: &mut AsyncPgConnection,
+    dead_letter: &DeadLetter,
+) -> HarvestResult<Vec<HarvestEvent>> {
+    let Some(exec_id) = dead_letter.workflow_exec_id else {
+        return Ok(Vec::new());
+    };
+    let mut events = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq(exec_id))
+        .order(harvest_events::event_id.desc())
+        .limit(10)
+        .select(HarvestEvent::as_select())
+        .load(conn)
+        .await
+        .map_err(database_error)?;
+    events.reverse();
+    Ok(events)
 }
 
 // ---------------------------------------------------------------------------
@@ -497,6 +863,423 @@ async fn load_workers_from_shards(
         })
         .collect();
     futures::future::join_all(futs).await
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_dead_letters_page(
+    filters: &DeadLetterUiFilters,
+    rows: &[DeadLetterUiRow],
+    shard_errors: &[(ShardId, &str)],
+    is_multi_shard: bool,
+    page: i64,
+    limit: i64,
+    has_next: bool,
+    total_matching: usize,
+    refresh: Option<u64>,
+    flash: Option<&str>,
+) -> Markup {
+    let body = html! {
+        h2 { "Dead Letters" }
+        @if let Some(message) = flash {
+            div.flash { (message) }
+        }
+        (render_dead_letter_filters(filters, limit, refresh))
+        (render_dead_letter_bulk_actions(filters, limit, refresh, total_matching))
+
+        @if rows.is_empty() && shard_errors.is_empty() {
+            div.card.empty {
+                @if filters.is_empty() {
+                    "No dead-lettered tasks. Healthy."
+                } @else {
+                    "No entries match this filter."
+                }
+            }
+        } @else {
+            @for (shard_id, error) in shard_errors {
+                div.shard-error {
+                    @if is_multi_shard {
+                        strong { "Shard " (shard_id.as_i32()) " unavailable: " }
+                    } @else {
+                        strong { "Shard unavailable: " }
+                    }
+                    (error)
+                }
+            }
+
+            (render_dead_letter_table(rows, filters, limit, refresh))
+        }
+
+        (render_dead_letter_pagination(page, limit, has_next, filters, refresh))
+    };
+
+    layout_dead_letters("Dead Letters · Vantage", &body, refresh)
+}
+
+fn render_dead_letter_filters(
+    filters: &DeadLetterUiFilters,
+    limit: i64,
+    refresh: Option<u64>,
+) -> Markup {
+    let workflow_name = filters.workflow_name.as_deref().unwrap_or("");
+    let task_kind = filters.task_kind.map(DeadLetterTaskKind::as_label);
+    let failed_after = filters
+        .failed_after
+        .map(|ts| ts.to_rfc3339())
+        .unwrap_or_default();
+    let failed_before = filters
+        .failed_before
+        .map(|ts| ts.to_rfc3339())
+        .unwrap_or_default();
+    let shard_id = filters
+        .shard_id
+        .map(|id| id.to_string())
+        .unwrap_or_default();
+    let refresh_value = refresh.map(|secs| secs.to_string()).unwrap_or_default();
+
+    html! {
+        form.filters method="get" action="dead-letters" {
+            label {
+                "Workflow name"
+                input type="text" name="workflow_name" value=(workflow_name) placeholder="e.g. invoice_workflow";
+            }
+            label {
+                "Task kind"
+                select name="task_kind" {
+                    option value="" selected[task_kind.is_none()] { "All" }
+                    option value="Activity" selected[task_kind == Some("Activity")] { "Activity" }
+                    option value="Workflow" selected[task_kind == Some("Workflow")] { "Workflow" }
+                }
+            }
+            label {
+                "Failed after"
+                input type="text" name="failed_after" value=(failed_after) placeholder="2026-05-10T00:00:00Z";
+            }
+            label {
+                "Failed before"
+                input type="text" name="failed_before" value=(failed_before) placeholder="2026-05-11T00:00:00Z";
+            }
+            label {
+                "Shard"
+                input type="number" name="shard_id" value=(shard_id) placeholder="e.g. 0";
+            }
+            label {
+                "Per page"
+                input type="number" name="limit" min="1" max=(MAX_PAGE_SIZE) value=(limit);
+            }
+            label {
+                "Refresh"
+                select name="refresh" {
+                    option value="" selected[refresh.is_none()] { "Off" }
+                    option value="30" selected[refresh == Some(30)] { "30s" }
+                    option value="60" selected[refresh == Some(60)] { "60s" }
+                    @if refresh.is_some_and(|secs| secs != 30 && secs != 60) {
+                        option value=(refresh_value) selected { (refresh_value) "s" }
+                    }
+                }
+            }
+            button type="submit" { "Apply" }
+            a.reset href="dead-letters" { "Reset" }
+        }
+    }
+}
+
+fn render_dead_letter_bulk_actions(
+    filters: &DeadLetterUiFilters,
+    limit: i64,
+    refresh: Option<u64>,
+    total_matching: usize,
+) -> Markup {
+    let return_to = dead_letter_return_to_path(filters, limit, refresh);
+    let replay_confirm = format!("Replay {total_matching} matching dead-letter entries?");
+    let discard_confirm = format!("Discard {total_matching} matching dead-letter entries?");
+    html! {
+        div."bulk-actions" {
+            form method="post" action="../dead-letters/replay" onsubmit={ "return confirm('" (replay_confirm) "')" } {
+                (render_dead_letter_hidden_filters(filters))
+                input type="hidden" name="return_to" value=(return_to);
+                button type="submit" disabled[total_matching == 0 || filters.is_empty()] {
+                    "Replay all matching (" (total_matching) ")"
+                }
+            }
+            form method="post" action="../dead-letters/discard" onsubmit={ "return confirm('" (discard_confirm) "')" } {
+                (render_dead_letter_hidden_filters(filters))
+                input type="hidden" name="return_to" value=(return_to);
+                button.danger type="submit" disabled[total_matching == 0 || filters.is_empty()] {
+                    "Discard all matching (" (total_matching) ")"
+                }
+            }
+        }
+    }
+}
+
+fn render_dead_letter_table(
+    rows: &[DeadLetterUiRow],
+    filters: &DeadLetterUiFilters,
+    limit: i64,
+    refresh: Option<u64>,
+) -> Markup {
+    let return_to = dead_letter_return_to_path(filters, limit, refresh);
+    html! {
+        table {
+            thead {
+                tr {
+                    th { "dead_letter_id" }
+                    th { "workflow_name" }
+                    th { "workflow_exec_id" }
+                    th { "task_kind" }
+                    th { "attempt" }
+                    th { "failed_at" }
+                    th { "error_message" }
+                    th { "shard_id" }
+                    th { "actions" }
+                }
+            }
+            tbody {
+                @for row in rows {
+                    @let id = row.dead_letter.id.to_string();
+                    @let workflow_name = row.workflow_name.as_deref().unwrap_or("unknown");
+                    @let task_kind = dead_letter_task_kind_label(&row.dead_letter.task_type);
+                    tr {
+                        td { code { (id) } }
+                        td { (workflow_name) }
+                        td {
+                            @if let Some(exec_id) = row.dead_letter.workflow_exec_id {
+                                @let exec = exec_id.to_string();
+                                a href={ "workflows/" (exec) } { code { (exec) } }
+                            } @else {
+                                "—"
+                            }
+                        }
+                        td { (task_kind) }
+                        td { (row.dead_letter.attempts) }
+                        td { (format_timestamp(Some(row.dead_letter.failed_at))) }
+                        td {
+                            (truncate_error(&row.dead_letter.error))
+                            (render_dead_letter_detail(row))
+                        }
+                        td { (row.shard_id.as_i32()) }
+                        td {
+                            div.actions {
+                                form method="post" action="../dead-letters/replay" onsubmit="return confirm('Replay this dead-letter entry?')" {
+                                    input type="hidden" name="dead_letter_id" value=(id);
+                                    input type="hidden" name="return_to" value=(return_to);
+                                    button type="submit" { "Replay" }
+                                }
+                                form method="post" action="../dead-letters/discard" onsubmit="return confirm('Discard this dead-letter entry?')" {
+                                    input type="hidden" name="dead_letter_id" value=(id);
+                                    input type="hidden" name="return_to" value=(return_to);
+                                    button.danger type="submit" { "Discard" }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn render_dead_letter_detail(row: &DeadLetterUiRow) -> Markup {
+    html! {
+        details {
+            summary { "details" }
+            div."detail-block" {
+                div {
+                    h3 { "Full error" }
+                    pre { (row.dead_letter.error) }
+                }
+                div {
+                    h3 { "Original payload" }
+                    pre { (pretty_json(&row.dead_letter.input)) }
+                }
+                div {
+                    h3 { "Last 10 events" }
+                    @if row.events.is_empty() {
+                        div.empty { "No workflow events found." }
+                    } @else {
+                        table {
+                            thead {
+                                tr {
+                                    th { "#" }
+                                    th { "Type" }
+                                    th { "Timestamp" }
+                                    th { "Data" }
+                                }
+                            }
+                            tbody {
+                                @for event in &row.events {
+                                    tr {
+                                        td { (event.event_id) }
+                                        td { code { (event.event_type) } }
+                                        td { (format_timestamp(Some(event.timestamp))) }
+                                        td { pre { (pretty_json(&event.event_data)) } }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn render_dead_letter_hidden_filters(filters: &DeadLetterUiFilters) -> Markup {
+    let task_kind = filters.task_kind.map(DeadLetterTaskKind::as_label);
+    let failed_after = filters.failed_after.map(|ts| ts.to_rfc3339());
+    let failed_before = filters.failed_before.map(|ts| ts.to_rfc3339());
+    html! {
+        @if let Some(workflow_name) = filters.workflow_name.as_deref() {
+            input type="hidden" name="workflow_name" value=(workflow_name);
+        }
+        @if let Some(task_kind) = task_kind {
+            input type="hidden" name="task_kind" value=(task_kind);
+        }
+        @if let Some(failed_after) = failed_after.as_deref() {
+            input type="hidden" name="failed_after" value=(failed_after);
+        }
+        @if let Some(failed_before) = failed_before.as_deref() {
+            input type="hidden" name="failed_before" value=(failed_before);
+        }
+        @if let Some(shard_id) = filters.shard_id {
+            input type="hidden" name="shard_id" value=(shard_id);
+        }
+    }
+}
+
+fn render_dead_letter_pagination(
+    page: i64,
+    limit: i64,
+    has_next: bool,
+    filters: &DeadLetterUiFilters,
+    refresh: Option<u64>,
+) -> Markup {
+    let base = build_dead_letter_query_string(limit, filters, refresh);
+    html! {
+        div.pagination {
+            @if page > 0 {
+                a href={ "dead-letters?page=" (page - 1) (PreEscaped(&base)) } {
+                    (PreEscaped("&larr;")) " Previous"
+                }
+            } @else {
+                span.disabled { (PreEscaped("&larr;")) " Previous" }
+            }
+
+            span { "Page " (page + 1) }
+
+            @if has_next {
+                a href={ "dead-letters?page=" (page + 1) (PreEscaped(&base)) } {
+                    "Next " (PreEscaped("&rarr;"))
+                }
+            } @else {
+                span.disabled { "Next " (PreEscaped("&rarr;")) }
+            }
+        }
+    }
+}
+
+fn build_dead_letter_query_string(
+    limit: i64,
+    filters: &DeadLetterUiFilters,
+    refresh: Option<u64>,
+) -> String {
+    let mut out = String::new();
+    if limit != DEFAULT_DLQ_PAGE_SIZE {
+        let _ = write!(out, "&limit={limit}");
+    }
+    if let Some(workflow_name) = filters.workflow_name.as_deref() {
+        let _ = write!(out, "&workflow_name={}", url_encode(workflow_name));
+    }
+    if let Some(task_kind) = filters.task_kind {
+        let _ = write!(out, "&task_kind={}", task_kind.as_label());
+    }
+    if let Some(failed_after) = filters.failed_after {
+        let _ = write!(
+            out,
+            "&failed_after={}",
+            url_encode(&failed_after.to_rfc3339())
+        );
+    }
+    if let Some(failed_before) = filters.failed_before {
+        let _ = write!(
+            out,
+            "&failed_before={}",
+            url_encode(&failed_before.to_rfc3339())
+        );
+    }
+    if let Some(shard_id) = filters.shard_id {
+        let _ = write!(out, "&shard_id={shard_id}");
+    }
+    if let Some(refresh) = refresh {
+        let _ = write!(out, "&refresh={refresh}");
+    }
+    out
+}
+
+fn dead_letter_return_to_path(
+    filters: &DeadLetterUiFilters,
+    limit: i64,
+    refresh: Option<u64>,
+) -> String {
+    let query = build_dead_letter_query_string(limit, filters, refresh);
+    if query.is_empty() {
+        "ui/dead-letters".to_string()
+    } else {
+        format!("ui/dead-letters?{}", &query[1..])
+    }
+}
+
+fn dead_letter_task_kind_label(task_type: &str) -> &'static str {
+    if task_type.eq_ignore_ascii_case("activity") {
+        "Activity"
+    } else if task_type.eq_ignore_ascii_case("workflow") {
+        "Workflow"
+    } else {
+        "Unknown"
+    }
+}
+
+fn truncate_error(error: &str) -> String {
+    const LIMIT: usize = 96;
+    let mut chars = error.chars();
+    let truncated = chars.by_ref().take(LIMIT).collect::<String>();
+    if chars.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
+}
+
+fn layout_dead_letters(title: &str, body: &Markup, refresh: Option<u64>) -> Markup {
+    html! {
+        (PreEscaped("<!DOCTYPE html>"))
+        html lang="en" {
+            head {
+                meta charset="utf-8";
+                meta name="viewport" content="width=device-width,initial-scale=1";
+                @if let Some(secs) = refresh {
+                    meta http-equiv="refresh" content=(secs);
+                }
+                title { (title) }
+                style { (PreEscaped(STYLE)) }
+            }
+            body {
+                header {
+                    h1 {
+                        a href="workflows" { "ðŸ”­ Vantage" }
+                        span.subtitle { "Harvest dashboard" }
+                    }
+                    nav {
+                        a href="workflows" { "Workflows" }
+                        a href="workers" { "Workers" }
+                        a.active href="dead-letters" { "Dead Letters" }
+                    }
+                }
+                main { (body) }
+                footer { "Operational dashboard â€” autumn-harvest" }
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -764,6 +1547,7 @@ fn layout_workers(title: &str, body: &Markup, refresh: Option<u64>) -> Markup {
                     nav {
                         a href="workflows" { "Workflows" }
                         a.active href="workers" { "Workers" }
+                        a href="dead-letters" { "Dead Letters" }
                     }
                 }
                 main { (body) }
@@ -1107,6 +1891,7 @@ fn layout(title: &str, body: &Markup, base_href: &str) -> Markup {
                     nav {
                         a.active href={ (base_href) "workflows" } { "Workflows" }
                         a href={ (base_href) "workers" } { "Workers" }
+                        a href={ (base_href) "dead-letters" } { "Dead Letters" }
                     }
                 }
                 main { (body) }

@@ -2,6 +2,7 @@
 #![allow(clippy::literal_string_with_formatting_args)]
 
 use std::collections::{BTreeMap, HashSet};
+use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -63,8 +64,9 @@ use autumn_harvest::scheduler::{
     scheduled_workflow_id_pub, trigger_dag,
 };
 use autumn_harvest::schema::{
-    harvest_backfill_log, harvest_dag_runs, harvest_events, harvest_schedules, harvest_signals,
-    harvest_task_queue, harvest_timers, harvest_workflow_executions,
+    harvest_backfill_log, harvest_dag_runs, harvest_dead_letters, harvest_events,
+    harvest_schedules, harvest_signals, harvest_task_queue, harvest_timers,
+    harvest_workflow_executions,
 };
 use autumn_harvest::shard::ShardRouter;
 use autumn_harvest::signal;
@@ -5332,17 +5334,365 @@ async fn replay_dead_letter(
     }
 }
 
+struct ParsedBulkDlqRequest {
+    selector: DlqBulkSelector,
+    return_to: Option<String>,
+    wants_redirect: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct DlqBulkSelector {
+    filter: dlq::BulkDlqFilter,
+    dead_letter_id: Option<uuid::Uuid>,
+    task_type: Option<String>,
+    shard_id: Option<i32>,
+}
+
+impl DlqBulkSelector {
+    const fn is_empty(&self) -> bool {
+        self.filter.is_empty()
+            && self.dead_letter_id.is_none()
+            && self.task_type.is_none()
+            && self.shard_id.is_none()
+    }
+
+    const fn dry_run(&self) -> bool {
+        self.filter.dry_run
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct BulkDlqApiBody {
+    #[serde(default)]
+    dead_letter_id: Option<uuid::Uuid>,
+    #[serde(default)]
+    activity_name: Option<String>,
+    #[serde(default)]
+    workflow_name: Option<String>,
+    #[serde(default, alias = "task_kind")]
+    task_type: Option<String>,
+    #[serde(default)]
+    failed_after: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    failed_before: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    shard_id: Option<i32>,
+    #[serde(default)]
+    limit: Option<u32>,
+    #[serde(default)]
+    dry_run: bool,
+}
+
+impl BulkDlqApiBody {
+    fn into_selector(self) -> Result<DlqBulkSelector, AutumnError> {
+        let task_type = self
+            .task_type
+            .as_deref()
+            .map(parse_dlq_task_type_filter)
+            .transpose()?;
+        Ok(DlqBulkSelector {
+            filter: dlq::BulkDlqFilter {
+                activity_name: self.activity_name,
+                workflow_name: self.workflow_name,
+                failed_after: self.failed_after,
+                failed_before: self.failed_before,
+                limit: self.limit,
+                dry_run: self.dry_run,
+            },
+            dead_letter_id: self.dead_letter_id,
+            task_type,
+            shard_id: self.shard_id,
+        })
+    }
+}
+
+fn parse_bulk_dlq_request(
+    headers: &axum::http::HeaderMap,
+    body: &[u8],
+) -> Result<ParsedBulkDlqRequest, AutumnError> {
+    if is_form_urlencoded(headers) {
+        parse_bulk_dlq_form(body)
+    } else {
+        let body = serde_json::from_slice::<BulkDlqApiBody>(body)
+            .map_err(|e| AutumnError::bad_request_msg(format!("invalid JSON body: {e}")))?;
+        Ok(ParsedBulkDlqRequest {
+            selector: body.into_selector()?,
+            return_to: None,
+            wants_redirect: false,
+        })
+    }
+}
+
+fn is_form_urlencoded(headers: &axum::http::HeaderMap) -> bool {
+    headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|mime| {
+            mime.trim()
+                .eq_ignore_ascii_case("application/x-www-form-urlencoded")
+        })
+}
+
+fn parse_bulk_dlq_form(body: &[u8]) -> Result<ParsedBulkDlqRequest, AutumnError> {
+    let raw = std::str::from_utf8(body)
+        .map_err(|_| AutumnError::bad_request_msg("form body must be valid UTF-8"))?;
+    let mut selector = DlqBulkSelector::default();
+    let mut return_to = None;
+
+    for (key, value) in parse_urlencoded_form(raw)? {
+        let field = key.trim();
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        match field {
+            "dead_letter_id" => {
+                selector.dead_letter_id = Some(parse_uuid(value, "dead_letter_id")?);
+            }
+            "activity_name" => selector.filter.activity_name = Some(value.to_string()),
+            "workflow_name" => selector.filter.workflow_name = Some(value.to_string()),
+            "task_kind" | "task_type" => {
+                selector.task_type = Some(parse_dlq_task_type_filter(value)?);
+            }
+            "failed_after" => {
+                selector.filter.failed_after = Some(parse_utc_datetime(value, "failed_after")?);
+            }
+            "failed_before" => {
+                selector.filter.failed_before = Some(parse_utc_datetime(value, "failed_before")?);
+            }
+            "limit" => selector.filter.limit = Some(parse_u32_field(value, "limit")?),
+            "dry_run" => selector.filter.dry_run = parse_bool_field(value, "dry_run")?,
+            "shard_id" => selector.shard_id = Some(parse_i32_field(value, "shard_id")?),
+            "return_to" => return_to = Some(value.to_string()),
+            _ => {}
+        }
+    }
+
+    Ok(ParsedBulkDlqRequest {
+        selector,
+        return_to,
+        wants_redirect: true,
+    })
+}
+
+fn parse_urlencoded_form(raw: &str) -> Result<Vec<(String, String)>, AutumnError> {
+    raw.split('&')
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let (key, value) = part.split_once('=').unwrap_or((part, ""));
+            Ok((decode_form_component(key)?, decode_form_component(value)?))
+        })
+        .collect()
+}
+
+fn decode_form_component(input: &str) -> Result<String, AutumnError> {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                out.push(b' ');
+                index += 1;
+            }
+            b'%' => {
+                if index + 2 >= bytes.len() {
+                    return Err(AutumnError::bad_request_msg(
+                        "invalid percent-encoded form component",
+                    ));
+                }
+                let high = hex_value(bytes[index + 1]).ok_or_else(|| {
+                    AutumnError::bad_request_msg("invalid percent-encoded form component")
+                })?;
+                let low = hex_value(bytes[index + 2]).ok_or_else(|| {
+                    AutumnError::bad_request_msg("invalid percent-encoded form component")
+                })?;
+                out.push((high << 4) | low);
+                index += 3;
+            }
+            byte => {
+                out.push(byte);
+                index += 1;
+            }
+        }
+    }
+
+    String::from_utf8(out)
+        .map_err(|_| AutumnError::bad_request_msg("form component must be valid UTF-8"))
+}
+
+const fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn parse_dlq_task_type_filter(value: &str) -> Result<String, AutumnError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "activity" => Ok("ACTIVITY".to_string()),
+        "workflow" => Ok("WORKFLOW".to_string()),
+        other => Err(AutumnError::bad_request_msg(format!(
+            "unknown task_type '{other}'; expected Activity or Workflow"
+        ))),
+    }
+}
+
+fn parse_utc_datetime(
+    value: &str,
+    field: &str,
+) -> Result<chrono::DateTime<chrono::Utc>, AutumnError> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .map_err(|_| {
+            AutumnError::bad_request_msg(format!("invalid {field}; expected RFC 3339 timestamp"))
+        })
+}
+
+fn parse_u32_field(value: &str, field: &str) -> Result<u32, AutumnError> {
+    value.parse::<u32>().map_err(|_| {
+        AutumnError::bad_request_msg(format!("invalid {field}; expected unsigned integer"))
+    })
+}
+
+fn parse_i32_field(value: &str, field: &str) -> Result<i32, AutumnError> {
+    value
+        .parse::<i32>()
+        .map_err(|_| AutumnError::bad_request_msg(format!("invalid {field}; expected integer")))
+}
+
+fn parse_bool_field(value: &str, field: &str) -> Result<bool, AutumnError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Ok(true),
+        "false" | "0" | "no" | "off" => Ok(false),
+        _ => Err(AutumnError::bad_request_msg(format!(
+            "invalid {field}; expected boolean"
+        ))),
+    }
+}
+
+fn dlq_bulk_empty_filter_response(request: &ParsedBulkDlqRequest) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+
+    const MESSAGE: &str = "bulk filter must specify at least one criterion: dead_letter_id, \
+                           activity_name, workflow_name, task_type, failed_after, failed_before, \
+                           or shard_id";
+
+    if request.wants_redirect {
+        return dlq_form_redirect(request.return_to.as_deref(), MESSAGE);
+    }
+
+    (
+        axum::http::StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({ "error": MESSAGE })),
+    )
+        .into_response()
+}
+
+fn dlq_bulk_flash(result: &dlq::BulkDlqResult, verb: &str) -> String {
+    if result.failures.is_empty() {
+        format!(
+            "{} dead-letter entr{} {verb}",
+            result.acted_on,
+            if result.acted_on == 1 { "y" } else { "ies" }
+        )
+    } else {
+        format!(
+            "{} dead-letter entries {verb}; {} failures",
+            result.acted_on,
+            result.failures.len()
+        )
+    }
+}
+
+struct DlqBulkAuditContext<'a> {
+    actor: &'a str,
+    source: &'a str,
+    request_id: Option<&'a str>,
+    operation: &'static str,
+    route: &'static str,
+    target_id: Option<&'a str>,
+    shard_id: Option<i32>,
+}
+
+async fn insert_dlq_bulk_audit(
+    api_state: &HarvestApiState,
+    context: &DlqBulkAuditContext<'_>,
+    status: &str,
+    error_summary: Option<&str>,
+) -> Result<(), AutumnError> {
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    let mut conn = acquire_conn(pool.default_pool()).await?;
+    let ar = NewAuditRecord {
+        actor: context.actor,
+        operation: context.operation,
+        target_type: TARGET_DEAD_LETTER,
+        target_id: context.target_id,
+        route_or_command: context.route,
+        request_id: context.request_id,
+        idempotency_key: None,
+        status,
+        error_summary,
+        shard_id: context.shard_id,
+        source: context.source,
+    };
+    audit::insert_audit(&mut conn, &ar)
+        .await
+        .map(|_| ())
+        .map_err(map_error)
+}
+
+fn dlq_form_redirect(return_to: Option<&str>, flash: &str) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+
+    axum::response::Redirect::to(&dlq_redirect_location(return_to, flash)).into_response()
+}
+
+fn dlq_redirect_location(return_to: Option<&str>, flash: &str) -> String {
+    let base = return_to
+        .map(str::trim)
+        .filter(|value| {
+            value.starts_with("ui/dead-letters")
+                || value.starts_with("/api/harvest/ui/dead-letters")
+        })
+        .unwrap_or("ui/dead-letters");
+    let separator = if base.contains('?') { '&' } else { '?' };
+    format!("{base}{separator}flash={}", url_encode_for_redirect(flash))
+}
+
+fn url_encode_for_redirect(input: &str) -> String {
+    let mut out = String::new();
+    for byte in input.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(char::from(byte));
+        } else {
+            let _ = write!(out, "%{byte:02X}");
+        }
+    }
+    out
+}
+
 async fn bulk_replay_dead_letters_handler(
     Extension(api_state): Extension<HarvestApiState>,
     headers: axum::http::HeaderMap,
-    Json(filter): Json<dlq::BulkDlqFilter>,
+    body: axum::body::Bytes,
 ) -> axum::response::Response {
     use axum::response::IntoResponse as _;
 
-    let (actor, source, request_id) = audit_context(&headers, &api_state);
+    let request = match parse_bulk_dlq_request(&headers, &body) {
+        Ok(request) => request,
+        Err(error) => return error.into_response(),
+    };
+    let (actor, mut source, request_id) = audit_context(&headers, &api_state);
+    if request.wants_redirect && source == SOURCE_API {
+        source = "ui".to_string();
+    }
     let route = "POST /dead-letters/replay";
 
-    if filter.is_empty() {
+    if request.selector.is_empty() {
         dlq_bulk_audit_reject_empty_filter(
             &api_state,
             &actor,
@@ -5352,30 +5702,38 @@ async fn bulk_replay_dead_letters_handler(
             route,
         )
         .await;
-        return (
-            axum::http::StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "bulk filter must specify at least one criterion: \
-                          activity_name, workflow_name, failed_after, or failed_before"
-            })),
-        )
-            .into_response();
+        return dlq_bulk_empty_filter_response(&request);
     }
 
     // Dry-run previews are read-only: no audit record needed.
-    if filter.dry_run {
-        return match bulk_replay_from_shards(&api_state, &filter).await {
-            Ok(result) => (axum::http::StatusCode::OK, Json(result)).into_response(),
+    if request.selector.dry_run() {
+        return match bulk_replay_from_shards(&api_state, &request.selector).await {
+            Ok(result) => {
+                if request.wants_redirect {
+                    dlq_form_redirect(
+                        request.return_to.as_deref(),
+                        &dlq_bulk_flash(&result, "previewed"),
+                    )
+                } else {
+                    (axum::http::StatusCode::OK, Json(result)).into_response()
+                }
+            }
             Err(e) => map_error(e).into_response(),
         };
     }
 
-    let replay_result = bulk_replay_from_shards(&api_state, &filter).await;
-    let pool = match api_state.storage_pool() {
-        Ok(p) => p,
-        Err(e) => return map_error(e).into_response(),
+    let target_id = request.selector.dead_letter_id.map(|id| id.to_string());
+    let shard_id = request.selector.shard_id;
+    let replay_result = bulk_replay_from_shards(&api_state, &request.selector).await;
+    let audit_context = DlqBulkAuditContext {
+        actor: &actor,
+        source: &source,
+        request_id: request_id.as_deref(),
+        operation: OP_DLQ_REPLAY_BULK,
+        route,
+        target_id: target_id.as_deref(),
+        shard_id,
     };
-    let audit_conn = acquire_conn(pool.default_pool()).await;
 
     match replay_result {
         Ok(result) => {
@@ -5392,47 +5750,34 @@ async fn bulk_replay_dead_letters_handler(
                     Some(format!("{} failures", result.failures.len())),
                 )
             };
-            match audit_conn {
-                Ok(mut conn) => {
-                    let ar = NewAuditRecord {
-                        actor: &actor,
-                        operation: OP_DLQ_REPLAY_BULK,
-                        target_type: TARGET_DEAD_LETTER,
-                        target_id: None,
-                        route_or_command: route,
-                        request_id: request_id.as_deref(),
-                        idempotency_key: None,
-                        status: audit_status,
-                        error_summary: audit_error.as_deref(),
-                        shard_id: None,
-                        source: &source,
-                    };
-                    if let Err(e) = audit::insert_audit(&mut conn, &ar).await {
-                        return map_error(e).into_response();
-                    }
-                }
-                Err(e) => return e.into_response(),
+            if let Err(error) = insert_dlq_bulk_audit(
+                &api_state,
+                &audit_context,
+                audit_status,
+                audit_error.as_deref(),
+            )
+            .await
+            {
+                return error.into_response();
             }
-            (status, Json(result)).into_response()
+            if request.wants_redirect {
+                dlq_form_redirect(
+                    request.return_to.as_deref(),
+                    &dlq_bulk_flash(&result, "replayed"),
+                )
+            } else {
+                (status, Json(result)).into_response()
+            }
         }
         Err(e) => {
             let err_str = e.to_string();
-            if let Ok(mut conn) = audit_conn {
-                let ar = NewAuditRecord {
-                    actor: &actor,
-                    operation: OP_DLQ_REPLAY_BULK,
-                    target_type: TARGET_DEAD_LETTER,
-                    target_id: None,
-                    route_or_command: route,
-                    request_id: request_id.as_deref(),
-                    idempotency_key: None,
-                    status: STATUS_FAILED,
-                    error_summary: Some(err_str.as_str()),
-                    shard_id: None,
-                    source: &source,
-                };
-                let _ = audit::insert_audit(&mut conn, &ar).await;
-            }
+            let _ = insert_dlq_bulk_audit(
+                &api_state,
+                &audit_context,
+                STATUS_FAILED,
+                Some(err_str.as_str()),
+            )
+            .await;
             map_error(e).into_response()
         }
     }
@@ -5441,14 +5786,21 @@ async fn bulk_replay_dead_letters_handler(
 async fn bulk_discard_dead_letters_handler(
     Extension(api_state): Extension<HarvestApiState>,
     headers: axum::http::HeaderMap,
-    Json(filter): Json<dlq::BulkDlqFilter>,
+    body: axum::body::Bytes,
 ) -> axum::response::Response {
     use axum::response::IntoResponse as _;
 
-    let (actor, source, request_id) = audit_context(&headers, &api_state);
+    let request = match parse_bulk_dlq_request(&headers, &body) {
+        Ok(request) => request,
+        Err(error) => return error.into_response(),
+    };
+    let (actor, mut source, request_id) = audit_context(&headers, &api_state);
+    if request.wants_redirect && source == SOURCE_API {
+        source = "ui".to_string();
+    }
     let route = "POST /dead-letters/discard";
 
-    if filter.is_empty() {
+    if request.selector.is_empty() {
         dlq_bulk_audit_reject_empty_filter(
             &api_state,
             &actor,
@@ -5458,30 +5810,38 @@ async fn bulk_discard_dead_letters_handler(
             route,
         )
         .await;
-        return (
-            axum::http::StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "bulk filter must specify at least one criterion: \
-                          activity_name, workflow_name, failed_after, or failed_before"
-            })),
-        )
-            .into_response();
+        return dlq_bulk_empty_filter_response(&request);
     }
 
     // Dry-run previews are read-only: no audit record needed.
-    if filter.dry_run {
-        return match bulk_discard_from_shards(&api_state, &filter).await {
-            Ok(result) => (axum::http::StatusCode::OK, Json(result)).into_response(),
+    if request.selector.dry_run() {
+        return match bulk_discard_from_shards(&api_state, &request.selector).await {
+            Ok(result) => {
+                if request.wants_redirect {
+                    dlq_form_redirect(
+                        request.return_to.as_deref(),
+                        &dlq_bulk_flash(&result, "previewed"),
+                    )
+                } else {
+                    (axum::http::StatusCode::OK, Json(result)).into_response()
+                }
+            }
             Err(e) => map_error(e).into_response(),
         };
     }
 
-    let discard_result = bulk_discard_from_shards(&api_state, &filter).await;
-    let pool = match api_state.storage_pool() {
-        Ok(p) => p,
-        Err(e) => return map_error(e).into_response(),
+    let target_id = request.selector.dead_letter_id.map(|id| id.to_string());
+    let shard_id = request.selector.shard_id;
+    let discard_result = bulk_discard_from_shards(&api_state, &request.selector).await;
+    let audit_context = DlqBulkAuditContext {
+        actor: &actor,
+        source: &source,
+        request_id: request_id.as_deref(),
+        operation: OP_DLQ_DISCARD_BULK,
+        route,
+        target_id: target_id.as_deref(),
+        shard_id,
     };
-    let audit_conn = acquire_conn(pool.default_pool()).await;
 
     match discard_result {
         Ok(result) => {
@@ -5498,47 +5858,34 @@ async fn bulk_discard_dead_letters_handler(
                     Some(format!("{} failures", result.failures.len())),
                 )
             };
-            match audit_conn {
-                Ok(mut conn) => {
-                    let ar = NewAuditRecord {
-                        actor: &actor,
-                        operation: OP_DLQ_DISCARD_BULK,
-                        target_type: TARGET_DEAD_LETTER,
-                        target_id: None,
-                        route_or_command: route,
-                        request_id: request_id.as_deref(),
-                        idempotency_key: None,
-                        status: audit_status,
-                        error_summary: audit_error.as_deref(),
-                        shard_id: None,
-                        source: &source,
-                    };
-                    if let Err(e) = audit::insert_audit(&mut conn, &ar).await {
-                        return map_error(e).into_response();
-                    }
-                }
-                Err(e) => return e.into_response(),
+            if let Err(error) = insert_dlq_bulk_audit(
+                &api_state,
+                &audit_context,
+                audit_status,
+                audit_error.as_deref(),
+            )
+            .await
+            {
+                return error.into_response();
             }
-            (status, Json(result)).into_response()
+            if request.wants_redirect {
+                dlq_form_redirect(
+                    request.return_to.as_deref(),
+                    &dlq_bulk_flash(&result, "discarded"),
+                )
+            } else {
+                (status, Json(result)).into_response()
+            }
         }
         Err(e) => {
             let err_str = e.to_string();
-            if let Ok(mut conn) = audit_conn {
-                let ar = NewAuditRecord {
-                    actor: &actor,
-                    operation: OP_DLQ_DISCARD_BULK,
-                    target_type: TARGET_DEAD_LETTER,
-                    target_id: None,
-                    route_or_command: route,
-                    request_id: request_id.as_deref(),
-                    idempotency_key: None,
-                    status: STATUS_FAILED,
-                    error_summary: Some(err_str.as_str()),
-                    shard_id: None,
-                    source: &source,
-                };
-                let _ = audit::insert_audit(&mut conn, &ar).await;
-            }
+            let _ = insert_dlq_bulk_audit(
+                &api_state,
+                &audit_context,
+                STATUS_FAILED,
+                Some(err_str.as_str()),
+            )
+            .await;
             map_error(e).into_response()
         }
     }
@@ -5546,7 +5893,7 @@ async fn bulk_discard_dead_letters_handler(
 
 async fn bulk_replay_from_shards(
     api_state: &HarvestApiState,
-    filter: &dlq::BulkDlqFilter,
+    selector: &DlqBulkSelector,
 ) -> Result<dlq::BulkDlqResult, HarvestError> {
     let pool = api_state.storage_pool()?;
     let mut total = dlq::BulkDlqResult {
@@ -5554,7 +5901,7 @@ async fn bulk_replay_from_shards(
         acted_on: 0,
         skipped: 0,
         ids: Vec::new(),
-        dry_run: filter.dry_run,
+        dry_run: selector.dry_run(),
         failures: Vec::new(),
     };
 
@@ -5562,9 +5909,15 @@ async fn bulk_replay_from_shards(
     // effective_limit() is guaranteed to be in [1, 1000] so both try_from
     // conversions below are infallible in practice.
     let mut remaining: u32 =
-        u32::try_from(filter.effective_limit()).unwrap_or(dlq::DEFAULT_BULK_LIMIT);
+        u32::try_from(selector.filter.effective_limit()).unwrap_or(dlq::DEFAULT_BULK_LIMIT);
 
-    for (_shard, shard_pool) in pool.iter_shards() {
+    for (shard_id, shard_pool) in pool.iter_shards() {
+        if selector
+            .shard_id
+            .is_some_and(|wanted| wanted != shard_id.as_i32())
+        {
+            continue;
+        }
         let mut conn = shard_pool
             .get()
             .await
@@ -5572,16 +5925,17 @@ async fn bulk_replay_from_shards(
 
         if remaining == 0 {
             // Budget exhausted: count-only so matched reflects all shards.
-            let shard_matched = dlq::count_bulk_filter_matches(&mut conn, filter)
+            let shard_matched = count_api_bulk_filter_matches(&mut conn, selector)
                 .await
                 .map(|n| usize::try_from(n).unwrap_or(0))?;
             total.matched += shard_matched;
             continue;
         }
 
-        let mut shard_filter = filter.clone();
-        shard_filter.limit = Some(remaining);
-        let shard_result = dlq::bulk_replay_dead_letters(&mut conn, &shard_filter).await?;
+        let mut shard_selector = selector.clone();
+        shard_selector.filter.limit = Some(remaining);
+        let shard_result =
+            bulk_replay_dead_letters_for_selector(&mut conn, &shard_selector).await?;
         // Rows consumed = acted + skipped + failed (or preview ids in dry-run).
         let consumed = shard_result.ids.len() + shard_result.skipped + shard_result.failures.len();
         remaining = remaining.saturating_sub(u32::try_from(consumed).unwrap_or(remaining));
@@ -5597,7 +5951,7 @@ async fn bulk_replay_from_shards(
 
 async fn bulk_discard_from_shards(
     api_state: &HarvestApiState,
-    filter: &dlq::BulkDlqFilter,
+    selector: &DlqBulkSelector,
 ) -> Result<dlq::BulkDlqResult, HarvestError> {
     let pool = api_state.storage_pool()?;
     let mut total = dlq::BulkDlqResult {
@@ -5605,15 +5959,21 @@ async fn bulk_discard_from_shards(
         acted_on: 0,
         skipped: 0,
         ids: Vec::new(),
-        dry_run: filter.dry_run,
+        dry_run: selector.dry_run(),
         failures: Vec::new(),
     };
 
     // Enforce the limit as a global cap across all shards, not per-shard.
     let mut remaining: u32 =
-        u32::try_from(filter.effective_limit()).unwrap_or(dlq::DEFAULT_BULK_LIMIT);
+        u32::try_from(selector.filter.effective_limit()).unwrap_or(dlq::DEFAULT_BULK_LIMIT);
 
-    for (_shard, shard_pool) in pool.iter_shards() {
+    for (shard_id, shard_pool) in pool.iter_shards() {
+        if selector
+            .shard_id
+            .is_some_and(|wanted| wanted != shard_id.as_i32())
+        {
+            continue;
+        }
         let mut conn = shard_pool
             .get()
             .await
@@ -5621,16 +5981,17 @@ async fn bulk_discard_from_shards(
 
         if remaining == 0 {
             // Budget exhausted: count-only so matched reflects all shards.
-            let shard_matched = dlq::count_bulk_filter_matches(&mut conn, filter)
+            let shard_matched = count_api_bulk_filter_matches(&mut conn, selector)
                 .await
                 .map(|n| usize::try_from(n).unwrap_or(0))?;
             total.matched += shard_matched;
             continue;
         }
 
-        let mut shard_filter = filter.clone();
-        shard_filter.limit = Some(remaining);
-        let shard_result = dlq::bulk_discard_dead_letters(&mut conn, &shard_filter).await?;
+        let mut shard_selector = selector.clone();
+        shard_selector.filter.limit = Some(remaining);
+        let shard_result =
+            bulk_discard_dead_letters_for_selector(&mut conn, &shard_selector).await?;
         let consumed = shard_result.ids.len() + shard_result.skipped + shard_result.failures.len();
         remaining = remaining.saturating_sub(u32::try_from(consumed).unwrap_or(remaining));
         total.matched += shard_result.matched;
@@ -5641,6 +6002,145 @@ async fn bulk_discard_from_shards(
     }
 
     Ok(total)
+}
+
+async fn count_api_bulk_filter_matches(
+    conn: &mut AsyncPgConnection,
+    selector: &DlqBulkSelector,
+) -> HarvestResult<i64> {
+    let mut query = harvest_dead_letters::table.into_boxed();
+    query = apply_api_bulk_filters(query, selector);
+    query.count().get_result(conn).await.map_err(database_error)
+}
+
+async fn query_dead_letters_for_api_bulk(
+    conn: &mut AsyncPgConnection,
+    selector: &DlqBulkSelector,
+) -> HarvestResult<Vec<DeadLetter>> {
+    let mut query = harvest_dead_letters::table
+        .into_boxed()
+        .order(harvest_dead_letters::failed_at.asc())
+        .limit(selector.filter.effective_limit());
+    query = apply_api_bulk_filters(query, selector);
+    query
+        .select(DeadLetter::as_select())
+        .load(conn)
+        .await
+        .map_err(database_error)
+}
+
+fn apply_api_bulk_filters<'a>(
+    mut query: harvest_dead_letters::BoxedQuery<'a, diesel::pg::Pg>,
+    selector: &DlqBulkSelector,
+) -> harvest_dead_letters::BoxedQuery<'a, diesel::pg::Pg> {
+    if let Some(id) = selector.dead_letter_id {
+        query = query.filter(harvest_dead_letters::id.eq(id));
+    }
+    if let Some(ref name) = selector.filter.activity_name {
+        query = query.filter(harvest_dead_letters::activity_name.eq(name.clone()));
+    }
+    if let Some(ref task_type) = selector.task_type {
+        query = query.filter(
+            diesel::dsl::sql::<diesel::sql_types::Bool>("LOWER(task_type) = LOWER(")
+                .bind::<diesel::sql_types::Text, _>(task_type.clone())
+                .sql(")"),
+        );
+    }
+    if let Some(after) = selector.filter.failed_after {
+        query = query.filter(harvest_dead_letters::failed_at.ge(after));
+    }
+    if let Some(before) = selector.filter.failed_before {
+        query = query.filter(harvest_dead_letters::failed_at.lt(before));
+    }
+    if let Some(ref workflow_name) = selector.filter.workflow_name {
+        query = query.filter(
+            diesel::dsl::sql::<diesel::sql_types::Bool>(
+                "workflow_exec_id IN (SELECT id FROM harvest_workflow_executions WHERE workflow_name = ",
+            )
+            .bind::<diesel::sql_types::Text, _>(workflow_name.clone())
+            .sql(")"),
+        );
+    }
+    query
+}
+
+async fn bulk_replay_dead_letters_for_selector(
+    conn: &mut AsyncPgConnection,
+    selector: &DlqBulkSelector,
+) -> HarvestResult<dlq::BulkDlqResult> {
+    let matched = count_api_bulk_filter_matches(conn, selector)
+        .await
+        .map(|n| usize::try_from(n).unwrap_or(0))?;
+    let rows = query_dead_letters_for_api_bulk(conn, selector).await?;
+    let mut result = dlq::BulkDlqResult {
+        matched,
+        acted_on: 0,
+        skipped: 0,
+        ids: Vec::new(),
+        dry_run: selector.dry_run(),
+        failures: Vec::new(),
+    };
+
+    if selector.dry_run() {
+        result.ids = rows.into_iter().map(|row| row.id.to_string()).collect();
+        return Ok(result);
+    }
+
+    for row in rows {
+        let id = row.id;
+        match dlq::replay_dead_letter(conn, id).await {
+            Ok(_) => {
+                result.acted_on += 1;
+                result.ids.push(id.to_string());
+            }
+            Err(HarvestError::NotFound(_)) => result.skipped += 1,
+            Err(error) => result.failures.push(dlq::BulkDlqFailure {
+                id: id.to_string(),
+                reason: error.to_string(),
+            }),
+        }
+    }
+
+    Ok(result)
+}
+
+async fn bulk_discard_dead_letters_for_selector(
+    conn: &mut AsyncPgConnection,
+    selector: &DlqBulkSelector,
+) -> HarvestResult<dlq::BulkDlqResult> {
+    let matched = count_api_bulk_filter_matches(conn, selector)
+        .await
+        .map(|n| usize::try_from(n).unwrap_or(0))?;
+    let rows = query_dead_letters_for_api_bulk(conn, selector).await?;
+    let mut result = dlq::BulkDlqResult {
+        matched,
+        acted_on: 0,
+        skipped: 0,
+        ids: Vec::new(),
+        dry_run: selector.dry_run(),
+        failures: Vec::new(),
+    };
+
+    if selector.dry_run() {
+        result.ids = rows.into_iter().map(|row| row.id.to_string()).collect();
+        return Ok(result);
+    }
+
+    for row in rows {
+        let id = row.id;
+        let deleted = diesel::delete(harvest_dead_letters::table.find(id))
+            .execute(conn)
+            .await
+            .map_err(database_error)?;
+        if deleted > 0 {
+            result.acted_on += 1;
+            result.ids.push(id.to_string());
+        } else {
+            result.skipped += 1;
+        }
+    }
+
+    Ok(result)
 }
 
 async fn retention_status(
