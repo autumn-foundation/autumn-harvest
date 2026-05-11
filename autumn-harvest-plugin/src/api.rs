@@ -4621,11 +4621,24 @@ enum BackfillPriorPrecheck {
     PrecheckFailed(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BackfillRunningCountCheck {
+    Count(i64),
+    CountFailed(String),
+}
+
 fn classify_backfill_prior_count(result: diesel::QueryResult<i64>) -> BackfillPriorPrecheck {
     match result {
         Ok(count) if count > 0 => BackfillPriorPrecheck::PriorRunExists,
         Ok(_) => BackfillPriorPrecheck::NoPriorRun,
         Err(error) => BackfillPriorPrecheck::PrecheckFailed(error.to_string()),
+    }
+}
+
+fn classify_backfill_running_count(result: diesel::QueryResult<i64>) -> BackfillRunningCountCheck {
+    match result {
+        Ok(count) => BackfillRunningCountCheck::Count(count),
+        Err(error) => BackfillRunningCountCheck::CountFailed(error.to_string()),
     }
 }
 
@@ -4722,7 +4735,7 @@ async fn schedule_backfill(
 
     // Dry-run: query current running count and project what would happen.
     if request.dry_run {
-        let running = query_running_count(&pool, &kind, &name).await;
+        let running = query_running_count_best_effort(&pool, &kind, &name).await;
         let already_exists = count_existing_in_window(&pool, &kind, &name, &timestamps).await;
         let remaining = total.saturating_sub(already_exists);
         let available_slots = usize::try_from((max_active - running).max(0)).unwrap_or(0);
@@ -4813,8 +4826,61 @@ async fn schedule_backfill(
         });
 
     // Count running executions once before the loop; track dispatched_this_call separately
-    // so we don't re-query on every timestamp.
-    let running_at_start = query_running_count(&pool, &kind, &name).await;
+    // so we don't re-query on every timestamp. This value gates max_active_runs,
+    // so non-dry-run dispatch must not treat count failures as zero.
+    let running_at_start = match query_running_count(&pool, &kind, &name).await {
+        Ok(count) => count,
+        Err(count_failures) => {
+            let status = "partial";
+            let error_summary = Some("one or more shard failures");
+            write_backfill_log(
+                &pool,
+                schedule_id,
+                &actor,
+                &source,
+                request.from,
+                request.to,
+                false,
+                total,
+                0,
+                0,
+                total,
+                status,
+                error_summary,
+                started_at,
+            )
+            .await;
+            let id_str = schedule_id.to_string();
+            write_audit(
+                &pool,
+                &actor,
+                &source,
+                req_id.as_deref(),
+                route,
+                &id_str,
+                STATUS_FAILED,
+                error_summary,
+            )
+            .await;
+
+            return Ok(Json(ScheduleBackfillResponse {
+                status: status.to_string(),
+                schedule_id,
+                kind,
+                name,
+                from: request.from,
+                to: request.to,
+                planned_timestamps: timestamps,
+                total,
+                dispatched: 0,
+                skipped: 0,
+                failed: total,
+                skipped_reasons,
+                partial_shard_failures: count_failures,
+                paused_schedule_warning,
+            }));
+        }
+    };
     let mut dispatched_this_call: i64 = 0;
 
     match kind {
@@ -5052,33 +5118,67 @@ async fn schedule_backfill(
 }
 
 /// Count RUNNING workflow executions or DAG runs for the named entity.
-/// Returns the total count across all shards. Returns 0 on any DB error (safe: just
-/// means we don't artificially cap the backfill).
-async fn query_running_count(pool: &HarvestDbPool, kind: &ScheduleKind, name: &str) -> i64 {
+/// Returns the total count across all shards, or all shard failures that made
+/// the count unsafe to use for `max_active_runs` enforcement.
+async fn query_running_count(
+    pool: &HarvestDbPool,
+    kind: &ScheduleKind,
+    name: &str,
+) -> Result<i64, Vec<BackfillShardFailure>> {
     let mut total = 0i64;
-    for (_, shard_pool) in pool.iter_shards() {
+    let mut failures = Vec::new();
+    for (shard_id, shard_pool) in pool.iter_shards() {
         let Ok(mut conn) = acquire_conn(shard_pool).await else {
+            failures.push(BackfillShardFailure {
+                shard_id: shard_id.as_i32(),
+                reason: "failed to acquire connection while counting running backfill slots"
+                    .to_string(),
+            });
             continue;
         };
-        let count = match kind {
-            ScheduleKind::Workflow => harvest_workflow_executions::table
-                .filter(harvest_workflow_executions::workflow_name.eq(name))
-                .filter(harvest_workflow_executions::state.eq("RUNNING"))
-                .count()
-                .get_result::<i64>(&mut conn)
-                .await
-                .unwrap_or(0),
-            ScheduleKind::Dag => harvest_dag_runs::table
-                .filter(harvest_dag_runs::dag_name.eq(name))
-                .filter(harvest_dag_runs::state.eq("RUNNING"))
-                .count()
-                .get_result::<i64>(&mut conn)
-                .await
-                .unwrap_or(0),
+        let count_result = match kind {
+            ScheduleKind::Workflow => {
+                harvest_workflow_executions::table
+                    .filter(harvest_workflow_executions::workflow_name.eq(name))
+                    .filter(harvest_workflow_executions::state.eq("RUNNING"))
+                    .count()
+                    .get_result::<i64>(&mut conn)
+                    .await
+            }
+            ScheduleKind::Dag => {
+                harvest_dag_runs::table
+                    .filter(harvest_dag_runs::dag_name.eq(name))
+                    .filter(harvest_dag_runs::state.eq("RUNNING"))
+                    .count()
+                    .get_result::<i64>(&mut conn)
+                    .await
+            }
         };
-        total += count;
+        match classify_backfill_running_count(count_result) {
+            BackfillRunningCountCheck::Count(count) => total += count,
+            BackfillRunningCountCheck::CountFailed(reason) => {
+                failures.push(BackfillShardFailure {
+                    shard_id: shard_id.as_i32(),
+                    reason: format!("failed to count running backfill slots: {reason}"),
+                });
+            }
+        }
     }
-    total
+    if failures.is_empty() {
+        Ok(total)
+    } else {
+        Err(failures)
+    }
+}
+
+/// Dry-run uses the running-count estimate for operator preview only, so it
+/// stays best-effort and preserves the historical conservative response shape.
+async fn query_running_count_best_effort(
+    pool: &HarvestDbPool,
+    kind: &ScheduleKind,
+    name: &str,
+) -> i64 {
+    query_running_count(pool, kind, name).await.unwrap_or(0)
 }
 
 /// Count how many of the planned timestamps already have an execution or DAG run.
@@ -7974,6 +8074,28 @@ mod tests {
         assert!(
             matches!(decision, BackfillPriorPrecheck::PrecheckFailed(_)),
             "count errors must not be interpreted as no prior run: {decision:?}"
+        );
+    }
+
+    #[test]
+    fn backfill_running_count_keeps_successful_counts() {
+        assert_eq!(
+            classify_backfill_running_count(Ok(7)),
+            BackfillRunningCountCheck::Count(7)
+        );
+    }
+
+    #[test]
+    fn backfill_running_count_treats_query_error_as_failure() {
+        let decision =
+            classify_backfill_running_count(Err(diesel::result::Error::RollbackErrorOnCommit {
+                rollback_error: Box::new(diesel::result::Error::NotFound),
+                commit_error: Box::new(diesel::result::Error::NotFound),
+            }));
+
+        assert!(
+            matches!(decision, BackfillRunningCountCheck::CountFailed(_)),
+            "running-count errors must not be used as zero before dispatch: {decision:?}"
         );
     }
 
