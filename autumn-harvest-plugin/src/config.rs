@@ -1,3 +1,5 @@
+//! Configuration management for the Harvest plugin (embedded, split, or external modes).
+
 use std::path::{Path, PathBuf};
 
 use autumn_web::config::{ConfigError, DatabaseConfig, Env, OsEnv};

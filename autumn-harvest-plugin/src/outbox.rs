@@ -1,3 +1,5 @@
+//! Transactional outbox implementation for reliable workflow event emission.
+
 use std::time::Duration;
 
 use autumn_web::AppState;
