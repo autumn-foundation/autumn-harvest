@@ -712,8 +712,12 @@ async fn run_local_activity_inline(
     }
     if !prefix_events.is_empty() {
         store::append_events(conn, exec_id, &prefix_events, *next_event_id).await?;
-        *next_event_id += i32::try_from(prefix_events.len())
-            .map_err(|_| HarvestError::Config("event count overflow".into()))?;
+        *next_event_id = next_event_id
+            .checked_add(
+                i32::try_from(prefix_events.len())
+                    .map_err(|_| HarvestError::Config("event count overflow".into()))?,
+            )
+            .ok_or_else(|| HarvestError::Database("Event ID overflow".to_string()))?;
     }
 
     let mut all_new_events = prefix_events;
@@ -775,7 +779,9 @@ async fn run_local_activity_inline(
                     *next_event_id,
                 )
                 .await?;
-                *next_event_id += 1;
+                *next_event_id = next_event_id
+                    .checked_add(1)
+                    .ok_or_else(|| HarvestError::Database("Event ID overflow".to_string()))?;
                 all_new_events.push(completed_event);
                 if let Some(event_count) =
                     local_activity_history_cap_reached(*next_event_id, history_event_hard_cap)
@@ -806,7 +812,9 @@ async fn run_local_activity_inline(
                             *next_event_id,
                         )
                         .await?;
-                        *next_event_id += 1;
+                        *next_event_id = next_event_id.checked_add(1).ok_or_else(|| {
+                            HarvestError::Database("Event ID overflow".to_string())
+                        })?;
                         all_new_events.push(failed_event);
                         let event_count = u64::try_from(*next_event_id).unwrap_or(u64::MAX);
                         return Ok(LocalActivityInlineOutcome::HistoryCapReached {
@@ -826,8 +834,12 @@ async fn run_local_activity_inline(
                     };
                     let terminal_pair = [failed_event, exhausted_event];
                     store::append_events(conn, exec_id, &terminal_pair, *next_event_id).await?;
-                    *next_event_id += i32::try_from(terminal_pair.len())
-                        .map_err(|_| HarvestError::Config("event count overflow".into()))?;
+                    *next_event_id = next_event_id
+                        .checked_add(
+                            i32::try_from(terminal_pair.len())
+                                .map_err(|_| HarvestError::Config("event count overflow".into()))?,
+                        )
+                        .ok_or_else(|| HarvestError::Database("Event ID overflow".to_string()))?;
                     all_new_events.extend(terminal_pair);
                     if let Some(event_count) =
                         local_activity_history_cap_reached(*next_event_id, history_event_hard_cap)
@@ -845,7 +857,9 @@ async fn run_local_activity_inline(
                         *next_event_id,
                     )
                     .await?;
-                    *next_event_id += 1;
+                    *next_event_id = next_event_id
+                        .checked_add(1)
+                        .ok_or_else(|| HarvestError::Database("Event ID overflow".to_string()))?;
                     all_new_events.push(failed_event);
                     if let Some(event_count) =
                         local_activity_history_cap_reached(*next_event_id, history_event_hard_cap)
