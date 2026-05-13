@@ -32,24 +32,43 @@ use crate::schema::harvest_audit_log;
 
 // ── Operation name constants ──────────────────────────────────────────────────
 
+/// Audit operation: Started a new workflow execution.
 pub const OP_WORKFLOW_START: &str = "workflow.start";
+/// Audit operation: Signaled a running workflow execution.
 pub const OP_WORKFLOW_SIGNAL: &str = "workflow.signal";
+/// Audit operation: Cancelled a workflow execution.
 pub const OP_WORKFLOW_CANCEL: &str = "workflow.cancel";
+/// Audit operation: Reset a workflow execution to a previous state.
 pub const OP_WORKFLOW_RESET: &str = "workflow.reset";
+/// Audit operation: Manually triggered a DAG execution.
 pub const OP_DAG_TRIGGER: &str = "dag.trigger";
+/// Audit operation: Applied a hot-patch to an active DAG.
 pub const OP_DAG_PATCH: &str = "dag.patch";
+/// Audit operation: Created a new workflow schedule.
 pub const OP_SCHEDULE_CREATE: &str = "schedule.create";
+/// Audit operation: Paused an active workflow schedule.
 pub const OP_SCHEDULE_PAUSE: &str = "schedule.pause";
+/// Audit operation: Resumed a paused workflow schedule.
 pub const OP_SCHEDULE_RESUME: &str = "schedule.resume";
+/// Audit operation: Deleted a workflow schedule.
 pub const OP_SCHEDULE_DELETE: &str = "schedule.delete";
+/// Audit operation: Triggered a backfill for a workflow schedule.
 pub const OP_SCHEDULE_BACKFILL: &str = "schedule.backfill";
+/// Audit operation: Replayed a dead-letter queue (DLQ) task.
 pub const OP_DLQ_REPLAY: &str = "dlq.replay";
+/// Audit operation: Bulk-replayed dead-letter queue (DLQ) tasks.
 pub const OP_DLQ_REPLAY_BULK: &str = "dlq.replay.bulk";
+/// Audit operation: Bulk-discarded dead-letter queue (DLQ) tasks.
 pub const OP_DLQ_DISCARD_BULK: &str = "dlq.discard.bulk";
+/// Audit operation: Submitted a batch processing job.
 pub const OP_BATCH_SUBMIT: &str = "batch.submit";
+/// Audit operation: Triggered a retention sweep manually.
 pub const OP_RETENTION_RUN_NOW: &str = "retention.run_now";
+/// Audit operation: Completed an external activity.
 pub const OP_EXTERNAL_ACTIVITY_COMPLETE: &str = "external_activity.complete";
+/// Audit operation: Failed an external activity.
 pub const OP_EXTERNAL_ACTIVITY_FAIL: &str = "external_activity.fail";
+/// Audit operation: Initiated draining of a worker fleet.
 pub const OP_WORKER_DRAIN: &str = "worker.drain";
 
 // ── Target type constants ─────────────────────────────────────────────────────

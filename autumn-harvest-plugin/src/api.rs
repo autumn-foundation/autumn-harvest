@@ -338,7 +338,7 @@ impl HarvestApiState {
             .expect("harvest api state lock poisoned") = required;
     }
 
-    /// Returns `Some(days)` only when explicitly set via [`set_audit_retention_days`];
+    /// Returns `Some(days)` only when explicitly set via [`HarvestApiState::set_audit_retention_days`];
     /// `None` means "use the builder's retention config unchanged".
     pub(crate) fn audit_retention_days(&self) -> Option<i64> {
         *self

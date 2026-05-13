@@ -1,3 +1,5 @@
+//! Diagnostic reporting for simulated workflow executions.
+
 use crate::analyzer::{AnalyzerWarning, HistoryAnalyzer};
 use crate::history_export::export_mermaid_sequence;
 use crate::simulator::SimulatorResult;

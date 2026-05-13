@@ -18,7 +18,7 @@
 //!   the stream directly. Instead the stable `task_id` is added to a per-queue
 //!   sorted set (`{prefix}:scheduled:{name}`) with score = unix milliseconds,
 //!   and the envelope payload is stored alongside in a hash
-//!   (`{prefix}:scheduled:{name}:payloads`). A periodic [`promote_due`] call
+//!   (`{prefix}:scheduled:{name}:payloads`). A periodic [`RedisTaskQueue::promote_due`] call
 //!   moves due entries onto the stream atomically via a small Lua script.
 //! - **Visibility timeout**: enforced by [`RedisTaskQueue::recover_pending`],
 //!   which calls XPENDING on each queue and XCLAIMs entries that have been
