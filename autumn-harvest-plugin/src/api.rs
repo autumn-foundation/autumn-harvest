@@ -3899,6 +3899,13 @@ async fn trigger_dag_run(
 ) -> Result<(axum::http::StatusCode, Json<StartWorkflowResponse>), AutumnError> {
     let runtime = api_state.runtime().map_err(map_error)?;
     let pool = api_state.storage_pool().map_err(map_error)?;
+
+    if !runtime.registry.workflows.contains_key(dag_name.as_str()) {
+        return Err(AutumnError::not_found_msg(format!(
+            "DAG '{dag_name}' is not registered"
+        )));
+    }
+
     let shard = runtime.router.pick_for_dag(&dag_name);
 
     let (actor, source, request_id) = audit_context(&headers, &api_state);
@@ -4243,6 +4250,7 @@ async fn create_workflow_schedule(
 
     let ws = WorkflowSchedule {
         workflow_name: request.workflow_name.clone(),
+        dag_name: None,
         schedule,
         input: request.input.clone(),
         catchup: request.catchup,

@@ -6,17 +6,14 @@ use std::time::Duration;
 use autumn_harvest::builder::WorkerConfig;
 use autumn_harvest::dag::DagBuilder;
 use autumn_harvest::info::{ActivityInfo, DagInfo, WorkflowInfo};
-use autumn_harvest::models::{
-    DagRun, HarvestSchedule, NewDagRun, TaskQueueItem, WorkflowExecution,
-};
+use autumn_harvest::models::{HarvestSchedule, TaskQueueItem, WorkflowExecution};
 use autumn_harvest::policy::Schedule;
 use autumn_harvest::scheduler::{
     DagCatalog, SchedulerMonitor, compile_dag_catalog, register_schedules,
     register_workflow_schedules, tick_once,
 };
 use autumn_harvest::schema::{
-    harvest_dag_runs, harvest_dead_letters, harvest_schedules, harvest_task_queue,
-    harvest_workflow_executions,
+    harvest_dead_letters, harvest_schedules, harvest_task_queue, harvest_workflow_executions,
 };
 use autumn_harvest::shard::{ShardRouter, ShardedDbPool};
 use autumn_harvest::store;
@@ -559,24 +556,29 @@ async fn register_sharded_manual_dag_schedules(
 }
 
 async fn seed_dag_run_on_url(database_url: &str, dag_name: &str) -> uuid::Uuid {
+    use autumn_harvest::models::NewWorkflowExecution;
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
         .await
         .expect("failed to connect to shard for dag-run seed");
-    let now = chrono::Utc::now();
     let seeded_run_id = uuid::Uuid::new_v4();
-    diesel::insert_into(harvest_dag_runs::table)
-        .values(&NewDagRun {
+    diesel::insert_into(harvest_workflow_executions::table)
+        .values(&NewWorkflowExecution {
             id: seeded_run_id,
-            dag_name,
-            workflow_exec_id: None,
-            logical_date: now,
-            data_interval_start: now,
-            data_interval_end: now,
-            conf: Some(json!({ "seeded": true })),
+            workflow_name: dag_name,
+            workflow_id: &seeded_run_id.to_string(),
+            run_id: uuid::Uuid::new_v4(),
+            shard_id: 0,
+            input: json!({ "seeded": true }),
+            parent_id: None,
+            queue_name: "default",
+            execution_timeout: None,
+            memo: None,
+            search_attrs: None,
+            assigned_build_id: None,
         })
         .execute(&mut conn)
         .await
-        .expect("failed to seed dag run");
+        .expect("failed to seed dag workflow execution");
     seeded_run_id
 }
 
@@ -793,12 +795,12 @@ async fn count_dag_runs_from_url(database_url: &str, dag_name: &str) -> i64 {
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
         .await
         .expect("failed to connect fresh Postgres client for dag-run count");
-    harvest_dag_runs::table
-        .filter(harvest_dag_runs::dag_name.eq(dag_name))
+    harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_name.eq(dag_name))
         .count()
         .get_result(&mut conn)
         .await
-        .expect("failed to count dag runs")
+        .expect("failed to count dag workflow executions")
 }
 
 async fn load_schedule_from_url(database_url: &str, dag_name: &str) -> HarvestSchedule {
@@ -813,18 +815,21 @@ async fn load_schedule_from_url(database_url: &str, dag_name: &str) -> HarvestSc
         .expect("failed to reload harvest schedule")
 }
 
-async fn load_latest_dag_run_from_url(database_url: &str, dag_name: &str) -> Option<DagRun> {
+async fn load_latest_dag_run_from_url(
+    database_url: &str,
+    dag_name: &str,
+) -> Option<WorkflowExecution> {
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
         .await
         .expect("failed to connect fresh Postgres client for dag run query");
-    harvest_dag_runs::table
-        .filter(harvest_dag_runs::dag_name.eq(dag_name))
-        .order(harvest_dag_runs::created_at.desc())
-        .select(DagRun::as_select())
+    harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_name.eq(dag_name))
+        .order(harvest_workflow_executions::created_at.desc())
+        .select(WorkflowExecution::as_select())
         .first(&mut conn)
         .await
         .optional()
-        .expect("failed to reload latest dag run")
+        .expect("failed to reload latest dag workflow execution")
 }
 
 async fn wait_for_workflow_state(
@@ -847,7 +852,7 @@ async fn wait_for_dag_run_state(
     database_url: &str,
     dag_name: &str,
     expected_state: &str,
-) -> DagRun {
+) -> WorkflowExecution {
     for _ in 0..100 {
         if let Some(run) = load_latest_dag_run_from_url(database_url, dag_name).await
             && run.state == expected_state
@@ -968,19 +973,9 @@ async fn seed_retention_fixtures(
             .await;
     }
 
-    diesel::sql_query(
-        "INSERT INTO harvest_dag_runs (
-            id, dag_name, workflow_exec_id, state, logical_date, data_interval_start, data_interval_end, created_at, started_at, completed_at
-         ) VALUES (
-            gen_random_uuid(), 'retention_fixture_dag', $1, 'SUCCESS',
-            NOW() - INTERVAL '10 days', NOW() - INTERVAL '10 days', NOW() - INTERVAL '9 days',
-            NOW() - INTERVAL '10 days', NOW() - INTERVAL '10 days', NOW() - INTERVAL '9 days'
-         )",
-    )
-    .bind::<diesel::sql_types::Uuid, _>(old_exec_b)
-    .execute(conn)
-    .await
-    .expect("failed to insert fixture dag run");
+    // harvest_dag_runs was dropped in Step 5 of issue #256; DAG runs are now
+    // workflow executions. The retention fixture for old_exec_b is already
+    // covered by the insert_retention_fixture_execution call above.
 }
 
 async fn trigger_retention_and_wait(app: &HarvestApiApp) {
@@ -2407,7 +2402,7 @@ async fn harvest_api_lists_and_triggers_manual_dags() {
     assert_eq!(trigger_status, StatusCode::CREATED);
 
     let run = wait_for_dag_run_state(&database_url, "manual_pipeline", "SUCCESS").await;
-    assert_eq!(run.dag_name, "manual_pipeline");
+    assert_eq!(run.workflow_name, "manual_pipeline");
 
     let (runs_status, runs_json) = get_json(&app, "/dags/manual_pipeline/runs").await;
     assert_eq!(runs_status, StatusCode::OK);
@@ -2521,7 +2516,7 @@ async fn scheduler_tick_creates_and_executes_due_interval_runs() {
     .expect("scheduler tick should succeed");
 
     let run = wait_for_dag_run_state(&database_url, "interval_pipeline", "SUCCESS").await;
-    assert_eq!(run.dag_name, "interval_pipeline");
+    assert_eq!(run.workflow_name, "interval_pipeline");
     assert_eq!(
         log.lock().expect("log mutex poisoned").clone(),
         vec!["interval_step"]
@@ -2588,7 +2583,7 @@ async fn concurrent_scheduler_ticks_activate_due_dag_run_once() {
     }
 
     let run = wait_for_dag_run_state(&database_url, "interval_pipeline", "SUCCESS").await;
-    assert_eq!(run.dag_name, "interval_pipeline");
+    assert_eq!(run.workflow_name, "interval_pipeline");
     assert_eq!(
         count_dag_runs_from_url(&database_url, "interval_pipeline").await,
         1,

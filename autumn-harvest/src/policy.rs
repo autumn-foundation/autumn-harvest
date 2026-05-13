@@ -282,6 +282,11 @@ pub enum Schedule {
 pub struct WorkflowSchedule {
     /// The registered workflow name to start on each firing.
     pub workflow_name: String,
+    /// When this schedule was promoted from a `#[dag]` definition, the
+    /// original DAG name is stored here so the DAG management API can still
+    /// list, pause, and resume the schedule via `GET /dags` and
+    /// `PATCH /dags/{name}`.  `None` for pure workflow schedules.
+    pub dag_name: Option<String>,
     /// Cron or interval schedule. `Schedule::Manual` is accepted but will
     /// never fire automatically — use the API to trigger it instead.
     pub schedule: Schedule,
@@ -314,6 +319,7 @@ impl WorkflowSchedule {
     pub fn new(workflow_name: impl Into<String>, schedule: Schedule) -> Self {
         Self {
             workflow_name: workflow_name.into(),
+            dag_name: None,
             schedule,
             input: serde_json::Value::Null,
             catchup: false,

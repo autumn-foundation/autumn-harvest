@@ -587,7 +587,7 @@ async fn upsert_workflow_schedule(
     // concurrent writer will hit DO NOTHING rather than inserting a duplicate.
     let row = NewHarvestSchedule {
         id: uuid::Uuid::new_v4(),
-        dag_name: None,
+        dag_name: ws.dag_name.as_deref(),
         schedule_expr: expr.as_deref(),
         timezone: "UTC",
         catchup: ws.catchup,

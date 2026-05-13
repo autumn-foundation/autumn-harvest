@@ -123,6 +123,7 @@ impl DagInfo {
         let schedule = self.schedule.clone()?;
         Some(WorkflowSchedule {
             workflow_name: self.name.to_string(),
+            dag_name: Some(self.name.to_string()),
             schedule,
             input: serde_json::Value::Null,
             catchup: self.catchup,
