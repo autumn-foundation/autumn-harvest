@@ -573,7 +573,7 @@ mod tests {
     {
         let _lock = SPAN_CAPTURE_LOCK
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let guard = tracing::subscriber::set_default(subscriber);
         tracing::callsite::rebuild_interest_cache();
 
