@@ -4462,56 +4462,64 @@ async fn set_schedule_paused(
     for (_shard, shard_pool) in pool.iter_shards() {
         let mut conn = acquire_conn(shard_pool).await?;
 
-        // Load the current row to implement idempotency and set metadata.
-        let current: Option<autumn_harvest::models::HarvestSchedule> = dsl::harvest_schedules
-            .find(id)
-            .select(autumn_harvest::models::HarvestSchedule::as_select())
-            .first(&mut conn)
+        // Atomic conditional UPDATE: only applies when `is_paused` differs from
+        // the requested state.  The `filter(dsl::is_paused.ne(paused))` predicate
+        // makes the idempotency check part of the UPDATE itself, eliminating the
+        // SELECT-then-UPDATE race condition that would otherwise let two
+        // concurrent requests both overwrite paused_at/paused_by.
+        let rows_updated: usize = if paused {
+            // Pause: set metadata only on the transition false → true.
+            diesel::update(
+                dsl::harvest_schedules
+                    .find(id)
+                    .filter(dsl::is_paused.ne(true)),
+            )
+            .set((
+                dsl::is_paused.eq(true),
+                dsl::paused_at.eq(Some(now)),
+                dsl::paused_by.eq(Some(actor.as_str())),
+                dsl::pause_reason.eq(reason),
+                dsl::updated_at.eq(now),
+            ))
+            .execute(&mut conn)
             .await
-            .optional()
             .map_err(database_error)
-            .map_err(map_error)?;
-
-        let Some(schedule) = current else {
-            continue;
-        };
-        found_count += 1;
-
-        // Idempotency: if the schedule is already in the requested state, skip
-        // the UPDATE so that paused_at/paused_by are not overwritten.
-        if schedule.is_paused == paused {
-            break;
-        }
-
-        if paused {
-            // Pause: record who paused it, when, and why.
-            diesel::update(dsl::harvest_schedules.find(id))
-                .set((
-                    dsl::is_paused.eq(true),
-                    dsl::paused_at.eq(Some(now)),
-                    dsl::paused_by.eq(Some(actor.as_str())),
-                    dsl::pause_reason.eq(reason),
-                    dsl::updated_at.eq(now),
-                ))
-                .execute(&mut conn)
-                .await
-                .map_err(database_error)
-                .map_err(map_error)?;
+            .map_err(map_error)?
         } else {
-            // Resume: clear all pause metadata.
-            diesel::update(dsl::harvest_schedules.find(id))
-                .set((
-                    dsl::is_paused.eq(false),
-                    dsl::paused_at.eq(None::<chrono::DateTime<chrono::Utc>>),
-                    dsl::paused_by.eq(None::<&str>),
-                    dsl::pause_reason.eq(None::<&str>),
-                    dsl::updated_at.eq(now),
-                ))
-                .execute(&mut conn)
+            // Resume: clear metadata only on the transition true → false.
+            diesel::update(
+                dsl::harvest_schedules
+                    .find(id)
+                    .filter(dsl::is_paused.ne(false)),
+            )
+            .set((
+                dsl::is_paused.eq(false),
+                dsl::paused_at.eq(None::<chrono::DateTime<chrono::Utc>>),
+                dsl::paused_by.eq(None::<&str>),
+                dsl::pause_reason.eq(None::<&str>),
+                dsl::updated_at.eq(now),
+            ))
+            .execute(&mut conn)
+            .await
+            .map_err(database_error)
+            .map_err(map_error)?
+        };
+
+        if rows_updated == 0 {
+            // Either not on this shard, or already in the requested state.
+            // Distinguish the two with a cheap existence check.
+            let exists: bool = diesel::select(diesel::dsl::exists(dsl::harvest_schedules.find(id)))
+                .get_result(&mut conn)
                 .await
                 .map_err(database_error)
                 .map_err(map_error)?;
+
+            if !exists {
+                continue; // not on this shard — try the next one
+            }
+            // Already in the requested state: idempotent no-op.
         }
+        found_count += 1;
 
         let ar = NewAuditRecord {
             actor: &actor,
