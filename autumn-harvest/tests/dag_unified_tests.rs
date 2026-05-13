@@ -1,0 +1,326 @@
+//! Tests for `#[dag]` lowering onto the workflow execution path (issue #256, Step 1).
+//!
+//! Requires features: `unified-dag-execution` + `testing`.
+//!
+//! These tests verify that when `unified-dag-execution` is enabled, `#[dag]`
+//! emits a shadow `__autumn_workflow_info_{name}()` companion whose handler
+//! walks the `DagDefinition` level by level, dispatches activities through
+//! `ctx.execute_activity_raw`, and evaluates trigger rules deterministically.
+
+#![allow(clippy::unused_async)]
+
+use autumn_harvest::event::WorkflowEvent;
+use autumn_harvest::prelude::*;
+use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
+use autumn_harvest::types::ActivityExecId;
+use chrono::Utc;
+use serde_json::Value;
+
+// ---------------------------------------------------------------------------
+// Shared activity stubs
+// ---------------------------------------------------------------------------
+
+#[activity]
+async fn extract_users(_ctx: &ActivityContext) -> Result<(), String> {
+    Ok(())
+}
+
+#[activity]
+async fn load_users(_ctx: &ActivityContext) -> Result<(), String> {
+    Ok(())
+}
+
+#[activity]
+async fn notify_complete(_ctx: &ActivityContext) -> Result<(), String> {
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// DAG definitions used across tests
+// ---------------------------------------------------------------------------
+
+/// A linear two-task DAG: extract_users → load_users (AllSuccess, default).
+#[dag(default_queue = "etl-workers")]
+fn linear_dag(dag: &mut DagBuilder) {
+    let extract = dag.activity(extract_users);
+    let _load = dag.activity(load_users).upstream(&extract);
+}
+
+/// Same topology but with AllDone trigger on the second task.
+#[dag]
+fn alldone_dag(dag: &mut DagBuilder) {
+    let extract = dag.activity(extract_users);
+    let _load = dag
+        .activity(load_users)
+        .upstream(&extract)
+        .trigger_rule(TriggerRule::AllDone);
+}
+
+/// Fan-out/fan-in: extract → [load_users, notify_complete] (both depend on extract).
+#[dag]
+fn fanout_dag(dag: &mut DagBuilder) {
+    let extract = dag.activity(extract_users);
+    let _load = dag.activity(load_users).upstream(&extract);
+    let _notify = dag.activity(notify_complete).upstream(&extract);
+}
+
+// ---------------------------------------------------------------------------
+// RED-PHASE TEST 1 — macro emits the workflow companion
+// ---------------------------------------------------------------------------
+
+/// `#[dag]` must emit `__autumn_workflow_info_{name}()` returning `WorkflowInfo`
+/// with the DAG's function name when `unified-dag-execution` is enabled.
+#[test]
+fn dag_macro_emits_workflow_info_companion() {
+    let info = __autumn_workflow_info_linear_dag();
+    assert_eq!(info.name, "linear_dag");
+    assert!(!info.module.is_empty(), "module path should be non-empty");
+}
+
+// ---------------------------------------------------------------------------
+// RED-PHASE TEST 2 — DagInfo backward compat is preserved
+// ---------------------------------------------------------------------------
+
+/// Enabling `unified-dag-execution` must not break the existing `DagInfo`
+/// companion or `build_definition()`.
+#[test]
+fn dag_info_backward_compat_still_works() {
+    let dag_info = __autumn_dag_info_linear_dag();
+    assert_eq!(dag_info.name, "linear_dag");
+    assert_eq!(dag_info.default_queue, Some("etl-workers"));
+
+    let definition = dag_info.build_definition().expect("definition should build");
+    assert_eq!(definition.tasks().len(), 2);
+    assert_eq!(definition.execution_levels().len(), 2);
+}
+
+// ---------------------------------------------------------------------------
+// RED-PHASE TEST 3 — lowered handler replays a fully-successful linear DAG
+// ---------------------------------------------------------------------------
+
+/// The lowered workflow handler must walk both execution levels, call
+/// `execute_activity_raw` for each task, and complete without divergence when
+/// the history records successful completions for both activities.
+#[tokio::test]
+async fn lowered_handler_replays_linear_dag_all_success() {
+    let id_extract = ActivityExecId::new();
+    let id_load = ActivityExecId::new();
+
+    let history = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: id_extract,
+            name: "extract_users".into(),
+            input: Value::Null,
+            queue: "etl-workers".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: id_extract,
+            output: Value::Null,
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: id_load,
+            name: "load_users".into(),
+            input: Value::Null,
+            queue: "etl-workers".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: id_load,
+            output: Value::Null,
+        },
+    ];
+
+    let report = WorkflowReplayer::new()
+        .register_fn("linear_dag", __autumn_workflow_info_linear_dag().handler)
+        .replay_from_events(history)
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "linear DAG all-success replay should succeed, got: {report}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// RED-PHASE TEST 4 — AllSuccess trigger skips downstream on upstream failure
+// ---------------------------------------------------------------------------
+
+/// When the upstream fails and the downstream has `TriggerRule::AllSuccess`
+/// (the default), the lowered handler must skip the downstream task entirely.
+/// The history therefore contains no `ActivityScheduled` for `load_users`, and
+/// the replay must still succeed (no divergence from an unexpected activity call).
+#[tokio::test]
+async fn lowered_handler_skips_all_success_downstream_on_upstream_failure() {
+    let id_extract = ActivityExecId::new();
+
+    let history = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: id_extract,
+            name: "extract_users".into(),
+            input: Value::Null,
+            queue: "etl-workers".into(),
+        },
+        WorkflowEvent::ActivityFailed {
+            activity_id: id_extract,
+            error: "db connection refused".into(),
+            attempt: 1,
+            error_type: "Error".into(),
+            non_retryable: false,
+            details: None,
+        },
+        // No ActivityScheduled for load_users — it is skipped by AllSuccess rule.
+    ];
+
+    let report = WorkflowReplayer::new()
+        .register_fn("linear_dag", __autumn_workflow_info_linear_dag().handler)
+        .replay_from_events(history)
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "AllSuccess skip should replay cleanly, got: {report}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// RED-PHASE TEST 5 — AllDone trigger runs downstream even on upstream failure
+// ---------------------------------------------------------------------------
+
+/// When the upstream fails and the downstream has `TriggerRule::AllDone`,
+/// the lowered handler must still schedule the downstream activity.
+/// The history must include both the upstream failure and the downstream
+/// completion, and the replay must succeed end-to-end.
+#[tokio::test]
+async fn lowered_handler_runs_alldone_downstream_on_upstream_failure() {
+    let id_extract = ActivityExecId::new();
+    let id_load = ActivityExecId::new();
+
+    let history = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: id_extract,
+            name: "extract_users".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityFailed {
+            activity_id: id_extract,
+            error: "db error".into(),
+            attempt: 1,
+            error_type: "Error".into(),
+            non_retryable: false,
+            details: None,
+        },
+        // AllDone: load_users runs regardless of extract_users outcome.
+        WorkflowEvent::ActivityScheduled {
+            activity_id: id_load,
+            name: "load_users".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: id_load,
+            output: Value::Null,
+        },
+    ];
+
+    let report = WorkflowReplayer::new()
+        .register_fn("alldone_dag", __autumn_workflow_info_alldone_dag().handler)
+        .replay_from_events(history)
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "AllDone downstream should run and replay cleanly, got: {report}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// REFACTOR TEST — DagInfo::as_workflow_info() returns the lowered handler
+// ---------------------------------------------------------------------------
+
+/// `DagInfo::as_workflow_info()` must return `Some(WorkflowInfo)` whose name
+/// matches the DAG name when the `unified-dag-execution` feature is enabled.
+#[test]
+fn dag_info_as_workflow_info_returns_some_with_matching_name() {
+    let dag_info = __autumn_dag_info_linear_dag();
+    let wf_info = dag_info
+        .as_workflow_info()
+        .expect("as_workflow_info should return Some with unified-dag-execution feature");
+    assert_eq!(wf_info.name, dag_info.name);
+    assert_eq!(wf_info.module, dag_info.module);
+}
+
+// ---------------------------------------------------------------------------
+// RED-PHASE TEST 6 — fan-out DAG: both parallel tasks in level 1 run
+// ---------------------------------------------------------------------------
+
+/// A DAG with one root and two parallel dependents (fan-out) must schedule
+/// both dependents when the root succeeds.  Tasks in the same level are
+/// dispatched sequentially (by task index order) so the history order is
+/// deterministic across replays.
+#[tokio::test]
+async fn lowered_handler_replays_fanout_dag() {
+    let id_extract = ActivityExecId::new();
+    let id_load = ActivityExecId::new();
+    let id_notify = ActivityExecId::new();
+
+    let history = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+        },
+        // Level 0: extract_users
+        WorkflowEvent::ActivityScheduled {
+            activity_id: id_extract,
+            name: "extract_users".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: id_extract,
+            output: Value::Null,
+        },
+        // Level 1: load_users (task index 1) then notify_complete (task index 2)
+        WorkflowEvent::ActivityScheduled {
+            activity_id: id_load,
+            name: "load_users".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: id_load,
+            output: Value::Null,
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: id_notify,
+            name: "notify_complete".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: id_notify,
+            output: Value::Null,
+        },
+    ];
+
+    let report = WorkflowReplayer::new()
+        .register_fn("fanout_dag", __autumn_workflow_info_fanout_dag().handler)
+        .replay_from_events(history)
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "fan-out DAG should replay correctly, got: {report}"
+    );
+}

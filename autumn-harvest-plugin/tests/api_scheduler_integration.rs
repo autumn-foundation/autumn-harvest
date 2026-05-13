@@ -500,6 +500,7 @@ fn manual_pipeline_info_named(name: &'static str) -> DagInfo {
         max_active_runs: 1,
         default_queue: Some("default"),
         builder: build_manual_pipeline_dag,
+        workflow_handler: None,
     }
 }
 
@@ -1142,6 +1143,7 @@ fn manual_pipeline_info() -> DagInfo {
         max_active_runs: 1,
         default_queue: Some("default"),
         builder: build_manual_pipeline_dag,
+        workflow_handler: None,
     }
 }
 
@@ -1154,6 +1156,7 @@ fn interval_pipeline_info() -> DagInfo {
         max_active_runs: 1,
         default_queue: Some("default"),
         builder: build_interval_pipeline_dag,
+        workflow_handler: None,
     }
 }
 
@@ -1166,6 +1169,7 @@ fn manual_interval_pipeline_info() -> DagInfo {
         max_active_runs: 1,
         default_queue: Some("default"),
         builder: build_interval_pipeline_dag,
+        workflow_handler: None,
     }
 }
 

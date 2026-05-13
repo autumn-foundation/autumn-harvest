@@ -498,6 +498,7 @@ mod tests {
             max_active_runs: 1,
             default_queue: Some("default"),
             builder: build,
+            workflow_handler: None,
         }
     }
 

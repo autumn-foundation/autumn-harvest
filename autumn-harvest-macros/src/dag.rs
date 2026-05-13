@@ -46,6 +46,7 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<DagAttrs> {
     Ok(result)
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn dag_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let attrs = match parse_attrs(attr) {
         Ok(attrs) => attrs,
@@ -67,7 +68,7 @@ pub fn dag_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let fn_name = &input_fn.sig.ident;
     let fn_name_str = fn_name.to_string();
-    let companion_name = format_ident!("__autumn_dag_info_{fn_name}");
+    let dag_companion_name = format_ident!("__autumn_dag_info_{fn_name}");
 
     let schedule_expr = attrs.schedule.as_deref().map_or_else(
         || quote! { None },
@@ -80,11 +81,114 @@ pub fn dag_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         .as_deref()
         .map_or_else(|| quote! { None }, |queue| quote! { Some(#queue) });
 
+    // Emit the shadow WorkflowInfo companion when the unified-dag-execution
+    // feature is enabled on the proc-macro crate (transitively enabled by
+    // `autumn-harvest/unified-dag-execution`).
+    #[cfg(feature = "unified-dag-execution")]
+    let workflow_companion = emit_workflow_companion(fn_name, &fn_name_str, attrs.default_queue.as_ref());
+
+    #[cfg(not(feature = "unified-dag-execution"))]
+    let workflow_companion = quote! {};
+
+    // Inline the workflow handler into `DagInfo::workflow_handler` so the
+    // runtime can route new runs through the unified path without a separate
+    // companion function lookup.
+    #[cfg(feature = "unified-dag-execution")]
+    let workflow_handler_field = {
+        let builder_init_for_field =
+            attrs.default_queue.as_deref().map_or_else(
+                || quote! { ::autumn_harvest::DagBuilder::new() },
+                |q| quote! { ::autumn_harvest::DagBuilder::with_default_queue(#q) },
+            );
+        quote! {
+            workflow_handler: Some(|ctx, _input| {
+                ::std::boxed::Box::pin(async move {
+                    let (__levels, __tasks): (
+                        ::std::vec::Vec<::std::vec::Vec<usize>>,
+                        ::std::vec::Vec<::autumn_harvest::DagTask>,
+                    ) = {
+                        let mut __dag_builder = #builder_init_for_field;
+                        #fn_name(&mut __dag_builder);
+                        let __definition = __dag_builder
+                            .build()
+                            .map_err(|e| e.to_string())?;
+                        (
+                            __definition.execution_levels().to_vec(),
+                            __definition.tasks().to_vec(),
+                        )
+                    };
+
+                    let __n = __tasks.len();
+                    let mut __statuses: ::std::vec::Vec<
+                        ::std::option::Option<::autumn_harvest::policy::TaskStatus>,
+                    > = vec![None; __n];
+
+                    for __level in &__levels {
+                        for &__task_idx in __level {
+                            let __activity_name: ::std::string::String =
+                                __tasks[__task_idx].activity_name.clone();
+                            let __queue_str: ::std::string::String = __tasks[__task_idx]
+                                .queue
+                                .clone()
+                                .unwrap_or_else(|| "default".to_owned());
+                            let __upstreams: ::std::vec::Vec<usize> =
+                                __tasks[__task_idx].upstreams.clone();
+                            let __trigger_rule = __tasks[__task_idx].trigger_rule.clone();
+
+                            let __should_run: bool = if __upstreams.is_empty() {
+                                true
+                            } else {
+                                let __ups: ::std::vec::Vec<
+                                    ::autumn_harvest::policy::TaskStatus,
+                                > = __upstreams
+                                    .iter()
+                                    .map(|&__i| {
+                                        __statuses[__i].unwrap_or(
+                                            ::autumn_harvest::policy::TaskStatus::Skipped,
+                                        )
+                                    })
+                                    .collect();
+                                __trigger_rule.should_run(&__ups)
+                            };
+
+                            if !__should_run {
+                                __statuses[__task_idx] = Some(
+                                    ::autumn_harvest::policy::TaskStatus::Skipped,
+                                );
+                                continue;
+                            }
+
+                            let __result = ctx
+                                .execute_activity_raw(
+                                    &__activity_name,
+                                    ::autumn_harvest::serde_json::Value::Null,
+                                    &__queue_str,
+                                )
+                                .await;
+
+                            __statuses[__task_idx] = Some(match __result {
+                                Ok(_) => ::autumn_harvest::policy::TaskStatus::Succeeded,
+                                Err(_) => ::autumn_harvest::policy::TaskStatus::Failed,
+                            });
+                        }
+                    }
+
+                    Ok(::autumn_harvest::serde_json::Value::Null)
+                })
+            }),
+        }
+    };
+
+    #[cfg(not(feature = "unified-dag-execution"))]
+    let workflow_handler_field = quote! {
+        workflow_handler: None,
+    };
+
     quote! {
         #input_fn
 
         #[doc(hidden)]
-        pub fn #companion_name() -> ::autumn_harvest::DagInfo {
+        pub fn #dag_companion_name() -> ::autumn_harvest::DagInfo {
             ::autumn_harvest::DagInfo {
                 name: #fn_name_str,
                 module: module_path!(),
@@ -94,6 +198,130 @@ pub fn dag_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 default_queue: #default_queue,
                 builder: |dag| {
                     #fn_name(dag);
+                },
+                #workflow_handler_field
+            }
+        }
+
+        #workflow_companion
+    }
+}
+
+/// Build the token stream for the shadow `__autumn_workflow_info_{name}()`
+/// companion function (only compiled when `unified-dag-execution` is on).
+#[cfg(feature = "unified-dag-execution")]
+#[allow(clippy::too_many_lines)]
+fn emit_workflow_companion(
+    fn_name: &syn::Ident,
+    fn_name_str: &str,
+    default_queue: Option<&String>,
+) -> TokenStream {
+    let companion_name = format_ident!("__autumn_workflow_info_{fn_name}");
+
+    let builder_init = default_queue.map(String::as_str).map_or_else(
+        || quote! { ::autumn_harvest::DagBuilder::new() },
+        |q| quote! { ::autumn_harvest::DagBuilder::with_default_queue(#q) },
+    );
+
+    quote! {
+        /// Shadow `WorkflowInfo` for this DAG, emitted when the
+        /// `unified-dag-execution` feature is enabled (issue #256 Step 1).
+        ///
+        /// The handler walks the compiled [`DagDefinition`] level by level,
+        /// dispatches each activity through `ctx.execute_activity_raw`, and
+        /// evaluates trigger rules from the accumulated task statuses so the
+        /// execution is deterministic and replay-safe.
+        #[doc(hidden)]
+        pub fn #companion_name() -> ::autumn_harvest::WorkflowInfo {
+            ::autumn_harvest::WorkflowInfo {
+                name: #fn_name_str,
+                module: module_path!(),
+                handler: |ctx, _input| {
+                    ::std::boxed::Box::pin(async move {
+                        // Build the DagDefinition inside a scoped block so that
+                        // `DagBuilder` (which holds `Rc<RefCell<...>>` and is
+                        // not `Send`) is dropped before any `.await` point.
+                        let (__levels, __tasks): (
+                            ::std::vec::Vec<::std::vec::Vec<usize>>,
+                            ::std::vec::Vec<::autumn_harvest::DagTask>,
+                        ) = {
+                            let mut __dag_builder = #builder_init;
+                            #fn_name(&mut __dag_builder);
+                            let __definition = __dag_builder
+                                .build()
+                                .map_err(|e| e.to_string())?;
+                            (
+                                __definition.execution_levels().to_vec(),
+                                __definition.tasks().to_vec(),
+                            )
+                            // __dag_builder and __definition are dropped here.
+                        };
+
+                        // Per-task status accumulator indexed by task index.
+                        let __n = __tasks.len();
+                        let mut __statuses: ::std::vec::Vec<
+                            ::std::option::Option<::autumn_harvest::policy::TaskStatus>,
+                        > = vec![None; __n];
+
+                        // Walk levels in order; tasks within each level are
+                        // dispatched sequentially (deterministic index order).
+                        for __level in &__levels {
+                            for &__task_idx in __level {
+                                // Eagerly copy task metadata into owned values
+                                // so no borrow of `__tasks` crosses `.await`.
+                                let __activity_name: ::std::string::String =
+                                    __tasks[__task_idx].activity_name.clone();
+                                let __queue_str: ::std::string::String = __tasks[__task_idx]
+                                    .queue
+                                    .clone()
+                                    .unwrap_or_else(|| "default".to_owned());
+                                let __upstreams: ::std::vec::Vec<usize> =
+                                    __tasks[__task_idx].upstreams.clone();
+                                let __trigger_rule =
+                                    __tasks[__task_idx].trigger_rule.clone();
+
+                                // Evaluate trigger rule against upstream statuses.
+                                let __should_run: bool = if __upstreams.is_empty() {
+                                    true // root task always runs
+                                } else {
+                                    let __ups: ::std::vec::Vec<
+                                        ::autumn_harvest::policy::TaskStatus,
+                                    > = __upstreams
+                                        .iter()
+                                        .map(|&__i| {
+                                            __statuses[__i].unwrap_or(
+                                                ::autumn_harvest::policy::TaskStatus::Skipped,
+                                            )
+                                        })
+                                        .collect();
+                                    __trigger_rule.should_run(&__ups)
+                                };
+
+                                if !__should_run {
+                                    __statuses[__task_idx] = Some(
+                                        ::autumn_harvest::policy::TaskStatus::Skipped,
+                                    );
+                                    continue; // skip to next task in this level
+                                }
+
+                                // Dispatch and record terminal status.
+                                let __result = ctx
+                                    .execute_activity_raw(
+                                        &__activity_name,
+                                        ::autumn_harvest::serde_json::Value::Null,
+                                        &__queue_str,
+                                    )
+                                    .await;
+
+                                __statuses[__task_idx] = Some(match __result {
+                                    Ok(_) => ::autumn_harvest::policy::TaskStatus::Succeeded,
+                                    Err(_) => ::autumn_harvest::policy::TaskStatus::Failed,
+                                });
+                            }
+                        }
+
+                        Ok(::autumn_harvest::serde_json::Value::Null)
+                    })
                 },
             }
         }
