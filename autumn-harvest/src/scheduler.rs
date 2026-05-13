@@ -13,19 +13,19 @@ use diesel::SelectableHelper;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::context::ActivityContext;
 use crate::error::{HarvestError, HarvestResult};
-use crate::execution::StartedWorkflowExecution;
-use crate::failure::parse_typed_payload;
+use crate::execution::{
+    StartWorkflowParams, StartedWorkflowExecution, start_or_load_workflow_execution,
+};
 use crate::info::DagInfo;
-use crate::models::{DagRun, HarvestSchedule, NewDagRun, NewHarvestSchedule};
-use crate::policy::{RetryPolicy, Schedule, TaskStatus, WorkflowSchedule};
-use crate::schema::{harvest_dag_runs, harvest_schedules, harvest_workflow_executions};
-use crate::types::{ActivityExecId, ExecutionId, IdempotencyKey, WorkflowIdReusePolicy};
+use crate::models::{HarvestSchedule, NewHarvestSchedule};
+use crate::policy::{Schedule, WorkflowSchedule};
+use crate::schema::{harvest_schedules, harvest_workflow_executions};
+use crate::types::{ExecutionId, WorkflowIdReusePolicy};
 use crate::worker::{DbPool, HandlerRegistry};
 
 const DEFAULT_SCHEDULER_TICK_INTERVAL: Duration = Duration::from_secs(1);
@@ -388,21 +388,23 @@ pub async fn register_workflow_schedules(
     Ok(())
 }
 
-/// Run one scheduler tick: create due DAG runs, activate queued runs, execute
-/// runnable DAG runs, and dispatch due workflow-schedule runs.
+/// Run one scheduler tick: dispatch due workflow-schedule runs.
+///
+/// The `_dags` parameter is retained for API compatibility; since
+/// `unified-dag-execution` is the default, all DAGs are registered as workflow
+/// schedules and `_dags` is always an empty catalog.
 ///
 /// # Errors
 ///
-/// Returns [`HarvestError`] if Postgres cannot be reached or a DAG run cannot
-/// be driven to completion.
+/// Returns [`HarvestError`] if Postgres cannot be reached.
 pub async fn tick_once(
     pool: DbPool,
     registry: Arc<HandlerRegistry>,
-    dags: Arc<DagCatalog>,
+    _dags: Arc<DagCatalog>,
     workflow_schedules: Arc<Vec<WorkflowSchedule>>,
     monitor: SchedulerMonitor,
 ) -> HarvestResult<()> {
-    let total = dags.len() + workflow_schedules.len();
+    let total = workflow_schedules.len();
     monitor.mark_tick(total);
 
     let mut conn = pool
@@ -410,8 +412,6 @@ pub async fn tick_once(
         .await
         .map_err(|error| HarvestError::Database(error.to_string()))?;
     let metrics = Arc::clone(&registry.telemetry().metrics);
-    create_due_runs(&mut conn, dags.as_ref()).await?;
-    let runnable = activate_queued_runs(&mut conn, dags.as_ref(), &metrics).await?;
 
     // Dispatch due workflow-schedule runs directly via start_or_load_workflow_execution.
     // Always check the DB — API-created schedules are DB-only and won't appear in the
@@ -419,78 +419,25 @@ pub async fn tick_once(
     if let Err(error) = tick_workflow_schedules(&mut conn, &metrics).await {
         tracing::warn!(error = %error, "harvest workflow-schedule tick error");
     }
-    drop(conn);
-
-    for (run, dag) in runnable {
-        execute_dag_run(pool.clone(), Arc::clone(&registry), dag, run).await?;
-    }
 
     Ok(())
 }
 
-/// Insert a manual DAG run and kick the scheduler so it can execute promptly.
+/// Trigger a DAG run as a workflow execution (issue #256 Step 5).
+///
+/// All DAGs run on the unified workflow execution path. This starts a workflow
+/// execution for the named DAG using `start_or_load_workflow_execution`.
 ///
 /// # Errors
 ///
-/// Returns [`HarvestError::NotFound`] if the DAG name is unknown, or
-/// [`HarvestError::Database`] if the run cannot be recorded.
-pub async fn trigger_dag(
-    pool: DbPool,
-    registry: Arc<HandlerRegistry>,
-    dags: Arc<DagCatalog>,
-    dag_name: &str,
-    run_conf: Option<Value>,
-    monitor: SchedulerMonitor,
-) -> HarvestResult<DagRun> {
-    let dag = dags
-        .get(dag_name)
-        .ok_or_else(|| HarvestError::NotFound(format!("dag '{dag_name}'")))?;
-    let mut db = pool
-        .get()
-        .await
-        .map_err(|error| HarvestError::Database(error.to_string()))?;
-    upsert_schedule(&mut db, dag).await?;
-    let run = insert_dag_run(&mut db, dag_name, Utc::now(), run_conf).await?;
-    drop(db);
-
-    tokio::spawn(async move {
-        let _ = tick_once(
-            pool,
-            registry,
-            dags,
-            Arc::new(Vec::new()), // no workflow schedules needed for a DAG trigger kick
-            monitor,
-        )
-        .await;
-    });
-
-    Ok(run)
-}
-
-/// Trigger a unified DAG run by starting a workflow execution (issue #256 Step 3).
-///
-/// When the `unified-dag-execution` feature is on, DAGs that were promoted to the
-/// workflow execution path (those whose `#[dag]` macro emitted a `workflow_handler`)
-/// are triggered through [`crate::execution::start_or_load_workflow_execution`]
-/// rather than through the classic `harvest_dag_runs` + executor path.
-///
-/// A `harvest_dag_runs` row with `workflow_exec_id` set is still written so that
-/// the existing observability tables remain consistent during the transition window
-/// (Step 5 will drop the table once the unified path is the sole execution path).
-///
-/// # Errors
-///
-/// Returns [`HarvestError`] if the DB pool is exhausted, the workflow start
-/// transaction fails, or the `harvest_dag_runs` insert fails.
-#[cfg(feature = "unified-dag-execution")]
+/// Returns [`HarvestError`] if the DB pool is exhausted or the workflow start
+/// transaction fails.
 pub async fn trigger_unified_dag(
     pool: DbPool,
     dag_name: &str,
     run_conf: Option<Value>,
     shard: crate::types::ShardId,
-) -> HarvestResult<DagRun> {
-    use crate::execution::{StartWorkflowParams, start_or_load_workflow_execution};
-
+) -> HarvestResult<StartedWorkflowExecution> {
     let mut db = pool
         .get()
         .await
@@ -515,9 +462,9 @@ pub async fn trigger_unified_dag(
             .unwrap_or_else(|| "default".to_string())
     };
 
-    let input = run_conf.clone().unwrap_or(Value::Null);
+    let input = run_conf.unwrap_or(Value::Null);
 
-    let started = start_or_load_workflow_execution(
+    start_or_load_workflow_execution(
         &mut db,
         StartWorkflowParams {
             workflow_name: dag_name,
@@ -533,47 +480,7 @@ pub async fn trigger_unified_dag(
             trace_context: None,
         },
     )
-    .await?;
-
-    // Write the bridge row so harvest_dag_runs stays consistent for observability.
-    insert_unified_dag_run(&mut db, dag_name, started.exec_id.as_uuid(), logical_date, run_conf)
-        .await
-}
-
-/// Insert a `harvest_dag_runs` row that points to an existing workflow execution.
-#[cfg(feature = "unified-dag-execution")]
-async fn insert_unified_dag_run(
-    db: &mut AsyncPgConnection,
-    dag_name: &str,
-    workflow_exec_id: uuid::Uuid,
-    logical_date: DateTime<Utc>,
-    conf: Option<Value>,
-) -> HarvestResult<DagRun> {
-    let row = NewDagRun {
-        id: uuid::Uuid::new_v4(),
-        dag_name,
-        workflow_exec_id: Some(workflow_exec_id),
-        logical_date,
-        data_interval_start: logical_date,
-        data_interval_end: logical_date,
-        conf,
-    };
-
-    diesel::insert_into(harvest_dag_runs::table)
-        .values(&row)
-        .on_conflict((harvest_dag_runs::dag_name, harvest_dag_runs::logical_date))
-        .do_nothing()
-        .execute(db)
-        .await
-        .map_err(crate::error::database_error)?;
-
-    harvest_dag_runs::table
-        .filter(harvest_dag_runs::dag_name.eq(dag_name))
-        .filter(harvest_dag_runs::logical_date.eq(logical_date))
-        .select(DagRun::as_select())
-        .first(db)
-        .await
-        .map_err(crate::error::database_error)
+    .await
 }
 
 async fn upsert_schedule(
@@ -739,142 +646,6 @@ async fn upsert_workflow_schedule(
         .first(conn)
         .await
         .map_err(crate::error::database_error)
-}
-
-async fn create_due_runs(conn: &mut AsyncPgConnection, dags: &DagCatalog) -> HarvestResult<()> {
-    use crate::schema::harvest_schedules::dsl;
-
-    let schedules = dsl::harvest_schedules
-        .filter(dsl::dag_name.is_not_null()) // DAG-only rows
-        .filter(dsl::is_paused.eq(false))
-        .filter(dsl::next_run_at.is_not_null())
-        .filter(dsl::next_run_at.le(Utc::now()))
-        .order(dsl::next_run_at.asc())
-        .select(HarvestSchedule::as_select())
-        .load(conn)
-        .await
-        .map_err(crate::error::database_error)?;
-
-    for schedule in schedules {
-        let Some(dag_name) = &schedule.dag_name else {
-            continue;
-        };
-        let Some(dag) = dags.get(dag_name) else {
-            continue;
-        };
-        let Some(logical_date) = schedule.next_run_at else {
-            continue;
-        };
-        let now = Utc::now();
-        let (created, next_run_at) =
-            due_run_plan(dag.schedule.as_ref(), logical_date, now, dag.catchup);
-
-        if !created.is_empty() {
-            let rows = create_new_dag_runs(dag_name, &created);
-            diesel::insert_into(harvest_dag_runs::table)
-                .values(&rows)
-                .on_conflict((harvest_dag_runs::dag_name, harvest_dag_runs::logical_date))
-                .do_nothing()
-                .execute(conn)
-                .await
-                .map_err(crate::error::database_error)?;
-        }
-
-        diesel::update(dsl::harvest_schedules.find(schedule.id))
-            .set((
-                dsl::last_run_at.eq(created.last().copied()),
-                dsl::next_run_at.eq(next_run_at),
-                dsl::updated_at.eq(Utc::now()),
-            ))
-            .execute(conn)
-            .await
-            .map_err(crate::error::database_error)?;
-    }
-
-    Ok(())
-}
-
-async fn activate_queued_runs<'a>(
-    conn: &mut AsyncPgConnection,
-    dags: &'a DagCatalog,
-    metrics: &Arc<dyn crate::telemetry::MetricsRecorder>,
-) -> HarvestResult<Vec<(DagRun, &'a RegisteredDag)>> {
-    use crate::schema::harvest_dag_runs::dsl as dag_runs_dsl;
-    use crate::schema::harvest_schedules::dsl as schedules_dsl;
-
-    let schedules = schedules_dsl::harvest_schedules
-        .filter(schedules_dsl::dag_name.is_not_null()) // DAG-only rows
-        .filter(schedules_dsl::is_paused.eq(false))
-        .select(HarvestSchedule::as_select())
-        .load(conn)
-        .await
-        .map_err(crate::error::database_error)?;
-    let mut runnable = Vec::with_capacity(schedules.len());
-
-    for schedule in schedules {
-        let Some(dag_name) = &schedule.dag_name else {
-            continue;
-        };
-        let Some(dag) = dags.get(dag_name) else {
-            continue;
-        };
-        let running_count = dag_runs_dsl::harvest_dag_runs
-            .filter(dag_runs_dsl::dag_name.eq(dag_name))
-            .filter(dag_runs_dsl::state.eq("RUNNING"))
-            .count()
-            .get_result::<i64>(conn)
-            .await
-            .map_err(crate::error::database_error)?;
-        let available = i64::from(schedule.max_active_runs) - running_count;
-
-        let queued = dag_runs_dsl::harvest_dag_runs
-            .filter(dag_runs_dsl::dag_name.eq(dag_name))
-            .filter(dag_runs_dsl::state.eq("QUEUED"))
-            .order(dag_runs_dsl::logical_date.asc())
-            .limit(available.max(1)) // load at least 1 to detect skip-worthy backlog
-            .select(DagRun::as_select())
-            .load(conn)
-            .await
-            .map_err(crate::error::database_error)?;
-
-        if queued.is_empty() {
-            continue;
-        }
-
-        if available <= 0 {
-            metrics.record_schedule_skipped("dag", dag_name, "max_active_runs_reached");
-            continue;
-        }
-        let queued_ids: Vec<_> = queued.iter().map(|r| r.id).collect();
-
-        // Keep the state predicate in the claim update so a second scheduler
-        // that selected stale QUEUED rows cannot reactivate the same run.
-        let mut updated_runs = diesel::update(
-            dag_runs_dsl::harvest_dag_runs
-                .filter(dag_runs_dsl::id.eq_any(queued_ids))
-                .filter(dag_runs_dsl::state.eq("QUEUED")),
-        )
-        .set((
-            dag_runs_dsl::state.eq("RUNNING"),
-            dag_runs_dsl::started_at.eq(Some(Utc::now())),
-        ))
-        .returning(DagRun::as_select())
-        .get_results::<DagRun>(conn)
-        .await
-        .map_err(crate::error::database_error)?;
-
-        // Sort by logical_date to preserve the original queue ordering (logical_date ASC).
-        updated_runs.sort_by_key(|r| r.logical_date);
-
-        for updated in updated_runs {
-            // Emit at activation, not at completion, so interrupted/failed runs
-            // are still counted — consistent with workflow schedule semantics.
-            metrics.record_schedule_run("dag", dag_name);
-            runnable.push((updated, dag));
-        }
-    }
-
-    Ok(runnable)
 }
 
 /// Derive a deterministic, idempotent `workflow_id` for a scheduled run.
@@ -1158,227 +929,6 @@ async fn tick_one_workflow_schedule(
     Ok(())
 }
 
-async fn execute_dag_run(
-    pool: DbPool,
-    registry: Arc<HandlerRegistry>,
-    dag: &RegisteredDag,
-    run: DagRun,
-) -> HarvestResult<()> {
-    // Bolt: Use Arc to avoid deep cloning the JSON Value for every task in the DAG
-    let run_input = Arc::new(run.conf.unwrap_or(Value::Null));
-    let mut statuses = vec![TaskStatus::Skipped; dag.definition.tasks().len()];
-
-    for level in dag.definition.execution_levels() {
-        let tasks = level.iter().map(|task_index| {
-            // Avoid an unnecessary heap allocation of `DagTask` per task when `&DagTask` works.
-            let task = &dag.definition.tasks()[*task_index];
-            let registry = Arc::clone(&registry);
-            let task_input = Arc::clone(&run_input);
-
-            // ⚡ Bolt: Remove an intermediate `.collect::<Vec<_>>()` when fetching upstream
-            // statuses by passing an Iterator into `execute_dag_task`. This avoids an
-            // unnecessary heap allocation per DAG task inside this loop.
-            let statuses_ref = &statuses;
-            let upstream_statuses = task
-                .upstreams
-                .iter()
-                .map(move |upstream| &statuses_ref[*upstream]);
-            let dag_run_id = run.id;
-            let node_index = *task_index;
-            async move {
-                execute_dag_task(
-                    &registry,
-                    task,
-                    upstream_statuses,
-                    &task_input,
-                    dag_run_id,
-                    node_index,
-                )
-                .await
-            }
-        });
-        let results = futures::future::join_all(tasks).await;
-        for (task_index, result) in level.iter().zip(results) {
-            statuses[*task_index] = result;
-        }
-    }
-
-    let final_state = if statuses.contains(&TaskStatus::Failed) {
-        "FAILED"
-    } else {
-        "SUCCESS"
-    };
-    let mut db = pool
-        .get()
-        .await
-        .map_err(|error| HarvestError::Database(error.to_string()))?;
-    diesel::update(harvest_dag_runs::table.find(run.id))
-        .set((
-            harvest_dag_runs::state.eq(final_state),
-            harvest_dag_runs::completed_at.eq(Some(Utc::now())),
-        ))
-        .execute(&mut db)
-        .await
-        .map_err(crate::error::database_error)?;
-
-    Ok(())
-}
-
-/// Namespace UUID for deriving stable DAG task idempotency keys.
-///
-/// Keyed on (`dag_run_id`, `task_name`) so each logical DAG task invocation
-/// always produces the same [`ActivityExecId`] regardless of retry attempt.
-const DAG_TASK_KEY_NAMESPACE: uuid::Uuid = uuid::Uuid::from_bytes([
-    0x6b, 0xa7, 0xb8, 0x14, 0x9d, 0xad, 0x11, 0xd1, 0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8,
-]);
-
-async fn execute_dag_task<'a>(
-    registry: &HandlerRegistry,
-    task: &crate::dag::DagTask,
-    upstream_statuses: impl IntoIterator<Item = &'a TaskStatus>,
-    conf: &Value,
-    dag_run_id: uuid::Uuid,
-    node_index: usize,
-) -> TaskStatus {
-    if !task.trigger_rule.should_run(upstream_statuses) {
-        return TaskStatus::Skipped;
-    }
-
-    let Some(activity) = registry.activities.get(&task.activity_name) else {
-        return TaskStatus::Failed;
-    };
-    let retry_policy = task
-        .retry_policy
-        .clone()
-        .or_else(|| activity.default_retry_policy.clone());
-    let timeout = task.start_to_close.or(activity.default_start_to_close);
-    let input = task_input(conf, &task.activity_name);
-    let mut attempt = 1u32;
-
-    // Derive a stable ActivityExecId from the DAG run ID and task name so
-    // the idempotency key is the same across retries for this logical task.
-    // node_index is included so two nodes that share the same activity_name
-    // within a DAG run receive distinct keys.
-    let task_exec_id = ActivityExecId::from_uuid(uuid::Uuid::new_v5(
-        &DAG_TASK_KEY_NAMESPACE,
-        format!("{dag_run_id}:{node_index}:{}", task.activity_name).as_bytes(),
-    ));
-    let idempotency_key = IdempotencyKey::from_activity_exec_id(task_exec_id);
-
-    loop {
-        let cancel = CancellationToken::new();
-        let ctx = ActivityContext::new(registry.shared_state(), None, cancel.clone())
-            .with_idempotency_key(idempotency_key.clone())
-            .with_attempt(attempt);
-        let future = (activity.handler)(&ctx, input.clone());
-        let result = match timeout {
-            Some(timeout) => tokio::time::timeout(timeout, future)
-                .await
-                .unwrap_or_else(|_| Err(format!("dag task '{}' timed out", task.activity_name))),
-            None => future.await,
-        };
-        cancel.cancel();
-
-        let Err(error) = result else {
-            return TaskStatus::Succeeded;
-        };
-
-        // Structured failure: only consult the typed `error_type` when the
-        // payload was the typed wire format — passing the synthetic "Error"
-        // fallback would break back-compat for legacy `Err(String)` callers
-        // whose retry policy happens to list "Error".
-        let typed = parse_typed_payload(&error);
-        if typed.as_ref().is_some_and(|f| f.non_retryable) {
-            return TaskStatus::Failed;
-        }
-
-        let Some(policy) = retry_policy.as_ref() else {
-            return TaskStatus::Failed;
-        };
-
-        let typed_error_type = typed.as_ref().map(|f| f.error_type.as_str());
-        if policy.is_non_retryable(typed_error_type, &error) {
-            return TaskStatus::Failed;
-        }
-
-        let Some(delay) = next_retry_delay(policy, attempt) else {
-            return TaskStatus::Failed;
-        };
-
-        attempt = attempt.saturating_add(1);
-        tokio::time::sleep(delay).await;
-    }
-}
-
-fn next_retry_delay(policy: &RetryPolicy, attempt: u32) -> Option<Duration> {
-    policy.next_delay(attempt)
-}
-
-fn task_input(conf: &Value, activity_name: &str) -> Value {
-    match conf {
-        Value::Object(map) => {
-            let mut payload = map.clone();
-            payload.insert(
-                "dag_task".to_string(),
-                Value::String(activity_name.to_string()),
-            );
-            Value::Object(payload)
-        }
-        _ => json!({
-            "conf": conf,
-            "dag_task": activity_name,
-        }),
-    }
-}
-
-fn create_new_dag_runs<'a>(dag_name: &'a str, run_dates: &[DateTime<Utc>]) -> Vec<NewDagRun<'a>> {
-    run_dates
-        .iter()
-        .map(|&logical_date| NewDagRun {
-            id: uuid::Uuid::new_v4(),
-            dag_name,
-            workflow_exec_id: None,
-            logical_date,
-            data_interval_start: logical_date,
-            data_interval_end: logical_date,
-            conf: None,
-        })
-        .collect()
-}
-
-async fn insert_dag_run(
-    db: &mut AsyncPgConnection,
-    dag_name: &str,
-    logical_date: DateTime<Utc>,
-    run_conf: Option<Value>,
-) -> HarvestResult<DagRun> {
-    let row = NewDagRun {
-        id: uuid::Uuid::new_v4(),
-        dag_name,
-        workflow_exec_id: None,
-        logical_date,
-        data_interval_start: logical_date,
-        data_interval_end: logical_date,
-        conf: run_conf,
-    };
-
-    diesel::insert_into(harvest_dag_runs::table)
-        .values(&row)
-        .on_conflict((harvest_dag_runs::dag_name, harvest_dag_runs::logical_date))
-        .do_nothing()
-        .execute(db)
-        .await
-        .map_err(crate::error::database_error)?;
-
-    harvest_dag_runs::table
-        .filter(harvest_dag_runs::dag_name.eq(dag_name))
-        .filter(harvest_dag_runs::logical_date.eq(logical_date))
-        .select(DagRun::as_select())
-        .first(db)
-        .await
-        .map_err(crate::error::database_error)
-}
-
 /// Validate a [`Schedule`] at creation time.
 ///
 /// Returns `Err` if the schedule is a `Cron` variant whose expression cannot be
@@ -1475,35 +1025,6 @@ mod tests {
             ]
         );
         assert_eq!(next_run_at, Some(parse_utc("2026-04-06T12:03:00Z")));
-    }
-
-    #[test]
-    fn create_new_dag_runs_generates_correct_rows() {
-        let first_due = parse_utc("2026-04-06T12:00:00Z");
-        let second_due = parse_utc("2026-04-06T12:01:00Z");
-        let dates = vec![first_due, second_due];
-
-        let rows = create_new_dag_runs("test_dag", &dates);
-
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].dag_name, "test_dag");
-        assert_eq!(rows[0].logical_date, first_due);
-        assert_eq!(rows[0].data_interval_start, first_due);
-        assert_eq!(rows[0].data_interval_end, first_due);
-        assert_eq!(rows[0].workflow_exec_id, None);
-        assert_eq!(rows[0].conf, None);
-        assert_eq!(rows[1].dag_name, "test_dag");
-        assert_eq!(rows[1].logical_date, second_due);
-        assert_eq!(rows[1].data_interval_start, second_due);
-        assert_eq!(rows[1].data_interval_end, second_due);
-        assert_eq!(rows[1].workflow_exec_id, None);
-        assert_eq!(rows[1].conf, None);
-    }
-
-    #[test]
-    fn create_new_dag_runs_returns_empty_for_no_dates() {
-        let rows = create_new_dag_runs("test_dag", &[]);
-        assert!(rows.is_empty());
     }
 
     #[test]

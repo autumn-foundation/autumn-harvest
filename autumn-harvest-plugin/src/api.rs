@@ -48,8 +48,8 @@ use autumn_harvest::history_export::{
     HistoryExportRequest, HistoryPayloadPolicy, export_history,
 };
 use autumn_harvest::models::{
-    AuditRecord, BackfillLogRow, DagRun, DeadLetter, HarvestSchedule, NewAuditRecord,
-    NewBackfillLogRow, WorkflowExecution,
+    AuditRecord, BackfillLogRow, DeadLetter, HarvestSchedule, NewAuditRecord, NewBackfillLogRow,
+    WorkflowExecution,
 };
 use autumn_harvest::policy::WorkflowSchedule;
 use autumn_harvest::queue::{self, ConcurrencyKeyStats};
@@ -61,14 +61,11 @@ use autumn_harvest::retention::{RetentionConfig, RetentionMonitor, RetentionStat
 use autumn_harvest::scheduler::{
     BackfillPlanError, DEFAULT_BACKFILL_MAX_COUNT, DagCatalog, RegisteredDag, SchedulerMonitor,
     SchedulerSnapshot, parse_schedule_from_expr_pub, plan_backfill_timestamps,
-    scheduled_workflow_id_pub, trigger_dag,
+    scheduled_workflow_id_pub, trigger_unified_dag,
 };
-#[cfg(feature = "unified-dag-execution")]
-use autumn_harvest::trigger_unified_dag;
 use autumn_harvest::schema::{
-    harvest_backfill_log, harvest_dag_runs, harvest_dead_letters, harvest_events,
-    harvest_schedules, harvest_signals, harvest_task_queue, harvest_timers,
-    harvest_workflow_executions,
+    harvest_backfill_log, harvest_dead_letters, harvest_events, harvest_schedules, harvest_signals,
+    harvest_task_queue, harvest_timers, harvest_workflow_executions,
 };
 use autumn_harvest::shard::ShardRouter;
 use autumn_harvest::signal;
@@ -1518,8 +1515,8 @@ pub const fn management_api_response_fields()
         ("GET", "/workflows/{id}/update/{update_id}/result", None), // polymorphic completed/failed
         // ── DAGs ─────────────────────────────────────────────────────────────
         ("GET", "/dags", None),                     // Vec<DagSummary>
-        ("GET", "/dags/{dag_name}/runs", None),     // Vec<DagRun> (external model)
-        ("POST", "/dags/{dag_name}/trigger", None), // DagRun (external model)
+        ("GET", "/dags/{dag_name}/runs", None),     // Vec<WorkflowExecution>
+        ("POST", "/dags/{dag_name}/trigger", None), // StartWorkflowResponse
         ("PATCH", "/dags/{dag_name}", None),        // HarvestSchedule (external model)
         // ── dead-letter queue ─────────────────────────────────────────────────
         ("GET", "/dead-letters", None), // Vec<DeadLetter> (external model)
@@ -3878,12 +3875,13 @@ async fn list_dags(
 async fn list_dag_runs(
     Extension(api_state): Extension<HarvestApiState>,
     Path(dag_name): Path<String>,
-) -> Result<Json<Vec<DagRun>>, AutumnError> {
-    let mut conn = db_conn_for_dag(&api_state, &dag_name).await?;
-    let runs = harvest_dag_runs::table
-        .filter(harvest_dag_runs::dag_name.eq(&dag_name))
-        .order(harvest_dag_runs::created_at.desc())
-        .select(DagRun::as_select())
+) -> Result<Json<Vec<WorkflowExecution>>, AutumnError> {
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    let mut conn = acquire_conn(pool.default_pool()).await?;
+    let runs = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_name.eq(&dag_name))
+        .order(harvest_workflow_executions::created_at.desc())
+        .select(WorkflowExecution::as_select())
         .load(&mut conn)
         .await
         .map_err(database_error)
@@ -3896,7 +3894,7 @@ async fn trigger_dag_run(
     Path(dag_name): Path<String>,
     headers: axum::http::HeaderMap,
     Json(request): Json<DagTriggerRequest>,
-) -> Result<(axum::http::StatusCode, Json<DagRun>), AutumnError> {
+) -> Result<(axum::http::StatusCode, Json<StartWorkflowResponse>), AutumnError> {
     let runtime = api_state.runtime().map_err(map_error)?;
     let pool = api_state.storage_pool().map_err(map_error)?;
     let shard = runtime.router.pick_for_dag(&dag_name);
@@ -3904,34 +3902,8 @@ async fn trigger_dag_run(
     let (actor, source, request_id) = audit_context(&headers, &api_state);
     let route = "POST /dags/{dag_name}/trigger";
 
-    // When unified-dag-execution is on, unified DAGs are registered as workflows
-    // (by HarvestBuilder::dags) and excluded from the classic DagCatalog. Route
-    // them through start_or_load_workflow_execution instead of the DAG executor.
-    #[cfg(feature = "unified-dag-execution")]
-    let trigger_result = if runtime.registry.workflows.contains_key(&dag_name) {
-        trigger_unified_dag(pool.pool_for(shard).clone(), &dag_name, request.conf, shard).await
-    } else {
-        trigger_dag(
-            pool.pool_for(shard).clone(),
-            Arc::clone(&runtime.registry),
-            Arc::clone(&runtime.dags),
-            &dag_name,
-            request.conf,
-            runtime.scheduler,
-        )
-        .await
-    };
-
-    #[cfg(not(feature = "unified-dag-execution"))]
-    let trigger_result = trigger_dag(
-        pool.pool_for(shard).clone(),
-        Arc::clone(&runtime.registry),
-        Arc::clone(&runtime.dags),
-        &dag_name,
-        request.conf,
-        runtime.scheduler,
-    )
-    .await;
+    let trigger_result =
+        trigger_unified_dag(pool.pool_for(shard).clone(), &dag_name, request.conf, shard).await;
 
     let mut audit_conn = acquire_conn(pool.pool_for(shard)).await?;
 
@@ -3954,13 +3926,13 @@ async fn trigger_dag_run(
             let _ = audit::insert_audit(&mut audit_conn, &ar).await;
             Err(map_error(e))
         }
-        Ok(run) => {
-            let run_id_str = run.id.to_string();
+        Ok(started) => {
+            let exec_id_str = started.exec_id.to_string();
             let ar = NewAuditRecord {
                 actor: &actor,
                 operation: OP_DAG_TRIGGER,
                 target_type: TARGET_DAG,
-                target_id: Some(dag_name.as_str()),
+                target_id: Some(exec_id_str.as_str()),
                 route_or_command: route,
                 request_id: request_id.as_deref(),
                 idempotency_key: None,
@@ -3970,12 +3942,20 @@ async fn trigger_dag_run(
                 source: &source,
             };
             if let Err(audit_err) = audit::insert_audit(&mut audit_conn, &ar).await {
-                tracing::error!(error = %audit_err, run_id = %run_id_str, "audit insert failed for dag.trigger");
+                tracing::error!(error = %audit_err, exec_id = %exec_id_str, "audit insert failed for dag.trigger");
                 return Err(AutumnError::service_unavailable_msg(format!(
                     "audit insert failed: {audit_err}"
                 )));
             }
-            Ok((axum::http::StatusCode::CREATED, Json(run)))
+            Ok((
+                axum::http::StatusCode::CREATED,
+                Json(StartWorkflowResponse {
+                    execution_id: started.exec_id.to_string(),
+                    workflow_name: started.workflow_name,
+                    workflow_id: started.workflow_id,
+                    state: started.state,
+                }),
+            ))
         }
     }
 }
@@ -4722,8 +4702,6 @@ async fn schedule_backfill(
     headers: axum::http::HeaderMap,
     Json(request): Json<ScheduleBackfillRequest>,
 ) -> Result<Json<ScheduleBackfillResponse>, AutumnError> {
-    use autumn_harvest::models::NewDagRun;
-
     let (actor, source, req_id) = audit_context(&headers, &api_state);
     let route = "POST /admin/schedules/{id}/backfill";
     let started_at = chrono::Utc::now();
@@ -5039,13 +5017,11 @@ async fn schedule_backfill(
         }
         ScheduleKind::Dag => {
             let dag_name = name.clone();
-            // DAG runs are pinned to a single shard by dag_name (same rendezvous hash
-            // as the scheduler tick), so ON CONFLICT DO NOTHING is effective across retries.
             let shard_id = runtime.router().pick_for_dag(&dag_name);
             let shard_pool = pool.pool_for(shard_id);
 
             for scheduled_for in &timestamps {
-                // Respect max_active_runs for DAGs.
+                // Respect max_active_runs for DAGs (now counted via workflow executions).
                 if running_at_start + dispatched_this_call >= max_active {
                     skipped += 1;
                     *skipped_reasons
@@ -5062,28 +5038,38 @@ async fn schedule_backfill(
                     failed += 1;
                     continue;
                 };
-                let row = NewDagRun {
-                    id: uuid::Uuid::new_v4(),
-                    dag_name: &dag_name,
-                    workflow_exec_id: None,
-                    logical_date: *scheduled_for,
-                    data_interval_start: *scheduled_for,
-                    data_interval_end: *scheduled_for,
-                    conf: Some(serde_json::json!({"_harvest_run_source": "backfill"})),
-                };
-                let insert_result = diesel::insert_into(harvest_dag_runs::table)
-                    .values(&row)
-                    .on_conflict((harvest_dag_runs::dag_name, harvest_dag_runs::logical_date))
-                    .do_nothing()
-                    .execute(&mut conn)
-                    .await;
-                match insert_result {
-                    Ok(1) => {
+                let workflow_id = scheduled_workflow_id_pub(&dag_name, *scheduled_for);
+                let exec_id = autumn_harvest::types::ExecutionId::new_for_shard(shard_id);
+                let start_result = start_or_load_workflow_execution(
+                    &mut conn,
+                    StartWorkflowParams {
+                        workflow_name: &dag_name,
+                        workflow_id: &workflow_id,
+                        exec_id,
+                        input: serde_json::json!({"_harvest_run_source": "backfill"}),
+                        parent_id: None,
+                        queue_name: "default",
+                        execution_timeout: None,
+                        memo: None,
+                        search_attrs: None,
+                        reuse_policy: autumn_harvest::types::WorkflowIdReusePolicy::RejectDuplicate,
+                        trace_context: None,
+                    },
+                )
+                .await;
+                match start_result {
+                    Ok(started) if started.created => {
                         dispatched += 1;
                         dispatched_this_call += 1;
                     }
                     Ok(_) => {
-                        // ON CONFLICT DO NOTHING → already exists
+                        // RejectDuplicate → already exists
+                        skipped += 1;
+                        *skipped_reasons
+                            .entry("already_exists".to_string())
+                            .or_insert(0) += 1;
+                    }
+                    Err(autumn_harvest::HarvestError::AlreadyExists { .. }) => {
                         skipped += 1;
                         *skipped_reasons
                             .entry("already_exists".to_string())
@@ -5183,24 +5169,15 @@ async fn query_running_count(
             });
             continue;
         };
-        let count_result = match kind {
-            ScheduleKind::Workflow => {
-                harvest_workflow_executions::table
-                    .filter(harvest_workflow_executions::workflow_name.eq(name))
-                    .filter(harvest_workflow_executions::state.eq("RUNNING"))
-                    .count()
-                    .get_result::<i64>(&mut conn)
-                    .await
-            }
-            ScheduleKind::Dag => {
-                harvest_dag_runs::table
-                    .filter(harvest_dag_runs::dag_name.eq(name))
-                    .filter(harvest_dag_runs::state.eq("RUNNING"))
-                    .count()
-                    .get_result::<i64>(&mut conn)
-                    .await
-            }
-        };
+        // Both DAG and Workflow kinds query harvest_workflow_executions since
+        // DAGs are now unified as workflows (issue #256 step 5).
+        let count_result = harvest_workflow_executions::table
+            .filter(harvest_workflow_executions::workflow_name.eq(name))
+            .filter(harvest_workflow_executions::state.eq("RUNNING"))
+            .count()
+            .get_result::<i64>(&mut conn)
+            .await;
+        let _ = kind; // consumed for pattern coverage above
         match classify_backfill_running_count(count_result) {
             BackfillRunningCountCheck::Count(count) => total += count,
             BackfillRunningCountCheck::CountFailed(reason) => {
@@ -5262,13 +5239,17 @@ async fn count_existing_in_window(
             }
         }
         ScheduleKind::Dag => {
+            let workflow_ids: Vec<String> = timestamps
+                .iter()
+                .map(|ts| scheduled_workflow_id_pub(name, *ts))
+                .collect();
             for (_, shard_pool) in pool.iter_shards() {
                 let Ok(mut conn) = acquire_conn(shard_pool).await else {
                     continue;
                 };
-                let count: i64 = harvest_dag_runs::table
-                    .filter(harvest_dag_runs::dag_name.eq(name))
-                    .filter(harvest_dag_runs::logical_date.eq_any(timestamps))
+                let count: i64 = harvest_workflow_executions::table
+                    .filter(harvest_workflow_executions::workflow_name.eq(name))
+                    .filter(harvest_workflow_executions::workflow_id.eq_any(&workflow_ids))
                     .count()
                     .get_result(&mut conn)
                     .await

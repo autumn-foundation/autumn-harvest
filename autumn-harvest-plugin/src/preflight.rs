@@ -313,7 +313,6 @@ const HARVEST_WRITE_PRIVILEGE_REQUIREMENTS: &[(&str, &[&str])] = &[
     ),
     ("harvest_events", &["SELECT", "INSERT"]),
     ("harvest_task_queue", &["SELECT", "INSERT", "UPDATE"]),
-    ("harvest_dag_runs", &["SELECT", "INSERT", "UPDATE"]),
     ("harvest_schedules", &["SELECT", "INSERT", "UPDATE"]),
     ("harvest_signals", &["SELECT", "INSERT", "UPDATE"]),
     ("harvest_timers", &["SELECT", "INSERT", "UPDATE", "DELETE"]),

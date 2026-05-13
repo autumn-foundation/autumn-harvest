@@ -11,9 +11,9 @@ use uuid::Uuid;
 
 use crate::schema::{
     harvest_audit_log, harvest_backfill_log, harvest_batch_jobs, harvest_build_compat,
-    harvest_build_policies, harvest_dag_runs, harvest_dead_letters, harvest_events,
-    harvest_external_tasks, harvest_schedules, harvest_signals, harvest_task_queue, harvest_timers,
-    harvest_workers, harvest_workflow_executions,
+    harvest_build_policies, harvest_dead_letters, harvest_events, harvest_external_tasks,
+    harvest_schedules, harvest_signals, harvest_task_queue, harvest_timers, harvest_workers,
+    harvest_workflow_executions,
 };
 
 // ── WorkflowExecution ─────────────────────────────────────────────────────────
@@ -169,41 +169,6 @@ pub struct NewTaskQueueItem<'a> {
     pub concurrency_cap: Option<i32>,
     /// Build ID required to claim this task. `None` = any worker may claim.
     pub required_build_id: Option<&'a str>,
-}
-
-// ── DagRun ────────────────────────────────────────────────────────────────────
-
-/// A single DAG run instance.
-#[derive(
-    Debug, Clone, Queryable, Selectable, Identifiable, serde::Serialize, serde::Deserialize,
-)]
-#[diesel(table_name = harvest_dag_runs)]
-#[diesel(check_for_backend(diesel::pg::Pg))]
-pub struct DagRun {
-    pub id: Uuid,
-    pub dag_name: String,
-    pub workflow_exec_id: Option<Uuid>,
-    pub state: String,
-    pub logical_date: DateTime<Utc>,
-    pub data_interval_start: DateTime<Utc>,
-    pub data_interval_end: DateTime<Utc>,
-    pub conf: Option<serde_json::Value>,
-    pub started_at: Option<DateTime<Utc>>,
-    pub completed_at: Option<DateTime<Utc>>,
-    pub created_at: DateTime<Utc>,
-}
-
-/// Insert struct for creating a new DAG run.
-#[derive(Debug, Insertable, serde::Serialize, serde::Deserialize)]
-#[diesel(table_name = harvest_dag_runs)]
-pub struct NewDagRun<'a> {
-    pub id: Uuid,
-    pub dag_name: &'a str,
-    pub workflow_exec_id: Option<Uuid>,
-    pub logical_date: DateTime<Utc>,
-    pub data_interval_start: DateTime<Utc>,
-    pub data_interval_end: DateTime<Utc>,
-    pub conf: Option<serde_json::Value>,
 }
 
 // ── Schedule ──────────────────────────────────────────────────────────────────

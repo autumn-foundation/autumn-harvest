@@ -89,7 +89,9 @@ fn dag_info_backward_compat_still_works() {
     assert_eq!(dag_info.name, "linear_dag");
     assert_eq!(dag_info.default_queue, Some("etl-workers"));
 
-    let definition = dag_info.build_definition().expect("definition should build");
+    let definition = dag_info
+        .build_definition()
+        .expect("definition should build");
     assert_eq!(definition.tasks().len(), 2);
     assert_eq!(definition.execution_levels().len(), 2);
 }
@@ -267,7 +269,12 @@ fn dag_info_as_workflow_info_returns_some_with_matching_name() {
 
 /// A DAG with a cron schedule, catchup=true, max_active_runs=3, and a custom
 /// queue — used to verify that `as_workflow_schedule()` maps fields correctly.
-#[dag(schedule = "0 * * * *", catchup = true, max_active_runs = 3, default_queue = "test-queue")]
+#[dag(
+    schedule = "0 * * * *",
+    catchup = true,
+    max_active_runs = 3,
+    default_queue = "test-queue"
+)]
 fn scheduled_dag(dag: &mut DagBuilder) {
     let _extract = dag.activity(extract_users);
 }
@@ -315,8 +322,10 @@ fn builder_dags_auto_registers_workflow_info() {
     use autumn_harvest::builder::HarvestBuilder;
 
     // Two dags: one with a schedule, one without.
-    let builder =
-        HarvestBuilder::new().dags(vec![__autumn_dag_info_linear_dag(), __autumn_dag_info_scheduled_dag()]);
+    let builder = HarvestBuilder::new().dags(vec![
+        __autumn_dag_info_linear_dag(),
+        __autumn_dag_info_scheduled_dag(),
+    ]);
 
     assert_eq!(
         builder.workflow_count(),
@@ -334,8 +343,10 @@ fn builder_dags_auto_registers_workflow_info() {
 fn builder_dags_auto_registers_workflow_schedule_only_for_scheduled_dags() {
     use autumn_harvest::builder::HarvestBuilder;
 
-    let builder =
-        HarvestBuilder::new().dags(vec![__autumn_dag_info_linear_dag(), __autumn_dag_info_scheduled_dag()]);
+    let builder = HarvestBuilder::new().dags(vec![
+        __autumn_dag_info_linear_dag(),
+        __autumn_dag_info_scheduled_dag(),
+    ]);
 
     // Only scheduled_dag has a schedule; linear_dag does not.
     assert_eq!(
@@ -363,10 +374,7 @@ fn trigger_routing_recognises_unified_dag_via_workflow_registry() {
 
     // Build a registry that mimics what HarvestBuilder::dags() produces for a
     // unified DAG: the WorkflowInfo from as_workflow_info() is auto-pushed.
-    let registry = HandlerRegistry::new(
-        vec![__autumn_workflow_info_linear_dag()],
-        vec![],
-    );
+    let registry = HandlerRegistry::new(vec![__autumn_workflow_info_linear_dag()], vec![]);
 
     // The routing predicate: unified dag present.
     assert!(

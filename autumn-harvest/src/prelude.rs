@@ -22,7 +22,7 @@ pub use crate::saga::Saga;
 #[cfg(feature = "db")]
 pub use crate::scheduler::{
     DagCatalog, RegisteredDag, SchedulerMonitor, SchedulerRuntime, compile_dag_catalog,
-    register_schedules, tick_once, trigger_dag,
+    register_schedules, tick_once, trigger_unified_dag,
 };
 pub use crate::telemetry::{
     ActivityStatus, MetricsRecorder, NoOpMetrics, NoOpPropagator, TelemetryConfig,

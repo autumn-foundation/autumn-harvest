@@ -85,7 +85,8 @@ pub fn dag_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // feature is enabled on the proc-macro crate (transitively enabled by
     // `autumn-harvest/unified-dag-execution`).
     #[cfg(feature = "unified-dag-execution")]
-    let workflow_companion = emit_workflow_companion(fn_name, &fn_name_str, attrs.default_queue.as_ref());
+    let workflow_companion =
+        emit_workflow_companion(fn_name, &fn_name_str, attrs.default_queue.as_ref());
 
     #[cfg(not(feature = "unified-dag-execution"))]
     let workflow_companion = quote! {};
@@ -95,11 +96,10 @@ pub fn dag_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // companion function lookup.
     #[cfg(feature = "unified-dag-execution")]
     let workflow_handler_field = {
-        let builder_init_for_field =
-            attrs.default_queue.as_deref().map_or_else(
-                || quote! { ::autumn_harvest::DagBuilder::new() },
-                |q| quote! { ::autumn_harvest::DagBuilder::with_default_queue(#q) },
-            );
+        let builder_init_for_field = attrs.default_queue.as_deref().map_or_else(
+            || quote! { ::autumn_harvest::DagBuilder::new() },
+            |q| quote! { ::autumn_harvest::DagBuilder::with_default_queue(#q) },
+        );
         quote! {
             workflow_handler: Some(|ctx, _input| {
                 ::std::boxed::Box::pin(async move {

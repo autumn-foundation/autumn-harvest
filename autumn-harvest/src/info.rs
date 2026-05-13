@@ -185,10 +185,7 @@ impl std::fmt::Debug for DagInfo {
             .field("max_active_runs", &self.max_active_runs)
             .field("default_queue", &self.default_queue)
             .field("builder", &"<fn>")
-            .field(
-                "workflow_handler",
-                &self.workflow_handler.map(|_| "<fn>"),
-            )
+            .field("workflow_handler", &self.workflow_handler.map(|_| "<fn>"))
             .finish()
     }
 }

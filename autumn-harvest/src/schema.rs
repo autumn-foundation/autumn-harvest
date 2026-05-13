@@ -87,24 +87,6 @@ diesel::table! {
 diesel::table! {
     use diesel::sql_types::*;
 
-    harvest_dag_runs (id) {
-        id -> Uuid,
-        dag_name -> Text,
-        workflow_exec_id -> Nullable<Uuid>,
-        state -> Text,
-        logical_date -> Timestamptz,
-        data_interval_start -> Timestamptz,
-        data_interval_end -> Timestamptz,
-        conf -> Nullable<Jsonb>,
-        started_at -> Nullable<Timestamptz>,
-        completed_at -> Nullable<Timestamptz>,
-        created_at -> Timestamptz,
-    }
-}
-
-diesel::table! {
-    use diesel::sql_types::*;
-
     harvest_schedules (id) {
         id -> Uuid,
         dag_name -> Nullable<Text>,
@@ -297,7 +279,6 @@ diesel::table! {
 
 diesel::joinable!(harvest_events -> harvest_workflow_executions (workflow_exec_id));
 diesel::joinable!(harvest_task_queue -> harvest_workflow_executions (workflow_exec_id));
-diesel::joinable!(harvest_dag_runs -> harvest_workflow_executions (workflow_exec_id));
 diesel::joinable!(harvest_signals -> harvest_workflow_executions (workflow_exec_id));
 diesel::joinable!(harvest_timers -> harvest_workflow_executions (workflow_exec_id));
 diesel::joinable!(harvest_external_tasks -> harvest_workflow_executions (workflow_exec_id));
@@ -306,7 +287,6 @@ diesel::allow_tables_to_appear_in_same_query!(
     harvest_workflow_executions,
     harvest_events,
     harvest_task_queue,
-    harvest_dag_runs,
     harvest_schedules,
     harvest_signals,
     harvest_timers,
