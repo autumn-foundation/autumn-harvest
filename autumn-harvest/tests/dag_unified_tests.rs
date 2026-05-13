@@ -39,14 +39,14 @@ async fn notify_complete(_ctx: &ActivityContext) -> Result<(), String> {
 // DAG definitions used across tests
 // ---------------------------------------------------------------------------
 
-/// A linear two-task DAG: extract_users → load_users (AllSuccess, default).
+/// A linear two-task DAG: `extract_users` → `load_users` (`AllSuccess`, default).
 #[dag(default_queue = "etl-workers")]
 fn linear_dag(dag: &mut DagBuilder) {
     let extract = dag.activity(extract_users);
     let _load = dag.activity(load_users).upstream(&extract);
 }
 
-/// Same topology but with AllDone trigger on the second task.
+/// Same topology but with `AllDone` trigger on the second task.
 #[dag]
 fn alldone_dag(dag: &mut DagBuilder) {
     let extract = dag.activity(extract_users);
@@ -56,7 +56,7 @@ fn alldone_dag(dag: &mut DagBuilder) {
         .trigger_rule(TriggerRule::AllDone);
 }
 
-/// Fan-out/fan-in: extract → [load_users, notify_complete] (both depend on extract).
+/// Fan-out/fan-in: extract → [`load_users`, `notify_complete`] (both depend on extract).
 #[dag]
 fn fanout_dag(dag: &mut DagBuilder) {
     let extract = dag.activity(extract_users);
@@ -267,7 +267,7 @@ fn dag_info_as_workflow_info_returns_some_with_matching_name() {
 // STEP 2 — scheduling promoted to WorkflowSchedule
 // ---------------------------------------------------------------------------
 
-/// A DAG with a cron schedule, catchup=true, max_active_runs=3, and a custom
+/// A DAG with a cron schedule, catchup=true, `max_active_runs`=3, and a custom
 /// queue — used to verify that `as_workflow_schedule()` maps fields correctly.
 #[dag(
     schedule = "0 * * * *",
@@ -280,7 +280,7 @@ fn scheduled_dag(dag: &mut DagBuilder) {
 }
 
 /// `DagInfo::as_workflow_schedule()` must return `Some(WorkflowSchedule)` with
-/// fields that mirror the DAG's schedule, catchup, max_active_runs, and queue
+/// fields that mirror the DAG's schedule, catchup, `max_active_runs`, and queue
 /// when `unified-dag-execution` is enabled.
 #[test]
 fn as_workflow_schedule_returns_some_with_matching_fields() {

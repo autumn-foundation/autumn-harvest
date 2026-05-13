@@ -3877,7 +3877,9 @@ async fn list_dag_runs(
     Path(dag_name): Path<String>,
 ) -> Result<Json<Vec<WorkflowExecution>>, AutumnError> {
     let pool = api_state.storage_pool().map_err(map_error)?;
-    let mut conn = acquire_conn(pool.default_pool()).await?;
+    let runtime = api_state.runtime().map_err(map_error)?;
+    let shard = runtime.router.pick_for_dag(&dag_name);
+    let mut conn = acquire_conn(pool.pool_for(shard)).await?;
     let runs = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::workflow_name.eq(&dag_name))
         .order(harvest_workflow_executions::created_at.desc())
@@ -3932,7 +3934,7 @@ async fn trigger_dag_run(
                 actor: &actor,
                 operation: OP_DAG_TRIGGER,
                 target_type: TARGET_DAG,
-                target_id: Some(exec_id_str.as_str()),
+                target_id: Some(dag_name.as_str()),
                 route_or_command: route,
                 request_id: request_id.as_deref(),
                 idempotency_key: None,
