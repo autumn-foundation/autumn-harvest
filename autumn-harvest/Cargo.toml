@@ -25,7 +25,7 @@ testing = []
 metrics-rs = ["dep:metrics"]
 
 [dependencies]
-autumn-harvest-macros = { version = "0.2.0", path = "../autumn-harvest-macros" }
+autumn-harvest-macros = { version = "0.3.0", path = "../autumn-harvest-macros" }
 tokio = { workspace = true }
 tokio-util = { version = "0.7", features = ["rt"] }
 serde = { workspace = true }

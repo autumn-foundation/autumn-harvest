@@ -18,6 +18,10 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260427000000_harvest_continue_as_new/up.sql"),
     "\n",
     include_str!("../migrations/20260429000000_harvest_concurrency_key/up.sql"),
+    "\n",
+    include_str!("../migrations/20260501000000_harvest_workers/up.sql"),
+    "\n",
+    include_str!("../migrations/20260509000000_harvest_build_routing/up.sql"),
 );
 
 async fn setup_test_db() -> (

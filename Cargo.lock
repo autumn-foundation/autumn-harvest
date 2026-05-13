@@ -169,7 +169,7 @@ checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
 name = "autumn-harvest"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "autumn-harvest-macros",
  "base64 0.22.1",
@@ -182,7 +182,7 @@ dependencies = [
  "diesel_migrations",
  "futures",
  "loom",
- "lru",
+ "lru 0.16.4",
  "metrics",
  "proptest",
  "scoped-futures",
@@ -202,7 +202,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-harvest-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "autumn-harvest",
  "clap",
@@ -217,7 +217,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-harvest-macros"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -226,7 +226,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-harvest-plugin"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "autumn-harvest",
  "autumn-web",
@@ -252,7 +252,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-harvest-redis"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "autumn-harvest",
@@ -272,9 +272,9 @@ dependencies = [
 
 [[package]]
 name = "autumn-macros"
-version = "0.2.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ca105c198a6cf9b63c54f2cc0f8fd885628de7432edddbb82c0e321d8a7b8512"
+checksum = "4a2adceaf5f7bfcdd8aa51b64674cf0f672640c83cb9dbda83ce791102c90a78"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -283,9 +283,9 @@ dependencies = [
 
 [[package]]
 name = "autumn-web"
-version = "0.2.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c214525022cda51a6bcffed7385a58729ac9176c11f75adc12f7d9c7f1488ee2"
+checksum = "44b1e5f726772f873971e71c1b7affedb00d42bc1d25ff19a051c3de30f18104"
 dependencies = [
  "autumn-macros",
  "axum",
@@ -293,21 +293,28 @@ dependencies = [
  "bytes",
  "chrono",
  "chrono-tz",
+ "croner 3.0.1",
  "deadpool",
  "diesel",
  "diesel-async",
  "diesel_migrations",
  "futures",
+ "hmac 0.12.1",
  "http",
  "http-body-util",
  "indexmap 2.14.0",
  "libsqlite3-sys",
+ "lru 0.18.0",
  "maud",
  "moka",
+ "percent-encoding",
  "pin-project-lite",
  "pq-sys",
+ "scoped-futures",
  "serde",
  "serde_json",
+ "serde_urlencoded",
+ "sha2 0.10.9",
  "subtle",
  "thiserror 2.0.18",
  "tokio",
@@ -426,7 +433,7 @@ dependencies = [
 
 [[package]]
 name = "billing-autumn-web"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "autumn-harvest",
  "autumn-harvest-plugin",
@@ -1282,6 +1289,7 @@ checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
 dependencies = [
  "block-buffer 0.10.4",
  "crypto-common 0.1.7",
+ "subtle",
 ]
 
 [[package]]
@@ -1709,6 +1717,11 @@ name = "hashbrown"
 version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4f467dd6dccf739c208452f8014c75c18bb8301b050ad1cfb27153803edb0f51"
+dependencies = [
+ "allocator-api2",
+ "equivalent",
+ "foldhash 0.2.0",
+]
 
 [[package]]
 name = "heck"
@@ -1727,6 +1740,15 @@ name = "hex"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+
+[[package]]
+name = "hmac"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
+dependencies = [
+ "digest 0.10.7",
+]
 
 [[package]]
 name = "hmac"
@@ -2301,6 +2323,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f66e8d5d03f609abc3a39e6f08e4164ebf1447a732906d39eb9b99b7919ef39"
 dependencies = [
  "hashbrown 0.16.1",
+]
+
+[[package]]
+name = "lru"
+version = "0.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a860605968fce16869fd239cf4237a82f3ac470723415db603b0e8b6c8d4fb9"
+dependencies = [
+ "hashbrown 0.17.0",
 ]
 
 [[package]]
@@ -2931,7 +2962,7 @@ dependencies = [
  "byteorder",
  "bytes",
  "fallible-iterator",
- "hmac",
+ "hmac 0.13.0",
  "md-5",
  "memchr",
  "rand 0.10.1",
@@ -3107,7 +3138,7 @@ checksum = "a1d01941d82fa2ab50be1e79e6714289dd7cde78eba4c074bc5a4374f650dfe0"
 
 [[package]]
 name = "quickstart"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "autumn-harvest",
  "autumn-harvest-plugin",
@@ -3297,7 +3328,7 @@ dependencies = [
  "indoc",
  "itertools 0.14.0",
  "kasuari",
- "lru",
+ "lru 0.16.4",
  "strum",
  "thiserror 2.0.18",
  "unicode-segmentation",
@@ -3978,7 +4009,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "standalone-runner"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "autumn-harvest",
  "autumn-harvest-plugin",

@@ -1234,14 +1234,14 @@ mod tests {
             shard_assignments: vec![0],
             max_concurrency: 10,
             host: "localhost".to_string(),
-            version: Some("0.2.0".to_string()),
+            version: Some("0.3.0".to_string()),
             build_id: String::new(),
             deployment_name: None,
         };
         assert_eq!(reg.worker_id, "w1");
         assert_eq!(reg.queues, vec!["default"]);
         assert_eq!(reg.max_concurrency, 10);
-        assert_eq!(reg.version.as_deref(), Some("0.2.0"));
+        assert_eq!(reg.version.as_deref(), Some("0.3.0"));
     }
 
     // -- apply_worker_filters (limit is applied after queue/shard/health filtering) --

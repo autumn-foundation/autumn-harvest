@@ -1417,6 +1417,11 @@ pub const fn management_api_request_fields()
         ),
         ("POST", "/admin/schedules/{id}/pause", Some(&[])),
         ("POST", "/admin/schedules/{id}/resume", Some(&[])),
+        (
+            "POST",
+            "/admin/schedules/{id}/backfill",
+            Some(&["from", "to", "dry_run", "include_paused", "max_count"]),
+        ),
         ("DELETE", "/admin/schedules/{id}", Some(&[])),
     ]
 }
@@ -1664,10 +1669,31 @@ pub const fn management_api_response_fields()
                 "last_run_at",
                 "max_active_runs",
                 "catchup",
+                "last_backfill",
             ]),
         ),
         ("POST", "/admin/schedules/{id}/pause", Some(&["ok"])),
         ("POST", "/admin/schedules/{id}/resume", Some(&["ok"])),
+        (
+            "POST",
+            "/admin/schedules/{id}/backfill",
+            Some(&[
+                "status",
+                "schedule_id",
+                "kind",
+                "name",
+                "from",
+                "to",
+                "planned_timestamps",
+                "total",
+                "dispatched",
+                "skipped",
+                "failed",
+                "skipped_reasons",
+                "partial_shard_failures",
+                "paused_schedule_warning",
+            ]),
+        ),
         ("DELETE", "/admin/schedules/{id}", Some(&["ok"])),
         // ── audit ─────────────────────────────────────────────────────────────
         ("GET", "/admin/audit", None), // Vec<AuditRecord> (external model)

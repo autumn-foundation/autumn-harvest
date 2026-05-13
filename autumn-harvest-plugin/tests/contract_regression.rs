@@ -189,6 +189,20 @@ fn contract_request_fields_match_code_registry() {
         }
     }
 
+    let registered_request_routes: HashSet<(String, String)> = management_api_request_fields()
+        .iter()
+        .map(|(method, path, _)| ((*method).to_string(), (*path).to_string()))
+        .collect();
+    for ((method, path), fields) in &contract_fields {
+        if fields.is_some() {
+            assert!(
+                registered_request_routes.contains(&(method.clone(), path.clone())),
+                "{method} {path}: contract has a structured request body but \
+                 management_api_request_fields() has no entry, so field drift is unchecked"
+            );
+        }
+    }
+
     // Compare against management_api_request_fields().
     for (method, path, code_fields) in management_api_request_fields() {
         let key = (method.to_string(), path.to_string());
@@ -273,6 +287,20 @@ fn contract_response_fields_match_code_registry() {
         }
     }
 
+    let registered_response_routes: HashSet<(String, String)> = management_api_response_fields()
+        .iter()
+        .map(|(method, path, _)| ((*method).to_string(), (*path).to_string()))
+        .collect();
+    for ((method, path), fields) in &contract_resp {
+        if fields.is_some() {
+            assert!(
+                registered_response_routes.contains(&(method.clone(), path.clone())),
+                "{method} {path}: contract has a structured success_response but \
+                 management_api_response_fields() has no entry, so field drift is unchecked"
+            );
+        }
+    }
+
     for (method, path, code_fields) in management_api_response_fields() {
         let key = (method.to_string(), path.to_string());
         match (code_fields, contract_resp.get(&key)) {
@@ -301,6 +329,76 @@ fn contract_response_fields_match_code_registry() {
             ),
         }
     }
+}
+
+#[test]
+fn schedule_backfill_response_documents_paused_schedule_warning() {
+    let contract = load_contract();
+    let route = contract["routes"]
+        .as_array()
+        .expect("contract.routes must be a JSON array")
+        .iter()
+        .find(|route| {
+            route["method"].as_str() == Some("POST")
+                && route["path"].as_str() == Some("/admin/schedules/{id}/backfill")
+        })
+        .expect("POST /admin/schedules/{id}/backfill must be documented");
+
+    let contract_fields: HashSet<&str> = route["success_response"]["fields"]
+        .as_array()
+        .expect("schedule backfill success_response must list structured fields")
+        .iter()
+        .filter_map(|field| field["name"].as_str())
+        .collect();
+    assert!(
+        contract_fields.contains("paused_schedule_warning"),
+        "schedule backfill contract must document the optional warning emitted \
+         when include_paused=true backfills a paused DAG schedule"
+    );
+
+    let registry_fields = management_api_response_fields()
+        .iter()
+        .find(|(method, path, _)| *method == "POST" && *path == "/admin/schedules/{id}/backfill")
+        .and_then(|(_, _, fields)| *fields)
+        .expect("schedule backfill must have structured response registry fields");
+    assert!(
+        registry_fields.contains(&"paused_schedule_warning"),
+        "schedule backfill response registry must include paused_schedule_warning"
+    );
+}
+
+#[test]
+fn schedule_list_preserves_array_response_classification() {
+    let contract = load_contract();
+    let route = contract["routes"]
+        .as_array()
+        .expect("contract.routes must be a JSON array")
+        .iter()
+        .find(|route| {
+            route["method"].as_str() == Some("GET")
+                && route["path"].as_str() == Some("/admin/schedules")
+        })
+        .expect("GET /admin/schedules must be documented");
+
+    assert!(
+        route["success_response"]["free_form"]
+            .as_bool()
+            .unwrap_or(false),
+        "GET /admin/schedules returns a JSON array, so its top-level \
+         success_response must stay free_form/array instead of object fields"
+    );
+
+    let registry_fields = management_api_response_fields()
+        .iter()
+        .find(|(method, path, _)| *method == "GET" && *path == "/admin/schedules")
+        .map(|(_, _, fields)| *fields)
+        .expect("GET /admin/schedules must stay in the response registry");
+
+    assert!(
+        registry_fields.is_none(),
+        "GET /admin/schedules returns Json<Vec<ScheduleEntry>>, so the response \
+         registry must preserve array/free-form classification"
+    );
 }
 
 /// Every contract route must document an `idempotency` field so embedders

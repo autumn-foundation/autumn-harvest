@@ -10,8 +10,12 @@ use autumn_harvest::audit::{
     TARGET_SCHEDULE, TARGET_WORKFLOW,
 };
 use autumn_harvest::models::NewAuditRecord;
+use autumn_harvest::schema::harvest_audit_log;
 
+use diesel::ExpressionMethods;
+use diesel::QueryDsl;
 use diesel_async::AsyncConnection;
+use diesel_async::RunQueryDsl;
 use diesel_async::SimpleAsyncConnection;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
@@ -303,25 +307,40 @@ async fn audit_list_filter_by_target_id() {
 async fn audit_list_date_range_since() {
     let (mut conn, _c) = make_conn().await;
 
-    // Insert one record, note the time, then insert another.
-    audit::insert_audit(
+    let before = chrono::DateTime::parse_from_rfc3339("2026-05-06T12:00:00Z")
+        .expect("fixed before timestamp")
+        .with_timezone(&chrono::Utc);
+    let midpoint = chrono::DateTime::parse_from_rfc3339("2026-05-06T12:30:00Z")
+        .expect("fixed midpoint timestamp")
+        .with_timezone(&chrono::Utc);
+    let after = chrono::DateTime::parse_from_rfc3339("2026-05-06T13:00:00Z")
+        .expect("fixed after timestamp")
+        .with_timezone(&chrono::Utc);
+
+    let before_id = audit::insert_audit(
         &mut conn,
         &succeeded_record("ops", OP_WORKFLOW_START, TARGET_WORKFLOW, None),
     )
     .await
     .expect("insert before");
 
-    let midpoint = chrono::Utc::now();
-
-    // Sleep briefly so timestamps differ.
-    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-
-    audit::insert_audit(
+    let after_id = audit::insert_audit(
         &mut conn,
         &succeeded_record("ops", OP_WORKFLOW_CANCEL, TARGET_WORKFLOW, None),
     )
     .await
     .expect("insert after");
+
+    diesel::update(harvest_audit_log::table.filter(harvest_audit_log::id.eq(before_id)))
+        .set(harvest_audit_log::occurred_at.eq(before))
+        .execute(&mut conn)
+        .await
+        .expect("pin before timestamp");
+    diesel::update(harvest_audit_log::table.filter(harvest_audit_log::id.eq(after_id)))
+        .set(harvest_audit_log::occurred_at.eq(after))
+        .execute(&mut conn)
+        .await
+        .expect("pin after timestamp");
 
     let rows = audit::list_audit(
         &mut conn,

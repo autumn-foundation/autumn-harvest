@@ -7,13 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-05-11
+
 ### Added
 
 - **Versioned management API contract** (`docs/api-contract.json`, issue #175):
   machine-readable JSON describing every route's method, path, category,
   `read_only` flag, request-body field schema, success/error responses,
   pagination params, and idempotency semantics. Contract version `"1"`,
-  aligned with crate version `"0.2.0"`.
+  aligned with crate version `"0.3.0"`.
 - `management_api_request_fields()` in `autumn_harvest_plugin::api`: canonical
   registry of request-body field names per mutating route. Compared against the
   contract by the regression test suite; update both together when adding or
@@ -35,9 +37,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Non-breaking
 
-This release adds documentation artefacts and test scaffolding only.  No route,
-event, or schema was removed or renamed.  Adding the contract is classified as
-non-breaking per the compatibility rules stated in `docs/api-contract.json`.
+This release is additive only.  No route, event, or schema was removed or
+renamed.  Adding the contract is classified as non-breaking per the
+compatibility rules stated in `docs/api-contract.json`.
 
 ## [0.2.0] - 2026-04-27
 

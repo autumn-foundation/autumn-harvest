@@ -17,7 +17,7 @@ edition = "2021"
 [dependencies]
 autumn-harvest = "0.2"
 autumn-harvest-plugin = "0.2"
-autumn-web = "0.2"
+autumn-web = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"

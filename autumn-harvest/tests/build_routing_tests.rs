@@ -314,7 +314,7 @@ mod db_tests {
             &[0_i32],
             4,
             "host-a",
-            Some("0.2.0"),
+            Some("0.3.0"),
             "v1.0",
             Some("prod-blue"),
         )

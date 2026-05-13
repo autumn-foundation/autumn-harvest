@@ -62,7 +62,7 @@ non-web or other-framework contexts.
 [dependencies]
 autumn-harvest = { version = "0.1", features = ["db"] }
 autumn-harvest-plugin = "0.1"
-autumn-web = { version = "0.2", features = ["ws"] }
+autumn-web = { version = "0.4", features = ["ws"] }
 # ... plus standard deps (serde_json, chrono, uuid, tokio, tracing, etc.)
 ```
 
