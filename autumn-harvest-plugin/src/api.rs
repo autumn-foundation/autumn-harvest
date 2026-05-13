@@ -914,11 +914,21 @@ struct ScheduleEntry {
     name: String,
     schedule_expr: Option<String>,
     is_paused: bool,
+    paused_at: Option<chrono::DateTime<chrono::Utc>>,
+    paused_by: Option<String>,
+    pause_reason: Option<String>,
     next_run_at: Option<chrono::DateTime<chrono::Utc>>,
     last_run_at: Option<chrono::DateTime<chrono::Utc>>,
     max_active_runs: i32,
     catchup: bool,
     last_backfill: Option<BackfillSummary>,
+}
+
+/// Optional request body for `POST /admin/schedules/{id}/pause` and `…/resume`.
+#[derive(Debug, Deserialize, Default)]
+struct PauseResumeRequest {
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 /// Request body for `POST /admin/schedules/workflow`.
@@ -1415,8 +1425,8 @@ pub const fn management_api_request_fields()
                 "queue_name",
             ]),
         ),
-        ("POST", "/admin/schedules/{id}/pause", Some(&[])),
-        ("POST", "/admin/schedules/{id}/resume", Some(&[])),
+        ("POST", "/admin/schedules/{id}/pause", Some(&["reason"])),
+        ("POST", "/admin/schedules/{id}/resume", Some(&["reason"])),
         (
             "POST",
             "/admin/schedules/{id}/backfill",
@@ -1665,6 +1675,9 @@ pub const fn management_api_response_fields()
                 "name",
                 "schedule_expr",
                 "is_paused",
+                "paused_at",
+                "paused_by",
+                "pause_reason",
                 "next_run_at",
                 "last_run_at",
                 "max_active_runs",
@@ -4077,6 +4090,9 @@ async fn list_schedules(
                 name,
                 schedule_expr: s.schedule_expr,
                 is_paused: s.is_paused,
+                paused_at: s.paused_at,
+                paused_by: s.paused_by,
+                pause_reason: s.pause_reason,
                 next_run_at: s.next_run_at,
                 last_run_at: s.last_run_at,
                 max_active_runs: s.max_active_runs,
@@ -4175,6 +4191,9 @@ async fn upsert_workflow_schedule_and_read_back(
         name: ws.workflow_name.clone(),
         schedule_expr: row.schedule_expr,
         is_paused: row.is_paused,
+        paused_at: row.paused_at,
+        paused_by: row.paused_by,
+        pause_reason: row.pause_reason,
         next_run_at: row.next_run_at,
         last_run_at: row.last_run_at,
         max_active_runs: row.max_active_runs,
@@ -4294,22 +4313,28 @@ async fn pause_schedule(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
     headers: axum::http::HeaderMap,
+    body: Option<Json<PauseResumeRequest>>,
 ) -> Result<Json<BasicAck>, AutumnError> {
-    set_schedule_paused(&api_state, &id, true, &headers).await
+    let reason = body.and_then(|Json(r)| r.reason);
+    set_schedule_paused(&api_state, &id, true, reason.as_deref(), &headers).await
 }
 
 async fn resume_schedule(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
     headers: axum::http::HeaderMap,
+    body: Option<Json<PauseResumeRequest>>,
 ) -> Result<Json<BasicAck>, AutumnError> {
-    set_schedule_paused(&api_state, &id, false, &headers).await
+    let reason = body.and_then(|Json(r)| r.reason);
+    set_schedule_paused(&api_state, &id, false, reason.as_deref(), &headers).await
 }
 
+#[allow(clippy::too_many_lines)]
 async fn set_schedule_paused(
     api_state: &HarvestApiState,
     id_str: &str,
     paused: bool,
+    reason: Option<&str>,
     headers: &axum::http::HeaderMap,
 ) -> Result<Json<BasicAck>, AutumnError> {
     use autumn_harvest::schema::harvest_schedules::dsl;
@@ -4352,42 +4377,84 @@ async fn set_schedule_paused(
     };
     let pool = api_state.storage_pool().map_err(map_error)?;
     let id_str_owned = id.to_string();
+    let now = chrono::Utc::now();
 
-    let mut updated_count = 0usize;
+    let mut found_count = 0usize;
     for (_shard, shard_pool) in pool.iter_shards() {
         let mut conn = acquire_conn(shard_pool).await?;
-        let n = diesel::update(dsl::harvest_schedules.find(id))
-            .set((
-                dsl::is_paused.eq(paused),
-                dsl::updated_at.eq(chrono::Utc::now()),
-            ))
-            .execute(&mut conn)
-            .await
-            .map_err(database_error)
-            .map_err(map_error)?;
-        updated_count += n;
-        if updated_count > 0 {
-            let ar = NewAuditRecord {
-                actor: &actor,
-                operation,
-                target_type: TARGET_SCHEDULE,
-                target_id: Some(id_str_owned.as_str()),
-                route_or_command: route,
-                request_id: request_id.as_deref(),
-                idempotency_key: None,
-                status: STATUS_SUCCEEDED,
-                error_summary: None,
-                shard_id: None,
-                source: &source,
-            };
-            audit::insert_audit(&mut conn, &ar)
+
+        // Load the current row to implement idempotency and set metadata.
+        let current: Option<autumn_harvest::models::HarvestSchedule> =
+            dsl::harvest_schedules
+                .find(id)
+                .select(autumn_harvest::models::HarvestSchedule::as_select())
+                .first(&mut conn)
                 .await
+                .optional()
+                .map_err(database_error)
                 .map_err(map_error)?;
+
+        let Some(schedule) = current else {
+            continue;
+        };
+        found_count += 1;
+
+        // Idempotency: if the schedule is already in the requested state, skip
+        // the UPDATE so that paused_at/paused_by are not overwritten.
+        if schedule.is_paused == paused {
             break;
         }
+
+        if paused {
+            // Pause: record who paused it, when, and why.
+            diesel::update(dsl::harvest_schedules.find(id))
+                .set((
+                    dsl::is_paused.eq(true),
+                    dsl::paused_at.eq(Some(now)),
+                    dsl::paused_by.eq(Some(actor.as_str())),
+                    dsl::pause_reason.eq(reason),
+                    dsl::updated_at.eq(now),
+                ))
+                .execute(&mut conn)
+                .await
+                .map_err(database_error)
+                .map_err(map_error)?;
+        } else {
+            // Resume: clear all pause metadata.
+            diesel::update(dsl::harvest_schedules.find(id))
+                .set((
+                    dsl::is_paused.eq(false),
+                    dsl::paused_at.eq(None::<chrono::DateTime<chrono::Utc>>),
+                    dsl::paused_by.eq(None::<&str>),
+                    dsl::pause_reason.eq(None::<&str>),
+                    dsl::updated_at.eq(now),
+                ))
+                .execute(&mut conn)
+                .await
+                .map_err(database_error)
+                .map_err(map_error)?;
+        }
+
+        let ar = NewAuditRecord {
+            actor: &actor,
+            operation,
+            target_type: TARGET_SCHEDULE,
+            target_id: Some(id_str_owned.as_str()),
+            route_or_command: route,
+            request_id: request_id.as_deref(),
+            idempotency_key: None,
+            status: STATUS_SUCCEEDED,
+            error_summary: None,
+            shard_id: None,
+            source: &source,
+        };
+        audit::insert_audit(&mut conn, &ar)
+            .await
+            .map_err(map_error)?;
+        break;
     }
 
-    if updated_count == 0 {
+    if found_count == 0 {
         if let Ok(mut conn) = acquire_conn(pool.default_pool()).await {
             let ar = NewAuditRecord {
                 actor: &actor,

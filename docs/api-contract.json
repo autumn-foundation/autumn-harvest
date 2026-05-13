@@ -1978,7 +1978,7 @@
       "success_response": {
         "status": 200,
         "free_form": true,
-        "description": "Returns an array of schedule entries. Each item includes id, kind, name, schedule_expr, is_paused, next_run_at, last_run_at, max_active_runs, catchup, and last_backfill."
+        "description": "Returns an array of schedule entries. Each item includes id, kind, name, schedule_expr, is_paused, paused_at, paused_by, pause_reason, next_run_at, last_run_at, max_active_runs, catchup, and last_backfill."
       },
       "error_responses": [
         {
@@ -2044,6 +2044,9 @@
           "name",
           "schedule_expr",
           "is_paused",
+          "paused_at",
+          "paused_by",
+          "pause_reason",
           "next_run_at",
           "last_run_at",
           "max_active_runs",
@@ -2080,7 +2083,13 @@
       "request_body": {
         "required": false,
         "free_form": false,
-        "fields": []
+        "fields": [
+          {
+            "name": "reason",
+            "required": false,
+            "description": "Optional free-text reason recorded in the audit trail and on the schedule row."
+          }
+        ]
       },
       "success_response": {
         "status": 200,
@@ -2117,7 +2126,13 @@
       "request_body": {
         "required": false,
         "free_form": false,
-        "fields": []
+        "fields": [
+          {
+            "name": "reason",
+            "required": false,
+            "description": "Optional free-text reason recorded in the audit trail."
+          }
+        ]
       },
       "success_response": {
         "status": 200,
