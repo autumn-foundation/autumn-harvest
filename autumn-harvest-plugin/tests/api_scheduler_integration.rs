@@ -86,6 +86,10 @@ const INIT_SQL: &str = concat!(
     ),
     "\n",
     include_str!("../../autumn-harvest/migrations/20260509000000_harvest_build_routing/up.sql"),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260513000000_harvest_schedule_pause_metadata/up.sql"
+    ),
 );
 type HarvestApiApp = axum::Router;
 
@@ -2710,5 +2714,312 @@ async fn register_schedules_recomputes_next_run_when_schedule_changes() {
     assert!(
         updated.next_run_at.is_none(),
         "changing an automatic schedule to manual should clear stale next_run_at"
+    );
+}
+
+// ── helpers for pause/resume metadata tests ──────────────────────────────────
+
+async fn post_json_with_actor(
+    app: &HarvestApiApp,
+    uri: impl Into<String>,
+    payload: Value,
+    actor: &str,
+) -> (StatusCode, Value) {
+    let uri = uri.into();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(&uri)
+                .header("content-type", "application/json")
+                .header("x-harvest-actor", actor)
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .expect("POST request failed");
+    let status = response.status();
+    let json = read_json_response(response).await;
+    (status, json)
+}
+
+async fn seed_workflow_schedule_and_get_id(database_url: &str, workflow_name: &str) -> uuid::Uuid {
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("failed to connect for schedule seeding");
+    let ws = WorkflowSchedule::new(workflow_name, Schedule::Interval(Duration::from_secs(3600)));
+    register_workflow_schedules(&mut conn, std::slice::from_ref(&ws))
+        .await
+        .expect("failed to register workflow schedule");
+    harvest_schedules::table
+        .filter(harvest_schedules::workflow_name.eq(workflow_name))
+        .select(harvest_schedules::id)
+        .first::<uuid::Uuid>(&mut conn)
+        .await
+        .expect("seeded schedule should be queryable")
+}
+
+fn find_schedule_in_list(list: &Value, id: uuid::Uuid) -> Value {
+    list.as_array()
+        .expect("schedule list must be a JSON array")
+        .iter()
+        .find(|s| s["id"].as_str() == Some(&id.to_string()))
+        .cloned()
+        .expect("schedule must appear in list")
+}
+
+// ── issue #229: pause/resume metadata (reason, paused_at, paused_by) ─────────
+
+#[tokio::test]
+async fn schedule_pause_with_reason_records_pause_metadata() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool));
+    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+
+    let id = seed_workflow_schedule_and_get_id(&database_url, "pause_metadata_wf").await;
+
+    let (status, ack) = post_json_with_actor(
+        &app,
+        format!("/admin/schedules/{id}/pause"),
+        json!({ "reason": "incident-response" }),
+        "ops-team",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "pause must return 200");
+    assert_eq!(ack["ok"], true, "pause ack must be {{ok: true}}");
+
+    let (list_status, list) = get_json(&app, "/admin/schedules").await;
+    assert_eq!(list_status, StatusCode::OK);
+    let entry = find_schedule_in_list(&list, id);
+
+    assert_eq!(entry["is_paused"], true, "schedule must be paused");
+    assert!(
+        entry["paused_at"].is_string(),
+        "paused_at must be a non-null timestamp string after pause; got: {}",
+        entry["paused_at"]
+    );
+    assert_eq!(
+        entry["paused_by"], "ops-team",
+        "paused_by must record the actor from X-Harvest-Actor"
+    );
+    assert_eq!(
+        entry["pause_reason"], "incident-response",
+        "pause_reason must store the reason from the request body"
+    );
+}
+
+#[tokio::test]
+async fn schedule_pause_idempotent_does_not_overwrite_paused_at() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool));
+    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+
+    let id = seed_workflow_schedule_and_get_id(&database_url, "pause_idempotent_wf").await;
+
+    // First pause — alice owns it
+    let (s1, _) = post_json_with_actor(
+        &app,
+        format!("/admin/schedules/{id}/pause"),
+        json!({ "reason": "first pause" }),
+        "alice",
+    )
+    .await;
+    assert_eq!(s1, StatusCode::OK);
+
+    let (_, list1) = get_json(&app, "/admin/schedules").await;
+    let entry1 = find_schedule_in_list(&list1, id);
+    let original_paused_at = entry1["paused_at"].clone();
+    let original_paused_by = entry1["paused_by"].clone();
+    assert!(
+        original_paused_at.is_string(),
+        "paused_at must be set after first pause"
+    );
+    assert_eq!(original_paused_by, "alice");
+
+    // Wait so clock would advance if the timestamp were overwritten
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Second pause — bob tries to take over
+    let (s2, _) = post_json_with_actor(
+        &app,
+        format!("/admin/schedules/{id}/pause"),
+        json!({ "reason": "second pause" }),
+        "bob",
+    )
+    .await;
+    assert_eq!(
+        s2,
+        StatusCode::OK,
+        "second pause must return 200 (idempotent)"
+    );
+
+    let (_, list2) = get_json(&app, "/admin/schedules").await;
+    let entry2 = find_schedule_in_list(&list2, id);
+
+    assert_eq!(
+        entry2["paused_at"], original_paused_at,
+        "paused_at must not change on a second pause (idempotency)"
+    );
+    assert_eq!(
+        entry2["paused_by"], original_paused_by,
+        "paused_by must not change on a second pause (idempotency)"
+    );
+}
+
+#[tokio::test]
+async fn schedule_resume_clears_pause_metadata() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool));
+    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+
+    let id = seed_workflow_schedule_and_get_id(&database_url, "resume_clears_wf").await;
+
+    // Pause first
+    let (pause_status, _) = post_json_with_actor(
+        &app,
+        format!("/admin/schedules/{id}/pause"),
+        json!({ "reason": "clearing test" }),
+        "ops",
+    )
+    .await;
+    assert_eq!(pause_status, StatusCode::OK);
+
+    // Resume
+    let (resume_status, resume_ack) = post_json_with_actor(
+        &app,
+        format!("/admin/schedules/{id}/resume"),
+        json!({}),
+        "ops",
+    )
+    .await;
+    assert_eq!(resume_status, StatusCode::OK, "resume must return 200");
+    assert_eq!(resume_ack["ok"], true);
+
+    let (_, list) = get_json(&app, "/admin/schedules").await;
+    let entry = find_schedule_in_list(&list, id);
+
+    assert_eq!(
+        entry["is_paused"], false,
+        "schedule must be active after resume"
+    );
+    assert!(
+        entry["paused_at"].is_null(),
+        "paused_at must be cleared to null after resume; got: {}",
+        entry["paused_at"]
+    );
+    assert!(
+        entry["paused_by"].is_null(),
+        "paused_by must be cleared to null after resume; got: {}",
+        entry["paused_by"]
+    );
+    assert!(
+        entry["pause_reason"].is_null(),
+        "pause_reason must be cleared to null after resume; got: {}",
+        entry["pause_reason"]
+    );
+}
+
+#[tokio::test]
+async fn schedule_resume_idempotent_when_schedule_is_not_paused() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool));
+    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+
+    let id = seed_workflow_schedule_and_get_id(&database_url, "resume_idempotent_wf").await;
+
+    // First resume on an already-active schedule
+    let (s1, ack1) = post_json_with_actor(
+        &app,
+        format!("/admin/schedules/{id}/resume"),
+        json!({}),
+        "ops",
+    )
+    .await;
+    assert_eq!(
+        s1,
+        StatusCode::OK,
+        "resume on non-paused schedule must return 200"
+    );
+    assert_eq!(ack1["ok"], true);
+
+    // Second resume — also idempotent
+    let (s2, ack2) = post_json_with_actor(
+        &app,
+        format!("/admin/schedules/{id}/resume"),
+        json!({}),
+        "ops",
+    )
+    .await;
+    assert_eq!(s2, StatusCode::OK, "second resume must also return 200");
+    assert_eq!(ack2["ok"], true);
+}
+
+#[tokio::test]
+async fn get_schedule_by_id_returns_entry_with_pause_fields() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool));
+    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+
+    let id = seed_workflow_schedule_and_get_id(&database_url, "get_by_id_wf").await;
+
+    // GET before pause: pause fields are null
+    let (status, entry) = get_json(&app, format!("/admin/schedules/{id}")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "GET /admin/schedules/:id must return 200"
+    );
+    assert_eq!(entry["id"].as_str(), Some(id.to_string().as_str()));
+    assert_eq!(entry["is_paused"], false);
+    assert!(
+        entry["paused_at"].is_null(),
+        "paused_at must be null before any pause"
+    );
+    assert!(
+        entry["paused_by"].is_null(),
+        "paused_by must be null before any pause"
+    );
+    assert!(
+        entry["pause_reason"].is_null(),
+        "pause_reason must be null before any pause"
+    );
+
+    // Pause and verify via GET /admin/schedules/{id}
+    post_json_with_actor(
+        &app,
+        format!("/admin/schedules/{id}/pause"),
+        json!({ "reason": "testing get-by-id" }),
+        "ops-bot",
+    )
+    .await;
+
+    let (status2, paused_entry) = get_json(&app, format!("/admin/schedules/{id}")).await;
+    assert_eq!(status2, StatusCode::OK);
+    assert_eq!(paused_entry["is_paused"], true);
+    assert!(
+        paused_entry["paused_at"].is_string(),
+        "paused_at must be set"
+    );
+    assert_eq!(paused_entry["paused_by"], "ops-bot");
+    assert_eq!(paused_entry["pause_reason"], "testing get-by-id");
+
+    // 404 for unknown id
+    let unknown = uuid::Uuid::new_v4();
+    let (not_found_status, _) = get_json(&app, format!("/admin/schedules/{unknown}")).await;
+    assert_eq!(
+        not_found_status,
+        StatusCode::NOT_FOUND,
+        "unknown id must return 404"
     );
 }

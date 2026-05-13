@@ -120,6 +120,9 @@ diesel::table! {
         workflow_name -> Nullable<Text>,
         workflow_input -> Nullable<Jsonb>,
         queue_name -> Nullable<Text>,
+        paused_at -> Nullable<Timestamptz>,
+        paused_by -> Nullable<Text>,
+        pause_reason -> Nullable<Text>,
     }
 }
 

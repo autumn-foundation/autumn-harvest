@@ -914,11 +914,21 @@ struct ScheduleEntry {
     name: String,
     schedule_expr: Option<String>,
     is_paused: bool,
+    paused_at: Option<chrono::DateTime<chrono::Utc>>,
+    paused_by: Option<String>,
+    pause_reason: Option<String>,
     next_run_at: Option<chrono::DateTime<chrono::Utc>>,
     last_run_at: Option<chrono::DateTime<chrono::Utc>>,
     max_active_runs: i32,
     catchup: bool,
     last_backfill: Option<BackfillSummary>,
+}
+
+/// Optional request body for `POST /admin/schedules/{id}/pause` and `…/resume`.
+#[derive(Debug, Deserialize, Default)]
+struct PauseResumeRequest {
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 /// Request body for `POST /admin/schedules/workflow`.
@@ -1191,6 +1201,7 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         // Schedule backfill (issue #177): bounded missed-run recovery.
         .route("/admin/schedules", get(list_schedules))
         .route("/admin/schedules/workflow", post(create_workflow_schedule))
+        .route("/admin/schedules/{id}", get(get_schedule))
         .route("/admin/schedules/{id}/pause", post(pause_schedule))
         .route("/admin/schedules/{id}/resume", post(resume_schedule))
         .route("/admin/schedules/{id}/backfill", post(schedule_backfill))
@@ -1286,8 +1297,9 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/admin/history/exports"),
         ("GET", "/admin/external-handoffs"),
         ("GET", "/admin/external-handoffs/{token}"),
-        // ── schedules (issues #91, #177) ──────────────────────────────────────
+        // ── schedules (issues #91, #177, #229) ───────────────────────────────
         ("GET", "/admin/schedules"),
+        ("GET", "/admin/schedules/{id}"),
         ("POST", "/admin/schedules/workflow"),
         ("POST", "/admin/schedules/{id}/pause"),
         ("POST", "/admin/schedules/{id}/resume"),
@@ -1415,7 +1427,9 @@ pub const fn management_api_request_fields()
                 "queue_name",
             ]),
         ),
-        ("POST", "/admin/schedules/{id}/pause", Some(&[])),
+        ("POST", "/admin/schedules/{id}/pause", Some(&["reason"])),
+        // Resume accepts an optional body for forward-compatibility but reason is not persisted
+        // (pause_reason is cleared on resume and AuditRecord has no free-text notes field).
         ("POST", "/admin/schedules/{id}/resume", Some(&[])),
         (
             "POST",
@@ -1657,6 +1671,25 @@ pub const fn management_api_response_fields()
         // ── schedules ─────────────────────────────────────────────────────────
         ("GET", "/admin/schedules", None), // Vec<ScheduleEntry>
         (
+            "GET",
+            "/admin/schedules/{id}",
+            Some(&[
+                "id",
+                "kind",
+                "name",
+                "schedule_expr",
+                "is_paused",
+                "paused_at",
+                "paused_by",
+                "pause_reason",
+                "next_run_at",
+                "last_run_at",
+                "max_active_runs",
+                "catchup",
+                "last_backfill",
+            ]),
+        ),
+        (
             "POST",
             "/admin/schedules/workflow",
             Some(&[
@@ -1665,6 +1698,9 @@ pub const fn management_api_response_fields()
                 "name",
                 "schedule_expr",
                 "is_paused",
+                "paused_at",
+                "paused_by",
+                "pause_reason",
                 "next_run_at",
                 "last_run_at",
                 "max_active_runs",
@@ -4077,6 +4113,9 @@ async fn list_schedules(
                 name,
                 schedule_expr: s.schedule_expr,
                 is_paused: s.is_paused,
+                paused_at: s.paused_at,
+                paused_by: s.paused_by,
+                pause_reason: s.pause_reason,
                 next_run_at: s.next_run_at,
                 last_run_at: s.last_run_at,
                 max_active_runs: s.max_active_runs,
@@ -4086,6 +4125,64 @@ async fn list_schedules(
         })
         .collect();
     Ok(Json(entries))
+}
+
+async fn get_schedule(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id_str): Path<String>,
+) -> Result<Json<ScheduleEntry>, AutumnError> {
+    use autumn_harvest::schema::harvest_schedules::dsl;
+
+    let id = parse_uuid(&id_str, "schedule id")?;
+    let pool = api_state.storage_pool().map_err(map_error)?;
+
+    let mut found: Option<HarvestSchedule> = None;
+    for (_shard, shard_pool) in pool.iter_shards() {
+        let mut conn = acquire_conn(shard_pool).await?;
+        let row: Option<HarvestSchedule> = dsl::harvest_schedules
+            .find(id)
+            .select(HarvestSchedule::as_select())
+            .first(&mut conn)
+            .await
+            .optional()
+            .map_err(database_error)
+            .map_err(map_error)?;
+        if row.is_some() {
+            found = row;
+            break;
+        }
+    }
+
+    let s = found.ok_or_else(|| AutumnError::not_found_msg(format!("schedule {id}")))?;
+
+    let (kind, name) = if let Some(ref dag_name) = s.dag_name {
+        (ScheduleKind::Dag, dag_name.clone())
+    } else if let Some(ref wf_name) = s.workflow_name {
+        (ScheduleKind::Workflow, wf_name.clone())
+    } else {
+        (ScheduleKind::Dag, String::new())
+    };
+
+    let last_backfill = load_recent_backfills(&api_state, std::slice::from_ref(&s.id))
+        .await
+        .remove(&s.id)
+        .map(BackfillSummary::from);
+
+    Ok(Json(ScheduleEntry {
+        id: s.id,
+        kind,
+        name,
+        schedule_expr: s.schedule_expr,
+        is_paused: s.is_paused,
+        paused_at: s.paused_at,
+        paused_by: s.paused_by,
+        pause_reason: s.pause_reason,
+        next_run_at: s.next_run_at,
+        last_run_at: s.last_run_at,
+        max_active_runs: s.max_active_runs,
+        catchup: s.catchup,
+        last_backfill,
+    }))
 }
 
 /// Load the most recent backfill log row for each of the given schedule IDs.
@@ -4175,6 +4272,9 @@ async fn upsert_workflow_schedule_and_read_back(
         name: ws.workflow_name.clone(),
         schedule_expr: row.schedule_expr,
         is_paused: row.is_paused,
+        paused_at: row.paused_at,
+        paused_by: row.paused_by,
+        pause_reason: row.pause_reason,
         next_run_at: row.next_run_at,
         last_run_at: row.last_run_at,
         max_active_runs: row.max_active_runs,
@@ -4294,22 +4394,28 @@ async fn pause_schedule(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
     headers: axum::http::HeaderMap,
+    body: Option<Json<PauseResumeRequest>>,
 ) -> Result<Json<BasicAck>, AutumnError> {
-    set_schedule_paused(&api_state, &id, true, &headers).await
+    let reason = body.and_then(|Json(r)| r.reason);
+    set_schedule_paused(&api_state, &id, true, reason.as_deref(), &headers).await
 }
 
 async fn resume_schedule(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
     headers: axum::http::HeaderMap,
+    body: Option<Json<PauseResumeRequest>>,
 ) -> Result<Json<BasicAck>, AutumnError> {
-    set_schedule_paused(&api_state, &id, false, &headers).await
+    let reason = body.and_then(|Json(r)| r.reason);
+    set_schedule_paused(&api_state, &id, false, reason.as_deref(), &headers).await
 }
 
+#[allow(clippy::too_many_lines)]
 async fn set_schedule_paused(
     api_state: &HarvestApiState,
     id_str: &str,
     paused: bool,
+    reason: Option<&str>,
     headers: &axum::http::HeaderMap,
 ) -> Result<Json<BasicAck>, AutumnError> {
     use autumn_harvest::schema::harvest_schedules::dsl;
@@ -4352,42 +4458,91 @@ async fn set_schedule_paused(
     };
     let pool = api_state.storage_pool().map_err(map_error)?;
     let id_str_owned = id.to_string();
+    let now = chrono::Utc::now();
 
-    let mut updated_count = 0usize;
+    let mut found_count = 0usize;
     for (_shard, shard_pool) in pool.iter_shards() {
         let mut conn = acquire_conn(shard_pool).await?;
-        let n = diesel::update(dsl::harvest_schedules.find(id))
+
+        // Atomic conditional UPDATE: only applies when `is_paused` differs from
+        // the requested state.  The `filter(dsl::is_paused.ne(paused))` predicate
+        // makes the idempotency check part of the UPDATE itself, eliminating the
+        // SELECT-then-UPDATE race condition that would otherwise let two
+        // concurrent requests both overwrite paused_at/paused_by.
+        let rows_updated: usize = if paused {
+            // Pause: set metadata only on the transition false → true.
+            diesel::update(
+                dsl::harvest_schedules
+                    .find(id)
+                    .filter(dsl::is_paused.ne(true)),
+            )
             .set((
-                dsl::is_paused.eq(paused),
-                dsl::updated_at.eq(chrono::Utc::now()),
+                dsl::is_paused.eq(true),
+                dsl::paused_at.eq(Some(now)),
+                dsl::paused_by.eq(Some(actor.as_str())),
+                dsl::pause_reason.eq(reason),
+                dsl::updated_at.eq(now),
             ))
             .execute(&mut conn)
             .await
             .map_err(database_error)
-            .map_err(map_error)?;
-        updated_count += n;
-        if updated_count > 0 {
-            let ar = NewAuditRecord {
-                actor: &actor,
-                operation,
-                target_type: TARGET_SCHEDULE,
-                target_id: Some(id_str_owned.as_str()),
-                route_or_command: route,
-                request_id: request_id.as_deref(),
-                idempotency_key: None,
-                status: STATUS_SUCCEEDED,
-                error_summary: None,
-                shard_id: None,
-                source: &source,
-            };
-            audit::insert_audit(&mut conn, &ar)
+            .map_err(map_error)?
+        } else {
+            // Resume: clear metadata only on the transition true → false.
+            diesel::update(
+                dsl::harvest_schedules
+                    .find(id)
+                    .filter(dsl::is_paused.ne(false)),
+            )
+            .set((
+                dsl::is_paused.eq(false),
+                dsl::paused_at.eq(None::<chrono::DateTime<chrono::Utc>>),
+                dsl::paused_by.eq(None::<&str>),
+                dsl::pause_reason.eq(None::<&str>),
+                dsl::updated_at.eq(now),
+            ))
+            .execute(&mut conn)
+            .await
+            .map_err(database_error)
+            .map_err(map_error)?
+        };
+
+        if rows_updated == 0 {
+            // Either not on this shard, or already in the requested state.
+            // Distinguish the two with a cheap existence check.
+            let exists: bool = diesel::select(diesel::dsl::exists(dsl::harvest_schedules.find(id)))
+                .get_result(&mut conn)
                 .await
+                .map_err(database_error)
                 .map_err(map_error)?;
-            break;
+
+            if !exists {
+                continue; // not on this shard — try the next one
+            }
+            // Already in the requested state: idempotent no-op.
         }
+        found_count += 1;
+
+        let ar = NewAuditRecord {
+            actor: &actor,
+            operation,
+            target_type: TARGET_SCHEDULE,
+            target_id: Some(id_str_owned.as_str()),
+            route_or_command: route,
+            request_id: request_id.as_deref(),
+            idempotency_key: None,
+            status: STATUS_SUCCEEDED,
+            error_summary: None,
+            shard_id: None,
+            source: &source,
+        };
+        audit::insert_audit(&mut conn, &ar)
+            .await
+            .map_err(map_error)?;
+        break;
     }
 
-    if updated_count == 0 {
+    if found_count == 0 {
         if let Ok(mut conn) = acquire_conn(pool.default_pool()).await {
             let ar = NewAuditRecord {
                 actor: &actor,
