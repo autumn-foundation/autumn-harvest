@@ -2953,3 +2953,44 @@ async fn schedule_resume_idempotent_when_schedule_is_not_paused() {
     assert_eq!(s2, StatusCode::OK, "second resume must also return 200");
     assert_eq!(ack2["ok"], true);
 }
+
+#[tokio::test]
+async fn get_schedule_by_id_returns_entry_with_pause_fields() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool));
+    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+
+    let id = seed_workflow_schedule_and_get_id(&database_url, "get_by_id_wf").await;
+
+    // GET before pause: pause fields are null
+    let (status, entry) = get_json(&app, format!("/admin/schedules/{id}")).await;
+    assert_eq!(status, StatusCode::OK, "GET /admin/schedules/{{id}} must return 200");
+    assert_eq!(entry["id"].as_str(), Some(id.to_string().as_str()));
+    assert_eq!(entry["is_paused"], false);
+    assert!(entry["paused_at"].is_null(), "paused_at must be null before any pause");
+    assert!(entry["paused_by"].is_null(), "paused_by must be null before any pause");
+    assert!(entry["pause_reason"].is_null(), "pause_reason must be null before any pause");
+
+    // Pause and verify via GET /admin/schedules/{id}
+    post_json_with_actor(
+        &app,
+        format!("/admin/schedules/{id}/pause"),
+        json!({ "reason": "testing get-by-id" }),
+        "ops-bot",
+    )
+    .await;
+
+    let (status2, paused_entry) = get_json(&app, format!("/admin/schedules/{id}")).await;
+    assert_eq!(status2, StatusCode::OK);
+    assert_eq!(paused_entry["is_paused"], true);
+    assert!(paused_entry["paused_at"].is_string(), "paused_at must be set");
+    assert_eq!(paused_entry["paused_by"], "ops-bot");
+    assert_eq!(paused_entry["pause_reason"], "testing get-by-id");
+
+    // 404 for unknown id
+    let unknown = uuid::Uuid::new_v4();
+    let (not_found_status, _) = get_json(&app, format!("/admin/schedules/{unknown}")).await;
+    assert_eq!(not_found_status, StatusCode::NOT_FOUND, "unknown id must return 404");
+}

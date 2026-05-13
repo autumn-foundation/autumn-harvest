@@ -1988,6 +1988,50 @@
       ]
     },
     {
+      "method": "GET",
+      "path": "/admin/schedules/{id}",
+      "category": "schedule",
+      "read_only": true,
+      "description": "Get a single schedule by UUID. Returns the same ScheduleEntry shape as the list endpoint, including pause metadata (paused_at, paused_by, pause_reason).",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Schedule UUID."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "id",
+          "kind",
+          "name",
+          "schedule_expr",
+          "is_paused",
+          "paused_at",
+          "paused_by",
+          "pause_reason",
+          "next_run_at",
+          "last_run_at",
+          "max_active_runs",
+          "catchup",
+          "last_backfill"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 404,
+          "description": "Schedule not found."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
       "method": "POST",
       "path": "/admin/schedules/workflow",
       "category": "schedule",

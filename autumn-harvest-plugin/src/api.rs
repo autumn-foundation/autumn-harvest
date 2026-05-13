@@ -1201,6 +1201,7 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         // Schedule backfill (issue #177): bounded missed-run recovery.
         .route("/admin/schedules", get(list_schedules))
         .route("/admin/schedules/workflow", post(create_workflow_schedule))
+        .route("/admin/schedules/{id}", get(get_schedule))
         .route("/admin/schedules/{id}/pause", post(pause_schedule))
         .route("/admin/schedules/{id}/resume", post(resume_schedule))
         .route("/admin/schedules/{id}/backfill", post(schedule_backfill))
@@ -1296,8 +1297,9 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/admin/history/exports"),
         ("GET", "/admin/external-handoffs"),
         ("GET", "/admin/external-handoffs/{token}"),
-        // ── schedules (issues #91, #177) ──────────────────────────────────────
+        // ── schedules (issues #91, #177, #229) ───────────────────────────────
         ("GET", "/admin/schedules"),
+        ("GET", "/admin/schedules/{id}"),
         ("POST", "/admin/schedules/workflow"),
         ("POST", "/admin/schedules/{id}/pause"),
         ("POST", "/admin/schedules/{id}/resume"),
@@ -1666,6 +1668,25 @@ pub const fn management_api_response_fields()
         ),
         // ── schedules ─────────────────────────────────────────────────────────
         ("GET", "/admin/schedules", None), // Vec<ScheduleEntry>
+        (
+            "GET",
+            "/admin/schedules/{id}",
+            Some(&[
+                "id",
+                "kind",
+                "name",
+                "schedule_expr",
+                "is_paused",
+                "paused_at",
+                "paused_by",
+                "pause_reason",
+                "next_run_at",
+                "last_run_at",
+                "max_active_runs",
+                "catchup",
+                "last_backfill",
+            ]),
+        ),
         (
             "POST",
             "/admin/schedules/workflow",
@@ -4102,6 +4123,64 @@ async fn list_schedules(
         })
         .collect();
     Ok(Json(entries))
+}
+
+async fn get_schedule(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id_str): Path<String>,
+) -> Result<Json<ScheduleEntry>, AutumnError> {
+    use autumn_harvest::schema::harvest_schedules::dsl;
+
+    let id = parse_uuid(&id_str, "schedule id")?;
+    let pool = api_state.storage_pool().map_err(map_error)?;
+
+    let mut found: Option<HarvestSchedule> = None;
+    for (_shard, shard_pool) in pool.iter_shards() {
+        let mut conn = acquire_conn(shard_pool).await?;
+        let row: Option<HarvestSchedule> = dsl::harvest_schedules
+            .find(id)
+            .select(HarvestSchedule::as_select())
+            .first(&mut conn)
+            .await
+            .optional()
+            .map_err(database_error)
+            .map_err(map_error)?;
+        if row.is_some() {
+            found = row;
+            break;
+        }
+    }
+
+    let s = found.ok_or_else(|| AutumnError::not_found_msg(format!("schedule {id}")))?;
+
+    let (kind, name) = if let Some(ref dag_name) = s.dag_name {
+        (ScheduleKind::Dag, dag_name.clone())
+    } else if let Some(ref wf_name) = s.workflow_name {
+        (ScheduleKind::Workflow, wf_name.clone())
+    } else {
+        (ScheduleKind::Dag, String::new())
+    };
+
+    let last_backfill = load_recent_backfills(&api_state, std::slice::from_ref(&s.id))
+        .await
+        .remove(&s.id)
+        .map(BackfillSummary::from);
+
+    Ok(Json(ScheduleEntry {
+        id: s.id,
+        kind,
+        name,
+        schedule_expr: s.schedule_expr,
+        is_paused: s.is_paused,
+        paused_at: s.paused_at,
+        paused_by: s.paused_by,
+        pause_reason: s.pause_reason,
+        next_run_at: s.next_run_at,
+        last_run_at: s.last_run_at,
+        max_active_runs: s.max_active_runs,
+        catchup: s.catchup,
+        last_backfill,
+    }))
 }
 
 /// Load the most recent backfill log row for each of the given schedule IDs.
