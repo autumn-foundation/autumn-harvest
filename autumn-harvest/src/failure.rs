@@ -157,12 +157,29 @@ enum WirePayload {
 /// and the human-readable message is the payload verbatim.
 #[must_use]
 pub fn parse_error_payload(payload: &str) -> (String, bool, String) {
+    let failure = parse_error_payload_full(payload);
+    (failure.error_type, failure.non_retryable, failure.message)
+}
+
+/// Like [`parse_error_payload`] but returns the full [`ActivityFailure`] so
+/// callers can also recover the structured `details` value.
+///
+/// Use this when persisting a failure into an event whose schema carries
+/// `details` (e.g. `WorkflowEvent::ActivityFailed`). Legacy payloads fall
+/// back to `error_type = "Error"`, `non_retryable = false`, `details = None`.
+#[must_use]
+pub fn parse_error_payload_full(payload: &str) -> ActivityFailure {
     if let Ok(WirePayload::ActivityFailureV1(failure)) =
         serde_json::from_str::<WirePayload>(payload)
     {
-        (failure.error_type, failure.non_retryable, failure.message)
+        failure
     } else {
-        ("Error".to_string(), false, payload.to_string())
+        ActivityFailure {
+            error_type: "Error".to_string(),
+            message: payload.to_string(),
+            details: None,
+            non_retryable: false,
+        }
     }
 }
 

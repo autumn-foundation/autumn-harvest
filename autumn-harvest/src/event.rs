@@ -100,6 +100,14 @@ pub enum WorkflowEvent {
         /// Defaults to `false` for events stored before issue #227.
         #[serde(default)]
         non_retryable: bool,
+        /// Optional structured details preserved from
+        /// [`ActivityFailure::with_details`](crate::failure::ActivityFailure::with_details).
+        ///
+        /// Defaults to `None` for events stored before issue #227 or for
+        /// failures returned via the legacy `Err(String)` path. Omitted from
+        /// the serialised form when `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        details: Option<serde_json::Value>,
     },
     /// The activity exceeded its allocated `start_to_close` or `heartbeat` timeout.
     ActivityTimedOut {
@@ -414,6 +422,7 @@ mod tests {
             attempt: 1,
             error_type: "InvalidInput".into(),
             non_retryable: true,
+            details: None,
         };
         let json = serde_json::to_string(&event).unwrap();
         let back: WorkflowEvent = serde_json::from_str(&json).unwrap();
@@ -464,6 +473,7 @@ mod tests {
             attempt: 1,
             error_type: "Transient".into(),
             non_retryable: false,
+            details: None,
         };
         let json = serde_json::to_string(&event).unwrap();
         let back: WorkflowEvent = serde_json::from_str(&json).unwrap();
@@ -605,6 +615,7 @@ mod tests {
                 attempt: 1,
                 error_type: "Error".into(),
                 non_retryable: false,
+                details: None,
             },
             WorkflowEvent::ActivityTimedOut {
                 activity_id: ActivityExecId::new(),

@@ -134,6 +134,7 @@ fn activity_failed_event_new_fields_round_trip() {
         attempt: 1,
         error_type: "InvalidInput".into(),
         non_retryable: true,
+        details: None,
     };
     let json = serde_json::to_string(&event).unwrap();
     let back: WorkflowEvent = serde_json::from_str(&json).unwrap();
@@ -152,6 +153,44 @@ fn activity_failed_event_new_fields_round_trip() {
     }
 }
 
+/// `ActivityFailed` now carries the structured `details` payload so consumers
+/// reading workflow history (replay diagnostics, history exports, etc.) can
+/// recover what `ActivityFailure::with_details(...)` attached at the call site.
+#[test]
+fn activity_failed_event_preserves_details_round_trip() {
+    use autumn_harvest::failure::parse_error_payload_full;
+
+    let failure = ActivityFailure::non_retryable("PaymentDeclined", "card expired")
+        .with_details(json!({"code": "card_expired", "field": "amount"}));
+    let payload = failure.into_error_payload();
+    let parsed = parse_error_payload_full(&payload);
+    assert_eq!(parsed.error_type, "PaymentDeclined");
+    assert_eq!(
+        parsed.details,
+        Some(json!({"code": "card_expired", "field": "amount"})),
+    );
+
+    let event = WorkflowEvent::ActivityFailed {
+        activity_id: ActivityExecId::new(),
+        error: parsed.message,
+        attempt: 1,
+        error_type: parsed.error_type,
+        non_retryable: parsed.non_retryable,
+        details: parsed.details,
+    };
+    let json = serde_json::to_string(&event).unwrap();
+    let back: WorkflowEvent = serde_json::from_str(&json).unwrap();
+    match back {
+        WorkflowEvent::ActivityFailed { details, .. } => {
+            assert_eq!(
+                details,
+                Some(json!({"code": "card_expired", "field": "amount"}))
+            );
+        }
+        _ => panic!("wrong variant"),
+    }
+}
+
 #[test]
 fn activity_failed_event_old_json_gets_defaults() {
     // Simulates a pre-#227 event stored in harvest_events.event_data.
@@ -163,12 +202,15 @@ fn activity_failed_event_old_json_gets_defaults() {
             attempt,
             error_type,
             non_retryable,
+            details,
             ..
         } => {
             assert_eq!(error, "timeout");
             assert_eq!(attempt, 3);
             assert_eq!(error_type, "Error");
             assert!(!non_retryable);
+            // New `details` field also serde-defaults to None for pre-#227 events.
+            assert!(details.is_none());
         }
         _ => panic!("wrong variant"),
     }
@@ -232,6 +274,7 @@ mod replay_tests {
                 attempt: 1,
                 error_type: "Error".into(),
                 non_retryable: false,
+                details: None,
             },
         ];
 

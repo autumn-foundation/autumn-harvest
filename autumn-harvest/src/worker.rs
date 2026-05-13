@@ -32,7 +32,7 @@ use crate::executor::{
     WorkflowExecuteSpanMeta, WorkflowOutcome, run_workflow_with_state_and_history_policy,
 };
 use crate::external_task;
-use crate::failure::parse_error_payload;
+use crate::failure::{parse_error_payload, parse_error_payload_full};
 use crate::info::{ActivityInfo, WorkflowInfo};
 use crate::models::{
     HarvestTimer, NewHarvestTimer, NewWorkflowExecution, TaskQueueItem, WorkflowExecution,
@@ -795,7 +795,20 @@ async fn run_local_activity_inline(
                     attempt,
                 };
 
-                if attempt == max_attempts {
+                // Per issue #227: honour `ActivityFailure::non_retryable`
+                // (and `RetryPolicy::non_retryable_errors`) for local
+                // activities too. Without this check, a fail-fast local
+                // activity would still retry up to `max_attempts`, defeating
+                // the typed-failure guarantee documented in the README.
+                let (error_type_parsed, payload_non_retryable, _) = parse_error_payload(&error);
+                let policy_non_retryable = run
+                    .retry_policy
+                    .as_ref()
+                    .is_some_and(|p| p.is_non_retryable(&error_type_parsed, &error));
+                let terminal_attempt =
+                    attempt == max_attempts || payload_non_retryable || policy_non_retryable;
+
+                if terminal_attempt {
                     let current_count = u64::try_from(*next_event_id).unwrap_or(u64::MAX);
                     let final_pair_would_exceed_cap = history_event_hard_cap
                         .is_some_and(|cap| current_count.saturating_add(2) > cap);
@@ -1837,13 +1850,14 @@ async fn finalize_activity_failure(
     activity_id: ActivityExecId,
     error: &str,
 ) -> HarvestResult<()> {
-    let (error_type, non_retryable, human_error) = parse_error_payload(error);
+    let failure = parse_error_payload_full(error);
     let failed_event = WorkflowEvent::ActivityFailed {
         activity_id,
-        error: human_error,
+        error: failure.message,
         attempt: task_attempt(task),
-        error_type,
-        non_retryable,
+        error_type: failure.error_type,
+        non_retryable: failure.non_retryable,
+        details: failure.details,
     };
 
     // Per issue #227: when an activity exhausts retries (or is flagged

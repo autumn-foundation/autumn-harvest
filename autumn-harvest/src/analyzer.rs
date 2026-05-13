@@ -257,6 +257,7 @@ mod tests {
                 attempt: 1,
                 error_type: "Error".into(),
                 non_retryable: false,
+                details: None,
             },
             // Failed 3 times, above threshold of 2
             WorkflowEvent::ActivityFailed {
@@ -265,6 +266,7 @@ mod tests {
                 attempt: 3,
                 error_type: "Error".into(),
                 non_retryable: false,
+                details: None,
             },
         ];
 
@@ -344,6 +346,7 @@ mod tests {
                 attempt: 2,
                 error_type: "Error".into(),
                 non_retryable: false,
+                details: None,
             },
         ];
 

@@ -2777,6 +2777,7 @@ mod tests {
                 attempt: 3,
                 error_type: "Error".into(),
                 non_retryable: false,
+                details: None,
             },
         ];
 

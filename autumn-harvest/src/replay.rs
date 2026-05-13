@@ -1246,6 +1246,7 @@ mod tests {
                 attempt,
                 error_type: "Error".into(),
                 non_retryable: false,
+                details: None,
             },
         ];
         (id, events)
