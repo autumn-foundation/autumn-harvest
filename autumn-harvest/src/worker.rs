@@ -317,11 +317,18 @@ fn suspended_workflow_error(commands: &[WorkflowCommand]) -> String {
             .to_string();
     }
 
-    let command_names = commands
-        .iter()
-        .map(workflow_command_name)
-        .collect::<Vec<_>>()
-        .join(", ");
+    // ⚡ Bolt: Remove intermediate vector allocation when formatting command names
+    let command_names =
+        commands
+            .iter()
+            .map(workflow_command_name)
+            .fold(String::new(), |mut acc, name| {
+                if !acc.is_empty() {
+                    acc.push_str(", ");
+                }
+                acc.push_str(name);
+                acc
+            });
     format!(
         "workflow task suspended with unsupported commands ({command_names}); this command set is not implemented yet"
     )
