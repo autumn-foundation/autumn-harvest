@@ -91,6 +91,42 @@ pub fn export_dot(dag: &DagDefinition) -> Result<String, std::fmt::Error> {
     Ok(out)
 }
 
+/// Exports the DAG execution profile to a Mermaid.js Gantt chart.
+///
+/// # Errors
+/// Returns `std::fmt::Error` if string formatting fails.
+#[cfg(feature = "testing")]
+pub fn export_mermaid_gantt(
+    profile: &crate::dag_profiler::DagProfile,
+) -> Result<String, std::fmt::Error> {
+    use std::collections::HashMap;
+
+    let mut out = String::new();
+    writeln!(out, "gantt")?;
+    writeln!(out, "    title DAG Execution Profile")?;
+    writeln!(out, "    dateFormat x")?;
+    writeln!(out, "    axisFormat %S.%L")?;
+    writeln!(out)?;
+    writeln!(out, "    section Tasks")?;
+
+    let mut starts = HashMap::new();
+    for event in &profile.timeline {
+        match &event.kind {
+            crate::dag_profiler::ProfilerEventKind::TaskStarted(id, name) => {
+                starts.insert(*id, (name.clone(), event.time.as_millis()));
+            }
+            crate::dag_profiler::ProfilerEventKind::TaskCompleted(id, _) => {
+                if let Some((name, start_time)) = starts.remove(id) {
+                    let end_time = event.time.as_millis();
+                    writeln!(out, "    {name} : t{id}, {start_time}, {end_time}")?;
+                }
+            }
+        }
+    }
+
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,5 +189,29 @@ digraph DAG {
 }
 ";
         assert_eq!(dot, expected_dot);
+    }
+
+    #[cfg(feature = "testing")]
+    #[test]
+    fn test_export_mermaid_gantt() {
+        use crate::dag_profiler::DagProfiler;
+        use std::time::Duration;
+
+        let mut builder = DagBuilder::new();
+        let a = builder.activity(dummy_activity);
+        let _b = builder.activity(dummy_activity2).upstream(&a);
+        let dag = builder.build().unwrap();
+
+        let profiler = DagProfiler::new(dag)
+            .mock_duration("dummy_activity", Duration::from_millis(1000))
+            .mock_duration("dummy_activity2", Duration::from_millis(2000));
+
+        let profile = profiler.profile();
+        let gantt = export_mermaid_gantt(&profile).unwrap();
+
+        assert!(gantt.contains("gantt"));
+        assert!(gantt.contains("dateFormat x"));
+        assert!(gantt.contains("dummy_activity : t0, 0, 1000"));
+        assert!(gantt.contains("dummy_activity2 : t1, 1000, 3000"));
     }
 }
