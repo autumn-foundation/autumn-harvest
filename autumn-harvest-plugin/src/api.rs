@@ -5051,6 +5051,38 @@ async fn schedule_backfill(
                 let workflow_id = scheduled_workflow_id_pub(&dag_name, *scheduled_for);
                 let exec_id = autumn_harvest::types::ExecutionId::new_for_shard(shard_id);
                 let dag_queue = schedule.queue_name.as_deref().unwrap_or("default");
+
+                // Pre-check across ALL states including CONTINUED_AS_NEW / TERMINATED.
+                // start_or_load_workflow_execution uses a partial unique index that
+                // excludes sealed rows, so a sealed prior run wouldn't conflict and
+                // a duplicate would be created for the same scheduled slot.
+                let prior_check = harvest_workflow_executions::table
+                    .filter(harvest_workflow_executions::workflow_name.eq(&dag_name))
+                    .filter(harvest_workflow_executions::workflow_id.eq(&workflow_id))
+                    .count()
+                    .get_result::<i64>(&mut conn)
+                    .await;
+                match classify_backfill_prior_count(prior_check) {
+                    BackfillPriorPrecheck::PriorRunExists => {
+                        skipped += 1;
+                        *skipped_reasons
+                            .entry("already_exists".to_string())
+                            .or_insert(0) += 1;
+                        continue;
+                    }
+                    BackfillPriorPrecheck::NoPriorRun => {}
+                    BackfillPriorPrecheck::PrecheckFailed(reason) => {
+                        shard_failures.push(BackfillShardFailure {
+                            shard_id: shard_id.as_i32(),
+                            reason: format!(
+                                "failed to check prior DAG execution for {workflow_id}: {reason}"
+                            ),
+                        });
+                        failed += 1;
+                        continue;
+                    }
+                }
+
                 let start_result = start_or_load_workflow_execution(
                     &mut conn,
                     StartWorkflowParams {
