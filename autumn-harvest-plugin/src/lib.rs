@@ -1,13 +1,17 @@
 //! Autumn plugin crate for autumn-harvest.
 
+/// Management HTTP API and Axum routing.
 pub mod api;
+/// Runtime configuration structures for the Harvest plugin.
 pub mod config;
+/// Outbox pattern implementation for reliable workflow start requests.
 pub mod outbox;
 pub mod plugin;
 pub mod preflight;
 pub mod prelude;
 pub mod runner;
 pub mod shard_health;
+/// Shared state and connection pooling for the Harvest plugin.
 pub mod state;
 pub mod ui;
 pub mod version_gate_retirement;

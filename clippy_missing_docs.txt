@@ -1,0 +1,3758 @@
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded async-stream-impl v0.3.6
+  Downloaded anstyle-parse v1.0.0
+  Downloaded bit-set v0.5.3
+  Downloaded bcrypt v0.19.0
+  Downloaded fallible-iterator v0.2.0
+  Downloaded futures-task v0.3.32
+  Downloaded http-range-header v0.4.2
+  Downloaded num v0.4.3
+  Downloaded nu-ansi-term v0.50.3
+  Downloaded phf v0.11.3
+  Downloaded rand_core v0.9.5
+  Downloaded tonic-prost v0.14.5
+  Downloaded toml_writer v1.1.1+spec-1.1.0
+  Downloaded toml_datetime v0.7.5+spec-1.1.0
+  Downloaded uuid v1.23.1
+  Downloaded validator v0.20.0
+  Downloaded yoke v0.8.2
+  Downloaded zerovec-derive v0.11.3
+  Downloaded zmij v1.0.21
+  Downloaded tonic v0.14.5
+  Downloaded schemars v0.9.0
+  Downloaded zerocopy-derive v0.8.48
+  Downloaded url v2.5.8
+  Downloaded zerotrie v0.2.4
+  Downloaded winnow v1.0.2
+  Downloaded rustls v0.23.40
+  Downloaded winnow v0.7.15
+  Downloaded regex-automata v0.4.14
+  Downloaded rustix v1.1.4
+  Downloaded regex-syntax v0.8.10
+  Downloaded ring v0.17.14
+  Downloaded reqwest v0.12.28
+  Downloaded zerocopy v0.8.48
+  Downloaded tower-http v0.6.8
+  Downloaded zerovec v0.11.6
+  Downloaded tracing v0.1.44
+  Downloaded tracing-subscriber v0.3.23
+  Downloaded unicode-segmentation v1.13.2
+  Downloaded unicode-normalization v0.1.25
+  Downloaded typenum v1.20.0
+  Downloaded wezterm-bidi v0.2.3
+  Downloaded vcpkg v0.2.15
+  Downloaded tungstenite v0.29.0
+  Downloaded tower v0.5.3
+  Downloaded termwiz v0.23.3
+  Downloaded syn v2.0.117
+  Downloaded syn v1.0.109
+  Downloaded ureq v3.3.0
+  Downloaded webpki-roots v1.0.7
+  Downloaded unicode-width v0.2.2
+  Downloaded rustls-webpki v0.103.13
+  Downloaded redis v0.27.6
+  Downloaded rayon v1.12.0
+  Downloaded ratatui-widgets v0.3.0
+  Downloaded tokio-util v0.7.18
+  Downloaded regex v1.12.3
+  Downloaded rayon-core v1.13.0
+  Downloaded zerofrom v0.1.7
+  Downloaded xattr v1.6.1
+  Downloaded wezterm-color-types v0.3.0
+  Downloaded wezterm-blob-leases v0.1.1
+  Downloaded want v0.3.1
+  Downloaded walkdir v2.5.0
+  Downloaded wait-timeout v0.2.1
+  Downloaded vtparse v0.6.2
+  Downloaded version_check v0.9.5
+  Downloaded validator_derive v0.20.0
+  Downloaded utf8_iter v1.0.4
+  Downloaded utf8-zero v0.8.1
+  Downloaded ureq-proto v0.6.0
+  Downloaded plotters v0.3.7
+  Downloaded zeroize v1.8.2
+  Downloaded zerofrom-derive v0.1.7
+  Downloaded yoke-derive v0.8.2
+  Downloaded writeable v0.6.3
+  Downloaded whoami v2.1.2
+  Downloaded wezterm-input-types v0.1.0
+  Downloaded wezterm-dynamic v0.2.1
+  Downloaded unicode-properties v0.1.4
+  Downloaded unicode-ident v1.0.24
+  Downloaded unicode-bidi v0.3.18
+  Downloaded unicase v2.9.0
+  Downloaded unarray v0.1.4
+  Downloaded ucd-trie v0.1.7
+  Downloaded try-lock v0.2.5
+  Downloaded tracing-serde v0.2.0
+  Downloaded tracing-log v0.2.0
+  Downloaded tracing-core v0.1.36
+  Downloaded tracing-attributes v0.1.31
+  Downloaded tower-service v0.3.3
+  Downloaded tower-layer v0.3.3
+  Downloaded tokio v1.52.1
+  Downloaded terminfo v0.9.0
+  Downloaded socket2 v0.6.3
+  Downloaded sharded-slab v0.1.7
+  Downloaded libsqlite3-sys v0.36.0
+  Downloaded wezterm-dynamic-derive v0.1.1
+  Downloaded termios v0.3.3
+  Downloaded tempfile v3.27.0
+  Downloaded tagptr v0.2.0
+  Downloaded synstructure v0.13.2
+  Downloaded sync_wrapper v1.0.2
+  Downloaded subtle v2.6.1
+  Downloaded strum_macros v0.27.2
+  Downloaded strum v0.27.2
+  Downloaded structmeta-derive v0.3.0
+  Downloaded structmeta v0.3.0
+  Downloaded strsim v0.11.1
+  Downloaded stringprep v0.1.5
+  Downloaded static_assertions v1.1.0
+  Downloaded stable_deref_trait v1.2.1
+  Downloaded smallvec v1.15.1
+  Downloaded slab v0.4.12
+  Downloaded siphasher v1.0.2
+  Downloaded signal-hook-registry v1.4.8
+  Downloaded signal-hook-mio v0.2.5
+  Downloaded signal-hook v0.3.18
+  Downloaded shlex v1.3.0
+  Downloaded utf8parse v0.2.2
+  Downloaded untrusted v0.9.0
+  Downloaded tokio-postgres v0.7.17
+  Downloaded tokio-cron-scheduler v0.15.1
+  Downloaded time v0.3.47
+  Downloaded testcontainers-modules v0.15.0
+  Downloaded testcontainers v0.27.3
+  Downloaded ryu v1.0.23
+  Downloaded unicode-truncate v2.0.1
+  Downloaded tokio-tungstenite v0.29.0
+  Downloaded serde_with v3.18.0
+  Downloaded serde_json v1.0.149
+  Downloaded serde v1.0.228
+  Downloaded schemars v1.2.1
+  Downloaded same-file v1.0.6
+  Downloaded rusty-fork v0.3.1
+  Downloaded rustversion v1.0.22
+  Downloaded rustls-pki-types v1.14.1
+  Downloaded rustls-native-certs v0.8.3
+  Downloaded rustc_version v0.4.1
+  Downloaded rustc-hash v2.1.2
+  Downloaded ref-cast v1.0.25
+  Downloaded ratatui-termwiz v0.1.0
+  Downloaded ratatui-macros v0.7.0
+  Downloaded ratatui-crossterm v0.1.0
+  Downloaded quinn-proto v0.11.14
+  Downloaded pq-src v0.3.11+libpq-18.3
+  Downloaded linux-raw-sys v0.12.1
+  Downloaded tokio-stream v0.1.18
+  Downloaded tinystr v0.8.3
+  Downloaded ref-cast-impl v1.0.25
+  Downloaded rand v0.10.1
+  Downloaded rand v0.9.4
+  Downloaded quinn v0.11.9
+  Downloaded proptest v1.11.0
+  Downloaded toml_parser v1.1.2+spec-1.1.0
+  Downloaded toml_datetime v1.1.1+spec-1.1.0
+  Downloaded toml v1.1.2+spec-1.1.0
+  Downloaded toml v0.9.12+spec-1.1.0
+  Downloaded tokio-rustls v0.26.4
+  Downloaded tokio-macros v2.7.0
+  Downloaded tinyvec v1.11.0
+  Downloaded tinytemplate v1.2.1
+  Downloaded time-macros v0.2.27
+  Downloaded time-core v0.1.8
+  Downloaded thread_local v1.1.9
+  Downloaded thiserror-impl v2.0.18
+  Downloaded thiserror-impl v1.0.69
+  Downloaded thiserror v2.0.18
+  Downloaded thiserror v1.0.69
+  Downloaded sha2 v0.11.0
+  Downloaded sha2 v0.10.9
+  Downloaded sha1 v0.10.6
+  Downloaded serde_spanned v1.1.1
+  Downloaded serde_repr v0.1.20
+  Downloaded serde_path_to_error v0.1.20
+  Downloaded serde_derive v1.0.228
+  Downloaded serde_core v1.0.228
+  Downloaded semver v1.0.28
+  Downloaded seahash v4.1.0
+  Downloaded ratatui-core v0.1.0
+  Downloaded ratatui v0.30.0
+  Downloaded rand v0.8.6
+  Downloaded portable-atomic v1.13.1
+  Downloaded pest_meta v2.8.6
+  Downloaded pest v2.8.6
+  Downloaded nom v7.1.3
+  Downloaded nix v0.29.0
+  Downloaded tinyvec_macros v0.1.1
+  Downloaded sha1_smol v1.0.1
+  Downloaded serde_with_macros v3.18.0
+  Downloaded serde_urlencoded v0.7.1
+  Downloaded scopeguard v1.2.0
+  Downloaded scoped-tls v1.0.1
+  Downloaded scoped-futures v0.1.4
+  Downloaded rapidhash v4.4.1
+  Downloaded rand_xorshift v0.4.0
+  Downloaded rand_core v0.10.1
+  Downloaded rand_core v0.6.4
+  Downloaded rand_chacha v0.9.0
+  Downloaded quote v1.0.45
+  Downloaded quinn-udp v0.5.14
+  Downloaded quick-error v1.2.3
+  Downloaded prost-types v0.14.3
+  Downloaded prost-derive v0.14.3
+  Downloaded prost v0.14.3
+  Downloaded proc-macro2-diagnostics v0.10.1
+  Downloaded proc-macro2 v1.0.106
+  Downloaded proc-macro-error2 v2.0.1
+  Downloaded proc-macro-error-attr2 v2.0.0
+  Downloaded pq-sys v0.7.5
+  Downloaded ppv-lite86 v0.2.21
+  Downloaded powerfmt v0.2.0
+  Downloaded potential_utf v0.1.5
+  Downloaded postgres-types v0.2.13
+  Downloaded postgres-protocol v0.6.11
+  Downloaded plotters-svg v0.3.7
+  Downloaded plotters-backend v0.3.7
+  Downloaded pkg-config v0.3.33
+  Downloaded pin-project-lite v0.2.17
+  Downloaded pin-project-internal v1.1.11
+  Downloaded pin-project v1.1.11
+  Downloaded phf_shared v0.13.1
+  Downloaded phf_shared v0.12.1
+  Downloaded phf_shared v0.11.3
+  Downloaded phf_macros v0.11.3
+  Downloaded phf_codegen v0.11.3
+  Downloaded num-bigint v0.4.6
+  Downloaded moka v0.12.15
+  Downloaded mio v1.2.0
+  Downloaded minimal-lexical v0.2.1
+  Downloaded libc v0.2.186
+  Downloaded deltae v0.3.2
+  Downloaded phf_generator v0.11.3
+  Downloaded phf v0.13.1
+  Downloaded phf v0.12.1
+  Downloaded pest_generator v2.8.6
+  Downloaded parse-display v0.9.1
+  Downloaded parking_lot v0.12.5
+  Downloaded openssl-probe v0.2.1
+  Downloaded num-traits v0.2.19
+  Downloaded num-rational v0.4.2
+  Downloaded itertools v0.14.0
+  Downloaded itertools v0.13.0
+  Downloaded iri-string v0.7.12
+  Downloaded idna v1.1.0
+  Downloaded icu_properties_data v2.2.0
+  Downloaded hyper v1.9.0
+  Downloaded hashbrown v0.17.0
+  Downloaded hashbrown v0.16.1
+  Downloaded h2 v0.4.13
+  Downloaded futures-util v0.3.32
+  Downloaded bollard-stubs v1.52.1-rc.29.1.3
+  Downloaded pest_derive v2.8.6
+  Downloaded percent-encoding v2.3.2
+  Downloaded parse-display-derive v0.9.1
+  Downloaded parking_lot_core v0.9.12
+  Downloaded ordered-float v4.6.0
+  Downloaded oorandom v11.1.5
+  Downloaded once_cell v1.21.4
+  Downloaded num_threads v0.1.7
+  Downloaded num_cpus v1.17.0
+  Downloaded num-iter v0.1.45
+  Downloaded num-integer v0.1.46
+  Downloaded num-derive v0.4.2
+  Downloaded num-conv v0.2.1
+  Downloaded num-complex v0.4.6
+  Downloaded mime_guess v2.0.5
+  Downloaded mime v0.3.17
+  Downloaded metrics v0.24.5
+  Downloaded memoffset v0.9.1
+  Downloaded memchr v2.8.0
+  Downloaded md-5 v0.11.0
+  Downloaded loom v0.7.2
+  Downloaded itertools v0.10.5
+  Downloaded indexmap v2.14.0
+  Downloaded indexmap v1.9.3
+  Downloaded icu_provider v2.2.0
+  Downloaded icu_properties v2.2.0
+  Downloaded icu_normalizer_data v2.2.0
+  Downloaded icu_normalizer v2.2.0
+  Downloaded icu_locale_core v2.2.0
+  Downloaded icu_collections v2.2.0
+  Downloaded hyper-util v0.1.20
+  Downloaded http v1.4.0
+  Downloaded hashbrown v0.12.3
+  Downloaded half v2.7.1
+  Downloaded getrandom v0.4.2
+  Downloaded getrandom v0.3.4
+  Downloaded getrandom v0.2.17
+  Downloaded futures v0.3.32
+  Downloaded finl_unicode v1.4.0
+  Downloaded ferroid v2.0.0
+  Downloaded euclid v0.22.14
+  Downloaded diesel_derives v2.3.9
+  Downloaded diesel-async v0.8.0
+  Downloaded diesel v2.3.9
+  Downloaded darling_core v0.23.0
+  Downloaded darling_core v0.20.11
+  Downloaded crossterm v0.29.0
+  Downloaded compact_str v0.9.0
+  Downloaded chrono-tz v0.10.4
+  Downloaded autumn-web v0.2.0
+  Downloaded migrations_internals v2.3.0
+  Downloaded maud v0.27.0
+  Downloaded lru v0.16.4
+  Downloaded log v0.4.29
+  Downloaded litrs v1.0.0
+  Downloaded litemap v0.8.2
+  Downloaded itoa v1.0.18
+  Downloaded ipnet v2.12.0
+  Downloaded inout v0.1.4
+  Downloaded iana-time-zone v0.1.65
+  Downloaded hyper-timeout v0.5.2
+  Downloaded hyper-rustls v0.27.9
+  Downloaded hybrid-array v0.4.11
+  Downloaded httparse v1.10.1
+  Downloaded http-body-util v0.1.3
+  Downloaded hmac v0.13.0
+  Downloaded generator v0.8.8
+  Downloaded futures-executor v0.3.32
+  Downloaded futures-channel v0.3.32
+  Downloaded foldhash v0.2.0
+  Downloaded find-msvc-tools v0.1.9
+  Downloaded filetime v0.2.27
+  Downloaded fastrand v2.4.1
+  Downloaded fancy-regex v0.11.0
+  Downloaded either v1.15.0
+  Downloaded docker_credential v1.3.2
+  Downloaded displaydoc v0.2.5
+  Downloaded digest v0.11.2
+  Downloaded digest v0.10.7
+  Downloaded derive_builder v0.20.2
+  Downloaded deadpool v0.13.0
+  Downloaded darling_macro v0.21.3
+  Downloaded darling_core v0.21.3
+  Downloaded crypto-common v0.2.1
+  Downloaded croner v2.2.0
+  Downloaded const-oid v0.10.2
+  Downloaded cmov v0.5.3
+  Downloaded clap_derive v4.6.1
+  Downloaded clap_builder v4.6.0
+  Downloaded ciborium-io v0.2.2
+  Downloaded chrono v0.4.44
+  Downloaded cfg-if v1.0.4
+  Downloaded cc v1.2.61
+  Downloaded castaway v0.2.4
+  Downloaded cast v0.3.0
+  Downloaded bytes v1.11.1
+  Downloaded migrations_macros v2.3.0
+  Downloaded memmem v0.1.1
+  Downloaded maud_macros v0.27.0
+  Downloaded matchit v0.8.4
+  Downloaded matchers v0.2.0
+  Downloaded mac_address v1.1.8
+  Downloaded lru-slab v0.1.2
+  Downloaded lock_api v0.4.14
+  Downloaded line-clipping v0.3.7
+  Downloaded lazy_static v1.5.0
+  Downloaded lab v0.11.0
+  Downloaded kasuari v0.4.12
+  Downloaded is_terminal_polyfill v1.70.2
+  Downloaded is-terminal v0.4.17
+  Downloaded instability v0.3.12
+  Downloaded indoc v2.0.7
+  Downloaded idna_adapter v1.2.2
+  Downloaded ident_case v1.0.1
+  Downloaded hyperlocal v0.9.1
+  Downloaded httpdate v1.0.3
+  Downloaded hex v0.4.3
+  Downloaded futures-sink v0.3.32
+  Downloaded futures-core v0.3.32
+  Downloaded equivalent v1.0.2
+  Downloaded dyn-clone v1.0.20
+  Downloaded dsl_auto_type v0.2.0
+  Downloaded document-features v0.2.12
+  Downloaded diesel_table_macro_syntax v0.3.0
+  Downloaded derive_more-impl v2.1.1
+  Downloaded derive_more v2.1.1
+  Downloaded derive_builder_core v0.20.2
+  Downloaded darling v0.23.0
+  Downloaded darling v0.21.3
+  Downloaded ctutils v0.4.2
+  Downloaded crossbeam-epoch v0.9.18
+  Downloaded crossbeam-deque v0.8.6
+  Downloaded crossbeam-channel v0.5.15
+  Downloaded croner v3.0.1
+  Downloaded criterion v0.5.1
+  Downloaded cpufeatures v0.2.17
+  Downloaded convert_case v0.10.0
+  Downloaded combine v4.6.7
+  Downloaded clap v4.6.1
+  Downloaded cipher v0.4.4
+  Downloaded ciborium v0.2.2
+  Downloaded chacha20 v0.10.0
+  Downloaded byteorder v1.5.0
+  Downloaded bytemuck v1.25.0
+  Downloaded bollard-buildkit-proto v0.7.0
+  Downloaded bollard v0.20.2
+  Downloaded blowfish v0.9.1
+  Downloaded base64 v0.22.1
+  Downloaded base64 v0.21.7
+  Downloaded axum v0.8.9
+  Downloaded arc-swap v1.9.1
+  Downloaded anes v0.1.6
+  Downloaded aho-corasick v1.1.4
+  Downloaded http-body v1.0.1
+  Downloaded home v0.5.12
+  Downloaded heck v0.5.0
+  Downloaded generic-array v0.14.7
+  Downloaded futures-macro v0.3.32
+  Downloaded futures-io v0.3.32
+  Downloaded form_urlencoded v1.2.2
+  Downloaded etcetera v0.11.0
+  Downloaded errno v0.3.14
+  Downloaded downcast-rs v2.0.2
+  Downloaded diesel_migrations v2.3.2
+  Downloaded derive_builder_macro v0.20.2
+  Downloaded deranged v0.5.8
+  Downloaded deadpool-runtime v0.3.1
+  Downloaded data-encoding v2.11.0
+  Downloaded darling_macro v0.23.0
+  Downloaded darling_macro v0.20.11
+  Downloaded darling v0.20.11
+  Downloaded csscolorparser v0.6.2
+  Downloaded crypto-common v0.1.7
+  Downloaded crossbeam-utils v0.8.21
+  Downloaded criterion-plot v0.5.0
+  Downloaded cpufeatures v0.3.0
+  Downloaded clap_lex v1.1.0
+  Downloaded ciborium-ll v0.2.2
+  Downloaded block-buffer v0.12.0
+  Downloaded bitflags v1.3.2
+  Downloaded bit-vec v0.8.0
+  Downloaded bit-vec v0.6.3
+  Downloaded bit-set v0.8.0
+  Downloaded axum-macros v0.5.1
+  Downloaded axum-core v0.5.6
+  Downloaded autumn-macros v0.2.0
+  Downloaded atomic-waker v1.1.2
+  Downloaded async-trait v0.1.89
+  Downloaded astral-tokio-tar v0.6.1
+  Downloaded anyhow v1.0.102
+  Downloaded anstyle v1.0.14
+  Downloaded fnv v1.0.7
+  Downloaded fixedbitset v0.4.2
+  Downloaded filedescriptor v0.8.3
+  Downloaded colorchoice v1.0.5
+  Downloaded cfg_aliases v0.2.1
+  Downloaded bitflags v2.11.1
+  Downloaded autocfg v1.5.0
+  Downloaded anstream v1.0.0
+  Downloaded block-buffer v0.10.4
+  Downloaded backon v1.6.0
+  Downloaded anstyle-query v1.1.5
+  Downloaded allocator-api2 v0.2.21
+  Downloaded atomic v0.6.1
+  Downloaded async-stream v0.3.6
+   Compiling proc-macro2 v1.0.106
+   Compiling quote v1.0.45
+   Compiling unicode-ident v1.0.24
+   Compiling libc v0.2.186
+    Checking cfg-if v1.0.4
+    Checking log v0.4.29
+   Compiling serde_core v1.0.228
+    Checking itoa v1.0.18
+    Checking smallvec v1.15.1
+    Checking bytes v1.11.1
+    Checking pin-project-lite v0.2.17
+   Compiling syn v2.0.117
+    Checking memchr v2.8.0
+   Compiling parking_lot_core v0.9.12
+    Checking errno v0.3.14
+    Checking scopeguard v1.2.0
+    Checking lock_api v0.4.14
+    Checking signal-hook-registry v1.4.8
+    Checking mio v1.2.0
+    Checking parking_lot v0.12.5
+    Checking futures-core v0.3.32
+    Checking once_cell v1.21.4
+    Checking socket2 v0.6.3
+   Compiling find-msvc-tools v0.1.9
+   Compiling shlex v1.3.0
+   Compiling serde v1.0.228
+   Compiling cc v1.2.61
+   Compiling strsim v0.11.1
+    Checking typenum v1.20.0
+   Compiling ident_case v1.0.1
+    Checking futures-sink v0.3.32
+    Checking futures-channel v0.3.32
+    Checking slab v0.4.12
+    Checking futures-task v0.3.32
+    Checking futures-io v0.3.32
+    Checking equivalent v1.0.2
+    Checking tracing-core v0.1.36
+   Compiling autocfg v1.5.0
+    Checking http v1.4.0
+   Compiling num-traits v0.2.19
+    Checking percent-encoding v2.3.2
+   Compiling zmij v1.0.21
+    Checking bitflags v2.11.1
+    Checking base64 v0.22.1
+   Compiling serde_json v1.0.149
+   Compiling httparse v1.10.1
+   Compiling getrandom v0.4.2
+    Checking rand_core v0.10.1
+   Compiling thiserror v2.0.18
+    Checking stable_deref_trait v1.2.1
+   Compiling fnv v1.0.7
+   Compiling synstructure v0.13.2
+    Checking http-body v1.0.1
+   Compiling heck v0.5.0
+    Checking hashbrown v0.17.0
+   Compiling rustversion v1.0.22
+    Checking ryu v1.0.23
+    Checking tower-service v0.3.3
+   Compiling version_check v0.9.5
+   Compiling either v1.15.0
+    Checking indexmap v2.14.0
+    Checking try-lock v0.2.5
+    Checking httpdate v1.0.3
+    Checking zeroize v1.8.2
+    Checking atomic-waker v1.1.2
+    Checking want v0.3.1
+    Checking http-body-util v0.1.3
+   Compiling serde_derive v1.0.228
+   Compiling tokio-macros v2.7.0
+   Compiling futures-macro v0.3.32
+   Compiling tracing-attributes v0.1.31
+    Checking tokio v1.52.1
+    Checking futures-util v0.3.32
+    Checking tracing v0.1.44
+   Compiling zerofrom-derive v0.1.7
+    Checking zerofrom v0.1.7
+   Compiling yoke-derive v0.8.2
+   Compiling thiserror-impl v2.0.18
+   Compiling zerovec-derive v0.11.3
+    Checking yoke v0.8.2
+   Compiling displaydoc v0.2.5
+    Checking form_urlencoded v1.2.2
+    Checking zerovec v0.11.6
+    Checking sync_wrapper v1.0.2
+    Checking writeable v0.6.3
+    Checking mime v0.3.17
+    Checking tower-layer v0.3.3
+    Checking ipnet v2.12.0
+    Checking tokio-util v0.7.18
+    Checking litemap v0.8.2
+    Checking zerotrie v0.2.4
+    Checking tinystr v0.8.3
+    Checking potential_utf v0.1.5
+   Compiling icu_properties_data v2.2.0
+    Checking icu_locale_core v2.2.0
+   Compiling icu_normalizer_data v2.2.0
+    Checking utf8_iter v1.0.4
+    Checking icu_collections v2.2.0
+   Compiling async-trait v0.1.89
+    Checking h2 v0.4.13
+    Checking hybrid-array v0.4.11
+    Checking icu_provider v2.2.0
+    Checking cpufeatures v0.3.0
+    Checking subtle v2.6.1
+    Checking tower v0.5.3
+   Compiling generic-array v0.14.7
+    Checking cmov v0.5.3
+   Compiling zerocopy v0.8.48
+   Compiling pkg-config v0.3.33
+    Checking ctutils v0.4.2
+    Checking icu_properties v2.2.0
+    Checking icu_normalizer v2.2.0
+    Checking crypto-common v0.2.1
+    Checking block-buffer v0.12.0
+    Checking chacha20 v0.10.0
+    Checking serde_urlencoded v0.7.1
+   Compiling zerocopy-derive v0.8.48
+    Checking iana-time-zone v0.1.65
+    Checking const-oid v0.10.2
+    Checking siphasher v1.0.2
+    Checking byteorder v1.5.0
+    Checking digest v0.11.2
+    Checking idna_adapter v1.2.2
+    Checking chrono v0.4.44
+    Checking rand v0.10.1
+    Checking hyper v1.9.0
+   Compiling darling_core v0.21.3
+    Checking hyper-util v0.1.20
+   Compiling pq-src v0.3.11+libpq-18.3
+    Checking allocator-api2 v0.2.21
+    Checking tinyvec_macros v0.1.1
+    Checking foldhash v0.2.0
+    Checking sha1_smol v1.0.1
+    Checking hashbrown v0.16.1
+    Checking tinyvec v1.11.0
+   Compiling darling_macro v0.21.3
+    Checking idna v1.1.0
+   Compiling vcpkg v0.2.15
+   Compiling getrandom v0.3.4
+    Checking url v2.5.8
+    Checking unicode-normalization v0.1.25
+   Compiling libsqlite3-sys v0.36.0
+   Compiling darling v0.21.3
+    Checking uuid v1.23.1
+   Compiling pq-sys v0.7.5
+    Checking futures-executor v0.3.32
+   Compiling ring v0.17.14
+    Checking winnow v1.0.2
+    Checking unicode-properties v0.1.4
+   Compiling diesel_derives v2.3.9
+    Checking unicode-bidi v0.3.18
+    Checking stringprep v0.1.5
+   Compiling toml_parser v1.1.2+spec-1.1.0
+    Checking futures v0.3.32
+   Compiling dsl_auto_type v0.2.0
+    Checking lru v0.16.4
+   Compiling toml_datetime v0.7.5+spec-1.1.0
+   Compiling serde_spanned v1.1.1
+    Checking crypto-common v0.1.7
+    Checking hmac v0.13.0
+    Checking md-5 v0.11.0
+    Checking sha2 v0.11.0
+    Checking rustls-pki-types v1.14.1
+   Compiling diesel_table_macro_syntax v0.3.0
+   Compiling winnow v0.7.15
+    Checking fallible-iterator v0.2.0
+    Checking postgres-protocol v0.6.11
+   Compiling toml v0.9.12+spec-1.1.0
+    Checking rand_core v0.9.5
+    Checking phf_shared v0.13.1
+    Checking getrandom v0.2.17
+   Compiling rustix v1.1.4
+    Checking untrusted v0.9.0
+    Checking downcast-rs v2.0.2
+    Checking phf v0.13.1
+   Compiling migrations_internals v2.3.0
+    Checking postgres-types v0.2.13
+    Checking ppv-lite86 v0.2.21
+    Checking deadpool-runtime v0.3.1
+   Compiling darling_core v0.23.0
+    Checking whoami v2.1.2
+    Checking num_cpus v1.17.0
+    Checking linux-raw-sys v0.12.1
+   Compiling rustls v0.23.40
+    Checking tokio-postgres v0.7.17
+    Checking diesel v2.3.9
+    Checking deadpool v0.13.0
+    Checking rand_chacha v0.9.0
+   Compiling migrations_macros v2.3.0
+    Checking rustls-webpki v0.103.13
+    Checking block-buffer v0.10.4
+    Checking scoped-futures v0.1.4
+    Checking digest v0.10.7
+    Checking rand v0.9.4
+   Compiling darling_macro v0.23.0
+   Compiling darling v0.23.0
+    Checking rapidhash v4.4.1
+    Checking powerfmt v0.2.0
+    Checking cpufeatures v0.2.17
+    Checking regex-syntax v0.8.10
+    Checking deranged v0.5.8
+    Checking sha1 v0.10.6
+    Checking metrics v0.24.5
+    Checking itertools v0.14.0
+    Checking croner v2.2.0
+   Compiling autumn-harvest-macros v0.3.0 (/app/autumn-harvest-macros)
+    Checking aho-corasick v1.1.4
+    Checking seahash v4.1.0
+    Checking time-core v0.1.8
+    Checking num_threads v0.1.7
+    Checking num-conv v0.2.1
+    Checking data-encoding v2.11.0
+    Checking time v0.3.47
+    Checking regex-automata v0.4.14
+    Checking tungstenite v0.29.0
+    Checking axum-core v0.5.6
+    Checking tokio-tungstenite v0.29.0
+   Compiling axum-macros v0.5.1
+    Checking serde_path_to_error v0.1.20
+    Checking matchit v0.8.4
+    Checking tokio-rustls v0.26.4
+    Checking webpki-roots v1.0.7
+   Compiling portable-atomic v1.13.1
+    Checking hyper-rustls v0.27.9
+   Compiling crossbeam-utils v0.8.21
+    Checking regex v1.12.3
+   Compiling anyhow v1.0.102
+    Checking axum v0.8.9
+    Checking crossbeam-epoch v0.9.18
+    Checking tokio-stream v0.1.18
+   Compiling pin-project-internal v1.1.11
+   Compiling prost-derive v0.14.3
+    Checking num-integer v0.1.46
+    Checking lazy_static v1.5.0
+    Checking sharded-slab v0.1.7
+    Checking pin-project v1.1.11
+    Checking matchers v0.2.0
+    Checking hyper-timeout v0.5.2
+    Checking tracing-serde v0.2.0
+    Checking tracing-log v0.2.0
+    Checking thread_local v1.1.9
+    Checking nu-ansi-term v0.50.3
+    Checking prost v0.14.3
+    Checking tracing-subscriber v0.3.23
+    Checking tonic v0.14.5
+    Checking num-bigint v0.4.6
+    Checking ureq-proto v0.6.0
+   Compiling bollard-buildkit-proto v0.7.0
+    Checking utf8-zero v0.8.1
+    Checking ureq v3.3.0
+    Checking tonic-prost v0.14.5
+    Checking prost-types v0.14.3
+   Compiling structmeta-derive v0.3.0
+   Compiling structmeta v0.3.0
+    Checking num-rational v0.4.2
+    Checking num-iter v0.1.45
+   Compiling async-stream-impl v0.3.6
+   Compiling serde_repr v0.1.20
+    Checking num-complex v0.4.6
+    Checking openssl-probe v0.2.1
+    Checking hex v0.4.3
+    Checking hyperlocal v0.9.1
+    Checking rustls-native-certs v0.8.3
+    Checking num v0.4.3
+    Checking bollard-stubs v1.52.1-rc.29.1.3
+    Checking async-stream v0.3.6
+   Compiling serde_with_macros v3.18.0
+   Compiling parse-display-derive v0.9.1
+    Checking xattr v1.6.1
+    Checking filetime v0.2.27
+    Checking base64 v0.21.7
+    Checking home v0.5.12
+    Checking rustc-hash v2.1.2
+    Checking astral-tokio-tar v0.6.1
+    Checking parse-display v0.9.1
+    Checking docker_credential v1.3.2
+    Checking serde_with v3.18.0
+    Checking diesel_migrations v2.3.2
+    Checking diesel-async v0.8.0
+    Checking ferroid v2.0.0
+    Checking etcetera v0.11.0
+    Checking utf8parse v0.2.2
+    Checking anstyle-parse v1.0.0
+    Checking anstyle v1.0.14
+    Checking colorchoice v1.0.5
+    Checking is_terminal_polyfill v1.70.2
+    Checking autumn-harvest v0.3.0 (/app/autumn-harvest)
+    Checking anstyle-query v1.1.5
+    Checking anstream v1.0.0
+    Checking clap_lex v1.1.0
+    Checking clap_builder v4.6.0
+   Compiling clap_derive v4.6.1
+   Compiling strum_macros v0.27.2
+    Checking clap v4.6.1
+    Checking fastrand v2.4.1
+   Compiling unicase v2.9.0
+   Compiling mime_guess v2.0.5
+   Compiling rayon-core v1.13.0
+    Checking crossbeam-deque v0.8.6
+    Checking half v2.7.1
+   Compiling generator v0.8.8
+    Checking ciborium-io v0.2.2
+    Checking plotters-backend v0.3.7
+    Checking strum v0.27.2
+    Checking http-range-header v0.4.2
+    Checking iri-string v0.7.12
+    Checking plotters-svg v0.3.7
+    Checking ciborium-ll v0.2.2
+    Checking tempfile v3.27.0
+    Checking itertools v0.10.5
+    Checking tower-http v0.6.8
+    Checking wait-timeout v0.2.1
+    Checking same-file v1.0.6
+    Checking cast v0.3.0
+    Checking quick-error v1.2.3
+    Checking bit-vec v0.8.0
+    Checking bit-set v0.8.0
+    Checking bollard v0.20.2
+    Checking rusty-fork v0.3.1
+    Checking criterion-plot v0.5.0
+    Checking walkdir v2.5.0
+    Checking rayon v1.12.0
+    Checking ciborium v0.2.2
+    Checking plotters v0.3.7
+    Checking rand_xorshift v0.4.0
+    Checking tinytemplate v1.2.1
+    Checking is-terminal v0.4.17
+    Checking scoped-tls v1.0.1
+    Checking testcontainers v0.27.3
+    Checking anes v0.1.6
+    Checking unarray v0.1.4
+    Checking oorandom v11.1.5
+    Checking proptest v1.11.0
+    Checking criterion v0.5.1
+    Checking loom v0.7.2
+    Checking testcontainers-modules v0.15.0
+   Compiling darling_core v0.20.11
+   Compiling proc-macro2-diagnostics v0.10.1
+    Checking inout v0.1.4
+    Checking phf_shared v0.12.1
+   Compiling proc-macro-error-attr2 v2.0.0
+   Compiling chrono-tz v0.10.4
+   Compiling proc-macro-error2 v2.0.1
+    Checking phf v0.12.1
+    Checking cipher v0.4.4
+   Compiling tokio-cron-scheduler v0.15.1
+   Compiling maud_macros v0.27.0
+    Checking blowfish v0.9.1
+    Checking crossbeam-channel v0.5.15
+   Compiling num-derive v0.4.2
+   Compiling darling_macro v0.20.11
+   Compiling darling v0.20.11
+   Compiling derive_builder_core v0.20.2
+   Compiling validator_derive v0.20.0
+   Compiling derive_builder_macro v0.20.2
+    Checking derive_builder v0.20.2
+    Checking croner v3.0.1
+    Checking toml_datetime v1.1.1+spec-1.1.0
+    Checking toml_writer v1.1.1+spec-1.1.0
+    Checking tagptr v0.2.0
+    Checking moka v0.12.15
+    Checking toml v1.1.2+spec-1.1.0
+    Checking validator v0.20.0
+    Checking maud v0.27.0
+    Checking bcrypt v0.19.0
+   Compiling autumn-macros v0.2.0
+    Checking castaway v0.2.4
+   Compiling unicode-segmentation v1.13.2
+    Checking unicode-width v0.2.2
+   Compiling indoc v2.0.7
+   Compiling signal-hook v0.3.18
+    Checking static_assertions v1.1.0
+   Compiling instability v0.3.12
+    Checking unicode-truncate v2.0.1
+    Checking compact_str v0.9.0
+   Compiling convert_case v0.10.0
+    Checking kasuari v0.4.12
+   Compiling derive_more-impl v2.1.1
+    Checking ratatui-core v0.1.0
+    Checking autumn-web v0.2.0
+   Compiling litrs v1.0.0
+    Checking signal-hook-mio v0.2.5
+    Checking derive_more v2.1.1
+    Checking line-clipping v0.3.7
+   Compiling document-features v0.2.12
+    Checking ratatui-widgets v0.3.0
+    Checking crossterm v0.29.0
+    Checking ratatui-macros v0.7.0
+    Checking reqwest v0.12.28
+    Checking ratatui-crossterm v0.1.0
+    Checking ratatui v0.30.0
+    Checking backon v1.6.0
+    Checking itertools v0.13.0
+    Checking combine v4.6.7
+    Checking arc-swap v1.9.1
+    Checking redis v0.27.6
+warning: missing documentation for a module
+  --> autumn-harvest/src/lib.rs:41:1
+   |
+41 | pub mod diagnostic;
+   | ^^^^^^^^^^^^^^^^^^
+   |
+   = note: requested on the command line with `-W missing-docs`
+
+warning: missing documentation for a constant
+  --> autumn-harvest/src/audit.rs:35:1
+   |
+35 | pub const OP_WORKFLOW_START: &str = "workflow.start";
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a constant
+  --> autumn-harvest/src/audit.rs:36:1
+   |
+36 | pub const OP_WORKFLOW_SIGNAL: &str = "workflow.signal";
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a constant
+  --> autumn-harvest/src/audit.rs:37:1
+   |
+37 | pub const OP_WORKFLOW_CANCEL: &str = "workflow.cancel";
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a constant
+  --> autumn-harvest/src/audit.rs:38:1
+   |
+38 | pub const OP_WORKFLOW_RESET: &str = "workflow.reset";
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a constant
+  --> autumn-harvest/src/audit.rs:39:1
+   |
+39 | pub const OP_DAG_TRIGGER: &str = "dag.trigger";
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a constant
+  --> autumn-harvest/src/audit.rs:40:1
+   |
+40 | pub const OP_DAG_PATCH: &str = "dag.patch";
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a constant
+  --> autumn-harvest/src/audit.rs:41:1
+   |
+41 | pub const OP_SCHEDULE_CREATE: &str = "schedule.create";
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a constant
+  --> autumn-harvest/src/audit.rs:42:1
+   |
+42 | pub const OP_SCHEDULE_PAUSE: &str = "schedule.pause";
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a constant
+  --> autumn-harvest/src/audit.rs:43:1
+   |
+43 | pub const OP_SCHEDULE_RESUME: &str = "schedule.resume";
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a constant
+  --> autumn-harvest/src/audit.rs:44:1
+   |
+44 | pub const OP_SCHEDULE_DELETE: &str = "schedule.delete";
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a constant
+  --> autumn-harvest/src/audit.rs:45:1
+   |
+45 | pub const OP_SCHEDULE_BACKFILL: &str = "schedule.backfill";
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a constant
+  --> autumn-harvest/src/audit.rs:46:1
+   |
+46 | pub const OP_DLQ_REPLAY: &str = "dlq.replay";
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a constant
+  --> autumn-harvest/src/audit.rs:47:1
+   |
+47 | pub const OP_DLQ_REPLAY_BULK: &str = "dlq.replay.bulk";
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a constant
+  --> autumn-harvest/src/audit.rs:48:1
+   |
+48 | pub const OP_DLQ_DISCARD_BULK: &str = "dlq.discard.bulk";
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a constant
+  --> autumn-harvest/src/audit.rs:49:1
+   |
+49 | pub const OP_BATCH_SUBMIT: &str = "batch.submit";
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a constant
+  --> autumn-harvest/src/audit.rs:50:1
+   |
+50 | pub const OP_RETENTION_RUN_NOW: &str = "retention.run_now";
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a constant
+  --> autumn-harvest/src/audit.rs:51:1
+   |
+51 | pub const OP_EXTERNAL_ACTIVITY_COMPLETE: &str = "external_activity.compl...
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a constant
+  --> autumn-harvest/src/audit.rs:52:1
+   |
+52 | pub const OP_EXTERNAL_ACTIVITY_FAIL: &str = "external_activity.fail";
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a constant
+  --> autumn-harvest/src/audit.rs:53:1
+   |
+53 | pub const OP_WORKER_DRAIN: &str = "worker.drain";
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a constant
+  --> autumn-harvest/src/audit.rs:57:1
+   |
+57 | pub const TARGET_WORKFLOW: &str = "workflow";
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a constant
+  --> autumn-harvest/src/audit.rs:58:1
+   |
+58 | pub const TARGET_DAG: &str = "dag";
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a constant
+  --> autumn-harvest/src/audit.rs:59:1
+   |
+59 | pub const TARGET_SCHEDULE: &str = "schedule";
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a constant
+  --> autumn-harvest/src/audit.rs:60:1
+   |
+60 | pub const TARGET_DEAD_LETTER: &str = "dead_letter";
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a constant
+  --> autumn-harvest/src/audit.rs:61:1
+   |
+61 | pub const TARGET_BATCH: &str = "batch";
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a constant
+  --> autumn-harvest/src/audit.rs:62:1
+   |
+62 | pub const TARGET_RETENTION: &str = "retention";
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a constant
+  --> autumn-harvest/src/audit.rs:63:1
+   |
+63 | pub const TARGET_EXTERNAL_ACTIVITY: &str = "external_activity";
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a constant
+  --> autumn-harvest/src/audit.rs:64:1
+   |
+64 | pub const TARGET_WORKER: &str = "worker";
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a constant
+  --> autumn-harvest/src/audit.rs:68:1
+   |
+68 | pub const STATUS_SUCCEEDED: &str = "succeeded";
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a constant
+  --> autumn-harvest/src/audit.rs:69:1
+   |
+69 | pub const STATUS_FAILED: &str = "failed";
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a constant
+  --> autumn-harvest/src/audit.rs:73:1
+   |
+73 | pub const SOURCE_API: &str = "api";
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a constant
+  --> autumn-harvest/src/audit.rs:74:1
+   |
+74 | pub const SOURCE_CLI: &str = "cli";
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a constant
+  --> autumn-harvest/src/audit.rs:75:1
+   |
+75 | pub const SOURCE_UI: &str = "ui";
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/audit.rs:405:5
+    |
+405 |     pub actor: Option<String>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/audit.rs:406:5
+    |
+406 |     pub operation: Option<String>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/audit.rs:407:5
+    |
+407 |     pub target_type: Option<String>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/audit.rs:408:5
+    |
+408 |     pub target_id: Option<String>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/audit.rs:409:5
+    |
+409 |     pub status: Option<String>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/audit.rs:410:5
+    |
+410 |     pub since: Option<DateTime<Utc>>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/audit.rs:411:5
+    |
+411 |     pub before: Option<DateTime<Utc>>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for an associated function
+   --> autumn-harvest/src/audit.rs:418:5
+    |
+418 |     pub const fn default_limit() -> i64 {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a variant
+  --> autumn-harvest/src/batch.rs:35:5
+   |
+35 |     Cancel,
+   |     ^^^^^^
+
+warning: missing documentation for a variant
+  --> autumn-harvest/src/batch.rs:36:5
+   |
+36 |     Terminate,
+   |     ^^^^^^^^^
+
+warning: missing documentation for a variant
+  --> autumn-harvest/src/batch.rs:37:5
+   |
+37 |     Signal,
+   |     ^^^^^^
+
+warning: missing documentation for a variant
+  --> autumn-harvest/src/batch.rs:78:5
+   |
+78 |     Pending,
+   |     ^^^^^^^
+
+warning: missing documentation for a variant
+  --> autumn-harvest/src/batch.rs:79:5
+   |
+79 |     Running,
+   |     ^^^^^^^
+
+warning: missing documentation for a variant
+  --> autumn-harvest/src/batch.rs:80:5
+   |
+80 |     Completed,
+   |     ^^^^^^^^^
+
+warning: missing documentation for a variant
+  --> autumn-harvest/src/batch.rs:81:5
+   |
+81 |     Failed,
+   |     ^^^^^^
+
+warning: missing documentation for a method
+  --> autumn-harvest/src/batch.rs:86:5
+   |
+86 |     pub const fn as_str(self) -> &'static str {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/batch.rs:184:9
+    |
+184 |         pub action: BatchAction,
+    |         ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/batch.rs:185:9
+    |
+185 |         pub filter: BatchFilter,
+    |         ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/batch.rs:186:9
+    |
+186 |         pub signal_name: Option<String>,
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/batch.rs:187:9
+    |
+187 |         pub signal_payload: Option<Value>,
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/batch.rs:188:9
+    |
+188 |         pub idempotency_key: Option<String>,
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/batch.rs:189:9
+    |
+189 |         pub created_by: Option<String>,
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/batch.rs:251:9
+    |
+251 |         pub status: Option<BatchJobStatus>,
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/batch.rs:252:9
+    |
+252 |         pub action: Option<BatchAction>,
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/batch.rs:253:9
+    |
+253 |         pub limit: i64,
+    |         ^^^^^^^^^^^^^^
+
+warning: missing documentation for a function
+   --> autumn-harvest/src/batch.rs:256:5
+    |
+256 | /     pub async fn get_batch_job(
+257 | |         conn: &mut AsyncPgConnection,
+258 | |         id: Uuid,
+259 | |     ) -> HarvestResult<Option<BatchJob>> {
+    | |________________________________________^
+
+warning: missing documentation for a function
+   --> autumn-harvest/src/batch.rs:269:5
+    |
+269 | /     pub async fn list_batch_jobs(
+270 | |         conn: &mut AsyncPgConnection,
+271 | |         filters: &ListFilters,
+272 | |     ) -> HarvestResult<Vec<BatchJob>> {
+    | |_____________________________________^
+
+warning: missing documentation for a function
+   --> autumn-harvest/src/batch.rs:410:5
+    |
+410 |     pub async fn mark_completed(conn: &mut AsyncPgConnection, id: Uuid) -> HarvestResult<()> {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/batch.rs:443:9
+    |
+443 |         pub id: String,
+    |         ^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/batch.rs:444:9
+    |
+444 |         pub action: String,
+    |         ^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/batch.rs:445:9
+    |
+445 |         pub filter: Value,
+    |         ^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/batch.rs:446:9
+    |
+446 |         pub signal_name: Option<String>,
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/batch.rs:447:9
+    |
+447 |         pub status: String,
+    |         ^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/batch.rs:448:9
+    |
+448 |         pub total: i64,
+    |         ^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/batch.rs:449:9
+    |
+449 |         pub completed: i64,
+    |         ^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/batch.rs:450:9
+    |
+450 |         pub failed: i64,
+    |         ^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/batch.rs:451:9
+    |
+451 |         pub started_at: Option<DateTime<Utc>>,
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/batch.rs:452:9
+    |
+452 |         pub completed_at: Option<DateTime<Utc>>,
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/batch.rs:453:9
+    |
+453 |         pub errors: Vec<BatchTargetError>,
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/batch.rs:454:9
+    |
+454 |         pub created_at: DateTime<Utc>,
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/batch.rs:455:9
+    |
+455 |         pub created_by: Option<String>,
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for an associated function
+   --> autumn-harvest/src/batch.rs:460:9
+    |
+460 |         pub fn from_row(row: BatchJob) -> Self {
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a function
+   --> autumn-harvest/src/batch.rs:767:5
+    |
+767 | /     pub async fn mark_failed(
+768 | |         conn: &mut AsyncPgConnection,
+769 | |         id: Uuid,
+770 | |         reason: &str,
+771 | |     ) -> HarvestResult<()> {
+    | |__________________________^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/build_routing.rs:123:5
+    |
+123 |     pub id: Uuid,
+    |     ^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/build_routing.rs:124:5
+    |
+124 |     pub queue_name: String,
+    |     ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/build_routing.rs:125:5
+    |
+125 |     pub build_id: String,
+    |     ^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/build_routing.rs:126:5
+    |
+126 |     pub deployment_name: Option<String>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/build_routing.rs:127:5
+    |
+127 |     pub created_at: DateTime<Utc>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/build_routing.rs:128:5
+    |
+128 |     pub updated_at: DateTime<Utc>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/build_routing.rs:137:5
+    |
+137 |     pub id: Uuid,
+    |     ^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/build_routing.rs:142:5
+    |
+142 |     pub declared_at: DateTime<Utc>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/build_routing.rs:148:5
+    |
+148 |     pub build_id: String,
+    |     ^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+   --> autumn-harvest/src/builder.rs:203:5
+    |
+203 |     pub const fn payload_codecs(&self) -> &PayloadCodecs {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+   --> autumn-harvest/src/builder.rs:434:5
+    |
+434 |     pub fn telemetry(mut self, telemetry: TelemetryConfig) -> Self {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a variant
+  --> autumn-harvest/src/dag_profiler.rs:13:5
+   |
+13 |     TaskStarted(usize, String),
+   |     ^^^^^^^^^^^
+
+warning: missing documentation for a variant
+  --> autumn-harvest/src/dag_profiler.rs:14:5
+   |
+14 |     TaskCompleted(usize, String),
+   |     ^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/dag_profiler.rs:20:5
+   |
+20 |     pub time: Duration,
+   |     ^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/dag_profiler.rs:21:5
+   |
+21 |     pub kind: ProfilerEventKind,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/diagnostic.rs:10:5
+   |
+10 |     pub final_output: Result<Value, String>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/diagnostic.rs:11:5
+   |
+11 |     pub event_count: usize,
+   |     ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/diagnostic.rs:12:5
+   |
+12 |     pub analyzer_warnings: Vec<AnalyzerWarning>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/diagnostic.rs:13:5
+   |
+13 |     pub mermaid_sequence: String,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/external_task.rs:28:5
+   |
+28 |     pub states: Vec<String>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/external_task.rs:29:5
+   |
+29 |     pub workflow_name: Option<String>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/external_task.rs:30:5
+   |
+30 |     pub execution_id: Option<ExecutionId>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/external_task.rs:31:5
+   |
+31 |     pub activity_name: Option<String>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/external_task.rs:32:5
+   |
+32 |     pub token: Option<ExternalActivityToken>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/external_task.rs:33:5
+   |
+33 |     pub shard_id: Option<i32>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/external_task.rs:34:5
+   |
+34 |     pub due_before: Option<chrono::DateTime<Utc>>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/external_task.rs:35:5
+   |
+35 |     pub updated_before: Option<chrono::DateTime<Utc>>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/external_task.rs:36:5
+   |
+36 |     pub limit: i64,
+   |     ^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+  --> autumn-harvest/src/external_task.rs:57:5
+   |
+57 |     pub const fn with_limit(mut self, limit: i64) -> Self {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/external_task.rs:66:5
+   |
+66 |     pub token: ExternalActivityToken,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/external_task.rs:67:5
+   |
+67 |     pub workflow_exec_id: ExecutionId,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/external_task.rs:68:5
+   |
+68 |     pub workflow_id: String,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/external_task.rs:69:5
+   |
+69 |     pub workflow_name: String,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/external_task.rs:70:5
+   |
+70 |     pub activity_id: ActivityExecId,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/external_task.rs:71:5
+   |
+71 |     pub activity_name: String,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/external_task.rs:72:5
+   |
+72 |     pub state: String,
+   |     ^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/external_task.rs:73:5
+   |
+73 |     pub created_at: chrono::DateTime<Utc>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/external_task.rs:74:5
+   |
+74 |     pub updated_at: chrono::DateTime<Utc>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/external_task.rs:75:5
+   |
+75 |     pub deadline_at: chrono::DateTime<Utc>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/external_task.rs:76:5
+   |
+76 |     pub shard_id: i32,
+   |     ^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+  --> autumn-harvest/src/history_export.rs:32:5
+   |
+32 |     pub const fn as_wire(self) -> &'static str {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+  --> autumn-harvest/src/reset.rs:37:5
+   |
+37 |     pub const fn as_str(self) -> &'static str {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/reset.rs:73:5
+   |
+73 |     pub reset_to_event_id: i64,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/reset.rs:74:5
+   |
+74 |     pub reason: String,
+   |     ^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/reset.rs:75:5
+   |
+75 |     pub operator_id: String,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/reset.rs:77:5
+   |
+77 |     pub signal_reapply: ResetSignalReapplyPolicy,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/reset.rs:99:5
+   |
+99 |     pub kind: String,
+   |     ^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:100:5
+    |
+100 |     pub side_effect_id: String,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:101:5
+    |
+101 |     pub name: Option<String>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:102:5
+    |
+102 |     pub scheduled_event_id: i64,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:108:5
+    |
+108 |     pub reset_to_event_id: i64,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:109:5
+    |
+109 |     pub events_carried_over: usize,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:110:5
+    |
+110 |     pub unresolved_side_effects: Vec<ResetUnresolvedSideEffect>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:111:5
+    |
+111 |     pub nearest_valid_before: Option<i64>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:112:5
+    |
+112 |     pub nearest_valid_after: Option<i64>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:113:5
+    |
+113 |     pub source_tasks_to_cancel: usize,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:114:5
+    |
+114 |     pub source_timers_to_remove: usize,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:115:5
+    |
+115 |     pub source_signals_to_drop: usize,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:116:5
+    |
+116 |     pub source_signals_to_buffer: usize,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:138:5
+    |
+138 |     pub message: String,
+    |     ^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:139:5
+    |
+139 |     pub reset_to_event_id: i64,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:140:5
+    |
+140 |     pub last_event_id: i64,
+    |     ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:141:5
+    |
+141 |     pub unresolved_side_effects: Vec<ResetUnresolvedSideEffect>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:142:5
+    |
+142 |     pub nearest_valid_before: Option<i64>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:143:5
+    |
+143 |     pub nearest_valid_after: Option<i64>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:157:5
+    |
+157 |     pub new_exec_id: ExecutionId,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:158:5
+    |
+158 |     pub reset_from_exec_id: ExecutionId,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:159:5
+    |
+159 |     pub reset_to_event_id: i64,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:160:5
+    |
+160 |     pub events_carried_over: usize,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:161:5
+    |
+161 |     pub source_tasks_cancelled: usize,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:162:5
+    |
+162 |     pub source_timers_removed: usize,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:163:5
+    |
+163 |     pub source_signals_dropped: usize,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:164:5
+    |
+164 |     pub source_signals_buffered: usize,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a variant
+   --> autumn-harvest/src/reset.rs:171:5
+    |
+171 |     InvalidPoint(#[from] ResetInvalidPoint),
+    |     ^^^^^^^^^^^^
+
+warning: missing documentation for a variant
+   --> autumn-harvest/src/reset.rs:173:5
+    |
+173 |     TerminalSource { exec_id: ExecutionId, state: String },
+    |     ^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:173:22
+    |
+173 |     TerminalSource { exec_id: ExecutionId, state: String },
+    |                      ^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:173:44
+    |
+173 |     TerminalSource { exec_id: ExecutionId, state: String },
+    |                                            ^^^^^^^^^^^^^
+
+warning: missing documentation for a variant
+   --> autumn-harvest/src/reset.rs:175:5
+    |
+175 |     ChildWorkflow {
+    |     ^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:176:9
+    |
+176 |         exec_id: ExecutionId,
+    |         ^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:177:9
+    |
+177 |         parent_id: Uuid,
+    |         ^^^^^^^^^^^^^^^
+
+warning: missing documentation for a variant
+   --> autumn-harvest/src/reset.rs:180:5
+    |
+180 |     ContinueAsNew,
+    |     ^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/version_gate_retirement.rs:55:5
+   |
+55 |     pub workflow_name: String,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/version_gate_retirement.rs:56:5
+   |
+56 |     pub change_id: String,
+   |     ^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/version_gate_retirement.rs:57:5
+   |
+57 |     pub recorded_version: u32,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/version_gate_retirement.rs:58:5
+   |
+58 |     pub active_executions: i64,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/version_gate_retirement.rs:59:5
+   |
+59 |     pub terminal_executions: i64,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/version_gate_retirement.rs:60:5
+   |
+60 |     pub oldest_blocker_started_at: DateTime<Utc>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/version_gate_retirement.rs:61:5
+   |
+61 |     pub newest_blocker_started_at: DateTime<Utc>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/version_gate_retirement.rs:64:5
+   |
+64 |     pub shard_id: i32,
+   |     ^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+  --> autumn-harvest/src/version_usage.rs:26:5
+   |
+26 |     pub const fn as_str(self) -> &'static str {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/version_usage.rs:53:5
+   |
+53 |     pub workflow_name: Option<String>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/version_usage.rs:54:5
+   |
+54 |     pub change_id: Option<String>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/version_usage.rs:55:5
+   |
+55 |     pub recorded_version: Option<u32>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/version_usage.rs:56:5
+   |
+56 |     pub state_group: VersionExecutionStateGroup,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/version_usage.rs:57:5
+   |
+57 |     pub shard_id: Option<i32>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/version_usage.rs:63:5
+   |
+63 |     pub workflow_name: String,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/version_usage.rs:64:5
+   |
+64 |     pub change_id: String,
+   |     ^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/version_usage.rs:65:5
+   |
+65 |     pub recorded_version: u32,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/version_usage.rs:66:5
+   |
+66 |     pub active_executions: i64,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/version_usage.rs:67:5
+   |
+67 |     pub terminal_executions: i64,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/version_usage.rs:68:5
+   |
+68 |     pub oldest_matching_started_at: DateTime<Utc>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/version_usage.rs:69:5
+   |
+69 |     pub newest_matching_started_at: DateTime<Utc>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/version_usage.rs:70:5
+   |
+70 |     pub shard_id: i32,
+   |     ^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/scheduler.rs:41:21
+   |
+41 |     LimitExceeded { limit: usize },
+   |                     ^^^^^^^^^^^^
+
+warning: `autumn-harvest` (lib) generated 180 warnings
+    Checking autumn-harvest-plugin v0.3.0 (/app/autumn-harvest-plugin)
+    Checking autumn-harvest-cli v0.3.0 (/app/autumn-harvest-cli)
+    Checking autumn-harvest-redis v0.3.0 (/app/autumn-harvest-redis)
+warning: missing documentation for a module
+    --> autumn-harvest-cli/src/lib.rs:1131:1
+     |
+1131 | pub mod tui;
+     | ^^^^^^^^^^^
+     |
+     = note: requested on the command line with `-W missing-docs`
+
+warning: `autumn-harvest-cli` (lib) generated 1 warning
+warning: missing documentation for the crate
+    --> autumn-harvest-cli/tests/request_mapping.rs:1:1
+     |
+   1 | / use autumn_harvest_cli::{ApiMethod, Cli};
+   2 | | use clap::Parser;
+   3 | | use serde_json::json;
+...    |
+1043 | |     );
+1044 | | }
+     | |_^
+     |
+     = note: requested on the command line with `-W missing-docs`
+
+warning: `autumn-harvest-cli` (test "request_mapping") generated 1 warning
+warning: missing documentation for the crate
+   --> autumn-harvest-cli/tests/contract_coverage.rs:1:1
+    |
+  1 | / /// CLI contract coverage tests.
+  2 | | ///
+  3 | | /// Every CLI subcommand that calls the management API must map to a ...
+  4 | | /// is documented in `docs/api-contract.json`.  If a CLI command maps...
+...   |
+759 | |     ]);
+760 | | }
+    | |_^
+    |
+    = note: requested on the command line with `-W missing-docs`
+
+warning: `autumn-harvest-cli` (test "contract_coverage") generated 1 warning
+warning: missing documentation for the crate
+  --> autumn-harvest-cli/src/main.rs:1:1
+   |
+ 1 | / use clap::Parser;
+ 2 | |
+ 3 | | use autumn_harvest_cli::{Cli, run_cli};
+...  |
+13 | | }
+   | |_^
+   |
+   = note: requested on the command line with `-W missing-docs`
+
+warning: `autumn-harvest-cli` (bin "harvest") generated 1 warning
+warning: `autumn-harvest-cli` (bin "harvest" test) generated 1 warning (1 duplicate)
+warning: missing documentation for the crate
+   --> autumn-harvest-cli/tests/http_execution.rs:1:1
+    |
+  1 | / use autumn_harvest_cli::{Cli, CliError, execute};
+  2 | | use clap::Parser;
+  3 | | use tokio::io::{AsyncReadExt, AsyncWriteExt};
+  4 | | use tokio::net::TcpListener;
+...   |
+170 | |     request.len() >= header_end + content_length
+171 | | }
+    | |_^
+    |
+    = note: requested on the command line with `-W missing-docs`
+
+warning: `autumn-harvest-cli` (test "http_execution") generated 1 warning
+warning: missing documentation for the crate
+  --> autumn-harvest-cli/tests/batch_tests.rs:1:1
+   |
+ 1 | / use autumn_harvest_cli::{ApiMethod, Cli};
+ 2 | | use clap::Parser;
+ 3 | |
+ 4 | | fn parse(args: &[&str]) -> Cli {
+...  |
+86 | |     assert_eq!(body["signal_payload"]["key"], "value");
+87 | | }
+   | |_^
+   |
+   = note: requested on the command line with `-W missing-docs`
+
+warning: `autumn-harvest-cli` (test "batch_tests") generated 1 warning
+warning: missing documentation for the crate
+  --> autumn-harvest/tests/macros_dag.rs:1:1
+   |
+ 1 | / #![allow(clippy::unused_async)]
+ 2 | |
+ 3 | | use std::time::Duration;
+...  |
+52 | |     assert_eq!(definition.tasks()[1].trigger_rule, TriggerRule::AllDone);
+53 | | }
+   | |_^
+   |
+   = note: requested on the command line with `-W missing-docs`
+
+warning: `autumn-harvest` (test "macros_dag") generated 1 warning
+warning: missing documentation for the crate
+   --> autumn-harvest/tests/alert_pack_docs.rs:1:1
+    |
+  1 | / use serde_json::Value;
+  2 | | use std::collections::BTreeSet;
+  3 | | use std::fs;
+  4 | | use std::path::{Path, PathBuf};
+...   |
+279 | |     Some(&document[start..end])
+280 | | }
+    | |_^
+    |
+    = note: requested on the command line with `-W missing-docs`
+
+warning: `autumn-harvest` (test "alert_pack_docs") generated 1 warning
+warning: missing documentation for the crate
+  --> autumn-harvest/tests/havoc_tests.rs:1:1
+   |
+ 1 | / use autumn_harvest::policy::RetryPolicy;
+ 2 | | #[cfg(feature = "db")]
+ 3 | | use autumn_harvest::store::events_to_insert_rows_from;
+ 4 | | #[cfg(feature = "db")]
+...  |
+61 | |     assert!(res.is_ok());
+62 | | }
+   | |_^
+   |
+   = note: requested on the command line with `-W missing-docs`
+
+warning: `autumn-harvest` (test "havoc_tests") generated 1 warning
+warning: missing documentation for a function
+  --> autumn-harvest/benches/metrics_noop.rs:54:1
+   |
+54 | / criterion_group!(
+55 | |     benches,
+56 | |     bench_noop_workflow_started,
+57 | |     bench_noop_workflow_completed,
+58 | |     bench_noop_activity_completed,
+59 | |     bench_noop_dlq_entries,
+60 | | );
+   | |_^
+   |
+   = note: requested on the command line with `-W missing-docs`
+   = note: this warning originates in the macro `$crate::criterion_group` which comes from the expansion of the macro `criterion_group` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: `autumn-harvest` (bench "metrics_noop") generated 1 warning
+warning: missing documentation for the crate
+   --> autumn-harvest/tests/guardrail_catalog_tests.rs:1:1
+    |
+  1 | / /// Red-phase tests for issue #173: deterministic guardrail rule cata...
+  2 | | ///
+  3 | | /// These tests define the expected shape of the catalog before any i...
+  4 | | /// exists. They should fail on first run (red), then pass once guard...
+...   |
+380 | |     assert!(!finding.alternative.is_empty());
+381 | | }
+    | |_^
+    |
+    = note: requested on the command line with `-W missing-docs`
+
+warning: `autumn-harvest` (test "guardrail_catalog_tests") generated 1 warning
+warning: missing documentation for the crate
+  --> autumn-harvest/tests/havoc_reentrancy.rs:1:1
+   |
+ 1 | / use autumn_harvest::WorkflowEvent;
+ 2 | | use autumn_harvest::context::WorkflowContext;
+ 3 | | use autumn_harvest::types::ExecutionId;
+ 4 | | use autumn_harvest::types::UpdateId;
+...  |
+86 | | }
+   | |_^
+   |
+   = note: requested on the command line with `-W missing-docs`
+
+warning: `autumn-harvest` (test "havoc_reentrancy") generated 1 warning
+warning: missing documentation for the crate
+  --> autumn-harvest/tests/macros_workflow.rs:1:1
+   |
+ 1 | / #![allow(clippy::unused_async, clippy::used_underscore_binding)]
+ 2 | |
+ 3 | | use autumn_harvest::prelude::*;
+...  |
+13 | |     assert_eq!(info.name, "test_workflow");
+14 | | }
+   | |_^
+   |
+   = note: requested on the command line with `-W missing-docs`
+
+warning: `autumn-harvest` (test "macros_workflow") generated 1 warning
+warning: missing documentation for a struct field
+  --> autumn-harvest/tests/metrics_coverage.rs:28:5
+   |
+28 |     pub name: &'static str,
+   |     ^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: requested on the command line with `-W missing-docs`
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/tests/metrics_coverage.rs:29:5
+   |
+29 |     pub labels: Vec<(&'static str, String)>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/tests/metrics_coverage.rs:36:5
+   |
+36 |     pub samples: Mutex<Vec<MetricSample>>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `autumn-harvest` (test "metrics_coverage") generated 3 warnings
+warning: missing documentation for the crate
+  --> autumn-harvest/tests/query_deadlock.rs:1:1
+   |
+ 1 | / use autumn_harvest::{WorkflowContext, types::ExecutionId};
+ 2 | | use serde_json::json;
+ 3 | | use std::sync::Arc;
+...  |
+26 | |     assert!(res.is_ok(), "The query deadlocked and timed out!");
+27 | | }
+   | |_^
+   |
+   = note: requested on the command line with `-W missing-docs`
+
+warning: `autumn-harvest` (test "query_deadlock") generated 1 warning
+warning: missing documentation for a struct field
+  --> autumn-harvest/examples/approval_workflow.rs:39:5
+   |
+39 |     pub approved: bool,
+   |     ^^^^^^^^^^^^^^^^^^
+   |
+   = note: requested on the command line with `-W missing-docs`
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/examples/approval_workflow.rs:40:5
+   |
+40 |     pub approver: String,
+   |     ^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/examples/approval_workflow.rs:41:5
+   |
+41 |     pub comment: Option<String>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `autumn-harvest` (example "approval_workflow") generated 3 warnings
+warning: missing documentation for the crate
+  --> autumn-harvest/tests/macros_activity.rs:1:1
+   |
+ 1 | / #![allow(clippy::unused_async)]
+ 2 | |
+ 3 | | use autumn_harvest::prelude::*;
+ 4 | | use std::time::Duration;
+...  |
+86 | |     assert!(!configured.is_local);
+87 | | }
+   | |_^
+   |
+   = note: requested on the command line with `-W missing-docs`
+
+warning: `autumn-harvest` (test "macros_activity") generated 1 warning
+warning: `autumn-harvest-cli` (lib test) generated 1 warning (1 duplicate)
+warning: missing documentation for the crate
+   --> autumn-harvest/tests/cancellation_tests.rs:1:1
+    |
+  1 | / #![cfg(feature = "db")]
+  2 | |
+  3 | | use autumn_harvest::event::WorkflowEvent;
+  4 | | use autumn_harvest::models::{TaskQueueItem, WorkflowExecution};
+...   |
+657 | |     worker_task.await.expect("worker should stop cleanly");
+658 | | }
+    | |_^
+    |
+    = note: requested on the command line with `-W missing-docs`
+
+warning: `autumn-harvest` (test "cancellation_tests") generated 1 warning
+warning: missing documentation for a module
+ --> autumn-harvest-plugin/src/lib.rs:4:1
+  |
+4 | pub mod config;
+  | ^^^^^^^^^^^^^^
+  |
+  = note: requested on the command line with `-W missing-docs`
+
+warning: missing documentation for a module
+ --> autumn-harvest-plugin/src/lib.rs:5:1
+  |
+5 | pub mod outbox;
+  | ^^^^^^^^^^^^^^
+
+warning: missing documentation for a module
+  --> autumn-harvest-plugin/src/lib.rs:11:1
+   |
+11 | pub mod state;
+   | ^^^^^^^^^^^^^
+
+warning: missing documentation for a struct
+  --> autumn-harvest-plugin/src/api.rs:96:1
+   |
+96 | pub struct HarvestRetentionRuntime {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for an associated function
+   --> autumn-harvest-plugin/src/api.rs:104:5
+    |
+104 | /     pub const fn new(
+105 | |         config: RetentionConfig,
+106 | |         monitor: Option<RetentionMonitor>,
+107 | |         trigger: Option<tokio::sync::mpsc::Sender<()>>,
+108 | |     ) -> Self {
+    | |_____________^
+
+warning: missing documentation for an associated function
+   --> autumn-harvest-plugin/src/api.rs:117:5
+    |
+117 |     pub const fn disabled(config: RetentionConfig) -> Self {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct
+   --> autumn-harvest-plugin/src/api.rs:123:1
+    |
+123 | pub struct HarvestApiRuntime {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct
+   --> autumn-harvest-plugin/src/api.rs:191:1
+    |
+191 | pub struct HarvestApiState {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for an associated function
+   --> autumn-harvest-plugin/src/api.rs:235:5
+    |
+235 |     pub fn new() -> Self {
+    |     ^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a function
+    --> autumn-harvest-plugin/src/api.rs:1134:1
+     |
+1134 | pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for an enum
+ --> autumn-harvest-plugin/src/config.rs:8:1
+  |
+8 | pub enum HarvestMode {
+  | ^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a variant
+  --> autumn-harvest-plugin/src/config.rs:10:5
+   |
+10 |     Embedded,
+   |     ^^^^^^^^
+
+warning: missing documentation for a variant
+  --> autumn-harvest-plugin/src/config.rs:11:5
+   |
+11 |     Split,
+   |     ^^^^^
+
+warning: missing documentation for a variant
+  --> autumn-harvest-plugin/src/config.rs:12:5
+   |
+12 |     External,
+   |     ^^^^^^^^
+
+warning: missing documentation for a struct
+  --> autumn-harvest-plugin/src/config.rs:16:1
+   |
+16 | pub struct HarvestDatabaseConfig {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/config.rs:17:5
+   |
+17 |     pub url: Option<String>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct
+  --> autumn-harvest-plugin/src/config.rs:21:1
+   |
+21 | pub struct HarvestOutboxConfig {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/config.rs:22:5
+   |
+22 |     pub enabled: bool,
+   |     ^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/config.rs:23:5
+   |
+23 |     pub batch_size: i64,
+   |     ^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/config.rs:24:5
+   |
+24 |     pub poll_interval_ms: u64,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/config.rs:25:5
+   |
+25 |     pub claim_ttl_ms: u64,
+   |     ^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/config.rs:26:5
+   |
+26 |     pub base_retry_delay_ms: u64,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/config.rs:27:5
+   |
+27 |     pub max_retry_delay_ms: u64,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/config.rs:38:5
+   |
+38 |     pub concurrency: u32,
+   |     ^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/config.rs:39:5
+   |
+39 |     pub tick_interval_ms: u64,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct
+  --> autumn-harvest-plugin/src/config.rs:50:1
+   |
+50 | pub struct HarvestRuntimeConfig {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/config.rs:51:5
+   |
+51 |     pub mode: HarvestMode,
+   |     ^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/config.rs:52:5
+   |
+52 |     pub worker_enabled: bool,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/config.rs:53:5
+   |
+53 |     pub scheduler_enabled: bool,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/config.rs:54:5
+   |
+54 |     pub database: HarvestDatabaseConfig,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/config.rs:55:5
+   |
+55 |     pub outbox: HarvestOutboxConfig,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/config.rs:56:5
+   |
+56 |     pub batch: HarvestBatchConfig,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/config.rs:57:5
+   |
+57 |     pub readiness: HarvestReadinessConfig,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a module
+  --> autumn-harvest-plugin/src/outbox.rs:23:1
+   |
+23 | / diesel::table! {
+24 | |     harvest_workflow_outbox (id) {
+   | |___________________________^
+   |
+   = note: this warning originates in the macro `diesel::table` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: missing documentation for a struct
+  --> autumn-harvest-plugin/src/outbox.rs:44:1
+   |
+44 | pub struct WorkflowStartRequest {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/outbox.rs:45:5
+   |
+45 |     pub workflow_name: String,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/outbox.rs:46:5
+   |
+46 |     pub workflow_id: String,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/outbox.rs:47:5
+   |
+47 |     pub queue_name: String,
+   |     ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/outbox.rs:48:5
+   |
+48 |     pub input: Value,
+   |     ^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/outbox.rs:49:5
+   |
+49 |     pub memo: Option<Value>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/outbox.rs:50:5
+   |
+50 |     pub search_attrs: Option<Value>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct
+  --> autumn-harvest-plugin/src/outbox.rs:25:9
+   |
+25 |         id -> BigInt,
+   |         ^^
+   |
+   = note: this warning originates in the macro `diesel::table` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: missing documentation for a struct
+  --> autumn-harvest-plugin/src/outbox.rs:26:9
+   |
+26 |         workflow_name -> Text,
+   |         ^^^^^^^^^^^^^
+   |
+   = note: this warning originates in the macro `diesel::table` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: missing documentation for a struct
+  --> autumn-harvest-plugin/src/outbox.rs:27:9
+   |
+27 |         workflow_id -> Text,
+   |         ^^^^^^^^^^^
+   |
+   = note: this warning originates in the macro `diesel::table` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: missing documentation for a struct
+  --> autumn-harvest-plugin/src/outbox.rs:28:9
+   |
+28 |         queue_name -> Text,
+   |         ^^^^^^^^^^
+   |
+   = note: this warning originates in the macro `diesel::table` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: missing documentation for a struct
+  --> autumn-harvest-plugin/src/outbox.rs:29:9
+   |
+29 |         input -> Jsonb,
+   |         ^^^^^
+   |
+   = note: this warning originates in the macro `diesel::table` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: missing documentation for a struct
+  --> autumn-harvest-plugin/src/outbox.rs:30:9
+   |
+30 |         memo -> Nullable<Jsonb>,
+   |         ^^^^
+   |
+   = note: this warning originates in the macro `diesel::table` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: missing documentation for a struct
+  --> autumn-harvest-plugin/src/outbox.rs:31:9
+   |
+31 |         search_attrs -> Nullable<Jsonb>,
+   |         ^^^^^^^^^^^^
+   |
+   = note: this warning originates in the macro `diesel::table` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: missing documentation for a struct
+  --> autumn-harvest-plugin/src/outbox.rs:32:9
+   |
+32 |         delivery_attempts -> BigInt,
+   |         ^^^^^^^^^^^^^^^^^
+   |
+   = note: this warning originates in the macro `diesel::table` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: missing documentation for a struct
+  --> autumn-harvest-plugin/src/outbox.rs:33:9
+   |
+33 |         last_error -> Nullable<Text>,
+   |         ^^^^^^^^^^
+   |
+   = note: this warning originates in the macro `diesel::table` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: missing documentation for a struct
+  --> autumn-harvest-plugin/src/outbox.rs:34:9
+   |
+34 |         delivered_execution_id -> Nullable<Text>,
+   |         ^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this warning originates in the macro `diesel::table` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: missing documentation for a struct
+  --> autumn-harvest-plugin/src/outbox.rs:35:9
+   |
+35 |         delivered_at -> Nullable<Timestamp>,
+   |         ^^^^^^^^^^^^
+   |
+   = note: this warning originates in the macro `diesel::table` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: missing documentation for a struct
+  --> autumn-harvest-plugin/src/outbox.rs:36:9
+   |
+36 |         next_attempt_at -> Timestamp,
+   |         ^^^^^^^^^^^^^^^
+   |
+   = note: this warning originates in the macro `diesel::table` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: missing documentation for a struct
+  --> autumn-harvest-plugin/src/outbox.rs:37:9
+   |
+37 |         claimed_at -> Nullable<Timestamp>,
+   |         ^^^^^^^^^^
+   |
+   = note: this warning originates in the macro `diesel::table` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: missing documentation for a struct
+  --> autumn-harvest-plugin/src/outbox.rs:38:9
+   |
+38 |         claimed_by -> Nullable<Text>,
+   |         ^^^^^^^^^^
+   |
+   = note: this warning originates in the macro `diesel::table` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: missing documentation for a struct
+  --> autumn-harvest-plugin/src/outbox.rs:39:9
+   |
+39 |         created_at -> Timestamp,
+   |         ^^^^^^^^^^
+   |
+   = note: this warning originates in the macro `diesel::table` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: missing documentation for a variant
+  --> autumn-harvest-plugin/src/preflight.rs:26:5
+   |
+26 |     Pass,
+   |     ^^^^
+
+warning: missing documentation for a variant
+  --> autumn-harvest-plugin/src/preflight.rs:27:5
+   |
+27 |     Warn,
+   |     ^^^^
+
+warning: missing documentation for a variant
+  --> autumn-harvest-plugin/src/preflight.rs:28:5
+   |
+28 |     Fail,
+   |     ^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/preflight.rs:44:5
+   |
+44 |     pub package: &'static str,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/preflight.rs:45:5
+   |
+45 |     pub version: &'static str,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/preflight.rs:46:5
+   |
+46 |     pub core_version: &'static str,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/preflight.rs:52:5
+   |
+52 |     pub name: String,
+   |     ^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/preflight.rs:53:5
+   |
+53 |     pub status: PreflightStatus,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/preflight.rs:54:5
+   |
+54 |     pub summary: String,
+   |     ^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/preflight.rs:55:5
+   |
+55 |     pub remediation: Option<String>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/preflight.rs:56:5
+   |
+56 |     pub affected_shards: Vec<i32>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/preflight.rs:57:5
+   |
+57 |     pub details: Value,
+   |     ^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/preflight.rs:63:5
+   |
+63 |     pub overall_status: PreflightStatus,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/preflight.rs:64:5
+   |
+64 |     pub observed_at: DateTime<Utc>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/preflight.rs:65:5
+   |
+65 |     pub version: PreflightVersion,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/preflight.rs:66:5
+   |
+66 |     pub checks: Vec<PreflightCheckResult>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a variant
+  --> autumn-harvest-plugin/src/shard_health.rs:26:5
+   |
+26 |     Ready,
+   |     ^^^^^
+
+warning: missing documentation for a variant
+  --> autumn-harvest-plugin/src/shard_health.rs:27:5
+   |
+27 |     Degraded,
+   |     ^^^^^^^^
+
+warning: missing documentation for a variant
+  --> autumn-harvest-plugin/src/shard_health.rs:28:5
+   |
+28 |     Unavailable,
+   |     ^^^^^^^^^^^
+
+warning: missing documentation for a variant
+  --> autumn-harvest-plugin/src/shard_health.rs:35:5
+   |
+35 |     Readable,
+   |     ^^^^^^^^
+
+warning: missing documentation for a variant
+  --> autumn-harvest-plugin/src/shard_health.rs:36:5
+   |
+36 |     Writable,
+   |     ^^^^^^^^
+
+warning: missing documentation for a variant
+  --> autumn-harvest-plugin/src/shard_health.rs:37:5
+   |
+37 |     Default,
+   |     ^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:43:5
+   |
+43 |     pub overall_readiness: ShardReadiness,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:44:5
+   |
+44 |     pub observed_at: DateTime<Utc>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:45:5
+   |
+45 |     pub freshness_window_secs: u64,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:46:5
+   |
+46 |     pub candidate_shard: Option<i32>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:47:5
+   |
+47 |     pub shards: Vec<ShardHealthRow>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:53:5
+   |
+53 |     pub shard_id: i32,
+   |     ^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:54:5
+   |
+54 |     pub roles: Vec<ShardRole>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:55:5
+   |
+55 |     pub candidate: bool,
+   |     ^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:56:5
+   |
+56 |     pub reachable: bool,
+   |     ^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:57:5
+   |
+57 |     pub active_worker_count: usize,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:58:5
+   |
+58 |     pub stale_worker_count: usize,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:59:5
+   |
+59 |     pub schema: ShardSchemaHealth,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:60:5
+   |
+60 |     pub worker_coverage: Vec<QueueWorkerCoverage>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:61:5
+   |
+61 |     pub scheduler: ShardSchedulerCoverage,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:62:5
+   |
+62 |     pub queue_depth: QueueDepthSummary,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:63:5
+   |
+63 |     pub dlq: DlqSummary,
+   |     ^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:64:5
+   |
+64 |     pub last_health_sample_time: Option<DateTime<Utc>>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:65:5
+   |
+65 |     pub readiness: ShardReadiness,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:66:5
+   |
+66 |     pub reason_codes: Vec<String>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:67:5
+   |
+67 |     pub blocking_reasons: Vec<String>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:68:5
+   |
+68 |     pub error_summary: Option<String>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:74:5
+   |
+74 |     pub ready: bool,
+   |     ^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:75:5
+   |
+75 |     pub applied_count: Option<usize>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:76:5
+   |
+76 |     pub missing_migrations: Vec<String>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:77:5
+   |
+77 |     pub error: Option<String>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:83:5
+   |
+83 |     pub queue: String,
+   |     ^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:84:5
+   |
+84 |     pub ready: bool,
+   |     ^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:85:5
+   |
+85 |     pub healthy_active: usize,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:86:5
+   |
+86 |     pub stale: usize,
+   |     ^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:87:5
+   |
+87 |     pub draining: usize,
+   |     ^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:88:5
+   |
+88 |     pub stopped: usize,
+   |     ^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:89:5
+   |
+89 |     pub total_matching: usize,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:95:5
+   |
+95 |     pub enabled: bool,
+   |     ^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:96:5
+   |
+96 |     pub ready: bool,
+   |     ^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:97:5
+   |
+97 |     pub running: bool,
+   |     ^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:98:5
+   |
+98 |     pub last_tick_at: Option<DateTime<Utc>>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:99:5
+   |
+99 |     pub tick_interval_ms: u64,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest-plugin/src/shard_health.rs:100:5
+    |
+100 |     pub freshness_window_secs: u64,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest-plugin/src/shard_health.rs:101:5
+    |
+101 |     pub schedule_count: usize,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest-plugin/src/shard_health.rs:102:5
+    |
+102 |     pub error: Option<String>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest-plugin/src/shard_health.rs:108:5
+    |
+108 |     pub total_pending: i64,
+    |     ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest-plugin/src/shard_health.rs:109:5
+    |
+109 |     pub by_queue: BTreeMap<String, i64>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest-plugin/src/shard_health.rs:110:5
+    |
+110 |     pub error: Option<String>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest-plugin/src/shard_health.rs:116:5
+    |
+116 |     pub count: Option<i64>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest-plugin/src/shard_health.rs:117:5
+    |
+117 |     pub error: Option<String>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+  --> autumn-harvest-plugin/src/state.rs:17:5
+   |
+17 |     pub fn clone_inner(&self) -> DbPool {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+  --> autumn-harvest-plugin/src/version_gate_retirement.rs:54:5
+   |
+54 |     pub const fn is_safe(self) -> bool {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a variant
+  --> autumn-harvest-plugin/src/version_gate_retirement.rs:63:5
+   |
+63 |     Inspected,
+   |     ^^^^^^^^^
+
+warning: missing documentation for a variant
+  --> autumn-harvest-plugin/src/version_gate_retirement.rs:64:5
+   |
+64 |     Unavailable,
+   |     ^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/version_gate_retirement.rs:70:5
+   |
+70 |     pub status: RetirementCheckStatus,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/version_gate_retirement.rs:73:5
+   |
+73 |     pub observed_at: DateTime<Utc>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/version_gate_retirement.rs:74:5
+   |
+74 |     pub filters: RetirementCheckReportFilters,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/version_gate_retirement.rs:78:5
+   |
+78 |     pub shards: Vec<RetirementShardInspection>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/version_gate_retirement.rs:84:5
+   |
+84 |     pub change_id: String,
+   |     ^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/version_gate_retirement.rs:85:5
+   |
+85 |     pub min_safe_version: u32,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/version_gate_retirement.rs:86:5
+   |
+86 |     pub workflow_name: Option<String>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/version_gate_retirement.rs:87:5
+   |
+87 |     pub state_group: VersionExecutionStateGroup,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/version_gate_retirement.rs:88:5
+   |
+88 |     pub shard_id: Option<i32>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/version_gate_retirement.rs:94:5
+   |
+94 |     pub workflow_name: String,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/version_gate_retirement.rs:95:5
+   |
+95 |     pub change_id: String,
+   |     ^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/version_gate_retirement.rs:96:5
+   |
+96 |     pub recorded_version: u32,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/version_gate_retirement.rs:97:5
+   |
+97 |     pub active_executions: i64,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/version_gate_retirement.rs:98:5
+   |
+98 |     pub terminal_executions: i64,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/version_gate_retirement.rs:99:5
+   |
+99 |     pub oldest_blocker_started_at: DateTime<Utc>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest-plugin/src/version_gate_retirement.rs:100:5
+    |
+100 |     pub newest_blocker_started_at: DateTime<Utc>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest-plugin/src/version_gate_retirement.rs:101:5
+    |
+101 |     pub oldest_blocker_age_secs: i64,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest-plugin/src/version_gate_retirement.rs:102:5
+    |
+102 |     pub newest_blocker_age_secs: i64,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest-plugin/src/version_gate_retirement.rs:105:5
+    |
+105 |     pub shard_coverage: RetirementShardCoverage,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest-plugin/src/version_gate_retirement.rs:111:5
+    |
+111 |     pub inspected_shards: Vec<i32>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest-plugin/src/version_gate_retirement.rs:112:5
+    |
+112 |     pub matched_shards: Vec<i32>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest-plugin/src/version_gate_retirement.rs:113:5
+    |
+113 |     pub unavailable_shards: Vec<i32>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest-plugin/src/version_gate_retirement.rs:119:5
+    |
+119 |     pub shard_id: i32,
+    |     ^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest-plugin/src/version_gate_retirement.rs:120:5
+    |
+120 |     pub status: RetirementShardInspectionStatus,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest-plugin/src/version_gate_retirement.rs:121:5
+    |
+121 |     pub matched_groups: Option<usize>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest-plugin/src/version_gate_retirement.rs:122:5
+    |
+122 |     pub error: Option<String>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/version_usage.rs:19:5
+   |
+19 |     pub workflow_name: Option<String>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/version_usage.rs:20:5
+   |
+20 |     pub change_id: Option<String>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/version_usage.rs:21:5
+   |
+21 |     pub recorded_version: Option<u32>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/version_usage.rs:22:5
+   |
+22 |     pub state_group: Option<String>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/version_usage.rs:23:5
+   |
+23 |     pub shard_id: Option<i32>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for an enum
+  --> autumn-harvest-plugin/src/version_usage.rs:28:1
+   |
+28 | pub enum VersionUsageReportStatus {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a variant
+  --> autumn-harvest-plugin/src/version_usage.rs:29:5
+   |
+29 |     Complete,
+   |     ^^^^^^^^
+
+warning: missing documentation for a variant
+  --> autumn-harvest-plugin/src/version_usage.rs:30:5
+   |
+30 |     NoMatches,
+   |     ^^^^^^^^^
+
+warning: missing documentation for a variant
+  --> autumn-harvest-plugin/src/version_usage.rs:31:5
+   |
+31 |     Partial,
+   |     ^^^^^^^
+
+warning: missing documentation for a variant
+  --> autumn-harvest-plugin/src/version_usage.rs:32:5
+   |
+32 |     Unavailable,
+   |     ^^^^^^^^^^^
+
+warning: missing documentation for an enum
+  --> autumn-harvest-plugin/src/version_usage.rs:37:1
+   |
+37 | pub enum VersionUsageShardInspectionStatus {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a variant
+  --> autumn-harvest-plugin/src/version_usage.rs:38:5
+   |
+38 |     Inspected,
+   |     ^^^^^^^^^
+
+warning: missing documentation for a variant
+  --> autumn-harvest-plugin/src/version_usage.rs:39:5
+   |
+39 |     Unavailable,
+   |     ^^^^^^^^^^^
+
+warning: missing documentation for a struct
+  --> autumn-harvest-plugin/src/version_usage.rs:43:1
+   |
+43 | pub struct VersionUsageReport {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/version_usage.rs:44:5
+   |
+44 |     pub status: VersionUsageReportStatus,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/version_usage.rs:45:5
+   |
+45 |     pub observed_at: DateTime<Utc>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/version_usage.rs:46:5
+   |
+46 |     pub filters: VersionUsageReportFilters,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/version_usage.rs:47:5
+   |
+47 |     pub items: Vec<VersionUsageReportRow>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/version_usage.rs:48:5
+   |
+48 |     pub shards: Vec<VersionUsageShardInspection>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct
+  --> autumn-harvest-plugin/src/version_usage.rs:52:1
+   |
+52 | pub struct VersionUsageReportFilters {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/version_usage.rs:53:5
+   |
+53 |     pub workflow_name: Option<String>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/version_usage.rs:54:5
+   |
+54 |     pub change_id: Option<String>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/version_usage.rs:55:5
+   |
+55 |     pub recorded_version: Option<u32>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/version_usage.rs:56:5
+   |
+56 |     pub state_group: VersionExecutionStateGroup,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/version_usage.rs:57:5
+   |
+57 |     pub shard_id: Option<i32>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct
+  --> autumn-harvest-plugin/src/version_usage.rs:61:1
+   |
+61 | pub struct VersionUsageReportRow {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/version_usage.rs:62:5
+   |
+62 |     pub workflow_name: String,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/version_usage.rs:63:5
+   |
+63 |     pub change_id: String,
+   |     ^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/version_usage.rs:64:5
+   |
+64 |     pub recorded_version: u32,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/version_usage.rs:65:5
+   |
+65 |     pub active_executions: i64,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/version_usage.rs:66:5
+   |
+66 |     pub terminal_executions: i64,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/version_usage.rs:67:5
+   |
+67 |     pub oldest_matching_started_at: DateTime<Utc>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/version_usage.rs:68:5
+   |
+68 |     pub newest_matching_started_at: DateTime<Utc>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/version_usage.rs:69:5
+   |
+69 |     pub oldest_matching_execution_age_secs: i64,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/version_usage.rs:70:5
+   |
+70 |     pub newest_matching_execution_age_secs: i64,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/version_usage.rs:71:5
+   |
+71 |     pub shard_coverage: VersionUsageShardCoverage,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct
+  --> autumn-harvest-plugin/src/version_usage.rs:75:1
+   |
+75 | pub struct VersionUsageShardCoverage {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/version_usage.rs:76:5
+   |
+76 |     pub inspected_shards: Vec<i32>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/version_usage.rs:77:5
+   |
+77 |     pub matched_shards: Vec<i32>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/version_usage.rs:78:5
+   |
+78 |     pub unavailable_shards: Vec<i32>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct
+  --> autumn-harvest-plugin/src/version_usage.rs:82:1
+   |
+82 | pub struct VersionUsageShardInspection {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/version_usage.rs:83:5
+   |
+83 |     pub shard_id: i32,
+   |     ^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/version_usage.rs:84:5
+   |
+84 |     pub status: VersionUsageShardInspectionStatus,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/version_usage.rs:85:5
+   |
+85 |     pub matched_groups: Option<usize>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/version_usage.rs:86:5
+   |
+86 |     pub error: Option<String>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for the crate
+   --> autumn-harvest/tests/signal_tests.rs:1:1
+    |
+  1 | / #![cfg(feature = "db")]
+  2 | |
+  3 | | use autumn_harvest::models::NewWorkflowExecution;
+  4 | | use autumn_harvest::schema::harvest_workflow_executions;
+...   |
+154 | |     assert_eq!(pending_signals.len(), 1);
+155 | | }
+    | |_^
+    |
+    = note: requested on the command line with `-W missing-docs`
+
+warning: `autumn-harvest` (test "signal_tests") generated 1 warning
+warning: missing documentation for a function
+   --> autumn-harvest/benches/replay_bench.rs:169:1
+    |
+169 | / criterion_group!(
+170 | |     benches,
+171 | |     bench_replay_1k,
+172 | |     bench_replay_10k,
+173 | |     bench_span_noop_overhead
+174 | | );
+    | |_^
+    |
+    = note: requested on the command line with `-W missing-docs`
+    = note: this warning originates in the macro `$crate::criterion_group` which comes from the expansion of the macro `criterion_group` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: `autumn-harvest` (bench "replay_bench") generated 1 warning
+warning: `autumn-harvest-plugin` (lib) generated 198 warnings
+warning: missing documentation for the crate
+   --> autumn-harvest-plugin/tests/outbox_integration.rs:1:1
+    |
+  1 | / use autumn_harvest_plugin::{
+  2 | |     HarvestDbPool, HarvestOutboxConfig, WorkflowStartRequest, drain_w...
+  3 | |     enqueue_workflow_start_outbox, flush_workflow_start_outbox,
+  4 | | };
+...   |
+302 | |     .expect("database url should create a pool")
+303 | | }
+    | |_^
+    |
+    = note: requested on the command line with `-W missing-docs`
+
+warning: `autumn-harvest-plugin` (test "outbox_integration") generated 1 warning
+warning: missing documentation for the crate
+  --> autumn-harvest-plugin/tests/examples_catalog.rs:1:1
+   |
+ 1 | / use std::fs;
+ 2 | | use std::path::Path;
+ 3 | |
+ 4 | | #[test]
+...  |
+27 | | }
+   | |_^
+   |
+   = note: requested on the command line with `-W missing-docs`
+
+warning: `autumn-harvest-plugin` (test "examples_catalog") generated 1 warning
+    Checking standalone-runner v0.3.0 (/app/examples/standalone-runner)
+warning: missing documentation for the crate
+   --> autumn-harvest-plugin/tests/retirement_check_integration.rs:1:1
+    |
+  1 | / use std::collections::BTreeMap;
+  2 | | use std::sync::Arc;
+  3 | |
+  4 | | use autumn_harvest::WorkflowEvent;
+...   |
+627 | |     );
+628 | | }
+    | |_^
+    |
+    = note: requested on the command line with `-W missing-docs`
+
+warning: `autumn-harvest-plugin` (test "retirement_check_integration") generated 1 warning
+warning: missing documentation for the crate
+  --> examples/standalone-runner/src/main.rs:1:1
+   |
+ 1 | / #![allow(clippy::missing_errors_doc, clippy::unused_async)]
+ 2 | |
+ 3 | | mod activities;
+ 4 | | mod domain;
+...  |
+14 | |     server::run().await
+15 | | }
+   | |_^
+   |
+   = note: requested on the command line with `-W missing-docs`
+
+warning: `standalone-runner` (bin "standalone-runner" test) generated 1 warning
+    Checking billing-autumn-web v0.3.0 (/app/examples/billing-autumn-web)
+warning: missing documentation for the crate
+   --> autumn-harvest-plugin/tests/shard_health_integration.rs:1:1
+    |
+  1 | / use std::collections::BTreeMap;
+  2 | | use std::sync::Arc;
+  3 | | use std::time::Duration;
+...   |
+847 | |     );
+848 | | }
+    | |_^
+    |
+    = note: requested on the command line with `-W missing-docs`
+
+warning: `autumn-harvest-plugin` (test "shard_health_integration") generated 1 warning
+warning: missing documentation for the crate
+  --> examples/billing-autumn-web/src/main.rs:1:1
+   |
+ 1 | / #![allow(clippy::missing_errors_doc, clippy::unused_async)]
+ 2 | |
+ 3 | | mod activities;
+ 4 | | mod dags;
+...  |
+35 | |         .await;
+36 | | }
+   | |_^
+   |
+   = note: requested on the command line with `-W missing-docs`
+
+warning: `billing-autumn-web` (bin "billing-autumn-web") generated 1 warning
+warning: missing documentation for the crate
+   --> autumn-harvest-plugin/tests/dlq_bulk_integration.rs:1:1
+    |
+  1 | / use std::collections::BTreeMap;
+  2 | |
+  3 | | use autumn_harvest::schema::{harvest_dead_letters, harvest_task_queue};
+  4 | | use autumn_harvest::shard::ShardedDbPool;
+...   |
+474 | |     assert!(ids.is_empty(), "no ids expected when nothing matched");
+475 | | }
+    | |_^
+    |
+    = note: requested on the command line with `-W missing-docs`
+
+warning: `autumn-harvest-plugin` (test "dlq_bulk_integration") generated 1 warning
+    Checking quickstart v0.3.0 (/app/examples/quickstart)
+warning: missing documentation for the crate
+    --> autumn-harvest-plugin/tests/api_scheduler_integration.rs:1:1
+     |
+   1 | / use std::collections::{BTreeMap, HashMap};
+   2 | | use std::pin::Pin;
+   3 | | use std::sync::{Arc, Mutex};
+   4 | | use std::time::Duration;
+...    |
+2713 | |     );
+2714 | | }
+     | |_^
+     |
+     = note: requested on the command line with `-W missing-docs`
+
+warning: `autumn-harvest-plugin` (test "api_scheduler_integration") generated 1 warning
+warning: missing documentation for the crate
+   --> autumn-harvest-plugin/tests/contract_regression.rs:1:1
+    |
+  1 | / /// Contract regression tests for the Harvest management API.
+  2 | | ///
+  3 | | /// These tests enforce that `docs/api-contract.json` stays in sync with
+  4 | | /// the routes registered in `harvest_api_router`.  If you add, remov...
+...   |
+437 | | }
+    | |_^
+    |
+    = note: requested on the command line with `-W missing-docs`
+
+warning: `autumn-harvest-plugin` (test "contract_regression") generated 1 warning
+warning: missing documentation for the crate
+   --> autumn-harvest-plugin/tests/security.rs:1:1
+    |
+  1 | / use autumn_harvest_plugin::api::{HarvestApiState, harvest_api_router};
+  2 | | use autumn_web::AppState;
+  3 | | use autumn_web::auth::RequireAuth;
+  4 | | use autumn_web::reexports::axum::body::Body;
+...   |
+612 | |     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+613 | | }
+    | |_^
+    |
+    = note: requested on the command line with `-W missing-docs`
+
+warning: `autumn-harvest-plugin` (test "security") generated 1 warning
+warning: `standalone-runner` (bin "standalone-runner") generated 1 warning (1 duplicate)
+warning: missing documentation for the crate
+   --> autumn-harvest-plugin/tests/history_export_integration.rs:1:1
+    |
+  1 | / use std::collections::BTreeMap;
+  2 | | use std::future::Future;
+  3 | | use std::pin::Pin;
+  4 | | use std::sync::Arc;
+...   |
+557 | |     assert_eq!(exported_ids, vec![exec_id.to_string()]);
+558 | | }
+    | |_^
+    |
+    = note: requested on the command line with `-W missing-docs`
+
+warning: `autumn-harvest-plugin` (test "history_export_integration") generated 1 warning
+warning: `billing-autumn-web` (bin "billing-autumn-web" test) generated 1 warning (1 duplicate)
+warning: missing documentation for the crate
+   --> autumn-harvest-plugin/tests/preflight_integration.rs:1:1
+    |
+  1 | / use std::collections::BTreeMap;
+  2 | | use std::sync::Arc;
+  3 | | use std::time::Duration;
+...   |
+911 | |     );
+912 | | }
+    | |_^
+    |
+    = note: requested on the command line with `-W missing-docs`
+
+warning: `autumn-harvest-plugin` (test "preflight_integration") generated 1 warning
+warning: missing documentation for the crate
+   --> autumn-harvest-plugin/tests/version_usage_integration.rs:1:1
+    |
+  1 | / use std::collections::BTreeMap;
+  2 | | use std::sync::Arc;
+  3 | |
+  4 | | use autumn_harvest::WorkflowEvent;
+...   |
+371 | |     assert_eq!(body["shards"][1]["status"], "inspected");
+372 | | }
+    | |_^
+    |
+    = note: requested on the command line with `-W missing-docs`
+
+warning: `autumn-harvest-plugin` (test "version_usage_integration") generated 1 warning
+warning: missing documentation for the crate
+  --> autumn-harvest/tests/macros_collect.rs:1:1
+   |
+ 1 | / #![allow(clippy::unused_async, clippy::used_underscore_binding)]
+ 2 | |
+ 3 | | use autumn_harvest::prelude::*;
+...  |
+32 | |     assert_eq!(acts[0].name, "act_a");
+33 | | }
+   | |_^
+   |
+   = note: requested on the command line with `-W missing-docs`
+
+warning: `autumn-harvest` (test "macros_collect") generated 1 warning
+warning: missing documentation for a function
+  --> autumn-harvest/examples/long_running.rs:17:1
+   |
+17 | / pub async fn poll_customer_exports(
+18 | |     ctx: &WorkflowContext,
+19 | |     mut state: Value,
+20 | | ) -> HarvestResult<Value> {
+   | |_________________________^
+   |
+   = note: requested on the command line with `-W missing-docs`
+
+warning: missing documentation for a function
+  --> autumn-harvest/examples/long_running.rs:62:1
+   |
+62 | / pub async fn poll_customer_export_page(
+63 | |     _ctx: &ActivityContext,
+64 | |     input: Value,
+65 | | ) -> HarvestResult<Value> {
+   | |_________________________^
+
+warning: `autumn-harvest` (example "long_running") generated 2 warnings
+warning: missing documentation for the crate
+   --> autumn-harvest/tests/dag_builder.rs:1:1
+    |
+  1 | / #![allow(clippy::unused_async)]
+  2 | |
+  3 | | use std::time::Duration;
+...   |
+113 | |     assert_eq!(builder.dag_count(), 1);
+114 | | }
+    | |_^
+    |
+    = note: requested on the command line with `-W missing-docs`
+
+warning: `autumn-harvest` (test "dag_builder") generated 1 warning
+warning: missing documentation for the crate
+  --> autumn-harvest/tests/security.rs:1:1
+   |
+ 1 | / #![cfg(feature = "db")]
+ 2 | |
+ 3 | | use autumn_harvest::error::HarvestError;
+ 4 | | use autumn_harvest::event::WorkflowEvent;
+...  |
+24 | |     assert!(matches!(error, HarvestError::Database(message) if message...
+25 | | }
+   | |_^
+   |
+   = note: requested on the command line with `-W missing-docs`
+
+warning: `autumn-harvest` (test "security") generated 1 warning
+warning: missing documentation for the crate
+   --> autumn-harvest/tests/saga_tests.rs:1:1
+    |
+  1 | / use std::sync::{Arc, Mutex};
+  2 | |
+  3 | | use autumn_harvest::{ExecutionId, HarvestError, Saga, WorkflowContext...
+  4 | | use chrono::Utc;
+...   |
+327 | |     assert_eq!(saga.context().version("test", 1, 1), 1);
+328 | | }
+    | |_^
+    |
+    = note: requested on the command line with `-W missing-docs`
+
+warning: `autumn-harvest` (test "saga_tests") generated 1 warning
+warning: `autumn-harvest` (lib test) generated 180 warnings (180 duplicates)
+warning: `autumn-harvest-plugin` (lib test) generated 198 warnings (198 duplicates)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2m 59s

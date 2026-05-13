@@ -43,7 +43,7 @@ use crate::error::{HarvestResult, database_error};
 /// Pure in-memory representation of the declared build compatibility graph.
 ///
 /// Built from `harvest_build_compat` rows via [`load_compat_set`]. Workers
-/// call [`is_eligible`] once per task-claim cycle; the struct is cheap to
+/// call [`BuildCompatibilitySet::is_eligible`] once per task-claim cycle; the struct is cheap to
 /// clone and can be refreshed periodically without holding a DB connection.
 ///
 /// ## Eligibility rule

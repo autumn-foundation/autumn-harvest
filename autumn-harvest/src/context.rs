@@ -595,7 +595,7 @@ impl WorkflowContext {
     /// compare the input value against the recorded `ActivityScheduled` event,
     /// returning [`HarvestError::NonDeterministic`] on any mismatch.
     ///
-    /// Used by [`WorkflowReplayer`](crate::testing::WorkflowReplayer) to catch
+    /// Used by `WorkflowReplayer` to catch
     /// non-deterministic changes to activity inputs before deployment.
     #[must_use]
     pub fn for_replay_strict(exec_id: ExecutionId, events: Vec<WorkflowEvent>) -> Self {
@@ -2084,7 +2084,7 @@ impl ActivityContext {
     ///
     /// Returns [`HarvestError::Config`] if no idempotency key was attached to
     /// this context.  In production this never happens; in tests use
-    /// [`Self::with_idempotency_key`] or [`Self::new_test`] which always
+    /// [`Self::with_idempotency_key`] which always
     /// provides a key.
     pub fn idempotency_key(&self) -> Result<&IdempotencyKey, HarvestError> {
         self.idempotency_key.as_ref().ok_or_else(|| {

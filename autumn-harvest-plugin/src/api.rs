@@ -1131,6 +1131,25 @@ struct DeadLetterListQuery {
     limit: Option<i64>,
 }
 
+/// Builds and returns the Axum router for the Harvest management API.
+///
+/// This router contains all HTTP endpoints necessary for interacting with workflows,
+/// batches, dead letters, and shards.
+///
+/// ## Examples
+///
+/// ```rust,no_run
+/// use autumn_harvest_plugin::{harvest_api_router, HarvestApiState};
+/// use autumn_web::AppState;
+/// use axum::Router;
+///
+/// # fn main() {
+/// # let api_state: HarvestApiState = unimplemented!();
+/// let harvest_router: Router<AppState> = harvest_api_router(api_state);
+///
+/// let app = Router::new().nest("/api/v1/harvest", harvest_router);
+/// # }
+/// ```
 pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
     Router::new()
         .route("/workflows", get(list_workflows))

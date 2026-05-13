@@ -38,6 +38,7 @@ pub mod dag_profiler;
 pub mod dag_simulator;
 /// Deterministic workflow guardrails: static source-level check for replay-breaking patterns.
 pub mod det_check;
+/// Diagnostic reporting for simulated workflows.
 pub mod diagnostic;
 pub mod error;
 pub mod event;
