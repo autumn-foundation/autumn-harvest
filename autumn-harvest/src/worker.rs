@@ -853,32 +853,40 @@ async fn run_local_activity_inline(
                             event_count,
                         });
                     }
-                } else {
-                    store::append_events(
-                        conn,
-                        exec_id,
-                        std::slice::from_ref(&failed_event),
-                        *next_event_id,
-                    )
-                    .await?;
-                    *next_event_id += 1;
-                    all_new_events.push(failed_event);
-                    if let Some(event_count) =
-                        local_activity_history_cap_reached(*next_event_id, history_event_hard_cap)
-                    {
-                        return Ok(LocalActivityInlineOutcome::HistoryCapReached {
-                            events: all_new_events,
-                            event_count,
-                        });
-                    }
+                    // Must return here — without it, when `terminal_attempt` was
+                    // set early by `payload_non_retryable` or `policy_non_retryable`
+                    // (i.e. `attempt < max_attempts`), the `for` loop would
+                    // re-execute the side-effecting handler on the next
+                    // iteration, defeating the fail-fast guarantee.
+                    return Ok(LocalActivityInlineOutcome::Complete(all_new_events));
+                }
 
-                    if let Some(delay) = run
-                        .retry_policy
-                        .as_ref()
-                        .and_then(|p| p.next_delay(attempt))
-                    {
-                        tokio::time::sleep(delay).await;
-                    }
+                // Non-terminal attempt: record the failure, optionally sleep,
+                // and loop to the next attempt.
+                store::append_events(
+                    conn,
+                    exec_id,
+                    std::slice::from_ref(&failed_event),
+                    *next_event_id,
+                )
+                .await?;
+                *next_event_id += 1;
+                all_new_events.push(failed_event);
+                if let Some(event_count) =
+                    local_activity_history_cap_reached(*next_event_id, history_event_hard_cap)
+                {
+                    return Ok(LocalActivityInlineOutcome::HistoryCapReached {
+                        events: all_new_events,
+                        event_count,
+                    });
+                }
+
+                if let Some(delay) = run
+                    .retry_policy
+                    .as_ref()
+                    .and_then(|p| p.next_delay(attempt))
+                {
+                    tokio::time::sleep(delay).await;
                 }
             }
         }
