@@ -443,9 +443,10 @@ pub async fn trigger_unified_dag(
         .await
         .map_err(|error| HarvestError::Database(error.to_string()))?;
 
-    let logical_date = Utc::now();
-    let workflow_id = format!("{dag_name}-{}", logical_date.timestamp_millis());
     let exec_id = ExecutionId::new_for_shard(shard);
+    // Use the exec_id UUID as the deduplication key so back-to-back manual
+    // triggers always produce distinct workflow IDs regardless of clock resolution.
+    let workflow_id = format!("{dag_name}-{exec_id}");
 
     // Resolve the task queue from the schedule row written by HarvestBuilder; fall
     // back to "default" when no row exists (e.g. on the very first trigger before

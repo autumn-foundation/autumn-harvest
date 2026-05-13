@@ -66,7 +66,7 @@ required-features = ["testing"]
 
 [[test]]
 name = "dag_unified_tests"
-required-features = ["testing"]
+required-features = ["testing", "unified-dag-execution"]
 
 [[test]]
 name = "replayer_integration_tests"
