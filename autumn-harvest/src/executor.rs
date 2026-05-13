@@ -481,6 +481,7 @@ mod tests {
     // These assert the ADR-0001 span contract: correct names, attribute keys from
     // the ATTR_* constants, and replay semantics.  They drive the GREEN-phase
     // changes in this module.
+    static SPAN_CAPTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Minimal subscriber layer that records every span name seen during a test.
     mod span_capture {
@@ -566,9 +567,26 @@ mod tests {
         }
     }
 
+    fn with_isolated_span_capture<S, T>(subscriber: S, f: impl FnOnce() -> T) -> T
+    where
+        S: tracing::Subscriber + Send + Sync + 'static,
+    {
+        let _lock = SPAN_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+
+        let result = f();
+
+        drop(guard);
+        tracing::callsite::rebuild_interest_cache();
+        result
+    }
+
     // ── ADR §2.1: harvest.workflow.execute span name ──────────────────────────
     // These are plain `#[test]` (not `#[tokio::test]`) so they can build their
-    // own Tokio runtime inside `tracing::subscriber::with_default`, which requires
+    // own Tokio runtime inside `with_isolated_span_capture`, which requires
     // a synchronous closure.
 
     /// `run_workflow` must emit a span named `harvest.workflow.execute`
@@ -589,7 +607,7 @@ mod tests {
             timestamp: Utc::now(),
         }];
 
-        tracing::subscriber::with_default(subscriber, || {
+        with_isolated_span_capture(subscriber, || {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -621,7 +639,7 @@ mod tests {
             timestamp: Utc::now(),
         }];
 
-        tracing::subscriber::with_default(subscriber, || {
+        with_isolated_span_capture(subscriber, || {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -657,7 +675,7 @@ mod tests {
             timestamp: Utc::now(),
         }];
 
-        tracing::subscriber::with_default(subscriber, || {
+        with_isolated_span_capture(subscriber, || {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -703,7 +721,7 @@ mod tests {
             timestamp: Utc::now(),
         }];
 
-        tracing::subscriber::with_default(subscriber, || {
+        with_isolated_span_capture(subscriber, || {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -762,7 +780,7 @@ mod tests {
             timestamp: Utc::now(),
         }];
 
-        tracing::subscriber::with_default(subscriber, || {
+        with_isolated_span_capture(subscriber, || {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
