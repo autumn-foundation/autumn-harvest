@@ -312,19 +312,26 @@ fn emit_workflow_companion(
                                 }
 
                                 // Dispatch and record terminal status.
-                                let __result = ctx
+                                let __status = match ctx
                                     .execute_activity_raw(
                                         &__activity_name,
-                                        ::autumn_harvest::serde_json::Value::Null,
+                                        _input.clone(),
                                         &__queue_str,
                                     )
-                                    .await;
-
-                                __statuses[__task_idx] = Some(match __result {
+                                    .await
+                                {
                                     Ok(_) => ::autumn_harvest::policy::TaskStatus::Succeeded,
                                     Err(_) => ::autumn_harvest::policy::TaskStatus::Failed,
-                                });
+                                };
+                                __statuses[__task_idx] = Some(__status);
                             }
+                        }
+
+                        let __any_failed = __statuses.iter().any(|s| {
+                            matches!(s, Some(::autumn_harvest::policy::TaskStatus::Failed))
+                        });
+                        if __any_failed {
+                            return Err("one or more DAG tasks failed".to_owned());
                         }
 
                         Ok(::autumn_harvest::serde_json::Value::Null)
