@@ -32,7 +32,7 @@ use crate::executor::{
     WorkflowExecuteSpanMeta, WorkflowOutcome, run_workflow_with_state_and_history_policy,
 };
 use crate::external_task;
-use crate::failure::{parse_error_payload, parse_error_payload_full};
+use crate::failure::{parse_error_payload, parse_error_payload_full, parse_typed_payload};
 use crate::info::{ActivityInfo, WorkflowInfo};
 use crate::models::{
     HarvestTimer, NewHarvestTimer, NewWorkflowExecution, TaskQueueItem, WorkflowExecution,
@@ -800,11 +800,13 @@ async fn run_local_activity_inline(
                 // activities too. Without this check, a fail-fast local
                 // activity would still retry up to `max_attempts`, defeating
                 // the typed-failure guarantee documented in the README.
-                let (error_type_parsed, payload_non_retryable, _) = parse_error_payload(&error);
+                let typed = parse_typed_payload(&error);
+                let payload_non_retryable = typed.as_ref().is_some_and(|f| f.non_retryable);
+                let typed_error_type = typed.as_ref().map(|f| f.error_type.as_str());
                 let policy_non_retryable = run
                     .retry_policy
                     .as_ref()
-                    .is_some_and(|p| p.is_non_retryable(&error_type_parsed, &error));
+                    .is_some_and(|p| p.is_non_retryable(typed_error_type, &error));
                 let terminal_attempt =
                     attempt == max_attempts || payload_non_retryable || policy_non_retryable;
 
@@ -927,14 +929,18 @@ fn next_retry_delay(
     error: &str,
     retry_policy: Option<&RetryPolicy>,
 ) -> HarvestResult<Option<chrono::Duration>> {
-    // Structured failure: honour the non_retryable flag immediately.
-    let (error_type, non_retryable, _) = parse_error_payload(error);
-    if non_retryable {
+    // Only consult the structured `error_type` when the payload was actually
+    // the typed wire format — passing the synthetic "Error" fallback would
+    // make a pre-existing `non_retryable_errors = ["Error"]` policy halt
+    // retries on every legacy `Err(String)` failure.
+    let typed = parse_typed_payload(error);
+    if typed.as_ref().is_some_and(|f| f.non_retryable) {
         return Ok(None);
     }
 
     if let Some(policy) = retry_policy {
-        if policy.is_non_retryable(&error_type, error) {
+        let typed_error_type = typed.as_ref().map(|f| f.error_type.as_str());
+        if policy.is_non_retryable(typed_error_type, error) {
             return Ok(None);
         }
 
@@ -1860,30 +1866,22 @@ async fn finalize_activity_failure(
         details: failure.details,
     };
 
-    // Per issue #227: when an activity exhausts retries (or is flagged
-    // non-retryable), route it to the DLQ. The `error` payload here is the
-    // raw serialised form produced by `IntoActivityErrorString` — for
-    // `ActivityFailure` returns it is the full JSON, which preserves
-    // `error_type` and `non_retryable` for downstream inspection. For legacy
-    // `Err(String)` returns it is the raw message.
-    let dlq_entry = NewDeadLetterEntry {
-        original_task_id: task.id,
-        queue_name: task.queue_name.clone(),
-        task_type: task.task_type.clone(),
-        workflow_exec_id: task.workflow_exec_id,
-        activity_name: task.activity_name.clone(),
-        input: task.input.clone(),
-        error: error.to_string(),
-        attempts: task.attempt,
-    };
-
+    // NOTE: we deliberately do **not** insert a `harvest_dead_letters` row
+    // here. The natural follow-up of `dlq::replay_dead_letter` on an
+    // activity DLQ entry would re-enqueue an activity task with the same
+    // `workflow_exec_id`/`activity_name`, but `process_activity_task` then
+    // calls `find_pending_scheduled_activity`, which excludes scheduled
+    // activities that already carry a terminal `ActivityFailed` event in
+    // history. Inserting an un-replayable row would silently break the DLQ
+    // contract. Workflow-level visibility is preserved via the
+    // `ActivityFailed` event (carrying `error_type`, `non_retryable`,
+    // `details`) and the `WorkflowFailed` event that follows when the
+    // workflow propagates the error.
     conn.transaction::<(), HarvestError, _>(|conn| {
         let error = error.to_string();
-        let dlq_entry = dlq_entry.clone();
         async move {
             store::append_events(conn, exec_id, &[failed_event], next_event_id).await?;
             queue::fail_task(conn, task.id, &error).await?;
-            dlq::dead_letter(conn, &dlq_entry).await?;
             queue::wake_workflow_task(conn, exec_id).await
         }
         .scope_boxed()

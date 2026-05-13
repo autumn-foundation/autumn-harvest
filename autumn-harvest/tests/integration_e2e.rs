@@ -4937,10 +4937,10 @@ async fn drain_preview_returns_active_workers() {
 }
 
 // ---------------------------------------------------------------------------
-// Issue #227: typed activity failure surface — end-to-end DLQ behavior
+// Issue #227: typed activity failure surface — end-to-end fail-fast behavior
 // ---------------------------------------------------------------------------
 
-use autumn_harvest::failure::{ActivityFailure, parse_error_payload};
+use autumn_harvest::failure::ActivityFailure;
 
 /// Activity handler that always fails with a typed `ActivityFailure` flagged
 /// `non_retryable`. Returned via the dispatch shim's typed JSON path.
@@ -4966,16 +4966,22 @@ fn always_legacy_string_failure_activity<'a>(
     Box::pin(async move { Err("foo".to_string()) })
 }
 
-/// Verify the full retry-exhaustion → DLQ flow for a typed `ActivityFailure`
-/// flagged `non_retryable`: the activity must reach the DLQ on attempt 1
-/// (skipping the retry policy entirely), the `ActivityFailed` event must
-/// carry `error_type == "PermanentValidation"` and `non_retryable == true`,
-/// and the DLQ row's `error` column must contain the full structured JSON
-/// so downstream consumers can recover the typed shape via
-/// `parse_error_payload`.
+/// End-to-end fail-fast for a typed `ActivityFailure` flagged `non_retryable`:
+/// the activity must fail on attempt 1 (skipping the retry policy entirely),
+/// the `ActivityFailed` event in history must carry the structured
+/// `error_type` and `non_retryable` fields, and the workflow itself must
+/// reach `FAILED` because the workflow function propagates the activity
+/// error.
+///
+/// We deliberately do **not** assert on a `harvest_dead_letters` row: the
+/// worker no longer auto-inserts DLQ rows for activity failures because
+/// `dlq::replay_dead_letter` cannot meaningfully re-run them (the terminal
+/// `ActivityFailed` event makes `find_pending_scheduled_activity` reject
+/// the replayed task). Workflow-level visibility is preserved via the
+/// `ActivityFailed` + `WorkflowFailed` event pair.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::too_many_lines)]
-async fn non_retryable_activity_reaches_dlq_on_attempt_one() {
+async fn non_retryable_activity_fails_fast_on_attempt_one() {
     let (database_url, _container) = setup_test_database_url().await;
     let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
         .await
@@ -5066,9 +5072,9 @@ async fn non_retryable_activity_reaches_dlq_on_attempt_one() {
         "non_retryable activities must not retry; got {activity_failed_count} ActivityFailed events"
     );
 
-    // 3. A DLQ row exists for this workflow with the full ActivityFailure JSON
-    //    in the `error` column (so downstream UIs/operators can recover the
-    //    structured shape via `parse_error_payload`).
+    // 3. No DLQ row is created for the failed activity — see the doc comment
+    //    on this test for why. The workflow's failure is observable via the
+    //    `ActivityFailed` event and the trailing `WorkflowFailed` event.
     let dlq_rows: Vec<autumn_harvest::models::DeadLetter> = {
         use autumn_harvest::schema::harvest_dead_letters::dsl;
         dsl::harvest_dead_letters
@@ -5080,27 +5086,23 @@ async fn non_retryable_activity_reaches_dlq_on_attempt_one() {
     };
     assert_eq!(
         dlq_rows.len(),
-        1,
-        "exactly one DLQ row expected for this execution"
+        0,
+        "activity retry exhaustion must not auto-insert a DLQ row (those rows are not replayable)"
     );
-    let dlq_row = &dlq_rows[0];
-    let (parsed_type, parsed_non_retryable, parsed_msg) = parse_error_payload(&dlq_row.error);
-    assert_eq!(parsed_type, "PermanentValidation");
-    assert!(parsed_non_retryable);
-    assert_eq!(parsed_msg, "amount must be positive");
-    assert_eq!(dlq_row.attempts, 1);
 
     // 4. The workflow ultimately failed (the workflow function propagated the
     //    activity error). Belt-and-braces check on execution state.
     assert_eq!(execution.state, "FAILED");
 }
 
-/// Back-compat mirror: an activity returning a legacy `Err("foo")` reaches the
-/// DLQ when `RetryPolicy::non_retryable_errors` contains `"foo"`, exactly as
-/// before #227. Confirms the legacy resolution path is still wired.
+/// Back-compat mirror: an activity returning a legacy `Err("foo")` short-
+/// circuits retries when `RetryPolicy::non_retryable_errors` contains `"foo"`,
+/// exactly as before #227. Confirms the legacy resolution path is still
+/// wired through the new `Option<&str>` signature on
+/// `RetryPolicy::is_non_retryable`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::too_many_lines)]
-async fn legacy_string_failure_in_non_retryable_errors_reaches_dlq() {
+async fn legacy_string_failure_in_non_retryable_errors_fails_fast() {
     let (database_url, _container) = setup_test_database_url().await;
     let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
         .await
@@ -5184,7 +5186,8 @@ async fn legacy_string_failure_in_non_retryable_errors_reaches_dlq() {
     assert_eq!(*attempt, 1);
     assert_eq!(error, "foo");
 
-    // The legacy string is also persisted on the DLQ row.
+    // No DLQ row for the failed activity — see note on
+    // `non_retryable_activity_fails_fast_on_attempt_one`.
     let dlq_rows: Vec<autumn_harvest::models::DeadLetter> = {
         use autumn_harvest::schema::harvest_dead_letters::dsl;
         dsl::harvest_dead_letters
@@ -5194,7 +5197,6 @@ async fn legacy_string_failure_in_non_retryable_errors_reaches_dlq() {
             .await
             .expect("dlq query failed")
     };
-    assert_eq!(dlq_rows.len(), 1);
-    assert_eq!(dlq_rows[0].error, "foo");
+    assert_eq!(dlq_rows.len(), 0);
     assert_eq!(execution.state, "FAILED");
 }

@@ -161,6 +161,25 @@ pub fn parse_error_payload(payload: &str) -> (String, bool, String) {
     (failure.error_type, failure.non_retryable, failure.message)
 }
 
+/// Returns `Some(ActivityFailure)` only for typed-wire-format payloads.
+///
+/// Returns `None` for legacy plain-string payloads (no `harvest_activity_failure_v1`
+/// envelope).
+///
+/// Use this for **retry-policy decisions**: callers must not consult the
+/// synthetic `error_type = "Error"` that `parse_error_payload_full` returns
+/// for legacy payloads, because a pre-existing
+/// `RetryPolicy::non_retryable_errors` entry of `"Error"` would otherwise
+/// silently halt retries on every legacy `Err(String)` failure, breaking
+/// the back-compat guarantee promised in issue #227.
+#[must_use]
+pub fn parse_typed_payload(payload: &str) -> Option<ActivityFailure> {
+    match serde_json::from_str::<WirePayload>(payload) {
+        Ok(WirePayload::ActivityFailureV1(failure)) => Some(failure),
+        Err(_) => None,
+    }
+}
+
 /// Like [`parse_error_payload`] but returns the full [`ActivityFailure`] so
 /// callers can also recover the structured `details` value.
 ///

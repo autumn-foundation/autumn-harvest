@@ -132,15 +132,21 @@ impl RetryPolicy {
     /// matches an entry in [`non_retryable_errors`](Self::non_retryable_errors).
     ///
     /// Resolution order (per issue #227):
-    /// 1. Match `error_type` first — the structured class on `ActivityFailure`,
-    ///    stable across log-format changes.
+    /// 1. When `typed_error_type` is `Some(...)` — i.e. the payload was the
+    ///    typed wire format — match it first. This is the structured class
+    ///    name from `ActivityFailure`, stable across log-format changes.
     /// 2. Fall back to a full-string match on the raw error payload — the
     ///    legacy back-compat path for activities returning `Err(String)`.
+    ///
+    /// `typed_error_type` must be `None` for legacy `Err(String)` payloads.
+    /// Passing the synthetic fallback `"Error"` would cause a pre-existing
+    /// `non_retryable_errors = ["Error"]` policy to halt retries on every
+    /// legacy failure, breaking the back-compat guarantee.
     #[must_use]
-    pub fn is_non_retryable(&self, error_type: &str, raw_error: &str) -> bool {
+    pub fn is_non_retryable(&self, typed_error_type: Option<&str>, raw_error: &str) -> bool {
         self.non_retryable_errors
             .iter()
-            .any(|nr| nr == error_type || nr == raw_error)
+            .any(|nr| typed_error_type.is_some_and(|et| nr == et) || nr == raw_error)
     }
 }
 

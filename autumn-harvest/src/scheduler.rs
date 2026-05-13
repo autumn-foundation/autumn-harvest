@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 use crate::context::ActivityContext;
 use crate::error::{HarvestError, HarvestResult};
 use crate::execution::StartedWorkflowExecution;
-use crate::failure::parse_error_payload;
+use crate::failure::parse_typed_payload;
 use crate::info::DagInfo;
 use crate::models::{DagRun, HarvestSchedule, NewDagRun, NewHarvestSchedule};
 use crate::policy::{RetryPolicy, Schedule, TaskStatus, WorkflowSchedule};
@@ -1167,12 +1167,12 @@ async fn execute_dag_task<'a>(
             return TaskStatus::Succeeded;
         };
 
-        // Structured failure: non_retryable flag short-circuits to DLQ.
-        // Resolution order for non_retryable_errors:
-        //   1. match error_type (structured, stable)
-        //   2. match full error string (legacy back-compat)
-        let (error_type, non_retryable, _) = parse_error_payload(&error);
-        if non_retryable {
+        // Structured failure: only consult the typed `error_type` when the
+        // payload was the typed wire format — passing the synthetic "Error"
+        // fallback would break back-compat for legacy `Err(String)` callers
+        // whose retry policy happens to list "Error".
+        let typed = parse_typed_payload(&error);
+        if typed.as_ref().is_some_and(|f| f.non_retryable) {
             return TaskStatus::Failed;
         }
 
@@ -1180,7 +1180,8 @@ async fn execute_dag_task<'a>(
             return TaskStatus::Failed;
         };
 
-        if policy.is_non_retryable(&error_type, &error) {
+        let typed_error_type = typed.as_ref().map(|f| f.error_type.as_str());
+        if policy.is_non_retryable(typed_error_type, &error) {
             return TaskStatus::Failed;
         }
 

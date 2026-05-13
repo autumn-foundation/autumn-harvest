@@ -457,8 +457,8 @@ async fn charge_card(ctx: &ActivityContext, amount: u32) -> Result<(), ActivityF
 |---|---|
 | `error_type` | Stable, low-cardinality class name (e.g. `"InvalidInput"`, `"RateLimitExceeded"`). Used as the `error.type` attribute on `harvest.activity.duration` and `harvest.activity.failed`, and as the matcher input for `RetryPolicy::non_retryable_errors`. |
 | `message` | Human-readable description. Shown in `Display` output (`"InvalidInput: amount exceeds per-transaction ceiling"`). |
-| `details` | Optional `serde_json::Value` for structured context preserved on the `ActivityFailed` event and the DLQ row. |
-| `non_retryable` | When `true`, the worker skips every remaining retry attempt regardless of `RetryPolicy.max_attempts` and routes the task straight to the DLQ. |
+| `details` | Optional `serde_json::Value` for structured context preserved on the `ActivityFailed` event in workflow history. |
+| `non_retryable` | When `true`, the worker skips every remaining retry attempt regardless of `RetryPolicy.max_attempts` and fails the activity on this attempt. The workflow function then sees `Err(HarvestError::ActivityFailed { … })`. |
 
 **Resolution order against `RetryPolicy::non_retryable_errors`**:
 
