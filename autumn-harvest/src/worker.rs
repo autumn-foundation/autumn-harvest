@@ -789,12 +789,6 @@ async fn run_local_activity_inline(
                 return Ok(LocalActivityInlineOutcome::Complete(all_new_events));
             }
             Err(error) => {
-                let failed_event = WorkflowEvent::LocalActivityFailed {
-                    activity_id: run.activity_id,
-                    error: error.clone(),
-                    attempt,
-                };
-
                 // Per issue #227: honour `ActivityFailure::non_retryable`
                 // (and `RetryPolicy::non_retryable_errors`) for local
                 // activities too. Without this check, a fail-fast local
@@ -809,6 +803,23 @@ async fn run_local_activity_inline(
                     .is_some_and(|p| p.is_non_retryable(typed_error_type, &error));
                 let terminal_attempt =
                     attempt == max_attempts || payload_non_retryable || policy_non_retryable;
+
+                // Persist the human-readable message in history events. For
+                // typed `ActivityFailure` payloads we extract `.message` so
+                // operators and the workflow's `HarvestError::ActivityFailed`
+                // surface see "amount must be positive" rather than the
+                // internal `{"harvest_activity_failure_v1":{...}}` envelope.
+                // Mirrors what `finalize_activity_failure` does for regular
+                // activities. (Local-activity events don't yet carry the
+                // typed fields — see #227 follow-up for symmetry parity.)
+                let stored_error = typed
+                    .as_ref()
+                    .map_or_else(|| error.clone(), |f| f.message.clone());
+                let failed_event = WorkflowEvent::LocalActivityFailed {
+                    activity_id: run.activity_id,
+                    error: stored_error.clone(),
+                    attempt,
+                };
 
                 if terminal_attempt {
                     let current_count = u64::try_from(*next_event_id).unwrap_or(u64::MAX);
@@ -837,7 +848,7 @@ async fn run_local_activity_inline(
                     // which would make the policy-invariant guarantee unsound.
                     let exhausted_event = WorkflowEvent::LocalActivityExhausted {
                         activity_id: run.activity_id,
-                        error: error.clone(),
+                        error: stored_error.clone(),
                         attempt,
                     };
                     let terminal_pair = [failed_event, exhausted_event];
