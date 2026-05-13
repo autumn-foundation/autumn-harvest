@@ -4935,3 +4935,268 @@ async fn drain_preview_returns_active_workers() {
         assert_eq!(item.status, "Active");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Issue #227: typed activity failure surface — end-to-end fail-fast behavior
+// ---------------------------------------------------------------------------
+
+use autumn_harvest::failure::ActivityFailure;
+
+/// Activity handler that always fails with a typed `ActivityFailure` flagged
+/// `non_retryable`. Returned via the dispatch shim's typed JSON path.
+fn always_non_retryable_activity<'a>(
+    _ctx: &'a ActivityContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        // Manually encode through the same path the macro uses.
+        Err(
+            autumn_harvest::failure::IntoActivityErrorString::into_error_payload(
+                ActivityFailure::non_retryable("PermanentValidation", "amount must be positive"),
+            ),
+        )
+    })
+}
+
+/// Activity handler that always fails with a legacy plain `String` error.
+fn always_legacy_string_failure_activity<'a>(
+    _ctx: &'a ActivityContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move { Err("foo".to_string()) })
+}
+
+/// End-to-end fail-fast for a typed `ActivityFailure` flagged `non_retryable`:
+/// the activity must fail on attempt 1 (skipping the retry policy entirely),
+/// the `ActivityFailed` event in history must carry the structured
+/// `error_type` and `non_retryable` fields, and the workflow itself must
+/// reach `FAILED` because the workflow function propagates the activity
+/// error.
+///
+/// We deliberately do **not** assert on a `harvest_dead_letters` row: the
+/// worker no longer auto-inserts DLQ rows for activity failures because
+/// `dlq::replay_dead_letter` cannot meaningfully re-run them (the terminal
+/// `ActivityFailed` event makes `find_pending_scheduled_activity` reject
+/// the replayed task). Workflow-level visibility is preserved via the
+/// `ActivityFailed` + `WorkflowFailed` event pair.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
+async fn non_retryable_activity_fails_fast_on_attempt_one() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect to Postgres container");
+
+    let exec_id = insert_workflow_execution(&mut conn).await;
+    let workflow_input = serde_json::json!({"amount": -1});
+
+    let started_events = vec![WorkflowEvent::WorkflowStarted {
+        input: workflow_input.clone(),
+        timestamp: Utc::now(),
+    }];
+    store::append_events(&mut conn, exec_id, &started_events, 0)
+        .await
+        .expect("append WorkflowStarted failed");
+
+    let mut params = EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
+    params.workflow_exec_id = Some(exec_id.as_uuid());
+    params.scheduled_at = Utc::now() - chrono::Duration::seconds(5);
+    queue::enqueue(&mut conn, &params)
+        .await
+        .expect("enqueue workflow task failed");
+
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![WorkflowInfo {
+            name: "e2e_test_workflow",
+            module: "integration_e2e",
+            handler: workflow_with_activity,
+        }],
+        vec![ActivityInfo {
+            name: "send_email",
+            module: "integration_e2e",
+            // Retry policy says "try 5 times" — but ActivityFailure.non_retryable
+            // must win over the policy and route to DLQ on attempt 1.
+            default_retry_policy: Some(autumn_harvest::RetryPolicy::exponential(
+                5,
+                Duration::from_millis(10),
+            )),
+            default_start_to_close: None,
+            default_heartbeat_timeout: None,
+            default_schedule_to_start: None,
+            default_queue: Some("default"),
+            max_concurrent: None,
+            concurrency_key: None,
+            is_local: false,
+            handler: always_non_retryable_activity,
+        }],
+    ));
+
+    let worker = build_runtime_worker("worker-non-retryable", 1, 1, registry);
+    let pool = build_test_pool(&database_url);
+    let handle = spawn_test_worker(Arc::clone(&worker), pool);
+
+    let execution = wait_for_execution_state(&database_url, exec_id, "FAILED").await;
+    worker.shutdown();
+    handle.await.expect("worker task should join");
+
+    // 1. The ActivityFailed event in history carries the typed fields.
+    let history = load_history_from_url(&database_url, exec_id).await;
+    let activity_failed = history
+        .events
+        .iter()
+        .find_map(|ev| match ev {
+            WorkflowEvent::ActivityFailed {
+                error_type,
+                non_retryable,
+                attempt,
+                ..
+            } => Some((error_type.clone(), *non_retryable, *attempt)),
+            _ => None,
+        })
+        .expect("history must contain ActivityFailed");
+    assert_eq!(activity_failed.0, "PermanentValidation");
+    assert!(activity_failed.1, "non_retryable flag must be true");
+    assert_eq!(
+        activity_failed.2, 1,
+        "must fail on attempt 1 — retry policy ignored"
+    );
+
+    // 2. Exactly one ActivityFailed event — the retry policy did not fire.
+    let activity_failed_count = history
+        .events
+        .iter()
+        .filter(|ev| matches!(ev, WorkflowEvent::ActivityFailed { .. }))
+        .count();
+    assert_eq!(
+        activity_failed_count, 1,
+        "non_retryable activities must not retry; got {activity_failed_count} ActivityFailed events"
+    );
+
+    // 3. No DLQ row is created for the failed activity — see the doc comment
+    //    on this test for why. The workflow's failure is observable via the
+    //    `ActivityFailed` event and the trailing `WorkflowFailed` event.
+    let dlq_rows: Vec<autumn_harvest::models::DeadLetter> = {
+        use autumn_harvest::schema::harvest_dead_letters::dsl;
+        dsl::harvest_dead_letters
+            .filter(dsl::workflow_exec_id.eq(Some(exec_id.as_uuid())))
+            .select(autumn_harvest::models::DeadLetter::as_select())
+            .load(&mut conn)
+            .await
+            .expect("dlq query failed")
+    };
+    assert_eq!(
+        dlq_rows.len(),
+        0,
+        "activity retry exhaustion must not auto-insert a DLQ row (those rows are not replayable)"
+    );
+
+    // 4. The workflow ultimately failed (the workflow function propagated the
+    //    activity error). Belt-and-braces check on execution state.
+    assert_eq!(execution.state, "FAILED");
+}
+
+/// Back-compat mirror: an activity returning a legacy `Err("foo")` short-
+/// circuits retries when `RetryPolicy::non_retryable_errors` contains `"foo"`,
+/// exactly as before #227. Confirms the legacy resolution path is still
+/// wired through the new `Option<&str>` signature on
+/// `RetryPolicy::is_non_retryable`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
+async fn legacy_string_failure_in_non_retryable_errors_fails_fast() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect to Postgres container");
+
+    let exec_id = insert_workflow_execution(&mut conn).await;
+    let workflow_input = serde_json::json!({});
+
+    let started_events = vec![WorkflowEvent::WorkflowStarted {
+        input: workflow_input.clone(),
+        timestamp: Utc::now(),
+    }];
+    store::append_events(&mut conn, exec_id, &started_events, 0)
+        .await
+        .expect("append WorkflowStarted failed");
+
+    let mut params = EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
+    params.workflow_exec_id = Some(exec_id.as_uuid());
+    params.scheduled_at = Utc::now() - chrono::Duration::seconds(5);
+    queue::enqueue(&mut conn, &params)
+        .await
+        .expect("enqueue workflow task failed");
+
+    let mut retry = autumn_harvest::RetryPolicy::exponential(5, Duration::from_millis(10));
+    retry.non_retryable_errors = vec!["foo".to_string()];
+
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![WorkflowInfo {
+            name: "e2e_test_workflow",
+            module: "integration_e2e",
+            handler: workflow_with_activity,
+        }],
+        vec![ActivityInfo {
+            name: "send_email",
+            module: "integration_e2e",
+            default_retry_policy: Some(retry),
+            default_start_to_close: None,
+            default_heartbeat_timeout: None,
+            default_schedule_to_start: None,
+            default_queue: Some("default"),
+            max_concurrent: None,
+            concurrency_key: None,
+            is_local: false,
+            handler: always_legacy_string_failure_activity,
+        }],
+    ));
+
+    let worker = build_runtime_worker("worker-legacy-non-retry", 1, 1, registry);
+    let pool = build_test_pool(&database_url);
+    let handle = spawn_test_worker(Arc::clone(&worker), pool);
+
+    let execution = wait_for_execution_state(&database_url, exec_id, "FAILED").await;
+    worker.shutdown();
+    handle.await.expect("worker task should join");
+
+    // Exactly one ActivityFailed event — the legacy non_retryable_errors match
+    // short-circuited the retry policy on attempt 1, matching the pre-#227 path.
+    let history = load_history_from_url(&database_url, exec_id).await;
+    let activity_failed_events: Vec<_> = history
+        .events
+        .iter()
+        .filter_map(|ev| match ev {
+            WorkflowEvent::ActivityFailed {
+                error_type,
+                non_retryable,
+                attempt,
+                error,
+                ..
+            } => Some((error_type.clone(), *non_retryable, *attempt, error.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(activity_failed_events.len(), 1);
+    let (etype, non_retryable, attempt, error) = &activity_failed_events[0];
+    // Plain-string errors deserialize through serde defaults → "Error" / false.
+    assert_eq!(etype, "Error");
+    assert!(
+        !non_retryable,
+        "legacy errors carry non_retryable=false; the engine uses the policy match instead"
+    );
+    assert_eq!(*attempt, 1);
+    assert_eq!(error, "foo");
+
+    // No DLQ row for the failed activity — see note on
+    // `non_retryable_activity_fails_fast_on_attempt_one`.
+    let dlq_rows: Vec<autumn_harvest::models::DeadLetter> = {
+        use autumn_harvest::schema::harvest_dead_letters::dsl;
+        dsl::harvest_dead_letters
+            .filter(dsl::workflow_exec_id.eq(Some(exec_id.as_uuid())))
+            .select(autumn_harvest::models::DeadLetter::as_select())
+            .load(&mut conn)
+            .await
+            .expect("dlq query failed")
+    };
+    assert_eq!(dlq_rows.len(), 0);
+    assert_eq!(execution.state, "FAILED");
+}

@@ -62,7 +62,7 @@ pub async fn poll_customer_exports(
 pub async fn poll_customer_export_page(
     _ctx: &ActivityContext,
     input: Value,
-) -> HarvestResult<Value> {
+) -> Result<Value, String> {
     let cycle = input.get("cycle").and_then(Value::as_u64).unwrap_or(0);
 
     Ok(json!({

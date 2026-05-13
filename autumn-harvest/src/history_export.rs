@@ -472,6 +472,7 @@ impl MermaidExporter {
                 activity_id,
                 error,
                 attempt,
+                ..
             } => {
                 let safe_error = error.replace('\n', " ").replace('"', "'");
                 writeln!(

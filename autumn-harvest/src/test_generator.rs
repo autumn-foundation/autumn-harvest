@@ -220,6 +220,9 @@ mod tests {
                 activity_id: act_id,
                 error: "insufficient funds".into(),
                 attempt: 1,
+                error_type: "Error".into(),
+                non_retryable: false,
+                details: None,
             },
             WorkflowEvent::WorkflowFailed {
                 error: "workflow failed: charge_card failed".into(),

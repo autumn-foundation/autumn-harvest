@@ -32,6 +32,7 @@ use crate::executor::{
     WorkflowExecuteSpanMeta, WorkflowOutcome, run_workflow_with_state_and_history_policy,
 };
 use crate::external_task;
+use crate::failure::{parse_error_payload, parse_error_payload_full, parse_typed_payload};
 use crate::info::{ActivityInfo, WorkflowInfo};
 use crate::models::{
     HarvestTimer, NewHarvestTimer, NewWorkflowExecution, TaskQueueItem, WorkflowExecution,
@@ -789,13 +790,39 @@ async fn run_local_activity_inline(
                 return Ok(LocalActivityInlineOutcome::Complete(all_new_events));
             }
             Err(error) => {
+                // Per issue #227: honour `ActivityFailure::non_retryable`
+                // (and `RetryPolicy::non_retryable_errors`) for local
+                // activities too. Without this check, a fail-fast local
+                // activity would still retry up to `max_attempts`, defeating
+                // the typed-failure guarantee documented in the README.
+                let typed = parse_typed_payload(&error);
+                let payload_non_retryable = typed.as_ref().is_some_and(|f| f.non_retryable);
+                let typed_error_type = typed.as_ref().map(|f| f.error_type.as_str());
+                let policy_non_retryable = run
+                    .retry_policy
+                    .as_ref()
+                    .is_some_and(|p| p.is_non_retryable(typed_error_type, &error));
+                let terminal_attempt =
+                    attempt == max_attempts || payload_non_retryable || policy_non_retryable;
+
+                // Persist the human-readable message in history events. For
+                // typed `ActivityFailure` payloads we extract `.message` so
+                // operators and the workflow's `HarvestError::ActivityFailed`
+                // surface see "amount must be positive" rather than the
+                // internal `{"harvest_activity_failure_v1":{...}}` envelope.
+                // Mirrors what `finalize_activity_failure` does for regular
+                // activities. (Local-activity events don't yet carry the
+                // typed fields — see #227 follow-up for symmetry parity.)
+                let stored_error = typed
+                    .as_ref()
+                    .map_or_else(|| error.clone(), |f| f.message.clone());
                 let failed_event = WorkflowEvent::LocalActivityFailed {
                     activity_id: run.activity_id,
-                    error: error.clone(),
+                    error: stored_error.clone(),
                     attempt,
                 };
 
-                if attempt == max_attempts {
+                if terminal_attempt {
                     let current_count = u64::try_from(*next_event_id).unwrap_or(u64::MAX);
                     let final_pair_would_exceed_cap = history_event_hard_cap
                         .is_some_and(|cap| current_count.saturating_add(2) > cap);
@@ -822,7 +849,7 @@ async fn run_local_activity_inline(
                     // which would make the policy-invariant guarantee unsound.
                     let exhausted_event = WorkflowEvent::LocalActivityExhausted {
                         activity_id: run.activity_id,
-                        error: error.clone(),
+                        error: stored_error.clone(),
                         attempt,
                     };
                     let terminal_pair = [failed_event, exhausted_event];
@@ -838,32 +865,40 @@ async fn run_local_activity_inline(
                             event_count,
                         });
                     }
-                } else {
-                    store::append_events(
-                        conn,
-                        exec_id,
-                        std::slice::from_ref(&failed_event),
-                        *next_event_id,
-                    )
-                    .await?;
-                    *next_event_id += 1;
-                    all_new_events.push(failed_event);
-                    if let Some(event_count) =
-                        local_activity_history_cap_reached(*next_event_id, history_event_hard_cap)
-                    {
-                        return Ok(LocalActivityInlineOutcome::HistoryCapReached {
-                            events: all_new_events,
-                            event_count,
-                        });
-                    }
+                    // Must return here — without it, when `terminal_attempt` was
+                    // set early by `payload_non_retryable` or `policy_non_retryable`
+                    // (i.e. `attempt < max_attempts`), the `for` loop would
+                    // re-execute the side-effecting handler on the next
+                    // iteration, defeating the fail-fast guarantee.
+                    return Ok(LocalActivityInlineOutcome::Complete(all_new_events));
+                }
 
-                    if let Some(delay) = run
-                        .retry_policy
-                        .as_ref()
-                        .and_then(|p| p.next_delay(attempt))
-                    {
-                        tokio::time::sleep(delay).await;
-                    }
+                // Non-terminal attempt: record the failure, optionally sleep,
+                // and loop to the next attempt.
+                store::append_events(
+                    conn,
+                    exec_id,
+                    std::slice::from_ref(&failed_event),
+                    *next_event_id,
+                )
+                .await?;
+                *next_event_id += 1;
+                all_new_events.push(failed_event);
+                if let Some(event_count) =
+                    local_activity_history_cap_reached(*next_event_id, history_event_hard_cap)
+                {
+                    return Ok(LocalActivityInlineOutcome::HistoryCapReached {
+                        events: all_new_events,
+                        event_count,
+                    });
+                }
+
+                if let Some(delay) = run
+                    .retry_policy
+                    .as_ref()
+                    .and_then(|p| p.next_delay(attempt))
+                {
+                    tokio::time::sleep(delay).await;
                 }
             }
         }
@@ -914,12 +949,18 @@ fn next_retry_delay(
     error: &str,
     retry_policy: Option<&RetryPolicy>,
 ) -> HarvestResult<Option<chrono::Duration>> {
+    // Only consult the structured `error_type` when the payload was actually
+    // the typed wire format — passing the synthetic "Error" fallback would
+    // make a pre-existing `non_retryable_errors = ["Error"]` policy halt
+    // retries on every legacy `Err(String)` failure.
+    let typed = parse_typed_payload(error);
+    if typed.as_ref().is_some_and(|f| f.non_retryable) {
+        return Ok(None);
+    }
+
     if let Some(policy) = retry_policy {
-        if policy
-            .non_retryable_errors
-            .iter()
-            .any(|non_retryable| non_retryable == error)
-        {
+        let typed_error_type = typed.as_ref().map(|f| f.error_type.as_str());
+        if policy.is_non_retryable(typed_error_type, error) {
             return Ok(None);
         }
 
@@ -1835,12 +1876,27 @@ async fn finalize_activity_failure(
     activity_id: ActivityExecId,
     error: &str,
 ) -> HarvestResult<()> {
+    let failure = parse_error_payload_full(error);
     let failed_event = WorkflowEvent::ActivityFailed {
         activity_id,
-        error: error.to_string(),
+        error: failure.message,
         attempt: task_attempt(task),
+        error_type: failure.error_type,
+        non_retryable: failure.non_retryable,
+        details: failure.details,
     };
 
+    // NOTE: we deliberately do **not** insert a `harvest_dead_letters` row
+    // here. The natural follow-up of `dlq::replay_dead_letter` on an
+    // activity DLQ entry would re-enqueue an activity task with the same
+    // `workflow_exec_id`/`activity_name`, but `process_activity_task` then
+    // calls `find_pending_scheduled_activity`, which excludes scheduled
+    // activities that already carry a terminal `ActivityFailed` event in
+    // history. Inserting an un-replayable row would silently break the DLQ
+    // contract. Workflow-level visibility is preserved via the
+    // `ActivityFailed` event (carrying `error_type`, `non_retryable`,
+    // `details`) and the `WorkflowFailed` event that follows when the
+    // workflow propagates the error.
     conn.transaction::<(), HarvestError, _>(|conn| {
         let error = error.to_string();
         async move {
@@ -2047,6 +2103,7 @@ async fn execute_activity_future_with_cancellation(
     .await
 }
 
+#[allow(clippy::too_many_lines)]
 async fn process_activity_task(
     pool: &DbPool,
     conn: &mut AsyncPgConnection,
@@ -2140,12 +2197,31 @@ async fn process_activity_task(
     } else {
         ActivityStatus::Failed
     };
-    telemetry.metrics.record_activity_completed(
+    // Parse the structured payload once and reuse for both the histogram
+    // and the per-failure counter (so the `error.type` attribute is
+    // consistent across `harvest.activity.duration` and
+    // `harvest.activity.failed`).
+    let failure_info = activity_result
+        .as_ref()
+        .err()
+        .map(|payload| parse_error_payload(payload));
+    telemetry.metrics.record_activity_completed_with_error_type(
         activity_name,
         &task.queue_name,
         duration_secs,
         status,
+        failure_info.as_ref().map(|(et, _, _)| et.as_str()),
     );
+    if let Some((error_type, non_retryable, _)) = failure_info.as_ref() {
+        // `workflow.type` is intentionally empty here: looking it up requires
+        // an extra `harvest_workflow_executions` query per failure, and the
+        // `MetricsRecorder` trait docs explicitly allow an empty string when
+        // the workflow type is unknown at the call site. Plumbing it through
+        // is tracked as a follow-up.
+        telemetry
+            .metrics
+            .record_activity_failed(activity_name, "", error_type, *non_retryable);
+    }
     cancel.cancel();
     drop(activity_future);
 

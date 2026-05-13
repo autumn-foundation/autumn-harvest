@@ -47,6 +47,7 @@ pub mod execution;
 pub mod executor;
 #[cfg(feature = "db")]
 pub mod external_task;
+pub mod failure;
 /// Deterministic workflow guardrail rule catalog (issue #173).
 pub mod guardrail;
 #[cfg(feature = "db")]
