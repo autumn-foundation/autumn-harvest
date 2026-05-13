@@ -2131,7 +2131,7 @@
           {
             "name": "reason",
             "required": false,
-            "description": "Optional free-text reason recorded in the audit trail and on the schedule row."
+            "description": "Optional free-text reason stored on the schedule row as pause_reason. Visible via GET /admin/schedules and GET /admin/schedules/{id} while the schedule is paused; cleared to null on resume."
           }
         ]
       },
