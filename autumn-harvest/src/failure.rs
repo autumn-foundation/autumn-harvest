@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 /// `From<String>` produces a retryable `ActivityFailure` with
 /// `error_type = "Error"`, so every activity that today returns
 /// `Err(String)` continues to compile and behave identically.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActivityFailure {
     /// A stable, low-cardinality error-type name used for metrics and policy
     /// matching (e.g. `"InvalidInput"`, `"RateLimitExceeded"`).

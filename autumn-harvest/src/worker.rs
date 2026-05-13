@@ -2078,6 +2078,7 @@ async fn execute_activity_future_with_cancellation(
     .await
 }
 
+#[allow(clippy::too_many_lines)]
 async fn process_activity_task(
     pool: &DbPool,
     conn: &mut AsyncPgConnection,

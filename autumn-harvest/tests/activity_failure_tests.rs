@@ -289,10 +289,12 @@ mod replay_tests {
 use autumn_harvest::telemetry::MetricsRecorder;
 use std::sync::{Arc, Mutex};
 
+type FailureCall = (String, String, String, bool);
+
 /// Test recorder that counts `record_activity_failed` invocations.
 #[derive(Default, Clone)]
 struct FailureCounter {
-    calls: Arc<Mutex<Vec<(String, String, String, bool)>>>,
+    calls: Arc<Mutex<Vec<FailureCall>>>,
 }
 
 impl MetricsRecorder for FailureCounter {
@@ -316,12 +318,12 @@ impl MetricsRecorder for FailureCounter {
 fn record_activity_failed_receives_error_type() {
     let recorder = FailureCounter::default();
     recorder.record_activity_failed("charge_card", "billing_workflow", "PaymentDeclined", true);
-    let calls = recorder.calls.lock().unwrap();
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].0, "charge_card");
-    assert_eq!(calls[0].1, "billing_workflow");
-    assert_eq!(calls[0].2, "PaymentDeclined");
-    assert!(calls[0].3);
+    let snapshot: Vec<FailureCall> = recorder.calls.lock().unwrap().clone();
+    assert_eq!(snapshot.len(), 1);
+    assert_eq!(snapshot[0].0, "charge_card");
+    assert_eq!(snapshot[0].1, "billing_workflow");
+    assert_eq!(snapshot[0].2, "PaymentDeclined");
+    assert!(snapshot[0].3);
 }
 
 #[test]
