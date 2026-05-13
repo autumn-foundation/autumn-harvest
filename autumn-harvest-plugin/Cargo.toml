@@ -13,7 +13,7 @@ categories = ["asynchronous", "database"]
 
 [dependencies]
 autumn-harvest = { version = "0.3.0", path = "../autumn-harvest", features = ["db"] }
-autumn-web = "0.2"
+autumn-web = "0.4"
 tokio = { workspace = true }
 tokio-util = { version = "0.7", features = ["rt"] }
 serde = { workspace = true }

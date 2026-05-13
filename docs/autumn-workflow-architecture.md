@@ -74,7 +74,7 @@ Workflow orchestration is a heavyweight dependency. Many Autumn users will never
 ```toml
 # Cargo.toml — only when you need workflows
 [dependencies]
-autumn-web = "0.1"
+autumn-web = "0.4"
 autumn-harvest = "0.1"
 ```
 
