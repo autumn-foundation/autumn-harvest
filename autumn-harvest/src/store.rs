@@ -502,15 +502,25 @@ pub async fn update_search_attrs<S: std::hash::BuildHasher + Sync>(
     Ok(())
 }
 
+/// Summarizes an error string to a single line, truncated to `MAX_ERROR_SUMMARY_CHARS`.
+///
+/// ⚡ Bolt: Avoids a heap allocation (`.chars().take().collect()`) by slicing the
+/// string at the correct byte boundary determined by `char_indices`.
 fn summarize_error(error: Option<String>) -> Option<String> {
     const MAX_ERROR_SUMMARY_CHARS: usize = 240;
 
-    let first_line = error?.lines().next()?.trim().to_string();
+    let error_str = error?;
+    let first_line = error_str.lines().next()?.trim();
     if first_line.is_empty() {
         return None;
     }
 
-    Some(first_line.chars().take(MAX_ERROR_SUMMARY_CHARS).collect())
+    let char_len = first_line
+        .char_indices()
+        .nth(MAX_ERROR_SUMMARY_CHARS)
+        .map_or(first_line.len(), |(idx, _)| idx);
+
+    Some(first_line[..char_len].to_string())
 }
 
 #[cfg(test)]
