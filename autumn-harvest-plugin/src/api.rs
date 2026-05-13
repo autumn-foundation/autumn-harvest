@@ -63,6 +63,8 @@ use autumn_harvest::scheduler::{
     SchedulerSnapshot, parse_schedule_from_expr_pub, plan_backfill_timestamps,
     scheduled_workflow_id_pub, trigger_dag,
 };
+#[cfg(feature = "unified-dag-execution")]
+use autumn_harvest::trigger_unified_dag;
 use autumn_harvest::schema::{
     harvest_backfill_log, harvest_dag_runs, harvest_dead_letters, harvest_events,
     harvest_schedules, harvest_signals, harvest_task_queue, harvest_timers,
@@ -3902,6 +3904,25 @@ async fn trigger_dag_run(
     let (actor, source, request_id) = audit_context(&headers, &api_state);
     let route = "POST /dags/{dag_name}/trigger";
 
+    // When unified-dag-execution is on, unified DAGs are registered as workflows
+    // (by HarvestBuilder::dags) and excluded from the classic DagCatalog. Route
+    // them through start_or_load_workflow_execution instead of the DAG executor.
+    #[cfg(feature = "unified-dag-execution")]
+    let trigger_result = if runtime.registry.workflows.contains_key(&dag_name) {
+        trigger_unified_dag(pool.pool_for(shard).clone(), &dag_name, request.conf, shard).await
+    } else {
+        trigger_dag(
+            pool.pool_for(shard).clone(),
+            Arc::clone(&runtime.registry),
+            Arc::clone(&runtime.dags),
+            &dag_name,
+            request.conf,
+            runtime.scheduler,
+        )
+        .await
+    };
+
+    #[cfg(not(feature = "unified-dag-execution"))]
     let trigger_result = trigger_dag(
         pool.pool_for(shard).clone(),
         Arc::clone(&runtime.registry),

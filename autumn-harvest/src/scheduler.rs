@@ -467,6 +467,115 @@ pub async fn trigger_dag(
     Ok(run)
 }
 
+/// Trigger a unified DAG run by starting a workflow execution (issue #256 Step 3).
+///
+/// When the `unified-dag-execution` feature is on, DAGs that were promoted to the
+/// workflow execution path (those whose `#[dag]` macro emitted a `workflow_handler`)
+/// are triggered through [`crate::execution::start_or_load_workflow_execution`]
+/// rather than through the classic `harvest_dag_runs` + executor path.
+///
+/// A `harvest_dag_runs` row with `workflow_exec_id` set is still written so that
+/// the existing observability tables remain consistent during the transition window
+/// (Step 5 will drop the table once the unified path is the sole execution path).
+///
+/// # Errors
+///
+/// Returns [`HarvestError`] if the DB pool is exhausted, the workflow start
+/// transaction fails, or the `harvest_dag_runs` insert fails.
+#[cfg(feature = "unified-dag-execution")]
+pub async fn trigger_unified_dag(
+    pool: DbPool,
+    dag_name: &str,
+    run_conf: Option<Value>,
+    shard: crate::types::ShardId,
+) -> HarvestResult<DagRun> {
+    use crate::execution::{StartWorkflowParams, start_or_load_workflow_execution};
+
+    let mut db = pool
+        .get()
+        .await
+        .map_err(|error| HarvestError::Database(error.to_string()))?;
+
+    let logical_date = Utc::now();
+    let workflow_id = format!("{dag_name}-{}", logical_date.timestamp_millis());
+    let exec_id = ExecutionId::new_for_shard(shard);
+
+    // Resolve the task queue from the schedule row written by HarvestBuilder; fall
+    // back to "default" when no row exists (e.g. on the very first trigger before
+    // register_workflow_schedules has run).
+    let queue_name = {
+        use crate::schema::harvest_schedules::dsl;
+        dsl::harvest_schedules
+            .filter(dsl::workflow_name.eq(dag_name))
+            .select(dsl::queue_name)
+            .first::<Option<String>>(&mut db)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "default".to_string())
+    };
+
+    let input = run_conf.clone().unwrap_or(Value::Null);
+
+    let started = start_or_load_workflow_execution(
+        &mut db,
+        StartWorkflowParams {
+            workflow_name: dag_name,
+            workflow_id: &workflow_id,
+            exec_id,
+            input,
+            parent_id: None,
+            queue_name: &queue_name,
+            execution_timeout: None,
+            memo: None,
+            search_attrs: None,
+            reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
+            trace_context: None,
+        },
+    )
+    .await?;
+
+    // Write the bridge row so harvest_dag_runs stays consistent for observability.
+    insert_unified_dag_run(&mut db, dag_name, started.exec_id.as_uuid(), logical_date, run_conf)
+        .await
+}
+
+/// Insert a `harvest_dag_runs` row that points to an existing workflow execution.
+#[cfg(feature = "unified-dag-execution")]
+async fn insert_unified_dag_run(
+    db: &mut AsyncPgConnection,
+    dag_name: &str,
+    workflow_exec_id: uuid::Uuid,
+    logical_date: DateTime<Utc>,
+    conf: Option<Value>,
+) -> HarvestResult<DagRun> {
+    let row = NewDagRun {
+        id: uuid::Uuid::new_v4(),
+        dag_name,
+        workflow_exec_id: Some(workflow_exec_id),
+        logical_date,
+        data_interval_start: logical_date,
+        data_interval_end: logical_date,
+        conf,
+    };
+
+    diesel::insert_into(harvest_dag_runs::table)
+        .values(&row)
+        .on_conflict((harvest_dag_runs::dag_name, harvest_dag_runs::logical_date))
+        .do_nothing()
+        .execute(db)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    harvest_dag_runs::table
+        .filter(harvest_dag_runs::dag_name.eq(dag_name))
+        .filter(harvest_dag_runs::logical_date.eq(logical_date))
+        .select(DagRun::as_select())
+        .first(db)
+        .await
+        .map_err(crate::error::database_error)
+}
+
 async fn upsert_schedule(
     conn: &mut AsyncPgConnection,
     dag: &RegisteredDag,

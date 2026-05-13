@@ -346,6 +346,41 @@ fn builder_dags_auto_registers_workflow_schedule_only_for_scheduled_dags() {
 }
 
 // ---------------------------------------------------------------------------
+// STEP 3 — trigger routing: unified DAGs must not require a classic catalog entry
+// ---------------------------------------------------------------------------
+
+/// When `unified-dag-execution` is on, a DAG that was promoted to the workflow
+/// execution path must be recognisable purely from the workflow registry — the
+/// scheduler's `DagCatalog` (classic path) will not contain it (Step 2 ensures
+/// `compile_dag_catalog` skips unified DAGs). The trigger handler uses
+/// `registry.workflows.contains_key(dag_name)` to decide which path to take.
+///
+/// This test constructs a minimal `HandlerRegistry` that mirrors what
+/// `HarvestBuilder::dags()` produces and asserts the routing predicate works.
+#[test]
+fn trigger_routing_recognises_unified_dag_via_workflow_registry() {
+    use autumn_harvest::worker::HandlerRegistry;
+
+    // Build a registry that mimics what HarvestBuilder::dags() produces for a
+    // unified DAG: the WorkflowInfo from as_workflow_info() is auto-pushed.
+    let registry = HandlerRegistry::new(
+        vec![__autumn_workflow_info_linear_dag()],
+        vec![],
+    );
+
+    // The routing predicate: unified dag present.
+    assert!(
+        registry.workflows.contains_key("linear_dag"),
+        "linear_dag was auto-registered as a workflow and must be found in the registry"
+    );
+    // Classic DAG (not registered as a workflow) must not match.
+    assert!(
+        !registry.workflows.contains_key("classic_unregistered_dag"),
+        "an unregistered name must not be found"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // RED-PHASE TEST 6 — fan-out DAG: both parallel tasks in level 1 run
 // ---------------------------------------------------------------------------
 
