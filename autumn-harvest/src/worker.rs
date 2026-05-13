@@ -632,7 +632,8 @@ fn local_activity_history_cap_reached(next_event_id: i32, cap: Option<u64>) -> O
 fn extract_run_local_activity(
     commands: Vec<WorkflowCommand>,
 ) -> (Vec<WorkflowEvent>, LocalActivityRun) {
-    let mut markers = Vec::new();
+    // ⚡ Bolt: Pre-allocate vector capacity to avoid intermediate allocations
+    let mut markers = Vec::with_capacity(commands.len());
     let mut local_run = None;
     for cmd in commands {
         match cmd {
