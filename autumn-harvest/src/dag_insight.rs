@@ -15,6 +15,8 @@ use crate::dag_profiler::{DagProfile, DagProfiler};
 use crate::dag_simulator::{DagSimulator, DagSimulatorResult};
 use crate::info::ActivityInfo;
 
+const DEFAULT_PARALLELISM_THRESHOLD: usize = 10;
+
 /// Comprehensive report containing all insights from DAG analysis.
 #[derive(Debug, Clone)]
 pub struct DagInsightReport {
@@ -35,6 +37,7 @@ pub struct DagInsight {
     activity_durations: HashMap<String, Duration>,
     activity_mocks: HashMap<String, Arc<dyn Fn() -> Result<(), String> + Send + Sync>>,
     default_duration: Duration,
+    parallelism_threshold: usize,
 }
 
 impl DagInsight {
@@ -47,6 +50,7 @@ impl DagInsight {
             activity_durations: HashMap::new(),
             activity_mocks: HashMap::new(),
             default_duration: Duration::from_secs(1),
+            parallelism_threshold: DEFAULT_PARALLELISM_THRESHOLD,
         }
     }
 
@@ -61,6 +65,13 @@ impl DagInsight {
     #[must_use]
     pub const fn with_default_duration(mut self, duration: Duration) -> Self {
         self.default_duration = duration;
+        self
+    }
+
+    /// Set the maximum execution-level width before the linter warns about parallelism.
+    #[must_use]
+    pub const fn with_parallelism_threshold(mut self, threshold: usize) -> Self {
+        self.parallelism_threshold = threshold;
         self
     }
 
@@ -88,7 +99,9 @@ impl DagInsight {
         let linter = DagLinter::new()
             .with_rule(crate::dag_linter::MissingRetryPolicyRule::new())
             .with_rule(crate::dag_linter::MissingTimeoutRule::new())
-            .with_rule(crate::dag_linter::ExcessiveParallelismRule::new(10));
+            .with_rule(crate::dag_linter::ExcessiveParallelismRule::new(
+                self.parallelism_threshold,
+            ));
         let warnings = linter.analyze(&self.dag, &self.activities);
 
         // Run Critical Path Analyzer
@@ -134,6 +147,14 @@ mod tests {
     fn activity_b() {}
     fn activity_c() {}
 
+    fn excessive_parallelism_warning_count(report: &DagInsightReport) -> usize {
+        report
+            .warnings
+            .iter()
+            .filter(|warning| warning.rule_name == "ExcessiveParallelism")
+            .count()
+    }
+
     #[test]
     fn test_insight_report_linear_dag() {
         let mut builder = DagBuilder::new();
@@ -177,5 +198,20 @@ mod tests {
             report.simulation.get_status(c.index()),
             Some(&TaskStatus::Skipped)
         );
+    }
+
+    #[test]
+    fn with_parallelism_threshold_controls_excessive_parallelism_warnings() {
+        let mut builder = DagBuilder::new();
+        let _a = builder.activity(activity_a);
+        let _b = builder.activity(activity_b);
+        let _c = builder.activity(activity_c);
+        let dag = builder.build().unwrap();
+
+        let default_report = DagInsight::new(dag.clone()).analyze();
+        assert_eq!(excessive_parallelism_warning_count(&default_report), 0);
+
+        let constrained_report = DagInsight::new(dag).with_parallelism_threshold(2).analyze();
+        assert_eq!(excessive_parallelism_warning_count(&constrained_report), 1);
     }
 }
