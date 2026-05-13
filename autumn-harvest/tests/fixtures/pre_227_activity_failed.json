@@ -1,0 +1,11 @@
+{
+    "workflow_name": "test_wf",
+    "execution_id": "00000000-0000-0000-0000-000000000010",
+    "events": [
+        {"type":"WorkflowStarted","data":{"input":null,"timestamp":"2026-01-01T00:00:00Z"}},
+        {"type":"ActivityScheduled","data":{"activity_id":"00000000-0000-0000-0000-000000000011","name":"do_work","input":null,"queue":"default"}},
+        {"type":"ActivityFailed","data":{"activity_id":"00000000-0000-0000-0000-000000000011","error":"connection refused","attempt":1}},
+        {"type":"ActivityScheduled","data":{"activity_id":"00000000-0000-0000-0000-000000000012","name":"do_work","input":null,"queue":"default"}},
+        {"type":"ActivityCompleted","data":{"activity_id":"00000000-0000-0000-0000-000000000012","output":"done"}}
+    ]
+}

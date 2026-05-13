@@ -75,6 +75,12 @@ pub const METRIC_WORKFLOW_CONTINUE_AS_NEW: &str = "harvest.workflow.continue_as_
 /// Histogram: wall-clock seconds an activity invocation took (success or failure).
 pub const METRIC_ACTIVITY_DURATION: &str = "harvest.activity.duration";
 
+/// Counter: incremented on each activity failure attempt.
+///
+/// Attributes: `activity.type`, `workflow.type`, `error.type`, `non_retryable`.
+/// Per ADR-0001 §7, `execution.id` / `activity.id` are span-only.
+pub const METRIC_ACTIVITY_FAILED: &str = "harvest.activity.failed";
+
 /// Counter: incremented when a durable timer is persisted.
 pub const METRIC_TIMER_STARTED: &str = "harvest.timer.started";
 
@@ -385,6 +391,27 @@ pub trait MetricsRecorder: Send + Sync {
         status: ActivityStatus,
     ) {
         let _ = (activity_name, queue, duration_secs, status);
+    }
+
+    /// An activity invocation failed (per-attempt failure record).
+    ///
+    /// Maps to the counter `harvest.activity.failed` with attributes:
+    /// - `activity.type`: the registered activity name
+    /// - `workflow.type`: the owning workflow name (empty string when unknown)
+    /// - `error.type`: low-cardinality error class (e.g. `"InvalidInput"`)
+    /// - `non_retryable`: whether the failure skipped remaining retries
+    ///
+    /// Per ADR-0001 §7: `execution.id` and `activity.id` are span-only and
+    /// must never appear as metric attributes. Callers are responsible for
+    /// keeping `error_type` low-cardinality.
+    fn record_activity_failed(
+        &self,
+        activity_name: &str,
+        workflow_type: &str,
+        error_type: &str,
+        non_retryable: bool,
+    ) {
+        let _ = (activity_name, workflow_type, error_type, non_retryable);
     }
 
     /// A durable timer was persisted.

@@ -201,6 +201,7 @@ impl HistoryMatcher {
                     activity_id: id,
                     error,
                     attempt,
+                    ..
                 } if *id == activity_id => {
                     let result = HistoryMatch::Failed {
                         error: error.clone(),
@@ -1243,6 +1244,8 @@ mod tests {
                 activity_id: id,
                 error: error.into(),
                 attempt,
+                error_type: "Error".into(),
+                non_retryable: false,
             },
         ];
         (id, events)

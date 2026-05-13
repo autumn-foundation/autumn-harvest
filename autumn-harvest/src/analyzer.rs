@@ -255,12 +255,16 @@ mod tests {
                 activity_id: id1,
                 error: "Timeout".to_string(),
                 attempt: 1,
+                error_type: "Error".into(),
+                non_retryable: false,
             },
             // Failed 3 times, above threshold of 2
             WorkflowEvent::ActivityFailed {
                 activity_id: id2,
                 error: "Card Declined".to_string(),
                 attempt: 3,
+                error_type: "Error".into(),
+                non_retryable: false,
             },
         ];
 
@@ -338,6 +342,8 @@ mod tests {
                 activity_id: ActivityExecId::new(), // Technically mismatch ID but rule checks just the event for simplicity/demo
                 error: "Err".to_string(),
                 attempt: 2,
+                error_type: "Error".into(),
+                non_retryable: false,
             },
         ];
 

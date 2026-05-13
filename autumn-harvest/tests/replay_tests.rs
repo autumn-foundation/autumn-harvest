@@ -312,6 +312,8 @@ async fn replay_handles_failed_activity() {
             activity_id: id1,
             error: "SMTP connection refused".into(),
             attempt: 3,
+            error_type: "Error".into(),
+            non_retryable: false,
         },
     ];
 

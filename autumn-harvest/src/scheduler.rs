@@ -19,6 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::context::ActivityContext;
 use crate::error::{HarvestError, HarvestResult};
+use crate::failure::parse_error_payload;
 use crate::execution::StartedWorkflowExecution;
 use crate::info::DagInfo;
 use crate::models::{DagRun, HarvestSchedule, NewDagRun, NewHarvestSchedule};
@@ -1166,15 +1167,24 @@ async fn execute_dag_task<'a>(
             return TaskStatus::Succeeded;
         };
 
+        // Structured failure: non_retryable flag short-circuits to DLQ.
+        // Resolution order for non_retryable_errors:
+        //   1. match error_type (structured, stable)
+        //   2. match full error string (legacy back-compat)
+        let (error_type, non_retryable, _) = parse_error_payload(&error);
+        if non_retryable {
+            return TaskStatus::Failed;
+        }
+
         let Some(policy) = retry_policy.as_ref() else {
             return TaskStatus::Failed;
         };
 
-        if policy
+        let is_non_retryable = policy
             .non_retryable_errors
             .iter()
-            .any(|non_retryable| non_retryable == &error)
-        {
+            .any(|nr| nr == &error_type || nr == &error);
+        if is_non_retryable {
             return TaskStatus::Failed;
         }
 

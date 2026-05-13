@@ -41,6 +41,7 @@ pub mod det_check;
 pub mod diagnostic;
 pub mod error;
 pub mod event;
+pub mod failure;
 #[cfg(feature = "db")]
 #[doc(hidden)]
 pub mod execution;

@@ -28,6 +28,7 @@ use crate::context::{
 use crate::dlq::{self, DeadLetterReason, NewDeadLetterEntry};
 use crate::error::{HarvestError, HarvestResult};
 use crate::event::WorkflowEvent;
+use crate::failure::parse_error_payload;
 use crate::executor::{
     WorkflowExecuteSpanMeta, WorkflowOutcome, run_workflow_with_state_and_history_policy,
 };
@@ -913,12 +914,20 @@ fn next_retry_delay(
     error: &str,
     retry_policy: Option<&RetryPolicy>,
 ) -> HarvestResult<Option<chrono::Duration>> {
+    // Structured failure: honour the non_retryable flag immediately.
+    // Resolution order for non_retryable_errors:
+    //   1. match error_type (structured path, stable across message changes)
+    //   2. match full error string (legacy exact-match, back-compat)
+    let (error_type, non_retryable, _) = parse_error_payload(error);
+    if non_retryable {
+        return Ok(None);
+    }
+
     if let Some(policy) = retry_policy {
-        if policy
-            .non_retryable_errors
-            .iter()
-            .any(|non_retryable| non_retryable == error)
-        {
+        let is_non_retryable = policy.non_retryable_errors.iter().any(|nr| {
+            nr == &error_type || nr == error
+        });
+        if is_non_retryable {
             return Ok(None);
         }
 
@@ -1834,10 +1843,13 @@ async fn finalize_activity_failure(
     activity_id: ActivityExecId,
     error: &str,
 ) -> HarvestResult<()> {
+    let (error_type, non_retryable, human_error) = parse_error_payload(error);
     let failed_event = WorkflowEvent::ActivityFailed {
         activity_id,
-        error: error.to_string(),
+        error: human_error,
         attempt: task_attempt(task),
+        error_type,
+        non_retryable,
     };
 
     conn.transaction::<(), HarvestError, _>(|conn| {
@@ -2145,6 +2157,17 @@ async fn process_activity_task(
         duration_secs,
         status,
     );
+    // Emit the per-failure counter (harvest.activity.failed) with error.type
+    // attribute so operators can slice failure rates by class.
+    if let Err(ref error_payload) = activity_result {
+        let (error_type, non_retryable, _) = parse_error_payload(error_payload);
+        telemetry.metrics.record_activity_failed(
+            activity_name,
+            task.activity_name.as_deref().unwrap_or(""),
+            &error_type,
+            non_retryable,
+        );
+    }
     cancel.cancel();
     drop(activity_future);
 
