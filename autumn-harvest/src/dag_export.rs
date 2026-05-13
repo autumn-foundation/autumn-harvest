@@ -203,8 +203,8 @@ digraph DAG {
         let dag = builder.build().unwrap();
 
         let profiler = DagProfiler::new(dag)
-            .mock_duration("dummy_activity", Duration::from_millis(1000))
-            .mock_duration("dummy_activity2", Duration::from_millis(2000));
+            .mock_duration("dummy_activity", Duration::from_secs(1))
+            .mock_duration("dummy_activity2", Duration::from_secs(2));
 
         let profile = profiler.profile();
         let gantt = export_mermaid_gantt(&profile).unwrap();
