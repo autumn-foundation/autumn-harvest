@@ -41,13 +41,13 @@ pub mod det_check;
 pub mod diagnostic;
 pub mod error;
 pub mod event;
-pub mod failure;
 #[cfg(feature = "db")]
 #[doc(hidden)]
 pub mod execution;
 pub mod executor;
 #[cfg(feature = "db")]
 pub mod external_task;
+pub mod failure;
 /// Deterministic workflow guardrail rule catalog (issue #173).
 pub mod guardrail;
 #[cfg(feature = "db")]

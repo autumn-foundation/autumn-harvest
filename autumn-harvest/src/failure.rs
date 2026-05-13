@@ -220,8 +220,8 @@ mod tests {
 
     #[test]
     fn parse_error_payload_decodes_activity_failure_json() {
-        let payload = ActivityFailure::non_retryable("RateLimit", "too many requests")
-            .into_error_payload();
+        let payload =
+            ActivityFailure::non_retryable("RateLimit", "too many requests").into_error_payload();
         let (error_type, non_retryable, message) = parse_error_payload(&payload);
         assert_eq!(error_type, "RateLimit");
         assert!(non_retryable);

@@ -120,6 +120,10 @@ pub const METRIC_LABEL_ACTIVITY: &str = "activity";
 pub const METRIC_LABEL_QUEUE: &str = "queue";
 /// Metric label: terminal outcome status (e.g. `"completed"`, `"failed"`).
 pub const METRIC_LABEL_STATUS: &str = "status";
+/// Metric label: low-cardinality error class on failed activity records.
+pub const METRIC_LABEL_ERROR_TYPE: &str = "error.type";
+/// Metric label: whether a failure was flagged non-retryable.
+pub const METRIC_LABEL_NON_RETRYABLE: &str = "non_retryable";
 /// Metric label: the shard number.
 pub const METRIC_LABEL_SHARD: &str = "shard";
 /// Metric label: schedule kind (`"dag"` or `"workflow"`).
@@ -391,6 +395,28 @@ pub trait MetricsRecorder: Send + Sync {
         status: ActivityStatus,
     ) {
         let _ = (activity_name, queue, duration_secs, status);
+    }
+
+    /// Variant of [`record_activity_completed`](Self::record_activity_completed)
+    /// that also carries an `error.type` attribute for failed records.
+    ///
+    /// Per ADR-0001 §7, `error.type` must remain a low-cardinality attribute on
+    /// the `harvest.activity.duration` histogram so operators can slice failure
+    /// rates by error class without parsing message strings.
+    ///
+    /// The default body delegates to `record_activity_completed`, dropping the
+    /// `error_type` — existing implementations stay correct without changes.
+    /// Backends that want the slicing should override this method instead.
+    fn record_activity_completed_with_error_type(
+        &self,
+        activity_name: &str,
+        queue: &str,
+        duration_secs: f64,
+        status: ActivityStatus,
+        error_type: Option<&str>,
+    ) {
+        let _ = error_type;
+        self.record_activity_completed(activity_name, queue, duration_secs, status);
     }
 
     /// An activity invocation failed (per-attempt failure record).

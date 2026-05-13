@@ -28,11 +28,11 @@ use crate::context::{
 use crate::dlq::{self, DeadLetterReason, NewDeadLetterEntry};
 use crate::error::{HarvestError, HarvestResult};
 use crate::event::WorkflowEvent;
-use crate::failure::parse_error_payload;
 use crate::executor::{
     WorkflowExecuteSpanMeta, WorkflowOutcome, run_workflow_with_state_and_history_policy,
 };
 use crate::external_task;
+use crate::failure::parse_error_payload;
 use crate::info::{ActivityInfo, WorkflowInfo};
 use crate::models::{
     HarvestTimer, NewHarvestTimer, NewWorkflowExecution, TaskQueueItem, WorkflowExecution,
@@ -924,9 +924,10 @@ fn next_retry_delay(
     }
 
     if let Some(policy) = retry_policy {
-        let is_non_retryable = policy.non_retryable_errors.iter().any(|nr| {
-            nr == &error_type || nr == error
-        });
+        let is_non_retryable = policy
+            .non_retryable_errors
+            .iter()
+            .any(|nr| nr == &error_type || nr == error);
         if is_non_retryable {
             return Ok(None);
         }
@@ -1852,11 +1853,30 @@ async fn finalize_activity_failure(
         non_retryable,
     };
 
+    // Per issue #227: when an activity exhausts retries (or is flagged
+    // non-retryable), route it to the DLQ. The `error` payload here is the
+    // raw serialised form produced by `IntoActivityErrorString` — for
+    // `ActivityFailure` returns it is the full JSON, which preserves
+    // `error_type` and `non_retryable` for downstream inspection. For legacy
+    // `Err(String)` returns it is the raw message.
+    let dlq_entry = NewDeadLetterEntry {
+        original_task_id: task.id,
+        queue_name: task.queue_name.clone(),
+        task_type: task.task_type.clone(),
+        workflow_exec_id: task.workflow_exec_id,
+        activity_name: task.activity_name.clone(),
+        input: task.input.clone(),
+        error: error.to_string(),
+        attempts: task.attempt,
+    };
+
     conn.transaction::<(), HarvestError, _>(|conn| {
         let error = error.to_string();
+        let dlq_entry = dlq_entry.clone();
         async move {
             store::append_events(conn, exec_id, &[failed_event], next_event_id).await?;
             queue::fail_task(conn, task.id, &error).await?;
+            dlq::dead_letter(conn, &dlq_entry).await?;
             queue::wake_workflow_task(conn, exec_id).await
         }
         .scope_boxed()
@@ -2151,21 +2171,27 @@ async fn process_activity_task(
     } else {
         ActivityStatus::Failed
     };
-    telemetry.metrics.record_activity_completed(
+    // Parse the structured payload once and reuse for both the histogram
+    // and the per-failure counter (so the `error.type` attribute is
+    // consistent across `harvest.activity.duration` and
+    // `harvest.activity.failed`).
+    let failure_info = activity_result
+        .as_ref()
+        .err()
+        .map(|payload| parse_error_payload(payload));
+    telemetry.metrics.record_activity_completed_with_error_type(
         activity_name,
         &task.queue_name,
         duration_secs,
         status,
+        failure_info.as_ref().map(|(et, _, _)| et.as_str()),
     );
-    // Emit the per-failure counter (harvest.activity.failed) with error.type
-    // attribute so operators can slice failure rates by class.
-    if let Err(ref error_payload) = activity_result {
-        let (error_type, non_retryable, _) = parse_error_payload(error_payload);
+    if let Some((error_type, non_retryable, _)) = failure_info.as_ref() {
         telemetry.metrics.record_activity_failed(
             activity_name,
             task.activity_name.as_deref().unwrap_or(""),
-            &error_type,
-            non_retryable,
+            error_type,
+            *non_retryable,
         );
     }
     cancel.cancel();

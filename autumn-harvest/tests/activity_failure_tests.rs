@@ -286,8 +286,8 @@ mod replay_tests {
 // Metrics: record_activity_failed counter
 // ---------------------------------------------------------------------------
 
-use std::sync::{Arc, Mutex};
 use autumn_harvest::telemetry::MetricsRecorder;
+use std::sync::{Arc, Mutex};
 
 /// Test recorder that counts `record_activity_failed` invocations.
 #[derive(Default, Clone)]

@@ -8,8 +8,8 @@ pub use crate::builder::{HarvestBuilder, WorkerConfig};
 pub use crate::context::{ActivityContext, WorkflowContext};
 pub use crate::dag::{DagBuildError, DagBuilder, DagDefinition, DagTask, DagTaskRef};
 pub use crate::error::{HarvestError, HarvestResult, TimeoutType};
-pub use crate::failure::{ActivityFailure, IntoActivityErrorString};
 pub use crate::event::WorkflowEvent;
+pub use crate::failure::{ActivityFailure, IntoActivityErrorString};
 #[cfg(feature = "db")]
 pub use crate::handle::{
     StartedWorkflowHandle, WorkflowHandle, WorkflowHandleClient, WorkflowResult,

@@ -82,6 +82,42 @@ fn duration_expr(s: &str) -> TokenStream {
     }
 }
 
+/// Returns `true` when the function's return type is `Result<_, ActivityFailure>`
+/// (with or without a path prefix like `failure::` or `autumn_harvest::failure::`).
+///
+/// Used to opt into the typed-failure encoding without breaking activities
+/// that return `Result<T, String>`, `HarvestResult<T>`, or a custom error
+/// enum.  Users who alias `ActivityFailure` to another name fall back to the
+/// `.to_string()` path — the typed JSON encoding can still be obtained by
+/// calling `.into_error_payload()` manually.
+fn activity_returns_activity_failure(output: &syn::ReturnType) -> bool {
+    let syn::ReturnType::Type(_, ty) = output else {
+        return false;
+    };
+    let syn::Type::Path(type_path) = &**ty else {
+        return false;
+    };
+    let Some(last) = type_path.path.segments.last() else {
+        return false;
+    };
+    if last.ident != "Result" {
+        return false;
+    }
+    let syn::PathArguments::AngleBracketed(args) = &last.arguments else {
+        return false;
+    };
+    // Second generic argument is the error type.
+    let Some(syn::GenericArgument::Type(syn::Type::Path(err_path))) = args.args.iter().nth(1)
+    else {
+        return false;
+    };
+    err_path
+        .path
+        .segments
+        .last()
+        .is_some_and(|seg| seg.ident == "ActivityFailure")
+}
+
 // The function necessarily handles multiple code-gen paths (0/1/N params,
 // 5 optional attribute fields, quote! blocks) — splitting it further would
 // hurt readability more than the length lint helps.
@@ -203,15 +239,31 @@ pub fn activity_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         })
         .collect();
 
-    // Use IntoActivityErrorString::into_error_payload instead of to_string()
-    // so that ActivityFailure errors are serialised as JSON (preserving
-    // error_type and non_retryable), while plain String errors pass through
-    // unchanged.  Type inference selects the right impl at compile time — no
-    // runtime string parsing is needed.
+    // Encode the activity's error.
+    //
+    // Backward-compat: by default we use `.to_string()` (the original
+    // `ToString`-bounded path) so every activity that returns
+    // `Result<T, String>`, `Result<T, HarvestError>`, or a custom
+    // `thiserror` enum continues to compile and behave identically.
+    //
+    // Issue #227: when the user opts into the typed surface by returning
+    // `Result<T, ActivityFailure>` (recognized syntactically below), we
+    // route through `ActivityFailure`'s `IntoActivityErrorString` impl so
+    // the JSON payload carries `error_type` and `non_retryable`.
+    let returns_activity_failure = activity_returns_activity_failure(&input_fn.sig.output);
+    let encode_err = if returns_activity_failure {
+        quote! {
+            |e| ::autumn_harvest::failure::IntoActivityErrorString::into_error_payload(e)
+        }
+    } else {
+        quote! {
+            |e| e.to_string()
+        }
+    };
     let dispatch = if param_names.is_empty() {
         quote! {
             let result = #fn_name(ctx).await;
-            result.map_err(|e| ::autumn_harvest::failure::IntoActivityErrorString::into_error_payload(e))
+            result.map_err(#encode_err)
                 .and_then(|v| {
                     ::autumn_harvest::serde_json::to_value(v)
                         .map_err(|e| e.to_string())
@@ -223,7 +275,7 @@ pub fn activity_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             let #name = ::autumn_harvest::serde_json::from_value(input)
                 .map_err(|e| e.to_string())?;
             let result = #fn_name(ctx, #name).await;
-            result.map_err(|e| ::autumn_harvest::failure::IntoActivityErrorString::into_error_payload(e))
+            result.map_err(#encode_err)
                 .and_then(|v| {
                     ::autumn_harvest::serde_json::to_value(v)
                         .map_err(|e| e.to_string())
@@ -239,7 +291,7 @@ pub fn activity_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     .map_err(|e| e.to_string())?;
             )*
             let result = #fn_name(ctx, #(#names),*).await;
-            result.map_err(|e| ::autumn_harvest::failure::IntoActivityErrorString::into_error_payload(e))
+            result.map_err(#encode_err)
                 .and_then(|v| {
                     ::autumn_harvest::serde_json::to_value(v)
                         .map_err(|e| e.to_string())

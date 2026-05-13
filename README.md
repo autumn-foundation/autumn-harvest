@@ -419,6 +419,86 @@ Or via the management API directly:
 GET /api/harvest/admin/concurrency
 ```
 
+### Activity error handling
+
+Activity handlers can return any error type that implements
+`autumn_harvest::failure::IntoActivityErrorString`. Out of the box that means
+**plain `String`** (the legacy shape — `Err("network down".to_string())`) **and
+`ActivityFailure`** (the typed shape introduced in #227). The macro dispatch
+chooses the right encoding at compile time, so authors never call serialisation
+helpers directly.
+
+```rust
+use autumn_harvest::prelude::*;
+
+#[activity(retry = RetryPolicy::exponential(5, Duration::from_secs(1)))]
+async fn charge_card(ctx: &ActivityContext, amount: u32) -> Result<(), ActivityFailure> {
+    // Transient — let the retry policy keep working.
+    if amount == 0 {
+        return Err(ActivityFailure::retryable(
+            "UpstreamTimeout",
+            "payment gateway timed out",
+        ));
+    }
+    // Permanent — skip remaining retries, route straight to DLQ.
+    if amount > 1_000_000 {
+        return Err(ActivityFailure::non_retryable(
+            "InvalidInput",
+            "amount exceeds per-transaction ceiling",
+        ));
+    }
+    Ok(())
+}
+```
+
+`ActivityFailure` carries four fields:
+
+| Field | Purpose |
+|---|---|
+| `error_type` | Stable, low-cardinality class name (e.g. `"InvalidInput"`, `"RateLimitExceeded"`). Used as the `error.type` attribute on `harvest.activity.duration` and `harvest.activity.failed`, and as the matcher input for `RetryPolicy::non_retryable_errors`. |
+| `message` | Human-readable description. Shown in `Display` output (`"InvalidInput: amount exceeds per-transaction ceiling"`). |
+| `details` | Optional `serde_json::Value` for structured context preserved on the `ActivityFailed` event and the DLQ row. |
+| `non_retryable` | When `true`, the worker skips every remaining retry attempt regardless of `RetryPolicy.max_attempts` and routes the task straight to the DLQ. |
+
+**Resolution order against `RetryPolicy::non_retryable_errors`**:
+
+1. If `ActivityFailure.non_retryable == true`, retries are skipped immediately.
+2. Otherwise the worker compares each entry in `non_retryable_errors` against
+   `error_type` first (structured, stable across log-format changes).
+3. If no `error_type` match, the worker falls back to a full-string match
+   against the raw error payload (legacy back-compat).
+
+So both of these halt retries on the first attempt:
+
+```rust
+// Typed surface (preferred).
+let mut policy = RetryPolicy::exponential(5, Duration::from_secs(1));
+policy.non_retryable_errors = vec!["InvalidInput".into()];
+// Activity returns: ActivityFailure::retryable("InvalidInput", "...")
+// → matched on error_type, no retries.
+
+// Legacy surface (still works).
+let mut policy = RetryPolicy::exponential(5, Duration::from_secs(1));
+policy.non_retryable_errors = vec!["amount exceeds per-transaction ceiling".into()];
+// Activity returns: Err("amount exceeds per-transaction ceiling".to_string())
+// → matched on raw string, no retries.
+```
+
+**Why typed errors?** Hand-formatted error strings drift every time a log
+message is reworded, silently breaking retry policies that depended on exact
+equality. The same drift makes operators do regex queries over
+`harvest_events.event_data->>'error'` to compute failure-class breakdowns.
+Lifting the class into a typed field (`error_type`) — the same shape Temporal,
+Cadence, and DBOS use — keeps retry policy stable across refactors and lets
+the `harvest.activity.failed{workflow.type="...", error.type="..."}` counter
+answer "what's the dominant failure class right now?" in one PromQL query.
+
+**Backward compatibility.** Every activity returning `Err(String)` continues to
+work unchanged: the engine wraps it as `ActivityFailure { error_type: "Error",
+non_retryable: false, .. }`, so existing dashboards see `error.type=Error`
+without code changes. Pre-#227 `ActivityFailed` events stored in the DB
+deserialise via `serde(default)` on the new fields — no migration is needed.
+
 ### Activity idempotency keys
 
 Harvest activities are **at-least-once**. A worker crash, a `start_to_close`
