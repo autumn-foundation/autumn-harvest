@@ -127,6 +127,21 @@ impl RetryPolicy {
             attempt,
         ))
     }
+
+    /// Returns `true` when a failure should skip remaining retries because it
+    /// matches an entry in [`non_retryable_errors`](Self::non_retryable_errors).
+    ///
+    /// Resolution order (per issue #227):
+    /// 1. Match `error_type` first — the structured class on `ActivityFailure`,
+    ///    stable across log-format changes.
+    /// 2. Fall back to a full-string match on the raw error payload — the
+    ///    legacy back-compat path for activities returning `Err(String)`.
+    #[must_use]
+    pub fn is_non_retryable(&self, error_type: &str, raw_error: &str) -> bool {
+        self.non_retryable_errors
+            .iter()
+            .any(|nr| nr == error_type || nr == raw_error)
+    }
 }
 
 impl Default for RetryPolicy {

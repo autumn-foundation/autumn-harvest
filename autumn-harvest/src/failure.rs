@@ -122,19 +122,44 @@ impl IntoActivityErrorString for String {
 
 impl IntoActivityErrorString for ActivityFailure {
     fn into_error_payload(self) -> String {
-        serde_json::to_string(&self).unwrap_or_else(|_| self.to_string())
+        // ActivityFailure has no maps with non-string keys, so to_string never
+        // fails — but if it ever does, fall back to the Display string of the
+        // inner failure rather than panicking on the worker hot path.
+        let fallback = self.to_string();
+        serde_json::to_string(&WirePayload::ActivityFailureV1(self)).unwrap_or(fallback)
     }
+}
+
+/// Wire-format envelope for `ActivityFailure` payloads.
+///
+/// The explicit `harvest_activity_failure_v1` discriminator (`#[serde(tag)]`
+/// via an enum variant name) prevents collision with legacy activities that
+/// happen to return JSON-shaped error strings. Only payloads emitted by
+/// `IntoActivityErrorString` are routed through the typed path; every other
+/// string — even one that looks like an `ActivityFailure` JSON object —
+/// stays on the legacy `error_type = "Error"`, `non_retryable = false`
+/// fallback.
+///
+/// `v1` leaves room to add a `v2` variant without breaking stored events.
+#[derive(serde::Serialize, serde::Deserialize)]
+enum WirePayload {
+    #[serde(rename = "harvest_activity_failure_v1")]
+    ActivityFailureV1(ActivityFailure),
 }
 
 /// Parse an error payload string, returning `(error_type, non_retryable,
 /// human_readable_message)`.
 ///
-/// If the payload is valid `ActivityFailure` JSON it is decoded; otherwise the
-/// legacy fallback of `error_type = "Error"` and `non_retryable = false` is
-/// used, and the payload is returned as-is for the human-readable field.
+/// If the payload is a well-formed wire envelope produced by
+/// [`IntoActivityErrorString`], decode it. Any other string — including
+/// JSON that happens to share `ActivityFailure`'s field shape — is treated
+/// as a legacy payload: `error_type = "Error"`, `non_retryable = false`,
+/// and the human-readable message is the payload verbatim.
 #[must_use]
 pub fn parse_error_payload(payload: &str) -> (String, bool, String) {
-    if let Ok(failure) = serde_json::from_str::<ActivityFailure>(payload) {
+    if let Ok(WirePayload::ActivityFailureV1(failure)) =
+        serde_json::from_str::<WirePayload>(payload)
+    {
         (failure.error_type, failure.non_retryable, failure.message)
     } else {
         ("Error".to_string(), false, payload.to_string())
@@ -209,13 +234,30 @@ mod tests {
     }
 
     #[test]
-    fn into_error_payload_for_activity_failure_is_json() {
+    fn into_error_payload_for_activity_failure_is_versioned_envelope() {
         let f = ActivityFailure::non_retryable("X", "y");
         let payload = f.into_error_payload();
-        // Should round-trip back to ActivityFailure
-        let back: ActivityFailure = serde_json::from_str(&payload).unwrap();
-        assert_eq!(back.error_type, "X");
-        assert!(back.non_retryable);
+        // The wire format carries an explicit discriminator so legacy
+        // JSON-shaped error strings can never be misread as a typed failure.
+        assert!(payload.contains("harvest_activity_failure_v1"));
+        // And it round-trips through `parse_error_payload`.
+        let (error_type, non_retryable, _) = parse_error_payload(&payload);
+        assert_eq!(error_type, "X");
+        assert!(non_retryable);
+    }
+
+    #[test]
+    fn parse_error_payload_rejects_legacy_activity_failure_shaped_json() {
+        // A pre-#227 activity could return a JSON string that happens to share
+        // the `ActivityFailure` field shape. Without the wire-format
+        // discriminator we would silently treat it as a typed failure and
+        // (possibly) skip retries; with the discriminator it stays on the
+        // legacy fallback.
+        let look_alike = r#"{"error_type":"InvalidInput","message":"x","non_retryable":true}"#;
+        let (error_type, non_retryable, message) = parse_error_payload(look_alike);
+        assert_eq!(error_type, "Error");
+        assert!(!non_retryable);
+        assert_eq!(message, look_alike);
     }
 
     #[test]

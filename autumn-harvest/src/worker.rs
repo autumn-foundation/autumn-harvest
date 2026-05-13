@@ -915,20 +915,13 @@ fn next_retry_delay(
     retry_policy: Option<&RetryPolicy>,
 ) -> HarvestResult<Option<chrono::Duration>> {
     // Structured failure: honour the non_retryable flag immediately.
-    // Resolution order for non_retryable_errors:
-    //   1. match error_type (structured path, stable across message changes)
-    //   2. match full error string (legacy exact-match, back-compat)
     let (error_type, non_retryable, _) = parse_error_payload(error);
     if non_retryable {
         return Ok(None);
     }
 
     if let Some(policy) = retry_policy {
-        let is_non_retryable = policy
-            .non_retryable_errors
-            .iter()
-            .any(|nr| nr == &error_type || nr == error);
-        if is_non_retryable {
+        if policy.is_non_retryable(&error_type, error) {
             return Ok(None);
         }
 
@@ -2188,12 +2181,14 @@ async fn process_activity_task(
         failure_info.as_ref().map(|(et, _, _)| et.as_str()),
     );
     if let Some((error_type, non_retryable, _)) = failure_info.as_ref() {
-        telemetry.metrics.record_activity_failed(
-            activity_name,
-            task.activity_name.as_deref().unwrap_or(""),
-            error_type,
-            *non_retryable,
-        );
+        // `workflow.type` is intentionally empty here: looking it up requires
+        // an extra `harvest_workflow_executions` query per failure, and the
+        // `MetricsRecorder` trait docs explicitly allow an empty string when
+        // the workflow type is unknown at the call site. Plumbing it through
+        // is tracked as a follow-up.
+        telemetry
+            .metrics
+            .record_activity_failed(activity_name, "", error_type, *non_retryable);
     }
     cancel.cancel();
     drop(activity_future);

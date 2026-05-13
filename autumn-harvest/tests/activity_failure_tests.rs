@@ -81,12 +81,16 @@ fn string_passthrough() {
 }
 
 #[test]
-fn activity_failure_serialized_to_json() {
+fn activity_failure_payload_carries_versioned_discriminator() {
     let f = ActivityFailure::non_retryable("RateLimit", "too many requests");
     let payload = f.into_error_payload();
-    let back: ActivityFailure = serde_json::from_str(&payload).unwrap();
-    assert_eq!(back.error_type, "RateLimit");
-    assert!(back.non_retryable);
+    // Wire format is wrapped in `harvest_activity_failure_v1` so it can
+    // never collide with a legacy activity that happens to return a JSON-
+    // shaped error string. Use `parse_error_payload` to recover the fields.
+    assert!(payload.contains("harvest_activity_failure_v1"));
+    let (error_type, non_retryable, _) = parse_error_payload(&payload);
+    assert_eq!(error_type, "RateLimit");
+    assert!(non_retryable);
 }
 
 // ---------------------------------------------------------------------------

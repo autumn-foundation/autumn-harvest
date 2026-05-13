@@ -1180,11 +1180,7 @@ async fn execute_dag_task<'a>(
             return TaskStatus::Failed;
         };
 
-        let is_non_retryable = policy
-            .non_retryable_errors
-            .iter()
-            .any(|nr| nr == &error_type || nr == &error);
-        if is_non_retryable {
+        if policy.is_non_retryable(&error_type, &error) {
             return TaskStatus::Failed;
         }
 
