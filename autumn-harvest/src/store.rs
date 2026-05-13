@@ -220,7 +220,10 @@ pub async fn append_single_event(
         .await
         .map_err(crate::error::database_error)?;
 
-    let next_id = max_id.map_or(0, |id| id.saturating_add(1));
+    let next_id = max_id.map_or(Ok(0), |id| {
+        id.checked_add(1)
+            .ok_or_else(|| crate::error::HarvestError::Database("Event ID overflow".to_string()))
+    })?;
     append_events(conn, exec_id, &[event], next_id).await?;
     Ok(())
 }
@@ -284,7 +287,11 @@ pub async fn admit_update_event(
                 .await
                 .map_err(crate::error::database_error)?;
 
-            let next_id = max_id.map_or(0, |id| id.saturating_add(1));
+            let next_id = max_id.map_or(Ok(0), |id| {
+                id.checked_add(1).ok_or_else(|| {
+                    crate::error::HarvestError::Database("Event ID overflow".to_string())
+                })
+            })?;
             let event = WorkflowEvent::UpdateAdmitted {
                 update_id,
                 name,
@@ -337,7 +344,11 @@ pub async fn load_history_with_codecs(
         .await
         .map_err(crate::error::database_error)?;
 
-    let next_event_id = rows.last().map_or(0, |r| r.event_id.saturating_add(1));
+    let next_event_id = rows.last().map_or(Ok(0), |r| {
+        r.event_id
+            .checked_add(1)
+            .ok_or_else(|| crate::error::HarvestError::Database("Event ID overflow".to_string()))
+    })?;
 
     let events = rows
         .into_iter()
@@ -519,6 +530,31 @@ mod tests {
     use crate::event::WorkflowEvent;
     use crate::types::{ActivityExecId, ExecutionId};
     use chrono::Utc;
+
+    #[test]
+    fn event_id_overflow_yields_database_error() {
+        let exec_id = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: serde_json::Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: ActivityExecId::new(),
+                name: "send_email".into(),
+                input: serde_json::Value::Null,
+                queue: "default".into(),
+            },
+        ];
+
+        let err = events_to_insert_rows_from(exec_id, &events, i32::MAX).unwrap_err();
+        match err {
+            crate::error::HarvestError::Database(msg) => {
+                assert!(msg.contains("Event ID overflow"));
+            }
+            _ => panic!("Expected Database error"),
+        }
+    }
 
     #[test]
     fn stored_event_has_sequential_event_id() {
