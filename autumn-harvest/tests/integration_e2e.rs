@@ -77,6 +77,8 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260508010000_harvest_workers_drain_deadline/up.sql"),
     "\n",
     include_str!("../migrations/20260509000000_harvest_build_routing/up.sql"),
+    "\n",
+    include_str!("../migrations/20260513000000_harvest_schedule_pause_metadata/up.sql"),
 );
 
 /// The minimal "legacy" migration set used by the upgrade-path regression
@@ -104,8 +106,6 @@ const LEGACY_INIT_SQL: &str = concat!(
     include_str!("../migrations/20260501000000_harvest_workers/up.sql"),
     "\n",
     include_str!("../migrations/20260509000000_harvest_build_routing/up.sql"),
-    "\n",
-    include_str!("../migrations/20260513000000_harvest_schedule_pause_metadata/up.sql"),
 );
 
 /// Start a Postgres container with the harvest schema applied and return

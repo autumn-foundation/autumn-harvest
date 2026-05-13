@@ -15,9 +15,7 @@ curl -X POST https://<host>/api/harvest/admin/schedules/<uuid>/pause \
 
 # Resume when the incident is resolved
 curl -X POST https://<host>/api/harvest/admin/schedules/<uuid>/resume \
-     -H 'Content-Type: application/json' \
-     -H 'X-Harvest-Actor: ops-team' \
-     -d '{"reason": "downstream API recovered"}'
+     -H 'X-Harvest-Actor: ops-team'
 
 # Inspect pause state
 curl https://<host>/api/harvest/admin/schedules/<uuid>
@@ -51,17 +49,27 @@ claimed by a worker — those tasks run to completion normally.
 
 - Clears `is_paused`, `paused_at`, `paused_by`, and `pause_reason` (all set to
   `NULL`/`false`).
-- The schedule resumes firing on its next natural tick based on its cron or
-  interval expression; the scheduler does not retroactively fire ticks that
-  were skipped during the pause window.
+- For `catchup = false` schedules: the schedule resumes from the next natural
+  tick after the resume time. Ticks that fell due while the schedule was paused
+  are skipped and not replayed.
+- For `catchup = true` schedules: the scheduler's normal catchup mechanism
+  applies. On the first tick after resume, the scheduler will dispatch all
+  missed slots between the stale `next_run_at` value and the current time.
+  **If your schedule has `catchup = true` and you do not want a backlog of
+  missed runs to fire on resume**, advance `next_run_at` manually or use the
+  backfill endpoint with `include_paused = false` to selectively replay only
+  the specific windows you need.
 
-### No backfill on resume (default)
+### No explicit backfill on resume
 
-By default, **resume does not backfill missed ticks** that occurred while the
-schedule was paused. The scheduler simply resumes from the next due tick after
-the resume time.
+The resume endpoint does not add an explicit backfill action. Whether missed
+ticks are dispatched depends entirely on the schedule's `catchup` setting:
 
-If you need to recover missed runs, use the backfill endpoint (issue #177):
+- `catchup = false` (default): missed ticks are silently dropped.
+- `catchup = true`: the standard catchup path runs on the next scheduler tick.
+
+If you need to recover specific missed runs on a `catchup = false` schedule,
+use the backfill endpoint (issue #177):
 
 ```bash
 curl -X POST https://<host>/api/harvest/admin/schedules/<uuid>/backfill \
@@ -85,8 +93,12 @@ This makes both operations safe to retry.
 
 Every pause and resume action is recorded in `harvest_audit_log` with the
 operation (`schedule.pause` or `schedule.resume`), the actor, and the schedule
-UUID as `target_id`. The `pause_reason` is additionally stored directly on the
-`harvest_schedules` row and returned by the GET endpoints.
+UUID as `target_id`.
+
+The optional `reason` field in the pause request body is stored as
+`pause_reason` directly on the `harvest_schedules` row and returned by the GET
+endpoints. There is no equivalent `reason` field for resume: `pause_reason` is
+cleared to `NULL` on resume, and the audit log does not carry free-text notes.
 
 ### Multi-shard deployments
 

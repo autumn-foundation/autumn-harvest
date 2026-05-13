@@ -2170,13 +2170,7 @@
       "request_body": {
         "required": false,
         "free_form": false,
-        "fields": [
-          {
-            "name": "reason",
-            "required": false,
-            "description": "Optional free-text reason recorded in the audit trail."
-          }
-        ]
+        "fields": []
       },
       "success_response": {
         "status": 200,
