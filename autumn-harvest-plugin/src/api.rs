@@ -5050,10 +5050,7 @@ async fn schedule_backfill(
                 };
                 let workflow_id = scheduled_workflow_id_pub(&dag_name, *scheduled_for);
                 let exec_id = autumn_harvest::types::ExecutionId::new_for_shard(shard_id);
-                let dag_queue = schedule
-                    .queue_name
-                    .as_deref()
-                    .unwrap_or("default");
+                let dag_queue = schedule.queue_name.as_deref().unwrap_or("default");
                 let start_result = start_or_load_workflow_execution(
                     &mut conn,
                     StartWorkflowParams {
