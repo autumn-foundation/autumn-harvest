@@ -623,6 +623,7 @@ mod db {
     }
 
     #[allow(clippy::too_many_lines)]
+    #[allow(clippy::cognitive_complexity)]
     async fn process_job(
         pool: &ShardedDbPool,
         owning_shard_pool: &DbPool,

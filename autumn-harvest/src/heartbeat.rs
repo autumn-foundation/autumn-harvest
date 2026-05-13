@@ -72,32 +72,35 @@ async fn heartbeat_loop(
 
         // If we got at least one heartbeat, flush to DB.
         if let Some(payload) = latest {
-            match pool.get().await {
-                Ok(mut conn) => {
-                    if let Err(e) =
-                        crate::queue::record_heartbeat(&mut conn, task_id, payload).await
-                    {
-                        tracing::warn!(
-                            task_id = %task_id,
-                            error = %e,
-                            "failed to flush heartbeat to database"
-                        );
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        task_id = %task_id,
-                        error = %e,
-                        "failed to acquire DB connection for heartbeat flush"
-                    );
-                }
-            }
+            flush_heartbeat(&pool, task_id, payload).await;
         }
 
         // Check cancellation after flush.
         if cancel.is_cancelled() {
             break;
         }
+    }
+}
+
+async fn flush_heartbeat(pool: &Pool<AsyncPgConnection>, task_id: Uuid, payload: Value) {
+    let mut conn = match pool.get().await {
+        Ok(conn) => conn,
+        Err(e) => {
+            tracing::warn!(
+                task_id = %task_id,
+                error = %e,
+                "failed to acquire DB connection for heartbeat flush"
+            );
+            return;
+        }
+    };
+
+    if let Err(e) = crate::queue::record_heartbeat(&mut conn, task_id, payload).await {
+        tracing::warn!(
+            task_id = %task_id,
+            error = %e,
+            "failed to flush heartbeat to database"
+        );
     }
 }
 

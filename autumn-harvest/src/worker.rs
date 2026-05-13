@@ -2843,6 +2843,7 @@ async fn fail_workflow_for_history_cap(
 }
 
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::cognitive_complexity)]
 async fn process_workflow_task(
     conn: &mut AsyncPgConnection,
     registry: &HandlerRegistry,
@@ -3455,6 +3456,7 @@ impl Worker {
     ///
     /// This lets callers separate listener startup from task polling when they
     /// need tighter control over startup sequencing.
+    #[allow(clippy::cognitive_complexity)]
     pub async fn run_with_listener(
         &self,
         pool: &DbPool,
@@ -3635,6 +3637,7 @@ impl Worker {
         }
     }
 
+    #[allow(clippy::cognitive_complexity)]
     async fn shutdown_and_cleanup(
         &self,
         heartbeat_handle: tokio::task::JoinHandle<()>,
@@ -3680,6 +3683,7 @@ impl Worker {
     }
 
     /// Register or re-register this worker in the fleet table.
+    #[allow(clippy::cognitive_complexity)]
     async fn register_in_fleet(&self, pool: &DbPool) {
         let shard_ids: Vec<i32> = self
             .config
@@ -3763,6 +3767,7 @@ impl Worker {
     ///
     /// Gets a connection from the pool, tries to claim a task, dispatches it
     /// if found, or sleeps for `poll_interval` if the queue was empty.
+    #[allow(clippy::cognitive_complexity)]
     async fn poll_once(&self, pool: &DbPool) -> bool {
         let mut conn = match pool.get().await {
             Ok(conn) => conn,

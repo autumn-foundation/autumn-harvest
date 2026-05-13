@@ -905,6 +905,7 @@ async fn tick_workflow_schedules(
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(clippy::cognitive_complexity)]
 async fn tick_one_workflow_schedule(
     conn: &mut AsyncPgConnection,
     wf_name: &str,
