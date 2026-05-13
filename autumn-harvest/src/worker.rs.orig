@@ -2920,50 +2920,6 @@ async fn fail_workflow_for_history_cap(
 }
 
 #[allow(clippy::too_many_lines)]
-fn emit_workflow_task_telemetry(
-    prepared: &PreparedWorkflowTask,
-    task: &TaskQueueItem,
-    telemetry: &Arc<crate::telemetry::TelemetryConfig>,
-) {
-    for timer_id in &prepared.timers_fired {
-        tracing::info_span!(
-            "harvest.timer.fire",
-            "otel.kind" = "internal",
-            { ATTR_EXECUTION_ID } = %prepared.exec_id,
-            timer.id = %timer_id,
-        )
-        .in_scope(|| {});
-    }
-    for signal_name in &prepared.signals_delivered {
-        tracing::info_span!(
-            "harvest.signal.deliver",
-            "otel.kind" = "consumer",
-            { ATTR_WORKFLOW_ID } = prepared.execution.workflow_name.as_str(),
-            { ATTR_EXECUTION_ID } = %prepared.exec_id,
-            signal.name = signal_name.as_str(),
-        )
-        .in_scope(|| {});
-    }
-
-    let has_scheduling_events = prepared.history_events.iter().any(|e| {
-        matches!(
-            e,
-            WorkflowEvent::ActivityScheduled { .. }
-                | WorkflowEvent::TimerStarted { .. }
-                | WorkflowEvent::ChildWorkflowStarted { .. }
-                | WorkflowEvent::LocalActivityScheduled { .. }
-                | WorkflowEvent::ActivityAwaitingExternal { .. }
-                | WorkflowEvent::MarkerRecorded { .. }
-        )
-    });
-    if task.attempt == 1 && !has_scheduling_events {
-        telemetry
-            .metrics
-            .record_workflow_started(&prepared.execution.workflow_name, &task.queue_name);
-    }
-}
-
-#[allow(clippy::too_many_lines)]
 async fn process_workflow_task(
     conn: &mut AsyncPgConnection,
     registry: &HandlerRegistry,
@@ -2988,7 +2944,59 @@ async fn process_workflow_task(
         .as_ref()
         .and_then(TraceContextCarrier::from_json);
 
-    emit_workflow_task_telemetry(&prepared, task, &telemetry);
+    // ADR-0001 §2.6 + §2.7: emit harvest.signal.deliver and harvest.timer.fire
+    // spans here, after the trace context is restored, so they are correlated
+    // with the workflow execution trace rather than being orphaned.
+    // EnteredSpan is !Send; .in_scope() drops it before any subsequent .await.
+    // ADR-0001 §2.7: one span per fired timer.
+    for timer_id in &prepared.timers_fired {
+        tracing::info_span!(
+            "harvest.timer.fire",
+            "otel.kind" = "internal",
+            { ATTR_EXECUTION_ID } = %prepared.exec_id,
+            timer.id = %timer_id,
+        )
+        .in_scope(|| {});
+    }
+    for signal_name in &prepared.signals_delivered {
+        tracing::info_span!(
+            "harvest.signal.deliver",
+            "otel.kind" = "consumer",
+            { ATTR_WORKFLOW_ID } = prepared.execution.workflow_name.as_str(),
+            { ATTR_EXECUTION_ID } = %prepared.exec_id,
+            signal.name = signal_name.as_str(),
+        )
+        .in_scope(|| {});
+    }
+
+    // Emit workflow.started exactly once per execution.  Two independent
+    // conditions must both hold:
+    //
+    // 1. task.attempt == 1: the task queue has never dispatched this execution
+    //    before (attempt starts at 0 and is incremented to 1 on first claim;
+    //    signal-resume paths increment it again on re-claim).
+    //
+    // 2. No scheduling events in history: guards against counting replayed
+    //    first-dispatch tasks that already committed scheduling work.
+    //    load_workflow_replay_state prepends SignalReceived/TimerFired for
+    //    pending signals and fired timers, so checking raw length alone is
+    //    unreliable for brand-new workflows.
+    let has_scheduling_events = prepared.history_events.iter().any(|e| {
+        matches!(
+            e,
+            WorkflowEvent::ActivityScheduled { .. }
+                | WorkflowEvent::TimerStarted { .. }
+                | WorkflowEvent::ChildWorkflowStarted { .. }
+                | WorkflowEvent::LocalActivityScheduled { .. }
+                | WorkflowEvent::ActivityAwaitingExternal { .. }
+                | WorkflowEvent::MarkerRecorded { .. }
+        )
+    });
+    if task.attempt == 1 && !has_scheduling_events {
+        telemetry
+            .metrics
+            .record_workflow_started(&prepared.execution.workflow_name, &task.queue_name);
+    }
     let started_at = std::time::Instant::now();
 
     // Drive the workflow in a loop so that local activities can be executed
@@ -3529,7 +3537,11 @@ impl Worker {
         pool: &DbPool,
         listener: Option<crate::notify::QueueListener>,
     ) {
-        self.log_worker_event("worker starting", Some(&self.config.queues));
+        tracing::info!(
+            worker_id = %self.config.worker_id,
+            queues = ?self.config.queues,
+            "worker starting"
+        );
 
         // Register this worker in the fleet table.
         self.register_in_fleet(pool).await;
@@ -3540,13 +3552,13 @@ impl Worker {
 
         self.run_poll_loop(pool, listener).await;
 
-        self.log_worker_event("shutdown signal received", None);
+        tracing::info!(worker_id = %self.config.worker_id, "shutdown signal received");
 
         // Transition to Draining before waiting for in-flight tasks.
         self.transition_fleet_status(pool, crate::workers::WorkerStatus::Draining)
             .await;
 
-        self.log_worker_event("draining in-flight tasks", None);
+        tracing::info!(worker_id = %self.config.worker_id, "draining in-flight tasks");
         self.drain_in_flight().await;
 
         // All tasks complete — mark Stopped, then stop the heartbeat task.
@@ -3556,22 +3568,7 @@ impl Worker {
 
         self.shutdown_and_cleanup(heartbeat_handle, monitors).await;
 
-        self.log_worker_event("worker stopped", None);
-    }
-
-    fn log_worker_event(&self, message: &str, queues: Option<&Vec<String>>) {
-        if let Some(q) = queues {
-            tracing::info!(
-                worker_id = %self.config.worker_id,
-                queues = ?q,
-                "{message}"
-            );
-        } else {
-            tracing::info!(
-                worker_id = %self.config.worker_id,
-                "{message}"
-            );
-        }
+        tracing::info!(worker_id = %self.config.worker_id, "worker stopped");
     }
 
     fn spawn_monitoring_tasks(&self, pool: &DbPool) -> WorkerMonitoringHandles {
@@ -3721,30 +3718,42 @@ impl Worker {
         monitors: WorkerMonitoringHandles,
     ) {
         if let Err(error) = heartbeat_handle.await {
-            self.log_shutdown_error(&error, "worker heartbeat task failed during shutdown");
+            tracing::warn!(
+                worker_id = %self.config.worker_id,
+                error = %error,
+                "worker heartbeat task failed during shutdown"
+            );
         }
         if let Err(error) = monitors.timeout_checker.await {
-            self.log_shutdown_error(&error, "timeout checker task failed during shutdown");
+            tracing::warn!(
+                worker_id = %self.config.worker_id,
+                error = %error,
+                "timeout checker task failed during shutdown"
+            );
         }
         if let Err(error) = monitors.queue_depth_sampler.await {
-            self.log_shutdown_error(&error, "queue depth sampler failed during shutdown");
+            tracing::warn!(
+                worker_id = %self.config.worker_id,
+                error = %error,
+                "queue depth sampler failed during shutdown"
+            );
         }
         if let Err(error) = monitors.concurrency_sampler.await {
-            self.log_shutdown_error(&error, "concurrency sampler failed during shutdown");
+            tracing::warn!(
+                worker_id = %self.config.worker_id,
+                error = %error,
+                "concurrency sampler failed during shutdown"
+            );
         }
         for sampler in monitors.dlq_depth_samplers {
             if let Err(error) = sampler.await {
-                self.log_shutdown_error(&error, "dlq depth sampler failed during shutdown");
+                tracing::warn!(
+                    worker_id = %self.config.worker_id,
+                    error = %error,
+                    "dlq depth sampler failed during shutdown"
+                );
             }
         }
-    }
-
-    fn log_shutdown_error(&self, error: &tokio::task::JoinError, message: &str) {
-        tracing::warn!(
-            worker_id = %self.config.worker_id,
-            error = %error,
-            "{message}"
-        );
     }
 
     /// Register or re-register this worker in the fleet table.
@@ -3762,44 +3771,43 @@ impl Worker {
         let host = crate::workers::local_hostname();
         let version = env!("CARGO_PKG_VERSION");
 
-        let mut conn = match pool.get().await {
-            Ok(conn) => conn,
-            Err(error) => {
-                self.log_fleet_error(&error.to_string(), "failed to get pool connection for fleet registration");
-                return;
+        match pool.get().await {
+            Ok(mut conn) => {
+                if let Err(error) = crate::workers::register_worker(
+                    &mut conn,
+                    &self.config.worker_id,
+                    &self.config.queues,
+                    &shard_ids,
+                    max_concurrency,
+                    &host,
+                    Some(version),
+                    &self.config.build_id,
+                    self.config.deployment_name.as_deref(),
+                )
+                .await
+                {
+                    tracing::warn!(
+                        worker_id = %self.config.worker_id,
+                        error = %error,
+                        "failed to register worker in fleet table; continuing without fleet registration"
+                    );
+                } else {
+                    tracing::info!(
+                        worker_id = %self.config.worker_id,
+                        host = %host,
+                        max_concurrency,
+                        "worker registered in fleet"
+                    );
+                }
             }
-        };
-
-        if let Err(error) = crate::workers::register_worker(
-            &mut conn,
-            &self.config.worker_id,
-            &self.config.queues,
-            &shard_ids,
-            max_concurrency,
-            &host,
-            Some(version),
-            &self.config.build_id,
-            self.config.deployment_name.as_deref(),
-        )
-        .await
-        {
-            self.log_fleet_error(&error.to_string(), "failed to register worker in fleet table; continuing without fleet registration");
-        } else {
-            tracing::info!(
-                worker_id = %self.config.worker_id,
-                host = %host,
-                max_concurrency,
-                "worker registered in fleet"
-            );
+            Err(error) => {
+                tracing::warn!(
+                    worker_id = %self.config.worker_id,
+                    error = %error,
+                    "failed to get pool connection for fleet registration"
+                );
+            }
         }
-    }
-
-    fn log_fleet_error(&self, error: &str, message: &str) {
-        tracing::warn!(
-            worker_id = %self.config.worker_id,
-            error = %error,
-            "{message}"
-        );
     }
 
     /// Transition this worker's status in the fleet table.
@@ -3850,7 +3858,12 @@ impl Worker {
         .await
         {
             Ok(Some(task)) => {
-                Self::log_claimed_task(&task);
+                tracing::debug!(
+                    task_id = %task.id,
+                    task_type = %task.task_type,
+                    queue = %task.queue_name,
+                    "claimed task"
+                );
                 self.dispatch_task(task, pool);
                 true
             }
@@ -3860,15 +3873,6 @@ impl Worker {
                 false
             }
         }
-    }
-
-    fn log_claimed_task(task: &TaskQueueItem) {
-        tracing::debug!(
-            task_id = %task.id,
-            task_type = %task.task_type,
-            queue = %task.queue_name,
-            "claimed task"
-        );
     }
 
     /// Spawn a bounded Tokio task for the claimed work item.

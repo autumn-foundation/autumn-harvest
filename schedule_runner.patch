@@ -1,0 +1,30 @@
+--- autumn-harvest-plugin/src/api.rs
++++ autumn-harvest-plugin/src/api.rs
+@@ -5488,2 +5488,3 @@
+
++#[allow(clippy::too_many_arguments)]
+ async fn write_audit(
+--- autumn-harvest-plugin/src/plugin.rs
++++ autumn-harvest-plugin/src/plugin.rs
+@@ -444,3 +444,3 @@
+     label: &str,
+-) -> autumn_web::AutumnResult<()> {
++) {
+     match autumn_web::migrate::pending_migrations(database_url, migrations) {
+@@ -463,4 +463,2 @@
+     }
+-
+-    Ok(())
+ }
+@@ -417,3 +415,4 @@
+     } else {
+-        check_production_migrations(database_url, migrations, label)
++        check_production_migrations(database_url, migrations, label);
++        Ok(())
+     }
+--- autumn-harvest-plugin/src/runner.rs
++++ autumn-harvest-plugin/src/runner.rs
+@@ -309,2 +309,3 @@
+
++    #[allow(clippy::cognitive_complexity)]
+     pub async fn stop(self) {

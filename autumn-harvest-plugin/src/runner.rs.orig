@@ -307,7 +307,6 @@ impl HarvestRunner {
     }
 
     /// Stop any locally owned worker and scheduler tasks.
-    #[allow(clippy::cognitive_complexity)]
     pub async fn stop(self) {
         let Self {
             api_runtime: _,

@@ -1,0 +1,16 @@
+--- autumn-harvest-plugin/src/api.rs
++++ autumn-harvest-plugin/src/api.rs
+@@ -87,2 +87,3 @@
+ };
++use autumn_harvest::TraceContextCarrier;
+
+@@ -4048,3 +4049,3 @@
+ async fn log_failed_workflow_start(
+-    pool: &autumn_harvest::DbPool,
++    pool: &DbPool,
+     actor: &str,
+@@ -4072,3 +4073,3 @@
+     queue_name: &str,
+-    runtime: &crate::runner::RuntimeState,
++    runtime: &HarvestApiRuntime,
+ ) -> Option<TraceContextCarrier> {

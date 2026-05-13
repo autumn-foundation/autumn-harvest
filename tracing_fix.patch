@@ -1,0 +1,167 @@
+--- autumn-harvest/src/worker.rs
++++ autumn-harvest/src/worker.rs
+@@ -3527,10 +3527,2 @@
+     ) {
+-        tracing::info!(
+-            worker_id = %self.config.worker_id,
+-            queues = ?self.config.queues,
+-            "worker starting"
+-        );
+-
++        self.log_worker_event("worker starting", Some(&self.config.queues));
+         // Register this worker in the fleet table.
+@@ -3542,3 +3534,3 @@
+
+-        tracing::info!(worker_id = %self.config.worker_id, "shutdown signal received");
++        self.log_worker_event("shutdown signal received", None);
+
+@@ -3548,3 +3540,3 @@
+
+-        tracing::info!(worker_id = %self.config.worker_id, "draining in-flight tasks");
++        self.log_worker_event("draining in-flight tasks", None);
+         self.drain_in_flight().await;
+@@ -3557,4 +3549,18 @@
+
+-        tracing::info!(worker_id = %self.config.worker_id, "worker stopped");
++        self.log_worker_event("worker stopped", None);
+     }
++
++    fn log_worker_event(&self, message: &str, queues: Option<&Vec<String>>) {
++        if let Some(q) = queues {
++            tracing::info!(
++                worker_id = %self.config.worker_id,
++                queues = ?q,
++                "{message}"
++            );
++        } else {
++            tracing::info!(
++                worker_id = %self.config.worker_id,
++                "{message}"
++            );
++        }
++    }
+@@ -3709,33 +3715,19 @@
+     ) {
+         if let Err(error) = heartbeat_handle.await {
+-            tracing::warn!(
+-                worker_id = %self.config.worker_id,
+-                error = %error,
+-                "worker heartbeat task failed during shutdown"
+-            );
++            self.log_shutdown_error(&error, "worker heartbeat task failed during shutdown");
+         }
+         if let Err(error) = monitors.timeout_checker.await {
+-            tracing::warn!(
+-                worker_id = %self.config.worker_id,
+-                error = %error,
+-                "timeout checker task failed during shutdown"
+-            );
++            self.log_shutdown_error(&error, "timeout checker task failed during shutdown");
+         }
+         if let Err(error) = monitors.queue_depth_sampler.await {
+-            tracing::warn!(
+-                worker_id = %self.config.worker_id,
+-                error = %error,
+-                "queue depth sampler failed during shutdown"
+-            );
++            self.log_shutdown_error(&error, "queue depth sampler failed during shutdown");
+         }
+         if let Err(error) = monitors.concurrency_sampler.await {
+-            tracing::warn!(
+-                worker_id = %self.config.worker_id,
+-                error = %error,
+-                "concurrency sampler failed during shutdown"
+-            );
++            self.log_shutdown_error(&error, "concurrency sampler failed during shutdown");
+         }
+         for sampler in monitors.dlq_depth_samplers {
+             if let Err(error) = sampler.await {
+-                tracing::warn!(
+-                    worker_id = %self.config.worker_id,
+-                    error = %error,
+-                    "dlq depth sampler failed during shutdown"
+-                );
++                self.log_shutdown_error(&error, "dlq depth sampler failed during shutdown");
+             }
+         }
+     }
++
++    fn log_shutdown_error(&self, error: &tokio::task::JoinError, message: &str) {
++        tracing::warn!(
++            worker_id = %self.config.worker_id,
++            error = %error,
++            "{message}"
++        );
++    }
+@@ -3766,27 +3758,26 @@
+         match pool.get().await {
+             Ok(mut conn) => {
+                 if let Err(error) = crate::workers::register_worker(
+                     &mut conn,
+                     &self.config.worker_id,
+                     &self.config.queues,
+                     &shard_ids,
+                     max_concurrency,
+                     &host,
+                     Some(version),
+                     &self.config.build_id,
+                     self.config.deployment_name.as_deref(),
+                 )
+                 .await
+                 {
+-                    tracing::warn!(
+-                        worker_id = %self.config.worker_id,
+-                        error = %error,
+-                        "failed to register worker in fleet table; continuing without fleet registration"
+-                    );
++                    self.log_fleet_error(&error.to_string(), "failed to register worker in fleet table; continuing without fleet registration");
+                 } else {
+                     tracing::info!(
+                         worker_id = %self.config.worker_id,
+                         host = %host,
+                         max_concurrency,
+                         "worker registered in fleet"
+                     );
+                 }
+             }
+             Err(error) => {
+-                tracing::warn!(
+-                    worker_id = %self.config.worker_id,
+-                    error = %error,
+-                    "failed to get pool connection for fleet registration"
+-                );
++                self.log_fleet_error(&error.to_string(), "failed to get pool connection for fleet registration");
+             }
+         }
+     }
++
++    fn log_fleet_error(&self, error: &str, message: &str) {
++        tracing::warn!(
++            worker_id = %self.config.worker_id,
++            error = %error,
++            "{message}"
++        );
++    }
+@@ -3850,11 +3841,6 @@
+             Ok(Some(task)) => {
+-                tracing::debug!(
+-                    task_id = %task.id,
+-                    task_type = %task.task_type,
+-                    queue = %task.queue_name,
+-                    "claimed task"
+-                );
++                self.log_claimed_task(&task);
+                 self.dispatch_task(task, pool);
+                 true
+             }
+@@ -3858,2 +3844,11 @@
+     }
++
++    fn log_claimed_task(&self, task: &TaskQueueItem) {
++        tracing::debug!(
++            task_id = %task.id,
++            task_type = %task.task_type,
++            queue = %task.queue_name,
++            "claimed task"
++        );
++    }

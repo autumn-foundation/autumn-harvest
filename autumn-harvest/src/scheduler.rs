@@ -916,7 +916,6 @@ async fn tick_one_workflow_schedule(
     now: DateTime<Utc>,
     metrics: &Arc<dyn crate::telemetry::MetricsRecorder>,
 ) -> HarvestResult<()> {
-    use crate::execution::StartWorkflowParams;
     use crate::schema::harvest_schedules::dsl;
 
     let running: i64 = harvest_workflow_executions::table
@@ -956,74 +955,16 @@ async fn tick_one_workflow_schedule(
         due_run_plan(parsed_schedule, logical_date, now, catchup);
     let dispatch_queue = schedule.queue_name.as_deref().unwrap_or("default");
 
-    let mut dispatched: u32 = 0;
-    let mut last_dispatched_at: Option<DateTime<Utc>> = None;
-    // Set to the first slot we could not dispatch due to max_active_runs; if Some,
-    // it becomes next_run_at so catchup slots are not silently dropped.
-    let mut deferred_next_run_at: Option<DateTime<Utc>> = None;
-    for scheduled_for in &run_dates {
-        if running + i64::from(dispatched) >= i64::from(schedule.max_active_runs) {
-            deferred_next_run_at = Some(*scheduled_for);
-            tracing::info!(
-                workflow_name = %wf_name,
-                max_active_runs = schedule.max_active_runs,
-                "harvest workflow schedule: max_active_runs reached during catchup; deferring remaining"
-            );
-            break;
-        }
-        let workflow_id = scheduled_workflow_id(wf_name, *scheduled_for);
-        let exec_id = ExecutionId::new();
-        let input = schedule
-            .workflow_input
-            .clone()
-            .unwrap_or(serde_json::Value::Null);
-        tracing::info!(
-            workflow_name = %wf_name, workflow_id = %workflow_id,
-            scheduled_for = %scheduled_for, "harvest: dispatching scheduled workflow run"
-        );
-        let start_result = crate::execution::start_or_load_workflow_execution(
-            conn,
-            StartWorkflowParams {
-                workflow_name: wf_name,
-                workflow_id: &workflow_id,
-                exec_id,
-                input,
-                parent_id: None,
-                queue_name: dispatch_queue,
-                execution_timeout: None,
-                memo: None,
-                search_attrs: None,
-                reuse_policy: scheduled_workflow_reuse_policy(),
-                trace_context: None,
-            },
-        )
-        .await;
-        match scheduled_start_outcome(start_result) {
-            Ok(outcome) => {
-                dispatched += 1;
-                last_dispatched_at = Some(*scheduled_for);
-                if outcome.created() {
-                    metrics.record_schedule_run("workflow", wf_name);
-                }
-                tracing::info!(
-                    workflow_name = %wf_name,
-                    execution_id = %outcome.exec_id(),
-                    state = %outcome.state(),
-                    created = outcome.created(),
-                    "harvest: scheduled workflow run dispatched"
-                );
-            }
-            Err(error) => {
-                // Propagate the error so last_run_at is not advanced — the next
-                // tick will retry the same firing rather than silently dropping it.
-                tracing::warn!(
-                    error = %error, workflow_name = %wf_name, workflow_id = %workflow_id,
-                    "harvest: failed to start scheduled workflow run"
-                );
-                return Err(error);
-            }
-        }
-    }
+    let (last_dispatched_at, deferred_next_run_at) = dispatch_scheduled_runs(
+        conn,
+        wf_name,
+        schedule,
+        &run_dates,
+        dispatch_queue,
+        running,
+        metrics,
+    )
+    .await?;
 
     // Deferred catchup slots become next_run_at so the next tick retries them.
     // last_run_at only advances to the last slot actually started.
@@ -1040,6 +981,105 @@ async fn tick_one_workflow_schedule(
         .map_err(crate::error::database_error)?;
 
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_scheduled_runs(
+    conn: &mut AsyncPgConnection,
+    wf_name: &str,
+    schedule: &HarvestSchedule,
+    run_dates: &[DateTime<Utc>],
+    dispatch_queue: &str,
+    running: i64,
+    metrics: &Arc<dyn crate::telemetry::MetricsRecorder>,
+) -> HarvestResult<(Option<DateTime<Utc>>, Option<DateTime<Utc>>)> {
+    let mut last_dispatched_at: Option<DateTime<Utc>> = None;
+    let mut deferred_next_run_at: Option<DateTime<Utc>> = None;
+    for (dispatched, scheduled_for) in (0_u32..).zip(run_dates.iter()) {
+        if running + i64::from(dispatched) >= i64::from(schedule.max_active_runs) {
+            deferred_next_run_at = Some(*scheduled_for);
+            tracing::info!(
+                workflow_name = %wf_name,
+                max_active_runs = schedule.max_active_runs,
+                "harvest workflow schedule: max_active_runs reached during catchup; deferring remaining"
+            );
+            break;
+        }
+        let workflow_id = scheduled_workflow_id(wf_name, *scheduled_for);
+        let input = schedule
+            .workflow_input
+            .clone()
+            .unwrap_or(serde_json::Value::Null);
+        tracing::info!(
+            workflow_name = %wf_name, workflow_id = %workflow_id,
+            scheduled_for = %scheduled_for, "harvest: dispatching scheduled workflow run"
+        );
+        dispatch_single_scheduled_run(
+            conn,
+            wf_name,
+            &workflow_id,
+            input,
+            dispatch_queue,
+            metrics,
+        )
+        .await?;
+
+        last_dispatched_at = Some(*scheduled_for);
+    }
+    Ok((last_dispatched_at, deferred_next_run_at))
+}
+
+async fn dispatch_single_scheduled_run(
+    conn: &mut AsyncPgConnection,
+    wf_name: &str,
+    workflow_id: &str,
+    input: serde_json::Value,
+    dispatch_queue: &str,
+    metrics: &Arc<dyn crate::telemetry::MetricsRecorder>,
+) -> HarvestResult<()> {
+    use crate::execution::StartWorkflowParams;
+
+    let exec_id = ExecutionId::new();
+    let start_result = crate::execution::start_or_load_workflow_execution(
+        conn,
+        StartWorkflowParams {
+            workflow_name: wf_name,
+            workflow_id,
+            exec_id,
+            input,
+            parent_id: None,
+            queue_name: dispatch_queue,
+            execution_timeout: None,
+            memo: None,
+            search_attrs: None,
+            reuse_policy: scheduled_workflow_reuse_policy(),
+            trace_context: None,
+        },
+    )
+    .await;
+
+    match scheduled_start_outcome(start_result) {
+        Ok(outcome) => {
+            if outcome.created() {
+                metrics.record_schedule_run("workflow", wf_name);
+            }
+            tracing::info!(
+                workflow_name = %wf_name,
+                execution_id = %outcome.exec_id(),
+                state = %outcome.state(),
+                created = outcome.created(),
+                "harvest: scheduled workflow run dispatched"
+            );
+            Ok(())
+        }
+        Err(error) => {
+            tracing::warn!(
+                error = %error, workflow_name = %wf_name, workflow_id = %workflow_id,
+                "harvest: failed to start scheduled workflow run"
+            );
+            Err(error)
+        }
+    }
 }
 
 async fn execute_dag_run(

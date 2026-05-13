@@ -1,0 +1,54 @@
+--- autumn-harvest-plugin/src/plugin.rs
++++ autumn-harvest-plugin/src/plugin.rs
+@@ -450,11 +450,3 @@
+         Ok(pending) => {
+-            tracing::warn!(
+-                target = label,
+-                count = pending.len(),
+-                "Pending migrations detected. Run `autumn migrate` to apply them."
+-            );
+-            for migration in pending {
+-                tracing::warn!(target = label, migration = %migration, "Pending migration");
+-            }
++            log_pending_migrations(label, pending);
+         }
+@@ -467,2 +459,13 @@
+
++fn log_pending_migrations(label: &str, pending: Vec<String>) {
++    tracing::warn!(
++        target = label,
++        count = pending.len(),
++        "Pending migrations detected. Run `autumn migrate` to apply them."
++    );
++    for migration in pending {
++        tracing::warn!(target = label, migration = %migration, "Pending migration");
++    }
++}
++
+ #[cfg(test)]
+--- autumn-harvest-plugin/src/api.rs
++++ autumn-harvest-plugin/src/api.rs
+@@ -4933,7 +4933,2 @@
+
+-    // Warn when the operator uses include_paused=true for a paused DAG schedule.
+-    // `activate_queued_runs` skips paused schedules, so the inserted QUEUED runs
+-    // will not execute until the schedule is resumed.
+-    let paused_schedule_warning =
+-        (schedule.is_paused && request.include_paused && kind == ScheduleKind::Dag).then(|| {
+-            "Schedule is paused; backfilled DAG runs are QUEUED but will not \
+-             execute until the schedule is resumed (`harvest schedule resume`)."
+-                .to_string()
+-        });
++    let paused_schedule_warning = get_paused_schedule_warning(schedule.is_paused, request.include_paused, &kind);
+
+@@ -5398,2 +5393,10 @@
+
++fn get_paused_schedule_warning(is_paused: bool, include_paused: bool, kind: &ScheduleKind) -> Option<String> {
++    (is_paused && include_paused && *kind == ScheduleKind::Dag).then(|| {
++        "Schedule is paused; backfilled DAG runs are QUEUED but will not \
++         execute until the schedule is resumed (`harvest schedule resume`)."
++            .to_string()
++    })
++}
++
+ #[allow(clippy::too_many_arguments)]

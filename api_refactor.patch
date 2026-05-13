@@ -1,0 +1,64 @@
+--- autumn-harvest-plugin/src/api.rs
++++ autumn-harvest-plugin/src/api.rs
+@@ -3335,18 +3335,3 @@
+         if let Ok(pool) = api_state.storage_pool()
+-            && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+         {
+-            let ar = NewAuditRecord {
+-                actor: &actor,
+-                operation: OP_WORKFLOW_START,
+-                target_type: TARGET_WORKFLOW,
+-                target_id: Some(workflow_name.as_str()),
+-                route_or_command: route,
+-                request_id: request_id.as_deref(),
+-                idempotency_key: None,
+-                status: STATUS_FAILED,
+-                error_summary: Some("workflow not registered"),
+-                shard_id: None,
+-                source: &source,
+-            };
+-            let _ = audit::insert_audit(&mut conn, &ar).await;
++            log_failed_workflow_start(pool, &actor, &source, request_id.as_deref(), &workflow_name, route, "workflow not registered").await;
+         }
+@@ -3360,18 +3345,3 @@
+             if let Ok(pool) = api_state.storage_pool()
+-                && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+             {
+-                let ar = NewAuditRecord {
+-                    actor: &actor,
+-                    operation: OP_WORKFLOW_START,
+-                    target_type: TARGET_WORKFLOW,
+-                    target_id: Some(workflow_name.as_str()),
+-                    route_or_command: route,
+-                    request_id: request_id.as_deref(),
+-                    idempotency_key: None,
+-                    status: STATUS_FAILED,
+-                    error_summary: Some("invalid reuse policy"),
+-                    shard_id: None,
+-                    source: &source,
+-                };
+-                let _ = audit::insert_audit(&mut conn, &ar).await;
++                log_failed_workflow_start(pool, &actor, &source, request_id.as_deref(), &workflow_name, route, "invalid reuse policy").await;
+             }
+@@ -3451,2 +3421,21 @@
+
++async fn log_failed_workflow_start(
++    pool: &autumn_harvest::DbPool,
++    actor: &str,
++    source: &str,
++    request_id: Option<&str>,
++    workflow_name: &str,
++    route: &str,
++    error_summary: &str,
++) {
++    if let Ok(mut conn) = acquire_conn(pool).await {
++        let ar = NewAuditRecord {
++            actor, operation: OP_WORKFLOW_START, target_type: TARGET_WORKFLOW,
++            target_id: Some(workflow_name), route_or_command: route,
++            request_id, idempotency_key: None, status: STATUS_FAILED,
++            error_summary: Some(error_summary), shard_id: None, source,
++        };
++        let _ = audit::insert_audit(&mut conn, &ar).await;
++    }
++}
++

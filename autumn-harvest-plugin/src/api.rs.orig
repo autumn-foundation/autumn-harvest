@@ -4906,14 +4906,22 @@ async fn schedule_backfill(
     })?;
 
     let total = timestamps.len();
-    let (kind, name) = get_schedule_kind(&schedule)?;
+    let (kind, name) = if let Some(ref dag_name) = schedule.dag_name {
+        (ScheduleKind::Dag, dag_name.clone())
+    } else if let Some(ref wf_name) = schedule.workflow_name {
+        (ScheduleKind::Workflow, wf_name.clone())
+    } else {
+        return Err(AutumnError::service_unavailable_msg(
+            "schedule row has neither dag_name nor workflow_name",
+        ));
+    };
 
     let max_active = i64::from(schedule.max_active_runs);
 
     // Dry-run: query current running count and project what would happen.
     if request.dry_run {
         return execute_dry_run_backfill(
-            &pool, &actor, &source, started_at, schedule_id, &id, route, req_id.as_deref(), &schedule, kind, &name, max_active, total, timestamps, &request
+            &pool, &actor, &source, started_at, schedule_id, &id, route, req_id.as_deref(), &schedule, &kind, &name, max_active, total, timestamps, &request
         ).await;
     }
 
@@ -4926,7 +4934,15 @@ async fn schedule_backfill(
     let mut skipped_reasons: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
 
-    let paused_schedule_warning = get_paused_schedule_warning(schedule.is_paused, request.include_paused, &kind);
+    // Warn when the operator uses include_paused=true for a paused DAG schedule.
+    // `activate_queued_runs` skips paused schedules, so the inserted QUEUED runs
+    // will not execute until the schedule is resumed.
+    let paused_schedule_warning =
+        (schedule.is_paused && request.include_paused && kind == ScheduleKind::Dag).then(|| {
+            "Schedule is paused; backfilled DAG runs are QUEUED but will not \
+             execute until the schedule is resumed (`harvest schedule resume`)."
+                .to_string()
+        });
 
     // Count running executions once before the loop; track dispatched_this_call separately
     // so we don't re-query on every timestamp. This value gates max_active_runs,
@@ -5381,27 +5397,10 @@ async fn write_backfill_log(
 }
 
 /// Write an audit record; silently swallows errors.
-fn get_schedule_kind(schedule: &HarvestSchedule) -> Result<(ScheduleKind, String), AutumnError> {
-    match (&schedule.dag_name, &schedule.workflow_name) {
-        (Some(dag_name), _) => Ok((ScheduleKind::Dag, dag_name.clone())),
-        (None, Some(wf_name)) => Ok((ScheduleKind::Workflow, wf_name.clone())),
-        (None, None) => Err(AutumnError::service_unavailable_msg(
-            "schedule row has neither dag_name nor workflow_name",
-        )),
-    }
-}
-
-fn get_paused_schedule_warning(is_paused: bool, include_paused: bool, kind: &ScheduleKind) -> Option<String> {
-    (is_paused && include_paused && *kind == ScheduleKind::Dag).then(|| {
-        "Schedule is paused; backfilled DAG runs are QUEUED but will not \
-         execute until the schedule is resumed (`harvest schedule resume`)."
-            .to_string()
-    })
-}
-
+#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 async fn execute_dry_run_backfill(
-    pool: &crate::HarvestDbPool,
+    pool: &autumn_harvest::DbPool,
     actor: &str,
     source: &str,
     started_at: chrono::DateTime<chrono::Utc>,
@@ -5410,15 +5409,15 @@ async fn execute_dry_run_backfill(
     route: &str,
     req_id: Option<&str>,
     schedule: &HarvestSchedule,
-    kind: ScheduleKind,
+    kind: &ScheduleKind,
     name: &str,
     max_active: i64,
     total: usize,
     timestamps: Vec<chrono::DateTime<chrono::Utc>>,
     request: &ScheduleBackfillRequest,
 ) -> Result<Json<ScheduleBackfillResponse>, AutumnError> {
-    let running = query_running_count_best_effort(pool, &kind, name).await;
-    let already_exists = count_existing_in_window(pool, &kind, name, &timestamps).await;
+    let running = query_running_count_best_effort(pool, kind, name).await;
+    let already_exists = count_existing_in_window(pool, kind, name, &timestamps).await;
     let remaining = total.saturating_sub(already_exists);
     let available_slots = usize::try_from((max_active - running).max(0)).unwrap_or(0);
     let would_dispatch = remaining.min(available_slots);
@@ -5434,7 +5433,7 @@ async fn execute_dry_run_backfill(
 
     let paused_schedule_warning = (schedule.is_paused
         && request.include_paused
-        && kind == ScheduleKind::Dag)
+        && *kind == ScheduleKind::Dag)
         .then(|| {
             "Schedule is paused; backfilled DAG runs are QUEUED but will not \
              execute until the schedule is resumed (`harvest schedule resume`)."
@@ -5473,7 +5472,7 @@ async fn execute_dry_run_backfill(
     Ok(Json(ScheduleBackfillResponse {
         status: "dry_run".to_string(),
         schedule_id,
-        kind,
+        kind: kind.clone(),
         name: name.to_string(),
         from: request.from,
         to: request.to,
@@ -5488,7 +5487,6 @@ async fn execute_dry_run_backfill(
     }))
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn write_audit(
     pool: &HarvestDbPool,
     actor: &str,

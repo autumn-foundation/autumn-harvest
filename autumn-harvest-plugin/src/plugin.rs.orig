@@ -417,8 +417,7 @@ fn apply_migrations_for_profile(
     if profile == "dev" {
         apply_dev_migrations(database_url, migrations, label)
     } else {
-        check_production_migrations(database_url, migrations, label);
-        Ok(())
+        check_production_migrations(database_url, migrations, label)
     }
 }
 
@@ -443,29 +442,27 @@ fn check_production_migrations(
     database_url: &str,
     migrations: EmbeddedMigrations,
     label: &str,
-) {
+) -> autumn_web::AutumnResult<()> {
     match autumn_web::migrate::pending_migrations(database_url, migrations) {
         Ok(pending) if pending.is_empty() => {
             tracing::info!(target = label, "Database migrations are up to date");
         }
         Ok(pending) => {
-            log_pending_migrations(label, pending);
+            tracing::warn!(
+                target = label,
+                count = pending.len(),
+                "Pending migrations detected. Run `autumn migrate` to apply them."
+            );
+            for migration in pending {
+                tracing::warn!(target = label, migration = %migration, "Pending migration");
+            }
         }
         Err(error) => {
             tracing::warn!(target = label, error = %error, "Could not check migration status");
         }
     }
-}
 
-fn log_pending_migrations(label: &str, pending: Vec<String>) {
-    tracing::warn!(
-        target = label,
-        count = pending.len(),
-        "Pending migrations detected. Run `autumn migrate` to apply them."
-    );
-    for migration in pending {
-        tracing::warn!(target = label, migration = %migration, "Pending migration");
-    }
+    Ok(())
 }
 
 #[cfg(test)]

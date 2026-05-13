@@ -1,0 +1,61 @@
+--- autumn-harvest-plugin/src/api.rs
++++ autumn-harvest-plugin/src/api.rs
+@@ -4914,35 +4914,8 @@
+     // Dry-run: query current running count and project what would happen.
+     if request.dry_run {
+-        let running = query_running_count_best_effort(&pool, &kind, &name).await;
+-        let already_exists = count_existing_in_window(&pool, &kind, &name, &timestamps).await;
+-        let remaining = total.saturating_sub(already_exists);
+-        let available_slots = usize::try_from((max_active - running).max(0)).unwrap_or(0);
+-        let would_dispatch = remaining.min(available_slots);
+-        let would_skip_max = remaining - would_dispatch;
+-
+-        let mut skipped_reasons = std::collections::HashMap::new();
+-        if already_exists > 0 {
+-            skipped_reasons.insert("already_exists".to_string(), already_exists);
+-        }
+-        if would_skip_max > 0 {
+-            skipped_reasons.insert("max_active_runs".to_string(), would_skip_max);
+-        }
+-
+-        let paused_schedule_warning = (schedule.is_paused
+-            && request.include_paused
+-            && kind == ScheduleKind::Dag)
+-            .then(|| {
+-                "Schedule is paused; backfilled DAG runs are QUEUED but will not \
+-                 execute until the schedule is resumed (`harvest schedule resume`)."
+-                    .to_string()
+-            });
+-
+-        let would_skip = already_exists + would_skip_max;
+-        write_backfill_log(
+-            &pool,
+-            schedule_id,
+-            &actor,
+-            &source,
+-            request.from,
+-            request.to,
+-            true,
+-            total,
+-            would_dispatch,
+-            would_skip,
+-            0,
+-            "dry_run",
+-        )
+-        .await;
+-
+-        return Ok(Json(ScheduleBackfillResponse {
+-            dispatched: would_dispatch,
+-            skipped: would_skip,
+-            failed: 0,
+-            total,
+-            skipped_reasons,
+-            warnings: paused_schedule_warning.into_iter().collect(),
+-            duration_ms: chrono::Utc::now()
+-                .signed_duration_since(started_at)
+-                .num_milliseconds(),
+-        }));
++        return execute_dry_run_backfill(
++            &pool, &actor, &source, started_at, schedule_id, &schedule, &kind, &name, max_active, total, &timestamps, &request
++        ).await;
+     }

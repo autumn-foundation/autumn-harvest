@@ -1,0 +1,8 @@
+--- autumn-harvest-plugin/src/plugin.rs
++++ autumn-harvest-plugin/src/plugin.rs
+@@ -419,3 +419,4 @@
+     } else {
+-        check_production_migrations(database_url, migrations, label)
++        check_production_migrations(database_url, migrations, label);
++        Ok(())
+     }

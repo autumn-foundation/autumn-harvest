@@ -1,0 +1,435 @@
+--- autumn-harvest-plugin/src/api.rs
++++ autumn-harvest-plugin/src/api.rs
+@@ -4928,142 +4928,4 @@
+     // Non-dry-run: dispatch each timestamp idempotently, respecting max_active_runs.
+-    let dispatch_queue = schedule.queue_name.as_deref().unwrap_or("default");
+-    let mut dispatched = 0usize;
+-    let mut skipped = 0usize;
+-    let mut failed = 0usize;
+-    let mut shard_failures: Vec<BackfillShardFailure> = Vec::new();
+-    let mut skipped_reasons: std::collections::HashMap<String, usize> =
+-        std::collections::HashMap::new();
+-
+-    // Warn when the operator uses include_paused=true for a paused DAG schedule.
+-    // `activate_queued_runs` skips paused schedules, so the inserted QUEUED runs
+-    // will not execute until the schedule is resumed.
+-    let paused_schedule_warning =
+-        (schedule.is_paused && request.include_paused && kind == ScheduleKind::Dag).then(|| {
+-            "Schedule is paused; backfilled DAG runs are QUEUED but will not \
+-             execute until the schedule is resumed (`harvest schedule resume`)."
+-                .to_string()
+-        });
+-
+-    // Count running executions once before the loop; track dispatched_this_call separately
+-    // so we don't re-query on every timestamp. This value gates max_active_runs,
+-    // so non-dry-run dispatch must not treat count failures as zero.
+-    let running_at_start = match query_running_count(&pool, &kind, &name).await {
+-        Ok(count) => count,
+-        Err(count_failures) => {
+-            let status = "partial";
+-            let error_summary = Some("one or more shard failures");
+-            write_backfill_log(
+-                &pool,
+-                schedule_id,
+-                &actor,
+-                &source,
+-                request.from,
+-                request.to,
+-                false,
+-                total,
+-                0,
+-                0,
+-                total,
+-                status,
+-                error_summary,
+-                started_at,
+-            )
+-            .await;
+-            let id_str = schedule_id.to_string();
+-            write_audit(
+-                &pool,
+-                &actor,
+-                &source,
+-                req_id.as_deref(),
+-                route,
+-                &id_str,
+-                STATUS_FAILED,
+-                error_summary,
+-            )
+-            .await;
+-
+-            return Ok(Json(ScheduleBackfillResponse {
+-                status: status.to_string(),
+-                schedule_id,
+-                kind,
+-                name,
+-                from: request.from,
+-                to: request.to,
+-                planned_timestamps: timestamps,
+-                total,
+-                dispatched: 0,
+-                skipped: 0,
+-                failed: total,
+-                skipped_reasons,
+-                partial_shard_failures: count_failures,
+-                paused_schedule_warning,
+-            }));
+-        }
+-    };
+-
+-    let mut running_now = running_at_start;
+-
+-    for scheduled_for in &timestamps {
+-        // Unlike scheduling ticks which advance the cursor and drop runs when
+-        // active_runs >= max_active, backfills actively record dropped runs
+-        // to the `skipped` stat so operators know they hit a concurrency limit.
+-        if running_now >= max_active {
+-            skipped += 1;
+-            *skipped_reasons
+-                .entry("max_active_runs".to_string())
+-                .or_insert(0) += 1;
+-            continue;
+-        }
+-
+-        match kind {
+-            ScheduleKind::Dag => {
+-                let mut conn = acquire_conn(pool.default_pool()).await.map_err(map_error)?;
+-                let dag_name = &name;
+-                let input = schedule
+-                    .workflow_input
+-                    .clone()
+-                    .unwrap_or(serde_json::Value::Null);
+-
+-                match trigger_dag(
+-                    &mut conn,
+-                    dag_name,
+-                    Some(*scheduled_for),
+-                    Some(input),
+-                    Some("backfill"),
+-                )
+-                .await
+-                {
+-                    Ok(_) => {
+-                        dispatched += 1;
+-                        running_now += 1;
+-                    }
+-                    Err(HarvestError::Conflict(_)) => {
+-                        skipped += 1;
+-                        *skipped_reasons
+-                            .entry("already_exists".to_string())
+-                            .or_insert(0) += 1;
+-                    }
+-                    Err(error) => {
+-                        failed += 1;
+-                        shard_failures.push(BackfillShardFailure {
+-                            shard_id: "default".to_string(),
+-                            reason: error.to_string(),
+-                        });
+-                        tracing::warn!(
+-                            error = %error,
+-                            dag_name = %dag_name,
+-                            scheduled_for = %scheduled_for,
+-                            "harvest: failed to trigger DAG for backfill"
+-                        );
+-                    }
+-                }
+-            }
+-            ScheduleKind::Workflow => {
+-                let wf_name = &name;
+-                let workflow_id = scheduled_workflow_id_pub(&wf_name, *scheduled_for);
+-                // Match the scheduler: ExecutionId::new() encodes ShardId::UNENCODED so
+-                // the execution lands on the default shard, same as tick_one_workflow_schedule.
+-                let exec_id = ExecutionId::new();
+-                let input = schedule
+-                    .workflow_input
+-                    .clone()
+-                    .unwrap_or(serde_json::Value::Null);
+-
+-                let shard = runtime
+-                    .router
+-                    .pick_for_new_workflow(wf_name, &workflow_id);
+-                match db_conn_for_shard(&api_state, shard).await {
+-                    Ok(mut conn) => {
+-                        let start_result = start_or_load_workflow_execution(
+-                            &mut conn,
+-                            StartWorkflowParams {
+-                                workflow_name: wf_name,
+-                                workflow_id: &workflow_id,
+-                                exec_id,
+-                                input,
+-                                parent_id: None,
+-                                queue_name: dispatch_queue,
+-                                execution_timeout: None,
+-                                memo: None,
+-                                search_attrs: None,
+-                                // Explicit retry: if the execution failed,
+-                                // the operator is actively attempting to replace it.
+-                                reuse_policy: WorkflowIdReusePolicy::AllowDuplicateFailedOnly,
+-                                trace_context: None,
+-                            },
+-                        )
+-                        .await;
+-                        match start_result {
+-                            Ok(res) if res.created() => {
+-                                dispatched += 1;
+-                                running_now += 1;
+-                            }
+-                            Ok(_) => {
+-                                skipped += 1;
+-                                *skipped_reasons
+-                                    .entry("already_exists".to_string())
+-                                    .or_insert(0) += 1;
+-                            }
+-                            Err(error) => {
+-                                failed += 1;
+-                                shard_failures.push(BackfillShardFailure {
+-                                    shard_id: shard.to_string(),
+-                                    reason: error.to_string(),
+-                                });
+-                                tracing::warn!(
+-                                    error = %error,
+-                                    workflow_name = %wf_name,
+-                                    workflow_id = %workflow_id,
+-                                    "harvest: failed to start scheduled workflow run for backfill"
+-                                );
+-                            }
+-                        }
+-                    }
+-                    Err(e) => {
+-                        failed += 1;
+-                        shard_failures.push(BackfillShardFailure {
+-                            shard_id: shard.to_string(),
+-                            reason: e.to_string(),
+-                        });
+-                    }
+-                }
+-            }
+-        }
+-    }
+-
+-    let status = if failed == 0 {
+-        "completed"
+-    } else if dispatched > 0 || skipped > 0 {
+-        "partial"
+-    } else {
+-        "failed"
+-    };
+-
+-    let error_summary = if failed > 0 {
+-        Some("one or more backfill runs failed to dispatch")
+-    } else {
+-        None
+-    };
+-
+-    write_backfill_log(
+-        &pool,
+-        schedule_id,
+-        &actor,
+-        &source,
+-        request.from,
+-        request.to,
+-        false,
+-        total,
+-        dispatched,
+-        skipped,
+-        failed,
+-        status,
+-        error_summary,
+-        started_at,
+-    )
+-    .await;
+-
+-    let audit_status = if failed == 0 {
+-        STATUS_SUCCEEDED
+-    } else {
+-        STATUS_FAILED
+-    };
+-
+-    let id_str = schedule_id.to_string();
+-    write_audit(
+-        &pool,
+-        &actor,
+-        &source,
+-        req_id.as_deref(),
+-        route,
+-        &id_str,
+-        audit_status,
+-        error_summary,
+-    )
+-    .await;
+-
+-    Ok(Json(ScheduleBackfillResponse {
+-        status: status.to_string(),
+-        schedule_id,
+-        kind,
+-        name,
+-        from: request.from,
+-        to: request.to,
+-        planned_timestamps: timestamps,
+-        total,
+-        dispatched,
+-        skipped,
+-        failed,
+-        skipped_reasons,
+-        partial_shard_failures: shard_failures,
+-        paused_schedule_warning,
+-        duration_ms: chrono::Utc::now()
+-            .signed_duration_since(started_at)
+-            .num_milliseconds(),
+-    }))
++    execute_live_backfill(&pool, &api_state, &actor, &source, started_at, schedule_id, route, req_id.as_deref(), &schedule, kind, &name, max_active, total, timestamps, &request, &runtime).await
+ }
+@@ -5488,2 +5350,154 @@
+
++#[allow(clippy::too_many_arguments)]
++async fn execute_live_backfill(
++    pool: &crate::HarvestDbPool,
++    api_state: &HarvestApiState,
++    actor: &str,
++    source: &str,
++    started_at: chrono::DateTime<chrono::Utc>,
++    schedule_id: uuid::Uuid,
++    route: &str,
++    req_id: Option<&str>,
++    schedule: &HarvestSchedule,
++    kind: ScheduleKind,
++    name: &str,
++    max_active: i64,
++    total: usize,
++    timestamps: Vec<chrono::DateTime<chrono::Utc>>,
++    request: &ScheduleBackfillRequest,
++    runtime: &HarvestApiRuntime,
++) -> Result<Json<ScheduleBackfillResponse>, AutumnError> {
++    let dispatch_queue = schedule.queue_name.as_deref().unwrap_or("default");
++    let mut dispatched = 0usize;
++    let mut skipped = 0usize;
++    let mut failed = 0usize;
++    let mut shard_failures: Vec<BackfillShardFailure> = Vec::new();
++    let mut skipped_reasons: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
++
++    let paused_schedule_warning = (schedule.is_paused && request.include_paused && kind == ScheduleKind::Dag).then(|| {
++        "Schedule is paused; backfilled DAG runs are QUEUED but will not \
++         execute until the schedule is resumed (`harvest schedule resume`).".to_string()
++    });
++
++    let running_at_start = match query_running_count(pool, &kind, name).await {
++        Ok(count) => count,
++        Err(count_failures) => {
++            let status = "partial";
++            let error_summary = Some("one or more shard failures");
++            write_backfill_log(pool, schedule_id, actor, source, request.from, request.to, false, total, 0, 0, total, status, error_summary, started_at).await;
++            let id_str = schedule_id.to_string();
++            write_audit(pool, actor, source, req_id, route, &id_str, STATUS_FAILED, error_summary).await;
++            return Ok(Json(ScheduleBackfillResponse {
++                status: status.to_string(), schedule_id, kind, name: name.to_string(),
++                from: request.from, to: request.to, planned_timestamps: timestamps, total,
++                dispatched: 0, skipped: 0, failed: total, skipped_reasons, partial_shard_failures: count_failures, paused_schedule_warning,
++                duration_ms: chrono::Utc::now().signed_duration_since(started_at).num_milliseconds(),
++            }));
++        }
++    };
++
++    let mut running_now = running_at_start;
++    for scheduled_for in &timestamps {
++        if running_now >= max_active {
++            skipped += 1;
++            *skipped_reasons.entry("max_active_runs".to_string()).or_insert(0) += 1;
++            continue;
++        }
++
++        match kind {
++            ScheduleKind::Dag => {
++                let mut conn = acquire_conn(pool.default_pool()).await.map_err(map_error)?;
++                let input = schedule.workflow_input.clone().unwrap_or(serde_json::Value::Null);
++                match trigger_dag(&mut conn, name, Some(*scheduled_for), Some(input), Some("backfill")).await {
++                    Ok(_) => { dispatched += 1; running_now += 1; }
++                    Err(HarvestError::Conflict(_)) => {
++                        skipped += 1; *skipped_reasons.entry("already_exists".to_string()).or_insert(0) += 1;
++                    }
++                    Err(error) => {
++                        failed += 1;
++                        shard_failures.push(BackfillShardFailure { shard_id: "default".to_string(), reason: error.to_string() });
++                        tracing::warn!(error = %error, dag_name = %name, scheduled_for = %scheduled_for, "harvest: failed to trigger DAG for backfill");
++                    }
++                }
++            }
++            ScheduleKind::Workflow => {
++                let workflow_id = scheduled_workflow_id_pub(name, *scheduled_for);
++                let exec_id = ExecutionId::new();
++                let input = schedule.workflow_input.clone().unwrap_or(serde_json::Value::Null);
++
++                let shard = runtime.router.pick_for_new_workflow(name, &workflow_id);
++                match db_conn_for_shard(api_state, shard).await {
++                    Ok(mut conn) => {
++                        let start_result = start_or_load_workflow_execution(
++                            &mut conn,
++                            StartWorkflowParams {
++                                workflow_name: name, workflow_id: &workflow_id, exec_id, input, parent_id: None,
++                                queue_name: dispatch_queue, execution_timeout: None, memo: None, search_attrs: None,
++                                reuse_policy: WorkflowIdReusePolicy::AllowDuplicateFailedOnly, trace_context: None,
++                            },
++                        ).await;
++                        match start_result {
++                            Ok(res) if res.created() => { dispatched += 1; running_now += 1; }
++                            Ok(_) => { skipped += 1; *skipped_reasons.entry("already_exists".to_string()).or_insert(0) += 1; }
++                            Err(error) => {
++                                failed += 1;
++                                shard_failures.push(BackfillShardFailure { shard_id: shard.to_string(), reason: error.to_string() });
++                                tracing::warn!(error = %error, workflow_name = %name, workflow_id = %workflow_id, "harvest: failed to start scheduled workflow run for backfill");
++                            }
++                        }
++                    }
++                    Err(e) => {
++                        failed += 1;
++                        shard_failures.push(BackfillShardFailure { shard_id: shard.to_string(), reason: e.to_string() });
++                    }
++                }
++            }
++        }
++    }
++
++    let status = if failed == 0 {
++        "completed"
++    } else if dispatched > 0 || skipped > 0 {
++        "partial"
++    } else {
++        "failed"
++    };
++
++    let error_summary = if failed > 0 {
++        Some("one or more backfill runs failed to dispatch")
++    } else {
++        None
++    };
++
++    write_backfill_log(
++        pool, schedule_id, actor, source, request.from, request.to, false, total,
++        dispatched, skipped, failed, status, error_summary, started_at,
++    ).await;
++
++    let audit_status = if failed == 0 { STATUS_SUCCEEDED } else { STATUS_FAILED };
++    let id_str = schedule_id.to_string();
++    write_audit(
++        pool, actor, source, req_id, route, &id_str, audit_status, error_summary,
++    ).await;
++
++    Ok(Json(ScheduleBackfillResponse {
++        status: status.to_string(),
++        schedule_id,
++        kind,
++        name: name.to_string(),
++        from: request.from,
++        to: request.to,
++        planned_timestamps: timestamps,
++        total,
++        dispatched,
++        skipped,
++        failed,
++        skipped_reasons,
++        partial_shard_failures: shard_failures,
++        paused_schedule_warning,
++        duration_ms: chrono::Utc::now().signed_duration_since(started_at).num_milliseconds(),
++    }))
++}
++
+ #[allow(clippy::too_many_arguments)]
