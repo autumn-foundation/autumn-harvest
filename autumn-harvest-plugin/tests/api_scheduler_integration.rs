@@ -2978,7 +2978,7 @@ async fn get_schedule_by_id_returns_entry_with_pause_fields() {
     assert_eq!(
         status,
         StatusCode::OK,
-        "GET /admin/schedules/{{id}} must return 200"
+        "GET /admin/schedules/:id must return 200"
     );
     assert_eq!(entry["id"].as_str(), Some(id.to_string().as_str()));
     assert_eq!(entry["is_paused"], false);
