@@ -5,81 +5,80 @@ All notable changes to autumn-harvest will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.0] - 2026-05-13
 
-## [0.3.0] - 2026-05-11
+### Documentation
 
-### Added
-
-- **Versioned management API contract** (`docs/api-contract.json`, issue #175):
-  machine-readable JSON describing every route's method, path, category,
-  `read_only` flag, request-body field schema, success/error responses,
-  pagination params, and idempotency semantics. Contract version `"1"`,
-  aligned with crate version `"0.3.0"`.
-- `management_api_request_fields()` in `autumn_harvest_plugin::api`: canonical
-  registry of request-body field names per mutating route. Compared against the
-  contract by the regression test suite; update both together when adding or
-  renaming fields.
-- Contract regression tests (`autumn-harvest-plugin/tests/contract_regression.rs`):
-  six tests assert route-set parity, required metadata fields, version/compat
-  metadata, structured `request_body` on all mutating routes, field-registry
-  parity, and read-only/method consistency.
-- CLI body-field coverage tests (`autumn-harvest-cli/tests/contract_coverage.rs`):
-  every CLI subcommand is exercised to confirm (a) it maps to a documented
-  contract route and (b) every key it sends in the request body is declared in
-  the contract's `fields` list.
-- Embedder guide `docs/api-contract-guide.md` with jq inspection recipes,
-  compatibility rules, client generation workflow, and developer update checklist.
-- Request/response workflow embedding (issue #224): in-process
-  `WorkflowHandleClient`/`WorkflowHandle`, compact
-  `GET /workflows/{id}/result?wait=...`, and quickstart coverage for awaiting
-  `handle.result_raw().await?` from an HTTP route.
-
-### Non-breaking
-
-This release is additive only.  No route, event, or schema was removed or
-renamed.  Adding the contract is classified as non-breaking per the
-compatibility rules stated in `docs/api-contract.json`.
-
+- Update CHANGELOG.md for v0.2.0([2eb8e1d](https://github.com/madmax983/autumn-harvest/commit/2eb8e1d6754cf0e3e2a5f1e755425a7541623891))
 ## [0.2.0] - 2026-04-27
 
+### Documentation
+
+- Update CHANGELOG.md for v0.1.1([0dc1ff1](https://github.com/madmax983/autumn-harvest/commit/0dc1ff1e8973c2076bc95c591a0a3883cbc1966c))
+## [0.1.1] - 2026-04-19
+
 ### Added
 
+- **harvest:** Add history guardrails for long-running workflows (#280)([212abd4](https://github.com/madmax983/autumn-harvest/commit/212abd474b6aa450d281d37e18616ed418afc10c))
+- Add workflow handle result waiting (#276)([af2b7ea](https://github.com/madmax983/autumn-harvest/commit/af2b7ea3fe639edf808f023ffa98cce64bb94f79))
+- **det_check:** Add deterministic workflow guardrails (issue #172) (#265)([8794a63](https://github.com/madmax983/autumn-harvest/commit/8794a63d2f646ff3001e23aff968d523820e2fd0))
+- Management API auth posture — route classification + security coverage (issue #174) (#267)([165e188](https://github.com/madmax983/autumn-harvest/commit/165e1880d3b9c7e20f614d4da94f0b7a5301ef2e))
+- Add deterministic guardrail rule catalog foundation (issue #173) (#266)([7301229](https://github.com/madmax983/autumn-harvest/commit/7301229532059b4c55597f8c924d9a84c876f3b5))
+- Add remote worker drain controls (issue #170) (#246)([f011825](https://github.com/madmax983/autumn-harvest/commit/f0118258e6779fe4f9dd271daddd5a5382d93a81))
+- Export workflow histories as replay fixtures (#242)([bdb37b7](https://github.com/madmax983/autumn-harvest/commit/bdb37b76edff49d32d2382f1a7820cb4e4187464))
+- Expose operator external activity handoffs (#239)([38ce949](https://github.com/madmax983/autumn-harvest/commit/38ce9498c794693939725ca48a0f50c43747683a))
+- Version-gate retirement check (issue #164) (#228)([8f7ecb2](https://github.com/madmax983/autumn-harvest/commit/8f7ecb25a5c71cb5c95c56f7eddecd598feb4dff))
+- Report workflow version-gate usage (#223)([4246798](https://github.com/madmax983/autumn-harvest/commit/4246798b0a9b1f3dc586d2ab5411ee9108e16ad1))
+- Add shard readiness health gate (#219)([10655a3](https://github.com/madmax983/autumn-harvest/commit/10655a3403049bbd45c6ac617977f868500c9912))
+- Heartbeats (#202)([68b6e59](https://github.com/madmax983/autumn-harvest/commit/68b6e599abcd6d29d54b46dbcbf043920d357988))
+- Filter GET /workflows by state, workflow name, and search_attrs (#85)([53bef7f](https://github.com/madmax983/autumn-harvest/commit/53bef7f9264f41f5145775ef12851f7cb481aff6))
 - Add harvest management cli (#29)([597dcfc](https://github.com/madmax983/autumn-harvest/commit/597dcfca7406dd5554223a843589a31d6cd2647c))
 - Add Mermaid.js workflow history exporter (#25)([7226560](https://github.com/madmax983/autumn-harvest/commit/72265609750ef9b02b18f6b9cb49b2d31ddcee91))
 
 ### Fixed
 
+- Route DLQ UI actions through audited bulk API (#286)([30e01dd](https://github.com/madmax983/autumn-harvest/commit/30e01dd44335e858417f0312f375f626635423a7))
+- Compensate saga when approve_high_value_subscription fails (#222)([3784578](https://github.com/madmax983/autumn-harvest/commit/3784578bfd90754f2e1cdb1f0e80267e5b5e74db))
+- Gate shared rollouts on readiness attempt 2 (#220)([190e5be](https://github.com/madmax983/autumn-harvest/commit/190e5be5a647cdf0769fda6ee405b1297b7ad6e9))
+- Gate shard rollouts on readiness([b960a15](https://github.com/madmax983/autumn-harvest/commit/b960a15efd39e84ef924283ca24ee44fb67f3d7b))
+- **worker:** Prevent panic in chrono_duration_from_secs (#126)([8511545](https://github.com/madmax983/autumn-harvest/commit/851154528d8d14afd3f264fc74706c3038498f70))
 - Redis depth handling([76335e6](https://github.com/madmax983/autumn-harvest/commit/76335e65f96643faf3e08c635dc3a7ad5fe2277f))
 - Replay determinism([d0a14d7](https://github.com/madmax983/autumn-harvest/commit/d0a14d7eede408bcf4449f1ad68ce04013c47b91))
 - Redit and continue-as-new([fd1c024](https://github.com/madmax983/autumn-harvest/commit/fd1c0242a42985e6a8cfc4a1d19b40daf091e88e))
 - Prevent silent integer truncation in concurrency limits and event indexing (#45)([68d5225](https://github.com/madmax983/autumn-harvest/commit/68d5225d6d5e97850ba975188d971e86a4bd5ce3))
 - Resolve broken intra-doc links for HarvestError (#19)([cd77f63](https://github.com/madmax983/autumn-harvest/commit/cd77f6365848bcd7c9861564ffc53b2c0bf69f08))
 
+### Changed
+
+- **worker:** Extract helper methods from `run_with_listener` (#258)([ba5da61](https://github.com/madmax983/autumn-harvest/commit/ba5da61e6622148a7f4ccec323669cb54f9fc7b7))
+- Simplify context history matching and worker execution error handling (#116)([f163e67](https://github.com/madmax983/autumn-harvest/commit/f163e6757515e4b78582abf85e649826fb56c131))
+- **plugin:** Render Vantage dashboard with maud + autumn-web extractors (#101)([875830e](https://github.com/madmax983/autumn-harvest/commit/875830e51a60407a16dd68d3af488183c1786be4))
+
 ### Documentation
 
+- **alerts:** Add starter Harvest alert pack and runbooks (#275)([49c41f2](https://github.com/madmax983/autumn-harvest/commit/49c41f209a44bde2dd7eccb8e2054e9af4719f7d))
+- Fix broken intra-doc links across workspace (#236)([0726486](https://github.com/madmax983/autumn-harvest/commit/0726486382140a672a4e289876677a5c9eded8cd))
+- Polyglot ADR([c43e8e4](https://github.com/madmax983/autumn-harvest/commit/c43e8e4b6770e140fc387670a671c8f295e4dc9f))
 - Skills([be33d2e](https://github.com/madmax983/autumn-harvest/commit/be33d2ebcde3c6eeb29540baf2e728ae175bd565))
 - Add module-level documentation and executable doc tests for query, dag_export, schema, and signal. (#69)([859bb21](https://github.com/madmax983/autumn-harvest/commit/859bb2101fcbc7f6efbc0b486adb05b6b171e1c4))
 - Add Vantage spec for Continue-As-New (#60)([d884143](https://github.com/madmax983/autumn-harvest/commit/d884143fe78da00cf627b11a72ea07445d8b077e))
 - Add Vantage specification for Saga Primitives (#18)([0cc01fe](https://github.com/madmax983/autumn-harvest/commit/0cc01fed2dea12ed2ce076ae230a1fd5d0ee3cf4))
-- Update CHANGELOG.md for v0.1.1([0dc1ff1](https://github.com/madmax983/autumn-harvest/commit/0dc1ff1e8973c2076bc95c591a0a3883cbc1966c))
+- Update CHANGELOG.md for v0.1.0([b12cfc1](https://github.com/madmax983/autumn-harvest/commit/b12cfc193de46590f7e05eecc8b2063e4b18e675))
 
 ### Testing
 
+- **error:** Add unit tests for HarvestError Display formatting (#215)([d326df5](https://github.com/madmax983/autumn-harvest/commit/d326df50a4e7d6be7142c4bf492567fa3d0d5f6d))
+- Add test coverage for WorkflowContext::check_cancellation (#90)([b4ed42e](https://github.com/madmax983/autumn-harvest/commit/b4ed42ed9ba7c5a0fb0d8da6ef1003b54261c7bc))
 - **saga:** Add comprehensive unit tests for Saga compensation logic (#44)([72d5760](https://github.com/madmax983/autumn-harvest/commit/72d5760b1217909d79342ac9a5242bc3a672b57d))
 - Improve test coverage for Error, Info, and Saga modules (#40)([48f5a37](https://github.com/madmax983/autumn-harvest/commit/48f5a377dd024b65c2782447fca4407ad3577e2a))
 
 ### Miscellaneous
 
+- Delete claude files([3c73e9e](https://github.com/madmax983/autumn-harvest/commit/3c73e9e6271497864a414987799f6cbed4caa85d))
 - Relase work([7e61ec0](https://github.com/madmax983/autumn-harvest/commit/7e61ec038ee985e93186a72c0cad28d53d8b7ddc))
 - Clippy([51b9b6e](https://github.com/madmax983/autumn-harvest/commit/51b9b6ec3626e5804eca98f138ac907f58554fdb))
 - PR feedback([6f40114](https://github.com/madmax983/autumn-harvest/commit/6f40114d7ac6109a0a277d98cce469ca8dfefc8f))
 - Cleanup([2c59de4](https://github.com/madmax983/autumn-harvest/commit/2c59de42684a19c036e1360584bfc53522eaa4e7))
-## [0.1.1] - 2026-04-19
-
-### Documentation
-
-- Update CHANGELOG.md for v0.1.0([b12cfc1](https://github.com/madmax983/autumn-harvest/commit/b12cfc193de46590f7e05eecc8b2063e4b18e675))
 ## [0.1.0] - 2026-04-19
 
 ### Added
