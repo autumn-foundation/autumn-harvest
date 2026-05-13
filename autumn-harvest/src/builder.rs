@@ -364,9 +364,27 @@ impl HarvestBuilder {
     /// Register DAG definitions (output of `dags![]` macro).
     ///
     /// DAGs define graphs of steps that run according to a schedule.
+    ///
+    /// When the `unified-dag-execution` feature is enabled every DAG whose
+    /// `workflow_handler` is populated (i.e. produced by the `#[dag]` macro
+    /// with that feature on) is also auto-registered as a [`WorkflowInfo`] and,
+    /// if it carries a schedule attribute, as a [`WorkflowSchedule`]. This
+    /// wires unified DAGs into the standard workflow execution and scheduler
+    /// paths without requiring separate `.workflow_schedule(...)` calls.
     #[must_use]
     pub fn dags(mut self, dags: Vec<DagInfo>) -> Self {
-        self.dags.extend(dags);
+        for dag in dags {
+            #[cfg(feature = "unified-dag-execution")]
+            {
+                if let Some(workflow_info) = dag.as_workflow_info() {
+                    self.workflows.push(workflow_info);
+                }
+                if let Some(workflow_schedule) = dag.as_workflow_schedule() {
+                    self.workflow_schedules.push(workflow_schedule);
+                }
+            }
+            self.dags.push(dag);
+        }
         self
     }
 

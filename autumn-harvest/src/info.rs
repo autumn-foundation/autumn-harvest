@@ -9,7 +9,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use crate::dag::{DagBuildError, DagBuilder, DagDefinition};
-use crate::policy::{RetryPolicy, Schedule};
+use crate::policy::{RetryPolicy, Schedule, WorkflowSchedule};
 
 /// Type-erased workflow handler.
 ///
@@ -109,6 +109,27 @@ impl DagInfo {
             .map_or_else(DagBuilder::new, DagBuilder::with_default_queue);
         (self.builder)(&mut dag);
         dag.build()
+    }
+
+    /// Return a [`WorkflowSchedule`] that fires this DAG on its declared cron
+    /// or interval via the unified workflow execution path (issue #256 Step 2).
+    ///
+    /// Returns `None` when either:
+    /// - `workflow_handler` is `None` (unified-dag-execution feature is off), or
+    /// - `schedule` is `None` (DAG has no automatic trigger).
+    #[must_use]
+    pub fn as_workflow_schedule(&self) -> Option<WorkflowSchedule> {
+        self.workflow_handler?;
+        let schedule = self.schedule.clone()?;
+        Some(WorkflowSchedule {
+            workflow_name: self.name.to_string(),
+            schedule,
+            input: serde_json::Value::Null,
+            catchup: self.catchup,
+            max_active_runs: self.max_active_runs,
+            paused: false,
+            queue_name: self.default_queue.unwrap_or("default").to_string(),
+        })
     }
 
     /// Return a [`WorkflowInfo`] that executes this DAG via the unified

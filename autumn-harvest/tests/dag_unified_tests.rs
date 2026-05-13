@@ -262,6 +262,90 @@ fn dag_info_as_workflow_info_returns_some_with_matching_name() {
 }
 
 // ---------------------------------------------------------------------------
+// STEP 2 — scheduling promoted to WorkflowSchedule
+// ---------------------------------------------------------------------------
+
+/// A DAG with a cron schedule, catchup=true, max_active_runs=3, and a custom
+/// queue — used to verify that `as_workflow_schedule()` maps fields correctly.
+#[dag(schedule = "0 * * * *", catchup = true, max_active_runs = 3, default_queue = "test-queue")]
+fn scheduled_dag(dag: &mut DagBuilder) {
+    let _extract = dag.activity(extract_users);
+}
+
+/// `DagInfo::as_workflow_schedule()` must return `Some(WorkflowSchedule)` with
+/// fields that mirror the DAG's schedule, catchup, max_active_runs, and queue
+/// when `unified-dag-execution` is enabled.
+#[test]
+fn as_workflow_schedule_returns_some_with_matching_fields() {
+    use autumn_harvest::policy::WorkflowSchedule;
+
+    let dag_info = __autumn_dag_info_scheduled_dag();
+    let ws: WorkflowSchedule = dag_info
+        .as_workflow_schedule()
+        .expect("scheduled unified DAG should return Some(WorkflowSchedule)");
+
+    assert_eq!(ws.workflow_name, "scheduled_dag");
+    assert!(ws.catchup, "catchup should mirror the DAG attribute");
+    assert_eq!(ws.max_active_runs, 3);
+    assert_eq!(ws.queue_name, "test-queue");
+    assert!(
+        matches!(ws.schedule, autumn_harvest::policy::Schedule::Cron(ref e) if e == "0 * * * *"),
+        "schedule should be Cron(\"0 * * * *\"), got {:?}",
+        ws.schedule
+    );
+}
+
+/// A DAG registered without a `schedule =` attribute must return `None` from
+/// `as_workflow_schedule()` — it has no automatic firing trigger.
+#[test]
+fn as_workflow_schedule_returns_none_for_unscheduled_dag() {
+    // linear_dag has no schedule attribute.
+    let dag_info = __autumn_dag_info_linear_dag();
+    assert!(
+        dag_info.as_workflow_schedule().is_none(),
+        "unscheduled DAG should return None from as_workflow_schedule()"
+    );
+}
+
+/// `HarvestBuilder::dags()` must auto-register a `WorkflowInfo` for every
+/// unified DAG (one whose `workflow_handler` is populated by the macro) so the
+/// runtime can route new starts through the workflow execution path.
+#[test]
+fn builder_dags_auto_registers_workflow_info() {
+    use autumn_harvest::builder::HarvestBuilder;
+
+    // Two dags: one with a schedule, one without.
+    let builder =
+        HarvestBuilder::new().dags(vec![__autumn_dag_info_linear_dag(), __autumn_dag_info_scheduled_dag()]);
+
+    assert_eq!(
+        builder.workflow_count(),
+        2,
+        "builder should auto-register one WorkflowInfo per unified DAG"
+    );
+    // DAG count stays at 2 (backward-compat field).
+    assert_eq!(builder.dag_count(), 2);
+}
+
+/// `HarvestBuilder::dags()` must auto-register a `WorkflowSchedule` for every
+/// unified DAG that carries a schedule attribute, with no duplicates for
+/// unscheduled DAGs.
+#[test]
+fn builder_dags_auto_registers_workflow_schedule_only_for_scheduled_dags() {
+    use autumn_harvest::builder::HarvestBuilder;
+
+    let builder =
+        HarvestBuilder::new().dags(vec![__autumn_dag_info_linear_dag(), __autumn_dag_info_scheduled_dag()]);
+
+    // Only scheduled_dag has a schedule; linear_dag does not.
+    assert_eq!(
+        builder.workflow_schedule_count(),
+        1,
+        "builder should auto-register one WorkflowSchedule for scheduled_dag only"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // RED-PHASE TEST 6 — fan-out DAG: both parallel tasks in level 1 run
 // ---------------------------------------------------------------------------
 

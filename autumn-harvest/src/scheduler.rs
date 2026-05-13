@@ -322,6 +322,13 @@ pub fn compile_dag_catalog(dags: Vec<DagInfo>) -> HarvestResult<DagCatalog> {
     let mut catalog = DagCatalog::new();
 
     for dag in dags {
+        // DAGs promoted to the unified workflow execution path are driven by
+        // the workflow executor; the classic DAG runtime must not claim them.
+        #[cfg(feature = "unified-dag-execution")]
+        if dag.workflow_handler.is_some() {
+            continue;
+        }
+
         let name = dag.name.to_string();
         if catalog.contains_key(&name) {
             return Err(HarvestError::Config(format!(
