@@ -2819,8 +2819,7 @@ async fn schedule_pause_idempotent_does_not_overwrite_paused_at() {
     api_state.install_storage_pool(HarvestDbPool::from(pool));
     let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
 
-    let id =
-        seed_workflow_schedule_and_get_id(&database_url, "pause_idempotent_wf").await;
+    let id = seed_workflow_schedule_and_get_id(&database_url, "pause_idempotent_wf").await;
 
     // First pause — alice owns it
     let (s1, _) = post_json_with_actor(
@@ -2853,7 +2852,11 @@ async fn schedule_pause_idempotent_does_not_overwrite_paused_at() {
         "bob",
     )
     .await;
-    assert_eq!(s2, StatusCode::OK, "second pause must return 200 (idempotent)");
+    assert_eq!(
+        s2,
+        StatusCode::OK,
+        "second pause must return 200 (idempotent)"
+    );
 
     let (_, list2) = get_json(&app, "/admin/schedules").await;
     let entry2 = find_schedule_in_list(&list2, id);
@@ -2902,7 +2905,10 @@ async fn schedule_resume_clears_pause_metadata() {
     let (_, list) = get_json(&app, "/admin/schedules").await;
     let entry = find_schedule_in_list(&list, id);
 
-    assert_eq!(entry["is_paused"], false, "schedule must be active after resume");
+    assert_eq!(
+        entry["is_paused"], false,
+        "schedule must be active after resume"
+    );
     assert!(
         entry["paused_at"].is_null(),
         "paused_at must be cleared to null after resume; got: {}",
@@ -2928,8 +2934,7 @@ async fn schedule_resume_idempotent_when_schedule_is_not_paused() {
     api_state.install_storage_pool(HarvestDbPool::from(pool));
     let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
 
-    let id =
-        seed_workflow_schedule_and_get_id(&database_url, "resume_idempotent_wf").await;
+    let id = seed_workflow_schedule_and_get_id(&database_url, "resume_idempotent_wf").await;
 
     // First resume on an already-active schedule
     let (s1, ack1) = post_json_with_actor(
@@ -2939,7 +2944,11 @@ async fn schedule_resume_idempotent_when_schedule_is_not_paused() {
         "ops",
     )
     .await;
-    assert_eq!(s1, StatusCode::OK, "resume on non-paused schedule must return 200");
+    assert_eq!(
+        s1,
+        StatusCode::OK,
+        "resume on non-paused schedule must return 200"
+    );
     assert_eq!(ack1["ok"], true);
 
     // Second resume — also idempotent
@@ -2966,12 +2975,25 @@ async fn get_schedule_by_id_returns_entry_with_pause_fields() {
 
     // GET before pause: pause fields are null
     let (status, entry) = get_json(&app, format!("/admin/schedules/{id}")).await;
-    assert_eq!(status, StatusCode::OK, "GET /admin/schedules/{{id}} must return 200");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "GET /admin/schedules/{{id}} must return 200"
+    );
     assert_eq!(entry["id"].as_str(), Some(id.to_string().as_str()));
     assert_eq!(entry["is_paused"], false);
-    assert!(entry["paused_at"].is_null(), "paused_at must be null before any pause");
-    assert!(entry["paused_by"].is_null(), "paused_by must be null before any pause");
-    assert!(entry["pause_reason"].is_null(), "pause_reason must be null before any pause");
+    assert!(
+        entry["paused_at"].is_null(),
+        "paused_at must be null before any pause"
+    );
+    assert!(
+        entry["paused_by"].is_null(),
+        "paused_by must be null before any pause"
+    );
+    assert!(
+        entry["pause_reason"].is_null(),
+        "pause_reason must be null before any pause"
+    );
 
     // Pause and verify via GET /admin/schedules/{id}
     post_json_with_actor(
@@ -2985,12 +3007,19 @@ async fn get_schedule_by_id_returns_entry_with_pause_fields() {
     let (status2, paused_entry) = get_json(&app, format!("/admin/schedules/{id}")).await;
     assert_eq!(status2, StatusCode::OK);
     assert_eq!(paused_entry["is_paused"], true);
-    assert!(paused_entry["paused_at"].is_string(), "paused_at must be set");
+    assert!(
+        paused_entry["paused_at"].is_string(),
+        "paused_at must be set"
+    );
     assert_eq!(paused_entry["paused_by"], "ops-bot");
     assert_eq!(paused_entry["pause_reason"], "testing get-by-id");
 
     // 404 for unknown id
     let unknown = uuid::Uuid::new_v4();
     let (not_found_status, _) = get_json(&app, format!("/admin/schedules/{unknown}")).await;
-    assert_eq!(not_found_status, StatusCode::NOT_FOUND, "unknown id must return 404");
+    assert_eq!(
+        not_found_status,
+        StatusCode::NOT_FOUND,
+        "unknown id must return 404"
+    );
 }

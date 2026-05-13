@@ -4463,15 +4463,14 @@ async fn set_schedule_paused(
         let mut conn = acquire_conn(shard_pool).await?;
 
         // Load the current row to implement idempotency and set metadata.
-        let current: Option<autumn_harvest::models::HarvestSchedule> =
-            dsl::harvest_schedules
-                .find(id)
-                .select(autumn_harvest::models::HarvestSchedule::as_select())
-                .first(&mut conn)
-                .await
-                .optional()
-                .map_err(database_error)
-                .map_err(map_error)?;
+        let current: Option<autumn_harvest::models::HarvestSchedule> = dsl::harvest_schedules
+            .find(id)
+            .select(autumn_harvest::models::HarvestSchedule::as_select())
+            .first(&mut conn)
+            .await
+            .optional()
+            .map_err(database_error)
+            .map_err(map_error)?;
 
         let Some(schedule) = current else {
             continue;
