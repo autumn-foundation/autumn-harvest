@@ -141,6 +141,11 @@ pub enum WorkflowCommand {
         input: Value,
         /// The queue to schedule the activity on.
         queue: String,
+        /// Optional retry policy override (e.g. from a DAG task definition).
+        /// When `Some`, overrides the activity's registered default.
+        retry_policy_override: Option<crate::policy::RetryPolicy>,
+        /// Optional start-to-close timeout override from a DAG task definition.
+        start_to_close_override: Option<std::time::Duration>,
         /// The worker sends the result back through this channel.
         result_tx: oneshot::Sender<Result<Value, String>>,
     },
@@ -1096,10 +1101,81 @@ impl WorkflowContext {
                     name: name.to_string(),
                     input,
                     queue: queue.to_string(),
+                    retry_policy_override: None,
+                    start_to_close_override: None,
                     result_tx: tx,
                 });
 
                 // Suspend the coroutine until the worker resolves this activity.
+                match rx.await {
+                    Ok(Ok(output)) => Ok(output),
+                    Ok(Err(error)) => Err(HarvestError::ActivityFailed {
+                        name: name.to_string(),
+                        attempt: 1,
+                        source: error.into(),
+                    }),
+                    Err(_) => Err(HarvestError::Cancelled(format!(
+                        "activity '{name}' cancelled: result channel dropped"
+                    ))),
+                }
+            }
+        }
+    }
+
+    /// Like [`execute_activity_raw`](Self::execute_activity_raw) but allows
+    /// per-call overrides for retry policy and start-to-close timeout.
+    /// Used by the DAG unified handler to honour task-level `.retry()` and
+    /// `.start_to_close()` settings from the `DagBuilder`.
+    #[doc(hidden)]
+    pub async fn execute_activity_raw_with_opts(
+        &self,
+        name: &str,
+        input: Value,
+        queue: &str,
+        retry_policy_override: Option<crate::policy::RetryPolicy>,
+        start_to_close_override: Option<std::time::Duration>,
+    ) -> HarvestResult<Value> {
+        let history_match = if self.strict_replay {
+            self.match_history(|m| m.match_activity_strict(name, &input))
+        } else {
+            self.match_history(|m| m.match_activity(name))
+        };
+
+        match history_match {
+            HistoryMatch::Matched { output } => Ok(output),
+            HistoryMatch::Failed { error, attempt } => Err(HarvestError::ActivityFailed {
+                name: name.to_string(),
+                attempt,
+                source: error.into(),
+            }),
+            HistoryMatch::TimedOut { timeout_type } => Err(HarvestError::Timeout {
+                timeout_type,
+                task_name: name.to_string(),
+            }),
+            HistoryMatch::Diverged { expected, actual } => Err(HarvestError::NonDeterministic(
+                format!("activity mismatch: expected {expected}, got {actual}"),
+            )),
+            HistoryMatch::AwaitingExternalCompletion { .. }
+            | HistoryMatch::ChildInProgress { .. }
+            | HistoryMatch::LocalActivityInProgress { .. } => {
+                unreachable!(
+                    "match_activity never returns AwaitingExternalCompletion, \
+                     ChildInProgress, or LocalActivityInProgress"
+                )
+            }
+            HistoryMatch::NoMatch => {
+                self.check_strict_replay_no_match(&format!("ActivityScheduled({name})"))?;
+                let activity_id = self.next_activity_id();
+                let (tx, rx) = oneshot::channel();
+                self.push_command(WorkflowCommand::ScheduleActivity {
+                    activity_id,
+                    name: name.to_string(),
+                    input,
+                    queue: queue.to_string(),
+                    retry_policy_override,
+                    start_to_close_override,
+                    result_tx: tx,
+                });
                 match rx.await {
                     Ok(Ok(output)) => Ok(output),
                     Ok(Err(error)) => Err(HarvestError::ActivityFailed {

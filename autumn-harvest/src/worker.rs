@@ -364,6 +364,8 @@ struct ScheduledActivityCommand {
     name: String,
     input: serde_json::Value,
     queue: String,
+    retry_policy_override: Option<crate::policy::RetryPolicy>,
+    start_to_close_override: Option<std::time::Duration>,
 }
 
 #[derive(Debug, Clone)]
@@ -483,6 +485,8 @@ fn extract_single_schedule_activity(
             name,
             input,
             queue,
+            retry_policy_override,
+            start_to_close_override,
             ..
         } = cmd
         else {
@@ -494,6 +498,8 @@ fn extract_single_schedule_activity(
             name: name.clone(),
             input: input.clone(),
             queue: queue.clone(),
+            retry_policy_override: retry_policy_override.clone(),
+            start_to_close_override: *start_to_close_override,
         })
     })
 }
@@ -1385,7 +1391,14 @@ async fn persist_scheduled_activity(
     // so the downstream worker's harvest.activity.execute span is stitched to
     // the producer span rather than the parent workflow-execute context.
 
-    if let Some(retry_policy) = activity.default_retry_policy.clone() {
+    // Task-level overrides (from DagBuilder) take precedence over the activity's
+    // registered defaults. This preserves per-task .retry() and .start_to_close()
+    // settings when a DAG is lowered onto the unified workflow execution path.
+    let effective_retry = scheduled
+        .retry_policy_override
+        .clone()
+        .or_else(|| activity.default_retry_policy.clone());
+    if let Some(retry_policy) = effective_retry {
         params.max_attempts = i32::try_from(retry_policy.max_attempts).map_err(|_| {
             HarvestError::Config(format!(
                 "activity '{}' retry policy max_attempts exceeds i32 range",
@@ -1398,7 +1411,10 @@ async fn persist_scheduled_activity(
     if let Some(timeout) = activity.default_heartbeat_timeout {
         params.heartbeat_timeout = Some(chrono_duration_from_std(timeout, "heartbeat timeout")?);
     }
-    if let Some(timeout) = activity.default_start_to_close {
+    let effective_stc = scheduled
+        .start_to_close_override
+        .or(activity.default_start_to_close);
+    if let Some(timeout) = effective_stc {
         params.start_to_close = Some(chrono_duration_from_std(timeout, "start_to_close timeout")?);
     }
     if let Some(timeout) = activity.default_schedule_to_start {

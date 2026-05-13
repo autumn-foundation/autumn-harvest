@@ -134,6 +134,8 @@ pub fn dag_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             let __upstreams: ::std::vec::Vec<usize> =
                                 __tasks[__task_idx].upstreams.clone();
                             let __trigger_rule = __tasks[__task_idx].trigger_rule.clone();
+                            let __retry_override = __tasks[__task_idx].retry_policy.clone();
+                            let __stc_override = __tasks[__task_idx].start_to_close;
 
                             let __should_run: bool = if __upstreams.is_empty() {
                                 true
@@ -159,10 +161,12 @@ pub fn dag_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             }
 
                             let __status = match ctx
-                                .execute_activity_raw(
+                                .execute_activity_raw_with_opts(
                                     &__activity_name,
                                     _input.clone(),
                                     &__queue_str,
+                                    __retry_override,
+                                    __stc_override,
                                 )
                                 .await
                             {
@@ -286,6 +290,10 @@ fn emit_workflow_companion(
                                     __tasks[__task_idx].upstreams.clone();
                                 let __trigger_rule =
                                     __tasks[__task_idx].trigger_rule.clone();
+                                let __retry_override =
+                                    __tasks[__task_idx].retry_policy.clone();
+                                let __stc_override =
+                                    __tasks[__task_idx].start_to_close;
 
                                 // Evaluate trigger rule against upstream statuses.
                                 let __should_run: bool = if __upstreams.is_empty() {
@@ -313,10 +321,12 @@ fn emit_workflow_companion(
 
                                 // Dispatch and record terminal status.
                                 let __status = match ctx
-                                    .execute_activity_raw(
+                                    .execute_activity_raw_with_opts(
                                         &__activity_name,
                                         _input.clone(),
                                         &__queue_str,
+                                        __retry_override,
+                                        __stc_override,
                                     )
                                     .await
                                 {
