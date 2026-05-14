@@ -175,7 +175,8 @@ async fn lowered_handler_replays_linear_dag_all_success() {
 /// When the upstream fails and the downstream has `TriggerRule::AllSuccess`
 /// (the default), the lowered handler must skip the downstream task entirely.
 /// The history therefore contains no `ActivityScheduled` for `load_users`, and
-/// the replay must still succeed (no divergence from an unexpected activity call).
+/// replay must consume exactly that history before returning the expected DAG
+/// workflow failure.
 #[tokio::test]
 async fn lowered_handler_skips_all_success_downstream_on_upstream_failure() {
     let id_extract = ActivityExecId::new();
@@ -202,14 +203,20 @@ async fn lowered_handler_skips_all_success_downstream_on_upstream_failure() {
         // No ActivityScheduled for load_users — it is skipped by AllSuccess rule.
     ];
 
+    let expected_events = history.len();
     let report = WorkflowReplayer::new()
         .register_fn("linear_dag", __autumn_workflow_info_linear_dag().handler)
         .replay_from_events(history)
         .await;
 
+    assert_eq!(report.events_replayed, expected_events);
     assert!(
-        matches!(report.status, ReplayStatus::ReplaySucceeded),
-        "AllSuccess skip should replay cleanly, got: {report}"
+        matches!(
+            report.status,
+            ReplayStatus::WorkflowFailed { ref error, .. }
+                if error == "one or more DAG tasks failed"
+        ),
+        "AllSuccess skip should replay deterministically then fail the DAG run, got: {report}"
     );
 }
 
@@ -220,7 +227,8 @@ async fn lowered_handler_skips_all_success_downstream_on_upstream_failure() {
 /// When the upstream fails and the downstream has `TriggerRule::AllDone`,
 /// the lowered handler must still schedule the downstream activity.
 /// The history must include both the upstream failure and the downstream
-/// completion, and the replay must succeed end-to-end.
+/// completion, and replay must consume both before returning the expected DAG
+/// workflow failure.
 #[tokio::test]
 async fn lowered_handler_runs_alldone_downstream_on_upstream_failure() {
     let id_extract = ActivityExecId::new();
@@ -258,14 +266,20 @@ async fn lowered_handler_runs_alldone_downstream_on_upstream_failure() {
         },
     ];
 
+    let expected_events = history.len();
     let report = WorkflowReplayer::new()
         .register_fn("alldone_dag", __autumn_workflow_info_alldone_dag().handler)
         .replay_from_events(history)
         .await;
 
+    assert_eq!(report.events_replayed, expected_events);
     assert!(
-        matches!(report.status, ReplayStatus::ReplaySucceeded),
-        "AllDone downstream should run and replay cleanly, got: {report}"
+        matches!(
+            report.status,
+            ReplayStatus::WorkflowFailed { ref error, .. }
+                if error == "one or more DAG tasks failed"
+        ),
+        "AllDone downstream should replay deterministically then fail the DAG run, got: {report}"
     );
 }
 
