@@ -1,20 +1,55 @@
-//! `#[activity]` attribute macro implementation.
+//! The `#[activity]` attribute macro implementation.
+//!
+//! This module contains the parsing and expansion logic that transforms
+//! standard async Rust functions into distributed tasks capable of routing
+//! inputs and handling resilient retry policies.
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::{Expr, ItemFn, LitInt, LitStr, parse::Parser as _};
 
+/// The parsed configuration payload extracted from the `#[activity(...)]` attribute.
+///
+/// When a tired developer annotates an async function with `#[activity]`, this struct
+/// holds all the knobs and dials they've configured for how that activity should
+/// behave in the distributed system. It bridges the gap between the macro's token stream
+/// and the strongly-typed [`autumn_harvest::ActivityInfo`] struct used by the engine.
 struct ActivityAttrs {
+    /// The retry policy expression. If a network call fails, this dictates how
+    /// aggressively the engine should try again.
     retry: Option<Expr>,
+    /// The maximum allowed duration for the activity to execute.
+    /// Prevents zombie workers from holding resources indefinitely.
     start_to_close: Option<String>,
+    /// The heartbeat timeout. If the activity doesn't report progress within
+    /// this window, the engine assumes the worker died and reschedules it.
     heartbeat_timeout: Option<String>,
+    /// The maximum time the activity is allowed to sit in the queue waiting
+    /// for a worker to pick it up.
     schedule_to_start: Option<String>,
+    /// The specific task queue this activity must be routed to. Useful for
+    /// pinning heavy jobs to specialized worker nodes.
     queue: Option<String>,
+    /// A concurrency limit to protect downstream services (like a fragile legacy API)
+    /// from being overwhelmed by too many simultaneous executions.
     max_concurrent: Option<u32>,
+    /// An optional string key used to group concurrency limits across different activities.
     concurrency_key: Option<String>,
+    /// A flag indicating that this activity is incredibly fast and should be
+    /// executed inline by the workflow worker itself, skipping the task queue entirely.
     local: bool,
 }
 
+/// Parses the raw token stream from the `#[activity(...)]` macro into a structured `ActivityAttrs`.
+///
+/// This function is the gatekeeper. It reads the developer's raw configuration,
+/// validating names and parsing values, ensuring we don't accidentally accept
+/// an unsupported attribute that would silently fail in production.
+///
+/// # Panics
+///
+/// This function returns a `syn::Result` rather than panicking, surfacing graceful
+/// compiler errors directly to the user's IDE if they misspell an attribute.
 fn parse_attrs(attr: TokenStream) -> syn::Result<ActivityAttrs> {
     let mut result = ActivityAttrs {
         retry: None,
@@ -75,6 +110,11 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<ActivityAttrs> {
     Ok(result)
 }
 
+/// Generates a token stream that parses a human-readable duration string into a [`std::time::Duration`].
+///
+/// We want users to write `start_to_close = "5m"` instead of forcing them to instantiate
+/// `Duration::from_secs(300)` directly in the macro. This helper writes the runtime
+/// parsing code that executes when the companion info struct is initialized.
 fn duration_expr(s: &str) -> TokenStream {
     quote! {
         ::autumn_harvest::task_duration(#s)
@@ -121,6 +161,26 @@ fn activity_returns_activity_failure(output: &syn::ReturnType) -> bool {
 // The function necessarily handles multiple code-gen paths (0/1/N params,
 // 5 optional attribute fields, quote! blocks) — splitting it further would
 // hurt readability more than the length lint helps.
+/// The core engine of the `#[activity]` macro.
+///
+/// This macro transforms a standard async function into a distributed task. It preserves
+/// the original function entirely, but weaves a hidden "companion function" into the module.
+/// This companion function (e.g., `__autumn_activity_info_my_task`) is what the worker
+/// actually calls to discover the task's name, configuration, and execution wrapper.
+///
+/// By generating this companion, we keep the user's original function pure and testable,
+/// while still providing the engine with the strongly-typed metadata it needs to route
+/// inputs and outputs across the network.
+///
+/// # Examples
+///
+/// ```ignore
+/// #[activity(start_to_close = "5m", retry = RetryPolicy::default())]
+/// async fn process_payment(ctx: ActivityContext, amount: u64) -> Result<(), ActivityFailure> {
+///     // Business logic
+///     Ok(())
+/// }
+/// ```
 #[allow(clippy::too_many_lines)]
 pub fn activity_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let attrs = match parse_attrs(attr) {

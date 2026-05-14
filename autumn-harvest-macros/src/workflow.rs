@@ -1,12 +1,34 @@
-//! `#[workflow]` attribute macro implementation.
+//! The `#[workflow]` attribute macro implementation.
 //!
-//! Emits the original function unchanged plus a companion:
-//!   `pub fn __autumn_workflow_info_{name}() -> ::autumn_harvest::WorkflowInfo`
+//! Workflows orchestrate the execution of activities. This module handles
+//! transforming standard async functions into robust workflow definitions
+//! by injecting dynamic dispatch wrappers for strongly-typed IO.
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::ItemFn;
 
+/// The core engine of the `#[workflow]` attribute macro.
+///
+/// Workflows are the heart of the system—they coordinate activities and manage state.
+/// This macro does not alter the developer's async function. Instead, it generates a
+/// hidden "companion function" (e.g., `__autumn_workflow_info_my_flow`) that returns a
+/// [`autumn_harvest::WorkflowInfo`] struct.
+///
+/// This generated struct contains a dynamic dispatch wrapper that knows how to
+/// deserialize incoming JSON arguments, execute the workflow, and serialize the result
+/// back to JSON. This is how the engine seamlessly bridges strongly-typed Rust code
+/// with language-agnostic distributed execution.
+///
+/// # Examples
+///
+/// ```ignore
+/// #[workflow]
+/// async fn process_order(ctx: WorkflowContext, order_id: Uuid) -> HarvestResult<()> {
+///     // Orchestration logic
+///     Ok(())
+/// }
+/// ```
 pub fn workflow_macro(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let input_fn: ItemFn = match syn::parse2(item) {
         Ok(f) => f,

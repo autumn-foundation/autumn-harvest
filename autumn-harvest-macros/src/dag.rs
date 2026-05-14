@@ -1,17 +1,38 @@
-//! `#[dag]` attribute macro implementation.
+//! The `#[dag]` attribute macro implementation.
+//!
+//! This module is responsible for parsing declarative pipeline definitions
+//! and translating scheduling rules (like cron strings) into metadata that
+//! the engine uses to wake up and dispatch work.
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::{ItemFn, LitBool, LitInt, LitStr, parse::Parser as _};
 
+/// The parsed configuration payload extracted from the `#[dag(...)]` attribute.
+///
+/// DAGs represent recurring, scheduled pipelines of execution. This struct captures
+/// the scheduling rules defined by the developer, translating them from macro tokens
+/// into the runtime [`autumn_harvest::DagInfo`] that the scheduler uses to wake up and dispatch work.
 #[derive(Debug, Default)]
 struct DagAttrs {
+    /// The cron expression defining when this DAG should run.
+    /// If omitted, the DAG can only be triggered manually.
     schedule: Option<String>,
+    /// Determines whether the scheduler should historically "backfill" runs
+    /// if the system was offline during scheduled intervals.
     catchup: bool,
+    /// Limits how many instances of this specific DAG can be running at the exact same time.
+    /// Crucial for preventing heavy data pipelines from trampling each other.
     max_active_runs: u32,
+    /// The default task queue to route child activities to, unless they specify their own.
     default_queue: Option<String>,
 }
 
+/// Parses the raw token stream from the `#[dag(...)]` macro into a structured `DagAttrs`.
+///
+/// It acts as the frontline validation, ensuring that developers get immediate,
+/// red squiggly lines in their editor if they misconfigure the DAG's schedule or limits,
+/// rather than discovering the error at runtime.
 fn parse_attrs(attr: TokenStream) -> syn::Result<DagAttrs> {
     let mut result = DagAttrs {
         max_active_runs: 1,
@@ -46,6 +67,21 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<DagAttrs> {
     Ok(result)
 }
 
+/// The core engine of the `#[dag]` macro.
+///
+/// This macro transforms a standard Rust function into a declarative pipeline builder.
+/// It leaves the original function intact, but creates a hidden companion function
+/// that returns a [`autumn_harvest::DagInfo`]. The engine uses this info to register the schedule
+/// and execute the builder to construct the dependency graph.
+///
+/// # Examples
+///
+/// ```ignore
+/// #[dag(schedule = "0 0 * * *", catchup = true)]
+/// fn daily_report(dag: &mut DagBuilder) {
+///     // Define the graph structure here
+/// }
+/// ```
 pub fn dag_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let attrs = match parse_attrs(attr) {
         Ok(attrs) => attrs,
