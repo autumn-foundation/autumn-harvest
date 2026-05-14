@@ -2420,6 +2420,39 @@ async fn harvest_api_lists_and_triggers_manual_dags() {
 }
 
 #[tokio::test]
+async fn harvest_api_rejects_dag_trigger_for_workflow_without_dag_registration() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
+    api_state.install(HarvestApiRuntime::new(
+        approval_registry(),
+        Arc::new(DagCatalog::default()),
+        Arc::new(Vec::new()),
+        Some("scheduler-only".to_string()),
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::single(),
+    ));
+    let app = harvest_api_router(api_state).with_state(test_app_state(pool.clone()));
+
+    let (trigger_status, _trigger_json) = post_json(
+        &app,
+        "/dags/approval_workflow/trigger",
+        json!({ "conf": { "request_id": "not-a-dag" } }),
+    )
+    .await;
+
+    assert_eq!(trigger_status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        count_workflow_executions_by_name_from_url(&database_url, "approval_workflow").await,
+        0,
+        "workflow-only registrations must not be started via the DAG trigger path"
+    );
+}
+
+#[tokio::test]
 async fn harvest_api_routes_dag_reads_and_mutations_to_owned_shard() {
     let ((shard0_url, shard1_url), _container) = setup_sharded_test_database_urls().await;
     let router = two_shard_router();

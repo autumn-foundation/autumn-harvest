@@ -122,6 +122,7 @@ impl HarvestRetentionRuntime {
 pub struct HarvestApiRuntime {
     registry: Arc<HandlerRegistry>,
     dags: Arc<DagCatalog>,
+    registered_dag_names: Arc<HashSet<String>>,
     workflow_schedules: Arc<Vec<WorkflowSchedule>>,
     worker_id: Option<String>,
     queues: Vec<String>,
@@ -135,7 +136,7 @@ impl HarvestApiRuntime {
     /// and any locally owned worker/scheduler state.
     #[must_use]
     #[allow(clippy::too_many_arguments)]
-    pub const fn new(
+    pub fn new(
         registry: Arc<HandlerRegistry>,
         dags: Arc<DagCatalog>,
         workflow_schedules: Arc<Vec<WorkflowSchedule>>,
@@ -145,9 +146,15 @@ impl HarvestApiRuntime {
         retention: HarvestRetentionRuntime,
         router: ShardRouter,
     ) -> Self {
+        let registered_dag_names = workflow_schedules
+            .iter()
+            .filter_map(|schedule| schedule.dag_name.clone())
+            .collect::<HashSet<_>>();
+
         Self {
             registry,
             dags,
+            registered_dag_names: Arc::new(registered_dag_names),
             workflow_schedules,
             worker_id,
             queues,
@@ -172,6 +179,20 @@ impl HarvestApiRuntime {
     #[must_use]
     pub fn workflow_schedules(&self) -> &[WorkflowSchedule] {
         &self.workflow_schedules
+    }
+
+    /// Add DAG names that were promoted to the unified workflow execution path.
+    #[must_use]
+    pub fn with_registered_dag_names(mut self, names: impl IntoIterator<Item = String>) -> Self {
+        let mut registered = (*self.registered_dag_names).clone();
+        registered.extend(names);
+        self.registered_dag_names = Arc::new(registered);
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn is_registered_dag(&self, dag_name: &str) -> bool {
+        self.registered_dag_names.contains(dag_name)
     }
 }
 
@@ -3900,7 +3921,7 @@ async fn trigger_dag_run(
     let runtime = api_state.runtime().map_err(map_error)?;
     let pool = api_state.storage_pool().map_err(map_error)?;
 
-    if !runtime.registry.workflows.contains_key(dag_name.as_str()) {
+    if !runtime.is_registered_dag(&dag_name) {
         return Err(AutumnError::not_found_msg(format!(
             "DAG '{dag_name}' is not registered"
         )));
@@ -7921,6 +7942,33 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect()
+    }
+
+    #[test]
+    fn dag_registration_marker_is_separate_from_workflow_registry() {
+        let registry = Arc::new(HandlerRegistry::new(
+            vec![autumn_harvest::WorkflowInfo {
+                name: "workflow_only",
+                module: "tests",
+                handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            }],
+            vec![],
+        ));
+        let runtime = HarvestApiRuntime::new(
+            registry,
+            Arc::new(DagCatalog::default()),
+            Arc::new(Vec::new()),
+            None,
+            Vec::new(),
+            SchedulerMonitor::offline(),
+            HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+            ShardRouter::single(),
+        );
+
+        assert!(!runtime.is_registered_dag("workflow_only"));
+
+        let runtime = runtime.with_registered_dag_names(["workflow_only".to_string()]);
+        assert!(runtime.is_registered_dag("workflow_only"));
     }
 
     #[test]

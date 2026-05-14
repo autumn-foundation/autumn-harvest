@@ -137,21 +137,17 @@ pub fn dag_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             let __retry_override = __tasks[__task_idx].retry_policy.clone();
                             let __stc_override = __tasks[__task_idx].start_to_close;
 
-                            let __should_run: bool = if __upstreams.is_empty() {
-                                true
-                            } else {
-                                let __ups: ::std::vec::Vec<
-                                    ::autumn_harvest::policy::TaskStatus,
-                                > = __upstreams
-                                    .iter()
-                                    .map(|&__i| {
-                                        __statuses[__i].unwrap_or(
-                                            ::autumn_harvest::policy::TaskStatus::Skipped,
-                                        )
-                                    })
-                                    .collect();
-                                __trigger_rule.should_run(&__ups)
-                            };
+                            let __ups: ::std::vec::Vec<
+                                ::autumn_harvest::policy::TaskStatus,
+                            > = __upstreams
+                                .iter()
+                                .map(|&__i| {
+                                    __statuses[__i].unwrap_or(
+                                        ::autumn_harvest::policy::TaskStatus::Skipped,
+                                    )
+                                })
+                                .collect();
+                            let __should_run: bool = __trigger_rule.should_run(&__ups);
 
                             if !__should_run {
                                 __statuses[__task_idx] = Some(
@@ -295,22 +291,17 @@ fn emit_workflow_companion(
                                 let __stc_override =
                                     __tasks[__task_idx].start_to_close;
 
-                                // Evaluate trigger rule against upstream statuses.
-                                let __should_run: bool = if __upstreams.is_empty() {
-                                    true // root task always runs
-                                } else {
-                                    let __ups: ::std::vec::Vec<
-                                        ::autumn_harvest::policy::TaskStatus,
-                                    > = __upstreams
-                                        .iter()
-                                        .map(|&__i| {
-                                            __statuses[__i].unwrap_or(
-                                                ::autumn_harvest::policy::TaskStatus::Skipped,
-                                            )
-                                        })
-                                        .collect();
-                                    __trigger_rule.should_run(&__ups)
-                                };
+                                let __ups: ::std::vec::Vec<
+                                    ::autumn_harvest::policy::TaskStatus,
+                                > = __upstreams
+                                    .iter()
+                                    .map(|&__i| {
+                                        __statuses[__i].unwrap_or(
+                                            ::autumn_harvest::policy::TaskStatus::Skipped,
+                                        )
+                                    })
+                                    .collect();
+                                let __should_run: bool = __trigger_rule.should_run(&__ups);
 
                                 if !__should_run {
                                     __statuses[__task_idx] = Some(

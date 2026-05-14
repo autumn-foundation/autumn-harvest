@@ -727,7 +727,7 @@ async fn check_schedule_resolvability(api_state: &HarvestApiState) -> PreflightC
             }));
         }
         if let Some(dag_name) = row.schedule.dag_name.as_deref()
-            && !runtime.dags().contains_key(dag_name)
+            && !runtime.is_registered_dag(dag_name)
         {
             affected.push(row.shard.as_i32());
             failures.push(json!({

@@ -10,6 +10,7 @@
 #![allow(clippy::unused_async)]
 
 use autumn_harvest::event::WorkflowEvent;
+use autumn_harvest::info::WorkflowHandlerFn;
 use autumn_harvest::prelude::*;
 use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
 use autumn_harvest::types::ActivityExecId;
@@ -62,6 +63,27 @@ fn fanout_dag(dag: &mut DagBuilder) {
     let extract = dag.activity(extract_users);
     let _load = dag.activity(load_users).upstream(&extract);
     let _notify = dag.activity(notify_complete).upstream(&extract);
+}
+
+#[dag]
+fn manual_root_dag(dag: &mut DagBuilder) {
+    let _root = dag
+        .activity(extract_users)
+        .trigger_rule(TriggerRule::Manual);
+}
+
+#[dag]
+fn one_failed_root_dag(dag: &mut DagBuilder) {
+    let _root = dag
+        .activity(extract_users)
+        .trigger_rule(TriggerRule::OneFailed);
+}
+
+#[dag]
+fn all_failed_root_dag(dag: &mut DagBuilder) {
+    let _root = dag
+        .activity(extract_users)
+        .trigger_rule(TriggerRule::AllFailed);
 }
 
 // ---------------------------------------------------------------------------
@@ -247,6 +269,53 @@ async fn lowered_handler_runs_alldone_downstream_on_upstream_failure() {
     );
 }
 
+async fn assert_root_trigger_rule_skips_without_upstreams(
+    dag_name: &str,
+    handler: WorkflowHandlerFn,
+) {
+    let history = vec![WorkflowEvent::WorkflowStarted {
+        input: Value::Null,
+        timestamp: Utc::now(),
+    }];
+
+    let report = WorkflowReplayer::new()
+        .register_fn(dag_name, handler)
+        .replay_from_events(history)
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "{dag_name} root trigger rule should skip with no upstreams, got: {report}"
+    );
+}
+
+#[tokio::test]
+async fn lowered_handler_applies_manual_trigger_rule_to_root_task() {
+    assert_root_trigger_rule_skips_without_upstreams(
+        "manual_root_dag",
+        __autumn_workflow_info_manual_root_dag().handler,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn lowered_handler_applies_one_failed_trigger_rule_to_root_task() {
+    assert_root_trigger_rule_skips_without_upstreams(
+        "one_failed_root_dag",
+        __autumn_workflow_info_one_failed_root_dag().handler,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn lowered_handler_applies_all_failed_trigger_rule_to_root_task() {
+    assert_root_trigger_rule_skips_without_upstreams(
+        "all_failed_root_dag",
+        __autumn_workflow_info_all_failed_root_dag().handler,
+    )
+    .await;
+}
+
 // ---------------------------------------------------------------------------
 // REFACTOR TEST — DagInfo::as_workflow_info() returns the lowered handler
 // ---------------------------------------------------------------------------
@@ -363,13 +432,13 @@ fn builder_dags_auto_registers_workflow_schedule_only_for_scheduled_dags() {
 /// When `unified-dag-execution` is on, a DAG that was promoted to the workflow
 /// execution path must be recognisable purely from the workflow registry — the
 /// scheduler's `DagCatalog` (classic path) will not contain it (Step 2 ensures
-/// `compile_dag_catalog` skips unified DAGs). The trigger handler uses
-/// `registry.workflows.contains_key(dag_name)` to decide which path to take.
+/// `compile_dag_catalog` skips unified DAGs). The management API validates a
+/// separate DAG registration marker before this workflow handler can run.
 ///
 /// This test constructs a minimal `HandlerRegistry` that mirrors what
-/// `HarvestBuilder::dags()` produces and asserts the routing predicate works.
+/// `HarvestBuilder::dags()` produces and asserts the worker handler is present.
 #[test]
-fn trigger_routing_recognises_unified_dag_via_workflow_registry() {
+fn unified_dag_registers_workflow_handler_for_worker_execution() {
     use autumn_harvest::worker::HandlerRegistry;
 
     // Build a registry that mimics what HarvestBuilder::dags() produces for a

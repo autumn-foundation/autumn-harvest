@@ -1,7 +1,7 @@
 //! Reusable Harvest runtime ownership for standalone or embedded processes.
 
 use std::any::{Any, TypeId};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use autumn_harvest::BuiltHarvest;
@@ -77,6 +77,7 @@ impl HarvestRunnerResources {
 struct PreparedHarvestRuntime {
     registry: Arc<HandlerRegistry>,
     dag_catalog: Arc<DagCatalog>,
+    registered_dag_names: HashSet<String>,
     workflow_schedules: Arc<Vec<WorkflowSchedule>>,
     worker_runtime_config: WorkerRuntimeConfig,
     storage_pool: HarvestDbPool,
@@ -91,6 +92,12 @@ impl PreparedHarvestRuntime {
     ) -> autumn_web::AutumnResult<Self> {
         let shard_router = resources.shard_router.clone().unwrap_or_default();
         let retention_config = built.retention().clone();
+        let registered_dag_names = built
+            .dags()
+            .iter()
+            .filter(|dag| dag.workflow_handler.is_some())
+            .map(|dag| dag.name.to_string())
+            .collect();
         let workflow_schedules = Arc::new(built.workflow_schedules().to_vec());
         let (registry, dags, _ws, worker_config) =
             built.into_worker_parts_with_extra_state(injected_runtime_state(
@@ -107,6 +114,7 @@ impl PreparedHarvestRuntime {
         Ok(Self {
             registry: Arc::new(registry),
             dag_catalog,
+            registered_dag_names,
             workflow_schedules,
             worker_runtime_config: WorkerRuntimeConfig::from(worker_config),
             storage_pool: HarvestDbPool::from(resources.harvest_pool),
@@ -281,7 +289,8 @@ impl HarvestRunner {
                 retention_trigger,
             ),
             shard_router,
-        );
+        )
+        .with_registered_dag_names(prepared.registered_dag_names.iter().cloned());
 
         Ok(Self {
             api_runtime,
