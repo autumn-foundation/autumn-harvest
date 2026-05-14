@@ -1,3 +1,5 @@
+#![cfg(feature = "testing")]
+
 use autumn_harvest::dag::DagBuilder;
 use autumn_harvest::dag_profiler::DagProfiler;
 use autumn_harvest::dag_trace_export::export_chrome_trace;
