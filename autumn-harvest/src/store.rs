@@ -521,6 +521,43 @@ mod tests {
     use chrono::Utc;
 
     #[test]
+    fn events_to_insert_rows_from_with_codecs_returns_error_on_overflow() {
+        let exec_id = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: serde_json::json!({}),
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::WorkflowCompleted {
+                output: serde_json::json!({}),
+            },
+        ];
+        let err = events_to_insert_rows_from(exec_id, &events, i32::MAX).unwrap_err();
+        assert!(
+            matches!(err, crate::error::HarvestError::Database(msg) if msg.contains("Event ID overflow"))
+        );
+    }
+
+    #[test]
+    fn summarize_error_truncates_long_strings() {
+        let long_str = "A".repeat(300);
+        let summary = summarize_error(Some(long_str)).unwrap();
+        assert_eq!(summary.len(), 240);
+        assert_eq!(summary, "A".repeat(240));
+    }
+
+    #[test]
+    fn summarize_error_handles_empty_lines() {
+        assert_eq!(summarize_error(None), None);
+        assert_eq!(summarize_error(Some(String::new())), None);
+        assert_eq!(summarize_error(Some("\n\n  \n".to_string())), None);
+        assert_eq!(
+            summarize_error(Some("first line\nsecond line".to_string())),
+            Some("first line".to_string())
+        );
+    }
+
+    #[test]
     fn stored_event_has_sequential_event_id() {
         let exec_id = ExecutionId::new();
         let events = vec![

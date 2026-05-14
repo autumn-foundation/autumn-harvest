@@ -1213,6 +1213,54 @@ mod tests {
     }
 
     #[test]
+    fn builder_rejects_invalid_workflow_schedule_interval_zero() {
+        use crate::policy::WorkflowSchedule;
+        let result = HarvestBuilder::new()
+            .workflows(vec![fake_workflow_info()])
+            .workflow_schedule(WorkflowSchedule::new(
+                "test",
+                Schedule::Interval(Duration::ZERO),
+            ))
+            .try_build();
+
+        let err = result.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                HarvestBuilderError::InvalidWorkflowSchedule {
+                    ref workflow_name,
+                    ref reason,
+                } if workflow_name == "test" && reason.contains("interval must be at least 1 second")
+            ),
+            "expected InvalidWorkflowSchedule with interval reason, got: {err}"
+        );
+    }
+
+    #[test]
+    fn builder_rejects_invalid_workflow_schedule_cron() {
+        use crate::policy::WorkflowSchedule;
+        let result = HarvestBuilder::new()
+            .workflows(vec![fake_workflow_info()])
+            .workflow_schedule(WorkflowSchedule::new(
+                "test",
+                Schedule::Cron("invalid cron string".to_string()),
+            ))
+            .try_build();
+
+        let err = result.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                HarvestBuilderError::InvalidWorkflowSchedule {
+                    ref workflow_name,
+                    ..
+                } if workflow_name == "test"
+            ),
+            "expected InvalidWorkflowSchedule, got: {err}"
+        );
+    }
+
+    #[test]
     fn builder_rejects_local_activity_exactly_at_cap_boundary_when_exceeded() {
         // Exactly 60s is fine; 61s should fail.
         let at_cap = HarvestBuilder::new()
