@@ -825,7 +825,7 @@ async fn run_local_activity_inline(
                 if terminal_attempt {
                     let current_count = u64::try_from(*next_event_id).unwrap_or(u64::MAX);
                     let final_pair_would_exceed_cap = history_event_hard_cap
-                        .is_some_and(|cap| current_count.saturating_add(2) > cap);
+                        .is_some_and(|cap| current_count.checked_add(2).is_none_or(|c| c > cap));
                     if final_pair_would_exceed_cap {
                         store::append_events(
                             conn,
@@ -2755,11 +2755,12 @@ fn pending_update_result_event_count(commands: &[WorkflowCommand]) -> u64 {
     .unwrap_or(u64::MAX)
 }
 
-fn terminal_history_event_count(next_event_id: i32, pending_cmds: &[WorkflowCommand]) -> u64 {
+fn terminal_history_event_count(next_event_id: i32, pending_cmds: &[WorkflowCommand]) -> HarvestResult<u64> {
     u64::try_from(next_event_id)
         .unwrap_or(0)
-        .saturating_add(pending_update_result_event_count(pending_cmds))
-        .saturating_add(1)
+        .checked_add(pending_update_result_event_count(pending_cmds))
+        .and_then(|c| c.checked_add(1))
+        .ok_or_else(|| crate::error::HarvestError::Database("Event count overflow".to_string()))
 }
 
 fn marker_event_count(commands: &[WorkflowCommand]) -> u64 {
@@ -2803,7 +2804,7 @@ async fn suspended_command_event_count(
 ) -> HarvestResult<u64> {
     let update_events = pending_update_result_event_count(commands);
     let marker_events = marker_event_count(commands);
-    let bookkeeping_events = update_events.saturating_add(marker_events);
+    let bookkeeping_events = update_events.checked_add(marker_events).ok_or_else(|| crate::error::HarvestError::Database("Event count overflow".to_string()))?;
 
     if should_requeue_signal_wait(commands) {
         return Ok(bookkeeping_events);
@@ -2811,11 +2812,11 @@ async fn suspended_command_event_count(
     if extract_single_schedule_activity(commands).is_some()
         || extract_single_started_timer(commands).is_some()
     {
-        return Ok(bookkeeping_events.saturating_add(1));
+        return bookkeeping_events.checked_add(1).ok_or_else(|| crate::error::HarvestError::Database("Event count overflow".to_string()));
     }
     if let Some(children) = extract_all_started_child_workflows(commands) {
-        return Ok(bookkeeping_events
-            .saturating_add(new_child_workflow_event_count(conn, &children).await?));
+        return bookkeeping_events
+            .checked_add(new_child_workflow_event_count(conn, &children).await?).ok_or_else(|| crate::error::HarvestError::Database("Event count overflow".to_string()));
     }
     if let Some(scheduled) = extract_single_schedule_external_activity(commands) {
         let awaiting_event = u64::from(
@@ -2823,10 +2824,10 @@ async fn suspended_command_event_count(
                 .await?
                 .is_none(),
         );
-        return Ok(bookkeeping_events.saturating_add(awaiting_event));
+        return bookkeeping_events.checked_add(awaiting_event).ok_or_else(|| crate::error::HarvestError::Database("Event count overflow".to_string()));
     }
 
-    Ok(update_events.saturating_add(1))
+    update_events.checked_add(1).ok_or_else(|| crate::error::HarvestError::Database("Event count overflow".to_string()))
 }
 
 async fn move_workflow_to_dlq_for_history_cap(
@@ -2891,7 +2892,7 @@ async fn fail_workflow_for_history_cap(
     event_count: u64,
     cap: u64,
 ) -> HarvestResult<()> {
-    let terminal_count = u64::try_from(next_event_id).unwrap_or(0).saturating_add(1);
+    let terminal_count = u64::try_from(next_event_id).unwrap_or(0).checked_add(1).ok_or_else(|| crate::error::HarvestError::Database("Event ID overflow".to_string()))?;
     telemetry.metrics.record_workflow_completed(
         &execution.workflow_name,
         &task.queue_name,
@@ -3144,7 +3145,8 @@ async fn process_workflow_task(
     };
     let current_history_event_count = u64::try_from(history_events.len())
         .unwrap_or(u64::MAX)
-        .saturating_add(pending_durable_event_count);
+        .checked_add(pending_durable_event_count)
+        .ok_or_else(|| crate::error::HarvestError::Database("Event count overflow".to_string()))?;
 
     if let Some(cap) = registry.history_policy().event_hard_cap()
         && current_history_event_count >= cap
@@ -3180,7 +3182,7 @@ async fn process_workflow_task(
     if !matches!(&outcome, WorkflowOutcome::Suspended { .. }) {
         telemetry.metrics.record_workflow_history_size(
             &prepared.execution.workflow_name,
-            terminal_history_event_count(next_event_id, &pending_cmds),
+            terminal_history_event_count(next_event_id, &pending_cmds)?,
         );
     }
     if matches!(&outcome, WorkflowOutcome::ContinuedAsNew { .. }) {

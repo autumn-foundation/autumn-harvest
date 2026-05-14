@@ -496,7 +496,7 @@ pub async fn reset_workflow_execution(
             let plan = validate_reset_point(&events, request.reset_to_event_id)?;
 
             let new_exec_id = ExecutionId::new_for_shard(ShardId::new(source.shard_id));
-            let source_next_event_id = rows.last().map_or(0, |row| row.event_id.saturating_add(1));
+            let source_next_event_id = rows.last().map_or(Ok(0), |row| row.event_id.checked_add(1).ok_or_else(|| crate::error::HarvestError::Database("Event ID overflow".to_string())))?;
 
             terminate_source_execution(conn, exec_id, new_exec_id, &request, source_next_event_id)
                 .await?;

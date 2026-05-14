@@ -220,7 +220,7 @@ pub async fn append_single_event(
         .await
         .map_err(crate::error::database_error)?;
 
-    let next_id = max_id.map_or(0, |id| id.saturating_add(1));
+    let next_id = max_id.map_or(Ok(0), |id| id.checked_add(1).ok_or_else(|| crate::error::HarvestError::Database("Event ID overflow".to_string())))?;
     append_events(conn, exec_id, &[event], next_id).await?;
     Ok(())
 }
@@ -284,7 +284,7 @@ pub async fn admit_update_event(
                 .await
                 .map_err(crate::error::database_error)?;
 
-            let next_id = max_id.map_or(0, |id| id.saturating_add(1));
+            let next_id = max_id.map_or(Ok(0), |id| id.checked_add(1).ok_or_else(|| crate::error::HarvestError::Database("Event ID overflow".to_string())))?;
             let event = WorkflowEvent::UpdateAdmitted {
                 update_id,
                 name,
@@ -337,7 +337,7 @@ pub async fn load_history_with_codecs(
         .await
         .map_err(crate::error::database_error)?;
 
-    let next_event_id = rows.last().map_or(0, |r| r.event_id.saturating_add(1));
+    let next_event_id = rows.last().map_or(Ok(0), |r| r.event_id.checked_add(1).ok_or_else(|| crate::error::HarvestError::Database("Event ID overflow".to_string())))?;
 
     let events = rows
         .into_iter()
