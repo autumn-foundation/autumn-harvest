@@ -556,6 +556,36 @@ mod tests {
         assert!(app.has_plugin(std::any::type_name::<HarvestPlugin>()));
     }
 
+    #[tokio::test]
+    async fn harvest_runner_rejects_classic_dags_without_unified_handler() {
+        let built = HarvestBuilder::new().dags(vec![fake_dag_info()]).build();
+        let pool = test_pool("postgres://harvest:harvest@localhost:5432/harvest", 4);
+        let result = HarvestRunner::start(
+            built,
+            &HarvestRuntimeConfig {
+                mode: HarvestMode::External,
+                worker_enabled: false,
+                scheduler_enabled: false,
+                database: HarvestDatabaseConfig {
+                    url: Some("postgres://harvest:harvest@localhost:5432/harvest".to_string()),
+                },
+                outbox: HarvestOutboxConfig::default(),
+                batch: crate::config::HarvestBatchConfig::default(),
+                readiness: crate::config::HarvestReadinessConfig::default(),
+            },
+            HarvestRunnerResources::new(pool),
+        );
+
+        let err = match result {
+            Ok(_) => panic!("classic DAG runtime should be rejected before startup"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("classic DAG"),
+            "error should identify unsupported classic DAG configuration: {err}"
+        );
+    }
+
     #[test]
     fn injected_runtime_state_contains_app_state() {
         let state = AppState::for_test();

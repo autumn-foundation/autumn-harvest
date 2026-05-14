@@ -476,32 +476,43 @@ fn extract_single_command<T>(
     extractor(first_cmd)
 }
 
-fn extract_single_schedule_activity(
+fn extract_all_scheduled_activities(
     commands: &[WorkflowCommand],
-) -> Option<ScheduledActivityCommand> {
-    extract_single_command(commands, |cmd| {
-        let WorkflowCommand::ScheduleActivity {
-            activity_id,
-            name,
-            input,
-            queue,
-            retry_policy_override,
-            start_to_close_override,
-            ..
-        } = cmd
-        else {
-            return None;
-        };
+) -> Option<Vec<ScheduledActivityCommand>> {
+    let mut scheduled = Vec::new();
 
-        Some(ScheduledActivityCommand {
-            activity_id: *activity_id,
-            name: name.clone(),
-            input: input.clone(),
-            queue: queue.clone(),
-            retry_policy_override: retry_policy_override.clone(),
-            start_to_close_override: *start_to_close_override,
-        })
-    })
+    for cmd in commands {
+        match cmd {
+            WorkflowCommand::RecordMarker { .. }
+            | WorkflowCommand::RecordUpdateResult { .. }
+            | WorkflowCommand::UpsertSearchAttributes { .. } => {}
+            WorkflowCommand::ScheduleActivity {
+                activity_id,
+                name,
+                input,
+                queue,
+                retry_policy_override,
+                start_to_close_override,
+                ..
+            } => {
+                scheduled.push(ScheduledActivityCommand {
+                    activity_id: *activity_id,
+                    name: name.clone(),
+                    input: input.clone(),
+                    queue: queue.clone(),
+                    retry_policy_override: retry_policy_override.clone(),
+                    start_to_close_override: *start_to_close_override,
+                });
+            }
+            _ => return None,
+        }
+    }
+
+    if scheduled.is_empty() {
+        None
+    } else {
+        Some(scheduled)
+    }
 }
 
 fn extract_single_started_timer(commands: &[WorkflowCommand]) -> Option<StartedTimerCommand> {
@@ -1352,116 +1363,112 @@ async fn persist_signal_wait_park(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn persist_scheduled_activity(
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn persist_scheduled_activities(
     conn: &mut AsyncPgConnection,
     registry: &HandlerRegistry,
     task_id: uuid::Uuid,
     exec_id: ExecutionId,
     next_event_id: i32,
     commands: &[WorkflowCommand],
-    scheduled: &ScheduledActivityCommand,
+    scheduled_activities: &[ScheduledActivityCommand],
     sticky: Option<queue::StickyHint<'_>>,
     execute_span: &tracing::Span,
     assigned_build_id: Option<&str>,
 ) -> HarvestResult<()> {
-    let activity = registry.activities.get(&scheduled.name).ok_or_else(|| {
-        HarvestError::Config(format!(
-            "no activity handler registered for '{}'",
-            scheduled.name
-        ))
-    })?;
     let marker_events = marker_events_from_commands(commands);
+    let mut events = marker_events;
+    let mut enqueued = Vec::with_capacity(scheduled_activities.len());
 
-    let queue_name = if scheduled.queue.is_empty() {
-        activity.default_queue.unwrap_or("default").to_string()
-    } else {
-        scheduled.queue.clone()
-    };
-
-    let mut params = queue::EnqueueParams::new(
-        queue_name.clone(),
-        TaskType::Activity,
-        scheduled.input.clone(),
-    );
-    params.workflow_exec_id = Some(exec_id.as_uuid());
-    params.activity_name = Some(scheduled.name.clone());
-    params.required_build_id = assigned_build_id.map(str::to_string);
-    // trace_context is set below, inside the harvest.activity.schedule span,
-    // so the downstream worker's harvest.activity.execute span is stitched to
-    // the producer span rather than the parent workflow-execute context.
-
-    // Task-level overrides (from DagBuilder) take precedence over the activity's
-    // registered defaults. This preserves per-task .retry() and .start_to_close()
-    // settings when a DAG is lowered onto the unified workflow execution path.
-    let effective_retry = scheduled
-        .retry_policy_override
-        .clone()
-        .or_else(|| activity.default_retry_policy.clone());
-    if let Some(retry_policy) = effective_retry {
-        params.max_attempts = i32::try_from(retry_policy.max_attempts).map_err(|_| {
+    for scheduled in scheduled_activities {
+        let activity = registry.activities.get(&scheduled.name).ok_or_else(|| {
             HarvestError::Config(format!(
-                "activity '{}' retry policy max_attempts exceeds i32 range",
-                activity.name
+                "no activity handler registered for '{}'",
+                scheduled.name
             ))
         })?;
-        params.retry_policy = Some(serde_json::to_value(retry_policy)?);
-    }
 
-    if let Some(timeout) = activity.default_heartbeat_timeout {
-        params.heartbeat_timeout = Some(chrono_duration_from_std(timeout, "heartbeat timeout")?);
-    }
-    let effective_stc = scheduled
-        .start_to_close_override
-        .or(activity.default_start_to_close);
-    if let Some(timeout) = effective_stc {
-        params.start_to_close = Some(chrono_duration_from_std(timeout, "start_to_close timeout")?);
-    }
-    if let Some(timeout) = activity.default_schedule_to_start {
-        params.schedule_to_start = Some(chrono_duration_from_std(
-            timeout,
-            "schedule_to_start timeout",
-        )?);
-    }
-    // When max_concurrent is set but concurrency_key is omitted, default the
-    // key to the activity name so the per-activity cap is enforced correctly.
-    let effective_key = activity
-        .concurrency_key
-        .map(ToString::to_string)
-        .or_else(|| activity.max_concurrent.map(|_| activity.name.to_string()));
-    if let Some(key) = effective_key {
-        params.concurrency_key = Some(key);
-        params.max_concurrent = activity.max_concurrent;
-    }
+        let queue_name = if scheduled.queue.is_empty() {
+            activity.default_queue.unwrap_or("default").to_string()
+        } else {
+            scheduled.queue.clone()
+        };
 
-    let activity_events = vec![WorkflowEvent::ActivityScheduled {
-        activity_id: scheduled.activity_id,
-        name: scheduled.name.clone(),
-        input: scheduled.input.clone(),
-        queue: queue_name.clone(),
-    }];
-    let mut events = marker_events;
-    events.extend(activity_events);
+        let mut params = queue::EnqueueParams::new(
+            queue_name.clone(),
+            TaskType::Activity,
+            scheduled.input.clone(),
+        );
+        params.workflow_exec_id = Some(exec_id.as_uuid());
+        params.activity_name = Some(scheduled.name.clone());
+        params.required_build_id = assigned_build_id.map(str::to_string);
 
-    // ADR-0001 §2.4: harvest.activity.schedule — PRODUCER, child of the
-    // harvest.workflow.execute span for this cycle.  Using `parent: execute_span`
-    // explicitly parents the span even though the execute span's instrumented
-    // future has already completed; the handle is still open.  Context is
-    // captured INSIDE in_scope so the queued task links back to this producer.
-    params.trace_context = tracing::info_span!(
-        parent: execute_span,
-        "harvest.activity.schedule",
-        "otel.kind" = "producer",
-        { ATTR_ACTIVITY_NAME } = %scheduled.name,
-        { ATTR_EXECUTION_ID } = %exec_id,
-        { ATTR_QUEUE } = %queue_name,
-    )
-    .in_scope(|| registry.telemetry().capture_trace_context());
+        let effective_retry = scheduled
+            .retry_policy_override
+            .clone()
+            .or_else(|| activity.default_retry_policy.clone());
+        if let Some(retry_policy) = effective_retry {
+            params.max_attempts = i32::try_from(retry_policy.max_attempts).map_err(|_| {
+                HarvestError::Config(format!(
+                    "activity '{}' retry policy max_attempts exceeds i32 range",
+                    activity.name
+                ))
+            })?;
+            params.retry_policy = Some(serde_json::to_value(retry_policy)?);
+        }
+
+        if let Some(timeout) = activity.default_heartbeat_timeout {
+            params.heartbeat_timeout =
+                Some(chrono_duration_from_std(timeout, "heartbeat timeout")?);
+        }
+        let effective_stc = scheduled
+            .start_to_close_override
+            .or(activity.default_start_to_close);
+        if let Some(timeout) = effective_stc {
+            params.start_to_close =
+                Some(chrono_duration_from_std(timeout, "start_to_close timeout")?);
+        }
+        if let Some(timeout) = activity.default_schedule_to_start {
+            params.schedule_to_start = Some(chrono_duration_from_std(
+                timeout,
+                "schedule_to_start timeout",
+            )?);
+        }
+
+        let effective_key = activity
+            .concurrency_key
+            .map(ToString::to_string)
+            .or_else(|| activity.max_concurrent.map(|_| activity.name.to_string()));
+        if let Some(key) = effective_key {
+            params.concurrency_key = Some(key);
+            params.max_concurrent = activity.max_concurrent;
+        }
+
+        events.push(WorkflowEvent::ActivityScheduled {
+            activity_id: scheduled.activity_id,
+            name: scheduled.name.clone(),
+            input: scheduled.input.clone(),
+            queue: queue_name.clone(),
+        });
+
+        params.trace_context = tracing::info_span!(
+            parent: execute_span,
+            "harvest.activity.schedule",
+            "otel.kind" = "producer",
+            { ATTR_ACTIVITY_NAME } = %scheduled.name,
+            { ATTR_EXECUTION_ID } = %exec_id,
+            { ATTR_QUEUE } = %queue_name,
+        )
+        .in_scope(|| registry.telemetry().capture_trace_context());
+        enqueued.push(params);
+    }
 
     conn.transaction::<(), HarvestError, _>(|conn| {
         async move {
             store::append_events(conn, exec_id, &events, next_event_id).await?;
-            queue::enqueue(conn, &params).await?;
+            for params in &enqueued {
+                queue::enqueue(conn, params).await?;
+            }
             queue::park_workflow_task(conn, task_id, sticky).await?;
             Ok(())
         }
@@ -2399,8 +2406,8 @@ async fn handle_suspended_workflow(
             sticky,
         )
         .await
-    } else if let Some(scheduled) = extract_single_schedule_activity(commands) {
-        persist_scheduled_activity(
+    } else if let Some(scheduled) = extract_all_scheduled_activities(commands) {
+        persist_scheduled_activities(
             conn,
             registry,
             context.persistence.task.id,
@@ -2824,9 +2831,12 @@ async fn suspended_command_event_count(
     if should_requeue_signal_wait(commands) {
         return Ok(bookkeeping_events);
     }
-    if extract_single_schedule_activity(commands).is_some()
-        || extract_single_started_timer(commands).is_some()
-    {
+    if let Some(activities) = extract_all_scheduled_activities(commands) {
+        return Ok(
+            bookkeeping_events.saturating_add(u64::try_from(activities.len()).unwrap_or(u64::MAX))
+        );
+    }
+    if extract_single_started_timer(commands).is_some() {
         return Ok(bookkeeping_events.saturating_add(1));
     }
     if let Some(children) = extract_all_started_child_workflows(commands) {

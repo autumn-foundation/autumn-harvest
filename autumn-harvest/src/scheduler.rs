@@ -425,10 +425,34 @@ async fn register_workflow_schedules_for_shard(
     shard: ShardId,
 ) -> HarvestResult<()> {
     for ws in schedules {
-        if workflow_schedule_shard(ws, router) == shard {
+        let owning_shard = workflow_schedule_shard(ws, router);
+        if owning_shard == shard {
             upsert_workflow_schedule(conn, ws).await?;
+        } else if ws.dag_name.is_some() {
+            delete_stale_dag_workflow_schedule(conn, ws).await?;
         }
     }
+    Ok(())
+}
+
+async fn delete_stale_dag_workflow_schedule(
+    conn: &mut AsyncPgConnection,
+    ws: &WorkflowSchedule,
+) -> HarvestResult<()> {
+    use crate::schema::harvest_schedules::dsl;
+
+    let Some(dag_name) = ws.dag_name.as_deref() else {
+        return Ok(());
+    };
+
+    diesel::delete(
+        dsl::harvest_schedules
+            .filter(dsl::dag_name.eq(dag_name))
+            .filter(dsl::workflow_name.eq(&ws.workflow_name)),
+    )
+    .execute(conn)
+    .await
+    .map_err(crate::error::database_error)?;
     Ok(())
 }
 

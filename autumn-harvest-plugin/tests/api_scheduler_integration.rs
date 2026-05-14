@@ -825,6 +825,22 @@ async fn load_schedule_from_url(database_url: &str, dag_name: &str) -> HarvestSc
         .expect("failed to reload harvest schedule")
 }
 
+async fn load_schedule_from_url_optional(
+    database_url: &str,
+    dag_name: &str,
+) -> Option<HarvestSchedule> {
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("failed to connect fresh Postgres client for optional schedule query");
+    harvest_schedules::table
+        .filter(harvest_schedules::dag_name.eq(dag_name))
+        .select(HarvestSchedule::as_select())
+        .first(&mut conn)
+        .await
+        .optional()
+        .expect("failed to reload optional harvest schedule")
+}
+
 async fn load_latest_dag_run_from_url(
     database_url: &str,
     dag_name: &str,
@@ -873,6 +889,21 @@ async fn wait_for_dag_run_state(
     }
 
     panic!("dag {dag_name} did not reach state {expected_state}");
+}
+
+async fn wait_for_workflow_terminal_state(database_url: &str, exec_id: &str) -> WorkflowExecution {
+    for _ in 0..200 {
+        let execution = load_execution_from_url(database_url, exec_id).await;
+        if matches!(
+            execution.state.as_str(),
+            "COMPLETED" | "FAILED" | "CANCELLED" | "TIMED_OUT" | "TERMINATED"
+        ) {
+            return execution;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    panic!("workflow {exec_id} did not reach a terminal state");
 }
 
 async fn insert_retention_fixture_execution(
@@ -1129,6 +1160,22 @@ fn interval_pipeline_workflow<'a>(
         )
         .await
         .map_err(|error| error.to_string())?;
+        Ok(Value::Null)
+    })
+}
+
+fn parallel_activities_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let first =
+            ctx.execute_activity_raw("parallel_a", json!({ "dag_task": "parallel_a" }), "default");
+        let second =
+            ctx.execute_activity_raw("parallel_b", json!({ "dag_task": "parallel_b" }), "default");
+        let (first, second) = tokio::join!(first, second);
+        first.map_err(|error| error.to_string())?;
+        second.map_err(|error| error.to_string())?;
         Ok(Value::Null)
     })
 }
@@ -2113,6 +2160,49 @@ async fn external_runner_processes_workflows_started_via_management_api() {
 
     runner.stop().await;
     web_runtime.stop().await;
+}
+
+#[tokio::test]
+async fn worker_enqueues_multiple_activity_commands_from_one_workflow_task() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let log = Arc::new(Mutex::new(Vec::<String>::new()));
+    let mut state = HashMap::new();
+    state.insert(
+        std::any::TypeId::of::<Arc<Mutex<Vec<String>>>>(),
+        Box::new(Arc::clone(&log)) as Box<dyn std::any::Any + Send + Sync>,
+    );
+    let registry = Arc::new(HandlerRegistry::with_state(
+        vec![WorkflowInfo {
+            name: "parallel_activities_workflow",
+            module: "tests",
+            handler: parallel_activities_workflow,
+        }],
+        vec![
+            recording_activity_info("parallel_a"),
+            recording_activity_info("parallel_b"),
+        ],
+        Arc::new(state),
+    ));
+    let worker = build_test_worker(Arc::clone(&registry));
+    let worker_task = spawn_test_worker(Arc::clone(&worker), pool.clone());
+
+    let exec_id = insert_workflow_on_url(
+        &database_url,
+        ShardId::new(0),
+        "parallel_activities_workflow",
+        "parallel-activity-level",
+    )
+    .await;
+
+    let execution = wait_for_workflow_terminal_state(&database_url, &exec_id.to_string()).await;
+    shutdown_test_worker(&worker, worker_task).await;
+
+    assert_eq!(execution.state, "COMPLETED");
+    assert_eq!(execution.workflow_name, "parallel_activities_workflow");
+    let mut observed = log.lock().expect("log mutex poisoned").clone();
+    observed.sort();
+    assert_eq!(observed, vec!["parallel_a", "parallel_b"]);
 }
 
 #[tokio::test]
@@ -3141,6 +3231,86 @@ async fn scheduler_tick_dispatches_scheduled_unified_dag_on_dag_shard() {
         ShardId::new(1)
     );
     assert_eq!(execution.queue_name, "dag-workers");
+}
+
+#[tokio::test]
+async fn scheduler_tick_removes_stale_unified_dag_schedule_from_old_shard() {
+    let ((shard0_url, shard1_url), _container) = setup_sharded_test_database_urls().await;
+    let router = two_shard_router();
+    let dag_name = find_dag_name_for_shard(&router, "moved_scheduled_unified", ShardId::new(1));
+    let dag_catalog = Arc::new(
+        compile_dag_catalog(vec![DagInfo {
+            name: dag_name,
+            module: "tests",
+            schedule: Some(Schedule::Interval(Duration::from_secs(60))),
+            catchup: false,
+            max_active_runs: 1,
+            default_queue: Some("dag-workers"),
+            builder: build_interval_pipeline_dag,
+            workflow_handler: Some(approval_workflow),
+        }])
+        .expect("scheduled unified dag should compile"),
+    );
+    let workflow_schedule = WorkflowSchedule {
+        workflow_name: dag_name.to_string(),
+        dag_name: Some(dag_name.to_string()),
+        schedule: Schedule::Interval(Duration::from_secs(60)),
+        input: Value::Null,
+        catchup: false,
+        max_active_runs: 1,
+        paused: false,
+        queue_name: "dag-workers".to_string(),
+    };
+    let harvest_pool = build_two_shard_pool(&shard0_url, &shard1_url);
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![workflow_info_named(dag_name)],
+        vec![],
+    ));
+    let workflow_schedules = Arc::new(vec![workflow_schedule.clone()]);
+
+    {
+        let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&shard0_url)
+            .await
+            .expect("failed to connect to shard 0 for stale schedule registration");
+        register_workflow_schedules(&mut conn, std::slice::from_ref(&workflow_schedule))
+            .await
+            .expect("failed to seed stale default-shard unified DAG schedule");
+        let stale = load_schedule_from_url(&shard0_url, dag_name).await;
+        diesel::update(harvest_schedules::table.find(stale.id))
+            .set(
+                harvest_schedules::next_run_at
+                    .eq(Some(chrono::Utc::now() - chrono::Duration::seconds(1))),
+            )
+            .execute(&mut conn)
+            .await
+            .expect("failed to force stale unified DAG schedule due");
+    }
+
+    tick_once_sharded(
+        harvest_pool.sharded_pool().clone(),
+        router.clone(),
+        registry,
+        dag_catalog,
+        workflow_schedules,
+        SchedulerMonitor::offline(),
+    )
+    .await
+    .expect("sharded tick should clean stale rows before ticking schedules");
+
+    assert!(
+        load_schedule_from_url_optional(&shard0_url, dag_name)
+            .await
+            .is_none(),
+        "stale default-shard row should be removed instead of dispatched"
+    );
+    assert_eq!(
+        count_workflow_executions_by_name_from_url(&shard0_url, dag_name).await,
+        0,
+        "stale default-shard schedule must not dispatch a duplicate DAG execution"
+    );
+    let schedule = load_schedule_from_url(&shard1_url, dag_name).await;
+    assert_eq!(schedule.workflow_name.as_deref(), Some(dag_name));
+    assert_eq!(schedule.queue_name.as_deref(), Some("dag-workers"));
 }
 
 #[tokio::test]

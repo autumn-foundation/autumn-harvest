@@ -92,6 +92,19 @@ impl PreparedHarvestRuntime {
     ) -> autumn_web::AutumnResult<Self> {
         let shard_router = resources.shard_router.clone().unwrap_or_default();
         let retention_config = built.retention().clone();
+        let classic_dag_names = built
+            .dags()
+            .iter()
+            .filter(|dag| dag.workflow_handler.is_none())
+            .map(|dag| dag.name)
+            .collect::<Vec<_>>();
+        if !classic_dag_names.is_empty() {
+            return Err(AutumnError::service_unavailable_msg(format!(
+                "classic DAG execution is not supported by this runtime; \
+                 rebuild with autumn-harvest/unified-dag-execution or remove classic DAGs: {}",
+                classic_dag_names.join(", ")
+            )));
+        }
         let registered_dag_names = built
             .dags()
             .iter()
