@@ -42,6 +42,7 @@ pub struct HarvestBuilder {
     activities: Vec<ActivityInfo>,
     dags: Vec<DagInfo>,
     workflow_schedules: Vec<WorkflowSchedule>,
+    auto_registered_dag_workflows: Vec<String>,
     worker_config: WorkerConfig,
     state: SharedStateMap,
     telemetry: Option<TelemetryConfig>,
@@ -57,6 +58,10 @@ impl std::fmt::Debug for HarvestBuilder {
             .field("activity_count", &self.activities.len())
             .field("dag_count", &self.dags.len())
             .field("workflow_schedule_count", &self.workflow_schedules.len())
+            .field(
+                "auto_registered_dag_workflow_count",
+                &self.auto_registered_dag_workflows.len(),
+            )
             .field("worker_config", &self.worker_config)
             .field("state_count", &self.state.len())
             .field("telemetry_configured", &self.telemetry.is_some())
@@ -191,6 +196,17 @@ pub enum HarvestBuilderError {
         workflow_name: String,
         /// Human-readable reason the schedule was rejected.
         reason: String,
+    },
+
+    /// A normal workflow registration reused the name of a DAG that is
+    /// auto-registered as a workflow for unified DAG execution.
+    #[error(
+        "workflow name '{name}' collides with an auto-registered DAG workflow; \
+         register workflows and DAGs with distinct names"
+    )]
+    DagWorkflowNameCollision {
+        /// The shared workflow/DAG name.
+        name: String,
     },
 
     /// A [`WorkerConfig`] field has an invalid value.
@@ -377,6 +393,8 @@ impl HarvestBuilder {
             #[cfg(feature = "unified-dag-execution")]
             {
                 if let Some(workflow_info) = dag.as_workflow_info() {
+                    self.auto_registered_dag_workflows
+                        .push(workflow_info.name.to_string());
                     self.workflows.push(workflow_info);
                 }
                 if let Some(workflow_schedule) = dag.as_workflow_schedule() {
@@ -534,6 +552,10 @@ impl HarvestBuilder {
         }
 
         validate_concurrency_keys(&self.activities)?;
+        validate_dag_workflow_name_collisions(
+            &self.workflows,
+            &self.auto_registered_dag_workflows,
+        )?;
         validate_workflow_schedules(&self.workflow_schedules, &self.workflows)?;
         validate_local_activity_timeouts(
             &self.activities,
@@ -553,6 +575,39 @@ impl HarvestBuilder {
             history_policy: self.history_policy,
         })
     }
+}
+
+/// Verify that unified DAG auto-registration does not overwrite or get
+/// overwritten by a normal workflow with the same name.
+fn validate_dag_workflow_name_collisions(
+    workflows: &[crate::info::WorkflowInfo],
+    auto_registered_dag_workflows: &[String],
+) -> Result<(), HarvestBuilderError> {
+    use std::collections::HashMap;
+
+    if auto_registered_dag_workflows.is_empty() {
+        return Ok(());
+    }
+
+    let mut auto_counts: HashMap<&str, usize> = HashMap::new();
+    for name in auto_registered_dag_workflows {
+        *auto_counts.entry(name.as_str()).or_default() += 1;
+    }
+
+    let mut workflow_counts: HashMap<&str, usize> = HashMap::new();
+    for workflow in workflows {
+        *workflow_counts.entry(workflow.name).or_default() += 1;
+    }
+
+    for (name, auto_count) in auto_counts {
+        if workflow_counts.get(name).copied().unwrap_or_default() > auto_count {
+            return Err(HarvestBuilderError::DagWorkflowNameCollision {
+                name: name.to_string(),
+            });
+        }
+    }
+
+    Ok(())
 }
 
 /// Verify that every [`WorkflowSchedule`] references a workflow name that is

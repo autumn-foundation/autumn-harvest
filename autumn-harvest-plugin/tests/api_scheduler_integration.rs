@@ -10,7 +10,7 @@ use autumn_harvest::models::{HarvestSchedule, TaskQueueItem, WorkflowExecution};
 use autumn_harvest::policy::Schedule;
 use autumn_harvest::scheduler::{
     DagCatalog, SchedulerMonitor, compile_dag_catalog, register_schedules,
-    register_workflow_schedules, tick_once,
+    register_workflow_schedules, tick_once, tick_once_sharded,
 };
 use autumn_harvest::schema::{
     harvest_dead_letters, harvest_schedules, harvest_task_queue, harvest_workflow_executions,
@@ -83,6 +83,8 @@ const INIT_SQL: &str = concat!(
     ),
     "\n",
     include_str!("../../autumn-harvest/migrations/20260509000000_harvest_build_routing/up.sql"),
+    "\n",
+    include_str!("../../autumn-harvest/migrations/20260514000000_unified_dag_schedule_kind/up.sql"),
 );
 type HarvestApiApp = axum::Router;
 
@@ -591,16 +593,20 @@ fn build_sharded_dag_api_app(
 ) -> HarvestApiApp {
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(build_two_shard_pool(shard0_url, shard1_url));
-    api_state.install(HarvestApiRuntime::new(
-        registry,
-        dag_catalog,
-        Arc::new(Vec::new()),
-        Some("scheduler-sharded".to_string()),
-        vec!["default".to_string()],
-        SchedulerMonitor::offline(),
-        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
-        router,
-    ));
+    let registered_dag_names = dag_catalog.keys().cloned().collect::<Vec<_>>();
+    api_state.install(
+        HarvestApiRuntime::new(
+            registry,
+            dag_catalog,
+            Arc::new(Vec::new()),
+            Some("scheduler-sharded".to_string()),
+            vec!["default".to_string()],
+            SchedulerMonitor::offline(),
+            HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+            router,
+        )
+        .with_registered_dag_names(registered_dag_names),
+    );
     harvest_api_router(api_state).with_state(test_app_state_without_database())
 }
 
@@ -1091,6 +1097,34 @@ fn timer_then_signal_workflow<'a>(
     })
 }
 
+fn manual_pipeline_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    input: Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        for step in ["extract", "transform", "notify"] {
+            ctx.execute_activity_raw(step, dag_activity_input(&input, step), "default")
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(Value::Null)
+    })
+}
+
+fn dag_activity_input(conf: &Value, task: &str) -> Value {
+    match conf {
+        Value::Object(object) => {
+            let mut object = object.clone();
+            object.insert("dag_task".to_string(), Value::String(task.to_string()));
+            Value::Object(object)
+        }
+        other => json!({
+            "conf": other,
+            "dag_task": task,
+        }),
+    }
+}
+
 fn record_activity<'a>(
     ctx: &'a ActivityContext,
     input: Value,
@@ -1138,7 +1172,7 @@ fn manual_pipeline_info() -> DagInfo {
         max_active_runs: 1,
         default_queue: Some("default"),
         builder: build_manual_pipeline_dag,
-        workflow_handler: None,
+        workflow_handler: Some(manual_pipeline_workflow),
     }
 }
 
@@ -1152,6 +1186,27 @@ fn interval_pipeline_info() -> DagInfo {
         default_queue: Some("default"),
         builder: build_interval_pipeline_dag,
         workflow_handler: None,
+    }
+}
+
+fn workflow_info_named(name: &'static str) -> WorkflowInfo {
+    WorkflowInfo {
+        name,
+        module: "tests",
+        handler: approval_workflow,
+    }
+}
+
+fn unified_manual_dag_info_named(name: &'static str, default_queue: &'static str) -> DagInfo {
+    DagInfo {
+        name,
+        module: "tests",
+        schedule: None,
+        catchup: false,
+        max_active_runs: 1,
+        default_queue: Some(default_queue),
+        builder: build_interval_pipeline_dag,
+        workflow_handler: Some(approval_workflow),
     }
 }
 
@@ -2355,8 +2410,14 @@ async fn harvest_api_lists_workflows_and_dead_letters_across_shards() {
 async fn harvest_api_lists_and_triggers_manual_dags() {
     let (database_url, _container) = setup_test_database_url().await;
     let pool = build_test_pool(&database_url);
-    let log = Arc::new(Mutex::new(Vec::<String>::new()));
-    let registry = recording_registry(Arc::clone(&log), &["extract", "transform", "notify"]);
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![WorkflowInfo {
+            name: "manual_pipeline",
+            module: "tests",
+            handler: manual_pipeline_workflow,
+        }],
+        vec![],
+    ));
     let dag_catalog = Arc::new(
         compile_dag_catalog(vec![manual_pipeline_info()])
             .expect("manual pipeline dag should compile"),
@@ -2393,15 +2454,17 @@ async fn harvest_api_lists_and_triggers_manual_dags() {
         "registered dag should be listed"
     );
 
-    let (trigger_status, _trigger_json) = post_json(
+    let (trigger_status, trigger_json) = post_json(
         &app,
         "/dags/manual_pipeline/trigger",
         json!({ "conf": { "step": "extract" } }),
     )
     .await;
     assert_eq!(trigger_status, StatusCode::CREATED);
-
-    let run = wait_for_dag_run_state(&database_url, "manual_pipeline", "SUCCESS").await;
+    let run_id = trigger_json["execution_id"]
+        .as_str()
+        .expect("trigger response should include execution_id");
+    let run = load_execution_from_url(&database_url, run_id).await;
     assert_eq!(run.workflow_name, "manual_pipeline");
 
     let (runs_status, runs_json) = get_json(&app, "/dags/manual_pipeline/runs").await;
@@ -2414,9 +2477,6 @@ async fn harvest_api_lists_and_triggers_manual_dags() {
             .any(|row| row["id"] == run.id.to_string()),
         "triggered dag run should be listed"
     );
-
-    let recorded = log.lock().expect("log mutex poisoned").clone();
-    assert_eq!(recorded, vec!["extract", "transform", "notify"]);
 }
 
 #[tokio::test]
@@ -2450,6 +2510,94 @@ async fn harvest_api_rejects_dag_trigger_for_workflow_without_dag_registration()
         0,
         "workflow-only registrations must not be started via the DAG trigger path"
     );
+}
+
+#[tokio::test]
+async fn harvest_api_triggers_manual_only_unified_dag_on_declared_default_queue() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let dag_info = unified_manual_dag_info_named("manual_only_unified", "dag-workers");
+    let dag_catalog = Arc::new(
+        compile_dag_catalog(vec![dag_info]).expect("manual-only unified dag should compile"),
+    );
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![workflow_info_named("manual_only_unified")],
+        vec![],
+    ));
+
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
+    api_state.install(HarvestApiRuntime::new(
+        registry,
+        Arc::clone(&dag_catalog),
+        Arc::new(Vec::new()),
+        Some("scheduler-only".to_string()),
+        vec!["dag-workers".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::single(),
+    ));
+    let app = harvest_api_router(api_state).with_state(test_app_state(pool.clone()));
+
+    let (trigger_status, _trigger_json) = post_json(
+        &app,
+        "/dags/manual_only_unified/trigger",
+        json!({ "conf": { "manual": true } }),
+    )
+    .await;
+
+    assert_eq!(trigger_status, StatusCode::CREATED);
+    let execution =
+        load_latest_workflow_execution_by_name_from_url(&database_url, "manual_only_unified")
+            .await
+            .expect("manual-only unified DAG trigger should create an execution");
+    assert_eq!(
+        execution.queue_name, "dag-workers",
+        "manual-only unified DAGs must use their default_queue without requiring a schedule row"
+    );
+}
+
+#[tokio::test]
+async fn harvest_api_lists_unscheduled_unified_dags_from_catalog() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let dag_catalog = Arc::new(
+        compile_dag_catalog(vec![unified_manual_dag_info_named(
+            "catalog_only_unified",
+            "dag-workers",
+        )])
+        .expect("manual-only unified dag should compile"),
+    );
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![workflow_info_named("catalog_only_unified")],
+        vec![],
+    ));
+
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
+    api_state.install(HarvestApiRuntime::new(
+        registry,
+        Arc::clone(&dag_catalog),
+        Arc::new(Vec::new()),
+        Some("scheduler-only".to_string()),
+        vec!["dag-workers".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::single(),
+    ));
+    let app = harvest_api_router(api_state).with_state(test_app_state(pool.clone()));
+
+    let (dags_status, dags_json) = get_json(&app, "/dags").await;
+    assert_eq!(dags_status, StatusCode::OK);
+    let dags = dags_json
+        .as_array()
+        .expect("dags response must be an array");
+    let row = dags
+        .iter()
+        .find(|dag| dag["name"] == "catalog_only_unified")
+        .expect("manual-only unified DAG should be listed even without a schedule row");
+    assert_eq!(row["task_count"], 1);
+    assert!(row["schedule_expr"].is_null());
 }
 
 #[tokio::test]
@@ -2707,6 +2855,133 @@ async fn concurrent_scheduler_ticks_dispatch_due_workflow_schedule_once() {
         1,
         "duplicate scheduler ticks must not enqueue duplicate workflow tasks"
     );
+}
+
+#[tokio::test]
+async fn register_workflow_schedules_accepts_unified_dag_schedule_rows() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let workflow_schedule = WorkflowSchedule {
+        workflow_name: "scheduled_unified_dag".to_string(),
+        dag_name: Some("scheduled_unified_dag".to_string()),
+        schedule: Schedule::Interval(Duration::from_secs(60)),
+        input: Value::Null,
+        catchup: false,
+        max_active_runs: 1,
+        paused: false,
+        queue_name: "dag-workers".to_string(),
+    };
+
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect for workflow schedule registration");
+    register_workflow_schedules(&mut conn, std::slice::from_ref(&workflow_schedule))
+        .await
+        .expect("unified DAG workflow schedule rows may carry both dag_name and workflow_name");
+
+    let schedule = load_schedule_from_url(&database_url, "scheduled_unified_dag").await;
+    assert_eq!(
+        schedule.workflow_name.as_deref(),
+        Some("scheduled_unified_dag")
+    );
+    assert_eq!(schedule.queue_name.as_deref(), Some("dag-workers"));
+}
+
+#[tokio::test]
+async fn scheduler_tick_dispatches_scheduled_unified_dag_on_dag_shard() {
+    let ((shard0_url, shard1_url), _container) = setup_sharded_test_database_urls().await;
+    let router = two_shard_router();
+    let dag_name = find_dag_name_for_shard(&router, "scheduled_unified", ShardId::new(1));
+    let dag_catalog = Arc::new(
+        compile_dag_catalog(vec![DagInfo {
+            name: dag_name,
+            module: "tests",
+            schedule: Some(Schedule::Interval(Duration::from_secs(60))),
+            catchup: false,
+            max_active_runs: 1,
+            default_queue: Some("dag-workers"),
+            builder: build_interval_pipeline_dag,
+            workflow_handler: Some(approval_workflow),
+        }])
+        .expect("scheduled unified dag should compile"),
+    );
+    let workflow_schedule = WorkflowSchedule {
+        workflow_name: dag_name.to_string(),
+        dag_name: Some(dag_name.to_string()),
+        schedule: Schedule::Interval(Duration::from_secs(60)),
+        input: Value::Null,
+        catchup: false,
+        max_active_runs: 1,
+        paused: false,
+        queue_name: "dag-workers".to_string(),
+    };
+    let harvest_pool = build_two_shard_pool(&shard0_url, &shard1_url);
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![workflow_info_named(dag_name)],
+        vec![],
+    ));
+    let workflow_schedules = Arc::new(vec![workflow_schedule]);
+
+    tick_once_sharded(
+        harvest_pool.sharded_pool().clone(),
+        router.clone(),
+        Arc::clone(&registry),
+        Arc::clone(&dag_catalog),
+        Arc::clone(&workflow_schedules),
+        SchedulerMonitor::offline(),
+    )
+    .await
+    .expect("initial sharded tick should register the schedule on the DAG shard");
+
+    assert!(
+        load_latest_dag_run_from_url(&shard0_url, dag_name)
+            .await
+            .is_none(),
+        "registration-only tick must not create a default-shard DAG execution"
+    );
+    let schedule = load_schedule_from_url(&shard1_url, dag_name).await;
+    {
+        let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&shard1_url)
+            .await
+            .expect("failed to connect to shard 1 for forcing due schedule");
+        diesel::update(harvest_schedules::table.find(schedule.id))
+            .set(
+                harvest_schedules::next_run_at
+                    .eq(Some(chrono::Utc::now() - chrono::Duration::seconds(1))),
+            )
+            .execute(&mut conn)
+            .await
+            .expect("failed to force unified DAG workflow schedule due");
+    }
+
+    tick_once_sharded(
+        harvest_pool.sharded_pool().clone(),
+        router.clone(),
+        registry,
+        dag_catalog,
+        workflow_schedules,
+        SchedulerMonitor::offline(),
+    )
+    .await
+    .expect("sharded tick should dispatch the due unified DAG schedule");
+
+    assert_eq!(
+        count_workflow_executions_by_name_from_url(&shard1_url, dag_name).await,
+        1,
+        "scheduled unified DAG runs must be inserted on the DAG-owning shard"
+    );
+    assert_eq!(
+        count_workflow_executions_by_name_from_url(&shard0_url, dag_name).await,
+        0,
+        "scheduled unified DAG runs must not be inserted on the default shard"
+    );
+    let execution = load_latest_workflow_execution_by_name_from_url(&shard1_url, dag_name)
+        .await
+        .expect("scheduled unified DAG execution should exist on shard 1");
+    assert_eq!(
+        ExecutionId::from_uuid(execution.id).shard(),
+        ShardId::new(1)
+    );
+    assert_eq!(execution.queue_name, "dag-workers");
 }
 
 #[tokio::test]

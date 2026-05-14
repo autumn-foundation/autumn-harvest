@@ -234,8 +234,9 @@ impl HarvestRunner {
             })
         });
         let scheduler = if config.scheduler_enabled {
-            Some(SchedulerRuntime::spawn(
-                harvest_pool,
+            Some(SchedulerRuntime::spawn_sharded(
+                prepared.storage_pool.sharded_pool().clone(),
+                shard_router.clone(),
                 Arc::clone(&registry),
                 Arc::clone(&dag_catalog),
                 Arc::clone(&workflow_schedules),

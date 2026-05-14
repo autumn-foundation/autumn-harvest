@@ -51,7 +51,7 @@ use autumn_harvest::models::{
     AuditRecord, BackfillLogRow, DeadLetter, HarvestSchedule, NewAuditRecord, NewBackfillLogRow,
     WorkflowExecution,
 };
-use autumn_harvest::policy::WorkflowSchedule;
+use autumn_harvest::policy::{Schedule, WorkflowSchedule};
 use autumn_harvest::queue::{self, ConcurrencyKeyStats};
 use autumn_harvest::reset::{
     ResetInvalidPoint, ResetResult, WorkflowResetError, WorkflowResetRequest,
@@ -146,10 +146,16 @@ impl HarvestApiRuntime {
         retention: HarvestRetentionRuntime,
         router: ShardRouter,
     ) -> Self {
-        let registered_dag_names = workflow_schedules
-            .iter()
-            .filter_map(|schedule| schedule.dag_name.clone())
+        let mut registered_dag_names = dags
+            .values()
+            .filter(|dag| dag.is_unified)
+            .map(|dag| dag.name.clone())
             .collect::<HashSet<_>>();
+        registered_dag_names.extend(
+            workflow_schedules
+                .iter()
+                .filter_map(|schedule| schedule.dag_name.clone()),
+        );
 
         Self {
             registry,
@@ -3865,17 +3871,28 @@ async fn query_workflow(
     ctx.execute_query(&query_name).map(Json).map_err(map_error)
 }
 
+fn schedule_expr_for_summary(schedule: &Schedule) -> String {
+    match schedule {
+        Schedule::Cron(expr) => format!("cron:{expr}"),
+        Schedule::Interval(interval) => format!("interval:{}", interval.as_secs()),
+        Schedule::Manual => "manual".to_string(),
+    }
+}
+
 async fn list_dags(
     Extension(api_state): Extension<HarvestApiState>,
 ) -> Result<Json<Vec<DagSummary>>, AutumnError> {
     let runtime = api_state.runtime().map_err(map_error)?;
     let schedules = load_schedules_from_shards(&api_state).await?;
 
-    let dags = schedules
-        .into_iter()
-        .filter_map(|schedule| {
-            let dag_name = schedule.dag_name.clone()?; // skip workflow-only rows
-            Some(DagSummary {
+    let mut dags = BTreeMap::new();
+    for schedule in schedules {
+        let Some(dag_name) = schedule.dag_name.clone() else {
+            continue;
+        };
+        dags.insert(
+            dag_name.clone(),
+            DagSummary {
                 name: dag_name.clone(),
                 schedule_expr: schedule.schedule_expr.clone(),
                 is_paused: schedule.is_paused,
@@ -3886,11 +3903,23 @@ async fn list_dags(
                     .dags
                     .get(&dag_name)
                     .map_or(0, RegisteredDag::task_count),
-            })
-        })
-        .collect();
+            },
+        );
+    }
 
-    Ok(Json(dags))
+    for (dag_name, dag) in runtime.dags.iter() {
+        dags.entry(dag_name.clone()).or_insert_with(|| DagSummary {
+            name: dag_name.clone(),
+            schedule_expr: dag.schedule.as_ref().map(schedule_expr_for_summary),
+            is_paused: false,
+            next_run_at: None,
+            max_active_runs: i32::try_from(dag.max_active_runs).unwrap_or(i32::MAX),
+            catchup: dag.catchup,
+            task_count: dag.task_count(),
+        });
+    }
+
+    Ok(Json(dags.into_values().collect()))
 }
 
 async fn list_dag_runs(
@@ -3928,12 +3957,24 @@ async fn trigger_dag_run(
     }
 
     let shard = runtime.router.pick_for_dag(&dag_name);
+    let default_queue = runtime
+        .dags
+        .get(&dag_name)
+        .and_then(|dag| dag.default_queue.as_deref())
+        .unwrap_or("default")
+        .to_string();
 
     let (actor, source, request_id) = audit_context(&headers, &api_state);
     let route = "POST /dags/{dag_name}/trigger";
 
-    let trigger_result =
-        trigger_unified_dag(pool.pool_for(shard).clone(), &dag_name, request.conf, shard).await;
+    let trigger_result = trigger_unified_dag(
+        pool.pool_for(shard).clone(),
+        &dag_name,
+        request.conf,
+        shard,
+        &default_queue,
+    )
+    .await;
 
     let mut audit_conn = acquire_conn(pool.pool_for(shard)).await?;
 

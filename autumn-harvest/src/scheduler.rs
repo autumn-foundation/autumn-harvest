@@ -25,7 +25,8 @@ use crate::info::DagInfo;
 use crate::models::{HarvestSchedule, NewHarvestSchedule};
 use crate::policy::{Schedule, WorkflowSchedule};
 use crate::schema::{harvest_schedules, harvest_workflow_executions};
-use crate::types::{ExecutionId, WorkflowIdReusePolicy};
+use crate::shard::{ShardRouter, ShardedDbPool};
+use crate::types::{ExecutionId, ShardId, WorkflowIdReusePolicy};
 use crate::worker::{DbPool, HandlerRegistry};
 
 const DEFAULT_SCHEDULER_TICK_INTERVAL: Duration = Duration::from_secs(1);
@@ -132,6 +133,10 @@ pub struct RegisteredDag {
     pub catchup: bool,
     /// Maximum number of concurrent executions for this DAG.
     pub max_active_runs: u32,
+    /// Default queue declared on the DAG, if any.
+    pub default_queue: Option<String>,
+    /// True when this DAG is executed through the workflow executor.
+    pub is_unified: bool,
     /// The compiled task and dependency definition.
     pub definition: crate::dag::DagDefinition,
 }
@@ -244,6 +249,28 @@ impl SchedulerRuntime {
         dags: Arc<DagCatalog>,
         workflow_schedules: Arc<Vec<WorkflowSchedule>>,
     ) -> Self {
+        Self::spawn_sharded(
+            ShardedDbPool::single(pool),
+            ShardRouter::single(),
+            registry,
+            dags,
+            workflow_schedules,
+        )
+    }
+
+    /// Spawns the scheduler loop for a sharded deployment.
+    ///
+    /// DAG-backed workflow schedules are registered and ticked on the shard
+    /// selected by [`ShardRouter::pick_for_dag`]. Workflow-only schedules remain
+    /// on the router's default shard for backward compatibility.
+    #[must_use]
+    pub fn spawn_sharded(
+        pool: ShardedDbPool,
+        router: ShardRouter,
+        registry: Arc<HandlerRegistry>,
+        dags: Arc<DagCatalog>,
+        workflow_schedules: Arc<Vec<WorkflowSchedule>>,
+    ) -> Self {
         let shutdown = CancellationToken::new();
         let shutdown_for_task = shutdown.clone();
         let total = dags.len() + workflow_schedules.len();
@@ -251,19 +278,9 @@ impl SchedulerRuntime {
         let monitor_for_task = monitor.clone();
         let handle = tokio::spawn(async move {
             while !shutdown_for_task.is_cancelled() {
-                if let Ok(mut conn) = pool.get().await {
-                    if let Err(error) = register_schedules(&mut conn, dags.as_ref()).await {
-                        tracing::warn!(error = %error, "failed to register harvest DAG schedules");
-                    }
-                    if let Err(error) =
-                        register_workflow_schedules(&mut conn, workflow_schedules.as_ref()).await
-                    {
-                        tracing::warn!(error = %error, "failed to register harvest workflow schedules");
-                    }
-                }
-
-                if let Err(error) = tick_once(
+                if let Err(error) = tick_once_sharded(
                     pool.clone(),
+                    router.clone(),
                     Arc::clone(&registry),
                     Arc::clone(&dags),
                     Arc::clone(&workflow_schedules),
@@ -322,13 +339,6 @@ pub fn compile_dag_catalog(dags: Vec<DagInfo>) -> HarvestResult<DagCatalog> {
     let mut catalog = DagCatalog::new();
 
     for dag in dags {
-        // DAGs promoted to the unified workflow execution path are driven by
-        // the workflow executor; the classic DAG runtime must not claim them.
-        #[cfg(feature = "unified-dag-execution")]
-        if dag.workflow_handler.is_some() {
-            continue;
-        }
-
         let name = dag.name.to_string();
         if catalog.contains_key(&name) {
             return Err(HarvestError::Config(format!(
@@ -348,6 +358,8 @@ pub fn compile_dag_catalog(dags: Vec<DagInfo>) -> HarvestResult<DagCatalog> {
                 schedule: dag.schedule.clone(),
                 catchup: dag.catchup,
                 max_active_runs: dag.max_active_runs,
+                default_queue: dag.default_queue.map(ToOwned::to_owned),
+                is_unified: dag.workflow_handler.is_some(),
                 definition,
             },
         );
@@ -367,6 +379,24 @@ pub async fn register_schedules(
     dags: &DagCatalog,
 ) -> HarvestResult<()> {
     for dag in dags.values() {
+        if dag.is_unified {
+            continue;
+        }
+        upsert_schedule(conn, dag).await?;
+    }
+    Ok(())
+}
+
+async fn register_schedules_for_shard(
+    conn: &mut AsyncPgConnection,
+    dags: &DagCatalog,
+    router: &ShardRouter,
+    shard: ShardId,
+) -> HarvestResult<()> {
+    for dag in dags.values() {
+        if dag.is_unified || router.pick_for_dag(&dag.name) != shard {
+            continue;
+        }
         upsert_schedule(conn, dag).await?;
     }
     Ok(())
@@ -388,6 +418,27 @@ pub async fn register_workflow_schedules(
     Ok(())
 }
 
+async fn register_workflow_schedules_for_shard(
+    conn: &mut AsyncPgConnection,
+    schedules: &[WorkflowSchedule],
+    router: &ShardRouter,
+    shard: ShardId,
+) -> HarvestResult<()> {
+    for ws in schedules {
+        if workflow_schedule_shard(ws, router) == shard {
+            upsert_workflow_schedule(conn, ws).await?;
+        }
+    }
+    Ok(())
+}
+
+fn workflow_schedule_shard(schedule: &WorkflowSchedule, router: &ShardRouter) -> ShardId {
+    schedule.dag_name.as_deref().map_or_else(
+        || router.default_shard(),
+        |dag_name| router.pick_for_dag(dag_name),
+    )
+}
+
 /// Run one scheduler tick: dispatch due workflow-schedule runs.
 ///
 /// The `_dags` parameter is retained for API compatibility; since
@@ -400,24 +451,66 @@ pub async fn register_workflow_schedules(
 pub async fn tick_once(
     pool: DbPool,
     registry: Arc<HandlerRegistry>,
-    _dags: Arc<DagCatalog>,
+    dags: Arc<DagCatalog>,
     workflow_schedules: Arc<Vec<WorkflowSchedule>>,
     monitor: SchedulerMonitor,
 ) -> HarvestResult<()> {
-    let total = workflow_schedules.len();
+    tick_once_sharded(
+        ShardedDbPool::single(pool),
+        ShardRouter::single(),
+        registry,
+        dags,
+        workflow_schedules,
+        monitor,
+    )
+    .await
+}
+
+/// Run one scheduler tick across every configured shard.
+///
+/// Classic DAG schedules are registered only on their owning DAG shard.
+/// Unified DAG workflow schedules follow the same DAG shard so automatic runs
+/// remain visible to the DAG APIs and carry an encoded shard id.
+///
+/// # Errors
+///
+/// Returns [`HarvestError`] if a shard connection or schedule registration
+/// fails.
+pub async fn tick_once_sharded(
+    pool: ShardedDbPool,
+    router: ShardRouter,
+    registry: Arc<HandlerRegistry>,
+    dags: Arc<DagCatalog>,
+    workflow_schedules: Arc<Vec<WorkflowSchedule>>,
+    monitor: SchedulerMonitor,
+) -> HarvestResult<()> {
+    let total = dags.len() + workflow_schedules.len();
     monitor.mark_tick(total);
 
-    let mut conn = pool
-        .get()
-        .await
-        .map_err(|error| HarvestError::Database(error.to_string()))?;
     let metrics = Arc::clone(&registry.telemetry().metrics);
 
-    // Dispatch due workflow-schedule runs directly via start_or_load_workflow_execution.
-    // Always check the DB — API-created schedules are DB-only and won't appear in the
-    // in-memory workflow_schedules list.
-    if let Err(error) = tick_workflow_schedules(&mut conn, &metrics).await {
-        tracing::warn!(error = %error, "harvest workflow-schedule tick error");
+    for (shard, shard_pool) in pool.iter_shards() {
+        let mut conn = shard_pool
+            .get()
+            .await
+            .map_err(|error| HarvestError::Database(error.to_string()))?;
+
+        register_schedules_for_shard(&mut conn, dags.as_ref(), &router, shard).await?;
+        register_workflow_schedules_for_shard(
+            &mut conn,
+            workflow_schedules.as_ref(),
+            &router,
+            shard,
+        )
+        .await?;
+
+        if let Err(error) = tick_workflow_schedules(&mut conn, shard, &metrics).await {
+            tracing::warn!(
+                error = %error,
+                shard_id = shard.as_i32(),
+                "harvest workflow-schedule tick error"
+            );
+        }
     }
 
     Ok(())
@@ -437,6 +530,7 @@ pub async fn trigger_unified_dag(
     dag_name: &str,
     run_conf: Option<Value>,
     shard: crate::types::ShardId,
+    default_queue: &str,
 ) -> HarvestResult<StartedWorkflowExecution> {
     let mut db = pool
         .get()
@@ -460,7 +554,7 @@ pub async fn trigger_unified_dag(
             .await
             .ok()
             .flatten()
-            .unwrap_or_else(|| "default".to_string())
+            .unwrap_or_else(|| default_queue.to_string())
     };
 
     let input = run_conf.unwrap_or(Value::Null);
@@ -632,6 +726,7 @@ async fn upsert_workflow_schedule(
             dsl::timezone.eq("UTC"),
             dsl::catchup.eq(ws.catchup),
             dsl::max_active_runs.eq(i32::try_from(ws.max_active_runs).unwrap_or(i32::MAX)),
+            dsl::dag_name.eq(ws.dag_name.as_deref()),
             dsl::workflow_input.eq(Some(ws.input.clone())),
             dsl::queue_name.eq(Some(ws.queue_name.as_str())),
             dsl::updated_at.eq(now),
@@ -739,6 +834,7 @@ fn parse_schedule_from_expr(expr: &str) -> Option<Schedule> {
 
 async fn tick_workflow_schedules(
     conn: &mut AsyncPgConnection,
+    current_shard: ShardId,
     metrics: &Arc<dyn crate::telemetry::MetricsRecorder>,
 ) -> HarvestResult<()> {
     use crate::schema::harvest_schedules::dsl;
@@ -779,6 +875,7 @@ async fn tick_workflow_schedules(
             &schedule,
             logical_date,
             now,
+            current_shard,
             metrics,
         )
         .await
@@ -802,6 +899,7 @@ async fn tick_one_workflow_schedule(
     schedule: &HarvestSchedule,
     logical_date: DateTime<Utc>,
     now: DateTime<Utc>,
+    current_shard: ShardId,
     metrics: &Arc<dyn crate::telemetry::MetricsRecorder>,
 ) -> HarvestResult<()> {
     use crate::execution::StartWorkflowParams;
@@ -860,7 +958,11 @@ async fn tick_one_workflow_schedule(
             break;
         }
         let workflow_id = scheduled_workflow_id(wf_name, *scheduled_for);
-        let exec_id = ExecutionId::new();
+        let exec_id = if schedule.dag_name.is_some() {
+            ExecutionId::new_for_shard(current_shard)
+        } else {
+            ExecutionId::new()
+        };
         let input = schedule
             .workflow_input
             .clone()

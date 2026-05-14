@@ -12,10 +12,11 @@
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::info::WorkflowHandlerFn;
 use autumn_harvest::prelude::*;
+use autumn_harvest::scheduler::compile_dag_catalog;
 use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
 use autumn_harvest::types::ActivityExecId;
 use chrono::Utc;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 // ---------------------------------------------------------------------------
 // Shared activity stubs
@@ -86,6 +87,13 @@ fn all_failed_root_dag(dag: &mut DagBuilder) {
         .trigger_rule(TriggerRule::AllFailed);
 }
 
+fn dag_task_input(task: &str) -> Value {
+    json!({
+        "conf": Value::Null,
+        "dag_task": task,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // RED-PHASE TEST 1 — macro emits the workflow companion
 // ---------------------------------------------------------------------------
@@ -138,7 +146,7 @@ async fn lowered_handler_replays_linear_dag_all_success() {
         WorkflowEvent::ActivityScheduled {
             activity_id: id_extract,
             name: "extract_users".into(),
-            input: Value::Null,
+            input: dag_task_input("extract_users"),
             queue: "etl-workers".into(),
         },
         WorkflowEvent::ActivityCompleted {
@@ -148,7 +156,7 @@ async fn lowered_handler_replays_linear_dag_all_success() {
         WorkflowEvent::ActivityScheduled {
             activity_id: id_load,
             name: "load_users".into(),
-            input: Value::Null,
+            input: dag_task_input("load_users"),
             queue: "etl-workers".into(),
         },
         WorkflowEvent::ActivityCompleted {
@@ -189,7 +197,7 @@ async fn lowered_handler_skips_all_success_downstream_on_upstream_failure() {
         WorkflowEvent::ActivityScheduled {
             activity_id: id_extract,
             name: "extract_users".into(),
-            input: Value::Null,
+            input: dag_task_input("extract_users"),
             queue: "etl-workers".into(),
         },
         WorkflowEvent::ActivityFailed {
@@ -242,7 +250,7 @@ async fn lowered_handler_runs_alldone_downstream_on_upstream_failure() {
         WorkflowEvent::ActivityScheduled {
             activity_id: id_extract,
             name: "extract_users".into(),
-            input: Value::Null,
+            input: dag_task_input("extract_users"),
             queue: "default".into(),
         },
         WorkflowEvent::ActivityFailed {
@@ -257,7 +265,7 @@ async fn lowered_handler_runs_alldone_downstream_on_upstream_failure() {
         WorkflowEvent::ActivityScheduled {
             activity_id: id_load,
             name: "load_users".into(),
-            input: Value::Null,
+            input: dag_task_input("load_users"),
             queue: "default".into(),
         },
         WorkflowEvent::ActivityCompleted {
@@ -397,6 +405,76 @@ fn as_workflow_schedule_returns_none_for_unscheduled_dag() {
     );
 }
 
+#[tokio::test]
+async fn lowered_handler_merges_dag_task_into_object_workflow_input() {
+    let id_extract = ActivityExecId::new();
+    let workflow_input = json!({ "tenant": "acme", "run": 42 });
+
+    let history = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: workflow_input.clone(),
+            timestamp: Utc::now(),
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: id_extract,
+            name: "extract_users".into(),
+            input: json!({ "tenant": "acme", "run": 42, "dag_task": "extract_users" }),
+            queue: "test-queue".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: id_extract,
+            output: Value::Null,
+        },
+    ];
+
+    let report = WorkflowReplayer::new()
+        .register_fn(
+            "scheduled_dag",
+            __autumn_workflow_info_scheduled_dag().handler,
+        )
+        .replay_from_events(history)
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "object workflow input should be merged with dag_task, got: {report}"
+    );
+}
+
+#[tokio::test]
+async fn lowered_handler_wraps_scalar_workflow_input_with_conf_and_dag_task() {
+    let id_extract = ActivityExecId::new();
+    let history = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: json!("manual-run"),
+            timestamp: Utc::now(),
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: id_extract,
+            name: "extract_users".into(),
+            input: json!({ "conf": "manual-run", "dag_task": "extract_users" }),
+            queue: "test-queue".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: id_extract,
+            output: Value::Null,
+        },
+    ];
+
+    let report = WorkflowReplayer::new()
+        .register_fn(
+            "scheduled_dag",
+            __autumn_workflow_info_scheduled_dag().handler,
+        )
+        .replay_from_events(history)
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "non-object workflow input should be wrapped as conf plus dag_task, got: {report}"
+    );
+}
+
 /// `HarvestBuilder::dags()` must auto-register a `WorkflowInfo` for every
 /// unified DAG (one whose `workflow_handler` is populated by the macro) so the
 /// runtime can route new starts through the workflow execution path.
@@ -436,6 +514,57 @@ fn builder_dags_auto_registers_workflow_schedule_only_for_scheduled_dags() {
         builder.workflow_schedule_count(),
         1,
         "builder should auto-register one WorkflowSchedule for scheduled_dag only"
+    );
+}
+
+#[test]
+fn builder_rejects_workflow_name_collision_with_auto_registered_dag() {
+    use autumn_harvest::builder::HarvestBuilder;
+    use autumn_harvest::info::WorkflowInfo;
+
+    let colliding_workflow = WorkflowInfo {
+        name: "linear_dag",
+        module: "tests",
+        handler: __autumn_workflow_info_scheduled_dag().handler,
+    };
+
+    let result = HarvestBuilder::new()
+        .workflows(vec![colliding_workflow])
+        .dags(vec![__autumn_dag_info_linear_dag()])
+        .try_build();
+
+    let err = result.expect_err("workflow/DAG name collision must be rejected");
+    assert!(
+        err.to_string().contains("linear_dag"),
+        "collision error should name the shared registration, got: {err}"
+    );
+}
+
+#[test]
+fn compile_dag_catalog_keeps_unified_dag_metadata() {
+    let catalog = compile_dag_catalog(vec![__autumn_dag_info_linear_dag()])
+        .expect("unified DAG metadata should compile into the catalog");
+
+    let registered = catalog
+        .get("linear_dag")
+        .expect("unified DAG should remain in runtime DAG catalog");
+    assert_eq!(registered.task_count(), 2);
+    assert!(registered.schedule.is_none());
+}
+
+#[test]
+fn compile_dag_catalog_rejects_duplicate_unified_dag_names() {
+    let result = compile_dag_catalog(vec![
+        __autumn_dag_info_linear_dag(),
+        __autumn_dag_info_linear_dag(),
+    ]);
+
+    assert!(
+        result
+            .expect_err("duplicate unified DAG names must be rejected")
+            .to_string()
+            .contains("duplicate dag registration"),
+        "duplicate DAG error should preserve the catalog validation message"
     );
 }
 
@@ -494,7 +623,7 @@ async fn lowered_handler_replays_fanout_dag() {
         WorkflowEvent::ActivityScheduled {
             activity_id: id_extract,
             name: "extract_users".into(),
-            input: Value::Null,
+            input: dag_task_input("extract_users"),
             queue: "default".into(),
         },
         WorkflowEvent::ActivityCompleted {
@@ -505,7 +634,7 @@ async fn lowered_handler_replays_fanout_dag() {
         WorkflowEvent::ActivityScheduled {
             activity_id: id_load,
             name: "load_users".into(),
-            input: Value::Null,
+            input: dag_task_input("load_users"),
             queue: "default".into(),
         },
         WorkflowEvent::ActivityCompleted {
@@ -515,7 +644,7 @@ async fn lowered_handler_replays_fanout_dag() {
         WorkflowEvent::ActivityScheduled {
             activity_id: id_notify,
             name: "notify_complete".into(),
-            input: Value::Null,
+            input: dag_task_input("notify_complete"),
             queue: "default".into(),
         },
         WorkflowEvent::ActivityCompleted {

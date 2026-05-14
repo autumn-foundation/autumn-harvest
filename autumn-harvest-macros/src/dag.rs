@@ -156,10 +156,34 @@ pub fn dag_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 continue;
                             }
 
+                            let __activity_input = match _input.clone() {
+                                ::autumn_harvest::serde_json::Value::Object(mut __object) => {
+                                    __object.insert(
+                                        "dag_task".to_owned(),
+                                        ::autumn_harvest::serde_json::Value::String(
+                                            __activity_name.clone(),
+                                        ),
+                                    );
+                                    ::autumn_harvest::serde_json::Value::Object(__object)
+                                }
+                                __conf => {
+                                    let mut __object =
+                                        ::autumn_harvest::serde_json::Map::new();
+                                    __object.insert("conf".to_owned(), __conf);
+                                    __object.insert(
+                                        "dag_task".to_owned(),
+                                        ::autumn_harvest::serde_json::Value::String(
+                                            __activity_name.clone(),
+                                        ),
+                                    );
+                                    ::autumn_harvest::serde_json::Value::Object(__object)
+                                }
+                            };
+
                             let __status = match ctx
                                 .execute_activity_raw_with_opts(
                                     &__activity_name,
-                                    _input.clone(),
+                                    __activity_input,
                                     &__queue_str,
                                     __retry_override,
                                     __stc_override,
@@ -310,11 +334,35 @@ fn emit_workflow_companion(
                                     continue; // skip to next task in this level
                                 }
 
+                                let __activity_input = match _input.clone() {
+                                    ::autumn_harvest::serde_json::Value::Object(mut __object) => {
+                                        __object.insert(
+                                            "dag_task".to_owned(),
+                                            ::autumn_harvest::serde_json::Value::String(
+                                                __activity_name.clone(),
+                                            ),
+                                        );
+                                        ::autumn_harvest::serde_json::Value::Object(__object)
+                                    }
+                                    __conf => {
+                                        let mut __object =
+                                            ::autumn_harvest::serde_json::Map::new();
+                                        __object.insert("conf".to_owned(), __conf);
+                                        __object.insert(
+                                            "dag_task".to_owned(),
+                                            ::autumn_harvest::serde_json::Value::String(
+                                                __activity_name.clone(),
+                                            ),
+                                        );
+                                        ::autumn_harvest::serde_json::Value::Object(__object)
+                                    }
+                                };
+
                                 // Dispatch and record terminal status.
                                 let __status = match ctx
                                     .execute_activity_raw_with_opts(
                                         &__activity_name,
-                                        _input.clone(),
+                                        __activity_input,
                                         &__queue_str,
                                         __retry_override,
                                         __stc_override,
