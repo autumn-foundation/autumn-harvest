@@ -665,9 +665,10 @@ async fn upsert_schedule(
 
 /// Upsert a `harvest_schedules` row for a [`WorkflowSchedule`].
 ///
-/// The insert uses `ON CONFLICT (workflow_name) DO NOTHING` so that concurrent
-/// scheduler instances or API requests cannot produce duplicate rows even without
-/// a serialisable transaction. A subsequent `UPDATE` then refreshes all mutable
+/// Unified DAG schedules first reuse any existing classic DAG row keyed by
+/// `dag_name`, then write `workflow_name` onto that row. Workflow-only schedules
+/// use `ON CONFLICT (workflow_name) DO NOTHING` so concurrent scheduler instances
+/// cannot produce duplicate rows. A subsequent `UPDATE` refreshes all mutable
 /// fields, preserving `is_paused` (managed independently via pause/resume).
 async fn upsert_workflow_schedule(
     conn: &mut AsyncPgConnection,
@@ -678,37 +679,68 @@ async fn upsert_workflow_schedule(
     let now = Utc::now();
     let expr = schedule_expr(Some(&ws.schedule));
 
-    // Attempt an atomic insert. The UNIQUE constraint on workflow_name means a
-    // concurrent writer will hit DO NOTHING rather than inserting a duplicate.
-    let row = NewHarvestSchedule {
-        id: uuid::Uuid::new_v4(),
-        dag_name: ws.dag_name.as_deref(),
-        schedule_expr: expr.as_deref(),
-        timezone: "UTC",
-        catchup: ws.catchup,
-        max_active_runs: i32::try_from(ws.max_active_runs).unwrap_or(i32::MAX),
-        // is_paused is set on initial insert only; subsequent upserts preserve the
-        // current value so that pause/resume state is not accidentally overwritten.
-        is_paused: ws.paused,
-        workflow_name: Some(&ws.workflow_name),
-        workflow_input: Some(ws.input.clone()),
-        queue_name: Some(ws.queue_name.as_str()),
-    };
-    diesel::insert_into(harvest_schedules::table)
-        .values(&row)
-        .on_conflict(dsl::workflow_name)
-        .do_nothing()
-        .execute(conn)
-        .await
-        .map_err(crate::error::database_error)?;
+    let existing = if let Some(dag_name) = ws.dag_name.as_deref() {
+        // Unified DAG schedules are keyed by dag_name during upgrade from
+        // classic schedule rows. Conflict on that key so old rows are reused
+        // and concurrent registrars do not trip the legacy unique constraint.
+        let row = NewHarvestSchedule {
+            id: uuid::Uuid::new_v4(),
+            dag_name: Some(dag_name),
+            schedule_expr: expr.as_deref(),
+            timezone: "UTC",
+            catchup: ws.catchup,
+            max_active_runs: i32::try_from(ws.max_active_runs).unwrap_or(i32::MAX),
+            is_paused: ws.paused,
+            workflow_name: Some(&ws.workflow_name),
+            workflow_input: Some(ws.input.clone()),
+            queue_name: Some(ws.queue_name.as_str()),
+        };
+        diesel::insert_into(harvest_schedules::table)
+            .values(&row)
+            .on_conflict(dsl::dag_name)
+            .do_nothing()
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?;
 
-    // Read back whichever row now exists (just-inserted or pre-existing).
-    let existing: HarvestSchedule = dsl::harvest_schedules
-        .filter(dsl::workflow_name.eq(&ws.workflow_name))
-        .select(HarvestSchedule::as_select())
-        .first(conn)
-        .await
-        .map_err(crate::error::database_error)?;
+        dsl::harvest_schedules
+            .filter(dsl::dag_name.eq(dag_name))
+            .select(HarvestSchedule::as_select())
+            .first(conn)
+            .await
+            .map_err(crate::error::database_error)?
+    } else {
+        // Attempt an atomic insert. The UNIQUE constraint on workflow_name means a
+        // concurrent writer will hit DO NOTHING rather than inserting a duplicate.
+        let row = NewHarvestSchedule {
+            id: uuid::Uuid::new_v4(),
+            dag_name: None,
+            schedule_expr: expr.as_deref(),
+            timezone: "UTC",
+            catchup: ws.catchup,
+            max_active_runs: i32::try_from(ws.max_active_runs).unwrap_or(i32::MAX),
+            // is_paused is set on initial insert only; subsequent upserts preserve the
+            // current value so that pause/resume state is not accidentally overwritten.
+            is_paused: ws.paused,
+            workflow_name: Some(&ws.workflow_name),
+            workflow_input: Some(ws.input.clone()),
+            queue_name: Some(ws.queue_name.as_str()),
+        };
+        diesel::insert_into(harvest_schedules::table)
+            .values(&row)
+            .on_conflict(dsl::workflow_name)
+            .do_nothing()
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+
+        dsl::harvest_schedules
+            .filter(dsl::workflow_name.eq(&ws.workflow_name))
+            .select(HarvestSchedule::as_select())
+            .first(conn)
+            .await
+            .map_err(crate::error::database_error)?
+    };
 
     // Recalculate next_run_at: reset on schedule-expression change, preserve otherwise.
     let schedule_changed = existing.schedule_expr != expr;
@@ -727,6 +759,7 @@ async fn upsert_workflow_schedule(
             dsl::catchup.eq(ws.catchup),
             dsl::max_active_runs.eq(i32::try_from(ws.max_active_runs).unwrap_or(i32::MAX)),
             dsl::dag_name.eq(ws.dag_name.as_deref()),
+            dsl::workflow_name.eq(Some(ws.workflow_name.as_str())),
             dsl::workflow_input.eq(Some(ws.input.clone())),
             dsl::queue_name.eq(Some(ws.queue_name.as_str())),
             dsl::updated_at.eq(now),

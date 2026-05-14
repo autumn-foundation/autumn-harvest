@@ -18,6 +18,38 @@ use autumn_harvest::types::ActivityExecId;
 use chrono::Utc;
 use serde_json::{Value, json};
 
+#[test]
+fn harvest_migration_versions_are_unique() {
+    let migration_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    let mut versions = std::collections::BTreeMap::<String, String>::new();
+
+    for entry in std::fs::read_dir(&migration_dir).expect("migrations directory should be readable")
+    {
+        let entry = entry.expect("migration directory entry should be readable");
+        if !entry
+            .file_type()
+            .expect("migration entry file type should be readable")
+            .is_dir()
+        {
+            continue;
+        }
+
+        if !entry.path().join("up.sql").is_file() {
+            continue;
+        }
+
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let version = name
+            .split_once('_')
+            .map_or_else(|| name.clone(), |(version, _)| version.to_owned());
+        if let Some(previous) = versions.insert(version.clone(), name.clone()) {
+            panic!(
+                "migration version {version} is used by both {previous} and {name}; Diesel tracks only the version prefix"
+            );
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Shared activity stubs
 // ---------------------------------------------------------------------------
@@ -605,9 +637,8 @@ fn unified_dag_registers_workflow_handler_for_worker_execution() {
 // ---------------------------------------------------------------------------
 
 /// A DAG with one root and two parallel dependents (fan-out) must schedule
-/// both dependents when the root succeeds.  Tasks in the same level are
-/// dispatched sequentially (by task index order) so the history order is
-/// deterministic across replays.
+/// both dependents before awaiting either completion. This preserves the
+/// classic executor's same-level parallelism and keeps replay deterministic.
 #[tokio::test]
 async fn lowered_handler_replays_fanout_dag() {
     let id_extract = ActivityExecId::new();
@@ -637,15 +668,15 @@ async fn lowered_handler_replays_fanout_dag() {
             input: dag_task_input("load_users"),
             queue: "default".into(),
         },
-        WorkflowEvent::ActivityCompleted {
-            activity_id: id_load,
-            output: Value::Null,
-        },
         WorkflowEvent::ActivityScheduled {
             activity_id: id_notify,
             name: "notify_complete".into(),
             input: dag_task_input("notify_complete"),
             queue: "default".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: id_load,
+            output: Value::Null,
         },
         WorkflowEvent::ActivityCompleted {
             activity_id: id_notify,

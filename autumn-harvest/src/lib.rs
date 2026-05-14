@@ -231,6 +231,9 @@ pub use queue::ConcurrencyKeyStats;
 
 // Allow macro-generated code to use ::autumn_harvest::serde_json
 pub use serde_json;
+// Allow macro-generated code to use ::autumn_harvest::futures.
+#[doc(hidden)]
+pub use futures;
 
 /// Parse a human-readable duration string like `"5m"`, `"30s"`, `"1h"`.
 ///

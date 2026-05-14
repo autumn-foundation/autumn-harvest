@@ -3962,8 +3962,14 @@ async fn list_dag_runs(
     Extension(api_state): Extension<HarvestApiState>,
     Path(dag_name): Path<String>,
 ) -> Result<Json<Vec<WorkflowExecution>>, AutumnError> {
-    let pool = api_state.storage_pool().map_err(map_error)?;
     let runtime = api_state.runtime().map_err(map_error)?;
+    if !runtime.is_registered_dag(&dag_name) {
+        return Err(AutumnError::not_found_msg(format!(
+            "DAG '{dag_name}' is not registered"
+        )));
+    }
+
+    let pool = api_state.storage_pool().map_err(map_error)?;
     let shard = runtime.router.pick_for_dag(&dag_name);
     let mut conn = acquire_conn(pool.pool_for(shard)).await?;
     let runs = harvest_workflow_executions::table

@@ -88,7 +88,7 @@ const INIT_SQL: &str = concat!(
         "../../autumn-harvest/migrations/20260513000000_harvest_schedule_pause_metadata/up.sql"
     ),
     "\n",
-    include_str!("../../autumn-harvest/migrations/20260514000000_unified_dag_schedule_kind/up.sql"),
+    include_str!("../../autumn-harvest/migrations/20260514010000_unified_dag_schedule_kind/up.sql"),
 );
 type HarvestApiApp = axum::Router;
 
@@ -1037,7 +1037,7 @@ async fn assert_retention_cleanup_state(
     inflight_exec: uuid::Uuid,
 ) {
     assert_eq!(count_execution_rows(conn, old_exec_a).await, 0);
-    assert_eq!(count_execution_rows(conn, old_exec_b).await, 1);
+    assert_eq!(count_execution_rows(conn, old_exec_b).await, 0);
     assert_eq!(count_execution_rows(conn, recent_exec).await, 1);
     assert_eq!(count_execution_rows(conn, inflight_exec).await, 1);
 
@@ -1048,8 +1048,10 @@ async fn assert_retention_cleanup_state(
         "harvest_signals",
         "harvest_dead_letters",
     ] {
-        let count = count_child_rows(conn, table, old_exec_a).await;
-        assert_eq!(count, 0, "cascade should clear {table} for {old_exec_a}");
+        for exec_id in [old_exec_a, old_exec_b] {
+            let count = count_child_rows(conn, table, exec_id).await;
+            assert_eq!(count, 0, "cascade should clear {table} for {exec_id}");
+        }
     }
 }
 
@@ -1111,6 +1113,22 @@ fn manual_pipeline_workflow<'a>(
                 .await
                 .map_err(|error| error.to_string())?;
         }
+        Ok(Value::Null)
+    })
+}
+
+fn interval_pipeline_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    input: Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        ctx.execute_activity_raw(
+            "interval_step",
+            dag_activity_input(&input, "interval_step"),
+            "default",
+        )
+        .await
+        .map_err(|error| error.to_string())?;
         Ok(Value::Null)
     })
 }
@@ -1181,6 +1199,19 @@ fn manual_pipeline_info() -> DagInfo {
 }
 
 fn interval_pipeline_info() -> DagInfo {
+    DagInfo {
+        name: "interval_pipeline",
+        module: "tests",
+        schedule: Some(Schedule::Interval(Duration::from_secs(1))),
+        catchup: false,
+        max_active_runs: 1,
+        default_queue: Some("default"),
+        builder: build_interval_pipeline_dag,
+        workflow_handler: Some(interval_pipeline_workflow),
+    }
+}
+
+fn classic_interval_pipeline_info() -> DagInfo {
     DagInfo {
         name: "interval_pipeline",
         module: "tests",
@@ -2517,6 +2548,37 @@ async fn harvest_api_rejects_dag_trigger_for_workflow_without_dag_registration()
 }
 
 #[tokio::test]
+async fn harvest_api_rejects_dag_run_listing_for_workflow_without_dag_registration() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    insert_workflow_on_url(
+        &database_url,
+        ShardId::new(0),
+        "approval_workflow",
+        "workflow-only-run",
+    )
+    .await;
+
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
+    api_state.install(HarvestApiRuntime::new(
+        approval_registry(),
+        Arc::new(DagCatalog::default()),
+        Arc::new(Vec::new()),
+        Some("scheduler-only".to_string()),
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::single(),
+    ));
+    let app = harvest_api_router(api_state).with_state(test_app_state(pool.clone()));
+
+    let (runs_status, _runs_json) = get_json(&app, "/dags/approval_workflow/runs").await;
+
+    assert_eq!(runs_status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn harvest_api_triggers_manual_only_unified_dag_on_declared_default_queue() {
     let (database_url, _container) = setup_test_database_url().await;
     let pool = build_test_pool(&database_url);
@@ -2641,7 +2703,11 @@ async fn scheduler_tick_creates_and_executes_due_interval_runs() {
         Box::new(Arc::clone(&log)) as Box<dyn std::any::Any + Send + Sync>,
     );
     let registry = Arc::new(HandlerRegistry::with_state(
-        vec![],
+        vec![WorkflowInfo {
+            name: "interval_pipeline",
+            module: "tests",
+            handler: interval_pipeline_workflow,
+        }],
         vec![ActivityInfo {
             name: "interval_step",
             module: "tests",
@@ -2657,18 +2723,21 @@ async fn scheduler_tick_creates_and_executes_due_interval_runs() {
         }],
         Arc::new(state),
     ));
+    let dag_info = interval_pipeline_info();
+    let workflow_schedule = dag_info
+        .as_workflow_schedule()
+        .expect("interval DAG should lower to a workflow schedule");
     let dag_catalog = Arc::new(
-        compile_dag_catalog(vec![interval_pipeline_info()])
-            .expect("interval pipeline dag should compile"),
+        compile_dag_catalog(vec![dag_info]).expect("interval pipeline dag should compile"),
     );
 
     {
         let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
             .await
             .expect("failed to connect for schedule registration");
-        register_schedules(&mut conn, dag_catalog.as_ref())
+        register_workflow_schedules(&mut conn, std::slice::from_ref(&workflow_schedule))
             .await
-            .expect("failed to register interval dag schedules");
+            .expect("failed to register interval dag workflow schedule");
     }
 
     let schedule = load_schedule_from_url(&database_url, "interval_pipeline").await;
@@ -2690,22 +2759,26 @@ async fn scheduler_tick_creates_and_executes_due_interval_runs() {
             .expect("failed to force interval schedule due");
     }
 
+    let worker = build_test_worker(Arc::clone(&registry));
+    let worker_task = spawn_test_worker(Arc::clone(&worker), pool.clone());
+
     tick_once(
         pool.clone(),
         Arc::clone(&registry),
         Arc::clone(&dag_catalog),
-        Arc::new(Vec::new()),
+        Arc::new(vec![workflow_schedule]),
         SchedulerMonitor::offline(),
     )
     .await
     .expect("scheduler tick should succeed");
 
-    let run = wait_for_dag_run_state(&database_url, "interval_pipeline", "SUCCESS").await;
+    let run = wait_for_dag_run_state(&database_url, "interval_pipeline", "COMPLETED").await;
     assert_eq!(run.workflow_name, "interval_pipeline");
     assert_eq!(
         log.lock().expect("log mutex poisoned").clone(),
         vec!["interval_step"]
     );
+    shutdown_test_worker(&worker, worker_task).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2713,17 +2786,35 @@ async fn concurrent_scheduler_ticks_activate_due_dag_run_once() {
     let (database_url, _container) = setup_test_database_url().await;
     let pool = build_test_pool(&database_url);
     let log = Arc::new(Mutex::new(Vec::<String>::new()));
-    let registry = recording_registry(Arc::clone(&log), &["interval_step"]);
-    let dag_catalog = Arc::new(
-        compile_dag_catalog(vec![interval_pipeline_info()])
-            .expect("interval pipeline dag should compile"),
+    let mut state = HashMap::new();
+    state.insert(
+        std::any::TypeId::of::<Arc<Mutex<Vec<String>>>>(),
+        Box::new(Arc::clone(&log)) as Box<dyn std::any::Any + Send + Sync>,
     );
-    register_test_schedules(
-        &database_url,
-        dag_catalog.as_ref(),
-        "failed to connect for schedule registration",
-    )
-    .await;
+    let registry = Arc::new(HandlerRegistry::with_state(
+        vec![WorkflowInfo {
+            name: "interval_pipeline",
+            module: "tests",
+            handler: interval_pipeline_workflow,
+        }],
+        vec![recording_activity_info("interval_step")],
+        Arc::new(state),
+    ));
+    let dag_info = interval_pipeline_info();
+    let workflow_schedule = dag_info
+        .as_workflow_schedule()
+        .expect("interval DAG should lower to a workflow schedule");
+    let dag_catalog = Arc::new(
+        compile_dag_catalog(vec![dag_info]).expect("interval pipeline dag should compile"),
+    );
+    {
+        let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+            .await
+            .expect("failed to connect for schedule registration");
+        register_workflow_schedules(&mut conn, std::slice::from_ref(&workflow_schedule))
+            .await
+            .expect("failed to register interval dag workflow schedule");
+    }
 
     let schedule = load_schedule_from_url(&database_url, "interval_pipeline").await;
     {
@@ -2747,13 +2838,14 @@ async fn concurrent_scheduler_ticks_activate_due_dag_run_once() {
         let pool = pool.clone();
         let registry = Arc::clone(&registry);
         let dag_catalog = Arc::clone(&dag_catalog);
+        let workflow_schedules = Arc::new(vec![workflow_schedule.clone()]);
         handles.push(tokio::spawn(async move {
             gate.wait().await;
             tick_once(
                 pool,
                 registry,
                 dag_catalog,
-                Arc::new(Vec::new()),
+                workflow_schedules,
                 SchedulerMonitor::offline(),
             )
             .await
@@ -2767,7 +2859,9 @@ async fn concurrent_scheduler_ticks_activate_due_dag_run_once() {
             .expect("concurrent scheduler tick should succeed");
     }
 
-    let run = wait_for_dag_run_state(&database_url, "interval_pipeline", "SUCCESS").await;
+    let worker = build_test_worker(Arc::clone(&registry));
+    let worker_task = spawn_test_worker(Arc::clone(&worker), pool.clone());
+    let run = wait_for_dag_run_state(&database_url, "interval_pipeline", "COMPLETED").await;
     assert_eq!(run.workflow_name, "interval_pipeline");
     assert_eq!(
         count_dag_runs_from_url(&database_url, "interval_pipeline").await,
@@ -2779,6 +2873,7 @@ async fn concurrent_scheduler_ticks_activate_due_dag_run_once() {
         vec!["interval_step"],
         "concurrent schedulers must not double-activate the same queued run"
     );
+    shutdown_test_worker(&worker, worker_task).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2891,6 +2986,66 @@ async fn register_workflow_schedules_accepts_unified_dag_schedule_rows() {
 }
 
 #[tokio::test]
+async fn register_workflow_schedules_reuses_existing_dag_schedule_row_on_upgrade() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let classic_dag = compile_dag_catalog(vec![DagInfo {
+        name: "upgraded_scheduled_dag",
+        module: "tests",
+        schedule: Some(Schedule::Interval(Duration::from_secs(60))),
+        catchup: false,
+        max_active_runs: 1,
+        default_queue: Some("default"),
+        builder: build_interval_pipeline_dag,
+        workflow_handler: None,
+    }])
+    .expect("classic scheduled DAG should compile");
+    register_test_schedules(
+        &database_url,
+        &classic_dag,
+        "failed to connect for classic schedule registration",
+    )
+    .await;
+    let old_schedule = load_schedule_from_url(&database_url, "upgraded_scheduled_dag").await;
+    assert!(
+        old_schedule.workflow_name.is_none(),
+        "pre-upgrade classic DAG schedule row should not have workflow_name"
+    );
+
+    let workflow_schedule = WorkflowSchedule {
+        workflow_name: "upgraded_scheduled_dag".to_string(),
+        dag_name: Some("upgraded_scheduled_dag".to_string()),
+        schedule: Schedule::Interval(Duration::from_secs(60)),
+        input: json!({ "source": "upgrade" }),
+        catchup: false,
+        max_active_runs: 1,
+        paused: false,
+        queue_name: "dag-workers".to_string(),
+    };
+
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect for unified schedule registration");
+    register_workflow_schedules(&mut conn, std::slice::from_ref(&workflow_schedule))
+        .await
+        .expect("unified DAG registration should convert the existing dag_name row");
+
+    let upgraded_schedule = load_schedule_from_url(&database_url, "upgraded_scheduled_dag").await;
+    assert_eq!(
+        upgraded_schedule.id, old_schedule.id,
+        "upgrade should reuse the existing dag_name row instead of inserting a conflicting row"
+    );
+    assert_eq!(
+        upgraded_schedule.workflow_name.as_deref(),
+        Some("upgraded_scheduled_dag")
+    );
+    assert_eq!(upgraded_schedule.queue_name.as_deref(), Some("dag-workers"));
+    assert_eq!(
+        upgraded_schedule.workflow_input,
+        Some(json!({ "source": "upgrade" }))
+    );
+}
+
+#[tokio::test]
 async fn scheduler_tick_dispatches_scheduled_unified_dag_on_dag_shard() {
     let ((shard0_url, shard1_url), _container) = setup_sharded_test_database_urls().await;
     let router = two_shard_router();
@@ -2992,7 +3147,7 @@ async fn scheduler_tick_dispatches_scheduled_unified_dag_on_dag_shard() {
 async fn register_schedules_recomputes_next_run_when_schedule_changes() {
     let (database_url, _container) = setup_test_database_url().await;
 
-    let interval_catalog = compile_dag_catalog(vec![interval_pipeline_info()])
+    let interval_catalog = compile_dag_catalog(vec![classic_interval_pipeline_info()])
         .expect("interval pipeline dag should compile");
     register_test_schedules(
         &database_url,

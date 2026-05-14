@@ -107,7 +107,7 @@ pub enum HistoryMatch {
 pub struct HistoryMatcher {
     events: Vec<WorkflowEvent>,
     cursor: usize,
-    consumed_child_terminal_events: HashSet<usize>,
+    consumed_out_of_order_events: HashSet<usize>,
     consumed_signal_events: HashSet<usize>,
     pending_signals: VecDeque<(String, Value)>,
 }
@@ -119,7 +119,7 @@ impl HistoryMatcher {
         Self {
             events,
             cursor: 0,
-            consumed_child_terminal_events: HashSet::new(),
+            consumed_out_of_order_events: HashSet::new(),
             consumed_signal_events: HashSet::new(),
             pending_signals: VecDeque::new(),
         }
@@ -127,7 +127,7 @@ impl HistoryMatcher {
 
     /// Returns `true` if the event at `index` has already been consumed out-of-order.
     fn is_consumed(&self, index: usize) -> bool {
-        self.consumed_child_terminal_events.contains(&index)
+        self.consumed_out_of_order_events.contains(&index)
             || self.consumed_signal_events.contains(&index)
     }
 
@@ -173,7 +173,7 @@ impl HistoryMatcher {
         activity_id: ActivityExecId,
         mut scan_cursor: usize,
     ) -> HistoryMatch {
-        let mut first_interleaved_child_start = None;
+        let mut first_interleaved_command = None;
 
         // Scan forward for Completed or Failed with matching activity_id,
         // skipping Started, Heartbeat, and other intermediate events.
@@ -191,11 +191,7 @@ impl HistoryMatcher {
                     let result = HistoryMatch::Matched {
                         output: output.clone(),
                     };
-                    return self.settle_terminal(
-                        scan_cursor,
-                        first_interleaved_child_start,
-                        result,
-                    );
+                    return self.settle_terminal(scan_cursor, first_interleaved_command, result);
                 }
                 WorkflowEvent::ActivityFailed {
                     activity_id: id,
@@ -207,11 +203,7 @@ impl HistoryMatcher {
                         error: error.clone(),
                         attempt: *attempt,
                     };
-                    return self.settle_terminal(
-                        scan_cursor,
-                        first_interleaved_child_start,
-                        result,
-                    );
+                    return self.settle_terminal(scan_cursor, first_interleaved_command, result);
                 }
                 WorkflowEvent::ActivityTimedOut {
                     activity_id: id,
@@ -220,11 +212,7 @@ impl HistoryMatcher {
                     let result = HistoryMatch::TimedOut {
                         timeout_type: timeout_type.clone(),
                     };
-                    return self.settle_terminal(
-                        scan_cursor,
-                        first_interleaved_child_start,
-                        result,
-                    );
+                    return self.settle_terminal(scan_cursor, first_interleaved_command, result);
                 }
                 // Skip heartbeats and started events for this activity.
                 WorkflowEvent::ActivityHeartbeat {
@@ -235,10 +223,37 @@ impl HistoryMatcher {
                 } if *id == activity_id => {
                     scan_cursor += 1;
                 }
+                // Other activities may be scheduled and complete while this
+                // activity is still running. Keep their scheduled event as the
+                // next replay cursor, but scan past it to find this activity's
+                // terminal event.
+                WorkflowEvent::ActivityScheduled {
+                    activity_id: id, ..
+                } if *id != activity_id => {
+                    first_interleaved_command.get_or_insert(scan_cursor);
+                    scan_cursor += 1;
+                }
+                WorkflowEvent::ActivityCompleted {
+                    activity_id: id, ..
+                }
+                | WorkflowEvent::ActivityFailed {
+                    activity_id: id, ..
+                }
+                | WorkflowEvent::ActivityTimedOut {
+                    activity_id: id, ..
+                }
+                | WorkflowEvent::ActivityHeartbeat {
+                    activity_id: id, ..
+                }
+                | WorkflowEvent::ActivityStarted {
+                    activity_id: id, ..
+                } if *id != activity_id => {
+                    scan_cursor += 1;
+                }
                 // Child workflows can run concurrently with activities.
                 // Preserve replay by scanning past interleaved child starts.
                 WorkflowEvent::ChildWorkflowStarted { .. } => {
-                    first_interleaved_child_start.get_or_insert(scan_cursor);
+                    first_interleaved_command.get_or_insert(scan_cursor);
                     scan_cursor += 1;
                 }
                 // Signals can arrive at any time; stash them for later
@@ -458,21 +473,20 @@ impl HistoryMatcher {
     }
 
     /// Advance the cursor after a terminal event, respecting any interleaved
-    /// child workflow start that needs to remain at the cursor for later replay.
+    /// command that needs to remain at the cursor for later replay.
     ///
-    /// If `first_interleaved_child_start` is set, the terminal event is marked
-    /// consumed and the cursor is rewound to the child start position so
-    /// `match_child_workflow` can pick it up. Otherwise the cursor advances
-    /// past the terminal event normally.
+    /// If `first_interleaved_command` is set, the terminal event is marked
+    /// consumed and the cursor is rewound so the matching command API can pick
+    /// it up. Otherwise the cursor advances past the terminal event normally.
     fn settle_terminal(
         &mut self,
         terminal_cursor: usize,
-        first_interleaved_child_start: Option<usize>,
+        first_interleaved_command: Option<usize>,
         result: HistoryMatch,
     ) -> HistoryMatch {
-        if let Some(child_start_cursor) = first_interleaved_child_start {
-            self.consumed_child_terminal_events.insert(terminal_cursor);
-            self.cursor = child_start_cursor;
+        if let Some(command_cursor) = first_interleaved_command {
+            self.consumed_out_of_order_events.insert(terminal_cursor);
+            self.cursor = command_cursor;
         } else {
             self.cursor = terminal_cursor + 1;
         }
@@ -924,7 +938,7 @@ impl HistoryMatcher {
                     output,
                 } if *id == child_id => {
                     let output = output.clone();
-                    self.consumed_child_terminal_events.insert(scan_cursor);
+                    self.consumed_out_of_order_events.insert(scan_cursor);
                     self.cursor = start_cursor + 1;
                     self.advance_to_next_unconsumed_event();
                     return HistoryMatch::Matched { output };
@@ -934,7 +948,7 @@ impl HistoryMatcher {
                     error,
                 } if *id == child_id => {
                     let error = error.clone();
-                    self.consumed_child_terminal_events.insert(scan_cursor);
+                    self.consumed_out_of_order_events.insert(scan_cursor);
                     self.cursor = start_cursor + 1;
                     self.advance_to_next_unconsumed_event();
                     return HistoryMatch::Failed { error, attempt: 1 };

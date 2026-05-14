@@ -124,6 +124,8 @@ pub fn dag_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     > = vec![None; __n];
 
                     for __level in &__levels {
+                        let mut __activity_futs = ::std::vec::Vec::new();
+
                         for &__task_idx in __level {
                             let __activity_name: ::std::string::String =
                                 __tasks[__task_idx].activity_name.clone();
@@ -180,19 +182,27 @@ pub fn dag_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 }
                             };
 
-                            let __status = match ctx
-                                .execute_activity_raw_with_opts(
-                                    &__activity_name,
-                                    __activity_input,
-                                    &__queue_str,
-                                    __retry_override,
-                                    __stc_override,
-                                )
-                                .await
-                            {
-                                Ok(_) => ::autumn_harvest::policy::TaskStatus::Succeeded,
-                                Err(_) => ::autumn_harvest::policy::TaskStatus::Failed,
-                            };
+                            __activity_futs.push(async move {
+                                let __status = match ctx
+                                    .execute_activity_raw_with_opts(
+                                        &__activity_name,
+                                        __activity_input,
+                                        &__queue_str,
+                                        __retry_override,
+                                        __stc_override,
+                                    )
+                                    .await
+                                {
+                                    Ok(_) => ::autumn_harvest::policy::TaskStatus::Succeeded,
+                                    Err(_) => ::autumn_harvest::policy::TaskStatus::Failed,
+                                };
+                                (__task_idx, __status)
+                            });
+                        }
+
+                        for (__task_idx, __status) in
+                            ::autumn_harvest::futures::future::join_all(__activity_futs).await
+                        {
                             __statuses[__task_idx] = Some(__status);
                         }
                     }
@@ -295,8 +305,11 @@ fn emit_workflow_companion(
                         > = vec![None; __n];
 
                         // Walk levels in order; tasks within each level are
-                        // dispatched sequentially (deterministic index order).
+                        // dispatched before awaiting completions so independent
+                        // same-level tasks preserve classic DAG parallelism.
                         for __level in &__levels {
+                            let mut __activity_futs = ::std::vec::Vec::new();
+
                             for &__task_idx in __level {
                                 // Eagerly copy task metadata into owned values
                                 // so no borrow of `__tasks` crosses `.await`.
@@ -358,20 +371,27 @@ fn emit_workflow_companion(
                                     }
                                 };
 
-                                // Dispatch and record terminal status.
-                                let __status = match ctx
-                                    .execute_activity_raw_with_opts(
-                                        &__activity_name,
-                                        __activity_input,
-                                        &__queue_str,
-                                        __retry_override,
-                                        __stc_override,
-                                    )
-                                    .await
-                                {
-                                    Ok(_) => ::autumn_harvest::policy::TaskStatus::Succeeded,
-                                    Err(_) => ::autumn_harvest::policy::TaskStatus::Failed,
-                                };
+                                __activity_futs.push(async move {
+                                    let __status = match ctx
+                                        .execute_activity_raw_with_opts(
+                                            &__activity_name,
+                                            __activity_input,
+                                            &__queue_str,
+                                            __retry_override,
+                                            __stc_override,
+                                        )
+                                        .await
+                                    {
+                                        Ok(_) => ::autumn_harvest::policy::TaskStatus::Succeeded,
+                                        Err(_) => ::autumn_harvest::policy::TaskStatus::Failed,
+                                    };
+                                    (__task_idx, __status)
+                                });
+                            }
+
+                            for (__task_idx, __status) in
+                                ::autumn_harvest::futures::future::join_all(__activity_futs).await
+                            {
                                 __statuses[__task_idx] = Some(__status);
                             }
                         }
