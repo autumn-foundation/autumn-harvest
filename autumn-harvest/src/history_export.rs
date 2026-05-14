@@ -705,6 +705,24 @@ mod tests {
     use chrono::Utc;
 
     #[test]
+    fn history_payload_policy_round_trips_through_string() {
+        let full = HistoryPayloadPolicy::from_str("full").expect("full should parse");
+        assert_eq!(full, HistoryPayloadPolicy::Full);
+
+        for s in ["redacted", "summary", "summarized"] {
+            let redacted =
+                HistoryPayloadPolicy::from_str(s).expect("redacted aliases should parse");
+            assert_eq!(redacted, HistoryPayloadPolicy::Redacted);
+        }
+    }
+
+    #[test]
+    fn history_payload_policy_rejects_unknown_string() {
+        let err = HistoryPayloadPolicy::from_str("invalid").expect_err("unknown policy must fail");
+        assert!(err.contains("unknown payload_policy"));
+    }
+
+    #[test]
     fn test_export_mermaid_sequence_empty() {
         let events = vec![];
         let diagram = export_mermaid_sequence(&events).expect("export should succeed");
