@@ -198,6 +198,12 @@ pub struct HarvestSchedule {
     pub workflow_input: Option<serde_json::Value>,
     /// Task queue for workflow dispatches. NULL for DAG schedule rows.
     pub queue_name: Option<String>,
+    /// When the schedule was paused. NULL when the schedule is active.
+    pub paused_at: Option<DateTime<Utc>>,
+    /// Actor identity that issued the most recent pause. NULL when active.
+    pub paused_by: Option<String>,
+    /// Free-text reason recorded with the most recent pause. NULL when active or no reason given.
+    pub pause_reason: Option<String>,
 }
 
 /// Insert struct for registering a new schedule (DAG or workflow).
