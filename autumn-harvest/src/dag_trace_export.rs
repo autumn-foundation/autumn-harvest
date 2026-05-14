@@ -105,8 +105,8 @@ mod tests {
         let dag = builder.build().unwrap();
 
         let profiler = DagProfiler::new(dag)
-            .mock_duration("activity_a", Duration::from_micros(1000))
-            .mock_duration("activity_b", Duration::from_micros(2000));
+            .mock_duration("activity_a", Duration::from_millis(1))
+            .mock_duration("activity_b", Duration::from_millis(2));
         let profile = profiler.profile();
 
         let trace = export_chrome_trace(&profile).unwrap();
