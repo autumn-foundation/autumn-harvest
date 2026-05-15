@@ -471,3 +471,34 @@ async fn lock_task(
         .map_err(database_error)?
         .ok_or_else(|| HarvestError::NotFound(format!("external task token {token}")))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_external_handoff_row_from_projection() {
+        use chrono::Utc;
+        use uuid::Uuid;
+        let now = Utc::now();
+        let proj: ExternalHandoffProjection = (
+            Uuid::nil(),
+            Uuid::nil(),
+            "wfid".to_string(),
+            "wfname".to_string(),
+            Uuid::nil(),
+            "actname".to_string(),
+            "PENDING".to_string(),
+            now,
+            now,
+            now,
+            0,
+        );
+        let row = ExternalHandoffRow::from(proj);
+        assert_eq!(row.workflow_id, "wfid");
+        assert_eq!(row.workflow_name, "wfname");
+        assert_eq!(row.activity_name, "actname");
+        assert_eq!(row.state, "PENDING");
+        assert_eq!(row.shard_id, 0);
+    }
+}

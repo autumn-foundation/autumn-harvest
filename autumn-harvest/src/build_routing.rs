@@ -633,3 +633,38 @@ pub fn merge_reachability(per_shard: Vec<Vec<BuildReachability>>) -> Vec<BuildRe
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_reachability_sums_counters_and_recomputes_safe_to_retire() {
+        let r1 = BuildReachability {
+            build_id: "v1".to_string(),
+            open_executions: 1,
+            pending_tasks: 0,
+            active_workers: 1,
+            stale_workers: 0,
+            safe_to_retire: false,
+        };
+        let r2 = BuildReachability {
+            build_id: "v1".to_string(),
+            open_executions: 0,
+            pending_tasks: 1,
+            active_workers: 0,
+            stale_workers: 1,
+            safe_to_retire: false,
+        };
+
+        let merged = merge_reachability(vec![vec![r1], vec![r2]]);
+        assert_eq!(merged.len(), 1);
+        let m = &merged[0];
+        assert_eq!(m.build_id, "v1");
+        assert_eq!(m.open_executions, 1);
+        assert_eq!(m.pending_tasks, 1);
+        assert_eq!(m.active_workers, 1);
+        assert_eq!(m.stale_workers, 1);
+        assert!(!m.safe_to_retire);
+    }
+}

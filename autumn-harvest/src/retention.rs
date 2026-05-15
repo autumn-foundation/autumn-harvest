@@ -652,3 +652,17 @@ struct CountRow {
     #[diesel(sql_type = BigInt)]
     count: i64,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_retention_config_default() {
+        let config = RetentionConfig::default();
+        assert_eq!(config.tick_interval_secs, 3600);
+        assert_eq!(config.batch_size, 1000);
+        assert_eq!(config.max_age_secs, None);
+        assert!(!config.dry_run);
+    }
+}
