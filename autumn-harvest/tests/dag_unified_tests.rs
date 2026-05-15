@@ -9,7 +9,9 @@
 
 #![allow(clippy::unused_async)]
 
+use autumn_harvest::context::WorkflowCommand;
 use autumn_harvest::event::WorkflowEvent;
+use autumn_harvest::executor::{WorkflowOutcome, run_workflow};
 use autumn_harvest::info::WorkflowHandlerFn;
 use autumn_harvest::prelude::*;
 use autumn_harvest::scheduler::compile_dag_catalog;
@@ -692,5 +694,31 @@ async fn lowered_handler_replays_fanout_dag() {
     assert!(
         matches!(report.status, ReplayStatus::ReplaySucceeded),
         "fan-out DAG should replay correctly, got: {report}"
+    );
+}
+
+#[tokio::test]
+async fn lowered_handler_leaves_queue_empty_when_dag_task_has_no_queue() {
+    let outcome = run_workflow(
+        ExecutionId::new(),
+        vec![WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+        }],
+        __autumn_workflow_info_alldone_dag().handler,
+        Value::Null,
+    )
+    .await;
+
+    let WorkflowOutcome::Suspended { commands } = outcome else {
+        panic!("expected initial DAG activity to suspend, got {outcome:?}");
+    };
+    assert_eq!(commands.len(), 1);
+    let WorkflowCommand::ScheduleActivity { queue, .. } = &commands[0] else {
+        panic!("expected ScheduleActivity command, got {:?}", commands[0]);
+    };
+    assert_eq!(
+        queue, "",
+        "DAG tasks with no DAG default_queue and no per-task queue must leave queue empty so the activity default queue can apply"
     );
 }

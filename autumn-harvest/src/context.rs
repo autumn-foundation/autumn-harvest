@@ -149,6 +149,14 @@ pub enum WorkflowCommand {
         /// The worker sends the result back through this channel.
         result_tx: oneshot::Sender<Result<Value, String>>,
     },
+    /// Park while an already-scheduled activity is still running.
+    WaitForActivity {
+        /// The existing activity execution ID from history.
+        activity_id: ActivityExecId,
+        /// The parked coroutine waits on this channel until the executor
+        /// suspension timeout drops it and the worker can re-park durably.
+        result_tx: oneshot::Sender<Result<Value, String>>,
+    },
     /// Start a durable timer.
     StartTimer {
         /// The unique ID of the timer.
@@ -296,6 +304,10 @@ impl std::fmt::Debug for WorkflowCommand {
                 .field("activity_id", activity_id)
                 .field("name", name)
                 .field("queue", queue)
+                .finish_non_exhaustive(),
+            Self::WaitForActivity { activity_id, .. } => f
+                .debug_struct("WaitForActivity")
+                .field("activity_id", activity_id)
                 .finish_non_exhaustive(),
             Self::StartTimer {
                 timer_id,
@@ -945,6 +957,7 @@ impl WorkflowContext {
 
             HistoryMatch::Failed { .. }
             | HistoryMatch::TimedOut { .. }
+            | HistoryMatch::ActivityInProgress { .. }
             | HistoryMatch::AwaitingExternalCompletion { .. }
             | HistoryMatch::ChildInProgress { .. }
             | HistoryMatch::LocalActivityInProgress { .. } => {
@@ -1077,6 +1090,25 @@ impl WorkflowContext {
                 format!("activity mismatch: expected {expected}, got {actual}"),
             )),
 
+            HistoryMatch::ActivityInProgress { activity_id } => {
+                let (tx, rx) = oneshot::channel();
+                self.push_command(WorkflowCommand::WaitForActivity {
+                    activity_id,
+                    result_tx: tx,
+                });
+                match rx.await {
+                    Ok(Ok(output)) => Ok(output),
+                    Ok(Err(error)) => Err(HarvestError::ActivityFailed {
+                        name: name.to_string(),
+                        attempt: 1,
+                        source: error.into(),
+                    }),
+                    Err(_) => Err(HarvestError::Cancelled(format!(
+                        "activity '{name}' cancelled: result channel dropped"
+                    ))),
+                }
+            }
+
             HistoryMatch::AwaitingExternalCompletion { .. }
             | HistoryMatch::ChildInProgress { .. }
             | HistoryMatch::LocalActivityInProgress { .. } => {
@@ -1155,6 +1187,24 @@ impl WorkflowContext {
             HistoryMatch::Diverged { expected, actual } => Err(HarvestError::NonDeterministic(
                 format!("activity mismatch: expected {expected}, got {actual}"),
             )),
+            HistoryMatch::ActivityInProgress { activity_id } => {
+                let (tx, rx) = oneshot::channel();
+                self.push_command(WorkflowCommand::WaitForActivity {
+                    activity_id,
+                    result_tx: tx,
+                });
+                match rx.await {
+                    Ok(Ok(output)) => Ok(output),
+                    Ok(Err(error)) => Err(HarvestError::ActivityFailed {
+                        name: name.to_string(),
+                        attempt: 1,
+                        source: error.into(),
+                    }),
+                    Err(_) => Err(HarvestError::Cancelled(format!(
+                        "activity '{name}' cancelled: result channel dropped"
+                    ))),
+                }
+            }
             HistoryMatch::AwaitingExternalCompletion { .. }
             | HistoryMatch::ChildInProgress { .. }
             | HistoryMatch::LocalActivityInProgress { .. } => {
@@ -1249,6 +1299,7 @@ impl WorkflowContext {
             )),
 
             HistoryMatch::AwaitingExternalCompletion { .. }
+            | HistoryMatch::ActivityInProgress { .. }
             | HistoryMatch::ChildInProgress { .. } => {
                 unreachable!(
                     "match_local_activity never returns AwaitingExternalCompletion or ChildInProgress"
@@ -1373,6 +1424,7 @@ impl WorkflowContext {
 
             HistoryMatch::Failed { .. }
             | HistoryMatch::TimedOut { .. }
+            | HistoryMatch::ActivityInProgress { .. }
             | HistoryMatch::AwaitingExternalCompletion { .. }
             | HistoryMatch::ChildInProgress { .. }
             | HistoryMatch::LocalActivityInProgress { .. } => {
@@ -1429,6 +1481,7 @@ impl WorkflowContext {
                 source: error.into(),
             }),
             HistoryMatch::TimedOut { .. }
+            | HistoryMatch::ActivityInProgress { .. }
             | HistoryMatch::AwaitingExternalCompletion { .. }
             | HistoryMatch::LocalActivityInProgress { .. } => {
                 unreachable!("child workflows do not time out in match_child_workflow")
@@ -1520,6 +1573,7 @@ impl WorkflowContext {
             )),
             HistoryMatch::Failed { .. }
             | HistoryMatch::TimedOut { .. }
+            | HistoryMatch::ActivityInProgress { .. }
             | HistoryMatch::AwaitingExternalCompletion { .. }
             | HistoryMatch::ChildInProgress { .. }
             | HistoryMatch::LocalActivityInProgress { .. } => Err(HarvestError::NonDeterministic(
@@ -1652,7 +1706,9 @@ impl WorkflowContext {
                 }
             }
 
-            HistoryMatch::ChildInProgress { .. } | HistoryMatch::LocalActivityInProgress { .. } => {
+            HistoryMatch::ActivityInProgress { .. }
+            | HistoryMatch::ChildInProgress { .. }
+            | HistoryMatch::LocalActivityInProgress { .. } => {
                 unreachable!(
                     "match_external_activity never returns ChildInProgress or LocalActivityInProgress"
                 )
@@ -1703,6 +1759,7 @@ impl WorkflowContext {
             )),
             HistoryMatch::Failed { .. }
             | HistoryMatch::TimedOut { .. }
+            | HistoryMatch::ActivityInProgress { .. }
             | HistoryMatch::AwaitingExternalCompletion { .. }
             | HistoryMatch::ChildInProgress { .. }
             | HistoryMatch::LocalActivityInProgress { .. } => Err(HarvestError::NonDeterministic(
@@ -3119,6 +3176,48 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(result.map_err(|e| e.to_string())?, expected_output);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn context_reparks_inflight_activity_without_rescheduling() {
+        let activity_id = ActivityExecId::new();
+        let ctx = Arc::new(WorkflowContext::for_replay(
+            ExecutionId::new(),
+            vec![
+                WorkflowEvent::WorkflowStarted {
+                    input: Value::Null,
+                    timestamp: Utc::now(),
+                },
+                WorkflowEvent::ActivityScheduled {
+                    activity_id,
+                    name: "send_email".into(),
+                    input: Value::Null,
+                    queue: "default".into(),
+                },
+            ],
+        ));
+        let ctx2 = Arc::clone(&ctx);
+
+        let handle = tokio::spawn(async move {
+            ctx2.execute_activity_raw("send_email", Value::Null, "default")
+                .await
+        });
+        tokio::task::yield_now().await;
+
+        let timeout_result =
+            tokio::time::timeout(std::time::Duration::from_millis(50), handle).await;
+        assert!(
+            timeout_result.is_err(),
+            "activity with only a scheduled event should suspend until its terminal event arrives"
+        );
+
+        let commands = ctx.drain_commands();
+        assert!(
+            commands
+                .iter()
+                .all(|cmd| !matches!(cmd, WorkflowCommand::ScheduleActivity { .. })),
+            "in-flight activity replay must not emit a fresh ScheduleActivity: {commands:?}"
+        );
     }
 
     #[tokio::test]

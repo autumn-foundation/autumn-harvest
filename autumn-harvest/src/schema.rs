@@ -56,6 +56,7 @@ diesel::table! {
         task_type -> Text,
         workflow_exec_id -> Nullable<Uuid>,
         activity_name -> Nullable<Text>,
+        activity_id -> Nullable<Uuid>,
         input -> Jsonb,
         state -> Text,
         priority -> Int4,

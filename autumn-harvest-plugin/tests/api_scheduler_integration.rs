@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use autumn_harvest::builder::WorkerConfig;
 use autumn_harvest::dag::DagBuilder;
+use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::info::{ActivityInfo, DagInfo, WorkflowInfo};
 use autumn_harvest::models::{HarvestSchedule, TaskQueueItem, WorkflowExecution};
 use autumn_harvest::policy::Schedule;
@@ -47,6 +48,7 @@ use serde_json::{Value, json};
 use testcontainers::ContainerAsync;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
+use tokio::sync::Barrier;
 use tower::ServiceExt;
 
 const INIT_SQL: &str = concat!(
@@ -89,6 +91,8 @@ const INIT_SQL: &str = concat!(
     ),
     "\n",
     include_str!("../../autumn-harvest/migrations/20260514010000_unified_dag_schedule_kind/up.sql"),
+    "\n",
+    include_str!("../../autumn-harvest/migrations/20260514020000_harvest_task_activity_id/up.sql"),
 );
 type HarvestApiApp = axum::Router;
 
@@ -790,6 +794,28 @@ async fn load_task_from_url(database_url: &str, task_id: uuid::Uuid) -> TaskQueu
         .expect("failed to load replayed task")
 }
 
+async fn count_activity_scheduled_events_from_url(
+    database_url: &str,
+    exec_id: ExecutionId,
+    activity_name: &str,
+) -> usize {
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("failed to connect fresh Postgres client for history query");
+    store::load_history(&mut conn, exec_id)
+        .await
+        .expect("failed to load workflow history")
+        .events
+        .into_iter()
+        .filter(|event| {
+            matches!(
+                event,
+                WorkflowEvent::ActivityScheduled { name, .. } if name == activity_name
+            )
+        })
+        .count()
+}
+
 async fn count_dead_letters_from_url(database_url: &str) -> i64 {
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
         .await
@@ -1180,6 +1206,72 @@ fn parallel_activities_workflow<'a>(
     })
 }
 
+fn staggered_parallel_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let fast = ctx.execute_activity_raw(
+            "parallel_fast",
+            json!({ "dag_task": "parallel_fast", "delay_ms": 0 }),
+            "default",
+        );
+        let slow = ctx.execute_activity_raw(
+            "parallel_slow",
+            json!({ "dag_task": "parallel_slow", "delay_ms": 450 }),
+            "default",
+        );
+        let (fast, slow) = tokio::join!(fast, slow);
+        fast.map_err(|error| error.to_string())?;
+        slow.map_err(|error| error.to_string())?;
+        Ok(Value::Null)
+    })
+}
+
+fn parallel_same_activity_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let left = ctx.execute_activity_raw(
+            "shared_parallel",
+            json!({ "dag_task": "left", "delay_ms": 75 }),
+            "default",
+        );
+        let right = ctx.execute_activity_raw(
+            "shared_parallel",
+            json!({ "dag_task": "right", "delay_ms": 75 }),
+            "default",
+        );
+        let (left, right) = tokio::join!(left, right);
+        left.map_err(|error| error.to_string())?;
+        right.map_err(|error| error.to_string())?;
+        Ok(Value::Null)
+    })
+}
+
+fn barrier_parallel_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let first = ctx.execute_activity_raw(
+            "barrier_first",
+            json!({ "dag_task": "barrier_first", "barrier": true }),
+            "default",
+        );
+        let second = ctx.execute_activity_raw(
+            "barrier_second",
+            json!({ "dag_task": "barrier_second", "barrier": true }),
+            "default",
+        );
+        let (first, second) = tokio::join!(first, second);
+        first.map_err(|error| error.to_string())?;
+        second.map_err(|error| error.to_string())?;
+        Ok(Value::Null)
+    })
+}
+
 fn dag_activity_input(conf: &Value, task: &str) -> Value {
     match conf {
         Value::Object(object) => {
@@ -1199,6 +1291,15 @@ fn record_activity<'a>(
     input: Value,
 ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
     Box::pin(async move {
+        if input
+            .get("barrier")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            && let Some(barrier) = ctx.state::<Arc<Barrier>>()
+        {
+            barrier.wait().await;
+        }
+
         let entries = ctx
             .state::<Arc<Mutex<Vec<String>>>>()
             .expect("shared log state must be registered");
@@ -1212,6 +1313,11 @@ fn record_activity<'a>(
             .lock()
             .expect("log mutex poisoned")
             .push(step.clone());
+
+        if let Some(delay_ms) = input.get("delay_ms").and_then(Value::as_u64) {
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        }
+
         Ok(json!({ "step": step }))
     })
 }
@@ -2206,6 +2312,144 @@ async fn worker_enqueues_multiple_activity_commands_from_one_workflow_task() {
 }
 
 #[tokio::test]
+async fn worker_does_not_reschedule_inflight_parallel_activity_after_sibling_completes() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let log = Arc::new(Mutex::new(Vec::<String>::new()));
+    let mut state = HashMap::new();
+    state.insert(
+        std::any::TypeId::of::<Arc<Mutex<Vec<String>>>>(),
+        Box::new(Arc::clone(&log)) as Box<dyn std::any::Any + Send + Sync>,
+    );
+    let registry = Arc::new(HandlerRegistry::with_state(
+        vec![WorkflowInfo {
+            name: "staggered_parallel_workflow",
+            module: "tests",
+            handler: staggered_parallel_workflow,
+        }],
+        vec![
+            recording_activity_info("parallel_fast"),
+            recording_activity_info("parallel_slow"),
+        ],
+        Arc::new(state),
+    ));
+    let worker = build_test_worker(Arc::clone(&registry));
+    let worker_task = spawn_test_worker(Arc::clone(&worker), pool.clone());
+
+    let exec_id = insert_workflow_on_url(
+        &database_url,
+        ShardId::new(0),
+        "staggered_parallel_workflow",
+        "staggered-activity-level",
+    )
+    .await;
+
+    let execution = wait_for_workflow_terminal_state(&database_url, &exec_id.to_string()).await;
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    shutdown_test_worker(&worker, worker_task).await;
+
+    assert_eq!(execution.state, "COMPLETED");
+    let mut observed = log.lock().expect("log mutex poisoned").clone();
+    observed.sort();
+    assert_eq!(
+        observed,
+        vec!["parallel_fast", "parallel_slow"],
+        "the slow sibling must not be enqueued a second time while its first task is still running"
+    );
+    assert_eq!(
+        count_activity_scheduled_events_from_url(&database_url, exec_id, "parallel_slow").await,
+        1,
+        "replay while the slow sibling is in-flight must not append a duplicate ActivityScheduled event"
+    );
+}
+
+#[tokio::test]
+async fn worker_resolves_parallel_sibling_tasks_that_share_activity_name() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let log = Arc::new(Mutex::new(Vec::<String>::new()));
+    let mut state = HashMap::new();
+    state.insert(
+        std::any::TypeId::of::<Arc<Mutex<Vec<String>>>>(),
+        Box::new(Arc::clone(&log)) as Box<dyn std::any::Any + Send + Sync>,
+    );
+    let registry = Arc::new(HandlerRegistry::with_state(
+        vec![WorkflowInfo {
+            name: "parallel_same_activity_workflow",
+            module: "tests",
+            handler: parallel_same_activity_workflow,
+        }],
+        vec![recording_activity_info("shared_parallel")],
+        Arc::new(state),
+    ));
+    let worker = build_test_worker(Arc::clone(&registry));
+    let worker_task = spawn_test_worker(Arc::clone(&worker), pool.clone());
+
+    let exec_id = insert_workflow_on_url(
+        &database_url,
+        ShardId::new(0),
+        "parallel_same_activity_workflow",
+        "parallel-same-activity",
+    )
+    .await;
+
+    let execution = wait_for_workflow_terminal_state(&database_url, &exec_id.to_string()).await;
+    shutdown_test_worker(&worker, worker_task).await;
+
+    assert_eq!(execution.state, "COMPLETED");
+    let mut observed = log.lock().expect("log mutex poisoned").clone();
+    observed.sort();
+    assert_eq!(observed, vec!["left", "right"]);
+}
+
+#[tokio::test]
+async fn worker_serializes_terminal_events_for_parallel_activity_completions() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let log = Arc::new(Mutex::new(Vec::<String>::new()));
+    let barrier = Arc::new(Barrier::new(2));
+    let mut state = HashMap::new();
+    state.insert(
+        std::any::TypeId::of::<Arc<Mutex<Vec<String>>>>(),
+        Box::new(Arc::clone(&log)) as Box<dyn std::any::Any + Send + Sync>,
+    );
+    state.insert(
+        std::any::TypeId::of::<Arc<Barrier>>(),
+        Box::new(Arc::clone(&barrier)) as Box<dyn std::any::Any + Send + Sync>,
+    );
+    let registry = Arc::new(HandlerRegistry::with_state(
+        vec![WorkflowInfo {
+            name: "barrier_parallel_workflow",
+            module: "tests",
+            handler: barrier_parallel_workflow,
+        }],
+        vec![
+            recording_activity_info("barrier_first"),
+            recording_activity_info("barrier_second"),
+        ],
+        Arc::new(state),
+    ));
+    let worker = build_test_worker(Arc::clone(&registry));
+    let worker_task = spawn_test_worker(Arc::clone(&worker), pool.clone());
+
+    let exec_id = insert_workflow_on_url(
+        &database_url,
+        ShardId::new(0),
+        "barrier_parallel_workflow",
+        "parallel-terminal-events",
+    )
+    .await;
+
+    let execution = wait_for_workflow_terminal_state(&database_url, &exec_id.to_string()).await;
+    shutdown_test_worker(&worker, worker_task).await;
+
+    assert_eq!(execution.state, "COMPLETED");
+    let mut observed = log.lock().expect("log mutex poisoned").clone();
+    observed.sort();
+    assert_eq!(observed, vec!["barrier_first", "barrier_second"]);
+}
+
+#[tokio::test]
 async fn retention_janitor_deletes_only_rows_older_than_max_age_and_cascades_children() {
     let (database_url, _container) = setup_test_database_url().await;
     let pool = build_test_pool(&database_url);
@@ -3073,6 +3317,54 @@ async fn register_workflow_schedules_accepts_unified_dag_schedule_rows() {
         Some("scheduled_unified_dag")
     );
     assert_eq!(schedule.queue_name.as_deref(), Some("dag-workers"));
+}
+
+#[tokio::test]
+async fn register_workflow_schedules_migrates_legacy_workflow_only_dag_row() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let legacy_workflow_row = WorkflowSchedule {
+        workflow_name: "legacy_workflow_only_dag".to_string(),
+        dag_name: None,
+        schedule: Schedule::Interval(Duration::from_secs(60)),
+        input: json!({ "source": "legacy" }),
+        catchup: false,
+        max_active_runs: 1,
+        paused: false,
+        queue_name: "legacy-queue".to_string(),
+    };
+    let unified_dag_row = WorkflowSchedule {
+        workflow_name: "legacy_workflow_only_dag".to_string(),
+        dag_name: Some("legacy_workflow_only_dag".to_string()),
+        schedule: Schedule::Interval(Duration::from_secs(120)),
+        input: json!({ "source": "unified" }),
+        catchup: true,
+        max_active_runs: 3,
+        paused: false,
+        queue_name: "dag-workers".to_string(),
+    };
+
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect for legacy workflow-only schedule registration");
+    register_workflow_schedules(&mut conn, std::slice::from_ref(&legacy_workflow_row))
+        .await
+        .expect("legacy workflow-only row should register");
+    register_workflow_schedules(&mut conn, std::slice::from_ref(&unified_dag_row))
+        .await
+        .expect("unified DAG registration should update the legacy workflow_name row in place");
+
+    let schedule = load_schedule_from_url(&database_url, "legacy_workflow_only_dag").await;
+    assert_eq!(
+        schedule.workflow_name.as_deref(),
+        Some("legacy_workflow_only_dag")
+    );
+    assert_eq!(
+        schedule.workflow_input,
+        Some(json!({ "source": "unified" }))
+    );
+    assert_eq!(schedule.queue_name.as_deref(), Some("dag-workers"));
+    assert!(schedule.catchup);
+    assert_eq!(schedule.max_active_runs, 3);
 }
 
 #[tokio::test]

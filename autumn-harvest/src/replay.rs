@@ -37,6 +37,10 @@ pub enum HistoryMatch {
         timeout_type: TimeoutType,
     },
     /// Cursor is past the end of history — this is a new command.
+    ActivityInProgress {
+        /// The activity execution ID already recorded in history.
+        activity_id: ActivityExecId,
+    },
     NoMatch,
     /// The command does not match what was recorded at this position,
     /// indicating non-determinism in the workflow code.
@@ -278,7 +282,7 @@ impl HistoryMatcher {
 
         // We found the Scheduled event but no terminal event — treat as
         // incomplete history (the activity was scheduled but never finished).
-        HistoryMatch::NoMatch
+        HistoryMatch::ActivityInProgress { activity_id }
     }
 
     fn scan_local_activity_terminal(

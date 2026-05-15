@@ -132,7 +132,7 @@ pub fn dag_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             let __queue_str: ::std::string::String = __tasks[__task_idx]
                                 .queue
                                 .clone()
-                                .unwrap_or_else(|| "default".to_owned());
+                                .unwrap_or_default();
                             let __upstreams: ::std::vec::Vec<usize> =
                                 __tasks[__task_idx].upstreams.clone();
                             let __trigger_rule = __tasks[__task_idx].trigger_rule.clone();
@@ -318,7 +318,7 @@ fn emit_workflow_companion(
                                 let __queue_str: ::std::string::String = __tasks[__task_idx]
                                     .queue
                                     .clone()
-                                    .unwrap_or_else(|| "default".to_owned());
+                                    .unwrap_or_default();
                                 let __upstreams: ::std::vec::Vec<usize> =
                                     __tasks[__task_idx].upstreams.clone();
                                 let __trigger_rule =
