@@ -479,7 +479,11 @@ async fn delete_stale_dag_workflow_schedule(
 
     diesel::delete(
         dsl::harvest_schedules
-            .filter(dsl::workflow_name.eq(&ws.workflow_name))
+            .filter(
+                dsl::workflow_name
+                    .eq(&ws.workflow_name)
+                    .or(dsl::workflow_name.is_null()),
+            )
             .filter(dsl::dag_name.eq(dag_name).or(dsl::dag_name.is_null())),
     )
     .execute(conn)
@@ -1042,7 +1046,17 @@ async fn upsert_workflow_schedule(
 /// updating `last_run_at`, `RejectDuplicate` reports the already-created
 /// execution and the scheduler treats that slot as dispatched.
 fn scheduled_workflow_id(workflow_name: &str, scheduled_for: DateTime<Utc>) -> String {
-    format!("sched:{}:{}", workflow_name, scheduled_for.timestamp())
+    let micros = scheduled_for.timestamp_subsec_micros();
+    if micros == 0 {
+        format!("sched:{}:{}", workflow_name, scheduled_for.timestamp())
+    } else {
+        format!(
+            "sched:{}:{}.{:06}",
+            workflow_name,
+            scheduled_for.timestamp(),
+            micros
+        )
+    }
 }
 
 /// Public re-export of `scheduled_workflow_id` for use in the backfill handler.
