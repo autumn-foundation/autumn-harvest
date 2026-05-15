@@ -556,7 +556,11 @@ impl HarvestBuilder {
             &self.workflows,
             &self.auto_registered_dag_workflows,
         )?;
-        validate_workflow_schedules(&self.workflow_schedules, &self.workflows)?;
+        validate_workflow_schedules(
+            &self.workflow_schedules,
+            &self.workflows,
+            &self.auto_registered_dag_workflows,
+        )?;
         validate_local_activity_timeouts(
             &self.activities,
             self.worker_config.max_local_activity_start_to_close,
@@ -616,6 +620,7 @@ fn validate_dag_workflow_name_collisions(
 fn validate_workflow_schedules(
     schedules: &[WorkflowSchedule],
     workflows: &[crate::info::WorkflowInfo],
+    auto_registered_dag_workflows: &[String],
 ) -> Result<(), HarvestBuilderError> {
     if schedules.is_empty() {
         return Ok(());
@@ -626,6 +631,16 @@ fn validate_workflow_schedules(
             return Err(HarvestBuilderError::UnknownWorkflowSchedule {
                 workflow_name: schedule.workflow_name.clone(),
                 registered,
+            });
+        }
+        if schedule.dag_name.is_none()
+            && auto_registered_dag_workflows
+                .iter()
+                .any(|dag_name| dag_name == &schedule.workflow_name)
+        {
+            return Err(HarvestBuilderError::InvalidWorkflowSchedule {
+                workflow_name: schedule.workflow_name.clone(),
+                reason: "workflow schedule targets an auto-registered DAG workflow; use the DAG schedule registration instead".to_string(),
             });
         }
         // Reject zero-length intervals (would cause infinite loops in due_run_plan
@@ -915,6 +930,22 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "unified-dag-execution")]
+    fn fake_unified_dag_info() -> DagInfo {
+        fn build(_dag: &mut DagBuilder) {}
+
+        DagInfo {
+            name: "daily_etl",
+            module: "test",
+            schedule: Some(Schedule::Manual),
+            catchup: false,
+            max_active_runs: 1,
+            default_queue: Some("default"),
+            builder: build,
+            workflow_handler: Some(|_ctx, input| Box::pin(async move { Ok(input) })),
+        }
+    }
+
     #[test]
     fn harvest_builder_collects_workflows() {
         let builder = HarvestBuilder::new().workflows(vec![fake_workflow_info()]);
@@ -973,6 +1004,31 @@ mod tests {
     fn harvest_builder_collects_dags() {
         let builder = HarvestBuilder::new().dags(vec![fake_dag_info()]);
         assert_eq!(builder.dag_count(), 1);
+    }
+
+    #[cfg(feature = "unified-dag-execution")]
+    #[test]
+    fn harvest_builder_rejects_workflow_schedule_targeting_auto_registered_dag_name() {
+        let result = HarvestBuilder::new()
+            .dags(vec![fake_unified_dag_info()])
+            .workflow_schedule(WorkflowSchedule::new(
+                "daily_etl",
+                Schedule::Interval(Duration::from_secs(60)),
+            ))
+            .try_build();
+
+        let err = result.unwrap_err();
+        assert!(matches!(
+            err,
+            HarvestBuilderError::InvalidWorkflowSchedule {
+                ref workflow_name,
+                ..
+            } if workflow_name == "daily_etl"
+        ));
+        assert!(
+            err.to_string().contains("auto-registered DAG"),
+            "error should explain the DAG/workflow schedule collision: {err}"
+        );
     }
 
     #[test]

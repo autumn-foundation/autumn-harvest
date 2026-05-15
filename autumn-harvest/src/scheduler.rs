@@ -822,6 +822,7 @@ async fn upsert_workflow_schedule(
     let now = Utc::now();
     let expr = schedule_expr(Some(&ws.schedule));
     let existing = find_or_insert_workflow_schedule(conn, ws, expr.as_deref()).await?;
+    let dag_name = ws.dag_name.as_deref().or(existing.dag_name.as_deref());
 
     // Recalculate next_run_at: reset on schedule-expression change, preserve otherwise.
     let schedule_changed = existing.schedule_expr != expr;
@@ -839,7 +840,7 @@ async fn upsert_workflow_schedule(
             dsl::timezone.eq("UTC"),
             dsl::catchup.eq(ws.catchup),
             dsl::max_active_runs.eq(i32::try_from(ws.max_active_runs).unwrap_or(i32::MAX)),
-            dsl::dag_name.eq(ws.dag_name.as_deref()),
+            dsl::dag_name.eq(dag_name),
             dsl::workflow_name.eq(Some(ws.workflow_name.as_str())),
             dsl::workflow_input.eq(Some(ws.input.clone())),
             dsl::queue_name.eq(Some(ws.queue_name.as_str())),

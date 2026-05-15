@@ -3376,6 +3376,31 @@ async fn start_workflow(
         return AutumnError::not_found_msg(format!("workflow '{workflow_name}'")).into_response();
     }
 
+    if runtime.is_registered_dag(&workflow_name) {
+        if let Ok(pool) = api_state.storage_pool()
+            && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+        {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_START,
+                target_type: TARGET_WORKFLOW,
+                target_id: Some(workflow_name.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_FAILED,
+                error_summary: Some("registered DAG cannot be started via workflow route"),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+        }
+        return AutumnError::bad_request_msg(format!(
+            "workflow '{workflow_name}' is a registered DAG; use POST /dags/{workflow_name}/trigger"
+        ))
+        .into_response();
+    }
+
     let reuse_policy = match parse_reuse_policy(request.reuse_policy.as_deref()) {
         Ok(p) => p,
         Err(e) => {
@@ -4329,6 +4354,64 @@ async fn schedule_create_audit_failed(
     let _ = audit::insert_audit(&mut conn, &ar).await;
 }
 
+async fn reject_workflow_schedule_for_registered_dag(
+    api_state: &HarvestApiState,
+    runtime: &HarvestApiRuntime,
+    actor: &str,
+    source: &str,
+    request_id: Option<&str>,
+    workflow_name: &str,
+) -> Result<(), AutumnError> {
+    if !runtime.is_registered_dag(workflow_name) {
+        return Ok(());
+    }
+
+    schedule_create_audit_failed(
+        api_state,
+        actor,
+        source,
+        request_id,
+        workflow_name,
+        "registered DAG cannot be scheduled via workflow schedule API",
+    )
+    .await;
+    Err(AutumnError::bad_request_msg(format!(
+        "workflow '{workflow_name}' is a registered DAG; manage its schedule through the DAG registration"
+    )))
+}
+
+async fn reject_unknown_workflow_schedule_target(
+    api_state: &HarvestApiState,
+    runtime: &HarvestApiRuntime,
+    actor: &str,
+    source: &str,
+    request_id: Option<&str>,
+    workflow_name: &str,
+) -> Result<(), AutumnError> {
+    if runtime.registry.workflows.contains_key(workflow_name) {
+        return Ok(());
+    }
+
+    let registered: Vec<&str> = runtime
+        .registry
+        .workflows
+        .keys()
+        .map(String::as_str)
+        .collect();
+    schedule_create_audit_failed(
+        api_state,
+        actor,
+        source,
+        request_id,
+        workflow_name,
+        "workflow not registered",
+    )
+    .await;
+    Err(AutumnError::not_found_msg(format!(
+        "workflow '{workflow_name}' is not registered; registered: {registered:?}"
+    )))
+}
+
 async fn upsert_workflow_schedule_and_read_back(
     conn: &mut diesel_async::AsyncPgConnection,
     ws: &WorkflowSchedule,
@@ -4370,31 +4453,25 @@ async fn create_workflow_schedule(
     let (actor, source, request_id) = audit_context(&headers, &api_state);
     let route = "POST /admin/schedules/workflow";
 
-    if !runtime
-        .registry
-        .workflows
-        .contains_key(&request.workflow_name)
-    {
-        let registered: Vec<&str> = runtime
-            .registry
-            .workflows
-            .keys()
-            .map(String::as_str)
-            .collect();
-        schedule_create_audit_failed(
-            &api_state,
-            &actor,
-            &source,
-            request_id.as_deref(),
-            &request.workflow_name,
-            "workflow not registered",
-        )
-        .await;
-        return Err(AutumnError::not_found_msg(format!(
-            "workflow '{}' is not registered; registered: {:?}",
-            request.workflow_name, registered
-        )));
-    }
+    reject_unknown_workflow_schedule_target(
+        &api_state,
+        &runtime,
+        &actor,
+        &source,
+        request_id.as_deref(),
+        &request.workflow_name,
+    )
+    .await?;
+
+    reject_workflow_schedule_for_registered_dag(
+        &api_state,
+        &runtime,
+        &actor,
+        &source,
+        request_id.as_deref(),
+        &request.workflow_name,
+    )
+    .await?;
 
     let schedule = match parse_schedule_expr(&request.schedule_expr) {
         Ok(s) => s,
@@ -4990,6 +5067,13 @@ async fn schedule_backfill(
     };
 
     let max_active = i64::from(schedule.max_active_runs);
+
+    if schedule.is_paused && request.include_paused && kind == ScheduleKind::Dag && !request.dry_run
+    {
+        return Err(AutumnError::bad_request_msg(format!(
+            "paused DAG schedule {schedule_id} cannot be backfilled in non-dry-run mode; resume the schedule before dispatching backfill work"
+        )));
+    }
 
     // Dry-run: query current running count and project what would happen.
     if request.dry_run {
