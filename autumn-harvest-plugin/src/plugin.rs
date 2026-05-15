@@ -576,9 +576,8 @@ mod tests {
             HarvestRunnerResources::new(pool),
         );
 
-        let err = match result {
-            Ok(_) => panic!("classic DAG runtime should be rejected before startup"),
-            Err(err) => err,
+        let Err(err) = result else {
+            panic!("classic DAG runtime should be rejected before startup");
         };
         assert!(
             err.to_string().contains("classic DAG"),
