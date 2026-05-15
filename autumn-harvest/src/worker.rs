@@ -3202,59 +3202,8 @@ async fn process_workflow_task(
         .as_ref()
         .and_then(TraceContextCarrier::from_json);
 
-    // ADR-0001 §2.6 + §2.7: emit harvest.signal.deliver and harvest.timer.fire
-    // spans here, after the trace context is restored, so they are correlated
-    // with the workflow execution trace rather than being orphaned.
-    // EnteredSpan is !Send; .in_scope() drops it before any subsequent .await.
-    // ADR-0001 §2.7: one span per fired timer.
-    for timer_id in &prepared.timers_fired {
-        tracing::info_span!(
-            "harvest.timer.fire",
-            "otel.kind" = "internal",
-            { ATTR_EXECUTION_ID } = %prepared.exec_id,
-            timer.id = %timer_id,
-        )
-        .in_scope(|| {});
-    }
-    for signal_name in &prepared.signals_delivered {
-        tracing::info_span!(
-            "harvest.signal.deliver",
-            "otel.kind" = "consumer",
-            { ATTR_WORKFLOW_ID } = prepared.execution.workflow_name.as_str(),
-            { ATTR_EXECUTION_ID } = %prepared.exec_id,
-            signal.name = signal_name.as_str(),
-        )
-        .in_scope(|| {});
-    }
-
-    // Emit workflow.started exactly once per execution.  Two independent
-    // conditions must both hold:
-    //
-    // 1. task.attempt == 1: the task queue has never dispatched this execution
-    //    before (attempt starts at 0 and is incremented to 1 on first claim;
-    //    signal-resume paths increment it again on re-claim).
-    //
-    // 2. No scheduling events in history: guards against counting replayed
-    //    first-dispatch tasks that already committed scheduling work.
-    //    load_workflow_replay_state prepends SignalReceived/TimerFired for
-    //    pending signals and fired timers, so checking raw length alone is
-    //    unreliable for brand-new workflows.
-    let has_scheduling_events = prepared.history_events.iter().any(|e| {
-        matches!(
-            e,
-            WorkflowEvent::ActivityScheduled { .. }
-                | WorkflowEvent::TimerStarted { .. }
-                | WorkflowEvent::ChildWorkflowStarted { .. }
-                | WorkflowEvent::LocalActivityScheduled { .. }
-                | WorkflowEvent::ActivityAwaitingExternal { .. }
-                | WorkflowEvent::MarkerRecorded { .. }
-        )
-    });
-    if task.attempt == 1 && !has_scheduling_events {
-        telemetry
-            .metrics
-            .record_workflow_started(&prepared.execution.workflow_name, &task.queue_name);
-    }
+    emit_timer_and_signal_spans(&prepared);
+    emit_workflow_started_metric_if_new(&prepared, task, &telemetry);
     let started_at = std::time::Instant::now();
 
     // Drive the workflow in a loop so that local activities can be executed
@@ -3482,6 +3431,68 @@ async fn process_workflow_task(
     .await
     // execute_span is dropped here, closing the OTel span after all producer
     // spans have been emitted as its children.
+}
+
+fn emit_timer_and_signal_spans(prepared: &PreparedWorkflowTask) {
+    // ADR-0001 §2.6 + §2.7: emit harvest.signal.deliver and harvest.timer.fire
+    // spans here, after the trace context is restored, so they are correlated
+    // with the workflow execution trace rather than being orphaned.
+    // EnteredSpan is !Send; .in_scope() drops it before any subsequent .await.
+    // ADR-0001 §2.7: one span per fired timer.
+    for timer_id in &prepared.timers_fired {
+        tracing::info_span!(
+            "harvest.timer.fire",
+            "otel.kind" = "internal",
+            { ATTR_EXECUTION_ID } = %prepared.exec_id,
+            timer.id = %timer_id,
+        )
+        .in_scope(|| {});
+    }
+    for signal_name in &prepared.signals_delivered {
+        tracing::info_span!(
+            "harvest.signal.deliver",
+            "otel.kind" = "consumer",
+            { ATTR_WORKFLOW_ID } = prepared.execution.workflow_name.as_str(),
+            { ATTR_EXECUTION_ID } = %prepared.exec_id,
+            signal.name = signal_name.as_str(),
+        )
+        .in_scope(|| {});
+    }
+}
+
+fn emit_workflow_started_metric_if_new(
+    prepared: &PreparedWorkflowTask,
+    task: &TaskQueueItem,
+    telemetry: &Arc<crate::telemetry::TelemetryConfig>,
+) {
+    // Emit workflow.started exactly once per execution.  Two independent
+    // conditions must both hold:
+    //
+    // 1. task.attempt == 1: the task queue has never dispatched this execution
+    //    before (attempt starts at 0 and is incremented to 1 on first claim;
+    //    signal-resume paths increment it again on re-claim).
+    //
+    // 2. No scheduling events in history: guards against counting replayed
+    //    first-dispatch tasks that already committed scheduling work.
+    //    load_workflow_replay_state prepends SignalReceived/TimerFired for
+    //    pending signals and fired timers, so checking raw length alone is
+    //    unreliable for brand-new workflows.
+    let has_scheduling_events = prepared.history_events.iter().any(|e| {
+        matches!(
+            e,
+            WorkflowEvent::ActivityScheduled { .. }
+                | WorkflowEvent::TimerStarted { .. }
+                | WorkflowEvent::ChildWorkflowStarted { .. }
+                | WorkflowEvent::LocalActivityScheduled { .. }
+                | WorkflowEvent::ActivityAwaitingExternal { .. }
+                | WorkflowEvent::MarkerRecorded { .. }
+        )
+    });
+    if task.attempt == 1 && !has_scheduling_events {
+        telemetry
+            .metrics
+            .record_workflow_started(&prepared.execution.workflow_name, &task.queue_name);
+    }
 }
 
 async fn process_task(
