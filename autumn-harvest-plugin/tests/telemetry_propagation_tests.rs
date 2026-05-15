@@ -79,6 +79,8 @@ const INIT_SQL: &str = concat!(
     include_str!(
         "../../autumn-harvest/migrations/20260513000000_harvest_schedule_pause_metadata/up.sql"
     ),
+    "\n",
+    include_str!("../../autumn-harvest/migrations/20260514020000_harvest_task_activity_id/up.sql"),
 );
 
 // -------------------------------------------------------------------------
