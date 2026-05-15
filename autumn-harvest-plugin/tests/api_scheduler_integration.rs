@@ -3978,6 +3978,86 @@ async fn harvest_api_rejects_non_dry_run_backfill_for_paused_dag_schedule() {
 }
 
 #[tokio::test]
+async fn harvest_api_backfills_legacy_dag_schedule_null_queue_on_dag_default_queue() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let dag_name = "backfill_null_queue_dag";
+    let dag_info = DagInfo {
+        name: dag_name,
+        module: "tests",
+        schedule: Some(Schedule::Interval(Duration::from_secs(3600))),
+        catchup: false,
+        max_active_runs: 1,
+        default_queue: Some("dag-workers"),
+        builder: build_interval_pipeline_dag,
+        workflow_handler: Some(approval_workflow),
+    };
+    let dag_catalog = Arc::new(
+        compile_dag_catalog(vec![dag_info]).expect("scheduled unified DAG should compile"),
+    );
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![workflow_info_named(dag_name)],
+        vec![],
+    ));
+
+    {
+        let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+            .await
+            .expect("failed to connect for legacy DAG schedule registration");
+        let dag = dag_catalog
+            .get(dag_name)
+            .expect("compiled DAG should be registered");
+        autumn_harvest::scheduler::ensure_dag_schedule(&mut conn, dag)
+            .await
+            .expect("legacy DAG schedule row should be created");
+    }
+    let schedule = load_schedule_from_url(&database_url, dag_name).await;
+    assert!(
+        schedule.queue_name.is_none(),
+        "legacy/classic DAG rows can have no durable queue_name"
+    );
+    assert!(
+        schedule.workflow_name.is_none(),
+        "ensure_dag_schedule models the upgraded classic row before unified registration"
+    );
+
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
+    api_state.install(HarvestApiRuntime::new(
+        registry,
+        Arc::clone(&dag_catalog),
+        Arc::new(Vec::new()),
+        Some("scheduler-only".to_string()),
+        vec!["dag-workers".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::single(),
+    ));
+    let app = harvest_api_router(api_state).with_state(test_app_state(pool.clone()));
+    let backfill_at = chrono::Utc::now() - chrono::Duration::hours(2);
+
+    let (status, body) = post_json(
+        &app,
+        format!("/admin/schedules/{}/backfill", schedule.id),
+        json!({
+            "from": backfill_at,
+            "to": backfill_at
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["dispatched"], serde_json::json!(1));
+    let execution = load_latest_workflow_execution_by_name_from_url(&database_url, dag_name)
+        .await
+        .expect("backfill should start the DAG workflow execution");
+    assert_eq!(
+        execution.queue_name, "dag-workers",
+        "legacy DAG backfills should fall back to the registered DAG default_queue before default"
+    );
+}
+
+#[tokio::test]
 async fn scheduler_tick_creates_and_executes_due_interval_runs() {
     let (database_url, _container) = setup_test_database_url().await;
     let pool = build_test_pool(&database_url);
@@ -4773,6 +4853,64 @@ async fn scheduler_tick_removes_legacy_workflow_only_dag_schedule_from_old_shard
     let schedule = load_schedule_from_url(&shard1_url, dag_name).await;
     assert_eq!(schedule.workflow_name.as_deref(), Some(dag_name));
     assert_eq!(schedule.queue_name.as_deref(), Some("dag-workers"));
+}
+
+#[tokio::test]
+async fn scheduler_tick_does_not_dispatch_removed_dag_schedule_rows() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let dag_name = "removed_unified_dag";
+    let workflow_schedule = WorkflowSchedule {
+        workflow_name: dag_name.to_string(),
+        dag_name: Some(dag_name.to_string()),
+        schedule: Schedule::Interval(Duration::from_secs(60)),
+        input: Value::Null,
+        catchup: false,
+        max_active_runs: 1,
+        paused: false,
+        queue_name: "dag-workers".to_string(),
+    };
+
+    {
+        let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+            .await
+            .expect("failed to connect for removed DAG schedule seed");
+        register_workflow_schedules(&mut conn, std::slice::from_ref(&workflow_schedule))
+            .await
+            .expect("failed to seed DAG-backed workflow schedule");
+        let schedule = load_schedule_from_url(&database_url, dag_name).await;
+        diesel::update(harvest_schedules::table.find(schedule.id))
+            .set(
+                harvest_schedules::next_run_at
+                    .eq(Some(chrono::Utc::now() - chrono::Duration::seconds(1))),
+            )
+            .execute(&mut conn)
+            .await
+            .expect("failed to force removed DAG schedule due");
+    }
+
+    tick_once(
+        pool.clone(),
+        Arc::new(HandlerRegistry::new(vec![], vec![])),
+        Arc::new(DagCatalog::default()),
+        Arc::new(Vec::new()),
+        SchedulerMonitor::offline(),
+    )
+    .await
+    .expect("scheduler tick should skip removed DAG-managed schedule rows");
+
+    assert_eq!(
+        count_workflow_executions_by_name_from_url(&database_url, dag_name).await,
+        0,
+        "DAG-marked schedules whose DAG is no longer registered must not dispatch workflows"
+    );
+    let maybe_schedule = load_schedule_from_url_optional(&database_url, dag_name).await;
+    if let Some(schedule) = maybe_schedule {
+        assert!(
+            schedule.next_run_at.is_none(),
+            "kept removed-DAG rows must be disabled so future ticks do not repeatedly dispatch"
+        );
+    }
 }
 
 #[tokio::test]

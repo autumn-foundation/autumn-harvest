@@ -5163,7 +5163,19 @@ async fn schedule_backfill(
     }
 
     // Non-dry-run: dispatch each timestamp idempotently, respecting max_active_runs.
-    let dispatch_queue = schedule.queue_name.as_deref().unwrap_or("default");
+    let dag_default_queue = if kind == ScheduleKind::Dag {
+        runtime
+            .dags()
+            .get(&name)
+            .and_then(|dag| dag.default_queue.as_deref())
+    } else {
+        None
+    };
+    let dispatch_queue = schedule
+        .queue_name
+        .as_deref()
+        .or(dag_default_queue)
+        .unwrap_or("default");
     let mut dispatched = 0usize;
     let mut skipped = 0usize;
     let mut failed = 0usize;
@@ -5371,7 +5383,11 @@ async fn schedule_backfill(
                 };
                 let workflow_id = scheduled_workflow_id_pub(&dag_name, *scheduled_for);
                 let exec_id = autumn_harvest::types::ExecutionId::new_for_shard(shard_id);
-                let dag_queue = schedule.queue_name.as_deref().unwrap_or("default");
+                let dag_queue = schedule
+                    .queue_name
+                    .as_deref()
+                    .or(dag_default_queue)
+                    .unwrap_or("default");
 
                 // Pre-check across ALL states including CONTINUED_AS_NEW / TERMINATED.
                 // start_or_load_workflow_execution uses a partial unique index that

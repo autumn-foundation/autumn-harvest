@@ -563,7 +563,8 @@ pub async fn tick_once_sharded(
         )
         .await?;
 
-        if let Err(error) = tick_workflow_schedules(&mut conn, shard, &metrics).await {
+        if let Err(error) = tick_workflow_schedules(&mut conn, shard, dags.as_ref(), &metrics).await
+        {
             tracing::warn!(
                 error = %error,
                 shard_id = shard.as_i32(),
@@ -1054,6 +1055,7 @@ fn parse_schedule_from_expr(expr: &str) -> Option<Schedule> {
 async fn tick_workflow_schedules(
     conn: &mut AsyncPgConnection,
     current_shard: ShardId,
+    registered_dags: &DagCatalog,
     metrics: &Arc<dyn crate::telemetry::MetricsRecorder>,
 ) -> HarvestResult<()> {
     use crate::schema::harvest_schedules::dsl;
@@ -1078,6 +1080,25 @@ async fn tick_workflow_schedules(
         let Some(logical_date) = schedule.next_run_at else {
             continue;
         };
+        if let Some(ref dag_name) = schedule.dag_name
+            && !registered_dags.contains_key(dag_name)
+        {
+            tracing::info!(
+                workflow_name = %wf_name,
+                dag_name = %dag_name,
+                "harvest DAG workflow schedule skipped: DAG is no longer registered"
+            );
+            metrics.record_schedule_skipped("dag", dag_name, "dag_not_registered");
+            diesel::update(dsl::harvest_schedules.find(schedule.id))
+                .set((
+                    dsl::next_run_at.eq(Option::<DateTime<Utc>>::None),
+                    dsl::updated_at.eq(now),
+                ))
+                .execute(conn)
+                .await
+                .map_err(crate::error::database_error)?;
+            continue;
+        }
         // Parse the schedule expression stored in the DB row. This covers both
         // in-process registered schedules and schedules created via the API
         // (which are DB-only and do not appear in the in-memory list).

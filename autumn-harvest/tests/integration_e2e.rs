@@ -182,6 +182,59 @@ async fn setup_blank_test_database_url() -> (String, ContainerAsync<Postgres>) {
     (database_url, container)
 }
 
+#[tokio::test]
+async fn drop_dag_runs_migration_copies_legacy_rows_to_workflow_executions() {
+    let (mut conn, _container) = setup_test_db().await;
+    let legacy_run_id = Uuid::new_v4();
+    let dag_name = "legacy_migrated_dag";
+    let logical_date = chrono::DateTime::parse_from_rfc3339("2026-05-14T02:00:00Z")
+        .expect("fixed timestamp should parse")
+        .with_timezone(&Utc);
+    let dag_conf = serde_json::json!({ "customer": "acme" });
+
+    diesel::sql_query(
+        r"
+        INSERT INTO harvest_dag_runs
+            (id, dag_name, workflow_exec_id, state, logical_date, data_interval_start,
+             data_interval_end, conf, started_at, completed_at, created_at)
+        VALUES ($1, $2, NULL, 'SUCCESS', $3, $3, $3, $4, $3, $3, $3)
+        ",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(legacy_run_id)
+    .bind::<diesel::sql_types::Text, _>(dag_name)
+    .bind::<diesel::sql_types::Timestamptz, _>(logical_date)
+    .bind::<diesel::sql_types::Jsonb, _>(dag_conf.clone())
+    .execute(&mut conn)
+    .await
+    .expect("failed to seed legacy DAG run");
+
+    conn.batch_execute(include_str!(
+        "../migrations/20260514000000_drop_harvest_dag_runs/up.sql"
+    ))
+    .await
+    .expect("drop migration should migrate legacy DAG runs before dropping the table");
+
+    let workflow_id = autumn_harvest::scheduler::scheduled_workflow_id_pub(dag_name, logical_date);
+    let migrated = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_name.eq(dag_name))
+        .filter(harvest_workflow_executions::workflow_id.eq(workflow_id))
+        .select(WorkflowExecution::as_select())
+        .first::<WorkflowExecution>(&mut conn)
+        .await
+        .expect("legacy DAG run should be copied into workflow executions");
+
+    assert_eq!(migrated.id, legacy_run_id);
+    assert_eq!(migrated.state, "COMPLETED");
+    assert_eq!(migrated.queue_name, "default");
+    assert_eq!(
+        migrated.input["_harvest_migrated_legacy_dag_run"],
+        serde_json::json!(true)
+    );
+    assert_eq!(migrated.input["dag_run_id"], legacy_run_id.to_string());
+    assert_eq!(migrated.input["conf"], dag_conf);
+    assert!(migrated.completed_at.is_some());
+}
+
 fn build_test_pool(database_url: &str) -> DbPool {
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(database_url);
     deadpool::managed::Pool::builder(manager)
