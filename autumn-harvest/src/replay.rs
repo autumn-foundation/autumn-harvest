@@ -282,6 +282,10 @@ impl HistoryMatcher {
 
         // We found the Scheduled event but no terminal event — treat as
         // incomplete history (the activity was scheduled but never finished).
+        if let Some(command_cursor) = first_interleaved_command {
+            self.cursor = command_cursor;
+            self.advance_to_next_unconsumed_event();
+        }
         HistoryMatch::ActivityInProgress { activity_id }
     }
 
@@ -1997,6 +2001,57 @@ mod tests {
         let r2 = matcher.match_activity("charge_payment");
         assert_eq!(r2, HistoryMatch::Matched { output: output2 });
 
+        assert!(!matcher.is_replaying());
+    }
+
+    #[test]
+    fn matcher_rewinds_to_later_sibling_when_earlier_activity_is_in_progress() {
+        let earlier_id = ActivityExecId::new();
+        let later_id = ActivityExecId::new();
+        let later_output = serde_json::json!({"done": "later"});
+
+        let events = vec![
+            WorkflowEvent::ActivityScheduled {
+                activity_id: earlier_id,
+                name: "slow_task".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityStarted {
+                activity_id: earlier_id,
+                worker_id: WorkerId::new("worker-a"),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: later_id,
+                name: "fast_task".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id: later_id,
+                output: later_output.clone(),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+
+        assert_eq!(
+            matcher.match_activity("slow_task"),
+            HistoryMatch::ActivityInProgress {
+                activity_id: earlier_id
+            }
+        );
+        assert_eq!(
+            matcher.position(),
+            2,
+            "in-progress replay must rewind to the first interleaved sibling command"
+        );
+
+        assert_eq!(
+            matcher.match_activity("fast_task"),
+            HistoryMatch::Matched {
+                output: later_output
+            }
+        );
         assert!(!matcher.is_replaying());
     }
 
