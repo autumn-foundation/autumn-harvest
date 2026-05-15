@@ -27,9 +27,7 @@ use crate::error::{HarvestError, HarvestResult, database_error};
 #[cfg(feature = "db")]
 use crate::schema::harvest_workflow_executions;
 #[cfg(feature = "db")]
-use crate::schema::{
-    harvest_dag_runs, harvest_dead_letters, harvest_signals, harvest_task_queue, harvest_timers,
-};
+use crate::schema::{harvest_dead_letters, harvest_signals, harvest_task_queue, harvest_timers};
 #[cfg(feature = "db")]
 use crate::shard::ShardedDbPool;
 #[cfg(feature = "db")]
@@ -588,16 +586,6 @@ async fn should_skip_candidate(
     .count;
 
     if active_parent_ref_count > 0 {
-        return Ok(true);
-    }
-
-    let dag_run_ref_count = harvest_dag_runs::table
-        .filter(harvest_dag_runs::workflow_exec_id.eq(Some(candidate.id)))
-        .count()
-        .get_result::<i64>(conn)
-        .await
-        .map_err(database_error)?;
-    if dag_run_ref_count > 0 {
         return Ok(true);
     }
 

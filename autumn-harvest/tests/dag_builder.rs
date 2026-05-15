@@ -108,6 +108,7 @@ fn harvest_builder_collects_dags() {
         max_active_runs: 1,
         default_queue: Some("etl-workers"),
         builder: build_daily,
+        workflow_handler: None,
     }]);
 
     assert_eq!(builder.dag_count(), 1);

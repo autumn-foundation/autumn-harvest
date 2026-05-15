@@ -12,7 +12,8 @@ keywords = ["workflow", "durable", "postgres", "orchestration", "autumn"]
 categories = ["asynchronous", "database"]
 
 [features]
-default = ["db"]
+default = ["db", "unified-dag-execution"]
+unified-dag-execution = ["autumn-harvest-macros/unified-dag-execution"]
 db = [
     "dep:deadpool",
     "dep:diesel",
@@ -62,6 +63,10 @@ required-features = ["testing"]
 [[test]]
 name = "replayer_tests"
 required-features = ["testing"]
+
+[[test]]
+name = "dag_unified_tests"
+required-features = ["testing", "unified-dag-execution"]
 
 [[test]]
 name = "replayer_integration_tests"

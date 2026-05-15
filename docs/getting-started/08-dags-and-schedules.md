@@ -81,6 +81,22 @@ That's the whole vocabulary. Three things to notice:
   terminal state, regardless of outcome. Useful for end-of-pipeline
   notification and cleanup.
 
+## Under the hood — unified execution
+
+Since Harvest 0.3 (`unified-dag-execution` feature, on by default), `#[dag]`
+functions are executed as *workflows* on the standard workflow execution path
+rather than through a bespoke DAG executor.  The macro lowers the graph
+definition into a `WorkflowHandlerFn` that walks `DagDefinition` level by
+level and dispatches each activity through `ctx.execute_activity_raw`, so DAG
+runs show up as workflow executions in `harvest_workflow_executions`, benefit
+from the same replay-safe history model, and are observable through all the
+same tooling.
+
+You do **not** need to register the underlying workflow manually —
+`HarvestPlugin::dags(dags![my_dag])` auto-registers the `WorkflowInfo` and
+(if the DAG has a `schedule = "..."` attribute) the `WorkflowSchedule` for
+you.
+
 ## `#[dag]` attributes
 
 | Key | Default | Meaning |

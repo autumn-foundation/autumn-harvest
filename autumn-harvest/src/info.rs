@@ -9,7 +9,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use crate::dag::{DagBuildError, DagBuilder, DagDefinition};
-use crate::policy::{RetryPolicy, Schedule};
+use crate::policy::{RetryPolicy, Schedule, WorkflowSchedule};
 
 /// Type-erased workflow handler.
 ///
@@ -88,6 +88,13 @@ pub struct DagInfo {
     pub default_queue: Option<&'static str>,
     /// Builder function that populates a [`DagBuilder`].
     pub builder: fn(&mut DagBuilder),
+    /// Lowered workflow handler, populated when the `unified-dag-execution`
+    /// feature is enabled (issue #256 Step 1).
+    ///
+    /// `None` on the classic DAG execution path; `Some` when the feature is
+    /// on so the runtime can route new DAG runs through `WorkflowInfo`
+    /// without needing to look up the companion by name.
+    pub workflow_handler: Option<WorkflowHandlerFn>,
 }
 
 impl DagInfo {
@@ -102,6 +109,42 @@ impl DagInfo {
             .map_or_else(DagBuilder::new, DagBuilder::with_default_queue);
         (self.builder)(&mut dag);
         dag.build()
+    }
+
+    /// Return a [`WorkflowSchedule`] that fires this DAG on its declared cron
+    /// or interval via the unified workflow execution path (issue #256 Step 2).
+    ///
+    /// Returns `None` when either:
+    /// - `workflow_handler` is `None` (unified-dag-execution feature is off), or
+    /// - `schedule` is `None` (DAG has no automatic trigger).
+    #[must_use]
+    pub fn as_workflow_schedule(&self) -> Option<WorkflowSchedule> {
+        self.workflow_handler?;
+        let schedule = self.schedule.clone()?;
+        Some(WorkflowSchedule {
+            workflow_name: self.name.to_string(),
+            dag_name: Some(self.name.to_string()),
+            schedule,
+            input: serde_json::Value::Null,
+            catchup: self.catchup,
+            max_active_runs: self.max_active_runs,
+            paused: false,
+            queue_name: self.default_queue.unwrap_or("default").to_string(),
+        })
+    }
+
+    /// Return a [`WorkflowInfo`] that executes this DAG via the unified
+    /// workflow execution path (issue #256 Step 1).
+    ///
+    /// Returns `None` when the `unified-dag-execution` feature is disabled and
+    /// `workflow_handler` was not populated by the macro.
+    #[must_use]
+    pub fn as_workflow_info(&self) -> Option<WorkflowInfo> {
+        self.workflow_handler.map(|handler| WorkflowInfo {
+            name: self.name,
+            module: self.module,
+            handler,
+        })
     }
 }
 
@@ -143,6 +186,7 @@ impl std::fmt::Debug for DagInfo {
             .field("max_active_runs", &self.max_active_runs)
             .field("default_queue", &self.default_queue)
             .field("builder", &"<fn>")
+            .field("workflow_handler", &self.workflow_handler.map(|_| "<fn>"))
             .finish()
     }
 }
@@ -251,6 +295,7 @@ mod tests {
             max_active_runs: 1,
             default_queue: Some("etl-workers"),
             builder: build,
+            workflow_handler: None,
         };
 
         let definition = info.build_definition().expect("dag should compile");
@@ -258,6 +303,11 @@ mod tests {
         assert_eq!(definition.execution_levels().len(), 2);
         assert_eq!(definition.tasks()[0].queue.as_deref(), Some("etl-workers"));
         assert_eq!(definition.tasks()[1].trigger_rule, TriggerRule::AllSuccess);
+
+        assert!(
+            info.as_workflow_info().is_none(),
+            "as_workflow_info should return None when workflow_handler is None"
+        );
     }
     #[test]
     fn info_debug_formats_correctly() {
@@ -295,6 +345,7 @@ mod tests {
             max_active_runs: 1,
             default_queue: None,
             builder: |_| {},
+            workflow_handler: None,
         };
         let debug_str = format!("{dag_info:?}");
         assert!(debug_str.contains("DagInfo"));

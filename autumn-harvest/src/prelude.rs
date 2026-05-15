@@ -16,13 +16,13 @@ pub use crate::handle::{
     WorkflowResultState, start_or_load_workflow_execution_with_handle,
 };
 pub use crate::info::{ActivityInfo, DagInfo, WorkflowInfo};
-pub use crate::policy::{RetryPolicy, Schedule, TriggerRule};
+pub use crate::policy::{RetryPolicy, Schedule, TaskStatus, TriggerRule};
 pub use crate::query::QueryRegistry;
 pub use crate::saga::Saga;
 #[cfg(feature = "db")]
 pub use crate::scheduler::{
     DagCatalog, RegisteredDag, SchedulerMonitor, SchedulerRuntime, compile_dag_catalog,
-    register_schedules, tick_once, trigger_dag,
+    register_schedules, tick_once, trigger_unified_dag,
 };
 pub use crate::telemetry::{
     ActivityStatus, MetricsRecorder, NoOpMetrics, NoOpPropagator, TelemetryConfig,

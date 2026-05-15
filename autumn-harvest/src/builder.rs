@@ -42,6 +42,7 @@ pub struct HarvestBuilder {
     activities: Vec<ActivityInfo>,
     dags: Vec<DagInfo>,
     workflow_schedules: Vec<WorkflowSchedule>,
+    auto_registered_dag_workflows: Vec<String>,
     worker_config: WorkerConfig,
     state: SharedStateMap,
     telemetry: Option<TelemetryConfig>,
@@ -57,6 +58,10 @@ impl std::fmt::Debug for HarvestBuilder {
             .field("activity_count", &self.activities.len())
             .field("dag_count", &self.dags.len())
             .field("workflow_schedule_count", &self.workflow_schedules.len())
+            .field(
+                "auto_registered_dag_workflow_count",
+                &self.auto_registered_dag_workflows.len(),
+            )
             .field("worker_config", &self.worker_config)
             .field("state_count", &self.state.len())
             .field("telemetry_configured", &self.telemetry.is_some())
@@ -191,6 +196,30 @@ pub enum HarvestBuilderError {
         workflow_name: String,
         /// Human-readable reason the schedule was rejected.
         reason: String,
+    },
+
+    /// A normal workflow registration reused the name of a DAG that is
+    /// auto-registered as a workflow for unified DAG execution.
+    #[error(
+        "workflow name '{name}' collides with an auto-registered DAG workflow; \
+         register workflows and DAGs with distinct names"
+    )]
+    DagWorkflowNameCollision {
+        /// The shared workflow/DAG name.
+        name: String,
+    },
+
+    /// A DAG references an activity registered as local-only. Local activities
+    /// run inline on the workflow worker and cannot be scheduled through the
+    /// DAG activity queue lowering.
+    #[error(
+        "DAG '{dag}' references local activity '{activity}'; local activities cannot be used in DAG definitions"
+    )]
+    LocalActivityInDag {
+        /// DAG containing the local activity task.
+        dag: String,
+        /// Local activity referenced by the DAG.
+        activity: String,
     },
 
     /// A [`WorkerConfig`] field has an invalid value.
@@ -364,9 +393,29 @@ impl HarvestBuilder {
     /// Register DAG definitions (output of `dags![]` macro).
     ///
     /// DAGs define graphs of steps that run according to a schedule.
+    ///
+    /// When the `unified-dag-execution` feature is enabled every DAG whose
+    /// `workflow_handler` is populated (i.e. produced by the `#[dag]` macro
+    /// with that feature on) is also auto-registered as a [`WorkflowInfo`] and,
+    /// if it carries a schedule attribute, as a [`WorkflowSchedule`]. This
+    /// wires unified DAGs into the standard workflow execution and scheduler
+    /// paths without requiring separate `.workflow_schedule(...)` calls.
     #[must_use]
     pub fn dags(mut self, dags: Vec<DagInfo>) -> Self {
-        self.dags.extend(dags);
+        for dag in dags {
+            #[cfg(feature = "unified-dag-execution")]
+            {
+                if let Some(workflow_info) = dag.as_workflow_info() {
+                    self.auto_registered_dag_workflows
+                        .push(workflow_info.name.to_string());
+                    self.workflows.push(workflow_info);
+                }
+                if let Some(workflow_schedule) = dag.as_workflow_schedule() {
+                    self.workflow_schedules.push(workflow_schedule);
+                }
+            }
+            self.dags.push(dag);
+        }
         self
     }
 
@@ -516,11 +565,20 @@ impl HarvestBuilder {
         }
 
         validate_concurrency_keys(&self.activities)?;
-        validate_workflow_schedules(&self.workflow_schedules, &self.workflows)?;
+        validate_dag_workflow_name_collisions(
+            &self.workflows,
+            &self.auto_registered_dag_workflows,
+        )?;
+        validate_workflow_schedules(
+            &self.workflow_schedules,
+            &self.workflows,
+            &self.auto_registered_dag_workflows,
+        )?;
         validate_local_activity_timeouts(
             &self.activities,
             self.worker_config.max_local_activity_start_to_close,
         )?;
+        validate_dags_do_not_use_local_activities(&self.dags, &self.activities)?;
 
         Ok(BuiltHarvest {
             workflows: self.workflows,
@@ -537,12 +595,78 @@ impl HarvestBuilder {
     }
 }
 
+fn validate_dags_do_not_use_local_activities(
+    dags: &[DagInfo],
+    activities: &[ActivityInfo],
+) -> Result<(), HarvestBuilderError> {
+    use std::collections::HashSet;
+
+    let local_activities = activities
+        .iter()
+        .filter(|activity| activity.is_local)
+        .map(|activity| activity.name)
+        .collect::<HashSet<_>>();
+    if local_activities.is_empty() || dags.is_empty() {
+        return Ok(());
+    }
+
+    for dag in dags {
+        let Ok(definition) = dag.build_definition() else {
+            continue;
+        };
+        for task in definition.tasks() {
+            if local_activities.contains(task.activity_name.as_str()) {
+                return Err(HarvestBuilderError::LocalActivityInDag {
+                    dag: dag.name.to_string(),
+                    activity: task.activity_name.clone(),
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Verify that unified DAG auto-registration does not overwrite or get
+/// overwritten by a normal workflow with the same name.
+fn validate_dag_workflow_name_collisions(
+    workflows: &[crate::info::WorkflowInfo],
+    auto_registered_dag_workflows: &[String],
+) -> Result<(), HarvestBuilderError> {
+    use std::collections::HashMap;
+
+    if auto_registered_dag_workflows.is_empty() {
+        return Ok(());
+    }
+
+    let mut auto_counts: HashMap<&str, usize> = HashMap::new();
+    for name in auto_registered_dag_workflows {
+        *auto_counts.entry(name.as_str()).or_default() += 1;
+    }
+
+    let mut workflow_counts: HashMap<&str, usize> = HashMap::new();
+    for workflow in workflows {
+        *workflow_counts.entry(workflow.name).or_default() += 1;
+    }
+
+    for (name, auto_count) in auto_counts {
+        if workflow_counts.get(name).copied().unwrap_or_default() > auto_count {
+            return Err(HarvestBuilderError::DagWorkflowNameCollision {
+                name: name.to_string(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
 /// Verify that every [`WorkflowSchedule`] references a workflow name that is
 /// actually registered on the builder. Fails fast with
 /// [`HarvestBuilderError::UnknownWorkflowSchedule`] on the first mismatch.
 fn validate_workflow_schedules(
     schedules: &[WorkflowSchedule],
     workflows: &[crate::info::WorkflowInfo],
+    auto_registered_dag_workflows: &[String],
 ) -> Result<(), HarvestBuilderError> {
     if schedules.is_empty() {
         return Ok(());
@@ -553,6 +677,16 @@ fn validate_workflow_schedules(
             return Err(HarvestBuilderError::UnknownWorkflowSchedule {
                 workflow_name: schedule.workflow_name.clone(),
                 registered,
+            });
+        }
+        if schedule.dag_name.is_none()
+            && auto_registered_dag_workflows
+                .iter()
+                .any(|dag_name| dag_name == &schedule.workflow_name)
+        {
+            return Err(HarvestBuilderError::InvalidWorkflowSchedule {
+                workflow_name: schedule.workflow_name.clone(),
+                reason: "workflow schedule targets an auto-registered DAG workflow; use the DAG schedule registration instead".to_string(),
             });
         }
         // Reject zero-length intervals (would cause infinite loops in due_run_plan
@@ -838,6 +972,23 @@ mod tests {
             max_active_runs: 1,
             default_queue: Some("default"),
             builder: build,
+            workflow_handler: None,
+        }
+    }
+
+    #[cfg(feature = "unified-dag-execution")]
+    fn fake_unified_dag_info() -> DagInfo {
+        fn build(_dag: &mut DagBuilder) {}
+
+        DagInfo {
+            name: "daily_etl",
+            module: "test",
+            schedule: Some(Schedule::Manual),
+            catchup: false,
+            max_active_runs: 1,
+            default_queue: Some("default"),
+            builder: build,
+            workflow_handler: Some(|_ctx, input| Box::pin(async move { Ok(input) })),
         }
     }
 
@@ -899,6 +1050,31 @@ mod tests {
     fn harvest_builder_collects_dags() {
         let builder = HarvestBuilder::new().dags(vec![fake_dag_info()]);
         assert_eq!(builder.dag_count(), 1);
+    }
+
+    #[cfg(feature = "unified-dag-execution")]
+    #[test]
+    fn harvest_builder_rejects_workflow_schedule_targeting_auto_registered_dag_name() {
+        let result = HarvestBuilder::new()
+            .dags(vec![fake_unified_dag_info()])
+            .workflow_schedule(WorkflowSchedule::new(
+                "daily_etl",
+                Schedule::Interval(Duration::from_secs(60)),
+            ))
+            .try_build();
+
+        let err = result.unwrap_err();
+        assert!(matches!(
+            err,
+            HarvestBuilderError::InvalidWorkflowSchedule {
+                ref workflow_name,
+                ..
+            } if workflow_name == "daily_etl"
+        ));
+        assert!(
+            err.to_string().contains("auto-registered DAG"),
+            "error should explain the DAG/workflow schedule collision: {err}"
+        );
     }
 
     #[test]

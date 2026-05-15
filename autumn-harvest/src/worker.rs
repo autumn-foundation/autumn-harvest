@@ -297,6 +297,7 @@ fn execution_id_from_uuid(id: uuid::Uuid) -> ExecutionId {
 const fn workflow_command_name(command: &WorkflowCommand) -> &'static str {
     match command {
         WorkflowCommand::ScheduleActivity { .. } => "ScheduleActivity",
+        WorkflowCommand::WaitForActivity { .. } => "WaitForActivity",
         WorkflowCommand::ScheduleExternalActivity { .. } => "ScheduleExternalActivity",
         WorkflowCommand::StartTimer { .. } => "StartTimer",
         WorkflowCommand::StartChildWorkflow { .. } => "StartChildWorkflow",
@@ -364,6 +365,8 @@ struct ScheduledActivityCommand {
     name: String,
     input: serde_json::Value,
     queue: String,
+    retry_policy_override: Option<crate::policy::RetryPolicy>,
+    start_to_close_override: Option<std::time::Duration>,
 }
 
 #[derive(Debug, Clone)]
@@ -474,28 +477,63 @@ fn extract_single_command<T>(
     extractor(first_cmd)
 }
 
-fn extract_single_schedule_activity(
+fn extract_all_scheduled_activities(
     commands: &[WorkflowCommand],
-) -> Option<ScheduledActivityCommand> {
-    extract_single_command(commands, |cmd| {
-        let WorkflowCommand::ScheduleActivity {
-            activity_id,
-            name,
-            input,
-            queue,
-            ..
-        } = cmd
-        else {
-            return None;
-        };
+) -> Option<Vec<ScheduledActivityCommand>> {
+    let mut scheduled = Vec::new();
 
-        Some(ScheduledActivityCommand {
-            activity_id: *activity_id,
-            name: name.clone(),
-            input: input.clone(),
-            queue: queue.clone(),
-        })
-    })
+    for cmd in commands {
+        match cmd {
+            WorkflowCommand::RecordMarker { .. }
+            | WorkflowCommand::RecordUpdateResult { .. }
+            | WorkflowCommand::UpsertSearchAttributes { .. } => {}
+            WorkflowCommand::ScheduleActivity {
+                activity_id,
+                name,
+                input,
+                queue,
+                retry_policy_override,
+                start_to_close_override,
+                ..
+            } => {
+                scheduled.push(ScheduledActivityCommand {
+                    activity_id: *activity_id,
+                    name: name.clone(),
+                    input: input.clone(),
+                    queue: queue.clone(),
+                    retry_policy_override: retry_policy_override.clone(),
+                    start_to_close_override: *start_to_close_override,
+                });
+            }
+            _ => return None,
+        }
+    }
+
+    if scheduled.is_empty() {
+        None
+    } else {
+        Some(scheduled)
+    }
+}
+
+fn extract_all_activity_waits(commands: &[WorkflowCommand]) -> Option<Vec<ActivityExecId>> {
+    let mut activity_ids = Vec::new();
+
+    for cmd in commands {
+        match cmd {
+            WorkflowCommand::RecordMarker { .. }
+            | WorkflowCommand::RecordUpdateResult { .. }
+            | WorkflowCommand::UpsertSearchAttributes { .. } => {}
+            WorkflowCommand::WaitForActivity { activity_id, .. } => activity_ids.push(*activity_id),
+            _ => return None,
+        }
+    }
+
+    if activity_ids.is_empty() {
+        None
+    } else {
+        Some(activity_ids)
+    }
 }
 
 fn extract_single_started_timer(commands: &[WorkflowCommand]) -> Option<StartedTimerCommand> {
@@ -1015,6 +1053,149 @@ fn find_pending_scheduled_activity(
     })
 }
 
+fn find_pending_scheduled_activity_by_id(
+    history: &[WorkflowEvent],
+    requested_activity_id: ActivityExecId,
+    activity_name: &str,
+) -> HarvestResult<ActivityExecId> {
+    let mut scheduled = false;
+    let mut terminal = false;
+
+    for event in history {
+        match event {
+            WorkflowEvent::ActivityScheduled {
+                activity_id, name, ..
+            } if *activity_id == requested_activity_id => {
+                if name != activity_name {
+                    return Err(HarvestError::NonDeterministic(format!(
+                        "activity task id '{}' was scheduled for '{name}', not '{activity_name}'",
+                        requested_activity_id.as_uuid()
+                    )));
+                }
+                scheduled = true;
+            }
+            WorkflowEvent::ActivityCompleted { activity_id, .. }
+            | WorkflowEvent::ActivityFailed { activity_id, .. }
+            | WorkflowEvent::ActivityTimedOut { activity_id, .. }
+                if *activity_id == requested_activity_id =>
+            {
+                terminal = true;
+            }
+            _ => {}
+        }
+    }
+
+    if scheduled && !terminal {
+        Ok(requested_activity_id)
+    } else if terminal {
+        Err(HarvestError::NotFound(format!(
+            "activity '{activity_name}' with id '{}' already has a terminal event",
+            requested_activity_id.as_uuid()
+        )))
+    } else {
+        Err(HarvestError::NotFound(format!(
+            "no scheduled activity '{activity_name}' with id '{}' in workflow history",
+            requested_activity_id.as_uuid()
+        )))
+    }
+}
+
+fn has_activity_terminal_event(history: &[WorkflowEvent], activity_id: ActivityExecId) -> bool {
+    history.iter().any(|event| {
+        matches!(
+            event,
+            WorkflowEvent::ActivityCompleted { activity_id: id, .. }
+                | WorkflowEvent::ActivityFailed { activity_id: id, .. }
+                | WorkflowEvent::ActivityTimedOut { activity_id: id, .. }
+                if *id == activity_id
+        )
+    })
+}
+
+async fn lock_workflow_execution_and_load_history(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> HarvestResult<store::EventHistory> {
+    harvest_workflow_executions::table
+        .find(exec_id.as_uuid())
+        .for_update()
+        .select(WorkflowExecution::as_select())
+        .first(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?
+        .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))?;
+
+    store::load_history(conn, exec_id).await
+}
+
+async fn task_state_for_update(
+    conn: &mut AsyncPgConnection,
+    task_id: uuid::Uuid,
+) -> HarvestResult<Option<String>> {
+    use crate::schema::harvest_task_queue::dsl;
+
+    dsl::harvest_task_queue
+        .find(task_id)
+        .for_update()
+        .select(dsl::state)
+        .first(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)
+}
+
+fn pending_activity_id_for_task(
+    history: &[WorkflowEvent],
+    task: &TaskQueueItem,
+    activity_name: &str,
+) -> HarvestResult<Option<ActivityExecId>> {
+    if let Some(activity_id) = task.activity_id {
+        let activity_id = ActivityExecId::from_uuid(activity_id);
+        if has_activity_terminal_event(history, activity_id) {
+            return Ok(None);
+        }
+        return find_pending_scheduled_activity_by_id(history, activity_id, activity_name)
+            .map(Some);
+    }
+
+    find_pending_scheduled_activity(history, activity_name).map(Some)
+}
+
+async fn append_activity_started_if_pending(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+    exec_id: ExecutionId,
+    activity_name: &str,
+    worker_id: &str,
+) -> HarvestResult<Option<ActivityExecId>> {
+    conn.transaction::<Option<ActivityExecId>, HarvestError, _>(|conn| {
+        async move {
+            let history = lock_workflow_execution_and_load_history(conn, exec_id).await?;
+            let Some(activity_id) =
+                pending_activity_id_for_task(&history.events, task, activity_name)?
+            else {
+                return Ok(None);
+            };
+            let Some(state) = task_state_for_update(conn, task.id).await? else {
+                return Ok(None);
+            };
+            if state != "RUNNING" {
+                return Ok(None);
+            }
+
+            let started_event = WorkflowEvent::ActivityStarted {
+                activity_id,
+                worker_id: WorkerId::new(worker_id),
+            };
+            store::append_events(conn, exec_id, &[started_event], history.next_event_id).await?;
+            Ok(Some(activity_id))
+        }
+        .scope_boxed()
+    })
+    .await
+}
+
 async fn load_workflow_execution(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
@@ -1346,106 +1527,155 @@ async fn persist_signal_wait_park(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn persist_scheduled_activity(
+async fn persist_activity_wait_park(
+    conn: &mut AsyncPgConnection,
+    task_id: uuid::Uuid,
+    exec_id: ExecutionId,
+    commands: &[WorkflowCommand],
+    activity_ids: &[ActivityExecId],
+    sticky: Option<queue::StickyHint<'_>>,
+) -> HarvestResult<()> {
+    let marker_events = marker_events_from_commands(commands);
+
+    conn.transaction::<(), HarvestError, _>(|conn| {
+        async move {
+            harvest_workflow_executions::table
+                .find(exec_id.as_uuid())
+                .for_update()
+                .select(WorkflowExecution::as_select())
+                .first(conn)
+                .await
+                .optional()
+                .map_err(crate::error::database_error)?
+                .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))?;
+
+            for event in marker_events {
+                store::append_single_event(conn, exec_id, event).await?;
+            }
+
+            let history = store::load_history(conn, exec_id).await?;
+            let has_terminal = activity_ids
+                .iter()
+                .any(|activity_id| has_activity_terminal_event(&history.events, *activity_id));
+
+            queue::park_workflow_task(conn, task_id, sticky).await?;
+            if has_terminal {
+                queue::wake_workflow_task(conn, exec_id).await?;
+            }
+            Ok(())
+        }
+        .scope_boxed()
+    })
+    .await
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn persist_scheduled_activities(
     conn: &mut AsyncPgConnection,
     registry: &HandlerRegistry,
     task_id: uuid::Uuid,
     exec_id: ExecutionId,
     next_event_id: i32,
     commands: &[WorkflowCommand],
-    scheduled: &ScheduledActivityCommand,
+    scheduled_activities: &[ScheduledActivityCommand],
     sticky: Option<queue::StickyHint<'_>>,
     execute_span: &tracing::Span,
     assigned_build_id: Option<&str>,
 ) -> HarvestResult<()> {
-    let activity = registry.activities.get(&scheduled.name).ok_or_else(|| {
-        HarvestError::Config(format!(
-            "no activity handler registered for '{}'",
-            scheduled.name
-        ))
-    })?;
     let marker_events = marker_events_from_commands(commands);
+    let mut events = marker_events;
+    let mut enqueued = Vec::with_capacity(scheduled_activities.len());
 
-    let queue_name = if scheduled.queue.is_empty() {
-        activity.default_queue.unwrap_or("default").to_string()
-    } else {
-        scheduled.queue.clone()
-    };
-
-    let mut params = queue::EnqueueParams::new(
-        queue_name.clone(),
-        TaskType::Activity,
-        scheduled.input.clone(),
-    );
-    params.workflow_exec_id = Some(exec_id.as_uuid());
-    params.activity_name = Some(scheduled.name.clone());
-    params.required_build_id = assigned_build_id.map(str::to_string);
-    // trace_context is set below, inside the harvest.activity.schedule span,
-    // so the downstream worker's harvest.activity.execute span is stitched to
-    // the producer span rather than the parent workflow-execute context.
-
-    if let Some(retry_policy) = activity.default_retry_policy.clone() {
-        params.max_attempts = i32::try_from(retry_policy.max_attempts).map_err(|_| {
+    for scheduled in scheduled_activities {
+        let activity = registry.activities.get(&scheduled.name).ok_or_else(|| {
             HarvestError::Config(format!(
-                "activity '{}' retry policy max_attempts exceeds i32 range",
-                activity.name
+                "no activity handler registered for '{}'",
+                scheduled.name
             ))
         })?;
-        params.retry_policy = Some(serde_json::to_value(retry_policy)?);
-    }
 
-    if let Some(timeout) = activity.default_heartbeat_timeout {
-        params.heartbeat_timeout = Some(chrono_duration_from_std(timeout, "heartbeat timeout")?);
-    }
-    if let Some(timeout) = activity.default_start_to_close {
-        params.start_to_close = Some(chrono_duration_from_std(timeout, "start_to_close timeout")?);
-    }
-    if let Some(timeout) = activity.default_schedule_to_start {
-        params.schedule_to_start = Some(chrono_duration_from_std(
-            timeout,
-            "schedule_to_start timeout",
-        )?);
-    }
-    // When max_concurrent is set but concurrency_key is omitted, default the
-    // key to the activity name so the per-activity cap is enforced correctly.
-    let effective_key = activity
-        .concurrency_key
-        .map(ToString::to_string)
-        .or_else(|| activity.max_concurrent.map(|_| activity.name.to_string()));
-    if let Some(key) = effective_key {
-        params.concurrency_key = Some(key);
-        params.max_concurrent = activity.max_concurrent;
-    }
+        let queue_name = if scheduled.queue.is_empty() {
+            activity.default_queue.unwrap_or("default").to_string()
+        } else {
+            scheduled.queue.clone()
+        };
 
-    let activity_events = vec![WorkflowEvent::ActivityScheduled {
-        activity_id: scheduled.activity_id,
-        name: scheduled.name.clone(),
-        input: scheduled.input.clone(),
-        queue: queue_name.clone(),
-    }];
-    let mut events = marker_events;
-    events.extend(activity_events);
+        let mut params = queue::EnqueueParams::new(
+            queue_name.clone(),
+            TaskType::Activity,
+            scheduled.input.clone(),
+        );
+        params.workflow_exec_id = Some(exec_id.as_uuid());
+        params.activity_name = Some(scheduled.name.clone());
+        params.activity_id = Some(scheduled.activity_id.as_uuid());
+        params.required_build_id = assigned_build_id.map(str::to_string);
 
-    // ADR-0001 §2.4: harvest.activity.schedule — PRODUCER, child of the
-    // harvest.workflow.execute span for this cycle.  Using `parent: execute_span`
-    // explicitly parents the span even though the execute span's instrumented
-    // future has already completed; the handle is still open.  Context is
-    // captured INSIDE in_scope so the queued task links back to this producer.
-    params.trace_context = tracing::info_span!(
-        parent: execute_span,
-        "harvest.activity.schedule",
-        "otel.kind" = "producer",
-        { ATTR_ACTIVITY_NAME } = %scheduled.name,
-        { ATTR_EXECUTION_ID } = %exec_id,
-        { ATTR_QUEUE } = %queue_name,
-    )
-    .in_scope(|| registry.telemetry().capture_trace_context());
+        let effective_retry = scheduled
+            .retry_policy_override
+            .clone()
+            .or_else(|| activity.default_retry_policy.clone());
+        if let Some(retry_policy) = effective_retry {
+            params.max_attempts = i32::try_from(retry_policy.max_attempts).map_err(|_| {
+                HarvestError::Config(format!(
+                    "activity '{}' retry policy max_attempts exceeds i32 range",
+                    activity.name
+                ))
+            })?;
+            params.retry_policy = Some(serde_json::to_value(retry_policy)?);
+        }
+
+        if let Some(timeout) = activity.default_heartbeat_timeout {
+            params.heartbeat_timeout =
+                Some(chrono_duration_from_std(timeout, "heartbeat timeout")?);
+        }
+        let effective_stc = scheduled
+            .start_to_close_override
+            .or(activity.default_start_to_close);
+        if let Some(timeout) = effective_stc {
+            params.start_to_close =
+                Some(chrono_duration_from_std(timeout, "start_to_close timeout")?);
+        }
+        if let Some(timeout) = activity.default_schedule_to_start {
+            params.schedule_to_start = Some(chrono_duration_from_std(
+                timeout,
+                "schedule_to_start timeout",
+            )?);
+        }
+
+        let effective_key = activity
+            .concurrency_key
+            .map(ToString::to_string)
+            .or_else(|| activity.max_concurrent.map(|_| activity.name.to_string()));
+        if let Some(key) = effective_key {
+            params.concurrency_key = Some(key);
+            params.max_concurrent = activity.max_concurrent;
+        }
+
+        events.push(WorkflowEvent::ActivityScheduled {
+            activity_id: scheduled.activity_id,
+            name: scheduled.name.clone(),
+            input: scheduled.input.clone(),
+            queue: queue_name.clone(),
+        });
+
+        params.trace_context = tracing::info_span!(
+            parent: execute_span,
+            "harvest.activity.schedule",
+            "otel.kind" = "producer",
+            { ATTR_ACTIVITY_NAME } = %scheduled.name,
+            { ATTR_EXECUTION_ID } = %exec_id,
+            { ATTR_QUEUE } = %queue_name,
+        )
+        .in_scope(|| registry.telemetry().capture_trace_context());
+        enqueued.push(params);
+    }
 
     conn.transaction::<(), HarvestError, _>(|conn| {
         async move {
             store::append_events(conn, exec_id, &events, next_event_id).await?;
-            queue::enqueue(conn, &params).await?;
+            for params in &enqueued {
+                queue::enqueue(conn, params).await?;
+            }
             queue::park_workflow_task(conn, task_id, sticky).await?;
             Ok(())
         }
@@ -1847,10 +2077,12 @@ async fn finalize_activity_completion(
     conn: &mut AsyncPgConnection,
     task: &TaskQueueItem,
     exec_id: ExecutionId,
-    next_event_id: i32,
     activity_id: ActivityExecId,
     output: serde_json::Value,
 ) -> HarvestResult<()> {
+    let Some(activity_name) = task.activity_name.as_deref() else {
+        return Ok(());
+    };
     let completion_event = WorkflowEvent::ActivityCompleted {
         activity_id,
         output: output.clone(),
@@ -1859,7 +2091,17 @@ async fn finalize_activity_completion(
     conn.transaction::<(), HarvestError, _>(|conn| {
         let output = output.clone();
         async move {
-            store::append_events(conn, exec_id, &[completion_event], next_event_id).await?;
+            let history = lock_workflow_execution_and_load_history(conn, exec_id).await?;
+            if pending_activity_id_for_task(&history.events, task, activity_name)?.is_none() {
+                return Ok(());
+            }
+            let Some(state) = task_state_for_update(conn, task.id).await? else {
+                return Ok(());
+            };
+            if state != "RUNNING" {
+                return Ok(());
+            }
+            store::append_events(conn, exec_id, &[completion_event], history.next_event_id).await?;
             queue::complete_task(conn, task.id, output).await?;
             queue::wake_workflow_task(conn, exec_id).await
         }
@@ -1872,10 +2114,12 @@ async fn finalize_activity_failure(
     conn: &mut AsyncPgConnection,
     task: &TaskQueueItem,
     exec_id: ExecutionId,
-    next_event_id: i32,
     activity_id: ActivityExecId,
     error: &str,
 ) -> HarvestResult<()> {
+    let Some(activity_name) = task.activity_name.as_deref() else {
+        return Ok(());
+    };
     let failure = parse_error_payload_full(error);
     let failed_event = WorkflowEvent::ActivityFailed {
         activity_id,
@@ -1900,7 +2144,17 @@ async fn finalize_activity_failure(
     conn.transaction::<(), HarvestError, _>(|conn| {
         let error = error.to_string();
         async move {
-            store::append_events(conn, exec_id, &[failed_event], next_event_id).await?;
+            let history = lock_workflow_execution_and_load_history(conn, exec_id).await?;
+            if pending_activity_id_for_task(&history.events, task, activity_name)?.is_none() {
+                return Ok(());
+            }
+            let Some(state) = task_state_for_update(conn, task.id).await? else {
+                return Ok(());
+            };
+            if state != "RUNNING" {
+                return Ok(());
+            }
+            store::append_events(conn, exec_id, &[failed_event], history.next_event_id).await?;
             queue::fail_task(conn, task.id, &error).await?;
             queue::wake_workflow_task(conn, exec_id).await
         }
@@ -2033,17 +2287,13 @@ async fn handle_activity_result(
     conn: &mut AsyncPgConnection,
     task: &TaskQueueItem,
     exec_id: ExecutionId,
-    next_event_id: i32,
     activity_id: ActivityExecId,
     worker_id: &str,
     retry_policy: Option<&crate::policy::RetryPolicy>,
     activity_result: Result<serde_json::Value, String>,
 ) -> HarvestResult<()> {
     match activity_result {
-        Ok(output) => {
-            finalize_activity_completion(conn, task, exec_id, next_event_id, activity_id, output)
-                .await
-        }
+        Ok(output) => finalize_activity_completion(conn, task, exec_id, activity_id, output).await,
         Err(error) => {
             let delay_result = next_retry_delay(task, &error, retry_policy);
             let delay = fail_execution_on_error(conn, task, worker_id, delay_result).await?;
@@ -2052,7 +2302,7 @@ async fn handle_activity_result(
                 return queue::requeue_for_retry(conn, task.id, delay).await;
             }
 
-            finalize_activity_failure(conn, task, exec_id, next_event_id, activity_id, &error).await
+            finalize_activity_failure(conn, task, exec_id, activity_id, &error).await
         }
     }
 }
@@ -2126,19 +2376,12 @@ async fn process_activity_task(
         return Err(HarvestError::Config(error));
     };
 
-    let history_result = store::load_history(conn, exec_id).await;
-    let history = fail_execution_on_error(conn, task, worker_id, history_result).await?;
-
-    let activity_id_result = find_pending_scheduled_activity(&history.events, activity_name);
-    let activity_id = fail_execution_on_error(conn, task, worker_id, activity_id_result).await?;
-
-    let started_event = WorkflowEvent::ActivityStarted {
-        activity_id,
-        worker_id: WorkerId::new(worker_id),
+    let started_result =
+        append_activity_started_if_pending(conn, task, exec_id, activity_name, worker_id).await;
+    let Some(activity_id) = fail_execution_on_error(conn, task, worker_id, started_result).await?
+    else {
+        return Ok(());
     };
-    let append_result =
-        store::append_events(conn, exec_id, &[started_event], history.next_event_id).await;
-    fail_execution_on_error(conn, task, worker_id, append_result).await?;
 
     let cancel = CancellationToken::new();
     let heartbeat_tx =
@@ -2232,7 +2475,6 @@ async fn process_activity_task(
         conn,
         task,
         exec_id,
-        history.next_event_id + 1,
         activity_id,
         worker_id,
         retry_policy.as_ref(),
@@ -2383,8 +2625,8 @@ async fn handle_suspended_workflow(
             sticky,
         )
         .await
-    } else if let Some(scheduled) = extract_single_schedule_activity(commands) {
-        persist_scheduled_activity(
+    } else if let Some(scheduled) = extract_all_scheduled_activities(commands) {
+        persist_scheduled_activities(
             conn,
             registry,
             context.persistence.task.id,
@@ -2395,6 +2637,16 @@ async fn handle_suspended_workflow(
             sticky,
             context.execute_span,
             context.execution.assigned_build_id.as_deref(),
+        )
+        .await
+    } else if let Some(activity_ids) = extract_all_activity_waits(commands) {
+        persist_activity_wait_park(
+            conn,
+            context.persistence.task.id,
+            context.persistence.exec_id,
+            commands,
+            &activity_ids,
+            sticky,
         )
         .await
     } else if let Some(timer) = extract_single_started_timer(commands) {
@@ -2808,9 +3060,15 @@ async fn suspended_command_event_count(
     if should_requeue_signal_wait(commands) {
         return Ok(bookkeeping_events);
     }
-    if extract_single_schedule_activity(commands).is_some()
-        || extract_single_started_timer(commands).is_some()
-    {
+    if let Some(activities) = extract_all_scheduled_activities(commands) {
+        return Ok(
+            bookkeeping_events.saturating_add(u64::try_from(activities.len()).unwrap_or(u64::MAX))
+        );
+    }
+    if extract_all_activity_waits(commands).is_some() {
+        return Ok(bookkeeping_events);
+    }
+    if extract_single_started_timer(commands).is_some() {
         return Ok(bookkeeping_events.saturating_add(1));
     }
     if let Some(children) = extract_all_started_child_workflows(commands) {

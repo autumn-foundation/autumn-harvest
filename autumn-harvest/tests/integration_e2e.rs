@@ -79,6 +79,8 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260509000000_harvest_build_routing/up.sql"),
     "\n",
     include_str!("../migrations/20260513000000_harvest_schedule_pause_metadata/up.sql"),
+    "\n",
+    include_str!("../migrations/20260514020000_harvest_task_activity_id/up.sql"),
 );
 
 /// The minimal "legacy" migration set used by the upgrade-path regression
@@ -106,6 +108,8 @@ const LEGACY_INIT_SQL: &str = concat!(
     include_str!("../migrations/20260501000000_harvest_workers/up.sql"),
     "\n",
     include_str!("../migrations/20260509000000_harvest_build_routing/up.sql"),
+    "\n",
+    include_str!("../migrations/20260514020000_harvest_task_activity_id/up.sql"),
 );
 
 /// Start a Postgres container with the harvest schema applied and return
@@ -176,6 +180,180 @@ async fn setup_blank_test_database_url() -> (String, ContainerAsync<Postgres>) {
     let database_url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
 
     (database_url, container)
+}
+
+#[tokio::test]
+async fn drop_dag_runs_migration_copies_legacy_rows_to_workflow_executions() {
+    let (mut conn, _container) = setup_test_db().await;
+    let legacy_run_id = Uuid::new_v4();
+    let dag_name = "legacy_migrated_dag";
+    let logical_date = chrono::DateTime::parse_from_rfc3339("2026-05-14T02:00:00Z")
+        .expect("fixed timestamp should parse")
+        .with_timezone(&Utc);
+    let dag_conf = serde_json::json!({ "customer": "acme" });
+
+    diesel::sql_query(
+        r"
+        INSERT INTO harvest_dag_runs
+            (id, dag_name, workflow_exec_id, state, logical_date, data_interval_start,
+             data_interval_end, conf, started_at, completed_at, created_at)
+        VALUES ($1, $2, NULL, 'SUCCESS', $3, $3, $3, $4, $3, $3, $3)
+        ",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(legacy_run_id)
+    .bind::<diesel::sql_types::Text, _>(dag_name)
+    .bind::<diesel::sql_types::Timestamptz, _>(logical_date)
+    .bind::<diesel::sql_types::Jsonb, _>(dag_conf.clone())
+    .execute(&mut conn)
+    .await
+    .expect("failed to seed legacy DAG run");
+
+    conn.batch_execute(include_str!(
+        "../migrations/20260514000000_drop_harvest_dag_runs/up.sql"
+    ))
+    .await
+    .expect("drop migration should migrate legacy DAG runs before dropping the table");
+
+    let workflow_id = autumn_harvest::scheduler::scheduled_workflow_id_pub(dag_name, logical_date);
+    let migrated = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_name.eq(dag_name))
+        .filter(harvest_workflow_executions::workflow_id.eq(workflow_id))
+        .select(WorkflowExecution::as_select())
+        .first::<WorkflowExecution>(&mut conn)
+        .await
+        .expect("legacy DAG run should be copied into workflow executions");
+
+    assert_eq!(migrated.id, legacy_run_id);
+    assert_eq!(migrated.state, "COMPLETED");
+    assert_eq!(migrated.queue_name, "default");
+    assert_eq!(
+        migrated.input["_harvest_migrated_legacy_dag_run"],
+        serde_json::json!(true)
+    );
+    assert_eq!(migrated.input["dag_run_id"], legacy_run_id.to_string());
+    assert_eq!(migrated.input["conf"], dag_conf);
+    assert!(migrated.completed_at.is_some());
+}
+
+#[tokio::test]
+async fn drop_dag_runs_migration_does_not_turn_queued_runs_into_running_workflows() {
+    let (mut conn, _container) = setup_test_db().await;
+    let legacy_run_id = Uuid::new_v4();
+    let dag_name = "legacy_queued_dag";
+    let logical_date = chrono::DateTime::parse_from_rfc3339("2026-05-14T02:00:00Z")
+        .expect("fixed timestamp should parse")
+        .with_timezone(&Utc);
+
+    diesel::sql_query(
+        r"
+        INSERT INTO harvest_dag_runs
+            (id, dag_name, workflow_exec_id, state, logical_date, data_interval_start,
+             data_interval_end, conf, started_at, completed_at, created_at)
+        VALUES ($1, $2, NULL, 'QUEUED', $3, $3, $3, NULL, NULL, NULL, $3)
+        ",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(legacy_run_id)
+    .bind::<diesel::sql_types::Text, _>(dag_name)
+    .bind::<diesel::sql_types::Timestamptz, _>(logical_date)
+    .execute(&mut conn)
+    .await
+    .expect("failed to seed queued legacy DAG run");
+
+    conn.batch_execute(include_str!(
+        "../migrations/20260514000000_drop_harvest_dag_runs/up.sql"
+    ))
+    .await
+    .expect("drop migration should migrate queued legacy DAG runs safely");
+
+    let migrated = harvest_workflow_executions::table
+        .find(legacy_run_id)
+        .select(WorkflowExecution::as_select())
+        .first::<WorkflowExecution>(&mut conn)
+        .await
+        .expect("queued legacy DAG run should be preserved as a workflow row");
+    assert_ne!(
+        migrated.state, "RUNNING",
+        "queued legacy DAG rows must not become permanently-running workflow executions"
+    );
+    assert_eq!(migrated.state, "CANCELLED");
+    assert!(migrated.completed_at.is_some());
+
+    let running_count: i64 = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_name.eq(dag_name))
+        .filter(harvest_workflow_executions::state.eq("RUNNING"))
+        .count()
+        .get_result(&mut conn)
+        .await
+        .expect("failed to count migrated running DAG workflows");
+    assert_eq!(
+        running_count, 0,
+        "migrated queued legacy runs must not consume max_active_runs slots"
+    );
+}
+
+#[tokio::test]
+async fn drop_dag_runs_migration_preserves_subsecond_legacy_run_identities() {
+    let (mut conn, _container) = setup_test_db().await;
+    let dag_name = "legacy_subsecond_dag";
+    let first_run_id = Uuid::new_v4();
+    let second_run_id = Uuid::new_v4();
+    let first_logical_date = chrono::DateTime::parse_from_rfc3339("2026-05-14T02:00:00.100000Z")
+        .expect("fixed timestamp should parse")
+        .with_timezone(&Utc);
+    let second_logical_date = chrono::DateTime::parse_from_rfc3339("2026-05-14T02:00:00.900000Z")
+        .expect("fixed timestamp should parse")
+        .with_timezone(&Utc);
+
+    diesel::sql_query(
+        r"
+        INSERT INTO harvest_dag_runs
+            (id, dag_name, workflow_exec_id, state, logical_date, data_interval_start,
+             data_interval_end, conf, started_at, completed_at, created_at)
+        VALUES
+            ($1, $2, NULL, 'SUCCESS', $3, $3, $3, NULL, $3, $3, $3),
+            ($4, $2, NULL, 'SUCCESS', $5, $5, $5, NULL, $5, $5, $5)
+        ",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(first_run_id)
+    .bind::<diesel::sql_types::Text, _>(dag_name)
+    .bind::<diesel::sql_types::Timestamptz, _>(first_logical_date)
+    .bind::<diesel::sql_types::Uuid, _>(second_run_id)
+    .bind::<diesel::sql_types::Timestamptz, _>(second_logical_date)
+    .execute(&mut conn)
+    .await
+    .expect("failed to seed subsecond legacy DAG runs");
+
+    conn.batch_execute(include_str!(
+        "../migrations/20260514000000_drop_harvest_dag_runs/up.sql"
+    ))
+    .await
+    .expect("drop migration should preserve subsecond legacy DAG identities");
+
+    let migrated: Vec<WorkflowExecution> = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_name.eq(dag_name))
+        .order(harvest_workflow_executions::workflow_id.asc())
+        .select(WorkflowExecution::as_select())
+        .load(&mut conn)
+        .await
+        .expect("failed to load migrated subsecond workflow rows");
+    assert_eq!(
+        migrated.len(),
+        2,
+        "same-second legacy DAG runs with distinct fractional logical dates must both migrate"
+    );
+    assert_ne!(migrated[0].workflow_id, migrated[1].workflow_id);
+    assert!(
+        migrated
+            .iter()
+            .any(|row| row.workflow_id.ends_with(".100000")),
+        "first subsecond logical date should be represented in the workflow_id: {migrated:?}"
+    );
+    assert!(
+        migrated
+            .iter()
+            .any(|row| row.workflow_id.ends_with(".900000")),
+        "second subsecond logical date should be represented in the workflow_id: {migrated:?}"
+    );
 }
 
 fn build_test_pool(database_url: &str) -> DbPool {

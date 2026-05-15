@@ -56,6 +56,7 @@ diesel::table! {
         task_type -> Text,
         workflow_exec_id -> Nullable<Uuid>,
         activity_name -> Nullable<Text>,
+        activity_id -> Nullable<Uuid>,
         input -> Jsonb,
         state -> Text,
         priority -> Int4,
@@ -81,24 +82,6 @@ diesel::table! {
         concurrency_cap -> Nullable<Int4>,
         /// Build ID required to claim this task (issue #171). NULL = any worker.
         required_build_id -> Nullable<Text>,
-    }
-}
-
-diesel::table! {
-    use diesel::sql_types::*;
-
-    harvest_dag_runs (id) {
-        id -> Uuid,
-        dag_name -> Text,
-        workflow_exec_id -> Nullable<Uuid>,
-        state -> Text,
-        logical_date -> Timestamptz,
-        data_interval_start -> Timestamptz,
-        data_interval_end -> Timestamptz,
-        conf -> Nullable<Jsonb>,
-        started_at -> Nullable<Timestamptz>,
-        completed_at -> Nullable<Timestamptz>,
-        created_at -> Timestamptz,
     }
 }
 
@@ -300,7 +283,6 @@ diesel::table! {
 
 diesel::joinable!(harvest_events -> harvest_workflow_executions (workflow_exec_id));
 diesel::joinable!(harvest_task_queue -> harvest_workflow_executions (workflow_exec_id));
-diesel::joinable!(harvest_dag_runs -> harvest_workflow_executions (workflow_exec_id));
 diesel::joinable!(harvest_signals -> harvest_workflow_executions (workflow_exec_id));
 diesel::joinable!(harvest_timers -> harvest_workflow_executions (workflow_exec_id));
 diesel::joinable!(harvest_external_tasks -> harvest_workflow_executions (workflow_exec_id));
@@ -309,7 +291,6 @@ diesel::allow_tables_to_appear_in_same_query!(
     harvest_workflow_executions,
     harvest_events,
     harvest_task_queue,
-    harvest_dag_runs,
     harvest_schedules,
     harvest_signals,
     harvest_timers,

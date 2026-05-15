@@ -11,6 +11,9 @@ readme = "../README.md"
 keywords = ["workflow", "durable", "postgres", "orchestration", "autumn"]
 categories = ["asynchronous", "database"]
 
+[features]
+unified-dag-execution = ["autumn-harvest/unified-dag-execution"]
+
 [dependencies]
 autumn-harvest = { version = "0.3.0", path = "../autumn-harvest", features = ["db"] }
 autumn-web = "0.4"

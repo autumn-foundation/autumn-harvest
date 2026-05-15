@@ -40,6 +40,19 @@ fn dag_companion_returns_metadata() {
     assert!(matches!(info.schedule, Some(Schedule::Cron(ref expr)) if expr == "0 2 * * *"));
 }
 
+/// `unified-dag-execution` is a default feature (Step 4 of issue #256).
+/// The `#[dag]` macro must therefore populate `workflow_handler` so every
+/// registered DAG can execute on the unified path without any opt-in flag.
+#[cfg(feature = "unified-dag-execution")]
+#[test]
+fn dag_macro_populates_workflow_handler_in_default_build() {
+    let info = __autumn_dag_info_daily_etl();
+    assert!(
+        info.workflow_handler.is_some(),
+        "workflow_handler must be Some when unified-dag-execution is in the default feature set"
+    );
+}
+
 #[test]
 fn dags_macro_collects_and_builds_definitions() {
     let dags: Vec<DagInfo> = dags![daily_etl];
