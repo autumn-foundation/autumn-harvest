@@ -1,8 +1,11 @@
+use std::collections::HashMap;
+
 use autumn_harvest_plugin::api::{HarvestApiState, harvest_api_router};
 use autumn_web::AppState;
 use autumn_web::auth::RequireAuth;
 use autumn_web::reexports::axum::body::Body;
 use autumn_web::reexports::http::{Method, Request, StatusCode};
+use autumn_web::session::Session;
 use tower::ServiceExt;
 
 /// Build an unauthenticated test app (no middleware applied).
@@ -15,6 +18,17 @@ fn unauthenticated_app() -> impl tower::Service<
     harvest_api_router(HarvestApiState::new()).with_state(AppState::for_test())
 }
 
+fn app_with_api_state(
+    api_state: HarvestApiState,
+) -> impl tower::Service<
+    Request<Body>,
+    Response = autumn_web::reexports::axum::response::Response,
+    Error = std::convert::Infallible,
+    Future = impl std::future::Future,
+> + Clone {
+    harvest_api_router(api_state).with_state(AppState::for_test())
+}
+
 /// Build a test app protected by `RequireAuth`.
 fn authenticated_app() -> impl tower::Service<
     Request<Body>,
@@ -23,7 +37,7 @@ fn authenticated_app() -> impl tower::Service<
     Future = impl std::future::Future,
 > + Clone {
     harvest_api_router(HarvestApiState::new())
-        .route_layer(RequireAuth::new("admin_id"))
+        .route_layer(RequireAuth::new("user_id"))
         .with_state(AppState::for_test())
 }
 
@@ -42,6 +56,17 @@ fn post_json(uri: &str, body: &str) -> Request<Body> {
         .header("Content-Type", "application/json")
         .body(Body::from(body.to_owned()))
         .unwrap()
+}
+
+fn post_json_with_session(uri: &str, body: &str, session_key: &str) -> Request<Body> {
+    let mut request = post_json(uri, body);
+    let mut data = HashMap::new();
+    data.insert(session_key.to_string(), "operator-1".to_string());
+    request.extensions_mut().insert(Session::new_for_test(
+        "harvest-test-session".to_string(),
+        data,
+    ));
+    request
 }
 
 fn patch_json(uri: &str, body: &str) -> Request<Body> {
@@ -327,6 +352,78 @@ async fn eris_unauthenticated_replay_dead_letter_is_blocked() {
 }
 
 #[tokio::test]
+async fn eris_unauthenticated_bulk_replay_dead_letters_is_blocked() {
+    let app = unauthenticated_app();
+    let res = app
+        .oneshot(post_json("/dead-letters/replay", r#"{"ids": []}"#))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn eris_unauthenticated_bulk_discard_dead_letters_is_blocked() {
+    let app = unauthenticated_app();
+    let res = app
+        .oneshot(post_json("/dead-letters/discard", r#"{"ids": []}"#))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn eris_builtin_guard_honors_configured_session_key() {
+    let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_session_key("operator_id");
+    let app = app_with_api_state(api_state);
+
+    let res = app
+        .oneshot(post_json_with_session(
+            "/dead-letters/replay",
+            r#"{"ids": []}"#,
+            "operator_id",
+        ))
+        .await
+        .unwrap();
+
+    assert_ne!(res.status(), StatusCode::UNAUTHORIZED);
+    assert_ne!(res.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn eris_builtin_guard_does_not_accept_hard_coded_admin_id() {
+    let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_session_key("operator_id");
+    let app = app_with_api_state(api_state);
+
+    let res = app
+        .oneshot(post_json_with_session(
+            "/dead-letters/replay",
+            r#"{"ids": []}"#,
+            "admin_id",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn eris_declared_outer_auth_boundary_skips_inner_session_check() {
+    let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(true);
+    let app = app_with_api_state(api_state);
+
+    let res = app
+        .oneshot(post_json("/dead-letters/replay", r#"{"ids": []}"#))
+        .await
+        .unwrap();
+
+    assert_ne!(res.status(), StatusCode::UNAUTHORIZED);
+    assert_ne!(res.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
 async fn eris_require_auth_blocks_list_dead_letters() {
     let app = authenticated_app();
     let res = app.oneshot(get("/dead-letters")).await.unwrap();
@@ -348,9 +445,8 @@ async fn eris_require_auth_blocks_replay_dead_letter() {
 
 // ── Additional unauthenticated-accessible checks ──────────────────────────────
 //
-// Documents that mutating routes which are NOT covered by the earlier
-// unauthenticated section are also open without middleware. Completes the
-// "no route has built-in auth" invariant for AC5 / issue #174.
+// Documents remaining routes that are intentionally still open without an
+// outer middleware or one of Harvest's high-impact built-in guards.
 
 #[tokio::test]
 async fn eris_unauthenticated_reset_workflow_is_accessible() {
@@ -360,28 +456,6 @@ async fn eris_unauthenticated_reset_workflow_is_accessible() {
             "/workflows/00000000-0000-0000-0000-000000000001/reset",
             "{}",
         ))
-        .await
-        .unwrap();
-    assert_ne!(res.status(), StatusCode::UNAUTHORIZED);
-    assert_ne!(res.status(), StatusCode::FORBIDDEN);
-}
-
-#[tokio::test]
-async fn eris_unauthenticated_bulk_replay_dead_letters_is_accessible() {
-    let app = unauthenticated_app();
-    let res = app
-        .oneshot(post_json("/dead-letters/replay", r#"{"ids": []}"#))
-        .await
-        .unwrap();
-    assert_ne!(res.status(), StatusCode::UNAUTHORIZED);
-    assert_ne!(res.status(), StatusCode::FORBIDDEN);
-}
-
-#[tokio::test]
-async fn eris_unauthenticated_bulk_discard_dead_letters_is_accessible() {
-    let app = unauthenticated_app();
-    let res = app
-        .oneshot(post_json("/dead-letters/discard", r#"{"ids": []}"#))
         .await
         .unwrap();
     assert_ne!(res.status(), StatusCode::UNAUTHORIZED);

@@ -145,12 +145,14 @@ fn build_two_shard_pool(shard0_url: &str, shard1_url: &str) -> HarvestDbPool {
 
 fn build_dlq_app(pool: DbPool) -> HarvestApiApp {
     let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool));
     harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
 }
 
 fn build_sharded_dlq_app(shard0_url: &str, shard1_url: &str) -> HarvestApiApp {
     let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(true);
     api_state.install_storage_pool(build_two_shard_pool(shard0_url, shard1_url));
     harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
 }

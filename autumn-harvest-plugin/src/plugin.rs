@@ -221,6 +221,7 @@ fn start_harvest_runtime(
     api_state: &HarvestApiState,
 ) -> autumn_web::AutumnResult<()> {
     api_state.set_deployment_profile(state.profile().to_string());
+    api_state.set_admin_auth_session_key(state.auth_session_key());
     let app_config = AutumnConfig::load()
         .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
     let harvest_config = HarvestRuntimeConfig::load()
