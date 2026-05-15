@@ -60,7 +60,7 @@ use autumn_harvest::reset::{
 use autumn_harvest::retention::{RetentionConfig, RetentionMonitor, RetentionStatus};
 use autumn_harvest::scheduler::{
     BackfillPlanError, DEFAULT_BACKFILL_MAX_COUNT, DagCatalog, RegisteredDag, SchedulerMonitor,
-    SchedulerSnapshot, parse_schedule_from_expr_pub, plan_backfill_timestamps,
+    SchedulerSnapshot, ensure_dag_schedule, parse_schedule_from_expr_pub, plan_backfill_timestamps,
     scheduled_workflow_id_pub, trigger_unified_dag,
 };
 use autumn_harvest::schema::{
@@ -4022,14 +4022,22 @@ async fn trigger_dag_run(
             "DAG '{dag_name}' is not registered"
         )));
     }
+    let dag =
+        runtime.dags.get(&dag_name).cloned().ok_or_else(|| {
+            AutumnError::not_found_msg(format!("DAG '{dag_name}' is not registered"))
+        })?;
 
     let shard = runtime.router.pick_for_dag(&dag_name);
-    let default_queue = runtime
-        .dags
-        .get(&dag_name)
-        .and_then(|dag| dag.default_queue.as_deref())
+    let default_queue = dag
+        .default_queue
+        .as_deref()
         .unwrap_or("default")
         .to_string();
+    let mut schedule_conn = acquire_conn(pool.pool_for(shard)).await?;
+    ensure_dag_schedule(&mut schedule_conn, &dag)
+        .await
+        .map_err(map_error)?;
+    drop(schedule_conn);
 
     let (actor, source, request_id) = audit_context(&headers, &api_state);
     let route = "POST /dags/{dag_name}/trigger";
@@ -4106,7 +4114,13 @@ async fn patch_dag(
 ) -> Result<Json<HarvestSchedule>, AutumnError> {
     use autumn_harvest::schema::harvest_schedules::dsl;
 
+    let runtime = api_state.runtime().map_err(map_error)?;
     let mut conn = db_conn_for_dag(&api_state, &dag_name).await?;
+    if let Some(dag) = runtime.dags.get(&dag_name) {
+        ensure_dag_schedule(&mut conn, dag)
+            .await
+            .map_err(map_error)?;
+    }
 
     let (actor, source, request_id) = audit_context(&headers, &api_state);
     let route = "PATCH /dags/{dag_name}";

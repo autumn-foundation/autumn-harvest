@@ -412,9 +412,6 @@ pub async fn register_schedules(
     #[cfg(not(feature = "unified-dag-execution"))]
     reject_classic_dags_without_unified_execution(dags)?;
     for dag in dags.values() {
-        if dag.is_unified {
-            continue;
-        }
         upsert_schedule(conn, dag).await?;
     }
     Ok(())
@@ -429,7 +426,7 @@ async fn register_schedules_for_shard(
     #[cfg(not(feature = "unified-dag-execution"))]
     reject_classic_dags_without_unified_execution(dags)?;
     for dag in dags.values() {
-        if dag.is_unified || router.pick_for_dag(&dag.name) != shard {
+        if router.pick_for_dag(&dag.name) != shard {
             continue;
         }
         upsert_schedule(conn, dag).await?;
@@ -604,21 +601,57 @@ pub async fn trigger_unified_dag(
     // triggers always produce distinct workflow IDs regardless of clock resolution.
     let workflow_id = format!("{dag_name}-{exec_id}");
 
-    // Resolve the task queue from the schedule row written by HarvestBuilder; fall
-    // back to "default" when no row exists (e.g. on the very first trigger before
-    // register_workflow_schedules has run).
-    let queue_name = {
+    // Resolve the DAG schedule row by its DAG marker first. Some upgrade paths
+    // can still have workflow-only rows, so use those as a fallback until
+    // registration merges them.
+    let schedule = {
         use crate::schema::harvest_schedules::dsl;
-        dsl::harvest_schedules
-            .filter(dsl::workflow_name.eq(dag_name))
-            .select(dsl::queue_name)
-            .first::<Option<String>>(&mut db)
+        let rows = dsl::harvest_schedules
+            .filter(
+                dsl::dag_name
+                    .eq(dag_name)
+                    .or(dsl::workflow_name.eq(dag_name)),
+            )
+            .select(HarvestSchedule::as_select())
+            .load::<HarvestSchedule>(&mut db)
             .await
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| default_queue.to_string())
+            .map_err(crate::error::database_error)?;
+        rows.iter()
+            .find(|row| row.dag_name.as_deref() == Some(dag_name))
+            .cloned()
+            .or_else(|| rows.into_iter().next())
     };
 
+    if let Some(schedule) = schedule.as_ref() {
+        if schedule.is_paused {
+            return Err(HarvestError::UpdateRejected {
+                reason: format!(
+                    "DAG '{dag_name}' is paused; manual trigger is deferred until the schedule is resumed"
+                ),
+            });
+        }
+
+        let running: i64 = harvest_workflow_executions::table
+            .filter(harvest_workflow_executions::workflow_name.eq(dag_name))
+            .filter(harvest_workflow_executions::state.eq("RUNNING"))
+            .count()
+            .get_result(&mut db)
+            .await
+            .map_err(crate::error::database_error)?;
+        if running >= i64::from(schedule.max_active_runs) {
+            return Err(HarvestError::UpdateRejected {
+                reason: format!(
+                    "DAG '{dag_name}' max_active_runs reached ({running}/{}); manual trigger is deferred",
+                    schedule.max_active_runs
+                ),
+            });
+        }
+    }
+
+    let queue_name = schedule
+        .as_ref()
+        .and_then(|schedule| schedule.queue_name.clone())
+        .unwrap_or_else(|| default_queue.to_string());
     let input = run_conf.unwrap_or(Value::Null);
 
     start_or_load_workflow_execution(
@@ -638,6 +671,22 @@ pub async fn trigger_unified_dag(
         },
     )
     .await
+}
+
+/// Upsert the durable schedule row for one registered DAG.
+///
+/// This is used by management API paths that need pause metadata even before
+/// the background scheduler has run its registration tick.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] if the schedule row cannot be read or
+/// written.
+pub async fn ensure_dag_schedule(
+    conn: &mut AsyncPgConnection,
+    dag: &RegisteredDag,
+) -> HarvestResult<HarvestSchedule> {
+    upsert_schedule(conn, dag).await
 }
 
 async fn upsert_schedule(
@@ -739,18 +788,35 @@ async fn find_reusable_dag_workflow_schedule(
 ) -> HarvestResult<Option<HarvestSchedule>> {
     use crate::schema::harvest_schedules::dsl;
 
-    dsl::harvest_schedules
+    let dag_row = dsl::harvest_schedules
         .filter(dsl::dag_name.eq(dag_name))
-        .or_filter(
-            dsl::workflow_name
-                .eq(workflow_name)
-                .and(dsl::dag_name.is_null()),
-        )
         .select(HarvestSchedule::as_select())
         .first(conn)
         .await
         .optional()
-        .map_err(crate::error::database_error)
+        .map_err(crate::error::database_error)?;
+
+    let workflow_only_row = dsl::harvest_schedules
+        .filter(dsl::workflow_name.eq(workflow_name))
+        .filter(dsl::dag_name.is_null())
+        .select(HarvestSchedule::as_select())
+        .first(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?;
+
+    match (dag_row, workflow_only_row) {
+        (Some(dag_row), Some(workflow_only_row)) if dag_row.id != workflow_only_row.id => {
+            diesel::delete(dsl::harvest_schedules.find(workflow_only_row.id))
+                .execute(conn)
+                .await
+                .map_err(crate::error::database_error)?;
+            Ok(Some(dag_row))
+        }
+        (Some(dag_row), _) => Ok(Some(dag_row)),
+        (None, Some(workflow_only_row)) => Ok(Some(workflow_only_row)),
+        (None, None) => Ok(None),
+    }
 }
 
 async fn insert_dag_workflow_schedule_if_missing(
