@@ -23,6 +23,7 @@ use crate::config::HarvestOutboxConfig;
 use crate::state::HarvestDbPool;
 
 diesel::table! {
+    #[allow(missing_docs)]
     harvest_workflow_outbox (id) {
         id -> BigInt,
         workflow_name -> Text,

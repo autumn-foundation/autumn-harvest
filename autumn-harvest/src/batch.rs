@@ -181,11 +181,17 @@ mod db {
     /// resolves to the same job, preventing the "double-cancel" foot-gun.
     #[derive(Debug, Clone)]
     pub struct BatchSubmission {
+        /// The action to be applied to the filtered workflows.
         pub action: BatchAction,
+        /// The query filter determining which workflows to target.
         pub filter: BatchFilter,
+        /// The name of the signal to send (required if `action` is `BatchAction::Signal`).
         pub signal_name: Option<String>,
+        /// The JSON payload to attach to the signal.
         pub signal_payload: Option<Value>,
+        /// A unique key to prevent duplicate batch submissions on client retries.
         pub idempotency_key: Option<String>,
+        /// The identity of the operator who submitted the batch job.
         pub created_by: Option<String>,
     }
 
@@ -253,6 +259,19 @@ mod db {
         pub limit: i64,
     }
 
+    /// Fetches the current state of a batch job, allowing an operator to
+    /// monitor progress or diagnose failures during a large-scale execution.
+    ///
+    /// ## Examples
+    ///
+    /// ```rust,ignore
+    /// # use uuid::Uuid;
+    /// # async fn example(conn: &mut AsyncPgConnection, job_id: Uuid) {
+    /// if let Some(job) = autumn_harvest::batch::get_batch_job(conn, job_id).await.unwrap() {
+    ///     println!("Job status: {}", job.status);
+    /// }
+    /// # }
+    /// ```
     pub async fn get_batch_job(
         conn: &mut AsyncPgConnection,
         id: Uuid,
@@ -266,6 +285,21 @@ mod db {
             .map_err(database_error)
     }
 
+    /// Queries the history of batch operations submitted to the system,
+    /// enabling operators to audit bulk actions or resume tracking incomplete jobs.
+    ///
+    /// ## Examples
+    ///
+    /// ```rust,ignore
+    /// # use autumn_harvest::batch::{ListFilters, BatchJobStatus};
+    /// # async fn example(conn: &mut AsyncPgConnection) {
+    /// let filters = ListFilters {
+    ///     status: Some(BatchJobStatus::Running),
+    ///     ..Default::default()
+    /// };
+    /// let running_jobs = autumn_harvest::batch::list_batch_jobs(conn, &filters).await.unwrap();
+    /// # }
+    /// ```
     pub async fn list_batch_jobs(
         conn: &mut AsyncPgConnection,
         filters: &ListFilters,
@@ -407,6 +441,17 @@ mod db {
         Ok(())
     }
 
+    /// Transitions a batch job into its terminal `Completed` state, indicating
+    /// all targeted workflows were successfully processed.
+    ///
+    /// ## Examples
+    ///
+    /// ```rust,ignore
+    /// # use uuid::Uuid;
+    /// # async fn example(conn: &mut AsyncPgConnection, job_id: Uuid) {
+    /// autumn_harvest::batch::mark_completed(conn, job_id).await.unwrap();
+    /// # }
+    /// ```
     pub async fn mark_completed(conn: &mut AsyncPgConnection, id: Uuid) -> HarvestResult<()> {
         diesel::update(harvest_batch_jobs::table.find(id))
             .set((
@@ -764,6 +809,17 @@ mod db {
         Ok(())
     }
 
+    /// Aborts a batch job, recording the terminal `Failed` state along with
+    /// a diagnostic message explaining why the execution halted.
+    ///
+    /// ## Examples
+    ///
+    /// ```rust,ignore
+    /// # use uuid::Uuid;
+    /// # async fn example(conn: &mut AsyncPgConnection, job_id: Uuid) {
+    /// autumn_harvest::batch::mark_failed(conn, job_id, "Database transaction timeout").await.unwrap();
+    /// # }
+    /// ```
     pub async fn mark_failed(
         conn: &mut AsyncPgConnection,
         id: Uuid,

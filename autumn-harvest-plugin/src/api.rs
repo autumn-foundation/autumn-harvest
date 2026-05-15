@@ -1141,6 +1141,23 @@ struct DeadLetterListQuery {
     limit: Option<i64>,
 }
 
+/// Constructs the central `Router` defining all public and administrative
+/// HTTP endpoints for managing workflows, workers, and system state.
+///
+/// Use this to mount the Harvest API into an existing Axum application.
+///
+/// ## Examples
+///
+/// ```rust,ignore
+/// # use axum::Router;
+/// # use autumn_web::AppState;
+/// # use autumn_harvest_plugin::api::harvest_api_router;
+/// # use autumn_harvest_plugin::state::HarvestApiState;
+/// # fn example(api_state: HarvestApiState) {
+/// let app: Router<AppState> = Router::new()
+///     .nest("/api/v1", harvest_api_router(api_state));
+/// # }
+/// ```
 pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
     Router::new()
         .route("/workflows", get(list_workflows))

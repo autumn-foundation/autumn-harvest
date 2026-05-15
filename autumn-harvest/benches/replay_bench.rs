@@ -11,6 +11,8 @@
 //! Run with:
 //!   cargo bench -p autumn-harvest --features testing --no-default-features --bench `replay_bench`
 
+#![allow(missing_docs)]
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};

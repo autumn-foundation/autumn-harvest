@@ -16,6 +16,8 @@
 //! cargo bench -p autumn-harvest --bench metrics_noop
 //! ```
 
+#![allow(missing_docs)]
+
 use autumn_harvest::telemetry::{ActivityStatus, MetricsRecorder, NoOpMetrics, WorkflowStatus};
 use criterion::{Criterion, criterion_group, criterion_main};
 

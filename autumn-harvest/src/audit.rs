@@ -73,24 +73,37 @@ pub const OP_WORKER_DRAIN: &str = "worker.drain";
 
 // ── Target type constants ─────────────────────────────────────────────────────
 
+/// Audit target: A workflow execution.
 pub const TARGET_WORKFLOW: &str = "workflow";
+/// Audit target: A directed acyclic graph (DAG) execution.
 pub const TARGET_DAG: &str = "dag";
+/// Audit target: A workflow schedule.
 pub const TARGET_SCHEDULE: &str = "schedule";
+/// Audit target: The dead-letter queue.
 pub const TARGET_DEAD_LETTER: &str = "dead_letter";
+/// Audit target: A batch processing job.
 pub const TARGET_BATCH: &str = "batch";
+/// Audit target: The data retention sweep process.
 pub const TARGET_RETENTION: &str = "retention";
+/// Audit target: An external activity.
 pub const TARGET_EXTERNAL_ACTIVITY: &str = "external_activity";
+/// Audit target: A worker fleet.
 pub const TARGET_WORKER: &str = "worker";
 
 // ── Status constants ──────────────────────────────────────────────────────────
 
+/// Audit status: The operation completed successfully.
 pub const STATUS_SUCCEEDED: &str = "succeeded";
+/// Audit status: The operation failed to complete.
 pub const STATUS_FAILED: &str = "failed";
 
 // ── Source constants ──────────────────────────────────────────────────────────
 
+/// Audit source: Action originated from the management API.
 pub const SOURCE_API: &str = "api";
+/// Audit source: Action originated from the command-line interface.
 pub const SOURCE_CLI: &str = "cli";
+/// Audit source: Action originated from the user interface.
 pub const SOURCE_UI: &str = "ui";
 
 // ── HTTP header names ─────────────────────────────────────────────────────────
@@ -421,12 +434,19 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
 /// Filters for `list_audit`.
 #[derive(Debug, Clone)]
 pub struct AuditFilters {
+    /// The actor who performed the operation.
     pub actor: Option<String>,
+    /// The specific operation name (e.g., `workflow.start`).
     pub operation: Option<String>,
+    /// The type of target the operation affected.
     pub target_type: Option<String>,
+    /// The unique identifier of the target.
     pub target_id: Option<String>,
+    /// The final status of the operation (`succeeded` or `failed`).
     pub status: Option<String>,
+    /// Filter for records created after this timestamp.
     pub since: Option<DateTime<Utc>>,
+    /// Filter for records created before this timestamp.
     pub before: Option<DateTime<Utc>>,
     /// Maximum number of records to return. Clamped to [1, 500].
     pub limit: i64,

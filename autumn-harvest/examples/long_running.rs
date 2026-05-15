@@ -12,6 +12,7 @@
 use autumn_harvest::prelude::*;
 use serde_json::{Value, json};
 
+/// A workflow that continuously polls for customer export pages until complete.
 #[workflow]
 #[allow(clippy::missing_errors_doc)]
 pub async fn poll_customer_exports(
@@ -57,6 +58,7 @@ pub async fn poll_customer_exports(
     }
 }
 
+/// An activity that polls a single page of customer exports.
 #[activity(start_to_close = "30s", queue = "pollers")]
 #[allow(clippy::missing_errors_doc, clippy::unused_async)]
 pub async fn poll_customer_export_page(
