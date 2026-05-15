@@ -263,6 +263,12 @@ impl SchedulerRuntime {
     /// DAG-backed workflow schedules are registered and ticked on the shard
     /// selected by [`ShardRouter::pick_for_dag`]. Workflow-only schedules remain
     /// on the router's default shard for backward compatibility.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the scheduler is built without `unified-dag-execution` and
+    /// the DAG catalog contains classic DAGs, because there is no supported
+    /// tick path for executing those schedule rows.
     #[must_use]
     pub fn spawn_sharded(
         pool: ShardedDbPool,
@@ -271,6 +277,13 @@ impl SchedulerRuntime {
         dags: Arc<DagCatalog>,
         workflow_schedules: Arc<Vec<WorkflowSchedule>>,
     ) -> Self {
+        #[cfg(not(feature = "unified-dag-execution"))]
+        {
+            if let Err(error) = reject_classic_dags_without_unified_execution(dags.as_ref()) {
+                panic!("{error}");
+            }
+        }
+
         let shutdown = CancellationToken::new();
         let shutdown_for_task = shutdown.clone();
         let total = dags.len() + workflow_schedules.len();
@@ -368,6 +381,24 @@ pub fn compile_dag_catalog(dags: Vec<DagInfo>) -> HarvestResult<DagCatalog> {
     Ok(catalog)
 }
 
+#[cfg(not(feature = "unified-dag-execution"))]
+fn reject_classic_dags_without_unified_execution(dags: &DagCatalog) -> HarvestResult<()> {
+    let classic_dag_names = dags
+        .values()
+        .filter(|dag| !dag.is_unified)
+        .map(|dag| dag.name.as_str())
+        .collect::<Vec<_>>();
+    if !classic_dag_names.is_empty() {
+        return Err(HarvestError::Config(format!(
+            "classic DAG execution is not supported by the scheduler without \
+             autumn-harvest/unified-dag-execution; rebuild with unified DAG execution \
+             or remove classic DAGs: {}",
+            classic_dag_names.join(", ")
+        )));
+    }
+    Ok(())
+}
+
 /// Upsert the durable schedule rows for the provided DAG catalog.
 ///
 /// # Errors
@@ -378,6 +409,8 @@ pub async fn register_schedules(
     conn: &mut AsyncPgConnection,
     dags: &DagCatalog,
 ) -> HarvestResult<()> {
+    #[cfg(not(feature = "unified-dag-execution"))]
+    reject_classic_dags_without_unified_execution(dags)?;
     for dag in dags.values() {
         if dag.is_unified {
             continue;
@@ -393,6 +426,8 @@ async fn register_schedules_for_shard(
     router: &ShardRouter,
     shard: ShardId,
 ) -> HarvestResult<()> {
+    #[cfg(not(feature = "unified-dag-execution"))]
+    reject_classic_dags_without_unified_execution(dags)?;
     for dag in dags.values() {
         if dag.is_unified || router.pick_for_dag(&dag.name) != shard {
             continue;
@@ -508,6 +543,9 @@ pub async fn tick_once_sharded(
     workflow_schedules: Arc<Vec<WorkflowSchedule>>,
     monitor: SchedulerMonitor,
 ) -> HarvestResult<()> {
+    #[cfg(not(feature = "unified-dag-execution"))]
+    reject_classic_dags_without_unified_execution(dags.as_ref())?;
+
     let total = dags.len() + workflow_schedules.len();
     monitor.mark_tick(total);
 
@@ -1208,6 +1246,33 @@ fn due_run_plan(
 mod tests {
     use super::*;
 
+    #[cfg(all(feature = "db", not(feature = "unified-dag-execution")))]
+    fn test_pool(database_url: &str) -> DbPool {
+        let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+            diesel_async::AsyncPgConnection,
+        >::new(database_url);
+        deadpool::managed::Pool::builder(manager)
+            .max_size(1)
+            .build()
+            .expect("test pool should build")
+    }
+
+    #[cfg(all(feature = "db", not(feature = "unified-dag-execution")))]
+    fn classic_scheduled_dag_info() -> DagInfo {
+        fn build(_dag: &mut crate::dag::DagBuilder) {}
+
+        DagInfo {
+            name: "classic_scheduled",
+            module: "tests",
+            schedule: Some(Schedule::Interval(Duration::from_secs(60))),
+            catchup: false,
+            max_active_runs: 1,
+            default_queue: Some("default"),
+            builder: build,
+            workflow_handler: None,
+        }
+    }
+
     fn parse_utc(value: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(value)
             .expect("timestamp should parse")
@@ -1274,6 +1339,32 @@ mod tests {
     }
 
     // ── plan_backfill_timestamps ──────────────────────────────────────────────
+
+    #[cfg(all(feature = "db", not(feature = "unified-dag-execution")))]
+    #[tokio::test]
+    async fn scheduler_rejects_classic_dags_when_unified_execution_is_disabled() {
+        let dags = Arc::new(
+            compile_dag_catalog(vec![classic_scheduled_dag_info()])
+                .expect("classic DAG should compile into the catalog"),
+        );
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+
+        let result = tick_once(
+            test_pool("postgres://postgres:postgres@127.0.0.1:1/unreachable"),
+            registry,
+            dags,
+            Arc::new(Vec::new()),
+            SchedulerMonitor::offline(),
+        )
+        .await;
+
+        let err = result.expect_err("classic DAG scheduler startup should be rejected");
+        assert!(matches!(err, HarvestError::Config(_)));
+        assert!(
+            err.to_string().contains("classic DAG execution"),
+            "error should identify the unsupported classic DAG configuration: {err}"
+        );
+    }
 
     #[test]
     fn plan_backfill_timestamps_hourly_cron_inclusive_bounds() {
