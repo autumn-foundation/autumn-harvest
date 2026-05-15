@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use autumn_web::AppState;
+use autumn_web::auth::RequireAuth;
 use autumn_web::error::AutumnError;
 use autumn_web::reexports::axum;
 use axum::Extension;
@@ -413,11 +414,16 @@ struct DeadLetterListQuery {
 }
 
 pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
+    let require_admin = RequireAuth::new("admin_id");
+
     Router::new()
         .route("/workflows", get(list_workflows))
         .route("/workflows/{id}", get(get_workflow))
         .route("/workflows/{workflow_name}/start", post(start_workflow))
-        .route("/workflows/{id}/cancel", post(cancel_workflow))
+        .route(
+            "/workflows/{id}/cancel",
+            post(cancel_workflow).route_layer(require_admin.clone()),
+        )
         .route(
             "/workflows/{id}/signal/{signal_name}",
             post(signal_workflow),
@@ -433,7 +439,10 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .route("/dags/{dag_name}/runs", get(list_dag_runs))
         .route("/dags/{dag_name}/trigger", post(trigger_dag_run))
         .route("/dags/{dag_name}", patch(patch_dag))
-        .route("/dead-letters", get(list_dead_letters))
+        .route(
+            "/dead-letters",
+            get(list_dead_letters).route_layer(require_admin.clone()),
+        )
         .route(
             "/dead-letters/replay",
             post(bulk_replay_dead_letters_handler),
@@ -442,7 +451,10 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             "/dead-letters/discard",
             post(bulk_discard_dead_letters_handler),
         )
-        .route("/dead-letters/{id}/replay", post(replay_dead_letter))
+        .route(
+            "/dead-letters/{id}/replay",
+            post(replay_dead_letter).route_layer(require_admin.clone()),
+        )
         .route("/health", get(health))
         .route("/admin/retention", get(retention_status))
         .route("/admin/retention/run-now", post(retention_run_now))
