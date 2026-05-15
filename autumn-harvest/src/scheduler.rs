@@ -447,8 +447,8 @@ async fn delete_stale_dag_workflow_schedule(
 
     diesel::delete(
         dsl::harvest_schedules
-            .filter(dsl::dag_name.eq(dag_name))
-            .filter(dsl::workflow_name.eq(&ws.workflow_name)),
+            .filter(dsl::workflow_name.eq(&ws.workflow_name))
+            .filter(dsl::dag_name.eq(dag_name).or(dsl::dag_name.is_null())),
     )
     .execute(conn)
     .await

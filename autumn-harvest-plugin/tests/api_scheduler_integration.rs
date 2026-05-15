@@ -18,11 +18,11 @@ use autumn_harvest::schema::{
 };
 use autumn_harvest::shard::{ShardRouter, ShardedDbPool};
 use autumn_harvest::store;
-use autumn_harvest::types::{ExecutionId, ShardId};
+use autumn_harvest::types::{ActivityExecId, ExecutionId, ShardId};
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{
-    ActivityContext, RetentionConfig, StartWorkflowParams, WorkflowContext, WorkflowSchedule,
-    start_or_load_workflow_execution,
+    ActivityContext, RetentionConfig, StartWorkflowParams, TimeoutType, WorkflowContext,
+    WorkflowSchedule, start_or_load_workflow_execution,
 };
 use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{
@@ -205,9 +205,16 @@ fn test_app_state_without_database() -> AppState {
 }
 
 fn build_test_worker(registry: Arc<HandlerRegistry>) -> Arc<Worker> {
+    build_test_worker_with_poll_interval(registry, Duration::from_millis(25))
+}
+
+fn build_test_worker_with_poll_interval(
+    registry: Arc<HandlerRegistry>,
+    poll_interval: Duration,
+) -> Arc<Worker> {
     let mut runtime_config = WorkerRuntimeConfig::from(WorkerConfig::default());
     runtime_config.worker_id = "test-worker".to_string();
-    runtime_config.poll_interval = Duration::from_millis(25);
+    runtime_config.poll_interval = poll_interval;
 
     Arc::new(Worker::new(runtime_config, registry).expect("worker config should be valid"))
 }
@@ -340,6 +347,22 @@ fn recording_activity_info(name: &'static str) -> ActivityInfo {
         concurrency_key: None,
         is_local: false,
         handler: record_activity,
+    }
+}
+
+fn blocking_activity_info(name: &'static str, start_to_close: Duration) -> ActivityInfo {
+    ActivityInfo {
+        name,
+        module: "tests",
+        default_retry_policy: None,
+        default_start_to_close: Some(start_to_close),
+        default_heartbeat_timeout: None,
+        default_schedule_to_start: None,
+        default_queue: Some("default"),
+        max_concurrent: None,
+        concurrency_key: None,
+        is_local: false,
+        handler: wait_on_barrier_activity,
     }
 }
 
@@ -794,6 +817,113 @@ async fn load_task_from_url(database_url: &str, task_id: uuid::Uuid) -> TaskQueu
         .expect("failed to load replayed task")
 }
 
+async fn load_activity_task_by_name_from_url_optional(
+    database_url: &str,
+    exec_id: ExecutionId,
+    activity_name: &str,
+) -> Option<TaskQueueItem> {
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("failed to connect fresh Postgres client for activity task query");
+    harvest_task_queue::table
+        .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_id.as_uuid())))
+        .filter(harvest_task_queue::activity_name.eq(Some(activity_name)))
+        .select(TaskQueueItem::as_select())
+        .first(&mut conn)
+        .await
+        .optional()
+        .expect("failed to load optional activity task")
+}
+
+async fn wait_for_activity_task_state_from_url(
+    database_url: &str,
+    exec_id: ExecutionId,
+    activity_name: &str,
+    state: &str,
+) -> TaskQueueItem {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut last_state = None;
+    loop {
+        if let Some(task) =
+            load_activity_task_by_name_from_url_optional(database_url, exec_id, activity_name).await
+        {
+            if task.state == state {
+                return task;
+            }
+            last_state = Some(task.state);
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "activity task {activity_name} did not reach {state}; last state: {last_state:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+async fn seed_scheduled_activity_task_from_url(
+    database_url: &str,
+    workflow_name: &str,
+    workflow_id: &str,
+    activity_name: &str,
+    activity_input: Value,
+) -> (ExecutionId, ActivityExecId, uuid::Uuid) {
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    let activity_id = ActivityExecId::new();
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("failed to connect for scheduled activity seed");
+    diesel::insert_into(harvest_workflow_executions::table)
+        .values(&autumn_harvest::models::NewWorkflowExecution {
+            id: exec_id.as_uuid(),
+            workflow_name,
+            workflow_id,
+            run_id: uuid::Uuid::new_v4(),
+            shard_id: 0,
+            input: Value::Null,
+            parent_id: None,
+            queue_name: "default",
+            execution_timeout: None,
+            memo: None,
+            search_attrs: None,
+            assigned_build_id: None,
+        })
+        .execute(&mut conn)
+        .await
+        .expect("failed to seed workflow execution");
+    store::append_events(
+        &mut conn,
+        exec_id,
+        &[
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: activity_name.to_string(),
+                input: activity_input.clone(),
+                queue: "default".to_string(),
+            },
+        ],
+        0,
+    )
+    .await
+    .expect("failed to seed activity history");
+
+    let mut params = autumn_harvest::queue::EnqueueParams::new(
+        "default",
+        autumn_harvest::queue::TaskType::Activity,
+        activity_input,
+    );
+    params.workflow_exec_id = Some(exec_id.as_uuid());
+    params.activity_name = Some(activity_name.to_string());
+    params.activity_id = Some(activity_id.as_uuid());
+    let task_id = autumn_harvest::queue::enqueue(&mut conn, &params)
+        .await
+        .expect("failed to seed activity task");
+    (exec_id, activity_id, task_id)
+}
+
 async fn count_activity_scheduled_events_from_url(
     database_url: &str,
     exec_id: ExecutionId,
@@ -814,6 +944,94 @@ async fn count_activity_scheduled_events_from_url(
             )
         })
         .count()
+}
+
+#[derive(Debug, Default)]
+struct ActivityHistoryCounts {
+    scheduled: usize,
+    started: usize,
+    completed: usize,
+    failed: usize,
+    timed_out: usize,
+}
+
+impl ActivityHistoryCounts {
+    const fn terminal(&self) -> usize {
+        self.completed + self.failed + self.timed_out
+    }
+}
+
+async fn activity_history_counts_from_url(
+    database_url: &str,
+    exec_id: ExecutionId,
+    activity_name: &str,
+) -> ActivityHistoryCounts {
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("failed to connect fresh Postgres client for history query");
+    let events = store::load_history(&mut conn, exec_id)
+        .await
+        .expect("failed to load workflow history")
+        .events;
+    let activity_ids = events
+        .iter()
+        .filter_map(|event| match event {
+            WorkflowEvent::ActivityScheduled {
+                activity_id, name, ..
+            } if name == activity_name => Some(*activity_id),
+            _ => None,
+        })
+        .collect::<std::collections::HashSet<_>>();
+
+    let mut counts = ActivityHistoryCounts {
+        scheduled: activity_ids.len(),
+        ..ActivityHistoryCounts::default()
+    };
+    for event in events {
+        match event {
+            WorkflowEvent::ActivityStarted { activity_id, .. }
+                if activity_ids.contains(&activity_id) =>
+            {
+                counts.started += 1;
+            }
+            WorkflowEvent::ActivityCompleted { activity_id, .. }
+                if activity_ids.contains(&activity_id) =>
+            {
+                counts.completed += 1;
+            }
+            WorkflowEvent::ActivityFailed { activity_id, .. }
+                if activity_ids.contains(&activity_id) =>
+            {
+                counts.failed += 1;
+            }
+            WorkflowEvent::ActivityTimedOut { activity_id, .. }
+                if activity_ids.contains(&activity_id) =>
+            {
+                counts.timed_out += 1;
+            }
+            _ => {}
+        }
+    }
+    counts
+}
+
+async fn wait_for_activity_started_event_from_url(
+    database_url: &str,
+    exec_id: ExecutionId,
+    activity_name: &str,
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let counts = activity_history_counts_from_url(database_url, exec_id, activity_name).await;
+        if counts.started >= 1 {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "activity {activity_name} did not record ActivityStarted"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 }
 
 async fn count_dead_letters_from_url(database_url: &str) -> i64 {
@@ -865,6 +1083,23 @@ async fn load_schedule_from_url_optional(
         .await
         .optional()
         .expect("failed to reload optional harvest schedule")
+}
+
+async fn load_workflow_only_schedule_from_url_optional(
+    database_url: &str,
+    workflow_name: &str,
+) -> Option<HarvestSchedule> {
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("failed to connect fresh Postgres client for optional workflow schedule query");
+    harvest_schedules::table
+        .filter(harvest_schedules::workflow_name.eq(workflow_name))
+        .filter(harvest_schedules::dag_name.is_null())
+        .select(HarvestSchedule::as_select())
+        .first(&mut conn)
+        .await
+        .optional()
+        .expect("failed to reload optional workflow-only harvest schedule")
 }
 
 async fn load_latest_dag_run_from_url(
@@ -1269,6 +1504,36 @@ fn barrier_parallel_workflow<'a>(
         first.map_err(|error| error.to_string())?;
         second.map_err(|error| error.to_string())?;
         Ok(Value::Null)
+    })
+}
+
+fn timeout_completion_race_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        ctx.execute_activity_raw(
+            "timeout_completion_race",
+            json!({ "dag_task": "timeout_completion_race" }),
+            "default",
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        Ok(Value::Null)
+    })
+}
+
+fn wait_on_barrier_activity<'a>(
+    ctx: &'a ActivityContext,
+    input: Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+    let barrier = Arc::clone(
+        ctx.state::<Arc<Barrier>>()
+            .expect("barrier state must be registered"),
+    );
+    Box::pin(async move {
+        barrier.wait().await;
+        Ok(input)
     })
 }
 
@@ -2407,15 +2672,10 @@ async fn worker_serializes_terminal_events_for_parallel_activity_completions() {
     let (database_url, _container) = setup_test_database_url().await;
     let pool = build_test_pool(&database_url);
     let log = Arc::new(Mutex::new(Vec::<String>::new()));
-    let barrier = Arc::new(Barrier::new(2));
     let mut state = HashMap::new();
     state.insert(
         std::any::TypeId::of::<Arc<Mutex<Vec<String>>>>(),
         Box::new(Arc::clone(&log)) as Box<dyn std::any::Any + Send + Sync>,
-    );
-    state.insert(
-        std::any::TypeId::of::<Arc<Barrier>>(),
-        Box::new(Arc::clone(&barrier)) as Box<dyn std::any::Any + Send + Sync>,
     );
     let registry = Arc::new(HandlerRegistry::with_state(
         vec![WorkflowInfo {
@@ -2447,6 +2707,183 @@ async fn worker_serializes_terminal_events_for_parallel_activity_completions() {
     let mut observed = log.lock().expect("log mutex poisoned").clone();
     observed.sort();
     assert_eq!(observed, vec!["barrier_first", "barrier_second"]);
+}
+
+#[tokio::test]
+async fn worker_does_not_append_completion_after_activity_timeout() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let log = Arc::new(Mutex::new(Vec::<String>::new()));
+    let barrier = Arc::new(Barrier::new(2));
+    let mut state = HashMap::new();
+    state.insert(
+        std::any::TypeId::of::<Arc<Mutex<Vec<String>>>>(),
+        Box::new(Arc::clone(&log)) as Box<dyn std::any::Any + Send + Sync>,
+    );
+    state.insert(
+        std::any::TypeId::of::<Arc<Barrier>>(),
+        Box::new(Arc::clone(&barrier)) as Box<dyn std::any::Any + Send + Sync>,
+    );
+    let registry = Arc::new(HandlerRegistry::with_state(
+        vec![WorkflowInfo {
+            name: "timeout_completion_race_workflow",
+            module: "tests",
+            handler: timeout_completion_race_workflow,
+        }],
+        vec![blocking_activity_info(
+            "timeout_completion_race",
+            Duration::from_secs(60),
+        )],
+        Arc::new(state),
+    ));
+    let exec_id = insert_workflow_on_url(
+        &database_url,
+        ShardId::new(0),
+        "timeout_completion_race_workflow",
+        "timeout-completion-race",
+    )
+    .await;
+
+    let worker = build_test_worker(Arc::clone(&registry));
+    let worker_task = spawn_test_worker(Arc::clone(&worker), pool.clone());
+
+    let running_task = wait_for_activity_task_state_from_url(
+        &database_url,
+        exec_id,
+        "timeout_completion_race",
+        "RUNNING",
+    )
+    .await;
+    wait_for_activity_started_event_from_url(&database_url, exec_id, "timeout_completion_race")
+        .await;
+    {
+        let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+            .await
+            .expect("failed to connect for forced timeout sweep");
+        assert!(
+            running_task.start_to_close.is_some(),
+            "activity task should persist a start-to-close timeout"
+        );
+        let history = store::load_history(&mut conn, exec_id)
+            .await
+            .expect("failed to load activity history before timeout");
+        store::append_events(
+            &mut conn,
+            exec_id,
+            &[WorkflowEvent::ActivityTimedOut {
+                activity_id: ActivityExecId::from_uuid(
+                    running_task
+                        .activity_id
+                        .expect("activity task should carry activity_id"),
+                ),
+                timeout_type: TimeoutType::StartToClose,
+            }],
+            history.next_event_id,
+        )
+        .await
+        .expect("failed to append competing timeout");
+        autumn_harvest::queue::fail_task(&mut conn, running_task.id, "activity timed out")
+            .await
+            .expect("failed to fail timed-out activity task");
+        autumn_harvest::queue::wake_workflow_task(&mut conn, exec_id)
+            .await
+            .expect("failed to wake workflow after timeout");
+    }
+
+    barrier.wait().await;
+    let execution = wait_for_workflow_terminal_state(&database_url, &exec_id.to_string()).await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    shutdown_test_worker(&worker, worker_task).await;
+
+    assert_eq!(execution.state, "FAILED");
+    let counts =
+        activity_history_counts_from_url(&database_url, exec_id, "timeout_completion_race").await;
+    assert_eq!(counts.scheduled, 1);
+    assert_eq!(
+        counts.timed_out, 1,
+        "timeout sweeper should record the activity timeout"
+    );
+    assert_eq!(
+        counts.completed, 0,
+        "late worker completion must not append a second terminal event after timeout"
+    );
+    assert_eq!(
+        counts.terminal(),
+        1,
+        "activity history must contain exactly one terminal event"
+    );
+}
+
+#[tokio::test]
+async fn worker_does_not_append_started_after_activity_timeout() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let log = Arc::new(Mutex::new(Vec::<String>::new()));
+    let registry = recording_registry(Arc::clone(&log), &["timeout_before_start"]);
+    let (exec_id, activity_id, task_id) = seed_scheduled_activity_task_from_url(
+        &database_url,
+        "activity_start_timeout_race",
+        "activity-start-timeout-race",
+        "timeout_before_start",
+        json!({ "step": "timeout_before_start" }),
+    )
+    .await;
+
+    let mut lock_conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect for workflow lock");
+    lock_conn
+        .batch_execute("BEGIN")
+        .await
+        .expect("failed to begin workflow lock transaction");
+    harvest_workflow_executions::table
+        .find(exec_id.as_uuid())
+        .for_update()
+        .select(WorkflowExecution::as_select())
+        .first(&mut lock_conn)
+        .await
+        .expect("failed to lock workflow execution");
+
+    let worker = build_test_worker(Arc::clone(&registry));
+    let worker_task = spawn_test_worker(Arc::clone(&worker), pool.clone());
+    wait_for_activity_task_state_from_url(
+        &database_url,
+        exec_id,
+        "timeout_before_start",
+        "RUNNING",
+    )
+    .await;
+
+    store::append_events(
+        &mut lock_conn,
+        exec_id,
+        &[WorkflowEvent::ActivityTimedOut {
+            activity_id,
+            timeout_type: TimeoutType::StartToClose,
+        }],
+        2,
+    )
+    .await
+    .expect("failed to append competing timeout");
+    autumn_harvest::queue::fail_task(&mut lock_conn, task_id, "activity timed out")
+        .await
+        .expect("failed to fail timed-out activity task");
+    lock_conn
+        .batch_execute("COMMIT")
+        .await
+        .expect("failed to commit competing timeout");
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    shutdown_test_worker(&worker, worker_task).await;
+
+    let counts =
+        activity_history_counts_from_url(&database_url, exec_id, "timeout_before_start").await;
+    assert_eq!(counts.scheduled, 1);
+    assert_eq!(counts.timed_out, 1);
+    assert_eq!(
+        counts.started, 0,
+        "worker must not append ActivityStarted after a timeout wins the workflow lock"
+    );
 }
 
 #[tokio::test]
@@ -3599,6 +4036,102 @@ async fn scheduler_tick_removes_stale_unified_dag_schedule_from_old_shard() {
         count_workflow_executions_by_name_from_url(&shard0_url, dag_name).await,
         0,
         "stale default-shard schedule must not dispatch a duplicate DAG execution"
+    );
+    let schedule = load_schedule_from_url(&shard1_url, dag_name).await;
+    assert_eq!(schedule.workflow_name.as_deref(), Some(dag_name));
+    assert_eq!(schedule.queue_name.as_deref(), Some("dag-workers"));
+}
+
+#[tokio::test]
+async fn scheduler_tick_removes_legacy_workflow_only_dag_schedule_from_old_shard() {
+    let ((shard0_url, shard1_url), _container) = setup_sharded_test_database_urls().await;
+    let router = two_shard_router();
+    let dag_name = find_dag_name_for_shard(
+        &router,
+        "moved_legacy_workflow_only_unified",
+        ShardId::new(1),
+    );
+    let dag_catalog = Arc::new(
+        compile_dag_catalog(vec![DagInfo {
+            name: dag_name,
+            module: "tests",
+            schedule: Some(Schedule::Interval(Duration::from_secs(60))),
+            catchup: false,
+            max_active_runs: 1,
+            default_queue: Some("dag-workers"),
+            builder: build_interval_pipeline_dag,
+            workflow_handler: Some(approval_workflow),
+        }])
+        .expect("scheduled unified dag should compile"),
+    );
+    let workflow_schedule = WorkflowSchedule {
+        workflow_name: dag_name.to_string(),
+        dag_name: Some(dag_name.to_string()),
+        schedule: Schedule::Interval(Duration::from_secs(60)),
+        input: Value::Null,
+        catchup: false,
+        max_active_runs: 1,
+        paused: false,
+        queue_name: "dag-workers".to_string(),
+    };
+    let harvest_pool = build_two_shard_pool(&shard0_url, &shard1_url);
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![workflow_info_named(dag_name)],
+        vec![],
+    ));
+    let workflow_schedules = Arc::new(vec![workflow_schedule.clone()]);
+
+    {
+        let legacy_schedule = WorkflowSchedule {
+            workflow_name: dag_name.to_string(),
+            dag_name: None,
+            schedule: Schedule::Interval(Duration::from_secs(60)),
+            input: Value::Null,
+            catchup: false,
+            max_active_runs: 1,
+            paused: false,
+            queue_name: "dag-workers".to_string(),
+        };
+        let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&shard0_url)
+            .await
+            .expect("failed to connect to shard 0 for legacy workflow-only schedule");
+        register_workflow_schedules(&mut conn, std::slice::from_ref(&legacy_schedule))
+            .await
+            .expect("failed to seed legacy default-shard workflow-only DAG schedule");
+        let stale = load_workflow_only_schedule_from_url_optional(&shard0_url, dag_name)
+            .await
+            .expect("legacy workflow-only schedule should exist on shard 0");
+        diesel::update(harvest_schedules::table.find(stale.id))
+            .set(
+                harvest_schedules::next_run_at
+                    .eq(Some(chrono::Utc::now() - chrono::Duration::seconds(1))),
+            )
+            .execute(&mut conn)
+            .await
+            .expect("failed to force legacy workflow-only DAG schedule due");
+    }
+
+    tick_once_sharded(
+        harvest_pool.sharded_pool().clone(),
+        router.clone(),
+        registry,
+        dag_catalog,
+        workflow_schedules,
+        SchedulerMonitor::offline(),
+    )
+    .await
+    .expect("sharded tick should clean legacy workflow-only rows before ticking schedules");
+
+    assert!(
+        load_workflow_only_schedule_from_url_optional(&shard0_url, dag_name)
+            .await
+            .is_none(),
+        "legacy default-shard workflow-only row should be removed instead of dispatched"
+    );
+    assert_eq!(
+        count_workflow_executions_by_name_from_url(&shard0_url, dag_name).await,
+        0,
+        "legacy default-shard workflow-only schedule must not dispatch a duplicate DAG execution"
     );
     let schedule = load_schedule_from_url(&shard1_url, dag_name).await;
     assert_eq!(schedule.workflow_name.as_deref(), Some(dag_name));

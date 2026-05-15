@@ -1112,6 +1112,90 @@ fn has_activity_terminal_event(history: &[WorkflowEvent], activity_id: ActivityE
     })
 }
 
+async fn lock_workflow_execution_and_load_history(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> HarvestResult<store::EventHistory> {
+    harvest_workflow_executions::table
+        .find(exec_id.as_uuid())
+        .for_update()
+        .select(WorkflowExecution::as_select())
+        .first(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?
+        .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))?;
+
+    store::load_history(conn, exec_id).await
+}
+
+async fn task_state_for_update(
+    conn: &mut AsyncPgConnection,
+    task_id: uuid::Uuid,
+) -> HarvestResult<Option<String>> {
+    use crate::schema::harvest_task_queue::dsl;
+
+    dsl::harvest_task_queue
+        .find(task_id)
+        .for_update()
+        .select(dsl::state)
+        .first(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)
+}
+
+fn pending_activity_id_for_task(
+    history: &[WorkflowEvent],
+    task: &TaskQueueItem,
+    activity_name: &str,
+) -> HarvestResult<Option<ActivityExecId>> {
+    if let Some(activity_id) = task.activity_id {
+        let activity_id = ActivityExecId::from_uuid(activity_id);
+        if has_activity_terminal_event(history, activity_id) {
+            return Ok(None);
+        }
+        return find_pending_scheduled_activity_by_id(history, activity_id, activity_name)
+            .map(Some);
+    }
+
+    find_pending_scheduled_activity(history, activity_name).map(Some)
+}
+
+async fn append_activity_started_if_pending(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+    exec_id: ExecutionId,
+    activity_name: &str,
+    worker_id: &str,
+) -> HarvestResult<Option<ActivityExecId>> {
+    conn.transaction::<Option<ActivityExecId>, HarvestError, _>(|conn| {
+        async move {
+            let history = lock_workflow_execution_and_load_history(conn, exec_id).await?;
+            let Some(activity_id) =
+                pending_activity_id_for_task(&history.events, task, activity_name)?
+            else {
+                return Ok(None);
+            };
+            let Some(state) = task_state_for_update(conn, task.id).await? else {
+                return Ok(None);
+            };
+            if state != "RUNNING" {
+                return Ok(None);
+            }
+
+            let started_event = WorkflowEvent::ActivityStarted {
+                activity_id,
+                worker_id: WorkerId::new(worker_id),
+            };
+            store::append_events(conn, exec_id, &[started_event], history.next_event_id).await?;
+            Ok(Some(activity_id))
+        }
+        .scope_boxed()
+    })
+    .await
+}
+
 async fn load_workflow_execution(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
@@ -1996,6 +2080,9 @@ async fn finalize_activity_completion(
     activity_id: ActivityExecId,
     output: serde_json::Value,
 ) -> HarvestResult<()> {
+    let Some(activity_name) = task.activity_name.as_deref() else {
+        return Ok(());
+    };
     let completion_event = WorkflowEvent::ActivityCompleted {
         activity_id,
         output: output.clone(),
@@ -2004,7 +2091,17 @@ async fn finalize_activity_completion(
     conn.transaction::<(), HarvestError, _>(|conn| {
         let output = output.clone();
         async move {
-            store::append_single_event(conn, exec_id, completion_event).await?;
+            let history = lock_workflow_execution_and_load_history(conn, exec_id).await?;
+            if pending_activity_id_for_task(&history.events, task, activity_name)?.is_none() {
+                return Ok(());
+            }
+            let Some(state) = task_state_for_update(conn, task.id).await? else {
+                return Ok(());
+            };
+            if state != "RUNNING" {
+                return Ok(());
+            }
+            store::append_events(conn, exec_id, &[completion_event], history.next_event_id).await?;
             queue::complete_task(conn, task.id, output).await?;
             queue::wake_workflow_task(conn, exec_id).await
         }
@@ -2020,6 +2117,9 @@ async fn finalize_activity_failure(
     activity_id: ActivityExecId,
     error: &str,
 ) -> HarvestResult<()> {
+    let Some(activity_name) = task.activity_name.as_deref() else {
+        return Ok(());
+    };
     let failure = parse_error_payload_full(error);
     let failed_event = WorkflowEvent::ActivityFailed {
         activity_id,
@@ -2044,7 +2144,17 @@ async fn finalize_activity_failure(
     conn.transaction::<(), HarvestError, _>(|conn| {
         let error = error.to_string();
         async move {
-            store::append_single_event(conn, exec_id, failed_event).await?;
+            let history = lock_workflow_execution_and_load_history(conn, exec_id).await?;
+            if pending_activity_id_for_task(&history.events, task, activity_name)?.is_none() {
+                return Ok(());
+            }
+            let Some(state) = task_state_for_update(conn, task.id).await? else {
+                return Ok(());
+            };
+            if state != "RUNNING" {
+                return Ok(());
+            }
+            store::append_events(conn, exec_id, &[failed_event], history.next_event_id).await?;
             queue::fail_task(conn, task.id, &error).await?;
             queue::wake_workflow_task(conn, exec_id).await
         }
@@ -2266,32 +2376,12 @@ async fn process_activity_task(
         return Err(HarvestError::Config(error));
     };
 
-    let history_result = store::load_history(conn, exec_id).await;
-    let history = fail_execution_on_error(conn, task, worker_id, history_result).await?;
-
-    let activity_id_result = task.activity_id.map_or_else(
-        || find_pending_scheduled_activity(&history.events, activity_name),
-        |id| {
-            find_pending_scheduled_activity_by_id(
-                &history.events,
-                ActivityExecId::from_uuid(id),
-                activity_name,
-            )
-        },
-    );
-    let activity_id = fail_execution_on_error(conn, task, worker_id, activity_id_result).await?;
-
-    let started_event = WorkflowEvent::ActivityStarted {
-        activity_id,
-        worker_id: WorkerId::new(worker_id),
+    let started_result =
+        append_activity_started_if_pending(conn, task, exec_id, activity_name, worker_id).await;
+    let Some(activity_id) = fail_execution_on_error(conn, task, worker_id, started_result).await?
+    else {
+        return Ok(());
     };
-    let append_result = conn
-        .transaction::<(), HarvestError, _>(|conn| {
-            async move { store::append_single_event(conn, exec_id, started_event).await }
-                .scope_boxed()
-        })
-        .await;
-    fail_execution_on_error(conn, task, worker_id, append_result).await?;
 
     let cancel = CancellationToken::new();
     let heartbeat_tx =
