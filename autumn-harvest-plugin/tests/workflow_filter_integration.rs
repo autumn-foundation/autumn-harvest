@@ -40,6 +40,16 @@ const INIT_SQL: &str = concat!(
     include_str!("../../autumn-harvest/migrations/20260427000000_harvest_continue_as_new/up.sql"),
     "\n",
     include_str!("../../autumn-harvest/migrations/20260429000000_harvest_concurrency_key/up.sql"),
+    "\n",
+    include_str!("../../autumn-harvest/migrations/20260505000000_harvest_heartbeat_details/up.sql"),
+    "\n",
+    include_str!("../../autumn-harvest/migrations/20260506000000_harvest_audit_log/up.sql"),
+    "\n",
+    include_str!("../../autumn-harvest/migrations/20260501000000_harvest_workers/up.sql"),
+    "\n",
+    include_str!("../../autumn-harvest/migrations/20260509000000_harvest_build_routing/up.sql"),
+    "\n",
+    include_str!("../../autumn-harvest/migrations/20260514020000_harvest_task_activity_id/up.sql"),
 );
 
 type HarvestApiApp = axum::Router;

@@ -10,9 +10,10 @@ use diesel::prelude::*;
 use uuid::Uuid;
 
 use crate::schema::{
-    harvest_batch_jobs, harvest_dag_runs, harvest_dead_letters, harvest_events,
-    harvest_external_tasks, harvest_schedules, harvest_signals, harvest_task_queue, harvest_timers,
-    harvest_workers, harvest_workflow_executions,
+    harvest_audit_log, harvest_backfill_log, harvest_batch_jobs, harvest_build_compat,
+    harvest_build_policies, harvest_dead_letters, harvest_events, harvest_external_tasks,
+    harvest_schedules, harvest_signals, harvest_task_queue, harvest_timers, harvest_workers,
+    harvest_workflow_executions,
 };
 
 // ── WorkflowExecution ─────────────────────────────────────────────────────────
@@ -42,6 +43,8 @@ pub struct WorkflowExecution {
     pub memo: Option<serde_json::Value>,
     pub search_attrs: Option<serde_json::Value>,
     pub created_at: DateTime<Utc>,
+    /// Build ID assigned at workflow start time (issue #171). `None` = pre-policy.
+    pub assigned_build_id: Option<String>,
 }
 
 /// Insert struct for creating a new workflow execution.
@@ -59,6 +62,8 @@ pub struct NewWorkflowExecution<'a> {
     pub execution_timeout: Option<chrono::Duration>,
     pub memo: Option<serde_json::Value>,
     pub search_attrs: Option<serde_json::Value>,
+    /// Build ID from the active build policy for this queue at start time.
+    pub assigned_build_id: Option<String>,
 }
 
 // ── HarvestEvent ──────────────────────────────────────────────────────────────
@@ -109,6 +114,7 @@ pub struct TaskQueueItem {
     pub task_type: String,
     pub workflow_exec_id: Option<Uuid>,
     pub activity_name: Option<String>,
+    pub activity_id: Option<Uuid>,
     pub input: serde_json::Value,
     pub state: String,
     pub priority: i32,
@@ -119,6 +125,7 @@ pub struct TaskQueueItem {
     pub started_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
     pub last_heartbeat_at: Option<DateTime<Utc>>,
+    pub heartbeat_details: Option<serde_json::Value>,
     pub heartbeat_timeout: Option<chrono::Duration>,
     pub start_to_close: Option<chrono::Duration>,
     pub schedule_to_start: Option<chrono::Duration>,
@@ -133,6 +140,8 @@ pub struct TaskQueueItem {
     pub concurrency_key: Option<String>,
     /// Maximum concurrent RUNNING tasks allowed for this `concurrency_key`.
     pub concurrency_cap: Option<i32>,
+    /// Build ID required to claim this task (issue #171). NULL = any worker.
+    pub required_build_id: Option<String>,
 }
 
 /// Insert struct for enqueuing a new task.
@@ -144,6 +153,7 @@ pub struct NewTaskQueueItem<'a> {
     pub task_type: &'a str,
     pub workflow_exec_id: Option<Uuid>,
     pub activity_name: Option<&'a str>,
+    pub activity_id: Option<Uuid>,
     pub input: serde_json::Value,
     pub priority: i32,
     pub max_attempts: i32,
@@ -152,47 +162,15 @@ pub struct NewTaskQueueItem<'a> {
     pub start_to_close: Option<chrono::Duration>,
     pub schedule_to_start: Option<chrono::Duration>,
     pub retry_policy: Option<serde_json::Value>,
+    pub heartbeat_details: Option<serde_json::Value>,
     pub sticky_worker_id: Option<&'a str>,
     pub sticky_until: Option<DateTime<Utc>>,
     pub sticky_timeout: Option<chrono::Duration>,
     pub trace_context: Option<serde_json::Value>,
     pub concurrency_key: Option<&'a str>,
     pub concurrency_cap: Option<i32>,
-}
-
-// ── DagRun ────────────────────────────────────────────────────────────────────
-
-/// A single DAG run instance.
-#[derive(
-    Debug, Clone, Queryable, Selectable, Identifiable, serde::Serialize, serde::Deserialize,
-)]
-#[diesel(table_name = harvest_dag_runs)]
-#[diesel(check_for_backend(diesel::pg::Pg))]
-pub struct DagRun {
-    pub id: Uuid,
-    pub dag_name: String,
-    pub workflow_exec_id: Option<Uuid>,
-    pub state: String,
-    pub logical_date: DateTime<Utc>,
-    pub data_interval_start: DateTime<Utc>,
-    pub data_interval_end: DateTime<Utc>,
-    pub conf: Option<serde_json::Value>,
-    pub started_at: Option<DateTime<Utc>>,
-    pub completed_at: Option<DateTime<Utc>>,
-    pub created_at: DateTime<Utc>,
-}
-
-/// Insert struct for creating a new DAG run.
-#[derive(Debug, Insertable, serde::Serialize, serde::Deserialize)]
-#[diesel(table_name = harvest_dag_runs)]
-pub struct NewDagRun<'a> {
-    pub id: Uuid,
-    pub dag_name: &'a str,
-    pub workflow_exec_id: Option<Uuid>,
-    pub logical_date: DateTime<Utc>,
-    pub data_interval_start: DateTime<Utc>,
-    pub data_interval_end: DateTime<Utc>,
-    pub conf: Option<serde_json::Value>,
+    /// Build ID required to claim this task. `None` = any worker may claim.
+    pub required_build_id: Option<&'a str>,
 }
 
 // ── Schedule ──────────────────────────────────────────────────────────────────
@@ -222,6 +200,12 @@ pub struct HarvestSchedule {
     pub workflow_input: Option<serde_json::Value>,
     /// Task queue for workflow dispatches. NULL for DAG schedule rows.
     pub queue_name: Option<String>,
+    /// When the schedule was paused. NULL when the schedule is active.
+    pub paused_at: Option<DateTime<Utc>>,
+    /// Actor identity that issued the most recent pause. NULL when active.
+    pub paused_by: Option<String>,
+    /// Free-text reason recorded with the most recent pause. NULL when active or no reason given.
+    pub pause_reason: Option<String>,
 }
 
 /// Insert struct for registering a new schedule (DAG or workflow).
@@ -348,6 +332,7 @@ pub struct ExternalTask {
     pub schedule_to_close_at: DateTime<Utc>,
     pub schedule_to_close_secs: i64,
     pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 /// Insert struct for registering a new external activity task.
@@ -388,6 +373,12 @@ pub struct HarvestWorker {
     pub version: Option<String>,
     /// Lifecycle status: `Active`, `Draining`, or `Stopped`.
     pub status: String,
+    /// When set, the deadline by which this worker must have finished draining.
+    pub drain_deadline_at: Option<DateTime<Utc>>,
+    /// Immutable build identifier advertised by this worker (issue #171).
+    pub build_id: String,
+    /// Optional human-readable deployment name (issue #171).
+    pub deployment_name: Option<String>,
 }
 
 /// Insert struct for registering a new worker process.
@@ -400,6 +391,10 @@ pub struct NewHarvestWorker<'a> {
     pub max_concurrency: i32,
     pub host: &'a str,
     pub version: Option<&'a str>,
+    /// Build ID advertised by this worker (empty string = legacy/unset).
+    pub build_id: &'a str,
+    /// Optional deployment name for operator observability.
+    pub deployment_name: Option<&'a str>,
 }
 
 // ── BatchJob ──────────────────────────────────────────────────────────────────
@@ -442,4 +437,141 @@ pub struct NewBatchJob<'a> {
     pub status: &'a str,
     pub idempotency_key: Option<&'a str>,
     pub created_by: Option<&'a str>,
+}
+
+// ── AuditRecord ───────────────────────────────────────────────────────────────
+
+/// A single management API audit record (issue #158).
+#[derive(
+    Debug, Clone, Queryable, Selectable, Identifiable, serde::Serialize, serde::Deserialize,
+)]
+#[diesel(table_name = harvest_audit_log)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct AuditRecord {
+    pub id: Uuid,
+    pub occurred_at: DateTime<Utc>,
+    pub actor: String,
+    pub operation: String,
+    pub target_type: String,
+    pub target_id: Option<String>,
+    pub route_or_command: String,
+    pub request_id: Option<String>,
+    pub idempotency_key: Option<String>,
+    pub status: String,
+    pub error_summary: Option<String>,
+    pub shard_id: Option<i32>,
+    pub source: String,
+}
+
+/// Insert struct for recording a new audit event.
+#[derive(Debug, Insertable, serde::Serialize, serde::Deserialize)]
+#[diesel(table_name = harvest_audit_log)]
+pub struct NewAuditRecord<'a> {
+    pub actor: &'a str,
+    pub operation: &'a str,
+    pub target_type: &'a str,
+    pub target_id: Option<&'a str>,
+    pub route_or_command: &'a str,
+    pub request_id: Option<&'a str>,
+    pub idempotency_key: Option<&'a str>,
+    pub status: &'a str,
+    pub error_summary: Option<&'a str>,
+    pub shard_id: Option<i32>,
+    pub source: &'a str,
+}
+
+// ── BuildPolicy ───────────────────────────────────────────────────────────────
+
+/// Active build policy for a task queue (issue #171).
+#[derive(
+    Debug, Clone, Queryable, Selectable, Identifiable, serde::Serialize, serde::Deserialize,
+)]
+#[diesel(table_name = harvest_build_policies)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct HarvestBuildPolicy {
+    pub id: Uuid,
+    pub queue_name: String,
+    pub build_id: String,
+    pub deployment_name: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Insert struct for a new build policy.
+#[derive(Debug, Insertable)]
+#[diesel(table_name = harvest_build_policies)]
+pub struct NewHarvestBuildPolicy<'a> {
+    pub id: Uuid,
+    pub queue_name: &'a str,
+    pub build_id: &'a str,
+    pub deployment_name: Option<&'a str>,
+}
+
+// ── BuildCompatEntry ──────────────────────────────────────────────────────────
+
+/// A build compatibility declaration (issue #171).
+#[derive(
+    Debug, Clone, Queryable, Selectable, Identifiable, serde::Serialize, serde::Deserialize,
+)]
+#[diesel(table_name = harvest_build_compat)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct HarvestBuildCompat {
+    pub id: Uuid,
+    pub build_id: String,
+    pub compatible_with: String,
+    pub declared_at: DateTime<Utc>,
+}
+
+/// Insert struct for a new compatibility declaration.
+#[derive(Debug, Insertable)]
+#[diesel(table_name = harvest_build_compat)]
+pub struct NewHarvestBuildCompat<'a> {
+    pub id: Uuid,
+    pub build_id: &'a str,
+    pub compatible_with: &'a str,
+}
+
+// ── BackfillLog ───────────────────────────────────────────────────────────────
+
+/// One row in `harvest_backfill_log`: durable record of a single backfill request.
+#[derive(Debug, Clone, Queryable, Selectable, serde::Serialize, serde::Deserialize)]
+#[diesel(table_name = harvest_backfill_log)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct BackfillLogRow {
+    pub id: Uuid,
+    pub schedule_id: Uuid,
+    pub actor: String,
+    pub source: String,
+    pub from_ts: DateTime<Utc>,
+    pub to_ts: DateTime<Utc>,
+    pub dry_run: bool,
+    pub total: i32,
+    pub dispatched: i32,
+    pub skipped: i32,
+    pub failed: i32,
+    pub status: String,
+    pub error_summary: Option<String>,
+    pub started_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+/// Insert struct for a new backfill log entry.
+#[derive(Debug, Insertable)]
+#[diesel(table_name = harvest_backfill_log)]
+pub struct NewBackfillLogRow {
+    pub id: Uuid,
+    pub schedule_id: Uuid,
+    pub actor: String,
+    pub source: String,
+    pub from_ts: DateTime<Utc>,
+    pub to_ts: DateTime<Utc>,
+    pub dry_run: bool,
+    pub total: i32,
+    pub dispatched: i32,
+    pub skipped: i32,
+    pub failed: i32,
+    pub status: String,
+    pub error_summary: Option<String>,
+    pub started_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
 }

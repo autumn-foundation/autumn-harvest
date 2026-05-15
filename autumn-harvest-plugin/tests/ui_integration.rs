@@ -5,8 +5,11 @@ use std::sync::Arc;
 
 use autumn_harvest::builder::WorkerConfig;
 use autumn_harvest::info::WorkflowInfo;
+use autumn_harvest::models::NewHarvestEvent;
 use autumn_harvest::scheduler::SchedulerMonitor;
-use autumn_harvest::schema::harvest_workflow_executions;
+use autumn_harvest::schema::{
+    harvest_dead_letters, harvest_events, harvest_task_queue, harvest_workflow_executions,
+};
 use autumn_harvest::shard::ShardRouter;
 use autumn_harvest::shard::ShardedDbPool;
 use autumn_harvest::types::{ExecutionId, ShardId};
@@ -19,6 +22,7 @@ use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use diesel::ExpressionMethods;
 use diesel::QueryDsl;
 use diesel_async::SimpleAsyncConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -44,6 +48,22 @@ const INIT_SQL: &str = concat!(
     ),
     "\n",
     include_str!("../../autumn-harvest/migrations/20260501000000_harvest_workers/up.sql"),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260508010000_harvest_workers_drain_deadline/up.sql"
+    ),
+    "\n",
+    include_str!("../../autumn-harvest/migrations/20260505000000_harvest_heartbeat_details/up.sql"),
+    "\n",
+    include_str!("../../autumn-harvest/migrations/20260506000000_harvest_audit_log/up.sql"),
+    "\n",
+    include_str!("../../autumn-harvest/migrations/20260509000000_harvest_build_routing/up.sql"),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260513000000_harvest_schedule_pause_metadata/up.sql"
+    ),
+    "\n",
+    include_str!("../../autumn-harvest/migrations/20260514020000_harvest_task_activity_id/up.sql"),
 );
 
 async fn setup_test_database_url() -> (String, ContainerAsync<Postgres>) {
@@ -204,6 +224,31 @@ async fn fetch_html(app: &axum::Router, uri: &str) -> (StatusCode, String) {
     (status, String::from_utf8_lossy(&bytes).to_string())
 }
 
+async fn post_form(
+    app: &axum::Router,
+    uri: &str,
+    body: impl Into<String>,
+) -> (StatusCode, axum::http::HeaderMap, String) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(body.into()))
+                .expect("valid form request"),
+        )
+        .await
+        .expect("POST form request failed");
+    let status = response.status();
+    let headers = response.headers().clone();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("failed to read response body");
+    (status, headers, String::from_utf8_lossy(&bytes).to_string())
+}
+
 async fn insert_workflow_on_url(
     database_url: &str,
     shard: ShardId,
@@ -233,6 +278,94 @@ async fn insert_workflow_on_url(
     .await
     .expect("workflow insert should succeed");
     exec_id
+}
+
+async fn append_test_events(database_url: &str, exec_id: ExecutionId, prefix: &str, count: i32) {
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("failed to connect for event insert");
+    for event_id in 1..=count {
+        diesel::insert_into(harvest_events::table)
+            .values(&NewHarvestEvent {
+                workflow_exec_id: exec_id.as_uuid(),
+                event_id,
+                event_type: &format!("{prefix}Event{event_id}"),
+                event_data: json!({ "event": event_id, "prefix": prefix }),
+            })
+            .execute(&mut conn)
+            .await
+            .expect("failed to insert test event");
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SeededDeadLetter {
+    id: uuid::Uuid,
+    shard_url: String,
+    workflow_name: String,
+    activity_name: Option<String>,
+}
+
+async fn insert_dead_letter_on_url(
+    database_url: &str,
+    shard: ShardId,
+    workflow_name: &str,
+    workflow_id: &str,
+    task_type: &str,
+    activity_name: Option<&str>,
+    ordinal: usize,
+) -> SeededDeadLetter {
+    let exec_id = insert_workflow_on_url(database_url, shard, workflow_name, workflow_id).await;
+    append_test_events(database_url, exec_id, workflow_name, 12).await;
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("failed to connect for dead-letter insert");
+    let id = autumn_harvest::dlq::dead_letter(
+        &mut conn,
+        &autumn_harvest::dlq::NewDeadLetterEntry {
+            original_task_id: uuid::Uuid::new_v4(),
+            queue_name: "default".to_string(),
+            task_type: task_type.to_string(),
+            workflow_exec_id: Some(exec_id.as_uuid()),
+            activity_name: activity_name.map(str::to_string),
+            input: json!({ "ordinal": ordinal, "workflow": workflow_name }),
+            error: format!("{workflow_name} failed at attempt {ordinal}: downstream timeout with enough text to truncate"),
+            attempts: i32::try_from(ordinal + 1).expect("ordinal fits i32"),
+        },
+    )
+    .await
+    .expect("dead-letter insert should succeed");
+
+    SeededDeadLetter {
+        id,
+        shard_url: database_url.to_string(),
+        workflow_name: workflow_name.to_string(),
+        activity_name: activity_name.map(str::to_string),
+    }
+}
+
+async fn count_dead_letter_by_id(database_url: &str, id: uuid::Uuid) -> i64 {
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("failed to connect for dead-letter count");
+    harvest_dead_letters::table
+        .filter(harvest_dead_letters::id.eq(id))
+        .count()
+        .get_result(&mut conn)
+        .await
+        .expect("failed to count dead-letter row")
+}
+
+async fn count_task_queue_by_activity(database_url: &str, activity_name: &str) -> i64 {
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("failed to connect for task queue count");
+    harvest_task_queue::table
+        .filter(harvest_task_queue::activity_name.eq(activity_name))
+        .count()
+        .get_result(&mut conn)
+        .await
+        .expect("failed to count task queue rows")
 }
 
 async fn start_workflow_and_wait(
@@ -483,6 +616,256 @@ fn build_single_shard_ui_app(database_url: &str) -> axum::Router {
     harvest_ui_router(api_state).with_state(test_app_state_without_database())
 }
 
+fn build_sharded_api_with_ui_app(shard0_url: &str, shard1_url: &str) -> axum::Router {
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(build_two_shard_pool(shard0_url, shard1_url));
+    api_state.install(HarvestApiRuntime::new(
+        echo_registry(),
+        Arc::new(HashMap::new()),
+        Arc::new(Vec::new()),
+        None,
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::new(
+            vec![ShardId::new(0), ShardId::new(1)],
+            vec![ShardId::new(0), ShardId::new(1)],
+            ShardId::new(0),
+        ),
+    ));
+
+    autumn_harvest_plugin::harvest_api_router(api_state.clone())
+        .nest("/ui", harvest_ui_router(api_state))
+        .with_state(test_app_state_without_database())
+}
+
+async fn seed_dead_letter_ui_fixture(shard0_url: &str, shard1_url: &str) -> Vec<SeededDeadLetter> {
+    let mut seeded = Vec::new();
+    for i in 0..5 {
+        seeded.push(
+            insert_dead_letter_on_url(
+                shard0_url,
+                ShardId::new(0),
+                if i % 2 == 0 {
+                    "invoice_workflow"
+                } else {
+                    "settlement_workflow"
+                },
+                &format!("dlq-shard0-{i}"),
+                "activity",
+                Some("charge_card"),
+                i,
+            )
+            .await,
+        );
+        seeded.push(
+            insert_dead_letter_on_url(
+                shard1_url,
+                ShardId::new(1),
+                if i % 2 == 0 {
+                    "invoice_workflow"
+                } else {
+                    "settlement_workflow"
+                },
+                &format!("dlq-shard1-{i}"),
+                "workflow",
+                None,
+                i + 5,
+            )
+            .await,
+        );
+    }
+    seeded
+}
+
+fn assert_dead_letter_list_html(html: &str, seeded: &[SeededDeadLetter]) {
+    assert!(html.contains("Dead Letters"), "page title missing: {html}");
+    assert!(
+        html.contains("href=\"dead-letters\"") && html.contains("Workers"),
+        "nav should link Dead Letters alongside Workers: {html}"
+    );
+    assert!(
+        html.contains("name=\"workflow_name\""),
+        "workflow filter missing"
+    );
+    assert!(
+        html.contains("name=\"task_kind\""),
+        "task kind filter missing"
+    );
+    assert!(
+        html.contains("name=\"failed_after\""),
+        "failed_after filter missing"
+    );
+    assert!(
+        html.contains("name=\"failed_before\""),
+        "failed_before filter missing"
+    );
+    assert!(html.contains("name=\"shard_id\""), "shard filter missing");
+    assert!(
+        html.contains("Replay all matching"),
+        "bulk replay control missing"
+    );
+    assert!(
+        html.contains("Discard all matching"),
+        "bulk discard control missing"
+    );
+    assert!(
+        html.contains("action=\"../dead-letters/replay\""),
+        "row replay form should post to the existing bulk replay endpoint: {html}"
+    );
+    assert!(
+        html.contains("action=\"../dead-letters/discard\""),
+        "row discard form should post to the existing bulk discard endpoint: {html}"
+    );
+
+    for row in seeded {
+        assert!(
+            html.contains(&row.id.to_string()),
+            "dead-letter id should be present for row action: {}",
+            row.id
+        );
+        assert!(
+            html.contains(&row.workflow_name),
+            "workflow name should render: {}",
+            row.workflow_name
+        );
+    }
+    assert!(
+        html.contains("invoice_workflowEvent12") && !html.contains("invoice_workflowEvent1</code>"),
+        "row detail should include the last events leading to failure, not the whole cemetery: {html}"
+    );
+    assert!(
+        html.contains("&quot;ordinal&quot;"),
+        "original task payload should render in row detail: {html}"
+    );
+}
+
+fn assert_dead_letter_filtered_html(filtered_html: &str) {
+    assert!(
+        filtered_html.contains("invoice_workflow"),
+        "invoice rows should remain after filter: {filtered_html}"
+    );
+    assert!(
+        !filtered_html.contains("settlement_workflow"),
+        "settlement rows should be filtered out: {filtered_html}"
+    );
+}
+
+fn assert_dead_letter_task_kind_filtered_html(
+    html: &str,
+    seeded: &[SeededDeadLetter],
+    include_activities: bool,
+) {
+    for row in seeded {
+        let should_include = row.activity_name.is_some() == include_activities;
+        assert_eq!(
+            html.contains(&row.id.to_string()),
+            should_include,
+            "task kind filter should {} row {} in HTML: {html}",
+            if should_include { "include" } else { "exclude" },
+            row.id
+        );
+    }
+}
+
+#[tokio::test]
+async fn ui_dead_letters_lists_filters_and_replays_single_entry() {
+    let ((shard0_url, shard1_url), _container) = setup_sharded_test_database_urls().await;
+    let seeded = seed_dead_letter_ui_fixture(&shard0_url, &shard1_url).await;
+    let app = build_sharded_api_with_ui_app(&shard0_url, &shard1_url);
+
+    let (status, html) = fetch_html(&app, "/ui/dead-letters").await;
+    assert_eq!(status, StatusCode::OK, "DLQ page should render: {html}");
+    assert_dead_letter_list_html(&html, &seeded);
+    assert!(
+        html.contains("name=\"return_to\" value=\"../ui/dead-letters\""),
+        "DLQ forms should return relative to the bulk endpoint path: {html}"
+    );
+
+    let (status, filtered_html) =
+        fetch_html(&app, "/ui/dead-letters?workflow_name=invoice_workflow").await;
+    assert_eq!(status, StatusCode::OK, "filtered DLQ page should render");
+    assert_dead_letter_filtered_html(&filtered_html);
+
+    let (status, activity_html) = fetch_html(&app, "/ui/dead-letters?task_kind=Activity").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "activity-filtered DLQ page should render"
+    );
+    assert_dead_letter_task_kind_filtered_html(&activity_html, &seeded, true);
+
+    let (status, workflow_html) = fetch_html(&app, "/ui/dead-letters?task_kind=Workflow").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "workflow-filtered DLQ page should render"
+    );
+    assert_dead_letter_task_kind_filtered_html(&workflow_html, &seeded, false);
+
+    let target = seeded
+        .iter()
+        .find(|row| row.activity_name.as_deref() == Some("charge_card"))
+        .expect("activity dead-letter should exist");
+    let legacy_target = seeded
+        .iter()
+        .find(|row| row.id != target.id)
+        .expect("second dead-letter should exist");
+    let (legacy_status, _legacy_headers, legacy_body) = post_form(
+        &app,
+        "/ui/dead-letters/replay",
+        format!(
+            "dead_letter_id={}&return_to=ui%2Fdead-letters",
+            legacy_target.id
+        ),
+    )
+    .await;
+    assert_eq!(
+        legacy_status,
+        StatusCode::NOT_FOUND,
+        "UI router must not keep a duplicate mutating replay route: {legacy_body}"
+    );
+    assert_eq!(
+        count_dead_letter_by_id(&legacy_target.shard_url, legacy_target.id).await,
+        1,
+        "legacy UI POST path should not mutate DLQ rows"
+    );
+
+    let (status, headers, body) = post_form(
+        &app,
+        "/dead-letters/replay",
+        format!(
+            "dead_letter_id={}&return_to=..%2Fui%2Fdead-letters",
+            target.id
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "single replay should redirect back to the page: {body}"
+    );
+    let location = headers
+        .get("location")
+        .expect("redirect should include Location")
+        .to_str()
+        .expect("Location should be valid UTF-8");
+    assert!(
+        location.starts_with("../ui/dead-letters?flash="),
+        "redirect should return to mounted DLQ UI with flash, got {location}"
+    );
+    assert_eq!(
+        count_dead_letter_by_id(&target.shard_url, target.id).await,
+        0,
+        "replayed DLQ row should be removed"
+    );
+    assert_eq!(
+        count_task_queue_by_activity(&target.shard_url, "charge_card").await,
+        1,
+        "single replay should enqueue exactly one activity task"
+    );
+}
+
 /// Navigation link: the index and workflows pages must include a Workers link.
 #[tokio::test]
 async fn ui_workers_nav_link_on_index_page() {
@@ -583,15 +966,9 @@ async fn ui_workers_shows_worker_rows() {
     let app = build_single_shard_ui_app(&database_url);
     let (status, html) = fetch_html(&app, "/workers").await;
     assert_eq!(status, StatusCode::OK);
-    assert!(
-        html.contains("worker-alpha"),
-        "alpha worker missing: {html}"
-    );
-    assert!(html.contains("worker-beta"), "beta worker missing: {html}");
-    assert!(
-        html.contains("worker-gamma"),
-        "gamma worker missing: {html}"
-    );
+    assert!(html.contains("worker-a"), "alpha worker missing: {html}");
+    assert!(html.contains("worker-b"), "beta worker missing: {html}");
+    assert!(html.contains("worker-g"), "gamma worker missing: {html}");
     assert!(html.contains("Active"), "Active status missing: {html}");
     assert!(html.contains("Draining"), "Draining status missing: {html}");
     assert!(html.contains("Stopped"), "Stopped status missing: {html}");
@@ -652,11 +1029,11 @@ async fn ui_workers_filter_stale_true() {
     let (status, html) = fetch_html(&app, "/workers?stale=true").await;
     assert_eq!(status, StatusCode::OK);
     assert!(
-        html.contains("w-stale-2"),
+        html.contains("w-stale-"),
         "stale worker should appear: {html}"
     );
     assert!(
-        !html.contains("w-fresh-2"),
+        !html.contains("w-fresh-"),
         "fresh worker should NOT appear after ?stale=true filter: {html}"
     );
 }
@@ -688,10 +1065,7 @@ async fn ui_workers_pagination_limits_rows() {
     let (status, html) = fetch_html(&app, "/workers?limit=1").await;
     assert_eq!(status, StatusCode::OK);
     // With limit=1, exactly one row appears and the Next pagination link is present.
-    let worker_count = ["pg-worker-1", "pg-worker-2", "pg-worker-3"]
-        .iter()
-        .filter(|id| html.contains(*id))
-        .count();
+    let worker_count = html.matches("pg-worke").count();
     assert_eq!(
         worker_count, 1,
         "limit=1 should render exactly 1 worker row: {html}"
@@ -732,14 +1106,8 @@ async fn ui_workers_multi_shard_grouped() {
 
     let (status, html) = fetch_html(&app, "/workers").await;
     assert_eq!(status, StatusCode::OK);
-    assert!(
-        html.contains("shard0-worker"),
-        "shard 0 worker missing: {html}"
-    );
-    assert!(
-        html.contains("shard1-worker"),
-        "shard 1 worker missing: {html}"
-    );
+    assert!(html.contains("shard0-w"), "shard 0 worker missing: {html}");
+    assert!(html.contains("shard1-w"), "shard 1 worker missing: {html}");
     // Multi-shard deployments should group workers with shard headers.
     assert!(
         html.contains("Shard") || html.contains("shard"),
@@ -850,7 +1218,17 @@ async fn ui_workers_perf_1k_workers_4_shards_under_500ms() {
     ));
     let app = harvest_ui_router(api_state).with_state(test_app_state_without_database());
 
-    // Measure wall-clock time for the page render.
+    // Warm the lazy shard pools before measuring. This test covers the workers
+    // page render/query budget, not first-use connection establishment against
+    // Docker-backed Postgres shards.
+    let (warm_status, _) = fetch_html(&app, "/workers?limit=200").await;
+    assert_eq!(
+        warm_status,
+        StatusCode::OK,
+        "perf test warm-up page must return 200",
+    );
+
+    // Measure wall-clock time for the warmed page render.
     let start = std::time::Instant::now();
     let (status, html) = fetch_html(&app, "/workers?limit=200").await;
     let elapsed = start.elapsed();

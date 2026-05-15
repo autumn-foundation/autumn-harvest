@@ -1,3 +1,5 @@
+//! Text-based user interface (TUI) built with ratatui for visualizing workflow state.
+
 use std::io;
 use std::time::Duration;
 

@@ -41,6 +41,9 @@ tag_pattern = "v[0-9].*"
 sort_commits = "newest"
 
 commit_parsers = [
+  { message = "^docs: update CHANGELOG\\.md", skip = true },
+  { message = "^chore: release notes", skip = true },
+  { message = "^chore\\(release\\)", skip = true },
   { message = "^feat", group = "<!-- 0 -->Added" },
   { message = "^fix", group = "<!-- 1 -->Fixed" },
   { message = "^perf", group = "<!-- 2 -->Performance" },
@@ -48,7 +51,6 @@ commit_parsers = [
   { message = "^docs", group = "<!-- 4 -->Documentation" },
   { message = "^style", group = "<!-- 5 -->Styling" },
   { message = "^test", group = "<!-- 6 -->Testing" },
-  { message = "^chore\\(release\\)", skip = true },
   { message = "^chore|^ci", group = "<!-- 7 -->Miscellaneous" },
   { body = ".*security", group = "<!-- 8 -->Security" },
   { message = "^revert", group = "<!-- 9 -->Reverted" },

@@ -11,9 +11,12 @@ readme = "../README.md"
 keywords = ["workflow", "durable", "postgres", "orchestration", "autumn"]
 categories = ["asynchronous", "database"]
 
+[features]
+unified-dag-execution = ["autumn-harvest/unified-dag-execution"]
+
 [dependencies]
-autumn-harvest = { version = "0.2.0", path = "../autumn-harvest", features = ["db"] }
-autumn-web = "0.2"
+autumn-harvest = { version = "0.3.0", path = "../autumn-harvest", features = ["db"] }
+autumn-web = "0.4"
 tokio = { workspace = true }
 tokio-util = { version = "0.7", features = ["rt"] }
 serde = { workspace = true }
@@ -32,6 +35,7 @@ tower = "0.5"
 maud = { version = "0.27", features = ["axum"] }
 
 [dev-dependencies]
+autumn-harvest = { version = "0.3.0", path = "../autumn-harvest", features = ["db", "testing"] }
 tower = "0.5"
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }

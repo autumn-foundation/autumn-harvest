@@ -32,9 +32,13 @@ use diesel_async::RunQueryDsl;
 use diesel_async::SimpleAsyncConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use scoped_futures::ScopedFutureExt;
+use std::any::TypeId;
+use std::collections::HashMap;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use testcontainers::ContainerAsync;
 use testcontainers_modules::postgres::Postgres;
@@ -54,6 +58,8 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../migrations/20260424000001_harvest_trace_context/up.sql"),
     "\n",
+    include_str!("../migrations/20260505000000_harvest_heartbeat_details/up.sql"),
+    "\n",
     include_str!("../migrations/20260427000000_harvest_continue_as_new/up.sql"),
     "\n",
     include_str!("../migrations/20260429000000_harvest_concurrency_key/up.sql"),
@@ -61,6 +67,20 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260430000000_harvest_workflow_schedules/up.sql"),
     "\n",
     include_str!("../migrations/20260430000001_harvest_external_tasks/up.sql"),
+    "\n",
+    include_str!("../migrations/20260508000000_harvest_external_task_updated_at/up.sql"),
+    "\n",
+    include_str!("../migrations/20260506000000_harvest_audit_log/up.sql"),
+    "\n",
+    include_str!("../migrations/20260501000000_harvest_workers/up.sql"),
+    "\n",
+    include_str!("../migrations/20260508010000_harvest_workers_drain_deadline/up.sql"),
+    "\n",
+    include_str!("../migrations/20260509000000_harvest_build_routing/up.sql"),
+    "\n",
+    include_str!("../migrations/20260513000000_harvest_schedule_pause_metadata/up.sql"),
+    "\n",
+    include_str!("../migrations/20260514020000_harvest_task_activity_id/up.sql"),
 );
 
 /// The minimal "legacy" migration set used by the upgrade-path regression
@@ -71,12 +91,25 @@ const INIT_SQL: &str = concat!(
 /// The `concurrency_key` migration is included because `enqueue` (called by
 /// `start_or_load_workflow_execution`) writes the `concurrency_key` and
 /// `concurrency_cap` columns that it added; without them the INSERT fails.
+/// The `harvest_workers` and `harvest_build_routing` migrations are included
+/// because `start_or_load_workflow_execution` queries `harvest_build_policies`
+/// (created by build routing) and inserts `assigned_build_id` into
+/// `harvest_workflow_executions`; the build routing migration also alters
+/// `harvest_workers`, so that table must exist first.
 const LEGACY_INIT_SQL: &str = concat!(
     include_str!("../migrations/20260409000000_harvest_initial/up.sql"),
     "\n",
     include_str!("../migrations/20260424000001_harvest_trace_context/up.sql"),
     "\n",
+    include_str!("../migrations/20260505000000_harvest_heartbeat_details/up.sql"),
+    "\n",
     include_str!("../migrations/20260429000000_harvest_concurrency_key/up.sql"),
+    "\n",
+    include_str!("../migrations/20260501000000_harvest_workers/up.sql"),
+    "\n",
+    include_str!("../migrations/20260509000000_harvest_build_routing/up.sql"),
+    "\n",
+    include_str!("../migrations/20260514020000_harvest_task_activity_id/up.sql"),
 );
 
 /// Start a Postgres container with the harvest schema applied and return
@@ -147,6 +180,180 @@ async fn setup_blank_test_database_url() -> (String, ContainerAsync<Postgres>) {
     let database_url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
 
     (database_url, container)
+}
+
+#[tokio::test]
+async fn drop_dag_runs_migration_copies_legacy_rows_to_workflow_executions() {
+    let (mut conn, _container) = setup_test_db().await;
+    let legacy_run_id = Uuid::new_v4();
+    let dag_name = "legacy_migrated_dag";
+    let logical_date = chrono::DateTime::parse_from_rfc3339("2026-05-14T02:00:00Z")
+        .expect("fixed timestamp should parse")
+        .with_timezone(&Utc);
+    let dag_conf = serde_json::json!({ "customer": "acme" });
+
+    diesel::sql_query(
+        r"
+        INSERT INTO harvest_dag_runs
+            (id, dag_name, workflow_exec_id, state, logical_date, data_interval_start,
+             data_interval_end, conf, started_at, completed_at, created_at)
+        VALUES ($1, $2, NULL, 'SUCCESS', $3, $3, $3, $4, $3, $3, $3)
+        ",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(legacy_run_id)
+    .bind::<diesel::sql_types::Text, _>(dag_name)
+    .bind::<diesel::sql_types::Timestamptz, _>(logical_date)
+    .bind::<diesel::sql_types::Jsonb, _>(dag_conf.clone())
+    .execute(&mut conn)
+    .await
+    .expect("failed to seed legacy DAG run");
+
+    conn.batch_execute(include_str!(
+        "../migrations/20260514000000_drop_harvest_dag_runs/up.sql"
+    ))
+    .await
+    .expect("drop migration should migrate legacy DAG runs before dropping the table");
+
+    let workflow_id = autumn_harvest::scheduler::scheduled_workflow_id_pub(dag_name, logical_date);
+    let migrated = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_name.eq(dag_name))
+        .filter(harvest_workflow_executions::workflow_id.eq(workflow_id))
+        .select(WorkflowExecution::as_select())
+        .first::<WorkflowExecution>(&mut conn)
+        .await
+        .expect("legacy DAG run should be copied into workflow executions");
+
+    assert_eq!(migrated.id, legacy_run_id);
+    assert_eq!(migrated.state, "COMPLETED");
+    assert_eq!(migrated.queue_name, "default");
+    assert_eq!(
+        migrated.input["_harvest_migrated_legacy_dag_run"],
+        serde_json::json!(true)
+    );
+    assert_eq!(migrated.input["dag_run_id"], legacy_run_id.to_string());
+    assert_eq!(migrated.input["conf"], dag_conf);
+    assert!(migrated.completed_at.is_some());
+}
+
+#[tokio::test]
+async fn drop_dag_runs_migration_does_not_turn_queued_runs_into_running_workflows() {
+    let (mut conn, _container) = setup_test_db().await;
+    let legacy_run_id = Uuid::new_v4();
+    let dag_name = "legacy_queued_dag";
+    let logical_date = chrono::DateTime::parse_from_rfc3339("2026-05-14T02:00:00Z")
+        .expect("fixed timestamp should parse")
+        .with_timezone(&Utc);
+
+    diesel::sql_query(
+        r"
+        INSERT INTO harvest_dag_runs
+            (id, dag_name, workflow_exec_id, state, logical_date, data_interval_start,
+             data_interval_end, conf, started_at, completed_at, created_at)
+        VALUES ($1, $2, NULL, 'QUEUED', $3, $3, $3, NULL, NULL, NULL, $3)
+        ",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(legacy_run_id)
+    .bind::<diesel::sql_types::Text, _>(dag_name)
+    .bind::<diesel::sql_types::Timestamptz, _>(logical_date)
+    .execute(&mut conn)
+    .await
+    .expect("failed to seed queued legacy DAG run");
+
+    conn.batch_execute(include_str!(
+        "../migrations/20260514000000_drop_harvest_dag_runs/up.sql"
+    ))
+    .await
+    .expect("drop migration should migrate queued legacy DAG runs safely");
+
+    let migrated = harvest_workflow_executions::table
+        .find(legacy_run_id)
+        .select(WorkflowExecution::as_select())
+        .first::<WorkflowExecution>(&mut conn)
+        .await
+        .expect("queued legacy DAG run should be preserved as a workflow row");
+    assert_ne!(
+        migrated.state, "RUNNING",
+        "queued legacy DAG rows must not become permanently-running workflow executions"
+    );
+    assert_eq!(migrated.state, "CANCELLED");
+    assert!(migrated.completed_at.is_some());
+
+    let running_count: i64 = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_name.eq(dag_name))
+        .filter(harvest_workflow_executions::state.eq("RUNNING"))
+        .count()
+        .get_result(&mut conn)
+        .await
+        .expect("failed to count migrated running DAG workflows");
+    assert_eq!(
+        running_count, 0,
+        "migrated queued legacy runs must not consume max_active_runs slots"
+    );
+}
+
+#[tokio::test]
+async fn drop_dag_runs_migration_preserves_subsecond_legacy_run_identities() {
+    let (mut conn, _container) = setup_test_db().await;
+    let dag_name = "legacy_subsecond_dag";
+    let first_run_id = Uuid::new_v4();
+    let second_run_id = Uuid::new_v4();
+    let first_logical_date = chrono::DateTime::parse_from_rfc3339("2026-05-14T02:00:00.100000Z")
+        .expect("fixed timestamp should parse")
+        .with_timezone(&Utc);
+    let second_logical_date = chrono::DateTime::parse_from_rfc3339("2026-05-14T02:00:00.900000Z")
+        .expect("fixed timestamp should parse")
+        .with_timezone(&Utc);
+
+    diesel::sql_query(
+        r"
+        INSERT INTO harvest_dag_runs
+            (id, dag_name, workflow_exec_id, state, logical_date, data_interval_start,
+             data_interval_end, conf, started_at, completed_at, created_at)
+        VALUES
+            ($1, $2, NULL, 'SUCCESS', $3, $3, $3, NULL, $3, $3, $3),
+            ($4, $2, NULL, 'SUCCESS', $5, $5, $5, NULL, $5, $5, $5)
+        ",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(first_run_id)
+    .bind::<diesel::sql_types::Text, _>(dag_name)
+    .bind::<diesel::sql_types::Timestamptz, _>(first_logical_date)
+    .bind::<diesel::sql_types::Uuid, _>(second_run_id)
+    .bind::<diesel::sql_types::Timestamptz, _>(second_logical_date)
+    .execute(&mut conn)
+    .await
+    .expect("failed to seed subsecond legacy DAG runs");
+
+    conn.batch_execute(include_str!(
+        "../migrations/20260514000000_drop_harvest_dag_runs/up.sql"
+    ))
+    .await
+    .expect("drop migration should preserve subsecond legacy DAG identities");
+
+    let migrated: Vec<WorkflowExecution> = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_name.eq(dag_name))
+        .order(harvest_workflow_executions::workflow_id.asc())
+        .select(WorkflowExecution::as_select())
+        .load(&mut conn)
+        .await
+        .expect("failed to load migrated subsecond workflow rows");
+    assert_eq!(
+        migrated.len(),
+        2,
+        "same-second legacy DAG runs with distinct fractional logical dates must both migrate"
+    );
+    assert_ne!(migrated[0].workflow_id, migrated[1].workflow_id);
+    assert!(
+        migrated
+            .iter()
+            .any(|row| row.workflow_id.ends_with(".100000")),
+        "first subsecond logical date should be represented in the workflow_id: {migrated:?}"
+    );
+    assert!(
+        migrated
+            .iter()
+            .any(|row| row.workflow_id.ends_with(".900000")),
+        "second subsecond logical date should be represented in the workflow_id: {migrated:?}"
+    );
 }
 
 fn build_test_pool(database_url: &str) -> DbPool {
@@ -253,6 +460,7 @@ async fn insert_workflow_execution(conn: &mut AsyncPgConnection) -> ExecutionId 
         execution_timeout: None,
         memo: None,
         search_attrs: None,
+        assigned_build_id: None,
     };
 
     diesel::insert_into(harvest_workflow_executions::table)
@@ -411,6 +619,8 @@ fn build_runtime_worker(
                 max_local_activity_start_to_close: Duration::from_secs(60),
                 shard_assignments: vec![autumn_harvest::types::ShardId::new(0)],
                 worker_heartbeat_interval: Duration::from_secs(5),
+                build_id: String::new(),
+                deployment_name: None,
             },
             registry,
         )
@@ -504,6 +714,17 @@ fn workflow_with_activity<'a>(
     })
 }
 
+fn workflow_with_checkpointed_activity<'a>(
+    ctx: &'a WorkflowContext,
+    input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        ctx.execute_activity_raw("checkpointed_import", input, "default")
+            .await
+            .map_err(|e| e.to_string())
+    })
+}
+
 fn send_email_activity<'a>(
     _ctx: &'a ActivityContext,
     input: serde_json::Value,
@@ -516,6 +737,81 @@ fn send_email_activity<'a>(
         Ok(serde_json::json!({
             "sent": true,
             "to": to,
+        }))
+    })
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ImportCheckpoint {
+    next_offset: usize,
+}
+
+#[derive(Debug, Default)]
+struct HeartbeatResumeStats {
+    attempts: AtomicUsize,
+    processed_steps: AtomicUsize,
+    resume_offsets: Mutex<Vec<usize>>,
+}
+
+fn heartbeat_resume_state(
+    stats: Arc<HeartbeatResumeStats>,
+) -> autumn_harvest::context::SharedState {
+    let mut shared_state_map = HashMap::new();
+    shared_state_map.insert(
+        TypeId::of::<Arc<HeartbeatResumeStats>>(),
+        Box::new(stats) as Box<dyn std::any::Any + Send + Sync>,
+    );
+    Arc::new(shared_state_map)
+}
+
+fn checkpointed_import_activity<'a>(
+    ctx: &'a ActivityContext,
+    input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let total = input
+            .get("total")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|n| usize::try_from(n).ok())
+            .unwrap_or(6);
+        let fail_after = input
+            .get("fail_after")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|n| usize::try_from(n).ok())
+            .unwrap_or(3);
+
+        let checkpoint = ctx
+            .heartbeat_details::<ImportCheckpoint>()
+            .map_err(|e| e.to_string())?;
+        let start = checkpoint.map_or(0, |details| details.next_offset);
+        let stats = Arc::clone(
+            ctx.state::<Arc<HeartbeatResumeStats>>()
+                .expect("test stats should be registered"),
+        );
+        let attempt = stats.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+        stats
+            .resume_offsets
+            .lock()
+            .expect("resume offset lock poisoned")
+            .push(start);
+
+        for offset in start..total {
+            stats.processed_steps.fetch_add(1, Ordering::SeqCst);
+            let next_offset = offset + 1;
+            ctx.heartbeat(ImportCheckpoint { next_offset })
+                .await
+                .map_err(|e| e.to_string())?;
+
+            if attempt == 1 && next_offset == fail_after {
+                tokio::time::sleep(Duration::from_millis(1_200)).await;
+                return Err(format!("fail after checkpoint {next_offset}"));
+            }
+        }
+
+        Ok(serde_json::json!({
+            "attempt": attempt,
+            "resumed_from": start,
+            "processed_total": AtomicUsize::load(&stats.processed_steps, Ordering::SeqCst),
         }))
     })
 }
@@ -733,7 +1029,7 @@ async fn full_workflow_lifecycle() {
 
     // 4. Claim the task
     let queues = vec!["default".to_string()];
-    let claimed = queue::claim_task(&mut conn, &queues, "worker-e2e-1")
+    let claimed = queue::claim_task(&mut conn, &queues, "worker-e2e-1", "")
         .await
         .expect("claim_task failed");
     let claimed = claimed.expect("no task claimed");
@@ -807,7 +1103,7 @@ async fn claim_task_returns_none_on_empty_queue() {
     let (mut conn, _container) = setup_test_db().await;
 
     let queues = vec!["default".to_string()];
-    let claimed = queue::claim_task(&mut conn, &queues, "worker-empty-1")
+    let claimed = queue::claim_task(&mut conn, &queues, "worker-empty-1", "")
         .await
         .expect("claim_task failed");
     assert!(
@@ -865,6 +1161,8 @@ async fn worker_completes_workflow_task_and_persists_result() {
                 max_local_activity_start_to_close: Duration::from_secs(60),
                 shard_assignments: vec![autumn_harvest::types::ShardId::new(0)],
                 worker_heartbeat_interval: Duration::from_secs(5),
+                build_id: String::new(),
+                deployment_name: None,
             },
             registry,
         )
@@ -959,6 +1257,8 @@ async fn worker_marks_workflow_failed_when_handler_errors() {
                 max_local_activity_start_to_close: Duration::from_secs(60),
                 shard_assignments: vec![autumn_harvest::types::ShardId::new(0)],
                 worker_heartbeat_interval: Duration::from_secs(5),
+                build_id: String::new(),
+                deployment_name: None,
             },
             registry,
         )
@@ -1014,6 +1314,7 @@ async fn worker_marks_workflow_failed_when_handler_errors() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
 async fn worker_completes_workflow_with_activity_round_trip() {
     let (database_url, _container) = setup_test_database_url().await;
     let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
@@ -1078,6 +1379,8 @@ async fn worker_completes_workflow_with_activity_round_trip() {
                 max_local_activity_start_to_close: Duration::from_secs(60),
                 shard_assignments: vec![autumn_harvest::types::ShardId::new(0)],
                 worker_heartbeat_interval: Duration::from_secs(5),
+                build_id: String::new(),
+                deployment_name: None,
             },
             registry,
         )
@@ -1129,6 +1432,94 @@ async fn worker_completes_workflow_with_activity_round_trip() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn activity_retry_resumes_from_persisted_heartbeat_details() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect to Postgres container");
+
+    let exec_id = insert_workflow_execution(&mut conn).await;
+    let workflow_input = serde_json::json!({
+        "total": 6,
+        "fail_after": 3,
+    });
+    store::append_events(
+        &mut conn,
+        exec_id,
+        &[WorkflowEvent::WorkflowStarted {
+            input: workflow_input.clone(),
+            timestamp: Utc::now(),
+        }],
+        0,
+    )
+    .await
+    .expect("append WorkflowStarted failed");
+
+    let mut params = EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
+    params.workflow_exec_id = Some(exec_id.as_uuid());
+    params.scheduled_at = Utc::now() - chrono::Duration::seconds(5);
+    queue::enqueue(&mut conn, &params)
+        .await
+        .expect("enqueue workflow task failed");
+
+    let stats = Arc::new(HeartbeatResumeStats::default());
+    let registry = Arc::new(HandlerRegistry::with_state(
+        vec![WorkflowInfo {
+            name: "e2e_test_workflow",
+            module: "integration_e2e",
+            handler: workflow_with_checkpointed_activity,
+        }],
+        vec![ActivityInfo {
+            name: "checkpointed_import",
+            module: "integration_e2e",
+            default_retry_policy: Some(autumn_harvest::RetryPolicy::fixed(
+                2,
+                Duration::from_millis(10),
+            )),
+            default_start_to_close: None,
+            default_heartbeat_timeout: None,
+            default_schedule_to_start: None,
+            default_queue: Some("default"),
+            max_concurrent: None,
+            concurrency_key: None,
+            is_local: false,
+            handler: checkpointed_import_activity,
+        }],
+        heartbeat_resume_state(Arc::clone(&stats)),
+    ));
+    let worker = build_runtime_worker("worker-heartbeat-resume", 1, 1, registry);
+    let pool = build_test_pool(&database_url);
+    let handle = spawn_test_worker(Arc::clone(&worker), pool);
+
+    let execution = wait_for_execution_state(&database_url, exec_id, "COMPLETED").await;
+
+    worker.shutdown();
+    handle.await.expect("worker task should join");
+
+    assert_eq!(
+        execution.output,
+        Some(serde_json::json!({
+            "attempt": 2,
+            "resumed_from": 3,
+            "processed_total": 6,
+        }))
+    );
+    assert_eq!(AtomicUsize::load(&stats.attempts, Ordering::SeqCst), 2);
+    assert_eq!(
+        AtomicUsize::load(&stats.processed_steps, Ordering::SeqCst),
+        6
+    );
+    assert_eq!(
+        *stats
+            .resume_offsets
+            .lock()
+            .expect("resume offset lock poisoned"),
+        vec![0, 3],
+        "second attempt must start from the checkpoint persisted by the first attempt",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn worker_fails_orphaned_activity_task_without_scheduled_event() {
     let (database_url, _container) = setup_test_database_url().await;
     let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
@@ -1170,6 +1561,8 @@ async fn worker_fails_orphaned_activity_task_without_scheduled_event() {
                 max_local_activity_start_to_close: Duration::from_secs(60),
                 shard_assignments: vec![autumn_harvest::types::ShardId::new(0)],
                 worker_heartbeat_interval: Duration::from_secs(5),
+                build_id: String::new(),
+                deployment_name: None,
             },
             Arc::new(HandlerRegistry::new(
                 vec![],
@@ -1280,7 +1673,7 @@ async fn timeout_enforcement_fails_pending_activity_and_wakes_workflow() {
         .expect("enqueue parked workflow task failed");
 
     let default_queues = vec!["default".to_string()];
-    let claimed_workflow = queue::claim_task(&mut conn, &default_queues, "parked-worker")
+    let claimed_workflow = queue::claim_task(&mut conn, &default_queues, "parked-worker", "")
         .await
         .expect("claim parked workflow task failed")
         .expect("workflow task should be claimable");
@@ -1379,6 +1772,8 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
                 max_local_activity_start_to_close: Duration::from_secs(60),
                 shard_assignments: vec![autumn_harvest::types::ShardId::new(0)],
                 worker_heartbeat_interval: Duration::from_secs(5),
+                build_id: String::new(),
+                deployment_name: None,
             },
             Arc::new(HandlerRegistry::new(
                 vec![WorkflowInfo {
@@ -1499,6 +1894,8 @@ async fn worker_completes_workflow_with_timer_round_trip() {
                 max_local_activity_start_to_close: Duration::from_secs(60),
                 shard_assignments: vec![autumn_harvest::types::ShardId::new(0)],
                 worker_heartbeat_interval: Duration::from_secs(5),
+                build_id: String::new(),
+                deployment_name: None,
             },
             Arc::new(HandlerRegistry::new(
                 vec![WorkflowInfo {
@@ -2033,7 +2430,7 @@ async fn wake_workflow_task_emits_notification() {
         .expect("enqueue should succeed");
 
     let queues = vec!["default".to_string()];
-    let claimed = queue::claim_task(&mut conn, &queues, "wake-test-worker")
+    let claimed = queue::claim_task(&mut conn, &queues, "wake-test-worker", "")
         .await
         .expect("claim should succeed")
         .expect("workflow task should be claimable");
@@ -2079,7 +2476,7 @@ async fn wake_workflow_task_does_not_requeue_active_running_task() {
         .await
         .expect("enqueue should succeed");
     let queues = vec!["default".to_string()];
-    let claimed = queue::claim_task(&mut conn, &queues, "active-worker")
+    let claimed = queue::claim_task(&mut conn, &queues, "active-worker", "")
         .await
         .expect("claim should succeed")
         .expect("workflow task should be claimable");
@@ -2119,19 +2516,25 @@ async fn reschedule_task_clears_stale_heartbeat_timestamp() {
         .await
         .expect("enqueue should succeed");
     let queues = vec!["default".to_string()];
-    let claimed = queue::claim_task(&mut conn, &queues, "retry-worker")
+    let claimed = queue::claim_task(&mut conn, &queues, "retry-worker", "")
         .await
         .expect("claim should succeed")
         .expect("activity task should be claimable");
     assert_eq!(claimed.id, task_id);
 
-    queue::record_heartbeat(&mut conn, task_id)
+    let checkpoint = serde_json::json!({"next_offset": 7});
+    queue::record_heartbeat(&mut conn, task_id, checkpoint.clone())
         .await
         .expect("record heartbeat should succeed");
     let heartbeating = load_task_from_url(&database_url, task_id).await;
     assert!(
         heartbeating.last_heartbeat_at.is_some(),
         "heartbeat should be recorded before reschedule"
+    );
+    assert_eq!(
+        heartbeating.heartbeat_details,
+        Some(checkpoint.clone()),
+        "heartbeat payload should be recorded before reschedule"
     );
 
     queue::reschedule_task(
@@ -2149,6 +2552,11 @@ async fn reschedule_task_clears_stale_heartbeat_timestamp() {
     assert!(
         task.last_heartbeat_at.is_none(),
         "rescheduling should clear stale heartbeat timestamps"
+    );
+    assert_eq!(
+        task.heartbeat_details,
+        Some(checkpoint),
+        "rescheduling should preserve checkpoint payload for the retry attempt"
     );
 }
 
@@ -2576,6 +2984,7 @@ async fn insert_named_workflow_execution(
         execution_timeout: None,
         memo: None,
         search_attrs: None,
+        assigned_build_id: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&row)
@@ -2610,7 +3019,7 @@ async fn claim_task_prefers_sticky_worker_within_window() {
         .expect("enqueue pinned task failed");
 
     let queues = vec!["default".to_string()];
-    let claimed = queue::claim_task(&mut conn, &queues, "sticky-worker")
+    let claimed = queue::claim_task(&mut conn, &queues, "sticky-worker", "")
         .await
         .expect("claim should succeed")
         .expect("sticky worker should get its pinned task");
@@ -2619,7 +3028,7 @@ async fn claim_task_prefers_sticky_worker_within_window() {
         "sticky worker should claim its pinned task ahead of the higher-priority free task",
     );
 
-    let claimed_other = queue::claim_task(&mut conn, &queues, "other-worker")
+    let claimed_other = queue::claim_task(&mut conn, &queues, "other-worker", "")
         .await
         .expect("second claim should succeed")
         .expect("other worker should pick up the free task");
@@ -2644,7 +3053,7 @@ async fn claim_task_excludes_other_workers_while_sticky_active() {
 
     let queues = vec!["default".to_string()];
     // Different worker must not steal a fresh sticky pin.
-    let claimed = queue::claim_task(&mut conn, &queues, "interloper")
+    let claimed = queue::claim_task(&mut conn, &queues, "interloper", "")
         .await
         .expect("claim should succeed");
     assert!(
@@ -2653,7 +3062,7 @@ async fn claim_task_excludes_other_workers_while_sticky_active() {
     );
 
     // The owner can still claim it.
-    let owner_claim = queue::claim_task(&mut conn, &queues, "owner-worker")
+    let owner_claim = queue::claim_task(&mut conn, &queues, "owner-worker", "")
         .await
         .expect("owner claim should succeed")
         .expect("owner should be able to claim its pinned task");
@@ -2682,7 +3091,7 @@ async fn claim_task_falls_back_to_any_worker_after_sticky_expires() {
     tokio::time::sleep(Duration::from_millis(800)).await;
 
     let queues = vec!["default".to_string()];
-    let claimed = queue::claim_task(&mut conn, &queues, "rescue-worker")
+    let claimed = queue::claim_task(&mut conn, &queues, "rescue-worker", "")
         .await
         .expect("claim should succeed")
         .expect("any worker may claim after sticky_until expires");
@@ -2725,7 +3134,7 @@ async fn claim_task_treats_expired_sticky_rows_like_unpinned_rows() {
         .expect("enqueue free task failed");
 
     let queues = vec!["default".to_string()];
-    let claimed = queue::claim_task(&mut conn, &queues, "rescue-worker")
+    let claimed = queue::claim_task(&mut conn, &queues, "rescue-worker", "")
         .await
         .expect("claim should succeed")
         .expect("one of the eligible tasks should be claimed");
@@ -2747,7 +3156,7 @@ async fn park_workflow_task_with_sticky_hint_pins_to_worker() {
         .await
         .expect("enqueue should succeed");
     let queues = vec!["default".to_string()];
-    let _claimed = queue::claim_task(&mut conn, &queues, "park-worker")
+    let _claimed = queue::claim_task(&mut conn, &queues, "park-worker", "")
         .await
         .expect("claim should succeed")
         .expect("row should be claimable");
@@ -2790,7 +3199,7 @@ async fn wake_workflow_task_refreshes_sticky_until() {
         .await
         .expect("enqueue should succeed");
     let queues = vec!["default".to_string()];
-    let _claimed = queue::claim_task(&mut conn, &queues, "wake-refresh-worker")
+    let _claimed = queue::claim_task(&mut conn, &queues, "wake-refresh-worker", "")
         .await
         .expect("claim should succeed");
     // Use a 5s window so both the park's sticky_until and the wake's refreshed
@@ -3534,17 +3943,17 @@ async fn concurrency_cap_limits_concurrent_claims_cluster_wide() {
             .expect("enqueue failed");
     }
 
-    let t1 = queue::claim_task(&mut conn, &queues, "worker-cc-1")
+    let t1 = queue::claim_task(&mut conn, &queues, "worker-cc-1", "")
         .await
         .expect("claim 1 query failed");
-    let t2 = queue::claim_task(&mut conn, &queues, "worker-cc-1")
+    let t2 = queue::claim_task(&mut conn, &queues, "worker-cc-1", "")
         .await
         .expect("claim 2 query failed");
     assert!(t1.is_some(), "first claim should succeed");
     assert!(t2.is_some(), "second claim should succeed");
 
     // Cap is now saturated — third claim must be deferred.
-    let t3 = queue::claim_task(&mut conn, &queues, "worker-cc-1")
+    let t3 = queue::claim_task(&mut conn, &queues, "worker-cc-1", "")
         .await
         .expect("claim 3 query failed");
     assert!(
@@ -3558,7 +3967,7 @@ async fn concurrency_cap_limits_concurrent_claims_cluster_wide() {
         .expect("complete_task failed");
 
     // Now a slot is free; one more task should be claimable.
-    let t4 = queue::claim_task(&mut conn, &queues, "worker-cc-1")
+    let t4 = queue::claim_task(&mut conn, &queues, "worker-cc-1", "")
         .await
         .expect("claim after complete query failed");
     assert!(
@@ -3610,7 +4019,7 @@ async fn concurrency_cap_shared_key_budget_is_not_doubled() {
     // Attempt to claim all 6; the shared budget of 3 should cap the total.
     let mut claimed = 0usize;
     for _ in 0..6 {
-        if queue::claim_task(&mut conn, &queues, "worker-sk-1")
+        if queue::claim_task(&mut conn, &queues, "worker-sk-1", "")
             .await
             .expect("claim query failed")
             .is_some()
@@ -3645,17 +4054,17 @@ async fn concurrency_cap_failure_frees_slot_and_does_not_wedge_queue() {
     }
 
     // Claim 2 (saturating the cap).
-    let t1 = queue::claim_task(&mut conn, &queues, "worker-fp-1")
+    let t1 = queue::claim_task(&mut conn, &queues, "worker-fp-1", "")
         .await
         .expect("claim 1 query failed")
         .expect("first task should be claimable");
-    let t2 = queue::claim_task(&mut conn, &queues, "worker-fp-1")
+    let t2 = queue::claim_task(&mut conn, &queues, "worker-fp-1", "")
         .await
         .expect("claim 2 query failed")
         .expect("second task should be claimable");
 
     // Cap is now saturated.
-    let t3 = queue::claim_task(&mut conn, &queues, "worker-fp-1")
+    let t3 = queue::claim_task(&mut conn, &queues, "worker-fp-1", "")
         .await
         .expect("claim 3 query failed");
     assert!(t3.is_none(), "cap must be saturated after 2 claims");
@@ -3669,10 +4078,10 @@ async fn concurrency_cap_failure_frees_slot_and_does_not_wedge_queue() {
         .expect("fail t2 failed");
 
     // The queue must not be wedged; the remaining pending tasks must be claimable.
-    let t4 = queue::claim_task(&mut conn, &queues, "worker-fp-1")
+    let t4 = queue::claim_task(&mut conn, &queues, "worker-fp-1", "")
         .await
         .expect("claim after fail query failed");
-    let t5 = queue::claim_task(&mut conn, &queues, "worker-fp-1")
+    let t5 = queue::claim_task(&mut conn, &queues, "worker-fp-1", "")
         .await
         .expect("claim 5 query failed");
     assert!(
@@ -3705,13 +4114,13 @@ async fn concurrency_cap_null_key_tasks_are_unaffected_by_saturated_key() {
             .await
             .expect("enqueue capped task failed");
         // Immediately claim each to put it in RUNNING state.
-        queue::claim_task(&mut conn, &queues, "worker-bc-1")
+        queue::claim_task(&mut conn, &queues, "worker-bc-1", "")
             .await
             .expect("claim capped task failed");
     }
 
     // Verify the key is saturated (third claim returns None).
-    let saturated_check = queue::claim_task(&mut conn, &queues, "worker-bc-1")
+    let saturated_check = queue::claim_task(&mut conn, &queues, "worker-bc-1", "")
         .await
         .expect("saturation check query failed");
     assert!(
@@ -3735,7 +4144,7 @@ async fn concurrency_cap_null_key_tasks_are_unaffected_by_saturated_key() {
     // is at its cap — the NULL check-path must not be constrained by other keys.
     let mut claimed = 0usize;
     for _ in 0..3 {
-        if queue::claim_task(&mut conn, &queues, "worker-bc-1")
+        if queue::claim_task(&mut conn, &queues, "worker-bc-1", "")
             .await
             .expect("uncapped claim query failed")
             .is_some()
@@ -3852,6 +4261,8 @@ async fn workflow_schedule_baseline_dispatches_multiple_runs() {
                 max_local_activity_start_to_close: Duration::from_secs(60),
                 shard_assignments: vec![autumn_harvest::types::ShardId::new(0)],
                 worker_heartbeat_interval: Duration::from_secs(5),
+                build_id: String::new(),
+                deployment_name: None,
             },
             Arc::clone(&registry),
         )
@@ -3945,6 +4356,8 @@ async fn workflow_schedule_max_active_runs_enforced() {
                 max_local_activity_start_to_close: Duration::from_secs(60),
                 shard_assignments: vec![autumn_harvest::types::ShardId::new(0)],
                 worker_heartbeat_interval: Duration::from_secs(5),
+                build_id: String::new(),
+                deployment_name: None,
             },
             Arc::clone(&registry),
         )
@@ -4026,6 +4439,8 @@ async fn workflow_schedule_pause_and_resume() {
                 max_local_activity_start_to_close: Duration::from_secs(60),
                 shard_assignments: vec![autumn_harvest::types::ShardId::new(0)],
                 worker_heartbeat_interval: Duration::from_secs(5),
+                build_id: String::new(),
+                deployment_name: None,
             },
             Arc::clone(&registry),
         )
@@ -4135,6 +4550,304 @@ async fn workflow_schedule_dag_only_deployment_unaffected() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Search-attribute lifecycle tests (issue #159, AC #11 and #12)
+// ---------------------------------------------------------------------------
+
+/// Workflow used by search-attribute tests.
+///
+/// - Immediately sets `phase=awaiting_approval`.
+/// - Suspends on a `charge` signal.
+/// - On receipt, overwrites `phase=charged`.
+/// - Completes.
+fn approval_search_attrs_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        ctx.upsert_search_attrs([(
+            "phase".to_string(),
+            Some(serde_json::json!("awaiting_approval")),
+        )])
+        .map_err(|e| e.to_string())?;
+
+        ctx.wait_for_signal("charge")
+            .await
+            .map_err(|e| e.to_string())?;
+
+        ctx.upsert_search_attrs([("phase".to_string(), Some(serde_json::json!("charged")))])
+            .map_err(|e| e.to_string())?;
+
+        Ok(serde_json::json!({"status": "charged"}))
+    })
+}
+
+/// Query `harvest_workflow_executions` rows whose `search_attrs` contains all
+/// key-value pairs in `predicate` (Postgres `@>` containment operator).
+async fn find_by_search_attrs(
+    database_url: &str,
+    predicate: serde_json::Value,
+) -> Vec<WorkflowExecution> {
+    use diesel::dsl::sql;
+    use diesel::sql_types::{Bool, Jsonb};
+
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(database_url)
+        .await
+        .expect("fresh connection for search_attrs query");
+
+    harvest_workflow_executions::table
+        .filter(sql::<Bool>("search_attrs @> ").bind::<Jsonb, _>(predicate))
+        .select(WorkflowExecution::as_select())
+        .load(&mut conn)
+        .await
+        .expect("search_attrs containment query failed")
+}
+
+/// AC #11 — mutable search-attribute lifecycle:
+///
+/// 1. Workflow starts with `tenant=acme`.
+/// 2. First execution cycle: `upsert_search_attrs` sets `phase=awaiting_approval`.
+/// 3. Workflow suspends on the `charge` signal.
+/// 4. DB query with `tenant=acme AND phase=awaiting_approval` finds the execution.
+/// 5. `charge` signal is delivered; second cycle sets `phase=charged`.
+/// 6. `phase=awaiting_approval` filter returns nothing; `phase=charged` filter finds it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn search_attrs_upsert_visible_after_update_and_filterable() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+        .await
+        .expect("connect to test DB");
+
+    let exec_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+
+    // Start the workflow with tenant=acme in initial search_attrs.
+    let start = start_or_load_workflow_execution(
+        &mut conn,
+        StartWorkflowParams {
+            workflow_name: "approval_search_attrs_workflow",
+            workflow_id: "acme-approval-001",
+            exec_id,
+            input: serde_json::json!({}),
+            parent_id: None,
+            queue_name: "default",
+            execution_timeout: None,
+            memo: None,
+            search_attrs: Some(serde_json::json!({"tenant": "acme"})),
+            reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
+            trace_context: None,
+        },
+    )
+    .await
+    .expect("start_or_load_workflow_execution failed");
+    assert!(start.created);
+
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![WorkflowInfo {
+            name: "approval_search_attrs_workflow",
+            module: "integration_e2e",
+            handler: approval_search_attrs_workflow,
+        }],
+        vec![],
+    ));
+    let worker = build_runtime_worker("worker-sa-lifecycle", 1, 1, registry);
+    let pool = build_test_pool(&database_url);
+    let handle = spawn_test_worker(Arc::clone(&worker), pool);
+
+    // Wait for the workflow to reach the signal-wait suspension (phase should
+    // now be awaiting_approval in the DB).
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let rows = find_by_search_attrs(
+                &database_url,
+                serde_json::json!({"tenant": "acme", "phase": "awaiting_approval"}),
+            )
+            .await;
+            if !rows.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("search_attrs should show phase=awaiting_approval within timeout");
+
+    // Confirm the old filter now has a hit.
+    let awaiting = find_by_search_attrs(
+        &database_url,
+        serde_json::json!({"tenant": "acme", "phase": "awaiting_approval"}),
+    )
+    .await;
+    assert_eq!(
+        awaiting.len(),
+        1,
+        "should find one execution awaiting approval"
+    );
+    assert_eq!(awaiting[0].id, exec_id.as_uuid());
+
+    // Confirm it is NOT yet in the charged filter.
+    let charged_before = find_by_search_attrs(
+        &database_url,
+        serde_json::json!({"tenant": "acme", "phase": "charged"}),
+    )
+    .await;
+    assert!(
+        charged_before.is_empty(),
+        "should not appear in charged filter before signal"
+    );
+
+    // Deliver the charge signal and wake the task.
+    autumn_harvest::signal::send_signal(&mut conn, exec_id, "charge", serde_json::json!({}))
+        .await
+        .expect("send_signal failed");
+    queue::wake_workflow_task(&mut conn, exec_id)
+        .await
+        .expect("wake_workflow_task failed");
+
+    // Wait for completion.
+    wait_for_execution_state(&database_url, exec_id, "COMPLETED").await;
+
+    worker.shutdown();
+    handle.await.expect("worker task should join");
+
+    // After completion: phase=awaiting_approval filter returns nothing.
+    let awaiting_after = find_by_search_attrs(
+        &database_url,
+        serde_json::json!({"tenant": "acme", "phase": "awaiting_approval"}),
+    )
+    .await;
+    assert!(
+        awaiting_after.is_empty(),
+        "awaiting_approval filter must be empty after phase update"
+    );
+
+    // phase=charged filter now finds the execution.
+    let charged_after = find_by_search_attrs(
+        &database_url,
+        serde_json::json!({"tenant": "acme", "phase": "charged"}),
+    )
+    .await;
+    assert_eq!(
+        charged_after.len(),
+        1,
+        "charged filter should find the execution after phase update"
+    );
+    assert_eq!(charged_after[0].id, exec_id.as_uuid());
+}
+
+/// AC #12 — search attributes survive a worker crash and resume:
+///
+/// 1. Worker runs the first cycle, sets `phase=awaiting_approval`, suspends.
+/// 2. Worker is shut down (simulating a crash).
+/// 3. A fresh query confirms the attribute is still in the DB.
+/// 4. A new worker picks up the task from where it left off.
+/// 5. Signal is delivered; workflow completes with `phase=charged` in the DB.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn search_attrs_survive_worker_crash_and_resume() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+        .await
+        .expect("connect to test DB");
+
+    let exec_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+
+    start_or_load_workflow_execution(
+        &mut conn,
+        StartWorkflowParams {
+            workflow_name: "approval_search_attrs_workflow",
+            workflow_id: "acme-crash-resume-001",
+            exec_id,
+            input: serde_json::json!({}),
+            parent_id: None,
+            queue_name: "default",
+            execution_timeout: None,
+            memo: None,
+            search_attrs: Some(serde_json::json!({"tenant": "acme"})),
+            reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
+            trace_context: None,
+        },
+    )
+    .await
+    .expect("start_or_load_workflow_execution failed");
+
+    let make_registry = || {
+        Arc::new(HandlerRegistry::new(
+            vec![WorkflowInfo {
+                name: "approval_search_attrs_workflow",
+                module: "integration_e2e",
+                handler: approval_search_attrs_workflow,
+            }],
+            vec![],
+        ))
+    };
+    let pool = build_test_pool(&database_url);
+
+    // --- First worker: run until phase=awaiting_approval is persisted ---
+    let worker1 = build_runtime_worker("worker-crash-1", 1, 1, make_registry());
+    let handle1 = spawn_test_worker(Arc::clone(&worker1), pool.clone());
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let rows = find_by_search_attrs(
+                &database_url,
+                serde_json::json!({"phase": "awaiting_approval"}),
+            )
+            .await;
+            if !rows.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("phase=awaiting_approval should be visible within timeout");
+
+    // Simulate crash: shut down the first worker.
+    worker1.shutdown();
+    handle1.await.expect("worker1 join");
+
+    // Confirm the attribute is durable after the crash.
+    let after_crash = find_by_search_attrs(
+        &database_url,
+        serde_json::json!({"tenant": "acme", "phase": "awaiting_approval"}),
+    )
+    .await;
+    assert_eq!(
+        after_crash.len(),
+        1,
+        "search_attrs must survive worker crash"
+    );
+
+    // --- Second worker: resume and complete ---
+    let worker2 = build_runtime_worker("worker-crash-2", 1, 1, make_registry());
+    let handle2 = spawn_test_worker(Arc::clone(&worker2), pool.clone());
+
+    // Wait for the task to be re-claimed by the new worker (sticky timeout
+    // elapses or the task is re-enqueued after the signal below).
+    autumn_harvest::signal::send_signal(&mut conn, exec_id, "charge", serde_json::json!({}))
+        .await
+        .expect("send_signal failed");
+    queue::wake_workflow_task(&mut conn, exec_id)
+        .await
+        .expect("wake_workflow_task failed");
+
+    wait_for_execution_state(&database_url, exec_id, "COMPLETED").await;
+
+    worker2.shutdown();
+    handle2.await.expect("worker2 join");
+
+    // Final check: phase=charged is now in the DB.
+    let final_state = find_by_search_attrs(
+        &database_url,
+        serde_json::json!({"tenant": "acme", "phase": "charged"}),
+    )
+    .await;
+    assert_eq!(
+        final_state.len(),
+        1,
+        "phase=charged must be set after resume and completion"
+    );
+}
+
 /// (e) Builder validation: scheduling an unregistered workflow name fails at
 /// `build()` with `HarvestBuilderError::UnknownWorkflowSchedule`.
 #[test]
@@ -4163,4 +4876,507 @@ fn workflow_schedule_builder_rejects_unregistered_workflow() {
         ),
         "expected UnknownWorkflowSchedule error, got: {result:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Worker drain controls (issue #170)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn drain_accepted_sets_status_to_draining() {
+    use autumn_harvest::workers::{DrainOutcome, register_worker, request_drain};
+
+    let (mut conn, _container) = setup_test_db().await;
+    let stale_threshold = Duration::from_secs(10);
+
+    register_worker(
+        &mut conn,
+        "w-drain-1",
+        &["default".to_string()],
+        &[0],
+        4,
+        "test-host",
+        None,
+        "",
+        None,
+    )
+    .await
+    .unwrap();
+
+    // Supply an explicit deadline; the default is computed by the HTTP handler
+    // layer, not request_drain itself. The integration test verifies the DB
+    // round-trip for a caller-supplied deadline.
+    let deadline = Utc::now() + chrono::Duration::minutes(1);
+    let resp = request_drain(
+        &mut conn,
+        "w-drain-1",
+        Some(deadline),
+        true,
+        stale_threshold,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        resp.outcome,
+        DrainOutcome::Accepted,
+        "first drain must be Accepted"
+    );
+    assert!(
+        resp.drain_deadline_at.is_some(),
+        "drain_deadline_at must be set when a deadline is supplied"
+    );
+    assert_eq!(resp.worker_id, "w-drain-1");
+    assert!(resp.unavailable_shards.is_empty());
+}
+
+#[tokio::test]
+async fn drain_already_draining_on_second_call() {
+    use autumn_harvest::workers::{DrainOutcome, register_worker, request_drain};
+
+    let (mut conn, _container) = setup_test_db().await;
+    let stale_threshold = Duration::from_secs(10);
+
+    register_worker(
+        &mut conn,
+        "w-drain-2",
+        &["default".to_string()],
+        &[],
+        2,
+        "test-host",
+        None,
+        "",
+        None,
+    )
+    .await
+    .unwrap();
+
+    let first_deadline = Utc::now() + chrono::Duration::minutes(1);
+    request_drain(
+        &mut conn,
+        "w-drain-2",
+        Some(first_deadline),
+        true,
+        stale_threshold,
+    )
+    .await
+    .unwrap();
+
+    // Re-drain with a new deadline — should return AlreadyDraining and
+    // persist the updated deadline (operators extending a drain window).
+    let new_deadline = Utc::now() + chrono::Duration::minutes(5);
+    let resp2 = request_drain(
+        &mut conn,
+        "w-drain-2",
+        Some(new_deadline),
+        true,
+        stale_threshold,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        resp2.outcome,
+        DrainOutcome::AlreadyDraining,
+        "second drain on already-draining worker must return AlreadyDraining"
+    );
+    // Deadline must reflect the refreshed value, not the original.
+    let stored = resp2.drain_deadline_at.expect("deadline must be echoed");
+    let diff = (stored - new_deadline).num_seconds().abs();
+    assert!(diff <= 2, "refreshed deadline differs by {diff}s");
+}
+
+#[tokio::test]
+async fn drain_already_stopped_after_transition() {
+    use autumn_harvest::workers::{
+        DrainOutcome, WorkerStatus, register_worker, request_drain, transition_status,
+    };
+
+    let (mut conn, _container) = setup_test_db().await;
+    let stale_threshold = Duration::from_secs(10);
+
+    register_worker(
+        &mut conn,
+        "w-drain-3",
+        &[],
+        &[],
+        1,
+        "test-host",
+        None,
+        "",
+        None,
+    )
+    .await
+    .unwrap();
+    transition_status(&mut conn, "w-drain-3", WorkerStatus::Stopped)
+        .await
+        .unwrap();
+
+    let resp = request_drain(&mut conn, "w-drain-3", None, false, stale_threshold)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.outcome,
+        DrainOutcome::AlreadyStopped,
+        "draining a stopped worker must return AlreadyStopped"
+    );
+}
+
+#[tokio::test]
+async fn drain_not_found_for_unknown_worker() {
+    use autumn_harvest::workers::request_drain;
+
+    let (mut conn, _container) = setup_test_db().await;
+    let stale_threshold = Duration::from_secs(10);
+
+    let resp = request_drain(&mut conn, "w-does-not-exist", None, false, stale_threshold)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.outcome,
+        autumn_harvest::workers::DrainOutcome::NotFound,
+        "unknown worker must return NotFound"
+    );
+}
+
+#[tokio::test]
+async fn drain_with_explicit_deadline_is_stored() {
+    use autumn_harvest::workers::{DrainOutcome, register_worker, request_drain};
+
+    let (mut conn, _container) = setup_test_db().await;
+    let stale_threshold = Duration::from_secs(10);
+
+    register_worker(
+        &mut conn,
+        "w-drain-deadline",
+        &[],
+        &[],
+        1,
+        "test-host",
+        None,
+        "",
+        None,
+    )
+    .await
+    .unwrap();
+
+    let explicit_deadline = Utc::now() + chrono::Duration::minutes(5);
+    let resp = request_drain(
+        &mut conn,
+        "w-drain-deadline",
+        Some(explicit_deadline),
+        true,
+        stale_threshold,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(resp.outcome, DrainOutcome::Accepted);
+    let stored = resp.drain_deadline_at.expect("deadline must be set");
+    let diff = (stored - explicit_deadline).num_seconds().abs();
+    assert!(diff <= 2, "stored deadline differs by {diff}s");
+}
+
+#[tokio::test]
+async fn drain_preview_returns_active_workers() {
+    use autumn_harvest::workers::{WorkerFilters, drain_preview, register_worker};
+
+    let (mut conn, _container) = setup_test_db().await;
+    let stale_threshold = Duration::from_secs(10);
+
+    for i in 0..3_u8 {
+        register_worker(
+            &mut conn,
+            &format!("w-preview-{i}"),
+            &["default".to_string()],
+            &[],
+            4,
+            "test-host",
+            None,
+            "",
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    let filters = WorkerFilters {
+        queue: Some("default".to_string()),
+        ..WorkerFilters::new()
+    };
+    let items = drain_preview(&mut conn, &filters, stale_threshold)
+        .await
+        .unwrap();
+
+    assert_eq!(items.len(), 3, "drain-preview should return all 3 workers");
+    for item in &items {
+        assert_eq!(item.status, "Active");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #227: typed activity failure surface — end-to-end fail-fast behavior
+// ---------------------------------------------------------------------------
+
+use autumn_harvest::failure::ActivityFailure;
+
+/// Activity handler that always fails with a typed `ActivityFailure` flagged
+/// `non_retryable`. Returned via the dispatch shim's typed JSON path.
+fn always_non_retryable_activity<'a>(
+    _ctx: &'a ActivityContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        // Manually encode through the same path the macro uses.
+        Err(
+            autumn_harvest::failure::IntoActivityErrorString::into_error_payload(
+                ActivityFailure::non_retryable("PermanentValidation", "amount must be positive"),
+            ),
+        )
+    })
+}
+
+/// Activity handler that always fails with a legacy plain `String` error.
+fn always_legacy_string_failure_activity<'a>(
+    _ctx: &'a ActivityContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move { Err("foo".to_string()) })
+}
+
+/// End-to-end fail-fast for a typed `ActivityFailure` flagged `non_retryable`:
+/// the activity must fail on attempt 1 (skipping the retry policy entirely),
+/// the `ActivityFailed` event in history must carry the structured
+/// `error_type` and `non_retryable` fields, and the workflow itself must
+/// reach `FAILED` because the workflow function propagates the activity
+/// error.
+///
+/// We deliberately do **not** assert on a `harvest_dead_letters` row: the
+/// worker no longer auto-inserts DLQ rows for activity failures because
+/// `dlq::replay_dead_letter` cannot meaningfully re-run them (the terminal
+/// `ActivityFailed` event makes `find_pending_scheduled_activity` reject
+/// the replayed task). Workflow-level visibility is preserved via the
+/// `ActivityFailed` + `WorkflowFailed` event pair.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
+async fn non_retryable_activity_fails_fast_on_attempt_one() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect to Postgres container");
+
+    let exec_id = insert_workflow_execution(&mut conn).await;
+    let workflow_input = serde_json::json!({"amount": -1});
+
+    let started_events = vec![WorkflowEvent::WorkflowStarted {
+        input: workflow_input.clone(),
+        timestamp: Utc::now(),
+    }];
+    store::append_events(&mut conn, exec_id, &started_events, 0)
+        .await
+        .expect("append WorkflowStarted failed");
+
+    let mut params = EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
+    params.workflow_exec_id = Some(exec_id.as_uuid());
+    params.scheduled_at = Utc::now() - chrono::Duration::seconds(5);
+    queue::enqueue(&mut conn, &params)
+        .await
+        .expect("enqueue workflow task failed");
+
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![WorkflowInfo {
+            name: "e2e_test_workflow",
+            module: "integration_e2e",
+            handler: workflow_with_activity,
+        }],
+        vec![ActivityInfo {
+            name: "send_email",
+            module: "integration_e2e",
+            // Retry policy says "try 5 times" — but ActivityFailure.non_retryable
+            // must win over the policy and route to DLQ on attempt 1.
+            default_retry_policy: Some(autumn_harvest::RetryPolicy::exponential(
+                5,
+                Duration::from_millis(10),
+            )),
+            default_start_to_close: None,
+            default_heartbeat_timeout: None,
+            default_schedule_to_start: None,
+            default_queue: Some("default"),
+            max_concurrent: None,
+            concurrency_key: None,
+            is_local: false,
+            handler: always_non_retryable_activity,
+        }],
+    ));
+
+    let worker = build_runtime_worker("worker-non-retryable", 1, 1, registry);
+    let pool = build_test_pool(&database_url);
+    let handle = spawn_test_worker(Arc::clone(&worker), pool);
+
+    let execution = wait_for_execution_state(&database_url, exec_id, "FAILED").await;
+    worker.shutdown();
+    handle.await.expect("worker task should join");
+
+    // 1. The ActivityFailed event in history carries the typed fields.
+    let history = load_history_from_url(&database_url, exec_id).await;
+    let activity_failed = history
+        .events
+        .iter()
+        .find_map(|ev| match ev {
+            WorkflowEvent::ActivityFailed {
+                error_type,
+                non_retryable,
+                attempt,
+                ..
+            } => Some((error_type.clone(), *non_retryable, *attempt)),
+            _ => None,
+        })
+        .expect("history must contain ActivityFailed");
+    assert_eq!(activity_failed.0, "PermanentValidation");
+    assert!(activity_failed.1, "non_retryable flag must be true");
+    assert_eq!(
+        activity_failed.2, 1,
+        "must fail on attempt 1 — retry policy ignored"
+    );
+
+    // 2. Exactly one ActivityFailed event — the retry policy did not fire.
+    let activity_failed_count = history
+        .events
+        .iter()
+        .filter(|ev| matches!(ev, WorkflowEvent::ActivityFailed { .. }))
+        .count();
+    assert_eq!(
+        activity_failed_count, 1,
+        "non_retryable activities must not retry; got {activity_failed_count} ActivityFailed events"
+    );
+
+    // 3. No DLQ row is created for the failed activity — see the doc comment
+    //    on this test for why. The workflow's failure is observable via the
+    //    `ActivityFailed` event and the trailing `WorkflowFailed` event.
+    let dlq_rows: Vec<autumn_harvest::models::DeadLetter> = {
+        use autumn_harvest::schema::harvest_dead_letters::dsl;
+        dsl::harvest_dead_letters
+            .filter(dsl::workflow_exec_id.eq(Some(exec_id.as_uuid())))
+            .select(autumn_harvest::models::DeadLetter::as_select())
+            .load(&mut conn)
+            .await
+            .expect("dlq query failed")
+    };
+    assert_eq!(
+        dlq_rows.len(),
+        0,
+        "activity retry exhaustion must not auto-insert a DLQ row (those rows are not replayable)"
+    );
+
+    // 4. The workflow ultimately failed (the workflow function propagated the
+    //    activity error). Belt-and-braces check on execution state.
+    assert_eq!(execution.state, "FAILED");
+}
+
+/// Back-compat mirror: an activity returning a legacy `Err("foo")` short-
+/// circuits retries when `RetryPolicy::non_retryable_errors` contains `"foo"`,
+/// exactly as before #227. Confirms the legacy resolution path is still
+/// wired through the new `Option<&str>` signature on
+/// `RetryPolicy::is_non_retryable`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
+async fn legacy_string_failure_in_non_retryable_errors_fails_fast() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect to Postgres container");
+
+    let exec_id = insert_workflow_execution(&mut conn).await;
+    let workflow_input = serde_json::json!({});
+
+    let started_events = vec![WorkflowEvent::WorkflowStarted {
+        input: workflow_input.clone(),
+        timestamp: Utc::now(),
+    }];
+    store::append_events(&mut conn, exec_id, &started_events, 0)
+        .await
+        .expect("append WorkflowStarted failed");
+
+    let mut params = EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
+    params.workflow_exec_id = Some(exec_id.as_uuid());
+    params.scheduled_at = Utc::now() - chrono::Duration::seconds(5);
+    queue::enqueue(&mut conn, &params)
+        .await
+        .expect("enqueue workflow task failed");
+
+    let mut retry = autumn_harvest::RetryPolicy::exponential(5, Duration::from_millis(10));
+    retry.non_retryable_errors = vec!["foo".to_string()];
+
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![WorkflowInfo {
+            name: "e2e_test_workflow",
+            module: "integration_e2e",
+            handler: workflow_with_activity,
+        }],
+        vec![ActivityInfo {
+            name: "send_email",
+            module: "integration_e2e",
+            default_retry_policy: Some(retry),
+            default_start_to_close: None,
+            default_heartbeat_timeout: None,
+            default_schedule_to_start: None,
+            default_queue: Some("default"),
+            max_concurrent: None,
+            concurrency_key: None,
+            is_local: false,
+            handler: always_legacy_string_failure_activity,
+        }],
+    ));
+
+    let worker = build_runtime_worker("worker-legacy-non-retry", 1, 1, registry);
+    let pool = build_test_pool(&database_url);
+    let handle = spawn_test_worker(Arc::clone(&worker), pool);
+
+    let execution = wait_for_execution_state(&database_url, exec_id, "FAILED").await;
+    worker.shutdown();
+    handle.await.expect("worker task should join");
+
+    // Exactly one ActivityFailed event — the legacy non_retryable_errors match
+    // short-circuited the retry policy on attempt 1, matching the pre-#227 path.
+    let history = load_history_from_url(&database_url, exec_id).await;
+    let activity_failed_events: Vec<_> = history
+        .events
+        .iter()
+        .filter_map(|ev| match ev {
+            WorkflowEvent::ActivityFailed {
+                error_type,
+                non_retryable,
+                attempt,
+                error,
+                ..
+            } => Some((error_type.clone(), *non_retryable, *attempt, error.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(activity_failed_events.len(), 1);
+    let (etype, non_retryable, attempt, error) = &activity_failed_events[0];
+    // Plain-string errors deserialize through serde defaults → "Error" / false.
+    assert_eq!(etype, "Error");
+    assert!(
+        !non_retryable,
+        "legacy errors carry non_retryable=false; the engine uses the policy match instead"
+    );
+    assert_eq!(*attempt, 1);
+    assert_eq!(error, "foo");
+
+    // No DLQ row for the failed activity — see note on
+    // `non_retryable_activity_fails_fast_on_attempt_one`.
+    let dlq_rows: Vec<autumn_harvest::models::DeadLetter> = {
+        use autumn_harvest::schema::harvest_dead_letters::dsl;
+        dsl::harvest_dead_letters
+            .filter(dsl::workflow_exec_id.eq(Some(exec_id.as_uuid())))
+            .select(autumn_harvest::models::DeadLetter::as_select())
+            .load(&mut conn)
+            .await
+            .expect("dlq query failed")
+    };
+    assert_eq!(dlq_rows.len(), 0);
+    assert_eq!(execution.state, "FAILED");
 }

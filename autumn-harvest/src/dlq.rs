@@ -19,7 +19,8 @@ use crate::models::{DeadLetter, NewDeadLetter};
 use crate::queue::{EnqueueParams, TaskType};
 
 pub const DEFAULT_BULK_LIMIT: u32 = 100;
-const MAX_BULK_LIMIT: u32 = 1000;
+/// Maximum number of DLQ rows a single bulk operation can act on.
+pub const MAX_BULK_LIMIT: u32 = 1000;
 
 /// Filter for bulk DLQ operations.
 ///
@@ -92,6 +93,28 @@ pub struct BulkDlqResult {
     pub dry_run: bool,
     /// Per-row failures that did not roll back other rows.
     pub failures: Vec<BulkDlqFailure>,
+}
+
+/// Typed dead-letter reason for engine-authored DLQ entries.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type")]
+pub enum DeadLetterReason {
+    /// Workflow history reached the operator-configured hard cap without
+    /// author code explicitly rotating via `continue_as_new`.
+    HistoryCapExceeded {
+        count: u64,
+        cap: u64,
+        workflow_type: String,
+    },
+}
+
+impl std::fmt::Display for DeadLetterReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match serde_json::to_string(self) {
+            Ok(json) => f.write_str(&json),
+            Err(_) => f.write_str("DeadLetterReasonSerializationFailed"),
+        }
+    }
 }
 
 fn dead_letter_task_type(dead_letter_id: Uuid, task_type: &str) -> HarvestResult<TaskType> {
@@ -249,6 +272,20 @@ pub async fn replay_dead_letter(
             params.activity_name = entry.activity_name;
             params.max_attempts = entry.attempts.max(1);
 
+            // Restore required_build_id from the owning execution so the
+            // replayed task is only claimable by a compatible worker build.
+            if let Some(exec_id) = params.workflow_exec_id {
+                use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
+                let build_id: Option<Option<String>> = exec_dsl::harvest_workflow_executions
+                    .find(exec_id)
+                    .select(exec_dsl::assigned_build_id)
+                    .first(conn)
+                    .await
+                    .optional()
+                    .map_err(crate::error::database_error)?;
+                params.required_build_id = build_id.flatten();
+            }
+
             let task_id = crate::queue::enqueue(conn, &params).await?;
             let deleted = diesel::delete(dsl::harvest_dead_letters.find(dead_letter_id))
                 .execute(conn)
@@ -385,8 +422,8 @@ pub async fn bulk_replay_dead_letters(
 
     let mut acted_on = 0usize;
     let mut skipped = 0usize;
-    let mut acted_ids: Vec<String> = Vec::new();
-    let mut failures: Vec<BulkDlqFailure> = Vec::new();
+    let mut acted_ids: Vec<String> = Vec::with_capacity(rows.len());
+    let mut failures: Vec<BulkDlqFailure> = Vec::with_capacity(rows.len());
 
     for row in &rows {
         match replay_dead_letter(conn, row.id).await {
@@ -449,8 +486,8 @@ pub async fn bulk_discard_dead_letters(
 
     let mut acted_on = 0usize;
     let mut skipped = 0usize;
-    let mut acted_ids: Vec<String> = Vec::new();
-    let mut failures: Vec<BulkDlqFailure> = Vec::new();
+    let mut acted_ids: Vec<String> = Vec::with_capacity(rows.len());
+    let mut failures: Vec<BulkDlqFailure> = Vec::with_capacity(rows.len());
 
     for row in &rows {
         match diesel::delete(dsl::harvest_dead_letters.find(row.id))
@@ -539,6 +576,22 @@ mod tests {
         assert!(
             matches!(error, HarvestError::Config(message) if message.contains("invalid task_type"))
         );
+    }
+
+    #[test]
+    fn dead_letter_reason_history_cap_is_typed_json() {
+        let reason = DeadLetterReason::HistoryCapExceeded {
+            count: 12_001,
+            cap: 12_000,
+            workflow_type: "billing_poll".into(),
+        };
+
+        let json = reason.to_string();
+        let back: DeadLetterReason =
+            serde_json::from_str(&json).expect("typed reason should deserialize");
+
+        assert_eq!(back, reason);
+        assert!(json.contains("HistoryCapExceeded"));
     }
 
     #[test]

@@ -208,6 +208,9 @@ impl WorkflowSimulator {
                                 activity_id,
                                 error: err,
                                 attempt: 1,
+                                error_type: "Error".into(),
+                                non_retryable: false,
+                                details: None,
                             });
                         }
                     }

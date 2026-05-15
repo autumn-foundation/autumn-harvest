@@ -610,6 +610,192 @@ pub enum WorkflowIdReusePolicy {
     TerminateIfRunning,
 }
 
+// ---------------------------------------------------------------------------
+// IdempotencyKey
+// ---------------------------------------------------------------------------
+
+/// A stable, deterministic idempotency key for a single logical activity
+/// invocation.
+///
+/// The key is derived from the `ActivityExecId` recorded in the
+/// `ActivityScheduled` (or `LocalActivityScheduled`) event the first time the
+/// activity is dispatched.  Because that event is part of the durable history,
+/// the key is identical across:
+///
+/// - worker restarts
+/// - duplicate task-queue dispatch
+/// - deterministic replay
+/// - every retry attempt for the same logical invocation
+///
+/// Two distinct activity invocations in the same workflow execution receive
+/// distinct keys, even when they call the same activity with the same input.
+///
+/// ## Subkeys
+///
+/// Use [`subkey`](Self::subkey) to derive a named child key when one activity
+/// must produce multiple distinct side effects (e.g. charge + notify).
+/// Subkeys are stable and collision-resistant within their parent.
+///
+/// ## HTTP-header safety
+///
+/// Both base keys and subkeys contain only printable ASCII characters and are
+/// safe to use as the value of an `Idempotency-Key` HTTP request header.
+///
+/// ## Example
+///
+/// ```rust
+/// use autumn_harvest::types::{ActivityExecId, IdempotencyKey};
+///
+/// // In production the engine sets this on ActivityContext for you.
+/// let id = ActivityExecId::new();
+/// let key = IdempotencyKey::from_activity_exec_id(id);
+///
+/// // Pass the base key to a payment gateway or email provider.
+/// let _charge_key: &str = key.as_str();
+///
+/// // Derive a subkey for a second outbound call within the same activity.
+/// let notify_key = key.subkey("notify");
+/// assert_ne!(key.as_str(), notify_key.as_str());
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct IdempotencyKey {
+    base: String,
+}
+
+impl IdempotencyKey {
+    /// Build an `IdempotencyKey` from the stable `ActivityExecId` for this
+    /// logical activity invocation.
+    #[must_use]
+    pub fn from_activity_exec_id(id: ActivityExecId) -> Self {
+        Self {
+            base: id.as_uuid().to_string(),
+        }
+    }
+
+    /// The key as a string slice — safe to pass directly as an
+    /// `Idempotency-Key` HTTP header value.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.base
+    }
+
+    /// Derive a stable named subkey for a secondary outbound call within the
+    /// same activity.
+    ///
+    /// `name` should be a short, stable identifier (e.g. `"charge"`,
+    /// `"notify"`, `"provision"`).  Distinct names always produce distinct
+    /// subkeys.  The same `(parent_key, name)` pair always produces the same
+    /// subkey, making it safe to use in retry loops.
+    ///
+    /// Subkeys are themselves `IdempotencyKey` values so they can be further
+    /// nested if necessary.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `name` is empty, contains `/`, or contains any character that
+    /// is not printable ASCII (byte range `0x21`–`0x7E`).  Subkey names are
+    /// programmer-provided constants; a panic surfaces the mistake immediately
+    /// rather than silently producing a malformed or colliding key.
+    #[must_use]
+    pub fn subkey(&self, name: &str) -> Self {
+        assert!(
+            !name.is_empty() && name.bytes().all(|b| b > b' ' && b < b'\x7f' && b != b'/'),
+            "IdempotencyKey::subkey: name must be non-empty printable ASCII without '/'; got {name:?}"
+        );
+        Self {
+            base: format!("{}/{name}", self.base),
+        }
+    }
+}
+
+impl fmt::Display for IdempotencyKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.base)
+    }
+}
+
+// ── BuildId ───────────────────────────────────────────────────────────────────
+
+/// Immutable build identifier advertised by a worker process.
+///
+/// Operators choose a stable string for each deployable binary (e.g. a Git SHA,
+/// a semantic version, or a CI job ID). Harvest uses this to ensure in-flight
+/// workflow executions are only resumed by workers running a compatible build.
+///
+/// The empty string `""` is the **legacy sentinel**: workers that pre-date
+/// build routing (or operators who have not opted in) advertise an empty
+/// `BuildId` and retain the ability to claim any task regardless of the task's
+/// `required_build_id`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct BuildId(String);
+
+impl BuildId {
+    /// Create a new `BuildId` from any string-like value.
+    #[must_use]
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    /// The legacy sentinel used by workers that pre-date build routing.
+    ///
+    /// Legacy workers advertise an empty build id and are allowed to claim any
+    /// task, including those with an explicit `required_build_id`. This
+    /// preserves backward compatibility for operators who have not yet adopted
+    /// build-aware routing.
+    #[must_use]
+    pub const fn legacy() -> Self {
+        Self(String::new())
+    }
+
+    /// Returns `true` when this is the legacy empty-string sentinel.
+    #[must_use]
+    pub const fn is_legacy(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Returns the underlying string slice.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for BuildId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+// ── DeploymentName ────────────────────────────────────────────────────────────
+
+/// Optional human-readable deployment name for a worker (e.g. `"prod-blue"`).
+///
+/// Deployment names are purely for operator observability — Harvest does not
+/// use them for routing decisions. They are stored alongside `BuildId` in the
+/// fleet table and surfaced in worker list/detail responses.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct DeploymentName(String);
+
+impl DeploymentName {
+    /// Create a new `DeploymentName`.
+    #[must_use]
+    pub fn new(name: impl Into<String>) -> Self {
+        Self(name.into())
+    }
+
+    /// Returns the underlying string slice.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for DeploymentName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -721,5 +907,20 @@ mod tests {
         assert!(invalid_uuid.parse::<ExecutionId>().is_err());
         assert!(invalid_uuid.parse::<ActivityExecId>().is_err());
         assert!(invalid_uuid.parse::<ExternalActivityToken>().is_err());
+    }
+
+    #[test]
+    fn build_id_legacy_sentinel() {
+        let legacy = BuildId::legacy();
+        assert!(legacy.is_legacy());
+        assert!(!BuildId::new("v1").is_legacy());
+    }
+
+    #[test]
+    fn deployment_name_round_trip() {
+        let n = DeploymentName::new("canary");
+        let json = serde_json::to_string(&n).unwrap();
+        let back: DeploymentName = serde_json::from_str(&json).unwrap();
+        assert_eq!(n, back);
     }
 }

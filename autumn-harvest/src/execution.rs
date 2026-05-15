@@ -14,6 +14,7 @@ use diesel_async::RunQueryDsl;
 use scoped_futures::ScopedFutureExt;
 use uuid::Uuid;
 
+use crate::build_routing;
 use crate::error::{HarvestError, HarvestResult, database_error};
 use crate::event::WorkflowEvent;
 use crate::models::{NewWorkflowExecution, WorkflowExecution};
@@ -181,6 +182,11 @@ pub async fn start_or_load_workflow_execution(
         }
     }
 
+    // Look up the active build policy for this queue. If a policy exists, new
+    // executions are stamped with its build_id so workers can enforce routing.
+    let policy = build_routing::get_build_policy(conn, request.queue_name).await?;
+    let assigned_build = policy.map(|p| p.build_id);
+
     let row = NewWorkflowExecution {
         id: exec_id.as_uuid(),
         workflow_name: request.workflow_name,
@@ -193,6 +199,7 @@ pub async fn start_or_load_workflow_execution(
         execution_timeout: request.execution_timeout,
         memo: request.memo.clone(),
         search_attrs: request.search_attrs.clone(),
+        assigned_build_id: assigned_build.clone(),
     };
     let mut enqueue = EnqueueParams::new(
         request.queue_name.to_owned(),
@@ -200,8 +207,9 @@ pub async fn start_or_load_workflow_execution(
         request.input.clone(),
     );
     enqueue.workflow_exec_id = Some(exec_id.as_uuid());
+    enqueue.required_build_id = assigned_build.clone();
     // ADR-0001 §3: store the caller's trace context so the worker can restore it.
-    enqueue.trace_context = request.trace_context.clone();
+    enqueue.trace_context.clone_from(&request.trace_context);
 
     conn.transaction::<StartedWorkflowExecution, HarvestError, _>(|conn| {
         let row = row;
@@ -211,8 +219,9 @@ pub async fn start_or_load_workflow_execution(
             // `on_conflict_do_nothing()` (no explicit target) lets Postgres
             // arbitrate against the partial unique index installed by the
             // continue-as-new migration, which only enforces uniqueness on
-            // rows whose state is not `CONTINUED_AS_NEW`. A previously sealed
-            // continue-as-new chain therefore does not block reusing the same
+            // rows whose state is not sealed (`CONTINUED_AS_NEW` or
+            // `TERMINATED`). A previously sealed continue-as-new chain or reset
+            // source therefore does not block reusing the same
             // (workflow_name, workflow_id).
             let inserted = diesel::insert_into(harvest_workflow_executions::table)
                 .values(&row)
@@ -298,7 +307,7 @@ async fn replace_execution(
     request: &StartWorkflowParams<'_>,
 ) -> HarvestResult<StartedWorkflowExecution> {
     // Seal the prior execution row as CONTINUED_AS_NEW. This removes it from
-    // the partial unique index scope (WHERE state != 'CONTINUED_AS_NEW'),
+    // the partial unique index scope (WHERE state NOT IN sealed states),
     // allowing the new row to be inserted without violating the constraint.
     diesel::update(harvest_workflow_executions::table.find(existing.id))
         .set((
@@ -556,7 +565,7 @@ async fn try_load_by_key(
     harvest_workflow_executions::table
         .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
         .filter(harvest_workflow_executions::workflow_id.eq(workflow_id))
-        .filter(harvest_workflow_executions::state.ne("CONTINUED_AS_NEW"))
+        .filter(harvest_workflow_executions::state.ne_all(["CONTINUED_AS_NEW", "TERMINATED"]))
         .select(WorkflowExecution::as_select())
         .first(conn)
         .await
@@ -574,7 +583,7 @@ async fn load_workflow_execution_by_key_for_update(
     harvest_workflow_executions::table
         .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
         .filter(harvest_workflow_executions::workflow_id.eq(workflow_id))
-        .filter(harvest_workflow_executions::state.ne("CONTINUED_AS_NEW"))
+        .filter(harvest_workflow_executions::state.ne_all(["CONTINUED_AS_NEW", "TERMINATED"]))
         .select(WorkflowExecution::as_select())
         .for_update()
         .first(conn)

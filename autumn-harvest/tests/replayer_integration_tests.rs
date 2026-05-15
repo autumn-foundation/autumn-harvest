@@ -38,6 +38,8 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../migrations/20260424000001_harvest_trace_context/up.sql"),
     "\n",
+    include_str!("../migrations/20260505000000_harvest_heartbeat_details/up.sql"),
+    "\n",
     include_str!("../migrations/20260427000000_harvest_continue_as_new/up.sql"),
     "\n",
     include_str!("../migrations/20260429000000_harvest_concurrency_key/up.sql"),
@@ -45,6 +47,14 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260430000000_harvest_workflow_schedules/up.sql"),
     "\n",
     include_str!("../migrations/20260430000001_harvest_external_tasks/up.sql"),
+    "\n",
+    include_str!("../migrations/20260508000000_harvest_external_task_updated_at/up.sql"),
+    "\n",
+    include_str!("../migrations/20260501000000_harvest_workers/up.sql"),
+    "\n",
+    include_str!("../migrations/20260509000000_harvest_build_routing/up.sql"),
+    "\n",
+    include_str!("../migrations/20260513000000_harvest_schedule_pause_metadata/up.sql"),
 );
 
 // ---------------------------------------------------------------------------
@@ -89,6 +99,7 @@ async fn insert_execution(conn: &mut AsyncPgConnection, exec_id: ExecutionId, na
         execution_timeout: None,
         memo: None,
         search_attrs: None,
+        assigned_build_id: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&row)

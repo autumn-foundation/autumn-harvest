@@ -14,7 +14,9 @@ use std::time::Duration;
 use serde_json::Value;
 use tracing::Instrument;
 
-use crate::context::{SharedState, WorkflowCommand, WorkflowContext, empty_shared_state};
+use crate::context::{
+    SharedState, WorkflowCommand, WorkflowContext, WorkflowHistoryPolicy, empty_shared_state,
+};
 use crate::event::WorkflowEvent;
 use crate::info::WorkflowHandlerFn;
 use crate::telemetry::{
@@ -129,7 +131,11 @@ pub async fn run_workflow_strict(
                                 expected <end of history>, got <workflow returned early>"
                             .to_string(),
                     }
-                } else if !ctx.drain_commands().is_empty() {
+                } else if ctx.drain_commands().into_iter().any(|cmd| {
+                    // UpsertSearchAttributes is pure metadata and does not
+                    // affect replay determinism; exclude it from this check.
+                    !matches!(cmd, WorkflowCommand::UpsertSearchAttributes { .. })
+                }) {
                     // New commands emitted after history was fully consumed (e.g. a
                     // newly-added version() or side_effect() call on an old history).
                     WorkflowOutcome::Failed {
@@ -181,7 +187,35 @@ pub async fn run_workflow_with_state(
     state: SharedState,
     span_meta: Option<&WorkflowExecuteSpanMeta>,
 ) -> (WorkflowOutcome, Vec<WorkflowCommand>, tracing::Span) {
-    let ctx = WorkflowContext::for_replay_with_state(exec_id, history, state);
+    run_workflow_with_state_and_history_policy(
+        exec_id,
+        history,
+        handler,
+        input,
+        state,
+        WorkflowHistoryPolicy::default(),
+        span_meta,
+    )
+    .await
+}
+
+/// Like [`run_workflow_with_state`] but installs explicit history guardrails
+/// into the [`WorkflowContext`].
+pub async fn run_workflow_with_state_and_history_policy(
+    exec_id: ExecutionId,
+    history: Vec<WorkflowEvent>,
+    handler: WorkflowHandlerFn,
+    input: Value,
+    state: SharedState,
+    history_policy: WorkflowHistoryPolicy,
+    span_meta: Option<&WorkflowExecuteSpanMeta>,
+) -> (WorkflowOutcome, Vec<WorkflowCommand>, tracing::Span) {
+    let ctx = WorkflowContext::for_replay_with_state_and_history_policy(
+        exec_id,
+        history,
+        state,
+        history_policy,
+    );
 
     // ADR-0001 §2.1: emit harvest.workflow.execute for every executor cycle.
     // harvest.replay defaults to false at span creation so subscribers that only
@@ -239,16 +273,16 @@ pub async fn run_workflow_with_state(
                 let mut commands = ctx.drain_commands();
                 // ContinueAsNew is terminal: when the workflow body parks on
                 // the dedicated suspension future, the latest command in the
-                // drain is the ContinueAsNew the user requested. Any commands
-                // earlier in the drain (e.g. RecordMarker for `version()` or
-                // `side_effect`) are intentionally discarded — they describe
-                // bookkeeping for an execution that is about to be sealed.
+                // drain is the ContinueAsNew the user requested. Bookkeeping
+                // commands earlier in the drain (e.g. RecordMarker, side_effect)
+                // are returned as pending_cmds so the worker can still apply
+                // any UpsertSearchAttributes patches before sealing the execution.
                 if let Some(idx) = commands
                     .iter()
                     .rposition(|cmd| matches!(cmd, WorkflowCommand::ContinueAsNew { .. }))
                     && let WorkflowCommand::ContinueAsNew { input } = commands.swap_remove(idx)
                 {
-                    return (WorkflowOutcome::ContinuedAsNew { input }, vec![]);
+                    return (WorkflowOutcome::ContinuedAsNew { input }, commands);
                 }
                 (WorkflowOutcome::Suspended { commands }, vec![])
             }

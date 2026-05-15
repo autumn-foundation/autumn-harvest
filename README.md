@@ -23,6 +23,10 @@ the same shape with one fewer service to operate.
 
 Try it end-to-end: `cargo run -p quickstart` (see [`examples/quickstart/`](examples/quickstart/)).
 
+For a chapter-by-chapter walkthrough — first workflow, durable timers, signals,
+child workflows, idempotency, and operating the service — read
+[`docs/getting-started/`](docs/getting-started/).
+
 Need a real reference instead of the tiny hello-world path? See:
 
 - [`examples/billing-autumn-web/`](examples/billing-autumn-web/) for a full Autumn web billing
@@ -74,6 +78,98 @@ async fn main() {
 }
 ```
 
+## Request/response embedding
+
+For short workflows behind an HTTP route, the plugin installs a shard-aware
+`WorkflowHandleClient` into `AppState`. Start the workflow through the normal
+storage pool, keep the returned handle, and await the terminal JSON result:
+
+```rust
+let started = workflow_handle_client
+    .start_or_load(&mut conn, start_params)
+    .await?;
+
+let result = started.handle.result_raw().await?;
+```
+
+`result_raw()` blocks on Postgres LISTEN/NOTIFY wakeups from the event log, not
+sleep polling. Successful workflows return their `output`; failed, cancelled,
+timed-out, and terminated workflows return typed `HarvestError` variants.
+
+Avoid the old polling anti-pattern of repeatedly calling
+`GET /api/harvest/workflows/{id}` and scanning the returned full event history
+for terminal events. That endpoint is for inspection. For HTTP clients that
+already know an execution ID, use
+`GET /api/harvest/workflows/{id}/result?wait=5s` instead. It returns only the
+compact terminal body with `state`, `output`/`error`, and `completed_at`, or
+`204 No Content` with `Retry-After` while the workflow is still running.
+
+## Long-running workflows
+
+Every workflow replay loads its durable event history. For pollers, monitors,
+and other workflows that may run for weeks, keep that history bounded by
+tail-calling `continue_as_new` once the loaded event count grows past the
+configured soft threshold:
+
+```rust
+use autumn_harvest::prelude::*;
+
+#[workflow]
+async fn polling_loop(ctx: &WorkflowContext, mut state: serde_json::Value)
+    -> HarvestResult<serde_json::Value>
+{
+    loop {
+        let cycle = state["cycle"].as_u64().unwrap_or(0);
+        let result = ctx
+            .execute_activity_raw("poll_remote_system", state.clone(), "pollers")
+            .await?;
+
+        if result["done"].as_bool().unwrap_or(false) {
+            return Ok(result);
+        }
+
+        let next_state = serde_json::json!({
+            "cycle": cycle + 1,
+            "cursor": result.get("next_cursor").cloned(),
+        });
+
+        if ctx.should_continue_as_new() {
+            ctx.continue_as_new(next_state).await?;
+        }
+
+        let timer_id = format!("poll-delay-{cycle}");
+        ctx.timer(&timer_id, 60).await?;
+        state = next_state;
+    }
+}
+```
+
+`ctx.history_event_count()` reports the number of loaded durable history events.
+`ctx.should_continue_as_new()` turns true once that count exceeds the
+`HarvestBuilder::history_continue_as_new_threshold(...)` soft threshold. The
+default threshold is `10_000` events.
+
+```rust
+let harvest = HarvestBuilder::new()
+    .workflows(workflows![polling_loop])
+    .history_continue_as_new_threshold(5_000)
+    .history_event_hard_cap(20_000)
+    .try_build()?;
+```
+
+The optional hard cap is a last-resort guardrail. If an execution reaches
+`history_event_hard_cap` and the workflow does not issue `continue_as_new`, the
+worker fails the execution and moves it to the DLQ with a typed
+`HistoryCapExceeded { count, cap, workflow_type }` reason. No new workflow event
+variant is used for this guardrail.
+
+Harvest emits `harvest.workflow.history_size` for terminal executions and
+`harvest.workflow.continue_as_new` when a workflow rotates. Both metrics use
+only the workflow type label to keep cardinality boring in the useful way.
+
+See [`autumn-harvest/examples/long_running.rs`](autumn-harvest/examples/long_running.rs)
+for a compile-checked polling loop that works with and without the `db` feature.
+
 ## What you get
 
 - **Event-sourced execution.** Workflows are deterministic functions; their
@@ -81,6 +177,9 @@ async fn main() {
   up at the same state.
 - **Activities with retries.** Side effects live in `#[activity]` functions
   with configurable `start_to_close`, `heartbeat_timeout`, and `retry` policies.
+  Activities are **at-least-once**: a worker crash or timeout will trigger a
+  retry. Use `ctx.idempotency_key()` (see below) to make downstream calls safe
+  to retry without duplicate charges or duplicate emails.
 - **Per-activity concurrency caps.** Declare `max_concurrent = N` on an
   activity to enforce a cluster-wide cap without spinning up dedicated worker
   processes. Activities sharing a rate-limited dependency can share a budget
@@ -130,6 +229,7 @@ runtime-owned behavior stay behind the same API surface your service exposes.
 
 ```bash
 cargo run -p autumn-harvest-cli -- health
+cargo run -p autumn-harvest-cli -- preflight
 cargo run -p autumn-harvest-cli -- workflow list --limit 25
 cargo run -p autumn-harvest-cli -- workflow list --state RUNNING --search-attr tenant=acme
 cargo run -p autumn-harvest-cli -- workflow get <execution-id>
@@ -137,6 +237,9 @@ cargo run -p autumn-harvest-cli -- workflow start approval_workflow --input-json
 cargo run -p autumn-harvest-cli -- workflow signal <execution-id> approved --payload-json '{"approved":true}'
 cargo run -p autumn-harvest-cli -- workflow query <execution-id> status
 cargo run -p autumn-harvest-cli -- workflow cancel <execution-id> --reason "operator request"
+cargo run -p autumn-harvest-cli -- workflow stack <execution-id>
+cargo run -p autumn-harvest-cli -- workflow children <execution-id> --status Failed
+cargo run -p autumn-harvest-cli -- workflow reset <execution-id> --to-event 42 --reason "bad deploy recovery" --operator-id mark
 cargo run -p autumn-harvest-cli -- dag list
 cargo run -p autumn-harvest-cli -- dag trigger daily_pipeline --conf-json '{"date":"2026-04-21"}'
 cargo run -p autumn-harvest-cli -- dag pause daily_pipeline
@@ -156,6 +259,46 @@ a bearer token. Successful responses are printed as pretty JSON by default; use
 `--output json` for compact script-friendly output. JSON request payloads accept
 inline `--*-json` values or `--*-file PATH`; use `-` as the file path to read
 from stdin.
+
+### Deployment preflight
+
+Run preflight before promoting a Harvest-backed service:
+
+```bash
+cargo run -p autumn-harvest-cli -- --base-url http://localhost:3000/api/harvest preflight
+cargo run -p autumn-harvest-cli -- --base-url http://localhost:3000/api/harvest --output json preflight
+```
+
+`harvest preflight` calls `GET /api/harvest/admin/preflight` and performs only
+read-only checks. It reports API/runtime readiness, Harvest migrations on every
+configured shard, shard read/write availability, catalog and schedule
+resolvability, worker queue coverage and freshness, DLQ read access, retention
+visibility, and whether the admin API has an auth boundary in non-dev profiles.
+The default output is a compact table; `--output json` returns the same response
+shape as the API for CI and release scripts.
+
+Exit codes are deploy-gate friendly: `0` means `overall_status = pass`, `2`
+means `warn`, and `1` means `fail` or a transport/API error. Use warning exit
+code `2` when your release process allows a separate "promote with caution"
+branch; otherwise treat any nonzero exit as a failed gate.
+
+### Starter alert rules and runbooks
+
+Harvest ships a versioned starter alert pack for first production deployments:
+[`docs/alerts/starter-pack-v0.1.0.json`](docs/alerts/starter-pack-v0.1.0.json).
+The pack covers preflight failure, missing worker coverage, stale/draining
+worker saturation, queue backlog growth, activity failures, DLQ growth, missed
+schedules, retention lag, shard readiness, and the pending
+`no_compatible_worker` build-routing signal. Pair it with
+[`docs/runbooks/harvest-alerts.md`](docs/runbooks/harvest-alerts.md) and the
+synthetic drills in
+[`docs/runbooks/synthetic-incident-drills.md`](docs/runbooks/synthetic-incident-drills.md).
+
+The thresholds are starter defaults, not universal SLOs. Tune them to workload
+volume, downstream SLAs, shard count, queue topology, and schedule cadence. The
+Prometheus examples use only ADR-0001/#138 metric names and bounded labels;
+operators without Prometheus can run the equivalent CLI/API checks documented
+in [`docs/alerts/README.md`](docs/alerts/README.md).
 
 ### Controlling duplicate workflow starts
 
@@ -276,6 +419,179 @@ Or via the management API directly:
 GET /api/harvest/admin/concurrency
 ```
 
+### Activity error handling
+
+Activity handlers can return any error type that implements
+`autumn_harvest::failure::IntoActivityErrorString`. Out of the box that means
+**plain `String`** (the legacy shape — `Err("network down".to_string())`) **and
+`ActivityFailure`** (the typed shape introduced in #227). The macro dispatch
+chooses the right encoding at compile time, so authors never call serialisation
+helpers directly.
+
+```rust
+use autumn_harvest::prelude::*;
+
+#[activity(retry = RetryPolicy::exponential(5, Duration::from_secs(1)))]
+async fn charge_card(ctx: &ActivityContext, amount: u32) -> Result<(), ActivityFailure> {
+    // Transient — let the retry policy keep working.
+    if amount == 0 {
+        return Err(ActivityFailure::retryable(
+            "UpstreamTimeout",
+            "payment gateway timed out",
+        ));
+    }
+    // Permanent — skip remaining retries, route straight to DLQ.
+    if amount > 1_000_000 {
+        return Err(ActivityFailure::non_retryable(
+            "InvalidInput",
+            "amount exceeds per-transaction ceiling",
+        ));
+    }
+    Ok(())
+}
+```
+
+`ActivityFailure` carries four fields:
+
+| Field | Purpose |
+|---|---|
+| `error_type` | Stable, low-cardinality class name (e.g. `"InvalidInput"`, `"RateLimitExceeded"`). Used as the `error.type` attribute on `harvest.activity.duration` and `harvest.activity.failed`, and as the matcher input for `RetryPolicy::non_retryable_errors`. |
+| `message` | Human-readable description. Shown in `Display` output (`"InvalidInput: amount exceeds per-transaction ceiling"`). |
+| `details` | Optional `serde_json::Value` for structured context preserved on the `ActivityFailed` event in workflow history. |
+| `non_retryable` | When `true`, the worker skips every remaining retry attempt regardless of `RetryPolicy.max_attempts` and fails the activity on this attempt. The workflow function then sees `Err(HarvestError::ActivityFailed { … })`. |
+
+**Resolution order against `RetryPolicy::non_retryable_errors`**:
+
+1. If `ActivityFailure.non_retryable == true`, retries are skipped immediately.
+2. Otherwise the worker compares each entry in `non_retryable_errors` against
+   `error_type` first (structured, stable across log-format changes).
+3. If no `error_type` match, the worker falls back to a full-string match
+   against the raw error payload (legacy back-compat).
+
+So both of these halt retries on the first attempt:
+
+```rust
+// Typed surface (preferred).
+let mut policy = RetryPolicy::exponential(5, Duration::from_secs(1));
+policy.non_retryable_errors = vec!["InvalidInput".into()];
+// Activity returns: ActivityFailure::retryable("InvalidInput", "...")
+// → matched on error_type, no retries.
+
+// Legacy surface (still works).
+let mut policy = RetryPolicy::exponential(5, Duration::from_secs(1));
+policy.non_retryable_errors = vec!["amount exceeds per-transaction ceiling".into()];
+// Activity returns: Err("amount exceeds per-transaction ceiling".to_string())
+// → matched on raw string, no retries.
+```
+
+**Why typed errors?** Hand-formatted error strings drift every time a log
+message is reworded, silently breaking retry policies that depended on exact
+equality. The same drift makes operators do regex queries over
+`harvest_events.event_data->>'error'` to compute failure-class breakdowns.
+Lifting the class into a typed field (`error_type`) — the same shape Temporal,
+Cadence, and DBOS use — keeps retry policy stable across refactors and lets
+the `harvest.activity.failed{workflow.type="...", error.type="..."}` counter
+answer "what's the dominant failure class right now?" in one PromQL query.
+
+**Backward compatibility.** Every activity returning `Err(String)` continues to
+work unchanged: the engine wraps it as `ActivityFailure { error_type: "Error",
+non_retryable: false, .. }`, so existing dashboards see `error.type=Error`
+without code changes. Pre-#227 `ActivityFailed` events stored in the DB
+deserialise via `serde(default)` on the new fields — no migration is needed.
+
+### Activity idempotency keys
+
+Harvest activities are **at-least-once**. A worker crash, a `start_to_close`
+timeout, or a duplicate task-queue dispatch will cause the activity to run
+again — potentially after the external system has already accepted the first
+request.  Passing a stable idempotency key to the downstream API (Stripe,
+SendGrid, Twilio, S3 multipart, your own mutation endpoint) converts
+at-least-once into effectively-exactly-once by letting the provider
+deduplicate.
+
+Every activity — **regular and local** — receives a Harvest-provided key via
+`ctx.idempotency_key()`.  The key is stable across:
+
+- worker restarts
+- duplicate task-queue dispatch of the same logical invocation
+- deterministic replay
+- every retry attempt for the same logical invocation
+
+Two distinct activity invocations — even calling the same activity name with
+the same input — always receive different keys.
+
+**Local activities** (`#[activity(local = true)]`) are fully supported.  The
+key is derived from the `ActivityExecId` recorded in the
+`LocalActivityScheduled` event, so it is identical across all inline retry
+attempts.  Local activities do not support heartbeating, but `idempotency_key()`
+works identically to regular activities.  If a future activity type were ever
+excluded, `idempotency_key()` would return a descriptive
+`HarvestError::Config` rather than silently producing an unstable or
+meaningless value.
+
+#### Billing / payment example
+
+```rust
+#[activity(start_to_close = "30s", retry = RetryPolicy::exponential(3, Duration::from_secs(2)))]
+async fn charge_card(
+    ctx: &ActivityContext,
+    amount_cents: u64,
+    customer_id: String,
+) -> HarvestResult<String> {
+    // idempotency_key() is always Ok in production; only None in bare unit-test
+    // contexts built without with_idempotency_key().
+    let idem_key = ctx.idempotency_key()?.as_str().to_owned();
+
+    let charge_id = stripe_client
+        .charges()
+        .create(CreateCharge {
+            amount: amount_cents as i64,
+            customer: customer_id,
+            idempotency_key: Some(idem_key), // ← same on every retry attempt
+            ..Default::default()
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(charge_id)
+}
+```
+
+If the worker crashes after Stripe accepts the charge but before Harvest
+records `ActivityCompleted`, the retry carries the same key and Stripe returns
+the already-created charge — no duplicate payment.
+
+#### Subkeys for multiple side effects
+
+When one activity must produce several distinct outbound calls, derive named
+subkeys from the base key:
+
+```rust
+#[activity(start_to_close = "60s")]
+async fn provision_account(ctx: &ActivityContext, user_id: i64) -> HarvestResult<()> {
+    let key = ctx.idempotency_key()?;
+
+    // Each call gets a distinct, stable key derived from the same parent.
+    create_db_user(&user_id, key.subkey("db").as_str()).await?;
+    send_welcome_email(&user_id, key.subkey("email").as_str()).await?;
+    create_billing_profile(&user_id, key.subkey("billing").as_str()).await?;
+
+    Ok(())
+}
+```
+
+#### Attempt-scoped keys (opt-in)
+
+The default key is **retry-stable** — the same value across all attempts for
+the same logical invocation. If a downstream API requires a fresh key on each
+attempt (uncommon), derive an attempt-scoped subkey:
+
+```rust
+let idem_key = ctx
+    .idempotency_key()?
+    .subkey(&format!("attempt-{}", ctx.attempt().unwrap_or(1)));
+```
+
 ### Filtering the workflow list
 
 `workflow list` (and `GET /workflows`) accept three additional filter knobs on
@@ -283,7 +599,7 @@ top of `limit`:
 
 | CLI flag | Query param | Behavior |
 |---|---|---|
-| `--state RUNNING` (repeatable, also accepts `RUNNING,FAILED`) | `?state=RUNNING,FAILED` (repeatable) | Exact match on the workflow execution state. Allowed values: `RUNNING`, `COMPLETED`, `FAILED`, `CANCELLED`, `TIMED_OUT`. |
+| `--state RUNNING` (repeatable, also accepts `RUNNING,FAILED`) | `?state=RUNNING,FAILED` (repeatable) | Exact match on the workflow execution state. Allowed values: `RUNNING`, `COMPLETED`, `FAILED`, `CANCELLED`, `TIMED_OUT`, `CONTINUED_AS_NEW`, `TERMINATED`. |
 | `--workflow-name onboarding` | `?workflow_name=onboarding` | Exact match on the registered workflow name. |
 | `--search-attr tenant=acme` (repeatable) | `?search_attr=tenant:acme` (repeatable) | JSONB containment predicate on `search_attrs`. Multiple flags AND together; repeating a key narrows. Hits the existing `idx_harvest_we_search` GIN index. |
 
@@ -298,6 +614,57 @@ cargo run -p autumn-harvest-cli -- workflow list \
     --workflow-name onboarding \
     --search-attr tenant=acme
 ```
+
+### Listing child workflows
+
+`workflow children` and `GET /workflows/{execution_id}/children` expose the
+parent -> child relationship recorded on workflow execution rows. The API fans
+out across all configured shards, merges by `started_at DESC`, and paginates the
+combined result.
+
+| CLI flag | Query param | Behavior |
+|---|---|---|
+| `--status Failed` (repeatable, also accepts comma-separated values) | `?status=Failed&status=Running` | OR filter on child status. Allowed values: `Running`, `Failed`, `Completed`, `Cancelled`, `Terminated`, `TimedOut`, `ContinuedAsNew`. |
+| `--workflow-name billing_child` | `?workflow_name=billing_child` | Exact match on the child workflow name. |
+| `--limit 100` | `?limit=100` | Page size. Defaults to 50 and is capped at 500. |
+| `--cursor <cursor>` | `?cursor=<cursor>` | Continue from the previous page's `next_cursor`. |
+| `--depth 1` | `?depth=1` | Include recursive descendants through the given zero-based depth. Direct children are depth `0`; values above `5` return `400 Bad Request`. |
+| `--json` | n/a | Print the raw JSON payload. Without `--json`, the CLI renders a table. |
+
+Each child entry includes `exec_id`, `workflow_name`, `status`, `started_at`,
+`completed_at`, `error_summary`, `shard_id`, and `depth`. `GET
+/workflows/{execution_id}` also includes top-level `parent_id` alongside the
+existing execution/history payload.
+
+### Inspecting workflow stack (current wait-state)
+
+Use the stack endpoint to inspect what an execution is currently waiting on
+(pending activities, local activities, timers, buffered signals, child
+workflows) plus the latest durable event cursor:
+
+```bash
+# CLI
+cargo run -p autumn-harvest-cli -- workflow stack <execution-id>
+
+# HTTP
+curl -s http://localhost:3000/api/harvest/workflows/<execution-id>/stack | jq .
+```
+
+Route:
+
+```text
+GET /api/harvest/workflows/{execution_id}/stack
+```
+
+Forward-compatibility contract:
+
+- Unknown top-level fields are additive; clients should ignore what they do not
+  recognize.
+- Collection item objects may gain new optional fields over time.
+- Known fields retain their current meaning; optional fields may be `null` when
+  data is unavailable.
+- `last_event_id` is monotonic per execution and can be used as a lightweight
+  change cursor.
 
 ### Post-incident DLQ drain
 
@@ -479,12 +846,13 @@ The embedded Vantage UI (`harvest_ui_router`, typically mounted at `/api/harvest
 
 ## Status
 
-Version 0.2.0 wraps the Phase 3 surface: DAG scheduling, `#[dag]`, trigger
-rules, signal delivery, `ctx.wait_for_signal`, query registration/dispatch, the
-management API, and dead-letter list/replay endpoints are implemented and
-covered by integration tests. Durable workflow cancellation is implemented with
-management API support and activity heartbeat cancellation checks. First-class
-Saga compensation is implemented through the `Saga` builder.
+Version 0.3.0 wraps the Phase 3 surface plus additive management API contract
+coverage: DAG scheduling, `#[dag]`, trigger rules, signal delivery,
+`ctx.wait_for_signal`, query registration/dispatch, the management API,
+workflow result polling, and dead-letter list/replay endpoints are implemented
+and covered by integration tests. Durable workflow cancellation is implemented
+with management API support and activity heartbeat cancellation checks.
+First-class Saga compensation is implemented through the `Saga` builder.
 
 API stability: pre-1.0. Breaking changes happen in minor versions per Cargo's
 0.x semver convention. Each release notes the migration where applicable.
@@ -526,8 +894,34 @@ assert_eq!(exec_id.shard(), shard);
 ```
 
 Adding a shard (new workflows only): provision and migrate the new database,
-add it to `readable_shards`, restart the plugin, then flip it into
-`writable_shards`. In-flight workflows drain on their original shard.
+add it to `readable_shards`, restart the plugin, then run the readiness gate
+before promotion:
+
+```bash
+cargo run -p autumn-harvest-cli -- shard health --candidate-shard 1
+cargo run -p autumn-harvest-cli -- --output json shard health --candidate-shard 1
+```
+
+The matching management API endpoint is `GET /api/harvest/admin/shards/health`.
+It returns one row per configured shard, including shard roles, reachability,
+schema readiness, active/stale worker counts, worker queue coverage, scheduler
+freshness when schedules are enabled, queue/DLQ pressure, and machine-readable
+reason codes. The CLI exits non-zero when any writable shard or named candidate
+reports `degraded` or `unavailable`. Only after the candidate row reports
+`readiness: "ready"` should you flip it into `writable_shards`. In-flight
+workflows drain on their original shard.
+
+By default `/api/harvest/health` stays a cheap liveness check for local
+single-shard development. To make it a rollout/readiness probe that returns
+`503` until writable shard readiness is `ready`, enable:
+
+```toml
+[harvest.readiness]
+require_shard_readiness = true
+```
+
+The equivalent environment override is
+`AUTUMN_HARVEST_READINESS__REQUIRE_SHARD_READINESS=true`.
 
 ## Testing workflow code changes with the replayer
 
@@ -566,19 +960,36 @@ async fn onboarding_is_replay_safe() {
 
 ### Exporting a history fixture
 
-Serialise a `HistorySnapshot` to JSON and check it in as a test fixture:
+Use the read-only history export API or CLI to capture a fixture directly from
+stored workflow history. Redacted exports are the default and are suitable for
+support/debugging. CI replay fixtures must use `full` payloads and should be
+stored only in private fixture storage because activity inputs, outputs, signal
+payloads, and tokens may be present.
 
-```rust
-use autumn_harvest::testing::HistorySnapshot;
-
-let snapshot = HistorySnapshot {
-    workflow_name: "onboarding".to_string(),
-    execution_id: exec_id,
-    events,  // Vec<WorkflowEvent> loaded from harvest_events
-};
-let json = serde_json::to_string_pretty(&snapshot).unwrap();
-std::fs::write("fixtures/onboarding_history.json", json).unwrap();
+```sh
+cargo run -p autumn-harvest-cli -- history export <execution-id> \
+  --payload-policy full \
+  --output-file fixtures/onboarding_history.json
 ```
+
+For release gates, export a bounded batch from recent production histories:
+
+```sh
+cargo run -p autumn-harvest-cli -- history export-batch \
+  --workflow-name onboarding \
+  --state-group terminal \
+  --updated-after 2026-05-01T00:00:00Z \
+  --limit 1000 \
+  --payload-policy full \
+  --output-file fixtures/onboarding_batch.json
+```
+
+Batch responses include `schema`, `version`, `status`, `exports`, `failures`,
+and `shard_coverage`. A `partial` status means at least one shard could not be
+read; treat that as a blocked release gate until the missing shard is exported
+or explicitly waived.
+
+See `docs/runbooks/replay-fixture-export.md` for the release-safety playbook.
 
 ### CLI validator
 
@@ -592,6 +1003,48 @@ cargo run --bin harvest-replay -- \
 Exit code 0 = `ReplaySucceeded`. Exit code 1 = non-determinism or workflow
 failure. Extend `harvest-replay/src/bin/harvest_replay.rs` with your own
 workflow handlers so the binary can replay against live code.
+
+### Resetting a workflow after a bad deploy
+
+Use reset when a running top-level workflow is stuck on history produced by code
+that the new workflow definition can no longer replay. Reset terminates the
+source execution, creates a new execution on the same shard, copies history
+through a valid event boundary, appends a `WorkflowResetFork` marker, and queues
+the fork for execution under the current code.
+
+The reset point must be a completed boundary: no open activity, local activity,
+timer, child workflow, external completion, or update may still be unresolved at
+or before `--to-event`. Terminal workflows, child workflows, and
+continue-as-new histories are rejected; those are different demons.
+
+Operator flow:
+
+```sh
+# Inspect the current wait-state and pick a candidate event cursor.
+cargo run -p autumn-harvest-cli -- workflow stack <execution-id>
+
+# Verify the boundary and side effects without writing anything.
+cargo run -p autumn-harvest-cli -- workflow reset <execution-id> \
+  --to-event 42 \
+  --reason "recover from bad deploy 2026-05-03" \
+  --operator-id "oncall-mark" \
+  --signal-reapply buffer \
+  --dry-run
+
+# Apply the reset once the dry run reports a valid plan.
+cargo run -p autumn-harvest-cli -- workflow reset <execution-id> \
+  --to-event 42 \
+  --reason "recover from bad deploy 2026-05-03" \
+  --operator-id "oncall-mark" \
+  --signal-reapply buffer
+```
+
+`--signal-reapply drop` consumes pending source signals during teardown.
+`--signal-reapply buffer` copies pending source signals onto the fork so the new
+run sees them after replay. The source execution ends in `TERMINATED`; verify
+the returned `new_exec_id` reaches `RUNNING` and then normal terminal state.
+For tests and pre-deploy checks, `WorkflowReplayer::replay_with_reset(history,
+reset_to_event_id)` replays only the carried history plus the reset marker.
 
 ### What the replayer detects
 
@@ -609,6 +1062,48 @@ Changes that are safe without a `ctx.version()` fence: none of the above.
 Use `ctx.version("change_id", 1, 2)` and guard the new code path behind the
 returned version number; old histories replay with version 1 and skip the new
 path.
+
+### Retiring a version-gated branch
+
+Use the version-gate usage report before deleting an old branch from workflow
+code. The report is read-only: it scans existing `version:{change_id}` marker
+events and never starts, cancels, signals, resets, replays, rewrites, or deletes
+workflow executions.
+
+Migration playbook:
+
+1. Introduce `ctx.version("billing_checkout_v2_tax", 1, 2)` and branch on the
+   returned version.
+2. Deploy the gated workflow code.
+3. Verify replay safety against representative histories with
+   `WorkflowReplayer`.
+4. Wait for active version-1 executions to drain.
+5. Run the guard:
+
+```bash
+cargo run -p autumn-harvest-cli -- version-usage \
+  --change-id billing_checkout_v2_tax \
+  --version 1 \
+  --guard
+```
+
+6. Remove the version-1 branch only after the guard exits successfully.
+
+For release automation, use compact JSON:
+
+```bash
+cargo run -p autumn-harvest-cli -- --output json version-usage \
+  --change-id billing_checkout_v2_tax \
+  --version 1 \
+  --state-group active
+```
+
+The management API endpoint is `GET /admin/version-gates/usage`. It supports
+`workflow_name`, `change_id`, `recorded_version`, `state_group` (`active`,
+`terminal`, or `all`), and `shard_id` filters. Response `status` is
+machine-readable: `complete`, `no_matches`, `partial`, or `unavailable`.
+Treat `partial` and `unavailable` as deploy blockers because one or more shards
+could not be inspected and a false zero would be worse than noisy code.
 
 ## Telemetry
 

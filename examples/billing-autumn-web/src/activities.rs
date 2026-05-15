@@ -26,6 +26,14 @@ pub fn activities() -> Vec<ActivityInfo> {
     ]
 }
 
+/// Validate the checkout payload before any side-effects.
+///
+/// Demonstrates issue #227: returning `ActivityFailure::non_retryable(...)`
+/// short-circuits the retry policy on a permanently-invalid input. The
+/// `RetryPolicy::exponential(3, …)` would normally allow three attempts;
+/// the typed `non_retryable` flag wins over the policy and routes the
+/// task straight to the DLQ on attempt 1 — proving that authors no longer
+/// need to register every fail-fast error string in `non_retryable_errors`.
 #[activity(
     start_to_close = "10s",
     retry = RetryPolicy::exponential(3, Duration::from_millis(100)),
@@ -34,13 +42,15 @@ pub fn activities() -> Vec<ActivityInfo> {
 pub async fn validate_checkout(
     _ctx: &ActivityContext,
     request: CheckoutRequest,
-) -> HarvestResult<CheckoutRequest> {
+) -> Result<CheckoutRequest, ActivityFailure> {
     let request = request.normalized();
     if request.seats == 0 {
-        return Err(HarvestError::WorkflowFailed {
-            name: "validate_checkout".to_owned(),
-            reason: "seats must be greater than zero".to_owned(),
-        });
+        // Permanent validation failure — operators see this as
+        // `error.type="PermanentValidation"` on `harvest.activity.failed`.
+        return Err(ActivityFailure::non_retryable(
+            "PermanentValidation",
+            "seats must be greater than zero",
+        ));
     }
     Ok(request)
 }

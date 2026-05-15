@@ -3,6 +3,108 @@ use clap::Parser;
 use serde_json::json;
 
 #[test]
+fn preflight_maps_to_management_api_request() {
+    let cli = Cli::try_parse_from(["harvest", "preflight"]).expect("preflight args should parse");
+
+    let request = cli.api_request().expect("preflight request should build");
+
+    assert_eq!(request.method, ApiMethod::Get);
+    assert_eq!(request.path, "/admin/preflight");
+    assert_eq!(request.body, None);
+}
+
+#[test]
+fn shard_health_maps_to_management_api_request() {
+    let cli = Cli::try_parse_from(["harvest", "shard", "health"])
+        .expect("shard health args should parse");
+
+    let request = cli
+        .api_request()
+        .expect("shard health request should build");
+
+    assert_eq!(request.method, ApiMethod::Get);
+    assert_eq!(request.path, "/admin/shards/health");
+    assert_eq!(request.body, None);
+}
+
+#[test]
+fn shard_health_candidate_maps_to_query_string() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "shard",
+        "health",
+        "--candidate-shard",
+        "2",
+        "--fail-on-unready",
+    ])
+    .expect("shard health candidate args should parse");
+
+    let request = cli
+        .api_request()
+        .expect("shard health request should build");
+
+    assert_eq!(request.method, ApiMethod::Get);
+    assert_eq!(request.path, "/admin/shards/health?candidate_shard=2");
+    assert_eq!(request.body, None);
+}
+
+#[test]
+fn version_usage_report_maps_filters_to_management_api_request() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "version-usage",
+        "--workflow-name",
+        "billing_checkout",
+        "--change-id",
+        "billing_checkout_v2_tax",
+        "--version",
+        "1",
+        "--state-group",
+        "active",
+        "--shard-id",
+        "2",
+    ])
+    .expect("version usage args should parse");
+
+    let request = cli
+        .api_request()
+        .expect("version usage request should build");
+
+    assert_eq!(request.method, ApiMethod::Get);
+    assert_eq!(
+        request.path,
+        "/admin/version-gates/usage?workflow_name=billing_checkout\
+         &change_id=billing_checkout_v2_tax&recorded_version=1&state_group=active&shard_id=2"
+    );
+    assert_eq!(request.body, None);
+}
+
+#[test]
+fn version_usage_guard_maps_to_active_state_group() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "version-usage",
+        "--change-id",
+        "billing_checkout_v2_tax",
+        "--version",
+        "1",
+        "--guard",
+    ])
+    .expect("version usage guard args should parse");
+
+    let request = cli
+        .api_request()
+        .expect("version usage guard request should build");
+
+    assert_eq!(request.method, ApiMethod::Get);
+    assert_eq!(
+        request.path,
+        "/admin/version-gates/usage?change_id=billing_checkout_v2_tax&recorded_version=1&state_group=active"
+    );
+    assert_eq!(request.body, None);
+}
+
+#[test]
 fn workflow_start_maps_to_management_api_request() {
     let cli = Cli::try_parse_from([
         "harvest",
@@ -67,6 +169,21 @@ fn workflow_list_and_query_use_get_requests() {
         "/workflows/00000000-0000-0000-0000-000000000001/query/status"
     );
     assert_eq!(query_request.body, None);
+
+    let stack = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "stack",
+        "00000000-0000-0000-0000-000000000001",
+    ])
+    .expect("workflow stack args should parse");
+    let stack_request = stack.api_request().expect("stack request should build");
+    assert_eq!(stack_request.method, ApiMethod::Get);
+    assert_eq!(
+        stack_request.path,
+        "/workflows/00000000-0000-0000-0000-000000000001/stack"
+    );
+    assert_eq!(stack_request.body, None);
 }
 
 #[test]
@@ -111,6 +228,233 @@ fn workflow_list_supports_repeated_and_comma_states() {
     let request = list.api_request().expect("list request should build");
 
     assert_eq!(request.path, "/workflows?state=RUNNING,FAILED,TIMED_OUT");
+}
+
+#[test]
+fn workflow_children_maps_to_management_api_request() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "children",
+        "00000000-0000-0000-0000-000000000001",
+        "--status",
+        "Failed",
+        "--status",
+        "Running",
+        "--workflow-name",
+        "billing_child",
+        "--limit",
+        "25",
+        "--cursor",
+        "2026-05-04T12:00:00Z|00000000-0000-0000-0000-000000000099",
+        "--depth",
+        "2",
+        "--json",
+    ])
+    .expect("workflow children args should parse");
+    let request = cli.api_request().expect("children request should build");
+
+    assert_eq!(request.method, ApiMethod::Get);
+    assert_eq!(
+        request.path,
+        "/workflows/00000000-0000-0000-0000-000000000001/children\
+         ?status=Failed&status=Running&workflow_name=billing_child&limit=25\
+         &cursor=2026-05-04T12:00:00Z%7C00000000-0000-0000-0000-000000000099&depth=2"
+    );
+    assert_eq!(request.body, None);
+}
+
+#[test]
+fn history_export_maps_single_execution_to_read_only_route() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "history",
+        "export",
+        "00000000-0000-0000-0000-000000000001",
+        "--payload-policy",
+        "full",
+        "--max-bytes",
+        "1048576",
+        "--output-file",
+        "fixtures/billing.json",
+    ])
+    .expect("history export args should parse");
+    let request = cli
+        .api_request()
+        .expect("history export request should build");
+
+    assert_eq!(request.method, ApiMethod::Get);
+    assert_eq!(
+        request.path,
+        "/workflows/00000000-0000-0000-0000-000000000001/history/export?payload_policy=full&max_bytes=1048576"
+    );
+    assert_eq!(request.body, None);
+}
+
+#[test]
+fn history_export_batch_maps_filters_to_admin_route() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "history",
+        "export-batch",
+        "--workflow-name",
+        "billing_checkout",
+        "--state-group",
+        "terminal",
+        "--updated-after",
+        "2026-05-01T00:00:00Z",
+        "--updated-before",
+        "2026-05-08T00:00:00Z",
+        "--shard-id",
+        "2",
+        "--limit",
+        "1000",
+        "--payload-policy",
+        "redacted",
+    ])
+    .expect("batch history export args should parse");
+    let request = cli
+        .api_request()
+        .expect("batch history export request should build");
+
+    assert_eq!(request.method, ApiMethod::Get);
+    assert_eq!(
+        request.path,
+        "/admin/history/exports?workflow_name=billing_checkout&state_group=terminal\
+         &updated_after=2026-05-01T00:00:00Z&updated_before=2026-05-08T00:00:00Z\
+         &shard_id=2&limit=1000&payload_policy=redacted"
+    );
+    assert_eq!(request.body, None);
+}
+
+#[test]
+fn handoff_list_maps_filters_to_management_api_request() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "handoff",
+        "list",
+        "--state",
+        "PENDING,FAILED",
+        "--workflow-name",
+        "billing_checkout",
+        "--execution-id",
+        "00000000-0000-0000-0000-000000000001",
+        "--activity-name",
+        "manager_approval",
+        "--token",
+        "11111111-1111-4111-8111-111111111111",
+        "--shard-id",
+        "2",
+        "--due-before",
+        "2026-05-08T12:00:00Z",
+        "--updated-before",
+        "2026-05-08T13:00:00Z",
+        "--limit",
+        "25",
+    ])
+    .expect("handoff list args should parse");
+    let request = cli
+        .api_request()
+        .expect("handoff list request should build");
+
+    assert_eq!(request.method, ApiMethod::Get);
+    assert_eq!(
+        request.path,
+        "/admin/external-handoffs?state=PENDING,FAILED&workflow_name=billing_checkout\
+         &execution_id=00000000-0000-0000-0000-000000000001&activity_name=manager_approval\
+         &token=11111111-1111-4111-8111-111111111111&shard_id=2\
+         &due_before=2026-05-08T12:00:00Z&updated_before=2026-05-08T13:00:00Z&limit=25"
+    );
+    assert_eq!(request.body, None);
+}
+
+#[test]
+fn handoff_inspect_maps_to_detail_request() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "handoff",
+        "inspect",
+        "11111111-1111-4111-8111-111111111111",
+    ])
+    .expect("handoff inspect args should parse");
+    let request = cli
+        .api_request()
+        .expect("handoff inspect request should build");
+
+    assert_eq!(request.method, ApiMethod::Get);
+    assert_eq!(
+        request.path,
+        "/admin/external-handoffs/11111111-1111-4111-8111-111111111111"
+    );
+    assert_eq!(request.body, None);
+}
+
+#[test]
+fn handoff_mutations_map_to_token_completion_routes() {
+    let complete = Cli::try_parse_from([
+        "harvest",
+        "handoff",
+        "complete",
+        "11111111-1111-4111-8111-111111111111",
+        "--output-json",
+        r#"{"approved":true}"#,
+    ])
+    .expect("handoff complete args should parse");
+    let complete_request = complete
+        .api_request()
+        .expect("complete request should build");
+    assert_eq!(complete_request.method, ApiMethod::Post);
+    assert_eq!(
+        complete_request.path,
+        "/activities/external/11111111-1111-4111-8111-111111111111/complete"
+    );
+    assert_eq!(
+        complete_request.body,
+        Some(json!({ "output": { "approved": true } }))
+    );
+
+    let fail = Cli::try_parse_from([
+        "harvest",
+        "handoff",
+        "fail",
+        "11111111-1111-4111-8111-111111111111",
+        "--error",
+        "manager rejected",
+        "--retryable",
+    ])
+    .expect("handoff fail args should parse");
+    let fail_request = fail.api_request().expect("fail request should build");
+    assert_eq!(fail_request.method, ApiMethod::Post);
+    assert_eq!(
+        fail_request.path,
+        "/activities/external/11111111-1111-4111-8111-111111111111/fail"
+    );
+    assert_eq!(
+        fail_request.body,
+        Some(json!({ "error": "manager rejected", "retryable": true }))
+    );
+
+    let heartbeat = Cli::try_parse_from([
+        "harvest",
+        "handoff",
+        "heartbeat",
+        "11111111-1111-4111-8111-111111111111",
+        "--extend-by-secs",
+        "3600",
+    ])
+    .expect("handoff heartbeat args should parse");
+    let heartbeat_request = heartbeat
+        .api_request()
+        .expect("heartbeat request should build");
+    assert_eq!(heartbeat_request.method, ApiMethod::Post);
+    assert_eq!(
+        heartbeat_request.path,
+        "/activities/external/11111111-1111-4111-8111-111111111111/heartbeat"
+    );
+    assert_eq!(
+        heartbeat_request.body,
+        Some(json!({ "extend_by_secs": 3600 }))
+    );
 }
 
 #[test]
@@ -168,6 +512,75 @@ fn workflow_signal_and_cancel_use_post_bodies() {
     assert_eq!(
         cancel_request.body,
         Some(json!({ "reason": "operator changed their mind" }))
+    );
+}
+
+#[test]
+fn workflow_reset_maps_to_management_api_request() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "reset",
+        "00000000-0000-0000-0000-000000000001",
+        "--to-event",
+        "100",
+        "--reason",
+        "bad deploy",
+        "--operator-id",
+        "oncall",
+        "--signal-reapply",
+        "buffer",
+    ])
+    .expect("workflow reset args should parse");
+    let request = cli.api_request().expect("reset request should build");
+
+    assert_eq!(request.method, ApiMethod::Post);
+    assert_eq!(
+        request.path,
+        "/workflows/00000000-0000-0000-0000-000000000001/reset"
+    );
+    assert_eq!(
+        request.body,
+        Some(json!({
+            "reset_to_event_id": 100,
+            "reason": "bad deploy",
+            "operator_id": "oncall",
+            "signal_reapply": "buffer"
+        }))
+    );
+}
+
+#[test]
+fn workflow_reset_dry_run_sets_query_flag() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "reset",
+        "00000000-0000-0000-0000-000000000001",
+        "--to-event",
+        "10",
+        "--reason",
+        "verify before the pointy end",
+        "--dry-run",
+    ])
+    .expect("workflow reset dry-run args should parse");
+    let request = cli
+        .api_request()
+        .expect("reset dry-run request should build");
+
+    assert_eq!(request.method, ApiMethod::Post);
+    assert_eq!(
+        request.path,
+        "/workflows/00000000-0000-0000-0000-000000000001/reset?dry_run=true"
+    );
+    assert_eq!(
+        request.body,
+        Some(json!({
+            "reset_to_event_id": 10,
+            "reason": "verify before the pointy end",
+            "operator_id": "cli",
+            "signal_reapply": "drop"
+        }))
     );
 }
 
@@ -421,4 +834,211 @@ fn retention_commands_match_management_routes() {
     assert_eq!(run_now_request.method, ApiMethod::Post);
     assert_eq!(run_now_request.path, "/admin/retention/run-now");
     assert_eq!(run_now_request.body, None);
+}
+
+#[test]
+fn audit_list_no_filters_maps_to_admin_audit() {
+    let cli =
+        Cli::try_parse_from(["harvest", "audit", "list"]).expect("audit list args should parse");
+    let request = cli.api_request().expect("request should build");
+    assert_eq!(request.method, ApiMethod::Get);
+    assert_eq!(request.path, "/admin/audit");
+    assert_eq!(request.body, None);
+}
+
+#[test]
+fn audit_list_all_filters_builds_correct_query_string() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "audit",
+        "list",
+        "--actor",
+        "alice@example.com",
+        "--operation",
+        "workflow.cancel",
+        "--target-type",
+        "workflow",
+        "--target-id",
+        "00000000-0000-0000-0000-000000000001",
+        "--status",
+        "succeeded",
+        "--since",
+        "2026-01-01T00:00:00Z",
+        "--before",
+        "2026-02-01T00:00:00Z",
+        "--limit",
+        "25",
+    ])
+    .expect("audit list args should parse");
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(request.method, ApiMethod::Get);
+    assert!(
+        request.path.starts_with("/admin/audit?"),
+        "path should include query string"
+    );
+    // Each filter must appear in the path. Colons in ISO timestamps are left
+    // unencoded by query_encode (matches the server's stable key:value shape).
+    for fragment in &[
+        "actor=alice%40example.com",
+        "operation=workflow.cancel",
+        "target_type=workflow",
+        "target_id=00000000-0000-0000-0000-000000000001",
+        "status=succeeded",
+        "since=2026-01-01T00:00:00Z",
+        "before=2026-02-01T00:00:00Z",
+        "limit=25",
+    ] {
+        assert!(
+            request.path.contains(fragment),
+            "expected fragment '{fragment}' not found in '{}'",
+            request.path
+        );
+    }
+    assert_eq!(request.body, None);
+}
+
+#[test]
+fn audit_list_partial_filters() {
+    let cli = Cli::try_parse_from([
+        "harvest", "audit", "list", "--status", "failed", "--limit", "10",
+    ])
+    .expect("audit list partial args should parse");
+    let request = cli.api_request().expect("request should build");
+    assert_eq!(request.method, ApiMethod::Get);
+    assert!(request.path.contains("status=failed"));
+    assert!(request.path.contains("limit=10"));
+    assert!(!request.path.contains("actor="), "actor should be absent");
+}
+
+// ── schedule backfill (issue #177) ──────────────────────────────────────────
+
+#[test]
+fn schedule_backfill_maps_to_post_backfill_route() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "schedule",
+        "backfill",
+        "00000000-0000-0000-0000-000000000042",
+        "--from",
+        "2026-04-01T00:00:00Z",
+        "--to",
+        "2026-04-08T00:00:00Z",
+    ])
+    .expect("schedule backfill args should parse");
+
+    let request = cli
+        .api_request()
+        .expect("schedule backfill request should build");
+
+    assert_eq!(request.method, ApiMethod::Post);
+    assert_eq!(
+        request.path,
+        "/admin/schedules/00000000-0000-0000-0000-000000000042/backfill"
+    );
+    let body = request.body.expect("backfill request must have a body");
+    assert_eq!(body["from"], "2026-04-01T00:00:00Z");
+    assert_eq!(body["to"], "2026-04-08T00:00:00Z");
+    assert_eq!(body["dry_run"], false);
+    assert_eq!(body["include_paused"], false);
+}
+
+#[test]
+fn schedule_backfill_dry_run_flag_sets_body_field() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "schedule",
+        "backfill",
+        "00000000-0000-0000-0000-000000000099",
+        "--from",
+        "2026-04-01T00:00:00Z",
+        "--to",
+        "2026-04-08T00:00:00Z",
+        "--dry-run",
+    ])
+    .expect("backfill --dry-run args should parse");
+
+    let request = cli
+        .api_request()
+        .expect("backfill dry-run request should build");
+    let body = request.body.expect("dry-run request must have a body");
+
+    assert_eq!(body["dry_run"], true);
+    assert_eq!(body["from"], "2026-04-01T00:00:00Z");
+    assert_eq!(body["to"], "2026-04-08T00:00:00Z");
+}
+
+#[test]
+fn schedule_backfill_max_count_appears_in_body() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "schedule",
+        "backfill",
+        "00000000-0000-0000-0000-000000000001",
+        "--from",
+        "2026-04-01T00:00:00Z",
+        "--to",
+        "2026-04-08T00:00:00Z",
+        "--max-count",
+        "50",
+    ])
+    .expect("backfill --max-count args should parse");
+
+    let request = cli.api_request().expect("request should build");
+    let body = request.body.expect("request must have a body");
+
+    assert_eq!(body["max_count"], json!(50u64));
+}
+
+#[test]
+fn schedule_backfill_include_paused_appears_in_body() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "schedule",
+        "backfill",
+        "00000000-0000-0000-0000-000000000001",
+        "--from",
+        "2026-04-01T00:00:00Z",
+        "--to",
+        "2026-04-08T00:00:00Z",
+        "--include-paused",
+    ])
+    .expect("backfill --include-paused args should parse");
+
+    let request = cli.api_request().expect("request should build");
+    let body = request.body.expect("request must have a body");
+
+    assert_eq!(body["include_paused"], true);
+}
+
+#[test]
+fn schedule_backfill_missing_from_is_rejected_by_clap() {
+    let result = Cli::try_parse_from([
+        "harvest",
+        "schedule",
+        "backfill",
+        "00000000-0000-0000-0000-000000000001",
+        "--to",
+        "2026-04-08T00:00:00Z",
+    ]);
+    assert!(
+        result.is_err(),
+        "--from is required and its absence should be rejected"
+    );
+}
+
+#[test]
+fn schedule_backfill_missing_to_is_rejected_by_clap() {
+    let result = Cli::try_parse_from([
+        "harvest",
+        "schedule",
+        "backfill",
+        "00000000-0000-0000-0000-000000000001",
+        "--from",
+        "2026-04-01T00:00:00Z",
+    ]);
+    assert!(
+        result.is_err(),
+        "--to is required and its absence should be rejected"
+    );
 }

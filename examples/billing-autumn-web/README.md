@@ -29,6 +29,12 @@ The app listens on `http://localhost:8081`.
 - Harvest API: `GET /api/harvest/health`
 - Harvest UI: `GET /api/harvest/ui`
 
+Run the deployment preflight before starting work:
+
+```bash
+cargo run -p autumn-harvest-cli -- --base-url http://localhost:8081/api/harvest preflight
+```
+
 ## Start Checkout Through The App
 
 ```bash

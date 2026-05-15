@@ -27,9 +27,7 @@ use crate::error::{HarvestError, HarvestResult, database_error};
 #[cfg(feature = "db")]
 use crate::schema::harvest_workflow_executions;
 #[cfg(feature = "db")]
-use crate::schema::{
-    harvest_dag_runs, harvest_dead_letters, harvest_signals, harvest_task_queue, harvest_timers,
-};
+use crate::schema::{harvest_dead_letters, harvest_signals, harvest_task_queue, harvest_timers};
 #[cfg(feature = "db")]
 use crate::shard::ShardedDbPool;
 #[cfg(feature = "db")]
@@ -40,12 +38,40 @@ const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const DEFAULT_BATCH_SIZE: usize = 1_000;
 const MIN_MAX_AGE: Duration = Duration::from_secs(1);
 const MAX_MAX_AGE: Duration = Duration::from_secs(60 * 60 * 24 * 365 * 10);
+
+/// Configuration for the background retention job.
+///
+/// **Why does this exist?**
+/// Workflow histories and audit logs can grow unbounded. This configuration allows operators
+/// to define constraints for automatically pruning old, closed workflows and stale audit events
+/// to prevent storage exhaustion.
+///
+/// ## Examples
+///
+/// ```rust
+/// use autumn_harvest::retention::RetentionConfig;
+/// use std::time::Duration;
+///
+/// let config = RetentionConfig::with_max_age(Duration::from_secs(86400))
+///     .with_audit_retention_days(30);
+///
+/// assert!(config.enabled());
+/// ```
 #[derive(Debug, Clone, Serialize)]
 pub struct RetentionConfig {
+    /// Maximum age in seconds for closed workflows before they are eligible for deletion.
+    /// If `None`, workflow history retention is disabled.
     pub max_age_secs: Option<u64>,
+    /// How often the background retention job wakes up to scan for expired data.
     pub tick_interval_secs: u64,
+    /// The maximum number of records to process in a single transaction/batch.
     pub batch_size: usize,
+    /// If `true`, the retention job simulates deletions and logs what would have been deleted
+    /// without actually modifying the database.
     pub dry_run: bool,
+    /// Audit log retention in days, independent of workflow-history retention.
+    /// Defaults to 90 days (3 months). Set to 0 to disable audit purging.
+    pub audit_retention_days: i64,
 }
 
 impl Default for RetentionConfig {
@@ -55,11 +81,13 @@ impl Default for RetentionConfig {
             tick_interval_secs: DEFAULT_TICK_INTERVAL.as_secs(),
             batch_size: DEFAULT_BATCH_SIZE,
             dry_run: false,
+            audit_retention_days: 90,
         }
     }
 }
 
 impl RetentionConfig {
+    /// Bootstraps a fresh configuration template that explicitly opts-in to the workflow retention features.
     #[must_use]
     pub fn with_max_age(max_age: Duration) -> Self {
         Self {
@@ -68,11 +96,21 @@ impl RetentionConfig {
         }
     }
 
+    /// Override the audit log retention window.
+    #[must_use]
+    pub const fn with_audit_retention_days(mut self, days: i64) -> Self {
+        self.audit_retention_days = days;
+        self
+    }
+
+    /// Safely unpacks the raw configuration integer into a standard rust [`Duration`], gracefully
+    /// handling systems where the feature is entirely turned off.
     #[must_use]
     pub fn max_age(&self) -> Option<Duration> {
         self.max_age_secs.map(Duration::from_secs)
     }
 
+    /// Translates the raw numeric tick value into a standard [`Duration`] for the scheduler loop.
     #[must_use]
     pub const fn tick_interval(&self) -> Duration {
         Duration::from_secs(self.tick_interval_secs)
@@ -101,35 +139,64 @@ impl RetentionConfig {
         Ok(())
     }
 
+    /// Returns `true` if any retention features (workflow history or audit log purging) are enabled.
     #[must_use]
     pub const fn enabled(&self) -> bool {
-        self.max_age_secs.is_some()
+        self.max_age_secs.is_some() || self.audit_retention_days > 0
     }
 }
 
+/// The result of a single execution tick of the retention job on a specific shard.
+///
+/// **Why does this exist?**
+/// Provides observability into the retention job's performance and impact. It captures
+/// how many records were evaluated, how many were deleted, and any errors encountered,
+/// allowing operators to monitor the health of the background cleanup process.
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct RetentionTickResult {
+    /// The ID of the shard this retention tick operated on.
     pub shard: u16,
+    /// The timestamp when this retention tick started.
     pub ran_at: Option<DateTime<Utc>>,
+    /// The number of expired candidate records identified during the tick.
     pub candidate_count: usize,
+    /// The actual number of records successfully deleted during the tick.
     pub deleted_count: usize,
+    /// The age (in seconds) of the oldest closed workflow that was skipped (not yet expired).
+    /// Used for tuning the `max_age_secs` configuration.
     pub oldest_age_secs_skipped: Option<u64>,
+    /// The duration of the retention tick in milliseconds.
     pub duration_ms: u128,
+    /// The last error encountered during the tick, if any.
     pub last_error: Option<String>,
 }
 
+/// The current overall status of the retention subsystem.
+///
+/// **Why does this exist?**
+/// Aggregates the static configuration and the dynamic runtime state (per-shard results)
+/// to provide a comprehensive snapshot of the retention process for diagnostic APIs.
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct RetentionStatus {
+    /// The active retention configuration.
     pub config: RetentionConfig,
+    /// The latest execution results for each active shard.
     pub per_shard: Vec<RetentionTickResult>,
 }
 
+/// A thread-safe monitor for observing the background retention process.
+///
+/// **Why does this exist?**
+/// Enables the background retention job to asynchronously report its progress and results,
+/// while allowing external components (like administrative APIs or telemetry systems)
+/// to safely query the latest status without blocking or tearing.
 #[derive(Debug, Clone)]
 pub struct RetentionMonitor {
     inner: Arc<Mutex<RetentionStatus>>,
 }
 
 impl RetentionMonitor {
+    /// Boots up a clean monitoring tracker that acts as the initial blank canvas before shards report results.
     #[must_use]
     pub fn new(config: RetentionConfig, shards: impl Iterator<Item = ShardId>) -> Self {
         let per_shard = shards
@@ -167,6 +234,12 @@ impl RetentionMonitor {
     }
 }
 
+/// Represents the running background task that processes retention policies.
+///
+/// **Why does this exist?**
+/// Provides a handle to control and monitor the active background retention job.
+/// It encapsulates the background tokio task, the cancellation token for graceful shutdown,
+/// and the channel used to force immediate retention sweeps.
 #[cfg(feature = "db")]
 pub struct RetentionRuntime {
     shutdown: CancellationToken,
@@ -206,68 +279,85 @@ impl RetentionRuntime {
                     }
                 }
 
-                let cutoff = Utc::now()
-                    - chrono::Duration::from_std(
-                        config.max_age().expect("enabled config has max_age"),
-                    )
-                    .unwrap_or_default();
-                let tick_futures = pools.iter_shards().map(|(shard, pool)| {
-                    let pool = pool.clone();
-                    let config = config.clone();
-                    let metrics = Arc::clone(&metrics);
-                    let cursor = scan_cursors.get(&shard).copied().flatten();
-                    async move {
-                        let started = Instant::now();
-                        let tick = run_shard_tick(
-                            pool,
-                            shard,
-                            cutoff,
-                            &config,
-                            cursor,
-                            Arc::clone(&metrics),
-                        )
-                        .await;
-                        (shard, started, tick)
-                    }
-                });
+                // Workflow-history retention: only when max_age is configured.
+                if let Some(max_age) = config.max_age() {
+                    let cutoff =
+                        Utc::now() - chrono::Duration::from_std(max_age).unwrap_or_default();
+                    let tick_futures = pools.iter_shards().map(|(shard, pool)| {
+                        let pool = pool.clone();
+                        let config = config.clone();
+                        let metrics = Arc::clone(&metrics);
+                        let cursor = scan_cursors.get(&shard).copied().flatten();
+                        async move {
+                            let started = Instant::now();
+                            let tick = run_shard_tick(
+                                pool,
+                                shard,
+                                cutoff,
+                                &config,
+                                cursor,
+                                Arc::clone(&metrics),
+                            )
+                            .await;
+                            (shard, started, tick)
+                        }
+                    });
 
-                for (shard, started, tick) in join_all(tick_futures).await {
-                    let mut result = RetentionTickResult {
-                        shard: u16::try_from(shard.as_i32()).unwrap_or(0),
-                        ran_at: Some(Utc::now()),
-                        duration_ms: started.elapsed().as_millis(),
-                        ..RetentionTickResult::default()
-                    };
-                    match tick {
-                        Ok(ok) => {
-                            scan_cursors.insert(shard, ok.next_cursor);
-                            result.candidate_count = ok.candidate_count;
-                            result.deleted_count = ok.deleted_count;
-                            result.oldest_age_secs_skipped = ok.oldest_age_secs_skipped;
-                            tracing::info!(
-                                shard = %shard,
-                                candidates = ok.candidate_count,
-                                deleted = ok.deleted_count,
-                                oldest_age_secs_skipped = ok.oldest_age_secs_skipped,
-                                duration_ms = result.duration_ms,
-                                dry_run = config.dry_run,
-                                "harvest retention tick completed"
-                            );
-                            #[allow(clippy::cast_precision_loss)]
-                            metrics.record_retention_tick(
-                                u16::try_from(shard.as_i32()).unwrap_or(0),
-                                ok.candidate_count as u64,
-                                ok.deleted_count as u64,
-                                result.duration_ms as f64 / 1000.0,
-                            );
+                    for (shard, started, tick) in join_all(tick_futures).await {
+                        let mut result = RetentionTickResult {
+                            shard: u16::try_from(shard.as_i32()).unwrap_or(0),
+                            ran_at: Some(Utc::now()),
+                            duration_ms: started.elapsed().as_millis(),
+                            ..RetentionTickResult::default()
+                        };
+                        match tick {
+                            Ok(ok) => {
+                                scan_cursors.insert(shard, ok.next_cursor);
+                                result.candidate_count = ok.candidate_count;
+                                result.deleted_count = ok.deleted_count;
+                                result.oldest_age_secs_skipped = ok.oldest_age_secs_skipped;
+                                tracing::info!(
+                                    shard = %shard,
+                                    candidates = ok.candidate_count,
+                                    deleted = ok.deleted_count,
+                                    oldest_age_secs_skipped = ok.oldest_age_secs_skipped,
+                                    duration_ms = result.duration_ms,
+                                    dry_run = config.dry_run,
+                                    "harvest retention tick completed"
+                                );
+                                #[allow(clippy::cast_precision_loss)]
+                                metrics.record_retention_tick(
+                                    u16::try_from(shard.as_i32()).unwrap_or(0),
+                                    ok.candidate_count as u64,
+                                    ok.deleted_count as u64,
+                                    result.duration_ms as f64 / 1000.0,
+                                );
+                            }
+                            Err(error) => {
+                                result.last_error = Some(error.to_string());
+                                scan_cursors.insert(shard, None);
+                                tracing::warn!(shard = %shard, error = %error, "harvest retention tick failed");
+                            }
                         }
-                        Err(error) => {
-                            result.last_error = Some(error.to_string());
-                            scan_cursors.insert(shard, None);
-                            tracing::warn!(shard = %shard, error = %error, "harvest retention tick failed");
+                        monitor_task.update(shard, result);
+                    }
+                }
+
+                // Purge old audit records once per tick, best-effort.
+                // Audit rows may live on any shard (workflow starts use shard-aware
+                // inserts), so iterate every shard to honour the retention window.
+                if config.audit_retention_days > 0 && !config.dry_run {
+                    for (_, pool) in pools.iter_shards() {
+                        if let Ok(mut conn) = pool.get().await
+                            && let Err(err) = crate::audit::purge_old_audit_records(
+                                &mut conn,
+                                config.audit_retention_days,
+                            )
+                            .await
+                        {
+                            tracing::warn!(error = %err, "harvest audit log purge failed");
                         }
                     }
-                    monitor_task.update(shard, result);
                 }
             }
         });
@@ -280,20 +370,25 @@ impl RetentionRuntime {
         })
     }
 
+    /// Shares a snapshot interface allowing telemetry dashboards to safely peek at the process.
     #[must_use]
     pub fn monitor(&self) -> RetentionMonitor {
         self.monitor.clone()
     }
 
+    /// Forces the background worker to wake up and aggressively prune immediately without waiting
+    /// for the next interval loop.
     pub fn run_now(&self) {
         let _ = self.trigger_tx.try_send(());
     }
 
+    /// Exposes a direct channel to bypass scheduling and command the worker to act right now.
     #[must_use]
     pub fn trigger_sender(&self) -> mpsc::Sender<()> {
         self.trigger_tx.clone()
     }
 
+    /// Triggers the emergency stop sequence to abort any running operations gracefully.
     pub fn shutdown(&self) {
         self.shutdown.cancel();
     }
@@ -358,7 +453,7 @@ async fn run_shard_tick(
         let candidates = diesel::sql_query(
             "SELECT id, workflow_name, workflow_id, completed_at
              FROM harvest_workflow_executions
-             WHERE state IN ('COMPLETED','FAILED','CANCELLED','TIMED_OUT','CONTINUED_AS_NEW')
+             WHERE state IN ('COMPLETED','FAILED','CANCELLED','TIMED_OUT','CONTINUED_AS_NEW','TERMINATED')
                AND completed_at IS NOT NULL
                AND completed_at < $1
                AND (
@@ -443,6 +538,7 @@ async fn delete_candidate_execution(
                         "CANCELLED",
                         "TIMED_OUT",
                         "CONTINUED_AS_NEW",
+                        "TERMINATED",
                     ])),
             )
             .set(harvest_workflow_executions::parent_id.eq::<Option<uuid::Uuid>>(None))
@@ -481,7 +577,7 @@ async fn should_skip_candidate(
         "SELECT COUNT(*) AS count
          FROM harvest_workflow_executions
          WHERE parent_id = $1
-           AND state NOT IN ('COMPLETED','FAILED','CANCELLED','TIMED_OUT','CONTINUED_AS_NEW')",
+           AND state NOT IN ('COMPLETED','FAILED','CANCELLED','TIMED_OUT','CONTINUED_AS_NEW','TERMINATED')",
     )
     .bind::<SqlUuid, _>(candidate.id)
     .get_result::<CountRow>(conn)
@@ -490,16 +586,6 @@ async fn should_skip_candidate(
     .count;
 
     if active_parent_ref_count > 0 {
-        return Ok(true);
-    }
-
-    let dag_run_ref_count = harvest_dag_runs::table
-        .filter(harvest_dag_runs::workflow_exec_id.eq(Some(candidate.id)))
-        .count()
-        .get_result::<i64>(conn)
-        .await
-        .map_err(database_error)?;
-    if dag_run_ref_count > 0 {
         return Ok(true);
     }
 
@@ -543,7 +629,7 @@ async fn should_skip_candidate(
            AND workflow_id = $2
            AND id <> $3
            AND (
-               state NOT IN ('COMPLETED','FAILED','CANCELLED','TIMED_OUT','CONTINUED_AS_NEW')
+                state NOT IN ('COMPLETED','FAILED','CANCELLED','TIMED_OUT','CONTINUED_AS_NEW','TERMINATED')
                OR completed_at IS NULL
                OR completed_at >= $4
            )",

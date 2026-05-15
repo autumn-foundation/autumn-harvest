@@ -16,6 +16,10 @@ use crate::types::{
     ActivityExecId, ExecutionId, ExternalActivityToken, TimerId, UpdateId, WorkerId,
 };
 
+fn default_error_type() -> String {
+    "Error".to_string()
+}
+
 /// All possible events in a workflow's history.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
@@ -71,13 +75,39 @@ pub enum WorkflowEvent {
         output: serde_json::Value,
     },
     /// The activity returned an error or panicked.
+    ///
+    /// ## Backward-compatibility note (issue #227)
+    ///
+    /// `error_type` and `non_retryable` were added after the initial release.
+    /// Old events stored without these fields deserialise cleanly via
+    /// `#[serde(default)]`: `error_type` falls back to `"Error"` and
+    /// `non_retryable` falls back to `false`. The append-only invariant is
+    /// preserved — no variants removed, no renames.
     ActivityFailed {
         /// Unique ID for this specific activity attempt.
         activity_id: ActivityExecId,
-        /// String representation of the failure.
+        /// Human-readable string representation of the failure.
         error: String,
         /// How many times the activity has failed so far.
         attempt: u32,
+        /// Low-cardinality error-type name for metrics and policy matching.
+        ///
+        /// Defaults to `"Error"` for events stored before issue #227.
+        #[serde(default = "default_error_type")]
+        error_type: String,
+        /// When `true`, the worker skipped retry and routed to DLQ immediately.
+        ///
+        /// Defaults to `false` for events stored before issue #227.
+        #[serde(default)]
+        non_retryable: bool,
+        /// Optional structured details preserved from
+        /// [`ActivityFailure::with_details`](crate::failure::ActivityFailure::with_details).
+        ///
+        /// Defaults to `None` for events stored before issue #227 or for
+        /// failures returned via the legacy `Err(String)` path. Omitted from
+        /// the serialised form when `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        details: Option<serde_json::Value>,
     },
     /// The activity exceeded its allocated `start_to_close` or `heartbeat` timeout.
     ActivityTimedOut {
@@ -186,8 +216,8 @@ pub enum WorkflowEvent {
     ///
     /// Multiple `LocalActivityFailed` events may appear in sequence (one per
     /// attempt) before a terminal `LocalActivityCompleted` (retry eventually
-    /// succeeded) or before the retry budget is exhausted (the last
-    /// `LocalActivityFailed` with no following `LocalActivityCompleted`).
+    /// succeeded) or before the retry budget is exhausted (followed by a
+    /// `LocalActivityExhausted` event that marks the terminal state).
     LocalActivityFailed {
         /// Unique ID matching the corresponding `LocalActivityScheduled`.
         activity_id: ActivityExecId,
@@ -275,6 +305,48 @@ pub enum WorkflowEvent {
         /// String representation of the handler error.
         error: String,
     },
+
+    // ── Workflow reset (issue #148) ─────────────────────────────────────────
+    /// Marker appended to the forked execution after the carried-over history.
+    ///
+    /// Replay treats this as informational: it records why the fork exists
+    /// without corresponding to a workflow command.
+    WorkflowResetFork {
+        /// The source execution that was reset.
+        reset_from_exec_id: ExecutionId,
+        /// Last source event copied into this fork.
+        reset_to_event_id: i64,
+        /// Operator-supplied recovery reason.
+        reason: String,
+        /// Operator identity for audit.
+        operator_id: String,
+    },
+    /// Marker appended to the source execution when a reset fork supersedes it.
+    WorkflowResetTerminated {
+        /// The forked execution that should continue forward.
+        reset_to_exec_id: ExecutionId,
+        /// Operator-supplied recovery reason.
+        reason: String,
+        /// Operator identity for audit.
+        operator_id: String,
+    },
+    /// All retry attempts for a local activity were exhausted. Appended
+    /// immediately after the final `LocalActivityFailed` event so replay can
+    /// identify the terminal state without knowing the current retry policy.
+    ///
+    /// This makes the terminal-vs-in-progress distinction policy-invariant:
+    /// if this event is present the activity is unambiguously done; if only
+    /// `LocalActivityFailed` events are present (without a following
+    /// `LocalActivityExhausted`) the worker crashed between retries and must
+    /// continue from the next attempt.
+    LocalActivityExhausted {
+        /// Unique ID matching the corresponding `LocalActivityScheduled`.
+        activity_id: ActivityExecId,
+        /// Error from the final attempt.
+        error: String,
+        /// Total attempts that were made (equals `max_attempts`).
+        attempt: u32,
+    },
 }
 
 impl WorkflowEvent {
@@ -311,6 +383,9 @@ impl WorkflowEvent {
             Self::UpdateAdmitted { .. } => "UpdateAdmitted",
             Self::UpdateCompleted { .. } => "UpdateCompleted",
             Self::UpdateFailed { .. } => "UpdateFailed",
+            Self::WorkflowResetFork { .. } => "WorkflowResetFork",
+            Self::WorkflowResetTerminated { .. } => "WorkflowResetTerminated",
+            Self::LocalActivityExhausted { .. } => "LocalActivityExhausted",
         }
     }
 
@@ -324,6 +399,8 @@ impl WorkflowEvent {
             Self::WorkflowCompleted { .. }
                 | Self::WorkflowFailed { .. }
                 | Self::WorkflowCancelled { .. }
+                | Self::WorkflowContinuedAsNew { .. }
+                | Self::WorkflowResetTerminated { .. }
         )
     }
 }
@@ -333,6 +410,81 @@ mod tests {
     use super::*;
     use crate::types::ActivityExecId;
     use chrono::Utc;
+
+    // ── ActivityFailed typed-failure tests (issue #227) ──────────────────────
+
+    #[test]
+    fn activity_failed_has_error_type_and_non_retryable_fields() {
+        let id = ActivityExecId::new();
+        let event = WorkflowEvent::ActivityFailed {
+            activity_id: id,
+            error: "InvalidInput: bad value".into(),
+            attempt: 1,
+            error_type: "InvalidInput".into(),
+            non_retryable: true,
+            details: None,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let back: WorkflowEvent = serde_json::from_str(&json).unwrap();
+        match back {
+            WorkflowEvent::ActivityFailed {
+                error_type,
+                non_retryable,
+                attempt,
+                ..
+            } => {
+                assert_eq!(error_type, "InvalidInput");
+                assert!(non_retryable);
+                assert_eq!(attempt, 1);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn activity_failed_old_format_deserializes_with_defaults() {
+        // Old events stored without error_type / non_retryable must deserialize
+        // cleanly via serde(default).
+        let old_json = r#"{"type":"ActivityFailed","data":{"activity_id":"00000000-0000-0000-0000-000000000001","error":"connection refused","attempt":2}}"#;
+        let back: WorkflowEvent = serde_json::from_str(old_json).unwrap();
+        match back {
+            WorkflowEvent::ActivityFailed {
+                error,
+                attempt,
+                error_type,
+                non_retryable,
+                ..
+            } => {
+                assert_eq!(error, "connection refused");
+                assert_eq!(attempt, 2);
+                assert_eq!(error_type, "Error", "default error_type must be 'Error'");
+                assert!(!non_retryable, "default non_retryable must be false");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn activity_failed_retryable_round_trips() {
+        let id = ActivityExecId::new();
+        let event = WorkflowEvent::ActivityFailed {
+            activity_id: id,
+            error: "Transient: timeout".into(),
+            attempt: 1,
+            error_type: "Transient".into(),
+            non_retryable: false,
+            details: None,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let back: WorkflowEvent = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            back,
+            WorkflowEvent::ActivityFailed {
+                non_retryable: false,
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn workflow_started_round_trips_serde() -> Result<(), serde_json::Error> {
@@ -402,6 +554,24 @@ mod tests {
     }
 
     #[test]
+    fn local_activity_exhausted_round_trips() -> Result<(), serde_json::Error> {
+        let id = ActivityExecId::new();
+        let event = WorkflowEvent::LocalActivityExhausted {
+            activity_id: id,
+            error: "always fails".into(),
+            attempt: 3,
+        };
+        let json = serde_json::to_string(&event)?;
+        let back: WorkflowEvent = serde_json::from_str(&json)?;
+        assert!(matches!(
+            back,
+            WorkflowEvent::LocalActivityExhausted { attempt: 3, .. }
+        ));
+        assert_eq!(event.type_name(), "LocalActivityExhausted");
+        Ok(())
+    }
+
+    #[test]
     fn event_type_name_is_stable() {
         let e = WorkflowEvent::WorkflowCompleted {
             output: serde_json::Value::Null,
@@ -443,6 +613,9 @@ mod tests {
                 activity_id: ActivityExecId::new(),
                 error: "x".into(),
                 attempt: 1,
+                error_type: "Error".into(),
+                non_retryable: false,
+                details: None,
             },
             WorkflowEvent::ActivityTimedOut {
                 activity_id: ActivityExecId::new(),
@@ -535,10 +708,55 @@ mod tests {
                 update_id: crate::types::UpdateId::new(),
                 error: "x".into(),
             },
+            WorkflowEvent::WorkflowResetFork {
+                reset_from_exec_id: ExecutionId::new(),
+                reset_to_event_id: 1,
+                reason: "bad deploy".into(),
+                operator_id: "ops".into(),
+            },
+            WorkflowEvent::WorkflowResetTerminated {
+                reset_to_exec_id: ExecutionId::new(),
+                reason: "bad deploy".into(),
+                operator_id: "ops".into(),
+            },
         ];
 
-        assert_eq!(events.len(), 28);
+        assert_eq!(events.len(), 30);
         let names: HashSet<_> = events.iter().map(WorkflowEvent::type_name).collect();
-        assert_eq!(names.len(), 28, "duplicate type names detected");
+        assert_eq!(names.len(), 30, "duplicate type names detected");
+    }
+
+    #[test]
+    fn workflow_reset_events_round_trip_and_type_names_are_stable() -> Result<(), serde_json::Error>
+    {
+        let source = ExecutionId::new();
+        let fork = ExecutionId::new();
+        let fork_event = WorkflowEvent::WorkflowResetFork {
+            reset_from_exec_id: source,
+            reset_to_event_id: 42,
+            reason: "rolled back bad signal".into(),
+            operator_id: "oncall".into(),
+        };
+        let terminated_event = WorkflowEvent::WorkflowResetTerminated {
+            reset_to_exec_id: fork,
+            reason: "rolled back bad signal".into(),
+            operator_id: "oncall".into(),
+        };
+
+        assert_eq!(fork_event.type_name(), "WorkflowResetFork");
+        assert_eq!(terminated_event.type_name(), "WorkflowResetTerminated");
+
+        let json = serde_json::to_string(&fork_event)?;
+        let back: WorkflowEvent = serde_json::from_str(&json)?;
+        assert!(matches!(
+            back,
+            WorkflowEvent::WorkflowResetFork {
+                reset_from_exec_id,
+                reset_to_event_id: 42,
+                ..
+            } if reset_from_exec_id == source
+        ));
+
+        Ok(())
     }
 }

@@ -48,6 +48,8 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../migrations/20260424000001_harvest_trace_context/up.sql"),
     "\n",
+    include_str!("../migrations/20260505000000_harvest_heartbeat_details/up.sql"),
+    "\n",
     include_str!("../migrations/20260427000000_harvest_continue_as_new/up.sql"),
     "\n",
     include_str!("../migrations/20260429000000_harvest_concurrency_key/up.sql"),
@@ -56,11 +58,19 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../migrations/20260430000001_harvest_external_tasks/up.sql"),
     "\n",
+    include_str!("../migrations/20260508000000_harvest_external_task_updated_at/up.sql"),
+    "\n",
     include_str!("../migrations/20260501000000_harvest_workers/up.sql"),
     "\n",
     include_str!("../migrations/20260501010000_harvest_batch_jobs/up.sql"),
     "\n",
     include_str!("../migrations/20260501020000_harvest_batch_processed_ids/up.sql"),
+    "\n",
+    include_str!("../migrations/20260509000000_harvest_build_routing/up.sql"),
+    "\n",
+    include_str!("../migrations/20260513000000_harvest_schedule_pause_metadata/up.sql"),
+    "\n",
+    include_str!("../migrations/20260514020000_harvest_task_activity_id/up.sql"),
 );
 
 // -------------------------------------------------------------------------
@@ -299,6 +309,8 @@ fn all_adr_0001_span_kinds_are_emitted() {
                         max_local_activity_start_to_close: Duration::from_secs(60),
                         shard_assignments: vec![ShardId::new(0)],
                         worker_heartbeat_interval: Duration::from_secs(5),
+                        build_id: String::new(),
+                        deployment_name: None,
                     },
                     registry,
                 )

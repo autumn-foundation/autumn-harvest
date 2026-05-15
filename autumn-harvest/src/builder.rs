@@ -4,8 +4,9 @@ use std::any::{Any, TypeId};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::context::SharedStateMap;
+use crate::context::{SharedStateMap, WorkflowHistoryPolicy};
 use crate::info::{ActivityInfo, DagInfo, WorkflowInfo};
+use crate::payload_codec::{PayloadCodec, PayloadCodecs};
 use crate::policy::WorkflowSchedule;
 use crate::retention::RetentionConfig;
 use crate::telemetry::TelemetryConfig;
@@ -41,10 +42,13 @@ pub struct HarvestBuilder {
     activities: Vec<ActivityInfo>,
     dags: Vec<DagInfo>,
     workflow_schedules: Vec<WorkflowSchedule>,
+    auto_registered_dag_workflows: Vec<String>,
     worker_config: WorkerConfig,
     state: SharedStateMap,
     telemetry: Option<TelemetryConfig>,
     retention: RetentionConfig,
+    payload_codecs: PayloadCodecs,
+    history_policy: WorkflowHistoryPolicy,
 }
 
 impl std::fmt::Debug for HarvestBuilder {
@@ -54,10 +58,16 @@ impl std::fmt::Debug for HarvestBuilder {
             .field("activity_count", &self.activities.len())
             .field("dag_count", &self.dags.len())
             .field("workflow_schedule_count", &self.workflow_schedules.len())
+            .field(
+                "auto_registered_dag_workflow_count",
+                &self.auto_registered_dag_workflows.len(),
+            )
             .field("worker_config", &self.worker_config)
             .field("state_count", &self.state.len())
             .field("telemetry_configured", &self.telemetry.is_some())
             .field("retention", &self.retention)
+            .field("payload_codecs", &"configured")
+            .field("history_policy", &self.history_policy)
             .finish()
     }
 }
@@ -72,6 +82,8 @@ pub struct BuiltHarvest {
     state: SharedStateMap,
     telemetry: Arc<TelemetryConfig>,
     retention: RetentionConfig,
+    payload_codecs: PayloadCodecs,
+    history_policy: WorkflowHistoryPolicy,
 }
 
 impl std::fmt::Debug for BuiltHarvest {
@@ -85,6 +97,8 @@ impl std::fmt::Debug for BuiltHarvest {
             .field("state_count", &self.state.len())
             .field("telemetry", &self.telemetry)
             .field("retention", &self.retention)
+            .field("payload_codecs", &"configured")
+            .field("history_policy", &self.history_policy)
             .finish()
     }
 }
@@ -184,12 +198,47 @@ pub enum HarvestBuilderError {
         reason: String,
     },
 
+    /// A normal workflow registration reused the name of a DAG that is
+    /// auto-registered as a workflow for unified DAG execution.
+    #[error(
+        "workflow name '{name}' collides with an auto-registered DAG workflow; \
+         register workflows and DAGs with distinct names"
+    )]
+    DagWorkflowNameCollision {
+        /// The shared workflow/DAG name.
+        name: String,
+    },
+
+    /// A DAG references an activity registered as local-only. Local activities
+    /// run inline on the workflow worker and cannot be scheduled through the
+    /// DAG activity queue lowering.
+    #[error(
+        "DAG '{dag}' references local activity '{activity}'; local activities cannot be used in DAG definitions"
+    )]
+    LocalActivityInDag {
+        /// DAG containing the local activity task.
+        dag: String,
+        /// Local activity referenced by the DAG.
+        activity: String,
+    },
+
     /// A [`WorkerConfig`] field has an invalid value.
     #[error("invalid worker configuration: {0}")]
     InvalidWorkerConfig(String),
 }
 
 impl BuiltHarvest {
+    #[must_use]
+    pub const fn payload_codecs(&self) -> &PayloadCodecs {
+        &self.payload_codecs
+    }
+
+    /// History-size guardrails applied to workflow contexts and workers.
+    #[must_use]
+    pub const fn history_policy(&self) -> WorkflowHistoryPolicy {
+        self.history_policy
+    }
+
     /// Number of registered workflows.
     #[must_use]
     pub const fn workflow_count(&self) -> usize {
@@ -250,6 +299,14 @@ impl BuiltHarvest {
         &self.retention
     }
 
+    /// Override the audit log retention window after the build step.
+    ///
+    /// Use this to apply a runtime-configured value (e.g. from `HarvestApiState`)
+    /// without rebuilding the entire harvest configuration.
+    pub const fn set_audit_retention_days(&mut self, days: i64) {
+        self.retention.audit_retention_days = days;
+    }
+
     /// Convert the built harvest registration into worker-ready parts.
     #[cfg(feature = "db")]
     #[must_use]
@@ -267,7 +324,8 @@ impl BuiltHarvest {
                 self.activities,
                 Arc::new(self.state),
                 self.telemetry,
-            ),
+            )
+            .with_history_policy(self.history_policy),
             self.dags,
             self.workflow_schedules,
             self.worker_config,
@@ -294,7 +352,8 @@ impl BuiltHarvest {
                 self.activities,
                 Arc::new(self.state),
                 self.telemetry,
-            ),
+            )
+            .with_history_policy(self.history_policy),
             self.dags,
             self.workflow_schedules,
             self.worker_config,
@@ -334,9 +393,29 @@ impl HarvestBuilder {
     /// Register DAG definitions (output of `dags![]` macro).
     ///
     /// DAGs define graphs of steps that run according to a schedule.
+    ///
+    /// When the `unified-dag-execution` feature is enabled every DAG whose
+    /// `workflow_handler` is populated (i.e. produced by the `#[dag]` macro
+    /// with that feature on) is also auto-registered as a [`WorkflowInfo`] and,
+    /// if it carries a schedule attribute, as a [`WorkflowSchedule`]. This
+    /// wires unified DAGs into the standard workflow execution and scheduler
+    /// paths without requiring separate `.workflow_schedule(...)` calls.
     #[must_use]
     pub fn dags(mut self, dags: Vec<DagInfo>) -> Self {
-        self.dags.extend(dags);
+        for dag in dags {
+            #[cfg(feature = "unified-dag-execution")]
+            {
+                if let Some(workflow_info) = dag.as_workflow_info() {
+                    self.auto_registered_dag_workflows
+                        .push(workflow_info.name.to_string());
+                    self.workflows.push(workflow_info);
+                }
+                if let Some(workflow_schedule) = dag.as_workflow_schedule() {
+                    self.workflow_schedules.push(workflow_schedule);
+                }
+            }
+            self.dags.push(dag);
+        }
         self
     }
 
@@ -395,6 +474,12 @@ impl HarvestBuilder {
     ///
     /// When unset, the runtime uses safe no-op defaults — telemetry is opt-in.
     #[must_use]
+    pub fn payload_codec(mut self, codec: impl PayloadCodec + 'static) -> Self {
+        self.payload_codecs.set_default(Arc::new(codec));
+        self
+    }
+
+    #[must_use]
     pub fn telemetry(mut self, telemetry: TelemetryConfig) -> Self {
         self.telemetry = Some(telemetry);
         self
@@ -404,6 +489,23 @@ impl HarvestBuilder {
     #[must_use]
     pub const fn retention(mut self, retention: RetentionConfig) -> Self {
         self.retention = retention;
+        self
+    }
+
+    /// Override the soft history-size threshold used by
+    /// [`crate::context::WorkflowContext::should_continue_as_new`].
+    #[must_use]
+    pub const fn history_continue_as_new_threshold(mut self, threshold: u64) -> Self {
+        self.history_policy = self
+            .history_policy
+            .with_continue_as_new_threshold(threshold);
+        self
+    }
+
+    /// Configure an opt-in hard cap for workflow history event counts.
+    #[must_use]
+    pub const fn history_event_hard_cap(mut self, cap: u64) -> Self {
+        self.history_policy = self.history_policy.with_event_hard_cap(cap);
         self
     }
 
@@ -463,11 +565,20 @@ impl HarvestBuilder {
         }
 
         validate_concurrency_keys(&self.activities)?;
-        validate_workflow_schedules(&self.workflow_schedules, &self.workflows)?;
+        validate_dag_workflow_name_collisions(
+            &self.workflows,
+            &self.auto_registered_dag_workflows,
+        )?;
+        validate_workflow_schedules(
+            &self.workflow_schedules,
+            &self.workflows,
+            &self.auto_registered_dag_workflows,
+        )?;
         validate_local_activity_timeouts(
             &self.activities,
             self.worker_config.max_local_activity_start_to_close,
         )?;
+        validate_dags_do_not_use_local_activities(&self.dags, &self.activities)?;
 
         Ok(BuiltHarvest {
             workflows: self.workflows,
@@ -478,8 +589,75 @@ impl HarvestBuilder {
             state: self.state,
             telemetry: Arc::new(self.telemetry.unwrap_or_default()),
             retention: self.retention,
+            payload_codecs: self.payload_codecs.clone(),
+            history_policy: self.history_policy,
         })
     }
+}
+
+fn validate_dags_do_not_use_local_activities(
+    dags: &[DagInfo],
+    activities: &[ActivityInfo],
+) -> Result<(), HarvestBuilderError> {
+    use std::collections::HashSet;
+
+    let local_activities = activities
+        .iter()
+        .filter(|activity| activity.is_local)
+        .map(|activity| activity.name)
+        .collect::<HashSet<_>>();
+    if local_activities.is_empty() || dags.is_empty() {
+        return Ok(());
+    }
+
+    for dag in dags {
+        let Ok(definition) = dag.build_definition() else {
+            continue;
+        };
+        for task in definition.tasks() {
+            if local_activities.contains(task.activity_name.as_str()) {
+                return Err(HarvestBuilderError::LocalActivityInDag {
+                    dag: dag.name.to_string(),
+                    activity: task.activity_name.clone(),
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Verify that unified DAG auto-registration does not overwrite or get
+/// overwritten by a normal workflow with the same name.
+fn validate_dag_workflow_name_collisions(
+    workflows: &[crate::info::WorkflowInfo],
+    auto_registered_dag_workflows: &[String],
+) -> Result<(), HarvestBuilderError> {
+    use std::collections::HashMap;
+
+    if auto_registered_dag_workflows.is_empty() {
+        return Ok(());
+    }
+
+    let mut auto_counts: HashMap<&str, usize> = HashMap::new();
+    for name in auto_registered_dag_workflows {
+        *auto_counts.entry(name.as_str()).or_default() += 1;
+    }
+
+    let mut workflow_counts: HashMap<&str, usize> = HashMap::new();
+    for workflow in workflows {
+        *workflow_counts.entry(workflow.name).or_default() += 1;
+    }
+
+    for (name, auto_count) in auto_counts {
+        if workflow_counts.get(name).copied().unwrap_or_default() > auto_count {
+            return Err(HarvestBuilderError::DagWorkflowNameCollision {
+                name: name.to_string(),
+            });
+        }
+    }
+
+    Ok(())
 }
 
 /// Verify that every [`WorkflowSchedule`] references a workflow name that is
@@ -488,6 +666,7 @@ impl HarvestBuilder {
 fn validate_workflow_schedules(
     schedules: &[WorkflowSchedule],
     workflows: &[crate::info::WorkflowInfo],
+    auto_registered_dag_workflows: &[String],
 ) -> Result<(), HarvestBuilderError> {
     if schedules.is_empty() {
         return Ok(());
@@ -498,6 +677,16 @@ fn validate_workflow_schedules(
             return Err(HarvestBuilderError::UnknownWorkflowSchedule {
                 workflow_name: schedule.workflow_name.clone(),
                 registered,
+            });
+        }
+        if schedule.dag_name.is_none()
+            && auto_registered_dag_workflows
+                .iter()
+                .any(|dag_name| dag_name == &schedule.workflow_name)
+        {
+            return Err(HarvestBuilderError::InvalidWorkflowSchedule {
+                workflow_name: schedule.workflow_name.clone(),
+                reason: "workflow schedule targets an auto-registered DAG workflow; use the DAG schedule registration instead".to_string(),
             });
         }
         // Reject zero-length intervals (would cause infinite loops in due_run_plan
@@ -641,6 +830,15 @@ pub struct WorkerConfig {
     /// Defaults to **5 seconds**. The API classifies a worker as stale after
     /// `2 × worker_heartbeat_interval` without a heartbeat.
     pub worker_heartbeat_interval: Duration,
+    /// Immutable build identifier for this worker binary (issue #171).
+    ///
+    /// Set to a stable per-build token (Git SHA, semver tag, CI job ID, etc.)
+    /// to enable build-aware task routing. Empty string = legacy behaviour
+    /// where the worker can claim any task regardless of `required_build_id`.
+    pub build_id: String,
+    /// Optional human-readable deployment name for operator observability
+    /// (issue #171), e.g. `"prod-blue"` or `"canary"`.
+    pub deployment_name: Option<String>,
 }
 
 impl Default for WorkerConfig {
@@ -657,6 +855,8 @@ impl Default for WorkerConfig {
             shard_assignments: vec![ShardId::new(0)],
             max_local_activity_start_to_close: Duration::from_secs(60),
             worker_heartbeat_interval: Duration::from_secs(5),
+            build_id: String::new(),
+            deployment_name: None,
         }
     }
 }
@@ -723,6 +923,27 @@ impl WorkerConfig {
         self.worker_heartbeat_interval = interval;
         self
     }
+
+    /// Set the immutable build identifier for this worker (issue #171).
+    ///
+    /// Use a stable per-build token — a Git SHA, semver tag, or CI job ID.
+    /// Workers without a build ID (the default empty string) behave as legacy
+    /// workers and can claim any task regardless of build routing policy.
+    #[must_use]
+    pub fn with_build_id(mut self, build_id: impl Into<String>) -> Self {
+        self.build_id = build_id.into();
+        self
+    }
+
+    /// Set an optional human-readable deployment name (issue #171).
+    ///
+    /// For operator observability only — e.g. `"prod-blue"`, `"canary"`.
+    /// Harvest does not use the deployment name for routing decisions.
+    #[must_use]
+    pub fn with_deployment_name(mut self, name: impl Into<String>) -> Self {
+        self.deployment_name = Some(name.into());
+        self
+    }
 }
 
 #[cfg(test)]
@@ -751,6 +972,23 @@ mod tests {
             max_active_runs: 1,
             default_queue: Some("default"),
             builder: build,
+            workflow_handler: None,
+        }
+    }
+
+    #[cfg(feature = "unified-dag-execution")]
+    fn fake_unified_dag_info() -> DagInfo {
+        fn build(_dag: &mut DagBuilder) {}
+
+        DagInfo {
+            name: "daily_etl",
+            module: "test",
+            schedule: Some(Schedule::Manual),
+            catchup: false,
+            max_active_runs: 1,
+            default_queue: Some("default"),
+            builder: build,
+            workflow_handler: Some(|_ctx, input| Box::pin(async move { Ok(input) })),
         }
     }
 
@@ -814,6 +1052,31 @@ mod tests {
         assert_eq!(builder.dag_count(), 1);
     }
 
+    #[cfg(feature = "unified-dag-execution")]
+    #[test]
+    fn harvest_builder_rejects_workflow_schedule_targeting_auto_registered_dag_name() {
+        let result = HarvestBuilder::new()
+            .dags(vec![fake_unified_dag_info()])
+            .workflow_schedule(WorkflowSchedule::new(
+                "daily_etl",
+                Schedule::Interval(Duration::from_secs(60)),
+            ))
+            .try_build();
+
+        let err = result.unwrap_err();
+        assert!(matches!(
+            err,
+            HarvestBuilderError::InvalidWorkflowSchedule {
+                ref workflow_name,
+                ..
+            } if workflow_name == "daily_etl"
+        ));
+        assert!(
+            err.to_string().contains("auto-registered DAG"),
+            "error should explain the DAG/workflow schedule collision: {err}"
+        );
+    }
+
     #[test]
     fn harvest_builder_build_registers_shared_state() {
         let built = HarvestBuilder::new().state(String::from("hello")).build();
@@ -830,6 +1093,41 @@ mod tests {
         let built = HarvestBuilder::new().build();
         // Default is a safe no-op: capturing yields nothing.
         assert!(built.telemetry().capture_trace_context().is_none());
+    }
+
+    #[test]
+    fn harvest_builder_defaults_history_guardrails() {
+        let built = HarvestBuilder::new().build();
+        let policy = built.history_policy();
+
+        assert_eq!(policy.continue_as_new_threshold(), 10_000);
+        assert_eq!(policy.event_hard_cap(), None);
+    }
+
+    #[test]
+    fn harvest_builder_accepts_history_guardrail_overrides() {
+        let built = HarvestBuilder::new()
+            .history_continue_as_new_threshold(128)
+            .history_event_hard_cap(256)
+            .build();
+        let policy = built.history_policy();
+
+        assert_eq!(policy.continue_as_new_threshold(), 128);
+        assert_eq!(policy.event_hard_cap(), Some(256));
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn harvest_builder_passes_history_policy_to_worker_registry() {
+        let built = HarvestBuilder::new()
+            .history_continue_as_new_threshold(9)
+            .history_event_hard_cap(11)
+            .build();
+
+        let (registry, _dags, _workflow_schedules, _worker_config) = built.into_worker_parts();
+
+        assert_eq!(registry.history_policy().continue_as_new_threshold(), 9);
+        assert_eq!(registry.history_policy().event_hard_cap(), Some(11));
     }
 
     #[test]

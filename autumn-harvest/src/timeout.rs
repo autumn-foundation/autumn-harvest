@@ -24,7 +24,7 @@ use tokio_util::sync::CancellationToken;
 use crate::error::{HarvestError, HarvestResult, TimeoutType};
 use crate::event::WorkflowEvent;
 use crate::models::{ExternalTask, TaskQueueItem, WorkflowExecution};
-use crate::schema::harvest_external_tasks;
+use crate::schema::{harvest_external_tasks, harvest_workflow_executions};
 use crate::types::ActivityExecId;
 use crate::{queue, store};
 
@@ -208,6 +208,125 @@ fn find_pending_scheduled_activity(
     })
 }
 
+fn find_pending_scheduled_activity_by_id(
+    history: &[WorkflowEvent],
+    requested_activity_id: crate::types::ActivityExecId,
+    activity_name: &str,
+) -> HarvestResult<crate::types::ActivityExecId> {
+    let mut scheduled = false;
+    let mut terminal = false;
+
+    for event in history {
+        match event {
+            WorkflowEvent::ActivityScheduled {
+                activity_id, name, ..
+            } if *activity_id == requested_activity_id => {
+                if name != activity_name {
+                    return Err(HarvestError::NonDeterministic(format!(
+                        "activity task id '{}' was scheduled for '{name}', not '{activity_name}'",
+                        requested_activity_id.as_uuid()
+                    )));
+                }
+                scheduled = true;
+            }
+            WorkflowEvent::ActivityCompleted { activity_id, .. }
+            | WorkflowEvent::ActivityFailed { activity_id, .. }
+            | WorkflowEvent::ActivityTimedOut { activity_id, .. }
+                if *activity_id == requested_activity_id =>
+            {
+                terminal = true;
+            }
+            _ => {}
+        }
+    }
+
+    if scheduled && !terminal {
+        Ok(requested_activity_id)
+    } else if terminal {
+        Err(HarvestError::NotFound(format!(
+            "activity '{activity_name}' with id '{}' already has a terminal event",
+            requested_activity_id.as_uuid()
+        )))
+    } else {
+        Err(HarvestError::NotFound(format!(
+            "no scheduled activity '{activity_name}' with id '{}' in workflow history",
+            requested_activity_id.as_uuid()
+        )))
+    }
+}
+
+fn has_activity_terminal_event(
+    history: &[WorkflowEvent],
+    activity_id: crate::types::ActivityExecId,
+) -> bool {
+    history.iter().any(|event| {
+        matches!(
+            event,
+            WorkflowEvent::ActivityCompleted { activity_id: id, .. }
+                | WorkflowEvent::ActivityFailed { activity_id: id, .. }
+                | WorkflowEvent::ActivityTimedOut { activity_id: id, .. }
+                if *id == activity_id
+        )
+    })
+}
+
+fn pending_activity_id_for_task(
+    history: &[WorkflowEvent],
+    task: &TaskQueueItem,
+    activity_name: &str,
+) -> HarvestResult<Option<crate::types::ActivityExecId>> {
+    if let Some(activity_id) = task.activity_id {
+        let activity_id = crate::types::ActivityExecId::from_uuid(activity_id);
+        if has_activity_terminal_event(history, activity_id) {
+            return Ok(None);
+        }
+        return find_pending_scheduled_activity_by_id(history, activity_id, activity_name)
+            .map(Some);
+    }
+
+    find_pending_scheduled_activity(history, activity_name).map(Some)
+}
+
+async fn lock_workflow_execution_and_load_history(
+    conn: &mut AsyncPgConnection,
+    exec_id: crate::types::ExecutionId,
+) -> HarvestResult<store::EventHistory> {
+    harvest_workflow_executions::table
+        .find(exec_id.as_uuid())
+        .for_update()
+        .select(WorkflowExecution::as_select())
+        .first(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?
+        .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))?;
+
+    store::load_history(conn, exec_id).await
+}
+
+async fn task_state_for_update(
+    conn: &mut AsyncPgConnection,
+    task_id: uuid::Uuid,
+) -> HarvestResult<Option<String>> {
+    use crate::schema::harvest_task_queue::dsl;
+
+    dsl::harvest_task_queue
+        .find(task_id)
+        .for_update()
+        .select(dsl::state)
+        .first(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)
+}
+
+const fn expected_task_state_for_timeout(reason: &TimeoutReason) -> &'static str {
+    match reason {
+        TimeoutReason::Heartbeat | TimeoutReason::StartToClose => "RUNNING",
+        TimeoutReason::ScheduleToStart => "PENDING",
+    }
+}
+
 async fn load_workflow_execution(
     conn: &mut AsyncPgConnection,
     exec_id: crate::types::ExecutionId,
@@ -278,25 +397,31 @@ async fn enforce_activity_timeout(
         return queue::fail_task(conn, task.id, &timeout_error("activity", reason)).await;
     };
     let error = timeout_error(activity_name, reason);
-    let history = store::load_history(conn, exec_id).await?;
-
-    let activity_id = match find_pending_scheduled_activity(&history.events, activity_name) {
-        Ok(activity_id) => activity_id,
-        Err(missing_error) => {
-            let fallback = missing_error.to_string();
-            queue::fail_task(conn, task.id, &fallback).await?;
-            return Ok(());
-        }
-    };
-
-    let timeout_event = WorkflowEvent::ActivityTimedOut {
-        activity_id,
-        timeout_type: reason.timeout_type(),
-    };
 
     conn.transaction::<(), HarvestError, _>(|conn| {
         let error = error.clone();
         async move {
+            let history = lock_workflow_execution_and_load_history(conn, exec_id).await?;
+            let Some(state) = task_state_for_update(conn, task.id).await? else {
+                return Ok(());
+            };
+            if state != expected_task_state_for_timeout(reason) {
+                return Ok(());
+            }
+            let activity_id =
+                match pending_activity_id_for_task(&history.events, task, activity_name) {
+                    Ok(Some(activity_id)) => activity_id,
+                    Ok(None) => return Ok(()),
+                    Err(missing_error) => {
+                        let fallback = missing_error.to_string();
+                        queue::fail_task(conn, task.id, &fallback).await?;
+                        return Ok(());
+                    }
+                };
+            let timeout_event = WorkflowEvent::ActivityTimedOut {
+                activity_id,
+                timeout_type: reason.timeout_type(),
+            };
             store::append_events(conn, exec_id, &[timeout_event], history.next_event_id).await?;
             queue::fail_task(conn, task.id, &error).await?;
             queue::wake_workflow_task(conn, exec_id).await
@@ -391,7 +516,10 @@ pub async fn enforce_external_task_timeouts(conn: &mut AsyncPgConnection) -> Har
                             .filter(harvest_external_tasks::state.eq("PENDING"))
                             .filter(harvest_external_tasks::schedule_to_close_at.lt(Utc::now())),
                     )
-                    .set(harvest_external_tasks::state.eq("TIMED_OUT"))
+                    .set((
+                        harvest_external_tasks::state.eq("TIMED_OUT"),
+                        harvest_external_tasks::updated_at.eq(Utc::now()),
+                    ))
                     .execute(conn)
                     .await
                     .map_err(crate::error::database_error)?;

@@ -4,6 +4,7 @@
 //! The `UNIQUE(workflow_exec_id, event_id)` constraint guarantees
 //! that two workers can't append conflicting events to the same workflow.
 
+use diesel::BoolExpressionMethods;
 use diesel::ExpressionMethods;
 use diesel::OptionalExtension;
 use diesel::QueryDsl;
@@ -16,7 +17,7 @@ use scoped_futures::ScopedFutureExt as _;
 use crate::error::HarvestResult;
 use crate::event::WorkflowEvent;
 use crate::models::NewHarvestEvent;
-use crate::schema::harvest_events;
+use crate::schema::{harvest_events, harvest_workflow_executions};
 use crate::types::ExecutionId;
 
 /// Loaded event history for a single workflow execution.
@@ -30,6 +31,45 @@ pub struct EventHistory {
     pub next_event_id: i32,
 }
 
+/// Filters for loading child workflow execution rows under one parent.
+#[derive(Debug, Clone, Default)]
+pub struct WorkflowChildFilters {
+    pub statuses: Vec<String>,
+    pub workflow_name: Option<String>,
+    pub cursor: Option<WorkflowChildCursor>,
+    pub limit: Option<i64>,
+}
+
+/// Cursor anchor for paged child workflow queries.
+#[derive(Debug, Clone)]
+pub struct WorkflowChildCursor {
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    pub exec_id: uuid::Uuid,
+}
+
+/// Operator-facing child workflow row used by management API read models.
+#[derive(Debug, Clone)]
+pub struct WorkflowChildRow {
+    pub exec_id: ExecutionId,
+    pub workflow_name: String,
+    pub status: String,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub error_summary: Option<String>,
+    pub shard_id: i32,
+    pub depth: u8,
+}
+
+type WorkflowChildProjection = (
+    uuid::Uuid,
+    String,
+    String,
+    chrono::DateTime<chrono::Utc>,
+    Option<chrono::DateTime<chrono::Utc>>,
+    Option<String>,
+    i32,
+);
+
 /// Convert in-memory events to insertable rows with sequential event IDs
 /// starting from 0.
 ///
@@ -39,7 +79,12 @@ pub fn events_to_insert_rows(
     exec_id: ExecutionId,
     events: &[WorkflowEvent],
 ) -> Result<Vec<NewHarvestEvent<'_>>, crate::error::HarvestError> {
-    events_to_insert_rows_from(exec_id, events, 0)
+    events_to_insert_rows_from_with_codecs(
+        exec_id,
+        events,
+        0,
+        &crate::payload_codec::PayloadCodecs::default(),
+    )
 }
 
 /// Convert in-memory events to insertable rows with sequential event IDs
@@ -57,6 +102,20 @@ pub fn events_to_insert_rows_from(
     events: &[WorkflowEvent],
     start_id: i32,
 ) -> Result<Vec<NewHarvestEvent<'_>>, crate::error::HarvestError> {
+    events_to_insert_rows_from_with_codecs(
+        exec_id,
+        events,
+        start_id,
+        &crate::payload_codec::PayloadCodecs::default(),
+    )
+}
+
+pub fn events_to_insert_rows_from_with_codecs<'a>(
+    exec_id: ExecutionId,
+    events: &'a [WorkflowEvent],
+    start_id: i32,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> Result<Vec<NewHarvestEvent<'a>>, crate::error::HarvestError> {
     events
         .iter()
         .enumerate()
@@ -70,7 +129,7 @@ pub fn events_to_insert_rows_from(
                 workflow_exec_id: exec_id.as_uuid(),
                 event_id,
                 event_type: event.type_name(),
-                event_data: serde_json::to_value(event).expect("WorkflowEvent must serialize"),
+                event_data: codecs.encode_event(event)?,
             })
         })
         .collect()
@@ -99,11 +158,23 @@ pub async fn append_events(
 
     let rows = events_to_insert_rows_from(exec_id, events, start_id)?;
 
-    diesel::insert_into(harvest_events::table)
+    let inserted = diesel::insert_into(harvest_events::table)
         .values(&rows)
         .execute(conn)
         .await
-        .map_err(crate::error::database_error)
+        .map_err(crate::error::database_error)?;
+
+    if let Some(last_event) = events.last() {
+        crate::notify::notify_workflow_events_appended(
+            conn,
+            exec_id.as_uuid(),
+            inserted,
+            last_event.type_name(),
+        )
+        .await?;
+    }
+
+    Ok(inserted)
 }
 
 /// Append a single event to a workflow's history without loading the full log.
@@ -244,6 +315,19 @@ pub async fn load_history(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
 ) -> HarvestResult<EventHistory> {
+    load_history_with_codecs(
+        conn,
+        exec_id,
+        &crate::payload_codec::PayloadCodecs::default(),
+    )
+    .await
+}
+
+pub async fn load_history_with_codecs(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<EventHistory> {
     use crate::models::HarvestEvent;
 
     let rows: Vec<HarvestEvent> = harvest_events::table
@@ -257,7 +341,7 @@ pub async fn load_history(
 
     let events = rows
         .into_iter()
-        .map(|row| serde_json::from_value(row.event_data))
+        .map(|row| codecs.decode_event(row.event_data))
         .collect::<Result<Vec<WorkflowEvent>, _>>()?;
 
     Ok(EventHistory {
@@ -265,6 +349,168 @@ pub async fn load_history(
         events,
         next_event_id,
     })
+}
+
+/// Load the direct children of `parent_id` from one shard.
+///
+/// Callers that need cross-shard discovery should call this once per shard and
+/// merge the rows after applying any global ordering/pagination.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub async fn load_workflow_children(
+    conn: &mut AsyncPgConnection,
+    parent_id: ExecutionId,
+    filters: &WorkflowChildFilters,
+    depth: u8,
+) -> HarvestResult<Vec<WorkflowChildRow>> {
+    let mut query = harvest_workflow_executions::table
+        .into_boxed()
+        .filter(harvest_workflow_executions::parent_id.eq(Some(parent_id.as_uuid())))
+        .order((
+            harvest_workflow_executions::started_at.desc(),
+            harvest_workflow_executions::id.desc(),
+        ));
+
+    if !filters.statuses.is_empty() {
+        query = query.filter(harvest_workflow_executions::state.eq_any(filters.statuses.clone()));
+    }
+    if let Some(name) = &filters.workflow_name {
+        query = query.filter(harvest_workflow_executions::workflow_name.eq(name.clone()));
+    }
+    if let Some(cursor) = &filters.cursor {
+        query = query.filter(
+            harvest_workflow_executions::started_at
+                .lt(cursor.started_at)
+                .or(harvest_workflow_executions::started_at
+                    .eq(cursor.started_at)
+                    .and(harvest_workflow_executions::id.lt(cursor.exec_id))),
+        );
+    }
+    if let Some(limit) = filters.limit {
+        query = query.limit(limit);
+    }
+
+    query
+        .select((
+            harvest_workflow_executions::id,
+            harvest_workflow_executions::workflow_name,
+            harvest_workflow_executions::state,
+            harvest_workflow_executions::started_at,
+            harvest_workflow_executions::completed_at,
+            harvest_workflow_executions::error,
+            harvest_workflow_executions::shard_id,
+        ))
+        .load::<WorkflowChildProjection>(conn)
+        .await
+        .map_err(crate::error::database_error)
+        .map(|rows| {
+            rows.into_iter()
+                .map(
+                    |(id, workflow_name, state, started_at, completed_at, error, shard_id)| {
+                        workflow_child_row_from_parts(
+                            id,
+                            workflow_name,
+                            state,
+                            started_at,
+                            completed_at,
+                            error,
+                            shard_id,
+                            depth,
+                        )
+                    },
+                )
+                .collect()
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn workflow_child_row_from_parts(
+    id: uuid::Uuid,
+    workflow_name: String,
+    state: String,
+    started_at: chrono::DateTime<chrono::Utc>,
+    completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    error: Option<String>,
+    shard_id: i32,
+    depth: u8,
+) -> WorkflowChildRow {
+    WorkflowChildRow {
+        exec_id: ExecutionId::from_uuid(id),
+        workflow_name,
+        status: state,
+        started_at,
+        completed_at,
+        error_summary: summarize_error(error),
+        shard_id,
+        depth,
+    }
+}
+
+/// Merge-patch the `search_attrs` JSONB column for a workflow execution.
+///
+/// `Some(value)` entries in `patch` overwrite the stored key; `None` entries
+/// remove the key. Keys absent from `patch` are preserved. The update is done
+/// as an atomic read-modify-write within the caller's transaction context so
+/// concurrent same-execution updates (which the task queue serialises) do not
+/// race.
+pub async fn update_search_attrs<S: std::hash::BuildHasher + Sync>(
+    conn: &mut AsyncPgConnection,
+    exec_id: crate::types::ExecutionId,
+    patch: &std::collections::HashMap<String, Option<serde_json::Value>, S>,
+) -> HarvestResult<()> {
+    use crate::schema::harvest_workflow_executions::dsl;
+
+    if patch.is_empty() {
+        return Ok(());
+    }
+
+    // Read the current value so we can apply the merge in Rust.  Workflow
+    // tasks are serialised per-execution by SKIP LOCKED, so no TOCTOU risk.
+    let current: Option<serde_json::Value> = dsl::harvest_workflow_executions
+        .find(exec_id.as_uuid())
+        .select(dsl::search_attrs)
+        .first::<Option<serde_json::Value>>(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    let mut merged: serde_json::Map<String, serde_json::Value> = match current {
+        Some(serde_json::Value::Object(m)) => m,
+        _ => serde_json::Map::new(),
+    };
+
+    for (key, value) in patch {
+        match value {
+            Some(v) => {
+                merged.insert(key.clone(), v.clone());
+            }
+            None => {
+                merged.remove(key.as_str());
+            }
+        }
+    }
+
+    let new_attrs = serde_json::Value::Object(merged);
+
+    diesel::update(dsl::harvest_workflow_executions.find(exec_id.as_uuid()))
+        .set(dsl::search_attrs.eq(Some(new_attrs)))
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    Ok(())
+}
+
+fn summarize_error(error: Option<String>) -> Option<String> {
+    const MAX_ERROR_SUMMARY_CHARS: usize = 240;
+
+    let first_line = error?.lines().next()?.trim().to_string();
+    if first_line.is_empty() {
+        return None;
+    }
+
+    Some(first_line.chars().take(MAX_ERROR_SUMMARY_CHARS).collect())
 }
 
 #[cfg(test)]

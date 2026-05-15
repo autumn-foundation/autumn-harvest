@@ -20,7 +20,9 @@ use crate::error::{HarvestError, HarvestResult};
 use crate::event::WorkflowEvent;
 use crate::query::QueryRegistry;
 use crate::replay::{HistoryMatch, HistoryMatcher};
-use crate::types::{ActivityExecId, ExecutionId, ExternalActivityToken, TimerId, UpdateId};
+use crate::types::{
+    ActivityExecId, ExecutionId, ExternalActivityToken, IdempotencyKey, TimerId, UpdateId,
+};
 use crate::update::{BoxUpdateHandler, BoxUpdateValidator, UpdateRegistry};
 
 /// Runtime map of typed shared state registered on the harvest builder.
@@ -35,12 +37,63 @@ pub fn empty_shared_state() -> SharedState {
     Arc::new(HashMap::new())
 }
 
+/// Default soft history-size threshold for recommending `continue_as_new`.
+pub const DEFAULT_HISTORY_CONTINUE_AS_NEW_THRESHOLD: u64 = 10_000;
+
+/// Replay-safe history guardrails made available to workflow code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkflowHistoryPolicy {
+    continue_as_new_threshold: u64,
+    event_hard_cap: Option<u64>,
+}
+
+impl Default for WorkflowHistoryPolicy {
+    fn default() -> Self {
+        Self {
+            continue_as_new_threshold: DEFAULT_HISTORY_CONTINUE_AS_NEW_THRESHOLD,
+            event_hard_cap: None,
+        }
+    }
+}
+
+impl WorkflowHistoryPolicy {
+    /// Soft threshold used by [`WorkflowContext::should_continue_as_new`].
+    #[must_use]
+    pub const fn continue_as_new_threshold(self) -> u64 {
+        self.continue_as_new_threshold
+    }
+
+    /// Optional hard cap that moves an execution to the DLQ when exceeded.
+    #[must_use]
+    pub const fn event_hard_cap(self) -> Option<u64> {
+        self.event_hard_cap
+    }
+
+    /// Override the soft continue-as-new threshold.
+    #[must_use]
+    pub const fn with_continue_as_new_threshold(mut self, threshold: u64) -> Self {
+        self.continue_as_new_threshold = threshold;
+        self
+    }
+
+    /// Override the optional hard cap.
+    #[must_use]
+    pub const fn with_event_hard_cap(mut self, cap: u64) -> Self {
+        self.event_hard_cap = Some(cap);
+        self
+    }
+}
+
 #[cfg(feature = "db")]
 type ActivityCancellationPool =
     diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>;
 
 #[cfg(feature = "db")]
 const DURABLE_CANCELLATION_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
+const NO_HEARTBEAT_FLUSHER_REASON: &str = "heartbeats are not supported for this activity context because no heartbeat flusher is attached";
+const LOCAL_ACTIVITY_HEARTBEAT_REASON: &str =
+    "local activities do not support heartbeats; use a regular activity";
 
 #[cfg(feature = "db")]
 struct ActivityCancellationCheck {
@@ -88,7 +141,20 @@ pub enum WorkflowCommand {
         input: Value,
         /// The queue to schedule the activity on.
         queue: String,
+        /// Optional retry policy override (e.g. from a DAG task definition).
+        /// When `Some`, overrides the activity's registered default.
+        retry_policy_override: Option<crate::policy::RetryPolicy>,
+        /// Optional start-to-close timeout override from a DAG task definition.
+        start_to_close_override: Option<std::time::Duration>,
         /// The worker sends the result back through this channel.
+        result_tx: oneshot::Sender<Result<Value, String>>,
+    },
+    /// Park while an already-scheduled activity is still running.
+    WaitForActivity {
+        /// The existing activity execution ID from history.
+        activity_id: ActivityExecId,
+        /// The parked coroutine waits on this channel until the executor
+        /// suspension timeout drops it and the worker can re-park durably.
         result_tx: oneshot::Sender<Result<Value, String>>,
     },
     /// Start a durable timer.
@@ -187,6 +253,18 @@ pub enum WorkflowCommand {
         retry_policy: Option<crate::policy::RetryPolicy>,
         /// The worker sends the final result (success or exhausted retries) here.
         result_tx: oneshot::Sender<Result<Value, String>>,
+        /// `true` when the `LocalActivityScheduled` event is already in history
+        /// (worker crashed after appending it but before recording a terminal
+        /// event). The worker must **not** append a second scheduled event.
+        already_scheduled: bool,
+        /// Number of `LocalActivityFailed` events already recorded in history.
+        /// The worker starts its retry loop from `failed_attempts + 1`.
+        /// When `failed_attempts >= max_attempts`, the worker returns `last_error`
+        /// immediately without executing the handler.
+        failed_attempts: u32,
+        /// Error from the last recorded `LocalActivityFailed`, used when
+        /// `failed_attempts >= max_attempts` to return the correct error.
+        last_error: Option<String>,
     },
     /// Record a terminal result for an admitted update.
     ///
@@ -199,6 +277,16 @@ pub enum WorkflowCommand {
         update_id: crate::types::UpdateId,
         /// `Ok(value)` on success; `Err(reason)` when the handler returned an error.
         result: Result<Value, String>,
+    },
+    /// Merge-patch the workflow execution's `search_attrs` column.
+    ///
+    /// `Some(value)` entries overwrite the keyed attribute; `None` entries
+    /// remove the key entirely. Keys absent from the patch are left untouched.
+    /// This command is suppressed during replay so the DB write is idempotent
+    /// across worker restarts.
+    UpsertSearchAttributes {
+        /// Per-key merge patch: `Some(v)` → set/overwrite, `None` → remove.
+        patch: std::collections::HashMap<String, Option<Value>>,
     },
 }
 
@@ -216,6 +304,10 @@ impl std::fmt::Debug for WorkflowCommand {
                 .field("activity_id", activity_id)
                 .field("name", name)
                 .field("queue", queue)
+                .finish_non_exhaustive(),
+            Self::WaitForActivity { activity_id, .. } => f
+                .debug_struct("WaitForActivity")
+                .field("activity_id", activity_id)
                 .finish_non_exhaustive(),
             Self::StartTimer {
                 timer_id,
@@ -278,6 +370,10 @@ impl std::fmt::Debug for WorkflowCommand {
                 .field("name", name)
                 .field("start_to_close_secs", start_to_close_secs)
                 .finish_non_exhaustive(),
+            Self::UpsertSearchAttributes { patch } => f
+                .debug_struct("UpsertSearchAttributes")
+                .field("keys", &patch.keys())
+                .finish(),
             Self::RecordUpdateResult { update_id, result } => f
                 .debug_struct("RecordUpdateResult")
                 .field("update_id", update_id)
@@ -297,6 +393,72 @@ impl std::fmt::Debug for WorkflowCommand {
 async fn park_until_dropped() -> HarvestResult<()> {
     std::future::pending::<()>().await;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Search-attribute validation helpers
+// ---------------------------------------------------------------------------
+
+const SEARCH_ATTR_KEY_MAX_LEN: usize = 64;
+
+const RESERVED_SEARCH_ATTR_KEYS: &[&str] =
+    &["exec_id", "workflow_name", "shard_id", "status", "run_id"];
+
+const RESERVED_SEARCH_ATTR_PREFIX: &str = "_harvest";
+
+fn validate_search_attr_key(key: &str) -> HarvestResult<()> {
+    if key.is_empty() {
+        return Err(HarvestError::InvalidSearchAttribute {
+            reason: "search attribute key must not be empty".into(),
+        });
+    }
+    if key.len() > SEARCH_ATTR_KEY_MAX_LEN {
+        return Err(HarvestError::InvalidSearchAttribute {
+            reason: format!(
+                "search attribute key '{key}' exceeds maximum length of {SEARCH_ATTR_KEY_MAX_LEN}"
+            ),
+        });
+    }
+    if !key
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(HarvestError::InvalidSearchAttribute {
+            reason: format!(
+                "search attribute key '{key}' contains invalid characters; \
+                 only [a-zA-Z0-9_-] are allowed"
+            ),
+        });
+    }
+    if RESERVED_SEARCH_ATTR_KEYS.contains(&key) {
+        return Err(HarvestError::InvalidSearchAttribute {
+            reason: format!("search attribute key '{key}' is reserved by the engine"),
+        });
+    }
+    if key.starts_with(RESERVED_SEARCH_ATTR_PREFIX) {
+        return Err(HarvestError::InvalidSearchAttribute {
+            reason: format!("search attribute key '{key}' uses the reserved '_harvest' prefix"),
+        });
+    }
+    Ok(())
+}
+
+fn validate_search_attr_value(value: &Value) -> HarvestResult<()> {
+    match value {
+        Value::Object(_) => Err(HarvestError::InvalidSearchAttribute {
+            reason:
+                "search attribute values must be primitives (string, number, boolean, or null); \
+                     objects are not allowed"
+                    .into(),
+        }),
+        Value::Array(_) => Err(HarvestError::InvalidSearchAttribute {
+            reason:
+                "search attribute values must be primitives (string, number, boolean, or null); \
+                     arrays are not allowed"
+                    .into(),
+        }),
+        _ => Ok(()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -323,6 +485,8 @@ pub struct WorkflowContext {
     commands: Mutex<Vec<WorkflowCommand>>,
     /// Deterministic "now" -- the timestamp from the `WorkflowStarted` event.
     start_time: DateTime<Utc>,
+    /// History-size thresholds visible to author code.
+    history_policy: WorkflowHistoryPolicy,
     /// Monotonically increasing counter for generating activity sequence IDs.
     activity_seq: Mutex<u32>,
     /// Shared typed state map (same `AppState` extras as the web server).
@@ -345,6 +509,16 @@ pub struct WorkflowContext {
 
 impl WorkflowContext {
     // ── Internal Helpers ──────────────────────────────────────────────────
+
+    fn check_strict_replay_no_match(&self, actual_event: &str) -> HarvestResult<()> {
+        if self.strict_replay {
+            return Err(HarvestError::NonDeterministic(format!(
+                "early completion mismatch: expected <end of history>, \
+                 got {actual_event}"
+            )));
+        }
+        Ok(())
+    }
 
     fn match_history<F, R>(&self, f: F) -> R
     where
@@ -381,6 +555,20 @@ impl WorkflowContext {
         events: Vec<WorkflowEvent>,
         state: SharedState,
     ) -> Self {
+        Self::for_replay_with_state_and_history_policy(
+            exec_id,
+            events,
+            state,
+            WorkflowHistoryPolicy::default(),
+        )
+    }
+
+    pub(crate) fn for_replay_with_state_and_history_policy(
+        exec_id: ExecutionId,
+        events: Vec<WorkflowEvent>,
+        state: SharedState,
+        history_policy: WorkflowHistoryPolicy,
+    ) -> Self {
         // Extract the start_time from WorkflowStarted (first event).
         let start_time = events
             .first()
@@ -407,6 +595,7 @@ impl WorkflowContext {
             matcher: Mutex::new(matcher),
             commands: Mutex::new(Vec::new()),
             start_time,
+            history_policy,
             activity_seq: Mutex::new(0),
             state,
             query_registry: Mutex::new(QueryRegistry::new()),
@@ -469,6 +658,7 @@ impl WorkflowContext {
             matcher: Mutex::new(HistoryMatcher::new(vec![])),
             commands: Mutex::new(Vec::new()),
             start_time,
+            history_policy: WorkflowHistoryPolicy::default(),
             activity_seq: Mutex::new(0),
             state: empty_shared_state(),
             query_registry: Mutex::new(QueryRegistry::new()),
@@ -491,6 +681,23 @@ impl WorkflowContext {
     #[must_use]
     pub const fn execution_id(&self) -> ExecutionId {
         self.exec_id
+    }
+
+    /// Number of events currently loaded in this workflow execution history.
+    ///
+    /// This is replay-safe: it is computed from the in-memory history snapshot
+    /// loaded before the current workflow task, not from a side-effecting
+    /// counter maintained by author code.
+    #[must_use]
+    pub fn history_event_count(&self) -> u64 {
+        self.match_history(|matcher| matcher.event_count())
+    }
+
+    /// Returns `true` once [`Self::history_event_count`] exceeds the configured
+    /// soft continue-as-new threshold.
+    #[must_use]
+    pub fn should_continue_as_new(&self) -> bool {
+        self.history_event_count() > self.history_policy.continue_as_new_threshold()
     }
 
     /// Returns `true` if the context is currently replaying recorded history
@@ -627,6 +834,65 @@ impl WorkflowContext {
         Ok(())
     }
 
+    // ── Search attribute mutations ────────────────────────────────────
+
+    /// Merge-patch the search attributes for this workflow execution.
+    ///
+    /// Keys present in `patch` with `Some(value)` overwrite the stored attribute.
+    /// Keys present with `None` remove the attribute. Keys absent from `patch`
+    /// are untouched (merge semantics, not full replacement).
+    ///
+    /// This is a **fire-and-forget metadata operation**: the method returns
+    /// immediately and the DB write is processed by the worker after the next
+    /// suspension or completion. Workflow logic must not branch on the return
+    /// value to maintain determinism.
+    ///
+    /// During **replay**, this call is a no-op — the attributes are already
+    /// correct in the database from the previous live execution cycle.
+    ///
+    /// # Key constraints
+    ///
+    /// - Non-empty, ≤ 64 characters, matching `[a-zA-Z0-9_-]+`.
+    /// - Not one of the reserved engine keys: `exec_id`, `workflow_name`,
+    ///   `shard_id`, `status`, `run_id`.
+    /// - Must not start with the `_harvest` prefix.
+    ///
+    /// # Value constraints
+    ///
+    /// Values must be JSON primitives (string, number, boolean, or `null`).
+    /// Objects and arrays are rejected.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::InvalidSearchAttribute`] if any key or value
+    /// violates the above constraints. The entire patch is rejected atomically —
+    /// no partial updates are applied.
+    pub fn upsert_search_attrs(
+        &self,
+        patch: impl IntoIterator<Item = (String, Option<Value>)>,
+    ) -> HarvestResult<()> {
+        let patch: std::collections::HashMap<String, Option<Value>> = patch.into_iter().collect();
+
+        if patch.is_empty() {
+            return Ok(());
+        }
+
+        for (key, value) in &patch {
+            validate_search_attr_key(key)?;
+            if let Some(v) = value {
+                validate_search_attr_value(v)?;
+            }
+        }
+
+        // During replay the DB update already happened; suppress the command.
+        if self.is_replaying() {
+            return Ok(());
+        }
+
+        self.push_command(WorkflowCommand::UpsertSearchAttributes { patch });
+        Ok(())
+    }
+
     // ── Side effects ──────────────────────────────────────────────────
 
     /// Execute a quick, deterministic inline side-effect.
@@ -691,18 +957,15 @@ impl WorkflowContext {
 
             HistoryMatch::Failed { .. }
             | HistoryMatch::TimedOut { .. }
+            | HistoryMatch::ActivityInProgress { .. }
             | HistoryMatch::AwaitingExternalCompletion { .. }
-            | HistoryMatch::ChildInProgress { .. } => {
+            | HistoryMatch::ChildInProgress { .. }
+            | HistoryMatch::LocalActivityInProgress { .. } => {
                 unreachable!("match_side_effect only returns Matched, Diverged or NoMatch")
             }
 
             HistoryMatch::NoMatch => {
-                if self.strict_replay {
-                    return Err(HarvestError::NonDeterministic(format!(
-                        "early completion mismatch: expected <end of history>, \
-                         got SideEffectRecorded({id})"
-                    )));
-                }
+                self.check_strict_replay_no_match(&format!("SideEffectRecorded({id})"))?;
 
                 let result = f();
                 let output = serde_json::to_value(&result)?;
@@ -827,22 +1090,38 @@ impl WorkflowContext {
                 format!("activity mismatch: expected {expected}, got {actual}"),
             )),
 
+            HistoryMatch::ActivityInProgress { activity_id } => {
+                let (tx, rx) = oneshot::channel();
+                self.push_command(WorkflowCommand::WaitForActivity {
+                    activity_id,
+                    result_tx: tx,
+                });
+                match rx.await {
+                    Ok(Ok(output)) => Ok(output),
+                    Ok(Err(error)) => Err(HarvestError::ActivityFailed {
+                        name: name.to_string(),
+                        attempt: 1,
+                        source: error.into(),
+                    }),
+                    Err(_) => Err(HarvestError::Cancelled(format!(
+                        "activity '{name}' cancelled: result channel dropped"
+                    ))),
+                }
+            }
+
             HistoryMatch::AwaitingExternalCompletion { .. }
-            | HistoryMatch::ChildInProgress { .. } => {
+            | HistoryMatch::ChildInProgress { .. }
+            | HistoryMatch::LocalActivityInProgress { .. } => {
                 unreachable!(
-                    "match_activity never returns AwaitingExternalCompletion or ChildInProgress"
+                    "match_activity never returns AwaitingExternalCompletion, ChildInProgress, \
+                     or LocalActivityInProgress"
                 )
             }
 
             HistoryMatch::NoMatch => {
                 // Strict replay: a command with no matching history entry means
                 // the new code issues a command the recorded history never saw.
-                if self.strict_replay {
-                    return Err(HarvestError::NonDeterministic(format!(
-                        "early completion mismatch: expected <end of history>, \
-                         got ActivityScheduled({name})"
-                    )));
-                }
+                self.check_strict_replay_no_match(&format!("ActivityScheduled({name})"))?;
 
                 // Live execution: emit a ScheduleActivity command and suspend
                 // until the worker sends the result through the oneshot channel.
@@ -854,10 +1133,99 @@ impl WorkflowContext {
                     name: name.to_string(),
                     input,
                     queue: queue.to_string(),
+                    retry_policy_override: None,
+                    start_to_close_override: None,
                     result_tx: tx,
                 });
 
                 // Suspend the coroutine until the worker resolves this activity.
+                match rx.await {
+                    Ok(Ok(output)) => Ok(output),
+                    Ok(Err(error)) => Err(HarvestError::ActivityFailed {
+                        name: name.to_string(),
+                        attempt: 1,
+                        source: error.into(),
+                    }),
+                    Err(_) => Err(HarvestError::Cancelled(format!(
+                        "activity '{name}' cancelled: result channel dropped"
+                    ))),
+                }
+            }
+        }
+    }
+
+    /// Like [`execute_activity_raw`](Self::execute_activity_raw) but allows
+    /// per-call overrides for retry policy and start-to-close timeout.
+    /// Used by the DAG unified handler to honour task-level `.retry()` and
+    /// `.start_to_close()` settings from the `DagBuilder`.
+    #[doc(hidden)]
+    pub async fn execute_activity_raw_with_opts(
+        &self,
+        name: &str,
+        input: Value,
+        queue: &str,
+        retry_policy_override: Option<crate::policy::RetryPolicy>,
+        start_to_close_override: Option<std::time::Duration>,
+    ) -> HarvestResult<Value> {
+        let history_match = if self.strict_replay {
+            self.match_history(|m| m.match_activity_strict(name, &input))
+        } else {
+            self.match_history(|m| m.match_activity(name))
+        };
+
+        match history_match {
+            HistoryMatch::Matched { output } => Ok(output),
+            HistoryMatch::Failed { error, attempt } => Err(HarvestError::ActivityFailed {
+                name: name.to_string(),
+                attempt,
+                source: error.into(),
+            }),
+            HistoryMatch::TimedOut { timeout_type } => Err(HarvestError::Timeout {
+                timeout_type,
+                task_name: name.to_string(),
+            }),
+            HistoryMatch::Diverged { expected, actual } => Err(HarvestError::NonDeterministic(
+                format!("activity mismatch: expected {expected}, got {actual}"),
+            )),
+            HistoryMatch::ActivityInProgress { activity_id } => {
+                let (tx, rx) = oneshot::channel();
+                self.push_command(WorkflowCommand::WaitForActivity {
+                    activity_id,
+                    result_tx: tx,
+                });
+                match rx.await {
+                    Ok(Ok(output)) => Ok(output),
+                    Ok(Err(error)) => Err(HarvestError::ActivityFailed {
+                        name: name.to_string(),
+                        attempt: 1,
+                        source: error.into(),
+                    }),
+                    Err(_) => Err(HarvestError::Cancelled(format!(
+                        "activity '{name}' cancelled: result channel dropped"
+                    ))),
+                }
+            }
+            HistoryMatch::AwaitingExternalCompletion { .. }
+            | HistoryMatch::ChildInProgress { .. }
+            | HistoryMatch::LocalActivityInProgress { .. } => {
+                unreachable!(
+                    "match_activity never returns AwaitingExternalCompletion, \
+                     ChildInProgress, or LocalActivityInProgress"
+                )
+            }
+            HistoryMatch::NoMatch => {
+                self.check_strict_replay_no_match(&format!("ActivityScheduled({name})"))?;
+                let activity_id = self.next_activity_id();
+                let (tx, rx) = oneshot::channel();
+                self.push_command(WorkflowCommand::ScheduleActivity {
+                    activity_id,
+                    name: name.to_string(),
+                    input,
+                    queue: queue.to_string(),
+                    retry_policy_override,
+                    start_to_close_override,
+                    result_tx: tx,
+                });
                 match rx.await {
                     Ok(Ok(output)) => Ok(output),
                     Ok(Err(error)) => Err(HarvestError::ActivityFailed {
@@ -898,6 +1266,7 @@ impl WorkflowContext {
     /// # Panics
     ///
     /// Panics if the internal matcher or commands mutex is poisoned.
+    #[allow(clippy::too_many_lines)]
     pub async fn execute_local_activity_raw(
         &self,
         name: &str,
@@ -930,19 +1299,72 @@ impl WorkflowContext {
             )),
 
             HistoryMatch::AwaitingExternalCompletion { .. }
+            | HistoryMatch::ActivityInProgress { .. }
             | HistoryMatch::ChildInProgress { .. } => {
                 unreachable!(
                     "match_local_activity never returns AwaitingExternalCompletion or ChildInProgress"
                 )
             }
 
-            HistoryMatch::NoMatch => {
+            // Worker crashed after appending `LocalActivityScheduled` (and
+            // possibly one or more `LocalActivityFailed` events) but before
+            // recording a terminal event. Re-run with the original `activity_id`
+            // so the idempotency key is stable across the crash.
+            HistoryMatch::LocalActivityInProgress {
+                activity_id,
+                failed_attempts,
+                last_error,
+            } => {
                 if self.strict_replay {
                     return Err(HarvestError::NonDeterministic(format!(
-                        "early completion mismatch: expected <end of history>, \
-                         got LocalActivityScheduled({name})"
+                        "local activity '{name}' scheduled but terminal not in history"
                     )));
                 }
+
+                // If the recorded failure count already covers all retry
+                // attempts, return the last error immediately — no handler
+                // execution is needed and no command should be pushed.
+                let max_attempts = retry_policy.as_ref().map_or(1, |p| p.max_attempts);
+                if failed_attempts >= max_attempts {
+                    let error = last_error.unwrap_or_else(|| {
+                        format!("local activity '{name}' failed after {failed_attempts} attempts")
+                    });
+                    return Err(HarvestError::ActivityFailed {
+                        name: name.to_string(),
+                        attempt: failed_attempts,
+                        source: error.into(),
+                    });
+                }
+
+                // Some retry attempts remain — push the command so the worker
+                // re-runs the handler starting from the next unrecorded attempt.
+                let (tx, rx) = oneshot::channel();
+                self.push_command(WorkflowCommand::RunLocalActivity {
+                    activity_id,
+                    name: name.to_string(),
+                    input,
+                    start_to_close_secs,
+                    retry_policy,
+                    result_tx: tx,
+                    already_scheduled: true,
+                    failed_attempts,
+                    last_error,
+                });
+                match rx.await {
+                    Ok(Ok(output)) => Ok(output),
+                    Ok(Err(error)) => Err(HarvestError::ActivityFailed {
+                        name: name.to_string(),
+                        attempt: failed_attempts.max(1),
+                        source: error.into(),
+                    }),
+                    Err(_) => Err(HarvestError::Cancelled(format!(
+                        "local activity '{name}' cancelled: result channel dropped"
+                    ))),
+                }
+            }
+
+            HistoryMatch::NoMatch => {
+                self.check_strict_replay_no_match(&format!("LocalActivityScheduled({name})"))?;
 
                 let activity_id = self.next_activity_id();
                 let (tx, rx) = oneshot::channel();
@@ -954,6 +1376,9 @@ impl WorkflowContext {
                     start_to_close_secs,
                     retry_policy,
                     result_tx: tx,
+                    already_scheduled: false,
+                    failed_attempts: 0,
+                    last_error: None,
                 });
 
                 match rx.await {
@@ -999,18 +1424,15 @@ impl WorkflowContext {
 
             HistoryMatch::Failed { .. }
             | HistoryMatch::TimedOut { .. }
+            | HistoryMatch::ActivityInProgress { .. }
             | HistoryMatch::AwaitingExternalCompletion { .. }
-            | HistoryMatch::ChildInProgress { .. } => {
+            | HistoryMatch::ChildInProgress { .. }
+            | HistoryMatch::LocalActivityInProgress { .. } => {
                 unreachable!("timers do not fail or time out in history matching")
             }
 
             HistoryMatch::NoMatch => {
-                if self.strict_replay {
-                    return Err(HarvestError::NonDeterministic(format!(
-                        "early completion mismatch: expected <end of history>, \
-                         got TimerStarted({timer_id})"
-                    )));
-                }
+                self.check_strict_replay_no_match(&format!("TimerStarted({timer_id})"))?;
 
                 let (tx, rx) = oneshot::channel();
                 self.push_command(WorkflowCommand::StartTimer {
@@ -1058,7 +1480,10 @@ impl WorkflowContext {
                 attempt,
                 source: error.into(),
             }),
-            HistoryMatch::TimedOut { .. } | HistoryMatch::AwaitingExternalCompletion { .. } => {
+            HistoryMatch::TimedOut { .. }
+            | HistoryMatch::ActivityInProgress { .. }
+            | HistoryMatch::AwaitingExternalCompletion { .. }
+            | HistoryMatch::LocalActivityInProgress { .. } => {
                 unreachable!("child workflows do not time out in match_child_workflow")
             }
             HistoryMatch::Diverged { expected, actual } => Err(HarvestError::NonDeterministic(
@@ -1100,12 +1525,9 @@ impl WorkflowContext {
                 }
             }
             HistoryMatch::NoMatch => {
-                if self.strict_replay {
-                    return Err(HarvestError::NonDeterministic(format!(
-                        "early completion mismatch: expected <end of history>, \
-                         got ChildWorkflowStarted({workflow_name})"
-                    )));
-                }
+                self.check_strict_replay_no_match(&format!(
+                    "ChildWorkflowStarted({workflow_name})"
+                ))?;
 
                 let (tx, rx) = oneshot::channel();
                 self.push_command(WorkflowCommand::StartChildWorkflow {
@@ -1151,17 +1573,14 @@ impl WorkflowContext {
             )),
             HistoryMatch::Failed { .. }
             | HistoryMatch::TimedOut { .. }
+            | HistoryMatch::ActivityInProgress { .. }
             | HistoryMatch::AwaitingExternalCompletion { .. }
-            | HistoryMatch::ChildInProgress { .. } => Err(HarvestError::NonDeterministic(
+            | HistoryMatch::ChildInProgress { .. }
+            | HistoryMatch::LocalActivityInProgress { .. } => Err(HarvestError::NonDeterministic(
                 "signal history contains unexpected failure".into(),
             )),
             HistoryMatch::NoMatch => {
-                if self.strict_replay {
-                    return Err(HarvestError::NonDeterministic(format!(
-                        "early completion mismatch: expected <end of history>, \
-                         got WaitForSignal({signal_name})"
-                    )));
-                }
+                self.check_strict_replay_no_match(&format!("WaitForSignal({signal_name})"))?;
 
                 let (tx, rx) = oneshot::channel();
                 self.push_command(WorkflowCommand::WaitForSignal {
@@ -1259,12 +1678,7 @@ impl WorkflowContext {
             }
 
             HistoryMatch::NoMatch => {
-                if self.strict_replay {
-                    return Err(HarvestError::NonDeterministic(format!(
-                        "early completion mismatch: expected <end of history>, \
-                         got ExternalActivityScheduled({name})"
-                    )));
-                }
+                self.check_strict_replay_no_match(&format!("ExternalActivityScheduled({name})"))?;
 
                 // First time — generate a fresh token and schedule.
                 let activity_id = self.next_activity_id();
@@ -1292,8 +1706,12 @@ impl WorkflowContext {
                 }
             }
 
-            HistoryMatch::ChildInProgress { .. } => {
-                unreachable!("match_external_activity never returns ChildInProgress")
+            HistoryMatch::ActivityInProgress { .. }
+            | HistoryMatch::ChildInProgress { .. }
+            | HistoryMatch::LocalActivityInProgress { .. } => {
+                unreachable!(
+                    "match_external_activity never returns ChildInProgress or LocalActivityInProgress"
+                )
             }
         }
     }
@@ -1341,18 +1759,14 @@ impl WorkflowContext {
             )),
             HistoryMatch::Failed { .. }
             | HistoryMatch::TimedOut { .. }
+            | HistoryMatch::ActivityInProgress { .. }
             | HistoryMatch::AwaitingExternalCompletion { .. }
-            | HistoryMatch::ChildInProgress { .. } => Err(HarvestError::NonDeterministic(
+            | HistoryMatch::ChildInProgress { .. }
+            | HistoryMatch::LocalActivityInProgress { .. } => Err(HarvestError::NonDeterministic(
                 "continue_as_new history contains unexpected terminal state".into(),
             )),
             HistoryMatch::NoMatch => {
-                if self.strict_replay {
-                    return Err(HarvestError::NonDeterministic(
-                        "early completion mismatch: expected <end of history>, \
-                         got ContinueAsNew"
-                            .to_string(),
-                    ));
-                }
+                self.check_strict_replay_no_match("ContinueAsNew")?;
                 self.push_command(WorkflowCommand::ContinueAsNew { input });
                 park_until_dropped().await
             }
@@ -1508,18 +1922,23 @@ impl WorkflowContext {
     ///
     /// Panics if the internal update registry mutex is poisoned.
     pub fn validate_update(&self, name: &str, input: &Value) -> HarvestResult<()> {
-        let registry = self
-            .update_registry
-            .lock()
-            .expect("update_registry lock poisoned");
-        // Check existence structurally so validator errors are never confused
-        // with a missing handler, regardless of the error message text.
-        if !registry.contains(name) {
-            return Err(HarvestError::UpdateHandlerNotFound(name.to_string()));
+        let validator_opt = {
+            let registry = self
+                .update_registry
+                .lock()
+                .expect("update_registry lock poisoned");
+            // Check existence structurally so validator errors are never confused
+            // with a missing handler, regardless of the error message text.
+            if !registry.contains(name) {
+                return Err(HarvestError::UpdateHandlerNotFound(name.to_string()));
+            }
+            registry.get_validator(name)
+        };
+
+        if let Some(validator) = validator_opt {
+            validator(input).map_err(|reason| HarvestError::UpdateRejected { reason })?;
         }
-        registry
-            .validate(name, input)
-            .map_err(|reason| HarvestError::UpdateRejected { reason })
+        Ok(())
     }
 
     /// Execute an already-admitted update by `update_id`.
@@ -1564,16 +1983,16 @@ impl WorkflowContext {
         }
 
         // Live path: invoke the registered handler.
-        let future = {
+        let handler_opt = {
             let registry = self
                 .update_registry
                 .lock()
                 .expect("update_registry lock poisoned");
-            registry.invoke(name, input)
+            registry.get_handler(name)
         };
 
-        let result = match future {
-            Some(fut) => fut.await,
+        let result = match handler_opt {
+            Some(handler) => handler(input).await,
             None => Err(format!("update handler '{name}' not found")),
         };
 
@@ -1643,6 +2062,10 @@ pub struct ActivityContext {
     state: SharedState,
     /// Heartbeat channel -- `None` in test contexts.
     heartbeat_tx: Option<tokio::sync::mpsc::Sender<serde_json::Value>>,
+    /// Latest heartbeat payload durably persisted by the previous attempt.
+    heartbeat_details: Option<serde_json::Value>,
+    /// Why heartbeat APIs are unavailable for this activity context.
+    heartbeat_unsupported_reason: Option<&'static str>,
     /// Cancellation token -- allows the worker to signal graceful shutdown.
     cancel: tokio_util::sync::CancellationToken,
     /// Optional durable queue-state cancellation check for worker activities.
@@ -1651,24 +2074,41 @@ pub struct ActivityContext {
     /// W3C tracecontext carrier captured at enqueue, surfaced so activity
     /// handlers can propagate the trace to downstream services.
     trace_context: Option<crate::telemetry::TraceContextCarrier>,
+    /// Stable idempotency key for this logical activity invocation.
+    ///
+    /// Derived from the `ActivityExecId` recorded in the `ActivityScheduled`
+    /// or `LocalActivityScheduled` event — identical across all retry attempts
+    /// for the same logical invocation.
+    idempotency_key: Option<IdempotencyKey>,
+    /// Which attempt of the logical activity invocation this context represents.
+    /// `1` for the first attempt. Stable retries share a key but differ here.
+    attempt: Option<u32>,
 }
 
 impl ActivityContext {
     /// Production constructor -- creates a context with heartbeat channel and
     /// cancellation token.
-    #[cfg_attr(not(feature = "db"), allow(dead_code))]
+    #[allow(dead_code)]
     pub(crate) fn new(
         state: SharedState,
         heartbeat_tx: Option<tokio::sync::mpsc::Sender<serde_json::Value>>,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Self {
+        let heartbeat_unsupported_reason = heartbeat_tx
+            .is_none()
+            .then_some(NO_HEARTBEAT_FLUSHER_REASON);
+
         Self {
             state,
             heartbeat_tx,
+            heartbeat_details: None,
+            heartbeat_unsupported_reason,
             cancel,
             #[cfg(feature = "db")]
             cancellation_check: None,
             trace_context: None,
+            idempotency_key: None,
+            attempt: None,
         }
     }
 
@@ -1677,13 +2117,20 @@ impl ActivityContext {
     pub(crate) fn new_with_cancellation_check(
         state: SharedState,
         heartbeat_tx: Option<tokio::sync::mpsc::Sender<serde_json::Value>>,
+        heartbeat_details: Option<serde_json::Value>,
         cancel: tokio_util::sync::CancellationToken,
         task_id: uuid::Uuid,
         pool: ActivityCancellationPool,
     ) -> Self {
+        let heartbeat_unsupported_reason = heartbeat_tx
+            .is_none()
+            .then_some(NO_HEARTBEAT_FLUSHER_REASON);
+
         Self {
             state,
             heartbeat_tx,
+            heartbeat_details,
+            heartbeat_unsupported_reason,
             cancel,
             cancellation_check: Some(ActivityCancellationCheck {
                 task_id,
@@ -1691,6 +2138,27 @@ impl ActivityContext {
                 last_checked_at: Mutex::new(None),
             }),
             trace_context: None,
+            idempotency_key: None,
+            attempt: None,
+        }
+    }
+
+    #[cfg_attr(not(feature = "db"), allow(dead_code))]
+    pub(crate) fn new_local_activity(
+        state: SharedState,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Self {
+        Self {
+            state,
+            heartbeat_tx: None,
+            heartbeat_details: None,
+            heartbeat_unsupported_reason: Some(LOCAL_ACTIVITY_HEARTBEAT_REASON),
+            cancel,
+            #[cfg(feature = "db")]
+            cancellation_check: None,
+            trace_context: None,
+            idempotency_key: None,
+            attempt: None,
         }
     }
 
@@ -1712,6 +2180,67 @@ impl ActivityContext {
     #[must_use]
     pub const fn trace_context(&self) -> Option<&crate::telemetry::TraceContextCarrier> {
         self.trace_context.as_ref()
+    }
+
+    /// Attach a stable idempotency key to this context.
+    ///
+    /// The engine calls this automatically for both regular and local
+    /// activities. You only need it when constructing a context manually in
+    /// tests.
+    #[must_use]
+    pub fn with_idempotency_key(mut self, key: IdempotencyKey) -> Self {
+        self.idempotency_key = Some(key);
+        self
+    }
+
+    /// Set the attempt number for this activity invocation.
+    ///
+    /// `1` means the first attempt. The engine sets this automatically; you
+    /// only need it when constructing a context manually in tests.
+    #[must_use]
+    pub const fn with_attempt(mut self, attempt: u32) -> Self {
+        self.attempt = Some(attempt);
+        self
+    }
+
+    /// The stable idempotency key for this logical activity invocation.
+    ///
+    /// Identical across all retry attempts for the same logical invocation
+    /// (worker restarts, duplicate dispatch, and deterministic replay all
+    /// produce the same key).  Safe to use directly as an `Idempotency-Key`
+    /// HTTP request header.
+    ///
+    /// Use [`IdempotencyKey::subkey`] to derive a named child key when one
+    /// activity must produce multiple distinct side effects.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Config`] if no idempotency key was attached to
+    /// this context.  In production this never happens; in tests use
+    /// [`Self::with_idempotency_key`] or [`Self::new_test`] which always
+    /// provides a key.
+    pub fn idempotency_key(&self) -> Result<&IdempotencyKey, HarvestError> {
+        self.idempotency_key.as_ref().ok_or_else(|| {
+            HarvestError::Config(
+                "idempotency key not available on this context; \
+                 use ActivityContext::new_test() or ActivityContext::with_idempotency_key()"
+                    .into(),
+            )
+        })
+    }
+
+    /// Which attempt of the logical activity invocation this context
+    /// represents.  `Some(1)` for the first attempt, `Some(2)` for the first
+    /// retry, and so on.  `None` if the engine did not set an attempt (e.g.
+    /// contexts built with the bare `new` constructor).
+    ///
+    /// The default idempotency key is **retry-stable** (same value for all
+    /// attempts).  Call `ctx.idempotency_key()?.subkey(&format!("attempt-{}",
+    /// ctx.attempt().unwrap_or(1)))` to opt into an attempt-scoped subkey if
+    /// your downstream API requires distinct keys per attempt.
+    #[must_use]
+    pub const fn attempt(&self) -> Option<u32> {
+        self.attempt
     }
 
     /// Access typed shared state.
@@ -1736,12 +2265,44 @@ impl ActivityContext {
         self.state.get(&TypeId::of::<T>())?.downcast_ref::<T>()
     }
 
+    /// Return the heartbeat payload durably persisted by the previous attempt.
+    ///
+    /// This is a snapshot captured before the current attempt starts. Heartbeats
+    /// sent by the current attempt become visible only to a later retry attempt,
+    /// after the heartbeat flusher successfully writes them to Postgres.
+    ///
+    /// # Errors
+    ///
+    /// - [`HarvestError::Serialization`] if the stored payload does not
+    ///   deserialize into `T`.
+    /// - [`HarvestError::Config`] for local activities, which do not support
+    ///   heartbeating.
+    pub fn heartbeat_details<T: serde::de::DeserializeOwned>(
+        &self,
+    ) -> crate::HarvestResult<Option<T>> {
+        if let Some(reason) = self.heartbeat_unsupported_reason {
+            return Err(HarvestError::Config(reason.into()));
+        }
+
+        self.heartbeat_details
+            .clone()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(HarvestError::from)
+    }
+
     /// Send a heartbeat to signal the activity is still running.
     ///
     /// The `details` payload is serialized to JSON and forwarded to the worker's
-    /// heartbeat loop, which batches writes to the database. Always check the
-    /// return value -- an `Err(Cancelled)` means the workflow was cancelled and
-    /// the activity should wind down promptly.
+    /// heartbeat loop, which batches writes to the database. On retry, the last
+    /// successfully flushed payload from the previous attempt is available via
+    /// [`Self::heartbeat_details`]. Always check the return value -- an
+    /// `Err(Cancelled)` means the workflow was cancelled and the activity should
+    /// wind down promptly.
+    ///
+    /// Within a single attempt, heartbeat payloads are last-write-wins and are
+    /// not read back through this context. Call [`Self::heartbeat_details`] at
+    /// the start of a later retry attempt to resume from the prior checkpoint.
     ///
     /// ## Examples
     ///
@@ -1775,6 +2336,10 @@ impl ActivityContext {
 
         #[cfg(feature = "db")]
         self.check_durable_cancellation().await?;
+
+        if let Some(reason) = self.heartbeat_unsupported_reason {
+            return Err(HarvestError::Config(reason.into()));
+        }
 
         let payload = serde_json::to_value(details)?;
 
@@ -1850,7 +2415,9 @@ impl ActivityContext {
     ///
     /// This method allows you to instantiate an `ActivityContext` in isolation
     /// for unit testing activity handlers without needing to spin up the entire
-    /// workflow engine.
+    /// workflow engine. It does not attach a heartbeat flusher, so
+    /// [`Self::heartbeat`] and [`Self::heartbeat_details`] return
+    /// [`HarvestError::Config`].
     ///
     /// ## Examples
     ///
@@ -1868,6 +2435,21 @@ impl ActivityContext {
     #[cfg(any(test, feature = "testing"))]
     #[must_use]
     pub fn new_test() -> Self {
+        let id = ActivityExecId::new();
+        Self::new(
+            empty_shared_state(),
+            None,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .with_idempotency_key(IdempotencyKey::from_activity_exec_id(id))
+        .with_attempt(1)
+    }
+
+    /// Like [`new_test`](Self::new_test) but intentionally omits the
+    /// idempotency key.  Used only in tests that verify the error path.
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn new_for_idempotency_test_no_key() -> Self {
         Self::new(
             empty_shared_state(),
             None,
@@ -1886,6 +2468,89 @@ mod tests {
     use crate::error::TimeoutType;
     use crate::types::ActivityExecId;
     use chrono::Utc;
+
+    #[test]
+    fn workflow_context_history_event_count_reports_loaded_history() {
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "poll_for_work".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: serde_json::json!({"work": false}),
+            },
+        ];
+
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+
+        assert_eq!(ctx.history_event_count(), 3);
+        assert!(
+            ctx.is_replaying(),
+            "counting history must not advance replay"
+        );
+    }
+
+    #[test]
+    fn workflow_context_should_continue_as_new_uses_soft_threshold() {
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "poll-cycle".into(),
+                details: serde_json::json!({"n": 1}),
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "poll-cycle".into(),
+                details: serde_json::json!({"n": 2}),
+            },
+        ];
+        let policy = WorkflowHistoryPolicy::default().with_continue_as_new_threshold(2);
+
+        let ctx = WorkflowContext::for_replay_with_state_and_history_policy(
+            ExecutionId::new(),
+            events,
+            empty_shared_state(),
+            policy,
+        );
+
+        assert_eq!(ctx.history_event_count(), 3);
+        assert!(ctx.should_continue_as_new());
+    }
+
+    #[test]
+    fn workflow_context_should_continue_as_new_is_false_at_threshold_boundary() {
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "poll-cycle".into(),
+                details: serde_json::json!({"n": 1}),
+            },
+        ];
+        let policy = WorkflowHistoryPolicy::default().with_continue_as_new_threshold(2);
+
+        let ctx = WorkflowContext::for_replay_with_state_and_history_policy(
+            ExecutionId::new(),
+            events,
+            empty_shared_state(),
+            policy,
+        );
+
+        assert_eq!(ctx.history_event_count(), 2);
+        assert!(!ctx.should_continue_as_new());
+    }
 
     #[tokio::test]
     async fn workflow_context_continue_as_new_pushes_terminal_command() {
@@ -2010,6 +2675,77 @@ mod tests {
     fn activity_context_trace_context_defaults_to_none() {
         let ctx = ActivityContext::new_test();
         assert!(ctx.trace_context().is_none());
+    }
+
+    #[derive(Debug, PartialEq, serde::Deserialize)]
+    struct TestHeartbeatDetails {
+        progress: u32,
+    }
+
+    fn activity_context_with_heartbeat_details(
+        details: Option<serde_json::Value>,
+    ) -> ActivityContext {
+        let mut ctx = ActivityContext::new_test();
+        ctx.heartbeat_details = details;
+        ctx.heartbeat_unsupported_reason = None;
+        ctx
+    }
+
+    #[test]
+    fn activity_context_heartbeat_details_deserializes_previous_payload() {
+        let ctx = activity_context_with_heartbeat_details(Some(serde_json::json!({
+            "progress": 42,
+        })));
+
+        let details = ctx
+            .heartbeat_details::<TestHeartbeatDetails>()
+            .expect("heartbeat details should deserialize");
+
+        assert_eq!(details, Some(TestHeartbeatDetails { progress: 42 }));
+    }
+
+    #[test]
+    fn activity_context_heartbeat_details_type_mismatch_returns_error() {
+        let ctx = activity_context_with_heartbeat_details(Some(serde_json::json!({
+            "progress": "not a number",
+        })));
+
+        let result = ctx.heartbeat_details::<TestHeartbeatDetails>();
+
+        assert!(matches!(result, Err(HarvestError::Serialization(_))));
+    }
+
+    #[tokio::test]
+    async fn local_activity_context_heartbeat_returns_explicit_error() {
+        let ctx = ActivityContext::new_local_activity(
+            empty_shared_state(),
+            tokio_util::sync::CancellationToken::new(),
+        );
+
+        let result = ctx.heartbeat(serde_json::json!({"progress": 1})).await;
+
+        assert!(
+            matches!(result, Err(HarvestError::Config(message)) if message.contains("local activities do not support heartbeats"))
+        );
+    }
+
+    #[tokio::test]
+    async fn activity_context_without_heartbeat_channel_rejects_heartbeats() {
+        let ctx = ActivityContext::new(
+            empty_shared_state(),
+            None,
+            tokio_util::sync::CancellationToken::new(),
+        );
+
+        let heartbeat_result = ctx.heartbeat(serde_json::json!({"progress": 1})).await;
+        let details_result = ctx.heartbeat_details::<TestHeartbeatDetails>();
+
+        assert!(
+            matches!(heartbeat_result, Err(HarvestError::Config(message)) if message.contains("heartbeats are not supported"))
+        );
+        assert!(
+            matches!(details_result, Err(HarvestError::Config(message)) if message.contains("heartbeats are not supported"))
+        );
     }
 
     #[tokio::test]
@@ -2172,6 +2908,9 @@ mod tests {
                 activity_id,
                 error: "SMTP connection refused".into(),
                 attempt: 3,
+                error_type: "Error".into(),
+                non_retryable: false,
+                details: None,
             },
         ];
 
@@ -2437,6 +3176,48 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(result.map_err(|e| e.to_string())?, expected_output);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn context_reparks_inflight_activity_without_rescheduling() {
+        let activity_id = ActivityExecId::new();
+        let ctx = Arc::new(WorkflowContext::for_replay(
+            ExecutionId::new(),
+            vec![
+                WorkflowEvent::WorkflowStarted {
+                    input: Value::Null,
+                    timestamp: Utc::now(),
+                },
+                WorkflowEvent::ActivityScheduled {
+                    activity_id,
+                    name: "send_email".into(),
+                    input: Value::Null,
+                    queue: "default".into(),
+                },
+            ],
+        ));
+        let ctx2 = Arc::clone(&ctx);
+
+        let handle = tokio::spawn(async move {
+            ctx2.execute_activity_raw("send_email", Value::Null, "default")
+                .await
+        });
+        tokio::task::yield_now().await;
+
+        let timeout_result =
+            tokio::time::timeout(std::time::Duration::from_millis(50), handle).await;
+        assert!(
+            timeout_result.is_err(),
+            "activity with only a scheduled event should suspend until its terminal event arrives"
+        );
+
+        let commands = ctx.drain_commands();
+        assert!(
+            commands
+                .iter()
+                .all(|cmd| !matches!(cmd, WorkflowCommand::ScheduleActivity { .. })),
+            "in-flight activity replay must not emit a fresh ScheduleActivity: {commands:?}"
+        );
     }
 
     #[tokio::test]
@@ -3089,6 +3870,13 @@ mod tests {
                 error: "always fails".into(),
                 attempt: 1,
             },
+            // LocalActivityExhausted is the authoritative terminal marker; without
+            // it the context would treat this as a crash-between-retries case.
+            WorkflowEvent::LocalActivityExhausted {
+                activity_id: id,
+                error: "always fails".into(),
+                attempt: 1,
+            },
         ];
         let ctx = WorkflowContext::for_replay(crate::types::ExecutionId::new(), events);
         let result = ctx
@@ -3273,5 +4061,195 @@ mod tests {
             .expect("both should succeed");
         assert_eq!(a, serde_json::json!({"a":"done"}));
         assert_eq!(b, serde_json::json!({"b":"done"}));
+    }
+
+    // ── upsert_search_attrs tests ─────────────────────────────────────
+
+    #[test]
+    fn upsert_search_attrs_live_emits_command() {
+        let ctx = WorkflowContext::new_test();
+        ctx.upsert_search_attrs([
+            (
+                "tenant".to_string(),
+                Some(Value::String("acme".to_string())),
+            ),
+            (
+                "phase".to_string(),
+                Some(Value::String("awaiting_approval".to_string())),
+            ),
+        ])
+        .expect("should succeed in live mode");
+
+        let cmds = ctx.drain_commands();
+        assert_eq!(cmds.len(), 1);
+        match &cmds[0] {
+            WorkflowCommand::UpsertSearchAttributes { patch } => {
+                assert_eq!(
+                    patch.get("tenant"),
+                    Some(&Some(Value::String("acme".to_string())))
+                );
+                assert_eq!(
+                    patch.get("phase"),
+                    Some(&Some(Value::String("awaiting_approval".to_string())))
+                );
+            }
+            other => panic!("expected UpsertSearchAttributes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn upsert_search_attrs_replay_is_noop() {
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: ActivityExecId::new(),
+                name: "step_1".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        assert!(ctx.is_replaying(), "context should be replaying");
+
+        ctx.upsert_search_attrs([("phase".to_string(), Some(Value::String("v1".to_string())))])
+            .expect("should succeed silently during replay");
+
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "no command emitted during replay"
+        );
+    }
+
+    #[test]
+    fn upsert_search_attrs_none_value_means_remove() {
+        let ctx = WorkflowContext::new_test();
+        ctx.upsert_search_attrs([("old_key".to_string(), None)])
+            .expect("removal should succeed");
+
+        let cmds = ctx.drain_commands();
+        assert_eq!(cmds.len(), 1);
+        match &cmds[0] {
+            WorkflowCommand::UpsertSearchAttributes { patch } => {
+                assert_eq!(patch.get("old_key"), Some(&None));
+            }
+            other => panic!("expected UpsertSearchAttributes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn upsert_search_attrs_rejects_empty_key() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .upsert_search_attrs([(String::new(), Some(Value::Bool(true)))])
+            .expect_err("empty key must be rejected");
+        assert!(matches!(err, HarvestError::InvalidSearchAttribute { .. }));
+    }
+
+    #[test]
+    fn upsert_search_attrs_rejects_key_too_long() {
+        let ctx = WorkflowContext::new_test();
+        let long_key = "a".repeat(65);
+        let err = ctx
+            .upsert_search_attrs([(long_key, Some(Value::Bool(true)))])
+            .expect_err("key > 64 chars must be rejected");
+        assert!(matches!(err, HarvestError::InvalidSearchAttribute { .. }));
+    }
+
+    #[test]
+    fn upsert_search_attrs_rejects_invalid_key_chars() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .upsert_search_attrs([("bad key!".to_string(), Some(Value::Bool(true)))])
+            .expect_err("key with space/special chars must be rejected");
+        assert!(matches!(err, HarvestError::InvalidSearchAttribute { .. }));
+    }
+
+    #[test]
+    fn upsert_search_attrs_rejects_reserved_key() {
+        let ctx = WorkflowContext::new_test();
+        for key in &["exec_id", "workflow_name", "shard_id", "status", "run_id"] {
+            let err = ctx
+                .upsert_search_attrs([(key.to_string(), Some(Value::String("x".to_string())))])
+                .expect_err(&format!("reserved key '{key}' must be rejected"));
+            assert!(
+                matches!(err, HarvestError::InvalidSearchAttribute { .. }),
+                "key '{key}': expected InvalidSearchAttribute"
+            );
+        }
+    }
+
+    #[test]
+    fn upsert_search_attrs_rejects_reserved_prefix() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .upsert_search_attrs([(
+                "_harvest_shard".to_string(),
+                Some(Value::String("1".to_string())),
+            )])
+            .expect_err("key with _harvest prefix must be rejected");
+        assert!(matches!(err, HarvestError::InvalidSearchAttribute { .. }));
+    }
+
+    #[test]
+    fn upsert_search_attrs_rejects_object_value() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .upsert_search_attrs([(
+                "meta".to_string(),
+                Some(serde_json::json!({"nested": "object"})),
+            )])
+            .expect_err("object value must be rejected");
+        assert!(matches!(err, HarvestError::InvalidSearchAttribute { .. }));
+    }
+
+    #[test]
+    fn upsert_search_attrs_rejects_array_value() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .upsert_search_attrs([("tags".to_string(), Some(serde_json::json!(["a", "b"])))])
+            .expect_err("array value must be rejected");
+        assert!(matches!(err, HarvestError::InvalidSearchAttribute { .. }));
+    }
+
+    #[test]
+    fn upsert_search_attrs_accepts_primitive_values() {
+        let ctx = WorkflowContext::new_test();
+        ctx.upsert_search_attrs([
+            (
+                "str_key".to_string(),
+                Some(Value::String("hello".to_string())),
+            ),
+            ("num_key".to_string(), Some(serde_json::json!(42))),
+            ("bool_key".to_string(), Some(Value::Bool(false))),
+            ("null_removal".to_string(), None),
+        ])
+        .expect("primitives and None should be accepted");
+
+        let cmds = ctx.drain_commands();
+        assert_eq!(cmds.len(), 1);
+        match &cmds[0] {
+            WorkflowCommand::UpsertSearchAttributes { patch } => {
+                assert!(patch.contains_key("str_key"));
+                assert!(patch.contains_key("num_key"));
+                assert!(patch.contains_key("bool_key"));
+                assert!(patch.contains_key("null_removal"));
+                assert_eq!(patch["null_removal"], None);
+            }
+            other => panic!("expected UpsertSearchAttributes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn upsert_search_attrs_empty_patch_is_noop() {
+        let ctx = WorkflowContext::new_test();
+        ctx.upsert_search_attrs(std::iter::empty::<(String, Option<Value>)>())
+            .expect("empty patch should succeed");
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "empty patch emits no command"
+        );
     }
 }

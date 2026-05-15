@@ -1,3 +1,5 @@
+//! Global shared state and database pools used by the Harvest plugin.
+
 use std::ops::Deref;
 
 use autumn_harvest::shard::ShardedDbPool;

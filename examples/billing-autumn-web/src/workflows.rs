@@ -109,14 +109,20 @@ pub async fn billing_checkout(
         .await?;
 
     if checkout.requires_manual_review() {
-        ctx.execute_activity_external(
-            "approve_high_value_subscription",
-            json!({
-                "subscription": subscription_record,
-                "authorization": authorization,
-            }),
-            OPS_QUEUE,
-            24 * 60 * 60,
+        saga.step(
+            || async {
+                ctx.execute_activity_external(
+                    "approve_high_value_subscription",
+                    json!({
+                        "subscription": subscription_record,
+                        "authorization": authorization,
+                    }),
+                    OPS_QUEUE,
+                    24 * 60 * 60,
+                )
+                .await
+            },
+            |_| async { Ok::<(), HarvestError>(()) },
         )
         .await?;
     }
@@ -156,11 +162,14 @@ pub async fn billing_checkout(
             reason: "payment capture was rejected".to_owned(),
         });
     }
-    let capture_id = capture
-        .get("capture_id")
-        .and_then(Value::as_str)
-        .unwrap_or("capture-missing")
-        .to_owned();
+    let Some(capture_id) = capture.get("capture_id").and_then(Value::as_str) else {
+        saga.compensate_all().await?;
+        return Err(HarvestError::WorkflowFailed {
+            name: "billing_checkout".to_owned(),
+            reason: "payment_captured signal missing capture_id".to_owned(),
+        });
+    };
+    let capture_id = capture_id.to_owned();
 
     ctx.execute_activity_raw(
         "record_payment_capture",

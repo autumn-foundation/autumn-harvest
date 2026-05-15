@@ -1,9 +1,0 @@
-<<<<<<< SEARCH
-        f.debug_struct("ShardedDbPool")
-            .field("shards", &self.pools.keys().collect::<Vec<_>>())
-            .field("default_shard", &self.default_shard)
-=======
-        f.debug_struct("ShardedDbPool")
-            .field("shards", &self.pools.keys())
-            .field("default_shard", &self.default_shard)
->>>>>>> REPLACE

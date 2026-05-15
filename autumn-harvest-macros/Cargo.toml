@@ -19,5 +19,8 @@ syn = { workspace = true }
 quote = { workspace = true }
 proc-macro2 = { workspace = true }
 
+[features]
+unified-dag-execution = []
+
 [lints]
 workspace = true

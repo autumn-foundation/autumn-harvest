@@ -152,8 +152,8 @@ impl ShardRouter {
 
     /// Pick a shard for a DAG at catalog-compile time.
     ///
-    /// DAG state (`harvest_schedules`, `harvest_dag_runs`) is scoped per
-    /// database, so each DAG must be pinned to a single shard that owns it.
+    /// DAG schedules (`harvest_schedules`) are scoped per database, so each
+    /// DAG must be pinned to a single shard that owns it.
     /// The same name always maps to the same shard because rendezvous hashing
     /// is stable.
     #[must_use]

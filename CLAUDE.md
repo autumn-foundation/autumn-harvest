@@ -31,11 +31,14 @@ autumn-harvest/          <- workspace root (this file lives here)
       dlq.rs             <- Phase 2: dead letter queue
       pool.rs            <- Phase 2: separate pool config with shared ceiling
       testing.rs         <- Phase 3.5 (testing feature): WorkflowReplayer harness
+      build_routing.rs   <- Phase 3.7: worker build-id routing (issue #171)
     migrations/
       20260409000000_harvest_initial/
+      20260509000000_harvest_build_routing/
     tests/
       integration_e2e.rs <- testcontainers integration tests
       replay_tests.rs    <- replay engine integration tests
+      build_routing_tests.rs <- build-id routing unit + integration tests
       macros_*.rs        <- proc-macro integration tests
   autumn-harvest-macros/ <- proc-macro crate
     src/
@@ -54,7 +57,10 @@ Two crates in the workspace. `autumn-harvest` is the public library. `autumn-har
 - **Phase 3** (implemented): DAG scheduler/runtime, `DagBuilder`, `#[dag]` macro, trigger rules, signals/queries, management HTTP API, Autumn adapter crate with `HarvestExt` lifecycle integration
 - **Phase 3.5** (implemented): Local activities (`#[activity(local = true)]`, `ctx.execute_local_activity_raw`, `WorkflowCommand::RunLocalActivity`, three new `WorkflowEvent` variants, builder cap validation) — see issue #98
 - **Phase 3.6** (implemented): Update primitive (`UpdateAdmitted`, `UpdateCompleted`, `UpdateFailed` event variants, `UpdateId` type, `UpdateRegistry`, `WorkflowContext::register_update_handler`, `validate_update`, `execute_admitted_update`, `HistoryMatcher::match_update`, `drain_admitted_updates`) — see issue #140
-- **Phase 4** (next): production hardening -- cancellation/saga semantics, sharding, sticky cross-worker routing, observability, metrics, dashboard (Vantage UI — Workers tab shipped in issue #142; DLQ, schedules, and DAG visualization pages remain)
+- **Phase 3.7** (implemented): Worker build-id routing (`BuildId`, `DeploymentName` newtypes; `build_routing.rs` with `BuildCompatibilitySet`, `BuildPolicy`, `BuildReachability`; `harvest_build_policies` + `harvest_build_compat` tables; `required_build_id` on task queue; `assigned_build_id` on executions; `build_id`/`deployment_name` on workers; SKIP LOCKED claim filter; `WorkerConfig::with_build_id`, `with_deployment_name`; build policy wired into `start_or_load_workflow_execution`; cross-shard reachability via `all_build_reachability_sharded`) — see issue #171 and `docs/runbooks/safe-deploy.md` for the operator deploy playbook
+- **Phase 3.8** (implemented): Starter production alert pack and runbooks (`docs/alerts/starter-pack-v0.1.0.json`, `docs/alerts/README.md`, `docs/runbooks/harvest-alerts.md`, `docs/runbooks/synthetic-incident-drills.md`) compose ADR-0001/#138 metrics with preflight, worker health, shard health, schedules, DLQ, retention, workflow stack, and build-routing signals. Thresholds are starter defaults, not universal SLOs.
+- **Phase 3.9** (implemented): Unified DAG execution (`unified-dag-execution` feature, on by default) — see issue #256. `#[dag]` lowers graph definitions onto the standard workflow execution path: the macro emits a `WorkflowHandlerFn` that walks `DagDefinition` level by level and dispatches activities through `ctx.execute_activity_raw`. `HarvestBuilder::dags()` auto-registers `WorkflowInfo` (and `WorkflowSchedule` when a schedule attribute is present) for each unified DAG. `POST /dags/{name}/trigger` routes through `trigger_unified_dag` → `start_or_load_workflow_execution` when the dag is in `registry.workflows`. `compile_dag_catalog` skips unified DAGs so the classic DAG executor never claims them. Classic DAGs (explicit `workflow_handler: None`) still work unchanged. `harvest_dag_runs` remains write-only for bridge observability during this transition.
+- **Phase 4** (next): production hardening -- cancellation/saga semantics, sharding, sticky cross-worker routing, observability, metrics, dashboard (Vantage UI — Workers tab shipped in issue #142; DLQ, schedules, and DAG visualization pages remain); Step 5 of issue #256 (remove classic DAG executor, drop `harvest_dag_runs`)
 
 ---
 
@@ -133,9 +139,12 @@ Operational "add a shard" procedure (new workflows only):
 
 1. Provision a new Postgres database and run `diesel migration run` against it.
 2. Add the new shard to `readable_shards` and keep `writable_shards` pointing at the existing shards. Restart the plugin — the router can now resolve ids that encode the new shard, even though nothing writes there yet.
-3. Add the new shard to `writable_shards`. New workflows begin landing on it via rendezvous hash. In-flight workflows on the old shards continue to drain through their own worker tasks.
+3. Run `harvest shard health --candidate-shard <id>` or `GET /admin/shards/health?candidate_shard=<id>` and wait for `readiness: "ready"`. `degraded` rows include machine-readable `reason_codes`; `unavailable` rows keep reachable shards visible while naming the broken shard.
+4. Add the new shard to `writable_shards`. New workflows begin landing on it via rendezvous hash. In-flight workflows on the old shards continue to drain through their own worker tasks.
 
-Current implementation scope: `ExecutionId`/`ShardId` encoding, `ShardRouter`, `ShardedDbPool`, shard-aware start/read paths in the plugin, and `WorkerConfig.shard_assignments`. Per-shard worker poll loops, per-shard scheduler tick loops with DAG→shard pinning, and cross-shard observability remain as follow-up work.
+`/api/harvest/health` is liveness-style by default. To make it fail with `503` when writable shard readiness is not `ready`, configure `[harvest.readiness] require_shard_readiness = true` or set `AUTUMN_HARVEST_READINESS__REQUIRE_SHARD_READINESS=true`.
+
+Current implementation scope: `ExecutionId`/`ShardId` encoding, `ShardRouter`, `ShardedDbPool`, shard-aware start/read paths in the plugin, `WorkerConfig.shard_assignments`, and shard health readiness for worker/scheduler rollout coverage. Per-shard worker poll loops and per-shard scheduler tick loops with DAG→shard pinning remain as follow-up work.
 
 ---
 
@@ -151,21 +160,22 @@ Current implementation scope: `ExecutionId`/`ShardId` encoding, `ShardRouter`, `
 | `info.rs` | 1 | `WorkflowInfo`, `ActivityInfo`, `WorkflowHandlerFn`, `ActivityHandlerFn` type aliases |
 | `builder.rs` | 1 | `HarvestBuilder` (fluent), `WorkerConfig` (queues, concurrency, timeouts) |
 | `prelude.rs` | 1 | Core glob re-export surface including macros |
-| `schema.rs` | 1 | Diesel `table!` macros -- 9 tables |
-| `models.rs` | 1 | `Queryable`/`Selectable` read structs and `Insertable` `New*` write structs for all 9 tables |
-| `store.rs` | 2 | Event store: `append_events`, `load_history`, `events_to_rows` with sequential event IDs |
+| `schema.rs` | 1 | Diesel `table!` macros -- 11 tables (includes `harvest_build_policies`, `harvest_build_compat`) |
+| `models.rs` | 1 | `Queryable`/`Selectable` read structs and `Insertable` `New*` write structs for all 11 tables |
+| `store.rs` | 2 | Event store and read helpers: `append_events`, `load_history`, `events_to_rows` with sequential event IDs, `load_workflow_children` for parent -> child operator queries |
 | `replay.rs` | 2 | Deterministic replay engine: `HistoryMatcher` walks event history, detects non-determinism |
 | `executor.rs` | 2 | Workflow executor: `run_workflow` drives replay + live execution, handles suspension |
 | `queue.rs` | 2 | Postgres task queue: `enqueue`, `claim` (FOR UPDATE SKIP LOCKED), `complete`, `fail` |
 | `notify.rs` | 2 | LISTEN/NOTIFY wrapper: `Listener` (async stream), `Notifier` (pg_notify), channel naming |
 | `worker.rs` | 2 | Worker runtime: poll loop, semaphore-bounded concurrent dispatch, graceful shutdown |
 | `workers.rs` | 4 | Worker fleet registry: `register_worker`, `heartbeat_worker`, `transition_status`, `list_workers`, `get_worker`, `fleet_health`, `spawn_worker_heartbeat` |
-| `heartbeat.rs` | 2 | Batched heartbeat flusher: debounced channel receiver, bulk DB update |
+| `heartbeat.rs` | 2 | Batched heartbeat flusher: debounced channel receiver, last-write-wins timestamp + checkpoint payload DB update |
 | `timeout.rs` | 2 | Timeout enforcement scanner: start-to-close, schedule-to-start, heartbeat timeout queries |
 | `cache.rs` | 2 | LRU workflow state cache: bounded capacity, access-order eviction |
 | `dlq.rs` | 2 | Dead letter queue: `DeadLetterEntry` builder, move-to-DLQ on retry exhaustion |
 | `pool.rs` | 2 | Separate DB pool config: web pool + worker pool with shared ceiling, minimum guarantees |
 | `update.rs` | 3.6 | Update primitive: `UpdateRegistry` (type-erased validators + async handlers), `BoxUpdateHandler`, `BoxUpdateValidator`. `WorkflowContext` methods: `register_update_handler`, `register_update_handler_no_validator`, `validate_update`, `execute_admitted_update`. `HistoryMatcher` methods: `match_update(update_id)`, `drain_admitted_updates()`. Error variants: `HarvestError::UpdateRejected`, `HarvestError::UpdateHandlerNotFound` |
+| `build_routing.rs` | 3.7 | Worker build-id routing: `BuildCompatibilitySet` (in-memory eligibility checker), `BuildPolicy`, `BuildCompatEntry`, `BuildReachability`. DB functions: `set_build_policy`, `get_build_policy`, `list_build_policies`, `declare_compat`, `revoke_compat`, `load_compat_set`, `build_reachability`, `all_build_reachability`, `all_build_reachability_sharded` (cross-shard fan-out), `merge_reachability`. New newtypes in `types.rs`: `BuildId`, `DeploymentName`. See `docs/runbooks/safe-deploy.md` for the operator deploy playbook. |
 | `telemetry.rs` | 4 | OpenTelemetry surface: `TraceContextCarrier`, `TraceContextPropagator`, `MetricsRecorder`, `TelemetryConfig` — no-op by default, opt-in via `HarvestBuilder::telemetry`. Implements all 8 ADR-0001 span kinds (issue #136); see `docs/adr/0001-otel-trace-contract.md` for the full attribute schema and propagation rules. Metric catalogue (ADR-0001 §7): `harvest.workflow.started` (counter, `worker.rs`), `harvest.workflow.duration` (histogram, `worker.rs`), `harvest.activity.duration` (histogram, `worker.rs`), `harvest.timer.started` (counter, `worker.rs`), `harvest.queue.depth` (gauge, `worker.rs` sampler), `harvest.dlq.entries` (gauge, `worker.rs` sampler), `harvest.schedule.runs` (counter, `scheduler.rs`), `harvest.schedule.skipped` (counter, `scheduler.rs`), `harvest.retention.deleted` (counter, `retention.rs`). Cardinality rule: `execution.id` is span-only; `MetricsRecorder` API enforces this by construction. |
 | `metrics_rs_adapter.rs` | 4 | `metrics-rs` feature flag adapter: `MetricsRsRecorder` bridges `MetricsRecorder` → `metrics` crate global registry. See `docs/telemetry.md` for recipe. |
 | `migrations/` | 1 | SQL -- run with `diesel migration run` |
@@ -238,7 +248,7 @@ async fn compute_checksum(ctx: &ActivityContext, data: Vec<u8>) -> Result<String
 | Execution location | Inline on the workflow worker | Dispatched to task queue / remote worker |
 | Typical duration | < 1 s | Any duration |
 | Hard timeout cap | `WorkerConfig::max_local_activity_start_to_close` (default 60 s) | No cap enforced by Harvest |
-| Heartbeating | **Not supported** | Supported |
+| Heartbeating | **Not supported**; `ctx.heartbeat(...)` returns a runtime `Config` error and no heartbeat checkpoint is available | Supported; retry attempts can read the last flushed payload with `ctx.heartbeat_details::<T>()` |
 | `schedule_to_start` timeout | **Not supported** | Supported |
 | Custom task queue | **Not supported** | Supported |
 | Retry policy | Supported | Supported |
@@ -313,9 +323,11 @@ The `testing` feature in `autumn-harvest/Cargo.toml` gates `WorkflowContext::new
 | `harvest_signals` | `Uuid` | Pending signals queued for delivery |
 | `harvest_timers` | `Uuid` | Durable timers registered by workflows |
 | `harvest_dead_letters` | `Uuid` | Tasks that exhausted all retry attempts |
-| `harvest_workers` | `Text` | Live worker process registrations and heartbeat state |
+| `harvest_workers` | `Text` | Live worker process registrations and heartbeat state (`build_id`, `deployment_name` added in issue #171) |
+| `harvest_build_policies` | `Uuid` | Per-queue active build policy: new starts get `assigned_build_id = policy.build_id` |
+| `harvest_build_compat` | `Uuid` | Compatibility declarations: workers running build B may process executions assigned build A |
 
-`harvest_workflow_executions` is the hub — six tables join back to it via `workflow_exec_id`.
+`harvest_workflow_executions` is the hub — six tables join back to it via `workflow_exec_id`. `harvest_build_policies` and `harvest_build_compat` are keyed by `queue_name` and `(build_id, compatible_with)` respectively.
 
 ---
 

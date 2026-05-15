@@ -52,11 +52,29 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../../autumn-harvest/migrations/20260430000001_harvest_external_tasks/up.sql"),
     "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260508000000_harvest_external_task_updated_at/up.sql"
+    ),
+    "\n",
+    include_str!("../../autumn-harvest/migrations/20260501000000_harvest_workers/up.sql"),
+    "\n",
     include_str!("../../autumn-harvest/migrations/20260501010000_harvest_batch_jobs/up.sql"),
     "\n",
     include_str!(
         "../../autumn-harvest/migrations/20260501020000_harvest_batch_processed_ids/up.sql"
     ),
+    "\n",
+    include_str!("../../autumn-harvest/migrations/20260505000000_harvest_heartbeat_details/up.sql"),
+    "\n",
+    include_str!("../../autumn-harvest/migrations/20260506000000_harvest_audit_log/up.sql"),
+    "\n",
+    include_str!("../../autumn-harvest/migrations/20260509000000_harvest_build_routing/up.sql"),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260513000000_harvest_schedule_pause_metadata/up.sql"
+    ),
+    "\n",
+    include_str!("../../autumn-harvest/migrations/20260514020000_harvest_task_activity_id/up.sql"),
 );
 
 type HarvestApiApp = axum::Router;
@@ -356,6 +374,11 @@ async fn batch_per_target_failures_dont_abort_run() {
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&url)
         .await
         .unwrap();
+    diesel::update(harvest_workflow_executions::table.find(ids[0].as_uuid()))
+        .set(harvest_workflow_executions::state.eq("CANCELLED"))
+        .execute(&mut conn)
+        .await
+        .unwrap();
     diesel::update(harvest_workflow_executions::table.find(ids[1].as_uuid()))
         .set(harvest_workflow_executions::state.eq("COMPLETED"))
         .execute(&mut conn)
@@ -367,7 +390,10 @@ async fn batch_per_target_failures_dont_abort_run() {
         "/batch-operations",
         json!({
             "action": "Cancel",
-            "filter": { "workflow_name": "onboarding" }
+            "filter": {
+                "workflow_name": "onboarding",
+                "states": ["RUNNING", "CANCELLED", "COMPLETED"]
+            }
         }),
     )
     .await;

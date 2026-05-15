@@ -44,11 +44,13 @@
 use metrics::{counter, gauge, histogram};
 
 use crate::telemetry::{
-    ActivityStatus, METRIC_ACTIVITY_DURATION, METRIC_DLQ_ENTRIES, METRIC_LABEL_ACTIVITY,
-    METRIC_LABEL_KEY, METRIC_LABEL_KIND, METRIC_LABEL_NAME, METRIC_LABEL_QUEUE,
-    METRIC_LABEL_REASON, METRIC_LABEL_SHARD, METRIC_LABEL_STATUS, METRIC_LABEL_WORKFLOW,
+    ActivityStatus, METRIC_ACTIVITY_DURATION, METRIC_ACTIVITY_FAILED, METRIC_DLQ_ENTRIES,
+    METRIC_LABEL_ACTIVITY, METRIC_LABEL_ERROR_TYPE, METRIC_LABEL_KEY, METRIC_LABEL_KIND,
+    METRIC_LABEL_NAME, METRIC_LABEL_NON_RETRYABLE, METRIC_LABEL_QUEUE, METRIC_LABEL_REASON,
+    METRIC_LABEL_SHARD, METRIC_LABEL_STATUS, METRIC_LABEL_WORKFLOW, METRIC_LABEL_WORKFLOW_TYPE,
     METRIC_QUEUE_DEPTH, METRIC_RETENTION_DELETED, METRIC_SCHEDULE_RUNS, METRIC_SCHEDULE_SKIPPED,
-    METRIC_TIMER_DURATION, METRIC_TIMER_STARTED, METRIC_WORKFLOW_DURATION, METRIC_WORKFLOW_STARTED,
+    METRIC_TIMER_DURATION, METRIC_TIMER_STARTED, METRIC_WORKFLOW_CONTINUE_AS_NEW,
+    METRIC_WORKFLOW_DURATION, METRIC_WORKFLOW_HISTORY_SIZE, METRIC_WORKFLOW_STARTED,
     MetricsRecorder, WorkflowStatus,
 };
 
@@ -86,6 +88,23 @@ impl MetricsRecorder for MetricsRsRecorder {
         .record(duration_secs);
     }
 
+    #[allow(clippy::cast_precision_loss)]
+    fn record_workflow_history_size(&self, workflow_name: &str, event_count: u64) {
+        histogram!(
+            METRIC_WORKFLOW_HISTORY_SIZE,
+            METRIC_LABEL_WORKFLOW_TYPE => workflow_name.to_owned(),
+        )
+        .record(event_count as f64);
+    }
+
+    fn record_workflow_continue_as_new(&self, workflow_name: &str) {
+        counter!(
+            METRIC_WORKFLOW_CONTINUE_AS_NEW,
+            METRIC_LABEL_WORKFLOW_TYPE => workflow_name.to_owned(),
+        )
+        .increment(1);
+    }
+
     fn record_activity_completed(
         &self,
         activity_name: &str,
@@ -100,6 +119,47 @@ impl MetricsRecorder for MetricsRsRecorder {
             METRIC_LABEL_STATUS => status.as_str(),
         )
         .record(duration_secs);
+    }
+
+    fn record_activity_completed_with_error_type(
+        &self,
+        activity_name: &str,
+        queue: &str,
+        duration_secs: f64,
+        status: ActivityStatus,
+        error_type: Option<&str>,
+    ) {
+        // Failed records carry `error.type` so operators can slice the
+        // duration histogram by failure class (ADR-0001 §7).
+        if let Some(error_type) = error_type {
+            histogram!(
+                METRIC_ACTIVITY_DURATION,
+                METRIC_LABEL_ACTIVITY => activity_name.to_owned(),
+                METRIC_LABEL_QUEUE => queue.to_owned(),
+                METRIC_LABEL_STATUS => status.as_str(),
+                METRIC_LABEL_ERROR_TYPE => error_type.to_owned(),
+            )
+            .record(duration_secs);
+        } else {
+            self.record_activity_completed(activity_name, queue, duration_secs, status);
+        }
+    }
+
+    fn record_activity_failed(
+        &self,
+        activity_name: &str,
+        workflow_type: &str,
+        error_type: &str,
+        non_retryable: bool,
+    ) {
+        counter!(
+            METRIC_ACTIVITY_FAILED,
+            METRIC_LABEL_ACTIVITY => activity_name.to_owned(),
+            METRIC_LABEL_WORKFLOW_TYPE => workflow_type.to_owned(),
+            METRIC_LABEL_ERROR_TYPE => error_type.to_owned(),
+            METRIC_LABEL_NON_RETRYABLE => non_retryable.to_string(),
+        )
+        .increment(1);
     }
 
     fn record_timer_started(&self, duration_secs: f64) {
@@ -210,6 +270,8 @@ mod tests {
         let rec = MetricsRsRecorder;
         rec.record_workflow_started("wf", "q");
         rec.record_workflow_completed("wf", "q", 1.0, WorkflowStatus::Completed);
+        rec.record_workflow_history_size("wf", 2);
+        rec.record_workflow_continue_as_new("wf");
         rec.record_activity_completed("act", "q", 0.5, ActivityStatus::Completed);
         rec.record_timer_started(30.0);
         rec.record_queue_depth("q", 5);

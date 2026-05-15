@@ -12,7 +12,8 @@ keywords = ["workflow", "durable", "postgres", "orchestration", "autumn"]
 categories = ["asynchronous", "database"]
 
 [features]
-default = ["db"]
+default = ["db", "unified-dag-execution"]
+unified-dag-execution = ["autumn-harvest-macros/unified-dag-execution"]
 db = [
     "dep:deadpool",
     "dep:diesel",
@@ -25,11 +26,12 @@ testing = []
 metrics-rs = ["dep:metrics"]
 
 [dependencies]
-autumn-harvest-macros = { version = "0.2.0", path = "../autumn-harvest-macros" }
+autumn-harvest-macros = { version = "0.3.0", path = "../autumn-harvest-macros" }
 tokio = { workspace = true }
 tokio-util = { version = "0.7", features = ["rt"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+base64 = "0.22"
 thiserror = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
@@ -55,12 +57,28 @@ name = "metrics_noop"
 harness = false
 
 [[test]]
+name = "idempotency_tests"
+required-features = ["testing"]
+
+[[test]]
 name = "replayer_tests"
 required-features = ["testing"]
 
 [[test]]
+name = "dag_unified_tests"
+required-features = ["testing", "unified-dag-execution"]
+
+[[test]]
 name = "replayer_integration_tests"
 required-features = ["testing", "db"]
+
+[[test]]
+name = "build_routing_tests"
+required-features = ["db"]
+
+[[test]]
+name = "workflow_handle_tests"
+required-features = ["db"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

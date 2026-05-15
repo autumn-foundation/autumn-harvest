@@ -64,6 +64,7 @@ pub struct EnqueueParams {
     pub task_type: TaskType,
     pub workflow_exec_id: Option<Uuid>,
     pub activity_name: Option<String>,
+    pub activity_id: Option<Uuid>,
     pub input: serde_json::Value,
     pub priority: i32,
     pub max_attempts: i32,
@@ -94,6 +95,12 @@ pub struct EnqueueParams {
     /// Stored on each row so the claim query can enforce the cap without
     /// application-layer input per poll.
     pub max_concurrent: Option<u32>,
+    /// Build ID required to claim this task (issue #171).
+    ///
+    /// Workers whose `build_id` does not match (or is not declared compatible)
+    /// will skip this task. `None` = any worker may claim (pre-policy / legacy
+    /// executions).
+    pub required_build_id: Option<String>,
 }
 
 impl EnqueueParams {
@@ -109,6 +116,7 @@ impl EnqueueParams {
             task_type,
             workflow_exec_id: None,
             activity_name: None,
+            activity_id: None,
             input,
             priority: 0,
             max_attempts: 3,
@@ -124,6 +132,7 @@ impl EnqueueParams {
             trace_context: None,
             concurrency_key: None,
             max_concurrent: None,
+            required_build_id: None,
         }
     }
 
@@ -186,6 +195,7 @@ pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> Ha
         task_type: params.task_type.as_str(),
         workflow_exec_id: params.workflow_exec_id,
         activity_name: params.activity_name.as_deref(),
+        activity_id: params.activity_id,
         input: params.input.clone(),
         priority: params.priority,
         max_attempts: params.max_attempts,
@@ -194,6 +204,7 @@ pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> Ha
         start_to_close: params.start_to_close,
         schedule_to_start: params.schedule_to_start,
         retry_policy: params.retry_policy.clone(),
+        heartbeat_details: None,
         sticky_worker_id: None,
         sticky_until: None,
         sticky_timeout: None,
@@ -203,6 +214,7 @@ pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> Ha
             .and_then(TraceContextCarrier::to_json),
         concurrency_key: params.concurrency_key.as_deref(),
         concurrency_cap,
+        required_build_id: params.required_build_id.as_deref(),
     };
 
     diesel::insert_into(harvest_task_queue::table)
@@ -252,6 +264,7 @@ pub async fn claim_task(
     conn: &mut AsyncPgConnection,
     queues: &[String],
     worker_id: &str,
+    worker_build_id: &str,
 ) -> HarvestResult<Option<TaskQueueItem>> {
     // Two-phase claim using a CTE to avoid holding advisory locks during
     // broad WHERE filtering.
@@ -274,6 +287,10 @@ pub async fn claim_task(
     //
     // The partial index harvest_task_queue_concurrency_key_running makes the
     // scalar subquery fast: it only scans RUNNING rows with a non-NULL key.
+    //
+    // Build routing filter (issue #171): a task with required_build_id can only
+    // be claimed by a worker whose build_id matches, is declared compatible, OR
+    // the worker has an empty build_id (legacy worker — can claim anything).
     let result: Vec<TaskQueueItem> = diesel::sql_query(
         "WITH candidate AS ( \
              SELECT id, concurrency_key, concurrency_cap \
@@ -295,6 +312,16 @@ pub async fn claim_task(
                        WHERE inner_q.concurrency_key = harvest_task_queue.concurrency_key \
                          AND inner_q.state = 'RUNNING' \
                    ) < harvest_task_queue.concurrency_cap \
+               ) \
+               AND ( \
+                   required_build_id IS NULL \
+                   OR $3 = '' \
+                   OR required_build_id = $3 \
+                   OR EXISTS ( \
+                       SELECT 1 FROM harvest_build_compat \
+                       WHERE build_id = $3 \
+                         AND compatible_with = harvest_task_queue.required_build_id \
+                   ) \
                ) \
              ORDER BY \
                  CASE \
@@ -327,6 +354,7 @@ pub async fn claim_task(
     )
     .bind::<diesel::sql_types::Text, _>(worker_id)
     .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
+    .bind::<diesel::sql_types::Text, _>(worker_build_id)
     .load(conn)
     .await
     .map_err(crate::error::database_error)?;
@@ -407,6 +435,9 @@ pub async fn concurrency_key_stats(
 
 /// Mark a task as completed with the given output.
 ///
+/// Terminal completion clears any heartbeat checkpoint payload so it cannot be
+/// observed after the activity has successfully finished.
+///
 /// # Errors
 ///
 /// Returns [`crate::error::HarvestError::Database`] on update failure.
@@ -425,6 +456,7 @@ pub async fn complete_task(
     .set((
         dsl::state.eq("COMPLETED"),
         dsl::output.eq(Some(output)),
+        dsl::heartbeat_details.eq(None::<serde_json::Value>),
         dsl::completed_at.eq(Some(Utc::now())),
     ))
     .execute(conn)
@@ -441,6 +473,10 @@ pub async fn complete_task(
 }
 
 /// Mark a task as failed with the given error message.
+///
+/// This is a terminal transition, so heartbeat checkpoint payloads are cleared.
+/// Retry rescheduling uses [`requeue_for_retry`] instead and preserves the
+/// payload for the next attempt.
 ///
 /// # Errors
 ///
@@ -460,6 +496,7 @@ pub async fn fail_task(
     .set((
         dsl::state.eq("FAILED"),
         dsl::error.eq(Some(error)),
+        dsl::heartbeat_details.eq(None::<serde_json::Value>),
         dsl::completed_at.eq(Some(Utc::now())),
     ))
     .execute(conn)
@@ -500,6 +537,40 @@ pub async fn fail_open_tasks_for_execution(
     .set((
         dsl::state.eq("FAILED"),
         dsl::error.eq(Some(error.to_string())),
+        dsl::heartbeat_details.eq(None::<serde_json::Value>),
+        dsl::completed_at.eq(Some(Utc::now())),
+    ))
+    .execute(conn)
+    .await
+    .map_err(crate::error::database_error)
+}
+
+/// Mark all pending or running task rows for a workflow execution as cancelled.
+///
+/// Reset uses this instead of failure so operators can distinguish work torn
+/// down by a fork from work that exhausted retries or crashed.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`](crate::error::HarvestError::Database) on
+/// update failure.
+pub async fn cancel_open_tasks_for_execution(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    reason: &str,
+) -> HarvestResult<usize> {
+    use crate::schema::harvest_task_queue::dsl;
+
+    diesel::update(
+        dsl::harvest_task_queue
+            .filter(dsl::workflow_exec_id.eq(Some(exec_id.as_uuid())))
+            .filter(dsl::state.eq_any(["PENDING", "RUNNING"])),
+    )
+    .set((
+        dsl::state.eq("CANCELLED"),
+        dsl::worker_id.eq(None::<String>),
+        dsl::error.eq(Some(reason.to_string())),
+        dsl::heartbeat_details.eq(None::<serde_json::Value>),
         dsl::completed_at.eq(Some(Utc::now())),
     ))
     .execute(conn)
@@ -544,12 +615,16 @@ pub async fn queue_depths(
     Ok(rows.into_iter().map(|r| (r.queue_name, r.depth)).collect())
 }
 
-/// Update the `last_heartbeat_at` timestamp for a running task.
+/// Update the `last_heartbeat_at` timestamp and checkpoint payload for a running task.
 ///
 /// # Errors
 ///
 /// Returns [`crate::error::HarvestError::Database`] on update failure.
-pub async fn record_heartbeat(conn: &mut AsyncPgConnection, task_id: Uuid) -> HarvestResult<()> {
+pub async fn record_heartbeat(
+    conn: &mut AsyncPgConnection,
+    task_id: Uuid,
+    details: serde_json::Value,
+) -> HarvestResult<()> {
     use crate::schema::harvest_task_queue::dsl;
 
     let updated = diesel::update(
@@ -557,7 +632,10 @@ pub async fn record_heartbeat(conn: &mut AsyncPgConnection, task_id: Uuid) -> Ha
             .find(task_id)
             .filter(dsl::state.eq("RUNNING")),
     )
-    .set(dsl::last_heartbeat_at.eq(Some(Utc::now())))
+    .set((
+        dsl::last_heartbeat_at.eq(Some(Utc::now())),
+        dsl::heartbeat_details.eq(Some(details)),
+    ))
     .execute(conn)
     .await
     .map_err(crate::error::database_error)?;
@@ -586,6 +664,10 @@ pub async fn requeue_for_retry(
 }
 
 /// Reset a task to `PENDING` at an explicit timestamp.
+///
+/// Clears only the liveness timestamp for the failed attempt. The heartbeat
+/// details payload is intentionally preserved so the retry attempt can resume
+/// from the last flushed checkpoint.
 ///
 /// # Errors
 ///

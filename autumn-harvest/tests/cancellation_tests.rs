@@ -35,9 +35,17 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../migrations/20260424000001_harvest_trace_context/up.sql"),
     "\n",
+    include_str!("../migrations/20260505000000_harvest_heartbeat_details/up.sql"),
+    "\n",
     include_str!("../migrations/20260427000000_harvest_continue_as_new/up.sql"),
     "\n",
     include_str!("../migrations/20260429000000_harvest_concurrency_key/up.sql"),
+    "\n",
+    include_str!("../migrations/20260501000000_harvest_workers/up.sql"),
+    "\n",
+    include_str!("../migrations/20260509000000_harvest_build_routing/up.sql"),
+    "\n",
+    include_str!("../migrations/20260514020000_harvest_task_activity_id/up.sql"),
 );
 
 async fn setup_test_db() -> (AsyncPgConnection, ContainerAsync<Postgres>) {
@@ -407,6 +415,8 @@ async fn running_activity_heartbeat_observes_workflow_cancellation() {
                 max_local_activity_start_to_close: Duration::from_secs(60),
                 shard_assignments: vec![autumn_harvest::types::ShardId::new(0)],
                 worker_heartbeat_interval: Duration::from_secs(5),
+                build_id: String::new(),
+                deployment_name: None,
             },
             registry,
         )
@@ -563,6 +573,8 @@ async fn uncooperative_activity_is_hard_aborted_after_grace_period() {
                 max_local_activity_start_to_close: Duration::from_secs(60),
                 shard_assignments: vec![autumn_harvest::types::ShardId::new(0)],
                 worker_heartbeat_interval: Duration::from_secs(5),
+                build_id: String::new(),
+                deployment_name: None,
             },
             registry,
         )
