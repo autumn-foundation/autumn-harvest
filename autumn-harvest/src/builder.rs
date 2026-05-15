@@ -209,6 +209,19 @@ pub enum HarvestBuilderError {
         name: String,
     },
 
+    /// A DAG references an activity registered as local-only. Local activities
+    /// run inline on the workflow worker and cannot be scheduled through the
+    /// DAG activity queue lowering.
+    #[error(
+        "DAG '{dag}' references local activity '{activity}'; local activities cannot be used in DAG definitions"
+    )]
+    LocalActivityInDag {
+        /// DAG containing the local activity task.
+        dag: String,
+        /// Local activity referenced by the DAG.
+        activity: String,
+    },
+
     /// A [`WorkerConfig`] field has an invalid value.
     #[error("invalid worker configuration: {0}")]
     InvalidWorkerConfig(String),
@@ -565,6 +578,7 @@ impl HarvestBuilder {
             &self.activities,
             self.worker_config.max_local_activity_start_to_close,
         )?;
+        validate_dags_do_not_use_local_activities(&self.dags, &self.activities)?;
 
         Ok(BuiltHarvest {
             workflows: self.workflows,
@@ -579,6 +593,38 @@ impl HarvestBuilder {
             history_policy: self.history_policy,
         })
     }
+}
+
+fn validate_dags_do_not_use_local_activities(
+    dags: &[DagInfo],
+    activities: &[ActivityInfo],
+) -> Result<(), HarvestBuilderError> {
+    use std::collections::HashSet;
+
+    let local_activities = activities
+        .iter()
+        .filter(|activity| activity.is_local)
+        .map(|activity| activity.name)
+        .collect::<HashSet<_>>();
+    if local_activities.is_empty() || dags.is_empty() {
+        return Ok(());
+    }
+
+    for dag in dags {
+        let Ok(definition) = dag.build_definition() else {
+            continue;
+        };
+        for task in definition.tasks() {
+            if local_activities.contains(task.activity_name.as_str()) {
+                return Err(HarvestBuilderError::LocalActivityInDag {
+                    dag: dag.name.to_string(),
+                    activity: task.activity_name.clone(),
+                });
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Verify that unified DAG auto-registration does not overwrite or get

@@ -690,19 +690,88 @@ pub async fn ensure_dag_schedule(
     upsert_schedule(conn, dag).await
 }
 
+async fn merge_pause_metadata_into_schedule(
+    conn: &mut AsyncPgConnection,
+    target: &HarvestSchedule,
+    source: &HarvestSchedule,
+) -> HarvestResult<HarvestSchedule> {
+    use crate::schema::harvest_schedules::dsl;
+
+    let paused_at_value = target.paused_at.or(source.paused_at);
+    let paused_by_value = target
+        .paused_by
+        .clone()
+        .or_else(|| source.paused_by.clone());
+    let pause_reason_value = target
+        .pause_reason
+        .clone()
+        .or_else(|| source.pause_reason.clone());
+
+    diesel::update(dsl::harvest_schedules.find(target.id))
+        .set((
+            dsl::is_paused.eq(target.is_paused || source.is_paused),
+            dsl::paused_at.eq(paused_at_value),
+            dsl::paused_by.eq(paused_by_value.as_deref()),
+            dsl::pause_reason.eq(pause_reason_value.as_deref()),
+        ))
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    dsl::harvest_schedules
+        .find(target.id)
+        .select(HarvestSchedule::as_select())
+        .first(conn)
+        .await
+        .map_err(crate::error::database_error)
+}
+
+async fn find_reusable_dag_schedule(
+    conn: &mut AsyncPgConnection,
+    dag_name: &str,
+) -> HarvestResult<Option<HarvestSchedule>> {
+    use crate::schema::harvest_schedules::dsl;
+
+    let dag_row = dsl::harvest_schedules
+        .filter(dsl::dag_name.eq(dag_name))
+        .select(HarvestSchedule::as_select())
+        .first(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?;
+
+    let workflow_only_row = dsl::harvest_schedules
+        .filter(dsl::workflow_name.eq(dag_name))
+        .filter(dsl::dag_name.is_null())
+        .select(HarvestSchedule::as_select())
+        .first(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?;
+
+    match (dag_row, workflow_only_row) {
+        (Some(dag_row), Some(workflow_only_row)) if dag_row.id != workflow_only_row.id => {
+            let merged =
+                merge_pause_metadata_into_schedule(conn, &dag_row, &workflow_only_row).await?;
+            diesel::delete(dsl::harvest_schedules.find(workflow_only_row.id))
+                .execute(conn)
+                .await
+                .map_err(crate::error::database_error)?;
+            Ok(Some(merged))
+        }
+        (Some(dag_row), _) => Ok(Some(dag_row)),
+        (None, Some(workflow_only_row)) => Ok(Some(workflow_only_row)),
+        (None, None) => Ok(None),
+    }
+}
+
 async fn upsert_schedule(
     conn: &mut AsyncPgConnection,
     dag: &RegisteredDag,
 ) -> HarvestResult<HarvestSchedule> {
     use crate::schema::harvest_schedules::dsl;
 
-    let existing = dsl::harvest_schedules
-        .filter(dsl::dag_name.eq(&dag.name))
-        .select(HarvestSchedule::as_select())
-        .first(conn)
-        .await
-        .optional()
-        .map_err(crate::error::database_error)?;
+    let existing = find_reusable_dag_schedule(conn, &dag.name).await?;
     let now = Utc::now();
     let expr = schedule_expr(dag.schedule.as_ref());
 
@@ -721,6 +790,7 @@ async fn upsert_schedule(
                 dsl::timezone.eq("UTC"),
                 dsl::catchup.eq(dag.catchup),
                 dsl::max_active_runs.eq(i32::try_from(dag.max_active_runs).unwrap_or(i32::MAX)),
+                dsl::dag_name.eq(Some(dag.name.as_str())),
                 dsl::updated_at.eq(now),
                 dsl::next_run_at.eq(next_run_at),
             ))
@@ -808,6 +878,8 @@ async fn find_reusable_dag_workflow_schedule(
 
     match (dag_row, workflow_only_row) {
         (Some(dag_row), Some(workflow_only_row)) if dag_row.id != workflow_only_row.id => {
+            let dag_row =
+                merge_pause_metadata_into_schedule(conn, &dag_row, &workflow_only_row).await?;
             diesel::delete(dsl::harvest_schedules.find(workflow_only_row.id))
                 .execute(conn)
                 .await

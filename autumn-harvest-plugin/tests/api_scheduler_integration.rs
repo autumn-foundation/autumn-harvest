@@ -4058,6 +4058,69 @@ async fn harvest_api_backfills_legacy_dag_schedule_null_queue_on_dag_default_que
 }
 
 #[tokio::test]
+async fn harvest_api_rejects_backfill_for_unregistered_dag_schedule_row() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let dag_name = "removed_backfill_dag";
+    let workflow_schedule = WorkflowSchedule {
+        workflow_name: dag_name.to_string(),
+        dag_name: Some(dag_name.to_string()),
+        schedule: Schedule::Interval(Duration::from_secs(3600)),
+        input: Value::Null,
+        catchup: false,
+        max_active_runs: 1,
+        paused: false,
+        queue_name: "dag-workers".to_string(),
+    };
+
+    {
+        let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+            .await
+            .expect("failed to connect for stale DAG schedule registration");
+        register_workflow_schedules(&mut conn, std::slice::from_ref(&workflow_schedule))
+            .await
+            .expect("failed to seed stale DAG-backed workflow schedule");
+    }
+    let schedule = load_schedule_from_url(&database_url, dag_name).await;
+
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
+    api_state.install(HarvestApiRuntime::new(
+        Arc::new(HandlerRegistry::new(vec![], vec![])),
+        Arc::new(DagCatalog::default()),
+        Arc::new(Vec::new()),
+        Some("scheduler-only".to_string()),
+        vec!["dag-workers".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::single(),
+    ));
+    let app = harvest_api_router(api_state).with_state(test_app_state(pool.clone()));
+    let backfill_at = chrono::Utc::now() - chrono::Duration::hours(2);
+
+    let (status, body) = post_json(
+        &app,
+        format!("/admin/schedules/{}/backfill", schedule.id),
+        json!({
+            "from": backfill_at,
+            "to": backfill_at
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(
+        body.to_string().contains("not registered"),
+        "error should explain that stale DAG schedule rows cannot be backfilled: {body}"
+    );
+    assert_eq!(
+        count_workflow_executions_by_name_from_url(&database_url, dag_name).await,
+        0,
+        "unregistered DAG schedule backfill must not start a workflow execution"
+    );
+}
+
+#[tokio::test]
 async fn scheduler_tick_creates_and_executes_due_interval_runs() {
     let (database_url, _container) = setup_test_database_url().await;
     let pool = build_test_pool(&database_url);
@@ -4446,6 +4509,79 @@ async fn register_workflow_schedules_migrates_legacy_workflow_only_dag_row() {
 }
 
 #[tokio::test]
+async fn ensure_dag_schedule_reuses_paused_legacy_workflow_only_dag_row() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let dag_name = "paused_workflow_only_upgrade";
+    let legacy_workflow_row = WorkflowSchedule {
+        workflow_name: dag_name.to_string(),
+        dag_name: None,
+        schedule: Schedule::Interval(Duration::from_secs(60)),
+        input: json!({ "source": "legacy" }),
+        catchup: false,
+        max_active_runs: 1,
+        paused: true,
+        queue_name: "legacy-queue".to_string(),
+    };
+    let paused_at = chrono::DateTime::parse_from_rfc3339("2026-05-14T02:00:00.123456Z")
+        .expect("fixed pause timestamp should parse")
+        .with_timezone(&chrono::Utc);
+    let dag_catalog = Arc::new(
+        compile_dag_catalog(vec![DagInfo {
+            name: dag_name,
+            module: "tests",
+            schedule: Some(Schedule::Interval(Duration::from_secs(60))),
+            catchup: false,
+            max_active_runs: 1,
+            default_queue: Some("dag-workers"),
+            builder: build_interval_pipeline_dag,
+            workflow_handler: Some(approval_workflow),
+        }])
+        .expect("unified DAG should compile"),
+    );
+
+    {
+        let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+            .await
+            .expect("failed to connect for legacy workflow-only schedule registration");
+        register_workflow_schedules(&mut conn, std::slice::from_ref(&legacy_workflow_row))
+            .await
+            .expect("legacy workflow-only row should register");
+        let legacy = load_workflow_only_schedule_from_url_optional(&database_url, dag_name)
+            .await
+            .expect("legacy workflow-only row should exist");
+        diesel::update(harvest_schedules::table.find(legacy.id))
+            .set((
+                harvest_schedules::paused_at.eq(Some(paused_at)),
+                harvest_schedules::paused_by.eq(Some("ops-team")),
+                harvest_schedules::pause_reason.eq(Some("incident-response")),
+            ))
+            .execute(&mut conn)
+            .await
+            .expect("failed to attach pause metadata to legacy workflow-only row");
+
+        let dag = dag_catalog
+            .get(dag_name)
+            .expect("compiled DAG should be registered");
+        autumn_harvest::scheduler::ensure_dag_schedule(&mut conn, dag)
+            .await
+            .expect("ensure_dag_schedule should reuse legacy workflow-only DAG row");
+    }
+
+    assert_eq!(
+        count_schedule_rows_for_name_from_url(&database_url, dag_name).await,
+        1,
+        "ensure_dag_schedule should mark the legacy workflow-only row instead of inserting a fresh unpaused DAG row"
+    );
+    let schedule = load_schedule_from_url(&database_url, dag_name).await;
+    assert_eq!(schedule.dag_name.as_deref(), Some(dag_name));
+    assert_eq!(schedule.workflow_name.as_deref(), Some(dag_name));
+    assert!(schedule.is_paused);
+    assert_eq!(schedule.paused_at, Some(paused_at));
+    assert_eq!(schedule.paused_by.as_deref(), Some("ops-team"));
+    assert_eq!(schedule.pause_reason.as_deref(), Some("incident-response"));
+}
+
+#[tokio::test]
 async fn register_workflow_schedules_reuses_existing_dag_schedule_row_on_upgrade() {
     let (database_url, _container) = setup_test_database_url().await;
     let classic_dag = compile_dag_catalog(vec![DagInfo {
@@ -4579,6 +4715,87 @@ async fn register_workflow_schedules_merges_split_legacy_dag_rows_before_upgrade
         schedule.workflow_input,
         Some(json!({ "source": "unified" }))
     );
+}
+
+#[tokio::test]
+async fn register_workflow_schedules_preserves_pause_metadata_when_merging_split_legacy_rows() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let dag_name = "split_paused_legacy_dag";
+    let paused_at = chrono::DateTime::parse_from_rfc3339("2026-05-14T02:00:00.654321Z")
+        .expect("fixed pause timestamp should parse")
+        .with_timezone(&chrono::Utc);
+    let classic_dag = compile_dag_catalog(vec![DagInfo {
+        name: dag_name,
+        module: "tests",
+        schedule: Some(Schedule::Interval(Duration::from_secs(60))),
+        catchup: false,
+        max_active_runs: 1,
+        default_queue: Some("classic-queue"),
+        builder: build_interval_pipeline_dag,
+        workflow_handler: None,
+    }])
+    .expect("classic scheduled DAG should compile");
+    register_test_schedules(
+        &database_url,
+        &classic_dag,
+        "failed to connect for classic schedule registration",
+    )
+    .await;
+
+    let legacy_workflow_only_row = WorkflowSchedule {
+        workflow_name: dag_name.to_string(),
+        dag_name: None,
+        schedule: Schedule::Interval(Duration::from_secs(300)),
+        input: json!({ "source": "legacy-workflow-only" }),
+        catchup: false,
+        max_active_runs: 1,
+        paused: true,
+        queue_name: "legacy-workflow-queue".to_string(),
+    };
+    let unified_dag_row = WorkflowSchedule {
+        workflow_name: dag_name.to_string(),
+        dag_name: Some(dag_name.to_string()),
+        schedule: Schedule::Interval(Duration::from_secs(120)),
+        input: json!({ "source": "unified" }),
+        catchup: true,
+        max_active_runs: 2,
+        paused: false,
+        queue_name: "dag-workers".to_string(),
+    };
+
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect for split paused legacy schedule registration");
+    register_workflow_schedules(&mut conn, std::slice::from_ref(&legacy_workflow_only_row))
+        .await
+        .expect("legacy paused workflow-only row should register beside the classic DAG row");
+    let workflow_only = load_workflow_only_schedule_from_url_optional(&database_url, dag_name)
+        .await
+        .expect("workflow-only legacy row should exist");
+    diesel::update(harvest_schedules::table.find(workflow_only.id))
+        .set((
+            harvest_schedules::paused_at.eq(Some(paused_at)),
+            harvest_schedules::paused_by.eq(Some("ops-team")),
+            harvest_schedules::pause_reason.eq(Some("incident-response")),
+        ))
+        .execute(&mut conn)
+        .await
+        .expect("failed to attach pause metadata to workflow-only row");
+
+    register_workflow_schedules(&mut conn, std::slice::from_ref(&unified_dag_row))
+        .await
+        .expect("unified DAG registration should merge pause metadata before deleting split rows");
+
+    assert_eq!(
+        count_schedule_rows_for_name_from_url(&database_url, dag_name).await,
+        1,
+        "upgrade should leave one canonical DAG-backed workflow schedule row"
+    );
+    let schedule = load_schedule_from_url(&database_url, dag_name).await;
+    assert!(schedule.is_paused);
+    assert_eq!(schedule.paused_at, Some(paused_at));
+    assert_eq!(schedule.paused_by.as_deref(), Some("ops-team"));
+    assert_eq!(schedule.pause_reason.as_deref(), Some("incident-response"));
 }
 
 #[tokio::test]

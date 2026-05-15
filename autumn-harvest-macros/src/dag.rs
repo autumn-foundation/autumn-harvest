@@ -194,15 +194,22 @@ pub fn dag_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     .await
                                 {
                                     Ok(_) => ::autumn_harvest::policy::TaskStatus::Succeeded,
-                                    Err(_) => ::autumn_harvest::policy::TaskStatus::Failed,
+                                    Err(
+                                        ::autumn_harvest::HarvestError::ActivityFailed { .. }
+                                        | ::autumn_harvest::HarvestError::Timeout { .. },
+                                    ) => {
+                                        ::autumn_harvest::policy::TaskStatus::Failed
+                                    }
+                                    Err(__error) => return Err(__error.to_string()),
                                 };
-                                (__task_idx, __status)
+                                Ok::<_, ::std::string::String>((__task_idx, __status))
                             });
                         }
 
-                        for (__task_idx, __status) in
+                        for __activity_result in
                             ::autumn_harvest::futures::future::join_all(__activity_futs).await
                         {
+                            let (__task_idx, __status) = __activity_result?;
                             __statuses[__task_idx] = Some(__status);
                         }
                     }
@@ -383,15 +390,22 @@ fn emit_workflow_companion(
                                         .await
                                     {
                                         Ok(_) => ::autumn_harvest::policy::TaskStatus::Succeeded,
-                                        Err(_) => ::autumn_harvest::policy::TaskStatus::Failed,
+                                        Err(
+                                            ::autumn_harvest::HarvestError::ActivityFailed { .. }
+                                            | ::autumn_harvest::HarvestError::Timeout { .. },
+                                        ) => {
+                                            ::autumn_harvest::policy::TaskStatus::Failed
+                                        }
+                                        Err(__error) => return Err(__error.to_string()),
                                     };
-                                    (__task_idx, __status)
+                                    Ok::<_, ::std::string::String>((__task_idx, __status))
                                 });
                             }
 
-                            for (__task_idx, __status) in
+                            for __activity_result in
                                 ::autumn_harvest::futures::future::join_all(__activity_futs).await
                             {
+                                let (__task_idx, __status) = __activity_result?;
                                 __statuses[__task_idx] = Some(__status);
                             }
                         }

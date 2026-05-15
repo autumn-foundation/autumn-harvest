@@ -5080,6 +5080,12 @@ async fn schedule_backfill(
         ));
     };
 
+    if kind == ScheduleKind::Dag && !runtime.is_registered_dag(&name) {
+        return Err(AutumnError::not_found_msg(format!(
+            "DAG '{name}' is not registered"
+        )));
+    }
+
     let max_active = i64::from(schedule.max_active_runs);
 
     if schedule.is_paused && request.include_paused && kind == ScheduleKind::Dag && !request.dry_run

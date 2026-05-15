@@ -15,7 +15,7 @@ use autumn_harvest::executor::{WorkflowOutcome, run_workflow};
 use autumn_harvest::info::WorkflowHandlerFn;
 use autumn_harvest::prelude::*;
 use autumn_harvest::scheduler::compile_dag_catalog;
-use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
+use autumn_harvest::testing::{NonDeterminismKind, ReplayStatus, WorkflowReplayer};
 use autumn_harvest::types::ActivityExecId;
 use chrono::Utc;
 use serde_json::{Value, json};
@@ -71,6 +71,11 @@ async fn notify_complete(_ctx: &ActivityContext) -> Result<(), String> {
     Ok(())
 }
 
+#[activity(local = true)]
+async fn local_only(_ctx: &ActivityContext) -> Result<(), String> {
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // DAG definitions used across tests
 // ---------------------------------------------------------------------------
@@ -119,6 +124,11 @@ fn all_failed_root_dag(dag: &mut DagBuilder) {
     let _root = dag
         .activity(extract_users)
         .trigger_rule(TriggerRule::AllFailed);
+}
+
+#[dag]
+fn local_activity_dag(dag: &mut DagBuilder) {
+    let _root = dag.activity(local_only);
 }
 
 fn dag_task_input(task: &str) -> Value {
@@ -322,6 +332,39 @@ async fn lowered_handler_runs_alldone_downstream_on_upstream_failure() {
                 if error == "one or more DAG tasks failed"
         ),
         "AllDone downstream should replay deterministically then fail the DAG run, got: {report}"
+    );
+}
+
+#[tokio::test]
+async fn lowered_handler_propagates_activity_replay_mismatch() {
+    let id_extract = ActivityExecId::new();
+    let history = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: id_extract,
+            name: "renamed_extract_users".into(),
+            input: dag_task_input("extract_users"),
+            queue: "etl-workers".into(),
+        },
+    ];
+
+    let report = WorkflowReplayer::new()
+        .register_fn("linear_dag", __autumn_workflow_info_linear_dag().handler)
+        .replay_from_events(history)
+        .await;
+
+    assert!(
+        matches!(
+            report.status,
+            ReplayStatus::NonDeterminismDetected {
+                kind: NonDeterminismKind::ActivityScheduleMismatch,
+                ..
+            }
+        ),
+        "DAG activity replay mismatches must propagate as non-determinism, got: {report}"
     );
 }
 
@@ -571,6 +614,24 @@ fn builder_rejects_workflow_name_collision_with_auto_registered_dag() {
     assert!(
         err.to_string().contains("linear_dag"),
         "collision error should name the shared registration, got: {err}"
+    );
+}
+
+#[test]
+fn builder_rejects_local_activities_in_dag_definitions() {
+    use autumn_harvest::builder::HarvestBuilder;
+
+    let result = HarvestBuilder::new()
+        .activities(vec![__autumn_activity_info_local_only()])
+        .dags(vec![__autumn_dag_info_local_activity_dag()])
+        .try_build();
+
+    let err = result.expect_err("DAGs must reject local activity tasks at build time");
+    assert!(
+        err.to_string().contains("local activity")
+            && err.to_string().contains("local_only")
+            && err.to_string().contains("local_activity_dag"),
+        "local-activity DAG rejection should name the DAG and activity, got: {err}"
     );
 }
 

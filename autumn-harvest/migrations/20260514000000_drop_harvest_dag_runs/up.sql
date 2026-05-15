@@ -25,13 +25,17 @@ INSERT INTO harvest_workflow_executions (
 SELECT
     COALESCE(dr.workflow_exec_id, dr.id) AS id,
     dr.dag_name AS workflow_name,
-    'sched:' || dr.dag_name || ':' || (FLOOR(EXTRACT(EPOCH FROM dr.logical_date))::BIGINT)::TEXT AS workflow_id,
+    'sched:' || dr.dag_name || ':' || (FLOOR(EXTRACT(EPOCH FROM dr.logical_date))::BIGINT)::TEXT ||
+        CASE
+            WHEN (EXTRACT(MICROSECONDS FROM dr.logical_date)::BIGINT % 1000000) = 0 THEN ''
+            ELSE '.' || LPAD(((EXTRACT(MICROSECONDS FROM dr.logical_date)::BIGINT % 1000000))::TEXT, 6, '0')
+        END AS workflow_id,
     dr.id AS run_id,
     0 AS shard_id,
     CASE dr.state
         WHEN 'SUCCESS' THEN 'COMPLETED'
         WHEN 'FAILED' THEN 'FAILED'
-        ELSE 'RUNNING'
+        ELSE 'CANCELLED'
     END AS state,
     jsonb_build_object(
         '_harvest_migrated_legacy_dag_run', true,
@@ -44,6 +48,7 @@ SELECT
     NULL AS output,
     CASE
         WHEN dr.state = 'FAILED' THEN 'migrated legacy DAG run failed before unified execution'
+        WHEN dr.state IN ('QUEUED', 'RUNNING') THEN 'migrated legacy DAG run was not started on the unified workflow executor'
         ELSE NULL
     END AS error,
     NULL AS parent_id,
@@ -51,7 +56,7 @@ SELECT
     COALESCE(s.queue_name, 'default') AS queue_name,
     COALESCE(dr.started_at, dr.created_at, dr.logical_date, NOW()) AS started_at,
     CASE
-        WHEN dr.state IN ('SUCCESS', 'FAILED') THEN COALESCE(dr.completed_at, dr.started_at, dr.created_at, dr.logical_date, NOW())
+        WHEN dr.state IN ('SUCCESS', 'FAILED', 'QUEUED', 'RUNNING') THEN COALESCE(dr.completed_at, dr.started_at, dr.created_at, dr.logical_date, NOW())
         ELSE dr.completed_at
     END AS completed_at,
     NULL AS execution_timeout,
