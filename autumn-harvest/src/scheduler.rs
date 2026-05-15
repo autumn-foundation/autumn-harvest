@@ -844,6 +844,18 @@ async fn tick_one_workflow_schedule(
         .await
         {
             Ok(started) => {
+                if !started.created {
+                    tracing::warn!(
+                        workflow_name = %wf_name,
+                        workflow_id = %workflow_id,
+                        execution_id = %started.exec_id,
+                        "harvest: scheduled workflow id collision detected; refusing to advance cursor"
+                    );
+                    return Err(HarvestError::Config(format!(
+                        "scheduled workflow id collision for workflow '{wf_name}' at {scheduled_for}; \
+                         refusing to treat an existing execution as a scheduled dispatch"
+                    )));
+                }
                 dispatched += 1;
                 last_dispatched_at = Some(*scheduled_for);
                 metrics.record_schedule_run("workflow", wf_name);

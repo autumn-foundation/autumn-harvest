@@ -769,6 +769,12 @@ async fn start_workflow(
     let workflow_id = request
         .workflow_id
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    if is_reserved_scheduler_workflow_id(&workflow_id) {
+        return AutumnError::bad_request_msg(
+            "workflow_id values starting with 'sched:' are reserved for scheduler-managed runs",
+        )
+        .into_response();
+    }
     let queue_name = request
         .queue
         .or_else(|| runtime.queues.as_slice().first().cloned())
@@ -1742,6 +1748,10 @@ fn parse_reuse_policy(raw: Option<&str>) -> Result<WorkflowIdReusePolicy, Autumn
     }
 }
 
+fn is_reserved_scheduler_workflow_id(workflow_id: &str) -> bool {
+    workflow_id.starts_with("sched:")
+}
+
 pub(crate) fn parse_execution_id(raw: &str) -> Result<ExecutionId, AutumnError> {
     raw.parse::<ExecutionId>()
         .map_err(|_| AutumnError::bad_request_msg(format!("invalid execution id '{raw}'")))
@@ -2435,6 +2445,14 @@ mod tests {
             parse_reuse_policy(Some("allow_DUPLICATE")).is_err(),
             "wrong case must not silently fall back"
         );
+    }
+
+    #[test]
+    fn reserved_scheduler_workflow_id_prefix_is_detected() {
+        assert!(is_reserved_scheduler_workflow_id("sched:daily:1777550400"));
+        assert!(!is_reserved_scheduler_workflow_id(
+            "manual:daily:1777550400"
+        ));
     }
 
     // -- Worker filter parsing via API wrapper --
