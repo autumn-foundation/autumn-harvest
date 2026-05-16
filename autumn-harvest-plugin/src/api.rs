@@ -1480,6 +1480,11 @@ pub const fn management_api_request_fields()
         ("POST", "/workflows/{id}/signal/{signal_name}", None), // free-form
         (
             "POST",
+            "/workflows/{id}/query/{query_name}",
+            Some(&["args"]),
+        ),
+        (
+            "POST",
             "/workflows/{id}/update/{update_name}",
             Some(&["input"]),
         ),
@@ -1658,7 +1663,11 @@ pub const fn management_api_response_fields()
         ),
         ("GET", "/workflows/{id}/queries", None), // Vec<String> query names
         ("GET", "/workflows/{id}/query/{query_name}", None), // opaque handler return
-        ("POST", "/workflows/{id}/query/{query_name}", None), // {"result": <value>}
+        (
+            "POST",
+            "/workflows/{id}/query/{query_name}",
+            Some(&["result"]),
+        ), // {"result": <value>}
         ("POST", "/workflows/{id}/update/{update_name}", None), // polymorphic admitted/completed/failed
         ("GET", "/workflows/{id}/update/{update_id}/result", None), // polymorphic completed/failed
         // ── DAGs ─────────────────────────────────────────────────────────────

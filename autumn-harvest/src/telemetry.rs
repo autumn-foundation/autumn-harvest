@@ -141,6 +141,8 @@ pub const METRIC_LABEL_NAME: &str = "name";
 pub const METRIC_LABEL_REASON: &str = "reason";
 /// Metric label: the concurrency group key.
 pub const METRIC_LABEL_KEY: &str = "key";
+/// Metric label: the query handler name (`query.name`).
+pub const METRIC_LABEL_QUERY: &str = "query.name";
 
 // ---------------------------------------------------------------------------
 // TraceContextCarrier

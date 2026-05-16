@@ -616,8 +616,9 @@
       "method": "POST",
       "path": "/workflows/{id}/query/{query_name}",
       "category": "workflow",
-      "read_only": true,
+      "read_only": false,
       "description": "Query the current state of a running workflow, passing typed JSON args to the handler. Returns {\"result\": <value>}.",
+      "idempotency": "Read-only at the workflow level (no events written); safe to retry if the caller can tolerate duplicate handler invocations.",
       "params": [
         {
           "name": "id",
@@ -633,12 +634,19 @@
         }
       ],
       "request_body": {
-        "content_type": "application/json",
-        "schema": "{\"type\":\"object\",\"properties\":{\"args\":{\"description\":\"Arguments passed to the query handler; schema is handler-defined.\"}},\"required\":[]}"
+        "required": false,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "args",
+            "required": false,
+            "description": "Arguments passed to the query handler; schema is handler-defined (any JSON value)."
+          }
+        ]
       },
       "success_response": {
         "status": 200,
-        "schema": "{\"type\":\"object\",\"properties\":{\"result\":{\"description\":\"JSON value returned by the query handler.\"}},\"required\":[\"result\"]}"
+        "fields": ["result"]
       },
       "error_responses": [
         {
@@ -680,7 +688,8 @@
       "request_body": null,
       "success_response": {
         "status": 200,
-        "schema": "{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"Sorted list of registered query handler names.\"}"
+        "free_form": true,
+        "note": "JSON array of registered query handler name strings, sorted alphabetically."
       },
       "error_responses": [
         {
