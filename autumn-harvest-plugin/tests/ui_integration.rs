@@ -1246,3 +1246,572 @@ async fn ui_workers_perf_1k_workers_4_shards_under_500ms() {
         elapsed.as_millis()
     );
 }
+
+// ---------------------------------------------------------------------------
+// Schedules page tests
+// ---------------------------------------------------------------------------
+
+/// Insert a test row into `harvest_schedules`.
+/// `kind` is "Workflow" or "Dag"; `name` is the workflow_name / dag_name.
+async fn insert_test_schedule(
+    database_url: &str,
+    kind: &str,
+    name: &str,
+    is_paused: bool,
+) -> uuid::Uuid {
+    let id = uuid::Uuid::new_v4();
+    let mut conn = AsyncPgConnection::establish(database_url)
+        .await
+        .expect("failed to connect for schedule insert");
+    let (dag_col, wf_col) = if kind == "Dag" {
+        (format!("'{name}'"), "NULL".to_string())
+    } else {
+        ("NULL".to_string(), format!("'{name}'"))
+    };
+    let paused_at_col = if is_paused { "NOW()" } else { "NULL" };
+    let sql = format!(
+        "INSERT INTO harvest_schedules \
+            (id, dag_name, workflow_name, schedule_expr, timezone, catchup, \
+             max_active_runs, is_paused, paused_at, created_at, updated_at) \
+         VALUES \
+            ('{id}', {dag_col}, {wf_col}, '0 * * * *', 'UTC', false, 1, \
+             {is_paused}, {paused_at_col}, NOW(), NOW())"
+    );
+    conn.batch_execute(&sql)
+        .await
+        .expect("insert_test_schedule failed");
+    id
+}
+
+/// Empty schedules table → page renders "No schedules registered."
+#[tokio::test]
+async fn ui_schedules_empty_state() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_single_shard_ui_app(&database_url);
+
+    let (status, html) = fetch_html(&app, "/schedules").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "schedules page must return 200: {html}"
+    );
+    assert!(html.contains("Schedules"), "page heading missing: {html}");
+    assert!(
+        html.contains("No schedules registered."),
+        "empty state message missing: {html}"
+    );
+    assert!(html.contains("🔭 Vantage"), "layout header missing: {html}");
+    assert!(!html.contains("<script"), "no script tags allowed: {html}");
+    assert!(!html.contains("http://"), "no external http URLs: {html}");
+    assert!(!html.contains("https://"), "no external https URLs: {html}");
+}
+
+/// Six schedules (3 Workflow + 3 Dag, mix of paused/active) all render.
+#[tokio::test]
+async fn ui_schedules_lists_all_rows() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let id_wf1 = insert_test_schedule(&database_url, "Workflow", "payment_workflow", false).await;
+    let id_wf2 = insert_test_schedule(&database_url, "Workflow", "invoice_workflow", true).await;
+    let id_wf3 = insert_test_schedule(&database_url, "Workflow", "report_workflow", false).await;
+    let id_dag1 = insert_test_schedule(&database_url, "Dag", "nightly_etl", true).await;
+    let id_dag2 = insert_test_schedule(&database_url, "Dag", "hourly_sync", false).await;
+    let id_dag3 = insert_test_schedule(&database_url, "Dag", "weekly_report", true).await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, html) = fetch_html(&app, "/schedules").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "schedules page must return 200: {html}"
+    );
+
+    for id in [id_wf1, id_wf2, id_wf3, id_dag1, id_dag2, id_dag3] {
+        assert!(
+            html.contains(&id.to_string()),
+            "schedule id {id} missing from page: {html}"
+        );
+    }
+    assert!(
+        html.contains("payment_workflow"),
+        "payment_workflow missing: {html}"
+    );
+    assert!(
+        html.contains("invoice_workflow"),
+        "invoice_workflow missing: {html}"
+    );
+    assert!(html.contains("nightly_etl"), "nightly_etl missing: {html}");
+    assert!(html.contains("Workflow"), "Workflow kind missing: {html}");
+    assert!(html.contains("Dag"), "Dag kind missing: {html}");
+    assert!(html.contains("Paused"), "paused badge missing: {html}");
+    assert!(html.contains("Active"), "active badge missing: {html}");
+    // Nav must link to Schedules
+    assert!(
+        html.contains("schedules"),
+        "nav must include schedules link: {html}"
+    );
+}
+
+/// Filter `kind=Workflow` shows only Workflow rows and hides Dag rows.
+#[tokio::test]
+async fn ui_schedules_filter_by_kind_workflow() {
+    let (database_url, _container) = setup_test_database_url().await;
+    insert_test_schedule(&database_url, "Workflow", "target_wf", false).await;
+    insert_test_schedule(&database_url, "Dag", "target_dag", false).await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, html) = fetch_html(&app, "/schedules?kind=Workflow").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains("target_wf"),
+        "workflow row missing after kind=Workflow: {html}"
+    );
+    assert!(
+        !html.contains("target_dag"),
+        "dag row should not appear after kind=Workflow: {html}"
+    );
+}
+
+/// Filter `kind=Dag` shows only Dag rows.
+#[tokio::test]
+async fn ui_schedules_filter_by_kind_dag() {
+    let (database_url, _container) = setup_test_database_url().await;
+    insert_test_schedule(&database_url, "Workflow", "wf_hidden", false).await;
+    insert_test_schedule(&database_url, "Dag", "dag_visible", false).await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, html) = fetch_html(&app, "/schedules?kind=Dag").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains("dag_visible"),
+        "dag row missing after kind=Dag: {html}"
+    );
+    assert!(
+        !html.contains("wf_hidden"),
+        "workflow row should not appear after kind=Dag: {html}"
+    );
+}
+
+/// Filter `paused=Paused` shows only paused rows.
+#[tokio::test]
+async fn ui_schedules_filter_by_paused() {
+    let (database_url, _container) = setup_test_database_url().await;
+    insert_test_schedule(&database_url, "Workflow", "active_wf", false).await;
+    insert_test_schedule(&database_url, "Workflow", "paused_wf", true).await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, html) = fetch_html(&app, "/schedules?paused=Paused").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains("paused_wf"),
+        "paused row missing after paused=Paused: {html}"
+    );
+    assert!(
+        !html.contains("active_wf"),
+        "active row should not appear after paused=Paused: {html}"
+    );
+}
+
+/// Filter `paused=Active` shows only active rows.
+#[tokio::test]
+async fn ui_schedules_filter_by_active() {
+    let (database_url, _container) = setup_test_database_url().await;
+    insert_test_schedule(&database_url, "Workflow", "active_visible", false).await;
+    insert_test_schedule(&database_url, "Workflow", "paused_hidden", true).await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, html) = fetch_html(&app, "/schedules?paused=Active").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains("active_visible"),
+        "active row missing after paused=Active: {html}"
+    );
+    assert!(
+        !html.contains("paused_hidden"),
+        "paused row should not appear after paused=Active: {html}"
+    );
+}
+
+/// Filter `target=my_wf` narrows by name substring.
+#[tokio::test]
+async fn ui_schedules_filter_by_target() {
+    let (database_url, _container) = setup_test_database_url().await;
+    insert_test_schedule(&database_url, "Workflow", "my_special_wf", false).await;
+    insert_test_schedule(&database_url, "Workflow", "other_wf", false).await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, html) = fetch_html(&app, "/schedules?target=my_special").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains("my_special_wf"),
+        "target row missing after target filter: {html}"
+    );
+    assert!(
+        !html.contains("other_wf"),
+        "other row should not appear after target filter: {html}"
+    );
+}
+
+/// Filter returns empty-set message when nothing matches.
+#[tokio::test]
+async fn ui_schedules_filter_no_match() {
+    let (database_url, _container) = setup_test_database_url().await;
+    insert_test_schedule(&database_url, "Workflow", "some_workflow", false).await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, html) = fetch_html(&app, "/schedules?target=nonexistent").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains("No schedules match this filter"),
+        "empty filter message missing: {html}"
+    );
+}
+
+/// Pause action: POST to /schedules/{id}/pause → 303 redirect with flash.
+#[tokio::test]
+async fn ui_schedules_pause_action_redirects() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let id = insert_test_schedule(&database_url, "Workflow", "pause_target", false).await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, headers, _body) =
+        post_form(&app, &format!("/schedules/{id}/pause"), String::new()).await;
+    assert!(
+        status == StatusCode::SEE_OTHER || status == StatusCode::FOUND,
+        "pause action must redirect (got {status})"
+    );
+    let location = headers
+        .get("location")
+        .expect("redirect must have Location header")
+        .to_str()
+        .unwrap();
+    assert!(
+        location.contains("schedules"),
+        "redirect must go back to the schedules page: {location}"
+    );
+    assert!(
+        location.contains("flash"),
+        "redirect must carry a flash message: {location}"
+    );
+
+    // Verify the DB row is now paused.
+    let mut conn = AsyncPgConnection::establish(&database_url).await.unwrap();
+    let is_paused: bool = autumn_harvest::schema::harvest_schedules::table
+        .filter(autumn_harvest::schema::harvest_schedules::id.eq(id))
+        .select(autumn_harvest::schema::harvest_schedules::is_paused)
+        .first(&mut conn)
+        .await
+        .expect("schedule should exist");
+    assert!(is_paused, "schedule should be paused after pause action");
+}
+
+/// Resume action: POST to /schedules/{id}/resume → 303 redirect with flash.
+#[tokio::test]
+async fn ui_schedules_resume_action_redirects() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let id = insert_test_schedule(&database_url, "Workflow", "resume_target", true).await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, headers, _body) =
+        post_form(&app, &format!("/schedules/{id}/resume"), String::new()).await;
+    assert!(
+        status == StatusCode::SEE_OTHER || status == StatusCode::FOUND,
+        "resume action must redirect (got {status})"
+    );
+    let location = headers
+        .get("location")
+        .expect("redirect must have Location header")
+        .to_str()
+        .unwrap();
+    assert!(
+        location.contains("schedules"),
+        "redirect must go back to the schedules page: {location}"
+    );
+    assert!(
+        location.contains("flash"),
+        "redirect must carry a flash message: {location}"
+    );
+
+    // Verify the DB row is now active.
+    let mut conn = AsyncPgConnection::establish(&database_url).await.unwrap();
+    let is_paused: bool = autumn_harvest::schema::harvest_schedules::table
+        .filter(autumn_harvest::schema::harvest_schedules::id.eq(id))
+        .select(autumn_harvest::schema::harvest_schedules::is_paused)
+        .first(&mut conn)
+        .await
+        .expect("schedule should exist");
+    assert!(!is_paused, "schedule should be active after resume action");
+}
+
+/// Delete action: POST to /schedules/{id}/delete → 303 redirect with flash.
+#[tokio::test]
+async fn ui_schedules_delete_action_redirects() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let id = insert_test_schedule(&database_url, "Workflow", "delete_target", false).await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, headers, _body) =
+        post_form(&app, &format!("/schedules/{id}/delete"), String::new()).await;
+    assert!(
+        status == StatusCode::SEE_OTHER || status == StatusCode::FOUND,
+        "delete action must redirect (got {status})"
+    );
+    let location = headers
+        .get("location")
+        .expect("redirect must have Location header")
+        .to_str()
+        .unwrap();
+    assert!(
+        location.contains("schedules"),
+        "redirect must go back to the schedules page: {location}"
+    );
+    assert!(
+        location.contains("flash"),
+        "redirect must carry a flash message: {location}"
+    );
+
+    // Verify the row is gone.
+    let mut conn = AsyncPgConnection::establish(&database_url).await.unwrap();
+    let count: i64 = autumn_harvest::schema::harvest_schedules::table
+        .filter(autumn_harvest::schema::harvest_schedules::id.eq(id))
+        .count()
+        .get_result(&mut conn)
+        .await
+        .expect("count query");
+    assert_eq!(count, 0, "schedule should be deleted");
+}
+
+/// Auto-refresh: `?refresh=30` emits a meta http-equiv refresh tag.
+#[tokio::test]
+async fn ui_schedules_auto_refresh_meta_tag() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_single_shard_ui_app(&database_url);
+
+    let (status, html) = fetch_html(&app, "/schedules?refresh=30").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains("content=\"30\"") && html.contains("http-equiv=\"refresh\""),
+        "auto-refresh meta tag with content=30 missing: {html}"
+    );
+
+    let (_, html_no_refresh) = fetch_html(&app, "/schedules").await;
+    assert!(
+        !html_no_refresh.contains("http-equiv=\"refresh\""),
+        "refresh tag must not appear when refresh not requested: {html_no_refresh}"
+    );
+}
+
+/// Bulk pause/resume forms are present in the HTML.
+#[tokio::test]
+async fn ui_schedules_bulk_actions_present() {
+    let (database_url, _container) = setup_test_database_url().await;
+    insert_test_schedule(&database_url, "Workflow", "bulk_wf", false).await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, html) = fetch_html(&app, "/schedules").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains("bulk-pause") || html.contains("Pause all"),
+        "bulk pause action missing: {html}"
+    );
+    assert!(
+        html.contains("bulk-resume") || html.contains("Resume all"),
+        "bulk resume action missing: {html}"
+    );
+}
+
+/// Bulk pause: POST to /schedules/bulk-pause with filter → redirects and pauses matching rows.
+#[tokio::test]
+async fn ui_schedules_bulk_pause_pauses_matching_rows() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let id1 = insert_test_schedule(&database_url, "Workflow", "bulk_target_a", false).await;
+    let id2 = insert_test_schedule(&database_url, "Workflow", "bulk_target_b", false).await;
+    let id_other = insert_test_schedule(&database_url, "Dag", "other_dag", false).await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, headers, _body) =
+        post_form(&app, "/schedules/bulk-pause", "kind=Workflow&paused=Active").await;
+    assert!(
+        status == StatusCode::SEE_OTHER || status == StatusCode::FOUND,
+        "bulk-pause must redirect (got {status})"
+    );
+    let location = headers
+        .get("location")
+        .expect("redirect must have Location header")
+        .to_str()
+        .unwrap();
+    assert!(
+        location.contains("schedules"),
+        "redirect must go to schedules: {location}"
+    );
+
+    // Verify workflow schedules are paused, dag is not.
+    let mut conn = AsyncPgConnection::establish(&database_url).await.unwrap();
+    let paused1: bool = autumn_harvest::schema::harvest_schedules::table
+        .filter(autumn_harvest::schema::harvest_schedules::id.eq(id1))
+        .select(autumn_harvest::schema::harvest_schedules::is_paused)
+        .first(&mut conn)
+        .await
+        .unwrap();
+    let paused2: bool = autumn_harvest::schema::harvest_schedules::table
+        .filter(autumn_harvest::schema::harvest_schedules::id.eq(id2))
+        .select(autumn_harvest::schema::harvest_schedules::is_paused)
+        .first(&mut conn)
+        .await
+        .unwrap();
+    let paused_other: bool = autumn_harvest::schema::harvest_schedules::table
+        .filter(autumn_harvest::schema::harvest_schedules::id.eq(id_other))
+        .select(autumn_harvest::schema::harvest_schedules::is_paused)
+        .first(&mut conn)
+        .await
+        .unwrap();
+    assert!(paused1, "bulk_target_a should be paused");
+    assert!(paused2, "bulk_target_b should be paused");
+    assert!(
+        !paused_other,
+        "other_dag should NOT be paused (different kind)"
+    );
+}
+
+/// Pagination: `?limit=1` caps the list to 1 row and shows Next link.
+#[tokio::test]
+async fn ui_schedules_pagination() {
+    let (database_url, _container) = setup_test_database_url().await;
+    insert_test_schedule(&database_url, "Workflow", "pag_wf_1", false).await;
+    insert_test_schedule(&database_url, "Workflow", "pag_wf_2", false).await;
+    insert_test_schedule(&database_url, "Workflow", "pag_wf_3", false).await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, html) = fetch_html(&app, "/schedules?limit=1").await;
+    assert_eq!(status, StatusCode::OK);
+    let row_count = html.matches("pag_wf_").count();
+    assert_eq!(row_count, 1, "limit=1 should render exactly 1 row: {html}");
+    assert!(
+        html.contains("Next"),
+        "Next pagination link missing when there are more rows: {html}"
+    );
+}
+
+/// Multi-shard: schedules from two shards both appear.
+#[tokio::test]
+async fn ui_schedules_multi_shard() {
+    let ((shard0_url, shard1_url), _container) = setup_sharded_test_database_urls().await;
+    insert_test_schedule(&shard0_url, "Workflow", "shard0_schedule", false).await;
+    insert_test_schedule(&shard1_url, "Dag", "shard1_dag_schedule", false).await;
+
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(build_two_shard_pool(&shard0_url, &shard1_url));
+    api_state.install(HarvestApiRuntime::new(
+        echo_registry(),
+        Arc::new(HashMap::new()),
+        Arc::new(Vec::new()),
+        None,
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::new(
+            vec![ShardId::new(0), ShardId::new(1)],
+            vec![ShardId::new(0), ShardId::new(1)],
+            ShardId::new(0),
+        ),
+    ));
+    let app = harvest_ui_router(api_state).with_state(test_app_state_without_database());
+
+    let (status, html) = fetch_html(&app, "/schedules").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "multi-shard schedules page must return 200: {html}"
+    );
+    assert!(
+        html.contains("shard0_schedule"),
+        "shard 0 schedule missing: {html}"
+    );
+    assert!(
+        html.contains("shard1_dag_schedule"),
+        "shard 1 schedule missing: {html}"
+    );
+}
+
+/// Partial shard failure: renders 200 with shard-error banner, does not 5xx.
+#[tokio::test]
+async fn ui_schedules_partial_shard_failure() {
+    let (good_url, _container) = setup_test_database_url().await;
+    insert_test_schedule(&good_url, "Workflow", "good_shard_schedule", false).await;
+
+    let bad_pool = build_test_pool("postgres://invalid:5432/nonexistent");
+    let good_pool = build_test_pool(&good_url);
+    let mut pools = BTreeMap::new();
+    pools.insert(ShardId::new(0), good_pool);
+    pools.insert(ShardId::new(1), bad_pool);
+    let harvest_pool = HarvestDbPool::sharded(ShardedDbPool::from_map(pools, ShardId::new(0)));
+
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(harvest_pool);
+    api_state.install(HarvestApiRuntime::new(
+        echo_registry(),
+        Arc::new(HashMap::new()),
+        Arc::new(Vec::new()),
+        None,
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::new(
+            vec![ShardId::new(0), ShardId::new(1)],
+            vec![ShardId::new(0), ShardId::new(1)],
+            ShardId::new(0),
+        ),
+    ));
+    let app = harvest_ui_router(api_state).with_state(test_app_state_without_database());
+
+    let (status, html) = fetch_html(&app, "/schedules").await;
+    assert_ne!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "partial shard failure must not 5xx: {html}"
+    );
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "partial shard failure should return 200: {html}"
+    );
+    assert!(
+        html.contains("unavailable") || html.contains("Shard"),
+        "partial shard failure should show shard-error banner: {html}"
+    );
+    assert!(
+        html.contains("good_shard_schedule"),
+        "good shard row should still appear: {html}"
+    );
+}
+
+/// Flash message from a redirect renders in the schedules list page.
+#[tokio::test]
+async fn ui_schedules_flash_message_renders() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_single_shard_ui_app(&database_url);
+
+    let (status, html) = fetch_html(&app, "/schedules?flash=Paused+my_workflow").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains("Paused my_workflow") || html.contains("Paused+my_workflow"),
+        "flash message should appear on the page: {html}"
+    );
+}
+
+/// Existing nav layouts include a Schedules link so operators can navigate.
+#[tokio::test]
+async fn ui_all_pages_have_schedules_nav_link() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_single_shard_ui_app(&database_url);
+
+    for path in ["/workflows", "/workers", "/schedules"] {
+        let (status, html) = fetch_html(&app, path).await;
+        assert_eq!(status, StatusCode::OK, "page {path} must render: {html}");
+        assert!(
+            html.contains("href=\"schedules\"")
+                || html.contains("href=\"/schedules\"")
+                || html.contains(">Schedules<"),
+            "page {path} must include a Schedules nav link: {html}"
+        );
+    }
+}

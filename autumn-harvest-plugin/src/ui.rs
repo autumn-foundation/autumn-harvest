@@ -12,9 +12,10 @@ use autumn_web::error::AutumnError;
 use autumn_web::extract::{Path, Query};
 use autumn_web::reexports::axum;
 use axum::Extension;
+use axum::Form;
 use axum::Router;
 use axum::middleware;
-use axum::routing::get;
+use axum::routing::{get, post};
 use chrono::{DateTime, Utc};
 use diesel::dsl::sql;
 use diesel::sql_types::{Bool, Text};
@@ -24,9 +25,17 @@ use maud::{Markup, PreEscaped, html};
 use serde::Deserialize;
 use serde_json::Value;
 
+use autumn_harvest::audit::{
+    OP_SCHEDULE_DELETE, OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, SOURCE_API, STATUS_SUCCEEDED,
+    TARGET_SCHEDULE, insert_audit,
+};
 use autumn_harvest::error::{HarvestError, HarvestResult, database_error};
-use autumn_harvest::models::{DeadLetter, HarvestEvent, WorkflowExecution};
-use autumn_harvest::schema::{harvest_dead_letters, harvest_events, harvest_workflow_executions};
+use autumn_harvest::models::{
+    DeadLetter, HarvestEvent, HarvestSchedule, NewAuditRecord, WorkflowExecution,
+};
+use autumn_harvest::schema::{
+    harvest_dead_letters, harvest_events, harvest_schedules, harvest_workflow_executions,
+};
 use autumn_harvest::store;
 use autumn_harvest::types::ShardId;
 use autumn_harvest::workers::{WorkerFilters, WorkerHealth, WorkerRow, list_workers};
@@ -352,6 +361,12 @@ pub fn harvest_ui_router(api_state: HarvestApiState) -> Router<AppState> {
             "/dead-letters",
             get(list_dead_letters_ui).route_layer(require_admin),
         )
+        .route("/schedules", get(list_schedules_ui))
+        .route("/schedules/bulk-pause", post(schedule_bulk_pause_ui))
+        .route("/schedules/bulk-resume", post(schedule_bulk_resume_ui))
+        .route("/schedules/{id}/pause", post(schedule_pause_ui))
+        .route("/schedules/{id}/resume", post(schedule_resume_ui))
+        .route("/schedules/{id}/delete", post(schedule_delete_ui))
         .layer(Extension(api_state))
 }
 
@@ -1307,17 +1322,18 @@ fn layout_dead_letters(title: &str, body: &Markup, refresh: Option<u64>) -> Mark
             body {
                 header {
                     h1 {
-                        a href="workflows" { "ðŸ”­ Vantage" }
+                        a href="workflows" { "🔭 Vantage" }
                         span.subtitle { "Harvest dashboard" }
                     }
                     nav {
                         a href="workflows" { "Workflows" }
                         a href="workers" { "Workers" }
+                        a href="schedules" { "Schedules" }
                         a.active href="dead-letters" { "Dead Letters" }
                     }
                 }
                 main { (body) }
-                footer { "Operational dashboard â€” autumn-harvest" }
+                footer { "Operational dashboard — autumn-harvest" }
             }
         }
     }
@@ -1588,6 +1604,7 @@ fn layout_workers(title: &str, body: &Markup, refresh: Option<u64>) -> Markup {
                     nav {
                         a href="workflows" { "Workflows" }
                         a.active href="workers" { "Workers" }
+                        a href="schedules" { "Schedules" }
                         a href="dead-letters" { "Dead Letters" }
                     }
                 }
@@ -1932,11 +1949,966 @@ fn layout(title: &str, body: &Markup, base_href: &str) -> Markup {
                     nav {
                         a.active href={ (base_href) "workflows" } { "Workflows" }
                         a href={ (base_href) "workers" } { "Workers" }
+                        a href={ (base_href) "schedules" } { "Schedules" }
                         a href={ (base_href) "dead-letters" } { "Dead Letters" }
                     }
                 }
                 main { (body) }
                 footer { "Read-only dashboard — autumn-harvest" }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Schedules UI page
+// ---------------------------------------------------------------------------
+
+const DEFAULT_SCHEDULE_PAGE_SIZE: i64 = 50;
+
+type ShardScheduleResult = (ShardId, Result<Vec<HarvestSchedule>, String>);
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ScheduleListParams {
+    #[serde(default)]
+    page: Option<i64>,
+    #[serde(default)]
+    limit: Option<i64>,
+    #[serde(default)]
+    target: Option<String>,
+    /// "Workflow", "Dag", or empty/absent for All.
+    #[serde(default)]
+    kind: Option<String>,
+    /// "Paused", "Active", or empty/absent for All.
+    #[serde(default)]
+    paused: Option<String>,
+    #[serde(default)]
+    shard_id: Option<i32>,
+    #[serde(default)]
+    refresh: Option<u64>,
+    #[serde(default)]
+    flash: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ScheduleBulkParams {
+    #[serde(default)]
+    target: Option<String>,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    paused: Option<String>,
+    #[serde(default)]
+    shard_id: Option<i32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum ScheduleKindFilter {
+    #[default]
+    All,
+    Workflow,
+    Dag,
+}
+
+impl ScheduleKindFilter {
+    fn parse(raw: &str) -> Result<Self, AutumnError> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "" => Ok(Self::All),
+            "workflow" => Ok(Self::Workflow),
+            "dag" => Ok(Self::Dag),
+            other => Err(AutumnError::bad_request_msg(format!(
+                "unknown kind '{other}'; expected Workflow, Dag, or empty"
+            ))),
+        }
+    }
+
+    const fn as_label(self) -> &'static str {
+        match self {
+            Self::All => "",
+            Self::Workflow => "Workflow",
+            Self::Dag => "Dag",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum SchedulePausedFilter {
+    #[default]
+    All,
+    Paused,
+    Active,
+}
+
+impl SchedulePausedFilter {
+    fn parse(raw: &str) -> Result<Self, AutumnError> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "" => Ok(Self::All),
+            "paused" => Ok(Self::Paused),
+            "active" => Ok(Self::Active),
+            other => Err(AutumnError::bad_request_msg(format!(
+                "unknown paused value '{other}'; expected Paused, Active, or empty"
+            ))),
+        }
+    }
+
+    const fn as_label(self) -> &'static str {
+        match self {
+            Self::All => "",
+            Self::Paused => "Paused",
+            Self::Active => "Active",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct ScheduleUiFilters {
+    target: Option<String>,
+    kind: ScheduleKindFilter,
+    paused: SchedulePausedFilter,
+    shard_id: Option<i32>,
+}
+
+impl ScheduleUiFilters {
+    fn matches(&self, shard_id: ShardId, row: &HarvestSchedule) -> bool {
+        let name = row
+            .workflow_name
+            .as_deref()
+            .or(row.dag_name.as_deref())
+            .unwrap_or("");
+
+        if self.target.as_deref().is_some_and(|t| !name.contains(t)) {
+            return false;
+        }
+        match self.kind {
+            ScheduleKindFilter::Workflow if row.workflow_name.is_none() => return false,
+            ScheduleKindFilter::Dag if row.dag_name.is_none() => return false,
+            _ => {}
+        }
+        match self.paused {
+            SchedulePausedFilter::Paused if !row.is_paused => return false,
+            SchedulePausedFilter::Active if row.is_paused => return false,
+            _ => {}
+        }
+        if self.shard_id.is_some_and(|sid| shard_id.as_i32() != sid) {
+            return false;
+        }
+        true
+    }
+
+    const fn is_empty(&self) -> bool {
+        self.target.is_none()
+            && matches!(self.kind, ScheduleKindFilter::All)
+            && matches!(self.paused, SchedulePausedFilter::All)
+            && self.shard_id.is_none()
+    }
+}
+
+async fn load_schedules_from_shards_ui(api_state: &HarvestApiState) -> Vec<ShardScheduleResult> {
+    let pool = match api_state.storage_pool() {
+        Ok(p) => p,
+        Err(e) => {
+            return vec![(ShardId::UNENCODED, Err(e.to_string()))];
+        }
+    };
+
+    let futs: Vec<_> = pool
+        .iter_shards()
+        .map(|(shard_id, shard_pool)| async move {
+            let result = async {
+                let mut conn = acquire_conn(shard_pool).await.map_err(|e| e.to_string())?;
+                harvest_schedules::table
+                    .order(harvest_schedules::next_run_at.asc())
+                    .select(HarvestSchedule::as_select())
+                    .load(&mut conn)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+            .await;
+            (shard_id, result)
+        })
+        .collect();
+
+    futures::future::join_all(futs).await
+}
+
+async fn list_schedules_ui(
+    Extension(api_state): Extension<HarvestApiState>,
+    Query(params): Query<ScheduleListParams>,
+) -> Result<Markup, AutumnError> {
+    let limit = params
+        .limit
+        .unwrap_or(DEFAULT_SCHEDULE_PAGE_SIZE)
+        .clamp(1, MAX_PAGE_SIZE);
+    let page = params.page.unwrap_or(0).max(0);
+    let offset = page.saturating_mul(limit);
+
+    let kind = params
+        .kind
+        .as_deref()
+        .map(ScheduleKindFilter::parse)
+        .transpose()?
+        .unwrap_or(ScheduleKindFilter::All);
+    let paused_filter = params
+        .paused
+        .as_deref()
+        .map(SchedulePausedFilter::parse)
+        .transpose()?
+        .unwrap_or(SchedulePausedFilter::All);
+    let target = params
+        .target
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    let filters = ScheduleUiFilters {
+        target,
+        kind,
+        paused: paused_filter,
+        shard_id: params.shard_id,
+    };
+
+    let shard_results = load_schedules_from_shards_ui(&api_state).await;
+    let is_multi_shard = shard_results.len() > 1;
+
+    let shard_errors: Vec<(ShardId, String)> = shard_results
+        .iter()
+        .filter_map(|(sid, r)| r.as_ref().err().map(|e| (*sid, e.clone())))
+        .collect();
+
+    // Flatten + filter across all shards.
+    let mut all_rows: Vec<(ShardId, HarvestSchedule)> = shard_results
+        .into_iter()
+        .flat_map(|(shard_id, result)| {
+            result
+                .into_iter()
+                .flat_map(move |rows| rows.into_iter().map(move |r| (shard_id, r)))
+        })
+        .filter(|(sid, row)| filters.matches(*sid, row))
+        .collect();
+
+    // Secondary sort: by name for stability when next_run_at is NULL.
+    all_rows.sort_by(|(_, a), (_, b)| {
+        let a_next = a.next_run_at;
+        let b_next = b.next_run_at;
+        match (a_next, b_next) {
+            (Some(a_ts), Some(b_ts)) => a_ts.cmp(&b_ts),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => {
+                let a_name = a
+                    .workflow_name
+                    .as_deref()
+                    .or(a.dag_name.as_deref())
+                    .unwrap_or("");
+                let b_name = b
+                    .workflow_name
+                    .as_deref()
+                    .or(b.dag_name.as_deref())
+                    .unwrap_or("");
+                a_name.cmp(b_name)
+            }
+        }
+        .then_with(|| a.id.cmp(&b.id))
+    });
+
+    let total_filtered = all_rows.len();
+    let offset_usize = usize::try_from(offset).unwrap_or(usize::MAX);
+    let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
+    let has_next = total_filtered > offset_usize.saturating_add(limit_usize);
+    let page_rows: Vec<(ShardId, HarvestSchedule)> = all_rows
+        .into_iter()
+        .skip(offset_usize)
+        .take(limit_usize)
+        .collect();
+
+    Ok(render_schedules_page(
+        &page_rows,
+        &shard_errors,
+        is_multi_shard,
+        &filters,
+        page,
+        limit,
+        has_next,
+        total_filtered,
+        params.refresh,
+        params.flash.as_deref(),
+    ))
+}
+
+/// Parse a `ScheduleUiFilters` from optional string fields.
+fn parse_schedule_bulk_filters(params: &ScheduleBulkParams) -> ScheduleUiFilters {
+    let kind = params
+        .kind
+        .as_deref()
+        .and_then(|s| ScheduleKindFilter::parse(s).ok())
+        .unwrap_or(ScheduleKindFilter::All);
+    let paused = params
+        .paused
+        .as_deref()
+        .and_then(|s| SchedulePausedFilter::parse(s).ok())
+        .unwrap_or(SchedulePausedFilter::All);
+    let target = params
+        .target
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    ScheduleUiFilters {
+        target,
+        kind,
+        paused,
+        shard_id: params.shard_id,
+    }
+}
+
+/// Find a schedule by id across all shards. Returns the row and a conn on success.
+async fn find_schedule_row(
+    api_state: &HarvestApiState,
+    id_str: &str,
+) -> Result<Option<(HarvestSchedule, crate::api::PoolConn)>, axum::response::Response> {
+    use autumn_harvest::schema::harvest_schedules::dsl;
+    use axum::response::IntoResponse as _;
+
+    let Ok(id) = id_str.parse::<uuid::Uuid>() else {
+        return Err(
+            AutumnError::bad_request_msg(format!("invalid schedule id '{id_str}'")).into_response(),
+        );
+    };
+    let pool = api_state
+        .storage_pool()
+        .map_err(|e| map_error(e).into_response())?;
+
+    for (_shard, shard_pool) in pool.iter_shards() {
+        let mut conn = match acquire_conn(shard_pool).await {
+            Ok(c) => c,
+            Err(e) => return Err(e.into_response()),
+        };
+        let row: Option<HarvestSchedule> = dsl::harvest_schedules
+            .find(id)
+            .select(HarvestSchedule::as_select())
+            .first(&mut conn)
+            .await
+            .optional()
+            .map_err(database_error)
+            .map_err(|e| map_error(e).into_response())?;
+        if let Some(row) = row {
+            return Ok(Some((row, conn)));
+        }
+    }
+    Ok(None)
+}
+
+fn schedule_name(row: &HarvestSchedule) -> String {
+    row.workflow_name
+        .as_deref()
+        .or(row.dag_name.as_deref())
+        .unwrap_or("")
+        .to_string()
+}
+
+async fn schedule_pause_ui(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id_str): Path<String>,
+) -> axum::response::Response {
+    use autumn_harvest::schema::harvest_schedules::dsl;
+
+    let found = match find_schedule_row(&api_state, &id_str).await {
+        Ok(f) => f,
+        Err(response) => return response,
+    };
+
+    let flash = if let Some((row, mut conn)) = found {
+        let name = schedule_name(&row);
+        let now = Utc::now();
+        let _ = diesel::update(
+            dsl::harvest_schedules
+                .find(row.id)
+                .filter(dsl::is_paused.ne(true)),
+        )
+        .set((
+            dsl::is_paused.eq(true),
+            dsl::paused_at.eq(Some(now)),
+            dsl::paused_by.eq(Some("ui")),
+            dsl::updated_at.eq(now),
+        ))
+        .execute(&mut conn)
+        .await;
+        let ar = NewAuditRecord {
+            actor: "ui",
+            operation: OP_SCHEDULE_PAUSE,
+            target_type: TARGET_SCHEDULE,
+            target_id: Some(id_str.as_str()),
+            route_or_command: "POST /ui/schedules/pause",
+            request_id: None,
+            idempotency_key: None,
+            status: STATUS_SUCCEEDED,
+            error_summary: None,
+            shard_id: None,
+            source: SOURCE_API,
+        };
+        let _ = insert_audit(&mut conn, &ar).await;
+        format!("Paused {name}")
+    } else {
+        format!("Paused schedule {}", &id_str[..8.min(id_str.len())])
+    };
+    schedule_redirect(&flash)
+}
+
+async fn schedule_resume_ui(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id_str): Path<String>,
+) -> axum::response::Response {
+    use autumn_harvest::schema::harvest_schedules::dsl;
+
+    let found = match find_schedule_row(&api_state, &id_str).await {
+        Ok(f) => f,
+        Err(response) => return response,
+    };
+
+    let flash = if let Some((row, mut conn)) = found {
+        let name = schedule_name(&row);
+        let now = Utc::now();
+        let _ = diesel::update(
+            dsl::harvest_schedules
+                .find(row.id)
+                .filter(dsl::is_paused.ne(false)),
+        )
+        .set((
+            dsl::is_paused.eq(false),
+            dsl::paused_at.eq(None::<chrono::DateTime<Utc>>),
+            dsl::paused_by.eq(None::<&str>),
+            dsl::pause_reason.eq(None::<&str>),
+            dsl::updated_at.eq(now),
+        ))
+        .execute(&mut conn)
+        .await;
+        let ar = NewAuditRecord {
+            actor: "ui",
+            operation: OP_SCHEDULE_RESUME,
+            target_type: TARGET_SCHEDULE,
+            target_id: Some(id_str.as_str()),
+            route_or_command: "POST /ui/schedules/resume",
+            request_id: None,
+            idempotency_key: None,
+            status: STATUS_SUCCEEDED,
+            error_summary: None,
+            shard_id: None,
+            source: SOURCE_API,
+        };
+        let _ = insert_audit(&mut conn, &ar).await;
+        format!("Resumed {name}")
+    } else {
+        format!("Resumed schedule {}", &id_str[..8.min(id_str.len())])
+    };
+    schedule_redirect(&flash)
+}
+
+async fn schedule_delete_ui(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id_str): Path<String>,
+) -> axum::response::Response {
+    use autumn_harvest::schema::harvest_schedules::dsl;
+
+    let found = match find_schedule_row(&api_state, &id_str).await {
+        Ok(f) => f,
+        Err(response) => return response,
+    };
+
+    let flash = if let Some((row, mut conn)) = found {
+        let name = schedule_name(&row);
+        let n = diesel::delete(dsl::harvest_schedules.find(row.id))
+            .execute(&mut conn)
+            .await
+            .unwrap_or(0);
+        if n > 0 {
+            let ar = NewAuditRecord {
+                actor: "ui",
+                operation: OP_SCHEDULE_DELETE,
+                target_type: TARGET_SCHEDULE,
+                target_id: Some(id_str.as_str()),
+                route_or_command: "POST /ui/schedules/delete",
+                request_id: None,
+                idempotency_key: None,
+                status: STATUS_SUCCEEDED,
+                error_summary: None,
+                shard_id: None,
+                source: SOURCE_API,
+            };
+            let _ = insert_audit(&mut conn, &ar).await;
+            format!("Deleted {name}")
+        } else {
+            format!(
+                "Schedule {} was already deleted",
+                &id_str[..8.min(id_str.len())]
+            )
+        }
+    } else {
+        format!("Schedule {} not found", &id_str[..8.min(id_str.len())])
+    };
+    schedule_redirect(&flash)
+}
+
+async fn schedule_bulk_pause_ui(
+    Extension(api_state): Extension<HarvestApiState>,
+    Form(params): Form<ScheduleBulkParams>,
+) -> axum::response::Response {
+    use autumn_harvest::schema::harvest_schedules::dsl;
+    use axum::response::IntoResponse as _;
+
+    let filters = parse_schedule_bulk_filters(&params);
+
+    let pool = match api_state.storage_pool() {
+        Ok(p) => p,
+        Err(e) => return map_error(e).into_response(),
+    };
+
+    let now = Utc::now();
+    let mut acted_on = 0usize;
+
+    for (shard_id, shard_pool) in pool.iter_shards() {
+        let Ok(mut conn) = acquire_conn(shard_pool).await else {
+            continue;
+        };
+        let rows: Vec<HarvestSchedule> = harvest_schedules::table
+            .select(HarvestSchedule::as_select())
+            .load(&mut conn)
+            .await
+            .unwrap_or_default();
+        for row in rows {
+            if !filters.matches(shard_id, &row) {
+                continue;
+            }
+            let id_str = row.id.to_string();
+            let n = diesel::update(
+                dsl::harvest_schedules
+                    .find(row.id)
+                    .filter(dsl::is_paused.ne(true)),
+            )
+            .set((
+                dsl::is_paused.eq(true),
+                dsl::paused_at.eq(Some(now)),
+                dsl::paused_by.eq(Some("ui-bulk")),
+                dsl::updated_at.eq(now),
+            ))
+            .execute(&mut conn)
+            .await
+            .unwrap_or(0);
+            if n > 0 {
+                acted_on += 1;
+                let ar = NewAuditRecord {
+                    actor: "ui",
+                    operation: OP_SCHEDULE_PAUSE,
+                    target_type: TARGET_SCHEDULE,
+                    target_id: Some(id_str.as_str()),
+                    route_or_command: "POST /ui/schedules/bulk-pause",
+                    request_id: None,
+                    idempotency_key: None,
+                    status: STATUS_SUCCEEDED,
+                    error_summary: None,
+                    shard_id: None,
+                    source: SOURCE_API,
+                };
+                let _ = insert_audit(&mut conn, &ar).await;
+            }
+        }
+    }
+
+    schedule_redirect(&format!("Paused {acted_on} schedule(s)"))
+}
+
+async fn schedule_bulk_resume_ui(
+    Extension(api_state): Extension<HarvestApiState>,
+    Form(params): Form<ScheduleBulkParams>,
+) -> axum::response::Response {
+    use autumn_harvest::schema::harvest_schedules::dsl;
+    use axum::response::IntoResponse as _;
+
+    let filters = parse_schedule_bulk_filters(&params);
+
+    let pool = match api_state.storage_pool() {
+        Ok(p) => p,
+        Err(e) => return map_error(e).into_response(),
+    };
+
+    let now = Utc::now();
+    let mut acted_on = 0usize;
+
+    for (shard_id, shard_pool) in pool.iter_shards() {
+        let Ok(mut conn) = acquire_conn(shard_pool).await else {
+            continue;
+        };
+        let rows: Vec<HarvestSchedule> = harvest_schedules::table
+            .select(HarvestSchedule::as_select())
+            .load(&mut conn)
+            .await
+            .unwrap_or_default();
+        for row in rows {
+            if !filters.matches(shard_id, &row) {
+                continue;
+            }
+            let id_str = row.id.to_string();
+            let n = diesel::update(
+                dsl::harvest_schedules
+                    .find(row.id)
+                    .filter(dsl::is_paused.ne(false)),
+            )
+            .set((
+                dsl::is_paused.eq(false),
+                dsl::paused_at.eq(None::<chrono::DateTime<Utc>>),
+                dsl::paused_by.eq(None::<&str>),
+                dsl::pause_reason.eq(None::<&str>),
+                dsl::updated_at.eq(now),
+            ))
+            .execute(&mut conn)
+            .await
+            .unwrap_or(0);
+            if n > 0 {
+                acted_on += 1;
+                let ar = NewAuditRecord {
+                    actor: "ui",
+                    operation: OP_SCHEDULE_RESUME,
+                    target_type: TARGET_SCHEDULE,
+                    target_id: Some(id_str.as_str()),
+                    route_or_command: "POST /ui/schedules/bulk-resume",
+                    request_id: None,
+                    idempotency_key: None,
+                    status: STATUS_SUCCEEDED,
+                    error_summary: None,
+                    shard_id: None,
+                    source: SOURCE_API,
+                };
+                let _ = insert_audit(&mut conn, &ar).await;
+            }
+        }
+    }
+
+    schedule_redirect(&format!("Resumed {acted_on} schedule(s)"))
+}
+
+fn schedule_redirect(flash: &str) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    let location = format!("schedules?flash={}", url_encode(flash));
+    axum::response::Redirect::to(&location).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Schedule rendering helpers
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+fn render_schedules_page(
+    rows: &[(ShardId, HarvestSchedule)],
+    shard_errors: &[(ShardId, String)],
+    is_multi_shard: bool,
+    filters: &ScheduleUiFilters,
+    page: i64,
+    limit: i64,
+    has_next: bool,
+    total_filtered: usize,
+    refresh: Option<u64>,
+    flash: Option<&str>,
+) -> Markup {
+    let body = html! {
+        h2 { "Schedules" }
+
+        @if let Some(message) = flash {
+            div.flash { (message) }
+        }
+
+        (render_schedule_filters(filters, limit, refresh))
+        (render_schedule_bulk_actions(filters, limit, refresh, total_filtered))
+
+        @if rows.is_empty() && shard_errors.is_empty() {
+            div.card.empty {
+                @if filters.is_empty() {
+                    "No schedules registered."
+                } @else {
+                    "No schedules match this filter."
+                }
+            }
+        } @else {
+            @for (shard_id, error) in shard_errors {
+                div.shard-error {
+                    @if is_multi_shard {
+                        strong { "Shard " (shard_id.as_i32()) " unavailable: " }
+                    } @else {
+                        strong { "Shard unavailable: " }
+                    }
+                    (error)
+                }
+            }
+            (render_schedule_table(rows, is_multi_shard))
+        }
+
+        (render_schedule_pagination(page, limit, has_next, filters, refresh))
+    };
+
+    layout_schedules("Schedules · Vantage", &body, refresh)
+}
+
+fn render_schedule_filters(
+    filters: &ScheduleUiFilters,
+    limit: i64,
+    refresh: Option<u64>,
+) -> Markup {
+    let target_val = filters.target.as_deref().unwrap_or("");
+    let kind_val = filters.kind.as_label();
+    let paused_val = filters.paused.as_label();
+    let shard_val = filters.shard_id.map(|s| s.to_string()).unwrap_or_default();
+    let refresh_value = refresh.map(|s| s.to_string()).unwrap_or_default();
+
+    html! {
+        form.filters method="get" action="schedules" {
+            label {
+                "Target"
+                input type="text" name="target" value=(target_val) placeholder="e.g. payment_workflow";
+            }
+            label {
+                "Kind"
+                select name="kind" {
+                    option value="" selected[kind_val.is_empty()] { "All" }
+                    option value="Workflow" selected[kind_val == "Workflow"] { "Workflow" }
+                    option value="Dag" selected[kind_val == "Dag"] { "Dag" }
+                }
+            }
+            label {
+                "Paused"
+                select name="paused" {
+                    option value="" selected[paused_val.is_empty()] { "All" }
+                    option value="Paused" selected[paused_val == "Paused"] { "Paused" }
+                    option value="Active" selected[paused_val == "Active"] { "Active" }
+                }
+            }
+            label {
+                "Shard"
+                input type="number" name="shard_id" value=(shard_val) placeholder="e.g. 0";
+            }
+            label {
+                "Per page"
+                input type="number" name="limit" min="1" max=(MAX_PAGE_SIZE) value=(limit);
+            }
+            label {
+                "Refresh"
+                select name="refresh" {
+                    option value="" selected[refresh.is_none()] { "Off" }
+                    option value="30" selected[refresh == Some(30)] { "30s" }
+                    option value="60" selected[refresh == Some(60)] { "60s" }
+                    @if refresh.is_some_and(|secs| secs != 30 && secs != 60) {
+                        option value=(refresh_value) selected { (refresh_value) "s" }
+                    }
+                }
+            }
+            button type="submit" { "Apply" }
+            a.reset href="schedules" { "Reset" }
+        }
+    }
+}
+
+fn render_schedule_bulk_actions(
+    filters: &ScheduleUiFilters,
+    limit: i64,
+    refresh: Option<u64>,
+    total_matching: usize,
+) -> Markup {
+    let return_qs = build_schedule_query_string(limit, filters, refresh);
+    html! {
+        div."bulk-actions" {
+            form method="post" action="schedules/bulk-pause"
+                onsubmit={ "return confirm('Pause " (total_matching) " matching schedule(s)?')" } {
+                (render_schedule_hidden_filters(filters))
+                button type="submit" disabled[total_matching == 0] {
+                    "Pause all matching (" (total_matching) ")"
+                }
+            }
+            form method="post" action="schedules/bulk-resume"
+                onsubmit={ "return confirm('Resume " (total_matching) " matching schedule(s)?')" } {
+                (render_schedule_hidden_filters(filters))
+                button type="submit" disabled[total_matching == 0] {
+                    "Resume all matching (" (total_matching) ")"
+                }
+            }
+            @if !return_qs.is_empty() {
+                span { "Filters active" }
+            }
+        }
+    }
+}
+
+fn render_schedule_hidden_filters(filters: &ScheduleUiFilters) -> Markup {
+    html! {
+        @if let Some(ref target) = filters.target {
+            input type="hidden" name="target" value=(target);
+        }
+        @if !matches!(filters.kind, ScheduleKindFilter::All) {
+            input type="hidden" name="kind" value=(filters.kind.as_label());
+        }
+        @if !matches!(filters.paused, SchedulePausedFilter::All) {
+            input type="hidden" name="paused" value=(filters.paused.as_label());
+        }
+        @if let Some(shard_id) = filters.shard_id {
+            input type="hidden" name="shard_id" value=(shard_id);
+        }
+    }
+}
+
+fn render_schedule_table(rows: &[(ShardId, HarvestSchedule)], is_multi_shard: bool) -> Markup {
+    html! {
+        table {
+            thead {
+                tr {
+                    th { "Schedule ID" }
+                    th { "Kind" }
+                    th { "Target" }
+                    th { "Expression" }
+                    th { "Next Run" }
+                    th { "Last Run" }
+                    th { "State" }
+                    th { "Created" }
+                    @if is_multi_shard { th { "Shard" } }
+                    th { "Actions" }
+                }
+            }
+            tbody {
+                @for (shard_id, row) in rows {
+                    @let id_str = row.id.to_string();
+                    @let kind_label = if row.dag_name.is_some() { "Dag" } else { "Workflow" };
+                    @let target_name = row.workflow_name.as_deref()
+                        .or(row.dag_name.as_deref())
+                        .unwrap_or("—");
+                    @let expr = row.schedule_expr.as_deref().unwrap_or("—");
+                    tr {
+                        td { code { (short_id(&id_str)) } }
+                        td { (kind_label) }
+                        td { code { (target_name) } }
+                        td { code { (expr) } }
+                        td { (format_timestamp(row.next_run_at)) }
+                        td { (format_timestamp(row.last_run_at)) }
+                        td { (schedule_state_badge(row.is_paused)) }
+                        td { (format_timestamp(Some(row.created_at))) }
+                        @if is_multi_shard { td { (shard_id.as_i32()) } }
+                        td {
+                            div.actions {
+                                @if !row.is_paused {
+                                    form method="post"
+                                        action={ "schedules/" (id_str) "/pause" }
+                                        onsubmit="return confirm('Pause this schedule?')" {
+                                        button type="submit" { "Pause" }
+                                    }
+                                }
+                                @if row.is_paused {
+                                    form method="post"
+                                        action={ "schedules/" (id_str) "/resume" }
+                                        onsubmit="return confirm('Resume this schedule?')" {
+                                        button type="submit" { "Resume" }
+                                    }
+                                }
+                                form method="post"
+                                    action={ "schedules/" (id_str) "/delete" }
+                                    onsubmit={ "return confirm('Delete schedule " (id_str) "? This cannot be undone.')" } {
+                                    button.danger type="submit" { "Delete" }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn schedule_state_badge(is_paused: bool) -> Markup {
+    if is_paused {
+        html! { span.badge.CANCELLED { "Paused" } }
+    } else {
+        html! { span.badge.Active { "Active" } }
+    }
+}
+
+fn render_schedule_pagination(
+    page: i64,
+    limit: i64,
+    has_next: bool,
+    filters: &ScheduleUiFilters,
+    refresh: Option<u64>,
+) -> Markup {
+    let base = build_schedule_query_string(limit, filters, refresh);
+    html! {
+        div.pagination {
+            @if page > 0 {
+                a href={ "schedules?page=" (page - 1) (PreEscaped(&base)) } {
+                    (PreEscaped("&larr;")) " Previous"
+                }
+            } @else {
+                span.disabled { (PreEscaped("&larr;")) " Previous" }
+            }
+            span { "Page " (page + 1) }
+            @if has_next {
+                a href={ "schedules?page=" (page + 1) (PreEscaped(&base)) } {
+                    "Next " (PreEscaped("&rarr;"))
+                }
+            } @else {
+                span.disabled { "Next " (PreEscaped("&rarr;")) }
+            }
+        }
+    }
+}
+
+fn build_schedule_query_string(
+    limit: i64,
+    filters: &ScheduleUiFilters,
+    refresh: Option<u64>,
+) -> String {
+    let mut out = String::new();
+    if limit != DEFAULT_SCHEDULE_PAGE_SIZE {
+        let _ = write!(out, "&limit={limit}");
+    }
+    if let Some(ref target) = filters.target {
+        let _ = write!(out, "&target={}", url_encode(target));
+    }
+    if !matches!(filters.kind, ScheduleKindFilter::All) {
+        let _ = write!(out, "&kind={}", filters.kind.as_label());
+    }
+    if !matches!(filters.paused, SchedulePausedFilter::All) {
+        let _ = write!(out, "&paused={}", filters.paused.as_label());
+    }
+    if let Some(shard_id) = filters.shard_id {
+        let _ = write!(out, "&shard_id={shard_id}");
+    }
+    if let Some(secs) = refresh {
+        let _ = write!(out, "&refresh={secs}");
+    }
+    out
+}
+
+fn layout_schedules(title: &str, body: &Markup, refresh: Option<u64>) -> Markup {
+    html! {
+        (PreEscaped("<!DOCTYPE html>"))
+        html lang="en" {
+            head {
+                meta charset="utf-8";
+                meta name="viewport" content="width=device-width,initial-scale=1";
+                @if let Some(secs) = refresh {
+                    meta http-equiv="refresh" content=(secs);
+                }
+                title { (title) }
+                style { (PreEscaped(STYLE)) }
+            }
+            body {
+                header {
+                    h1 {
+                        a href="workflows" { "🔭 Vantage" }
+                        span.subtitle { "Harvest dashboard" }
+                    }
+                    nav {
+                        a href="workflows" { "Workflows" }
+                        a href="workers" { "Workers" }
+                        a.active href="schedules" { "Schedules" }
+                        a href="dead-letters" { "Dead Letters" }
+                    }
+                }
+                main { (body) }
+                footer { "Operational dashboard — autumn-harvest" }
             }
         }
     }
@@ -2169,5 +3141,223 @@ mod tests {
         let html = worker_status_badge("Active", false).into_string();
         assert!(html.contains("Active"));
         assert!(!html.contains("stale"));
+    }
+
+    // -- Schedule page pure-logic unit tests --
+
+    fn make_schedule(
+        workflow_name: Option<&str>,
+        dag_name: Option<&str>,
+        is_paused: bool,
+    ) -> HarvestSchedule {
+        HarvestSchedule {
+            id: uuid::Uuid::new_v4(),
+            dag_name: dag_name.map(str::to_string),
+            schedule_expr: Some("0 * * * *".to_string()),
+            timezone: "UTC".to_string(),
+            catchup: false,
+            max_active_runs: 1,
+            is_paused,
+            last_run_at: None,
+            next_run_at: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            workflow_name: workflow_name.map(str::to_string),
+            workflow_input: None,
+            queue_name: None,
+            paused_at: None,
+            paused_by: None,
+            pause_reason: None,
+        }
+    }
+
+    #[test]
+    fn schedule_filter_matches_all_when_empty() {
+        let filters = ScheduleUiFilters::default();
+        let wf = make_schedule(Some("my_workflow"), None, false);
+        let dag = make_schedule(None, Some("my_dag"), true);
+        assert!(filters.matches(ShardId::new(0), &wf));
+        assert!(filters.matches(ShardId::new(0), &dag));
+    }
+
+    #[test]
+    fn schedule_filter_kind_workflow_excludes_dags() {
+        let filters = ScheduleUiFilters {
+            kind: ScheduleKindFilter::Workflow,
+            ..Default::default()
+        };
+        let wf = make_schedule(Some("wf"), None, false);
+        let dag = make_schedule(None, Some("dag"), false);
+        assert!(filters.matches(ShardId::new(0), &wf));
+        assert!(!filters.matches(ShardId::new(0), &dag));
+    }
+
+    #[test]
+    fn schedule_filter_kind_dag_excludes_workflows() {
+        let filters = ScheduleUiFilters {
+            kind: ScheduleKindFilter::Dag,
+            ..Default::default()
+        };
+        let wf = make_schedule(Some("wf"), None, false);
+        let dag = make_schedule(None, Some("dag"), false);
+        assert!(!filters.matches(ShardId::new(0), &wf));
+        assert!(filters.matches(ShardId::new(0), &dag));
+    }
+
+    #[test]
+    fn schedule_filter_paused_excludes_active() {
+        let filters = ScheduleUiFilters {
+            paused: SchedulePausedFilter::Paused,
+            ..Default::default()
+        };
+        let active = make_schedule(Some("wf"), None, false);
+        let paused = make_schedule(Some("wf2"), None, true);
+        assert!(!filters.matches(ShardId::new(0), &active));
+        assert!(filters.matches(ShardId::new(0), &paused));
+    }
+
+    #[test]
+    fn schedule_filter_active_excludes_paused() {
+        let filters = ScheduleUiFilters {
+            paused: SchedulePausedFilter::Active,
+            ..Default::default()
+        };
+        let active = make_schedule(Some("wf"), None, false);
+        let paused = make_schedule(Some("wf2"), None, true);
+        assert!(filters.matches(ShardId::new(0), &active));
+        assert!(!filters.matches(ShardId::new(0), &paused));
+    }
+
+    #[test]
+    fn schedule_filter_target_substring_match() {
+        let filters = ScheduleUiFilters {
+            target: Some("payment".to_string()),
+            ..Default::default()
+        };
+        let matching = make_schedule(Some("payment_workflow"), None, false);
+        let other = make_schedule(Some("invoice_workflow"), None, false);
+        assert!(filters.matches(ShardId::new(0), &matching));
+        assert!(!filters.matches(ShardId::new(0), &other));
+    }
+
+    #[test]
+    fn schedule_filter_shard_id_match() {
+        let filters = ScheduleUiFilters {
+            shard_id: Some(1),
+            ..Default::default()
+        };
+        let row = make_schedule(Some("wf"), None, false);
+        assert!(filters.matches(ShardId::new(1), &row));
+        assert!(!filters.matches(ShardId::new(0), &row));
+    }
+
+    #[test]
+    fn schedule_state_badge_paused() {
+        let html = schedule_state_badge(true).into_string();
+        assert!(html.contains("Paused"));
+    }
+
+    #[test]
+    fn schedule_state_badge_active() {
+        let html = schedule_state_badge(false).into_string();
+        assert!(html.contains("Active"));
+    }
+
+    #[test]
+    fn build_schedule_query_string_omits_defaults() {
+        let filters = ScheduleUiFilters::default();
+        assert_eq!(
+            build_schedule_query_string(DEFAULT_SCHEDULE_PAGE_SIZE, &filters, None),
+            ""
+        );
+    }
+
+    #[test]
+    fn build_schedule_query_string_includes_all_params() {
+        let filters = ScheduleUiFilters {
+            target: Some("payment".to_string()),
+            kind: ScheduleKindFilter::Workflow,
+            paused: SchedulePausedFilter::Paused,
+            shard_id: Some(2),
+        };
+        let q = build_schedule_query_string(10, &filters, Some(30));
+        assert!(q.contains("limit=10"), "missing limit: {q}");
+        assert!(q.contains("target=payment"), "missing target: {q}");
+        assert!(q.contains("kind=Workflow"), "missing kind: {q}");
+        assert!(q.contains("paused=Paused"), "missing paused: {q}");
+        assert!(q.contains("shard_id=2"), "missing shard_id: {q}");
+        assert!(q.contains("refresh=30"), "missing refresh: {q}");
+    }
+
+    #[test]
+    fn layout_schedules_has_nav_link() {
+        let body = html! { p { "test" } };
+        let html = layout_schedules("Test", &body, None).into_string();
+        assert!(
+            html.contains("schedules"),
+            "layout_schedules must include schedules link"
+        );
+        assert!(
+            html.contains("Workflows"),
+            "layout_schedules must include workflows link"
+        );
+        assert!(
+            html.contains("Workers"),
+            "layout_schedules must include workers link"
+        );
+    }
+
+    #[test]
+    fn layout_schedules_auto_refresh_tag() {
+        let body = html! { p { "test" } };
+        let html_with = layout_schedules("T", &body, Some(30)).into_string();
+        assert!(html_with.contains("http-equiv=\"refresh\""));
+        assert!(html_with.contains("content=\"30\""));
+        let html_without = layout_schedules("T", &body, None).into_string();
+        assert!(!html_without.contains("http-equiv=\"refresh\""));
+    }
+
+    #[test]
+    fn layout_includes_schedules_nav_link() {
+        let body = html! { p { "test" } };
+        let html = layout("Test", &body, "").into_string();
+        assert!(
+            html.contains("schedules"),
+            "layout must include schedules nav link"
+        );
+    }
+
+    #[test]
+    fn schedule_kind_filter_parse_roundtrips() {
+        assert!(matches!(
+            ScheduleKindFilter::parse("").unwrap(),
+            ScheduleKindFilter::All
+        ));
+        assert!(matches!(
+            ScheduleKindFilter::parse("Workflow").unwrap(),
+            ScheduleKindFilter::Workflow
+        ));
+        assert!(matches!(
+            ScheduleKindFilter::parse("Dag").unwrap(),
+            ScheduleKindFilter::Dag
+        ));
+        assert!(ScheduleKindFilter::parse("bogus").is_err());
+    }
+
+    #[test]
+    fn schedule_paused_filter_parse_roundtrips() {
+        assert!(matches!(
+            SchedulePausedFilter::parse("").unwrap(),
+            SchedulePausedFilter::All
+        ));
+        assert!(matches!(
+            SchedulePausedFilter::parse("Paused").unwrap(),
+            SchedulePausedFilter::Paused
+        ));
+        assert!(matches!(
+            SchedulePausedFilter::parse("Active").unwrap(),
+            SchedulePausedFilter::Active
+        ));
+        assert!(SchedulePausedFilter::parse("maybe").is_err());
     }
 }
