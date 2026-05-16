@@ -306,7 +306,8 @@ impl HarvestApiState {
     /// # Panics
     ///
     /// Panics if the internal mutex is poisoned.
-    pub(crate) fn query_timeout(&self) -> std::time::Duration {
+    #[must_use]
+    pub fn query_timeout(&self) -> std::time::Duration {
         *self
             .query_timeout
             .lock()
@@ -4025,7 +4026,6 @@ async fn signal_workflow(
 async fn hydrate_ctx_for_query(
     api_state: &HarvestApiState,
     exec_id: ExecutionId,
-    query_timeout: Duration,
 ) -> Result<WorkflowContext, AutumnError> {
     let runtime = api_state.runtime().map_err(map_error)?;
     let mut conn = db_conn_for_execution(api_state, exec_id).await?;
@@ -4052,19 +4052,32 @@ async fn hydrate_ctx_for_query(
         .await
         .map_err(map_error)?;
 
+    // Drop the DB connection before driving user code — prevents holding a
+    // pool slot during replay, which would starve other management and worker
+    // DB operations for the entire duration of the workflow replay.
+    drop(conn);
+
     let ctx = WorkflowContext::for_replay_with_state(
         exec_id,
         history.events,
         runtime.registry.shared_state(),
     );
-    // Drive the workflow function long enough to register query handlers, then
-    // let it suspend at the first unrecorded activity (expected for live workflows).
-    // The timeout is a safety cap against buggy workflow code with infinite loops.
-    let _ = tokio::time::timeout(
-        query_timeout,
-        (workflow.handler)(&ctx, execution.input.clone()),
-    )
-    .await;
+
+    // Poll the workflow exactly once to drive through all recorded history.
+    // Recorded events resolve immediately (pre-sent oneshot channels), so the
+    // entire history replay happens in a single poll. The workflow then suspends
+    // at the first unrecorded event (Poll::Pending). Query handlers registered
+    // before that suspension point are captured in ctx.query_registry.
+    //
+    // A noop waker avoids integrating with Tokio's wakeup system — we only
+    // need the side-effect of handler registration, not the future's result.
+    {
+        let waker = futures::task::noop_waker_ref();
+        let mut poll_cx = std::task::Context::from_waker(waker);
+        let handler_fut = (workflow.handler)(&ctx, execution.input.clone());
+        tokio::pin!(handler_fut);
+        let _ = handler_fut.as_mut().poll(&mut poll_cx);
+    }
 
     Ok(ctx)
 }
@@ -4075,25 +4088,9 @@ async fn query_workflow(
     Path((id, query_name)): Path<(String, String)>,
 ) -> Result<Json<Value>, AutumnError> {
     let exec_id = parse_execution_id(&id)?;
-    let timeout_dur = api_state.query_timeout();
-    let timeout_ms = u64::try_from(timeout_dur.as_millis()).unwrap_or(u64::MAX);
     let start = Instant::now();
 
-    let ctx = hydrate_ctx_for_query(&api_state, exec_id, timeout_dur).await?;
-
-    if start.elapsed() >= timeout_dur {
-        if let Ok(runtime) = api_state.runtime() {
-            runtime.registry.telemetry().metrics.record_query_completed(
-                &query_name,
-                start.elapsed().as_secs_f64(),
-                false,
-            );
-        }
-        return Err(map_error(HarvestError::QueryTimedOut {
-            query_name: query_name.clone(),
-            timeout_ms,
-        }));
-    }
+    let ctx = hydrate_ctx_for_query(&api_state, exec_id).await?;
 
     let harvest_result = ctx.execute_query(&query_name);
     // Skip metric for not-found: query_name is user-supplied and recording it
@@ -4124,33 +4121,21 @@ struct QueryWorkflowResponse {
 }
 
 /// `POST /workflows/{id}/query/{query_name}` — query with typed args (issue #234).
+///
+/// The request body is optional. Clients that invoke a no-arg handler via POST
+/// may omit the body entirely; `args` defaults to `null` in that case.
 async fn query_workflow_post(
     Extension(api_state): Extension<HarvestApiState>,
     Path((id, query_name)): Path<(String, String)>,
-    Json(body): Json<QueryWorkflowRequest>,
+    body: Option<Json<QueryWorkflowRequest>>,
 ) -> Result<Json<QueryWorkflowResponse>, AutumnError> {
     let exec_id = parse_execution_id(&id)?;
-    let timeout_dur = api_state.query_timeout();
-    let timeout_ms = u64::try_from(timeout_dur.as_millis()).unwrap_or(u64::MAX);
     let start = Instant::now();
 
-    let ctx = hydrate_ctx_for_query(&api_state, exec_id, timeout_dur).await?;
+    let ctx = hydrate_ctx_for_query(&api_state, exec_id).await?;
+    let args = body.map_or(Value::Null, |Json(b)| b.args);
 
-    if start.elapsed() >= timeout_dur {
-        if let Ok(runtime) = api_state.runtime() {
-            runtime.registry.telemetry().metrics.record_query_completed(
-                &query_name,
-                start.elapsed().as_secs_f64(),
-                false,
-            );
-        }
-        return Err(map_error(HarvestError::QueryTimedOut {
-            query_name: query_name.clone(),
-            timeout_ms,
-        }));
-    }
-
-    let harvest_result = ctx.execute_query_with_args(&query_name, body.args);
+    let harvest_result = ctx.execute_query_with_args(&query_name, args);
     // Skip metric for not-found: user-supplied names create unbounded cardinality.
     if !matches!(&harvest_result, Err(HarvestError::QueryHandlerNotFound(_)))
         && let Ok(runtime) = api_state.runtime()
@@ -4176,19 +4161,7 @@ async fn list_workflow_queries(
     Path(id): Path<String>,
 ) -> Result<Json<Vec<String>>, AutumnError> {
     let exec_id = parse_execution_id(&id)?;
-    let timeout_dur = api_state.query_timeout();
-    let timeout_ms = u64::try_from(timeout_dur.as_millis()).unwrap_or(u64::MAX);
-    let start = Instant::now();
-
-    let ctx = hydrate_ctx_for_query(&api_state, exec_id, timeout_dur).await?;
-
-    if start.elapsed() >= timeout_dur {
-        return Err(map_error(HarvestError::QueryTimedOut {
-            query_name: "list_queries".to_string(),
-            timeout_ms,
-        }));
-    }
-
+    let ctx = hydrate_ctx_for_query(&api_state, exec_id).await?;
     let mut names = ctx.list_query_names();
     names.sort(); // deterministic order for UI
     Ok(Json(names))
