@@ -618,6 +618,7 @@ fn build_single_shard_ui_app(database_url: &str) -> axum::Router {
 
 fn build_sharded_api_with_ui_app(shard0_url: &str, shard1_url: &str) -> axum::Router {
     let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(true);
     api_state.install_storage_pool(build_two_shard_pool(shard0_url, shard1_url));
     api_state.install(HarvestApiRuntime::new(
         echo_registry(),

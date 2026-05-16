@@ -105,6 +105,7 @@ fn test_app_state() -> AppState {
 
 fn build_app(pool: &DbPool) -> HarvestApiApp {
     let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
     api_state.install(HarvestApiRuntime::new(
         Arc::new(HandlerRegistry::new(vec![], vec![])),

@@ -2439,6 +2439,7 @@ async fn harvest_api_cancels_workflows_and_rejects_late_signals() {
     let pool = build_test_pool(&database_url);
     let registry = approval_registry();
     let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
     api_state.install(HarvestApiRuntime::new(
         Arc::clone(&registry),
@@ -3242,6 +3243,7 @@ async fn harvest_api_lists_and_replays_dead_letters() {
     let (database_url, _container) = setup_test_database_url().await;
     let pool = build_test_pool(&database_url);
     let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
     let app = harvest_api_router(api_state).with_state(test_app_state(pool));
 
@@ -3310,6 +3312,7 @@ async fn harvest_api_lists_and_replays_dead_letters() {
 async fn harvest_api_lists_workflows_and_dead_letters_across_shards() {
     let ((shard0_url, shard1_url), _container) = setup_sharded_test_database_urls().await;
     let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(true);
     api_state.install_storage_pool(build_two_shard_pool(&shard0_url, &shard1_url));
     let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
 

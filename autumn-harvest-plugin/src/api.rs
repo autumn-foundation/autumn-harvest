@@ -9,11 +9,13 @@ use std::time::Duration;
 use autumn_web::AppState;
 use autumn_web::error::AutumnError;
 use autumn_web::reexports::axum;
+use autumn_web::session::Session;
 use axum::Extension;
 use axum::Json;
 use axum::Router;
-use axum::extract::{Path, Query};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
+use axum::middleware::{self, Next};
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, patch, post};
 use diesel::ExpressionMethods;
@@ -227,6 +229,8 @@ pub struct HarvestApiState {
     deployment_profile: Arc<Mutex<String>>,
     /// Whether the management API was mounted behind an embedder-provided auth boundary.
     admin_auth_boundary: Arc<Mutex<bool>>,
+    /// Autumn session key used by built-in guards when no outer auth boundary is configured.
+    admin_auth_session_key: Arc<Mutex<String>>,
     /// When enabled, `/health` returns 503 until writable shards are ready.
     health_requires_shard_readiness: Arc<Mutex<bool>>,
     /// Default drain deadline offset used when `POST /workers/{id}/drain` omits `deadline_at`.
@@ -248,6 +252,7 @@ impl Default for HarvestApiState {
             audit_retention_days: Arc::new(Mutex::new(None)),
             deployment_profile: Arc::new(Mutex::new("unknown".to_string())),
             admin_auth_boundary: Arc::new(Mutex::new(false)),
+            admin_auth_session_key: Arc::new(Mutex::new("user_id".to_string())),
             health_requires_shard_readiness: Arc::new(Mutex::new(false)),
             worker_shutdown_timeout: Arc::new(Mutex::new(std::time::Duration::from_secs(30))),
             workflow_result_notification_urls: Arc::default(),
@@ -347,6 +352,22 @@ impl HarvestApiState {
             .expect("harvest api state lock poisoned") = present;
     }
 
+    /// Set the Autumn session key used by built-in management guards.
+    ///
+    /// This mirrors `AppState::auth_session_key()` during plugin startup. Standalone
+    /// integrations that mount `harvest_api_router` directly can call this to keep
+    /// Harvest's built-in high-impact route guard aligned with their app auth config.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    pub fn set_admin_auth_session_key(&self, session_key: impl Into<String>) {
+        *self
+            .admin_auth_session_key
+            .lock()
+            .expect("harvest api state lock poisoned") = session_key.into();
+    }
+
     /// Configure `/health` to fail when writable shard rollout readiness is not `ready`.
     ///
     /// The default is `false` so local single-shard development keeps a cheap
@@ -385,6 +406,13 @@ impl HarvestApiState {
             .admin_auth_boundary
             .lock()
             .expect("harvest api state lock poisoned")
+    }
+
+    pub(crate) fn admin_auth_session_key(&self) -> String {
+        self.admin_auth_session_key
+            .lock()
+            .expect("harvest api state lock poisoned")
+            .clone()
     }
 
     fn health_requires_shard_readiness(&self) -> bool {
@@ -1168,6 +1196,8 @@ struct DeadLetterListQuery {
 }
 
 pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
+    let require_admin = middleware::from_fn_with_state(api_state.clone(), require_harvest_admin);
+
     Router::new()
         .route("/workflows", get(list_workflows))
         .route(
@@ -1179,7 +1209,10 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .route("/workflows/{id}/children", get(list_workflow_children))
         .route("/workflows/{id}/stack", get(get_workflow_stack))
         .route("/workflows/{workflow_name}/start", post(start_workflow))
-        .route("/workflows/{id}/cancel", post(cancel_workflow))
+        .route(
+            "/workflows/{id}/cancel",
+            post(cancel_workflow).route_layer(require_admin.clone()),
+        )
         .route("/workflows/{id}/reset", post(reset_workflow))
         .route(
             "/workflows/{id}/signal/{signal_name}",
@@ -1196,16 +1229,22 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .route("/dags/{dag_name}/runs", get(list_dag_runs))
         .route("/dags/{dag_name}/trigger", post(trigger_dag_run))
         .route("/dags/{dag_name}", patch(patch_dag))
-        .route("/dead-letters", get(list_dead_letters))
+        .route(
+            "/dead-letters",
+            get(list_dead_letters).route_layer(require_admin.clone()),
+        )
         .route(
             "/dead-letters/replay",
-            post(bulk_replay_dead_letters_handler),
+            post(bulk_replay_dead_letters_handler).route_layer(require_admin.clone()),
         )
         .route(
             "/dead-letters/discard",
-            post(bulk_discard_dead_letters_handler),
+            post(bulk_discard_dead_letters_handler).route_layer(require_admin.clone()),
         )
-        .route("/dead-letters/{id}/replay", post(replay_dead_letter))
+        .route(
+            "/dead-letters/{id}/replay",
+            post(replay_dead_letter).route_layer(require_admin.clone()),
+        )
         .route("/health", get(health))
         .route("/admin/preflight", get(preflight))
         .route("/admin/shards/health", get(shards_health))
@@ -1258,12 +1297,41 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         // terminate / signal so an incident commander does not have to script
         // a one-off loop over GET /workflows.
         .route("/batch-operations", get(list_batch_operations))
-        .route("/batch-operations", post(submit_batch_operation))
+        .route(
+            "/batch-operations",
+            post(submit_batch_operation).route_layer(require_admin),
+        )
         .route("/batch-operations/{id}", get(get_batch_operation))
         // Audit trail (issue #158): read-only endpoint to query management
         // API mutations. See `audit::ALL_MUTATION_ROUTES` for covered paths.
         .route("/admin/audit", get(list_audit_records))
         .layer(Extension(api_state))
+}
+
+pub(crate) async fn require_harvest_admin(
+    State(api_state): State<HarvestApiState>,
+    request: axum::extract::Request,
+    next: Next,
+) -> axum::response::Response {
+    let session = request.extensions().get::<Session>().cloned();
+    if has_harvest_admin_access(&api_state, session).await {
+        next.run(request).await
+    } else {
+        AutumnError::unauthorized_msg("authentication required").into_response()
+    }
+}
+
+async fn has_harvest_admin_access(api_state: &HarvestApiState, session: Option<Session>) -> bool {
+    if api_state.admin_auth_boundary() {
+        return true;
+    }
+
+    let session_key = api_state.admin_auth_session_key();
+    if let Some(session) = session {
+        session.contains_key(&session_key).await
+    } else {
+        false
+    }
 }
 
 /// Canonical `(METHOD, path-template)` list for every route in `harvest_api_router`.
@@ -3341,10 +3409,20 @@ async fn get_workflow_stack(
 async fn start_workflow(
     Extension(api_state): Extension<HarvestApiState>,
     Path(workflow_name): Path<String>,
+    maybe_session: Option<Extension<Session>>,
     headers: axum::http::HeaderMap,
     Json(request): Json<StartWorkflowRequest>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse as _;
+
+    if matches!(
+        request.reuse_policy.as_deref(),
+        Some("terminate_if_running")
+    ) && !has_harvest_admin_access(&api_state, maybe_session.map(|Extension(session)| session))
+        .await
+    {
+        return AutumnError::unauthorized_msg("authentication required").into_response();
+    }
 
     let runtime = match api_state.runtime() {
         Ok(r) => r,
