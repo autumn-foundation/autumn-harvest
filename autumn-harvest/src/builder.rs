@@ -839,6 +839,12 @@ pub struct WorkerConfig {
     /// Optional human-readable deployment name for operator observability
     /// (issue #171), e.g. `"prod-blue"` or `"canary"`.
     pub deployment_name: Option<String>,
+    /// Per-query execution timeout (issue #234).
+    ///
+    /// When a query handler takes longer than this to complete, the engine
+    /// terminates the handler and returns [`HarvestError::QueryTimedOut`] to
+    /// the caller. Defaults to **5 seconds**.
+    pub query_timeout: Duration,
 }
 
 impl Default for WorkerConfig {
@@ -857,6 +863,7 @@ impl Default for WorkerConfig {
             worker_heartbeat_interval: Duration::from_secs(5),
             build_id: String::new(),
             deployment_name: None,
+            query_timeout: Duration::from_secs(5),
         }
     }
 }
@@ -942,6 +949,17 @@ impl WorkerConfig {
     #[must_use]
     pub fn with_deployment_name(mut self, name: impl Into<String>) -> Self {
         self.deployment_name = Some(name.into());
+        self
+    }
+
+    /// Override the per-query execution timeout (default 5 s, issue #234).
+    ///
+    /// When a query handler takes longer than this to complete, the engine
+    /// terminates the handler and returns [`crate::error::HarvestError::QueryTimedOut`]
+    /// to the caller.
+    #[must_use]
+    pub const fn with_query_timeout(mut self, timeout: Duration) -> Self {
+        self.query_timeout = timeout;
         self
     }
 }

@@ -102,6 +102,13 @@ pub const METRIC_SCHEDULE_SKIPPED: &str = "harvest.schedule.skipped";
 /// Counter: number of rows deleted by the retention janitor in one tick.
 pub const METRIC_RETENTION_DELETED: &str = "harvest.retention.deleted";
 
+/// Histogram: wall-clock latency of query handler invocations (seconds).
+///
+/// Labelled with `query.name` (low-cardinality handler name registered by the
+/// workflow author). Per ADR-0001 cardinality rule, `execution.id` stays
+/// span-only and is never a metric label.
+pub const METRIC_QUERY_DURATION: &str = "harvest.query.duration";
+
 // ---------------------------------------------------------------------------
 // Metric label key constants
 // Used by MetricsRecorder implementations to avoid string literals at call
@@ -507,6 +514,21 @@ pub trait MetricsRecorder: Send + Sync {
     /// Maps to the metric `harvest_schedule_skipped_total{kind, name, reason}`.
     fn record_schedule_skipped(&self, kind: &str, name: &str, reason: &str) {
         let _ = (kind, name, reason);
+    }
+
+    /// A query handler invocation completed (issue #234).
+    ///
+    /// `query_name` is the handler name registered via `register_query` /
+    /// `register_query_handler`. Per ADR-0001 cardinality rule, `execution.id`
+    /// stays span-only — it must never appear as a metric label here.
+    ///
+    /// `duration_secs` is the wall-clock time from invocation start to the
+    /// handler returning (or being timed out). `success` is `true` when the
+    /// handler returned `Ok`, `false` on `Err` or timeout.
+    ///
+    /// Maps to the histogram `harvest.query.duration{query.name, status}`.
+    fn record_query_completed(&self, query_name: &str, duration_secs: f64, success: bool) {
+        let _ = (query_name, duration_secs, success);
     }
 }
 

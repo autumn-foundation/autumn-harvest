@@ -263,6 +263,8 @@ fn start_harvest_runtime(
     // Mirror the configured shutdown timeout so drain requests can compute a
     // sensible default deadline without the caller having to supply one.
     api_state.set_worker_shutdown_timeout(built.worker_config().shutdown_timeout);
+    // Propagate the per-query timeout from WorkerConfig (issue #234).
+    api_state.set_query_timeout(built.worker_config().query_timeout);
 
     // Apply the api_state audit retention override only when explicitly set,
     // so that builder-level retention config is not silently clobbered.

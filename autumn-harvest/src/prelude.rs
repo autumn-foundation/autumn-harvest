@@ -34,4 +34,4 @@ pub use crate::types::{
 };
 
 // Re-export macros from autumn-harvest-macros.
-pub use autumn_harvest_macros::{activities, activity, dag, dags, workflow, workflows};
+pub use autumn_harvest_macros::{activities, activity, dag, dags, query, workflow, workflows};

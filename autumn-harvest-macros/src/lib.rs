@@ -8,6 +8,7 @@ use proc_macro::TokenStream;
 mod activity;
 mod collect;
 mod dag;
+mod query;
 mod workflow;
 
 /// Marks an async function as a Harvest workflow.
@@ -73,4 +74,32 @@ pub fn activities(input: TokenStream) -> TokenStream {
 #[proc_macro]
 pub fn dags(input: TokenStream) -> TokenStream {
     collect::dags_macro(input.into()).into()
+}
+
+/// Marks a function as a read-only Harvest query handler (issue #234).
+///
+/// This attribute is a **documentation and tooling marker** — it validates that
+/// the annotated item is a function but otherwise passes it through unchanged.
+/// Register the function with [`WorkflowContext::register_query_handler`] inside
+/// the workflow body.
+///
+/// # Example
+///
+/// ```ignore
+/// use autumn_harvest::prelude::*;
+///
+/// #[derive(serde::Deserialize)]
+/// struct ProgressQuery { include_details: bool }
+///
+/// #[derive(serde::Serialize)]
+/// struct ProgressResponse { processed: u32 }
+///
+/// #[query]
+/// fn progress_query(req: &ProgressQuery, count: u32) -> Result<ProgressResponse, String> {
+///     Ok(ProgressResponse { processed: count })
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn query(attr: TokenStream, item: TokenStream) -> TokenStream {
+    query::query_macro(attr.into(), item.into()).into()
 }
