@@ -43,6 +43,35 @@ pub fn spawn_heartbeat_flusher(
     tx
 }
 
+fn drain_heartbeats(rx: &mut mpsc::Receiver<Value>) -> Option<Value> {
+    let mut latest: Option<Value> = None;
+    while let Ok(payload) = rx.try_recv() {
+        latest = Some(payload);
+    }
+    latest
+}
+
+async fn flush_heartbeat(task_id: Uuid, pool: &Pool<AsyncPgConnection>, payload: Value) {
+    match pool.get().await {
+        Ok(mut conn) => {
+            if let Err(e) = crate::queue::record_heartbeat(&mut conn, task_id, payload).await {
+                tracing::warn!(
+                    task_id = %task_id,
+                    error = %e,
+                    "failed to flush heartbeat to database"
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                task_id = %task_id,
+                error = %e,
+                "failed to acquire DB connection for heartbeat flush"
+            );
+        }
+    }
+}
+
 /// The main heartbeat flushing loop.
 async fn heartbeat_loop(
     task_id: Uuid,
@@ -65,33 +94,8 @@ async fn heartbeat_loop(
         }
 
         // Drain all pending heartbeats, keeping only the most recent.
-        let mut latest: Option<Value> = None;
-        while let Ok(payload) = rx.try_recv() {
-            latest = Some(payload);
-        }
-
-        // If we got at least one heartbeat, flush to DB.
-        if let Some(payload) = latest {
-            match pool.get().await {
-                Ok(mut conn) => {
-                    if let Err(e) =
-                        crate::queue::record_heartbeat(&mut conn, task_id, payload).await
-                    {
-                        tracing::warn!(
-                            task_id = %task_id,
-                            error = %e,
-                            "failed to flush heartbeat to database"
-                        );
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        task_id = %task_id,
-                        error = %e,
-                        "failed to acquire DB connection for heartbeat flush"
-                    );
-                }
-            }
+        if let Some(payload) = drain_heartbeats(&mut rx) {
+            flush_heartbeat(task_id, &pool, payload).await;
         }
 
         // Check cancellation after flush.
