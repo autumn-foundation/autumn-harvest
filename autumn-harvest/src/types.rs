@@ -699,8 +699,10 @@ impl IdempotencyKey {
     #[must_use]
     pub fn subkey(&self, name: &str) -> Self {
         assert!(
-            !name.is_empty() && name.bytes().all(|b| b > b' ' && b < b'\x7f' && b != b'/'),
-            "IdempotencyKey::subkey: name must be non-empty printable ASCII without '/'; got {name:?}"
+            !name.is_empty()
+                && name.len() <= 255
+                && name.bytes().all(|b| b > b' ' && b < b'\x7f' && b != b'/'),
+            "IdempotencyKey::subkey: name must be non-empty printable ASCII without '/' and max 255 bytes; got {name:?}"
         );
         Self {
             base: format!("{}/{name}", self.base),
@@ -922,5 +924,25 @@ mod tests {
         let json = serde_json::to_string(&n).unwrap();
         let back: DeploymentName = serde_json::from_str(&json).unwrap();
         assert_eq!(n, back);
+    }
+}
+
+#[cfg(test)]
+mod test_havoc {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn attack_idempotency_key_subkey_length(s in "a{256, 1000}") {
+            let id = ActivityExecId::new();
+            let key = IdempotencyKey::from_activity_exec_id(id);
+            // Chaos mode: Attack with large strings that SHOULD cause the new panic
+            // assert we just put in place (since we added a length limit of 255).
+            let result = std::panic::catch_unwind(|| {
+                let _ = key.subkey(&s);
+            });
+            assert!(result.is_err(), "Havoc: system accepted too long subkey");
+        }
     }
 }
