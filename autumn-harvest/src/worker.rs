@@ -100,6 +100,9 @@ pub struct WorkerRuntimeConfig {
     pub build_id: String,
     /// Optional deployment name for operator observability (issue #171).
     pub deployment_name: Option<String>,
+    /// Maximum number of entries in the per-worker in-process LRU workflow
+    /// state cache (issue #235). Defaults to 1000.
+    pub workflow_cache_size: usize,
 }
 
 impl WorkerRuntimeConfig {
@@ -135,6 +138,7 @@ impl From<WorkerConfig> for WorkerRuntimeConfig {
             worker_heartbeat_interval: cfg.worker_heartbeat_interval,
             build_id: cfg.build_id,
             deployment_name: cfg.deployment_name,
+            workflow_cache_size: cfg.workflow_cache_size,
         }
     }
 }
@@ -400,6 +404,10 @@ struct PreparedWorkflowTask {
     next_event_id: i32,
     timers_fired: Vec<TimerId>,
     signals_delivered: Vec<String>,
+    /// `true` if the event history was served from the in-process LRU cache
+    /// (only delta events were loaded from Postgres); `false` if the full
+    /// history was loaded cold.
+    was_cache_hit: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2767,10 +2775,23 @@ async fn load_workflow_replay_state(
     Ok((final_history, timers_fired, signals_delivered))
 }
 
-async fn prepare_workflow_task(
+/// Prepare the workflow task, checking the in-process LRU cache first.
+///
+/// On a cache **hit** the worker already holds the event history snapshot from
+/// the previous suspension in its local `WorkflowCache`.  Only delta events
+/// (timer firings and signals appended since the last suspension) are loaded
+/// from Postgres, and the full history is reconstructed as
+/// `cached_events + delta_events`.  This cuts Postgres event-store reads from
+/// `O(history_size)` to `O(new_events)` on warm executions.
+///
+/// On a cache **miss** (first task, evicted entry, or cache disabled when
+/// `sticky_timeout == 0`) the function falls back to the full `load_history`
+/// path.
+async fn prepare_workflow_task_with_cache(
     conn: &mut AsyncPgConnection,
     task: &TaskQueueItem,
     worker_id: &str,
+    workflow_cache: &tokio::sync::Mutex<crate::cache::WorkflowCache>,
 ) -> HarvestResult<PreparedWorkflowTask> {
     let Some(exec_uuid) = task.workflow_exec_id else {
         let error = HarvestError::Config("workflow task missing workflow_exec_id".into());
@@ -2778,18 +2799,69 @@ async fn prepare_workflow_task(
         return Err(error);
     };
     let exec_id = execution_id_from_uuid(exec_uuid);
-    let execution = load_task_execution(conn, task, exec_id).await?;
-    let (history, timers_fired, signals_delivered) =
-        load_workflow_replay_state(conn, task, worker_id, exec_id).await?;
 
-    Ok(PreparedWorkflowTask {
-        execution,
-        exec_id,
-        history_events: history.events,
-        next_event_id: history.next_event_id,
-        timers_fired,
-        signals_delivered,
-    })
+    // Brief lock to check cache without holding it during DB work.
+    let cached = {
+        let mut guard = workflow_cache.lock().await;
+        guard.get(&exec_uuid).cloned()
+    };
+
+    let execution = load_task_execution(conn, task, exec_id).await?;
+
+    if let Some(ref cached_state) = cached {
+        // Cache hit path: ingest timers/signals then load only delta events.
+        let timers_result =
+            ingest_fired_timers(conn, exec_id, cached_state.next_event_id).await;
+        let timers_fired =
+            fail_execution_on_error(conn, task, worker_id, timers_result).await?;
+
+        // Load events appended by timer ingestion.
+        let after_timers_result =
+            store::load_history_since(conn, exec_id, cached_state.next_event_id).await;
+        let after_timers =
+            fail_execution_on_error(conn, task, worker_id, after_timers_result).await?;
+
+        let signals_result =
+            ingest_pending_signals(conn, exec_id, after_timers.next_event_id).await;
+        let signals_delivered =
+            fail_execution_on_error(conn, task, worker_id, signals_result).await?;
+
+        // Load events appended by signal ingestion.
+        let after_signals_result =
+            store::load_history_since(conn, exec_id, after_timers.next_event_id).await;
+        let after_signals =
+            fail_execution_on_error(conn, task, worker_id, after_signals_result).await?;
+
+        // Reconstruct full history: cached snapshot + delta.
+        let mut history_events = cached_state.events.clone();
+        history_events.extend(after_timers.events);
+        history_events.extend(after_signals.events);
+        let next_event_id = after_signals.next_event_id;
+
+        Ok(PreparedWorkflowTask {
+            execution,
+            exec_id,
+            history_events,
+            next_event_id,
+            timers_fired,
+            signals_delivered,
+            was_cache_hit: true,
+        })
+    } else {
+        // Cache miss path: full history load.
+        let (history, timers_fired, signals_delivered) =
+            load_workflow_replay_state(conn, task, worker_id, exec_id).await?;
+
+        Ok(PreparedWorkflowTask {
+            execution,
+            exec_id,
+            history_events: history.events,
+            next_event_id: history.next_event_id,
+            timers_fired,
+            signals_delivered,
+            was_cache_hit: false,
+        })
+    }
 }
 
 /// Atomically seal the current execution as `CONTINUED_AS_NEW` and start a
@@ -3185,8 +3257,10 @@ async fn process_workflow_task(
     worker_id: &str,
     sticky_timeout: Duration,
     max_local_activity_start_to_close: Duration,
+    workflow_cache: Arc<tokio::sync::Mutex<crate::cache::WorkflowCache>>,
 ) -> HarvestResult<()> {
-    let mut prepared = prepare_workflow_task(conn, task, worker_id).await?;
+    let mut prepared =
+        prepare_workflow_task_with_cache(conn, task, worker_id, &workflow_cache).await?;
     let Some(workflow) = registry.workflows.get(&prepared.execution.workflow_name) else {
         let error = format!(
             "no workflow handler registered for '{}'",
@@ -3197,6 +3271,18 @@ async fn process_workflow_task(
     };
 
     let telemetry = registry.telemetry().clone();
+
+    // Emit cache hit/miss metric now that we know the workflow name.
+    if prepared.was_cache_hit {
+        telemetry
+            .metrics
+            .record_workflow_cache_hit(&prepared.execution.workflow_name, &task.queue_name);
+    } else {
+        telemetry
+            .metrics
+            .record_workflow_cache_miss(&prepared.execution.workflow_name, &task.queue_name);
+    }
+
     let trace_carrier = task
         .trace_context
         .as_ref()
@@ -3465,6 +3551,31 @@ async fn process_workflow_task(
         );
     }
 
+    // Update the in-process LRU cache based on outcome before persisting the
+    // DB changes.  A Suspended outcome refreshes the cache entry so the next
+    // task for this execution can use a delta load; terminal outcomes evict the
+    // entry so it does not consume cache capacity after the execution ends.
+    {
+        let exec_uuid = prepared.exec_id.as_uuid();
+        let mut guard = workflow_cache.lock().await;
+        match &outcome {
+            WorkflowOutcome::Suspended { .. } => {
+                guard.insert(
+                    exec_uuid,
+                    crate::cache::CachedWorkflowState {
+                        events: history_events.clone(),
+                        next_event_id,
+                    },
+                );
+            }
+            WorkflowOutcome::Completed { .. }
+            | WorkflowOutcome::Failed { .. }
+            | WorkflowOutcome::ContinuedAsNew { .. } => {
+                guard.remove(&exec_uuid);
+            }
+        }
+    }
+
     persist_workflow_outcome(
         conn,
         registry,
@@ -3484,6 +3595,7 @@ async fn process_workflow_task(
     // spans have been emitted as its children.
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn process_task(
     pool: &DbPool,
     registry: Arc<HandlerRegistry>,
@@ -3492,6 +3604,7 @@ async fn process_task(
     cancellation_grace_period: Duration,
     sticky_timeout: Duration,
     max_local_activity_start_to_close: Duration,
+    workflow_cache: Arc<tokio::sync::Mutex<crate::cache::WorkflowCache>>,
 ) -> HarvestResult<()> {
     let mut conn = pool.get().await.map_err(crate::error::database_error)?;
 
@@ -3504,6 +3617,7 @@ async fn process_task(
                 worker_id,
                 sticky_timeout,
                 max_local_activity_start_to_close,
+                workflow_cache,
             )
             .await
         }
@@ -3723,6 +3837,13 @@ pub struct Worker {
     /// `drain_deadline_at` so that `drain_in_flight` can honour an extended
     /// window even after it has already started waiting.
     remote_drain_deadline: Arc<Mutex<Option<std::time::Instant>>>,
+    /// Per-worker in-process LRU cache for suspended workflow event histories.
+    ///
+    /// Populated after each suspension; consulted at the start of each workflow
+    /// task to decide whether a delta load or a full history load is needed.
+    /// Wrapped in `Arc<tokio::sync::Mutex<_>>` so it can be shared across
+    /// concurrently-running task handler futures without cloning the events.
+    workflow_cache: Arc<tokio::sync::Mutex<crate::cache::WorkflowCache>>,
 }
 
 struct WorkerMonitoringHandles {
@@ -3743,6 +3864,9 @@ impl Worker {
 
         let workflow_semaphore = Arc::new(Semaphore::new(config.max_concurrent_workflows));
         let activity_semaphore = Arc::new(Semaphore::new(config.max_concurrent_activities));
+        let workflow_cache = Arc::new(tokio::sync::Mutex::new(
+            crate::cache::WorkflowCache::new(config.workflow_cache_size),
+        ));
 
         Ok(Self {
             config,
@@ -3751,6 +3875,7 @@ impl Worker {
             activity_semaphore,
             shutdown: CancellationToken::new(),
             remote_drain_deadline: Arc::new(Mutex::new(None)),
+            workflow_cache,
         })
     }
 
@@ -4160,6 +4285,7 @@ impl Worker {
         let cancellation_grace_period = self.config.cancellation_grace_period;
         let sticky_timeout = self.config.sticky_timeout;
         let max_local_activity_start_to_close = self.config.max_local_activity_start_to_close;
+        let workflow_cache = Arc::clone(&self.workflow_cache);
 
         tokio::spawn(async move {
             // Acquire semaphore permit — blocks if at concurrency limit.
@@ -4183,6 +4309,7 @@ impl Worker {
                 cancellation_grace_period,
                 sticky_timeout,
                 max_local_activity_start_to_close,
+                workflow_cache,
             )
             .await
             {
@@ -4306,6 +4433,7 @@ mod tests {
             worker_heartbeat_interval: Duration::from_secs(5),
             build_id: String::new(),
             deployment_name: None,
+            workflow_cache_size: 1000,
         }
     }
 

@@ -788,6 +788,37 @@ fn validate_local_activity_timeouts(
     Ok(())
 }
 
+/// Configuration for sticky cross-worker routing (issue #235).
+///
+/// Sticky routing keeps follow-up tasks for a workflow execution on the worker
+/// that already has that execution's event history in its in-process LRU cache,
+/// reducing cold event-history reloads from Postgres.
+///
+/// Sticky routing is **off by default**. Enable it via
+/// [`WorkerConfig::with_sticky_routing`].
+///
+/// ## Trade-offs
+///
+/// | Parameter | Short TTL | Long TTL |
+/// |-----------|-----------|----------|
+/// | Cache hit rate | Lower (sticky window may expire before follow-up arrives) | Higher |
+/// | Failover latency | Fast (expired window → any eligible worker claims) | Slower |
+/// | Load distribution | Better (sticky windows expire quickly) | Skewed toward hot workers |
+///
+/// A 5–30 second `lease_ttl` is a reasonable starting point for most
+/// deployments. See `docs/sticky-routing.md` for the full operator guide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StickyRoutingConfig {
+    /// How long to prefer the owning worker for follow-up tasks after a
+    /// workflow suspends.
+    ///
+    /// The task queue will offer tasks whose workflow has an active,
+    /// unexpired sticky lease to the owning worker before any other eligible
+    /// worker can claim them. Once the window elapses the task becomes
+    /// claimable by any eligible worker (safe failover).
+    pub lease_ttl: Duration,
+}
+
 /// Worker concurrency and queue configuration.
 #[derive(Debug, Clone)]
 pub struct WorkerConfig {
@@ -856,7 +887,7 @@ impl Default for WorkerConfig {
             max_concurrent_activities: 50,
             shutdown_timeout: Duration::from_secs(30),
             workflow_cache_size: 1000,
-            sticky_timeout: Duration::from_secs(5),
+            sticky_timeout: Duration::ZERO,
             cancellation_grace_period: Duration::from_secs(5),
             shard_assignments: vec![ShardId::new(0)],
             max_local_activity_start_to_close: Duration::from_secs(60),
@@ -960,6 +991,39 @@ impl WorkerConfig {
     #[must_use]
     pub const fn with_query_timeout(mut self, timeout: Duration) -> Self {
         self.query_timeout = timeout;
+        self
+    }
+
+    /// Enable sticky cross-worker routing (issue #235).
+    ///
+    /// Sticky routing is **off by default**. When enabled, each time a workflow
+    /// suspends the task queue records a soft affinity lease pointing at the
+    /// current worker. Subsequent tasks for that execution are offered to the
+    /// owning worker first so its in-process LRU cache stays warm, reducing
+    /// full event-history reloads from Postgres.
+    ///
+    /// When the lease expires (after `config.lease_ttl`) or the owning worker
+    /// is unhealthy / draining, the task becomes claimable by any eligible
+    /// worker — sticky routing never blocks progress.
+    ///
+    /// See `docs/sticky-routing.md` for the full operator guide including
+    /// the lease-TTL trade-off and interaction with shard assignments and
+    /// build-id routing.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use autumn_harvest::builder::{StickyRoutingConfig, WorkerConfig};
+    /// use std::time::Duration;
+    ///
+    /// let config = WorkerConfig::default()
+    ///     .with_sticky_routing(StickyRoutingConfig {
+    ///         lease_ttl: Duration::from_secs(10),
+    ///     });
+    /// ```
+    #[must_use]
+    pub const fn with_sticky_routing(mut self, config: StickyRoutingConfig) -> Self {
+        self.sticky_timeout = config.lease_ttl;
         self
     }
 }

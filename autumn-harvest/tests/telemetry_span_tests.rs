@@ -311,6 +311,7 @@ fn all_adr_0001_span_kinds_are_emitted() {
                         worker_heartbeat_interval: Duration::from_secs(5),
                         build_id: String::new(),
                         deployment_name: None,
+                workflow_cache_size: 1000,
                     },
                     registry,
                 )

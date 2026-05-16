@@ -351,6 +351,54 @@ pub async fn load_history_with_codecs(
     })
 }
 
+/// Load only events appended since a known event-id cursor.
+///
+/// Returns events where `event_id >= from_event_id`, ordered by `event_id ASC`.
+/// When the result is empty (no new events), `next_event_id` is set to
+/// `from_event_id` so callers can use it as the baseline for the next ingestion.
+///
+/// This is the delta-load companion to [`load_history`]: the worker calls this
+/// on cache hits to fetch only the timer-fire / signal events appended since
+/// the last suspension, and prepends the cached event snapshot to reconstruct
+/// the full history without reading old events from Postgres.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+#[cfg(feature = "db")]
+pub async fn load_history_since(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    from_event_id: i32,
+) -> HarvestResult<EventHistory> {
+    use crate::models::HarvestEvent;
+
+    let rows: Vec<HarvestEvent> = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
+        .filter(harvest_events::event_id.ge(from_event_id))
+        .order(harvest_events::event_id.asc())
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    let next_event_id = rows
+        .last()
+        .map_or(from_event_id, |r| r.event_id.saturating_add(1));
+
+    let events = rows
+        .into_iter()
+        .map(|row| {
+            crate::payload_codec::PayloadCodecs::default().decode_event(row.event_data)
+        })
+        .collect::<Result<Vec<WorkflowEvent>, _>>()?;
+
+    Ok(EventHistory {
+        exec_id,
+        events,
+        next_event_id,
+    })
+}
+
 /// Load the direct children of `parent_id` from one shard.
 ///
 /// Callers that need cross-shard discovery should call this once per shard and

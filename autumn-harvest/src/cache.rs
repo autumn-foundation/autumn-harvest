@@ -1,11 +1,20 @@
 //! LRU cache for suspended workflow states.
 //!
-//! When a workflow suspends, its replay position and sequence counters are
-//! cached so that subsequent replay attempts can skip already-processed events.
-//! This avoids re-replaying the entire history from scratch on every wake-up.
+//! When a workflow suspends, its full event history and the next DB event-id
+//! are cached keyed by execution UUID. On the next task for that execution, the
+//! worker fetches only *delta* events (new timer firings and signals appended
+//! since the last suspension) and prepends the cached snapshot, avoiding a full
+//! history reload from Postgres.
 //!
-//! The cache uses a fixed maximum size with LRU eviction -- when the cache is
-//! full, the least-recently-used entry is evicted to make room.
+//! This is the in-process companion to the Postgres-level sticky routing
+//! mechanism: sticky routing keeps follow-up tasks on the owning worker
+//! (issue #235); this cache ensures that when a task does land on the
+//! owning worker the benefit is a cheap delta load rather than a full load.
+//!
+//! The cache uses a fixed maximum size with LRU eviction — when the cache is
+//! full, the least-recently-used entry is evicted. Evicted entries cause the
+//! next task to fall back to a full history load (cold path), which is always
+//! correct — it is just slower.
 //!
 //! This module is pure data structure logic and does NOT require the `db` feature.
 
@@ -13,18 +22,27 @@ use lru::LruCache;
 use std::num::NonZeroUsize;
 use uuid::Uuid;
 
+use crate::event::WorkflowEvent;
+
 /// Cached state for a suspended workflow execution.
 ///
-/// Stores the replay cursor position and sequence counters so that
-/// subsequent replay attempts can fast-forward past already-processed events.
+/// The worker inserts an entry here after each suspension and uses it on the
+/// next task for the same execution to avoid a full history reload.
 #[derive(Debug, Clone)]
 pub struct CachedWorkflowState {
-    /// Number of events already processed in the history.
-    pub replay_position: usize,
-    /// Next activity sequence number to assign.
-    pub next_activity_seq: u32,
-    /// Next timer sequence number to assign.
-    pub next_timer_seq: u32,
+    /// All events present in the history at the point of the last suspension.
+    ///
+    /// On a cache hit the worker fetches only events with
+    /// `event_id >= next_event_id` (the delta since the last suspension),
+    /// then prepends this snapshot to reconstruct the full history for the
+    /// executor without reading the old events from Postgres again.
+    pub events: Vec<WorkflowEvent>,
+
+    /// The `next_event_id` at the time of the last suspension.
+    ///
+    /// Delta queries use `WHERE event_id >= next_event_id` to load only the
+    /// events appended after the last suspension (timer firings, signals).
+    pub next_event_id: i32,
 }
 
 /// LRU cache mapping workflow execution IDs to their cached replay state.
@@ -76,7 +94,7 @@ impl WorkflowCache {
     /// use autumn_harvest::cache::{WorkflowCache, CachedWorkflowState};
     ///
     /// let mut cache = WorkflowCache::new(10);
-    /// let state = CachedWorkflowState { replay_position: 1, next_activity_seq: 1, next_timer_seq: 1 };
+    /// let state = CachedWorkflowState { events: vec![], next_event_id: 10 };
     /// cache.insert(Uuid::new_v4(), state);
     /// ```
     pub fn insert(&mut self, exec_id: Uuid, state: CachedWorkflowState) {
@@ -165,11 +183,10 @@ impl std::fmt::Debug for WorkflowCache {
 mod tests {
     use super::*;
 
-    fn make_state(pos: usize) -> CachedWorkflowState {
+    fn make_state(next_event_id: i32) -> CachedWorkflowState {
         CachedWorkflowState {
-            replay_position: pos,
-            next_activity_seq: 0,
-            next_timer_seq: 0,
+            events: vec![],
+            next_event_id,
         }
     }
 
@@ -178,17 +195,15 @@ mod tests {
         let mut cache = WorkflowCache::new(10);
         let id = Uuid::new_v4();
         let state = CachedWorkflowState {
-            replay_position: 5,
-            next_activity_seq: 3,
-            next_timer_seq: 1,
+            events: vec![],
+            next_event_id: 5,
         };
 
         cache.insert(id, state);
 
         let retrieved = cache.get(&id).expect("should find cached state");
-        assert_eq!(retrieved.replay_position, 5);
-        assert_eq!(retrieved.next_activity_seq, 3);
-        assert_eq!(retrieved.next_timer_seq, 1);
+        assert_eq!(retrieved.next_event_id, 5);
+        assert!(retrieved.events.is_empty());
 
         assert_eq!(cache.len(), 1);
         assert!(!cache.is_empty());
@@ -225,7 +240,7 @@ mod tests {
         assert_eq!(
             removed
                 .expect("removed entry should not be None")
-                .replay_position,
+                .next_event_id,
             10
         );
         assert!(cache.is_empty());
@@ -275,5 +290,26 @@ mod tests {
             "id2 should have been evicted (LRU)"
         );
         assert!(cache.get(&id3).is_some(), "id3 should be present");
+    }
+
+    #[test]
+    fn cached_state_stores_events_and_next_event_id() {
+        use crate::event::WorkflowEvent;
+        use chrono::Utc;
+        let mut cache = WorkflowCache::new(5);
+        let id = Uuid::new_v4();
+
+        let state = CachedWorkflowState {
+            events: vec![WorkflowEvent::WorkflowStarted {
+                input: serde_json::Value::Null,
+                timestamp: Utc::now(),
+            }],
+            next_event_id: 42,
+        };
+        cache.insert(id, state);
+
+        let retrieved = cache.get(&id).expect("should be present");
+        assert_eq!(retrieved.next_event_id, 42);
+        assert_eq!(retrieved.events.len(), 1);
     }
 }

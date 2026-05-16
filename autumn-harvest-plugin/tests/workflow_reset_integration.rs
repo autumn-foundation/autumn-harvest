@@ -134,6 +134,7 @@ fn build_reset_worker(registry: Arc<HandlerRegistry>) -> Arc<Worker> {
                 worker_heartbeat_interval: Duration::from_secs(5),
                 build_id: String::new(),
                 deployment_name: None,
+                workflow_cache_size: 1000,
             },
             registry,
         )
