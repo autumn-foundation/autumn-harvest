@@ -1299,7 +1299,7 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .route("/batch-operations", get(list_batch_operations))
         .route(
             "/batch-operations",
-            post(submit_batch_operation).route_layer(require_admin.clone()),
+            post(submit_batch_operation).route_layer(require_admin),
         )
         .route("/batch-operations/{id}", get(get_batch_operation))
         // Audit trail (issue #158): read-only endpoint to query management
