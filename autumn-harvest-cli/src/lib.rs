@@ -2972,7 +2972,7 @@ fn parse_json_source(
 fn read_json_file(path: &Path, label: &'static str) -> Result<String, CliError> {
     if path == Path::new("-") {
         let mut input = String::new();
-        std::io::stdin()
+        std::io::Read::take(std::io::stdin().lock(), 10 * 1024 * 1024)
             .read_to_string(&mut input)
             .map_err(|source| CliError::ReadJson {
                 label,
