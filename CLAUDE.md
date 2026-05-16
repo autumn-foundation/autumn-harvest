@@ -39,6 +39,7 @@ autumn-harvest/          <- workspace root (this file lives here)
       integration_e2e.rs <- testcontainers integration tests
       replay_tests.rs    <- replay engine integration tests
       build_routing_tests.rs <- build-id routing unit + integration tests
+      sticky_routing_tests.rs <- sticky routing unit + integration tests (issue #235)
       macros_*.rs        <- proc-macro integration tests
   autumn-harvest-macros/ <- proc-macro crate
     src/
@@ -61,7 +62,8 @@ Two crates in the workspace. `autumn-harvest` is the public library. `autumn-har
 - **Phase 3.8** (implemented): Starter production alert pack and runbooks (`docs/alerts/starter-pack-v0.1.0.json`, `docs/alerts/README.md`, `docs/runbooks/harvest-alerts.md`, `docs/runbooks/synthetic-incident-drills.md`) compose ADR-0001/#138 metrics with preflight, worker health, shard health, schedules, DLQ, retention, workflow stack, and build-routing signals. Thresholds are starter defaults, not universal SLOs.
 - **Phase 3.9** (implemented): Unified DAG execution (`unified-dag-execution` feature, on by default) — see issue #256. `#[dag]` lowers graph definitions onto the standard workflow execution path: the macro emits a `WorkflowHandlerFn` that walks `DagDefinition` level by level and dispatches activities through `ctx.execute_activity_raw`. `HarvestBuilder::dags()` auto-registers `WorkflowInfo` (and `WorkflowSchedule` when a schedule attribute is present) for each unified DAG. `POST /dags/{name}/trigger` routes through `trigger_unified_dag` → `start_or_load_workflow_execution` when the dag is in `registry.workflows`. `compile_dag_catalog` skips unified DAGs so the classic DAG executor never claims them. Classic DAGs (explicit `workflow_handler: None`) still work unchanged. `harvest_dag_runs` remains write-only for bridge observability during this transition.
 - **Phase 3.10** (implemented): Read-only Query handlers (`query.rs`, `QueryRegistry`, `WorkflowContext::register_query_handler<Req,Resp>`, `execute_query_with_args`, `list_query_names`; `WorkerConfig::query_timeout` default 5 s; `telemetry::METRIC_QUERY_DURATION`; `#[query]` macro; management routes `POST /workflows/{id}/query/{name}` and `GET /workflows/{id}/queries`) — see issue #234 and `examples/progress_query.rs`.
-- **Phase 4** (next): production hardening -- cancellation/saga semantics, sharding, sticky cross-worker routing, observability, metrics, dashboard (Vantage UI — Workers tab shipped in issue #142; DLQ, schedules, and DAG visualization pages remain); Step 5 of issue #256 (remove classic DAG executor, drop `harvest_dag_runs`)
+- **Phase 3.11** (implemented): Sticky cross-worker routing and warm-cache delta loading (`StickyRoutingConfig`, `WorkerConfig::with_sticky_routing`; `WorkflowCache` wired into worker hot path; `store::load_history_since` for delta event queries; `METRIC_WORKFLOW_CACHE_HIT` / `METRIC_WORKFLOW_CACHE_MISS` constants + `MetricsRecorder` methods; `CachedWorkflowState` redesigned with `events: Vec<WorkflowEvent>` + `next_event_id: i32` for actual delta-load support; sticky routing off by default) — see issue #235 and `docs/sticky-routing.md` for the operator guide
+- **Phase 4** (next): production hardening -- cancellation/saga semantics, sharding, observability, metrics, dashboard (Vantage UI — Workers tab shipped in issue #142; DLQ, schedules, and DAG visualization pages remain); Step 5 of issue #256 (remove classic DAG executor, drop `harvest_dag_runs`)
 
 ---
 
@@ -163,7 +165,7 @@ Current implementation scope: `ExecutionId`/`ShardId` encoding, `ShardRouter`, `
 | `prelude.rs` | 1 | Core glob re-export surface including macros |
 | `schema.rs` | 1 | Diesel `table!` macros -- 11 tables (includes `harvest_build_policies`, `harvest_build_compat`) |
 | `models.rs` | 1 | `Queryable`/`Selectable` read structs and `Insertable` `New*` write structs for all 11 tables |
-| `store.rs` | 2 | Event store and read helpers: `append_events`, `load_history`, `events_to_rows` with sequential event IDs, `load_workflow_children` for parent -> child operator queries |
+| `store.rs` | 2 | Event store and read helpers: `append_events`, `load_history`, `load_history_since` (delta load for cache-hit path, issue #235), `events_to_rows` with sequential event IDs, `load_workflow_children` for parent -> child operator queries |
 | `replay.rs` | 2 | Deterministic replay engine: `HistoryMatcher` walks event history, detects non-determinism |
 | `executor.rs` | 2 | Workflow executor: `run_workflow` drives replay + live execution, handles suspension |
 | `queue.rs` | 2 | Postgres task queue: `enqueue`, `claim` (FOR UPDATE SKIP LOCKED), `complete`, `fail` |
@@ -172,13 +174,13 @@ Current implementation scope: `ExecutionId`/`ShardId` encoding, `ShardRouter`, `
 | `workers.rs` | 4 | Worker fleet registry: `register_worker`, `heartbeat_worker`, `transition_status`, `list_workers`, `get_worker`, `fleet_health`, `spawn_worker_heartbeat` |
 | `heartbeat.rs` | 2 | Batched heartbeat flusher: debounced channel receiver, last-write-wins timestamp + checkpoint payload DB update |
 | `timeout.rs` | 2 | Timeout enforcement scanner: start-to-close, schedule-to-start, heartbeat timeout queries |
-| `cache.rs` | 2 | LRU workflow state cache: bounded capacity, access-order eviction |
+| `cache.rs` | 2 | LRU workflow state cache: bounded capacity, access-order eviction. `CachedWorkflowState` holds `events: Vec<WorkflowEvent>` + `next_event_id: i32` for delta-load support (issue #235). |
 | `dlq.rs` | 2 | Dead letter queue: `DeadLetterEntry` builder, move-to-DLQ on retry exhaustion |
 | `pool.rs` | 2 | Separate DB pool config: web pool + worker pool with shared ceiling, minimum guarantees |
 | `update.rs` | 3.6 | Update primitive: `UpdateRegistry` (type-erased validators + async handlers), `BoxUpdateHandler`, `BoxUpdateValidator`. `WorkflowContext` methods: `register_update_handler`, `register_update_handler_no_validator`, `validate_update`, `execute_admitted_update`. `HistoryMatcher` methods: `match_update(update_id)`, `drain_admitted_updates()`. Error variants: `HarvestError::UpdateRejected`, `HarvestError::UpdateHandlerNotFound` |
 | `query.rs` | 3.10 | Query registry: `QueryRegistry`, `QueryHandler`. `WorkflowContext` methods: `register_query` (no-arg), `register_query_handler<Req,Resp>` (typed), `execute_query_with_args`, `list_query_names`. Error variants: `QueryHandlerNotFound`, `WorkflowNotRunning`, `QueryHandlerPanicked`, `QueryTimedOut`. `WorkerConfig::query_timeout` (default 5 s). `telemetry::METRIC_QUERY_DURATION` constant. No `WorkflowEvent` variants — queries leave zero footprint in `harvest_events`. |
 | `build_routing.rs` | 3.7 | Worker build-id routing: `BuildCompatibilitySet` (in-memory eligibility checker), `BuildPolicy`, `BuildCompatEntry`, `BuildReachability`. DB functions: `set_build_policy`, `get_build_policy`, `list_build_policies`, `declare_compat`, `revoke_compat`, `load_compat_set`, `build_reachability`, `all_build_reachability`, `all_build_reachability_sharded` (cross-shard fan-out), `merge_reachability`. New newtypes in `types.rs`: `BuildId`, `DeploymentName`. See `docs/runbooks/safe-deploy.md` for the operator deploy playbook. |
-| `telemetry.rs` | 4 | OpenTelemetry surface: `TraceContextCarrier`, `TraceContextPropagator`, `MetricsRecorder`, `TelemetryConfig` — no-op by default, opt-in via `HarvestBuilder::telemetry`. Implements all 8 ADR-0001 span kinds (issue #136); see `docs/adr/0001-otel-trace-contract.md` for the full attribute schema and propagation rules. Metric catalogue (ADR-0001 §7): `harvest.workflow.started` (counter, `worker.rs`), `harvest.workflow.duration` (histogram, `worker.rs`), `harvest.activity.duration` (histogram, `worker.rs`), `harvest.timer.started` (counter, `worker.rs`), `harvest.queue.depth` (gauge, `worker.rs` sampler), `harvest.dlq.entries` (gauge, `worker.rs` sampler), `harvest.schedule.runs` (counter, `scheduler.rs`), `harvest.schedule.skipped` (counter, `scheduler.rs`), `harvest.retention.deleted` (counter, `retention.rs`). Cardinality rule: `execution.id` is span-only; `MetricsRecorder` API enforces this by construction. |
+| `telemetry.rs` | 4 | OpenTelemetry surface: `TraceContextCarrier`, `TraceContextPropagator`, `MetricsRecorder`, `TelemetryConfig` — no-op by default, opt-in via `HarvestBuilder::telemetry`. Implements all 8 ADR-0001 span kinds (issue #136); see `docs/adr/0001-otel-trace-contract.md` for the full attribute schema and propagation rules. Metric catalogue (ADR-0001 §7): `harvest.workflow.started` (counter, `worker.rs`), `harvest.workflow.duration` (histogram, `worker.rs`), `harvest.activity.duration` (histogram, `worker.rs`), `harvest.timer.started` (counter, `worker.rs`), `harvest.queue.depth` (gauge, `worker.rs` sampler), `harvest.dlq.entries` (gauge, `worker.rs` sampler), `harvest.schedule.runs` (counter, `scheduler.rs`), `harvest.schedule.skipped` (counter, `scheduler.rs`), `harvest.retention.deleted` (counter, `retention.rs`), `harvest.workflow.cache_hit` (counter, `worker.rs`, issue #235), `harvest.workflow.cache_miss` (counter, `worker.rs`, issue #235). Cardinality rule: `execution.id` is span-only; `MetricsRecorder` API enforces this by construction. |
 | `metrics_rs_adapter.rs` | 4 | `metrics-rs` feature flag adapter: `MetricsRsRecorder` bridges `MetricsRecorder` → `metrics` crate global registry. See `docs/telemetry.md` for recipe. |
 | `migrations/` | 1 | SQL -- run with `diesel migration run` |
 
@@ -450,7 +452,7 @@ Worker pool and web pool are independently sized but share a total connection ce
 `WorkflowContext::version()` emits a `VersionMarker` event on first live call and replays the recorded version on subsequent runs. This allows workflow code to branch on version (`if ctx.version() >= 2 { ... }`) to handle non-determinism across deploys without breaking replay of in-flight executions.
 
 **DD-4: Basic in-process LRU cache**
-`WorkflowCache` is a bounded LRU cache for workflow state, keyed by `ExecutionId`. Cross-worker sticky routing (ensuring the same execution always lands on the same worker) is deferred to Phase 3/4. For now, cache misses just reload from the event store.
+`WorkflowCache` is a bounded LRU cache for workflow state, keyed by `ExecutionId`. It is wired into the worker hot path (Phase 3.11 / issue #235): on a cache hit the worker loads only delta events since the last suspension (`store::load_history_since`) rather than the full history. Sticky cross-worker routing (ensuring follow-up tasks prefer the owning worker) is enabled via `WorkerConfig::with_sticky_routing`. See `docs/sticky-routing.md`.
 
 ---
 
@@ -459,6 +461,6 @@ Worker pool and web pool are independently sized but share a total connection ce
 - **Worker fleet observability** (implemented, issue #100): `harvest_workers` table, per-worker heartbeat upsert, `Active → Draining → Stopped` lifecycle, `GET /workers`, `GET /workers/{id}`, `GET /workers/health` management routes, cross-shard aggregation via `iter_shards()`.
 - **Cancellation semantics**: explicit workflow/activity cancellation and propagation
 - **Saga primitives**: compensations and failure orchestration
-- **Cross-worker routing**: sticky execution affinity and shard-aware placement
+- **Cross-worker routing** (implemented, issue #235): sticky execution affinity via `StickyRoutingConfig` + warm-cache delta loading. Shard-aware placement follow-up TBD.
 - **Sharding follow-up**: per-shard worker poll loops, per-shard scheduler tick loops with DAG→shard pinning, and multi-shard observability (the core `ShardId`/`ShardRouter`/`ShardedDbPool` primitives and the shard-aware write/read paths in the plugin are already in place).
 - **Operational surface**: richer metrics, observability, and dashboard/UI work
