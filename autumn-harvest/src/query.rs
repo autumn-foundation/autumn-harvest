@@ -132,7 +132,17 @@ impl QueryRegistry {
             .ok_or_else(|| HarvestError::QueryHandlerNotFound(name.to_string()))?;
 
         // Lock released; call handler outside the borrow.
-        handler(args).map_err(HarvestError::QueryHandlerPanicked)
+        // Wrap in catch_unwind so a panicking handler doesn't crash the worker.
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(args)))
+            .map_err(|e| {
+                let msg = e
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_string())
+                    .or_else(|| e.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "unknown panic".to_string());
+                HarvestError::QueryHandlerPanicked(msg)
+            })?
+            .map_err(HarvestError::QueryHandlerPanicked)
     }
 
     /// Execute a registered query handler with no arguments (`Value::Null`).

@@ -4017,12 +4017,18 @@ async fn hydrate_ctx_for_query(
     api_state: &HarvestApiState,
     exec_id: ExecutionId,
     query_timeout: Duration,
-) -> Result<(WorkflowContext, String), AutumnError> {
+) -> Result<WorkflowContext, AutumnError> {
     let runtime = api_state.runtime().map_err(map_error)?;
     let mut conn = db_conn_for_execution(api_state, exec_id).await?;
     let execution = load_execution(&mut conn, exec_id)
         .await
         .map_err(map_error)?;
+
+    // Queries are only meaningful on running workflows.
+    if is_terminal_state(&execution.state) {
+        return Err(map_error(HarvestError::WorkflowNotRunning(exec_id)));
+    }
+
     let workflow = runtime
         .registry
         .workflows
@@ -4043,15 +4049,15 @@ async fn hydrate_ctx_for_query(
         runtime.registry.shared_state(),
     );
     // Drive the workflow function long enough to register query handlers, then
-    // suspend via timeout. The timeout here is the query timeout, not the 100ms
-    // hard-coded value, so it covers slow rehydration of large histories.
+    // let it suspend at the first unrecorded activity (expected for live workflows).
+    // The timeout is a safety cap against buggy workflow code with infinite loops.
     let _ = tokio::time::timeout(
         query_timeout,
         (workflow.handler)(&ctx, execution.input.clone()),
     )
     .await;
 
-    Ok((ctx, execution.workflow_name))
+    Ok(ctx)
 }
 
 /// `GET /workflows/{id}/query/{query_name}` — query with no args (backward compat).
@@ -4064,7 +4070,7 @@ async fn query_workflow(
     let timeout_ms = u64::try_from(timeout_dur.as_millis()).unwrap_or(u64::MAX);
     let start = Instant::now();
 
-    let (ctx, _) = hydrate_ctx_for_query(&api_state, exec_id, timeout_dur).await?;
+    let ctx = hydrate_ctx_for_query(&api_state, exec_id, timeout_dur).await?;
 
     if start.elapsed() >= timeout_dur {
         if let Ok(runtime) = api_state.runtime() {
@@ -4080,16 +4086,19 @@ async fn query_workflow(
         }));
     }
 
-    let result = ctx.execute_query(&query_name).map_err(map_error);
-    let duration_secs = start.elapsed().as_secs_f64();
-    if let Ok(runtime) = api_state.runtime() {
+    let harvest_result = ctx.execute_query(&query_name);
+    // Skip metric for not-found: query_name is user-supplied and recording it
+    // creates unbounded cardinality; registered names are low-cardinality.
+    if !matches!(&harvest_result, Err(HarvestError::QueryHandlerNotFound(_)))
+        && let Ok(runtime) = api_state.runtime()
+    {
         runtime.registry.telemetry().metrics.record_query_completed(
             &query_name,
-            duration_secs,
-            result.is_ok(),
+            start.elapsed().as_secs_f64(),
+            harvest_result.is_ok(),
         );
     }
-    result.map(Json)
+    harvest_result.map_err(map_error).map(Json)
 }
 
 /// Request body for `POST /workflows/{id}/query/{query_name}`.
@@ -4116,7 +4125,7 @@ async fn query_workflow_post(
     let timeout_ms = u64::try_from(timeout_dur.as_millis()).unwrap_or(u64::MAX);
     let start = Instant::now();
 
-    let (ctx, _) = hydrate_ctx_for_query(&api_state, exec_id, timeout_dur).await?;
+    let ctx = hydrate_ctx_for_query(&api_state, exec_id, timeout_dur).await?;
 
     if start.elapsed() >= timeout_dur {
         if let Ok(runtime) = api_state.runtime() {
@@ -4132,18 +4141,20 @@ async fn query_workflow_post(
         }));
     }
 
-    let result = ctx
-        .execute_query_with_args(&query_name, body.args)
-        .map_err(map_error);
-    let duration_secs = start.elapsed().as_secs_f64();
-    if let Ok(runtime) = api_state.runtime() {
+    let harvest_result = ctx.execute_query_with_args(&query_name, body.args);
+    // Skip metric for not-found: user-supplied names create unbounded cardinality.
+    if !matches!(&harvest_result, Err(HarvestError::QueryHandlerNotFound(_)))
+        && let Ok(runtime) = api_state.runtime()
+    {
         runtime.registry.telemetry().metrics.record_query_completed(
             &query_name,
-            duration_secs,
-            result.is_ok(),
+            start.elapsed().as_secs_f64(),
+            harvest_result.is_ok(),
         );
     }
-    result.map(|result| Json(QueryWorkflowResponse { result }))
+    harvest_result
+        .map_err(map_error)
+        .map(|result| Json(QueryWorkflowResponse { result }))
 }
 
 /// `GET /workflows/{id}/queries` — list registered query handler names (issue #234).
@@ -4156,8 +4167,19 @@ async fn list_workflow_queries(
     Path(id): Path<String>,
 ) -> Result<Json<Vec<String>>, AutumnError> {
     let exec_id = parse_execution_id(&id)?;
-    let timeout = api_state.query_timeout();
-    let (ctx, _) = hydrate_ctx_for_query(&api_state, exec_id, timeout).await?;
+    let timeout_dur = api_state.query_timeout();
+    let timeout_ms = u64::try_from(timeout_dur.as_millis()).unwrap_or(u64::MAX);
+    let start = Instant::now();
+
+    let ctx = hydrate_ctx_for_query(&api_state, exec_id, timeout_dur).await?;
+
+    if start.elapsed() >= timeout_dur {
+        return Err(map_error(HarvestError::QueryTimedOut {
+            query_name: "list_queries".to_string(),
+            timeout_ms,
+        }));
+    }
+
     let mut names = ctx.list_query_names();
     names.sort(); // deterministic order for UI
     Ok(Json(names))
@@ -7642,7 +7664,12 @@ pub(crate) fn map_error(error: HarvestError) -> AutumnError {
                 .with_status(axum::http::StatusCode::CONFLICT)
         }
         HarvestError::QueryHandlerPanicked(msg) => {
-            AutumnError::service_unavailable_msg(format!("query handler panicked: {msg}"))
+            // Deserialization failures are client errors (bad args), not server errors.
+            if msg.starts_with("failed to deserialize query args:") {
+                AutumnError::bad_request_msg(msg)
+            } else {
+                AutumnError::service_unavailable_msg(format!("query handler panicked: {msg}"))
+            }
         }
         HarvestError::QueryTimedOut {
             query_name,
