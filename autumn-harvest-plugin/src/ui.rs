@@ -13,6 +13,7 @@ use autumn_web::extract::{Path, Query};
 use autumn_web::reexports::axum;
 use axum::Extension;
 use axum::Router;
+use axum::middleware;
 use axum::routing::get;
 use chrono::{DateTime, Utc};
 use diesel::dsl::sql;
@@ -33,6 +34,7 @@ use autumn_harvest::workers::{WorkerFilters, WorkerHealth, WorkerRow, list_worke
 use crate::api::{
     HarvestApiState, KNOWN_WORKFLOW_STATES, WorkflowFilters, acquire_conn, db_conn_for_execution,
     load_execution, load_workflows_from_shards, map_error, parse_execution_id,
+    require_harvest_admin,
 };
 
 const DEFAULT_PAGE_SIZE: i64 = 25;
@@ -339,12 +341,17 @@ fn worker_sort_key(row: &WorkerRow) -> (u8, u8, &str) {
 
 /// Build the Vantage dashboard router.
 pub fn harvest_ui_router(api_state: HarvestApiState) -> Router<AppState> {
+    let require_admin = middleware::from_fn_with_state(api_state.clone(), require_harvest_admin);
+
     Router::new()
         .route("/", get(index))
         .route("/workflows", get(list_workflows_ui))
         .route("/workflows/{id}", get(workflow_detail_ui))
         .route("/workers", get(list_workers_ui))
-        .route("/dead-letters", get(list_dead_letters_ui))
+        .route(
+            "/dead-letters",
+            get(list_dead_letters_ui).route_layer(require_admin),
+        )
         .layer(Extension(api_state))
 }
 

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use autumn_harvest_plugin::api::{HarvestApiState, harvest_api_router};
+use autumn_harvest_plugin::ui::harvest_ui_router;
 use autumn_web::AppState;
 use autumn_web::auth::RequireAuth;
 use autumn_web::reexports::axum::body::Body;
@@ -27,6 +28,18 @@ fn app_with_api_state(
     Future = impl std::future::Future,
 > + Clone {
     harvest_api_router(api_state).with_state(AppState::for_test())
+}
+
+fn unauthenticated_app_with_ui() -> impl tower::Service<
+    Request<Body>,
+    Response = autumn_web::reexports::axum::response::Response,
+    Error = std::convert::Infallible,
+    Future = impl std::future::Future,
+> + Clone {
+    let api_state = HarvestApiState::new();
+    harvest_api_router(api_state.clone())
+        .nest("/ui", harvest_ui_router(api_state))
+        .with_state(AppState::for_test())
 }
 
 /// Build a test app protected by `RequireAuth`.
@@ -88,9 +101,9 @@ fn delete(uri: &str) -> Request<Body> {
 
 // ── Without authentication middleware ────────────────────────────────────────
 //
-// When `harvest_api_router` is mounted without any auth layer the API is
-// directly reachable. Responses will be errors (no DB), but crucially the
-// requests are NOT rejected with 401/403 – authentication is entirely absent.
+// When `harvest_api_router` is mounted without any auth layer, ordinary routes
+// remain directly reachable while high-impact management operations use
+// Harvest's built-in guard.
 
 #[tokio::test]
 async fn eris_unauthenticated_health_is_accessible() {
@@ -115,6 +128,38 @@ async fn eris_unauthenticated_start_workflow_is_accessible() {
         .oneshot(post_json("/workflows/my-workflow/start", "{}"))
         .await
         .unwrap();
+    assert_ne!(res.status(), StatusCode::UNAUTHORIZED);
+    assert_ne!(res.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn eris_unauthenticated_start_workflow_terminate_if_running_is_blocked() {
+    let app = unauthenticated_app();
+    let res = app
+        .oneshot(post_json(
+            "/workflows/my-workflow/start",
+            r#"{"reuse_policy": "terminate_if_running"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn eris_start_workflow_terminate_if_running_honors_configured_session_key() {
+    let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_session_key("operator_id");
+    let app = app_with_api_state(api_state);
+
+    let res = app
+        .oneshot(post_json_with_session(
+            "/workflows/my-workflow/start",
+            r#"{"reuse_policy": "terminate_if_running"}"#,
+            "operator_id",
+        ))
+        .await
+        .unwrap();
+
     assert_ne!(res.status(), StatusCode::UNAUTHORIZED);
     assert_ne!(res.status(), StatusCode::FORBIDDEN);
 }
@@ -372,6 +417,13 @@ async fn eris_unauthenticated_bulk_discard_dead_letters_is_blocked() {
 }
 
 #[tokio::test]
+async fn eris_unauthenticated_vantage_dead_letters_page_is_blocked() {
+    let app = unauthenticated_app_with_ui();
+    let res = app.oneshot(get("/ui/dead-letters")).await.unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn eris_builtin_guard_honors_configured_session_key() {
     let api_state = HarvestApiState::new();
     api_state.set_admin_auth_session_key("operator_id");
@@ -485,14 +537,29 @@ async fn eris_unauthenticated_create_schedule_is_accessible() {
 }
 
 #[tokio::test]
-async fn eris_unauthenticated_submit_batch_operation_is_accessible() {
+async fn eris_unauthenticated_submit_batch_cancel_operation_is_blocked() {
     let app = unauthenticated_app();
     let res = app
-        .oneshot(post_json("/batch-operations", "{}"))
+        .oneshot(post_json(
+            "/batch-operations",
+            r#"{"action": "Cancel", "filter": {"workflow_name": "billing"}}"#,
+        ))
         .await
         .unwrap();
-    assert_ne!(res.status(), StatusCode::UNAUTHORIZED);
-    assert_ne!(res.status(), StatusCode::FORBIDDEN);
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn eris_unauthenticated_submit_batch_terminate_operation_is_blocked() {
+    let app = unauthenticated_app();
+    let res = app
+        .oneshot(post_json(
+            "/batch-operations",
+            r#"{"action": "Terminate", "filter": {"workflow_name": "billing"}}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]

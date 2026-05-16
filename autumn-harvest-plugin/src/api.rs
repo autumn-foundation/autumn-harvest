@@ -1297,7 +1297,10 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         // terminate / signal so an incident commander does not have to script
         // a one-off loop over GET /workflows.
         .route("/batch-operations", get(list_batch_operations))
-        .route("/batch-operations", post(submit_batch_operation))
+        .route(
+            "/batch-operations",
+            post(submit_batch_operation).route_layer(require_admin.clone()),
+        )
         .route("/batch-operations/{id}", get(get_batch_operation))
         // Audit trail (issue #158): read-only endpoint to query management
         // API mutations. See `audit::ALL_MUTATION_ROUTES` for covered paths.
@@ -1305,26 +1308,29 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .layer(Extension(api_state))
 }
 
-async fn require_harvest_admin(
+pub(crate) async fn require_harvest_admin(
     State(api_state): State<HarvestApiState>,
     request: axum::extract::Request,
     next: Next,
 ) -> axum::response::Response {
-    if api_state.admin_auth_boundary() {
-        return next.run(request).await;
-    }
-
-    let session_key = api_state.admin_auth_session_key();
-    let authenticated = if let Some(session) = request.extensions().get::<Session>().cloned() {
-        session.contains_key(&session_key).await
-    } else {
-        false
-    };
-
-    if authenticated {
+    let session = request.extensions().get::<Session>().cloned();
+    if has_harvest_admin_access(&api_state, session).await {
         next.run(request).await
     } else {
         AutumnError::unauthorized_msg("authentication required").into_response()
+    }
+}
+
+async fn has_harvest_admin_access(api_state: &HarvestApiState, session: Option<Session>) -> bool {
+    if api_state.admin_auth_boundary() {
+        return true;
+    }
+
+    let session_key = api_state.admin_auth_session_key();
+    if let Some(session) = session {
+        session.contains_key(&session_key).await
+    } else {
+        false
     }
 }
 
@@ -3403,10 +3409,20 @@ async fn get_workflow_stack(
 async fn start_workflow(
     Extension(api_state): Extension<HarvestApiState>,
     Path(workflow_name): Path<String>,
+    maybe_session: Option<Extension<Session>>,
     headers: axum::http::HeaderMap,
     Json(request): Json<StartWorkflowRequest>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse as _;
+
+    if matches!(
+        request.reuse_policy.as_deref(),
+        Some("terminate_if_running")
+    ) && !has_harvest_admin_access(&api_state, maybe_session.map(|Extension(session)| session))
+        .await
+    {
+        return AutumnError::unauthorized_msg("authentication required").into_response();
+    }
 
     let runtime = match api_state.runtime() {
         Ok(r) => r,
