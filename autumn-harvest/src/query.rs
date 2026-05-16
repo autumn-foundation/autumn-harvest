@@ -133,6 +133,7 @@ impl QueryRegistry {
 
         // Lock released; call handler outside the borrow.
         // Wrap in catch_unwind so a panicking handler doesn't crash the worker.
+        // Panics → QueryHandlerPanicked (503); intentional Err returns → QueryHandlerFailed (400).
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(args)))
             .map_err(|e| {
                 let msg = e
@@ -142,7 +143,7 @@ impl QueryRegistry {
                     .unwrap_or_else(|| "unknown panic".to_string());
                 HarvestError::QueryHandlerPanicked(msg)
             })?
-            .map_err(HarvestError::QueryHandlerPanicked)
+            .map_err(HarvestError::QueryHandlerFailed)
     }
 
     /// Execute a registered query handler with no arguments (`Value::Null`).

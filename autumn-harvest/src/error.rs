@@ -197,10 +197,18 @@ pub enum HarvestError {
     #[error("workflow not running: {0}")]
     WorkflowNotRunning(ExecutionId),
 
+    /// The query handler returned an application-level error (not a panic).
+    ///
+    /// This is distinct from [`QueryHandlerPanicked`][Self::QueryHandlerPanicked]:
+    /// the handler ran to completion and intentionally returned `Err(msg)`.
+    /// Surfaces as `400 Bad Request` at the management API layer.
+    #[error("query handler error: {0}")]
+    QueryHandlerFailed(String),
+
     /// The query handler panicked during execution.
     ///
     /// The panic message is captured via `std::panic::catch_unwind` and
-    /// surfaced to the caller as a `500 Internal Server Error`.
+    /// surfaced to the caller as `503 Service Unavailable`.
     #[error("query handler panicked: {0}")]
     QueryHandlerPanicked(String),
 

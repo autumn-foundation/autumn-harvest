@@ -1891,7 +1891,7 @@ impl WorkflowContext {
 
         handler.map_or_else(
             || Err(HarvestError::QueryHandlerNotFound(name.to_string())),
-            |h| h(args).map_err(HarvestError::QueryHandlerPanicked),
+            |h| h(args).map_err(HarvestError::QueryHandlerFailed),
         )
     }
 

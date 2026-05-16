@@ -4088,9 +4088,8 @@ async fn query_workflow(
     Path((id, query_name)): Path<(String, String)>,
 ) -> Result<Json<Value>, AutumnError> {
     let exec_id = parse_execution_id(&id)?;
-    let start = Instant::now();
-
     let ctx = hydrate_ctx_for_query(&api_state, exec_id).await?;
+    let start = Instant::now(); // measure handler invocation latency, not hydration cost
 
     let harvest_result = ctx.execute_query(&query_name);
     // Skip metric for not-found: query_name is user-supplied and recording it
@@ -4130,9 +4129,8 @@ async fn query_workflow_post(
     body: Option<Json<QueryWorkflowRequest>>,
 ) -> Result<Json<QueryWorkflowResponse>, AutumnError> {
     let exec_id = parse_execution_id(&id)?;
-    let start = Instant::now();
-
     let ctx = hydrate_ctx_for_query(&api_state, exec_id).await?;
+    let start = Instant::now(); // measure handler invocation latency, not hydration cost
     let args = body.map_or(Value::Null, |Json(b)| b.args);
 
     let harvest_result = ctx.execute_query_with_args(&query_name, args);
@@ -7645,13 +7643,11 @@ pub(crate) fn map_error(error: HarvestError) -> AutumnError {
             AutumnError::bad_request_msg(format!("workflow not running: {exec_id}"))
                 .with_status(axum::http::StatusCode::CONFLICT)
         }
+        // Intentional handler errors (returned Err, not panicked) → 400.
+        HarvestError::QueryHandlerFailed(msg) => AutumnError::bad_request_msg(msg),
+        // Actual panics are an engine fault → 503.
         HarvestError::QueryHandlerPanicked(msg) => {
-            // Deserialization failures are client errors (bad args), not server errors.
-            if msg.starts_with("failed to deserialize query args:") {
-                AutumnError::bad_request_msg(msg)
-            } else {
-                AutumnError::service_unavailable_msg(format!("query handler panicked: {msg}"))
-            }
+            AutumnError::service_unavailable_msg(format!("query handler panicked: {msg}"))
         }
         HarvestError::QueryTimedOut {
             query_name,
