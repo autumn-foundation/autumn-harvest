@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use autumn_web::AppState;
 use autumn_web::error::AutumnError;
@@ -4060,9 +4060,36 @@ async fn query_workflow(
     Path((id, query_name)): Path<(String, String)>,
 ) -> Result<Json<Value>, AutumnError> {
     let exec_id = parse_execution_id(&id)?;
-    let timeout = api_state.query_timeout();
-    let (ctx, _) = hydrate_ctx_for_query(&api_state, exec_id, timeout).await?;
-    ctx.execute_query(&query_name).map(Json).map_err(map_error)
+    let timeout_dur = api_state.query_timeout();
+    let timeout_ms = u64::try_from(timeout_dur.as_millis()).unwrap_or(u64::MAX);
+    let start = Instant::now();
+
+    let (ctx, _) = hydrate_ctx_for_query(&api_state, exec_id, timeout_dur).await?;
+
+    if start.elapsed() >= timeout_dur {
+        if let Ok(runtime) = api_state.runtime() {
+            runtime.registry.telemetry().metrics.record_query_completed(
+                &query_name,
+                start.elapsed().as_secs_f64(),
+                false,
+            );
+        }
+        return Err(map_error(HarvestError::QueryTimedOut {
+            query_name: query_name.clone(),
+            timeout_ms,
+        }));
+    }
+
+    let result = ctx.execute_query(&query_name).map_err(map_error);
+    let duration_secs = start.elapsed().as_secs_f64();
+    if let Ok(runtime) = api_state.runtime() {
+        runtime.registry.telemetry().metrics.record_query_completed(
+            &query_name,
+            duration_secs,
+            result.is_ok(),
+        );
+    }
+    result.map(Json)
 }
 
 /// Request body for `POST /workflows/{id}/query/{query_name}`.
@@ -4085,12 +4112,38 @@ async fn query_workflow_post(
     Json(body): Json<QueryWorkflowRequest>,
 ) -> Result<Json<QueryWorkflowResponse>, AutumnError> {
     let exec_id = parse_execution_id(&id)?;
-    let timeout = api_state.query_timeout();
-    let (ctx, _) = hydrate_ctx_for_query(&api_state, exec_id, timeout).await?;
+    let timeout_dur = api_state.query_timeout();
+    let timeout_ms = u64::try_from(timeout_dur.as_millis()).unwrap_or(u64::MAX);
+    let start = Instant::now();
+
+    let (ctx, _) = hydrate_ctx_for_query(&api_state, exec_id, timeout_dur).await?;
+
+    if start.elapsed() >= timeout_dur {
+        if let Ok(runtime) = api_state.runtime() {
+            runtime.registry.telemetry().metrics.record_query_completed(
+                &query_name,
+                start.elapsed().as_secs_f64(),
+                false,
+            );
+        }
+        return Err(map_error(HarvestError::QueryTimedOut {
+            query_name: query_name.clone(),
+            timeout_ms,
+        }));
+    }
+
     let result = ctx
         .execute_query_with_args(&query_name, body.args)
-        .map_err(map_error)?;
-    Ok(Json(QueryWorkflowResponse { result }))
+        .map_err(map_error);
+    let duration_secs = start.elapsed().as_secs_f64();
+    if let Ok(runtime) = api_state.runtime() {
+        runtime.registry.telemetry().metrics.record_query_completed(
+            &query_name,
+            duration_secs,
+            result.is_ok(),
+        );
+    }
+    result.map(|result| Json(QueryWorkflowResponse { result }))
 }
 
 /// `GET /workflows/{id}/queries` — list registered query handler names (issue #234).
