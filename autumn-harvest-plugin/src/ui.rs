@@ -2213,6 +2213,7 @@ async fn list_schedules_ui(
     });
 
     let total_filtered = all_rows.len();
+    let distribution = schedule_kind_distribution(&all_rows);
     let offset_usize = usize::try_from(offset).unwrap_or(usize::MAX);
     let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
     let has_next = total_filtered > offset_usize.saturating_add(limit_usize);
@@ -2231,6 +2232,7 @@ async fn list_schedules_ui(
         limit,
         has_next,
         total_filtered,
+        &distribution,
         params.refresh,
         params.flash.as_deref(),
     ))
@@ -2596,6 +2598,25 @@ fn schedule_redirect(flash: &str) -> axum::response::Response {
 // Schedule rendering helpers
 // ---------------------------------------------------------------------------
 
+/// Returns a short distribution string like "3 Workflow, 2 Dag" for all matching rows.
+fn schedule_kind_distribution(rows: &[(ShardId, HarvestSchedule)]) -> String {
+    let mut wf = 0usize;
+    let mut dag = 0usize;
+    for (_, row) in rows {
+        if row.workflow_name.is_some() {
+            wf += 1;
+        } else {
+            dag += 1;
+        }
+    }
+    match (wf, dag) {
+        (0, 0) => String::new(),
+        (w, 0) => format!("{w} Workflow"),
+        (0, d) => format!("{d} Dag"),
+        (w, d) => format!("{w} Workflow, {d} Dag"),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_schedules_page(
     rows: &[(ShardId, HarvestSchedule)],
@@ -2606,6 +2627,7 @@ fn render_schedules_page(
     limit: i64,
     has_next: bool,
     total_filtered: usize,
+    distribution: &str,
     refresh: Option<u64>,
     flash: Option<&str>,
 ) -> Markup {
@@ -2617,7 +2639,7 @@ fn render_schedules_page(
         }
 
         (render_schedule_filters(filters, limit, refresh))
-        (render_schedule_bulk_actions(filters, limit, refresh, total_filtered))
+        (render_schedule_bulk_actions(filters, limit, refresh, total_filtered, distribution))
 
         @if rows.is_empty() && shard_errors.is_empty() {
             div.card.empty {
@@ -2710,19 +2732,25 @@ fn render_schedule_bulk_actions(
     limit: i64,
     refresh: Option<u64>,
     total_matching: usize,
+    distribution: &str,
 ) -> Markup {
     let return_qs = build_schedule_query_string(limit, filters, refresh);
+    let dist_suffix = if distribution.is_empty() {
+        String::new()
+    } else {
+        format!(" ({distribution})")
+    };
     html! {
         div."bulk-actions" {
             form method="post" action="schedules/bulk-pause"
-                onsubmit={ "return confirm('Pause " (total_matching) " matching schedule(s)?')" } {
+                onsubmit={ "return confirm('Pause " (total_matching) " matching schedule(s)" (&dist_suffix) "?')" } {
                 (render_schedule_hidden_filters(filters))
                 button type="submit" disabled[total_matching == 0] {
                     "Pause all matching (" (total_matching) ")"
                 }
             }
             form method="post" action="schedules/bulk-resume"
-                onsubmit={ "return confirm('Resume " (total_matching) " matching schedule(s)?')" } {
+                onsubmit={ "return confirm('Resume " (total_matching) " matching schedule(s)" (&dist_suffix) "?')" } {
                 (render_schedule_hidden_filters(filters))
                 button type="submit" disabled[total_matching == 0] {
                     "Resume all matching (" (total_matching) ")"
@@ -3261,6 +3289,42 @@ mod tests {
     fn schedule_state_badge_active() {
         let html = schedule_state_badge(false).into_string();
         assert!(html.contains("Active"));
+    }
+
+    #[test]
+    fn schedule_kind_distribution_empty() {
+        assert_eq!(schedule_kind_distribution(&[]), "");
+    }
+
+    #[test]
+    fn schedule_kind_distribution_workflow_only() {
+        let row = make_schedule(Some("wf"), None, false);
+        assert_eq!(
+            schedule_kind_distribution(&[(ShardId::UNENCODED, row)]),
+            "1 Workflow"
+        );
+    }
+
+    #[test]
+    fn schedule_kind_distribution_dag_only() {
+        let row = make_schedule(None, Some("my_dag"), false);
+        assert_eq!(
+            schedule_kind_distribution(&[(ShardId::UNENCODED, row)]),
+            "1 Dag"
+        );
+    }
+
+    #[test]
+    fn schedule_kind_distribution_mixed() {
+        let wf = make_schedule(Some("wf"), None, false);
+        let dag1 = make_schedule(None, Some("dag_a"), false);
+        let dag2 = make_schedule(None, Some("dag_b"), false);
+        let rows = vec![
+            (ShardId::UNENCODED, wf),
+            (ShardId::UNENCODED, dag1),
+            (ShardId::UNENCODED, dag2),
+        ];
+        assert_eq!(schedule_kind_distribution(&rows), "1 Workflow, 2 Dag");
     }
 
     #[test]
