@@ -1252,7 +1252,7 @@ async fn ui_workers_perf_1k_workers_4_shards_under_500ms() {
 // ---------------------------------------------------------------------------
 
 /// Insert a test row into `harvest_schedules`.
-/// `kind` is "Workflow" or "Dag"; `name` is the workflow_name / dag_name.
+/// `kind` is `"Workflow"` or `"Dag"`; `name` is the `workflow_name` / `dag_name`.
 async fn insert_test_schedule(
     database_url: &str,
     kind: &str,

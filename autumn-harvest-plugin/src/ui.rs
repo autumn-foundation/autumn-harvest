@@ -2076,7 +2076,11 @@ impl ScheduleUiFilters {
             .or(row.dag_name.as_deref())
             .unwrap_or("");
 
-        if self.target.as_deref().is_some_and(|t| !name.contains(t)) {
+        if !self
+            .target
+            .as_deref()
+            .is_none_or(|t| name.to_lowercase().contains(&t.to_lowercase()))
+        {
             return false;
         }
         match self.kind {
@@ -2282,9 +2286,8 @@ async fn find_schedule_row(
         .map_err(|e| map_error(e).into_response())?;
 
     for (_shard, shard_pool) in pool.iter_shards() {
-        let mut conn = match acquire_conn(shard_pool).await {
-            Ok(c) => c,
-            Err(e) => return Err(e.into_response()),
+        let Ok(mut conn) = acquire_conn(shard_pool).await else {
+            continue;
         };
         let row: Option<HarvestSchedule> = dsl::harvest_schedules
             .find(id)
@@ -2292,8 +2295,7 @@ async fn find_schedule_row(
             .first(&mut conn)
             .await
             .optional()
-            .map_err(database_error)
-            .map_err(|e| map_error(e).into_response())?;
+            .unwrap_or(None);
         if let Some(row) = row {
             return Ok(Some((row, conn)));
         }
@@ -2469,50 +2471,70 @@ async fn schedule_bulk_pause_ui(
     let mut acted_on = 0usize;
 
     for (shard_id, shard_pool) in pool.iter_shards() {
+        if filters.shard_id.is_some_and(|sid| shard_id.as_i32() != sid) {
+            continue;
+        }
         let Ok(mut conn) = acquire_conn(shard_pool).await else {
             continue;
         };
-        let rows: Vec<HarvestSchedule> = harvest_schedules::table
-            .select(HarvestSchedule::as_select())
+        // Load just id + name fields to apply kind/target filters without N+1 updates.
+        let candidates: Vec<(uuid::Uuid, Option<String>, Option<String>)> = dsl::harvest_schedules
+            .filter(dsl::is_paused.ne(true))
+            .select((dsl::id, dsl::workflow_name, dsl::dag_name))
             .load(&mut conn)
             .await
             .unwrap_or_default();
-        for row in rows {
-            if !filters.matches(shard_id, &row) {
-                continue;
-            }
-            let id_str = row.id.to_string();
-            let n = diesel::update(
-                dsl::harvest_schedules
-                    .find(row.id)
-                    .filter(dsl::is_paused.ne(true)),
-            )
-            .set((
-                dsl::is_paused.eq(true),
-                dsl::paused_at.eq(Some(now)),
-                dsl::paused_by.eq(Some("ui-bulk")),
-                dsl::updated_at.eq(now),
-            ))
-            .execute(&mut conn)
-            .await
-            .unwrap_or(0);
-            if n > 0 {
-                acted_on += 1;
-                let ar = NewAuditRecord {
-                    actor: "ui",
-                    operation: OP_SCHEDULE_PAUSE,
-                    target_type: TARGET_SCHEDULE,
-                    target_id: Some(id_str.as_str()),
-                    route_or_command: "POST /ui/schedules/bulk-pause",
-                    request_id: None,
-                    idempotency_key: None,
-                    status: STATUS_SUCCEEDED,
-                    error_summary: None,
-                    shard_id: None,
-                    source: SOURCE_API,
-                };
-                let _ = insert_audit(&mut conn, &ar).await;
-            }
+        let matching_ids: Vec<uuid::Uuid> = candidates
+            .into_iter()
+            .filter(|(_, wf, dag)| {
+                let name = wf.as_deref().or(dag.as_deref()).unwrap_or("");
+                match filters.kind {
+                    ScheduleKindFilter::Workflow if wf.is_none() => return false,
+                    ScheduleKindFilter::Dag if dag.is_none() => return false,
+                    _ => {}
+                }
+                filters
+                    .target
+                    .as_deref()
+                    .is_none_or(|t| name.to_lowercase().contains(&t.to_lowercase()))
+            })
+            .map(|(id, _, _)| id)
+            .collect();
+        if matching_ids.is_empty() {
+            continue;
+        }
+        let updated_ids: Vec<uuid::Uuid> = diesel::update(
+            dsl::harvest_schedules
+                .filter(dsl::id.eq_any(&matching_ids))
+                .filter(dsl::is_paused.ne(true)),
+        )
+        .set((
+            dsl::is_paused.eq(true),
+            dsl::paused_at.eq(Some(now)),
+            dsl::paused_by.eq(Some("ui-bulk")),
+            dsl::updated_at.eq(now),
+        ))
+        .returning(dsl::id)
+        .get_results(&mut conn)
+        .await
+        .unwrap_or_default();
+        acted_on += updated_ids.len();
+        for id in &updated_ids {
+            let id_str = id.to_string();
+            let ar = NewAuditRecord {
+                actor: "ui",
+                operation: OP_SCHEDULE_PAUSE,
+                target_type: TARGET_SCHEDULE,
+                target_id: Some(id_str.as_str()),
+                route_or_command: "POST /ui/schedules/bulk-pause",
+                request_id: None,
+                idempotency_key: None,
+                status: STATUS_SUCCEEDED,
+                error_summary: None,
+                shard_id: Some(shard_id.as_i32()),
+                source: SOURCE_API,
+            };
+            let _ = insert_audit(&mut conn, &ar).await;
         }
     }
 
@@ -2537,51 +2559,70 @@ async fn schedule_bulk_resume_ui(
     let mut acted_on = 0usize;
 
     for (shard_id, shard_pool) in pool.iter_shards() {
+        if filters.shard_id.is_some_and(|sid| shard_id.as_i32() != sid) {
+            continue;
+        }
         let Ok(mut conn) = acquire_conn(shard_pool).await else {
             continue;
         };
-        let rows: Vec<HarvestSchedule> = harvest_schedules::table
-            .select(HarvestSchedule::as_select())
+        let candidates: Vec<(uuid::Uuid, Option<String>, Option<String>)> = dsl::harvest_schedules
+            .filter(dsl::is_paused.eq(true))
+            .select((dsl::id, dsl::workflow_name, dsl::dag_name))
             .load(&mut conn)
             .await
             .unwrap_or_default();
-        for row in rows {
-            if !filters.matches(shard_id, &row) {
-                continue;
-            }
-            let id_str = row.id.to_string();
-            let n = diesel::update(
-                dsl::harvest_schedules
-                    .find(row.id)
-                    .filter(dsl::is_paused.ne(false)),
-            )
-            .set((
-                dsl::is_paused.eq(false),
-                dsl::paused_at.eq(None::<chrono::DateTime<Utc>>),
-                dsl::paused_by.eq(None::<&str>),
-                dsl::pause_reason.eq(None::<&str>),
-                dsl::updated_at.eq(now),
-            ))
-            .execute(&mut conn)
-            .await
-            .unwrap_or(0);
-            if n > 0 {
-                acted_on += 1;
-                let ar = NewAuditRecord {
-                    actor: "ui",
-                    operation: OP_SCHEDULE_RESUME,
-                    target_type: TARGET_SCHEDULE,
-                    target_id: Some(id_str.as_str()),
-                    route_or_command: "POST /ui/schedules/bulk-resume",
-                    request_id: None,
-                    idempotency_key: None,
-                    status: STATUS_SUCCEEDED,
-                    error_summary: None,
-                    shard_id: None,
-                    source: SOURCE_API,
-                };
-                let _ = insert_audit(&mut conn, &ar).await;
-            }
+        let matching_ids: Vec<uuid::Uuid> = candidates
+            .into_iter()
+            .filter(|(_, wf, dag)| {
+                let name = wf.as_deref().or(dag.as_deref()).unwrap_or("");
+                match filters.kind {
+                    ScheduleKindFilter::Workflow if wf.is_none() => return false,
+                    ScheduleKindFilter::Dag if dag.is_none() => return false,
+                    _ => {}
+                }
+                filters
+                    .target
+                    .as_deref()
+                    .is_none_or(|t| name.to_lowercase().contains(&t.to_lowercase()))
+            })
+            .map(|(id, _, _)| id)
+            .collect();
+        if matching_ids.is_empty() {
+            continue;
+        }
+        let updated_ids: Vec<uuid::Uuid> = diesel::update(
+            dsl::harvest_schedules
+                .filter(dsl::id.eq_any(&matching_ids))
+                .filter(dsl::is_paused.eq(true)),
+        )
+        .set((
+            dsl::is_paused.eq(false),
+            dsl::paused_at.eq(None::<chrono::DateTime<Utc>>),
+            dsl::paused_by.eq(None::<&str>),
+            dsl::pause_reason.eq(None::<&str>),
+            dsl::updated_at.eq(now),
+        ))
+        .returning(dsl::id)
+        .get_results(&mut conn)
+        .await
+        .unwrap_or_default();
+        acted_on += updated_ids.len();
+        for id in &updated_ids {
+            let id_str = id.to_string();
+            let ar = NewAuditRecord {
+                actor: "ui",
+                operation: OP_SCHEDULE_RESUME,
+                target_type: TARGET_SCHEDULE,
+                target_id: Some(id_str.as_str()),
+                route_or_command: "POST /ui/schedules/bulk-resume",
+                request_id: None,
+                idempotency_key: None,
+                status: STATUS_SUCCEEDED,
+                error_summary: None,
+                shard_id: Some(shard_id.as_i32()),
+                source: SOURCE_API,
+            };
+            let _ = insert_audit(&mut conn, &ar).await;
         }
     }
 
@@ -3266,6 +3307,16 @@ mod tests {
         let other = make_schedule(Some("invoice_workflow"), None, false);
         assert!(filters.matches(ShardId::new(0), &matching));
         assert!(!filters.matches(ShardId::new(0), &other));
+    }
+
+    #[test]
+    fn schedule_filter_target_case_insensitive() {
+        let filters = ScheduleUiFilters {
+            target: Some("PAYMENT".to_string()),
+            ..Default::default()
+        };
+        let matching = make_schedule(Some("payment_workflow"), None, false);
+        assert!(filters.matches(ShardId::new(0), &matching));
     }
 
     #[test]
