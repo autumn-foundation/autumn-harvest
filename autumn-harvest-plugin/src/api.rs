@@ -13,6 +13,7 @@ use autumn_web::session::Session;
 use axum::Extension;
 use axum::Json;
 use axum::Router;
+use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
@@ -4021,6 +4022,24 @@ async fn signal_workflow(
     ))
 }
 
+/// Waker that records whether `wake()` was called synchronously during a poll.
+///
+/// Used by [`hydrate_ctx_for_query`] to distinguish genuine command-based
+/// suspension (waker never fired) from ordinary async yields like
+/// `tokio::task::yield_now()` (waker fires immediately, signalling the caller
+/// to re-poll).
+struct WokenFlag(std::sync::atomic::AtomicBool);
+
+impl futures::task::ArcWake for WokenFlag {
+    fn wake_by_ref(arc_self: &Arc<Self>) {
+        std::sync::atomic::AtomicBool::store(
+            &arc_self.0,
+            true,
+            std::sync::atomic::Ordering::Release,
+        );
+    }
+}
+
 /// Hydrate a workflow context by replaying its history into the workflow
 /// handler long enough for it to register its query handlers.
 async fn hydrate_ctx_for_query(
@@ -4057,26 +4076,48 @@ async fn hydrate_ctx_for_query(
     // DB operations for the entire duration of the workflow replay.
     drop(conn);
 
-    let ctx = WorkflowContext::for_replay_with_state(
+    let ctx = WorkflowContext::for_replay_with_state_and_history_policy(
         exec_id,
         history.events,
         runtime.registry.shared_state(),
+        runtime.registry.history_policy(),
     );
 
-    // Poll the workflow exactly once to drive through all recorded history.
-    // Recorded events resolve immediately (pre-sent oneshot channels), so the
-    // entire history replay happens in a single poll. The workflow then suspends
-    // at the first unrecorded event (Poll::Pending). Query handlers registered
-    // before that suspension point are captured in ctx.query_registry.
-    //
-    // A noop waker avoids integrating with Tokio's wakeup system — we only
-    // need the side-effect of handler registration, not the future's result.
+    // Drive the workflow future until it genuinely suspends on a workflow
+    // command (activity, signal wait, timer). Recorded events resolve via
+    // pre-sent oneshot channels so the entire history replays synchronously.
+    // Some workflows interleave ordinary async yields (e.g. yield_now) before
+    // registering query handlers; the WokenFlag waker detects those and keeps
+    // us polling. A wall-clock deadline (query_timeout) prevents spinning on a
+    // misbehaving workflow.
+    let deadline = std::time::Instant::now() + api_state.query_timeout();
+    let flag = Arc::new(WokenFlag(std::sync::atomic::AtomicBool::new(false)));
     {
-        let waker = futures::task::noop_waker_ref();
-        let mut poll_cx = std::task::Context::from_waker(waker);
+        let waker = futures::task::waker_ref(&flag);
+        let mut poll_cx = std::task::Context::from_waker(&waker);
         let handler_fut = (workflow.handler)(&ctx, execution.input.clone());
         tokio::pin!(handler_fut);
-        let _ = handler_fut.as_mut().poll(&mut poll_cx);
+        loop {
+            std::sync::atomic::AtomicBool::store(
+                &flag.0,
+                false,
+                std::sync::atomic::Ordering::Release,
+            );
+            match handler_fut.as_mut().poll(&mut poll_cx) {
+                std::task::Poll::Ready(_) => break,
+                std::task::Poll::Pending => {
+                    let was_woken = std::sync::atomic::AtomicBool::load(
+                        &flag.0,
+                        std::sync::atomic::Ordering::Acquire,
+                    );
+                    if !was_woken || std::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    // Waker was signalled immediately — the future yielded but
+                    // wants to be re-polled (e.g. yield_now). Keep driving.
+                }
+            }
+        }
     }
 
     Ok(ctx)
@@ -4121,17 +4162,24 @@ struct QueryWorkflowResponse {
 
 /// `POST /workflows/{id}/query/{query_name}` — query with typed args (issue #234).
 ///
-/// The request body is optional. Clients that invoke a no-arg handler via POST
-/// may omit the body entirely; `args` defaults to `null` in that case.
+/// The request body is optional. Clients may omit the body entirely or send
+/// `Content-Type: application/json` with an empty body; both default `args`
+/// to `null`. A non-empty body must be `{"args": <value>}`.
 async fn query_workflow_post(
     Extension(api_state): Extension<HarvestApiState>,
     Path((id, query_name)): Path<(String, String)>,
-    body: Option<Json<QueryWorkflowRequest>>,
+    body: Bytes,
 ) -> Result<Json<QueryWorkflowResponse>, AutumnError> {
     let exec_id = parse_execution_id(&id)?;
     let ctx = hydrate_ctx_for_query(&api_state, exec_id).await?;
     let start = Instant::now(); // measure handler invocation latency, not hydration cost
-    let args = body.map_or(Value::Null, |Json(b)| b.args);
+    let args: Value = if body.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice::<QueryWorkflowRequest>(&body)
+            .map(|r| r.args)
+            .map_err(|e| AutumnError::bad_request_msg(format!("invalid JSON body: {e}")))?
+    };
 
     let harvest_result = ctx.execute_query_with_args(&query_name, args);
     // Skip metric for not-found: user-supplied names create unbounded cardinality.

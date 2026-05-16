@@ -563,7 +563,7 @@ impl WorkflowContext {
         )
     }
 
-    pub(crate) fn for_replay_with_state_and_history_policy(
+    pub fn for_replay_with_state_and_history_policy(
         exec_id: ExecutionId,
         events: Vec<WorkflowEvent>,
         state: SharedState,
