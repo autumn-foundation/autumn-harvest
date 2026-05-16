@@ -616,8 +616,9 @@
       "method": "POST",
       "path": "/workflows/{id}/query/{query_name}",
       "category": "workflow",
-      "read_only": false,
-      "description": "Query the current state of a running workflow, passing typed JSON args to the handler. Returns {\"result\": <value>}.",
+      "read_only": true,
+      "post_for_body_only": true,
+      "description": "Query the current state of a running workflow, passing typed JSON args to the handler. Returns {\"result\": <value>}. POST is used instead of GET solely to allow a structured JSON request body; this route never writes workflow events.",
       "idempotency": "Read-only at the workflow level (no events written); safe to retry if the caller can tolerate duplicate handler invocations.",
       "params": [
         {
