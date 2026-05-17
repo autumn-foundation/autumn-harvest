@@ -264,6 +264,7 @@ pub struct HarvestSignal {
     pub payload: serde_json::Value,
     pub received_at: DateTime<Utc>,
     pub consumed: bool,
+    pub idempotency_key: Option<String>,
 }
 
 /// Insert struct for queuing a new signal.
@@ -273,6 +274,7 @@ pub struct NewHarvestSignal<'a> {
     pub workflow_exec_id: Uuid,
     pub signal_name: &'a str,
     pub payload: serde_json::Value,
+    pub idempotency_key: Option<&'a str>,
 }
 
 // ── Timer ─────────────────────────────────────────────────────────────────────

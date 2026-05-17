@@ -535,6 +535,7 @@ fn audit_coverage_all_mutation_routes_declared() {
     // All known mutation routes (hard-coded expected set) must be present.
     let expected_mutations = [
         "POST /workflows/{workflow_name}/start",
+        "POST /workflows/{workflow_name}/signal-with-start",
         "POST /workflows/{id}/cancel",
         "POST /workflows/{id}/reset",
         "POST /workflows/{id}/signal/{signal_name}",
