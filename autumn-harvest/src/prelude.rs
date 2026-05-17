@@ -15,9 +15,7 @@ pub use crate::handle::{
     StartedWorkflowHandle, WorkflowHandle, WorkflowHandleClient, WorkflowResult,
     WorkflowResultState, start_or_load_workflow_execution_with_handle,
 };
-pub use crate::info::{
-    ActivityInfo, DagInfo, QueryHandlerInfo, UpdateHandlerInfo, WorkflowInfo,
-};
+pub use crate::info::{ActivityInfo, DagInfo, QueryHandlerInfo, UpdateHandlerInfo, WorkflowInfo};
 pub use crate::policy::{RetryPolicy, Schedule, TaskStatus, TriggerRule};
 pub use crate::query::QueryRegistry;
 pub use crate::saga::Saga;

@@ -255,36 +255,32 @@ fn extract_ok_type_hint(output: &syn::ReturnType) -> String {
 /// Returns the human-readable name of a type suitable for type hints.
 fn type_name_hint(ty: &syn::Type) -> String {
     match ty {
-        syn::Type::Path(tp) => tp
-            .path
-            .segments
-            .last()
-            .map_or_else(
-                || "?".to_string(),
-                |s| {
-                    let ident = s.ident.to_string();
-                    if let syn::PathArguments::AngleBracketed(ref args) = s.arguments {
-                        let inner: Vec<_> = args
-                            .args
-                            .iter()
-                            .filter_map(|a| {
-                                if let syn::GenericArgument::Type(t) = a {
-                                    Some(type_name_hint(t))
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect();
-                        if inner.is_empty() {
-                            ident
-                        } else {
-                            format!("{ident}<{}>", inner.join(", "))
-                        }
-                    } else {
+        syn::Type::Path(tp) => tp.path.segments.last().map_or_else(
+            || "?".to_string(),
+            |s| {
+                let ident = s.ident.to_string();
+                if let syn::PathArguments::AngleBracketed(ref args) = s.arguments {
+                    let inner: Vec<_> = args
+                        .args
+                        .iter()
+                        .filter_map(|a| {
+                            if let syn::GenericArgument::Type(t) = a {
+                                Some(type_name_hint(t))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    if inner.is_empty() {
                         ident
+                    } else {
+                        format!("{ident}<{}>", inner.join(", "))
                     }
-                },
-            ),
+                } else {
+                    ident
+                }
+            },
+        ),
         syn::Type::Reference(r) => type_name_hint(&r.elem),
         syn::Type::Tuple(t) if t.elems.is_empty() => "()".to_string(),
         syn::Type::Tuple(t) => {

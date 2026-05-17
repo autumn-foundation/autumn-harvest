@@ -4098,7 +4098,12 @@ async fn hydrate_ctx_for_query(
     // Seed declarative query handlers (registered via `.queries(queries![...])`)
     // before replaying, so execute_query_with_args can find them.
     let wf_name = execution.workflow_name.as_str();
-    for h in runtime.registry.query_handlers.iter().filter(|h| h.workflow == wf_name) {
+    for h in runtime
+        .registry
+        .query_handlers
+        .iter()
+        .filter(|h| h.workflow == wf_name)
+    {
         ctx.register_declarative_query_handler(h);
     }
 

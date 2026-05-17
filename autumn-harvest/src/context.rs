@@ -2060,22 +2060,20 @@ impl WorkflowContext {
         let state = std::sync::Arc::clone(&self.state);
         let name = info.name;
 
-        let boxed_handler: crate::update::BoxUpdateHandler =
-            std::sync::Arc::new(move |input| {
-                let ctx = Self::new_for_handler(
-                    exec_id,
-                    start_time,
-                    cancellation_reason.clone(),
-                    std::sync::Arc::clone(&state),
-                );
-                handler_fn(ctx, input)
-            });
+        let boxed_handler: crate::update::BoxUpdateHandler = std::sync::Arc::new(move |input| {
+            let ctx = Self::new_for_handler(
+                exec_id,
+                start_time,
+                cancellation_reason.clone(),
+                std::sync::Arc::clone(&state),
+            );
+            handler_fn(ctx, input)
+        });
 
-        let boxed_validator: Option<crate::update::BoxUpdateValidator> =
-            info.validator.map(|v| {
-                let arc: crate::update::BoxUpdateValidator = std::sync::Arc::new(v);
-                arc
-            });
+        let boxed_validator: Option<crate::update::BoxUpdateValidator> = info.validator.map(|v| {
+            let arc: crate::update::BoxUpdateValidator = std::sync::Arc::new(v);
+            arc
+        });
 
         self.update_registry
             .lock()

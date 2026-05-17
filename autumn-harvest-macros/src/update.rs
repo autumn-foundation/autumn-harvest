@@ -71,11 +71,8 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // ── Validation ────────────────────────────────────────────────────────────
 
     if func.sig.asyncness.is_none() {
-        return syn::Error::new_spanned(
-            func.sig.fn_token,
-            "#[update] handlers must be async",
-        )
-        .to_compile_error();
+        return syn::Error::new_spanned(func.sig.fn_token, "#[update] handlers must be async")
+            .to_compile_error();
     }
 
     // First parameter must be ctx: &WorkflowContext.
@@ -121,14 +118,15 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let dispatch = build_update_dispatch(fn_name, &param_names);
 
-    let (has_validator, validator_expr) =
-        attrs.validator.as_ref().map_or_else(
-            || (quote! { false }, quote! { None }),
-            |validator_path| (
+    let (has_validator, validator_expr) = attrs.validator.as_ref().map_or_else(
+        || (quote! { false }, quote! { None }),
+        |validator_path| {
+            (
                 quote! { true },
                 quote! { Some(#validator_path as ::autumn_harvest::UpdateValidatorFn) },
-            ),
-        );
+            )
+        },
+    );
 
     quote! {
         #func
@@ -165,9 +163,7 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Returns `true` when the first parameter matches `ctx: &WorkflowContext`.
-fn first_param_is_ctx(
-    inputs: &syn::punctuated::Punctuated<syn::FnArg, syn::token::Comma>,
-) -> bool {
+fn first_param_is_ctx(inputs: &syn::punctuated::Punctuated<syn::FnArg, syn::token::Comma>) -> bool {
     let Some(first) = inputs.first() else {
         return false;
     };
@@ -283,36 +279,32 @@ fn extract_ok_type_hint(output: &syn::ReturnType) -> String {
 
 fn type_name_hint(ty: &syn::Type) -> String {
     match ty {
-        syn::Type::Path(tp) => tp
-            .path
-            .segments
-            .last()
-            .map_or_else(
-                || "?".to_string(),
-                |s| {
-                    let ident = s.ident.to_string();
-                    if let syn::PathArguments::AngleBracketed(ref args) = s.arguments {
-                        let inner: Vec<_> = args
-                            .args
-                            .iter()
-                            .filter_map(|a| {
-                                if let syn::GenericArgument::Type(t) = a {
-                                    Some(type_name_hint(t))
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect();
-                        if inner.is_empty() {
-                            ident
-                        } else {
-                            format!("{ident}<{}>", inner.join(", "))
-                        }
-                    } else {
+        syn::Type::Path(tp) => tp.path.segments.last().map_or_else(
+            || "?".to_string(),
+            |s| {
+                let ident = s.ident.to_string();
+                if let syn::PathArguments::AngleBracketed(ref args) = s.arguments {
+                    let inner: Vec<_> = args
+                        .args
+                        .iter()
+                        .filter_map(|a| {
+                            if let syn::GenericArgument::Type(t) = a {
+                                Some(type_name_hint(t))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    if inner.is_empty() {
                         ident
+                    } else {
+                        format!("{ident}<{}>", inner.join(", "))
                     }
-                },
-            ),
+                } else {
+                    ident
+                }
+            },
+        ),
         syn::Type::Reference(r) => type_name_hint(&r.elem),
         syn::Type::Tuple(t) if t.elems.is_empty() => "()".to_string(),
         syn::Type::Tuple(t) => {

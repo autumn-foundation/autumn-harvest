@@ -12,7 +12,7 @@
     clippy::redundant_closure_for_method_calls,
     clippy::unnecessary_wraps,
     clippy::unused_async,
-    clippy::used_underscore_binding,
+    clippy::used_underscore_binding
 )]
 
 use autumn_harvest::context::{WorkflowContext, empty_shared_state};
@@ -242,7 +242,12 @@ fn query_handler_dispatches_multi_param() {
 #[tokio::test]
 async fn update_handler_dispatches_without_validator() {
     let info = __autumn_update_handler_info_approve();
-    let ctx = WorkflowContext::new_for_handler(ExecutionId::new(), chrono::Utc::now(), None, empty_shared_state());
+    let ctx = WorkflowContext::new_for_handler(
+        ExecutionId::new(),
+        chrono::Utc::now(),
+        None,
+        empty_shared_state(),
+    );
     let result = (info.handler)(ctx, serde_json::json!({"approved": true}))
         .await
         .unwrap();
@@ -259,7 +264,12 @@ async fn update_handler_with_validator_accept() {
         "valid input should pass"
     );
 
-    let ctx = WorkflowContext::new_for_handler(ExecutionId::new(), chrono::Utc::now(), None, empty_shared_state());
+    let ctx = WorkflowContext::new_for_handler(
+        ExecutionId::new(),
+        chrono::Utc::now(),
+        None,
+        empty_shared_state(),
+    );
     let result = (info.handler)(ctx, serde_json::json!({"approved": true}))
         .await
         .unwrap();
@@ -323,10 +333,16 @@ async fn declarative_handlers_register_idempotently_on_multiple_replays() {
         ctx.register_declarative_update_handler(&update_info);
     }
 
-    let q = ctx.execute_query_with_args("get_count", serde_json::Value::Null).unwrap();
+    let q = ctx
+        .execute_query_with_args("get_count", serde_json::Value::Null)
+        .unwrap();
     assert_eq!(q, serde_json::json!(42));
 
-    let u = ctx.invoke_update("approve", serde_json::json!({"approved": true})).unwrap().await.unwrap();
+    let u = ctx
+        .invoke_update("approve", serde_json::json!({"approved": true}))
+        .unwrap()
+        .await
+        .unwrap();
     assert_eq!(u, serde_json::json!(true));
 }
 
@@ -346,8 +362,8 @@ fn read_counter(ctx: &WorkflowContext) -> Result<u64, String> {
 
 #[test]
 fn query_ctx_can_access_shared_state() {
-    use std::any::TypeId;
     use autumn_harvest::context::SharedStateMap;
+    use std::any::TypeId;
 
     let mut map = SharedStateMap::new();
     map.insert(TypeId::of::<MyCounter>(), Box::new(MyCounter { count: 77 }));

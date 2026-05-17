@@ -15,7 +15,13 @@ pub struct StatusResponse {
 }
 
 fn validate_decision(input: &serde_json::Value) -> Result<(), String> {
-    if input.get("reason").and_then(|v| v.as_str()).unwrap_or("").trim().is_empty() {
+    if input
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .is_empty()
+    {
         return Err("reason must not be empty".into());
     }
     Ok(())
@@ -30,14 +36,23 @@ pub async fn decide(_ctx: &WorkflowContext, _input: Decision) -> Result<(), Stri
 // Declarative query handler — auto-registered before the workflow runs.
 #[query(workflow = "approval_workflow")]
 pub fn approval_status(_ctx: &WorkflowContext) -> Result<StatusResponse, String> {
-    Ok(StatusResponse { pending: true, approved: None })
+    Ok(StatusResponse {
+        pending: true,
+        approved: None,
+    })
 }
 
 #[workflow]
-pub async fn approval_workflow(_ctx: &WorkflowContext, _id: String) -> Result<StatusResponse, String> {
+pub async fn approval_workflow(
+    _ctx: &WorkflowContext,
+    _id: String,
+) -> Result<StatusResponse, String> {
     // The worker injects declarative handlers before this fn runs on every replay.
     // Business logic (e.g. wait for the "decide" signal) would go here.
-    Ok(StatusResponse { pending: false, approved: Some(true) })
+    Ok(StatusResponse {
+        pending: false,
+        approved: Some(true),
+    })
 }
 
 fn main() {
