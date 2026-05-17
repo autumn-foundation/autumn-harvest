@@ -271,13 +271,13 @@ pub enum Schedule {
 ///
 /// ## Decision matrix
 ///
-/// | Policy | In-flight run | New firing | Subsequent firings while busy | Durability |
-/// |---|---|---|---|---|
-/// | `Skip` | Continues | Dropped | Each evaluated at next tick | N/A |
-/// | `BufferOne` | Continues | Queued (one slot) | Dropped while slot occupied | Durable in DB |
-/// | `BufferAll` | Continues | Queued (up to `buffer_all_max`) | Dropped past cap | Durable in DB |
-/// | `CancelOther` | Cancelled gracefully | Started immediately | Normal | N/A |
-/// | `TerminateOther` | Terminated immediately | Started immediately | Normal | N/A |
+/// | Policy | When to use | In-flight run | New firing | Subsequent firings while busy | Durability |
+/// |---|---|---|---|---|---|
+/// | `Skip` | Default; predictable load, idempotent schedules | Continues | Dropped | Each evaluated at next tick | N/A |
+/// | `BufferOne` | Long-running jobs that must catch up by exactly one slot | Continues | Queued (one slot) | Dropped while slot occupied | Durable in DB |
+/// | `BufferAll` | Backfill/replay; every missed slot must eventually run | Continues | Queued (up to `buffer_all_max`) | Dropped past cap | Durable in DB |
+/// | `CancelOther` | Wedged runs; always prefer the latest firing | Cancelled gracefully | Started immediately | Normal | N/A |
+/// | `TerminateOther` | Same as `CancelOther` but with immediate force-stop | Terminated immediately | Started immediately | Normal | N/A |
 ///
 /// The default is [`Skip`](OverlapPolicy::Skip), which preserves pre-existing behaviour.
 ///
