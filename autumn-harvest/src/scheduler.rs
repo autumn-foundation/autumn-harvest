@@ -580,7 +580,9 @@ pub async fn tick_once_sharded(
         // capacity freed by a just-completed run is consumed by the oldest
         // pending slot first, not by the freshest next_run_at firing.
         #[cfg(feature = "db")]
-        if let Err(error) = drain_buffered_schedule_runs(&mut conn, shard, &metrics).await {
+        if let Err(error) =
+            drain_buffered_schedule_runs(&mut conn, shard, dags.as_ref(), &metrics).await
+        {
             tracing::warn!(
                 error = %error,
                 shard_id = shard.as_i32(),
@@ -809,6 +811,18 @@ async fn upsert_schedule(
                 .next_run_at
                 .or_else(|| next_run_after(dag.schedule.as_ref(), now))
         };
+        // Clear buffered slots when the schedule cadence changes or when the
+        // operator switches away from a buffering policy, so stale firings are
+        // not dispatched under a configuration that never produced them.
+        let is_buffering_policy = matches!(
+            dag.overlap_policy,
+            OverlapPolicy::BufferOne | OverlapPolicy::BufferAll
+        );
+        let new_buffered_runs = if is_buffering_policy && !schedule_changed {
+            existing.buffered_runs.clone()
+        } else {
+            serde_json::json!([])
+        };
         diesel::update(dsl::harvest_schedules.find(existing.id))
             .set((
                 dsl::schedule_expr.eq(expr.clone()),
@@ -821,6 +835,7 @@ async fn upsert_schedule(
                 dsl::jitter_secs.eq(i64::try_from(dag.jitter.as_secs()).unwrap_or(i64::MAX)),
                 dsl::overlap_policy.eq(dag.overlap_policy.as_str()),
                 dsl::buffer_all_max.eq(i32::try_from(dag.buffer_all_max).unwrap_or(i32::MAX)),
+                dsl::buffered_runs.eq(new_buffered_runs),
             ))
             .execute(conn)
             .await
@@ -1051,13 +1066,14 @@ async fn upsert_workflow_schedule(
             .or_else(|| next_run_after(Some(&ws.schedule), now))
     };
     // is_paused is deliberately excluded — it is managed via pause/resume, not here.
-    // buffered_runs: preserved when staying in a buffering policy; cleared when switching
-    // away from BufferOne/BufferAll so stale slots are not dispatched under the new policy.
+    // buffered_runs: preserved only when the policy is still buffering AND the cadence
+    // has not changed. Clearing on schedule_changed prevents stale firings from the old
+    // cadence being dispatched under a new cron/interval.
     let is_buffering_policy = matches!(
         ws.overlap_policy,
         OverlapPolicy::BufferOne | OverlapPolicy::BufferAll
     );
-    let new_buffered_runs = if is_buffering_policy {
+    let new_buffered_runs = if is_buffering_policy && !schedule_changed {
         existing.buffered_runs.clone()
     } else {
         serde_json::json!([])
@@ -1763,6 +1779,7 @@ pub(crate) fn buffered_runs_to_json(runs: &[DateTime<Utc>]) -> serde_json::Value
 async fn drain_buffered_schedule_runs(
     conn: &mut AsyncPgConnection,
     current_shard: ShardId,
+    registered_dags: &DagCatalog,
     metrics: &Arc<dyn crate::telemetry::MetricsRecorder>,
 ) -> HarvestResult<()> {
     use crate::schema::harvest_schedules::dsl;
@@ -1786,6 +1803,19 @@ async fn drain_buffered_schedule_runs(
         let Some(ref wf_name) = schedule.workflow_name else {
             continue;
         };
+
+        // Skip DAG-backed schedules whose DAG is no longer registered so that
+        // removing a DAG does not cause its stale buffered slots to be dispatched.
+        if let Some(ref dag_name) = schedule.dag_name
+            && !registered_dags.contains_key(dag_name)
+        {
+            tracing::debug!(
+                workflow_name = %wf_name,
+                dag_name = %dag_name,
+                "harvest: skipping buffered drain for unregistered DAG"
+            );
+            continue;
+        }
 
         let mut buffered = parse_buffered_runs(&schedule.buffered_runs);
         if buffered.is_empty() {

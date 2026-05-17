@@ -4859,7 +4859,12 @@ async fn create_workflow_schedule(
     let pool = api_state.storage_pool().map_err(map_error)?;
     let mut conn = acquire_conn(pool.pool_for(runtime.router().default_shard())).await?;
 
-    let overlap_policy = autumn_harvest::OverlapPolicy::from_db(&request.overlap_policy);
+    // Reject unknown overlap_policy strings with 400 before storing.
+    // `from_db` is lenient for backward compat; user input is validated strictly.
+    let overlap_policy = autumn_harvest::OverlapPolicy::from_user_input(&request.overlap_policy)
+        .map_err(|v| AutumnError::bad_request_msg(format!(
+            "invalid overlap_policy '{v}'; valid values: skip, buffer_one, buffer_all, cancel_other, terminate_other"
+        )))?;
     let ws = WorkflowSchedule {
         workflow_name: request.workflow_name.clone(),
         dag_name: None,

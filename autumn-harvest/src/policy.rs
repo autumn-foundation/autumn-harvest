@@ -332,6 +332,26 @@ impl OverlapPolicy {
             _ => Self::Skip,
         }
     }
+
+    /// Parse an `overlap_policy` value from user-supplied input (e.g. an API request).
+    ///
+    /// Unlike [`from_db`](Self::from_db) this is strict: an unknown value returns
+    /// `Err` so callers can surface a 400 response rather than silently applying
+    /// the `Skip` fallback.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(s)` when `s` is not a recognised variant name.
+    pub fn from_user_input(s: &str) -> Result<Self, &str> {
+        match s {
+            "skip" => Ok(Self::Skip),
+            "buffer_one" => Ok(Self::BufferOne),
+            "buffer_all" => Ok(Self::BufferAll),
+            "cancel_other" => Ok(Self::CancelOther),
+            "terminate_other" => Ok(Self::TerminateOther),
+            _ => Err(s),
+        }
+    }
 }
 
 /// Per-workflow cron/interval schedule — the lightweight alternative to a
