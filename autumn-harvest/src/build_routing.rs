@@ -633,3 +633,89 @@ pub fn merge_reachability(per_shard: Vec<Vec<BuildReachability>>) -> Vec<BuildRe
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_compatibility_set() {
+        let mut set = BuildCompatibilitySet::new();
+        assert!(set.is_eligible("worker1", None));
+        assert!(set.is_eligible("", Some("req1")));
+        assert!(set.is_eligible("worker1", Some("worker1")));
+        assert!(!set.is_eligible("worker1", Some("req1")));
+
+        set.add_declaration("worker1", "req1");
+        assert!(set.is_eligible("worker1", Some("req1")));
+
+        set.remove_declaration("worker1", "req1");
+        assert!(!set.is_eligible("worker1", Some("req1")));
+    }
+
+    #[test]
+    fn test_merge_reachability() {
+        let shard1 = vec![
+            BuildReachability {
+                build_id: "build1".to_string(),
+                open_executions: 1,
+                pending_tasks: 2,
+                active_workers: 3,
+                stale_workers: 4,
+                safe_to_retire: false,
+            },
+            BuildReachability {
+                build_id: "build2".to_string(),
+                open_executions: 0,
+                pending_tasks: 0,
+                active_workers: 0,
+                stale_workers: 1,
+                safe_to_retire: true,
+            },
+        ];
+
+        let shard2 = vec![
+            BuildReachability {
+                build_id: "build1".to_string(),
+                open_executions: 10,
+                pending_tasks: 20,
+                active_workers: 30,
+                stale_workers: 40,
+                safe_to_retire: false,
+            },
+            BuildReachability {
+                build_id: "build3".to_string(),
+                open_executions: 5,
+                pending_tasks: 0,
+                active_workers: 1,
+                stale_workers: 0,
+                safe_to_retire: false,
+            },
+        ];
+
+        let merged = merge_reachability(vec![shard1, shard2]);
+
+        assert_eq!(merged.len(), 3);
+
+        let build1 = merged.iter().find(|x| x.build_id == "build1").unwrap();
+        assert_eq!(build1.open_executions, 11);
+        assert_eq!(build1.pending_tasks, 22);
+        assert_eq!(build1.active_workers, 33);
+        assert_eq!(build1.stale_workers, 44);
+        assert!(!build1.safe_to_retire);
+
+        let build2 = merged.iter().find(|x| x.build_id == "build2").unwrap();
+        assert_eq!(build2.open_executions, 0);
+        assert_eq!(build2.pending_tasks, 0);
+        assert_eq!(build2.active_workers, 0);
+        assert_eq!(build2.stale_workers, 1);
+        assert!(build2.safe_to_retire);
+
+        let build3 = merged.iter().find(|x| x.build_id == "build3").unwrap();
+        assert_eq!(build3.open_executions, 5);
+        assert_eq!(build3.pending_tasks, 0);
+        assert_eq!(build3.active_workers, 1);
+        assert_eq!(build3.stale_workers, 0);
+        assert!(!build3.safe_to_retire);
+    }
+}
