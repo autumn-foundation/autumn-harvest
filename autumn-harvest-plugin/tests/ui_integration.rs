@@ -1920,7 +1920,11 @@ async fn detail_page_shows_parent_children_panel() {
 
     // Parent page should show children section with child exec id
     let (status, html) = fetch_html(&app, &format!("/workflows/{parent_exec_id}")).await;
-    assert_eq!(status, StatusCode::OK, "parent detail page should render: {html}");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "parent detail page should render: {html}"
+    );
     assert!(
         html.contains("Children") || html.contains("children"),
         "parent detail page should show a 'Children' section: {html}"
@@ -1932,7 +1936,11 @@ async fn detail_page_shows_parent_children_panel() {
 
     // Child page should show parent as a clickable link
     let (status, html) = fetch_html(&app, &format!("/workflows/{child_exec_id}")).await;
-    assert_eq!(status, StatusCode::OK, "child detail page should render: {html}");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "child detail page should render: {html}"
+    );
     let parent_str = parent_exec_id.to_string();
     assert!(
         html.contains(&format!("href=\"../../workflows/{parent_str}\""))
@@ -2017,8 +2025,7 @@ async fn detail_page_event_labels_human_readable() {
 #[tokio::test]
 async fn detail_page_events_paginated_for_large_history() {
     let (database_url, _container) = setup_test_database_url().await;
-    let exec_id =
-        insert_workflow_on_url(&database_url, ShardId::new(0), "big_wf", "big-1").await;
+    let exec_id = insert_workflow_on_url(&database_url, ShardId::new(0), "big_wf", "big-1").await;
 
     // Insert 150 signal events so the pagination threshold is crossed.
     let many_events: Vec<autumn_harvest::WorkflowEvent> = (0..150)
@@ -2054,8 +2061,7 @@ async fn detail_page_events_paginated_for_large_history() {
 #[tokio::test]
 async fn detail_page_status_badge_has_aria_label() {
     let (database_url, _container) = setup_test_database_url().await;
-    let exec_id =
-        insert_workflow_on_url(&database_url, ShardId::new(0), "aria_wf", "aria-1").await;
+    let exec_id = insert_workflow_on_url(&database_url, ShardId::new(0), "aria_wf", "aria-1").await;
 
     let app = build_single_shard_ui_app(&database_url);
     let (status, html) = fetch_html(&app, &format!("/workflows/{exec_id}")).await;
@@ -2088,8 +2094,7 @@ async fn list_page_has_time_range_filters() {
 #[tokio::test]
 async fn detail_page_event_timestamps_display() {
     let (database_url, _container) = setup_test_database_url().await;
-    let exec_id =
-        insert_workflow_on_url(&database_url, ShardId::new(0), "ts_wf", "ts-1").await;
+    let exec_id = insert_workflow_on_url(&database_url, ShardId::new(0), "ts_wf", "ts-1").await;
 
     let app = build_single_shard_ui_app(&database_url);
     let (status, html) = fetch_html(&app, &format!("/workflows/{exec_id}")).await;
@@ -2164,7 +2169,9 @@ async fn detail_page_blocked_on_panel_for_running_workflow() {
     let (status, html) = fetch_html(&app, &format!("/workflows/{exec_id}")).await;
     assert_eq!(status, StatusCode::OK, "detail page should render: {html}");
     assert!(
-        html.to_lowercase().contains("blocked") || html.contains("Blocked on") || html.contains("pending"),
+        html.to_lowercase().contains("blocked")
+            || html.contains("Blocked on")
+            || html.contains("pending"),
         "detail page should show blocked-on or pending panel: {html}"
     );
     assert!(
@@ -2251,11 +2258,8 @@ async fn detail_page_renders_flash_message() {
         insert_workflow_on_url(&database_url, ShardId::new(0), "flash_wf", "flash-1").await;
 
     let app = build_single_shard_ui_app(&database_url);
-    let (status, html) = fetch_html(
-        &app,
-        &format!("/workflows/{exec_id}?flash=Hello%20world"),
-    )
-    .await;
+    let (status, html) =
+        fetch_html(&app, &format!("/workflows/{exec_id}?flash=Hello%20world")).await;
     assert_eq!(status, StatusCode::OK, "detail page should render: {html}");
     assert!(
         html.contains("Hello world") || html.contains("Hello+world"),
@@ -2312,8 +2316,7 @@ async fn detail_page_reset_action_redirects_with_flash() {
 #[tokio::test]
 async fn detail_page_has_jump_to_event_n_control() {
     let (database_url, _container) = setup_test_database_url().await;
-    let exec_id =
-        insert_workflow_on_url(&database_url, ShardId::new(0), "jump_wf", "jump-1").await;
+    let exec_id = insert_workflow_on_url(&database_url, ShardId::new(0), "jump_wf", "jump-1").await;
 
     // Insert 150 events so pagination threshold is crossed
     let many_events: Vec<autumn_harvest::WorkflowEvent> = (0..150)
