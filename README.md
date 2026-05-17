@@ -104,6 +104,65 @@ already know an execution ID, use
 compact terminal body with `state`, `output`/`error`, and `completed_at`, or
 `204 No Content` with `Retry-After` while the workflow is still running.
 
+## Communicating with running workflows
+
+Harvest supports two styles for registering query and update handlers on a
+workflow. The **declarative style** (recommended) uses proc-macro attributes and
+bang macros; the **imperative style** is supported for advanced cases such as
+dynamic handler sets determined at runtime.
+
+### Declarative style (recommended)
+
+Annotate free-standing functions and register them on the builder:
+
+```rust
+use autumn_harvest::prelude::*;
+
+#[update(workflow = "approval_workflow", validator = validate_decision)]
+pub fn decide(ctx: &WorkflowContext, input: DecisionInput) -> Result<(), String> { /* … */ }
+
+#[query(workflow = "approval_workflow")]
+pub fn approval_status(ctx: &WorkflowContext) -> Result<StatusResponse, String> { /* … */ }
+
+HarvestBuilder::new()
+    .workflows(workflows![approval_workflow])
+    .updates(updates![decide])
+    .queries(queries![approval_status]);
+```
+
+See [`autumn-harvest/examples/approval_workflow.rs`](autumn-harvest/examples/approval_workflow.rs)
+for a complete working example including a validator and `drain_admitted_updates`.
+
+### Imperative style (supported for advanced cases)
+
+Use `ctx.register_update_handler` / `ctx.register_query_handler` directly inside
+the workflow body when handler sets are determined at runtime:
+
+```rust
+ctx.register_update_handler("decide", Some(validate_decision), |ctx, input: DecisionInput| {
+    /* … */
+});
+ctx.register_query_handler("status", |_req: &()| Ok("running"));
+```
+
+### Handler discovery via management API
+
+To enumerate all registered query and update handlers for a workflow type:
+
+```
+GET /api/harvest/workflows/types/{workflow_name}/handlers
+```
+
+Response shape:
+
+```json
+{
+  "workflow": "approval_workflow",
+  "queries": [{ "name": "approval_status", "input_type_hint": "…", "output_type_hint": "…" }],
+  "updates": [{ "name": "decide", "input_type_hint": "…", "output_type_hint": "…", "has_validator": true }]
+}
+```
+
 ## Long-running workflows
 
 Every workflow replay loads its durable event history. For pollers, monitors,

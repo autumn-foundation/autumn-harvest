@@ -1,0 +1,5 @@
+error: #[query] return type must be `Result<T, E>`
+ --> tests/compile_fail/query_wrong_return.rs:5:38
+  |
+5 | fn get_count(_ctx: &WorkflowContext) -> u64 {
+  |                                      ^^^^^^

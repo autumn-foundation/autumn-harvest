@@ -1266,6 +1266,11 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             get(query_workflow).post(query_workflow_post),
         )
         .route("/workflows/{id}/queries", get(list_workflow_queries))
+        // Handler discovery (issue #346): enumerate declarative queries and updates for a type.
+        .route(
+            "/workflows/types/{workflow_name}/handlers",
+            get(list_workflow_type_handlers),
+        )
         // Update primitive (issue #140): synchronous request/response into a running workflow.
         .route("/workflows/{id}/update/{update_name}", post(admit_update))
         .route(
@@ -4098,6 +4103,18 @@ async fn hydrate_ctx_for_query(
         runtime.registry.history_policy(),
     );
 
+    // Seed declarative query handlers (registered via `.queries(queries![...])`)
+    // before replaying, so execute_query_with_args can find them.
+    let wf_name = execution.workflow_name.as_str();
+    for h in runtime
+        .registry
+        .query_handlers
+        .iter()
+        .filter(|h| h.workflow == wf_name)
+    {
+        ctx.register_declarative_query_handler(h);
+    }
+
     // Drive the workflow future until it genuinely suspends on a workflow
     // command (activity, signal wait, timer). Recorded events resolve via
     // pre-sent oneshot channels so the entire history replays synchronously.
@@ -4226,6 +4243,67 @@ async fn list_workflow_queries(
     let mut names = ctx.list_query_names();
     names.sort(); // deterministic order for UI
     Ok(Json(names))
+}
+
+/// Response body for `GET /workflows/types/{workflow_name}/handlers` (issue #346).
+#[derive(Serialize)]
+struct WorkflowTypeHandlers {
+    workflow: String,
+    queries: Vec<HandlerSummary>,
+    updates: Vec<UpdateHandlerSummary>,
+}
+
+#[derive(Serialize)]
+struct HandlerSummary {
+    name: &'static str,
+    input_type_hint: &'static str,
+    output_type_hint: &'static str,
+}
+
+#[derive(Serialize)]
+struct UpdateHandlerSummary {
+    name: &'static str,
+    input_type_hint: &'static str,
+    output_type_hint: &'static str,
+    has_validator: bool,
+}
+
+async fn list_workflow_type_handlers(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(workflow_name): Path<String>,
+) -> Result<Json<WorkflowTypeHandlers>, AutumnError> {
+    let runtime = api_state.runtime().map_err(map_error)?;
+
+    let queries = runtime
+        .registry
+        .query_handlers
+        .iter()
+        .filter(|h| h.workflow == workflow_name)
+        .map(|h| HandlerSummary {
+            name: h.name,
+            input_type_hint: h.input_type_hint,
+            output_type_hint: h.output_type_hint,
+        })
+        .collect();
+
+    let updates = runtime
+        .registry
+        .update_handlers
+        .iter()
+        .filter(|h| h.workflow == workflow_name)
+        .map(|h| UpdateHandlerSummary {
+            name: h.name,
+            input_type_hint: h.input_type_hint,
+            output_type_hint: h.output_type_hint,
+            has_validator: h.has_validator,
+        })
+        .collect();
+
+    Ok(Json(WorkflowTypeHandlers {
+        workflow: workflow_name,
+        queries,
+        updates,
+    }))
 }
 
 fn schedule_expr_for_summary(schedule: &Schedule) -> String {

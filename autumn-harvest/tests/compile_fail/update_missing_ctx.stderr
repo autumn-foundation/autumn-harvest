@@ -1,0 +1,5 @@
+error: #[update] handlers must take `ctx: &WorkflowContext` as the first argument
+ --> tests/compile_fail/update_missing_ctx.rs:5:1
+  |
+5 | async fn approve() -> Result<bool, String> {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

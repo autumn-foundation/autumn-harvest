@@ -33,7 +33,7 @@ use crate::executor::{
 };
 use crate::external_task;
 use crate::failure::{parse_error_payload, parse_error_payload_full, parse_typed_payload};
-use crate::info::{ActivityInfo, WorkflowInfo};
+use crate::info::{ActivityInfo, QueryHandlerInfo, UpdateHandlerInfo, WorkflowInfo};
 use crate::models::{
     HarvestTimer, NewHarvestTimer, NewWorkflowExecution, TaskQueueItem, WorkflowExecution,
 };
@@ -156,6 +156,10 @@ pub struct HandlerRegistry {
     pub workflows: HashMap<String, WorkflowInfo>,
     /// Activity handlers indexed by name.
     pub activities: HashMap<String, ActivityInfo>,
+    /// Declarative query handlers (issue #346), indexed by `(workflow, name)`.
+    pub query_handlers: Vec<QueryHandlerInfo>,
+    /// Declarative update handlers (issue #346), indexed by `(workflow, name)`.
+    pub update_handlers: Vec<UpdateHandlerInfo>,
     /// Shared typed state visible to workflow and activity handlers.
     state: SharedState,
     /// Telemetry bundle (trace-context propagator + metrics recorder) applied
@@ -211,10 +215,24 @@ impl HandlerRegistry {
         Self {
             workflows,
             activities,
+            query_handlers: Vec::new(),
+            update_handlers: Vec::new(),
             state,
             telemetry,
             history_policy: WorkflowHistoryPolicy::default(),
         }
+    }
+
+    /// Set declarative query and update handlers (issue #346).
+    #[must_use]
+    pub fn with_handler_infos(
+        mut self,
+        query_handlers: Vec<QueryHandlerInfo>,
+        update_handlers: Vec<UpdateHandlerInfo>,
+    ) -> Self {
+        self.query_handlers = query_handlers;
+        self.update_handlers = update_handlers;
+        self
     }
 
     /// Create a new registry with shared state, telemetry, and history guardrails.
@@ -267,6 +285,8 @@ impl std::fmt::Debug for HandlerRegistry {
         f.debug_struct("HandlerRegistry")
             .field("workflows", &self.workflows.keys())
             .field("activities", &self.activities.keys())
+            .field("query_handler_count", &self.query_handlers.len())
+            .field("update_handler_count", &self.update_handlers.len())
             .field("state_count", &self.state.len())
             .field("telemetry", &self.telemetry)
             .field("history_policy", &self.history_policy)
@@ -3397,6 +3417,19 @@ async fn process_workflow_task(
                 .and_then(|c| c.link_traceparent.clone().or_else(|| c.traceparent.clone())),
         };
 
+        // Filter declarative handlers to those that target this workflow type.
+        let wf_name = prepared.execution.workflow_name.as_str();
+        let dq: Vec<&crate::info::QueryHandlerInfo> = registry
+            .query_handlers
+            .iter()
+            .filter(|h| h.workflow == wf_name)
+            .collect();
+        let du: Vec<&crate::info::UpdateHandlerInfo> = registry
+            .update_handlers
+            .iter()
+            .filter(|h| h.workflow == wf_name)
+            .collect();
+
         let (run_outcome, pending_cmds, execute_span) = run_workflow_with_state_and_history_policy(
             prepared.exec_id,
             history_events.clone(),
@@ -3405,6 +3438,8 @@ async fn process_workflow_task(
             registry.shared_state(),
             registry.history_policy(),
             Some(&span_meta),
+            &dq,
+            &du,
         )
         .await;
 

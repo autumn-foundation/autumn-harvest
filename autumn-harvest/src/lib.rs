@@ -176,7 +176,10 @@ pub use history_export::{
     HistoryExportDocument, HistoryExportError, HistoryExportRequest, HistoryExportSizeLimit,
     HistoryExportStatus, HistoryPayloadPolicy, export_history, export_mermaid_sequence,
 };
-pub use info::{ActivityHandlerFn, ActivityInfo, DagInfo, WorkflowHandlerFn, WorkflowInfo};
+pub use info::{
+    ActivityHandlerFn, ActivityInfo, DagInfo, QueryHandlerFn, QueryHandlerInfo, UpdateHandlerFn,
+    UpdateHandlerInfo, UpdateValidatorFn, WorkflowHandlerFn, WorkflowInfo,
+};
 pub use payload_codec::{CodecError, IdentityCodec, PayloadCodec, PayloadCodecs};
 pub use policy::validate_schedule;
 pub use policy::{RetryPolicy, Schedule, TaskStatus, TriggerRule, WorkflowSchedule};

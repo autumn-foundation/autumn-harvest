@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::context::{SharedStateMap, WorkflowHistoryPolicy};
-use crate::info::{ActivityInfo, DagInfo, WorkflowInfo};
+use crate::info::{ActivityInfo, DagInfo, QueryHandlerInfo, UpdateHandlerInfo, WorkflowInfo};
 use crate::payload_codec::{PayloadCodec, PayloadCodecs};
 use crate::policy::WorkflowSchedule;
 use crate::retention::RetentionConfig;
@@ -43,6 +43,10 @@ pub struct HarvestBuilder {
     dags: Vec<DagInfo>,
     workflow_schedules: Vec<WorkflowSchedule>,
     auto_registered_dag_workflows: Vec<String>,
+    /// Declarative query handlers collected via `queries![…]`.
+    query_handlers: Vec<QueryHandlerInfo>,
+    /// Declarative update handlers collected via `updates![…]`.
+    update_handlers: Vec<UpdateHandlerInfo>,
     worker_config: WorkerConfig,
     state: SharedStateMap,
     telemetry: Option<TelemetryConfig>,
@@ -62,6 +66,8 @@ impl std::fmt::Debug for HarvestBuilder {
                 "auto_registered_dag_workflow_count",
                 &self.auto_registered_dag_workflows.len(),
             )
+            .field("query_handler_count", &self.query_handlers.len())
+            .field("update_handler_count", &self.update_handlers.len())
             .field("worker_config", &self.worker_config)
             .field("state_count", &self.state.len())
             .field("telemetry_configured", &self.telemetry.is_some())
@@ -78,6 +84,10 @@ pub struct BuiltHarvest {
     activities: Vec<ActivityInfo>,
     dags: Vec<DagInfo>,
     workflow_schedules: Vec<WorkflowSchedule>,
+    /// Declarative query handlers indexed by workflow name for fast lookup.
+    query_handlers: Vec<QueryHandlerInfo>,
+    /// Declarative update handlers indexed by workflow name for fast lookup.
+    update_handlers: Vec<UpdateHandlerInfo>,
     worker_config: WorkerConfig,
     state: SharedStateMap,
     telemetry: Arc<TelemetryConfig>,
@@ -93,6 +103,8 @@ impl std::fmt::Debug for BuiltHarvest {
             .field("activity_count", &self.activities.len())
             .field("dag_count", &self.dags.len())
             .field("workflow_schedule_count", &self.workflow_schedules.len())
+            .field("query_handler_count", &self.query_handlers.len())
+            .field("update_handler_count", &self.update_handlers.len())
             .field("worker_config", &self.worker_config)
             .field("state_count", &self.state.len())
             .field("telemetry", &self.telemetry)
@@ -287,6 +299,36 @@ impl BuiltHarvest {
         &self.dags
     }
 
+    /// Declarative query handlers collected via `.queries(queries![…])`.
+    #[must_use]
+    pub fn query_handlers(&self) -> &[QueryHandlerInfo] {
+        &self.query_handlers
+    }
+
+    /// Declarative update handlers collected via `.updates(updates![…])`.
+    #[must_use]
+    pub fn update_handlers(&self) -> &[UpdateHandlerInfo] {
+        &self.update_handlers
+    }
+
+    /// Returns all query handler infos for the named workflow.
+    #[must_use]
+    pub fn query_handlers_for(&self, workflow_name: &str) -> Vec<&QueryHandlerInfo> {
+        self.query_handlers
+            .iter()
+            .filter(|h| h.workflow == workflow_name)
+            .collect()
+    }
+
+    /// Returns all update handler infos for the named workflow.
+    #[must_use]
+    pub fn update_handlers_for(&self, workflow_name: &str) -> Vec<&UpdateHandlerInfo> {
+        self.update_handlers
+            .iter()
+            .filter(|h| h.workflow == workflow_name)
+            .collect()
+    }
+
     /// Telemetry configuration (spans propagator + metrics recorder).
     #[must_use]
     pub const fn telemetry(&self) -> &Arc<TelemetryConfig> {
@@ -325,6 +367,7 @@ impl BuiltHarvest {
                 Arc::new(self.state),
                 self.telemetry,
             )
+            .with_handler_infos(self.query_handlers, self.update_handlers)
             .with_history_policy(self.history_policy),
             self.dags,
             self.workflow_schedules,
@@ -353,6 +396,7 @@ impl BuiltHarvest {
                 Arc::new(self.state),
                 self.telemetry,
             )
+            .with_handler_infos(self.query_handlers, self.update_handlers)
             .with_history_policy(self.history_policy),
             self.dags,
             self.workflow_schedules,
@@ -416,6 +460,34 @@ impl HarvestBuilder {
             }
             self.dags.push(dag);
         }
+        self
+    }
+
+    /// Register declarative query handlers (output of `queries![…]` macro).
+    ///
+    /// Each [`QueryHandlerInfo`] is associated with a specific workflow name via
+    /// the `workflow = "…"` attribute. The runtime uses this list to auto-register
+    /// handlers before the workflow function runs, and the management API exposes
+    /// them via `GET /workflows/types/{name}/handlers`.
+    ///
+    /// Calling this method multiple times appends all provided handlers.
+    #[must_use]
+    pub fn queries(mut self, handlers: Vec<QueryHandlerInfo>) -> Self {
+        self.query_handlers.extend(handlers);
+        self
+    }
+
+    /// Register declarative update handlers (output of `updates![…]` macro).
+    ///
+    /// Each [`UpdateHandlerInfo`] is associated with a specific workflow name via
+    /// the `workflow = "…"` attribute. The runtime uses this list to auto-register
+    /// handlers before the workflow function runs, and the management API exposes
+    /// them via `GET /workflows/types/{name}/handlers`.
+    ///
+    /// Calling this method multiple times appends all provided handlers.
+    #[must_use]
+    pub fn updates(mut self, handlers: Vec<UpdateHandlerInfo>) -> Self {
+        self.update_handlers.extend(handlers);
         self
     }
 
@@ -585,6 +657,8 @@ impl HarvestBuilder {
             activities: self.activities,
             dags: self.dags,
             workflow_schedules: self.workflow_schedules,
+            query_handlers: self.query_handlers,
+            update_handlers: self.update_handlers,
             worker_config: self.worker_config,
             state: self.state,
             telemetry: Arc::new(self.telemetry.unwrap_or_default()),

@@ -1,0 +1,5 @@
+error: #[query] handlers must take `ctx: &WorkflowContext` as the first argument
+ --> tests/compile_fail/query_missing_ctx.rs:5:1
+  |
+5 | fn get_count() -> Result<u64, String> {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
