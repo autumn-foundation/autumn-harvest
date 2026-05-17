@@ -5424,7 +5424,7 @@ async fn query_buffered_runs_count(database_url: &str, workflow_name: &str) -> u
         .first::<serde_json::Value>(&mut conn)
         .await
         .expect("buffered_runs query failed");
-    val.as_array().map_or(0, |a| a.len())
+    val.as_array().map_or(0, Vec::len)
 }
 
 /// Query all RUNNING execution IDs for a workflow schedule (used to terminate them in tests).
@@ -5493,7 +5493,7 @@ async fn overlap_policy_skip_explicitly_drops_new_firings() {
     let _ = scheduler.join().await;
 }
 
-/// (overlap-b1) BufferOne: exactly one pending firing is queued in DB; subsequent firings are
+/// (overlap-b1) `BufferOne`: exactly one pending firing is queued in DB; subsequent firings are
 /// dropped with `reason = "buffered_slot_full"`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn overlap_policy_buffer_one_queues_single_slot() {
@@ -5549,7 +5549,7 @@ async fn overlap_policy_buffer_one_queues_single_slot() {
     let _ = scheduler.join().await;
 }
 
-/// (overlap-b2) BufferAll: every missed firing is buffered up to `buffer_all_max`; firings past
+/// (overlap-b2) `BufferAll`: every missed firing is buffered up to `buffer_all_max`; firings past
 /// the cap are dropped with `reason = "buffer_full"`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn overlap_policy_buffer_all_queues_multiple_slots() {
@@ -5606,7 +5606,7 @@ async fn overlap_policy_buffer_all_queues_multiple_slots() {
     let _ = scheduler.join().await;
 }
 
-/// (overlap-c1) CancelOther: in-flight run is cancelled and the new firing starts immediately.
+/// (overlap-c1) `CancelOther`: in-flight run is cancelled and the new firing starts immediately.
 ///
 /// Without a worker the executions stay in the state set by the scheduler DB writes:
 /// - exec#1 → CANCELLED (by `cancel_workflow_execution`)
@@ -5665,7 +5665,7 @@ async fn overlap_policy_cancel_other_cancels_inflight_run() {
     let _ = scheduler.join().await;
 }
 
-/// (overlap-c2) TerminateOther: in-flight run is force-terminated and the new firing starts
+/// (overlap-c2) `TerminateOther`: in-flight run is force-terminated and the new firing starts
 /// immediately.  `terminate_workflow_execution` writes state CANCELLED (force, regardless of
 /// prior state), then the new firing is dispatched as RUNNING.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -5722,9 +5722,9 @@ async fn overlap_policy_terminate_other_terminates_inflight_run() {
     let _ = scheduler.join().await;
 }
 
-/// (overlap-d) BufferOne durability: buffered slots survive a scheduler restart.
+/// (overlap-d) `BufferOne` durability: buffered slots survive a scheduler restart.
 ///
-/// Phase 1 — Scheduler A dispatches exec#1 (slow_workflow) and buffers one slot.
+/// Phase 1 — Scheduler A dispatches exec#1 (`slow_workflow`) and buffers one slot.
 /// Shutdown Scheduler A.  The `buffered_runs` column in DB still holds the entry.
 ///
 /// Phase 2 — Exec#1 is terminated to free capacity.  Scheduler B starts.  Its
