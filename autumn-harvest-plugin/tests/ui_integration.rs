@@ -2100,3 +2100,239 @@ async fn detail_page_event_timestamps_display() {
         "event timestamps should display real dates, not placeholder dashes: {html}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #253 — NEW RED tests for remaining acceptance criteria
+// ---------------------------------------------------------------------------
+
+/// Event timeline shows collapsible payload for each event.
+#[tokio::test]
+async fn detail_page_event_timeline_has_collapsible_payload() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let exec_id =
+        insert_workflow_on_url(&database_url, ShardId::new(0), "payload_wf", "payload-1").await;
+
+    let activity_exec_id = autumn_harvest::ActivityExecId::new();
+    let events = vec![autumn_harvest::WorkflowEvent::ActivityScheduled {
+        activity_id: activity_exec_id,
+        name: "do_work".to_string(),
+        input: serde_json::json!({"amount": 42}),
+        queue: "default".to_string(),
+    }];
+    insert_workflow_events(&database_url, exec_id, &events, 1).await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, html) = fetch_html(&app, &format!("/workflows/{exec_id}")).await;
+    assert_eq!(status, StatusCode::OK, "detail page should render: {html}");
+    assert!(
+        html.contains("<details"),
+        "event timeline should have a <details> element for collapsible payload: {html}"
+    );
+    assert!(
+        html.contains("view payload") || html.contains("payload"),
+        "details summary should mention payload: {html}"
+    );
+    // The raw JSON payload data should appear in the page
+    assert!(
+        html.contains("amount") || html.contains("42"),
+        "event payload data should be present in the expanded section: {html}"
+    );
+}
+
+/// Detail page blocked-on panel appears for a running workflow with a pending activity.
+#[tokio::test]
+async fn detail_page_blocked_on_panel_for_running_workflow() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let exec_id =
+        insert_workflow_on_url(&database_url, ShardId::new(0), "blocked_wf", "blocked-1").await;
+
+    // Insert a pending task queue row for this workflow
+    let mut conn = AsyncPgConnection::establish(&database_url).await.unwrap();
+    let task_id = uuid::Uuid::new_v4();
+    let sql = format!(
+        "INSERT INTO harvest_task_queue \
+            (id, queue_name, task_type, workflow_exec_id, activity_name, input, state, priority, \
+             attempt, max_attempts, scheduled_at) \
+         VALUES \
+            ('{task_id}', 'default', 'activity', '{exec_uuid}', 'process_payment', \
+             '{{}}', 'PENDING', 0, 0, 3, NOW())",
+        exec_uuid = exec_id.as_uuid()
+    );
+    conn.batch_execute(&sql).await.expect("insert pending task");
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, html) = fetch_html(&app, &format!("/workflows/{exec_id}")).await;
+    assert_eq!(status, StatusCode::OK, "detail page should render: {html}");
+    assert!(
+        html.to_lowercase().contains("blocked") || html.contains("Blocked on") || html.contains("pending"),
+        "detail page should show blocked-on or pending panel: {html}"
+    );
+    assert!(
+        html.contains("process_payment"),
+        "pending activity name should appear in blocked-on panel: {html}"
+    );
+}
+
+/// Cancel action in the UI redirects back to the detail page with a flash message.
+#[tokio::test]
+async fn detail_page_cancel_action_redirects_with_flash() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let exec_id =
+        insert_workflow_on_url(&database_url, ShardId::new(0), "cancel_wf", "cancel-2").await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, headers, body) = post_form(
+        &app,
+        &format!("/workflows/{exec_id}/cancel"),
+        "reason=test+cancellation",
+    )
+    .await;
+    assert!(
+        status == StatusCode::SEE_OTHER || status == StatusCode::FOUND,
+        "cancel action must redirect (got {status}): {body}"
+    );
+    let location = headers
+        .get("location")
+        .expect("redirect must have Location header")
+        .to_str()
+        .unwrap();
+    assert!(
+        location.contains(&exec_id.to_string()) || location.contains("workflows"),
+        "redirect must go to the workflow detail page: {location}"
+    );
+    assert!(
+        location.contains("flash"),
+        "redirect must carry a flash message: {location}"
+    );
+    assert!(
+        !location.ends_with("flash="),
+        "flash param must be non-empty: {location}"
+    );
+}
+
+/// Send signal action redirects back with flash.
+#[tokio::test]
+async fn detail_page_signal_action_redirects_with_flash() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let exec_id =
+        insert_workflow_on_url(&database_url, ShardId::new(0), "signal_wf2", "signal-2").await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, headers, body) = post_form(
+        &app,
+        &format!("/workflows/{exec_id}/signal"),
+        "signal_name=ping&payload=%7B%7D",
+    )
+    .await;
+    assert!(
+        status == StatusCode::SEE_OTHER || status == StatusCode::FOUND,
+        "signal action must redirect (got {status}): {body}"
+    );
+    let location = headers
+        .get("location")
+        .expect("redirect must have Location header")
+        .to_str()
+        .unwrap();
+    assert!(
+        location.contains(&exec_id.to_string()) || location.contains("workflows"),
+        "redirect must go back to the detail page: {location}"
+    );
+    assert!(
+        location.contains("flash"),
+        "redirect must carry a flash message: {location}"
+    );
+}
+
+/// Flash message is rendered on the detail page when flash param is present.
+#[tokio::test]
+async fn detail_page_renders_flash_message() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let exec_id =
+        insert_workflow_on_url(&database_url, ShardId::new(0), "flash_wf", "flash-1").await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, html) = fetch_html(
+        &app,
+        &format!("/workflows/{exec_id}?flash=Hello%20world"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "detail page should render: {html}");
+    assert!(
+        html.contains("Hello world") || html.contains("Hello+world"),
+        "flash message should appear on the page: {html}"
+    );
+}
+
+/// Reset action redirects back with flash.
+#[tokio::test]
+async fn detail_page_reset_action_redirects_with_flash() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let exec_id =
+        insert_workflow_on_url(&database_url, ShardId::new(0), "reset_wf2", "reset-2").await;
+
+    // Insert at least 2 events so there is a valid reset point
+    let events = vec![
+        autumn_harvest::WorkflowEvent::TimerStarted {
+            timer_id: autumn_harvest::types::TimerId::new("t1"),
+            duration_secs: 60,
+        },
+        autumn_harvest::WorkflowEvent::TimerFired {
+            timer_id: autumn_harvest::types::TimerId::new("t1"),
+        },
+    ];
+    insert_workflow_events(&database_url, exec_id, &events, 1).await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, headers, body) = post_form(
+        &app,
+        &format!("/workflows/{exec_id}/reset"),
+        "reset_to_event_id=0&reason=rollback",
+    )
+    .await;
+    assert!(
+        status == StatusCode::SEE_OTHER || status == StatusCode::FOUND,
+        "reset action must redirect (got {status}): {body}"
+    );
+    let location = headers
+        .get("location")
+        .expect("redirect must have Location header")
+        .to_str()
+        .unwrap();
+    assert!(
+        location.contains(&exec_id.to_string()) || location.contains("workflows"),
+        "redirect must go back to the detail page: {location}"
+    );
+    assert!(
+        location.contains("flash"),
+        "redirect must carry a flash message: {location}"
+    );
+}
+
+/// Detail page shows a "Jump to event" control in large histories.
+#[tokio::test]
+async fn detail_page_has_jump_to_event_n_control() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let exec_id =
+        insert_workflow_on_url(&database_url, ShardId::new(0), "jump_wf", "jump-1").await;
+
+    // Insert 150 events so pagination threshold is crossed
+    let many_events: Vec<autumn_harvest::WorkflowEvent> = (0..150)
+        .map(|i| autumn_harvest::WorkflowEvent::SignalReceived {
+            signal_name: format!("jump_signal_{i}"),
+            payload: serde_json::json!({}),
+        })
+        .collect();
+    insert_workflow_events(&database_url, exec_id, &many_events, 1).await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, html) = fetch_html(&app, &format!("/workflows/{exec_id}")).await;
+    assert_eq!(status, StatusCode::OK, "detail page should render: {html}");
+    assert!(
+        html.contains("name=\"event_page\"") || html.contains("name=\"jump_event\""),
+        "detail page should have a jump-to-event or event_page input control for large histories: {html}"
+    );
+    assert!(
+        html.contains("Jump to") || html.contains("jump") || html.contains("Go"),
+        "detail page should have a jump/go button or label for the control: {html}"
+    );
+}
