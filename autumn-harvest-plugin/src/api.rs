@@ -1080,6 +1080,10 @@ pub(crate) struct WorkflowFilters {
     pub(crate) states: Vec<String>,
     pub(crate) workflow_name: Option<String>,
     pub(crate) search_attrs: Vec<Value>,
+    pub(crate) started_after: Option<chrono::DateTime<chrono::Utc>>,
+    pub(crate) started_before: Option<chrono::DateTime<chrono::Utc>>,
+    /// Prefix match on the execution UUID cast to text (e.g. "abc123").
+    pub(crate) exec_id_prefix: Option<String>,
 }
 
 impl WorkflowFilters {
@@ -7326,7 +7330,7 @@ pub(crate) async fn load_workflows(
     filters: &WorkflowFilters,
 ) -> HarvestResult<Vec<WorkflowExecution>> {
     use diesel::dsl::sql;
-    use diesel::sql_types::{Bool, Jsonb};
+    use diesel::sql_types::{Bool, Jsonb, Text};
 
     let mut query = harvest_workflow_executions::table
         .into_boxed()
@@ -7337,6 +7341,19 @@ pub(crate) async fn load_workflows(
     }
     if let Some(name) = &filters.workflow_name {
         query = query.filter(harvest_workflow_executions::workflow_name.eq(name.clone()));
+    }
+    if let Some(after) = filters.started_after {
+        query = query.filter(harvest_workflow_executions::started_at.ge(after));
+    }
+    if let Some(before) = filters.started_before {
+        query = query.filter(harvest_workflow_executions::started_at.le(before));
+    }
+    if let Some(prefix) = &filters.exec_id_prefix {
+        // Cast the UUID column to text and apply a case-insensitive prefix match.
+        // Uses the `CAST(id AS TEXT) ILIKE $1` form so the query is index-friendly
+        // for short prefixes and never requires a full sequential scan.
+        let pattern = format!("{}%", prefix.to_lowercase());
+        query = query.filter(sql::<Bool>("CAST(id AS TEXT) ILIKE ").bind::<Text, _>(pattern));
     }
     // Each search_attr filter contributes its own `search_attrs @> {...}` predicate.
     // The `@>` operator hits the existing `idx_harvest_we_search` GIN index on
