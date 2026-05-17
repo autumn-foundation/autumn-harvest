@@ -486,6 +486,76 @@ async fn saga_compensate_all_on_cancel_pattern() {
     );
 }
 
+/// Simulates one complete pick-up of the workflow task for the idempotency test.
+/// On a crash-then-replay, the executor calls the workflow function a second
+/// time with the same history, re-registering all Saga compensation closures.
+async fn run_compensated_saga_once(comp_log: Arc<Mutex<Vec<String>>>) {
+    let ctx = WorkflowContext::for_replay(
+        ExecutionId::new(),
+        vec![WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+        }],
+    );
+    let mut saga = Saga::new(&ctx);
+
+    // Step 1: charge payment.
+    saga.step(
+        || async { Ok::<_, HarvestError>("charge-001".to_string()) },
+        {
+            let comp_log = Arc::clone(&comp_log);
+            move |charge_id| async move {
+                // Idempotent: refund by specific charge ID — safe to call twice.
+                comp_log
+                    .lock()
+                    .expect("lock")
+                    .push(format!("refund:{charge_id}"));
+                Ok::<_, HarvestError>(())
+            }
+        },
+    )
+    .await
+    .expect("charge step ok");
+
+    // Step 2: reserve inventory.
+    saga.step(
+        || async { Ok::<_, HarvestError>("inventory-002".to_string()) },
+        {
+            let comp_log = Arc::clone(&comp_log);
+            move |inv_id| async move {
+                comp_log
+                    .lock()
+                    .expect("lock")
+                    .push(format!("release_inventory:{inv_id}"));
+                Ok::<_, HarvestError>(())
+            }
+        },
+    )
+    .await
+    .expect("inventory step ok");
+
+    // Step 3: reserve seat.
+    saga.step(
+        || async { Ok::<_, HarvestError>("seat-003".to_string()) },
+        {
+            let comp_log = Arc::clone(&comp_log);
+            move |seat_id| async move {
+                comp_log
+                    .lock()
+                    .expect("lock")
+                    .push(format!("release_seat:{seat_id}"));
+                Ok::<_, HarvestError>(())
+            }
+        },
+    )
+    .await
+    .expect("seat step ok");
+
+    saga.compensate_all()
+        .await
+        .expect("compensations should succeed");
+}
+
 /// Demonstrates the idempotency contract for compensation closures.
 ///
 /// When a worker crashes mid-`compensate_all`, the next worker replays the
@@ -507,78 +577,8 @@ async fn saga_compensate_all_on_cancel_pattern() {
 async fn saga_compensation_idempotency_under_replay() {
     let comp_log = Arc::new(Mutex::new(Vec::<String>::new()));
 
-    // run_once simulates one complete pick-up of the workflow task.
-    // On a crash-then-replay, the executor calls the workflow function a second
-    // time with the same history, re-registering all Saga compensation closures.
-    async fn run_once(comp_log: Arc<Mutex<Vec<String>>>) {
-        let ctx = WorkflowContext::for_replay(
-            ExecutionId::new(),
-            vec![WorkflowEvent::WorkflowStarted {
-                input: Value::Null,
-                timestamp: Utc::now(),
-            }],
-        );
-        let mut saga = Saga::new(&ctx);
-
-        // Step 1: charge payment.
-        saga.step(
-            || async { Ok::<_, HarvestError>("charge-001".to_string()) },
-            {
-                let comp_log = Arc::clone(&comp_log);
-                move |charge_id| async move {
-                    // Idempotent: refund by specific charge ID — safe to call twice.
-                    comp_log
-                        .lock()
-                        .expect("lock")
-                        .push(format!("refund:{charge_id}"));
-                    Ok::<_, HarvestError>(())
-                }
-            },
-        )
-        .await
-        .expect("charge step ok");
-
-        // Step 2: reserve inventory.
-        saga.step(
-            || async { Ok::<_, HarvestError>("inventory-002".to_string()) },
-            {
-                let comp_log = Arc::clone(&comp_log);
-                move |inv_id| async move {
-                    comp_log
-                        .lock()
-                        .expect("lock")
-                        .push(format!("release_inventory:{inv_id}"));
-                    Ok::<_, HarvestError>(())
-                }
-            },
-        )
-        .await
-        .expect("inventory step ok");
-
-        // Step 3: reserve seat.
-        saga.step(
-            || async { Ok::<_, HarvestError>("seat-003".to_string()) },
-            {
-                let comp_log = Arc::clone(&comp_log);
-                move |seat_id| async move {
-                    comp_log
-                        .lock()
-                        .expect("lock")
-                        .push(format!("release_seat:{seat_id}"));
-                    Ok::<_, HarvestError>(())
-                }
-            },
-        )
-        .await
-        .expect("seat step ok");
-
-        saga.compensate_all()
-            .await
-            .expect("compensations should succeed");
-    }
-
     // First execution: compensations #3, #2, #1 each run once (LIFO).
-    run_once(Arc::clone(&comp_log)).await;
+    run_compensated_saga_once(Arc::clone(&comp_log)).await;
     assert_eq!(
         *comp_log.lock().expect("lock"),
         vec![
@@ -594,7 +594,7 @@ async fn saga_compensation_idempotency_under_replay() {
     // On replay the entire stack re-runs — idempotent by-ID compensations
     // are safe; a release-most-recent anti-pattern would release the wrong
     // resource on this second invocation.
-    run_once(Arc::clone(&comp_log)).await;
+    run_compensated_saga_once(Arc::clone(&comp_log)).await;
     assert_eq!(
         *comp_log.lock().expect("lock"),
         vec![
