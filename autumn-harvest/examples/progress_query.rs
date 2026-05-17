@@ -9,7 +9,7 @@
 //! many records have been processed so far, while the workflow is still running.
 //!
 //! Run with:
-//!   cargo run --example progress_query
+//!   cargo run --example `progress_query`
 
 use std::sync::{Arc, Mutex};
 
@@ -39,7 +39,8 @@ struct ProgressResponse {
 // ---------------------------------------------------------------------------
 
 #[workflow]
-async fn batch_processor(ctx: &WorkflowContext, _input: ()) -> Result<(), String> {
+async fn batch_processor(ctx: &WorkflowContext, input: ()) -> Result<(), String> {
+    let () = input;
     let total: u64 = 1_000;
     let processed = Arc::new(Mutex::new(0u64));
 
@@ -47,6 +48,7 @@ async fn batch_processor(ctx: &WorkflowContext, _input: ()) -> Result<(), String
     // `total` from the surrounding scope. No events are ever written to
     // `harvest_events` — the registry lives only in-memory.
     let query_state = processed.clone();
+    #[allow(clippy::cast_precision_loss)]
     ctx.register_query_handler("progress", move |req: &ProgressQuery| {
         let n = *query_state.lock().unwrap();
         let pct = if total > 0 {
@@ -75,6 +77,7 @@ async fn batch_processor(ctx: &WorkflowContext, _input: ()) -> Result<(), String
         // ctx.execute_activity_raw("process_batch_chunk", ...).await?;
     }
 
+    std::future::ready(()).await;
     Ok(())
 }
 
@@ -85,9 +88,9 @@ fn main() {
     println!();
     println!("# Typed query with args:");
     println!(
-        r#"  curl -X POST http://localhost:8080/api/harvest/workflows/{{exec_id}}/query/progress \"#
+        r"  curl -X POST http://localhost:8080/api/harvest/workflows/{{exec_id}}/query/progress \"
     );
-    println!(r#"       -H 'Content-Type: application/json' \"#);
+    println!(r"       -H 'Content-Type: application/json' \");
     println!(r#"       -d '{{"args": {{"include_summary": true}}}}'"#);
     println!();
     println!("# Simple no-arg query (GET or POST):");
