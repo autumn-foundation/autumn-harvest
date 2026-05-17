@@ -2001,10 +2001,21 @@ impl WorkflowContext {
     /// Panics if the internal query registry mutex is poisoned.
     #[must_use]
     pub fn list_query_names(&self) -> Vec<String> {
-        self.query_registry
+        let mut names: std::collections::BTreeSet<String> = self
+            .query_registry
             .lock()
             .expect("query_registry lock poisoned")
             .list_names()
+            .into_iter()
+            .collect();
+        names.extend(
+            self.declarative_queries
+                .lock()
+                .expect("declarative_queries lock poisoned")
+                .keys()
+                .cloned(),
+        );
+        names.into_iter().collect()
     }
 
     /// Register a declarative query handler from a [`QueryHandlerInfo`] companion record.

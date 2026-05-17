@@ -1,7 +1,7 @@
 //! Compile-fail tests for `#[query]` and `#[update]` error cases (issue #346).
 //!
 //! Run with:
-//!   cargo test -p autumn-harvest --test macros_compile_fail --features testing
+//!   `cargo test -p autumn-harvest --test macros_compile_fail --features testing`
 
 #[test]
 fn compile_fail_cases() {

@@ -1,8 +1,19 @@
 //! Integration tests for the `#[query]` and `#[update]` declarative macros (issue #346).
 //!
 //! Run with:
-//!   cargo test -p autumn-harvest --test macros_query_update --features testing
-#![allow(clippy::unused_async, clippy::used_underscore_binding)]
+//!   `cargo test -p autumn-harvest --test macros_query_update --features testing`
+// Test handler functions are constrained by the macro interface (must return
+// Result, take args by value, etc.) so several pedantic lints don't apply here.
+#![allow(
+    clippy::doc_markdown,
+    clippy::missing_const_for_fn,
+    clippy::needless_pass_by_value,
+    clippy::option_if_let_else,
+    clippy::redundant_closure_for_method_calls,
+    clippy::unnecessary_wraps,
+    clippy::unused_async,
+    clippy::used_underscore_binding,
+)]
 
 use autumn_harvest::context::{WorkflowContext, empty_shared_state};
 use autumn_harvest::prelude::*;

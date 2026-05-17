@@ -4095,6 +4095,13 @@ async fn hydrate_ctx_for_query(
         runtime.registry.history_policy(),
     );
 
+    // Seed declarative query handlers (registered via `.queries(queries![...])`)
+    // before replaying, so execute_query_with_args can find them.
+    let wf_name = execution.workflow_name.as_str();
+    for h in runtime.registry.query_handlers.iter().filter(|h| h.workflow == wf_name) {
+        ctx.register_declarative_query_handler(h);
+    }
+
     // Drive the workflow future until it genuinely suspends on a workflow
     // command (activity, signal wait, timer). Recorded events resolve via
     // pre-sent oneshot channels so the entire history replays synchronously.
