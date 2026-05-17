@@ -67,4 +67,5 @@ The cache size is configured via `WorkerConfig::workflow_cache_size` (default: 1
 - Enable sticky routing for workflows that suspend frequently (timer waits, fan-out/fan-in, multi-step human-in-the-loop).
 - For short-lived workflows that complete in a single task (no suspension), sticky routing has no effect — there is no follow-up task to benefit from the warm cache.
 - Set `lease_ttl` to 2-3× your median worker restart time. A value shorter than a typical deploy window will cause a burst of cold reloads during rolling restarts.
+- **Timer duration vs. lease TTL**: the affinity lease is written when the workflow parks (`sticky_until = NOW() + lease_ttl`). If a timer fires *after* `sticky_until`, any worker can claim the follow-up task regardless of which worker set the pin. For timer-heavy workflows whose timers routinely exceed `lease_ttl`, set `lease_ttl` to at least the 95th-percentile timer duration, or accept that long-timer suspension points will incur a cold reload.
 - Watch the `harvest.workflow.cache_miss` counter during rolling deploys: it will spike as executions migrate to new workers and then settle as the new workers warm their caches.

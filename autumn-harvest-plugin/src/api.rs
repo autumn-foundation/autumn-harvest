@@ -8117,9 +8117,7 @@ async fn worker_pinned_executions_handler(
     let mut results = Vec::new();
 
     for (_shard, shard_pool) in pool.iter_shards() {
-        let Ok(mut conn) = acquire_conn(shard_pool).await else {
-            continue;
-        };
+        let mut conn = acquire_conn(shard_pool).await?;
         let mut rows = list_pinned_executions(&mut conn, &worker_id)
             .await
             .map_err(map_error)?;

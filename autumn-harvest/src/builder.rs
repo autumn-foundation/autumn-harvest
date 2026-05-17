@@ -1002,9 +1002,10 @@ impl WorkerConfig {
     /// owning worker first so its in-process LRU cache stays warm, reducing
     /// full event-history reloads from Postgres.
     ///
-    /// When the lease expires (after `config.lease_ttl`) or the owning worker
-    /// is unhealthy / draining, the task becomes claimable by any eligible
-    /// worker — sticky routing never blocks progress.
+    /// When the lease expires (after `config.lease_ttl`) the task becomes
+    /// claimable by any eligible worker — sticky routing never blocks progress.
+    /// Note: worker drain or unhealthy status does **not** trigger early lease
+    /// expiry; only the TTL controls when other workers can claim the task.
     ///
     /// See `docs/sticky-routing.md` for the full operator guide including
     /// the lease-TTL trade-off and interaction with shard assignments and
