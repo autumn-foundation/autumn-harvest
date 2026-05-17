@@ -385,6 +385,123 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    // ── Schedule jitter ───────────────────────────────────────────────────────
+
+    #[test]
+    fn workflow_schedule_jitter_defaults_to_zero() {
+        let sched = WorkflowSchedule::new("my_workflow", Schedule::Manual);
+        assert_eq!(sched.jitter, Duration::ZERO);
+    }
+
+    #[test]
+    fn workflow_schedule_with_jitter_sets_duration() {
+        let sched = WorkflowSchedule::new("my_wf", Schedule::Manual)
+            .with_jitter(Duration::from_secs(300));
+        assert_eq!(sched.jitter, Duration::from_secs(300));
+    }
+
+    #[test]
+    fn validate_jitter_zero_always_accepted() {
+        assert!(validate_jitter(&Schedule::Manual, Duration::ZERO).is_ok());
+        assert!(
+            validate_jitter(&Schedule::Interval(Duration::from_secs(60)), Duration::ZERO).is_ok()
+        );
+        assert!(
+            validate_jitter(&Schedule::Cron("0 * * * *".to_string()), Duration::ZERO).is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_jitter_interval_gte_period_is_error() {
+        let period = Duration::from_secs(60);
+        assert!(
+            validate_jitter(&Schedule::Interval(period), Duration::from_secs(60)).is_err(),
+            "jitter equal to period must be rejected"
+        );
+        assert!(
+            validate_jitter(&Schedule::Interval(period), Duration::from_secs(90)).is_err(),
+            "jitter greater than period must be rejected"
+        );
+    }
+
+    #[test]
+    fn validate_jitter_interval_lt_period_is_ok() {
+        let period = Duration::from_secs(60);
+        assert!(validate_jitter(&Schedule::Interval(period), Duration::from_secs(59)).is_ok());
+        assert!(validate_jitter(&Schedule::Interval(period), Duration::from_secs(1)).is_ok());
+    }
+
+    #[test]
+    fn validate_jitter_cron_gt_one_hour_is_error() {
+        let cron = Schedule::Cron("0 * * * *".to_string());
+        assert!(validate_jitter(&cron, Duration::from_secs(3601)).is_err());
+        assert!(validate_jitter(&cron, Duration::from_secs(7200)).is_err());
+    }
+
+    #[test]
+    fn validate_jitter_cron_lte_one_hour_is_ok() {
+        let cron = Schedule::Cron("0 * * * *".to_string());
+        assert!(validate_jitter(&cron, Duration::from_secs(3600)).is_ok());
+        assert!(validate_jitter(&cron, Duration::from_secs(300)).is_ok());
+    }
+
+    #[test]
+    fn compute_jitter_offset_deterministic() {
+        use chrono::{DateTime, Utc};
+        use uuid::Uuid;
+        let id = Uuid::from_u128(42);
+        let fire_time = "2026-04-01T10:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let jitter = Duration::from_secs(300);
+        let first = compute_jitter_offset(id, fire_time, jitter);
+        for _ in 0..999 {
+            assert_eq!(compute_jitter_offset(id, fire_time, jitter), first);
+        }
+    }
+
+    #[test]
+    fn compute_jitter_offset_zero_jitter_returns_zero() {
+        use chrono::{DateTime, Utc};
+        use uuid::Uuid;
+        let id = Uuid::from_u128(1);
+        let fire_time = "2026-04-01T10:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        assert_eq!(compute_jitter_offset(id, fire_time, Duration::ZERO), Duration::ZERO);
+    }
+
+    #[test]
+    fn compute_jitter_offset_within_bounds() {
+        use chrono::{DateTime, Utc};
+        use uuid::Uuid;
+        let id = Uuid::from_u128(12345);
+        let fire_time = "2026-04-01T10:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let jitter = Duration::from_secs(300);
+        let offset = compute_jitter_offset(id, fire_time, jitter);
+        assert!(offset < jitter, "offset {offset:?} must be < jitter {jitter:?}");
+    }
+
+    #[test]
+    fn compute_jitter_offset_uniform_distribution() {
+        use chrono::{DateTime, Utc};
+        use uuid::Uuid;
+        let fire_time = "2026-04-01T10:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let jitter = Duration::from_secs(300);
+        let num_ids: u128 = 10_000;
+        let num_buckets = 10usize;
+        let mut buckets = vec![0u32; num_buckets];
+        for i in 0..num_ids {
+            let id = Uuid::from_u128(i);
+            let offset = compute_jitter_offset(id, fire_time, jitter);
+            let bucket_width = jitter.as_nanos() / num_buckets as u128;
+            let bucket = ((offset.as_nanos() / bucket_width) as usize).min(num_buckets - 1);
+            buckets[bucket] += 1;
+        }
+        for (i, &count) in buckets.iter().enumerate() {
+            assert!(
+                count > 500 && count < 1500,
+                "bucket {i} has {count} items; expected ~1000 (range 500–1500)"
+            );
+        }
+    }
+
     #[test]
     fn exponential_backoff_doubles() {
         let policy = RetryPolicy::exponential(5, Duration::from_secs(1));
