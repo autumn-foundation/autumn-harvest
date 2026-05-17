@@ -685,9 +685,17 @@ mod db_tests {
             .await
             .expect("park_workflow_task");
 
-        // Record the sticky_until immediately after park.
-        let before = read_sticky(&mut conn, task_id).await;
-        let until_after_park = before.sticky_until.expect("sticky_until must be set");
+        // Deliberately expire the sticky window so a no-op wake cannot pass
+        // the assertion below by simply preserving the parked value.
+        diesel::sql_query(
+            "UPDATE harvest_task_queue \
+             SET sticky_until = NOW() - INTERVAL '5 seconds' \
+             WHERE id = $1",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .execute(&mut conn)
+        .await
+        .expect("expire sticky_until before wake");
 
         // Wake the task (simulates an activity completion or timer fire).
         queue::wake_workflow_task(&mut conn, exec_id)
@@ -703,12 +711,12 @@ mod db_tests {
             Some("worker-theta"),
             "AC#1+AC#4: wake must preserve sticky_worker_id"
         );
-        // sticky_until must be refreshed (>= the value set at park time).
+        // sticky_until must be strictly in the future — a no-op (or preserve)
+        // would leave it 5 s in the past and fail this assertion.
         let until_after_wake = after.sticky_until.expect("sticky_until must survive wake");
         assert!(
-            until_after_wake >= until_after_park,
-            "AC#1: wake must refresh sticky_until ({until_after_wake:?}) \
-             to at least the park value ({until_after_park:?})"
+            until_after_wake > chrono::Utc::now(),
+            "AC#1: wake must refresh sticky_until to the future; got {until_after_wake:?}"
         );
     }
 
