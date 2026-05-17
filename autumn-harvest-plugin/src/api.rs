@@ -1039,6 +1039,9 @@ struct CreateWorkflowScheduleRequest {
     paused: bool,
     #[serde(default = "default_queue_name")]
     queue_name: String,
+    /// Jitter window in seconds. `0` disables jitter (default).
+    #[serde(default)]
+    jitter_secs: u64,
 }
 
 fn default_queue_name() -> String {
@@ -4830,7 +4833,7 @@ async fn create_workflow_schedule(
         max_active_runs: request.max_active_runs,
         paused: request.paused,
         queue_name: request.queue_name.clone(),
-        jitter: std::time::Duration::ZERO,
+        jitter: std::time::Duration::from_secs(request.jitter_secs),
     };
     let entry = match upsert_workflow_schedule_and_read_back(&mut conn, &ws).await {
         Ok(e) => e,

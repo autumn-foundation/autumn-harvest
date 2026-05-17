@@ -329,6 +329,7 @@ pub struct WorkflowSchedule {
     /// )
     /// .with_jitter(Duration::from_secs(300));
     /// ```
+    #[serde(default)]
     pub jitter: Duration,
 }
 
