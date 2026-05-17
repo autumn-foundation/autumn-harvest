@@ -38,15 +38,15 @@ use autumn_harvest::audit::{
 use autumn_harvest::cancel_workflow_execution;
 use autumn_harvest::error::{HarvestResult, database_error};
 use autumn_harvest::models::{
-    DeadLetter, HarvestEvent, HarvestSchedule, HarvestSignal, HarvestTimer, NewAuditRecord,
-    TaskQueueItem, WorkflowExecution,
+    DeadLetter, ExternalTask, HarvestEvent, HarvestSchedule, HarvestSignal, HarvestTimer,
+    NewAuditRecord, TaskQueueItem, WorkflowExecution,
 };
 use autumn_harvest::reset::{
     ResetSignalReapplyPolicy, WorkflowResetRequest, reset_workflow_execution,
 };
 use autumn_harvest::schema::{
-    harvest_dead_letters, harvest_events, harvest_schedules, harvest_signals, harvest_task_queue,
-    harvest_timers, harvest_workflow_executions,
+    harvest_dead_letters, harvest_events, harvest_external_tasks, harvest_schedules,
+    harvest_signals, harvest_task_queue, harvest_timers, harvest_workflow_executions,
 };
 use autumn_harvest::signal::send_signal;
 use autumn_harvest::store::admit_update_event;
@@ -226,6 +226,7 @@ struct WorkflowTriggerUpdateForm {
 
 struct BlockedOnData {
     activities: Vec<TaskQueueItem>,
+    external_tasks: Vec<ExternalTask>,
     timers: Vec<HarvestTimer>,
     signals: Vec<HarvestSignal>,
 }
@@ -703,6 +704,7 @@ async fn load_blocked_on_data(
     if is_terminal_workflow_state(state) {
         return Ok(BlockedOnData {
             activities: vec![],
+            external_tasks: vec![],
             timers: vec![],
             signals: vec![],
         });
@@ -748,8 +750,21 @@ async fn load_blocked_on_data(
         .map_err(database_error)
         .map_err(map_error)?;
 
+    // External activities awaiting a third-party result (state = 'PENDING').
+    let external_tasks: Vec<ExternalTask> = harvest_external_tasks::table
+        .filter(harvest_external_tasks::workflow_exec_id.eq(exec_uuid))
+        .filter(harvest_external_tasks::state.eq("PENDING"))
+        .order(harvest_external_tasks::created_at.asc())
+        .limit(20)
+        .select(ExternalTask::as_select())
+        .load(conn)
+        .await
+        .map_err(database_error)
+        .map_err(map_error)?;
+
     Ok(BlockedOnData {
         activities,
+        external_tasks,
         timers,
         signals,
     })
@@ -952,7 +967,25 @@ async fn trigger_update_ui(
         match serde_json::from_str(payload_str) {
             Ok(v) => v,
             Err(e) => {
-                let flash = url_encode(&format!("Invalid JSON payload: {e}"));
+                let err_msg = format!("Invalid JSON payload: {e}");
+                let _ = insert_audit(
+                    &mut conn,
+                    &NewAuditRecord {
+                        actor: &actor,
+                        operation: "workflow.update",
+                        target_type: TARGET_WORKFLOW,
+                        target_id: Some(&exec_id_str),
+                        route_or_command: "POST /workflows/{id}/trigger-update",
+                        request_id: None,
+                        idempotency_key: None,
+                        status: STATUS_FAILED,
+                        error_summary: Some(&err_msg),
+                        shard_id: None,
+                        source: SOURCE_UI,
+                    },
+                )
+                .await;
+                let flash = url_encode(&err_msg);
                 let redirect_url = format!("../../workflows/{id}?flash={flash}");
                 return Ok(axum::response::Redirect::to(&redirect_url).into_response());
             }
@@ -2379,7 +2412,10 @@ const ACTIVITY_PANEL_EVENT_TYPES: &[&str] = &[
     "ActivityFailed",
     "ActivityTimedOut",
     "ActivityHeartbeat",
+    "ActivityAwaitingExternal",
     "ActivityCompletedExternally",
+    "ActivityFailedExternally",
+    "ActivityExternalDeadlineExtended",
 ];
 
 /// Extract a string field from the inner `data` object of an adjacently-tagged event payload.
@@ -2410,6 +2446,13 @@ fn event_human_label(event_type: &str, event_data: &Value) -> String {
         }
         "ActivityTimedOut" => "Activity timed out".to_string(),
         "ActivityHeartbeat" => "Activity heartbeat".to_string(),
+        "ActivityAwaitingExternal" => {
+            let name = event_data_field(event_data, "name").unwrap_or("?");
+            format!("Activity awaiting external: {name}")
+        }
+        "ActivityCompletedExternally" => "Activity completed externally".to_string(),
+        "ActivityFailedExternally" => "Activity failed externally".to_string(),
+        "ActivityExternalDeadlineExtended" => "External activity deadline extended".to_string(),
         "TimerStarted" => "Timer started".to_string(),
         "TimerFired" => "Timer fired".to_string(),
         "SignalReceived" => {
@@ -2469,7 +2512,9 @@ fn collect_activity_attempts(events: &[HarvestEvent]) -> Vec<ActivityAttemptRow>
             );
         }
         if let Some(row) = groups.get_mut(&aid) {
-            if event.event_type == "ActivityScheduled" {
+            if event.event_type == "ActivityScheduled"
+                || event.event_type == "ActivityAwaitingExternal"
+            {
                 row.attempt_count += 1;
                 if row.name.is_empty() {
                     row.name = event_data_field(&event.event_data, "name")
@@ -2477,12 +2522,20 @@ fn collect_activity_attempts(events: &[HarvestEvent]) -> Vec<ActivityAttemptRow>
                         .to_string();
                 }
             }
-            row.last_status.clone_from(&event.event_type);
-            row.last_ts = format_timestamp(Some(event.timestamp));
+            // `ActivityFailed` records the authoritative cumulative attempt count; use it
+            // when it exceeds what we counted from scheduled events (handles retry paths
+            // where the scheduled event may be absent or arrive out of order).
             if event.event_type == "ActivityFailed" {
+                if let Some(attempt_str) = event_data_field(&event.event_data, "attempt")
+                    && let Ok(n) = attempt_str.parse::<usize>()
+                {
+                    row.attempt_count = row.attempt_count.max(n);
+                }
                 row.last_error =
                     event_data_field(&event.event_data, "error").map(ToOwned::to_owned);
             }
+            row.last_status.clone_from(&event.event_type);
+            row.last_ts = format_timestamp(Some(event.timestamp));
         }
     }
 
@@ -2860,6 +2913,7 @@ fn render_workflow_detail(
 
 fn render_blocked_on_panel(blocked_on: &BlockedOnData) -> Markup {
     let has_anything = !blocked_on.activities.is_empty()
+        || !blocked_on.external_tasks.is_empty()
         || !blocked_on.timers.is_empty()
         || !blocked_on.signals.is_empty();
 
@@ -2887,6 +2941,27 @@ fn render_blocked_on_panel(blocked_on: &BlockedOnData) -> Markup {
                                     td { code { (&item.state) } }
                                     td { (item.attempt) }
                                     td { (format_timestamp(Some(item.scheduled_at))) }
+                                }
+                            }
+                        }
+                    }
+                }
+                @if !blocked_on.external_tasks.is_empty() {
+                    h3 style="margin-top:8px" { "Pending external activities" }
+                    table {
+                        thead {
+                            tr {
+                                th { "Activity" }
+                                th { "Deadline" }
+                                th { "Scheduled" }
+                            }
+                        }
+                        tbody {
+                            @for task in &blocked_on.external_tasks {
+                                tr {
+                                    td { (&task.name) }
+                                    td { (format_timestamp(Some(task.schedule_to_close_at))) }
+                                    td { (format_timestamp(Some(task.created_at))) }
                                 }
                             }
                         }
