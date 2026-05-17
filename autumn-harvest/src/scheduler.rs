@@ -9,7 +9,7 @@ use croner::Cron;
 use diesel::OptionalExtension;
 use diesel::QueryDsl;
 use diesel::SelectableHelper;
-use diesel::{BoolExpressionMethods, ExpressionMethods};
+use diesel::{BoolExpressionMethods, ExpressionMethods, TextExpressionMethods};
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use serde::Serialize;
@@ -576,21 +576,24 @@ pub async fn tick_once_sharded(
         )
         .await?;
 
-        if let Err(error) = tick_workflow_schedules(&mut conn, shard, dags.as_ref(), &metrics).await
-        {
-            tracing::warn!(
-                error = %error,
-                shard_id = shard.as_i32(),
-                "harvest workflow-schedule tick error"
-            );
-        }
-
+        // Drain buffered slots BEFORE evaluating newly-due firings so that
+        // capacity freed by a just-completed run is consumed by the oldest
+        // pending slot first, not by the freshest next_run_at firing.
         #[cfg(feature = "db")]
         if let Err(error) = drain_buffered_schedule_runs(&mut conn, shard, &metrics).await {
             tracing::warn!(
                 error = %error,
                 shard_id = shard.as_i32(),
                 "harvest: buffered schedule drain error"
+            );
+        }
+
+        if let Err(error) = tick_workflow_schedules(&mut conn, shard, dags.as_ref(), &metrics).await
+        {
+            tracing::warn!(
+                error = %error,
+                shard_id = shard.as_i32(),
+                "harvest workflow-schedule tick error"
             );
         }
     }
@@ -1048,7 +1051,17 @@ async fn upsert_workflow_schedule(
             .or_else(|| next_run_after(Some(&ws.schedule), now))
     };
     // is_paused is deliberately excluded — it is managed via pause/resume, not here.
-    // buffered_runs is also excluded — it is managed by the scheduler tick, not here.
+    // buffered_runs: preserved when staying in a buffering policy; cleared when switching
+    // away from BufferOne/BufferAll so stale slots are not dispatched under the new policy.
+    let is_buffering_policy = matches!(
+        ws.overlap_policy,
+        OverlapPolicy::BufferOne | OverlapPolicy::BufferAll
+    );
+    let new_buffered_runs = if is_buffering_policy {
+        existing.buffered_runs.clone()
+    } else {
+        serde_json::json!([])
+    };
     diesel::update(dsl::harvest_schedules.find(existing.id))
         .set((
             dsl::schedule_expr.eq(expr),
@@ -1064,6 +1077,7 @@ async fn upsert_workflow_schedule(
             dsl::jitter_secs.eq(i64::try_from(ws.jitter.as_secs()).unwrap_or(i64::MAX)),
             dsl::overlap_policy.eq(ws.overlap_policy.as_str()),
             dsl::buffer_all_max.eq(i32::try_from(ws.buffer_all_max).unwrap_or(i32::MAX)),
+            dsl::buffered_runs.eq(new_buffered_runs),
         ))
         .execute(conn)
         .await
@@ -1253,25 +1267,35 @@ async fn tick_workflow_schedules(
     Ok(())
 }
 
-/// Cancel all RUNNING executions for `workflow_name` and return how many were cancelled.
+/// Cancel the oldest scheduled RUNNING executions for `workflow_name`, up to `max_to_cancel`.
+///
+/// Only cancels executions with a `sched:` workflow ID so operator-triggered manual runs are
+/// not inadvertently cancelled. Orders by `started_at ASC` so the oldest executions are
+/// cancelled first, preserving the most recent progress.
 #[cfg(feature = "db")]
 async fn cancel_in_flight_runs(
     conn: &mut AsyncPgConnection,
     workflow_name: &str,
     reason: &str,
+    max_to_cancel: u32,
 ) -> HarvestResult<u32> {
     use crate::execution::cancel_workflow_execution;
 
     let running_ids: Vec<uuid::Uuid> = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
+        .filter(harvest_workflow_executions::workflow_id.like("sched:%"))
         .filter(harvest_workflow_executions::state.eq("RUNNING"))
+        .order(harvest_workflow_executions::started_at.asc())
         .select(harvest_workflow_executions::id)
         .load(conn)
         .await
         .map_err(crate::error::database_error)?;
 
     let mut count: u32 = 0;
-    for raw_id in running_ids {
+    for raw_id in running_ids
+        .into_iter()
+        .take(usize::try_from(max_to_cancel).unwrap_or(usize::MAX))
+    {
         let exec_id = ExecutionId::from_uuid(raw_id);
         match cancel_workflow_execution(conn, exec_id, reason).await {
             Ok(_) => count += 1,
@@ -1287,25 +1311,34 @@ async fn cancel_in_flight_runs(
     Ok(count)
 }
 
-/// Terminate all non-cancelled executions for `workflow_name`.
+/// Terminate the oldest scheduled RUNNING executions for `workflow_name`, up to `max_to_terminate`.
+///
+/// Only terminates executions with a `sched:` workflow ID. Orders by `started_at ASC` so the
+/// oldest executions are terminated first.
 #[cfg(feature = "db")]
 async fn terminate_in_flight_runs(
     conn: &mut AsyncPgConnection,
     workflow_name: &str,
     reason: &str,
+    max_to_terminate: u32,
 ) -> HarvestResult<u32> {
     use crate::execution::terminate_workflow_execution;
 
     let active_ids: Vec<uuid::Uuid> = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
+        .filter(harvest_workflow_executions::workflow_id.like("sched:%"))
         .filter(harvest_workflow_executions::state.eq("RUNNING"))
+        .order(harvest_workflow_executions::started_at.asc())
         .select(harvest_workflow_executions::id)
         .load(conn)
         .await
         .map_err(crate::error::database_error)?;
 
     let mut count: u32 = 0;
-    for raw_id in active_ids {
+    for raw_id in active_ids
+        .into_iter()
+        .take(usize::try_from(max_to_terminate).unwrap_or(usize::MAX))
+    {
         let exec_id = ExecutionId::from_uuid(raw_id);
         match terminate_workflow_execution(conn, exec_id, reason).await {
             Ok(_) => count += 1,
@@ -1336,7 +1369,22 @@ async fn tick_one_workflow_schedule(
     use crate::execution::StartWorkflowParams;
     use crate::schema::harvest_schedules::dsl;
 
-    let running: i64 = harvest_workflow_executions::table
+    // Compute jitter window once so it can be reused in the dispatch loop below.
+    let jitter_window =
+        std::time::Duration::from_secs(u64::try_from(schedule.jitter_secs.max(0)).unwrap_or(0));
+
+    // If jitter for this slot has not yet elapsed, skip the overlap check and any
+    // dispatch; the scheduler will revisit on the next tick (next_run_at unchanged).
+    {
+        let jitter_offset = compute_jitter_offset(schedule.id, logical_date, jitter_window);
+        let effective_fire_time =
+            logical_date + chrono::Duration::from_std(jitter_offset).unwrap_or_default();
+        if now < effective_fire_time {
+            return Ok(());
+        }
+    }
+
+    let mut running: i64 = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::workflow_name.eq(wf_name))
         .filter(harvest_workflow_executions::state.eq("RUNNING"))
         .count()
@@ -1405,18 +1453,34 @@ async fn tick_one_workflow_schedule(
                 return Ok(());
             }
             OverlapAction::CancelAndProceed => {
-                // Cancel all in-flight runs for this workflow, then fall through
-                // to normal dispatch below.
-                cancel_in_flight_runs(conn, wf_name, "overlap policy CancelOther: new firing")
-                    .await?;
+                // Cancel only the oldest scheduled runs needed to free one slot,
+                // then fall through to dispatch. Subtract the cancelled count so
+                // the dispatch loop sees the correct remaining capacity.
+                let needed =
+                    u32::try_from(running.saturating_sub(i64::from(schedule.max_active_runs)) + 1)
+                        .unwrap_or(1);
+                let cancelled = cancel_in_flight_runs(
+                    conn,
+                    wf_name,
+                    "overlap policy CancelOther: new firing",
+                    needed,
+                )
+                .await?;
+                running -= i64::from(cancelled);
             }
             OverlapAction::TerminateAndProceed => {
-                terminate_in_flight_runs(
+                // Terminate only the minimum needed to free one slot.
+                let needed =
+                    u32::try_from(running.saturating_sub(i64::from(schedule.max_active_runs)) + 1)
+                        .unwrap_or(1);
+                let terminated = terminate_in_flight_runs(
                     conn,
                     wf_name,
                     "overlap policy TerminateOther: new firing",
+                    needed,
                 )
                 .await?;
+                running -= i64::from(terminated);
             }
         }
     }
@@ -1424,8 +1488,7 @@ async fn tick_one_workflow_schedule(
     let (run_dates, next_run_after_plan) =
         due_run_plan(parsed_schedule, logical_date, now, catchup);
     let dispatch_queue = schedule.queue_name.as_deref().unwrap_or("default");
-    let jitter_window =
-        std::time::Duration::from_secs(u64::try_from(schedule.jitter_secs.max(0)).unwrap_or(0));
+    // jitter_window already computed at function entry; reused here.
 
     let mut dispatched: u32 = 0;
     let mut last_dispatched_at: Option<DateTime<Utc>> = None;
@@ -1798,14 +1861,18 @@ async fn drain_buffered_schedule_runs(
                     );
                 }
                 Err(error) => {
+                    // Drop the failing slot rather than re-inserting it. Re-queuing a
+                    // permanently-failing slot (e.g. deleted workflow, bad input) would
+                    // create an infinite retry loop on every scheduler tick. Transient
+                    // failures are rare for buffered slots (same path as normal dispatch);
+                    // if they occur the schedule's regular tick will generate fresh firings.
                     tracing::warn!(
                         error = %error,
                         workflow_name = %wf_name,
                         workflow_id = %workflow_id,
-                        "harvest: failed to dispatch buffered workflow run; re-queuing"
+                        buffered_for = %scheduled_for,
+                        "harvest: failed to dispatch buffered workflow run; dropping slot"
                     );
-                    // Re-insert at front so it's retried next tick.
-                    buffered.insert(0, scheduled_for);
                     break;
                 }
             }

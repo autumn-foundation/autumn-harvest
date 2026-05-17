@@ -1751,6 +1751,8 @@ fn unified_manual_dag_info_named(name: &'static str, default_queue: &'static str
         workflow_handler: Some(approval_workflow),
 
         jitter: ::std::time::Duration::ZERO,
+        overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+        buffer_all_max: 100u32,
     }
 }
 
@@ -1766,6 +1768,8 @@ fn manual_interval_pipeline_info() -> DagInfo {
         workflow_handler: None,
 
         jitter: ::std::time::Duration::ZERO,
+        overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+        buffer_all_max: 100u32,
     }
 }
 
@@ -3665,6 +3669,8 @@ async fn harvest_api_defers_manual_dag_trigger_when_schedule_is_paused() {
             workflow_handler: Some(approval_workflow),
 
             jitter: ::std::time::Duration::ZERO,
+            overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+            buffer_all_max: 100u32,
         }])
         .expect("manual unified DAG should compile"),
     );
@@ -3678,6 +3684,8 @@ async fn harvest_api_defers_manual_dag_trigger_when_schedule_is_paused() {
         paused: true,
         queue_name: "dag-workers".to_string(),
         jitter: Duration::ZERO,
+        overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+        buffer_all_max: 100u32,
     };
     let registry = Arc::new(HandlerRegistry::new(
         vec![workflow_info_named(dag_name)],
@@ -3952,6 +3960,8 @@ async fn harvest_api_rejects_non_dry_run_backfill_for_paused_dag_schedule() {
         workflow_handler: Some(approval_workflow),
 
         jitter: ::std::time::Duration::ZERO,
+        overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+        buffer_all_max: 100u32,
     };
     let workflow_schedule = dag_info
         .as_workflow_schedule()
@@ -4037,6 +4047,8 @@ async fn harvest_api_backfills_legacy_dag_schedule_null_queue_on_dag_default_que
         workflow_handler: Some(approval_workflow),
 
         jitter: ::std::time::Duration::ZERO,
+        overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+        buffer_all_max: 100u32,
     };
     let dag_catalog = Arc::new(
         compile_dag_catalog(vec![dag_info]).expect("scheduled unified DAG should compile"),
@@ -4119,6 +4131,8 @@ async fn harvest_api_backfill_matches_fractional_legacy_dag_workflow_id() {
         workflow_handler: Some(approval_workflow),
 
         jitter: ::std::time::Duration::ZERO,
+        overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+        buffer_all_max: 100u32,
     };
     let dag_catalog = Arc::new(
         compile_dag_catalog(vec![dag_info]).expect("scheduled unified DAG should compile"),
@@ -4137,6 +4151,8 @@ async fn harvest_api_backfill_matches_fractional_legacy_dag_workflow_id() {
         paused: false,
         queue_name: "dag-workers".to_string(),
         jitter: Duration::ZERO,
+        overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+        buffer_all_max: 100u32,
     };
 
     {
@@ -4220,6 +4236,8 @@ async fn harvest_api_rejects_backfill_for_unregistered_dag_schedule_row() {
         paused: false,
         queue_name: "dag-workers".to_string(),
         jitter: Duration::ZERO,
+        overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+        buffer_all_max: 100u32,
     };
 
     {
@@ -4546,6 +4564,8 @@ async fn register_workflow_schedules_accepts_unified_dag_schedule_rows() {
         paused: false,
         queue_name: "dag-workers".to_string(),
         jitter: Duration::ZERO,
+        overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+        buffer_all_max: 100u32,
     };
 
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
@@ -4576,6 +4596,8 @@ async fn register_workflow_schedules_preserves_existing_dag_marker_for_workflow_
         paused: false,
         queue_name: "dag-workers".to_string(),
         jitter: Duration::ZERO,
+        overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+        buffer_all_max: 100u32,
     };
     let workflow_only_update = WorkflowSchedule::new(
         "preserve_dag_marker",
@@ -4624,6 +4646,8 @@ async fn register_workflow_schedules_migrates_legacy_workflow_only_dag_row() {
         paused: false,
         queue_name: "legacy-queue".to_string(),
         jitter: Duration::ZERO,
+        overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+        buffer_all_max: 100u32,
     };
     let unified_dag_row = WorkflowSchedule {
         workflow_name: "legacy_workflow_only_dag".to_string(),
@@ -4635,6 +4659,8 @@ async fn register_workflow_schedules_migrates_legacy_workflow_only_dag_row() {
         paused: false,
         queue_name: "dag-workers".to_string(),
         jitter: Duration::ZERO,
+        overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+        buffer_all_max: 100u32,
     };
 
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
@@ -4675,6 +4701,8 @@ async fn ensure_dag_schedule_reuses_paused_legacy_workflow_only_dag_row() {
         paused: true,
         queue_name: "legacy-queue".to_string(),
         jitter: Duration::ZERO,
+        overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+        buffer_all_max: 100u32,
     };
     let paused_at = chrono::DateTime::parse_from_rfc3339("2026-05-14T02:00:00.123456Z")
         .expect("fixed pause timestamp should parse")
@@ -4691,6 +4719,8 @@ async fn ensure_dag_schedule_reuses_paused_legacy_workflow_only_dag_row() {
             workflow_handler: Some(approval_workflow),
 
             jitter: ::std::time::Duration::ZERO,
+            overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+            buffer_all_max: 100u32,
         }])
         .expect("unified DAG should compile"),
     );
@@ -4751,6 +4781,8 @@ async fn register_workflow_schedules_reuses_existing_dag_schedule_row_on_upgrade
         workflow_handler: None,
 
         jitter: ::std::time::Duration::ZERO,
+        overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+        buffer_all_max: 100u32,
     }])
     .expect("classic scheduled DAG should compile");
     register_test_schedules(
@@ -4775,6 +4807,8 @@ async fn register_workflow_schedules_reuses_existing_dag_schedule_row_on_upgrade
         paused: false,
         queue_name: "dag-workers".to_string(),
         jitter: Duration::ZERO,
+        overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+        buffer_all_max: 100u32,
     };
 
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
@@ -4815,6 +4849,8 @@ async fn register_workflow_schedules_merges_split_legacy_dag_rows_before_upgrade
         workflow_handler: None,
 
         jitter: ::std::time::Duration::ZERO,
+        overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+        buffer_all_max: 100u32,
     }])
     .expect("classic scheduled DAG should compile");
     register_test_schedules(
@@ -4834,6 +4870,8 @@ async fn register_workflow_schedules_merges_split_legacy_dag_rows_before_upgrade
         paused: false,
         queue_name: "legacy-workflow-queue".to_string(),
         jitter: Duration::ZERO,
+        overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+        buffer_all_max: 100u32,
     };
     let unified_dag_row = WorkflowSchedule {
         workflow_name: dag_name.to_string(),
@@ -4845,6 +4883,8 @@ async fn register_workflow_schedules_merges_split_legacy_dag_rows_before_upgrade
         paused: false,
         queue_name: "dag-workers".to_string(),
         jitter: Duration::ZERO,
+        overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+        buffer_all_max: 100u32,
     };
 
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
@@ -4898,6 +4938,8 @@ async fn register_workflow_schedules_preserves_pause_metadata_when_merging_split
         workflow_handler: None,
 
         jitter: ::std::time::Duration::ZERO,
+        overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+        buffer_all_max: 100u32,
     }])
     .expect("classic scheduled DAG should compile");
     register_test_schedules(
@@ -4917,6 +4959,8 @@ async fn register_workflow_schedules_preserves_pause_metadata_when_merging_split
         paused: true,
         queue_name: "legacy-workflow-queue".to_string(),
         jitter: Duration::ZERO,
+        overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+        buffer_all_max: 100u32,
     };
     let unified_dag_row = WorkflowSchedule {
         workflow_name: dag_name.to_string(),
@@ -4928,6 +4972,8 @@ async fn register_workflow_schedules_preserves_pause_metadata_when_merging_split
         paused: false,
         queue_name: "dag-workers".to_string(),
         jitter: Duration::ZERO,
+        overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+        buffer_all_max: 100u32,
     };
 
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
@@ -4982,6 +5028,8 @@ async fn scheduler_tick_dispatches_scheduled_unified_dag_on_dag_shard() {
             workflow_handler: Some(approval_workflow),
 
             jitter: ::std::time::Duration::ZERO,
+            overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+            buffer_all_max: 100u32,
         }])
         .expect("scheduled unified dag should compile"),
     );
@@ -4995,6 +5043,8 @@ async fn scheduler_tick_dispatches_scheduled_unified_dag_on_dag_shard() {
         paused: false,
         queue_name: "dag-workers".to_string(),
         jitter: Duration::ZERO,
+        overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+        buffer_all_max: 100u32,
     };
     let harvest_pool = build_two_shard_pool(&shard0_url, &shard1_url);
     let registry = Arc::new(HandlerRegistry::new(
@@ -5083,6 +5133,8 @@ async fn scheduler_tick_removes_stale_unified_dag_schedule_from_old_shard() {
             workflow_handler: Some(approval_workflow),
 
             jitter: ::std::time::Duration::ZERO,
+            overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+            buffer_all_max: 100u32,
         }])
         .expect("scheduled unified dag should compile"),
     );
@@ -5096,6 +5148,8 @@ async fn scheduler_tick_removes_stale_unified_dag_schedule_from_old_shard() {
         paused: false,
         queue_name: "dag-workers".to_string(),
         jitter: Duration::ZERO,
+        overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+        buffer_all_max: 100u32,
     };
     let harvest_pool = build_two_shard_pool(&shard0_url, &shard1_url);
     let registry = Arc::new(HandlerRegistry::new(
@@ -5170,6 +5224,8 @@ async fn scheduler_tick_removes_legacy_workflow_only_dag_schedule_from_old_shard
             workflow_handler: Some(approval_workflow),
 
             jitter: ::std::time::Duration::ZERO,
+            overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+            buffer_all_max: 100u32,
         }])
         .expect("scheduled unified dag should compile"),
     );
@@ -5183,6 +5239,8 @@ async fn scheduler_tick_removes_legacy_workflow_only_dag_schedule_from_old_shard
         paused: false,
         queue_name: "dag-workers".to_string(),
         jitter: Duration::ZERO,
+        overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+        buffer_all_max: 100u32,
     };
     let harvest_pool = build_two_shard_pool(&shard0_url, &shard1_url);
     let registry = Arc::new(HandlerRegistry::new(
@@ -5202,6 +5260,8 @@ async fn scheduler_tick_removes_legacy_workflow_only_dag_schedule_from_old_shard
             paused: false,
             queue_name: "dag-workers".to_string(),
             jitter: Duration::ZERO,
+            overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+            buffer_all_max: 100u32,
         };
         let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&shard0_url)
             .await
@@ -5266,6 +5326,8 @@ async fn scheduler_tick_removes_stale_classic_dag_schedule_from_old_shard() {
             workflow_handler: Some(approval_workflow),
 
             jitter: ::std::time::Duration::ZERO,
+            overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+            buffer_all_max: 100u32,
         }])
         .expect("scheduled unified dag should compile"),
     );
@@ -5279,6 +5341,8 @@ async fn scheduler_tick_removes_stale_classic_dag_schedule_from_old_shard() {
         paused: false,
         queue_name: "dag-workers".to_string(),
         jitter: Duration::ZERO,
+        overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+        buffer_all_max: 100u32,
     };
     let harvest_pool = build_two_shard_pool(&shard0_url, &shard1_url);
     let registry = Arc::new(HandlerRegistry::new(
@@ -5299,6 +5363,8 @@ async fn scheduler_tick_removes_stale_classic_dag_schedule_from_old_shard() {
             workflow_handler: None,
 
             jitter: ::std::time::Duration::ZERO,
+            overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+            buffer_all_max: 100u32,
         }])
         .expect("classic DAG schedule should compile");
         let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&shard0_url)
@@ -5364,6 +5430,8 @@ async fn scheduler_tick_does_not_dispatch_removed_dag_schedule_rows() {
         paused: false,
         queue_name: "dag-workers".to_string(),
         jitter: Duration::ZERO,
+        overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+        buffer_all_max: 100u32,
     };
 
     {
