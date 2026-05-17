@@ -32,6 +32,10 @@ const HARVEST_INIT_SQL: &str = concat!(
     include_str!("../../autumn-harvest/migrations/20260506000000_harvest_audit_log/up.sql"),
     "\n",
     include_str!("../../autumn-harvest/migrations/20260509000000_harvest_build_routing/up.sql"),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260518000000_harvest_signal_idempotency/up.sql"
+    ),
 );
 
 #[derive(Debug, QueryableByName)]

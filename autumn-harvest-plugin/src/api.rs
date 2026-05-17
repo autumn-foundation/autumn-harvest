@@ -3901,9 +3901,47 @@ async fn signal_with_start_workflow(
     let route = "POST /workflows/{workflow_name}/signal-with-start";
 
     if !runtime.registry.workflows.contains_key(&workflow_name) {
+        if let Ok(pool) = api_state.storage_pool()
+            && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+        {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_SIGNAL_WITH_START,
+                target_type: TARGET_WORKFLOW,
+                target_id: Some(workflow_name.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: request.idempotency_key.as_deref(),
+                status: STATUS_FAILED,
+                error_summary: Some("workflow not registered"),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+        }
         return AutumnError::not_found_msg(format!("workflow '{workflow_name}'")).into_response();
     }
     if runtime.is_registered_dag(&workflow_name) {
+        if let Ok(pool) = api_state.storage_pool()
+            && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+        {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_SIGNAL_WITH_START,
+                target_type: TARGET_WORKFLOW,
+                target_id: Some(workflow_name.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: request.idempotency_key.as_deref(),
+                status: STATUS_FAILED,
+                error_summary: Some(
+                    "registered DAG cannot receive signal-with-start via workflow route",
+                ),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+        }
         return AutumnError::bad_request_msg(format!(
             "workflow '{workflow_name}' is a registered DAG; signal-with-start applies to plain workflows"
         ))
@@ -3912,7 +3950,27 @@ async fn signal_with_start_workflow(
 
     let reuse_policy = match parse_reuse_policy(request.id_reuse_policy.as_deref()) {
         Ok(p) => p,
-        Err(e) => return e.into_response(),
+        Err(e) => {
+            if let Ok(pool) = api_state.storage_pool()
+                && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+            {
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_SIGNAL_WITH_START,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: Some(workflow_name.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: request.idempotency_key.as_deref(),
+                    status: STATUS_FAILED,
+                    error_summary: Some("invalid id_reuse_policy"),
+                    shard_id: None,
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+            }
+            return e.into_response();
+        }
     };
 
     let workflow_id = request.workflow_id;

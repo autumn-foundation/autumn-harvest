@@ -688,10 +688,16 @@ pub struct SignalWithStartOutcome {
 /// it up at the next dispatch boundary.
 ///
 /// On a **cancel + start** (`TerminateIfRunning` + RUNNING prior), the prior
-/// execution receives a `WorkflowCancelled` event and is moved to `CANCELLED`
-/// in a first transaction; the fresh start + signal commits in a second
-/// transaction. A crash between the two leaves the prior workflow CANCELLED;
-/// the retry succeeds because CANCELLED is treated as "start fresh".
+/// execution receives a `WorkflowCancelled` event and is moved to `CANCELLED`,
+/// then the fresh start + signal lands — all inside this function's outer
+/// transaction. Diesel-async demotes the inner `conn.transaction(..)` blocks
+/// in `cancel_workflow_execution` and `start_or_load_workflow_execution` to
+/// savepoints under the outer one, so a crash mid-flight rolls back the
+/// cancellation as well: the prior workflow stays RUNNING and the caller can
+/// retry from a clean state. (This is a strictly safer guarantee than the
+/// standalone `start_or_load_workflow_execution` two-transaction shape, which
+/// can leave a CANCELLED orphan on a crash; the wrapping transaction here
+/// turns that into an all-or-nothing operation.)
 ///
 /// # Errors
 ///
@@ -701,13 +707,16 @@ pub async fn signal_with_start_workflow_execution(
     conn: &mut AsyncPgConnection,
     request: SignalWithStartParams<'_>,
 ) -> HarvestResult<SignalWithStartOutcome> {
-    // Wrap both halves in a single outer transaction so the start and the
-    // signal commit atomically. Diesel-async demotes the inner
-    // `conn.transaction(..)` in `start_or_load_workflow_execution` to a
-    // savepoint, so the prior pre-cancel transaction used by
-    // `TerminateIfRunning` is preserved as a separate commit (as documented
-    // in the function's policy table), while the start + signal pair lands
-    // as one unit.
+    // Wrap the whole operation in a single outer transaction so the entire
+    // outcome — including the `TerminateIfRunning` pre-cancel, the start
+    // (or attach), and the signal insert — commits atomically. Diesel-async
+    // demotes every inner `conn.transaction(..)` call (the cancel inside
+    // `cancel_workflow_execution` and the start inside
+    // `start_or_load_workflow_execution`) to a savepoint under this outer
+    // transaction, so a crash anywhere in the pipeline rolls back the
+    // cancellation alongside the start and the signal. The signal cannot be
+    // observed without its triggering workflow having started, and the prior
+    // run cannot be left CANCELLED-with-no-replacement.
     conn.transaction::<SignalWithStartOutcome, HarvestError, _>(|conn| {
         let request = request;
         async move {

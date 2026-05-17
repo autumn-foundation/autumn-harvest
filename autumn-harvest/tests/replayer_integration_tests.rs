@@ -56,6 +56,8 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../migrations/20260513000000_harvest_schedule_pause_metadata/up.sql"),
     "\n",
+    include_str!("../migrations/20260518000000_harvest_signal_idempotency/up.sql"),
+    "\n",
     include_str!("../migrations/20260518000000_harvest_workflow_execution_timeout/up.sql"),
 );
 
