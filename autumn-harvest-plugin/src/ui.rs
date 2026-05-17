@@ -630,11 +630,13 @@ async fn workflow_detail_ui(
         .map_err(database_error)
         .map_err(map_error)?;
 
-    // Activity-type events for the attempts panel (all pages, but only activity types).
+    // Activity-type events for the attempts panel. Heartbeats are excluded from
+    // the type filter; a hard cap bounds memory on very large executions.
     let activity_events: Vec<HarvestEvent> = harvest_events::table
         .filter(harvest_events::workflow_exec_id.eq(exec_uuid))
         .filter(harvest_events::event_type.eq_any(ACTIVITY_PANEL_EVENT_TYPES))
         .order(harvest_events::event_id.asc())
+        .limit(ACTIVITY_PANEL_MAX_EVENTS)
         .select(HarvestEvent::as_select())
         .load(&mut conn)
         .await
@@ -2398,6 +2400,10 @@ fn build_query_string(
 }
 
 const DETAIL_EVENT_PAGE_SIZE: i64 = 100;
+/// Maximum activity-type events fetched for the attempts panel.
+/// Heartbeats are excluded from the filter, so this cap is only reached
+/// on executions with a very large number of distinct activity attempts.
+const ACTIVITY_PANEL_MAX_EVENTS: i64 = 2000;
 const SIGNAL_UPDATE_TYPES: &[&str] = &[
     "SignalReceived",
     "UpdateAdmitted",
@@ -2411,11 +2417,16 @@ const ACTIVITY_PANEL_EVENT_TYPES: &[&str] = &[
     "ActivityCompleted",
     "ActivityFailed",
     "ActivityTimedOut",
-    "ActivityHeartbeat",
+    // ActivityHeartbeat intentionally excluded — heartbeats are high-cardinality
+    // and carry no information useful for the attempts panel triage view.
     "ActivityAwaitingExternal",
     "ActivityCompletedExternally",
     "ActivityFailedExternally",
     "ActivityExternalDeadlineExtended",
+    "LocalActivityScheduled",
+    "LocalActivityCompleted",
+    "LocalActivityFailed",
+    "LocalActivityExhausted",
 ];
 
 /// Extract a string field from the inner `data` object of an adjacently-tagged event payload.
@@ -2468,6 +2479,7 @@ fn event_human_label(event_type: &str, event_data: &Value) -> String {
         "LocalActivityScheduled" => "Local activity scheduled".to_string(),
         "LocalActivityCompleted" => "Local activity completed".to_string(),
         "LocalActivityFailed" => "Local activity failed".to_string(),
+        "LocalActivityExhausted" => "Local activity exhausted".to_string(),
         "VersionMarker" => "Version marker".to_string(),
         "ContinueAsNew" => "Continue as new".to_string(),
         other => other.to_string(),
@@ -2512,9 +2524,13 @@ fn collect_activity_attempts(events: &[HarvestEvent]) -> Vec<ActivityAttemptRow>
             );
         }
         if let Some(row) = groups.get_mut(&aid) {
-            if event.event_type == "ActivityScheduled"
-                || event.event_type == "ActivityAwaitingExternal"
-            {
+            // Scheduling events: one per attempt for regular activities, one total
+            // for local activities (retries are tracked via the attempt field on
+            // LocalActivityFailed/LocalActivityExhausted instead).
+            if matches!(
+                event.event_type.as_str(),
+                "ActivityScheduled" | "ActivityAwaitingExternal" | "LocalActivityScheduled"
+            ) {
                 row.attempt_count += 1;
                 if row.name.is_empty() {
                     row.name = event_data_field(&event.event_data, "name")
@@ -2522,15 +2538,25 @@ fn collect_activity_attempts(events: &[HarvestEvent]) -> Vec<ActivityAttemptRow>
                         .to_string();
                 }
             }
-            // `ActivityFailed` records the authoritative cumulative attempt count; use it
-            // when it exceeds what we counted from scheduled events (handles retry paths
-            // where the scheduled event may be absent or arrive out of order).
-            if event.event_type == "ActivityFailed" {
-                if let Some(attempt_str) = event_data_field(&event.event_data, "attempt")
-                    && let Ok(n) = attempt_str.parse::<usize>()
-                {
-                    row.attempt_count = row.attempt_count.max(n);
-                }
+            // Failure events carry an authoritative `attempt` count. Use max() so the
+            // panel is accurate whether or not every scheduled event was captured.
+            // This covers regular retries, external failures, and local activity retries.
+            if matches!(
+                event.event_type.as_str(),
+                "ActivityFailed" | "LocalActivityFailed" | "LocalActivityExhausted"
+            ) && let Some(attempt_str) = event_data_field(&event.event_data, "attempt")
+                && let Ok(n) = attempt_str.parse::<usize>()
+            {
+                row.attempt_count = row.attempt_count.max(n);
+            }
+            // Copy the error message from any failure event type.
+            if matches!(
+                event.event_type.as_str(),
+                "ActivityFailed"
+                    | "ActivityFailedExternally"
+                    | "LocalActivityFailed"
+                    | "LocalActivityExhausted"
+            ) {
                 row.last_error =
                     event_data_field(&event.event_data, "error").map(ToOwned::to_owned);
             }
