@@ -502,6 +502,8 @@ mod tests {
             default_queue: Some("default"),
             builder: build,
             workflow_handler: None,
+
+            jitter: ::std::time::Duration::ZERO,
         }
     }
 

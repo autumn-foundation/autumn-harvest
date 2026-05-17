@@ -81,6 +81,8 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260513000000_harvest_schedule_pause_metadata/up.sql"),
     "\n",
     include_str!("../migrations/20260514020000_harvest_task_activity_id/up.sql"),
+    "\n",
+    include_str!("../migrations/20260517000000_harvest_schedule_jitter/up.sql"),
 );
 
 /// The minimal "legacy" migration set used by the upgrade-path regression

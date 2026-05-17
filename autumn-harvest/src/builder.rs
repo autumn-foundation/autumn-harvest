@@ -704,6 +704,12 @@ fn validate_workflow_schedules(
                 reason,
             });
         }
+        if let Err(reason) = crate::policy::validate_jitter(&schedule.schedule, schedule.jitter) {
+            return Err(HarvestBuilderError::InvalidWorkflowSchedule {
+                workflow_name: schedule.workflow_name.clone(),
+                reason,
+            });
+        }
     }
     Ok(())
 }
@@ -1056,6 +1062,8 @@ mod tests {
             default_queue: Some("default"),
             builder: build,
             workflow_handler: None,
+
+            jitter: ::std::time::Duration::ZERO,
         }
     }
 
@@ -1072,6 +1080,7 @@ mod tests {
             default_queue: Some("default"),
             builder: build,
             workflow_handler: Some(|_ctx, input| Box::pin(async move { Ok(input) })),
+            jitter: ::std::time::Duration::ZERO,
         }
     }
 

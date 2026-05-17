@@ -206,6 +206,8 @@ pub struct HarvestSchedule {
     pub paused_by: Option<String>,
     /// Free-text reason recorded with the most recent pause. NULL when active or no reason given.
     pub pause_reason: Option<String>,
+    /// Maximum jitter window in seconds. 0 = no jitter (default).
+    pub jitter_secs: i64,
 }
 
 /// Insert struct for registering a new schedule (DAG or workflow).
@@ -225,6 +227,8 @@ pub struct NewHarvestSchedule<'a> {
     pub workflow_input: Option<serde_json::Value>,
     /// Task queue for workflow dispatches. None for DAG schedule rows.
     pub queue_name: Option<&'a str>,
+    /// Maximum jitter window in seconds. 0 = no jitter.
+    pub jitter_secs: i64,
 }
 
 // ── Signal ────────────────────────────────────────────────────────────────────

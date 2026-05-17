@@ -2,8 +2,10 @@
 
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use croner::Cron;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 /// Compute the next retry delay using exponential backoff.
 ///
@@ -308,6 +310,27 @@ pub struct WorkflowSchedule {
     pub paused: bool,
     /// Task queue name for dispatched runs. Defaults to `"default"`.
     pub queue_name: String,
+    /// Maximum spread window for staggering schedule fires.
+    ///
+    /// The actual fire time is shifted forward by a deterministic offset in
+    /// `[0, jitter)` derived from `(schedule_id, scheduled_fire_time)`.
+    /// Defaults to `Duration::ZERO` (no jitter — today's behaviour).
+    ///
+    /// ## Example
+    ///
+    /// ```rust
+    /// use std::time::Duration;
+    /// use autumn_harvest::policy::{Schedule, WorkflowSchedule};
+    ///
+    /// // Spread 100 hourly schedules over the first 5 minutes of every hour.
+    /// let sched = WorkflowSchedule::new(
+    ///     "nightly_report",
+    ///     Schedule::Cron("0 * * * *".to_string()),
+    /// )
+    /// .with_jitter(Duration::from_secs(300));
+    /// ```
+    #[serde(default)]
+    pub jitter: Duration,
 }
 
 impl WorkflowSchedule {
@@ -326,6 +349,7 @@ impl WorkflowSchedule {
             max_active_runs: 1,
             paused: false,
             queue_name: "default".to_string(),
+            jitter: Duration::ZERO,
         }
     }
 
@@ -356,6 +380,22 @@ impl WorkflowSchedule {
         self.paused = paused;
         self
     }
+
+    /// Set the maximum jitter window for this schedule.
+    ///
+    /// The scheduler shifts the effective fire time forward by a deterministic
+    /// offset in `[0, jitter)` computed from `(schedule_id, scheduled_fire_time)`.
+    /// Identical inputs always produce the same offset, so backfills and restarts
+    /// never re-roll the spread.
+    ///
+    /// Validation at build time rejects values that would cause consecutive fires
+    /// to collide (`jitter >= period` for `Interval` schedules) or exceed the
+    /// 1-hour sane upper bound for `Cron` schedules.
+    #[must_use]
+    pub const fn with_jitter(mut self, jitter: Duration) -> Self {
+        self.jitter = jitter;
+        self
+    }
 }
 
 /// Validate a [`Schedule`] value, returning an error string if it is invalid.
@@ -380,10 +420,203 @@ pub fn validate_schedule(schedule: &Schedule) -> Result<(), String> {
     }
 }
 
+/// Maximum jitter allowed for a [`Schedule::Cron`] schedule (1 hour).
+pub const MAX_CRON_JITTER: Duration = Duration::from_secs(3600);
+
+/// Validate a jitter window against a schedule's natural period.
+///
+/// # Rules
+///
+/// - `Duration::ZERO` is always valid (disables jitter).
+/// - For `Schedule::Interval(period)`: `jitter` must be `< period` so that two
+///   consecutive fired slots cannot collide.
+/// - For `Schedule::Cron(_)`: `jitter` must be `<= 1 hour`.
+/// - For `Schedule::Manual`: any value is accepted (jitter has no effect).
+///
+/// # Errors
+///
+/// Returns a human-readable error string describing the violated constraint.
+pub fn validate_jitter(schedule: &Schedule, jitter: Duration) -> Result<(), String> {
+    if jitter.is_zero() {
+        return Ok(());
+    }
+    match schedule {
+        Schedule::Interval(period) => {
+            if jitter >= *period {
+                return Err(format!(
+                    "jitter ({jitter:?}) must be less than the interval period ({period:?})"
+                ));
+            }
+        }
+        Schedule::Cron(_) => {
+            if jitter > MAX_CRON_JITTER {
+                return Err(format!(
+                    "jitter ({jitter:?}) exceeds the 1-hour maximum for cron schedules"
+                ));
+            }
+        }
+        Schedule::Manual => {}
+    }
+    Ok(())
+}
+
+/// Compute the deterministic jitter offset for a scheduled fire.
+///
+/// The offset is a pure function of `(schedule_id, fire_time)` so that:
+/// - Scheduler restarts and leader handoffs never re-roll the value.
+/// - Backfills under the same `(schedule_id, fire_time)` reproduce the same
+///   effective fire time.
+///
+/// Returns `Duration::ZERO` when `jitter` is zero.
+///
+/// The hash uses `seahash` over `[schedule_id_bytes (16) || fire_time_nanos_le (8)]`,
+/// mirroring the shard-router pattern already present in this crate.
+#[must_use]
+pub fn compute_jitter_offset(
+    schedule_id: Uuid,
+    fire_time: DateTime<Utc>,
+    jitter: Duration,
+) -> Duration {
+    if jitter.is_zero() {
+        return Duration::ZERO;
+    }
+    let jitter_nanos = u64::try_from(jitter.as_nanos()).unwrap_or(u64::MAX);
+    let fire_nanos = fire_time
+        .timestamp_nanos_opt()
+        .unwrap_or_default()
+        .cast_unsigned();
+    let mut bytes = [0u8; 24];
+    bytes[..16].copy_from_slice(schedule_id.as_bytes());
+    bytes[16..].copy_from_slice(&fire_nanos.to_le_bytes());
+    let hash = seahash::hash(&bytes);
+    Duration::from_nanos(hash % jitter_nanos)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    // ── Schedule jitter ───────────────────────────────────────────────────────
+
+    #[test]
+    fn workflow_schedule_jitter_defaults_to_zero() {
+        let sched = WorkflowSchedule::new("my_workflow", Schedule::Manual);
+        assert_eq!(sched.jitter, Duration::ZERO);
+    }
+
+    #[test]
+    fn workflow_schedule_with_jitter_sets_duration() {
+        let sched =
+            WorkflowSchedule::new("my_wf", Schedule::Manual).with_jitter(Duration::from_secs(300));
+        assert_eq!(sched.jitter, Duration::from_secs(300));
+    }
+
+    #[test]
+    fn validate_jitter_zero_always_accepted() {
+        assert!(validate_jitter(&Schedule::Manual, Duration::ZERO).is_ok());
+        assert!(
+            validate_jitter(&Schedule::Interval(Duration::from_secs(60)), Duration::ZERO).is_ok()
+        );
+        assert!(validate_jitter(&Schedule::Cron("0 * * * *".to_string()), Duration::ZERO).is_ok());
+    }
+
+    #[test]
+    fn validate_jitter_interval_gte_period_is_error() {
+        let period = Duration::from_secs(60);
+        assert!(
+            validate_jitter(&Schedule::Interval(period), Duration::from_secs(60)).is_err(),
+            "jitter equal to period must be rejected"
+        );
+        assert!(
+            validate_jitter(&Schedule::Interval(period), Duration::from_secs(90)).is_err(),
+            "jitter greater than period must be rejected"
+        );
+    }
+
+    #[test]
+    fn validate_jitter_interval_lt_period_is_ok() {
+        let period = Duration::from_secs(60);
+        assert!(validate_jitter(&Schedule::Interval(period), Duration::from_secs(59)).is_ok());
+        assert!(validate_jitter(&Schedule::Interval(period), Duration::from_secs(1)).is_ok());
+    }
+
+    #[test]
+    fn validate_jitter_cron_gt_one_hour_is_error() {
+        let cron = Schedule::Cron("0 * * * *".to_string());
+        assert!(validate_jitter(&cron, Duration::from_secs(3601)).is_err());
+        assert!(validate_jitter(&cron, Duration::from_secs(7200)).is_err());
+    }
+
+    #[test]
+    fn validate_jitter_cron_lte_one_hour_is_ok() {
+        let cron = Schedule::Cron("0 * * * *".to_string());
+        assert!(validate_jitter(&cron, Duration::from_secs(3600)).is_ok());
+        assert!(validate_jitter(&cron, Duration::from_secs(300)).is_ok());
+    }
+
+    #[test]
+    fn compute_jitter_offset_deterministic() {
+        use chrono::{DateTime, Utc};
+        use uuid::Uuid;
+        let id = Uuid::from_u128(42);
+        let fire_time = "2026-04-01T10:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let jitter = Duration::from_secs(300);
+        let first = compute_jitter_offset(id, fire_time, jitter);
+        for _ in 0..999 {
+            assert_eq!(compute_jitter_offset(id, fire_time, jitter), first);
+        }
+    }
+
+    #[test]
+    fn compute_jitter_offset_zero_jitter_returns_zero() {
+        use chrono::{DateTime, Utc};
+        use uuid::Uuid;
+        let id = Uuid::from_u128(1);
+        let fire_time = "2026-04-01T10:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        assert_eq!(
+            compute_jitter_offset(id, fire_time, Duration::ZERO),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn compute_jitter_offset_within_bounds() {
+        use chrono::{DateTime, Utc};
+        use uuid::Uuid;
+        let id = Uuid::from_u128(12345);
+        let fire_time = "2026-04-01T10:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let jitter = Duration::from_secs(300);
+        let offset = compute_jitter_offset(id, fire_time, jitter);
+        assert!(
+            offset < jitter,
+            "offset {offset:?} must be < jitter {jitter:?}"
+        );
+    }
+
+    #[test]
+    fn compute_jitter_offset_uniform_distribution() {
+        use chrono::{DateTime, Utc};
+        use uuid::Uuid;
+        let fire_time = "2026-04-01T10:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let jitter = Duration::from_secs(300);
+        let num_ids: u128 = 10_000;
+        let num_buckets = 10usize;
+        let mut buckets = vec![0u32; num_buckets];
+        for i in 0..num_ids {
+            let id = Uuid::from_u128(i);
+            let offset = compute_jitter_offset(id, fire_time, jitter);
+            let bucket_width = jitter.as_nanos() / num_buckets as u128;
+            let bucket = ((offset.as_nanos() / bucket_width) as usize).min(num_buckets - 1);
+            buckets[bucket] += 1;
+        }
+        for (i, &count) in buckets.iter().enumerate() {
+            assert!(
+                count > 500 && count < 1500,
+                "bucket {i} has {count} items; expected ~1000 (range 500–1500)"
+            );
+        }
+    }
 
     #[test]
     fn exponential_backoff_doubles() {

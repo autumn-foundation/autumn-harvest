@@ -10,6 +10,7 @@ struct DagAttrs {
     catchup: bool,
     max_active_runs: u32,
     default_queue: Option<String>,
+    jitter: Option<String>,
 }
 
 fn parse_attrs(attr: TokenStream) -> syn::Result<DagAttrs> {
@@ -35,9 +36,13 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<DagAttrs> {
             let value: LitStr = meta.value()?.parse()?;
             result.default_queue = Some(value.value());
             Ok(())
+        } else if meta.path.is_ident("jitter") {
+            let value: LitStr = meta.value()?.parse()?;
+            result.jitter = Some(value.value());
+            Ok(())
         } else {
             Err(meta.error(
-                "unsupported attribute: expected schedule, catchup, max_active_runs, or default_queue",
+                "unsupported attribute: expected schedule, catchup, max_active_runs, default_queue, or jitter",
             ))
         }
     })
@@ -80,6 +85,16 @@ pub fn dag_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         .default_queue
         .as_deref()
         .map_or_else(|| quote! { None }, |queue| quote! { Some(#queue) });
+
+    let jitter_expr = attrs.jitter.as_deref().map_or_else(
+        || quote! { ::std::time::Duration::ZERO },
+        |s| {
+            quote! {
+                ::autumn_harvest::task_duration(#s)
+                    .expect(concat!("invalid jitter duration string: ", #s))
+            }
+        },
+    );
 
     // Emit the shadow WorkflowInfo companion when the unified-dag-execution
     // feature is enabled on the proc-macro crate (transitively enabled by
@@ -248,6 +263,7 @@ pub fn dag_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     #fn_name(dag);
                 },
                 #workflow_handler_field
+                jitter: #jitter_expr,
             }
         }
 

@@ -53,6 +53,33 @@ fn dag_macro_populates_workflow_handler_in_default_build() {
     );
 }
 
+#[dag(
+    schedule = "0 * * * *",
+    catchup = false,
+    max_active_runs = 1,
+    jitter = "5m"
+)]
+fn hourly_report(dag: &mut DagBuilder) {
+    let _ = dag.activity(extract_users);
+}
+
+#[test]
+fn dag_macro_jitter_attribute_populates_field() {
+    let info = __autumn_dag_info_hourly_report();
+    assert_eq!(
+        info.jitter,
+        Duration::from_secs(300),
+        "jitter should be 5 minutes"
+    );
+    assert_eq!(info.name, "hourly_report");
+}
+
+#[test]
+fn dag_macro_default_jitter_is_zero() {
+    let info = __autumn_dag_info_daily_etl();
+    assert_eq!(info.jitter, Duration::ZERO, "jitter must default to zero");
+}
+
 #[test]
 fn dags_macro_collects_and_builds_definitions() {
     let dags: Vec<DagInfo> = dags![daily_etl];
