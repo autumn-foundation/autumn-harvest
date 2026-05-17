@@ -253,6 +253,30 @@ mod db {
         pub limit: i64,
     }
 
+    /// Retrieves a single batch job by its unique identifier.
+    ///
+    /// Operators often need to check on the status of a specific batch operation
+    /// that they previously initiated. This function looks up the job and returns it
+    /// if it exists.
+    ///
+    /// # Arguments
+    /// * `conn` - A mutable reference to an asynchronous `PostgreSQL` connection.
+    /// * `id` - The `Uuid` of the batch job to retrieve.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # use autumn_harvest::batch::{get_batch_job, ListFilters};
+    /// # use uuid::Uuid;
+    /// # async fn example(conn: &mut diesel_async::AsyncPgConnection) -> Result<(), Box<dyn std::error::Error>> {
+    /// let job_id = Uuid::new_v4();
+    /// if let Some(job) = get_batch_job(conn, job_id).await? {
+    ///     println!("Job status: {:?}", job.status);
+    /// } else {
+    ///     println!("Job not found.");
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn get_batch_job(
         conn: &mut AsyncPgConnection,
         id: Uuid,
@@ -266,6 +290,29 @@ mod db {
             .map_err(database_error)
     }
 
+    /// Returns a list of batch jobs matching the provided filters.
+    ///
+    /// This is commonly used in management endpoints to display a paginated or
+    /// filtered view of ongoing and completed batch operations (e.g., finding
+    /// all "Pending" jobs).
+    ///
+    /// # Arguments
+    /// * `conn` - A mutable reference to an asynchronous `PostgreSQL` connection.
+    /// * `filters` - A `ListFilters` struct specifying the status, action, and limit.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # use autumn_harvest::batch::{list_batch_jobs, ListFilters, BatchJobStatus};
+    /// # async fn example(conn: &mut diesel_async::AsyncPgConnection) -> Result<(), Box<dyn std::error::Error>> {
+    /// let filters = ListFilters {
+    ///     status: Some(BatchJobStatus::Pending),
+    ///     ..Default::default()
+    /// };
+    /// let pending_jobs = list_batch_jobs(conn, &filters).await?;
+    /// println!("Found {} pending jobs.", pending_jobs.len());
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn list_batch_jobs(
         conn: &mut AsyncPgConnection,
         filters: &ListFilters,
@@ -407,6 +454,27 @@ mod db {
         Ok(())
     }
 
+    /// Marks a batch job as successfully completed.
+    ///
+    /// This transitions the job's status to [`BatchJobStatus::Completed`] and
+    /// populates the `completed_at` timestamp. If the job does not exist, this
+    /// completes successfully without affecting any rows.
+    ///
+    /// # Arguments
+    /// * `conn` - A mutable reference to an asynchronous `PostgreSQL` connection.
+    /// * `id` - The `Uuid` of the batch job.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # use autumn_harvest::batch::{mark_completed};
+    /// # use uuid::Uuid;
+    /// # async fn example(conn: &mut diesel_async::AsyncPgConnection) -> Result<(), Box<dyn std::error::Error>> {
+    /// let job_id = Uuid::new_v4();
+    /// mark_completed(conn, job_id).await?;
+    /// println!("Job {} marked as complete.", job_id);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn mark_completed(conn: &mut AsyncPgConnection, id: Uuid) -> HarvestResult<()> {
         diesel::update(harvest_batch_jobs::table.find(id))
             .set((
@@ -764,6 +832,28 @@ mod db {
         Ok(())
     }
 
+    /// Transitions a batch job to a failed state and records the reason.
+    ///
+    /// Unlike per-target failures which are accumulated in a job, this function
+    /// is used when the overall batch job fundamentally aborts (e.g., due to an
+    /// invalid filter or infrastructure error). It records a top-level error
+    /// in the `errors` JSON column and sets the status to [`BatchJobStatus::Failed`].
+    ///
+    /// # Arguments
+    /// * `conn` - A mutable reference to an asynchronous `PostgreSQL` connection.
+    /// * `id` - The `Uuid` of the batch job to fail.
+    /// * `reason` - A human-readable string explaining why the batch failed.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # use autumn_harvest::batch::{mark_failed};
+    /// # use uuid::Uuid;
+    /// # async fn example(conn: &mut diesel_async::AsyncPgConnection) -> Result<(), Box<dyn std::error::Error>> {
+    /// let job_id = Uuid::new_v4();
+    /// mark_failed(conn, job_id, "Filter matched over 1 million rows, aborting").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn mark_failed(
         conn: &mut AsyncPgConnection,
         id: Uuid,
