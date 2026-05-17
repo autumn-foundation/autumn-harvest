@@ -28,7 +28,7 @@ let worker = WorkerConfig::default()
     });
 ```
 
-`lease_ttl` controls how long a worker holds the affinity lease on an execution. Set it shorter than your typical worker restart cadence. After the TTL expires another worker may claim the task (a cache miss, which is always correct — it is just slower).
+`lease_ttl` controls how long a worker holds the affinity lease on an execution. After the TTL expires another worker may claim the task (a cache miss, which is always correct — it is just slower). See the operational recommendations below for guidance on sizing this value.
 
 To disable sticky routing after enabling it, pass `lease_ttl: Duration::ZERO`:
 

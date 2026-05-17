@@ -2792,6 +2792,7 @@ async fn prepare_workflow_task_with_cache(
     task: &TaskQueueItem,
     worker_id: &str,
     workflow_cache: &tokio::sync::Mutex<crate::cache::WorkflowCache>,
+    sticky_timeout: Duration,
 ) -> HarvestResult<PreparedWorkflowTask> {
     let Some(exec_uuid) = task.workflow_exec_id else {
         let error = HarvestError::Config("workflow task missing workflow_exec_id".into());
@@ -2800,8 +2801,13 @@ async fn prepare_workflow_task_with_cache(
     };
     let exec_id = execution_id_from_uuid(exec_uuid);
 
-    // Brief lock to check cache without holding it during DB work.
-    let cached = {
+    // Only probe the cache when sticky routing is enabled (lease_ttl > 0).
+    // With sticky_timeout == 0 the cache is permanently disabled: no lookups,
+    // no inserts, no memory consumed — the whole warm-cache path is skipped.
+    let cached = if sticky_timeout.is_zero() {
+        None
+    } else {
+        // Brief lock to check cache without holding it during DB work.
         let mut guard = workflow_cache.lock().await;
         guard.get(&exec_uuid).cloned()
     };
@@ -2809,15 +2815,23 @@ async fn prepare_workflow_task_with_cache(
     let execution = load_task_execution(conn, task, exec_id).await?;
 
     if let Some(ref cached_state) = cached {
-        // Cache hit path: ingest timers/signals then load only delta events.
+        // Cache hit path: first load any events already appended since the
+        // cache snapshot (e.g. by timeout.rs/external_task.rs via
+        // append_single_event), then ingest timers/signals at the REAL current
+        // next_event_id to avoid a unique-constraint collision on event_id.
+        let existing_delta_result =
+            store::load_history_since(conn, exec_id, cached_state.next_event_id).await;
+        let existing_delta =
+            fail_execution_on_error(conn, task, worker_id, existing_delta_result).await?;
+
         let timers_result =
-            ingest_fired_timers(conn, exec_id, cached_state.next_event_id).await;
+            ingest_fired_timers(conn, exec_id, existing_delta.next_event_id).await;
         let timers_fired =
             fail_execution_on_error(conn, task, worker_id, timers_result).await?;
 
         // Load events appended by timer ingestion.
         let after_timers_result =
-            store::load_history_since(conn, exec_id, cached_state.next_event_id).await;
+            store::load_history_since(conn, exec_id, existing_delta.next_event_id).await;
         let after_timers =
             fail_execution_on_error(conn, task, worker_id, after_timers_result).await?;
 
@@ -2832,8 +2846,10 @@ async fn prepare_workflow_task_with_cache(
         let after_signals =
             fail_execution_on_error(conn, task, worker_id, after_signals_result).await?;
 
-        // Reconstruct full history: cached snapshot + delta.
+        // Reconstruct full history: cached snapshot + any pre-existing delta +
+        // timer events + signal events.
         let mut history_events = cached_state.events.clone();
+        history_events.extend(existing_delta.events);
         history_events.extend(after_timers.events);
         history_events.extend(after_signals.events);
         let next_event_id = after_signals.next_event_id;
@@ -3260,7 +3276,8 @@ async fn process_workflow_task(
     workflow_cache: Arc<tokio::sync::Mutex<crate::cache::WorkflowCache>>,
 ) -> HarvestResult<()> {
     let mut prepared =
-        prepare_workflow_task_with_cache(conn, task, worker_id, &workflow_cache).await?;
+        prepare_workflow_task_with_cache(conn, task, worker_id, &workflow_cache, sticky_timeout)
+            .await?;
     let Some(workflow) = registry.workflows.get(&prepared.execution.workflow_name) else {
         let error = format!(
             "no workflow handler registered for '{}'",
@@ -3551,30 +3568,24 @@ async fn process_workflow_task(
         );
     }
 
-    // Update the in-process LRU cache based on outcome before persisting the
-    // DB changes.  A Suspended outcome refreshes the cache entry so the next
-    // task for this execution can use a delta load; terminal outcomes evict the
-    // entry so it does not consume cache capacity after the execution ends.
-    {
-        let exec_uuid = prepared.exec_id.as_uuid();
-        let mut guard = workflow_cache.lock().await;
-        match &outcome {
-            WorkflowOutcome::Suspended { .. } => {
-                guard.insert(
-                    exec_uuid,
-                    crate::cache::CachedWorkflowState {
-                        events: history_events.clone(),
-                        next_event_id,
-                    },
-                );
-            }
-            WorkflowOutcome::Completed { .. }
-            | WorkflowOutcome::Failed { .. }
-            | WorkflowOutcome::ContinuedAsNew { .. } => {
-                guard.remove(&exec_uuid);
-            }
-        }
-    }
+    // Pre-compute the cache action while `outcome` is still accessible (it
+    // will be consumed by `persist_workflow_outcome` below).  We do NOT apply
+    // the update yet: the cache must only be written AFTER persistence succeeds
+    // so that a failed commit never leaves a warm cache snapshot pointing at
+    // events that were never durably written.
+    //
+    // `Some(state)` → insert on success; `None` → evict on success.
+    // Cache operations are skipped entirely when sticky routing is disabled.
+    let pending_cache_update = if sticky_timeout.is_zero() {
+        None
+    } else if let WorkflowOutcome::Suspended { .. } = &outcome {
+        Some(Some(crate::cache::CachedWorkflowState {
+            events: history_events.clone(),
+            next_event_id,
+        }))
+    } else {
+        Some(None) // terminal — evict
+    };
 
     persist_workflow_outcome(
         conn,
@@ -3590,9 +3601,25 @@ async fn process_workflow_task(
         outcome,
         &execute_span,
     )
-    .await
+    .await?;
     // execute_span is dropped here, closing the OTel span after all producer
     // spans have been emitted as its children.
+
+    // Update the in-process LRU cache ONLY on successful persistence.
+    // A Suspended outcome inserts the warm snapshot; terminal outcomes evict.
+    // Skipped entirely when sticky routing is disabled (sticky_timeout == 0).
+    if let Some(update) = pending_cache_update {
+        let exec_uuid = prepared.exec_id.as_uuid();
+        let mut guard = workflow_cache.lock().await;
+        match update {
+            Some(state) => guard.insert(exec_uuid, state),
+            None => {
+                guard.remove(&exec_uuid);
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
