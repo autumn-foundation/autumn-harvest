@@ -50,8 +50,9 @@ use crate::telemetry::{
     METRIC_LABEL_REASON, METRIC_LABEL_SHARD, METRIC_LABEL_STATUS, METRIC_LABEL_WORKFLOW,
     METRIC_LABEL_WORKFLOW_TYPE, METRIC_QUERY_DURATION, METRIC_QUEUE_DEPTH,
     METRIC_RETENTION_DELETED, METRIC_SCHEDULE_RUNS, METRIC_SCHEDULE_SKIPPED, METRIC_TIMER_DURATION,
-    METRIC_TIMER_STARTED, METRIC_WORKFLOW_CONTINUE_AS_NEW, METRIC_WORKFLOW_DURATION,
-    METRIC_WORKFLOW_HISTORY_SIZE, METRIC_WORKFLOW_STARTED, MetricsRecorder, WorkflowStatus,
+    METRIC_TIMER_STARTED, METRIC_WORKFLOW_CACHE_HIT, METRIC_WORKFLOW_CACHE_MISS,
+    METRIC_WORKFLOW_CONTINUE_AS_NEW, METRIC_WORKFLOW_DURATION, METRIC_WORKFLOW_HISTORY_SIZE,
+    METRIC_WORKFLOW_STARTED, MetricsRecorder, WorkflowStatus,
 };
 
 /// [`MetricsRecorder`] implementation that forwards every sample to the
@@ -244,6 +245,24 @@ impl MetricsRecorder for MetricsRsRecorder {
         )
         .set(deferred as f64);
     }
+
+    fn record_workflow_cache_hit(&self, workflow_name: &str, queue: &str) {
+        counter!(
+            METRIC_WORKFLOW_CACHE_HIT,
+            METRIC_LABEL_WORKFLOW => workflow_name.to_owned(),
+            METRIC_LABEL_QUEUE => queue.to_owned(),
+        )
+        .increment(1);
+    }
+
+    fn record_workflow_cache_miss(&self, workflow_name: &str, queue: &str) {
+        counter!(
+            METRIC_WORKFLOW_CACHE_MISS,
+            METRIC_LABEL_WORKFLOW => workflow_name.to_owned(),
+            METRIC_LABEL_QUEUE => queue.to_owned(),
+        )
+        .increment(1);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -290,6 +309,8 @@ mod tests {
         rec.record_retention_tick(0, 100, 50, 0.01);
         rec.record_concurrency_key_in_flight("cap", 3);
         rec.record_concurrency_key_deferred("cap", 1);
+        rec.record_workflow_cache_hit("wf", "q");
+        rec.record_workflow_cache_miss("wf", "q");
     }
 
     #[test]

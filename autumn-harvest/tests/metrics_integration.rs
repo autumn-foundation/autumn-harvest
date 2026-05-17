@@ -315,6 +315,7 @@ fn build_worker(worker_id: &str, registry: Arc<HandlerRegistry>) -> Arc<Worker> 
                 worker_heartbeat_interval: Duration::from_secs(30),
                 build_id: String::new(),
                 deployment_name: None,
+                workflow_cache_size: 1000,
             },
             registry,
         )

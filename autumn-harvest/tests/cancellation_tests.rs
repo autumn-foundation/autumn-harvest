@@ -417,6 +417,7 @@ async fn running_activity_heartbeat_observes_workflow_cancellation() {
                 worker_heartbeat_interval: Duration::from_secs(5),
                 build_id: String::new(),
                 deployment_name: None,
+                workflow_cache_size: 1000,
             },
             registry,
         )
@@ -575,6 +576,7 @@ async fn uncooperative_activity_is_hard_aborted_after_grace_period() {
                 worker_heartbeat_interval: Duration::from_secs(5),
                 build_id: String::new(),
                 deployment_name: None,
+                workflow_cache_size: 1000,
             },
             registry,
         )

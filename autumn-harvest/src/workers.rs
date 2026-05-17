@@ -55,7 +55,7 @@ pub struct WorkerRegistration {
     pub deployment_name: Option<String>,
 }
 use crate::models::{HarvestWorker, NewHarvestWorker};
-use crate::schema::{harvest_task_queue, harvest_workers};
+use crate::schema::{harvest_task_queue, harvest_workers, harvest_workflow_executions};
 use crate::worker::DbPool;
 
 // ---------------------------------------------------------------------------
@@ -691,6 +691,117 @@ pub fn preview_item_from_row(row: &WorkerRow) -> DrainPreviewItem {
         queues,
         shard_ids,
     }
+}
+
+// ---------------------------------------------------------------------------
+// PinnedExecutionRow + list_pinned_executions (issue #235)
+// ---------------------------------------------------------------------------
+
+/// Summary of one workflow execution currently sticky-pinned to a worker.
+///
+/// An execution is "live-pinned" when it has a parked task in
+/// `harvest_task_queue` with `sticky_worker_id = <this worker>` and a
+/// non-expired `sticky_until`. That is the authoritative liveness signal:
+/// `harvest_workflow_executions.sticky_worker_id` is only written on terminal
+/// transitions (completed / failed / continued-as-new) and therefore does NOT
+/// reflect currently-suspended executions.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PinnedExecutionRow {
+    /// Unique execution UUID.
+    pub execution_id: Uuid,
+    /// Registered workflow function name.
+    pub workflow_name: String,
+    /// Business-key workflow ID supplied by the caller.
+    pub workflow_id: String,
+    /// Lifecycle state of the execution (e.g. `"Running"`, `"Suspended"`).
+    pub state: String,
+    /// Task queue the parked task is waiting on.
+    pub queue_name: String,
+    /// Wall-clock start time of this execution.
+    pub started_at: DateTime<Utc>,
+    /// When the affinity lease expires (UTC). After this the task becomes
+    /// claimable by any eligible worker.
+    pub sticky_until: DateTime<Utc>,
+}
+
+/// List workflow executions currently soft-pinned to `worker_id` via the
+/// task-queue affinity mechanism (issue #235).
+///
+/// Queries `harvest_task_queue` for parked tasks whose `sticky_worker_id`
+/// matches `worker_id` and whose lease (`sticky_until`) has not yet expired,
+/// then joins to `harvest_workflow_executions` for metadata.
+///
+/// The returned set shrinks as leases expire or executions complete, and grows
+/// as follow-up tasks park back to this worker.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] when the Postgres query fails.
+pub async fn list_pinned_executions(
+    conn: &mut AsyncPgConnection,
+    worker_id: &str,
+) -> HarvestResult<Vec<PinnedExecutionRow>> {
+    use crate::schema::harvest_task_queue;
+    use diesel::dsl::sql;
+    use diesel::sql_types::Nullable;
+    use diesel::sql_types::Timestamptz;
+
+    type Row = (
+        Uuid,                  // harvest_task_queue.workflow_exec_id
+        Option<DateTime<Utc>>, // harvest_task_queue.sticky_until
+        Uuid,                  // harvest_workflow_executions.id
+        String,                // workflow_name
+        String,                // workflow_id
+        String,                // state
+        String,                // queue_name (from execution)
+        DateTime<Utc>,         // started_at
+    );
+
+    let rows: Vec<Row> = harvest_task_queue::table
+        .inner_join(harvest_workflow_executions::table)
+        .filter(harvest_task_queue::sticky_worker_id.eq(worker_id))
+        .filter(harvest_task_queue::sticky_until.gt(sql::<Nullable<Timestamptz>>("NOW()")))
+        .filter(harvest_task_queue::state.eq_any(["PENDING", "RUNNING"]))
+        .select((
+            harvest_task_queue::workflow_exec_id.assume_not_null(),
+            harvest_task_queue::sticky_until,
+            harvest_workflow_executions::id,
+            harvest_workflow_executions::workflow_name,
+            harvest_workflow_executions::workflow_id,
+            harvest_workflow_executions::state,
+            harvest_workflow_executions::queue_name,
+            harvest_workflow_executions::started_at,
+        ))
+        .order(harvest_workflow_executions::started_at.asc())
+        .load(conn)
+        .await
+        .map_err(|e| HarvestError::Database(e.to_string()))?;
+
+    Ok(rows
+        .into_iter()
+        .filter_map(
+            |(
+                _,
+                sticky_until,
+                exec_id,
+                workflow_name,
+                workflow_id,
+                state,
+                queue_name,
+                started_at,
+            )| {
+                sticky_until.map(|su| PinnedExecutionRow {
+                    execution_id: exec_id,
+                    workflow_name,
+                    workflow_id,
+                    state,
+                    queue_name,
+                    started_at,
+                    sticky_until: su,
+                })
+            },
+        )
+        .collect())
 }
 
 /// Read the current lifecycle status of a worker without modifying it.

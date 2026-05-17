@@ -109,6 +109,21 @@ pub const METRIC_RETENTION_DELETED: &str = "harvest.retention.deleted";
 /// span-only and is never a metric label.
 pub const METRIC_QUERY_DURATION: &str = "harvest.query.duration";
 
+/// Counter: incremented when a workflow task is picked up by the worker that
+/// already holds that execution's replay state in its in-process LRU cache.
+///
+/// Labeled by `workflow` (workflow name). `execution.id` stays span-only per
+/// the existing cardinality rule (ADR-0001 §7).
+pub const METRIC_WORKFLOW_CACHE_HIT: &str = "harvest.workflow.cache_hit";
+
+/// Counter: incremented when a workflow task is picked up by a worker that
+/// does NOT hold that execution's replay state in its in-process LRU cache,
+/// causing a full event-history reload from Postgres.
+///
+/// Labeled by `workflow` (workflow name). `execution.id` stays span-only per
+/// the existing cardinality rule (ADR-0001 §7).
+pub const METRIC_WORKFLOW_CACHE_MISS: &str = "harvest.workflow.cache_miss";
+
 // ---------------------------------------------------------------------------
 // Metric label key constants
 // Used by MetricsRecorder implementations to avoid string literals at call
@@ -531,6 +546,28 @@ pub trait MetricsRecorder: Send + Sync {
     /// Maps to the histogram `harvest.query.duration{query.name, status}`.
     fn record_query_completed(&self, query_name: &str, duration_secs: f64, success: bool) {
         let _ = (query_name, duration_secs, success);
+    }
+
+    /// A workflow task was served from the in-process LRU cache (warm path).
+    ///
+    /// The worker already holds this execution's event history in its local
+    /// `WorkflowCache`, so only delta events (new timer firings / signals) need
+    /// to be fetched from Postgres rather than the full history.
+    ///
+    /// Maps to the counter `harvest.workflow.cache_hit{workflow}`.
+    fn record_workflow_cache_hit(&self, workflow_name: &str, queue: &str) {
+        let _ = (workflow_name, queue);
+    }
+
+    /// A workflow task required a full event-history reload from Postgres (cold path).
+    ///
+    /// The worker's LRU cache did not contain an entry for this execution —
+    /// either because this is the first task for this execution on this worker,
+    /// the entry was evicted by LRU pressure, or sticky routing is disabled.
+    ///
+    /// Maps to the counter `harvest.workflow.cache_miss{workflow}`.
+    fn record_workflow_cache_miss(&self, workflow_name: &str, queue: &str) {
+        let _ = (workflow_name, queue);
     }
 }
 

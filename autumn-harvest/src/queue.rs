@@ -833,6 +833,11 @@ pub async fn park_workflow_task(
         .await
         .map_err(crate::error::database_error)?
     } else {
+        // No sticky hint: clear any stale affinity left by a previous worker
+        // that ran with sticky routing enabled. Without this, wake_workflow_task
+        // would refresh sticky_until from the stored sticky_timeout column and
+        // re-pin the execution to the old worker even though the current worker
+        // is running with sticky routing disabled.
         use crate::schema::harvest_task_queue::dsl;
         diesel::update(
             dsl::harvest_task_queue
@@ -843,6 +848,9 @@ pub async fn park_workflow_task(
         .set((
             dsl::worker_id.eq(None::<String>),
             dsl::started_at.eq(None::<chrono::DateTime<Utc>>),
+            dsl::sticky_worker_id.eq(None::<String>),
+            dsl::sticky_until.eq(None::<chrono::DateTime<Utc>>),
+            dsl::sticky_timeout.eq(None::<chrono::Duration>),
         ))
         .execute(conn)
         .await

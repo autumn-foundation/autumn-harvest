@@ -621,6 +621,7 @@ fn build_runtime_worker(
                 worker_heartbeat_interval: Duration::from_secs(5),
                 build_id: String::new(),
                 deployment_name: None,
+                workflow_cache_size: 1000,
             },
             registry,
         )
@@ -1163,6 +1164,7 @@ async fn worker_completes_workflow_task_and_persists_result() {
                 worker_heartbeat_interval: Duration::from_secs(5),
                 build_id: String::new(),
                 deployment_name: None,
+                workflow_cache_size: 1000,
             },
             registry,
         )
@@ -1259,6 +1261,7 @@ async fn worker_marks_workflow_failed_when_handler_errors() {
                 worker_heartbeat_interval: Duration::from_secs(5),
                 build_id: String::new(),
                 deployment_name: None,
+                workflow_cache_size: 1000,
             },
             registry,
         )
@@ -1381,6 +1384,7 @@ async fn worker_completes_workflow_with_activity_round_trip() {
                 worker_heartbeat_interval: Duration::from_secs(5),
                 build_id: String::new(),
                 deployment_name: None,
+                workflow_cache_size: 1000,
             },
             registry,
         )
@@ -1563,6 +1567,7 @@ async fn worker_fails_orphaned_activity_task_without_scheduled_event() {
                 worker_heartbeat_interval: Duration::from_secs(5),
                 build_id: String::new(),
                 deployment_name: None,
+                workflow_cache_size: 1000,
             },
             Arc::new(HandlerRegistry::new(
                 vec![],
@@ -1774,6 +1779,7 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
                 worker_heartbeat_interval: Duration::from_secs(5),
                 build_id: String::new(),
                 deployment_name: None,
+                workflow_cache_size: 1000,
             },
             Arc::new(HandlerRegistry::new(
                 vec![WorkflowInfo {
@@ -1896,6 +1902,7 @@ async fn worker_completes_workflow_with_timer_round_trip() {
                 worker_heartbeat_interval: Duration::from_secs(5),
                 build_id: String::new(),
                 deployment_name: None,
+                workflow_cache_size: 1000,
             },
             Arc::new(HandlerRegistry::new(
                 vec![WorkflowInfo {
@@ -4263,6 +4270,7 @@ async fn workflow_schedule_baseline_dispatches_multiple_runs() {
                 worker_heartbeat_interval: Duration::from_secs(5),
                 build_id: String::new(),
                 deployment_name: None,
+                workflow_cache_size: 1000,
             },
             Arc::clone(&registry),
         )
@@ -4358,6 +4366,7 @@ async fn workflow_schedule_max_active_runs_enforced() {
                 worker_heartbeat_interval: Duration::from_secs(5),
                 build_id: String::new(),
                 deployment_name: None,
+                workflow_cache_size: 1000,
             },
             Arc::clone(&registry),
         )
@@ -4441,6 +4450,7 @@ async fn workflow_schedule_pause_and_resume() {
                 worker_heartbeat_interval: Duration::from_secs(5),
                 build_id: String::new(),
                 deployment_name: None,
+                workflow_cache_size: 1000,
             },
             Arc::clone(&registry),
         )
