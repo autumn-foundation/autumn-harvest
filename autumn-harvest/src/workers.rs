@@ -54,8 +54,8 @@ pub struct WorkerRegistration {
     /// Optional human-readable deployment name, e.g. `"prod-blue"` (issue #171).
     pub deployment_name: Option<String>,
 }
-use crate::models::{HarvestWorker, NewHarvestWorker};
-use crate::schema::{harvest_task_queue, harvest_workers};
+use crate::models::{HarvestWorker, NewHarvestWorker, WorkflowExecution};
+use crate::schema::{harvest_task_queue, harvest_workers, harvest_workflow_executions};
 use crate::worker::DbPool;
 
 // ---------------------------------------------------------------------------
@@ -691,6 +691,65 @@ pub fn preview_item_from_row(row: &WorkerRow) -> DrainPreviewItem {
         queues,
         shard_ids,
     }
+}
+
+// ---------------------------------------------------------------------------
+// PinnedExecutionRow + list_pinned_executions (issue #235)
+// ---------------------------------------------------------------------------
+
+/// Summary of one workflow execution currently sticky-pinned to a worker.
+///
+/// The `sticky_worker_id` column on `harvest_workflow_executions` records
+/// which worker last parked a task for this execution. An operator can query
+/// this to see which executions are warm-cache-resident on a given worker.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PinnedExecutionRow {
+    /// Unique execution UUID.
+    pub execution_id: Uuid,
+    /// Registered workflow function name.
+    pub workflow_name: String,
+    /// Business-key workflow ID supplied by the caller.
+    pub workflow_id: String,
+    /// Lifecycle state: `"Running"`, `"Suspended"`, etc.
+    pub state: String,
+    /// Task queue the execution is polling.
+    pub queue_name: String,
+    /// Wall-clock start time of this execution.
+    pub started_at: DateTime<Utc>,
+}
+
+/// List workflow executions currently soft-pinned to `worker_id`.
+///
+/// Returns all rows in `harvest_workflow_executions` where
+/// `sticky_worker_id = worker_id`. The set shrinks as executions complete
+/// (cache entry evicted, column cleared) and grows as follow-up tasks park
+/// back to this worker.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] when the Postgres query fails.
+pub async fn list_pinned_executions(
+    conn: &mut AsyncPgConnection,
+    worker_id: &str,
+) -> HarvestResult<Vec<PinnedExecutionRow>> {
+    let rows: Vec<WorkflowExecution> = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::sticky_worker_id.eq(worker_id))
+        .order(harvest_workflow_executions::started_at.asc())
+        .load(conn)
+        .await
+        .map_err(|e| HarvestError::Database(e.to_string()))?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| PinnedExecutionRow {
+            execution_id: r.id,
+            workflow_name: r.workflow_name,
+            workflow_id: r.workflow_id,
+            state: r.state,
+            queue_name: r.queue_name,
+            started_at: r.started_at,
+        })
+        .collect())
 }
 
 /// Read the current lifecycle status of a worker without modifying it.

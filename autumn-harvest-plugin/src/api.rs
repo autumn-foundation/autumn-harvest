@@ -79,8 +79,9 @@ use autumn_harvest::types::{
 };
 use autumn_harvest::worker::{DbPool, HandlerRegistry};
 use autumn_harvest::workers::{
-    DrainPreviewItem, DrainResponse, FleetHealth, WorkerFilters, WorkerRow, drain_preview,
-    fleet_health, get_worker, list_workers, parse_worker_filters, request_drain,
+    DrainPreviewItem, DrainResponse, FleetHealth, PinnedExecutionRow, WorkerFilters, WorkerRow,
+    drain_preview, fleet_health, get_worker, list_pinned_executions, list_workers,
+    parse_worker_filters, request_drain,
 };
 use autumn_harvest::{HistoryMatch, HistoryMatcher, WorkflowEvent};
 use autumn_harvest::{
@@ -1330,6 +1331,10 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .route("/workers", get(list_workers_handler))
         .route("/workers/{worker_id}", get(get_worker_handler))
         .route("/workers/{worker_id}/drain", post(request_drain_handler))
+        .route(
+            "/workers/{worker_id}/pinned",
+            get(worker_pinned_executions_handler),
+        )
         // Batch operations (issue #102): operator-facing fleet-wide cancel /
         // terminate / signal so an incident commander does not have to script
         // a one-off loop over GET /workflows.
@@ -1408,12 +1413,13 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("POST", "/activities/external/{token}/complete"),
         ("POST", "/activities/external/{token}/fail"),
         ("POST", "/activities/external/{token}/heartbeat"),
-        // ── workers (issues #100, #170) ───────────────────────────────────────
+        // ── workers (issues #100, #170, #235) ────────────────────────────────
         ("GET", "/workers"),
         ("GET", "/workers/{worker_id}"),
         ("GET", "/workers/health"),
         ("GET", "/workers/drain-preview"),
         ("POST", "/workers/{worker_id}/drain"),
+        ("GET", "/workers/{worker_id}/pinned"),
         // ── batch operations (issue #102) ─────────────────────────────────────
         ("GET", "/batch-operations"),
         ("POST", "/batch-operations"),
@@ -8090,6 +8096,37 @@ async fn get_worker_handler(
     }
 
     Err(AutumnError::not_found_msg(format!("worker '{worker_id}'")))
+}
+
+/// `GET /workers/{worker_id}/pinned`
+///
+/// Lists workflow executions currently soft-pinned to the given worker by the
+/// sticky-routing affinity mechanism (issue #235). An execution appears here
+/// while its `sticky_worker_id` column points at this worker — i.e., after the
+/// worker most recently parked a follow-up task for it and before the execution
+/// either completes or is reclaimed by another worker after lease expiry.
+///
+/// Returns an empty array (not 404) if the worker exists but has no pinned
+/// executions.
+async fn worker_pinned_executions_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(worker_id): Path<String>,
+) -> Result<Json<Vec<PinnedExecutionRow>>, AutumnError> {
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    let mut results = Vec::new();
+
+    for (_shard, shard_pool) in pool.iter_shards() {
+        let Ok(mut conn) = acquire_conn(shard_pool).await else {
+            continue;
+        };
+        let mut rows = list_pinned_executions(&mut conn, &worker_id)
+            .await
+            .map_err(map_error)?;
+        results.append(&mut rows);
+    }
+
+    results.sort_by_key(|r| r.started_at);
+    Ok(Json(results))
 }
 
 async fn workers_health(
