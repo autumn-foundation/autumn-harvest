@@ -542,13 +542,9 @@ async fn list_workflows_ui(
     }
     filters.started_after = started_after;
     filters.started_before = started_before;
+    filters.exec_id_prefix = exec_id_search.clone();
 
-    let mut workflows = load_workflows_from_shards(&api_state, &filters).await?;
-
-    // Apply in-memory exec_id prefix filter (substring on UUID string).
-    if let Some(ref search) = exec_id_search {
-        workflows.retain(|w| w.id.to_string().to_lowercase().contains(search.as_str()));
-    }
+    let workflows = load_workflows_from_shards(&api_state, &filters).await?;
 
     let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
     let offset_usize = usize::try_from(offset).unwrap_or(usize::MAX);
@@ -725,16 +721,20 @@ async fn signal_workflow_ui(
     let exec_id = parse_execution_id(&id)?;
     let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
 
-    let payload_json: serde_json::Value = form
-        .payload
-        .as_deref()
-        .filter(|s| !s.trim().is_empty())
-        .and_then(|s| serde_json::from_str(s).ok())
-        .unwrap_or(serde_json::Value::Null);
-
-    let flash = match send_signal(&mut conn, exec_id, &form.signal_name, payload_json).await {
-        Ok(()) => url_encode(&format!("Signal '{}' sent", form.signal_name)),
-        Err(e) => url_encode(&format!("Signal failed: {e}")),
+    let payload_str = form.payload.as_deref().unwrap_or("").trim();
+    let payload_result: Result<serde_json::Value, String> = if payload_str.is_empty() {
+        Ok(serde_json::Value::Null)
+    } else {
+        serde_json::from_str(payload_str).map_err(|e| format!("Invalid JSON payload: {e}"))
+    };
+    let flash = match payload_result {
+        Err(e) => url_encode(&e),
+        Ok(payload_json) => {
+            match send_signal(&mut conn, exec_id, &form.signal_name, payload_json).await {
+                Ok(()) => url_encode(&format!("Signal '{}' sent", form.signal_name)),
+                Err(e) => url_encode(&format!("Signal failed: {e}")),
+            }
+        }
     };
 
     let redirect_url = format!("../../workflows/{id}?flash={flash}");
@@ -743,11 +743,13 @@ async fn signal_workflow_ui(
 
 async fn reset_workflow_ui(
     Extension(api_state): Extension<HarvestApiState>,
+    headers: axum::http::HeaderMap,
     Path(id): Path<String>,
     Form(form): Form<WorkflowResetForm>,
 ) -> Result<axum::response::Response, AutumnError> {
     let exec_id = parse_execution_id(&id)?;
     let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
+    let actor = api_state.extract_actor(&headers);
 
     let reason = form
         .reason
@@ -759,7 +761,7 @@ async fn reset_workflow_ui(
     let request = WorkflowResetRequest {
         reset_to_event_id: form.reset_to_event_id,
         reason,
-        operator_id: "vantage".to_string(),
+        operator_id: actor,
         signal_reapply: ResetSignalReapplyPolicy::default(),
     };
 
@@ -783,12 +785,19 @@ async fn trigger_update_ui(
     let exec_id = parse_execution_id(&id)?;
     let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
 
-    let payload_json: serde_json::Value = form
-        .payload
-        .as_deref()
-        .filter(|s| !s.trim().is_empty())
-        .and_then(|s| serde_json::from_str(s).ok())
-        .unwrap_or(serde_json::Value::Null);
+    let payload_str = form.payload.as_deref().unwrap_or("").trim();
+    let payload_json: serde_json::Value = if payload_str.is_empty() {
+        serde_json::Value::Null
+    } else {
+        match serde_json::from_str(payload_str) {
+            Ok(v) => v,
+            Err(e) => {
+                let flash = url_encode(&format!("Invalid JSON payload: {e}"));
+                let redirect_url = format!("../../workflows/{id}?flash={flash}");
+                return Ok(axum::response::Redirect::to(&redirect_url).into_response());
+            }
+        }
+    };
 
     let update_id = UpdateId::new();
     let flash = match admit_update_event(
@@ -800,7 +809,11 @@ async fn trigger_update_ui(
     )
     .await
     {
-        Ok(()) => url_encode(&format!("Update '{}' admitted", form.update_name)),
+        Ok(()) => {
+            // Wake the workflow task so it picks up the admitted update immediately.
+            let _ = autumn_harvest::queue::wake_workflow_task(&mut conn, exec_id).await;
+            url_encode(&format!("Update '{}' admitted", form.update_name))
+        }
         Err(e) => url_encode(&format!("Update failed: {e}")),
     };
 
@@ -2358,16 +2371,17 @@ fn render_workflow_detail(
             }
         }
 
-        // Operator actions
+        // Operator actions — use the exec_id in action URLs so they resolve correctly
+        // whether the router is mounted at "/" or at a subpath like "/api/harvest/ui".
         div."operator-actions" {
-            form method="post" action="cancel"
+            form method="post" action={ (exec_id_str) "/cancel" }
                   onsubmit="return confirm('Cancel this workflow execution?')" {
                 button.danger type="submit" { "Cancel" }
             }
             button disabled title="Not yet available" { "Terminate" }
             details style="display:inline-block" {
                 summary style="cursor:pointer;color:#93c5fd;font-size:12px;display:inline-block;padding:6px 12px;border:1px solid #2563eb;border-radius:6px" { "Send signal" }
-                form method="post" action="signal" style="margin-top:8px;background:#1e293b;border:1px solid #334155;border-radius:6px;padding:12px;display:flex;flex-direction:column;gap:8px;min-width:280px" {
+                form method="post" action={ (exec_id_str) "/signal" } style="margin-top:8px;background:#1e293b;border:1px solid #334155;border-radius:6px;padding:12px;display:flex;flex-direction:column;gap:8px;min-width:280px" {
                     label style="font-size:12px;color:#94a3b8" {
                         "Signal name"
                         input type="text" name="signal_name" required placeholder="e.g. approve" style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
@@ -2381,7 +2395,7 @@ fn render_workflow_detail(
             }
             details style="display:inline-block" {
                 summary style="cursor:pointer;color:#93c5fd;font-size:12px;display:inline-block;padding:6px 12px;border:1px solid #2563eb;border-radius:6px" { "Reset to event N" }
-                form method="post" action="reset" style="margin-top:8px;background:#1e293b;border:1px solid #334155;border-radius:6px;padding:12px;display:flex;flex-direction:column;gap:8px;min-width:280px" {
+                form method="post" action={ (exec_id_str) "/reset" } style="margin-top:8px;background:#1e293b;border:1px solid #334155;border-radius:6px;padding:12px;display:flex;flex-direction:column;gap:8px;min-width:280px" {
                     label style="font-size:12px;color:#94a3b8" {
                         "Reset to event ID"
                         input type="number" name="reset_to_event_id" min="0" required placeholder="0" style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
@@ -2395,7 +2409,7 @@ fn render_workflow_detail(
             }
             details style="display:inline-block" {
                 summary style="cursor:pointer;color:#93c5fd;font-size:12px;display:inline-block;padding:6px 12px;border:1px solid #2563eb;border-radius:6px" { "Trigger update" }
-                form method="post" action="trigger-update" style="margin-top:8px;background:#1e293b;border:1px solid #334155;border-radius:6px;padding:12px;display:flex;flex-direction:column;gap:8px;min-width:280px" {
+                form method="post" action={ (exec_id_str) "/trigger-update" } style="margin-top:8px;background:#1e293b;border:1px solid #334155;border-radius:6px;padding:12px;display:flex;flex-direction:column;gap:8px;min-width:280px" {
                     label style="font-size:12px;color:#94a3b8" {
                         "Update name"
                         input type="text" name="update_name" required placeholder="e.g. set_priority" style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
@@ -3875,14 +3889,28 @@ mod tests {
 
     #[test]
     fn build_query_string_omits_default_limit() {
-        assert_eq!(build_query_string(DEFAULT_PAGE_SIZE, None, None, None), "");
-        assert_eq!(build_query_string(10, None, None, None), "&limit=10");
         assert_eq!(
-            build_query_string(DEFAULT_PAGE_SIZE, Some("FAILED"), None, None),
+            build_query_string(DEFAULT_PAGE_SIZE, None, None, None, None, None, None),
+            ""
+        );
+        assert_eq!(
+            build_query_string(10, None, None, None, None, None, None),
+            "&limit=10"
+        );
+        assert_eq!(
+            build_query_string(
+                DEFAULT_PAGE_SIZE,
+                Some("FAILED"),
+                None,
+                None,
+                None,
+                None,
+                None
+            ),
             "&state=FAILED"
         );
         assert_eq!(
-            build_query_string(50, Some("with space"), None, None),
+            build_query_string(50, Some("with space"), None, None, None, None, None),
             "&limit=50&state=with%20space"
         );
     }
@@ -3890,12 +3918,20 @@ mod tests {
     #[test]
     fn build_query_string_includes_workflow_name_and_search_attrs() {
         assert_eq!(
-            build_query_string(DEFAULT_PAGE_SIZE, None, Some("onboarding"), None),
+            build_query_string(
+                DEFAULT_PAGE_SIZE,
+                None,
+                Some("onboarding"),
+                None,
+                None,
+                None,
+                None
+            ),
             "&workflow_name=onboarding"
         );
         let pair = ("tenant".to_string(), "acme".to_string());
         assert_eq!(
-            build_query_string(DEFAULT_PAGE_SIZE, None, None, Some(&pair)),
+            build_query_string(DEFAULT_PAGE_SIZE, None, None, Some(&pair), None, None, None),
             "&search_attr_key=tenant&search_attr_value=acme"
         );
     }

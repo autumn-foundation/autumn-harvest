@@ -1996,7 +1996,7 @@ async fn detail_page_shows_operator_actions() {
     );
 }
 
-/// ActivityScheduled events render with a human-readable label in the event timeline.
+/// `ActivityScheduled` events render with a human-readable label in the event timeline.
 #[tokio::test]
 async fn detail_page_event_labels_human_readable() {
     let (database_url, _container) = setup_test_database_url().await;
@@ -2072,7 +2072,7 @@ async fn detail_page_status_badge_has_aria_label() {
     );
 }
 
-/// Workflow list filter form includes started_after and started_before inputs.
+/// Workflow list filter form includes `started_after` and `started_before` inputs.
 #[tokio::test]
 async fn list_page_has_time_range_filters() {
     let (database_url, _container) = setup_test_database_url().await;
