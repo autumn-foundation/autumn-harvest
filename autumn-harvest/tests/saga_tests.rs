@@ -631,7 +631,9 @@ async fn saga_compensation_idempotency_under_replay() {
                 move |_ignored: String| {
                     let released = slot.lock().expect("lock").clone();
                     async move {
-                        log.lock().expect("lock").push(format!("released:{released}"));
+                        log.lock()
+                            .expect("lock")
+                            .push(format!("released:{released}"));
                         Ok::<_, HarvestError>(())
                     }
                 },
@@ -656,7 +658,9 @@ async fn saga_compensation_idempotency_under_replay() {
                 move |_ignored: String| {
                     let released = slot.lock().expect("lock").clone();
                     async move {
-                        log.lock().expect("lock").push(format!("released:{released}"));
+                        log.lock()
+                            .expect("lock")
+                            .push(format!("released:{released}"));
                         Ok::<_, HarvestError>(())
                     }
                 },
