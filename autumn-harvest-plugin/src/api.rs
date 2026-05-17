@@ -1072,6 +1072,8 @@ pub(crate) struct WorkflowFilters {
     pub(crate) states: Vec<String>,
     pub(crate) workflow_name: Option<String>,
     pub(crate) search_attrs: Vec<Value>,
+    pub(crate) started_after: Option<chrono::DateTime<chrono::Utc>>,
+    pub(crate) started_before: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl WorkflowFilters {
@@ -7229,6 +7231,12 @@ pub(crate) async fn load_workflows(
     }
     if let Some(name) = &filters.workflow_name {
         query = query.filter(harvest_workflow_executions::workflow_name.eq(name.clone()));
+    }
+    if let Some(after) = filters.started_after {
+        query = query.filter(harvest_workflow_executions::started_at.gt(after));
+    }
+    if let Some(before) = filters.started_before {
+        query = query.filter(harvest_workflow_executions::started_at.lt(before));
     }
     // Each search_attr filter contributes its own `search_attrs @> {...}` predicate.
     // The `@>` operator hits the existing `idx_harvest_we_search` GIN index on

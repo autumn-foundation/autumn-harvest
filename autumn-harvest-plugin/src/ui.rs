@@ -7,6 +7,8 @@
 
 use std::fmt::Write as _;
 
+use std::collections::HashMap;
+
 use autumn_web::AppState;
 use autumn_web::error::AutumnError;
 use autumn_web::extract::{Path, Query};
@@ -29,14 +31,13 @@ use autumn_harvest::audit::{
     OP_SCHEDULE_DELETE, OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, SOURCE_API, STATUS_SUCCEEDED,
     TARGET_SCHEDULE, insert_audit,
 };
-use autumn_harvest::error::{HarvestError, HarvestResult, database_error};
+use autumn_harvest::error::{HarvestResult, database_error};
 use autumn_harvest::models::{
     DeadLetter, HarvestEvent, HarvestSchedule, NewAuditRecord, WorkflowExecution,
 };
 use autumn_harvest::schema::{
     harvest_dead_letters, harvest_events, harvest_schedules, harvest_workflow_executions,
 };
-use autumn_harvest::store;
 use autumn_harvest::types::ShardId;
 use autumn_harvest::workers::{WorkerFilters, WorkerHealth, WorkerRow, list_workers};
 
@@ -128,6 +129,14 @@ details{margin-top:8px}
 details summary{cursor:pointer;color:#93c5fd;font-size:12px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
 .detail-block{display:grid;gap:10px;margin-top:10px}
 footer{padding:20px 24px;color:#64748b;font-size:12px;text-align:center;border-top:1px solid #1e293b;margin-top:32px}
+.event-label{font-size:13px}
+.event-label code{font-size:11px;color:#64748b;margin-left:4px}
+.operator-actions{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px}
+.operator-actions form{margin:0}
+.operator-actions button,.operator-actions a.btn{background:#1e3a5f;color:#93c5fd;border:1px solid #2563eb;border-radius:6px;padding:6px 12px;font-size:12px;cursor:pointer;text-decoration:none;display:inline-block}
+.operator-actions button:hover,.operator-actions a.btn:hover{background:#2563eb;color:#fff}
+.operator-actions button.danger{background:#450a0a;color:#fca5a5;border-color:#991b1b}
+.operator-actions button.danger:hover{background:#991b1b;color:#fff}
 "#;
 
 #[derive(Debug, Deserialize)]
@@ -144,6 +153,22 @@ pub(crate) struct WorkflowListParams {
     search_attr_key: Option<String>,
     #[serde(default)]
     search_attr_value: Option<String>,
+    /// ISO 8601 / RFC 3339 lower bound on `started_at`.
+    #[serde(default)]
+    started_after: Option<String>,
+    /// ISO 8601 / RFC 3339 upper bound on `started_at`.
+    #[serde(default)]
+    started_before: Option<String>,
+    /// Free-text prefix/substring match on execution id (UUID string).
+    #[serde(default)]
+    exec_id_search: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub(crate) struct WorkflowDetailParams {
+    /// Zero-based page index for the event timeline.
+    #[serde(default)]
+    event_page: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -416,6 +441,25 @@ async fn list_workflows_ui(
         .as_ref()
         .map(|key| (key.clone(), search_attr_value.clone()));
 
+    let started_after = params
+        .started_after
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .and_then(|v| DateTime::parse_from_rfc3339(v).ok().map(|d| d.with_timezone(&Utc)));
+    let started_before = params
+        .started_before
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .and_then(|v| DateTime::parse_from_rfc3339(v).ok().map(|d| d.with_timezone(&Utc)));
+    let exec_id_search = params
+        .exec_id_search
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_lowercase);
+
     let fetch_limit = offset.saturating_add(limit).saturating_add(1);
     let mut filters = WorkflowFilters::default().with_limit(fetch_limit);
     if let Some(state) = state_filter.as_deref() {
@@ -427,8 +471,16 @@ async fn list_workflows_ui(
         object.insert(key, Value::String(value));
         filters.search_attrs.push(Value::Object(object));
     }
+    filters.started_after = started_after;
+    filters.started_before = started_before;
 
-    let workflows = load_workflows_from_shards(&api_state, &filters).await?;
+    let mut workflows = load_workflows_from_shards(&api_state, &filters).await?;
+
+    // Apply in-memory exec_id prefix filter (substring on UUID string).
+    if let Some(ref search) = exec_id_search {
+        workflows.retain(|w| w.id.to_string().to_lowercase().contains(search.as_str()));
+    }
+
     let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
     let offset_usize = usize::try_from(offset).unwrap_or(usize::MAX);
     let has_next = workflows.len() > offset_usize.saturating_add(limit_usize);
@@ -446,29 +498,47 @@ async fn list_workflows_ui(
         state_filter.as_deref(),
         workflow_name_filter.as_deref(),
         search_attr_pair.as_ref(),
+        started_after,
+        started_before,
+        exec_id_search.as_deref(),
     ))
 }
 
 async fn workflow_detail_ui(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
+    Query(params): Query<WorkflowDetailParams>,
 ) -> Result<Markup, AutumnError> {
     let exec_id = parse_execution_id(&id)?;
+    let exec_uuid = exec_id.as_uuid();
     let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
     let execution = load_execution(&mut conn, exec_id)
         .await
         .map_err(map_error)?;
-    let history = store::load_history(&mut conn, exec_id)
+
+    // Load raw event rows so we have DB-level timestamps without deserialization risk.
+    let events: Vec<HarvestEvent> = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq(exec_uuid))
+        .order(harvest_events::event_id.asc())
+        .select(HarvestEvent::as_select())
+        .load(&mut conn)
         .await
-        .map_err(map_error)?;
-    let events = history
-        .events
-        .into_iter()
-        .map(|event| serde_json::to_value(event).map_err(HarvestError::from))
-        .collect::<HarvestResult<Vec<_>>>()
+        .map_err(database_error)
         .map_err(map_error)?;
 
-    Ok(render_workflow_detail(&execution, &events))
+    // Load direct children (cap at 50 to avoid overwhelming the UI).
+    let children: Vec<WorkflowExecution> = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::parent_id.eq(Some(exec_uuid)))
+        .order(harvest_workflow_executions::created_at.asc())
+        .limit(50)
+        .select(WorkflowExecution::as_select())
+        .load(&mut conn)
+        .await
+        .map_err(database_error)
+        .map_err(map_error)?;
+
+    let event_page = params.event_page.unwrap_or(0).max(0);
+    Ok(render_workflow_detail(&execution, &events, &children, event_page))
 }
 
 // ---------------------------------------------------------------------------
@@ -1615,6 +1685,7 @@ fn layout_workers(title: &str, body: &Markup, refresh: Option<u64>) -> Markup {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_workflow_list(
     workflows: &[WorkflowExecution],
     page: i64,
@@ -1623,10 +1694,13 @@ fn render_workflow_list(
     state_filter: Option<&str>,
     workflow_name_filter: Option<&str>,
     search_attr_filter: Option<&(String, String)>,
+    started_after: Option<DateTime<Utc>>,
+    started_before: Option<DateTime<Utc>>,
+    exec_id_search: Option<&str>,
 ) -> Markup {
     let body = html! {
         h2 { "Workflows" }
-        (render_filters(state_filter, workflow_name_filter, search_attr_filter, limit))
+        (render_filters(state_filter, workflow_name_filter, search_attr_filter, started_after, started_before, exec_id_search, limit))
 
         @if workflows.is_empty() {
             div.card.empty { "No workflows match this filter." }
@@ -1660,21 +1734,32 @@ fn render_workflow_list(
             }
         }
 
-        (render_pagination(page, limit, has_next, state_filter, workflow_name_filter, search_attr_filter))
+        (render_pagination(page, limit, has_next, state_filter, workflow_name_filter, search_attr_filter, started_after, started_before, exec_id_search))
     };
 
     layout("Workflows · Vantage", &body, "")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_filters(
     state_filter: Option<&str>,
     workflow_name_filter: Option<&str>,
     search_attr_filter: Option<&(String, String)>,
+    started_after: Option<DateTime<Utc>>,
+    started_before: Option<DateTime<Utc>>,
+    exec_id_search: Option<&str>,
     limit: i64,
 ) -> Markup {
     let (attr_key, attr_value) =
         search_attr_filter.map_or(("", ""), |(k, v)| (k.as_str(), v.as_str()));
     let workflow_name_value = workflow_name_filter.unwrap_or("");
+    let started_after_value = started_after
+        .map(|d| d.to_rfc3339())
+        .unwrap_or_default();
+    let started_before_value = started_before
+        .map(|d| d.to_rfc3339())
+        .unwrap_or_default();
+    let exec_id_search_value = exec_id_search.unwrap_or("");
 
     html! {
         form.filters method="get" action="workflows" {
@@ -1697,6 +1782,18 @@ fn render_filters(
                 input type="text" name="workflow_name" value=(workflow_name_value) placeholder="e.g. onboarding";
             }
             label {
+                "Started after"
+                input type="text" name="started_after" value=(started_after_value) placeholder="2026-01-01T00:00:00Z";
+            }
+            label {
+                "Started before"
+                input type="text" name="started_before" value=(started_before_value) placeholder="2026-12-31T23:59:59Z";
+            }
+            label {
+                "Exec ID search"
+                input type="text" name="exec_id_search" value=(exec_id_search_value) placeholder="UUID prefix…";
+            }
+            label {
                 "Search attr key"
                 input type="text" name="search_attr_key" value=(attr_key) placeholder="e.g. tenant";
             }
@@ -1714,6 +1811,7 @@ fn render_filters(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_pagination(
     page: i64,
     limit: i64,
@@ -1721,12 +1819,18 @@ fn render_pagination(
     state_filter: Option<&str>,
     workflow_name_filter: Option<&str>,
     search_attr_filter: Option<&(String, String)>,
+    started_after: Option<DateTime<Utc>>,
+    started_before: Option<DateTime<Utc>>,
+    exec_id_search: Option<&str>,
 ) -> Markup {
     let base_query = build_query_string(
         limit,
         state_filter,
         workflow_name_filter,
         search_attr_filter,
+        started_after,
+        started_before,
+        exec_id_search,
     );
 
     html! {
@@ -1752,11 +1856,15 @@ fn render_pagination(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_query_string(
     limit: i64,
     state_filter: Option<&str>,
     workflow_name_filter: Option<&str>,
     search_attr_filter: Option<&(String, String)>,
+    started_after: Option<DateTime<Utc>>,
+    started_before: Option<DateTime<Utc>>,
+    exec_id_search: Option<&str>,
 ) -> String {
     let mut out = String::new();
     if limit != DEFAULT_PAGE_SIZE {
@@ -1772,18 +1880,200 @@ fn build_query_string(
         let _ = write!(out, "&search_attr_key={}", url_encode(key));
         let _ = write!(out, "&search_attr_value={}", url_encode(value));
     }
+    if let Some(after) = started_after {
+        let _ = write!(out, "&started_after={}", url_encode(&after.to_rfc3339()));
+    }
+    if let Some(before) = started_before {
+        let _ = write!(out, "&started_before={}", url_encode(&before.to_rfc3339()));
+    }
+    if let Some(search) = exec_id_search {
+        let _ = write!(out, "&exec_id_search={}", url_encode(search));
+    }
     out
 }
 
-fn render_workflow_detail(execution: &WorkflowExecution, events: &[Value]) -> Markup {
+const DETAIL_EVENT_PAGE_SIZE: i64 = 100;
+
+/// Map a raw event_type string to a human-readable label.
+fn event_human_label(event_type: &str, event_data: &Value) -> String {
+    match event_type {
+        "WorkflowStarted" => "Workflow started".to_string(),
+        "WorkflowCompleted" => "Workflow completed".to_string(),
+        "WorkflowFailed" => "Workflow failed".to_string(),
+        "WorkflowCancelled" => "Workflow cancelled".to_string(),
+        "WorkflowTerminated" => "Workflow terminated".to_string(),
+        "ActivityScheduled" => {
+            let d = event_data.get("data");
+            let name = d.and_then(|d| d.get("name")).and_then(Value::as_str).unwrap_or("?");
+            format!("Activity scheduled: {name}")
+        }
+        "ActivityStarted" => "Activity started".to_string(),
+        "ActivityCompleted" => "Activity completed".to_string(),
+        "ActivityFailed" => {
+            let d = event_data.get("data");
+            let err = d.and_then(|d| d.get("error")).and_then(Value::as_str).unwrap_or("error");
+            format!("Activity failed: {}", truncate_error(err))
+        }
+        "ActivityTimedOut" => "Activity timed out".to_string(),
+        "ActivityHeartbeat" => "Activity heartbeat".to_string(),
+        "TimerStarted" => "Timer started".to_string(),
+        "TimerFired" => "Timer fired".to_string(),
+        "SignalReceived" => {
+            let d = event_data.get("data");
+            let name = d.and_then(|d| d.get("signal_name")).and_then(Value::as_str).unwrap_or("?");
+            format!("Signal received: {name}")
+        }
+        "ChildWorkflowStarted" => "Child workflow started".to_string(),
+        "ChildWorkflowCompleted" => "Child workflow completed".to_string(),
+        "ChildWorkflowFailed" => "Child workflow failed".to_string(),
+        "UpdateAdmitted" => "Update admitted".to_string(),
+        "UpdateCompleted" => "Update completed".to_string(),
+        "UpdateFailed" => "Update failed".to_string(),
+        "LocalActivityScheduled" => "Local activity scheduled".to_string(),
+        "LocalActivityCompleted" => "Local activity completed".to_string(),
+        "LocalActivityFailed" => "Local activity failed".to_string(),
+        "VersionMarker" => "Version marker".to_string(),
+        "ContinueAsNew" => "Continue as new".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// A grouped summary row for the activity attempts panel.
+struct ActivityAttemptRow {
+    name: String,
+    attempt_count: usize,
+    last_status: String,
+    last_ts: String,
+    last_error: Option<String>,
+}
+
+fn collect_activity_attempts(events: &[HarvestEvent]) -> Vec<ActivityAttemptRow> {
+    const ACTIVITY_TYPES: &[&str] = &[
+        "ActivityScheduled",
+        "ActivityStarted",
+        "ActivityCompleted",
+        "ActivityFailed",
+        "ActivityTimedOut",
+        "ActivityHeartbeat",
+        "ActivityCompletedExternally",
+    ];
+
+    let mut order: Vec<String> = Vec::new();
+    // (name, attempt_count, last_status, last_ts, last_error)
+    let mut groups: HashMap<String, ActivityAttemptRow> = HashMap::new();
+
+    for event in events {
+        if !ACTIVITY_TYPES.contains(&event.event_type.as_str()) {
+            continue;
+        }
+        let d = event.event_data.get("data");
+        let Some(aid) = d.and_then(|d| d.get("activity_id")).and_then(Value::as_str) else {
+            continue;
+        };
+        let aid = aid.to_string();
+        if !groups.contains_key(&aid) {
+            let name = d
+                .and_then(|d| d.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            order.push(aid.clone());
+            groups.insert(
+                aid.clone(),
+                ActivityAttemptRow {
+                    name,
+                    attempt_count: 0,
+                    last_status: event.event_type.clone(),
+                    last_ts: format_timestamp(Some(event.timestamp)),
+                    last_error: None,
+                },
+            );
+        }
+        if let Some(row) = groups.get_mut(&aid) {
+            if event.event_type == "ActivityScheduled" {
+                row.attempt_count += 1;
+                if row.name.is_empty() {
+                    if let Some(n) = d.and_then(|d| d.get("name")).and_then(Value::as_str) {
+                        row.name = n.to_string();
+                    }
+                }
+            }
+            row.last_status = event.event_type.clone();
+            row.last_ts = format_timestamp(Some(event.timestamp));
+            if event.event_type == "ActivityFailed" {
+                row.last_error = d
+                    .and_then(|d| d.get("error"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+            }
+        }
+    }
+
+    order.into_iter().filter_map(|id| groups.remove(&id)).collect()
+}
+
+fn render_workflow_detail(
+    execution: &WorkflowExecution,
+    events: &[HarvestEvent],
+    children: &[WorkflowExecution],
+    event_page: i64,
+) -> Markup {
+    let exec_id_str = execution.id.to_string();
     let title = format!("{} · Vantage", execution.workflow_name);
     let detail_badge_class = format!("badge {}", badge_class(&execution.state));
+
+    // Duration string.
+    let duration = execution.completed_at.map(|end| {
+        let secs = (end - execution.started_at).num_seconds().max(0);
+        if secs < 60 {
+            format!("{secs}s")
+        } else if secs < 3600 {
+            format!("{}m {}s", secs / 60, secs % 60)
+        } else {
+            format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+        }
+    });
+
+    // Activity attempts.
+    let activity_attempts = collect_activity_attempts(events);
+
+    // Signal / update events — cap at 20 to keep the page manageable.
+    const SIGNAL_UPDATE_TYPES: &[&str] =
+        &["SignalReceived", "UpdateAdmitted", "UpdateCompleted", "UpdateFailed"];
+    const SIGNAL_UPDATE_PANEL_LIMIT: usize = 20;
+    let signal_update_total = events
+        .iter()
+        .filter(|e| SIGNAL_UPDATE_TYPES.contains(&e.event_type.as_str()))
+        .count();
+    let signal_update_events: Vec<&HarvestEvent> = events
+        .iter()
+        .filter(|e| SIGNAL_UPDATE_TYPES.contains(&e.event_type.as_str()))
+        .take(SIGNAL_UPDATE_PANEL_LIMIT)
+        .collect();
+
+    // Paginated event slice.
+    let total_events = events.len();
+    let page_size = usize::try_from(DETAIL_EVENT_PAGE_SIZE).unwrap_or(100);
+    let page_usize = usize::try_from(event_page).unwrap_or(0);
+    let page_start = page_usize.saturating_mul(page_size).min(total_events);
+    let page_end = (page_start + page_size).min(total_events);
+    let page_events = &events[page_start..page_end];
+    let has_prev_page = event_page > 0;
+    let has_next_page = page_end < total_events;
+    let last_page = if total_events == 0 {
+        0_i64
+    } else {
+        i64::try_from((total_events - 1) / page_size).unwrap_or(0)
+    };
+
     let body = html! {
         div.detail-row { a.back href="../workflows" { (PreEscaped("&larr;")) " Back to workflows" } }
 
         h2 {
             (execution.workflow_name) " "
-            span class=(detail_badge_class) { (execution.state) }
+            span class=(detail_badge_class) aria-label={ "Status: " (execution.state) } role="status" {
+                (execution.state)
+            }
         }
 
         @if let Some(error) = execution.error.as_deref() {
@@ -1792,21 +2082,40 @@ fn render_workflow_detail(execution: &WorkflowExecution, events: &[Value]) -> Ma
             }
         }
 
+        // Operator actions
+        div."operator-actions" {
+            form method="post" action={ "../../workflows/" (exec_id_str) "/cancel" }
+                  onsubmit="return confirm('Cancel this workflow execution?')" {
+                button.danger type="submit" { "Cancel" }
+            }
+            a.btn href={ "../../workflows/" (exec_id_str) "/history/export" } {
+                "Export history"
+            }
+        }
+
         div.card {
             h3 { "Metadata" }
             div.kv {
-                (kv("Execution ID", &execution.id.to_string(), true))
+                (kv("Execution ID", &exec_id_str, true))
                 (kv("Workflow ID", &execution.workflow_id, true))
                 (kv("Run ID", &execution.run_id.to_string(), true))
                 (kv("Shard ID", &execution.shard_id.to_string(), true))
                 (kv("Queue", &execution.queue_name, true))
                 (kv("Started", &format_timestamp(Some(execution.started_at)), false))
                 (kv("Completed", &format_timestamp(execution.completed_at), false))
+                @if let Some(dur) = &duration {
+                    (kv("Duration", dur, false))
+                }
                 @if let Some(parent) = execution.parent_id {
-                    (kv("Parent", &parent.to_string(), true))
+                    div.k { "Parent" }
+                    div.v {
+                        a href={ "../../workflows/" (parent.to_string()) } {
+                            code { (short_id(&parent.to_string())) }
+                        }
+                    }
                 }
                 @if let Some(worker) = execution.sticky_worker_id.as_deref() {
-                    (kv("Sticky worker", worker, true))
+                    (kv("Current worker", worker, true))
                 }
                 @if let Some(timeout) = execution.execution_timeout {
                     (kv("Execution timeout", &format!("{}s", timeout.num_seconds()), false))
@@ -1825,37 +2134,178 @@ fn render_workflow_detail(execution: &WorkflowExecution, events: &[Value]) -> Ma
             (json_card("Search attributes", attrs))
         }
 
+        // Activity attempts panel
+        @if !activity_attempts.is_empty() {
+            div.card {
+                h3 { "Activity attempts" }
+                table {
+                    thead {
+                        tr {
+                            th { "Activity" }
+                            th { "Attempts" }
+                            th { "Last status" }
+                            th { "Last updated" }
+                        }
+                    }
+                    tbody {
+                        @for row in &activity_attempts {
+                            @let display_name = if row.name.is_empty() { "—".to_string() } else { row.name.clone() };
+                            tr {
+                                td { (display_name) }
+                                td { (row.attempt_count.max(1)) }
+                                td {
+                                    code { (row.last_status) }
+                                    @if let Some(err) = &row.last_error {
+                                        " — " (truncate_error(err))
+                                    }
+                                }
+                                td { (row.last_ts) }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Children panel
+        @if !children.is_empty() {
+            div.card {
+                h3 { "Children (" (children.len()) ")" }
+                table {
+                    thead {
+                        tr {
+                            th { "Exec ID" }
+                            th { "Workflow" }
+                            th { "Status" }
+                            th { "Started" }
+                        }
+                    }
+                    tbody {
+                        @for child in children {
+                            @let child_id = child.id.to_string();
+                            tr {
+                                td {
+                                    a href={ "../../workflows/" (child_id) } {
+                                        code { (short_id(&child_id)) }
+                                    }
+                                }
+                                td { (child.workflow_name) }
+                                td { (state_badge(&child.state)) }
+                                td { (format_timestamp(Some(child.started_at))) }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Signals & updates panel
+        @if !signal_update_events.is_empty() {
+            div.card {
+                @if signal_update_total > SIGNAL_UPDATE_PANEL_LIMIT {
+                    h3 { "Signals & Updates (showing " (SIGNAL_UPDATE_PANEL_LIMIT) " of " (signal_update_total) ")" }
+                } @else {
+                    h3 { "Signals & Updates" }
+                }
+                table {
+                    thead {
+                        tr {
+                            th { "Type" }
+                            th { "Name / ID" }
+                            th { "Timestamp" }
+                        }
+                    }
+                    tbody {
+                        @for event in &signal_update_events {
+                            @let label = event_human_label(&event.event_type, &event.event_data);
+                            @let edata = event.event_data.get("data");
+                            @let name_or_id = edata
+                                .and_then(|d| d.get("signal_name"))
+                                .or_else(|| edata.and_then(|d| d.get("update_id")))
+                                .and_then(Value::as_str)
+                                .unwrap_or("—");
+                            tr {
+                                td { (label) }
+                                td { code { (name_or_id) } }
+                                td { (format_timestamp(Some(event.timestamp))) }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Event timeline
         div.card {
-            h3 { "Event history" }
+            h3 { "Event history (" (total_events) " events)" }
             @if events.is_empty() {
                 div.empty { "No events recorded yet." }
             } @else {
+                // Jump controls for large histories
+                @if total_events > page_size {
+                    div.pagination style="margin-bottom:12px" {
+                        @if has_prev_page {
+                            a href={ "?event_page=" (event_page - 1) } {
+                                (PreEscaped("&larr;")) " Previous"
+                            }
+                        } @else {
+                            span.disabled { (PreEscaped("&larr;")) " Previous" }
+                        }
+                        span { " Events " (page_start + 1) "–" (page_end) " of " (total_events) " " }
+                        @if has_next_page {
+                            a href={ "?event_page=" (event_page + 1) } {
+                                "Next " (PreEscaped("&rarr;"))
+                            }
+                        } @else {
+                            span.disabled { "Next " (PreEscaped("&rarr;")) }
+                        }
+                        a href={ "?event_page=" (last_page) } { "Jump to latest" }
+                    }
+                }
                 table {
                     thead {
                         tr {
                             th { "#" }
                             th { "Type" }
                             th { "Timestamp" }
-                            th { "Data" }
                         }
                     }
                     tbody {
-                        @for (index, event) in events.iter().enumerate() {
-                            @let event_type = event.get("type").and_then(Value::as_str).unwrap_or("<unknown>");
-                            @let timestamp = event.get("timestamp").and_then(Value::as_str).unwrap_or("—");
-                            @let data_pretty = event.get("data").map_or_else(|| "{}".to_string(), pretty_json);
+                        @for event in page_events {
+                            @let label = event_human_label(&event.event_type, &event.event_data);
+                            @let ts = format_timestamp(Some(event.timestamp));
                             tr {
-                                td { (index + 1) }
-                                td { code { (event_type) } }
-                                td { (timestamp) }
-                                td {
-                                    details {
-                                        summary { "view payload" }
-                                        pre { (data_pretty) }
+                                td { (event.event_id + 1) }
+                                td title=(event.event_type) {
+                                    span.event-label {
+                                        (label)
+                                        code { "(" (event.event_type) ")" }
                                     }
                                 }
+                                td { (ts) }
                             }
                         }
+                    }
+                }
+                // Bottom pagination for convenience
+                @if total_events > page_size {
+                    div.pagination style="margin-top:12px" {
+                        @if has_prev_page {
+                            a href={ "?event_page=" (event_page - 1) } {
+                                (PreEscaped("&larr;")) " Previous"
+                            }
+                        } @else {
+                            span.disabled { (PreEscaped("&larr;")) " Previous" }
+                        }
+                        span { "Page " (event_page + 1) }
+                        @if has_next_page {
+                            a href={ "?event_page=" (event_page + 1) } {
+                                "Next " (PreEscaped("&rarr;"))
+                            }
+                        } @else {
+                            span.disabled { "Next " (PreEscaped("&rarr;")) }
+                        }
+                        a href={ "?event_page=" (last_page) } { "Jump to latest" }
                     }
                 }
             }
@@ -1898,8 +2348,9 @@ fn format_timestamp(ts: Option<DateTime<Utc>>) -> String {
 
 fn state_badge(state: &str) -> Markup {
     let class = format!("badge {}", badge_class(state));
+    let aria = format!("Status: {state}");
     html! {
-        span class=(class) { (state) }
+        span class=(class) aria-label=(aria) role="status" { (state) }
     }
 }
 

@@ -1815,3 +1815,285 @@ async fn ui_all_pages_have_schedules_nav_link() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Issue #253 — Workflow Execution Detail page
+// ---------------------------------------------------------------------------
+
+async fn insert_workflow_events(
+    database_url: &str,
+    exec_id: ExecutionId,
+    events: &[autumn_harvest::WorkflowEvent],
+    start_id: i32,
+) {
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("connect for event insert");
+    autumn_harvest::store::append_events(&mut conn, exec_id, events, start_id)
+        .await
+        .expect("append_events should succeed");
+}
+
+async fn insert_child_workflow_on_url(
+    database_url: &str,
+    shard: ShardId,
+    workflow_name: &str,
+    workflow_id: &str,
+    parent_id: ExecutionId,
+) -> ExecutionId {
+    let exec_id = ExecutionId::new_for_shard(shard);
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("connect for child workflow insert");
+    start_or_load_workflow_execution(
+        &mut conn,
+        StartWorkflowParams {
+            workflow_name,
+            workflow_id,
+            exec_id,
+            input: serde_json::json!({}),
+            parent_id: Some(parent_id.as_uuid()),
+            queue_name: "default",
+            execution_timeout: None,
+            memo: None,
+            search_attrs: None,
+            reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
+            trace_context: None,
+        },
+    )
+    .await
+    .expect("child workflow insert should succeed");
+    exec_id
+}
+
+/// Detail page groups activity events into an "Activity attempts" section.
+#[tokio::test]
+async fn detail_page_shows_activity_attempts_panel() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let exec_id =
+        insert_workflow_on_url(&database_url, ShardId::new(0), "send_email_wf", "act-1").await;
+
+    let activity_exec_id = autumn_harvest::ActivityExecId::new();
+    let events = vec![
+        autumn_harvest::WorkflowEvent::ActivityScheduled {
+            activity_id: activity_exec_id,
+            name: "send_email".to_string(),
+            input: serde_json::json!({}),
+            queue: "default".to_string(),
+        },
+        autumn_harvest::WorkflowEvent::ActivityCompleted {
+            activity_id: activity_exec_id,
+            output: serde_json::json!("sent"),
+        },
+    ];
+    insert_workflow_events(&database_url, exec_id, &events, 1).await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, html) = fetch_html(&app, &format!("/workflows/{exec_id}")).await;
+    assert_eq!(status, StatusCode::OK, "detail page should render: {html}");
+    assert!(
+        html.contains("Activity attempts"),
+        "detail page should show an 'Activity attempts' panel: {html}"
+    );
+    assert!(
+        html.contains("send_email"),
+        "activity name should appear in the attempts panel: {html}"
+    );
+}
+
+/// Detail page shows a children panel on the parent and a parent link on the child.
+#[tokio::test]
+async fn detail_page_shows_parent_children_panel() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let parent_exec_id =
+        insert_workflow_on_url(&database_url, ShardId::new(0), "parent_wf", "parent-1").await;
+    let child_exec_id = insert_child_workflow_on_url(
+        &database_url,
+        ShardId::new(0),
+        "child_wf",
+        "child-1",
+        parent_exec_id,
+    )
+    .await;
+
+    let app = build_single_shard_ui_app(&database_url);
+
+    // Parent page should show children section with child exec id
+    let (status, html) = fetch_html(&app, &format!("/workflows/{parent_exec_id}")).await;
+    assert_eq!(status, StatusCode::OK, "parent detail page should render: {html}");
+    assert!(
+        html.contains("Children") || html.contains("children"),
+        "parent detail page should show a 'Children' section: {html}"
+    );
+    assert!(
+        html.contains(&child_exec_id.to_string()[..8]),
+        "child exec id prefix should appear on parent page: {html}"
+    );
+
+    // Child page should show parent as a clickable link
+    let (status, html) = fetch_html(&app, &format!("/workflows/{child_exec_id}")).await;
+    assert_eq!(status, StatusCode::OK, "child detail page should render: {html}");
+    let parent_str = parent_exec_id.to_string();
+    assert!(
+        html.contains(&format!("href=\"../../workflows/{parent_str}\""))
+            || html.contains(&format!("href=\"../workflows/{parent_str}\""))
+            || html.contains(&format!("href=\"{parent_str}\"")),
+        "parent exec id should be a clickable link on child page: {html}"
+    );
+}
+
+/// Detail page shows a Signals & Updates section when those events are present.
+#[tokio::test]
+async fn detail_page_shows_signals_updates_panel() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let exec_id =
+        insert_workflow_on_url(&database_url, ShardId::new(0), "signal_wf", "signal-1").await;
+
+    let events = vec![autumn_harvest::WorkflowEvent::SignalReceived {
+        signal_name: "approve_request".to_string(),
+        payload: serde_json::json!({"approved": true}),
+    }];
+    insert_workflow_events(&database_url, exec_id, &events, 1).await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, html) = fetch_html(&app, &format!("/workflows/{exec_id}")).await;
+    assert_eq!(status, StatusCode::OK, "detail page should render: {html}");
+    assert!(
+        html.contains("Signals") || html.contains("Updates"),
+        "detail page should show a 'Signals & Updates' section: {html}"
+    );
+    assert!(
+        html.contains("approve_request"),
+        "signal name should appear in the signals panel: {html}"
+    );
+}
+
+/// Detail page shows operator action forms: cancel and export history.
+#[tokio::test]
+async fn detail_page_shows_operator_actions() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let exec_id =
+        insert_workflow_on_url(&database_url, ShardId::new(0), "action_wf", "action-1").await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, html) = fetch_html(&app, &format!("/workflows/{exec_id}")).await;
+    assert_eq!(status, StatusCode::OK, "detail page should render: {html}");
+    assert!(
+        html.contains("Cancel") || html.contains("cancel"),
+        "detail page should show a Cancel action: {html}"
+    );
+    assert!(
+        html.contains("history/export") || html.contains("Export history"),
+        "detail page should show an Export history link: {html}"
+    );
+}
+
+/// ActivityScheduled events render with a human-readable label in the event timeline.
+#[tokio::test]
+async fn detail_page_event_labels_human_readable() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let exec_id =
+        insert_workflow_on_url(&database_url, ShardId::new(0), "label_wf", "label-1").await;
+
+    let activity_exec_id = autumn_harvest::ActivityExecId::new();
+    let events = vec![autumn_harvest::WorkflowEvent::ActivityScheduled {
+        activity_id: activity_exec_id,
+        name: "charge_card".to_string(),
+        input: serde_json::json!({}),
+        queue: "payments".to_string(),
+    }];
+    insert_workflow_events(&database_url, exec_id, &events, 1).await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, html) = fetch_html(&app, &format!("/workflows/{exec_id}")).await;
+    assert_eq!(status, StatusCode::OK, "detail page should render: {html}");
+    assert!(
+        html.contains("Activity scheduled") || html.contains("activity scheduled"),
+        "ActivityScheduled event should render with a human-readable label: {html}"
+    );
+}
+
+/// Detail page paginates the event timeline when there are many events.
+#[tokio::test]
+async fn detail_page_events_paginated_for_large_history() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let exec_id =
+        insert_workflow_on_url(&database_url, ShardId::new(0), "big_wf", "big-1").await;
+
+    // Insert 150 signal events so the pagination threshold is crossed.
+    let many_events: Vec<autumn_harvest::WorkflowEvent> = (0..150)
+        .map(|i| autumn_harvest::WorkflowEvent::SignalReceived {
+            signal_name: format!("signal_{i}"),
+            payload: serde_json::json!({}),
+        })
+        .collect();
+    insert_workflow_events(&database_url, exec_id, &many_events, 1).await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, html) = fetch_html(&app, &format!("/workflows/{exec_id}")).await;
+    assert_eq!(status, StatusCode::OK, "detail page should render: {html}");
+
+    // The page must not render all 150 signals at once.
+    let signal_count = html.matches("signal_").count();
+    assert!(
+        signal_count < 150,
+        "all 150 events should not appear on one page, got {signal_count}: {html}"
+    );
+
+    // Pagination controls must be visible.
+    assert!(
+        html.contains("Next") || html.contains("Jump to latest"),
+        "pagination or jump-to-latest control should appear for large event histories: {html}"
+    );
+}
+
+/// Status badges on the detail page include aria-label for screen reader accessibility.
+#[tokio::test]
+async fn detail_page_status_badge_has_aria_label() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let exec_id =
+        insert_workflow_on_url(&database_url, ShardId::new(0), "aria_wf", "aria-1").await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, html) = fetch_html(&app, &format!("/workflows/{exec_id}")).await;
+    assert_eq!(status, StatusCode::OK, "detail page should render: {html}");
+    assert!(
+        html.contains("aria-label"),
+        "detail page status badge should have aria-label for accessibility: {html}"
+    );
+}
+
+/// Workflow list filter form includes started_after and started_before inputs.
+#[tokio::test]
+async fn list_page_has_time_range_filters() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_single_shard_ui_app(&database_url);
+
+    let (status, html) = fetch_html(&app, "/workflows").await;
+    assert_eq!(status, StatusCode::OK, "list page should render: {html}");
+    assert!(
+        html.contains("name=\"started_after\""),
+        "list page filter form should have a started_after input: {html}"
+    );
+    assert!(
+        html.contains("name=\"started_before\""),
+        "list page filter form should have a started_before input: {html}"
+    );
+}
+
+/// Detail page event timestamps are displayed (not "—" for every row).
+#[tokio::test]
+async fn detail_page_event_timestamps_display() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let exec_id =
+        insert_workflow_on_url(&database_url, ShardId::new(0), "ts_wf", "ts-1").await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, html) = fetch_html(&app, &format!("/workflows/{exec_id}")).await;
+    assert_eq!(status, StatusCode::OK, "detail page should render: {html}");
+    // WorkflowStarted event is inserted by start_or_load; its timestamp should appear.
+    assert!(
+        html.contains("UTC") || html.contains("2026"),
+        "event timestamps should display real dates, not placeholder dashes: {html}"
+    );
+}
