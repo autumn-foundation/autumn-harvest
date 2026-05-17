@@ -761,6 +761,7 @@ pub async fn list_pinned_executions(
         .inner_join(harvest_workflow_executions::table)
         .filter(harvest_task_queue::sticky_worker_id.eq(worker_id))
         .filter(harvest_task_queue::sticky_until.gt(sql::<Nullable<Timestamptz>>("NOW()")))
+        .filter(harvest_task_queue::state.ne_all(["COMPLETED", "FAILED"]))
         .select((
             harvest_task_queue::workflow_exec_id.assume_not_null(),
             harvest_task_queue::sticky_until,

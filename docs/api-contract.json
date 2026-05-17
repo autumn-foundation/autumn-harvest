@@ -1515,6 +1515,39 @@
     },
     {
       "method": "GET",
+      "path": "/workers/{worker_id}/pinned",
+      "category": "worker",
+      "read_only": true,
+      "description": "List workflow executions currently soft-pinned to the given worker by the sticky routing lease. Only returns executions with an active (non-expired) lease on a non-terminal task row.",
+      "params": [
+        {
+          "name": "worker_id",
+          "in": "path",
+          "required": true,
+          "description": "Worker process identifier."
+        }
+      ],
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "execution_id",
+          "workflow_name",
+          "workflow_id",
+          "state",
+          "queue_name",
+          "started_at",
+          "sticky_until"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
       "path": "/batch-operations",
       "category": "batch",
       "read_only": true,
