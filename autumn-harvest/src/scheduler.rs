@@ -1429,7 +1429,15 @@ fn due_run_plan(
     catchup: bool,
 ) -> (Vec<DateTime<Utc>>, Option<DateTime<Utc>>) {
     if !catchup {
-        return (vec![first_due], next_run_after(schedule, now));
+        // Anchor the next slot to first_due so that jitter-induced latency
+        // does not drift the schedule (interval schedules: next = first_due +
+        // period, not now + period). Fall back to next_run_after(now) when the
+        // slot-anchored next is already in the past to preserve the non-catchup
+        // skip-overdue-slots semantics for very late dispatchers.
+        let next = next_run_after(schedule, first_due)
+            .filter(|&t| t > now)
+            .or_else(|| next_run_after(schedule, now));
+        return (vec![first_due], next);
     }
 
     let mut created = Vec::with_capacity(1);
@@ -1496,6 +1504,22 @@ mod tests {
 
         assert_eq!(created, vec![first_due]);
         assert_eq!(next_run_at, Some(parse_utc("2026-04-06T12:06:00Z")));
+    }
+
+    #[test]
+    fn due_run_plan_without_catchup_anchors_next_slot_to_first_due() {
+        // When now is only slightly past first_due (e.g. jitter delay of 3 min
+        // inside a 60-min interval), next slot must be first_due + period, not
+        // now + period, so the schedule doesn't drift on every fired slot.
+        let schedule = Schedule::Interval(Duration::from_secs(3600));
+        let first_due = parse_utc("2026-04-06T10:00:00Z");
+        let now = parse_utc("2026-04-06T10:03:00Z"); // 3 min jitter delay
+
+        let (created, next_run_at) = due_run_plan(Some(&schedule), first_due, now, false);
+
+        assert_eq!(created, vec![first_due]);
+        // Should be 11:00, not 11:03
+        assert_eq!(next_run_at, Some(parse_utc("2026-04-06T11:00:00Z")));
     }
 
     #[test]
