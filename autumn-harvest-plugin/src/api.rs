@@ -4504,9 +4504,7 @@ fn effective_fire_time(
     }
     let jitter_window = std::time::Duration::from_secs(jitter_secs as u64);
     let offset = compute_jitter_offset(schedule_id, t, jitter_window);
-    chrono::Duration::from_std(offset)
-        .ok()
-        .map(|d| t + d)
+    chrono::Duration::from_std(offset).ok().map(|d| t + d)
 }
 
 async fn list_schedules(

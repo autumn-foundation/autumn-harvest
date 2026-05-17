@@ -471,12 +471,19 @@ pub fn validate_jitter(schedule: &Schedule, jitter: Duration) -> Result<(), Stri
 /// The hash uses `seahash` over `[schedule_id_bytes (16) || fire_time_nanos_le (8)]`,
 /// mirroring the shard-router pattern already present in this crate.
 #[must_use]
-pub fn compute_jitter_offset(schedule_id: Uuid, fire_time: DateTime<Utc>, jitter: Duration) -> Duration {
+pub fn compute_jitter_offset(
+    schedule_id: Uuid,
+    fire_time: DateTime<Utc>,
+    jitter: Duration,
+) -> Duration {
     if jitter.is_zero() {
         return Duration::ZERO;
     }
     let jitter_nanos = u64::try_from(jitter.as_nanos()).unwrap_or(u64::MAX);
-    let fire_nanos = fire_time.timestamp_nanos_opt().unwrap_or_default().cast_unsigned();
+    let fire_nanos = fire_time
+        .timestamp_nanos_opt()
+        .unwrap_or_default()
+        .cast_unsigned();
     let mut bytes = [0u8; 24];
     bytes[..16].copy_from_slice(schedule_id.as_bytes());
     bytes[16..].copy_from_slice(&fire_nanos.to_le_bytes());
@@ -499,8 +506,8 @@ mod tests {
 
     #[test]
     fn workflow_schedule_with_jitter_sets_duration() {
-        let sched = WorkflowSchedule::new("my_wf", Schedule::Manual)
-            .with_jitter(Duration::from_secs(300));
+        let sched =
+            WorkflowSchedule::new("my_wf", Schedule::Manual).with_jitter(Duration::from_secs(300));
         assert_eq!(sched.jitter, Duration::from_secs(300));
     }
 
@@ -510,9 +517,7 @@ mod tests {
         assert!(
             validate_jitter(&Schedule::Interval(Duration::from_secs(60)), Duration::ZERO).is_ok()
         );
-        assert!(
-            validate_jitter(&Schedule::Cron("0 * * * *".to_string()), Duration::ZERO).is_ok()
-        );
+        assert!(validate_jitter(&Schedule::Cron("0 * * * *".to_string()), Duration::ZERO).is_ok());
     }
 
     #[test]
@@ -568,7 +573,10 @@ mod tests {
         use uuid::Uuid;
         let id = Uuid::from_u128(1);
         let fire_time = "2026-04-01T10:00:00Z".parse::<DateTime<Utc>>().unwrap();
-        assert_eq!(compute_jitter_offset(id, fire_time, Duration::ZERO), Duration::ZERO);
+        assert_eq!(
+            compute_jitter_offset(id, fire_time, Duration::ZERO),
+            Duration::ZERO
+        );
     }
 
     #[test]
@@ -579,7 +587,10 @@ mod tests {
         let fire_time = "2026-04-01T10:00:00Z".parse::<DateTime<Utc>>().unwrap();
         let jitter = Duration::from_secs(300);
         let offset = compute_jitter_offset(id, fire_time, jitter);
-        assert!(offset < jitter, "offset {offset:?} must be < jitter {jitter:?}");
+        assert!(
+            offset < jitter,
+            "offset {offset:?} must be < jitter {jitter:?}"
+        );
     }
 
     #[test]

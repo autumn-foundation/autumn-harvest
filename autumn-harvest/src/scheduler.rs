@@ -1296,8 +1296,8 @@ async fn tick_one_workflow_schedule(
         // Jitter: stall dispatch until the effective fire time has elapsed.
         // effective_fire_time = scheduled_for + hash(schedule_id, scheduled_for) % jitter_window
         let jitter_offset = compute_jitter_offset(schedule.id, *scheduled_for, jitter_window);
-        let effective_fire_time = *scheduled_for
-            + chrono::Duration::from_std(jitter_offset).unwrap_or_default();
+        let effective_fire_time =
+            *scheduled_for + chrono::Duration::from_std(jitter_offset).unwrap_or_default();
         if now < effective_fire_time {
             deferred_next_run_at = Some(*scheduled_for);
             tracing::debug!(
