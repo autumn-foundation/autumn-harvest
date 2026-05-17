@@ -39,7 +39,9 @@ use autumn_harvest::models::{
     DeadLetter, HarvestEvent, HarvestSchedule, HarvestSignal, HarvestTimer, NewAuditRecord,
     TaskQueueItem, WorkflowExecution,
 };
-use autumn_harvest::reset::{ResetSignalReapplyPolicy, WorkflowResetRequest, reset_workflow_execution};
+use autumn_harvest::reset::{
+    ResetSignalReapplyPolicy, WorkflowResetRequest, reset_workflow_execution,
+};
 use autumn_harvest::schema::{
     harvest_dead_letters, harvest_events, harvest_schedules, harvest_signals, harvest_task_queue,
     harvest_timers, harvest_workflow_executions,
@@ -505,13 +507,21 @@ async fn list_workflows_ui(
         .as_deref()
         .map(str::trim)
         .filter(|v| !v.is_empty())
-        .and_then(|v| DateTime::parse_from_rfc3339(v).ok().map(|d| d.with_timezone(&Utc)));
+        .and_then(|v| {
+            DateTime::parse_from_rfc3339(v)
+                .ok()
+                .map(|d| d.with_timezone(&Utc))
+        });
     let started_before = params
         .started_before
         .as_deref()
         .map(str::trim)
         .filter(|v| !v.is_empty())
-        .and_then(|v| DateTime::parse_from_rfc3339(v).ok().map(|d| d.with_timezone(&Utc)));
+        .and_then(|v| {
+            DateTime::parse_from_rfc3339(v)
+                .ok()
+                .map(|d| d.with_timezone(&Utc))
+        });
     let exec_id_search = params
         .exec_id_search
         .as_deref()
@@ -641,7 +651,8 @@ async fn load_blocked_on_data(
     let activities: Vec<TaskQueueItem> = harvest_task_queue::table
         .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_uuid)))
         .filter(
-            harvest_task_queue::state.eq("PENDING")
+            harvest_task_queue::state
+                .eq("PENDING")
                 .or(harvest_task_queue::state.eq("CLAIMED"))
                 .or(harvest_task_queue::state.eq("RUNNING"))
                 .or(harvest_task_queue::state.eq("BACKOFF")),
@@ -2009,12 +2020,8 @@ fn render_filters(
     let (attr_key, attr_value) =
         search_attr_filter.map_or(("", ""), |(k, v)| (k.as_str(), v.as_str()));
     let workflow_name_value = workflow_name_filter.unwrap_or("");
-    let started_after_value = started_after
-        .map(|d| d.to_rfc3339())
-        .unwrap_or_default();
-    let started_before_value = started_before
-        .map(|d| d.to_rfc3339())
-        .unwrap_or_default();
+    let started_after_value = started_after.map(|d| d.to_rfc3339()).unwrap_or_default();
+    let started_before_value = started_before.map(|d| d.to_rfc3339()).unwrap_or_default();
     let exec_id_search_value = exec_id_search.unwrap_or("");
 
     html! {
@@ -2149,8 +2156,12 @@ fn build_query_string(
 }
 
 const DETAIL_EVENT_PAGE_SIZE: i64 = 100;
-const SIGNAL_UPDATE_TYPES: &[&str] =
-    &["SignalReceived", "UpdateAdmitted", "UpdateCompleted", "UpdateFailed"];
+const SIGNAL_UPDATE_TYPES: &[&str] = &[
+    "SignalReceived",
+    "UpdateAdmitted",
+    "UpdateCompleted",
+    "UpdateFailed",
+];
 const SIGNAL_UPDATE_PANEL_LIMIT: usize = 20;
 
 /// Extract a string field from the inner `data` object of an adjacently-tagged event payload.
@@ -2234,7 +2245,9 @@ fn collect_activity_attempts(events: &[HarvestEvent]) -> Vec<ActivityAttemptRow>
         };
         let aid = aid.to_string();
         if !groups.contains_key(&aid) {
-            let name = event_data_field(&event.event_data, "name").unwrap_or("").to_string();
+            let name = event_data_field(&event.event_data, "name")
+                .unwrap_or("")
+                .to_string();
             order.push(aid.clone());
             groups.insert(
                 aid.clone(),
@@ -2265,7 +2278,10 @@ fn collect_activity_attempts(events: &[HarvestEvent]) -> Vec<ActivityAttemptRow>
         }
     }
 
-    order.into_iter().filter_map(|id| groups.remove(&id)).collect()
+    order
+        .into_iter()
+        .filter_map(|id| groups.remove(&id))
+        .collect()
 }
 
 #[allow(clippy::too_many_lines)]
