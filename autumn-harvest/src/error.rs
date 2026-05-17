@@ -183,6 +183,47 @@ pub enum HarvestError {
         /// Human-readable description of the constraint that was violated.
         reason: String,
     },
+
+    /// No query handler is registered under the given name.
+    ///
+    /// Surfaces as `404 Not Found` at the management API layer.
+    #[error("query handler not found: {0}")]
+    QueryHandlerNotFound(String),
+
+    /// The workflow execution is not in a running state and therefore cannot
+    /// answer a query (it may have completed, failed, or not yet started).
+    ///
+    /// Surfaces as `409 Conflict` at the management API layer.
+    #[error("workflow not running: {0}")]
+    WorkflowNotRunning(ExecutionId),
+
+    /// The query handler returned an application-level error (not a panic).
+    ///
+    /// This is distinct from [`QueryHandlerPanicked`][Self::QueryHandlerPanicked]:
+    /// the handler ran to completion and intentionally returned `Err(msg)`.
+    /// Surfaces as `400 Bad Request` at the management API layer.
+    #[error("query handler error: {0}")]
+    QueryHandlerFailed(String),
+
+    /// The query handler panicked during execution.
+    ///
+    /// The panic message is captured via `std::panic::catch_unwind` and
+    /// surfaced to the caller as `503 Service Unavailable`.
+    #[error("query handler panicked: {0}")]
+    QueryHandlerPanicked(String),
+
+    /// The query execution exceeded the configured per-query timeout.
+    ///
+    /// The handler is terminated and this error is returned to the caller.
+    /// Surfaces as `408 Request Timeout` or `504 Gateway Timeout` depending
+    /// on whether the client or the engine imposed the limit.
+    #[error("query timed out: {query_name} (timeout: {timeout_ms}ms)")]
+    QueryTimedOut {
+        /// Name of the query handler that timed out.
+        query_name: String,
+        /// Configured timeout in milliseconds.
+        timeout_ms: u64,
+    },
 }
 
 /// Standard result type for internal harvest engine operations.

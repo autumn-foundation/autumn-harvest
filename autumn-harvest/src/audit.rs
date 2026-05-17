@@ -180,6 +180,12 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
         "GET /workflows/{id}/query/{query_name}",
         RouteClass::ReadOnly,
     ),
+    // POST query accepts typed args but never mutates workflow state.
+    (
+        "POST /workflows/{id}/query/{query_name}",
+        RouteClass::ReadOnly,
+    ),
+    ("GET /workflows/{id}/queries", RouteClass::ReadOnly),
     (
         "GET /workflows/{id}/update/{update_id}/result",
         RouteClass::ReadOnly,
@@ -297,6 +303,8 @@ pub const EXCLUDED_ROUTES: &[&str] = &[
     "GET /workflows/{id}/children",
     "GET /workflows/{id}/stack",
     "GET /workflows/{id}/query/{query_name}",
+    "POST /workflows/{id}/query/{query_name}",
+    "GET /workflows/{id}/queries",
     "GET /workflows/{id}/update/{update_id}/result",
     // Updates are synchronous request/response, not tracked as operator
     // audit events in this slice; they appear in the workflow event history.
@@ -354,6 +362,8 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
         Some(OP_WORKFLOW_SIGNAL),
     ),
     ("GET /workflows/{id}/query/{query_name}", None),
+    ("POST /workflows/{id}/query/{query_name}", None),
+    ("GET /workflows/{id}/queries", None),
     ("POST /workflows/{id}/update/{update_name}", None),
     ("GET /workflows/{id}/update/{update_id}/result", None),
     ("GET /workflows/{id}/history/export", None),

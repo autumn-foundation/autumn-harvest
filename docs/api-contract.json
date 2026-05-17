@@ -573,7 +573,7 @@
       "path": "/workflows/{id}/query/{query_name}",
       "category": "workflow",
       "read_only": true,
-      "description": "Query the current state of a running workflow by invoking a registered query handler.",
+      "description": "Query the current state of a running workflow by invoking a registered no-arg query handler (backward-compat; prefer POST for typed args).",
       "params": [
         {
           "name": "id",
@@ -599,8 +599,111 @@
           "description": "Execution not found or query handler not registered."
         },
         {
-          "status": 500,
-          "description": "Query execution error."
+          "status": 408,
+          "description": "Query timed out (exceeded WorkerConfig::query_timeout)."
+        },
+        {
+          "status": 409,
+          "description": "Workflow is not in a running state."
+        },
+        {
+          "status": 503,
+          "description": "Query handler panicked."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/workflows/{id}/query/{query_name}",
+      "category": "workflow",
+      "read_only": true,
+      "post_for_body_only": true,
+      "description": "Query the current state of a running workflow, passing typed JSON args to the handler. Returns {\"result\": <value>}. POST is used instead of GET solely to allow a structured JSON request body; this route never writes workflow events.",
+      "idempotency": "Read-only at the workflow level (no events written); safe to retry if the caller can tolerate duplicate handler invocations.",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Execution UUID."
+        },
+        {
+          "name": "query_name",
+          "in": "path",
+          "required": true,
+          "description": "Registered query handler name."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "args",
+            "required": false,
+            "description": "Arguments passed to the query handler; schema is handler-defined (any JSON value)."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 200,
+        "fields": ["result"]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Args failed to deserialize into the handler's request type."
+        },
+        {
+          "status": 404,
+          "description": "Execution not found or query handler not registered."
+        },
+        {
+          "status": 408,
+          "description": "Query timed out (exceeded WorkerConfig::query_timeout)."
+        },
+        {
+          "status": 409,
+          "description": "Workflow is not in a running state."
+        },
+        {
+          "status": 503,
+          "description": "Query handler panicked."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/workflows/{id}/queries",
+      "category": "workflow",
+      "read_only": true,
+      "description": "List all query handler names registered by a running workflow. Used by the Vantage UI to populate the Run Query control.",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Execution UUID."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "free_form": true,
+        "note": "JSON array of registered query handler name strings, sorted alphabetically."
+      },
+      "error_responses": [
+        {
+          "status": 404,
+          "description": "Execution not found."
+        },
+        {
+          "status": 408,
+          "description": "Rehydration timed out before handlers could be registered."
+        },
+        {
+          "status": 409,
+          "description": "Workflow is not in a running state."
         }
       ]
     },

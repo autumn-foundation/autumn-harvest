@@ -4362,6 +4362,7 @@ mod tests {
             worker_heartbeat_interval: Duration::from_secs(5),
             build_id: String::new(),
             deployment_name: None,
+            query_timeout: Duration::from_secs(5),
         };
 
         let runtime_cfg: WorkerRuntimeConfig = builder_cfg.into();

@@ -563,7 +563,7 @@ impl WorkflowContext {
         )
     }
 
-    pub(crate) fn for_replay_with_state_and_history_policy(
+    pub fn for_replay_with_state_and_history_policy(
         exec_id: ExecutionId,
         events: Vec<WorkflowEvent>,
         state: SharedState,
@@ -1773,12 +1773,20 @@ impl WorkflowContext {
         }
     }
 
-    /// Register a named query handler for this workflow execution.
+    // ── Query handlers ────────────────────────────────────────────────
+
+    /// Register a named no-arg query handler for this workflow execution.
     ///
     /// Queries allow external clients (via the management API) to inspect the
-    /// internal state of a running workflow. Handlers run in-memory and are
-    /// never recorded in the event history. Because queries execute synchronously
-    /// without awaiting I/O, they must be fast and side-effect free.
+    /// internal state of a running workflow without writing any event to
+    /// `harvest_events`. Handlers run in-memory and must be fast and side-effect
+    /// free.
+    ///
+    /// Registration is **idempotent** — calling with the same `name` multiple
+    /// times (e.g., on every replay cycle) is a no-op after the first call.
+    ///
+    /// For typed request/response shapes, use
+    /// [`register_query_handler`](Self::register_query_handler) instead.
     ///
     /// # Examples
     ///
@@ -1787,16 +1795,12 @@ impl WorkflowContext {
     /// use autumn_harvest::context::WorkflowContext;
     ///
     /// # fn example(ctx: &WorkflowContext) {
-    /// let items_processed = Arc::new(Mutex::new(0));
+    /// let items_processed = Arc::new(Mutex::new(0u32));
     ///
-    /// // Register a query that returns the current counter value
     /// let query_state = items_processed.clone();
     /// ctx.register_query("items_processed", move || {
     ///     serde_json::json!(*query_state.lock().unwrap())
     /// });
-    ///
-    /// // ... later in the workflow ...
-    /// *items_processed.lock().unwrap() += 1;
     /// # }
     /// ```
     ///
@@ -1807,16 +1811,93 @@ impl WorkflowContext {
     where
         F: Fn() -> Value + Send + Sync + 'static,
     {
+        // Wrap the no-arg closure into the unified `Fn(Value) -> Result<Value, String>` shape.
+        let wrapped = Arc::new(move |_args: Value| -> Result<Value, String> { Ok(handler()) });
         self.query_registry
             .lock()
             .expect("query_registry lock poisoned")
-            .register(name, Arc::new(handler));
+            .register(name, wrapped);
     }
 
-    /// Execute a previously registered query by name.
+    /// Register a **typed** query handler.
     ///
-    /// This is typically called by the worker infrastructure when servicing an
-    /// external API request. User workflow code rarely needs to call this directly.
+    /// Unlike [`register_query`](Self::register_query), this variant accepts
+    /// typed request and response structs. The engine deserializes the incoming
+    /// JSON args as `Req`, calls the handler, and serializes the `Resp` back to
+    /// JSON. Serialization errors are surfaced as handler errors.
+    ///
+    /// Registration is **idempotent** — calling with the same `name` multiple
+    /// times is a no-op after the first call.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use autumn_harvest::context::WorkflowContext;
+    /// use autumn_harvest::types::ExecutionId;
+    ///
+    /// #[derive(serde::Deserialize)]
+    /// struct ProgressQuery { include_details: bool }
+    ///
+    /// #[derive(serde::Serialize)]
+    /// struct ProgressResponse { processed: u32 }
+    ///
+    /// # let ctx = WorkflowContext::for_replay(ExecutionId::new(), vec![]);
+    /// ctx.register_query_handler("progress", |req: &ProgressQuery| {
+    ///     Ok(ProgressResponse { processed: 42 })
+    /// });
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal query registry mutex is poisoned.
+    pub fn register_query_handler<Req, Resp, F>(&self, name: &str, handler: F)
+    where
+        Req: serde::de::DeserializeOwned + 'static,
+        Resp: serde::Serialize + 'static,
+        F: Fn(&Req) -> Result<Resp, String> + Send + Sync + 'static,
+    {
+        let wrapped = Arc::new(move |args: Value| -> Result<Value, String> {
+            let req: Req = serde_json::from_value(args)
+                .map_err(|e| format!("failed to deserialize query args: {e}"))?;
+            let resp = handler(&req)?;
+            serde_json::to_value(resp)
+                .map_err(|e| format!("failed to serialize query response: {e}"))
+        });
+        self.query_registry
+            .lock()
+            .expect("query_registry lock poisoned")
+            .register(name, wrapped);
+    }
+
+    /// Execute a registered query handler with JSON `args`.
+    ///
+    /// The registry lock is released before the handler runs, preventing
+    /// re-entrant deadlocks.
+    ///
+    /// # Errors
+    ///
+    /// - [`HarvestError::QueryHandlerNotFound`] — no handler registered under `name`.
+    /// - [`HarvestError::QueryHandlerPanicked`] — handler returned an `Err` string.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal query registry mutex is poisoned.
+    pub fn execute_query_with_args(&self, name: &str, args: Value) -> HarvestResult<Value> {
+        let handler = self
+            .query_registry
+            .lock()
+            .expect("query_registry lock poisoned")
+            .get(name);
+
+        handler.map_or_else(
+            || Err(HarvestError::QueryHandlerNotFound(name.to_string())),
+            |h| h(args).map_err(HarvestError::QueryHandlerFailed),
+        )
+    }
+
+    /// Execute a registered query handler with no arguments.
+    ///
+    /// Convenience alias for `execute_query_with_args(name, Value::Null)`.
     ///
     /// # Examples
     ///
@@ -1826,7 +1907,6 @@ impl WorkflowContext {
     /// # fn example(ctx: &WorkflowContext) -> autumn_harvest::HarvestResult<()> {
     /// ctx.register_query("status", || serde_json::json!("running"));
     ///
-    /// // The framework internally dispatches queries like this:
     /// let result = ctx.execute_query("status")?;
     /// assert_eq!(result, "running");
     /// # Ok(())
@@ -1835,23 +1915,30 @@ impl WorkflowContext {
     ///
     /// # Errors
     ///
-    /// Returns [`HarvestError::NotFound`] if no query handler is registered under
-    /// `name`.
+    /// Returns [`HarvestError::QueryHandlerNotFound`] if no query handler is
+    /// registered under `name`.
     ///
     /// # Panics
     ///
     /// Panics if the internal query registry mutex is poisoned.
     pub fn execute_query(&self, name: &str) -> HarvestResult<Value> {
-        let handler = self
-            .query_registry
+        self.execute_query_with_args(name, Value::Null)
+    }
+
+    /// Return the names of all currently registered query handlers.
+    ///
+    /// This is the list the Vantage UI uses to populate the *"Run query"*
+    /// drop-down for this workflow execution.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal query registry mutex is poisoned.
+    #[must_use]
+    pub fn list_query_names(&self) -> Vec<String> {
+        self.query_registry
             .lock()
             .expect("query_registry lock poisoned")
-            .get(name);
-
-        handler.map_or_else(
-            || Err(HarvestError::NotFound(format!("query handler '{name}'"))),
-            |h| Ok(h()),
-        )
+            .list_names()
     }
 
     // ── Update handlers ───────────────────────────────────────────────

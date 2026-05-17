@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use autumn_web::AppState;
 use autumn_web::error::AutumnError;
@@ -13,6 +13,7 @@ use autumn_web::session::Session;
 use axum::Extension;
 use axum::Json;
 use axum::Router;
+use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
@@ -240,6 +241,9 @@ pub struct HarvestApiState {
     workflow_result_notification_urls: Arc<Mutex<BTreeMap<ShardId, String>>>,
     /// Maximum wait accepted by `GET /workflows/{id}/result?wait=...`.
     workflow_result_max_wait: Arc<Mutex<std::time::Duration>>,
+    /// Per-query execution timeout (issue #234); derived from `WorkerConfig::query_timeout`
+    /// at startup. Defaults to 5 s.
+    query_timeout: Arc<Mutex<std::time::Duration>>,
 }
 
 impl Default for HarvestApiState {
@@ -257,6 +261,7 @@ impl Default for HarvestApiState {
             worker_shutdown_timeout: Arc::new(Mutex::new(std::time::Duration::from_secs(30))),
             workflow_result_notification_urls: Arc::default(),
             workflow_result_max_wait: Arc::new(Mutex::new(std::time::Duration::from_secs(30))),
+            query_timeout: Arc::new(Mutex::new(std::time::Duration::from_secs(5))),
         }
     }
 }
@@ -280,6 +285,34 @@ impl HarvestApiState {
             .worker_stale_threshold
             .lock()
             .expect("harvest api state lock poisoned") = threshold;
+    }
+
+    /// Override the per-query execution timeout (default 5 s, issue #234).
+    ///
+    /// Call this at startup with `WorkerConfig::query_timeout` so the management
+    /// API honours the same timeout as the worker's in-process query dispatch.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    pub fn set_query_timeout(&self, timeout: std::time::Duration) {
+        *self
+            .query_timeout
+            .lock()
+            .expect("harvest api state lock poisoned") = timeout;
+    }
+
+    /// Current per-query execution timeout.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    #[must_use]
+    pub fn query_timeout(&self) -> std::time::Duration {
+        *self
+            .query_timeout
+            .lock()
+            .expect("harvest api state lock poisoned")
     }
 
     /// Install a custom actor extractor used to derive the `actor` field of
@@ -1218,7 +1251,11 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             "/workflows/{id}/signal/{signal_name}",
             post(signal_workflow),
         )
-        .route("/workflows/{id}/query/{query_name}", get(query_workflow))
+        .route(
+            "/workflows/{id}/query/{query_name}",
+            get(query_workflow).post(query_workflow_post),
+        )
+        .route("/workflows/{id}/queries", get(list_workflow_queries))
         // Update primitive (issue #140): synchronous request/response into a running workflow.
         .route("/workflows/{id}/update/{update_name}", post(admit_update))
         .route(
@@ -1352,7 +1389,9 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("POST", "/workflows/{id}/cancel"),
         ("POST", "/workflows/{id}/reset"),
         ("POST", "/workflows/{id}/signal/{signal_name}"),
+        ("GET", "/workflows/{id}/queries"),
         ("GET", "/workflows/{id}/query/{query_name}"),
+        ("POST", "/workflows/{id}/query/{query_name}"),
         ("POST", "/workflows/{id}/update/{update_name}"),
         ("GET", "/workflows/{id}/update/{update_id}/result"),
         // ── DAGs ─────────────────────────────────────────────────────────────
@@ -1441,6 +1480,11 @@ pub const fn management_api_request_fields()
             ]),
         ),
         ("POST", "/workflows/{id}/signal/{signal_name}", None), // free-form
+        (
+            "POST",
+            "/workflows/{id}/query/{query_name}",
+            Some(&["args"]),
+        ),
         (
             "POST",
             "/workflows/{id}/update/{update_name}",
@@ -1619,7 +1663,13 @@ pub const fn management_api_response_fields()
             "/workflows/{id}/signal/{signal_name}",
             Some(&["ok"]),
         ),
+        ("GET", "/workflows/{id}/queries", None), // Vec<String> query names
         ("GET", "/workflows/{id}/query/{query_name}", None), // opaque handler return
+        (
+            "POST",
+            "/workflows/{id}/query/{query_name}",
+            Some(&["result"]),
+        ), // {"result": <value>}
         ("POST", "/workflows/{id}/update/{update_name}", None), // polymorphic admitted/completed/failed
         ("GET", "/workflows/{id}/update/{update_id}/result", None), // polymorphic completed/failed
         // ── DAGs ─────────────────────────────────────────────────────────────
@@ -3972,16 +4022,41 @@ async fn signal_workflow(
     ))
 }
 
-async fn query_workflow(
-    Extension(api_state): Extension<HarvestApiState>,
-    Path((id, query_name)): Path<(String, String)>,
-) -> Result<Json<Value>, AutumnError> {
+/// Waker that records whether `wake()` was called synchronously during a poll.
+///
+/// Used by [`hydrate_ctx_for_query`] to distinguish genuine command-based
+/// suspension (waker never fired) from ordinary async yields like
+/// `tokio::task::yield_now()` (waker fires immediately, signalling the caller
+/// to re-poll).
+struct WokenFlag(std::sync::atomic::AtomicBool);
+
+impl futures::task::ArcWake for WokenFlag {
+    fn wake_by_ref(arc_self: &Arc<Self>) {
+        std::sync::atomic::AtomicBool::store(
+            &arc_self.0,
+            true,
+            std::sync::atomic::Ordering::Release,
+        );
+    }
+}
+
+/// Hydrate a workflow context by replaying its history into the workflow
+/// handler long enough for it to register its query handlers.
+async fn hydrate_ctx_for_query(
+    api_state: &HarvestApiState,
+    exec_id: ExecutionId,
+) -> Result<WorkflowContext, AutumnError> {
     let runtime = api_state.runtime().map_err(map_error)?;
-    let exec_id = parse_execution_id(&id)?;
-    let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
+    let mut conn = db_conn_for_execution(api_state, exec_id).await?;
     let execution = load_execution(&mut conn, exec_id)
         .await
         .map_err(map_error)?;
+
+    // Queries are only meaningful on running workflows.
+    if is_terminal_state(&execution.state) {
+        return Err(map_error(HarvestError::WorkflowNotRunning(exec_id)));
+    }
+
     let workflow = runtime
         .registry
         .workflows
@@ -3996,18 +4071,146 @@ async fn query_workflow(
         .await
         .map_err(map_error)?;
 
-    let ctx = WorkflowContext::for_replay_with_state(
+    // Drop the DB connection before driving user code — prevents holding a
+    // pool slot during replay, which would starve other management and worker
+    // DB operations for the entire duration of the workflow replay.
+    drop(conn);
+
+    let ctx = WorkflowContext::for_replay_with_state_and_history_policy(
         exec_id,
         history.events,
         runtime.registry.shared_state(),
+        runtime.registry.history_policy(),
     );
-    let _ = tokio::time::timeout(
-        Duration::from_millis(100),
-        (workflow.handler)(&ctx, execution.input.clone()),
-    )
-    .await;
 
-    ctx.execute_query(&query_name).map(Json).map_err(map_error)
+    // Drive the workflow future until it genuinely suspends on a workflow
+    // command (activity, signal wait, timer). Recorded events resolve via
+    // pre-sent oneshot channels so the entire history replays synchronously.
+    // Some workflows interleave ordinary async yields (e.g. yield_now) before
+    // registering query handlers; the WokenFlag waker detects those and keeps
+    // us polling. A wall-clock deadline (query_timeout) prevents spinning on a
+    // misbehaving workflow.
+    let deadline = std::time::Instant::now() + api_state.query_timeout();
+    let flag = Arc::new(WokenFlag(std::sync::atomic::AtomicBool::new(false)));
+    {
+        let waker = futures::task::waker_ref(&flag);
+        let mut poll_cx = std::task::Context::from_waker(&waker);
+        let handler_fut = (workflow.handler)(&ctx, execution.input.clone());
+        tokio::pin!(handler_fut);
+        loop {
+            std::sync::atomic::AtomicBool::store(
+                &flag.0,
+                false,
+                std::sync::atomic::Ordering::Release,
+            );
+            match handler_fut.as_mut().poll(&mut poll_cx) {
+                std::task::Poll::Ready(_) => break,
+                std::task::Poll::Pending => {
+                    let was_woken = std::sync::atomic::AtomicBool::load(
+                        &flag.0,
+                        std::sync::atomic::Ordering::Acquire,
+                    );
+                    if !was_woken || std::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    // Waker was signalled immediately — the future yielded but
+                    // wants to be re-polled (e.g. yield_now). Keep driving.
+                }
+            }
+        }
+    }
+
+    Ok(ctx)
+}
+
+/// `GET /workflows/{id}/query/{query_name}` — query with no args (backward compat).
+async fn query_workflow(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path((id, query_name)): Path<(String, String)>,
+) -> Result<Json<Value>, AutumnError> {
+    let exec_id = parse_execution_id(&id)?;
+    let ctx = hydrate_ctx_for_query(&api_state, exec_id).await?;
+    let start = Instant::now(); // measure handler invocation latency, not hydration cost
+
+    let harvest_result = ctx.execute_query(&query_name);
+    // Skip metric for not-found: query_name is user-supplied and recording it
+    // creates unbounded cardinality; registered names are low-cardinality.
+    if !matches!(&harvest_result, Err(HarvestError::QueryHandlerNotFound(_)))
+        && let Ok(runtime) = api_state.runtime()
+    {
+        runtime.registry.telemetry().metrics.record_query_completed(
+            &query_name,
+            start.elapsed().as_secs_f64(),
+            harvest_result.is_ok(),
+        );
+    }
+    harvest_result.map_err(map_error).map(Json)
+}
+
+/// Request body for `POST /workflows/{id}/query/{query_name}`.
+#[derive(Debug, Deserialize)]
+struct QueryWorkflowRequest {
+    #[serde(default)]
+    args: Value,
+}
+
+/// Response body for `POST /workflows/{id}/query/{query_name}`.
+#[derive(Debug, Serialize)]
+struct QueryWorkflowResponse {
+    result: Value,
+}
+
+/// `POST /workflows/{id}/query/{query_name}` — query with typed args (issue #234).
+///
+/// The request body is optional. Clients may omit the body entirely or send
+/// `Content-Type: application/json` with an empty body; both default `args`
+/// to `null`. A non-empty body must be `{"args": <value>}`.
+async fn query_workflow_post(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path((id, query_name)): Path<(String, String)>,
+    body: Bytes,
+) -> Result<Json<QueryWorkflowResponse>, AutumnError> {
+    let exec_id = parse_execution_id(&id)?;
+    let ctx = hydrate_ctx_for_query(&api_state, exec_id).await?;
+    let start = Instant::now(); // measure handler invocation latency, not hydration cost
+    let args: Value = if body.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice::<QueryWorkflowRequest>(&body)
+            .map(|r| r.args)
+            .map_err(|e| AutumnError::bad_request_msg(format!("invalid JSON body: {e}")))?
+    };
+
+    let harvest_result = ctx.execute_query_with_args(&query_name, args);
+    // Skip metric for not-found: user-supplied names create unbounded cardinality.
+    if !matches!(&harvest_result, Err(HarvestError::QueryHandlerNotFound(_)))
+        && let Ok(runtime) = api_state.runtime()
+    {
+        runtime.registry.telemetry().metrics.record_query_completed(
+            &query_name,
+            start.elapsed().as_secs_f64(),
+            harvest_result.is_ok(),
+        );
+    }
+    harvest_result
+        .map_err(map_error)
+        .map(|result| Json(QueryWorkflowResponse { result }))
+}
+
+/// `GET /workflows/{id}/queries` — list registered query handler names (issue #234).
+///
+/// Returns the names the workflow has registered via `register_query` /
+/// `register_query_handler`, which the Vantage UI uses to populate the
+/// *"Run query"* control.
+async fn list_workflow_queries(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<String>>, AutumnError> {
+    let exec_id = parse_execution_id(&id)?;
+    let ctx = hydrate_ctx_for_query(&api_state, exec_id).await?;
+    let mut names = ctx.list_query_names();
+    names.sort(); // deterministic order for UI
+    Ok(Json(names))
 }
 
 fn schedule_expr_for_summary(schedule: &Schedule) -> String {
@@ -7481,9 +7684,26 @@ fn parse_uuid(raw: &str, label: &str) -> Result<uuid::Uuid, AutumnError> {
 
 pub(crate) fn map_error(error: HarvestError) -> AutumnError {
     match error {
-        HarvestError::NotFound(message) | HarvestError::UpdateHandlerNotFound(message) => {
-            AutumnError::not_found_msg(message)
+        HarvestError::NotFound(message)
+        | HarvestError::UpdateHandlerNotFound(message)
+        | HarvestError::QueryHandlerNotFound(message) => AutumnError::not_found_msg(message),
+        HarvestError::WorkflowNotRunning(exec_id) => {
+            AutumnError::bad_request_msg(format!("workflow not running: {exec_id}"))
+                .with_status(axum::http::StatusCode::CONFLICT)
         }
+        // Intentional handler errors (returned Err, not panicked) → 400.
+        HarvestError::QueryHandlerFailed(msg) => AutumnError::bad_request_msg(msg),
+        // Actual panics are an engine fault → 503.
+        HarvestError::QueryHandlerPanicked(msg) => {
+            AutumnError::service_unavailable_msg(format!("query handler panicked: {msg}"))
+        }
+        HarvestError::QueryTimedOut {
+            query_name,
+            timeout_ms,
+        } => AutumnError::bad_request_msg(format!(
+            "query '{query_name}' timed out after {timeout_ms}ms"
+        ))
+        .with_status(axum::http::StatusCode::REQUEST_TIMEOUT),
         HarvestError::Config(message)
         | HarvestError::NonDeterministic(message)
         | HarvestError::Cancelled(message)
