@@ -5642,15 +5642,25 @@ async fn overlap_policy_cancel_other_cancels_inflight_run() {
         Arc::clone(&workflow_schedules),
     );
 
-    // T=0: exec#1 dispatched. T=2: exec#1 cancelled → exec#2 dispatched. Check at T=3.
-    tokio::time::sleep(Duration::from_secs(4)).await;
+    // Poll until the cancel+redispatch cycle completes (up to 12 s to tolerate
+    // Docker container startup latency and cron alignment jitter).
+    let (cancelled, running) = tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            let c = count_executions_in_state(&database_url, wf_name, "CANCELLED").await;
+            let r = count_running_executions(&database_url, wf_name).await;
+            if c >= 1 && r == 1 {
+                return (c, r);
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    })
+    .await
+    .expect("CancelOther: timed out waiting for cancel+redispatch within 12 s");
 
-    let cancelled = count_executions_in_state(&database_url, wf_name, "CANCELLED").await;
     assert!(
         cancelled >= 1,
         "CancelOther: at least 1 execution must be CANCELLED, got {cancelled}"
     );
-    let running = count_running_executions(&database_url, wf_name).await;
     assert_eq!(
         running, 1,
         "CancelOther: exactly 1 execution must be RUNNING, got {running}"
@@ -5699,15 +5709,24 @@ async fn overlap_policy_terminate_other_terminates_inflight_run() {
         Arc::clone(&workflow_schedules),
     );
 
-    // T=0: exec#1 dispatched. T=2: exec#1 terminated (→ CANCELLED) → exec#2 dispatched.
-    tokio::time::sleep(Duration::from_secs(4)).await;
+    // Poll until the terminate+redispatch cycle completes (up to 12 s).
+    let (cancelled, running) = tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            let c = count_executions_in_state(&database_url, wf_name, "CANCELLED").await;
+            let r = count_running_executions(&database_url, wf_name).await;
+            if c >= 1 && r == 1 {
+                return (c, r);
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    })
+    .await
+    .expect("TerminateOther: timed out waiting for terminate+redispatch within 12 s");
 
-    let cancelled = count_executions_in_state(&database_url, wf_name, "CANCELLED").await;
     assert!(
         cancelled >= 1,
         "TerminateOther: at least 1 execution must be CANCELLED (terminated), got {cancelled}"
     );
-    let running = count_running_executions(&database_url, wf_name).await;
     assert_eq!(
         running, 1,
         "TerminateOther: exactly 1 execution must be RUNNING, got {running}"
@@ -5761,13 +5780,21 @@ async fn overlap_policy_buffer_one_survives_scheduler_restart() {
         Arc::new(DagCatalog::default()),
         Arc::clone(&workflow_schedules),
     );
-    // T=0 dispatch, T=2 buffer → wait until T=5 to confirm buffered_runs = 1.
-    tokio::time::sleep(Duration::from_secs(5)).await;
-
-    let buffered_before = query_buffered_runs_count(&database_url, wf_name).await;
+    // Poll for the buffered slot to appear (up to 12 s to tolerate Docker latency).
+    let buffered_before = tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            let b = query_buffered_runs_count(&database_url, wf_name).await;
+            if b >= 1 {
+                return b;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    })
+    .await
+    .expect("expected 1 buffered slot within 12 s");
     assert_eq!(
         buffered_before, 1,
-        "expected 1 buffered slot before restart, got {buffered_before}"
+        "expected exactly 1 buffered slot before restart, got {buffered_before}"
     );
 
     scheduler1.shutdown();
