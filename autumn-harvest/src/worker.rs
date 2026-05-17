@@ -285,6 +285,8 @@ impl std::fmt::Debug for HandlerRegistry {
         f.debug_struct("HandlerRegistry")
             .field("workflows", &self.workflows.keys())
             .field("activities", &self.activities.keys())
+            .field("query_handler_count", &self.query_handlers.len())
+            .field("update_handler_count", &self.update_handlers.len())
             .field("state_count", &self.state.len())
             .field("telemetry", &self.telemetry)
             .field("history_policy", &self.history_policy)
