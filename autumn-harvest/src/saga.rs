@@ -3,6 +3,9 @@
 //! A [`Saga`] records compensating actions for successful forward steps. If a
 //! later step fails, the recorded actions run in reverse order before the
 //! original error is returned.
+//!
+//! See [`docs/saga.md`](https://github.com/madmax983/autumn-harvest/blob/trunk/docs/saga.md)
+//! for the full cancellation + idempotency contract.
 
 use std::future::Future;
 
@@ -20,6 +23,55 @@ type Compensation<'ctx> = Box<dyn FnOnce() -> BoxFuture<'ctx, HarvestResult<()>>
 /// order. Compensation actions are ordinary workflow actions, so calling
 /// `ctx.execute_activity_raw(...)` inside a compensation records the activity in
 /// workflow history just like any other activity.
+///
+/// For the full narrative, worked examples, and test coverage table see
+/// [`docs/saga.md`](https://github.com/madmax983/autumn-harvest/blob/trunk/docs/saga.md).
+///
+/// # Cancellation interaction
+///
+/// **Cancellation does not auto-compensate.** When an operator calls
+/// `cancel_workflow_execution`, a `WorkflowCancelled` event is appended to
+/// history and the executor replays the workflow function with a context where
+/// [`WorkflowContext::is_cancelled`] returns `true`.  The `Saga` struct never
+/// observes this directly; its compensation stack is left intact.  The workflow
+/// author must check for cancellation and invoke [`compensate_all`](Self::compensate_all)
+/// explicitly:
+///
+/// ```rust,ignore
+/// // Recommended pattern — check for cancellation after each step or at the end.
+/// if ctx.is_cancelled() {
+///     saga.compensate_all().await?;
+///     return Err(HarvestError::Cancelled("workflow cancelled".into()));
+/// }
+/// ```
+///
+/// This matches Temporal's documented model and avoids surprising partial-unwind
+/// behaviour in long sagas where automatic, silent compensation could be worse
+/// than no compensation at all.
+///
+/// # Idempotency contract
+///
+/// Compensation closures are re-registered on **every** workflow replay.  If a
+/// worker crashes mid-[`compensate_all`](Self::compensate_all), the next worker
+/// replays the workflow function from scratch, re-registers all compensations,
+/// and calls `compensate_all()` again — including compensations that already ran
+/// before the crash.
+///
+/// **Compensation activities must therefore be idempotent.**
+///
+/// * **Good — release by ID:** `release_reservation("rsv-abc")` is a no-op when
+///   the reservation is already released.  Running it twice is safe.
+/// * **Bad — release most-recent:** `release_last_reservation()` on a second
+///   invocation would release a *different* reservation that may belong to
+///   another order entirely.
+///
+/// # Replay-determinism contract
+///
+/// The `compensate` closure receives the forward step's `T` result, which on
+/// replay is returned from the recorded `ActivityCompleted` event rather than
+/// re-executing the activity.  Any non-deterministic or side-effecting logic
+/// placed *directly inside* the compensation closure (rather than inside an
+/// activity invoked by the closure) will break replay.
 ///
 /// ## Examples
 ///
@@ -64,9 +116,27 @@ impl<'ctx> Saga<'ctx> {
     /// Run one forward step and register its compensation on success.
     ///
     /// If `step` fails, previously registered compensations run in reverse
-    /// order. When compensation succeeds, the original error is returned. When
-    /// any compensation fails, all remaining compensations are still attempted
-    /// and the result is [`HarvestError::SagaCompensationFailed`].
+    /// (LIFO) order.  When all compensations succeed the original step error is
+    /// returned.  When any compensation fails, all remaining compensations are
+    /// still attempted before returning
+    /// [`HarvestError::SagaCompensationFailed`].
+    ///
+    /// **Cancellation:** calling this method when
+    /// [`WorkflowContext::is_cancelled`] is `true` does **not** trigger
+    /// automatic compensation.  See the [`Saga`] type-level documentation for
+    /// the recommended cancel-and-compensate pattern.
+    ///
+    /// **Idempotency:** the `compensate` closure is re-registered on every
+    /// workflow replay; if the worker crashes mid-[`compensate_all`](Self::compensate_all)
+    /// the compensation will run again on the next replay.  The compensation
+    /// activity must be idempotent (e.g., release-by-id rather than
+    /// release-most-recent).
+    ///
+    /// **Replay determinism:** the `compensate` closure receives the forward
+    /// step's `T` result, which on replay is sourced from recorded history
+    /// rather than re-executing the activity.  Do not place non-deterministic
+    /// side effects directly inside the closure body; invoke an activity via
+    /// `ctx.execute_activity_raw(...)` instead.
     ///
     /// # Errors
     ///
@@ -103,8 +173,20 @@ impl<'ctx> Saga<'ctx> {
 
     /// Run all pending compensations in reverse registration order.
     ///
-    /// This is useful when workflow code decides to abort after successful
-    /// steps without expressing that abort as a failing saga step.
+    /// Call this explicitly when the workflow needs to abort after successful
+    /// forward steps — either because a later step failed outside the saga, or
+    /// because the workflow was cancelled (see [`Saga`] for the recommended
+    /// cancel-and-compensate pattern).
+    ///
+    /// **Cancellation:** `compensate_all` does **not** detect cancellation
+    /// automatically.  The author is responsible for calling it after checking
+    /// [`WorkflowContext::is_cancelled`].
+    ///
+    /// **Idempotency under replay:** if the worker crashes after some but not
+    /// all compensations have run, the next worker will call `compensate_all`
+    /// again on a fresh replay, re-running *all* compensations from the
+    /// beginning of the stack.  Compensation activities must therefore be
+    /// idempotent.
     ///
     /// # Errors
     ///
