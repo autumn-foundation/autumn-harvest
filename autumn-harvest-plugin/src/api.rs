@@ -1229,6 +1229,7 @@ struct DeadLetterListQuery {
     limit: Option<i64>,
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
     let require_admin = middleware::from_fn_with_state(api_state.clone(), require_harvest_admin);
 

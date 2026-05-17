@@ -387,9 +387,7 @@ pub async fn load_history_since(
 
     let events = rows
         .into_iter()
-        .map(|row| {
-            crate::payload_codec::PayloadCodecs::default().decode_event(row.event_data)
-        })
+        .map(|row| crate::payload_codec::PayloadCodecs::default().decode_event(row.event_data))
         .collect::<Result<Vec<WorkflowEvent>, _>>()?;
 
     Ok(EventHistory {

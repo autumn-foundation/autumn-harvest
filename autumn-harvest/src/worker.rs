@@ -2824,10 +2824,8 @@ async fn prepare_workflow_task_with_cache(
         let existing_delta =
             fail_execution_on_error(conn, task, worker_id, existing_delta_result).await?;
 
-        let timers_result =
-            ingest_fired_timers(conn, exec_id, existing_delta.next_event_id).await;
-        let timers_fired =
-            fail_execution_on_error(conn, task, worker_id, timers_result).await?;
+        let timers_result = ingest_fired_timers(conn, exec_id, existing_delta.next_event_id).await;
+        let timers_fired = fail_execution_on_error(conn, task, worker_id, timers_result).await?;
 
         // Load events appended by timer ingestion.
         let after_timers_result =
@@ -3891,9 +3889,9 @@ impl Worker {
 
         let workflow_semaphore = Arc::new(Semaphore::new(config.max_concurrent_workflows));
         let activity_semaphore = Arc::new(Semaphore::new(config.max_concurrent_activities));
-        let workflow_cache = Arc::new(tokio::sync::Mutex::new(
-            crate::cache::WorkflowCache::new(config.workflow_cache_size),
-        ));
+        let workflow_cache = Arc::new(tokio::sync::Mutex::new(crate::cache::WorkflowCache::new(
+            config.workflow_cache_size,
+        )));
 
         Ok(Self {
             config,

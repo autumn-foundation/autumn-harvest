@@ -747,23 +747,20 @@ pub async fn list_pinned_executions(
     use diesel::sql_types::Timestamptz;
 
     type Row = (
-        Uuid,   // harvest_task_queue.workflow_exec_id
+        Uuid,                  // harvest_task_queue.workflow_exec_id
         Option<DateTime<Utc>>, // harvest_task_queue.sticky_until
-        Uuid,   // harvest_workflow_executions.id
-        String, // workflow_name
-        String, // workflow_id
-        String, // state
-        String, // queue_name (from execution)
-        DateTime<Utc>, // started_at
+        Uuid,                  // harvest_workflow_executions.id
+        String,                // workflow_name
+        String,                // workflow_id
+        String,                // state
+        String,                // queue_name (from execution)
+        DateTime<Utc>,         // started_at
     );
 
     let rows: Vec<Row> = harvest_task_queue::table
         .inner_join(harvest_workflow_executions::table)
         .filter(harvest_task_queue::sticky_worker_id.eq(worker_id))
-        .filter(
-            harvest_task_queue::sticky_until
-                .gt(sql::<Nullable<Timestamptz>>("NOW()")),
-        )
+        .filter(harvest_task_queue::sticky_until.gt(sql::<Nullable<Timestamptz>>("NOW()")))
         .select((
             harvest_task_queue::workflow_exec_id.assume_not_null(),
             harvest_task_queue::sticky_until,
@@ -781,17 +778,28 @@ pub async fn list_pinned_executions(
 
     Ok(rows
         .into_iter()
-        .filter_map(|(_, sticky_until, exec_id, workflow_name, workflow_id, state, queue_name, started_at)| {
-            sticky_until.map(|su| PinnedExecutionRow {
-                execution_id: exec_id,
+        .filter_map(
+            |(
+                _,
+                sticky_until,
+                exec_id,
                 workflow_name,
                 workflow_id,
                 state,
                 queue_name,
                 started_at,
-                sticky_until: su,
-            })
-        })
+            )| {
+                sticky_until.map(|su| PinnedExecutionRow {
+                    execution_id: exec_id,
+                    workflow_name,
+                    workflow_id,
+                    state,
+                    queue_name,
+                    started_at,
+                    sticky_until: su,
+                })
+            },
+        )
         .collect())
 }
 

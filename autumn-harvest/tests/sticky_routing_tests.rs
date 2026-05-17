@@ -9,8 +9,8 @@
 //! a database — demonstrating the warm-path optimisation that is the core
 //! deliverable of issue #235.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use autumn_harvest::builder::{StickyRoutingConfig, WorkerConfig};
@@ -130,8 +130,7 @@ fn with_sticky_routing_zero_lease_ttl_disables_sticky() {
 #[test]
 fn cache_hit_metric_constant_has_correct_name() {
     assert_eq!(
-        METRIC_WORKFLOW_CACHE_HIT,
-        "harvest.workflow.cache_hit",
+        METRIC_WORKFLOW_CACHE_HIT, "harvest.workflow.cache_hit",
         "cache hit metric must follow harvest.<noun>.<instrument> naming"
     );
 }
@@ -139,8 +138,7 @@ fn cache_hit_metric_constant_has_correct_name() {
 #[test]
 fn cache_miss_metric_constant_has_correct_name() {
     assert_eq!(
-        METRIC_WORKFLOW_CACHE_MISS,
-        "harvest.workflow.cache_miss",
+        METRIC_WORKFLOW_CACHE_MISS, "harvest.workflow.cache_miss",
         "cache miss metric must follow harvest.<noun>.<instrument> naming"
     );
 }
@@ -251,7 +249,10 @@ fn first_task_is_cache_miss_subsequent_tasks_on_same_worker_are_hits() {
     assert_eq!(metrics.hit_count(), 2);
 
     // After completion the entry must be evicted.
-    assert!(cache.get(&exec_id).is_none(), "completed execution must be evicted");
+    assert!(
+        cache.get(&exec_id).is_none(),
+        "completed execution must be evicted"
+    );
 }
 
 #[test]

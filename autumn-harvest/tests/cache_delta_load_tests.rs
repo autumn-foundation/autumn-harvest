@@ -265,10 +265,10 @@ async fn warm_path_delta_load_reads_only_new_events() {
 ///    enabled, vs. ≈ N reloads with sticky routing off."
 #[tokio::test]
 async fn sticky_routing_on_vs_off_reload_count() {
-    let (mut conn, _container) = setup_test_db().await;
-
     const INITIAL_EVENTS: usize = 50;
     const FOLLOW_UP_TASKS: usize = 5;
+
+    let (mut conn, _container) = setup_test_db().await;
 
     // ── Set up an execution with 50 initial events ──────────────────────────
 
@@ -356,11 +356,10 @@ async fn sticky_routing_on_vs_off_reload_count() {
         "sticky ON: must have exactly 1 full history reload"
     );
     assert_eq!(sticky_delta_reloads, FOLLOW_UP_TASKS);
-    // Each delta should be small (≤ 2 new events per cycle in this scenario).
-    let avg_delta = total_delta_rows as f64 / FOLLOW_UP_TASKS as f64;
+    // Each delta should be small (≤ 10 new events per cycle in this scenario).
     assert!(
-        avg_delta <= 10.0,
-        "sticky ON: average delta size must be small, got {avg_delta:.1}"
+        total_delta_rows <= FOLLOW_UP_TASKS * 10,
+        "sticky ON: average delta size must be small, got {total_delta_rows} rows over {FOLLOW_UP_TASKS} tasks"
     );
 
     // ── Sticky routing OFF: N full reloads ──────────────────────────────────
