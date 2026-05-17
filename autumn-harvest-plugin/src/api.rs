@@ -1012,8 +1012,8 @@ struct ScheduleEntry {
     last_backfill: Option<BackfillSummary>,
     /// Maximum jitter window in seconds. 0 means no jitter.
     jitter_secs: i64,
-    /// Effective next fire time = next_run_at + deterministic jitter offset.
-    /// `None` when next_run_at is `None` or jitter is zero.
+    /// Effective next fire time = `next_run_at` + deterministic jitter offset.
+    /// `None` when `next_run_at` is `None` or jitter is zero.
     effective_fire_time: Option<chrono::DateTime<chrono::Utc>>,
 }
 
@@ -4502,7 +4502,7 @@ fn effective_fire_time(
     if jitter_secs <= 0 {
         return None;
     }
-    let jitter_window = std::time::Duration::from_secs(jitter_secs as u64);
+    let jitter_window = std::time::Duration::from_secs(jitter_secs.cast_unsigned());
     let offset = compute_jitter_offset(schedule_id, t, jitter_window);
     chrono::Duration::from_std(offset).ok().map(|d| t + d)
 }
