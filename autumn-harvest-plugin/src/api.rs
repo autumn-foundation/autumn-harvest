@@ -4810,6 +4810,7 @@ async fn upsert_workflow_schedule_and_read_back(
     })
 }
 
+#[allow(clippy::too_many_lines)]
 async fn create_workflow_schedule(
     Extension(api_state): Extension<HarvestApiState>,
     headers: axum::http::HeaderMap,
@@ -4861,10 +4862,26 @@ async fn create_workflow_schedule(
 
     // Reject unknown overlap_policy strings with 400 before storing.
     // `from_db` is lenient for backward compat; user input is validated strictly.
-    let overlap_policy = autumn_harvest::OverlapPolicy::from_user_input(&request.overlap_policy)
-        .map_err(|v| AutumnError::bad_request_msg(format!(
-            "invalid overlap_policy '{v}'; valid values: skip, buffer_one, buffer_all, cancel_other, terminate_other"
-        )))?;
+    let overlap_policy = match autumn_harvest::OverlapPolicy::from_user_input(
+        &request.overlap_policy,
+    ) {
+        Ok(p) => p,
+        Err(v) => {
+            let err_summary = format!(
+                "invalid overlap_policy '{v}'; valid values: skip, buffer_one, buffer_all, cancel_other, terminate_other"
+            );
+            schedule_create_audit_failed(
+                &api_state,
+                &actor,
+                &source,
+                request_id.as_deref(),
+                &request.workflow_name,
+                &err_summary,
+            )
+            .await;
+            return Err(AutumnError::bad_request_msg(err_summary));
+        }
+    };
     let ws = WorkflowSchedule {
         workflow_name: request.workflow_name.clone(),
         dag_name: None,

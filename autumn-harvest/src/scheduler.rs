@@ -813,13 +813,21 @@ async fn upsert_schedule(
         };
         // Clear buffered slots when the schedule cadence changes or when the
         // operator switches away from a buffering policy, so stale firings are
-        // not dispatched under a configuration that never produced them.
+        // not dispatched under a configuration that never produced them.  Also
+        // trim to the new cap when tightening the policy or buffer_all_max.
         let is_buffering_policy = matches!(
             dag.overlap_policy,
             OverlapPolicy::BufferOne | OverlapPolicy::BufferAll
         );
         let new_buffered_runs = if is_buffering_policy && !schedule_changed {
-            existing.buffered_runs.clone()
+            let cap = if dag.overlap_policy == OverlapPolicy::BufferOne {
+                1usize
+            } else {
+                usize::try_from(dag.buffer_all_max.max(1)).unwrap_or(usize::MAX)
+            };
+            let mut existing_buffered = parse_buffered_runs(&existing.buffered_runs);
+            existing_buffered.truncate(cap);
+            buffered_runs_to_json(&existing_buffered)
         } else {
             serde_json::json!([])
         };
@@ -1067,14 +1075,22 @@ async fn upsert_workflow_schedule(
     };
     // is_paused is deliberately excluded — it is managed via pause/resume, not here.
     // buffered_runs: preserved only when the policy is still buffering AND the cadence
-    // has not changed. Clearing on schedule_changed prevents stale firings from the old
-    // cadence being dispatched under a new cron/interval.
+    // has not changed.  Also trim to the new effective cap so that tightening the
+    // policy (BufferAll→BufferOne, or lowering buffer_all_max) never lets the drain
+    // dispatch more slots than the updated configuration permits.
     let is_buffering_policy = matches!(
         ws.overlap_policy,
         OverlapPolicy::BufferOne | OverlapPolicy::BufferAll
     );
     let new_buffered_runs = if is_buffering_policy && !schedule_changed {
-        existing.buffered_runs.clone()
+        let cap = if ws.overlap_policy == OverlapPolicy::BufferOne {
+            1usize
+        } else {
+            usize::try_from(ws.buffer_all_max.max(1)).unwrap_or(usize::MAX)
+        };
+        let mut existing_buffered = parse_buffered_runs(&existing.buffered_runs);
+        existing_buffered.truncate(cap);
+        buffered_runs_to_json(&existing_buffered)
     } else {
         serde_json::json!([])
     };
@@ -1426,11 +1442,13 @@ async fn tick_one_workflow_schedule(
                     "harvest workflow schedule firing skipped due to overlap policy"
                 );
                 metrics.record_schedule_skipped("workflow", wf_name, reason);
-                // For catchup schedules keep next_run_at at logical_date so the
-                // overdue slot is retried on the next tick once a run slot opens.
-                // For non-catchup schedules advance past overdue slots to the next
-                // future firing so the scheduler doesn't spin on an old timestamp.
-                let next = if catchup {
+                // For Skip drops (reason = "max_active_runs_reached"), retain
+                // logical_date under catchup so the overdue slot fires once
+                // capacity opens. For buffer-full drops the slot is permanently
+                // discarded; advance past it so newer catchup slots are not
+                // blocked behind the same overdue timestamp on every tick.
+                let retain_for_retry = catchup && reason == "max_active_runs_reached";
+                let next = if retain_for_retry {
                     Some(logical_date)
                 } else {
                     next_run_after(parsed_schedule, now)
