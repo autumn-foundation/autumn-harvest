@@ -665,6 +665,11 @@ enum WorkflowCommand {
         /// Update ID returned by a prior `harvest workflow update` call.
         update_id: String,
     },
+    /// List declarative query and update handlers registered for a workflow type.
+    Handlers {
+        /// Registered workflow name.
+        workflow_name: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -2367,6 +2372,10 @@ fn workflow_request(command: &WorkflowCommand) -> Result<ApiRequest, CliError> {
             "/workflows/{}/update/{}/result",
             path_segment(execution_id),
             path_segment(update_id),
+        ))),
+        WorkflowCommand::Handlers { workflow_name } => Ok(ApiRequest::get(format!(
+            "/workflows/types/{}/handlers",
+            path_segment(workflow_name),
         ))),
     }
 }

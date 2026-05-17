@@ -53,6 +53,10 @@ name = "macros_query_update"
 required-features = ["testing"]
 
 [[test]]
+name = "macros_compile_fail"
+required-features = ["testing"]
+
+[[test]]
 name = "external_completion_tests"
 required-features = ["testing"]
 
@@ -92,6 +96,7 @@ proptest = "1.11.0"
 loom = "0.7.2"
 criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+trybuild = "1"
 
 [[bench]]
 name = "replay_bench"

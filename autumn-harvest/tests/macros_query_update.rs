@@ -4,6 +4,7 @@
 //!   cargo test -p autumn-harvest --test macros_query_update --features testing
 #![allow(clippy::unused_async, clippy::used_underscore_binding)]
 
+use autumn_harvest::context::{WorkflowContext, empty_shared_state};
 use autumn_harvest::prelude::*;
 
 // ── Helper types ──────────────────────────────────────────────────────────────
@@ -27,7 +28,7 @@ struct ApproveRequest {
 
 // Single-param query
 #[query(workflow = "my_workflow")]
-fn get_status(req: StatusRequest) -> Result<StatusResponse, String> {
+fn get_status(_ctx: &WorkflowContext, req: StatusRequest) -> Result<StatusResponse, String> {
     Ok(StatusResponse {
         status: if req.verbose {
             "RUNNING (verbose)".to_string()
@@ -39,13 +40,13 @@ fn get_status(req: StatusRequest) -> Result<StatusResponse, String> {
 
 // Zero-param query
 #[query(workflow = "my_workflow")]
-fn get_count() -> Result<u64, String> {
+fn get_count(_ctx: &WorkflowContext) -> Result<u64, String> {
     Ok(42)
 }
 
 // Multi-param query (two params)
 #[query(workflow = "my_workflow")]
-fn get_item(index: u32, prefix: String) -> Result<String, String> {
+fn get_item(_ctx: &WorkflowContext, index: u32, prefix: String) -> Result<String, String> {
     Ok(format!("{prefix}:{index}"))
 }
 
@@ -53,7 +54,7 @@ fn get_item(index: u32, prefix: String) -> Result<String, String> {
 
 // Update without validator
 #[update(workflow = "my_workflow")]
-async fn approve(req: ApproveRequest) -> Result<bool, String> {
+async fn approve(_ctx: &WorkflowContext, req: ApproveRequest) -> Result<bool, String> {
     Ok(req.approved)
 }
 
@@ -72,7 +73,10 @@ fn validate_approve(req: &serde_json::Value) -> Result<(), String> {
 
 // Update with validator
 #[update(workflow = "my_workflow", validator = validate_approve)]
-async fn approve_with_validator(req: ApproveRequest) -> Result<bool, String> {
+async fn approve_with_validator(
+    _ctx: &WorkflowContext,
+    req: ApproveRequest,
+) -> Result<bool, String> {
     Ok(req.approved)
 }
 
@@ -194,35 +198,40 @@ fn updates_macro_collects_correct_count_and_names() {
 #[test]
 fn query_handler_dispatches_single_param() {
     let info = __autumn_query_handler_info_get_status();
-    let result = (info.handler)(serde_json::json!({"verbose": false})).unwrap();
+    let ctx = WorkflowContext::new_test();
+    let result = (info.handler)(&ctx, serde_json::json!({"verbose": false})).unwrap();
     assert_eq!(result, serde_json::json!({"status": "RUNNING"}));
 }
 
 #[test]
 fn query_handler_dispatches_verbose_param() {
     let info = __autumn_query_handler_info_get_status();
-    let result = (info.handler)(serde_json::json!({"verbose": true})).unwrap();
+    let ctx = WorkflowContext::new_test();
+    let result = (info.handler)(&ctx, serde_json::json!({"verbose": true})).unwrap();
     assert_eq!(result, serde_json::json!({"status": "RUNNING (verbose)"}));
 }
 
 #[test]
 fn query_handler_dispatches_zero_params() {
     let info = __autumn_query_handler_info_get_count();
-    let result = (info.handler)(serde_json::Value::Null).unwrap();
+    let ctx = WorkflowContext::new_test();
+    let result = (info.handler)(&ctx, serde_json::Value::Null).unwrap();
     assert_eq!(result, serde_json::json!(42));
 }
 
 #[test]
 fn query_handler_dispatches_multi_param() {
     let info = __autumn_query_handler_info_get_item();
-    let result = (info.handler)(serde_json::json!([5, "item"])).unwrap();
+    let ctx = WorkflowContext::new_test();
+    let result = (info.handler)(&ctx, serde_json::json!([5, "item"])).unwrap();
     assert_eq!(result, serde_json::json!("item:5"));
 }
 
 #[tokio::test]
 async fn update_handler_dispatches_without_validator() {
     let info = __autumn_update_handler_info_approve();
-    let result = (info.handler)(serde_json::json!({"approved": true}))
+    let ctx = WorkflowContext::new_for_handler(empty_shared_state());
+    let result = (info.handler)(ctx, serde_json::json!({"approved": true}))
         .await
         .unwrap();
     assert_eq!(result, serde_json::json!(true));
@@ -238,7 +247,8 @@ async fn update_handler_with_validator_accept() {
         "valid input should pass"
     );
 
-    let result = (info.handler)(serde_json::json!({"approved": true}))
+    let ctx = WorkflowContext::new_for_handler(empty_shared_state());
+    let result = (info.handler)(ctx, serde_json::json!({"approved": true}))
         .await
         .unwrap();
     assert_eq!(result, serde_json::json!(true));
@@ -266,11 +276,8 @@ fn update_handler_with_validator_missing_field_reject() {
 fn query_handler_can_be_registered_on_context() {
     let info = __autumn_query_handler_info_get_status();
     let ctx = WorkflowContext::new_test();
-
-    // Register the declarative handler using the convenience method
     ctx.register_declarative_query_handler(&info);
 
-    // Verify it's accessible through the normal query dispatch path
     let result = ctx
         .execute_query_with_args("get_status", serde_json::json!({"verbose": false}))
         .unwrap();
@@ -281,10 +288,8 @@ fn query_handler_can_be_registered_on_context() {
 async fn update_handler_can_be_registered_on_context() {
     let info = __autumn_update_handler_info_approve();
     let ctx = WorkflowContext::new_test();
-
     ctx.register_declarative_update_handler(&info);
 
-    // Verify it's accessible through the normal update dispatch path
     let future = ctx
         .invoke_update("approve", serde_json::json!({"approved": true}))
         .unwrap();
@@ -292,13 +297,78 @@ async fn update_handler_can_be_registered_on_context() {
     assert_eq!(result, serde_json::json!(true));
 }
 
+// ── Tests: idempotent re-registration (replay safety) ────────────────────────
+
+#[tokio::test]
+async fn declarative_handlers_register_idempotently_on_multiple_replays() {
+    let query_info = __autumn_query_handler_info_get_count();
+    let update_info = __autumn_update_handler_info_approve();
+    let ctx = WorkflowContext::new_test();
+
+    // Simulate the executor calling registration on each replay cycle.
+    for _ in 0..3 {
+        ctx.register_declarative_query_handler(&query_info);
+        ctx.register_declarative_update_handler(&update_info);
+    }
+
+    let q = ctx.execute_query_with_args("get_count", serde_json::Value::Null).unwrap();
+    assert_eq!(q, serde_json::json!(42));
+
+    let u = ctx.invoke_update("approve", serde_json::json!({"approved": true})).unwrap().await.unwrap();
+    assert_eq!(u, serde_json::json!(true));
+}
+
+// ── Tests: ctx state access ───────────────────────────────────────────────────
+
+#[derive(Clone)]
+struct MyCounter {
+    count: u64,
+}
+
+#[query(workflow = "state_wf")]
+fn read_counter(ctx: &WorkflowContext) -> Result<u64, String> {
+    ctx.state::<MyCounter>()
+        .map(|s| s.count)
+        .ok_or_else(|| "no state".to_string())
+}
+
+#[test]
+fn query_ctx_can_access_shared_state() {
+    use std::any::TypeId;
+    use autumn_harvest::context::SharedStateMap;
+
+    let mut map = SharedStateMap::new();
+    map.insert(TypeId::of::<MyCounter>(), Box::new(MyCounter { count: 77 }));
+    let state = std::sync::Arc::new(map);
+
+    let info = __autumn_query_handler_info_read_counter();
+    let ctx = WorkflowContext::new_for_handler(state);
+    let result = (info.handler)(ctx.as_ref(), serde_json::Value::Null).unwrap();
+    assert_eq!(result, serde_json::json!(77));
+}
+
+// ── Tests: HarvestBuilder integration ────────────────────────────────────────
+
+#[test]
+fn builder_queries_and_updates_methods_store_handlers() {
+    use autumn_harvest::builder::HarvestBuilder;
+
+    let built = HarvestBuilder::new()
+        .queries(queries![get_status, get_count])
+        .updates(updates![approve])
+        .build();
+
+    assert_eq!(built.query_handlers().len(), 2);
+    assert_eq!(built.update_handlers().len(), 1);
+    assert_eq!(built.query_handlers_for("my_workflow").len(), 2);
+    assert_eq!(built.update_handlers_for("my_workflow").len(), 1);
+    assert_eq!(built.query_handlers_for("other_workflow").len(), 0);
+}
+
 // ── Tests: backward compatibility ────────────────────────────────────────────
 
 #[test]
 fn bare_query_macro_still_passes_through() {
-    // Bare #[query] (no workflow attribute) should still compile and work
-    // as a documentation marker (no companion fn generated).
-
     #[query]
     fn my_old_style_query(req: &StatusRequest) -> Result<StatusResponse, String> {
         Ok(StatusResponse {
@@ -306,7 +376,6 @@ fn bare_query_macro_still_passes_through() {
         })
     }
 
-    // The function should compile and be callable normally
     let resp = my_old_style_query(&StatusRequest { verbose: false }).unwrap();
     assert_eq!(resp.status, "normal");
 }

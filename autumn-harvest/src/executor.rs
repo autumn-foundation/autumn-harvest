@@ -18,7 +18,7 @@ use crate::context::{
     SharedState, WorkflowCommand, WorkflowContext, WorkflowHistoryPolicy, empty_shared_state,
 };
 use crate::event::WorkflowEvent;
-use crate::info::WorkflowHandlerFn;
+use crate::info::{QueryHandlerInfo, UpdateHandlerInfo, WorkflowHandlerFn};
 use crate::telemetry::{
     ATTR_EXECUTION_ID, ATTR_QUEUE, ATTR_REPLAY, ATTR_SHARD_ID, ATTR_WORKFLOW_ID,
 };
@@ -195,12 +195,15 @@ pub async fn run_workflow_with_state(
         state,
         WorkflowHistoryPolicy::default(),
         span_meta,
+        &[],
+        &[],
     )
     .await
 }
 
 /// Like [`run_workflow_with_state`] but installs explicit history guardrails
 /// into the [`WorkflowContext`].
+#[allow(clippy::too_many_arguments)]
 pub async fn run_workflow_with_state_and_history_policy(
     exec_id: ExecutionId,
     history: Vec<WorkflowEvent>,
@@ -209,6 +212,8 @@ pub async fn run_workflow_with_state_and_history_policy(
     state: SharedState,
     history_policy: WorkflowHistoryPolicy,
     span_meta: Option<&WorkflowExecuteSpanMeta>,
+    declarative_query_handlers: &[&QueryHandlerInfo],
+    declarative_update_handlers: &[&UpdateHandlerInfo],
 ) -> (WorkflowOutcome, Vec<WorkflowCommand>, tracing::Span) {
     let ctx = WorkflowContext::for_replay_with_state_and_history_policy(
         exec_id,
@@ -216,6 +221,16 @@ pub async fn run_workflow_with_state_and_history_policy(
         state,
         history_policy,
     );
+
+    // Auto-register declarative handlers before any workflow code runs.
+    // This satisfies the AC: "authors do not call ctx.register_*_handler in
+    // their workflow body; the runtime guarantees registration happens first."
+    for h in declarative_query_handlers {
+        ctx.register_declarative_query_handler(h);
+    }
+    for h in declarative_update_handlers {
+        ctx.register_declarative_update_handler(h);
+    }
 
     // ADR-0001 §2.1: emit harvest.workflow.execute for every executor cycle.
     // harvest.replay defaults to false at span creation so subscribers that only

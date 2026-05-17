@@ -3415,6 +3415,19 @@ async fn process_workflow_task(
                 .and_then(|c| c.link_traceparent.clone().or_else(|| c.traceparent.clone())),
         };
 
+        // Filter declarative handlers to those that target this workflow type.
+        let wf_name = prepared.execution.workflow_name.as_str();
+        let dq: Vec<&crate::info::QueryHandlerInfo> = registry
+            .query_handlers
+            .iter()
+            .filter(|h| h.workflow == wf_name)
+            .collect();
+        let du: Vec<&crate::info::UpdateHandlerInfo> = registry
+            .update_handlers
+            .iter()
+            .filter(|h| h.workflow == wf_name)
+            .collect();
+
         let (run_outcome, pending_cmds, execute_span) = run_workflow_with_state_and_history_policy(
             prepared.exec_id,
             history_events.clone(),
@@ -3423,6 +3436,8 @@ async fn process_workflow_task(
             registry.shared_state(),
             registry.history_policy(),
             Some(&span_meta),
+            &dq,
+            &du,
         )
         .await;
 

@@ -8,6 +8,11 @@
 //! - `workflow = "name"` (required) — the workflow this handler belongs to.
 //! - `validator = path::to::fn` (optional) — synchronous validator called before
 //!   the update is admitted to history.
+//!
+//! The annotated function must:
+//! - Be `async`
+//! - Take `ctx: &WorkflowContext` as its first argument
+//! - Return `Result<T, E>`
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
@@ -73,6 +78,15 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         .to_compile_error();
     }
 
+    // First parameter must be ctx: &WorkflowContext.
+    if !first_param_is_ctx(&func.sig.inputs) {
+        return syn::Error::new_spanned(
+            &func.sig,
+            "#[update] handlers must take `ctx: &WorkflowContext` as the first argument",
+        )
+        .to_compile_error();
+    }
+
     // Return type must be Result<T, E>.
     if !returns_result(&func.sig.output) {
         return syn::Error::new_spanned(
@@ -88,7 +102,8 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let fn_name_str = fn_name.to_string();
     let companion_name = format_ident!("__autumn_update_handler_info_{fn_name}");
 
-    let params: Vec<_> = func.sig.inputs.iter().collect();
+    // Skip the leading ctx param when building type hints and dispatch args.
+    let params: Vec<_> = func.sig.inputs.iter().skip(1).collect();
     let param_names: Vec<_> = params
         .iter()
         .filter_map(|arg| {
@@ -121,6 +136,7 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         #[doc(hidden)]
         pub fn #companion_name() -> ::autumn_harvest::UpdateHandlerInfo {
             fn __dispatch(
+                ctx: ::std::sync::Arc<::autumn_harvest::WorkflowContext>,
                 args: ::autumn_harvest::serde_json::Value,
             ) -> ::std::pin::Pin<::std::boxed::Box<
                 dyn ::std::future::Future<
@@ -148,6 +164,28 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+/// Returns `true` when the first parameter matches `ctx: &WorkflowContext`.
+fn first_param_is_ctx(
+    inputs: &syn::punctuated::Punctuated<syn::FnArg, syn::token::Comma>,
+) -> bool {
+    let Some(first) = inputs.first() else {
+        return false;
+    };
+    let syn::FnArg::Typed(pt) = first else {
+        return false;
+    };
+    let syn::Type::Reference(r) = &*pt.ty else {
+        return false;
+    };
+    let syn::Type::Path(tp) = &*r.elem else {
+        return false;
+    };
+    tp.path
+        .segments
+        .last()
+        .is_some_and(|s| s.ident == "WorkflowContext")
+}
+
 fn returns_result(output: &syn::ReturnType) -> bool {
     let syn::ReturnType::Type(_, ty) = output else {
         return false;
@@ -165,7 +203,7 @@ fn returns_result(output: &syn::ReturnType) -> bool {
 fn build_update_dispatch(fn_name: &syn::Ident, param_names: &[&syn::Ident]) -> TokenStream {
     if param_names.is_empty() {
         quote! {
-            let result = #fn_name().await;
+            let result = #fn_name(ctx.as_ref()).await;
             result.map_err(|e| e.to_string())
                 .and_then(|v| {
                     ::autumn_harvest::serde_json::to_value(v).map_err(|e| e.to_string())
@@ -176,7 +214,7 @@ fn build_update_dispatch(fn_name: &syn::Ident, param_names: &[&syn::Ident]) -> T
         quote! {
             let #name = ::autumn_harvest::serde_json::from_value(args)
                 .map_err(|e| e.to_string())?;
-            let result = #fn_name(#name).await;
+            let result = #fn_name(ctx.as_ref(), #name).await;
             result.map_err(|e| e.to_string())
                 .and_then(|v| {
                     ::autumn_harvest::serde_json::to_value(v).map_err(|e| e.to_string())
@@ -191,7 +229,7 @@ fn build_update_dispatch(fn_name: &syn::Ident, param_names: &[&syn::Ident]) -> T
                 let #names = ::autumn_harvest::serde_json::from_value(__args[#indices].clone())
                     .map_err(|e| e.to_string())?;
             )*
-            let result = #fn_name(#(#names),*).await;
+            let result = #fn_name(ctx.as_ref(), #(#names),*).await;
             result.map_err(|e| e.to_string())
                 .and_then(|v| {
                     ::autumn_harvest::serde_json::to_value(v).map_err(|e| e.to_string())
