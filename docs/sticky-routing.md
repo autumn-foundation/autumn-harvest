@@ -10,7 +10,9 @@ The `WorkflowCache` LRU was introduced in Phase 2 to store this snapshot in memo
 
 ## Solution
 
-Sticky routing adds a soft affinity lease: when a worker claims a task it records its own worker ID on the execution row. The claim query (`queue.rs`) prefers tasks whose `sticky_worker_id` matches the claiming worker via `ORDER BY` priority. Workers without a match still pick up tasks once higher-priority items are exhausted — stickiness is a hint, not a hard guarantee.
+Sticky routing adds a hard affinity lease: when a worker claims a task it records its own worker ID on the execution row. While `sticky_until > NOW()`, the claim query's WHERE clause restricts that task to the owning worker — other workers cannot see it at all. Once the lease expires (`sticky_until <= NOW()` or `sticky_until IS NULL`), the task becomes claimable by any eligible worker. Within the claimable set, tasks whose `sticky_worker_id` matches the claiming worker are ordered first via `ORDER BY ... DESC`, so a worker that holds the warm cache wins ties.
+
+Stickiness is therefore a **hard exclusion during the lease window, not a soft ordering hint**. Operators should size `lease_ttl` accordingly: a long TTL means pinned tasks are invisible to other workers for that duration if the owning worker is unavailable.
 
 On a cache hit the worker loads only the *delta* events appended since the last suspension (timer firings and signals) and prepends the cached snapshot, reducing the per-task Postgres read from `O(history_size)` to `O(new_events)`.
 
