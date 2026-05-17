@@ -23,7 +23,7 @@ use crate::execution::{
 };
 use crate::info::DagInfo;
 use crate::models::{HarvestSchedule, NewHarvestSchedule};
-use crate::policy::{Schedule, WorkflowSchedule};
+use crate::policy::{Schedule, WorkflowSchedule, compute_jitter_offset};
 use crate::schema::{harvest_schedules, harvest_workflow_executions};
 use crate::shard::{ShardRouter, ShardedDbPool};
 use crate::types::{ExecutionId, ShardId, WorkflowIdReusePolicy};
@@ -139,6 +139,8 @@ pub struct RegisteredDag {
     pub is_unified: bool,
     /// The compiled task and dependency definition.
     pub definition: crate::dag::DagDefinition,
+    /// Maximum spread window for schedule fires. `Duration::ZERO` disables jitter.
+    pub jitter: std::time::Duration,
 }
 
 impl RegisteredDag {
@@ -374,6 +376,7 @@ pub fn compile_dag_catalog(dags: Vec<DagInfo>) -> HarvestResult<DagCatalog> {
                 default_queue: dag.default_queue.map(ToOwned::to_owned),
                 is_unified: dag.workflow_handler.is_some(),
                 definition,
+                jitter: dag.jitter,
             },
         );
     }
@@ -797,6 +800,7 @@ async fn upsert_schedule(
                 dsl::dag_name.eq(Some(dag.name.as_str())),
                 dsl::updated_at.eq(now),
                 dsl::next_run_at.eq(next_run_at),
+                dsl::jitter_secs.eq(i64::try_from(dag.jitter.as_secs()).unwrap_or(i64::MAX)),
             ))
             .execute(conn)
             .await
@@ -820,6 +824,7 @@ async fn upsert_schedule(
             workflow_name: None,
             workflow_input: None,
             queue_name: None,
+            jitter_secs: i64::try_from(dag.jitter.as_secs()).unwrap_or(i64::MAX),
         };
         diesel::insert_into(harvest_schedules::table)
             .values(&row)
@@ -915,6 +920,7 @@ async fn insert_dag_workflow_schedule_if_missing(
         workflow_name: Some(&ws.workflow_name),
         workflow_input: Some(ws.input.clone()),
         queue_name: Some(ws.queue_name.as_str()),
+        jitter_secs: i64::try_from(ws.jitter.as_secs()).unwrap_or(i64::MAX),
     };
     diesel::insert_into(harvest_schedules::table)
         .values(&row)
@@ -952,6 +958,7 @@ async fn insert_workflow_schedule_if_missing(
         workflow_name: Some(&ws.workflow_name),
         workflow_input: Some(ws.input.clone()),
         queue_name: Some(ws.queue_name.as_str()),
+        jitter_secs: i64::try_from(ws.jitter.as_secs()).unwrap_or(i64::MAX),
     };
     diesel::insert_into(harvest_schedules::table)
         .values(&row)
@@ -1027,6 +1034,7 @@ async fn upsert_workflow_schedule(
             dsl::queue_name.eq(Some(ws.queue_name.as_str())),
             dsl::updated_at.eq(now),
             dsl::next_run_at.eq(next_run_at),
+            dsl::jitter_secs.eq(i64::try_from(ws.jitter.as_secs()).unwrap_or(i64::MAX)),
         ))
         .execute(conn)
         .await
@@ -1267,10 +1275,12 @@ async fn tick_one_workflow_schedule(
     let (run_dates, next_run_after_plan) =
         due_run_plan(parsed_schedule, logical_date, now, catchup);
     let dispatch_queue = schedule.queue_name.as_deref().unwrap_or("default");
+    let jitter_window =
+        std::time::Duration::from_secs(u64::try_from(schedule.jitter_secs.max(0)).unwrap_or(0));
 
     let mut dispatched: u32 = 0;
     let mut last_dispatched_at: Option<DateTime<Utc>> = None;
-    // Set to the first slot we could not dispatch due to max_active_runs; if Some,
+    // Set to the first slot we could not dispatch due to max_active_runs or jitter; if Some,
     // it becomes next_run_at so catchup slots are not silently dropped.
     let mut deferred_next_run_at: Option<DateTime<Utc>> = None;
     for scheduled_for in &run_dates {
@@ -1280,6 +1290,21 @@ async fn tick_one_workflow_schedule(
                 workflow_name = %wf_name,
                 max_active_runs = schedule.max_active_runs,
                 "harvest workflow schedule: max_active_runs reached during catchup; deferring remaining"
+            );
+            break;
+        }
+        // Jitter: stall dispatch until the effective fire time has elapsed.
+        // effective_fire_time = scheduled_for + hash(schedule_id, scheduled_for) % jitter_window
+        let jitter_offset = compute_jitter_offset(schedule.id, *scheduled_for, jitter_window);
+        let effective_fire_time = *scheduled_for
+            + chrono::Duration::from_std(jitter_offset).unwrap_or_default();
+        if now < effective_fire_time {
+            deferred_next_run_at = Some(*scheduled_for);
+            tracing::debug!(
+                workflow_name = %wf_name,
+                logical_date = %scheduled_for,
+                effective_fire_time = %effective_fire_time,
+                "harvest: schedule jitter pending; deferring dispatch"
             );
             break;
         }
@@ -1443,6 +1468,8 @@ mod tests {
             default_queue: Some("default"),
             builder: build,
             workflow_handler: None,
+
+            jitter: ::std::time::Duration::ZERO,
         }
     }
 

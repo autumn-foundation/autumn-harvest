@@ -54,7 +54,7 @@ use autumn_harvest::models::{
     AuditRecord, BackfillLogRow, DeadLetter, HarvestSchedule, NewAuditRecord, NewBackfillLogRow,
     WorkflowExecution,
 };
-use autumn_harvest::policy::{Schedule, WorkflowSchedule};
+use autumn_harvest::policy::{Schedule, WorkflowSchedule, compute_jitter_offset};
 use autumn_harvest::queue::{self, ConcurrencyKeyStats};
 use autumn_harvest::reset::{
     ResetInvalidPoint, ResetResult, WorkflowResetError, WorkflowResetRequest,
@@ -1010,6 +1010,11 @@ struct ScheduleEntry {
     max_active_runs: i32,
     catchup: bool,
     last_backfill: Option<BackfillSummary>,
+    /// Maximum jitter window in seconds. 0 means no jitter.
+    jitter_secs: i64,
+    /// Effective next fire time = next_run_at + deterministic jitter offset.
+    /// `None` when next_run_at is `None` or jitter is zero.
+    effective_fire_time: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Optional request body for `POST /admin/schedules/{id}/pause` and `…/resume`.
@@ -4488,6 +4493,22 @@ async fn patch_dag(
     }
 }
 
+fn effective_fire_time(
+    schedule_id: uuid::Uuid,
+    next_run_at: Option<chrono::DateTime<chrono::Utc>>,
+    jitter_secs: i64,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    let t = next_run_at?;
+    if jitter_secs <= 0 {
+        return None;
+    }
+    let jitter_window = std::time::Duration::from_secs(jitter_secs as u64);
+    let offset = compute_jitter_offset(schedule_id, t, jitter_window);
+    chrono::Duration::from_std(offset)
+        .ok()
+        .map(|d| t + d)
+}
+
 async fn list_schedules(
     Extension(api_state): Extension<HarvestApiState>,
 ) -> Result<Json<Vec<ScheduleEntry>>, AutumnError> {
@@ -4512,6 +4533,7 @@ async fn list_schedules(
                 .get(&s.id)
                 .cloned()
                 .map(BackfillSummary::from);
+            let eft = effective_fire_time(s.id, s.next_run_at, s.jitter_secs);
             ScheduleEntry {
                 id: s.id,
                 kind,
@@ -4526,6 +4548,8 @@ async fn list_schedules(
                 max_active_runs: s.max_active_runs,
                 catchup: s.catchup,
                 last_backfill,
+                jitter_secs: s.jitter_secs,
+                effective_fire_time: eft,
             }
         })
         .collect();
@@ -4574,6 +4598,8 @@ async fn get_schedule(
         .map(BackfillSummary::from);
 
     Ok(Json(ScheduleEntry {
+        effective_fire_time: effective_fire_time(s.id, s.next_run_at, s.jitter_secs),
+        jitter_secs: s.jitter_secs,
         id: s.id,
         kind,
         name,
@@ -4730,6 +4756,8 @@ async fn upsert_workflow_schedule_and_read_back(
         .map_err(database_error)
         .map_err(map_error)?;
     Ok(ScheduleEntry {
+        effective_fire_time: effective_fire_time(row.id, row.next_run_at, row.jitter_secs),
+        jitter_secs: row.jitter_secs,
         id: row.id,
         kind: ScheduleKind::Workflow,
         name: ws.workflow_name.clone(),
@@ -4804,6 +4832,7 @@ async fn create_workflow_schedule(
         max_active_runs: request.max_active_runs,
         paused: request.paused,
         queue_name: request.queue_name.clone(),
+        jitter: std::time::Duration::ZERO,
     };
     let entry = match upsert_workflow_schedule_and_read_back(&mut conn, &ws).await {
         Ok(e) => e,

@@ -95,6 +95,9 @@ pub struct DagInfo {
     /// on so the runtime can route new DAG runs through `WorkflowInfo`
     /// without needing to look up the companion by name.
     pub workflow_handler: Option<WorkflowHandlerFn>,
+    /// Maximum spread window for staggering schedule fires. `Duration::ZERO`
+    /// disables jitter (default — today's behaviour).
+    pub jitter: Duration,
 }
 
 impl DagInfo {
@@ -130,6 +133,7 @@ impl DagInfo {
             max_active_runs: self.max_active_runs,
             paused: false,
             queue_name: self.default_queue.unwrap_or("default").to_string(),
+            jitter: self.jitter,
         })
     }
 
@@ -187,6 +191,7 @@ impl std::fmt::Debug for DagInfo {
             .field("default_queue", &self.default_queue)
             .field("builder", &"<fn>")
             .field("workflow_handler", &self.workflow_handler.map(|_| "<fn>"))
+            .field("jitter", &self.jitter)
             .finish()
     }
 }
@@ -296,6 +301,8 @@ mod tests {
             default_queue: Some("etl-workers"),
             builder: build,
             workflow_handler: None,
+
+            jitter: ::std::time::Duration::ZERO,
         };
 
         let definition = info.build_definition().expect("dag should compile");
@@ -346,6 +353,8 @@ mod tests {
             default_queue: None,
             builder: |_| {},
             workflow_handler: None,
+
+            jitter: ::std::time::Duration::ZERO,
         };
         let debug_str = format!("{dag_info:?}");
         assert!(debug_str.contains("DagInfo"));

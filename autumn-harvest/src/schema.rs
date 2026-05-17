@@ -106,6 +106,7 @@ diesel::table! {
         paused_at -> Nullable<Timestamptz>,
         paused_by -> Nullable<Text>,
         pause_reason -> Nullable<Text>,
+        jitter_secs -> Int8,
     }
 }
 

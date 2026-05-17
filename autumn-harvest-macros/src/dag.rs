@@ -248,6 +248,7 @@ pub fn dag_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     #fn_name(dag);
                 },
                 #workflow_handler_field
+                jitter: ::std::time::Duration::ZERO,
             }
         }
 

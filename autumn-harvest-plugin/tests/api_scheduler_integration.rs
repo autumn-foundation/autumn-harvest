@@ -550,6 +550,8 @@ fn manual_pipeline_info_named(name: &'static str) -> DagInfo {
         default_queue: Some("default"),
         builder: build_manual_pipeline_dag,
         workflow_handler: None,
+
+        jitter: ::std::time::Duration::ZERO,
     }
 }
 
@@ -1688,6 +1690,8 @@ fn manual_pipeline_info() -> DagInfo {
         default_queue: Some("default"),
         builder: build_manual_pipeline_dag,
         workflow_handler: Some(manual_pipeline_workflow),
+
+        jitter: ::std::time::Duration::ZERO,
     }
 }
 
@@ -1701,6 +1705,8 @@ fn interval_pipeline_info() -> DagInfo {
         default_queue: Some("default"),
         builder: build_interval_pipeline_dag,
         workflow_handler: Some(interval_pipeline_workflow),
+
+        jitter: ::std::time::Duration::ZERO,
     }
 }
 
@@ -1714,6 +1720,8 @@ fn classic_interval_pipeline_info() -> DagInfo {
         default_queue: Some("default"),
         builder: build_interval_pipeline_dag,
         workflow_handler: None,
+
+        jitter: ::std::time::Duration::ZERO,
     }
 }
 
@@ -1735,6 +1743,8 @@ fn unified_manual_dag_info_named(name: &'static str, default_queue: &'static str
         default_queue: Some(default_queue),
         builder: build_interval_pipeline_dag,
         workflow_handler: Some(approval_workflow),
+
+        jitter: ::std::time::Duration::ZERO,
     }
 }
 
@@ -1748,6 +1758,8 @@ fn manual_interval_pipeline_info() -> DagInfo {
         default_queue: Some("default"),
         builder: build_interval_pipeline_dag,
         workflow_handler: None,
+
+        jitter: ::std::time::Duration::ZERO,
     }
 }
 
@@ -3645,6 +3657,8 @@ async fn harvest_api_defers_manual_dag_trigger_when_schedule_is_paused() {
             default_queue: Some("dag-workers"),
             builder: build_interval_pipeline_dag,
             workflow_handler: Some(approval_workflow),
+
+            jitter: ::std::time::Duration::ZERO,
         }])
         .expect("manual unified DAG should compile"),
     );
@@ -3929,6 +3943,8 @@ async fn harvest_api_rejects_non_dry_run_backfill_for_paused_dag_schedule() {
         default_queue: Some("dag-workers"),
         builder: build_interval_pipeline_dag,
         workflow_handler: Some(approval_workflow),
+
+        jitter: ::std::time::Duration::ZERO,
     };
     let workflow_schedule = dag_info
         .as_workflow_schedule()
@@ -4012,6 +4028,8 @@ async fn harvest_api_backfills_legacy_dag_schedule_null_queue_on_dag_default_que
         default_queue: Some("dag-workers"),
         builder: build_interval_pipeline_dag,
         workflow_handler: Some(approval_workflow),
+
+        jitter: ::std::time::Duration::ZERO,
     };
     let dag_catalog = Arc::new(
         compile_dag_catalog(vec![dag_info]).expect("scheduled unified DAG should compile"),
@@ -4092,6 +4110,8 @@ async fn harvest_api_backfill_matches_fractional_legacy_dag_workflow_id() {
         default_queue: Some("dag-workers"),
         builder: build_interval_pipeline_dag,
         workflow_handler: Some(approval_workflow),
+
+        jitter: ::std::time::Duration::ZERO,
     };
     let dag_catalog = Arc::new(
         compile_dag_catalog(vec![dag_info]).expect("scheduled unified DAG should compile"),
@@ -4655,6 +4675,8 @@ async fn ensure_dag_schedule_reuses_paused_legacy_workflow_only_dag_row() {
             default_queue: Some("dag-workers"),
             builder: build_interval_pipeline_dag,
             workflow_handler: Some(approval_workflow),
+
+            jitter: ::std::time::Duration::ZERO,
         }])
         .expect("unified DAG should compile"),
     );
@@ -4713,6 +4735,8 @@ async fn register_workflow_schedules_reuses_existing_dag_schedule_row_on_upgrade
         default_queue: Some("default"),
         builder: build_interval_pipeline_dag,
         workflow_handler: None,
+
+        jitter: ::std::time::Duration::ZERO,
     }])
     .expect("classic scheduled DAG should compile");
     register_test_schedules(
@@ -4774,6 +4798,8 @@ async fn register_workflow_schedules_merges_split_legacy_dag_rows_before_upgrade
         default_queue: Some("classic-queue"),
         builder: build_interval_pipeline_dag,
         workflow_handler: None,
+
+        jitter: ::std::time::Duration::ZERO,
     }])
     .expect("classic scheduled DAG should compile");
     register_test_schedules(
@@ -4853,6 +4879,8 @@ async fn register_workflow_schedules_preserves_pause_metadata_when_merging_split
         default_queue: Some("classic-queue"),
         builder: build_interval_pipeline_dag,
         workflow_handler: None,
+
+        jitter: ::std::time::Duration::ZERO,
     }])
     .expect("classic scheduled DAG should compile");
     register_test_schedules(
@@ -4933,6 +4961,8 @@ async fn scheduler_tick_dispatches_scheduled_unified_dag_on_dag_shard() {
             default_queue: Some("dag-workers"),
             builder: build_interval_pipeline_dag,
             workflow_handler: Some(approval_workflow),
+
+            jitter: ::std::time::Duration::ZERO,
         }])
         .expect("scheduled unified dag should compile"),
     );
@@ -5031,6 +5061,8 @@ async fn scheduler_tick_removes_stale_unified_dag_schedule_from_old_shard() {
             default_queue: Some("dag-workers"),
             builder: build_interval_pipeline_dag,
             workflow_handler: Some(approval_workflow),
+
+            jitter: ::std::time::Duration::ZERO,
         }])
         .expect("scheduled unified dag should compile"),
     );
@@ -5115,6 +5147,8 @@ async fn scheduler_tick_removes_legacy_workflow_only_dag_schedule_from_old_shard
             default_queue: Some("dag-workers"),
             builder: build_interval_pipeline_dag,
             workflow_handler: Some(approval_workflow),
+
+            jitter: ::std::time::Duration::ZERO,
         }])
         .expect("scheduled unified dag should compile"),
     );
@@ -5207,6 +5241,8 @@ async fn scheduler_tick_removes_stale_classic_dag_schedule_from_old_shard() {
             default_queue: Some("dag-workers"),
             builder: build_interval_pipeline_dag,
             workflow_handler: Some(approval_workflow),
+
+            jitter: ::std::time::Duration::ZERO,
         }])
         .expect("scheduled unified dag should compile"),
     );
@@ -5237,6 +5273,8 @@ async fn scheduler_tick_removes_stale_classic_dag_schedule_from_old_shard() {
             default_queue: Some("classic-workers"),
             builder: build_interval_pipeline_dag,
             workflow_handler: None,
+
+            jitter: ::std::time::Duration::ZERO,
         }])
         .expect("classic DAG schedule should compile");
         let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&shard0_url)
