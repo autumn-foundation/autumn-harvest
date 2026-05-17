@@ -5479,8 +5479,20 @@ async fn overlap_policy_skip_explicitly_drops_new_firings() {
         Arc::clone(&workflow_schedules),
     );
 
-    // 3+ ticks: T=0 dispatches exec#1 (stays RUNNING), T=2 + T=4 both skip.
-    tokio::time::sleep(Duration::from_secs(7)).await;
+    // Poll until exec#1 is dispatched (up to 12 s to tolerate Docker startup latency and
+    // cron-boundary alignment jitter).  Once the first dispatch lands the state is stable:
+    // subsequent ticks all hit the Skip branch and neither add executions nor buffer slots.
+    tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            let r = count_running_executions(&database_url, wf_name).await;
+            if r >= 1 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    })
+    .await
+    .expect("Skip: timed out waiting for first dispatch within 12 s");
 
     let running = count_running_executions(&database_url, wf_name).await;
     assert_eq!(running, 1, "Skip: must keep exactly 1 RUNNING execution");
@@ -5526,8 +5538,20 @@ async fn overlap_policy_buffer_one_queues_single_slot() {
         Arc::clone(&workflow_schedules),
     );
 
-    // 4+ ticks: T=0 dispatches exec#1, T=2 buffers 1 slot, T=4+ see slot full → drop.
-    tokio::time::sleep(Duration::from_secs(9)).await;
+    // Poll until the buffer holds exactly 1 slot (up to 12 s).  Two ticks are needed:
+    // tick 1 dispatches exec#1, tick 2 buffers the first slot.  Once buffered == 1 the
+    // state is stable: exec#1 stays RUNNING (no worker), so subsequent ticks all drop.
+    tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            let b = query_buffered_runs_count(&database_url, wf_name).await;
+            if b >= 1 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    })
+    .await
+    .expect("BufferOne: timed out waiting for 1 buffered slot within 12 s");
 
     let running = count_running_executions(&database_url, wf_name).await;
     assert_eq!(
@@ -5583,8 +5607,20 @@ async fn overlap_policy_buffer_all_queues_multiple_slots() {
         Arc::clone(&workflow_schedules),
     );
 
-    // 6+ ticks: T=0 dispatches exec#1, T=2/T=4/T=6 buffer (filling 3 slots), T=8+ drop.
-    tokio::time::sleep(Duration::from_secs(15)).await;
+    // Poll until the buffer reaches its cap of 3 slots (up to 20 s).  Four ticks are needed:
+    // tick 1 dispatches exec#1, ticks 2–4 each buffer one slot.  Once buffered == 3 (cap),
+    // subsequent ticks drop — the state is stable because exec#1 stays RUNNING (no worker).
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let b = query_buffered_runs_count(&database_url, wf_name).await;
+            if b >= 3 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    })
+    .await
+    .expect("BufferAll: timed out waiting for 3 buffered slots within 20 s");
 
     let running = count_running_executions(&database_url, wf_name).await;
     assert_eq!(
