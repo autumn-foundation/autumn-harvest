@@ -208,6 +208,12 @@ pub struct HarvestSchedule {
     pub pause_reason: Option<String>,
     /// Maximum jitter window in seconds. 0 = no jitter (default).
     pub jitter_secs: i64,
+    /// Overlap policy variant stored as a `snake_case` string (issue #241).
+    pub overlap_policy: String,
+    /// Durable buffered fire times for `BufferOne`/`BufferAll` (issue #241).
+    pub buffered_runs: serde_json::Value,
+    /// Maximum buffered slots under `BufferAll` (issue #241). Default 100.
+    pub buffer_all_max: i32,
 }
 
 /// Insert struct for registering a new schedule (DAG or workflow).
@@ -229,6 +235,12 @@ pub struct NewHarvestSchedule<'a> {
     pub queue_name: Option<&'a str>,
     /// Maximum jitter window in seconds. 0 = no jitter.
     pub jitter_secs: i64,
+    /// Overlap policy for this schedule (issue #241).
+    pub overlap_policy: &'a str,
+    /// Durable buffered fire times JSON array (issue #241).
+    pub buffered_runs: serde_json::Value,
+    /// Maximum buffered slots under `BufferAll` (issue #241).
+    pub buffer_all_max: i32,
 }
 
 // ── Signal ────────────────────────────────────────────────────────────────────

@@ -98,6 +98,11 @@ pub struct DagInfo {
     /// Maximum spread window for staggering schedule fires. `Duration::ZERO`
     /// disables jitter (default — today's behaviour).
     pub jitter: Duration,
+    /// What to do when a new firing collides with a still-running execution.
+    /// Defaults to [`OverlapPolicy::Skip`].
+    pub overlap_policy: crate::policy::OverlapPolicy,
+    /// Maximum buffered slots under [`OverlapPolicy::BufferAll`]. Default 100.
+    pub buffer_all_max: u32,
 }
 
 impl DagInfo {
@@ -134,6 +139,8 @@ impl DagInfo {
             paused: false,
             queue_name: self.default_queue.unwrap_or("default").to_string(),
             jitter: self.jitter,
+            overlap_policy: self.overlap_policy,
+            buffer_all_max: self.buffer_all_max,
         })
     }
 
@@ -192,6 +199,8 @@ impl std::fmt::Debug for DagInfo {
             .field("builder", &"<fn>")
             .field("workflow_handler", &self.workflow_handler.map(|_| "<fn>"))
             .field("jitter", &self.jitter)
+            .field("overlap_policy", &self.overlap_policy)
+            .field("buffer_all_max", &self.buffer_all_max)
             .finish()
     }
 }
@@ -301,8 +310,9 @@ mod tests {
             default_queue: Some("etl-workers"),
             builder: build,
             workflow_handler: None,
-
             jitter: ::std::time::Duration::ZERO,
+            overlap_policy: crate::policy::OverlapPolicy::Skip,
+            buffer_all_max: 100,
         };
 
         let definition = info.build_definition().expect("dag should compile");
@@ -353,8 +363,9 @@ mod tests {
             default_queue: None,
             builder: |_| {},
             workflow_handler: None,
-
             jitter: ::std::time::Duration::ZERO,
+            overlap_policy: crate::policy::OverlapPolicy::Skip,
+            buffer_all_max: 100,
         };
         let debug_str = format!("{dag_info:?}");
         assert!(debug_str.contains("DagInfo"));

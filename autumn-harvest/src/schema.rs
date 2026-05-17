@@ -107,6 +107,12 @@ diesel::table! {
         paused_by -> Nullable<Text>,
         pause_reason -> Nullable<Text>,
         jitter_secs -> Int8,
+        /// Overlap policy variant for this schedule (issue #241).
+        overlap_policy -> Text,
+        /// Durable buffered fire times for `BufferOne`/`BufferAll` (issue #241).
+        buffered_runs -> Jsonb,
+        /// Maximum buffered slots under `BufferAll` (issue #241).
+        buffer_all_max -> Int4,
     }
 }
 

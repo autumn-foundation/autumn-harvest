@@ -552,8 +552,9 @@ fn manual_pipeline_info_named(name: &'static str) -> DagInfo {
         default_queue: Some("default"),
         builder: build_manual_pipeline_dag,
         workflow_handler: None,
-
         jitter: ::std::time::Duration::ZERO,
+        overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+        buffer_all_max: 100,
     }
 }
 
@@ -1692,8 +1693,9 @@ fn manual_pipeline_info() -> DagInfo {
         default_queue: Some("default"),
         builder: build_manual_pipeline_dag,
         workflow_handler: Some(manual_pipeline_workflow),
-
         jitter: ::std::time::Duration::ZERO,
+        overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+        buffer_all_max: 100,
     }
 }
 
@@ -1707,8 +1709,9 @@ fn interval_pipeline_info() -> DagInfo {
         default_queue: Some("default"),
         builder: build_interval_pipeline_dag,
         workflow_handler: Some(interval_pipeline_workflow),
-
         jitter: ::std::time::Duration::ZERO,
+        overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+        buffer_all_max: 100,
     }
 }
 
@@ -1722,8 +1725,9 @@ fn classic_interval_pipeline_info() -> DagInfo {
         default_queue: Some("default"),
         builder: build_interval_pipeline_dag,
         workflow_handler: None,
-
         jitter: ::std::time::Duration::ZERO,
+        overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+        buffer_all_max: 100,
     }
 }
 

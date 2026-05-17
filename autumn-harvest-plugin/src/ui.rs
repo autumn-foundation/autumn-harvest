@@ -3238,6 +3238,9 @@ mod tests {
             paused_by: None,
             pause_reason: None,
             jitter_secs: 0,
+            overlap_policy: "skip".to_string(),
+            buffered_runs: serde_json::json!([]),
+            buffer_all_max: 100,
         }
     }
 
