@@ -2033,11 +2033,14 @@ async fn detail_page_events_paginated_for_large_history() {
     let (status, html) = fetch_html(&app, &format!("/workflows/{exec_id}")).await;
     assert_eq!(status, StatusCode::OK, "detail page should render: {html}");
 
-    // The page must not render all 150 signals at once.
-    let signal_count = html.matches("signal_").count();
+    // The first page shows events 0–99; signal_149 is on page 1 and must not appear.
     assert!(
-        signal_count < 150,
-        "all 150 events should not appear on one page, got {signal_count}: {html}"
+        !html.contains("signal_149"),
+        "signal_149 is on page 1 (event 150 of 150) and should not render on page 0: {html}"
+    );
+    assert!(
+        !html.contains("signal_100"),
+        "signal_100 is on page 1 (event 101 of 150) and should not render on page 0: {html}"
     );
 
     // Pagination controls must be visible.
