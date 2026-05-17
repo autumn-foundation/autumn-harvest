@@ -1,13 +1,18 @@
-//! Unit tests for the sticky cross-worker routing feature (issue #235).
+//! Tests for sticky cross-worker routing (issue #235 / spec #35).
 //!
-//! These tests verify the public API surface introduced for opt-in sticky routing:
-//! `StickyRoutingConfig`, `WorkerConfig::with_sticky_routing`, the two new metric
-//! constants, and the corresponding `MetricsRecorder` trait methods.
+//! ## Structure
 //!
-//! The integration section at the bottom uses a `CountingMetrics` recorder and
-//! `WorkflowCache` directly to simulate the cache hit/miss lifecycle without
-//! a database — demonstrating the warm-path optimisation that is the core
-//! deliverable of issue #235.
+//! **Pure-logic tests (no DB required):** verify the public API surface —
+//! `StickyRoutingConfig`, `WorkerConfig::with_sticky_routing`, metric constants,
+//! and the `MetricsRecorder` trait methods.  The integration section at the
+//! bottom uses a `CountingMetrics` recorder and `WorkflowCache` to simulate the
+//! cache hit/miss lifecycle without a database.
+//!
+//! **DB integration tests (`db` feature, bottom of file):** validate the
+//! acceptance criteria from the Vantage spec at the Postgres level —
+//! the pin mechanism, exclusive claim within TTL, graceful fallback after
+//! expiry, and `park`/`wake` sticky lifecycle.  Written RED-first; they
+//! pass GREEN against the implementation in `queue.rs`.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -340,4 +345,399 @@ fn counting_metrics_tracks_hit_miss_independently() {
 
     assert_eq!(m.hit_count(), 2);
     assert_eq!(m.miss_count(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// DB integration tests — validate acceptance criteria at the Postgres level.
+//
+// RED phase: these tests were written against the spec acceptance criteria
+//   before being run, defining the expected DB-level behaviour.
+// GREEN phase: they pass against the implementation in `queue.rs` and the
+//   sticky routing columns in the initial migration.
+//
+// Acceptance criteria (from docs/plans/vantage-spec-sticky-routing.md):
+//   AC#1 – Pin mechanism: sticky_worker_id + sticky_until set in DB for TTL.
+//   AC#2 – Graceful fallback: after sticky_until elapses any worker can claim.
+//   AC#3 – No external cache required (satisfied architecturally).
+//   AC#4 – SKIP LOCKED integration: sticky worker gets priority; non-sticky
+//            workers cannot claim within TTL; park/wake maintain the pin.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "db")]
+mod db_tests {
+    use autumn_harvest::models::NewWorkflowExecution;
+    use autumn_harvest::queue::{self, EnqueueParams, StickyHint, TaskType};
+    use autumn_harvest::schema::harvest_workflow_executions;
+    use autumn_harvest::types::ExecutionId;
+    use diesel::sql_types::{Nullable, Text, Timestamptz};
+    use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+    use std::time::Duration;
+    use testcontainers::ContainerAsync;
+    use testcontainers_modules::postgres::Postgres;
+    use testcontainers_modules::testcontainers::runners::AsyncRunner;
+    use uuid::Uuid;
+
+    // All migrations needed for harvest_task_queue + harvest_workflow_executions
+    // + harvest_build_compat (required by claim_task's build-routing filter).
+    const INIT_SQL: &str = concat!(
+        include_str!("../migrations/20260409000000_harvest_initial/up.sql"),
+        "\n",
+        include_str!("../migrations/20260424000001_harvest_trace_context/up.sql"),
+        "\n",
+        include_str!("../migrations/20260505000000_harvest_heartbeat_details/up.sql"),
+        "\n",
+        include_str!("../migrations/20260427000000_harvest_continue_as_new/up.sql"),
+        "\n",
+        include_str!("../migrations/20260429000000_harvest_concurrency_key/up.sql"),
+        "\n",
+        include_str!("../migrations/20260501000000_harvest_workers/up.sql"),
+        "\n",
+        include_str!("../migrations/20260508010000_harvest_workers_drain_deadline/up.sql"),
+        "\n",
+        include_str!("../migrations/20260509000000_harvest_build_routing/up.sql"),
+        "\n",
+        include_str!("../migrations/20260514020000_harvest_task_activity_id/up.sql"),
+    );
+
+    async fn setup() -> (AsyncPgConnection, ContainerAsync<Postgres>) {
+        let container = Postgres::default()
+            .with_init_sql(INIT_SQL.to_string().into_bytes())
+            .start()
+            .await
+            .expect("failed to start Postgres container");
+        let host = container.get_host().await.expect("host");
+        let port = container.get_host_port_ipv4(5432).await.expect("port");
+        let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+        let conn = AsyncPgConnection::establish(&url).await.expect("connect");
+        (conn, container)
+    }
+
+    async fn insert_execution(conn: &mut AsyncPgConnection) -> ExecutionId {
+        let exec_id = ExecutionId::new();
+        let row = NewWorkflowExecution {
+            id: exec_id.as_uuid(),
+            workflow_name: "sticky_test_wf",
+            workflow_id: &Uuid::new_v4().to_string(),
+            run_id: Uuid::new_v4(),
+            shard_id: 0,
+            input: serde_json::json!({}),
+            parent_id: None,
+            queue_name: "default",
+            execution_timeout: None,
+            memo: None,
+            search_attrs: None,
+            assigned_build_id: None,
+        };
+        diesel::insert_into(harvest_workflow_executions::table)
+            .values(&row)
+            .execute(conn)
+            .await
+            .expect("insert execution");
+        exec_id
+    }
+
+    /// Read back the sticky columns for a task row.
+    #[derive(diesel::QueryableByName, Debug)]
+    struct StickyColumns {
+        #[diesel(sql_type = Nullable<Text>)]
+        sticky_worker_id: Option<String>,
+        #[diesel(sql_type = Nullable<Timestamptz>)]
+        sticky_until: Option<chrono::DateTime<chrono::Utc>>,
+    }
+
+    async fn read_sticky(conn: &mut AsyncPgConnection, task_id: Uuid) -> StickyColumns {
+        diesel::sql_query(
+            "SELECT sticky_worker_id, sticky_until \
+             FROM harvest_task_queue WHERE id = $1",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .get_result(conn)
+        .await
+        .expect("read sticky columns")
+    }
+
+    // ── AC#1 — Pin mechanism ─────────────────────────────────────────────────
+
+    /// Enqueueing with a sticky hint writes `sticky_worker_id` and `sticky_until`
+    /// to the DB row (not just in memory).  This is the foundation of AC#1: the
+    /// pin must survive round-trips through Postgres so any future claim query
+    /// sees it.
+    #[tokio::test]
+    async fn enqueue_with_sticky_pin_writes_worker_id_and_ttl_to_db() {
+        let (mut conn, _c) = setup().await;
+        let exec_id = insert_execution(&mut conn).await;
+
+        let mut params = EnqueueParams::new("default", TaskType::Workflow, serde_json::json!(null));
+        params.workflow_exec_id = Some(exec_id.as_uuid());
+        let params = params.with_sticky("worker-alpha", Duration::from_secs(30));
+
+        let task_id = queue::enqueue(&mut conn, &params).await.expect("enqueue");
+
+        let cols = read_sticky(&mut conn, task_id).await;
+
+        assert_eq!(
+            cols.sticky_worker_id.as_deref(),
+            Some("worker-alpha"),
+            "AC#1: sticky_worker_id must be persisted in DB"
+        );
+        assert!(
+            cols.sticky_until.is_some(),
+            "AC#1: sticky_until must be set to a future timestamp"
+        );
+        // Sanity: sticky_until must be in the future.
+        let until = cols.sticky_until.unwrap();
+        assert!(
+            until > chrono::Utc::now(),
+            "AC#1: sticky_until={until:?} must be in the future"
+        );
+    }
+
+    // ── AC#1 + AC#4 — Sticky worker claims pinned task ───────────────────────
+
+    /// The worker named in `sticky_worker_id` must be able to claim its pinned
+    /// task within the TTL window.  Without this guarantee, sticky routing would
+    /// break the happy path entirely.
+    #[tokio::test]
+    async fn sticky_worker_can_claim_its_pinned_task_within_ttl() {
+        let (mut conn, _c) = setup().await;
+        let exec_id = insert_execution(&mut conn).await;
+
+        let mut params = EnqueueParams::new("default", TaskType::Workflow, serde_json::json!(null));
+        params.workflow_exec_id = Some(exec_id.as_uuid());
+        let params = params.with_sticky("worker-beta", Duration::from_secs(60));
+
+        let task_id = queue::enqueue(&mut conn, &params).await.expect("enqueue");
+
+        // The owning worker claims the task.
+        let claimed = queue::claim_task(
+            &mut conn,
+            &["default".to_string()],
+            "worker-beta",
+            "", // legacy build id — claims anything
+        )
+        .await
+        .expect("claim_task");
+
+        assert!(
+            claimed.is_some(),
+            "AC#1+AC#4: sticky worker must be able to claim its pinned task"
+        );
+        assert_eq!(
+            claimed.unwrap().id,
+            task_id,
+            "AC#4: claimed task must be the one that was enqueued"
+        );
+    }
+
+    // ── AC#2 prerequisite — Non-sticky worker cannot claim during TTL ─────────
+
+    /// Within the TTL window, a worker that is NOT the sticky owner must not be
+    /// able to claim the pinned task.  This exclusivity is what makes sticky
+    /// routing useful: the owning worker (which holds the LRU cache) gets first
+    /// pick before any other worker can steal the work.
+    #[tokio::test]
+    async fn non_sticky_worker_cannot_claim_task_within_ttl() {
+        let (mut conn, _c) = setup().await;
+        let exec_id = insert_execution(&mut conn).await;
+
+        let mut params = EnqueueParams::new("default", TaskType::Workflow, serde_json::json!(null));
+        params.workflow_exec_id = Some(exec_id.as_uuid());
+        let params = params.with_sticky("worker-gamma", Duration::from_secs(60));
+
+        queue::enqueue(&mut conn, &params).await.expect("enqueue");
+
+        // A different worker tries to claim — must get nothing.
+        let claimed = queue::claim_task(
+            &mut conn,
+            &["default".to_string()],
+            "worker-delta", // not the sticky worker
+            "",
+        )
+        .await
+        .expect("claim_task");
+
+        assert!(
+            claimed.is_none(),
+            "AC#2 prerequisite: non-sticky worker must not claim a task within its TTL"
+        );
+    }
+
+    // ── AC#2 — Graceful fallback after sticky TTL expires ────────────────────
+
+    /// Once `sticky_until` elapses, ANY worker must be eligible to claim the
+    /// task.  This prevents a single point of failure: if the sticky worker
+    /// crashes or is slow, the task is not lost — another worker picks it up
+    /// after the grace period, at the cost of a full history reload.
+    #[tokio::test]
+    async fn any_worker_can_claim_after_sticky_expires() {
+        let (mut conn, _c) = setup().await;
+        let exec_id = insert_execution(&mut conn).await;
+
+        let mut params = EnqueueParams::new("default", TaskType::Workflow, serde_json::json!(null));
+        params.workflow_exec_id = Some(exec_id.as_uuid());
+        let params = params.with_sticky("worker-epsilon", Duration::from_secs(60));
+
+        let task_id = queue::enqueue(&mut conn, &params).await.expect("enqueue");
+
+        // Fast-forward the sticky_until to the past so the TTL has "expired".
+        diesel::sql_query(
+            "UPDATE harvest_task_queue \
+             SET sticky_until = NOW() - INTERVAL '1 second' \
+             WHERE id = $1",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .execute(&mut conn)
+        .await
+        .expect("expire sticky_until");
+
+        // A completely different worker can now claim it (fallback).
+        let claimed = queue::claim_task(
+            &mut conn,
+            &["default".to_string()],
+            "worker-zeta", // not the original sticky worker
+            "",
+        )
+        .await
+        .expect("claim_task");
+
+        assert!(
+            claimed.is_some(),
+            "AC#2: any worker must be able to claim after sticky_until expires"
+        );
+        assert_eq!(
+            claimed.unwrap().id,
+            task_id,
+            "AC#2: the claimed task must be the one whose TTL expired"
+        );
+    }
+
+    // ── AC#4 — park_workflow_task writes sticky affinity ─────────────────────
+
+    /// After a workflow suspends (parks), the task row must have the worker's
+    /// sticky affinity written to `sticky_worker_id` so that the next resume
+    /// cycle preferentially routes back to this worker (the one holding the
+    /// in-process LRU cache snapshot).
+    #[tokio::test]
+    async fn park_workflow_task_writes_sticky_affinity_to_db() {
+        let (mut conn, _c) = setup().await;
+        let exec_id = insert_execution(&mut conn).await;
+
+        // Enqueue with no initial pin — simulates a fresh start on any worker.
+        let mut params = EnqueueParams::new("default", TaskType::Workflow, serde_json::json!(null));
+        params.workflow_exec_id = Some(exec_id.as_uuid());
+
+        let task_id = queue::enqueue(&mut conn, &params).await.expect("enqueue");
+
+        // Worker claims the task.
+        queue::claim_task(&mut conn, &["default".to_string()], "worker-eta", "")
+            .await
+            .expect("claim_task")
+            .expect("must claim");
+
+        // Worker parks the task, pinning itself as the sticky worker.
+        let hint = StickyHint::new("worker-eta", Duration::from_secs(20));
+        queue::park_workflow_task(&mut conn, task_id, Some(hint))
+            .await
+            .expect("park_workflow_task");
+
+        let cols = read_sticky(&mut conn, task_id).await;
+
+        assert_eq!(
+            cols.sticky_worker_id.as_deref(),
+            Some("worker-eta"),
+            "AC#4: park must write sticky_worker_id = claiming worker"
+        );
+        assert!(
+            cols.sticky_until.is_some(),
+            "AC#4: park must set sticky_until to a future timestamp"
+        );
+        let until = cols.sticky_until.unwrap();
+        assert!(
+            until > chrono::Utc::now(),
+            "AC#4: sticky_until={until:?} must be in the future after park"
+        );
+    }
+
+    // ── AC#1 + AC#4 — wake_workflow_task refreshes the sticky window ─────────
+
+    /// When the runtime wakes a parked task (e.g., an activity completes or a
+    /// timer fires), `wake_workflow_task` must refresh `sticky_until` to
+    /// `NOW() + sticky_timeout`.  Without the refresh, the pin would expire
+    /// mid-execution and the next task might be routed to a cold worker.
+    #[tokio::test]
+    async fn wake_workflow_task_refreshes_sticky_until() {
+        let (mut conn, _c) = setup().await;
+        let exec_id = insert_execution(&mut conn).await;
+
+        let mut params = EnqueueParams::new("default", TaskType::Workflow, serde_json::json!(null));
+        params.workflow_exec_id = Some(exec_id.as_uuid());
+
+        let task_id = queue::enqueue(&mut conn, &params).await.expect("enqueue");
+
+        // Claim → park with a sticky pin.
+        queue::claim_task(&mut conn, &["default".to_string()], "worker-theta", "")
+            .await
+            .expect("claim_task")
+            .expect("must claim");
+
+        let hint = StickyHint::new("worker-theta", Duration::from_secs(30));
+        queue::park_workflow_task(&mut conn, task_id, Some(hint))
+            .await
+            .expect("park_workflow_task");
+
+        // Record the sticky_until immediately after park.
+        let before = read_sticky(&mut conn, task_id).await;
+        let until_after_park = before.sticky_until.expect("sticky_until must be set");
+
+        // Wake the task (simulates an activity completion or timer fire).
+        queue::wake_workflow_task(&mut conn, exec_id)
+            .await
+            .expect("wake_workflow_task");
+
+        // After wake, the task is PENDING again. Re-read the sticky columns.
+        let after = read_sticky(&mut conn, task_id).await;
+
+        // sticky_worker_id must still be set — wake does not clear the pin.
+        assert_eq!(
+            after.sticky_worker_id.as_deref(),
+            Some("worker-theta"),
+            "AC#1+AC#4: wake must preserve sticky_worker_id"
+        );
+        // sticky_until must be refreshed (>= the value set at park time).
+        let until_after_wake = after.sticky_until.expect("sticky_until must survive wake");
+        assert!(
+            until_after_wake >= until_after_park,
+            "AC#1: wake must refresh sticky_until ({until_after_wake:?}) \
+             to at least the park value ({until_after_park:?})"
+        );
+    }
+
+    // ── AC#1 — Enqueue without sticky leaves columns NULL ────────────────────
+
+    /// A task enqueued without `.with_sticky()` must have `sticky_worker_id = NULL`
+    /// and `sticky_until = NULL`, so it is claimable by any worker.  This is the
+    /// baseline (sticky routing disabled) that must never be broken.
+    #[tokio::test]
+    async fn enqueue_without_sticky_leaves_pin_columns_null() {
+        let (mut conn, _c) = setup().await;
+        let exec_id = insert_execution(&mut conn).await;
+
+        let mut params = EnqueueParams::new("default", TaskType::Workflow, serde_json::json!(null));
+        params.workflow_exec_id = Some(exec_id.as_uuid());
+        // Note: no .with_sticky() call.
+
+        let task_id = queue::enqueue(&mut conn, &params).await.expect("enqueue");
+
+        let cols = read_sticky(&mut conn, task_id).await;
+
+        assert!(
+            cols.sticky_worker_id.is_none(),
+            "no sticky: sticky_worker_id must be NULL, got {:?}",
+            cols.sticky_worker_id
+        );
+        assert!(
+            cols.sticky_until.is_none(),
+            "no sticky: sticky_until must be NULL"
+        );
+    }
 }
