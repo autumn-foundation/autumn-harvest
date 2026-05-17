@@ -95,8 +95,8 @@ it has no persistent identity in `harvest_events`.  If a worker crashes after
 
 1. Replay all forward steps (returning their results from recorded history).
 2. Re-register all compensation closures via the same `Saga::step()` calls.
-3. Call `compensate_all()` again, running **all** compensations from the top of
-   the LIFO stack — including compensations that already ran before the crash.
+3. Call `compensate_all()` again, re-invoking all compensation closures from the top of
+   the LIFO stack — including closures that already ran before the crash.
 
 **Consequence: compensation activities must be idempotent.**
 

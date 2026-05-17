@@ -116,7 +116,7 @@ impl<'ctx> Saga<'ctx> {
     /// Run one forward step and register its compensation on success.
     ///
     /// If `step` fails, previously registered compensations run in reverse
-    /// (LIFO) order.  When all compensations succeed the original step error is
+    /// (LIFO) order.  When all compensations succeed, the original step error is
     /// returned.  When any compensation fails, all remaining compensations are
     /// still attempted before returning
     /// [`HarvestError::SagaCompensationFailed`].
