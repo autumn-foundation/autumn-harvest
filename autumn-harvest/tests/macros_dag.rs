@@ -66,7 +66,11 @@ fn hourly_report(dag: &mut DagBuilder) {
 #[test]
 fn dag_macro_jitter_attribute_populates_field() {
     let info = __autumn_dag_info_hourly_report();
-    assert_eq!(info.jitter, Duration::from_secs(300), "jitter should be 5 minutes");
+    assert_eq!(
+        info.jitter,
+        Duration::from_secs(300),
+        "jitter should be 5 minutes"
+    );
     assert_eq!(info.name, "hourly_report");
 }
 
