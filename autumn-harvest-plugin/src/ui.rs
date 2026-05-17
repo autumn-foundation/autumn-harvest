@@ -1894,6 +1894,14 @@ fn build_query_string(
 
 const DETAIL_EVENT_PAGE_SIZE: i64 = 100;
 
+/// Extract a string field from the inner `data` object of an adjacently-tagged event payload.
+///
+/// Events are stored as `{"type": "...", "data": {...}}`. This helper reaches through the outer
+/// wrapper so callers don't have to repeat the two-step lookup everywhere.
+fn event_data_field<'a>(event_data: &'a Value, field: &str) -> Option<&'a str> {
+    event_data.get("data")?.get(field)?.as_str()
+}
+
 /// Map a raw event_type string to a human-readable label.
 fn event_human_label(event_type: &str, event_data: &Value) -> String {
     match event_type {
@@ -1903,15 +1911,13 @@ fn event_human_label(event_type: &str, event_data: &Value) -> String {
         "WorkflowCancelled" => "Workflow cancelled".to_string(),
         "WorkflowTerminated" => "Workflow terminated".to_string(),
         "ActivityScheduled" => {
-            let d = event_data.get("data");
-            let name = d.and_then(|d| d.get("name")).and_then(Value::as_str).unwrap_or("?");
+            let name = event_data_field(event_data, "name").unwrap_or("?");
             format!("Activity scheduled: {name}")
         }
         "ActivityStarted" => "Activity started".to_string(),
         "ActivityCompleted" => "Activity completed".to_string(),
         "ActivityFailed" => {
-            let d = event_data.get("data");
-            let err = d.and_then(|d| d.get("error")).and_then(Value::as_str).unwrap_or("error");
+            let err = event_data_field(event_data, "error").unwrap_or("error");
             format!("Activity failed: {}", truncate_error(err))
         }
         "ActivityTimedOut" => "Activity timed out".to_string(),
@@ -1919,8 +1925,7 @@ fn event_human_label(event_type: &str, event_data: &Value) -> String {
         "TimerStarted" => "Timer started".to_string(),
         "TimerFired" => "Timer fired".to_string(),
         "SignalReceived" => {
-            let d = event_data.get("data");
-            let name = d.and_then(|d| d.get("signal_name")).and_then(Value::as_str).unwrap_or("?");
+            let name = event_data_field(event_data, "signal_name").unwrap_or("?");
             format!("Signal received: {name}")
         }
         "ChildWorkflowStarted" => "Child workflow started".to_string(),
@@ -1959,24 +1964,18 @@ fn collect_activity_attempts(events: &[HarvestEvent]) -> Vec<ActivityAttemptRow>
     ];
 
     let mut order: Vec<String> = Vec::new();
-    // (name, attempt_count, last_status, last_ts, last_error)
     let mut groups: HashMap<String, ActivityAttemptRow> = HashMap::new();
 
     for event in events {
         if !ACTIVITY_TYPES.contains(&event.event_type.as_str()) {
             continue;
         }
-        let d = event.event_data.get("data");
-        let Some(aid) = d.and_then(|d| d.get("activity_id")).and_then(Value::as_str) else {
+        let Some(aid) = event_data_field(&event.event_data, "activity_id") else {
             continue;
         };
         let aid = aid.to_string();
         if !groups.contains_key(&aid) {
-            let name = d
-                .and_then(|d| d.get("name"))
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
+            let name = event_data_field(&event.event_data, "name").unwrap_or("").to_string();
             order.push(aid.clone());
             groups.insert(
                 aid.clone(),
@@ -1993,7 +1992,7 @@ fn collect_activity_attempts(events: &[HarvestEvent]) -> Vec<ActivityAttemptRow>
             if event.event_type == "ActivityScheduled" {
                 row.attempt_count += 1;
                 if row.name.is_empty() {
-                    if let Some(n) = d.and_then(|d| d.get("name")).and_then(Value::as_str) {
+                    if let Some(n) = event_data_field(&event.event_data, "name") {
                         row.name = n.to_string();
                     }
                 }
@@ -2001,10 +2000,8 @@ fn collect_activity_attempts(events: &[HarvestEvent]) -> Vec<ActivityAttemptRow>
             row.last_status = event.event_type.clone();
             row.last_ts = format_timestamp(Some(event.timestamp));
             if event.event_type == "ActivityFailed" {
-                row.last_error = d
-                    .and_then(|d| d.get("error"))
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned);
+                row.last_error =
+                    event_data_field(&event.event_data, "error").map(ToOwned::to_owned);
             }
         }
     }
@@ -2218,11 +2215,8 @@ fn render_workflow_detail(
                     tbody {
                         @for event in &signal_update_events {
                             @let label = event_human_label(&event.event_type, &event.event_data);
-                            @let edata = event.event_data.get("data");
-                            @let name_or_id = edata
-                                .and_then(|d| d.get("signal_name"))
-                                .or_else(|| edata.and_then(|d| d.get("update_id")))
-                                .and_then(Value::as_str)
+                            @let name_or_id = event_data_field(&event.event_data, "signal_name")
+                                .or_else(|| event_data_field(&event.event_data, "update_id"))
                                 .unwrap_or("—");
                             tr {
                                 td { (label) }
