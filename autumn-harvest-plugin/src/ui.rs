@@ -3237,6 +3237,7 @@ mod tests {
             paused_at: None,
             paused_by: None,
             pause_reason: None,
+            jitter_secs: 0,
         }
     }
 
