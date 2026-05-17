@@ -631,37 +631,44 @@ async fn workflow_detail_ui(
         .map_err(map_error)?;
 
     // Activity-type events for the attempts panel. Heartbeats are excluded from
-    // the type filter; a hard cap bounds memory on very large executions.
-    let activity_events: Vec<HarvestEvent> = harvest_events::table
+    // the type filter. We fetch the most recent ACTIVITY_PANEL_MAX_EVENTS rows
+    // (DESC) and reverse them so collect_activity_attempts sees chronological
+    // order; this ensures activities scheduled near the end of a long history
+    // are never silently dropped by the cap.
+    let mut activity_events: Vec<HarvestEvent> = harvest_events::table
         .filter(harvest_events::workflow_exec_id.eq(exec_uuid))
         .filter(harvest_events::event_type.eq_any(ACTIVITY_PANEL_EVENT_TYPES))
-        .order(harvest_events::event_id.asc())
+        .order(harvest_events::event_id.desc())
         .limit(ACTIVITY_PANEL_MAX_EVENTS)
         .select(HarvestEvent::as_select())
         .load(&mut conn)
         .await
         .map_err(database_error)
         .map_err(map_error)?;
+    activity_events.reverse();
 
-    // Signal/update events for the signals panel — fetch one extra to detect overflow.
-    let signal_panel_fetch = i64::try_from(SIGNAL_UPDATE_PANEL_LIMIT).unwrap_or(20) + 1;
+    // Signal/update events for the signals panel. Fetch DESC so the most recent
+    // entries are kept when the panel is capped; reverse before rendering so the
+    // table reads oldest→newest.
     let signal_update_events_raw: Vec<HarvestEvent> = harvest_events::table
         .filter(harvest_events::workflow_exec_id.eq(exec_uuid))
         .filter(harvest_events::event_type.eq_any(SIGNAL_UPDATE_TYPES))
-        .order(harvest_events::event_id.asc())
-        .limit(signal_panel_fetch)
+        .order(harvest_events::event_id.desc())
+        .limit(i64::try_from(SIGNAL_UPDATE_PANEL_LIMIT).unwrap_or(20) + 1)
         .select(HarvestEvent::as_select())
         .load(&mut conn)
         .await
         .map_err(database_error)
         .map_err(map_error)?;
 
-    let signal_update_overflow = signal_update_events_raw.len()
-        > usize::try_from(signal_panel_fetch - 1).unwrap_or(SIGNAL_UPDATE_PANEL_LIMIT);
-    let signal_update_events: Vec<HarvestEvent> = signal_update_events_raw
+    let signal_update_overflow = signal_update_events_raw.len() > SIGNAL_UPDATE_PANEL_LIMIT;
+    // Take the most recent SIGNAL_UPDATE_PANEL_LIMIT entries (raw is DESC) and
+    // restore chronological order for the panel table.
+    let mut signal_update_events: Vec<HarvestEvent> = signal_update_events_raw
         .into_iter()
         .take(SIGNAL_UPDATE_PANEL_LIMIT)
         .collect();
+    signal_update_events.reverse();
 
     // Load direct children (cap at 50 to avoid overwhelming the UI).
     let children: Vec<WorkflowExecution> = harvest_workflow_executions::table
@@ -2437,6 +2444,11 @@ fn event_data_field<'a>(event_data: &'a Value, field: &str) -> Option<&'a str> {
     event_data.get("data")?.get(field)?.as_str()
 }
 
+/// Extract a numeric field from the inner `data` object of an adjacently-tagged event payload.
+fn event_data_u64(event_data: &Value, field: &str) -> Option<u64> {
+    event_data.get("data")?.get(field)?.as_u64()
+}
+
 /// Map a raw `event_type` string to a human-readable label.
 fn event_human_label(event_type: &str, event_data: &Value) -> String {
     match event_type {
@@ -2541,13 +2553,15 @@ fn collect_activity_attempts(events: &[HarvestEvent]) -> Vec<ActivityAttemptRow>
             // Failure events carry an authoritative `attempt` count. Use max() so the
             // panel is accurate whether or not every scheduled event was captured.
             // This covers regular retries, external failures, and local activity retries.
+            // `attempt` is serialized as a JSON number, so use the u64 accessor.
             if matches!(
                 event.event_type.as_str(),
                 "ActivityFailed" | "LocalActivityFailed" | "LocalActivityExhausted"
-            ) && let Some(attempt_str) = event_data_field(&event.event_data, "attempt")
-                && let Ok(n) = attempt_str.parse::<usize>()
+            ) && let Some(n) = event_data_u64(&event.event_data, "attempt")
             {
-                row.attempt_count = row.attempt_count.max(n);
+                row.attempt_count = row
+                    .attempt_count
+                    .max(usize::try_from(n).unwrap_or(usize::MAX));
             }
             // Copy the error message from any failure event type.
             if matches!(
