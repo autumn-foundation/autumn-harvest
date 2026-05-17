@@ -740,4 +740,102 @@ mod db_tests {
             "no sticky: sticky_until must be NULL"
         );
     }
+
+    // ── AC#4 — Sticky task preferred over unpinned task for the owning worker ─
+
+    /// When a worker has both a sticky task (pinned to itself) and an unpinned
+    /// task available in the queue, it must claim the sticky task first.  This
+    /// is the AC#4 priority-ordering guarantee: SKIP LOCKED elects candidates,
+    /// then the `ORDER BY sticky_worker_id = $1 DESC` clause ensures the
+    /// owning worker always maximises cache locality when it has a choice.
+    ///
+    /// Without this ordering, sticky routing would only improve locality when
+    /// no other work is pending — useless under any real load.
+    #[tokio::test]
+    async fn sticky_task_preferred_over_unpinned_task_for_owning_worker() {
+        let (mut conn, _c) = setup().await;
+
+        // Two independent executions so FK constraints are satisfied.
+        let exec_a = insert_execution(&mut conn).await;
+        let exec_b = insert_execution(&mut conn).await;
+
+        // Task 1: unpinned, enqueued first (earlier scheduled_at under default ordering).
+        let mut p1 = EnqueueParams::new("default", TaskType::Workflow, serde_json::json!(null));
+        p1.workflow_exec_id = Some(exec_a.as_uuid());
+        let task_unpinned = queue::enqueue(&mut conn, &p1)
+            .await
+            .expect("enqueue unpinned");
+
+        // Task 2: pinned to "worker-iota" — enqueued second (later scheduled_at).
+        let mut p2 = EnqueueParams::new("default", TaskType::Workflow, serde_json::json!(null));
+        p2.workflow_exec_id = Some(exec_b.as_uuid());
+        let p2 = p2.with_sticky("worker-iota", Duration::from_secs(60));
+        let task_sticky = queue::enqueue(&mut conn, &p2)
+            .await
+            .expect("enqueue sticky");
+
+        // Worker-iota claims: must get the STICKY task (higher priority in ORDER BY)
+        // even though the unpinned task was enqueued earlier.
+        let claimed = queue::claim_task(&mut conn, &["default".to_string()], "worker-iota", "")
+            .await
+            .expect("claim_task")
+            .expect("must claim something");
+
+        assert_eq!(
+            claimed.id, task_sticky,
+            "AC#4: sticky task must be preferred over unpinned task for the owning worker \
+             (claimed {:?}, expected sticky {:?}, unpinned {:?})",
+            claimed.id, task_sticky, task_unpinned
+        );
+    }
+
+    // ── AC#4 — set_task_sticky_affinity(None) clears an existing pin ─────────
+
+    /// The `set_task_sticky_affinity` function must be able to clear a sticky
+    /// pin (pass `None`) so that a task becomes claimable by any worker again.
+    /// This is used in the worker's signal and timer re-queue paths when sticky
+    /// routing is disabled after a task has already been pinned.
+    #[tokio::test]
+    async fn set_task_sticky_affinity_none_clears_existing_pin() {
+        let (mut conn, _c) = setup().await;
+        let exec_id = insert_execution(&mut conn).await;
+
+        // Enqueue with a sticky pin.
+        let mut params = EnqueueParams::new("default", TaskType::Workflow, serde_json::json!(null));
+        params.workflow_exec_id = Some(exec_id.as_uuid());
+        let params = params.with_sticky("worker-kappa", Duration::from_secs(60));
+        let task_id = queue::enqueue(&mut conn, &params).await.expect("enqueue");
+
+        // Verify pin is set.
+        let before = read_sticky(&mut conn, task_id).await;
+        assert!(
+            before.sticky_worker_id.is_some(),
+            "precondition: sticky_worker_id must be set before clearing"
+        );
+
+        // Clear the pin.
+        queue::set_task_sticky_affinity(&mut conn, task_id, None)
+            .await
+            .expect("set_task_sticky_affinity(None)");
+
+        // Verify pin is gone.
+        let after = read_sticky(&mut conn, task_id).await;
+        assert!(
+            after.sticky_worker_id.is_none(),
+            "AC#4: set_task_sticky_affinity(None) must clear sticky_worker_id"
+        );
+        assert!(
+            after.sticky_until.is_none(),
+            "AC#4: set_task_sticky_affinity(None) must clear sticky_until"
+        );
+
+        // The task is now claimable by any worker.
+        let claimed = queue::claim_task(&mut conn, &["default".to_string()], "worker-lambda", "")
+            .await
+            .expect("claim_task");
+        assert!(
+            claimed.is_some(),
+            "AC#4: task with cleared pin must be claimable by any worker"
+        );
+    }
 }
