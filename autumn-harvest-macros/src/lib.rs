@@ -1,7 +1,8 @@
 //! Procedural macros for the `autumn-harvest` workflow engine.
 //!
-//! This crate provides attribute macros to define workflows, activities, and DAGs,
-//! as well as collection macros to bundle them for registration.
+//! This crate provides attribute macros to define workflows, activities, DAGs,
+//! query handlers, and update handlers, as well as collection macros to bundle
+//! them for registration.
 
 use proc_macro::TokenStream;
 
@@ -9,6 +10,7 @@ mod activity;
 mod collect;
 mod dag;
 mod query;
+mod update;
 mod workflow;
 
 /// Marks an async function as a Harvest workflow.
@@ -40,48 +42,16 @@ pub fn dag(attr: TokenStream, item: TokenStream) -> TokenStream {
     dag::dag_macro(attr.into(), item.into()).into()
 }
 
-/// Collects multiple workflow functions into a `Vec<WorkflowInfo>`.
+/// Marks a synchronous function as a read-only Harvest query handler (issue #346).
 ///
-/// # Examples
+/// **Without attributes** (`#[query]`): documentation marker only — validates
+/// the annotated item is a function and passes it through unchanged. Register
+/// imperatively via `WorkflowContext::register_query_handler`.
 ///
-/// ```ignore
-/// let w = workflows![my_workflow, another_workflow];
-/// ```
-#[proc_macro]
-pub fn workflows(input: TokenStream) -> TokenStream {
-    collect::workflows_macro(input.into()).into()
-}
-
-/// Collects multiple activity functions into a `Vec<ActivityInfo>`.
-///
-/// # Examples
-///
-/// ```ignore
-/// let a = activities![my_activity, another_activity];
-/// ```
-#[proc_macro]
-pub fn activities(input: TokenStream) -> TokenStream {
-    collect::activities_macro(input.into()).into()
-}
-
-/// Collects multiple DAG builder functions into a `Vec<DagInfo>`.
-///
-/// # Examples
-///
-/// ```ignore
-/// let d = dags![my_dag, another_dag];
-/// ```
-#[proc_macro]
-pub fn dags(input: TokenStream) -> TokenStream {
-    collect::dags_macro(input.into()).into()
-}
-
-/// Marks a function as a read-only Harvest query handler (issue #234).
-///
-/// This attribute is a **documentation and tooling marker** — it validates that
-/// the annotated item is a function but otherwise passes it through unchanged.
-/// Register the function with [`WorkflowContext::register_query_handler`] inside
-/// the workflow body.
+/// **With `workflow = "name"`**: generates a companion function
+/// `__autumn_query_handler_info_{fn_name}() -> QueryHandlerInfo` for use with
+/// `queries![…]` and `HarvestBuilder::queries(…)`. The function must be
+/// synchronous and take `ctx: &WorkflowContext` as its first argument.
 ///
 /// # Example
 ///
@@ -94,12 +64,96 @@ pub fn dags(input: TokenStream) -> TokenStream {
 /// #[derive(serde::Serialize)]
 /// struct ProgressResponse { processed: u32 }
 ///
-/// #[query]
-/// fn progress_query(req: &ProgressQuery, count: u32) -> Result<ProgressResponse, String> {
-///     Ok(ProgressResponse { processed: count })
+/// #[query(workflow = "batch_processor")]
+/// fn progress_query(_ctx: &WorkflowContext, req: ProgressQuery) -> Result<ProgressResponse, String> {
+///     Ok(ProgressResponse { processed: 0 })
 /// }
 /// ```
 #[proc_macro_attribute]
 pub fn query(attr: TokenStream, item: TokenStream) -> TokenStream {
     query::query_macro(attr.into(), item.into()).into()
+}
+
+/// Marks an async function as a Harvest update handler (issue #346).
+///
+/// Generates a companion function
+/// `__autumn_update_handler_info_{fn_name}() -> UpdateHandlerInfo` for use
+/// with `updates![…]` and `HarvestBuilder::updates(…)`.
+///
+/// # Attributes
+///
+/// - `workflow = "name"` (**required**) — the workflow this handler belongs to.
+/// - `validator = path::to::fn` (optional) — synchronous validator with
+///   signature `fn(&serde_json::Value) -> Result<(), String>`.
+///
+/// # Example
+///
+/// ```ignore
+/// use autumn_harvest::prelude::*;
+///
+/// #[derive(serde::Deserialize, serde::Serialize)]
+/// struct ApproveRequest { approved: bool }
+///
+/// fn validate_approve(input: &serde_json::Value) -> Result<(), String> {
+///     if input.get("approved").and_then(|v| v.as_bool()).unwrap_or(false) {
+///         Ok(())
+///     } else {
+///         Err("not approved".to_string())
+///     }
+/// }
+///
+/// #[update(workflow = "subscription", validator = validate_approve)]
+/// async fn approve(_ctx: &WorkflowContext, req: ApproveRequest) -> Result<bool, String> {
+///     Ok(req.approved)
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn update(attr: TokenStream, item: TokenStream) -> TokenStream {
+    update::update_macro(attr.into(), item.into()).into()
+}
+
+/// Collects multiple workflow functions into a `Vec<WorkflowInfo>`.
+#[proc_macro]
+pub fn workflows(input: TokenStream) -> TokenStream {
+    collect::workflows_macro(input.into()).into()
+}
+
+/// Collects multiple activity functions into a `Vec<ActivityInfo>`.
+#[proc_macro]
+pub fn activities(input: TokenStream) -> TokenStream {
+    collect::activities_macro(input.into()).into()
+}
+
+/// Collects multiple DAG builder functions into a `Vec<DagInfo>`.
+#[proc_macro]
+pub fn dags(input: TokenStream) -> TokenStream {
+    collect::dags_macro(input.into()).into()
+}
+
+/// Collects multiple query handler functions into a `Vec<QueryHandlerInfo>`.
+///
+/// Each name must have been annotated with `#[query(workflow = "…")]`.
+///
+/// # Example
+///
+/// ```ignore
+/// let qs: Vec<QueryHandlerInfo> = queries![get_status, get_count];
+/// ```
+#[proc_macro]
+pub fn queries(input: TokenStream) -> TokenStream {
+    collect::queries_macro(input.into()).into()
+}
+
+/// Collects multiple update handler functions into a `Vec<UpdateHandlerInfo>`.
+///
+/// Each name must have been annotated with `#[update(workflow = "…")]`.
+///
+/// # Example
+///
+/// ```ignore
+/// let us: Vec<UpdateHandlerInfo> = updates![approve, cancel];
+/// ```
+#[proc_macro]
+pub fn updates(input: TokenStream) -> TokenStream {
+    collect::updates_macro(input.into()).into()
 }

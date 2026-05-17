@@ -49,6 +49,10 @@ tokio-postgres = { version = "0.7", optional = true }
 metrics = { version = "0.24", optional = true }
 
 [[test]]
+name = "macros_query_update"
+required-features = ["testing"]
+
+[[test]]
 name = "external_completion_tests"
 required-features = ["testing"]
 

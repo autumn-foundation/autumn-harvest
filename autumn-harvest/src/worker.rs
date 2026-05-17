@@ -33,7 +33,7 @@ use crate::executor::{
 };
 use crate::external_task;
 use crate::failure::{parse_error_payload, parse_error_payload_full, parse_typed_payload};
-use crate::info::{ActivityInfo, WorkflowInfo};
+use crate::info::{ActivityInfo, QueryHandlerInfo, UpdateHandlerInfo, WorkflowInfo};
 use crate::models::{
     HarvestTimer, NewHarvestTimer, NewWorkflowExecution, TaskQueueItem, WorkflowExecution,
 };
@@ -156,6 +156,10 @@ pub struct HandlerRegistry {
     pub workflows: HashMap<String, WorkflowInfo>,
     /// Activity handlers indexed by name.
     pub activities: HashMap<String, ActivityInfo>,
+    /// Declarative query handlers (issue #346), indexed by `(workflow, name)`.
+    pub query_handlers: Vec<QueryHandlerInfo>,
+    /// Declarative update handlers (issue #346), indexed by `(workflow, name)`.
+    pub update_handlers: Vec<UpdateHandlerInfo>,
     /// Shared typed state visible to workflow and activity handlers.
     state: SharedState,
     /// Telemetry bundle (trace-context propagator + metrics recorder) applied
@@ -211,10 +215,24 @@ impl HandlerRegistry {
         Self {
             workflows,
             activities,
+            query_handlers: Vec::new(),
+            update_handlers: Vec::new(),
             state,
             telemetry,
             history_policy: WorkflowHistoryPolicy::default(),
         }
+    }
+
+    /// Set declarative query and update handlers (issue #346).
+    #[must_use]
+    pub fn with_handler_infos(
+        mut self,
+        query_handlers: Vec<QueryHandlerInfo>,
+        update_handlers: Vec<UpdateHandlerInfo>,
+    ) -> Self {
+        self.query_handlers = query_handlers;
+        self.update_handlers = update_handlers;
+        self
     }
 
     /// Create a new registry with shared state, telemetry, and history guardrails.
