@@ -4,6 +4,7 @@
 //! paginated workflow list and a per-workflow detail page showing inputs,
 //! outputs, and the full event history. Assets are inlined so the dashboard
 //! works in network-restricted environments.
+#![allow(clippy::literal_string_with_formatting_args)]
 
 use std::fmt::Write as _;
 
@@ -30,8 +31,9 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use autumn_harvest::audit::{
-    OP_SCHEDULE_DELETE, OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, SOURCE_API, STATUS_SUCCEEDED,
-    TARGET_SCHEDULE, insert_audit,
+    OP_SCHEDULE_DELETE, OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_WORKFLOW_CANCEL,
+    OP_WORKFLOW_RESET, OP_WORKFLOW_SIGNAL, SOURCE_API, SOURCE_UI, STATUS_FAILED, STATUS_SUCCEEDED,
+    TARGET_SCHEDULE, TARGET_WORKFLOW, insert_audit,
 };
 use autumn_harvest::cancel_workflow_execution;
 use autumn_harvest::error::{HarvestResult, database_error};
@@ -460,6 +462,7 @@ async fn index() -> axum::response::Redirect {
     axum::response::Redirect::to("workflows")
 }
 
+#[allow(clippy::too_many_lines)]
 async fn list_workflows_ui(
     Extension(api_state): Extension<HarvestApiState>,
     Query(params): Query<WorkflowListParams>,
@@ -502,26 +505,40 @@ async fn list_workflows_ui(
         .as_ref()
         .map(|key| (key.clone(), search_attr_value.clone()));
 
-    let started_after = params
+    let started_after = match params
         .started_after
         .as_deref()
         .map(str::trim)
         .filter(|v| !v.is_empty())
-        .and_then(|v| {
+    {
+        None => None,
+        Some(v) => Some(
             DateTime::parse_from_rfc3339(v)
-                .ok()
                 .map(|d| d.with_timezone(&Utc))
-        });
-    let started_before = params
+                .map_err(|_| {
+                    AutumnError::bad_request_msg(format!(
+                        "invalid started_after: expected RFC 3339 (e.g. 2026-01-01T00:00:00Z), got '{v}'"
+                    ))
+                })?,
+        ),
+    };
+    let started_before = match params
         .started_before
         .as_deref()
         .map(str::trim)
         .filter(|v| !v.is_empty())
-        .and_then(|v| {
+    {
+        None => None,
+        Some(v) => Some(
             DateTime::parse_from_rfc3339(v)
-                .ok()
                 .map(|d| d.with_timezone(&Utc))
-        });
+                .map_err(|_| {
+                    AutumnError::bad_request_msg(format!(
+                        "invalid started_before: expected RFC 3339 (e.g. 2026-01-01T00:00:00Z), got '{v}'"
+                    ))
+                })?,
+        ),
+    };
     let exec_id_search = params
         .exec_id_search
         .as_deref()
@@ -581,15 +598,67 @@ async fn workflow_detail_ui(
         .await
         .map_err(map_error)?;
 
-    // Load raw event rows so we have DB-level timestamps without deserialization risk.
-    let events: Vec<HarvestEvent> = harvest_events::table
+    // Resolve event_page before any DB queries so we can use OFFSET/LIMIT directly.
+    let page_size = DETAIL_EVENT_PAGE_SIZE;
+    let event_page = if let Some(jump) = params.jump_event {
+        let jump_zero = (jump - 1).max(0);
+        jump_zero / page_size
+    } else {
+        params.event_page.unwrap_or(0).max(0)
+    };
+
+    // Total event count — used for pagination controls.
+    let total_events: i64 = harvest_events::table
         .filter(harvest_events::workflow_exec_id.eq(exec_uuid))
+        .count()
+        .get_result(&mut conn)
+        .await
+        .map_err(database_error)
+        .map_err(map_error)?;
+
+    // Page of events for the timeline — only the current page is fetched.
+    let page_offset = event_page.saturating_mul(page_size);
+    let page_events: Vec<HarvestEvent> = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq(exec_uuid))
+        .order(harvest_events::event_id.asc())
+        .offset(page_offset)
+        .limit(page_size)
+        .select(HarvestEvent::as_select())
+        .load(&mut conn)
+        .await
+        .map_err(database_error)
+        .map_err(map_error)?;
+
+    // Activity-type events for the attempts panel (all pages, but only activity types).
+    let activity_events: Vec<HarvestEvent> = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq(exec_uuid))
+        .filter(harvest_events::event_type.eq_any(ACTIVITY_PANEL_EVENT_TYPES))
         .order(harvest_events::event_id.asc())
         .select(HarvestEvent::as_select())
         .load(&mut conn)
         .await
         .map_err(database_error)
         .map_err(map_error)?;
+
+    // Signal/update events for the signals panel — fetch one extra to detect overflow.
+    let signal_panel_fetch = i64::try_from(SIGNAL_UPDATE_PANEL_LIMIT).unwrap_or(20) + 1;
+    let signal_update_events_raw: Vec<HarvestEvent> = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq(exec_uuid))
+        .filter(harvest_events::event_type.eq_any(SIGNAL_UPDATE_TYPES))
+        .order(harvest_events::event_id.asc())
+        .limit(signal_panel_fetch)
+        .select(HarvestEvent::as_select())
+        .load(&mut conn)
+        .await
+        .map_err(database_error)
+        .map_err(map_error)?;
+
+    let signal_update_overflow = signal_update_events_raw.len()
+        > usize::try_from(signal_panel_fetch - 1).unwrap_or(SIGNAL_UPDATE_PANEL_LIMIT);
+    let signal_update_events: Vec<HarvestEvent> = signal_update_events_raw
+        .into_iter()
+        .take(SIGNAL_UPDATE_PANEL_LIMIT)
+        .collect();
 
     // Load direct children (cap at 50 to avoid overwhelming the UI).
     let children: Vec<WorkflowExecution> = harvest_workflow_executions::table
@@ -605,18 +674,13 @@ async fn workflow_detail_ui(
     // Load blocked-on data for non-terminal workflows.
     let blocked_on = load_blocked_on_data(&mut conn, exec_uuid, &execution.state).await?;
 
-    // Resolve event_page: prefer explicit event_page param; otherwise compute from jump_event.
-    let page_size = DETAIL_EVENT_PAGE_SIZE;
-    let event_page = if let Some(jump) = params.jump_event {
-        let jump_zero = (jump - 1).max(0);
-        jump_zero / page_size
-    } else {
-        params.event_page.unwrap_or(0).max(0)
-    };
-
     Ok(render_workflow_detail(
         &execution,
-        &events,
+        total_events,
+        &page_events,
+        &activity_events,
+        &signal_update_events,
+        signal_update_overflow,
         &children,
         event_page,
         &blocked_on,
@@ -697,17 +761,45 @@ async fn load_blocked_on_data(
 
 async fn cancel_workflow_ui(
     Extension(api_state): Extension<HarvestApiState>,
+    headers: axum::http::HeaderMap,
     Path(id): Path<String>,
     Form(form): Form<WorkflowCancelForm>,
 ) -> Result<axum::response::Response, AutumnError> {
     let exec_id = parse_execution_id(&id)?;
     let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
+    let actor = api_state.extract_actor(&headers);
+    let exec_id_str = exec_id.as_uuid().to_string();
     let reason = form.reason.as_deref().unwrap_or("").trim().to_string();
 
-    let flash = match cancel_workflow_execution(&mut conn, exec_id, &reason).await {
-        Ok(_) => url_encode("Workflow cancelled"),
-        Err(e) => url_encode(&format!("Cancel failed: {e}")),
+    let cancel_result = cancel_workflow_execution(&mut conn, exec_id, &reason).await;
+    let (status, error_summary, flash) = match &cancel_result {
+        Ok(_) => (STATUS_SUCCEEDED, None, url_encode("Workflow cancelled")),
+        Err(e) => {
+            let msg = e.to_string();
+            (
+                STATUS_FAILED,
+                Some(msg.clone()),
+                url_encode(&format!("Cancel failed: {msg}")),
+            )
+        }
     };
+    let _ = insert_audit(
+        &mut conn,
+        &NewAuditRecord {
+            actor: &actor,
+            operation: OP_WORKFLOW_CANCEL,
+            target_type: TARGET_WORKFLOW,
+            target_id: Some(&exec_id_str),
+            route_or_command: "POST /workflows/{id}/cancel",
+            request_id: None,
+            idempotency_key: None,
+            status,
+            error_summary: error_summary.as_deref(),
+            shard_id: None,
+            source: SOURCE_UI,
+        },
+    )
+    .await;
 
     let redirect_url = format!("../../workflows/{id}?flash={flash}");
     Ok(axum::response::Redirect::to(&redirect_url).into_response())
@@ -715,11 +807,14 @@ async fn cancel_workflow_ui(
 
 async fn signal_workflow_ui(
     Extension(api_state): Extension<HarvestApiState>,
+    headers: axum::http::HeaderMap,
     Path(id): Path<String>,
     Form(form): Form<WorkflowSignalForm>,
 ) -> Result<axum::response::Response, AutumnError> {
     let exec_id = parse_execution_id(&id)?;
     let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
+    let actor = api_state.extract_actor(&headers);
+    let exec_id_str = exec_id.as_uuid().to_string();
 
     let payload_str = form.payload.as_deref().unwrap_or("").trim();
     let payload_result: Result<serde_json::Value, String> = if payload_str.is_empty() {
@@ -727,15 +822,43 @@ async fn signal_workflow_ui(
     } else {
         serde_json::from_str(payload_str).map_err(|e| format!("Invalid JSON payload: {e}"))
     };
-    let flash = match payload_result {
-        Err(e) => url_encode(&e),
+    let (status, error_summary, flash) = match payload_result {
+        Err(e) => (STATUS_FAILED, Some(e.clone()), url_encode(&e)),
         Ok(payload_json) => {
             match send_signal(&mut conn, exec_id, &form.signal_name, payload_json).await {
-                Ok(()) => url_encode(&format!("Signal '{}' sent", form.signal_name)),
-                Err(e) => url_encode(&format!("Signal failed: {e}")),
+                Ok(()) => (
+                    STATUS_SUCCEEDED,
+                    None,
+                    url_encode(&format!("Signal '{}' sent", form.signal_name)),
+                ),
+                Err(e) => {
+                    let msg = e.to_string();
+                    (
+                        STATUS_FAILED,
+                        Some(msg.clone()),
+                        url_encode(&format!("Signal failed: {msg}")),
+                    )
+                }
             }
         }
     };
+    let _ = insert_audit(
+        &mut conn,
+        &NewAuditRecord {
+            actor: &actor,
+            operation: OP_WORKFLOW_SIGNAL,
+            target_type: TARGET_WORKFLOW,
+            target_id: Some(&exec_id_str),
+            route_or_command: "POST /workflows/{id}/signal",
+            request_id: None,
+            idempotency_key: None,
+            status,
+            error_summary: error_summary.as_deref(),
+            shard_id: None,
+            source: SOURCE_UI,
+        },
+    )
+    .await;
 
     let redirect_url = format!("../../workflows/{id}?flash={flash}");
     Ok(axum::response::Redirect::to(&redirect_url).into_response())
@@ -750,6 +873,7 @@ async fn reset_workflow_ui(
     let exec_id = parse_execution_id(&id)?;
     let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
     let actor = api_state.extract_actor(&headers);
+    let exec_id_str = exec_id.as_uuid().to_string();
 
     let reason = form
         .reason
@@ -758,20 +882,53 @@ async fn reset_workflow_ui(
         .unwrap_or("workflow reset requested")
         .to_string();
 
+    // The form shows 1-based event numbers (matching the timeline "#" column).
+    // The reset API accepts 0-based event IDs.
+    let reset_to_event_id = form.reset_to_event_id.saturating_sub(1);
+
     let request = WorkflowResetRequest {
-        reset_to_event_id: form.reset_to_event_id,
+        reset_to_event_id,
         reason,
-        operator_id: actor,
+        operator_id: actor.clone(),
         signal_reapply: ResetSignalReapplyPolicy::default(),
     };
 
-    let flash = match reset_workflow_execution(&mut conn, exec_id, request).await {
-        Ok(result) => url_encode(&format!(
-            "Reset complete — new execution {}",
-            result.new_exec_id
-        )),
-        Err(e) => url_encode(&format!("Reset failed: {e}")),
+    let reset_result = reset_workflow_execution(&mut conn, exec_id, request).await;
+    let (status, error_summary, flash) = match &reset_result {
+        Ok(result) => (
+            STATUS_SUCCEEDED,
+            None,
+            url_encode(&format!(
+                "Reset complete — new execution {}",
+                result.new_exec_id
+            )),
+        ),
+        Err(e) => {
+            let msg = e.to_string();
+            (
+                STATUS_FAILED,
+                Some(msg.clone()),
+                url_encode(&format!("Reset failed: {msg}")),
+            )
+        }
     };
+    let _ = insert_audit(
+        &mut conn,
+        &NewAuditRecord {
+            actor: &actor,
+            operation: OP_WORKFLOW_RESET,
+            target_type: TARGET_WORKFLOW,
+            target_id: Some(&exec_id_str),
+            route_or_command: "POST /workflows/{id}/reset",
+            request_id: None,
+            idempotency_key: None,
+            status,
+            error_summary: error_summary.as_deref(),
+            shard_id: None,
+            source: SOURCE_UI,
+        },
+    )
+    .await;
 
     let redirect_url = format!("../../workflows/{id}?flash={flash}");
     Ok(axum::response::Redirect::to(&redirect_url).into_response())
@@ -779,11 +936,14 @@ async fn reset_workflow_ui(
 
 async fn trigger_update_ui(
     Extension(api_state): Extension<HarvestApiState>,
+    headers: axum::http::HeaderMap,
     Path(id): Path<String>,
     Form(form): Form<WorkflowTriggerUpdateForm>,
 ) -> Result<axum::response::Response, AutumnError> {
     let exec_id = parse_execution_id(&id)?;
     let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
+    let actor = api_state.extract_actor(&headers);
+    let exec_id_str = exec_id.as_uuid().to_string();
 
     let payload_str = form.payload.as_deref().unwrap_or("").trim();
     let payload_json: serde_json::Value = if payload_str.is_empty() {
@@ -800,7 +960,7 @@ async fn trigger_update_ui(
     };
 
     let update_id = UpdateId::new();
-    let flash = match admit_update_event(
+    let (status, error_summary, flash) = match admit_update_event(
         &mut conn,
         exec_id,
         update_id,
@@ -811,11 +971,47 @@ async fn trigger_update_ui(
     {
         Ok(()) => {
             // Wake the workflow task so it picks up the admitted update immediately.
-            let _ = autumn_harvest::queue::wake_workflow_task(&mut conn, exec_id).await;
-            url_encode(&format!("Update '{}' admitted", form.update_name))
+            // Surface any wake failure in the flash so the operator knows to retry.
+            let wake_note =
+                match autumn_harvest::queue::wake_workflow_task(&mut conn, exec_id).await {
+                    Ok(()) => String::new(),
+                    Err(e) => format!(" (wake failed: {e})"),
+                };
+            (
+                STATUS_SUCCEEDED,
+                None,
+                url_encode(&format!(
+                    "Update '{}' admitted{}",
+                    form.update_name, wake_note
+                )),
+            )
         }
-        Err(e) => url_encode(&format!("Update failed: {e}")),
+        Err(e) => {
+            let msg = e.to_string();
+            (
+                STATUS_FAILED,
+                Some(msg.clone()),
+                url_encode(&format!("Update failed: {msg}")),
+            )
+        }
     };
+    let _ = insert_audit(
+        &mut conn,
+        &NewAuditRecord {
+            actor: &actor,
+            operation: "workflow.update",
+            target_type: TARGET_WORKFLOW,
+            target_id: Some(&exec_id_str),
+            route_or_command: "POST /workflows/{id}/trigger-update",
+            request_id: None,
+            idempotency_key: None,
+            status,
+            error_summary: error_summary.as_deref(),
+            shard_id: None,
+            source: SOURCE_UI,
+        },
+    )
+    .await;
 
     let redirect_url = format!("../../workflows/{id}?flash={flash}");
     Ok(axum::response::Redirect::to(&redirect_url).into_response())
@@ -2176,6 +2372,15 @@ const SIGNAL_UPDATE_TYPES: &[&str] = &[
     "UpdateFailed",
 ];
 const SIGNAL_UPDATE_PANEL_LIMIT: usize = 20;
+const ACTIVITY_PANEL_EVENT_TYPES: &[&str] = &[
+    "ActivityScheduled",
+    "ActivityStarted",
+    "ActivityCompleted",
+    "ActivityFailed",
+    "ActivityTimedOut",
+    "ActivityHeartbeat",
+    "ActivityCompletedExternally",
+];
 
 /// Extract a string field from the inner `data` object of an adjacently-tagged event payload.
 ///
@@ -2236,21 +2441,11 @@ struct ActivityAttemptRow {
 }
 
 fn collect_activity_attempts(events: &[HarvestEvent]) -> Vec<ActivityAttemptRow> {
-    const ACTIVITY_TYPES: &[&str] = &[
-        "ActivityScheduled",
-        "ActivityStarted",
-        "ActivityCompleted",
-        "ActivityFailed",
-        "ActivityTimedOut",
-        "ActivityHeartbeat",
-        "ActivityCompletedExternally",
-    ];
-
     let mut order: Vec<String> = Vec::new();
     let mut groups: HashMap<String, ActivityAttemptRow> = HashMap::new();
 
     for event in events {
-        if !ACTIVITY_TYPES.contains(&event.event_type.as_str()) {
+        if !ACTIVITY_PANEL_EVENT_TYPES.contains(&event.event_type.as_str()) {
             continue;
         }
         let Some(aid) = event_data_field(&event.event_data, "activity_id") else {
@@ -2297,10 +2492,14 @@ fn collect_activity_attempts(events: &[HarvestEvent]) -> Vec<ActivityAttemptRow>
         .collect()
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn render_workflow_detail(
     execution: &WorkflowExecution,
-    events: &[HarvestEvent],
+    total_events: i64,
+    page_events: &[HarvestEvent],
+    activity_events: &[HarvestEvent],
+    signal_update_events: &[HarvestEvent],
+    signal_update_overflow: bool,
     children: &[WorkflowExecution],
     event_page: i64,
     blocked_on: &BlockedOnData,
@@ -2322,33 +2521,31 @@ fn render_workflow_detail(
         }
     });
 
-    // Activity attempts.
-    let activity_attempts = collect_activity_attempts(events);
+    // Activity attempts from the pre-filtered activity events.
+    let activity_attempts = collect_activity_attempts(activity_events);
 
-    // Signal / update events — cap at 20 to keep the page manageable.
-    let signal_update_total = events
-        .iter()
-        .filter(|e| SIGNAL_UPDATE_TYPES.contains(&e.event_type.as_str()))
-        .count();
-    let signal_update_events: Vec<&HarvestEvent> = events
-        .iter()
-        .filter(|e| SIGNAL_UPDATE_TYPES.contains(&e.event_type.as_str()))
-        .take(SIGNAL_UPDATE_PANEL_LIMIT)
-        .collect();
+    // Signal/update panel counts.
+    let signal_update_shown = signal_update_events.len();
+    let signal_update_label_total = if signal_update_overflow {
+        signal_update_shown + 1
+    } else {
+        signal_update_shown
+    };
 
-    // Paginated event slice.
-    let total_events = events.len();
+    // Pagination arithmetic based on the DB-level total.
+    let total_events_usize = usize::try_from(total_events).unwrap_or(usize::MAX);
     let page_size = usize::try_from(DETAIL_EVENT_PAGE_SIZE).unwrap_or(100);
     let event_page_idx = usize::try_from(event_page).unwrap_or(0);
-    let page_start = event_page_idx.saturating_mul(page_size).min(total_events);
-    let page_end = (page_start + page_size).min(total_events);
-    let page_events = &events[page_start..page_end];
+    let page_start = event_page_idx
+        .saturating_mul(page_size)
+        .min(total_events_usize);
+    let page_end = (page_start + page_events.len()).min(total_events_usize);
     let has_prev_page = event_page > 0;
-    let has_next_page = page_end < total_events;
+    let has_next_page = page_end < total_events_usize;
     let last_page = if total_events == 0 {
         0_i64
     } else {
-        i64::try_from((total_events - 1) / page_size).unwrap_or(0)
+        (total_events - 1) / DETAIL_EVENT_PAGE_SIZE
     };
 
     let body = html! {
@@ -2397,8 +2594,8 @@ fn render_workflow_detail(
                 summary style="cursor:pointer;color:#93c5fd;font-size:12px;display:inline-block;padding:6px 12px;border:1px solid #2563eb;border-radius:6px" { "Reset to event N" }
                 form method="post" action={ (exec_id_str) "/reset" } style="margin-top:8px;background:#1e293b;border:1px solid #334155;border-radius:6px;padding:12px;display:flex;flex-direction:column;gap:8px;min-width:280px" {
                     label style="font-size:12px;color:#94a3b8" {
-                        "Reset to event ID"
-                        input type="number" name="reset_to_event_id" min="0" required placeholder="0" style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
+                        "Event # (1-based, as shown in timeline)"
+                        input type="number" name="reset_to_event_id" min="1" required placeholder="1" style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
                     }
                     label style="font-size:12px;color:#94a3b8" {
                         "Reason"
@@ -2538,8 +2735,8 @@ fn render_workflow_detail(
         // Signals & updates panel
         @if !signal_update_events.is_empty() {
             div.card {
-                @if signal_update_total > SIGNAL_UPDATE_PANEL_LIMIT {
-                    h3 { "Signals & Updates (showing " (SIGNAL_UPDATE_PANEL_LIMIT) " of " (signal_update_total) ")" }
+                @if signal_update_overflow {
+                    h3 { "Signals & Updates (showing " (SIGNAL_UPDATE_PANEL_LIMIT) " of " (signal_update_label_total) "+)" }
                 } @else {
                     h3 { "Signals & Updates" }
                 }
@@ -2552,7 +2749,7 @@ fn render_workflow_detail(
                         }
                     }
                     tbody {
-                        @for event in &signal_update_events {
+                        @for event in signal_update_events {
                             @let label = event_human_label(&event.event_type, &event.event_data);
                             @let name_or_id = event_data_field(&event.event_data, "signal_name")
                                 .or_else(|| event_data_field(&event.event_data, "update_id"))
@@ -2571,11 +2768,11 @@ fn render_workflow_detail(
         // Event timeline
         div.card {
             h3 { "Event history (" (total_events) " events)" }
-            @if events.is_empty() {
+            @if total_events == 0 {
                 div.empty { "No events recorded yet." }
             } @else {
                 // Jump controls for large histories
-                @if total_events > page_size {
+                @if total_events > DETAIL_EVENT_PAGE_SIZE {
                     div.pagination style="margin-bottom:12px" {
                         @if has_prev_page {
                             a href={ "?event_page=" (event_page - 1) } {
@@ -2628,7 +2825,7 @@ fn render_workflow_detail(
                     }
                 }
                 // Bottom pagination with jump-to-event control
-                @if total_events > page_size {
+                @if total_events > DETAIL_EVENT_PAGE_SIZE {
                     div.pagination style="margin-top:12px" {
                         @if has_prev_page {
                             a href={ "?event_page=" (event_page - 1) } {
