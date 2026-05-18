@@ -1030,15 +1030,31 @@ impl WorkflowTestEnv {
 
             match outcome {
                 WorkflowOutcome::Completed { output } => {
-                    history.push(WorkflowEvent::WorkflowCompleted { output: output.clone() });
-                    return TestRunOutcome { result: Ok(output), events: history, exec_id };
+                    history.push(WorkflowEvent::WorkflowCompleted {
+                        output: output.clone(),
+                    });
+                    return TestRunOutcome {
+                        result: Ok(output),
+                        events: history,
+                        exec_id,
+                    };
                 }
                 WorkflowOutcome::Failed { error } => {
-                    history.push(WorkflowEvent::WorkflowFailed { error: error.clone() });
-                    return TestRunOutcome { result: Err(error), events: history, exec_id };
+                    history.push(WorkflowEvent::WorkflowFailed {
+                        error: error.clone(),
+                    });
+                    return TestRunOutcome {
+                        result: Err(error),
+                        events: history,
+                        exec_id,
+                    };
                 }
                 WorkflowOutcome::ContinuedAsNew { input: new_input } => {
-                    return TestRunOutcome { result: Ok(new_input), events: history, exec_id };
+                    return TestRunOutcome {
+                        result: Ok(new_input),
+                        events: history,
+                        exec_id,
+                    };
                 }
                 WorkflowOutcome::Suspended { commands } => {
                     let made_progress = self.process_suspension(
@@ -1049,12 +1065,10 @@ impl WorkflowTestEnv {
                     );
                     if !made_progress {
                         return TestRunOutcome {
-                            result: Err(
-                                "WorkflowTestEnv: workflow suspended with no resolvable \
+                            result: Err("WorkflowTestEnv: workflow suspended with no resolvable \
                                  commands (check that all signals are queued and activities \
                                  are mocked)"
-                                    .to_string(),
-                            ),
+                                .to_string()),
                             events: history,
                             exec_id,
                         };
@@ -1114,7 +1128,13 @@ impl WorkflowTestEnv {
         call_counts: &mut HashMap<String, u32>,
     ) -> bool {
         match cmd {
-            WorkflowCommand::ScheduleActivity { activity_id, name, input: act_input, queue, .. } => {
+            WorkflowCommand::ScheduleActivity {
+                activity_id,
+                name,
+                input: act_input,
+                queue,
+                ..
+            } => {
                 let call_num = Self::next_call_count(call_counts, &name);
                 let result = self.resolve_activity(&name, act_input.clone(), call_num);
                 history.push(WorkflowEvent::ActivityScheduled {
@@ -1127,7 +1147,12 @@ impl WorkflowTestEnv {
                 true
             }
 
-            WorkflowCommand::RunLocalActivity { activity_id, name, input: act_input, .. } => {
+            WorkflowCommand::RunLocalActivity {
+                activity_id,
+                name,
+                input: act_input,
+                ..
+            } => {
                 let call_num = Self::next_call_count(call_counts, &name);
                 let result = self.resolve_activity(&name, act_input.clone(), call_num);
                 history.push(WorkflowEvent::LocalActivityScheduled {
@@ -1139,7 +1164,11 @@ impl WorkflowTestEnv {
                 true
             }
 
-            WorkflowCommand::StartTimer { timer_id, duration_secs, .. } => {
+            WorkflowCommand::StartTimer {
+                timer_id,
+                duration_secs,
+                ..
+            } => {
                 if signal_will_resolve {
                     // Skip firing the timer — a concurrent signal takes priority
                     // so the workflow takes the signal branch in select!.
@@ -1153,18 +1182,24 @@ impl WorkflowTestEnv {
                 true
             }
 
-            WorkflowCommand::WaitForSignal { signal_name, .. } => {
-                remaining_signals
-                    .iter()
-                    .position(|(n, _)| n == &signal_name)
-                    .is_some_and(|pos| {
-                        let (_, payload) = remaining_signals.remove(pos);
-                        history.push(WorkflowEvent::SignalReceived { signal_name, payload });
-                        true
-                    })
-            }
+            WorkflowCommand::WaitForSignal { signal_name, .. } => remaining_signals
+                .iter()
+                .position(|(n, _)| n == &signal_name)
+                .is_some_and(|pos| {
+                    let (_, payload) = remaining_signals.remove(pos);
+                    history.push(WorkflowEvent::SignalReceived {
+                        signal_name,
+                        payload,
+                    });
+                    true
+                }),
 
-            WorkflowCommand::StartChildWorkflow { child_id, workflow_name, input: child_input, .. } => {
+            WorkflowCommand::StartChildWorkflow {
+                child_id,
+                workflow_name,
+                input: child_input,
+                ..
+            } => {
                 let result = self.resolve_child(&workflow_name, child_input.clone());
                 history.push(WorkflowEvent::ChildWorkflowStarted {
                     child_id,

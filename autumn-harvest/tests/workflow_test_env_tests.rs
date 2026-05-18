@@ -158,7 +158,9 @@ async fn test_happy_path_one_activity() {
         "expected ActivityScheduled for send_email"
     );
     assert!(
-        events.iter().any(|e| matches!(e, WorkflowEvent::ActivityCompleted { .. })),
+        events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::ActivityCompleted { .. })),
         "expected ActivityCompleted"
     );
 }
@@ -178,18 +180,24 @@ async fn test_first_attempt_fails_second_succeeds() {
     let events = outcome.events();
     let scheduled_count = events
         .iter()
-        .filter(|e| matches!(e, WorkflowEvent::ActivityScheduled { name, .. } if name == "charge_card"))
+        .filter(
+            |e| matches!(e, WorkflowEvent::ActivityScheduled { name, .. } if name == "charge_card"),
+        )
         .count();
     assert_eq!(
         scheduled_count, 2,
         "expected two ActivityScheduled events (one failed, one succeeded)"
     );
     assert!(
-        events.iter().any(|e| matches!(e, WorkflowEvent::ActivityFailed { .. })),
+        events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::ActivityFailed { .. })),
         "expected an ActivityFailed event for the first attempt"
     );
     assert!(
-        events.iter().any(|e| matches!(e, WorkflowEvent::ActivityCompleted { .. })),
+        events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::ActivityCompleted { .. })),
         "expected an ActivityCompleted event for the second attempt"
     );
 }
@@ -204,15 +212,21 @@ async fn test_timer_wins_when_no_signal_queued() {
 
     let events = outcome.events();
     assert!(
-        events.iter().any(|e| matches!(e, WorkflowEvent::TimerStarted { .. })),
+        events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::TimerStarted { .. })),
         "expected TimerStarted"
     );
     assert!(
-        events.iter().any(|e| matches!(e, WorkflowEvent::TimerFired { .. })),
+        events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::TimerFired { .. })),
         "expected TimerFired"
     );
     assert!(
-        !events.iter().any(|e| matches!(e, WorkflowEvent::SignalReceived { .. })),
+        !events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::SignalReceived { .. })),
         "signal must not be in events when timer wins"
     );
 }
@@ -232,7 +246,9 @@ async fn test_signal_wins_when_queued() {
         "expected SignalReceived(approve)"
     );
     assert!(
-        !events.iter().any(|e| matches!(e, WorkflowEvent::TimerFired { .. })),
+        !events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::TimerFired { .. })),
         "timer must not fire when signal wins"
     );
 }
@@ -393,7 +409,9 @@ async fn test_cancellation_injection() {
         "expected WorkflowCancelled in the event log"
     );
     assert!(
-        !events.iter().any(|e| matches!(e, WorkflowEvent::ActivityScheduled { .. })),
+        !events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::ActivityScheduled { .. })),
         "activity must not be scheduled after cancellation"
     );
 }
@@ -468,7 +486,10 @@ async fn test_all_attempts_fail_returns_error() {
         .run(max_retries_workflow, json!(null))
         .await;
 
-    assert!(outcome.result.is_err(), "exhausted retries should return Err");
+    assert!(
+        outcome.result.is_err(),
+        "exhausted retries should return Err"
+    );
 }
 
 #[tokio::test]
@@ -484,7 +505,9 @@ async fn test_third_attempt_succeeds() {
     let scheduled = outcome
         .events()
         .iter()
-        .filter(|e| matches!(e, WorkflowEvent::ActivityScheduled { name, .. } if name == "flaky_op"))
+        .filter(
+            |e| matches!(e, WorkflowEvent::ActivityScheduled { name, .. } if name == "flaky_op"),
+        )
         .count();
     assert_eq!(scheduled, 3, "expected exactly 3 scheduled events");
 }
