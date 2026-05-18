@@ -10,7 +10,7 @@
 //! replay-mode self-check.
 //!
 //! Run with:
-//!   cargo test -p autumn-harvest --test workflow_test_env_tests \
+//!   cargo test -p autumn-harvest --test `workflow_test_env_tests` \
 //!     --features testing --no-default-features
 
 use std::future::Future;
@@ -317,8 +317,7 @@ async fn test_local_activity_mock() {
         .mock_activity("compute_hash", |input| {
             let sum: i64 = input
                 .as_array()
-                .map(Vec::as_slice)
-                .unwrap_or(&[])
+                .map_or(&[][..], Vec::as_slice)
                 .iter()
                 .filter_map(|v: &Value| v.as_i64())
                 .sum();
@@ -437,10 +436,7 @@ fn stateful_workflow<'a>(
     input: Value,
 ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
     Box::pin(async move {
-        let mult = ctx
-            .state::<CounterConfig>()
-            .map(|c| c.multiplier)
-            .unwrap_or(1);
+        let mult = ctx.state::<CounterConfig>().map_or(1, |c| c.multiplier);
         let v = input.as_i64().unwrap_or(0);
         Ok(json!(v * mult))
     })
@@ -471,7 +467,7 @@ fn max_retries_workflow<'a>(
                 .await
             {
                 Ok(v) => return Ok(v),
-                Err(_) if attempt < MAX => continue,
+                Err(_) if attempt < MAX => {}
                 Err(e) => return Err(e.to_string()),
             }
         }
