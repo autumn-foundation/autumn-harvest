@@ -117,6 +117,8 @@ const LEGACY_INIT_SQL: &str = concat!(
     include_str!("../migrations/20260509000000_harvest_build_routing/up.sql"),
     "\n",
     include_str!("../migrations/20260514020000_harvest_task_activity_id/up.sql"),
+    "\n",
+    include_str!("../migrations/20260518000000_harvest_workflow_execution_timeout/up.sql"),
 );
 
 /// Start a Postgres container with the harvest schema applied and return
