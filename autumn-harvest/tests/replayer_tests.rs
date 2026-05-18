@@ -1039,7 +1039,7 @@ async fn replayer_detects_changed_child_workflow_input() {
 // External signal replay tests (issue #330)
 // ---------------------------------------------------------------------------
 
-/// Build a history with ExternalSignalRequested + ExternalSignalDelivered.
+/// Build a history with `ExternalSignalRequested` + `ExternalSignalDelivered`.
 fn external_signal_delivered_history() -> (ExecutionId, Vec<WorkflowEvent>) {
     let exec_id = ExecutionId::new();
     let signal_id = autumn_harvest::types::ExternalSignalId::new();
@@ -1063,7 +1063,7 @@ fn external_signal_delivered_history() -> (ExecutionId, Vec<WorkflowEvent>) {
     (exec_id, events)
 }
 
-/// Build a history with ExternalSignalRequested + ExternalSignalFailed.
+/// Build a history with `ExternalSignalRequested` + `ExternalSignalFailed`.
 fn external_signal_failed_history() -> (ExecutionId, Vec<WorkflowEvent>) {
     let exec_id = ExecutionId::new();
     let signal_id = autumn_harvest::types::ExternalSignalId::new();
@@ -1125,33 +1125,9 @@ fn external_signal_wrong_name_workflow<'a>(
     })
 }
 
-fn make_external_signal_snapshot(
-    workflow_name: &str,
-    exec_id: ExecutionId,
-    events: Vec<WorkflowEvent>,
-) -> HistorySnapshot {
-    // Extract target execution id from the ExternalSignalRequested event
-    let target = events
-        .iter()
-        .find_map(|e| {
-            if let WorkflowEvent::ExternalSignalRequested { target, .. } = e {
-                Some(*target)
-            } else {
-                None
-            }
-        })
-        .expect("history must contain ExternalSignalRequested");
-
-    HistorySnapshot {
-        workflow_name: workflow_name.to_string(),
-        execution_id: exec_id,
-        events,
-    }
-}
-
 #[tokio::test]
 async fn replayer_replays_external_signal_delivered_successfully() {
-    let (exec_id, events) = external_signal_delivered_history();
+    let (_exec_id, events) = external_signal_delivered_history();
     // Extract target from events
     let target = events
         .iter()
@@ -1165,30 +1141,20 @@ async fn replayer_replays_external_signal_delivered_successfully() {
         .unwrap();
 
     let input = serde_json::json!({"target": target.to_string()});
-    let snapshot = HistorySnapshot {
-        workflow_name: "external_signal_workflow".to_string(),
-        execution_id: exec_id,
-        events,
-    };
+    let events_with_input: Vec<_> = events
+        .iter()
+        .map(|e| match e {
+            WorkflowEvent::WorkflowStarted { timestamp, .. } => WorkflowEvent::WorkflowStarted {
+                input: input.clone(),
+                timestamp: *timestamp,
+            },
+            other => other.clone(),
+        })
+        .collect();
 
-    // Inject input through modified snapshot (replayer uses WorkflowStarted's input)
     let report = WorkflowReplayer::new()
         .register_fn("external_signal_workflow", external_signal_workflow)
-        .replay_from_events(
-            snapshot
-                .events
-                .iter()
-                .map(|e| match e {
-                    WorkflowEvent::WorkflowStarted { timestamp, .. } => {
-                        WorkflowEvent::WorkflowStarted {
-                            input: input.clone(),
-                            timestamp: *timestamp,
-                        }
-                    }
-                    other => other.clone(),
-                })
-                .collect(),
-        )
+        .replay_from_events(events_with_input)
         .await;
 
     assert!(
@@ -1199,7 +1165,7 @@ async fn replayer_replays_external_signal_delivered_successfully() {
 
 #[tokio::test]
 async fn replayer_detects_external_signal_name_mismatch() {
-    let (exec_id, events) = external_signal_delivered_history();
+    let (_exec_id, events) = external_signal_delivered_history();
     let target = events
         .iter()
         .find_map(|e| {
@@ -1245,7 +1211,7 @@ async fn replayer_detects_external_signal_name_mismatch() {
 
 #[tokio::test]
 async fn replayer_replays_external_signal_failed_history() {
-    let (exec_id, events) = external_signal_failed_history();
+    let (_exec_id, events) = external_signal_failed_history();
     let target = events
         .iter()
         .find_map(|e| {

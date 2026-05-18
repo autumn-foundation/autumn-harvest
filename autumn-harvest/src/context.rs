@@ -4728,7 +4728,6 @@ mod tests {
 
     #[tokio::test]
     async fn signal_external_workflow_live_mode_emits_command() {
-        let ctx = WorkflowContext::new_test();
         let target = ExecutionId::new();
 
         // Signal delivery never happens in live mode without a worker resolving
