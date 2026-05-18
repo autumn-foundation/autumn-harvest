@@ -809,7 +809,7 @@ impl WorkflowContext {
         self.matcher
             .lock()
             .expect("matcher lock poisoned")
-            .is_replaying()
+            .has_buffered_history()
     }
 
     /// Access typed shared state (e.g., email clients, config) injected via the builder.
@@ -1759,9 +1759,14 @@ impl WorkflowContext {
                 format!("external signal mismatch: expected {expected}, got {actual}"),
             )),
 
-            // Crash-recovery: ExternalSignalRequested is already durable; re-attempt delivery.
-            HistoryMatch::ExternalSignalInProgress { signal_id } => {
-                self.dispatch_signal_command(target, signal_name, payload, signal_id, true)
+            // Crash-recovery: ExternalSignalRequested is already durable; re-attempt delivery
+            // using the recorded payload so the target receives the same data regardless of
+            // any code changes to the payload expression between the crash and recovery.
+            HistoryMatch::ExternalSignalInProgress {
+                signal_id,
+                payload: recorded_payload,
+            } => {
+                self.dispatch_signal_command(target, signal_name, recorded_payload, signal_id, true)
                     .await
             }
 

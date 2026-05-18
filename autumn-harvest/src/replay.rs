@@ -105,11 +105,17 @@ pub enum HistoryMatch {
     ///
     /// This occurs when the worker crashed after appending the request event
     /// but before recording the delivery outcome. The caller must re-attempt
-    /// delivery using the **same** `signal_id` so the idempotency key is
-    /// unchanged, and must NOT append a second `ExternalSignalRequested` event.
+    /// delivery using the **same** `signal_id` and the **same** `payload` so
+    /// the idempotency key is unchanged, and must NOT append a second
+    /// `ExternalSignalRequested` event.
     ExternalSignalInProgress {
         /// The `ExternalSignalId` already recorded in history. Must be reused.
         signal_id: ExternalSignalId,
+        /// The payload stored in the durable `ExternalSignalRequested` event.
+        /// The worker must re-send this exact payload rather than the current
+        /// argument value, so that target receives consistent data if the
+        /// workflow code changed the payload expression between crash and recovery.
+        payload: serde_json::Value,
     },
     /// History contains an `ExternalSignalFailed` terminal event for a
     /// `signal_external_workflow` call.  Carries the original `signal_id` from
@@ -139,6 +145,11 @@ struct StashedExternalSignal {
     signal_id: ExternalSignalId,
     target: ExecutionId,
     signal_name: String,
+    /// Durable payload from the recorded `ExternalSignalRequested` event.
+    /// Carried through so that crash-recovery re-dispatch uses the same
+    /// payload that was originally sent, not whatever the workflow currently
+    /// passes as an argument.
+    payload: serde_json::Value,
     terminal: Option<StashedSignalTerminal>,
 }
 
@@ -326,12 +337,13 @@ impl HistoryMatcher {
                     signal_id,
                     target,
                     signal_name,
-                    ..
+                    payload,
                 } => {
                     let stashed = StashedExternalSignal {
                         signal_id: *signal_id,
                         target: *target,
                         signal_name: signal_name.clone(),
+                        payload: payload.clone(),
                         terminal: None,
                     };
                     self.pending_external_signals.push(stashed);
@@ -469,7 +481,12 @@ impl HistoryMatcher {
         self.is_replaying()
     }
 
-    /// Returns `true` if the cursor is still within the recorded history.
+    /// Returns `true` if the cursor is still within the recorded history
+    /// (cursor-based check only, does not inspect the early-drain stash).
+    ///
+    /// Used internally by `prepare_match` and other cursor-advancing methods.
+    /// For the user-visible `ctx.is_replaying()` check, use
+    /// [`has_buffered_history`](Self::has_buffered_history) instead.
     #[must_use]
     pub fn is_replaying(&self) -> bool {
         let mut cursor = self.cursor;
@@ -477,6 +494,20 @@ impl HistoryMatcher {
             cursor += 1;
         }
         cursor < self.events.len()
+    }
+
+    /// Returns `true` if there is any un-replayed history — either cursor-based
+    /// events or signals/external-signals buffered in the early-drain stash.
+    ///
+    /// Use this for the user-visible `ctx.is_replaying()` check.  Stashed entries
+    /// represent recorded history that `drain_early_signals` moved out of the
+    /// cursor path for out-of-order matching; they are still "history" from the
+    /// workflow's perspective even though the cursor is past them.
+    #[must_use]
+    pub fn has_buffered_history(&self) -> bool {
+        self.is_replaying()
+            || !self.pending_signals.is_empty()
+            || !self.pending_external_signals.is_empty()
     }
 
     /// Number of events loaded into this replay matcher.
@@ -576,12 +607,13 @@ impl HistoryMatcher {
                     signal_id,
                     target,
                     signal_name,
-                    ..
+                    payload,
                 } => {
                     let stashed = StashedExternalSignal {
                         signal_id: *signal_id,
                         target: *target,
                         signal_name: signal_name.clone(),
+                        payload: payload.clone(),
                         terminal: None,
                     };
                     self.pending_external_signals.push(stashed);
@@ -875,12 +907,13 @@ impl HistoryMatcher {
                     signal_id,
                     target,
                     signal_name,
-                    ..
+                    payload,
                 } => {
                     let stashed = StashedExternalSignal {
                         signal_id: *signal_id,
                         target: *target,
                         signal_name: signal_name.clone(),
+                        payload: payload.clone(),
                         terminal: None,
                     };
                     self.pending_external_signals.push(stashed);
@@ -960,6 +993,7 @@ impl HistoryMatcher {
                 }
                 None => HistoryMatch::ExternalSignalInProgress {
                     signal_id: stashed.signal_id,
+                    payload: stashed.payload,
                 },
             })
         };
@@ -1016,7 +1050,7 @@ impl HistoryMatcher {
                 signal_id,
                 target: recorded_target,
                 signal_name: recorded_name,
-                ..
+                payload: recorded_payload,
             } => {
                 if *recorded_target != target {
                     return HistoryMatch::Diverged {
@@ -1038,7 +1072,7 @@ impl HistoryMatcher {
                         ),
                     };
                 }
-                Ok(*signal_id)
+                Ok((*signal_id, recorded_payload.clone()))
             }
             other => Err(HistoryMatch::Diverged {
                 expected: format!("ExternalSignalRequested(target={target}, signal={signal_name})"),
@@ -1046,8 +1080,8 @@ impl HistoryMatcher {
             }),
         };
 
-        let signal_id = match result {
-            Ok(id) => id,
+        let (signal_id, recorded_payload) = match result {
+            Ok(pair) => pair,
             Err(diverged) => return diverged,
         };
 
@@ -1101,7 +1135,12 @@ impl HistoryMatcher {
 
         // ExternalSignalRequested found in history but no terminal event yet.
         // Worker crashed between recording the request and the delivery outcome.
-        HistoryMatch::ExternalSignalInProgress { signal_id }
+        // Return the durable payload so the caller re-sends exactly what was
+        // originally recorded, regardless of any code changes since the crash.
+        HistoryMatch::ExternalSignalInProgress {
+            signal_id,
+            payload: recorded_payload,
+        }
     }
 
     /// Match a timer command against history.
@@ -1184,12 +1223,13 @@ impl HistoryMatcher {
                     signal_id,
                     target,
                     signal_name,
-                    ..
+                    payload,
                 } => {
                     let stashed = StashedExternalSignal {
                         signal_id: *signal_id,
                         target: *target,
                         signal_name: signal_name.clone(),
+                        payload: payload.clone(),
                         terminal: None,
                     };
                     self.pending_external_signals.push(stashed);
@@ -1300,12 +1340,13 @@ impl HistoryMatcher {
                     signal_id,
                     target,
                     signal_name: sn,
-                    ..
+                    payload,
                 } => {
                     let stashed = StashedExternalSignal {
                         signal_id: *signal_id,
                         target: *target,
                         signal_name: sn.clone(),
+                        payload: payload.clone(),
                         terminal: None,
                     };
                     self.pending_external_signals.push(stashed);
@@ -1608,13 +1649,24 @@ impl HistoryMatcher {
     /// while new executions start on the new `max_version` path.
     pub fn match_version(&mut self, change_id: &str, min_version: u32, max_version: u32) -> u32 {
         self.advance_to_next_unconsumed_event();
-        // Drain ExternalSignal events that may have been written before this version
-        // marker in a mixed batch (e.g. concurrent signal_external + ctx.version call).
-        self.drain_early_signals();
         let marker_name = format!("version:{change_id}");
 
+        // Check BEFORE draining: if already past cursor-based history, this is
+        // a genuinely new code path → record max_version.
         if !self.is_replaying() {
             return max_version;
+        }
+
+        // Now safe to drain ExternalSignal events that may precede this marker
+        // in a mixed batch (e.g. tokio::join!(ctx.version(...), signal_external)).
+        self.drain_early_signals();
+
+        // After draining: if cursor is past end (only stashed ExternalSignal
+        // events were the remaining history), this is an unversioned position —
+        // return min_version so existing executions stay on the old branch
+        // instead of recording a new marker and jumping to max_version.
+        if !self.is_replaying() {
+            return min_version;
         }
 
         match &self.events[self.cursor] {
