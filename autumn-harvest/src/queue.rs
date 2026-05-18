@@ -17,7 +17,7 @@ use uuid::Uuid;
 use crate::error::HarvestResult;
 use crate::models::{NewTaskQueueItem, TaskQueueItem};
 use crate::telemetry::TraceContextCarrier;
-use crate::types::ExecutionId;
+use crate::types::{ExecutionId, Priority};
 
 // ---------------------------------------------------------------------------
 // TaskType
@@ -136,6 +136,17 @@ impl EnqueueParams {
         }
     }
 
+    /// Set the task priority, overriding the `Normal` default.
+    ///
+    /// The claim query orders candidates by `priority DESC, available_at ASC`
+    /// so tasks with higher priority are always claimed before lower-priority
+    /// tasks that arrived earlier on the same queue.
+    #[must_use]
+    pub const fn with_priority(mut self, priority: Priority) -> Self {
+        self.priority = priority.as_i32();
+        self
+    }
+
     /// Pin this task to the given worker for the duration of `timeout`.
     ///
     /// Both fields are required together -- passing either alone is a no-op.
@@ -249,6 +260,14 @@ pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> Ha
 /// Uses `FOR UPDATE SKIP LOCKED` so concurrent workers never contend on the
 /// same row. Returns `None` if no eligible task is available.
 ///
+/// # Priority and anti-starvation
+///
+/// Tasks are ordered `priority DESC, available_at ASC` so higher-priority work
+/// is claimed first.  When `priority_aging_secs` is `Some(K)`, each task's
+/// effective priority is boosted by `+1` for every `K` seconds it has been
+/// waiting in `PENDING` state.  This bounds the maximum starvation time for
+/// `Low` priority tasks even under sustained high-priority load.
+///
 /// # Sticky routing
 ///
 /// When a row has `sticky_worker_id` set and `sticky_until > NOW()`, only that
@@ -265,6 +284,7 @@ pub async fn claim_task(
     queues: &[String],
     worker_id: &str,
     worker_build_id: &str,
+    priority_aging_secs: Option<u32>,
 ) -> HarvestResult<Option<TaskQueueItem>> {
     // Two-phase claim using a CTE to avoid holding advisory locks during
     // broad WHERE filtering.
@@ -291,6 +311,11 @@ pub async fn claim_task(
     // Build routing filter (issue #171): a task with required_build_id can only
     // be claimed by a worker whose build_id matches, is declared compatible, OR
     // the worker has an empty build_id (legacy worker — can claim anything).
+    // When priority_aging_secs is Some(K), each task's effective priority is
+    // boosted by floor(wait_seconds / K) to prevent indefinite starvation.
+    // A NULL value (or 0, which the builder normalizes to None) disables aging.
+    let aging_secs_i64: Option<i64> = priority_aging_secs.map(i64::from);
+
     let result: Vec<TaskQueueItem> = diesel::sql_query(
         "WITH candidate AS ( \
              SELECT id, task_type, concurrency_key, concurrency_cap \
@@ -330,7 +355,11 @@ pub async fn claim_task(
                      WHEN sticky_worker_id = $1 AND sticky_until > NOW() THEN 1 \
                      ELSE 0 \
                  END DESC, \
-                 priority DESC, \
+                 CASE \
+                     WHEN $4::BIGINT IS NOT NULL AND $4::BIGINT > 0 \
+                     THEN priority + FLOOR(EXTRACT(EPOCH FROM (NOW() - scheduled_at)) / $4::BIGINT)::INT \
+                     ELSE priority \
+                 END DESC, \
                  scheduled_at ASC \
              LIMIT 1 FOR UPDATE SKIP LOCKED \
          ) \
@@ -359,6 +388,7 @@ pub async fn claim_task(
     .bind::<diesel::sql_types::Text, _>(worker_id)
     .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
     .bind::<diesel::sql_types::Text, _>(worker_build_id)
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::BigInt>, _>(aging_secs_i64)
     .load(conn)
     .await
     .map_err(crate::error::database_error)?;
@@ -946,6 +976,59 @@ pub async fn wake_workflow_task(
     crate::notify::notify_tasks_enqueued(conn, &queue_names, Uuid::nil()).await?;
 
     Ok(())
+}
+
+/// Update the priority of a pending task via the management API.
+///
+/// Only tasks in `PENDING` state are eligible; already-running tasks ignore
+/// the change (the running attempt keeps its original priority). The next retry
+/// attempt will use the new value because it will be re-claimed using the
+/// updated row. Terminal tasks (`COMPLETED`, `FAILED`, `CANCELLED`) are not
+/// found by this filter and the function returns `false`.
+///
+/// Returns `true` when the update was applied, `false` when the task was not
+/// found in an updatable state (terminal tasks return `false`).
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub async fn update_task_priority(
+    conn: &mut AsyncPgConnection,
+    task_id: Uuid,
+    priority: Priority,
+) -> HarvestResult<bool> {
+    use crate::schema::harvest_task_queue::dsl;
+
+    let updated = diesel::update(
+        dsl::harvest_task_queue
+            .find(task_id)
+            .filter(dsl::state.eq_any(["PENDING", "RUNNING"])),
+    )
+    .set(dsl::priority.eq(priority.as_i32()))
+    .execute(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+
+    Ok(updated > 0)
+}
+
+/// Returns `true` if a task with the given ID exists in the queue (regardless of state).
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub async fn task_exists(conn: &mut AsyncPgConnection, task_id: Uuid) -> HarvestResult<bool> {
+    use crate::schema::harvest_task_queue::dsl;
+
+    let found: Option<Uuid> = dsl::harvest_task_queue
+        .filter(dsl::id.eq(task_id))
+        .select(dsl::id)
+        .first::<Uuid>(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?;
+
+    Ok(found.is_some())
 }
 
 // ---------------------------------------------------------------------------

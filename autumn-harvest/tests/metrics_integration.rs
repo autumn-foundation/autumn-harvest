@@ -318,6 +318,7 @@ fn build_worker(worker_id: &str, registry: Arc<HandlerRegistry>) -> Arc<Worker> 
                 build_id: String::new(),
                 deployment_name: None,
                 workflow_cache_size: 1000,
+                priority_aging_secs: None,
             },
             registry,
         )

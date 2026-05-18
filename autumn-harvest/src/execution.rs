@@ -22,7 +22,7 @@ use crate::queue::{self, EnqueueParams, TaskType};
 use crate::schema::{harvest_signals, harvest_workflow_executions};
 use crate::store;
 use crate::telemetry::TraceContextCarrier;
-use crate::types::{ExecutionId, WorkflowIdReusePolicy};
+use crate::types::{ExecutionId, Priority, WorkflowIdReusePolicy};
 
 /// Parameters for starting a workflow execution.
 ///
@@ -67,6 +67,12 @@ pub struct StartWorkflowParams<'a> {
     /// Maximum number of RUNNING workflow tasks allowed for [`Self::concurrency_key`].
     /// Required whenever `concurrency_key` is `Some`; ignored when it is `None`.
     pub concurrency_limit: Option<u32>,
+    /// Within-queue claim priority for this workflow execution (issue #249).
+    ///
+    /// Stored on the task queue row; does not affect the event history or
+    /// replay determinism. Defaults to [`Priority::Normal`] so pre-upgrade
+    /// callers that do not set this field are unaffected.
+    pub priority: Priority,
 }
 
 impl StartWorkflowParams<'_> {
@@ -246,6 +252,7 @@ pub async fn start_or_load_workflow_execution(
     enqueue.trace_context.clone_from(&request.trace_context);
     enqueue.concurrency_key.clone_from(&request.concurrency_key);
     enqueue.max_concurrent = request.concurrency_limit;
+    enqueue.priority = request.priority.as_i32();
 
     conn.transaction::<StartedWorkflowExecution, HarvestError, _>(|conn| {
         let row = row;
@@ -809,6 +816,7 @@ pub async fn signal_with_start_workflow_execution(
                     max_execution_timeout_ceiling: request.max_execution_timeout_ceiling,
                     concurrency_key: request.concurrency_key.clone(),
                     concurrency_limit: request.concurrency_limit,
+                    priority: Priority::default(),
                 };
 
             let started = start_or_load_workflow_execution(

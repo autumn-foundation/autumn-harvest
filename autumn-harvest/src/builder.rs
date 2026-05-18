@@ -1081,6 +1081,16 @@ pub struct WorkerConfig {
     /// terminates the handler and returns [`HarvestError::QueryTimedOut`] to
     /// the caller. Defaults to **5 seconds**.
     pub query_timeout: Duration,
+    /// Anti-starvation aging period for the priority claim query (issue #249).
+    ///
+    /// When `Some(K)`, a task's effective priority is boosted by `+1` for
+    /// every `K` seconds it has been waiting in `PENDING` state. This ensures
+    /// that low-priority tasks are not indefinitely starved under sustained
+    /// high-priority load.
+    ///
+    /// A value of `0` is normalized to `None` (no aging). `None` is the
+    /// default — existing deployments are unaffected.
+    pub priority_aging_secs: Option<u32>,
 }
 
 impl Default for WorkerConfig {
@@ -1100,6 +1110,7 @@ impl Default for WorkerConfig {
             build_id: String::new(),
             deployment_name: None,
             query_timeout: Duration::from_secs(5),
+            priority_aging_secs: None,
         }
     }
 }
@@ -1196,6 +1207,32 @@ impl WorkerConfig {
     #[must_use]
     pub const fn with_query_timeout(mut self, timeout: Duration) -> Self {
         self.query_timeout = timeout;
+        self
+    }
+
+    /// Enable priority aging to prevent low-priority task starvation (issue #249).
+    ///
+    /// When set to `K` seconds, a task's effective priority is boosted by `+1`
+    /// for every `K` seconds it has been waiting in `PENDING` state. This
+    /// bounds the maximum starvation time for `Low` priority tasks even under
+    /// sustained high-priority load.
+    ///
+    /// A value of `0` is treated as "no aging" and normalised to `None`.
+    /// Defaults to `None` (aging disabled) — existing deployments are
+    /// unaffected.
+    ///
+    /// ## Example
+    ///
+    /// ```rust
+    /// use autumn_harvest::builder::WorkerConfig;
+    ///
+    /// // Low-priority tasks gain +1 effective priority every 5 minutes of waiting.
+    /// let config = WorkerConfig::default().with_priority_aging_secs(300);
+    /// assert_eq!(config.priority_aging_secs, Some(300));
+    /// ```
+    #[must_use]
+    pub const fn with_priority_aging_secs(mut self, secs: u32) -> Self {
+        self.priority_aging_secs = if secs == 0 { None } else { Some(secs) };
         self
     }
 

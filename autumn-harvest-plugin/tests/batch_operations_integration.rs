@@ -13,7 +13,7 @@ use autumn_harvest::batch::{BatchExecutorConfig, run_executor_once};
 use autumn_harvest::scheduler::{DagCatalog, SchedulerMonitor};
 use autumn_harvest::schema::harvest_workflow_executions;
 use autumn_harvest::shard::ShardRouter;
-use autumn_harvest::types::{ExecutionId, ShardId};
+use autumn_harvest::types::{ExecutionId, Priority, ShardId};
 use autumn_harvest::worker::DbPool;
 use autumn_harvest::worker::HandlerRegistry;
 use autumn_harvest::{StartWorkflowParams, start_or_load_workflow_execution};
@@ -195,6 +195,7 @@ async fn seed_workflows(database_url: &str, workflow_name: &str, count: usize) -
                 max_execution_timeout_ceiling: None,
                 concurrency_key: None,
                 concurrency_limit: None,
+                priority: Priority::default(),
             },
         )
         .await
