@@ -1612,8 +1612,8 @@ async fn tick_one_workflow_schedule(
                 reuse_policy: scheduled_workflow_reuse_policy(),
                 trace_context: None,
                 max_execution_timeout_ceiling: None,
-                concurrency_key: None,
-                concurrency_limit: None,
+                concurrency_key,
+                concurrency_limit,
             },
         )
         .await;
@@ -1925,8 +1925,8 @@ async fn drain_buffered_schedule_runs(
                     reuse_policy: scheduled_workflow_reuse_policy(),
                     trace_context: None,
                     max_execution_timeout_ceiling: None,
-                    concurrency_key: None,
-                    concurrency_limit: None,
+                    concurrency_key,
+                    concurrency_limit,
                 },
             )
             .await;
