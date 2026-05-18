@@ -981,8 +981,7 @@ impl WorkflowTestEnv {
     /// Return the current simulated wall-clock time.
     ///
     /// This is the value that `ctx.now()` returns inside the workflow function
-    /// during the run.  The time is fixed at construction and advances by the
-    /// sum of all timers that fire.
+    /// during the run.  The time is fixed at construction.
     #[must_use]
     pub const fn now(&self) -> DateTime<Utc> {
         self.simulated_now
@@ -1050,6 +1049,10 @@ impl WorkflowTestEnv {
                     };
                 }
                 WorkflowOutcome::ContinuedAsNew { input: new_input } => {
+                    history.push(WorkflowEvent::WorkflowContinuedAsNew {
+                        new_exec_id: ExecutionId::new(),
+                        input: new_input.clone(),
+                    });
                     return TestRunOutcome {
                         result: Ok(new_input),
                         events: history,
