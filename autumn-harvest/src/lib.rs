@@ -214,12 +214,15 @@ pub use telemetry::{
 };
 #[cfg(any(test, feature = "testing"))]
 pub use test_generator::TestHarnessGenerator;
+#[cfg(feature = "testing")]
+pub use testing::{
+    BatchReplayReport, CiReport, FailOnMode, FixtureResult, FixtureStatus, HarnessErrorKind,
+    ReplayVerifier, ReportFormat, TestRunOutcome, WorkflowTestEnv,
+};
 #[cfg(any(test, feature = "testing"))]
 pub use testing::{
     HistorySnapshot, NonDeterminismKind, ReplayReport, ReplayStatus, WorkflowReplayer,
 };
-#[cfg(feature = "testing")]
-pub use testing::{TestRunOutcome, WorkflowTestEnv};
 pub use types::{
     ActivityExecId, BuildId, DeploymentName, ExecutionId, ExternalActivityToken, Priority, ShardId,
     TimerId, UpdateId, WorkerId, WorkflowId, WorkflowIdReusePolicy,
