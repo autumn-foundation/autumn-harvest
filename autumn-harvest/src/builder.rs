@@ -265,6 +265,19 @@ pub enum HarvestBuilderError {
     /// A [`WorkerConfig`] field has an invalid value.
     #[error("invalid worker configuration: {0}")]
     InvalidWorkerConfig(String),
+
+    /// A [`crate::policy::Schedule::CronInTimezone`] variant declares a
+    /// timezone name that is not a valid IANA entry. The name is rejected at
+    /// build time so the operator sees a clear error rather than silently
+    /// misfiring at the wrong time.
+    #[error(
+        "unknown timezone '{name}'; use an IANA timezone name \
+         (e.g. \"America/Los_Angeles\", \"Europe/London\", \"UTC\")"
+    )]
+    UnknownTimezone {
+        /// The unrecognised IANA timezone name.
+        name: String,
+    },
 }
 
 impl BuiltHarvest {
@@ -838,11 +851,20 @@ fn validate_workflow_schedules(
                     reason: "interval must be at least 1 second".to_string(),
                 });
             }
-        } else if let Err(reason) = crate::policy::validate_schedule(&schedule.schedule) {
-            return Err(HarvestBuilderError::InvalidWorkflowSchedule {
-                workflow_name: schedule.workflow_name.clone(),
-                reason,
-            });
+        } else {
+            // Validate timezone names early so operators get a typed error rather
+            // than a silent bad-timezone panic at first scheduler tick.
+            if let crate::policy::Schedule::CronInTimezone { tz, .. } = &schedule.schedule
+                && tz.parse::<chrono_tz::Tz>().is_err()
+            {
+                return Err(HarvestBuilderError::UnknownTimezone { name: tz.clone() });
+            }
+            if let Err(reason) = crate::policy::validate_schedule(&schedule.schedule) {
+                return Err(HarvestBuilderError::InvalidWorkflowSchedule {
+                    workflow_name: schedule.workflow_name.clone(),
+                    reason,
+                });
+            }
         }
         if let Err(reason) = crate::policy::validate_jitter(&schedule.schedule, schedule.jitter) {
             return Err(HarvestBuilderError::InvalidWorkflowSchedule {
@@ -1778,5 +1800,43 @@ mod tests {
             built.max_workflow_execution_timeout_ceiling(),
             Some(ceiling)
         );
+    }
+
+    // ── CronInTimezone builder validation ────────────────────────────────────
+
+    #[test]
+    fn builder_rejects_unknown_timezone_in_workflow_schedule() {
+        let result = HarvestBuilder::new()
+            .workflows(vec![fake_workflow_info()])
+            .workflow_schedule(WorkflowSchedule::new(
+                "test",
+                Schedule::CronInTimezone {
+                    expr: "0 9 * * *".to_string(),
+                    tz: "Not/ATimezone".to_string(),
+                },
+            ))
+            .try_build();
+
+        let err = result.unwrap_err();
+        assert!(
+            matches!(&err, HarvestBuilderError::UnknownTimezone { name } if name == "Not/ATimezone"),
+            "expected UnknownTimezone, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn builder_accepts_valid_timezone_in_workflow_schedule() {
+        let result = HarvestBuilder::new()
+            .workflows(vec![fake_workflow_info()])
+            .workflow_schedule(WorkflowSchedule::new(
+                "test",
+                Schedule::CronInTimezone {
+                    expr: "0 9 * * 1-5".to_string(),
+                    tz: "America/Los_Angeles".to_string(),
+                },
+            ))
+            .try_build();
+
+        assert!(result.is_ok(), "valid timezone must be accepted: {result:?}");
     }
 }

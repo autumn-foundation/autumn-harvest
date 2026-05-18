@@ -5,6 +5,38 @@ All notable changes to autumn-harvest will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Timezone-aware cron schedules** (`Schedule::CronInTimezone`, issue #245).
+  A new `Schedule` variant lets schedule authors anchor a cron expression to an
+  IANA timezone so that jobs like `"0 9 * * 1-5"` fire at 9 AM local time
+  year-round, regardless of DST transitions:
+
+  ```rust
+  Schedule::CronInTimezone {
+      expr: "0 9 * * 1-5".into(),
+      tz: "America/Los_Angeles".into(),
+  }
+  ```
+
+  DST disambiguation rules: spring-forward gaps do not produce spurious firings
+  (the skipped local time is not back-fired); fall-back repetitions fire exactly
+  once on the first occurrence of the repeated hour.
+
+  Unknown IANA timezone names are rejected at builder/registration time with
+  `HarvestBuilderError::UnknownTimezone { name }`, not at first scheduler tick.
+
+  The `harvest_schedules.timezone` column is now written with the schedule's
+  declared timezone (was always hard-coded `"UTC"`). The management API
+  `GET /admin/schedules` and `POST /admin/schedules/workflow` accept and emit a
+  `"timezone"` field; schedules created without the field default to `"UTC"`.
+
+  **Backward compatibility:** `Schedule::Cron(expr)` schedules retain UTC
+  semantics on upgrade. The new variant is strictly opt-in. No migration is
+  required — the `timezone` column already exists.
+
 ## [0.3.0] - 2026-05-13
 
 ### Documentation
