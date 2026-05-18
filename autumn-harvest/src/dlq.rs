@@ -292,17 +292,16 @@ pub async fn replay_dead_letter(
                     // to the workflow-level cap (the claim query enforces caps
                     // per task_type, so mixing them would throttle activities
                     // against the wrong budget).
-                    if task_type == TaskType::Workflow {
-                        if let Some(reg) = registry
-                            && let Some(info) = reg.workflows.get(&workflow_name)
-                            && let Some(policy) = &info.concurrency
-                        {
-                            params.concurrency_key = crate::concurrency::resolve_concurrency_key(
-                                policy.key_expr,
-                                &params.input,
-                            );
-                            params.max_concurrent = Some(policy.limit);
-                        }
+                    if task_type == TaskType::Workflow
+                        && let Some(reg) = registry
+                        && let Some(info) = reg.workflows.get(&workflow_name)
+                        && let Some(policy) = &info.concurrency
+                    {
+                        params.concurrency_key = crate::concurrency::resolve_concurrency_key(
+                            policy.key_expr,
+                            &params.input,
+                        );
+                        params.max_concurrent = Some(policy.limit);
                     }
                 }
             }
