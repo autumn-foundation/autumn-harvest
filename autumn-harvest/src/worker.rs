@@ -3660,6 +3660,61 @@ async fn process_workflow_task(
                 // Local-activity re-run: drop this iteration's execute span
                 // so the OTel span closes before we start inline execution.
                 drop(execute_span);
+                // If the batch also contains SignalExternalWorkflow commands,
+                // write their history events BEFORE the local-activity events.
+                // This preserves correct replay ordering: on the next run
+                // drain_early_signals stashes the signal events so
+                // match_external_signal sees them before LocalActivityScheduled.
+                let commands = if commands
+                    .iter()
+                    .any(|c| matches!(c, WorkflowCommand::SignalExternalWorkflow { .. }))
+                {
+                    let (signal_items, remaining) = split_mixed_signal_batch(commands);
+                    if !signal_items.is_empty() {
+                        let new_events = match persist_external_signal_inline(
+                            conn,
+                            prepared.exec_id,
+                            signal_items,
+                            &mut next_event_id,
+                        )
+                        .await
+                        {
+                            Ok(events) => events,
+                            Err(e) => {
+                                return fail_execution_on_error(
+                                    conn,
+                                    task,
+                                    worker_id,
+                                    Err::<(), _>(e),
+                                )
+                                .await;
+                            }
+                        };
+                        history_events.extend(new_events);
+                        let current_history_event_count =
+                            u64::try_from(history_events.len()).unwrap_or(u64::MAX);
+                        if let Some(cap) = registry.history_policy().event_hard_cap()
+                            && current_history_event_count >= cap
+                        {
+                            return fail_workflow_for_history_cap(
+                                conn,
+                                &telemetry,
+                                task,
+                                &prepared.execution,
+                                prepared.exec_id,
+                                next_event_id,
+                                worker_id,
+                                started_at,
+                                current_history_event_count,
+                                cap,
+                            )
+                            .await;
+                        }
+                    }
+                    remaining
+                } else {
+                    commands
+                };
                 let (markers, local_run) = extract_run_local_activity(commands);
                 let inline_outcome = run_local_activity_inline(
                     conn,

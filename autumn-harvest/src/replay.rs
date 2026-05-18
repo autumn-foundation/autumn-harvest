@@ -759,6 +759,7 @@ impl HistoryMatcher {
     /// - [`HistoryMatch::AwaitingExternalCompletion`] when scheduled but no terminal yet
     /// - [`HistoryMatch::NoMatch`] when past end of history (first-time scheduling)
     /// - [`HistoryMatch::Diverged`] when history has a different event at this position
+    #[allow(clippy::too_many_lines)]
     pub fn match_external_activity(&mut self, activity_name: &str) -> HistoryMatch {
         if !self.prepare_match() {
             return HistoryMatch::NoMatch;
@@ -864,6 +865,56 @@ impl HistoryMatcher {
                 ev if Self::is_update_event(ev) => {
                     scan_cursor += 1;
                 }
+                // ExternalSignal event triplets can be interleaved when the
+                // workflow sends a concurrent external signal while awaiting
+                // external activity completion (e.g. tokio::join! with
+                // signal_external_workflow).  Stash them so
+                // match_external_signal can find them after the activity
+                // resolves, rather than breaking the scan prematurely.
+                WorkflowEvent::ExternalSignalRequested {
+                    signal_id,
+                    target,
+                    signal_name,
+                    ..
+                } => {
+                    let stashed = StashedExternalSignal {
+                        signal_id: *signal_id,
+                        target: *target,
+                        signal_name: signal_name.clone(),
+                        terminal: None,
+                    };
+                    self.pending_external_signals.push(stashed);
+                    self.consumed_signal_events.insert(scan_cursor);
+                    scan_cursor += 1;
+                }
+                WorkflowEvent::ExternalSignalDelivered { signal_id } => {
+                    let id = *signal_id;
+                    if let Some(p) = self
+                        .pending_external_signals
+                        .iter_mut()
+                        .find(|p| p.signal_id == id)
+                    {
+                        p.terminal = Some(StashedSignalTerminal::Delivered);
+                    }
+                    self.consumed_signal_events.insert(scan_cursor);
+                    scan_cursor += 1;
+                }
+                WorkflowEvent::ExternalSignalFailed {
+                    signal_id,
+                    reason_code,
+                } => {
+                    let id = *signal_id;
+                    let code = reason_code.clone();
+                    if let Some(p) = self
+                        .pending_external_signals
+                        .iter_mut()
+                        .find(|p| p.signal_id == id)
+                    {
+                        p.terminal = Some(StashedSignalTerminal::Failed(code));
+                    }
+                    self.consumed_signal_events.insert(scan_cursor);
+                    scan_cursor += 1;
+                }
                 _ => break,
             }
         }
@@ -929,11 +980,30 @@ impl HistoryMatcher {
         // prepare_match calls drain_early_signals which eagerly stashes any
         // ExternalSignal events sitting at the current cursor.  Check the
         // stash again immediately after to consume what was just drained.
+        // Track the stash size so we can distinguish "no history at all"
+        // from "history had a different signal here" after the drain.
+        let stash_size_before = self.pending_external_signals.len();
         let has_history = self.prepare_match();
         if let Some(result) = try_stash(&mut self.pending_external_signals) {
             return result;
         }
         if !has_history {
+            // If prepare_match drained ExternalSignal events (stash grew) and
+            // none matched, history recorded a *different* signal at this
+            // position — report non-determinism instead of silently issuing a
+            // new live signal.
+            if self.pending_external_signals.len() > stash_size_before {
+                let actual = &self.pending_external_signals[stash_size_before];
+                return HistoryMatch::Diverged {
+                    expected: format!(
+                        "ExternalSignalRequested(target={target}, signal={signal_name})"
+                    ),
+                    actual: format!(
+                        "ExternalSignalRequested(target={}, signal={})",
+                        actual.target, actual.signal_name
+                    ),
+                };
+            }
             return HistoryMatch::NoMatch;
         }
 
@@ -1401,9 +1471,16 @@ impl HistoryMatcher {
     /// - `max_version` if past end of history (new code path)
     #[must_use]
     pub fn match_side_effect(&mut self, side_effect_id: &str) -> HistoryMatch {
-        // Use prepare_match (not just advance) so drain_early_signals skips
-        // ExternalSignal events that may have been written before this marker
-        // in a mixed batch (e.g. tokio::join!(side_effect, signal_external)).
+        // Use prepare_match so drain_early_signals skips ExternalSignal events
+        // that may have been written before this marker in a mixed batch
+        // (e.g. tokio::join!(ctx.side_effect(...), ctx.signal_external_workflow(...))).
+        //
+        // Known limitation: the event pattern is identical for a concurrent
+        // mixed batch and a sequential call where signal_external historically
+        // preceded side_effect.  If a new workflow version reverses a sequential
+        // ordering, drain_early_signals absorbs the signal events and the marker
+        // still matches — silently accepting what should be Diverged.  Fixing
+        // this requires batch-ordering metadata in the history schema.
         let marker_name = format!("side_effect:{side_effect_id}");
         if !self.prepare_match() {
             return HistoryMatch::NoMatch;
