@@ -143,10 +143,14 @@ pub use context::{
 pub use critical_path::{CriticalPathAnalyzer, CriticalPathResult};
 pub use dag::{DagBuildError, DagBuilder, DagDefinition, DagTask, DagTaskRef};
 pub use dag_export::{export_dot, export_mermaid};
+#[cfg(feature = "testing")]
+pub use dag_gantt::export_gantt;
 pub use dag_linter::{
     DagLinter, DagRule, DagWarning, ExcessiveParallelismRule, MissingRetryPolicyRule,
     MissingTimeoutRule,
 };
+#[cfg(feature = "testing")]
+pub mod dag_gantt;
 #[cfg(feature = "testing")]
 pub use dag_profiler::{DagProfile, DagProfiler, ProfilerEvent, ProfilerEventKind};
 #[cfg(any(test, feature = "testing"))]
