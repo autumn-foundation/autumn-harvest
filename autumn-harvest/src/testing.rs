@@ -42,14 +42,16 @@
 
 use std::any::TypeId;
 use std::collections::HashMap;
+use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 
-use crate::context::{SharedState, empty_shared_state};
+use crate::context::{SharedState, WorkflowCommand, empty_shared_state};
 use crate::event::WorkflowEvent;
-use crate::executor::{WorkflowOutcome, run_workflow_strict};
+use crate::executor::{WorkflowOutcome, run_workflow_strict, run_workflow_with_state};
 use crate::info::{WorkflowHandlerFn, WorkflowInfo};
-use crate::types::ExecutionId;
+use crate::types::{ActivityExecId, ExecutionId};
 
 // ---------------------------------------------------------------------------
 // NonDeterminismKind
@@ -291,6 +293,17 @@ impl WorkflowReplayer {
         std::sync::Arc::get_mut(&mut self.state)
             .expect("state Arc has no other references during WorkflowReplayer construction")
             .insert(TypeId::of::<T>(), Box::new(value));
+        self
+    }
+
+    /// Replace the shared state with a pre-built `SharedState` arc.
+    ///
+    /// Used internally by [`TestRunOutcome::replay_check`] to forward the test
+    /// environment's state to the replayer so the workflow sees the same typed
+    /// state it saw during the original run.
+    #[must_use]
+    fn with_existing_state(mut self, state: SharedState) -> Self {
+        self.state = state;
         self
     }
 
@@ -717,6 +730,651 @@ fn find_event_index(events: &[WorkflowEvent], actual: &str) -> usize {
         .iter()
         .position(|e| e.type_name() == target)
         .unwrap_or(0)
+}
+
+// ===========================================================================
+// WorkflowTestEnv  — in-process unit-test harness for workflow functions
+// ===========================================================================
+//
+// Design notes
+// ──────────────
+// `WorkflowTestEnv` drives a workflow function to completion by repeatedly
+// running it through the executor, processing the `WorkflowCommand`s emitted
+// on each suspension, appending mock results to an in-memory event history,
+// and re-running with the updated history.
+//
+// No Postgres, no worker process, no Docker — all side effects are satisfied
+// by closures registered before the run.
+//
+// Execution order
+// ───────────────
+// On each suspension:
+//   1. Regular and local activities are resolved immediately via registered
+//      mocks (either per-call-count or general fallback).
+//   2. Child-workflow spawns are resolved via registered child mocks.
+//   3. Signals are injected from the pre-queued queue when a `WaitForSignal`
+//      command is outstanding.
+//   4. Timers auto-fire *unless* a signal is also being resolved in the same
+//      suspension batch (signal takes priority in concurrent select! branches).
+//
+// The loop terminates when the workflow returns `Completed` or `Failed`, or
+// when no commands can be resolved (workflow stuck) or the iteration cap is
+// reached.
+
+/// Maximum number of executor iterations before declaring an infinite loop.
+const MAX_TEST_ITERATIONS: usize = 1_000;
+
+/// Type alias for the mock closure stored in `WorkflowTestEnv`.
+type MockFn = Arc<dyn Fn(Value) -> Result<Value, String> + Send + Sync>;
+
+// ---------------------------------------------------------------------------
+// Public types
+// ---------------------------------------------------------------------------
+
+/// The outcome of a [`WorkflowTestEnv::run`] call.
+///
+/// Contains the workflow's final `result` (success or failure) and the full
+/// ordered event log produced during the run.  Use [`TestRunOutcome::events`]
+/// for event-log assertions and [`TestRunOutcome::replay_check`] to verify
+/// that the produced history is replay-deterministic.
+pub struct TestRunOutcome {
+    /// The workflow's terminal result: `Ok(output)` or `Err(error_string)`.
+    pub result: Result<Value, String>,
+    /// The complete ordered event log built during the test run.
+    events: Vec<WorkflowEvent>,
+    /// Execution ID used for the run (stable for replay checks).
+    exec_id: ExecutionId,
+    /// Shared state from the test env — forwarded to `replay_check` so the
+    /// replayer sees the same typed state the workflow saw during the run.
+    state: SharedState,
+}
+
+impl TestRunOutcome {
+    /// Returns a reference to the ordered event log.
+    ///
+    /// Use this to assert ordering invariants such as `ActivityCompleted` for
+    /// `charge_card` came after `SignalReceived(approve)`.
+    #[must_use]
+    pub fn events(&self) -> &[WorkflowEvent] {
+        &self.events
+    }
+
+    /// Run the recorded event history through [`WorkflowReplayer`] and return
+    /// the replay report.
+    ///
+    /// If the workflow function is deterministic, this will always return
+    /// [`ReplayStatus::ReplaySucceeded`].  A failure here means the workflow
+    /// code is non-deterministic and would cause problems in production replay.
+    ///
+    /// This check is free — it reuses the event history already produced by
+    /// the test run, so there is no extra DB or network call.
+    pub async fn replay_check(&self, handler: WorkflowHandlerFn) -> ReplayReport {
+        let snapshot = crate::testing::HistorySnapshot {
+            workflow_name: "__test__".to_string(),
+            execution_id: self.exec_id,
+            events: self.events.clone(),
+        };
+        WorkflowReplayer::new()
+            .with_existing_state(self.state.clone())
+            .register_fn("__test__", handler)
+            .replay_from_snapshot(snapshot)
+            .await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WorkflowTestEnv
+// ---------------------------------------------------------------------------
+
+/// In-process unit-test harness for `#[workflow]` functions.
+///
+/// Run a workflow to completion without Postgres, workers, or Docker.
+/// Activities are satisfied by registered closures; timers auto-fire;
+/// signals are injected from a pre-queued list; child workflows are stubbed.
+///
+/// # Quick start
+///
+/// ```rust,no_run
+/// # use autumn_harvest::testing::WorkflowTestEnv;
+/// # use autumn_harvest::context::WorkflowContext;
+/// # use serde_json::{Value, json};
+/// # use std::pin::Pin;
+/// # fn my_workflow<'a>(ctx: &'a WorkflowContext, _: Value)
+/// #   -> Pin<Box<dyn std::future::Future<Output=Result<Value,String>>+Send+'a>>
+/// # { Box::pin(async move { Ok(json!(null)) }) }
+/// # #[tokio::main] async fn main() {
+/// let outcome = WorkflowTestEnv::new()
+///     .mock_activity("send_email", |_| Ok(json!("delivered")))
+///     .run(my_workflow, json!({"user_id": 1}))
+///     .await;
+///
+/// assert_eq!(outcome.result, Ok(json!("delivered")));
+/// # }
+/// ```
+pub struct WorkflowTestEnv {
+    /// Fallback mocks: activity name → closure(input) → result.
+    activity_mocks: HashMap<String, MockFn>,
+    /// Per-call-count mocks: (name, 1-based call number) → result.
+    ///
+    /// "Call number" is the number of times the workflow has issued a command
+    /// for this activity name (across all iterations).  This corresponds to
+    /// explicit workflow-level retries, not worker-level retry attempts.
+    attempt_results: HashMap<(String, u32), Result<Value, String>>,
+    /// Child-workflow stubs: workflow name → closure(input) → result.
+    child_mocks: HashMap<String, MockFn>,
+    /// Simulated wall-clock time.  Used as the `WorkflowStarted` timestamp so
+    /// `ctx.now()` inside the workflow function is deterministic.
+    simulated_now: DateTime<Utc>,
+    /// Signals pre-queued for delivery when the workflow calls `wait_for_signal`.
+    queued_signals: Vec<(String, Value)>,
+    /// If `Some`, a `WorkflowCancelled` event is prepended to the history so
+    /// `ctx.is_cancelled()` returns `true` from the first execution cycle.
+    cancellation_reason: Option<String>,
+    /// Shared typed state injected into the `WorkflowContext`.
+    state: SharedState,
+}
+
+impl Default for WorkflowTestEnv {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WorkflowTestEnv {
+    // ── Construction ─────────────────────────────────────────────────────
+
+    /// Create an empty test environment.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            activity_mocks: HashMap::new(),
+            attempt_results: HashMap::new(),
+            child_mocks: HashMap::new(),
+            simulated_now: Utc::now(),
+            queued_signals: Vec::new(),
+            cancellation_reason: None,
+            state: empty_shared_state(),
+        }
+    }
+
+    // ── Fluent builder ───────────────────────────────────────────────────
+
+    /// Register a fallback mock for an activity (or local activity) by name.
+    ///
+    /// The closure receives the deserialized input payload and must return the
+    /// activity result.  This mock is used for every call whose call-number
+    /// does not have a [`mock_activity_attempt`](Self::mock_activity_attempt)
+    /// registered.
+    ///
+    /// The same mock covers both `execute_activity_raw` and
+    /// `execute_local_activity_raw` — the name is the only routing key.
+    #[must_use]
+    pub fn mock_activity<F>(mut self, name: impl Into<String>, mock: F) -> Self
+    where
+        F: Fn(Value) -> Result<Value, String> + Send + Sync + 'static,
+    {
+        self.activity_mocks.insert(name.into(), Arc::new(mock));
+        self
+    }
+
+    /// Register a result for a specific per-call invocation of an activity.
+    ///
+    /// `call_number` is 1-based and counts how many times the workflow code
+    /// has called `execute_activity_raw` / `execute_local_activity_raw` for
+    /// this activity name.  This lets you test explicit workflow-level retry
+    /// logic:
+    ///
+    /// ```rust,no_run
+    /// # use autumn_harvest::testing::WorkflowTestEnv;
+    /// # use serde_json::json;
+    /// let env = WorkflowTestEnv::new()
+    ///     .mock_activity_attempt("charge_card", 1, Err("transient".into()))
+    ///     .mock_activity_attempt("charge_card", 2, Ok(json!({"status": "charged"})));
+    /// ```
+    #[must_use]
+    pub fn mock_activity_attempt(
+        mut self,
+        name: impl Into<String>,
+        call_number: u32,
+        result: Result<Value, String>,
+    ) -> Self {
+        self.attempt_results
+            .insert((name.into(), call_number), result);
+        self
+    }
+
+    /// Stub a child workflow by name.
+    ///
+    /// When the workflow calls `ctx.spawn_child_workflow_raw("name", input)`,
+    /// the closure is invoked instead of actually running the child.
+    #[must_use]
+    pub fn mock_child_workflow<F>(mut self, name: impl Into<String>, mock: F) -> Self
+    where
+        F: Fn(Value) -> Result<Value, String> + Send + Sync + 'static,
+    {
+        self.child_mocks.insert(name.into(), Arc::new(mock));
+        self
+    }
+
+    /// Pre-queue a signal for delivery when the workflow calls
+    /// `ctx.wait_for_signal(name)`.
+    ///
+    /// Signals are delivered in the order they are queued, matched by name.
+    /// Queuing a signal for name "approve" will satisfy the first
+    /// `wait_for_signal("approve")` the workflow issues.
+    #[must_use]
+    pub fn queue_signal(mut self, name: impl Into<String>, payload: Value) -> Self {
+        self.queued_signals.push((name.into(), payload));
+        self
+    }
+
+    /// Inject a `WorkflowCancelled` event so `ctx.is_cancelled()` returns
+    /// `true` and `ctx.check_cancellation()` returns `Err(Cancelled(...))`.
+    ///
+    /// The cancellation is visible from the very first execution cycle.
+    #[must_use]
+    pub fn with_cancellation(mut self, reason: impl Into<String>) -> Self {
+        self.cancellation_reason = Some(reason.into());
+        self
+    }
+
+    /// Inject typed shared state accessible via `ctx.state::<T>()` inside the
+    /// workflow function.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal `Arc` has been cloned — unreachable in normal
+    /// builder usage.
+    #[must_use]
+    pub fn with_state<T: Send + Sync + 'static>(mut self, value: T) -> Self {
+        std::sync::Arc::get_mut(&mut self.state)
+            .expect("state Arc has no other references during WorkflowTestEnv construction")
+            .insert(std::any::TypeId::of::<T>(), Box::new(value));
+        self
+    }
+
+    /// Return the current simulated wall-clock time.
+    ///
+    /// This is the value that `ctx.now()` returns inside the workflow function
+    /// during the run.  The time is fixed at construction.
+    #[must_use]
+    pub const fn now(&self) -> DateTime<Utc> {
+        self.simulated_now
+    }
+
+    // ── Execution ────────────────────────────────────────────────────────
+
+    /// Run the workflow function to completion and return the outcome.
+    ///
+    /// The workflow is executed in a loop:
+    /// 1. Run the workflow with the current history.
+    /// 2. If suspended: resolve each command (activities, timers, signals,
+    ///    child workflows) and append events to history.
+    /// 3. Repeat until `Completed`, `Failed`, or stuck.
+    ///
+    /// Timers auto-fire unless a signal is being resolved in the same
+    /// suspension batch (signal takes priority in concurrent `tokio::select!`
+    /// branches).
+    pub async fn run(&self, handler: WorkflowHandlerFn, input: Value) -> TestRunOutcome {
+        let exec_id = ExecutionId::new();
+
+        let mut history = vec![WorkflowEvent::WorkflowStarted {
+            input: input.clone(),
+            timestamp: self.simulated_now,
+        }];
+        if let Some(reason) = &self.cancellation_reason {
+            history.push(WorkflowEvent::WorkflowCancelled {
+                reason: reason.clone(),
+            });
+        }
+
+        let mut call_counts: HashMap<String, u32> = HashMap::new();
+        let mut remaining_signals = self.queued_signals.clone();
+
+        for _iter in 0..MAX_TEST_ITERATIONS {
+            let (outcome, _pending_cmds, _span) = run_workflow_with_state(
+                exec_id,
+                history.clone(),
+                handler,
+                input.clone(),
+                self.state.clone(),
+                None,
+            )
+            .await;
+
+            match outcome {
+                WorkflowOutcome::Completed { output } => {
+                    history.push(WorkflowEvent::WorkflowCompleted {
+                        output: output.clone(),
+                    });
+                    return TestRunOutcome {
+                        result: Ok(output),
+                        events: history,
+                        exec_id,
+                        state: self.state.clone(),
+                    };
+                }
+                WorkflowOutcome::Failed { error } => {
+                    history.push(WorkflowEvent::WorkflowFailed {
+                        error: error.clone(),
+                    });
+                    return TestRunOutcome {
+                        result: Err(error),
+                        events: history,
+                        exec_id,
+                        state: self.state.clone(),
+                    };
+                }
+                WorkflowOutcome::ContinuedAsNew { input: new_input } => {
+                    history.push(WorkflowEvent::WorkflowContinuedAsNew {
+                        new_exec_id: ExecutionId::new(),
+                        input: new_input.clone(),
+                    });
+                    return TestRunOutcome {
+                        result: Ok(new_input),
+                        events: history,
+                        exec_id,
+                        state: self.state.clone(),
+                    };
+                }
+                WorkflowOutcome::Suspended { commands } => {
+                    let made_progress = match self.process_suspension(
+                        commands,
+                        &mut history,
+                        &mut remaining_signals,
+                        &mut call_counts,
+                    ) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            return TestRunOutcome {
+                                result: Err(e),
+                                events: history,
+                                exec_id,
+                                state: self.state.clone(),
+                            };
+                        }
+                    };
+                    if !made_progress {
+                        return TestRunOutcome {
+                            result: Err("WorkflowTestEnv: workflow suspended with no resolvable \
+                                 commands (check that all signals are queued and activities \
+                                 are mocked)"
+                                .to_string()),
+                            events: history,
+                            exec_id,
+                            state: self.state.clone(),
+                        };
+                    }
+                }
+            }
+        }
+
+        TestRunOutcome {
+            result: Err(format!(
+                "WorkflowTestEnv: workflow exceeded {MAX_TEST_ITERATIONS} iterations \
+                 (possible infinite loop or unresolvable suspension)"
+            )),
+            events: history,
+            exec_id,
+            state: self.state.clone(),
+        }
+    }
+
+    /// Process one suspension batch: resolve commands and append events.
+    ///
+    /// Returns `Ok(true)` if at least one command was resolved, `Ok(false)` if
+    /// no progress was made, or `Err(msg)` if a harness configuration error was
+    /// encountered (e.g. a missing activity mock or child-workflow stub).
+    fn process_suspension(
+        &self,
+        commands: Vec<WorkflowCommand>,
+        history: &mut Vec<WorkflowEvent>,
+        remaining_signals: &mut Vec<(String, Value)>,
+        call_counts: &mut HashMap<String, u32>,
+    ) -> Result<bool, String> {
+        let signal_will_resolve = commands.iter().any(|cmd| {
+            if let WorkflowCommand::WaitForSignal { signal_name, .. } = cmd {
+                remaining_signals.iter().any(|(n, _)| n == signal_name)
+            } else {
+                false
+            }
+        });
+
+        let mut made_progress = false;
+        for cmd in commands {
+            made_progress |= self.process_command(
+                cmd,
+                signal_will_resolve,
+                history,
+                remaining_signals,
+                call_counts,
+            )?;
+        }
+        Ok(made_progress)
+    }
+
+    /// Resolve a single workflow command and append the resulting events.
+    ///
+    /// Returns `Ok(true)` when a command produced progress, `Ok(false)` when
+    /// the command was a no-op, or `Err(msg)` when a mock/stub lookup failed
+    /// (harness configuration error — the test must be fixed, not the workflow).
+    fn process_command(
+        &self,
+        cmd: WorkflowCommand,
+        signal_will_resolve: bool,
+        history: &mut Vec<WorkflowEvent>,
+        remaining_signals: &mut Vec<(String, Value)>,
+        call_counts: &mut HashMap<String, u32>,
+    ) -> Result<bool, String> {
+        match cmd {
+            WorkflowCommand::ScheduleActivity {
+                activity_id,
+                name,
+                input: act_input,
+                queue,
+                ..
+            } => {
+                let call_num = Self::next_call_count(call_counts, &name);
+                let result = self.resolve_activity(&name, act_input.clone(), call_num)?;
+                history.push(WorkflowEvent::ActivityScheduled {
+                    activity_id,
+                    name: name.clone(),
+                    input: act_input,
+                    queue,
+                });
+                Self::push_activity_terminal(history, activity_id, result);
+                Ok(true)
+            }
+
+            WorkflowCommand::RunLocalActivity {
+                activity_id,
+                name,
+                input: act_input,
+                ..
+            } => {
+                let call_num = Self::next_call_count(call_counts, &name);
+                let result = self.resolve_activity(&name, act_input.clone(), call_num)?;
+                history.push(WorkflowEvent::LocalActivityScheduled {
+                    activity_id,
+                    name: name.clone(),
+                    input: act_input,
+                });
+                Self::push_local_activity_terminal(history, activity_id, result);
+                Ok(true)
+            }
+
+            WorkflowCommand::StartTimer {
+                timer_id,
+                duration_secs,
+                ..
+            } => {
+                if signal_will_resolve {
+                    // Skip firing the timer — a concurrent signal takes priority
+                    // so the workflow takes the signal branch in select!.
+                    return Ok(false);
+                }
+                history.push(WorkflowEvent::TimerStarted {
+                    timer_id: timer_id.clone(),
+                    duration_secs,
+                });
+                history.push(WorkflowEvent::TimerFired { timer_id });
+                Ok(true)
+            }
+
+            WorkflowCommand::WaitForSignal { signal_name, .. } => Ok(remaining_signals
+                .iter()
+                .position(|(n, _)| n == &signal_name)
+                .is_some_and(|pos| {
+                    let (_, payload) = remaining_signals.remove(pos);
+                    history.push(WorkflowEvent::SignalReceived {
+                        signal_name,
+                        payload,
+                    });
+                    true
+                })),
+
+            WorkflowCommand::StartChildWorkflow {
+                child_id,
+                workflow_name,
+                input: child_input,
+                ..
+            } => {
+                let result = self.resolve_child(&workflow_name, child_input.clone())?;
+                history.push(WorkflowEvent::ChildWorkflowStarted {
+                    child_id,
+                    workflow_name,
+                    input: child_input,
+                });
+                match result {
+                    Ok(output) => {
+                        history.push(WorkflowEvent::ChildWorkflowCompleted { child_id, output });
+                    }
+                    Err(error) => {
+                        history.push(WorkflowEvent::ChildWorkflowFailed { child_id, error });
+                    }
+                }
+                Ok(true)
+            }
+
+            // WaitForActivity: activity was scheduled in a previous iteration;
+            // its terminal event is already in history and will be matched on replay.
+            WorkflowCommand::WaitForActivity { .. }
+            | WorkflowCommand::RecordMarker { .. }
+            | WorkflowCommand::RecordUpdateResult { .. }
+            | WorkflowCommand::UpsertSearchAttributes { .. }
+            | WorkflowCommand::ScheduleExternalActivity { .. }
+            | WorkflowCommand::Complete { .. }
+            | WorkflowCommand::Fail { .. }
+            | WorkflowCommand::ContinueAsNew { .. } => Ok(false),
+        }
+    }
+
+    // ── Internal helpers ─────────────────────────────────────────────────
+
+    /// Increment and return the per-name call counter (1-based).
+    fn next_call_count(call_counts: &mut HashMap<String, u32>, name: &str) -> u32 {
+        let count = call_counts.entry(name.to_string()).or_insert(0);
+        *count += 1;
+        *count
+    }
+
+    /// Resolve an activity (regular or local) using registered mocks.
+    ///
+    /// Per-call-count results take priority over the general fallback mock.
+    ///
+    /// Returns `Ok(activity_result)` when a mock is found (the inner `Result`
+    /// is the mock's success/failure value), or `Err(harness_error)` when no
+    /// mock is registered — a harness configuration problem that must be fixed
+    /// in the test, not handled as a workflow-level failure.
+    fn resolve_activity(
+        &self,
+        name: &str,
+        input: Value,
+        call_num: u32,
+    ) -> Result<Result<Value, String>, String> {
+        if let Some(result) = self.attempt_results.get(&(name.to_string(), call_num)) {
+            return Ok(result.clone());
+        }
+        if let Some(mock) = self.activity_mocks.get(name) {
+            return Ok(mock(input));
+        }
+        Err(format!(
+            "WorkflowTestEnv: no mock registered for activity '{name}' \
+             (call {call_num}). Register one with mock_activity() or \
+             mock_activity_attempt()."
+        ))
+    }
+
+    /// Resolve a child workflow using registered stubs.
+    ///
+    /// Returns `Ok(child_result)` when a stub is found, or `Err(harness_error)`
+    /// when no stub is registered — must be fixed in the test.
+    fn resolve_child(&self, name: &str, input: Value) -> Result<Result<Value, String>, String> {
+        if let Some(mock) = self.child_mocks.get(name) {
+            return Ok(mock(input));
+        }
+        Err(format!(
+            "WorkflowTestEnv: no mock registered for child workflow '{name}'. \
+             Register one with mock_child_workflow()."
+        ))
+    }
+
+    /// Append `ActivityCompleted` or `ActivityFailed` to history.
+    ///
+    /// `attempt` is always 1 because each explicit call to `execute_activity_raw`
+    /// represents a new scheduling — worker-level retries within one scheduling
+    /// are not modelled by the test harness.
+    fn push_activity_terminal(
+        history: &mut Vec<WorkflowEvent>,
+        activity_id: ActivityExecId,
+        result: Result<Value, String>,
+    ) {
+        match result {
+            Ok(output) => history.push(WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output,
+            }),
+            Err(error) => history.push(WorkflowEvent::ActivityFailed {
+                activity_id,
+                error,
+                attempt: 1,
+                error_type: "Error".to_string(),
+                non_retryable: false,
+                details: None,
+            }),
+        }
+    }
+
+    /// Append `LocalActivityCompleted`, or `LocalActivityFailed` +
+    /// `LocalActivityExhausted` to history.
+    ///
+    /// Production records one `LocalActivityFailed` per attempt before the
+    /// terminal `LocalActivityExhausted`; the harness models a single attempt
+    /// so it emits exactly one of each on failure.
+    fn push_local_activity_terminal(
+        history: &mut Vec<WorkflowEvent>,
+        activity_id: ActivityExecId,
+        result: Result<Value, String>,
+    ) {
+        match result {
+            Ok(output) => history.push(WorkflowEvent::LocalActivityCompleted {
+                activity_id,
+                output,
+            }),
+            Err(error) => {
+                history.push(WorkflowEvent::LocalActivityFailed {
+                    activity_id,
+                    error: error.clone(),
+                    attempt: 1,
+                });
+                history.push(WorkflowEvent::LocalActivityExhausted {
+                    activity_id,
+                    error,
+                    attempt: 1,
+                });
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
