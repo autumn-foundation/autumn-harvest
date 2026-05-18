@@ -222,15 +222,20 @@ async fn allow_duplicate_signals_running_execution_and_returns_existing_id() {
 }
 
 #[tokio::test]
-async fn allow_duplicate_signals_completed_execution_returns_existing_id_no_new_signal() {
+async fn allow_duplicate_with_completed_prior_starts_fresh_and_delivers_signal() {
+    // Spec invariant: "no signal is silently dropped". When the prior run is
+    // terminal under AllowDuplicate, signal-with-start escalates to a fresh
+    // start so the signal can land on a live execution. This diverges from
+    // the standalone `start_or_load_workflow_execution` behaviour by design.
     let (mut conn, _container) = setup_test_db().await;
     let first = seed_running(&mut conn, "wf", "id-done").await;
     force_state(&mut conn, first, "COMPLETED").await;
 
+    let new_id = ExecutionId::new();
     let p = params(
         "wf",
         "id-done",
-        ExecutionId::new(),
+        new_id,
         "late",
         serde_json::json!({}),
         WorkflowIdReusePolicy::AllowDuplicate,
@@ -239,12 +244,13 @@ async fn allow_duplicate_signals_completed_execution_returns_existing_id_no_new_
         .await
         .unwrap();
 
-    assert!(!out.started_fresh);
-    assert!(
-        !out.signal_delivered,
-        "signal cannot be delivered to a terminal execution"
-    );
-    assert_eq!(out.exec_id, first);
+    assert!(out.started_fresh, "terminal prior must trigger fresh start");
+    assert!(out.signal_delivered, "fresh start must accept the signal");
+    assert_ne!(out.exec_id, first, "new exec id, not the COMPLETED prior");
+    assert_eq!(out.exec_id, new_id);
+
+    let pending = load_pending_signals(&mut conn, new_id).await.unwrap();
+    assert_eq!(pending.len(), 1, "exactly one signal queued on the new run");
 }
 
 #[tokio::test]

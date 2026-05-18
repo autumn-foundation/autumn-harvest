@@ -268,9 +268,14 @@ transaction. The same primitive is exposed over HTTP as
 |-------------|------------------|-------------------|---------------------------|----------------------|
 | none | start + signal | start + signal | start + signal | start + signal |
 | RUNNING / SUSPENDED | signal existing | `Err(AlreadyExists)` | signal existing | cancel + start + signal |
-| COMPLETED | attach, no signal | `Err(AlreadyExists)` | attach, no signal | start fresh + signal |
-| FAILED | attach, no signal | `Err(AlreadyExists)` | start fresh + signal | start fresh + signal |
-| CANCELLED / TERMINATED | attach, no signal | `Err(AlreadyExists)` | start fresh + signal | start fresh + signal |
+| COMPLETED | start fresh + signal | `Err(AlreadyExists)` | start fresh + signal | start fresh + signal |
+| FAILED | start fresh + signal | `Err(AlreadyExists)` | start fresh + signal | start fresh + signal |
+| CANCELLED / TERMINATED | start fresh + signal | `Err(AlreadyExists)` | start fresh + signal | start fresh + signal |
+
+For terminal priors, `AllowDuplicate` and `AllowDuplicateFailedOnly` diverge
+from the standalone `start_or_load_workflow_execution` semantics (which return
+the existing terminal run): signal-with-start escalates internally to a
+fresh start so the spec's "no signal silently dropped" invariant holds.
 
 `SignalWithStartOutcome.started_fresh` distinguishes a freshly inserted run
 from one attached to an existing live execution; `signal_delivered` reports

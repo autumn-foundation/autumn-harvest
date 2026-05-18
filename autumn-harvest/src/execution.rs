@@ -667,13 +667,20 @@ pub struct SignalWithStartOutcome {
 /// |----------------------|-----------------------------|-----------------------|------------------------------|------------------------------|
 /// | none                 | start + signal              | start + signal        | start + signal               | start + signal               |
 /// | RUNNING / SUSPENDED  | signal existing             | `Err(AlreadyExists)`  | signal existing              | cancel + start + signal      |
-/// | COMPLETED            | attach, no signal           | `Err(AlreadyExists)`  | attach, no signal            | start fresh + signal         |
-/// | FAILED               | attach, no signal           | `Err(AlreadyExists)`  | start fresh + signal         | start fresh + signal         |
-/// | CANCELLED / TERMINATED | attach, no signal         | `Err(AlreadyExists)`  | start fresh + signal         | start fresh + signal         |
+/// | COMPLETED            | start fresh + signal        | `Err(AlreadyExists)`  | start fresh + signal         | start fresh + signal         |
+/// | FAILED               | start fresh + signal        | `Err(AlreadyExists)`  | start fresh + signal         | start fresh + signal         |
+/// | CANCELLED / TERMINATED | start fresh + signal      | `Err(AlreadyExists)`  | start fresh + signal         | start fresh + signal         |
 ///
 /// "Suspended" workflows are observable to the engine as `RUNNING` — they are
 /// running executions whose handler is awaiting external input — so they
 /// behave identically to `RUNNING` in this matrix.
+///
+/// Note: `AllowDuplicate` and `AllowDuplicateFailedOnly` diverge from the
+/// standalone [`start_or_load_workflow_execution`] behaviour for terminal
+/// priors: the standalone start returns the existing terminal row, while
+/// signal-with-start escalates to a fresh start so the signal can land. This
+/// keeps the spec's "no signal silently dropped" invariant intact.
+/// `RejectDuplicate` and `TerminateIfRunning` keep their original semantics.
 ///
 /// ## Event ordering
 ///
@@ -720,6 +727,25 @@ pub async fn signal_with_start_workflow_execution(
     conn.transaction::<SignalWithStartOutcome, HarvestError, _>(|conn| {
         let request = request;
         async move {
+            // The issue's spec enumerates four outcomes — start fresh, signal
+            // existing, reject, terminate-then-start-and-signal — and requires
+            // that "no signal is silently dropped". The base
+            // `start_or_load_workflow_execution` semantics return an existing
+            // terminal run for `AllowDuplicate`, which would leave us with no
+            // way to deliver the signal. For signal-with-start specifically we
+            // therefore upgrade `AllowDuplicate` and `AllowDuplicateFailedOnly`
+            // to `TerminateIfRunning` whenever the prior run is non-RUNNING
+            // (terminal): the prior is sealed and a fresh run is started, so
+            // the signal lands on a live execution. `RejectDuplicate` and
+            // `TerminateIfRunning` keep their original semantics.
+            let effective_policy = resolve_effective_signal_with_start_policy(
+                conn,
+                request.workflow_name,
+                request.workflow_id,
+                request.reuse_policy,
+            )
+            .await?;
+
             let start_request = StartWorkflowParams {
                 workflow_name: request.workflow_name,
                 workflow_id: request.workflow_id,
@@ -730,16 +756,17 @@ pub async fn signal_with_start_workflow_execution(
                 execution_timeout: request.execution_timeout,
                 memo: request.memo.clone(),
                 search_attrs: request.search_attrs.clone(),
-                reuse_policy: request.reuse_policy,
+                reuse_policy: effective_policy,
                 trace_context: request.trace_context.clone(),
             };
             let started = start_or_load_workflow_execution(conn, start_request).await?;
 
-            // RUNNING is the only non-terminal state. Anything else means the
-            // execution cannot receive signals — the caller's existing
-            // `signal_workflow` path would reject with `Cancelled`/`Config`,
-            // and silently dropping the row is the correct behaviour for the
-            // attach outcomes (the caller already sees `started_fresh = false`).
+            // After the policy upgrade above, `started.state` is either RUNNING
+            // (live execution: signal staged for ingest) or a terminal state
+            // only reachable when the caller explicitly chose RejectDuplicate
+            // / TerminateIfRunning and the matrix dictates "attach, no signal"
+            // (not applicable here). In practice we expect RUNNING on every
+            // success path.
             let signal_delivered = if started.state == "RUNNING" {
                 stage_signal_with_idempotency(
                     conn,
@@ -765,6 +792,37 @@ pub async fn signal_with_start_workflow_execution(
         .scope_boxed()
     })
     .await
+}
+
+/// Pick the policy `start_or_load_workflow_execution` is invoked with, given
+/// the caller's requested policy and the current prior-run state. For
+/// signal-with-start, `AllowDuplicate` and `AllowDuplicateFailedOnly` are
+/// upgraded to `TerminateIfRunning` whenever the prior run is non-RUNNING so
+/// that the spec's "no signal silently dropped" invariant holds on terminal
+/// priors. `RejectDuplicate` and `TerminateIfRunning` are returned unchanged.
+async fn resolve_effective_signal_with_start_policy(
+    conn: &mut AsyncPgConnection,
+    workflow_name: &str,
+    workflow_id: &str,
+    requested: WorkflowIdReusePolicy,
+) -> HarvestResult<WorkflowIdReusePolicy> {
+    if !matches!(
+        requested,
+        WorkflowIdReusePolicy::AllowDuplicate | WorkflowIdReusePolicy::AllowDuplicateFailedOnly
+    ) {
+        return Ok(requested);
+    }
+    let Some(existing) = try_load_by_key(conn, workflow_name, workflow_id).await? else {
+        return Ok(requested);
+    };
+    if existing.state == "RUNNING" {
+        Ok(requested)
+    } else {
+        // Non-RUNNING prior under a non-rejecting policy: upgrade so the
+        // start transaction takes the `replace_execution` path (seal prior,
+        // insert fresh, append WorkflowStarted) and the signal can land.
+        Ok(WorkflowIdReusePolicy::TerminateIfRunning)
+    }
 }
 
 /// Insert a signal row, returning `false` when the idempotency key collides
