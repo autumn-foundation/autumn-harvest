@@ -182,8 +182,7 @@ async fn three_fixture_batch_has_expected_counts() {
         "must have exactly one FixtureStatus::Failed result"
     );
     if let Some(r) = fail_result
-        && let FixtureStatus::Failed(ReplayStatus::NonDeterminismDetected { kind, .. }) =
-            &r.status
+        && let FixtureStatus::Failed(ReplayStatus::NonDeterminismDetected { kind, .. }) = &r.status
     {
         assert_eq!(
             *kind,
