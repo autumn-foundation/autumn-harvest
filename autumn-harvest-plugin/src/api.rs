@@ -3687,7 +3687,9 @@ async fn start_workflow(
             search_attrs: request.search_attrs.clone(),
             reuse_policy,
             trace_context: trace_ctx,
-            max_execution_timeout_ceiling: None,
+            max_execution_timeout_ceiling: api_state
+                .max_workflow_execution_timeout()
+                .map(|d| chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX)),
             concurrency_key,
             concurrency_limit,
         },
