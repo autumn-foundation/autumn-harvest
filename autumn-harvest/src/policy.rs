@@ -613,7 +613,9 @@ pub fn validate_schedule(schedule: &Schedule) -> Result<(), String> {
         Schedule::CronInTimezone { expr, tz } => {
             // Validate the IANA timezone name first so callers get a clear error.
             if tz.parse::<chrono_tz::Tz>().is_err() {
-                return Err(format!("unknown timezone '{tz}'; use an IANA timezone name (e.g. \"America/Los_Angeles\", \"UTC\")"));
+                return Err(format!(
+                    "unknown timezone '{tz}'; use an IANA timezone name (e.g. \"America/Los_Angeles\", \"UTC\")"
+                ));
             }
             Cron::new(expr)
                 .with_seconds_optional()

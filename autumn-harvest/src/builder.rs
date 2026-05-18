@@ -1837,6 +1837,9 @@ mod tests {
             ))
             .try_build();
 
-        assert!(result.is_ok(), "valid timezone must be accepted: {result:?}");
+        assert!(
+            result.is_ok(),
+            "valid timezone must be accepted: {result:?}"
+        );
     }
 }

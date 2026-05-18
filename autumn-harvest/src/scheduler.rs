@@ -1684,9 +1684,7 @@ pub use crate::policy::validate_schedule;
 fn schedule_expr(schedule: Option<&Schedule>) -> Option<String> {
     match schedule {
         Some(Schedule::Cron(expr)) => Some(format!("cron:{expr}")),
-        Some(Schedule::CronInTimezone { expr, tz }) => {
-            Some(format!("cron_tz:{tz}:{expr}"))
-        }
+        Some(Schedule::CronInTimezone { expr, tz }) => Some(format!("cron_tz:{tz}:{expr}")),
         Some(Schedule::Interval(interval)) => Some(format!("interval:{}", interval.as_secs())),
         Some(Schedule::Manual) => Some("manual".to_string()),
         None => None,
@@ -2403,8 +2401,8 @@ mod tests {
         };
         // Reference: 2026-03-08 01:50 AM PST = 09:50 UTC (just before the gap)
         let reference = parse_utc("2026-03-08T09:50:00Z");
-        let next = next_run_after(Some(&schedule), reference)
-            .expect("should produce a next occurrence");
+        let next =
+            next_run_after(Some(&schedule), reference).expect("should produce a next occurrence");
         // Expected: 2026-03-09 02:30 PDT = 09:30 UTC
         let expected = parse_utc("2026-03-09T09:30:00Z");
         assert_eq!(
@@ -2423,8 +2421,8 @@ mod tests {
         };
         // Reference: 2026-11-01 00:50 AM PDT = 07:50 UTC
         let reference = parse_utc("2026-11-01T07:50:00Z");
-        let first_next = next_run_after(Some(&schedule), reference)
-            .expect("should fire on fall-back day");
+        let first_next =
+            next_run_after(Some(&schedule), reference).expect("should fire on fall-back day");
         // First 01:30 PDT (UTC-7) = 2026-11-01T08:30:00Z
         let expected_first = parse_utc("2026-11-01T08:30:00Z");
         assert_eq!(
@@ -2433,8 +2431,8 @@ mod tests {
         );
         // Calling next_run_after again from that instant must NOT return the
         // same time (no double-fire on the repeated hour).
-        let second_next = next_run_after(Some(&schedule), first_next)
-            .expect("should advance past fall-back");
+        let second_next =
+            next_run_after(Some(&schedule), first_next).expect("should advance past fall-back");
         assert_ne!(
             second_next, first_next,
             "must not double-fire the repeated fall-back hour"
@@ -2453,10 +2451,8 @@ mod tests {
             expr: "0 9 * * 1-5".to_string(),
             tz: "America/Los_Angeles".to_string(),
         };
-        let expr_str =
-            schedule_expr(Some(&schedule)).expect("should produce expr string");
-        let parsed =
-            parse_schedule_from_expr(&expr_str).expect("should round-trip parse");
+        let expr_str = schedule_expr(Some(&schedule)).expect("should produce expr string");
+        let parsed = parse_schedule_from_expr(&expr_str).expect("should round-trip parse");
         assert!(
             matches!(&parsed, Schedule::CronInTimezone { tz, .. } if tz == "America/Los_Angeles"),
             "round-trip failed: {parsed:?}"

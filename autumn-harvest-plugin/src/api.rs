@@ -6731,7 +6731,10 @@ fn parse_schedule_expr_with_tz(
         if timezone == "UTC" {
             Schedule::Cron(cron_expr)
         } else {
-            Schedule::CronInTimezone { expr: cron_expr, tz: timezone.to_string() }
+            Schedule::CronInTimezone {
+                expr: cron_expr,
+                tz: timezone.to_string(),
+            }
         }
     } else if let Some(secs_str) = trimmed.strip_prefix("interval:") {
         let secs: u64 = secs_str
@@ -6749,7 +6752,10 @@ fn parse_schedule_expr_with_tz(
         if timezone == "UTC" {
             Schedule::Cron(trimmed.to_string())
         } else {
-            Schedule::CronInTimezone { expr: trimmed.to_string(), tz: timezone.to_string() }
+            Schedule::CronInTimezone {
+                expr: trimmed.to_string(),
+                tz: timezone.to_string(),
+            }
         }
     };
     // Validate cron expressions eagerly (including timezone names) so callers
@@ -10015,8 +10021,8 @@ mod tests {
     #[test]
     fn parse_schedule_expr_with_tz_utc_produces_cron_variant() {
         use autumn_harvest::policy::Schedule;
-        let result = parse_schedule_expr_with_tz("0 9 * * 1-5", "UTC")
-            .expect("valid cron+UTC should parse");
+        let result =
+            parse_schedule_expr_with_tz("0 9 * * 1-5", "UTC").expect("valid cron+UTC should parse");
         assert!(
             matches!(result, Schedule::Cron(_)),
             "UTC timezone must produce Schedule::Cron, not CronInTimezone: {result:?}"
