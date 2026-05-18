@@ -678,11 +678,20 @@ pub struct SignalWithStartOutcome {
 /// | RUNNING / SUSPENDED  | signal existing             | `Err(AlreadyExists)`  | signal existing              | cancel + start + signal      |
 /// | COMPLETED            | start fresh + signal        | `Err(AlreadyExists)`  | start fresh + signal         | start fresh + signal         |
 /// | FAILED               | start fresh + signal        | `Err(AlreadyExists)`  | start fresh + signal         | start fresh + signal         |
-/// | CANCELLED / TERMINATED | start fresh + signal      | `Err(AlreadyExists)`  | start fresh + signal         | start fresh + signal         |
+/// | CANCELLED            | start fresh + signal        | `Err(AlreadyExists)`  | start fresh + signal         | start fresh + signal         |
+/// | TERMINATED           | start fresh + signal        | start fresh + signal  | start fresh + signal         | start fresh + signal         |
 ///
 /// "Suspended" workflows are observable to the engine as `RUNNING` — they are
 /// running executions whose handler is awaiting external input — so they
 /// behave identically to `RUNNING` in this matrix.
+///
+/// `TERMINATED` is the *sealed* state set by the reset path (`reset.rs`): the
+/// row is released from the partial unique index over
+/// `(workflow_name, workflow_id) WHERE state NOT IN ('CONTINUED_AS_NEW',
+/// 'TERMINATED')`. A `TERMINATED` row is treated as if the `workflow_id` were
+/// free, including under `RejectDuplicate`. This matches the broader
+/// [`start_or_load_workflow_execution`] semantics; the reset operator
+/// explicitly opted the prior row out of the uniqueness scope.
 ///
 /// Note: `AllowDuplicate` and `AllowDuplicateFailedOnly` diverge from the
 /// standalone [`start_or_load_workflow_execution`] behaviour for terminal
@@ -736,6 +745,35 @@ pub async fn signal_with_start_workflow_execution(
     conn.transaction::<SignalWithStartOutcome, HarvestError, _>(|conn| {
         let request = request;
         async move {
+            // Cross-execution idempotency dedupe. The partial unique index on
+            // `harvest_signals (workflow_exec_id, idempotency_key)` only dedupes
+            // within a single `exec_id`. The fresh-start escalation below and
+            // the reset-buffer path both move signals across `exec_id`s for
+            // the same logical workflow, so a per-exec_id index alone would
+            // re-queue the duplicate signal on a brand-new run. Scope the
+            // dedupe to `(workflow_name, workflow_id, idempotency_key)` by
+            // joining `harvest_signals` to `harvest_workflow_executions` and
+            // short-circuit if any prior signal with this key has already
+            // landed on any execution of this logical workflow.
+            if let Some(key) = request.idempotency_key.as_deref()
+                && let Some(prior) = lookup_idempotent_signal_dedupe(
+                    conn,
+                    request.workflow_name,
+                    request.workflow_id,
+                    key,
+                )
+                .await?
+            {
+                return Ok(SignalWithStartOutcome {
+                    exec_id: ExecutionId::from_uuid(prior.id),
+                    workflow_name: prior.workflow_name,
+                    workflow_id: prior.workflow_id,
+                    state: prior.state,
+                    started_fresh: false,
+                    signal_delivered: false,
+                });
+            }
+
             // The issue's spec enumerates four outcomes — start fresh, signal
             // existing, reject, terminate-then-start-and-signal — and requires
             // that "no signal is silently dropped". The base
@@ -903,6 +941,39 @@ async fn try_load_active_execution_for_update(
         .filter(harvest_workflow_executions::state.ne_all(["CONTINUED_AS_NEW", "TERMINATED"]))
         .select(WorkflowExecution::as_select())
         .for_update()
+        .first(conn)
+        .await
+        .optional()
+        .map_err(database_error)
+}
+
+/// Cross-execution idempotency dedupe for `signal_with_start`.
+///
+/// Returns the most recent workflow execution of `(workflow_name, workflow_id)`
+/// that has a `harvest_signals` row with this `idempotency_key`. The per-shard
+/// partial unique index on `(workflow_exec_id, idempotency_key)` only enforces
+/// uniqueness within one execution; this query scopes the dedupe to the
+/// logical workflow so a webhook retry that arrives after the prior signal
+/// drove its execution to a terminal state is recognised as a duplicate and
+/// short-circuited before any fresh start / replacement happens.
+async fn lookup_idempotent_signal_dedupe(
+    conn: &mut AsyncPgConnection,
+    workflow_name: &str,
+    workflow_id: &str,
+    idempotency_key: &str,
+) -> HarvestResult<Option<WorkflowExecution>> {
+    use diesel::JoinOnDsl;
+
+    harvest_signals::table
+        .inner_join(
+            harvest_workflow_executions::table
+                .on(harvest_signals::workflow_exec_id.eq(harvest_workflow_executions::id)),
+        )
+        .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
+        .filter(harvest_workflow_executions::workflow_id.eq(workflow_id))
+        .filter(harvest_signals::idempotency_key.eq(idempotency_key))
+        .order_by(harvest_signals::received_at.desc())
+        .select(WorkflowExecution::as_select())
         .first(conn)
         .await
         .optional()

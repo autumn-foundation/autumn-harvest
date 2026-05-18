@@ -270,12 +270,29 @@ transaction. The same primitive is exposed over HTTP as
 | RUNNING / SUSPENDED | signal existing | `Err(AlreadyExists)` | signal existing | cancel + start + signal |
 | COMPLETED | start fresh + signal | `Err(AlreadyExists)` | start fresh + signal | start fresh + signal |
 | FAILED | start fresh + signal | `Err(AlreadyExists)` | start fresh + signal | start fresh + signal |
-| CANCELLED / TERMINATED | start fresh + signal | `Err(AlreadyExists)` | start fresh + signal | start fresh + signal |
+| CANCELLED | start fresh + signal | `Err(AlreadyExists)` | start fresh + signal | start fresh + signal |
+| TERMINATED | start fresh + signal | start fresh + signal | start fresh + signal | start fresh + signal |
 
 For terminal priors, `AllowDuplicate` and `AllowDuplicateFailedOnly` diverge
 from the standalone `start_or_load_workflow_execution` semantics (which return
 the existing terminal run): signal-with-start escalates internally to a
 fresh start so the spec's "no signal silently dropped" invariant holds.
+
+`TERMINATED` is the *sealed* state set by the reset path: the row is released
+from the partial unique index, so `RejectDuplicate` no longer treats it as a
+duplicate. The reset operator explicitly opted the prior row out of the
+uniqueness scope, matching the broader `start_or_load_workflow_execution`
+semantics.
+
+**Idempotency dedupe is scoped to the logical workflow**, not the
+`workflow_exec_id`. A webhook retry carrying the same `idempotency_key` that
+arrives after the original execution has reached a terminal state will be
+recognised as a duplicate and short-circuited: no fresh execution is started
+and no second signal is queued, even though the fresh-start escalation would
+otherwise create a new `exec_id`. The dedupe joins `harvest_signals` to
+`harvest_workflow_executions` so the per-shard partial unique index
+(`workflow_exec_id, idempotency_key`) is augmented with a
+`(workflow_name, workflow_id)` scope.
 
 `SignalWithStartOutcome.started_fresh` distinguishes a freshly inserted run
 from one attached to an existing live execution; `signal_delivered` reports
