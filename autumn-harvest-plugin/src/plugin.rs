@@ -502,8 +502,9 @@ mod tests {
             default_queue: Some("default"),
             builder: build,
             workflow_handler: None,
-
             jitter: ::std::time::Duration::ZERO,
+            overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+            buffer_all_max: 100,
         }
     }
 

@@ -1136,8 +1136,9 @@ mod tests {
             default_queue: Some("default"),
             builder: build,
             workflow_handler: None,
-
             jitter: ::std::time::Duration::ZERO,
+            overlap_policy: crate::policy::OverlapPolicy::Skip,
+            buffer_all_max: 100,
         }
     }
 
@@ -1155,6 +1156,8 @@ mod tests {
             builder: build,
             workflow_handler: Some(|_ctx, input| Box::pin(async move { Ok(input) })),
             jitter: ::std::time::Duration::ZERO,
+            overlap_policy: crate::policy::OverlapPolicy::Skip,
+            buffer_all_max: 100,
         }
     }
 

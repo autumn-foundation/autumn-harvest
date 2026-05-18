@@ -266,6 +266,94 @@ pub enum Schedule {
     Manual,
 }
 
+/// What happens when a new schedule firing collides with a still-running previous
+/// run from the same schedule.
+///
+/// ## Decision matrix
+///
+/// | Policy | When to use | In-flight run | New firing | Subsequent firings while busy | Durability |
+/// |---|---|---|---|---|---|
+/// | `Skip` | Default; predictable load, idempotent schedules | Continues | Dropped | Each evaluated at next tick | N/A |
+/// | `BufferOne` | Long-running jobs that must catch up by exactly one slot | Continues | Queued (one slot) | Dropped while slot occupied | Durable in DB |
+/// | `BufferAll` | Backfill/replay; every missed slot must eventually run | Continues | Queued (up to `buffer_all_max`) | Dropped past cap | Durable in DB |
+/// | `CancelOther` | Wedged runs; always prefer the latest firing | Cancelled gracefully | Started immediately | Normal | N/A |
+/// | `TerminateOther` | Same as `CancelOther` but with immediate force-stop | Terminated immediately | Started immediately | Normal | N/A |
+///
+/// The default is [`Skip`](OverlapPolicy::Skip), which preserves pre-existing behaviour.
+///
+/// `BufferOne` / `BufferAll` store pending firings durably in `harvest_schedules`
+/// so they survive scheduler restarts and leader handoffs.
+///
+/// `CancelOther` / `TerminateOther` require the cancellation contract from
+/// issue #238, which is implemented in this codebase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OverlapPolicy {
+    /// Drop the new firing when the previous run is still active (default).
+    #[default]
+    Skip,
+    /// Buffer at most one pending firing; drop subsequent firings while the
+    /// buffer slot is occupied (records `reason = "buffered_slot_full"`).
+    BufferOne,
+    /// Buffer every missed firing up to `buffer_all_max`; drop firings past
+    /// the cap (records `reason = "buffer_full"`).
+    BufferAll,
+    /// Cancel the in-flight run and start the new one.
+    CancelOther,
+    /// Terminate the in-flight run immediately and start the new one.
+    TerminateOther,
+}
+
+impl OverlapPolicy {
+    /// The `snake_case` string used to store this policy in `harvest_schedules`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Skip => "skip",
+            Self::BufferOne => "buffer_one",
+            Self::BufferAll => "buffer_all",
+            Self::CancelOther => "cancel_other",
+            Self::TerminateOther => "terminate_other",
+        }
+    }
+
+    /// Parse an `overlap_policy` column value from the database.
+    ///
+    /// Unknown values fall back to [`Skip`](Self::Skip) to preserve the
+    /// append-only-schema invariant: a deployment using an older binary
+    /// reading a newer enum value degrades to the safe default.
+    #[must_use]
+    pub fn from_db(s: &str) -> Self {
+        match s {
+            "buffer_one" => Self::BufferOne,
+            "buffer_all" => Self::BufferAll,
+            "cancel_other" => Self::CancelOther,
+            "terminate_other" => Self::TerminateOther,
+            _ => Self::Skip,
+        }
+    }
+
+    /// Parse an `overlap_policy` value from user-supplied input (e.g. an API request).
+    ///
+    /// Unlike [`from_db`](Self::from_db) this is strict: an unknown value returns
+    /// `Err` so callers can surface a 400 response rather than silently applying
+    /// the `Skip` fallback.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(s)` when `s` is not a recognised variant name.
+    pub fn from_user_input(s: &str) -> Result<Self, &str> {
+        match s {
+            "skip" => Ok(Self::Skip),
+            "buffer_one" => Ok(Self::BufferOne),
+            "buffer_all" => Ok(Self::BufferAll),
+            "cancel_other" => Ok(Self::CancelOther),
+            "terminate_other" => Ok(Self::TerminateOther),
+            _ => Err(s),
+        }
+    }
+}
+
 /// Per-workflow cron/interval schedule — the lightweight alternative to a
 /// single-node DAG when all you need is "run this workflow on a schedule."
 ///
@@ -331,13 +419,27 @@ pub struct WorkflowSchedule {
     /// ```
     #[serde(default)]
     pub jitter: Duration,
+    /// What to do when a new firing collides with a still-running execution
+    /// from the same schedule. Defaults to [`OverlapPolicy::Skip`].
+    #[serde(default)]
+    pub overlap_policy: OverlapPolicy,
+    /// Maximum number of pending firings stored under [`OverlapPolicy::BufferAll`].
+    /// Past this cap, additional firings are dropped and recorded as skipped with
+    /// `reason = "buffer_full"`. Defaults to `100`.
+    #[serde(default = "default_buffer_all_max")]
+    pub buffer_all_max: u32,
+}
+
+const fn default_buffer_all_max() -> u32 {
+    100
 }
 
 impl WorkflowSchedule {
     /// Create a new workflow schedule with sensible defaults.
     ///
     /// Defaults: `input = null`, `catchup = false`, `max_active_runs = 1`,
-    /// `paused = false`, `queue_name = "default"`.
+    /// `paused = false`, `queue_name = "default"`, `overlap_policy = Skip`,
+    /// `buffer_all_max = 100`.
     #[must_use]
     pub fn new(workflow_name: impl Into<String>, schedule: Schedule) -> Self {
         Self {
@@ -350,6 +452,8 @@ impl WorkflowSchedule {
             paused: false,
             queue_name: "default".to_string(),
             jitter: Duration::ZERO,
+            overlap_policy: OverlapPolicy::Skip,
+            buffer_all_max: 100,
         }
     }
 
@@ -378,6 +482,26 @@ impl WorkflowSchedule {
     #[must_use]
     pub const fn with_paused(mut self, paused: bool) -> Self {
         self.paused = paused;
+        self
+    }
+
+    /// Set the overlap policy for this schedule.
+    ///
+    /// Determines what happens when a new firing collides with a still-running
+    /// execution from the same schedule. See [`OverlapPolicy`] for semantics.
+    #[must_use]
+    pub const fn with_overlap_policy(mut self, policy: OverlapPolicy) -> Self {
+        self.overlap_policy = policy;
+        self
+    }
+
+    /// Set the maximum buffer size for [`OverlapPolicy::BufferAll`].
+    ///
+    /// Firings beyond this cap are dropped and recorded as skipped with
+    /// `reason = "buffer_full"`. Has no effect for other overlap policies.
+    #[must_use]
+    pub const fn with_buffer_all_max(mut self, max: u32) -> Self {
+        self.buffer_all_max = max;
         self
     }
 
@@ -698,6 +822,81 @@ mod tests {
         assert!(TriggerRule::AllSuccess.should_run(&[]));
         assert!(TriggerRule::AllDone.should_run(&[]));
     }
+
+    // ── OverlapPolicy ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn overlap_policy_default_is_skip() {
+        assert_eq!(OverlapPolicy::default(), OverlapPolicy::Skip);
+    }
+
+    #[test]
+    fn overlap_policy_as_str_round_trips() {
+        let cases = [
+            (OverlapPolicy::Skip, "skip"),
+            (OverlapPolicy::BufferOne, "buffer_one"),
+            (OverlapPolicy::BufferAll, "buffer_all"),
+            (OverlapPolicy::CancelOther, "cancel_other"),
+            (OverlapPolicy::TerminateOther, "terminate_other"),
+        ];
+        for (policy, s) in cases {
+            assert_eq!(policy.as_str(), s, "as_str mismatch for {policy:?}");
+            assert_eq!(
+                OverlapPolicy::from_db(s),
+                policy,
+                "from_db mismatch for {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn overlap_policy_from_db_unknown_defaults_to_skip() {
+        assert_eq!(OverlapPolicy::from_db("unknown_value"), OverlapPolicy::Skip);
+        assert_eq!(OverlapPolicy::from_db(""), OverlapPolicy::Skip);
+    }
+
+    #[test]
+    fn workflow_schedule_overlap_policy_defaults_to_skip() {
+        let sched = WorkflowSchedule::new("my_wf", Schedule::Manual);
+        assert_eq!(sched.overlap_policy, OverlapPolicy::Skip);
+    }
+
+    #[test]
+    fn workflow_schedule_with_overlap_policy_sets_field() {
+        let sched = WorkflowSchedule::new("my_wf", Schedule::Manual)
+            .with_overlap_policy(OverlapPolicy::BufferOne);
+        assert_eq!(sched.overlap_policy, OverlapPolicy::BufferOne);
+    }
+
+    #[test]
+    fn workflow_schedule_buffer_all_max_defaults_to_100() {
+        let sched = WorkflowSchedule::new("my_wf", Schedule::Manual);
+        assert_eq!(sched.buffer_all_max, 100);
+    }
+
+    #[test]
+    fn workflow_schedule_with_buffer_all_max_sets_field() {
+        let sched = WorkflowSchedule::new("my_wf", Schedule::Manual).with_buffer_all_max(50);
+        assert_eq!(sched.buffer_all_max, 50);
+    }
+
+    #[test]
+    fn overlap_policy_serde_round_trips() {
+        let policies = [
+            OverlapPolicy::Skip,
+            OverlapPolicy::BufferOne,
+            OverlapPolicy::BufferAll,
+            OverlapPolicy::CancelOther,
+            OverlapPolicy::TerminateOther,
+        ];
+        for policy in policies {
+            let json = serde_json::to_string(&policy).expect("serialize");
+            let back: OverlapPolicy = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(back, policy, "serde round-trip failed for {policy:?}");
+        }
+    }
+
+    // ── compute_retry_delay ───────────────────────────────────────────────────
 
     #[test]
     fn compute_retry_delay_exponential() {

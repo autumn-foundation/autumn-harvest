@@ -18,10 +18,11 @@ use autumn_harvest::store;
 use autumn_harvest::types::{ActivityExecId, ExecutionId};
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{
-    ActivityContext, DagCatalog, HarvestBuilder, HarvestError, Schedule, SchedulerMonitor,
-    SchedulerRuntime, StartWorkflowParams, TimeoutType, WorkerConfig, WorkflowContext,
-    WorkflowIdReusePolicy, WorkflowSchedule, cancel_workflow_execution, queue,
-    register_workflow_schedules, start_or_load_workflow_execution, tick_once, timeout,
+    ActivityContext, DagCatalog, HarvestBuilder, HarvestError, OverlapPolicy, Schedule,
+    SchedulerMonitor, SchedulerRuntime, StartWorkflowParams, TimeoutType, WorkerConfig,
+    WorkflowContext, WorkflowIdReusePolicy, WorkflowSchedule, cancel_workflow_execution, queue,
+    register_workflow_schedules, start_or_load_workflow_execution, terminate_workflow_execution,
+    tick_once, timeout,
 };
 
 use chrono::Utc;
@@ -83,6 +84,8 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260514020000_harvest_task_activity_id/up.sql"),
     "\n",
     include_str!("../migrations/20260517000000_harvest_schedule_jitter/up.sql"),
+    "\n",
+    include_str!("../migrations/20260517000001_harvest_schedule_overlap_policy/up.sql"),
 );
 
 /// The minimal "legacy" migration set used by the upgrade-path regression
@@ -5391,4 +5394,494 @@ async fn legacy_string_failure_in_non_retryable_errors_fails_fast() {
     };
     assert_eq!(dlq_rows.len(), 0);
     assert_eq!(execution.state, "FAILED");
+}
+
+// ===== Overlap policy integration tests (issue #241) =============================
+
+/// Count executions for a workflow in an exact DB state value.
+async fn count_executions_in_state(database_url: &str, workflow_name: &str, state: &str) -> i64 {
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(database_url)
+        .await
+        .expect("failed to connect for state count query");
+    harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
+        .filter(harvest_workflow_executions::state.eq(state))
+        .count()
+        .get_result::<i64>(&mut conn)
+        .await
+        .expect("state count query failed")
+}
+
+/// Query the number of entries in `harvest_schedules.buffered_runs` for a workflow schedule.
+async fn query_buffered_runs_count(database_url: &str, workflow_name: &str) -> usize {
+    use autumn_harvest::schema::harvest_schedules::dsl as sched_dsl;
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(database_url)
+        .await
+        .expect("failed to connect for buffered_runs query");
+    let val: serde_json::Value = sched_dsl::harvest_schedules
+        .filter(sched_dsl::workflow_name.eq(workflow_name))
+        .select(sched_dsl::buffered_runs)
+        .first::<serde_json::Value>(&mut conn)
+        .await
+        .expect("buffered_runs query failed");
+    val.as_array().map_or(0, Vec::len)
+}
+
+/// Query all RUNNING execution IDs for a workflow schedule (used to terminate them in tests).
+async fn query_running_exec_ids(database_url: &str, workflow_name: &str) -> Vec<ExecutionId> {
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(database_url)
+        .await
+        .expect("failed to connect for running exec ids query");
+    harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
+        .filter(harvest_workflow_executions::state.eq("RUNNING"))
+        .select(harvest_workflow_executions::id)
+        .load::<uuid::Uuid>(&mut conn)
+        .await
+        .expect("running exec ids query failed")
+        .into_iter()
+        .map(ExecutionId::from_uuid)
+        .collect()
+}
+
+/// (overlap-a) Skip explicitly configured: no buffering, total stays at 1 while a run is in flight.
+///
+/// The scheduler dispatches on tick 1, then every subsequent tick sees `running = 1` and
+/// drops the firing with `reason = "max_active_runs_reached"`.  No buffered slots.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn overlap_policy_skip_explicitly_drops_new_firings() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let wf_name = "overlap_skip_wf";
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![WorkflowInfo {
+            name: wf_name,
+            module: "integration_e2e",
+            handler: slow_workflow,
+        }],
+        vec![],
+    ));
+    let pool = build_test_pool(&database_url);
+
+    let ws = WorkflowSchedule::new(wf_name, Schedule::Cron("*/2 * * * * *".to_string()))
+        .with_max_active_runs(1)
+        .with_overlap_policy(OverlapPolicy::Skip);
+    {
+        let mut conn = pool.get().await.expect("pool get failed");
+        register_workflow_schedules(&mut conn, std::slice::from_ref(&ws))
+            .await
+            .expect("register_workflow_schedules failed");
+    }
+    let workflow_schedules = Arc::new(vec![ws]);
+    let scheduler = SchedulerRuntime::spawn(
+        pool.clone(),
+        Arc::clone(&registry),
+        Arc::new(DagCatalog::default()),
+        Arc::clone(&workflow_schedules),
+    );
+
+    // Poll until exec#1 is dispatched (up to 12 s to tolerate Docker startup latency and
+    // cron-boundary alignment jitter).  Once the first dispatch lands the state is stable:
+    // subsequent ticks all hit the Skip branch and neither add executions nor buffer slots.
+    tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            let r = count_running_executions(&database_url, wf_name).await;
+            if r >= 1 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    })
+    .await
+    .expect("Skip: timed out waiting for first dispatch within 12 s");
+
+    let running = count_running_executions(&database_url, wf_name).await;
+    assert_eq!(running, 1, "Skip: must keep exactly 1 RUNNING execution");
+    let total = count_executions_for_workflow(&database_url, wf_name).await;
+    assert_eq!(total, 1, "Skip: no extra dispatches, total must be 1");
+    let buffered = query_buffered_runs_count(&database_url, wf_name).await;
+    assert_eq!(buffered, 0, "Skip: must not buffer any firings");
+
+    scheduler.shutdown();
+    let _ = scheduler.join().await;
+}
+
+/// (overlap-b1) `BufferOne`: exactly one pending firing is queued in DB; subsequent firings are
+/// dropped with `reason = "buffered_slot_full"`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn overlap_policy_buffer_one_queues_single_slot() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let wf_name = "overlap_buffer_one_wf";
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![WorkflowInfo {
+            name: wf_name,
+            module: "integration_e2e",
+            handler: slow_workflow,
+        }],
+        vec![],
+    ));
+    let pool = build_test_pool(&database_url);
+
+    let ws = WorkflowSchedule::new(wf_name, Schedule::Cron("*/2 * * * * *".to_string()))
+        .with_max_active_runs(1)
+        .with_overlap_policy(OverlapPolicy::BufferOne);
+    {
+        let mut conn = pool.get().await.expect("pool get failed");
+        register_workflow_schedules(&mut conn, std::slice::from_ref(&ws))
+            .await
+            .expect("register_workflow_schedules failed");
+    }
+    let workflow_schedules = Arc::new(vec![ws]);
+    let scheduler = SchedulerRuntime::spawn(
+        pool.clone(),
+        Arc::clone(&registry),
+        Arc::new(DagCatalog::default()),
+        Arc::clone(&workflow_schedules),
+    );
+
+    // Poll until the buffer holds exactly 1 slot (up to 12 s).  Two ticks are needed:
+    // tick 1 dispatches exec#1, tick 2 buffers the first slot.  Once buffered == 1 the
+    // state is stable: exec#1 stays RUNNING (no worker), so subsequent ticks all drop.
+    tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            let b = query_buffered_runs_count(&database_url, wf_name).await;
+            if b >= 1 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    })
+    .await
+    .expect("BufferOne: timed out waiting for 1 buffered slot within 12 s");
+
+    let running = count_running_executions(&database_url, wf_name).await;
+    assert_eq!(
+        running, 1,
+        "BufferOne: must keep exactly 1 RUNNING execution"
+    );
+    let total = count_executions_for_workflow(&database_url, wf_name).await;
+    assert_eq!(
+        total, 1,
+        "BufferOne: no extra dispatches while slot is filled"
+    );
+    let buffered = query_buffered_runs_count(&database_url, wf_name).await;
+    assert_eq!(
+        buffered, 1,
+        "BufferOne: must buffer exactly 1 firing and no more"
+    );
+
+    scheduler.shutdown();
+    let _ = scheduler.join().await;
+}
+
+/// (overlap-b2) `BufferAll`: every missed firing is buffered up to `buffer_all_max`; firings past
+/// the cap are dropped with `reason = "buffer_full"`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn overlap_policy_buffer_all_queues_multiple_slots() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let wf_name = "overlap_buffer_all_wf";
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![WorkflowInfo {
+            name: wf_name,
+            module: "integration_e2e",
+            handler: slow_workflow,
+        }],
+        vec![],
+    ));
+    let pool = build_test_pool(&database_url);
+
+    let ws = WorkflowSchedule::new(wf_name, Schedule::Cron("*/2 * * * * *".to_string()))
+        .with_max_active_runs(1)
+        .with_overlap_policy(OverlapPolicy::BufferAll)
+        .with_buffer_all_max(3);
+    {
+        let mut conn = pool.get().await.expect("pool get failed");
+        register_workflow_schedules(&mut conn, std::slice::from_ref(&ws))
+            .await
+            .expect("register_workflow_schedules failed");
+    }
+    let workflow_schedules = Arc::new(vec![ws]);
+    let scheduler = SchedulerRuntime::spawn(
+        pool.clone(),
+        Arc::clone(&registry),
+        Arc::new(DagCatalog::default()),
+        Arc::clone(&workflow_schedules),
+    );
+
+    // Poll until the buffer reaches its cap of 3 slots (up to 20 s).  Four ticks are needed:
+    // tick 1 dispatches exec#1, ticks 2–4 each buffer one slot.  Once buffered == 3 (cap),
+    // subsequent ticks drop — the state is stable because exec#1 stays RUNNING (no worker).
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let b = query_buffered_runs_count(&database_url, wf_name).await;
+            if b >= 3 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    })
+    .await
+    .expect("BufferAll: timed out waiting for 3 buffered slots within 20 s");
+
+    let running = count_running_executions(&database_url, wf_name).await;
+    assert_eq!(
+        running, 1,
+        "BufferAll: must keep exactly 1 RUNNING execution"
+    );
+    let total = count_executions_for_workflow(&database_url, wf_name).await;
+    assert_eq!(
+        total, 1,
+        "BufferAll: no extra dispatches while buffer absorbs firings"
+    );
+    let buffered = query_buffered_runs_count(&database_url, wf_name).await;
+    assert_eq!(
+        buffered, 3,
+        "BufferAll: must buffer exactly 3 firings (at buffer_all_max cap)"
+    );
+
+    scheduler.shutdown();
+    let _ = scheduler.join().await;
+}
+
+/// (overlap-c1) `CancelOther`: in-flight run is cancelled and the new firing starts immediately.
+///
+/// Without a worker the executions stay in the state set by the scheduler DB writes:
+/// - exec#1 → CANCELLED (by `cancel_workflow_execution`)
+/// - exec#2 → RUNNING (by `start_or_load_workflow_execution`)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn overlap_policy_cancel_other_cancels_inflight_run() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let wf_name = "overlap_cancel_other_wf";
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![WorkflowInfo {
+            name: wf_name,
+            module: "integration_e2e",
+            handler: slow_workflow,
+        }],
+        vec![],
+    ));
+    let pool = build_test_pool(&database_url);
+
+    let ws = WorkflowSchedule::new(wf_name, Schedule::Cron("*/2 * * * * *".to_string()))
+        .with_max_active_runs(1)
+        .with_overlap_policy(OverlapPolicy::CancelOther);
+    {
+        let mut conn = pool.get().await.expect("pool get failed");
+        register_workflow_schedules(&mut conn, std::slice::from_ref(&ws))
+            .await
+            .expect("register_workflow_schedules failed");
+    }
+    let workflow_schedules = Arc::new(vec![ws]);
+    let scheduler = SchedulerRuntime::spawn(
+        pool.clone(),
+        Arc::clone(&registry),
+        Arc::new(DagCatalog::default()),
+        Arc::clone(&workflow_schedules),
+    );
+
+    // Poll until the cancel+redispatch cycle completes (up to 12 s to tolerate
+    // Docker container startup latency and cron alignment jitter).
+    let (cancelled, running) = tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            let c = count_executions_in_state(&database_url, wf_name, "CANCELLED").await;
+            let r = count_running_executions(&database_url, wf_name).await;
+            if c >= 1 && r == 1 {
+                return (c, r);
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    })
+    .await
+    .expect("CancelOther: timed out waiting for cancel+redispatch within 12 s");
+
+    assert!(
+        cancelled >= 1,
+        "CancelOther: at least 1 execution must be CANCELLED, got {cancelled}"
+    );
+    assert_eq!(
+        running, 1,
+        "CancelOther: exactly 1 execution must be RUNNING, got {running}"
+    );
+    let total = count_executions_for_workflow(&database_url, wf_name).await;
+    assert!(
+        total >= 2,
+        "CancelOther: at least 2 total executions (cancelled + running), got {total}"
+    );
+
+    scheduler.shutdown();
+    let _ = scheduler.join().await;
+}
+
+/// (overlap-c2) `TerminateOther`: in-flight run is force-terminated and the new firing starts
+/// immediately.  `terminate_workflow_execution` writes state CANCELLED (force, regardless of
+/// prior state), then the new firing is dispatched as RUNNING.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn overlap_policy_terminate_other_terminates_inflight_run() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let wf_name = "overlap_terminate_other_wf";
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![WorkflowInfo {
+            name: wf_name,
+            module: "integration_e2e",
+            handler: slow_workflow,
+        }],
+        vec![],
+    ));
+    let pool = build_test_pool(&database_url);
+
+    let ws = WorkflowSchedule::new(wf_name, Schedule::Cron("*/2 * * * * *".to_string()))
+        .with_max_active_runs(1)
+        .with_overlap_policy(OverlapPolicy::TerminateOther);
+    {
+        let mut conn = pool.get().await.expect("pool get failed");
+        register_workflow_schedules(&mut conn, std::slice::from_ref(&ws))
+            .await
+            .expect("register_workflow_schedules failed");
+    }
+    let workflow_schedules = Arc::new(vec![ws]);
+    let scheduler = SchedulerRuntime::spawn(
+        pool.clone(),
+        Arc::clone(&registry),
+        Arc::new(DagCatalog::default()),
+        Arc::clone(&workflow_schedules),
+    );
+
+    // Poll until the terminate+redispatch cycle completes (up to 12 s).
+    let (cancelled, running) = tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            let c = count_executions_in_state(&database_url, wf_name, "CANCELLED").await;
+            let r = count_running_executions(&database_url, wf_name).await;
+            if c >= 1 && r == 1 {
+                return (c, r);
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    })
+    .await
+    .expect("TerminateOther: timed out waiting for terminate+redispatch within 12 s");
+
+    assert!(
+        cancelled >= 1,
+        "TerminateOther: at least 1 execution must be CANCELLED (terminated), got {cancelled}"
+    );
+    assert_eq!(
+        running, 1,
+        "TerminateOther: exactly 1 execution must be RUNNING, got {running}"
+    );
+    let total = count_executions_for_workflow(&database_url, wf_name).await;
+    assert!(
+        total >= 2,
+        "TerminateOther: at least 2 total executions (terminated + running), got {total}"
+    );
+
+    scheduler.shutdown();
+    let _ = scheduler.join().await;
+}
+
+/// (overlap-d) `BufferOne` durability: buffered slots survive a scheduler restart.
+///
+/// Phase 1 — Scheduler A dispatches exec#1 (`slow_workflow`) and buffers one slot.
+/// Shutdown Scheduler A.  The `buffered_runs` column in DB still holds the entry.
+///
+/// Phase 2 — Exec#1 is terminated to free capacity.  Scheduler B starts.  Its
+/// drain pass sees `running = 0` and `buffered_runs` non-empty → dispatches exec#2.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn overlap_policy_buffer_one_survives_scheduler_restart() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let wf_name = "overlap_restart_wf";
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![WorkflowInfo {
+            name: wf_name,
+            module: "integration_e2e",
+            handler: slow_workflow,
+        }],
+        vec![],
+    ));
+    let pool = build_test_pool(&database_url);
+
+    let ws = WorkflowSchedule::new(wf_name, Schedule::Cron("*/2 * * * * *".to_string()))
+        .with_max_active_runs(1)
+        .with_overlap_policy(OverlapPolicy::BufferOne);
+    {
+        let mut conn = pool.get().await.expect("pool get failed");
+        register_workflow_schedules(&mut conn, std::slice::from_ref(&ws))
+            .await
+            .expect("register_workflow_schedules failed");
+    }
+    let workflow_schedules = Arc::new(vec![ws]);
+
+    // ---- Phase 1: run scheduler until one slot is buffered ----
+    let scheduler1 = SchedulerRuntime::spawn(
+        pool.clone(),
+        Arc::clone(&registry),
+        Arc::new(DagCatalog::default()),
+        Arc::clone(&workflow_schedules),
+    );
+    // Poll for the buffered slot to appear (up to 12 s to tolerate Docker latency).
+    let buffered_before = tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            let b = query_buffered_runs_count(&database_url, wf_name).await;
+            if b >= 1 {
+                return b;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    })
+    .await
+    .expect("expected 1 buffered slot within 12 s");
+    assert_eq!(
+        buffered_before, 1,
+        "expected exactly 1 buffered slot before restart, got {buffered_before}"
+    );
+
+    scheduler1.shutdown();
+    let _ = scheduler1.join().await;
+
+    // buffered_runs must persist after shutdown (durability assertion).
+    let buffered_after_shutdown = query_buffered_runs_count(&database_url, wf_name).await;
+    assert_eq!(
+        buffered_after_shutdown, 1,
+        "buffered_runs must survive scheduler shutdown (got {buffered_after_shutdown})"
+    );
+
+    // Terminate exec#1 to free the capacity slot for the drain.
+    let running_ids = query_running_exec_ids(&database_url, wf_name).await;
+    assert_eq!(
+        running_ids.len(),
+        1,
+        "expected 1 RUNNING execution before restart"
+    );
+    {
+        let mut conn = pool.get().await.expect("pool get failed");
+        terminate_workflow_execution(&mut conn, running_ids[0], "overlap restart test cleanup")
+            .await
+            .expect("terminate must succeed");
+    }
+
+    // ---- Phase 2: restart scheduler; drain dispatches the buffered slot ----
+    let scheduler2 = SchedulerRuntime::spawn(
+        pool.clone(),
+        Arc::clone(&registry),
+        Arc::new(DagCatalog::default()),
+        Arc::clone(&workflow_schedules),
+    );
+
+    let total = tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let n = count_executions_for_workflow(&database_url, wf_name).await;
+            if n >= 2 {
+                break n;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("buffered slot must be dispatched after scheduler restart within 8 s");
+
+    assert!(
+        total >= 2,
+        "expected >=2 total executions after restart (exec#1 terminated + exec#2 from buffer), got {total}"
+    );
+
+    scheduler2.shutdown();
+    let _ = scheduler2.join().await;
 }

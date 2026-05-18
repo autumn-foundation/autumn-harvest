@@ -1015,6 +1015,12 @@ struct ScheduleEntry {
     /// Effective next fire time = `next_run_at` + deterministic jitter offset.
     /// `None` when `next_run_at` is `None` or jitter is zero.
     effective_fire_time: Option<chrono::DateTime<chrono::Utc>>,
+    /// Overlap policy for this schedule (e.g. `"skip"`, `"buffer_one"`).
+    overlap_policy: String,
+    /// Number of firings currently buffered (non-zero only for `buffer_one` / `buffer_all`).
+    buffered_count: usize,
+    /// Maximum buffered slots under `buffer_all`. 0 for other policies.
+    buffer_all_max: i32,
 }
 
 /// Optional request body for `POST /admin/schedules/{id}/pause` and `…/resume`.
@@ -1042,6 +1048,13 @@ struct CreateWorkflowScheduleRequest {
     /// Jitter window in seconds. `0` disables jitter (default).
     #[serde(default)]
     jitter_secs: u64,
+    /// Overlap policy string (e.g. `"skip"`, `"buffer_one"`, `"buffer_all"`,
+    /// `"cancel_other"`, `"terminate_other"`). Defaults to `"skip"`.
+    #[serde(default = "default_overlap_policy")]
+    overlap_policy: String,
+    /// Maximum buffered slots under `BufferAll`. Defaults to `100`.
+    #[serde(default = "default_buffer_all_max")]
+    buffer_all_max: u32,
 }
 
 fn default_queue_name() -> String {
@@ -1050,6 +1063,14 @@ fn default_queue_name() -> String {
 
 const fn default_max_active_runs() -> u32 {
     1
+}
+
+fn default_overlap_policy() -> String {
+    "skip".to_string()
+}
+
+const fn default_buffer_all_max() -> u32 {
+    100
 }
 
 /// Workflow execution states that the management API recognises in `state=`
@@ -4617,6 +4638,8 @@ async fn list_schedules(
                 .cloned()
                 .map(BackfillSummary::from);
             let eft = effective_fire_time(s.id, s.next_run_at, s.jitter_secs);
+            let buffered_count =
+                autumn_harvest::scheduler::parse_buffered_runs_pub(&s.buffered_runs).len();
             ScheduleEntry {
                 id: s.id,
                 kind,
@@ -4633,6 +4656,9 @@ async fn list_schedules(
                 last_backfill,
                 jitter_secs: s.jitter_secs,
                 effective_fire_time: eft,
+                overlap_policy: s.overlap_policy.clone(),
+                buffered_count,
+                buffer_all_max: s.buffer_all_max,
             }
         })
         .collect();
@@ -4680,6 +4706,7 @@ async fn get_schedule(
         .remove(&s.id)
         .map(BackfillSummary::from);
 
+    let buffered_count = autumn_harvest::scheduler::parse_buffered_runs_pub(&s.buffered_runs).len();
     Ok(Json(ScheduleEntry {
         effective_fire_time: effective_fire_time(s.id, s.next_run_at, s.jitter_secs),
         jitter_secs: s.jitter_secs,
@@ -4696,6 +4723,9 @@ async fn get_schedule(
         max_active_runs: s.max_active_runs,
         catchup: s.catchup,
         last_backfill,
+        overlap_policy: s.overlap_policy.clone(),
+        buffered_count,
+        buffer_all_max: s.buffer_all_max,
     }))
 }
 
@@ -4838,6 +4868,8 @@ async fn upsert_workflow_schedule_and_read_back(
         .await
         .map_err(database_error)
         .map_err(map_error)?;
+    let buffered_count =
+        autumn_harvest::scheduler::parse_buffered_runs_pub(&row.buffered_runs).len();
     Ok(ScheduleEntry {
         effective_fire_time: effective_fire_time(row.id, row.next_run_at, row.jitter_secs),
         jitter_secs: row.jitter_secs,
@@ -4854,9 +4886,13 @@ async fn upsert_workflow_schedule_and_read_back(
         max_active_runs: row.max_active_runs,
         catchup: row.catchup,
         last_backfill: None, // newly created; no backfill history yet
+        overlap_policy: row.overlap_policy.clone(),
+        buffered_count,
+        buffer_all_max: row.buffer_all_max,
     })
 }
 
+#[allow(clippy::too_many_lines)]
 async fn create_workflow_schedule(
     Extension(api_state): Extension<HarvestApiState>,
     headers: axum::http::HeaderMap,
@@ -4906,6 +4942,28 @@ async fn create_workflow_schedule(
     let pool = api_state.storage_pool().map_err(map_error)?;
     let mut conn = acquire_conn(pool.pool_for(runtime.router().default_shard())).await?;
 
+    // Reject unknown overlap_policy strings with 400 before storing.
+    // `from_db` is lenient for backward compat; user input is validated strictly.
+    let overlap_policy = match autumn_harvest::OverlapPolicy::from_user_input(
+        &request.overlap_policy,
+    ) {
+        Ok(p) => p,
+        Err(v) => {
+            let err_summary = format!(
+                "invalid overlap_policy '{v}'; valid values: skip, buffer_one, buffer_all, cancel_other, terminate_other"
+            );
+            schedule_create_audit_failed(
+                &api_state,
+                &actor,
+                &source,
+                request_id.as_deref(),
+                &request.workflow_name,
+                &err_summary,
+            )
+            .await;
+            return Err(AutumnError::bad_request_msg(err_summary));
+        }
+    };
     let ws = WorkflowSchedule {
         workflow_name: request.workflow_name.clone(),
         dag_name: None,
@@ -4916,6 +4974,8 @@ async fn create_workflow_schedule(
         paused: request.paused,
         queue_name: request.queue_name.clone(),
         jitter: std::time::Duration::from_secs(request.jitter_secs),
+        overlap_policy,
+        buffer_all_max: request.buffer_all_max,
     };
     let entry = match upsert_workflow_schedule_and_read_back(&mut conn, &ws).await {
         Ok(e) => e,

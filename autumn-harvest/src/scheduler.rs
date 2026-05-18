@@ -9,7 +9,7 @@ use croner::Cron;
 use diesel::OptionalExtension;
 use diesel::QueryDsl;
 use diesel::SelectableHelper;
-use diesel::{BoolExpressionMethods, ExpressionMethods};
+use diesel::{BoolExpressionMethods, ExpressionMethods, TextExpressionMethods};
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use serde::Serialize;
@@ -23,7 +23,7 @@ use crate::execution::{
 };
 use crate::info::DagInfo;
 use crate::models::{HarvestSchedule, NewHarvestSchedule};
-use crate::policy::{Schedule, WorkflowSchedule, compute_jitter_offset};
+use crate::policy::{OverlapPolicy, Schedule, WorkflowSchedule, compute_jitter_offset};
 use crate::schema::{harvest_schedules, harvest_workflow_executions};
 use crate::shard::{ShardRouter, ShardedDbPool};
 use crate::types::{ExecutionId, ShardId, WorkflowIdReusePolicy};
@@ -141,6 +141,10 @@ pub struct RegisteredDag {
     pub definition: crate::dag::DagDefinition,
     /// Maximum spread window for schedule fires. `Duration::ZERO` disables jitter.
     pub jitter: std::time::Duration,
+    /// Overlap policy for this DAG's schedule (issue #241).
+    pub overlap_policy: OverlapPolicy,
+    /// Maximum buffered slots under `BufferAll` (issue #241).
+    pub buffer_all_max: u32,
 }
 
 impl RegisteredDag {
@@ -377,6 +381,8 @@ pub fn compile_dag_catalog(dags: Vec<DagInfo>) -> HarvestResult<DagCatalog> {
                 is_unified: dag.workflow_handler.is_some(),
                 definition,
                 jitter: dag.jitter,
+                overlap_policy: dag.overlap_policy,
+                buffer_all_max: dag.buffer_all_max,
             },
         );
     }
@@ -569,6 +575,20 @@ pub async fn tick_once_sharded(
             shard,
         )
         .await?;
+
+        // Drain buffered slots BEFORE evaluating newly-due firings so that
+        // capacity freed by a just-completed run is consumed by the oldest
+        // pending slot first, not by the freshest next_run_at firing.
+        #[cfg(feature = "db")]
+        if let Err(error) =
+            drain_buffered_schedule_runs(&mut conn, shard, dags.as_ref(), &metrics).await
+        {
+            tracing::warn!(
+                error = %error,
+                shard_id = shard.as_i32(),
+                "harvest: buffered schedule drain error"
+            );
+        }
 
         if let Err(error) = tick_workflow_schedules(&mut conn, shard, dags.as_ref(), &metrics).await
         {
@@ -791,6 +811,26 @@ async fn upsert_schedule(
                 .next_run_at
                 .or_else(|| next_run_after(dag.schedule.as_ref(), now))
         };
+        // Clear buffered slots when the schedule cadence changes or when the
+        // operator switches away from a buffering policy, so stale firings are
+        // not dispatched under a configuration that never produced them.  Also
+        // trim to the new cap when tightening the policy or buffer_all_max.
+        let is_buffering_policy = matches!(
+            dag.overlap_policy,
+            OverlapPolicy::BufferOne | OverlapPolicy::BufferAll
+        );
+        let new_buffered_runs = if is_buffering_policy && !schedule_changed {
+            let cap = if dag.overlap_policy == OverlapPolicy::BufferOne {
+                1usize
+            } else {
+                usize::try_from(dag.buffer_all_max.max(1)).unwrap_or(usize::MAX)
+            };
+            let mut existing_buffered = parse_buffered_runs(&existing.buffered_runs);
+            existing_buffered.truncate(cap);
+            buffered_runs_to_json(&existing_buffered)
+        } else {
+            serde_json::json!([])
+        };
         diesel::update(dsl::harvest_schedules.find(existing.id))
             .set((
                 dsl::schedule_expr.eq(expr.clone()),
@@ -801,6 +841,9 @@ async fn upsert_schedule(
                 dsl::updated_at.eq(now),
                 dsl::next_run_at.eq(next_run_at),
                 dsl::jitter_secs.eq(i64::try_from(dag.jitter.as_secs()).unwrap_or(i64::MAX)),
+                dsl::overlap_policy.eq(dag.overlap_policy.as_str()),
+                dsl::buffer_all_max.eq(i32::try_from(dag.buffer_all_max).unwrap_or(i32::MAX)),
+                dsl::buffered_runs.eq(new_buffered_runs),
             ))
             .execute(conn)
             .await
@@ -825,6 +868,9 @@ async fn upsert_schedule(
             workflow_input: None,
             queue_name: None,
             jitter_secs: i64::try_from(dag.jitter.as_secs()).unwrap_or(i64::MAX),
+            overlap_policy: dag.overlap_policy.as_str(),
+            buffered_runs: serde_json::json!([]),
+            buffer_all_max: i32::try_from(dag.buffer_all_max).unwrap_or(i32::MAX),
         };
         diesel::insert_into(harvest_schedules::table)
             .values(&row)
@@ -921,6 +967,9 @@ async fn insert_dag_workflow_schedule_if_missing(
         workflow_input: Some(ws.input.clone()),
         queue_name: Some(ws.queue_name.as_str()),
         jitter_secs: i64::try_from(ws.jitter.as_secs()).unwrap_or(i64::MAX),
+        overlap_policy: ws.overlap_policy.as_str(),
+        buffered_runs: serde_json::json!([]),
+        buffer_all_max: i32::try_from(ws.buffer_all_max).unwrap_or(i32::MAX),
     };
     diesel::insert_into(harvest_schedules::table)
         .values(&row)
@@ -959,6 +1008,9 @@ async fn insert_workflow_schedule_if_missing(
         workflow_input: Some(ws.input.clone()),
         queue_name: Some(ws.queue_name.as_str()),
         jitter_secs: i64::try_from(ws.jitter.as_secs()).unwrap_or(i64::MAX),
+        overlap_policy: ws.overlap_policy.as_str(),
+        buffered_runs: serde_json::json!([]),
+        buffer_all_max: i32::try_from(ws.buffer_all_max).unwrap_or(i32::MAX),
     };
     diesel::insert_into(harvest_schedules::table)
         .values(&row)
@@ -1022,6 +1074,26 @@ async fn upsert_workflow_schedule(
             .or_else(|| next_run_after(Some(&ws.schedule), now))
     };
     // is_paused is deliberately excluded — it is managed via pause/resume, not here.
+    // buffered_runs: preserved only when the policy is still buffering AND the cadence
+    // has not changed.  Also trim to the new effective cap so that tightening the
+    // policy (BufferAll→BufferOne, or lowering buffer_all_max) never lets the drain
+    // dispatch more slots than the updated configuration permits.
+    let is_buffering_policy = matches!(
+        ws.overlap_policy,
+        OverlapPolicy::BufferOne | OverlapPolicy::BufferAll
+    );
+    let new_buffered_runs = if is_buffering_policy && !schedule_changed {
+        let cap = if ws.overlap_policy == OverlapPolicy::BufferOne {
+            1usize
+        } else {
+            usize::try_from(ws.buffer_all_max.max(1)).unwrap_or(usize::MAX)
+        };
+        let mut existing_buffered = parse_buffered_runs(&existing.buffered_runs);
+        existing_buffered.truncate(cap);
+        buffered_runs_to_json(&existing_buffered)
+    } else {
+        serde_json::json!([])
+    };
     diesel::update(dsl::harvest_schedules.find(existing.id))
         .set((
             dsl::schedule_expr.eq(expr),
@@ -1035,6 +1107,9 @@ async fn upsert_workflow_schedule(
             dsl::updated_at.eq(now),
             dsl::next_run_at.eq(next_run_at),
             dsl::jitter_secs.eq(i64::try_from(ws.jitter.as_secs()).unwrap_or(i64::MAX)),
+            dsl::overlap_policy.eq(ws.overlap_policy.as_str()),
+            dsl::buffer_all_max.eq(i32::try_from(ws.buffer_all_max).unwrap_or(i32::MAX)),
+            dsl::buffered_runs.eq(new_buffered_runs),
         ))
         .execute(conn)
         .await
@@ -1224,6 +1299,93 @@ async fn tick_workflow_schedules(
     Ok(())
 }
 
+/// Cancel the oldest scheduled RUNNING executions for `workflow_name`, up to `max_to_cancel`.
+///
+/// Only cancels executions with a `sched:` workflow ID so operator-triggered manual runs are
+/// not inadvertently cancelled. Orders by `started_at ASC` so the oldest executions are
+/// cancelled first, preserving the most recent progress.
+#[cfg(feature = "db")]
+async fn cancel_in_flight_runs(
+    conn: &mut AsyncPgConnection,
+    workflow_name: &str,
+    reason: &str,
+    max_to_cancel: u32,
+) -> HarvestResult<u32> {
+    use crate::execution::cancel_workflow_execution;
+
+    let running_ids: Vec<uuid::Uuid> = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
+        .filter(harvest_workflow_executions::workflow_id.like("sched:%"))
+        .filter(harvest_workflow_executions::state.eq("RUNNING"))
+        .order(harvest_workflow_executions::started_at.asc())
+        .select(harvest_workflow_executions::id)
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    let mut count: u32 = 0;
+    for raw_id in running_ids
+        .into_iter()
+        .take(usize::try_from(max_to_cancel).unwrap_or(usize::MAX))
+    {
+        let exec_id = ExecutionId::from_uuid(raw_id);
+        match cancel_workflow_execution(conn, exec_id, reason).await {
+            Ok(_) => count += 1,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    exec_id = %exec_id,
+                    "harvest: CancelOther could not cancel in-flight execution; skipping"
+                );
+            }
+        }
+    }
+    Ok(count)
+}
+
+/// Terminate the oldest scheduled RUNNING executions for `workflow_name`, up to `max_to_terminate`.
+///
+/// Only terminates executions with a `sched:` workflow ID. Orders by `started_at ASC` so the
+/// oldest executions are terminated first.
+#[cfg(feature = "db")]
+async fn terminate_in_flight_runs(
+    conn: &mut AsyncPgConnection,
+    workflow_name: &str,
+    reason: &str,
+    max_to_terminate: u32,
+) -> HarvestResult<u32> {
+    use crate::execution::terminate_workflow_execution;
+
+    let active_ids: Vec<uuid::Uuid> = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
+        .filter(harvest_workflow_executions::workflow_id.like("sched:%"))
+        .filter(harvest_workflow_executions::state.eq("RUNNING"))
+        .order(harvest_workflow_executions::started_at.asc())
+        .select(harvest_workflow_executions::id)
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    let mut count: u32 = 0;
+    for raw_id in active_ids
+        .into_iter()
+        .take(usize::try_from(max_to_terminate).unwrap_or(usize::MAX))
+    {
+        let exec_id = ExecutionId::from_uuid(raw_id);
+        match terminate_workflow_execution(conn, exec_id, reason).await {
+            Ok(_) => count += 1,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    exec_id = %exec_id,
+                    "harvest: TerminateOther could not terminate in-flight execution; skipping"
+                );
+            }
+        }
+    }
+    Ok(count)
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn tick_one_workflow_schedule(
     conn: &mut AsyncPgConnection,
@@ -1239,7 +1401,22 @@ async fn tick_one_workflow_schedule(
     use crate::execution::StartWorkflowParams;
     use crate::schema::harvest_schedules::dsl;
 
-    let running: i64 = harvest_workflow_executions::table
+    // Compute jitter window once so it can be reused in the dispatch loop below.
+    let jitter_window =
+        std::time::Duration::from_secs(u64::try_from(schedule.jitter_secs.max(0)).unwrap_or(0));
+
+    // If jitter for this slot has not yet elapsed, skip the overlap check and any
+    // dispatch; the scheduler will revisit on the next tick (next_run_at unchanged).
+    {
+        let jitter_offset = compute_jitter_offset(schedule.id, logical_date, jitter_window);
+        let effective_fire_time =
+            logical_date + chrono::Duration::from_std(jitter_offset).unwrap_or_default();
+        if now < effective_fire_time {
+            return Ok(());
+        }
+    }
+
+    let mut running: i64 = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::workflow_name.eq(wf_name))
         .filter(harvest_workflow_executions::state.eq("RUNNING"))
         .count()
@@ -1248,35 +1425,104 @@ async fn tick_one_workflow_schedule(
         .map_err(crate::error::database_error)?;
 
     if running >= i64::from(schedule.max_active_runs) {
-        tracing::info!(
-            workflow_name = %wf_name,
-            running,
-            max_active_runs = schedule.max_active_runs,
-            "harvest workflow schedule skipped: max_active_runs reached"
-        );
-        metrics.record_schedule_skipped("workflow", wf_name, "max_active_runs_reached");
-        // For catchup schedules keep next_run_at at logical_date so the
-        // overdue slot is retried on the next tick once a run slot opens.
-        // For non-catchup schedules advance past overdue slots to the next
-        // future firing so the scheduler doesn't spin on an old timestamp.
-        let next = if catchup {
-            Some(logical_date)
-        } else {
-            next_run_after(parsed_schedule, now)
-        };
-        diesel::update(dsl::harvest_schedules.find(schedule.id))
-            .set((dsl::next_run_at.eq(next), dsl::updated_at.eq(now)))
-            .execute(conn)
-            .await
-            .map_err(crate::error::database_error)?;
-        return Ok(());
+        let overlap_policy = OverlapPolicy::from_db(&schedule.overlap_policy);
+        let mut buffered = parse_buffered_runs(&schedule.buffered_runs);
+        let buffer_all_max = usize::try_from(schedule.buffer_all_max.max(1)).unwrap_or(usize::MAX);
+
+        let action = apply_overlap_policy(overlap_policy, logical_date, &buffered, buffer_all_max);
+
+        match action {
+            OverlapAction::Drop { reason } => {
+                tracing::info!(
+                    workflow_name = %wf_name,
+                    running,
+                    max_active_runs = schedule.max_active_runs,
+                    overlap_policy = %overlap_policy.as_str(),
+                    reason,
+                    "harvest workflow schedule firing skipped due to overlap policy"
+                );
+                metrics.record_schedule_skipped("workflow", wf_name, reason);
+                // For Skip drops (reason = "max_active_runs_reached"), retain
+                // logical_date under catchup so the overdue slot fires once
+                // capacity opens. For buffer-full drops the slot is permanently
+                // discarded; advance past it so newer catchup slots are not
+                // blocked behind the same overdue timestamp on every tick.
+                let retain_for_retry = catchup && reason == "max_active_runs_reached";
+                let next = if retain_for_retry {
+                    Some(logical_date)
+                } else {
+                    next_run_after(parsed_schedule, now)
+                };
+                diesel::update(dsl::harvest_schedules.find(schedule.id))
+                    .set((dsl::next_run_at.eq(next), dsl::updated_at.eq(now)))
+                    .execute(conn)
+                    .await
+                    .map_err(crate::error::database_error)?;
+                return Ok(());
+            }
+            OverlapAction::Buffer { fire_time } => {
+                buffered.push(fire_time);
+                tracing::info!(
+                    workflow_name = %wf_name,
+                    buffered_count = buffered.len(),
+                    overlap_policy = %overlap_policy.as_str(),
+                    "harvest: buffering schedule firing for later dispatch"
+                );
+                // Advance next_run_at past the buffered slot so new firings
+                // can be evaluated normally on subsequent ticks.
+                let next = if catchup {
+                    next_run_after(parsed_schedule, logical_date)
+                } else {
+                    next_run_after(parsed_schedule, now)
+                };
+                diesel::update(dsl::harvest_schedules.find(schedule.id))
+                    .set((
+                        dsl::next_run_at.eq(next),
+                        dsl::buffered_runs.eq(buffered_runs_to_json(&buffered)),
+                        dsl::updated_at.eq(now),
+                    ))
+                    .execute(conn)
+                    .await
+                    .map_err(crate::error::database_error)?;
+                return Ok(());
+            }
+            OverlapAction::CancelAndProceed => {
+                // Cancel only the oldest scheduled runs needed to free one slot,
+                // then fall through to dispatch. Subtract the cancelled count so
+                // the dispatch loop sees the correct remaining capacity.
+                let needed =
+                    u32::try_from(running.saturating_sub(i64::from(schedule.max_active_runs)) + 1)
+                        .unwrap_or(1);
+                let cancelled = cancel_in_flight_runs(
+                    conn,
+                    wf_name,
+                    "overlap policy CancelOther: new firing",
+                    needed,
+                )
+                .await?;
+                running -= i64::from(cancelled);
+            }
+            OverlapAction::TerminateAndProceed => {
+                // Terminate only the minimum needed to free one slot.
+                let needed =
+                    u32::try_from(running.saturating_sub(i64::from(schedule.max_active_runs)) + 1)
+                        .unwrap_or(1);
+                let terminated = terminate_in_flight_runs(
+                    conn,
+                    wf_name,
+                    "overlap policy TerminateOther: new firing",
+                    needed,
+                )
+                .await?;
+                running -= i64::from(terminated);
+            }
+        }
     }
 
     let (run_dates, next_run_after_plan) =
         due_run_plan(parsed_schedule, logical_date, now, catchup);
     let dispatch_queue = schedule.queue_name.as_deref().unwrap_or("default");
-    let jitter_window =
-        std::time::Duration::from_secs(u64::try_from(schedule.jitter_secs.max(0)).unwrap_or(0));
+    // jitter_window already computed at function entry; reused here.
 
     let mut dispatched: u32 = 0;
     let mut last_dispatched_at: Option<DateTime<Utc>> = None;
@@ -1455,6 +1701,245 @@ fn due_run_plan(
     }
 }
 
+// ── Overlap policy helpers ────────────────────────────────────────────────────
+
+/// The action the scheduler takes when a new firing can't start immediately
+/// because `max_active_runs` is already reached.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OverlapAction {
+    /// Store this fire time in the schedule's buffer for later dispatch.
+    Buffer { fire_time: DateTime<Utc> },
+    /// Drop this firing, recording a skip metric with the given reason string.
+    Drop { reason: &'static str },
+    /// Cancel all in-flight runs for this workflow, then start the new firing.
+    CancelAndProceed,
+    /// Terminate all in-flight runs for this workflow, then start the new firing.
+    TerminateAndProceed,
+}
+
+/// Decide what to do with a new firing that can't run immediately.
+///
+/// `buffered` is the current set of already-buffered fire times.
+/// `buffer_all_max` is the cap for [`OverlapPolicy::BufferAll`].
+#[allow(clippy::missing_const_for_fn)]
+pub(crate) fn apply_overlap_policy(
+    policy: OverlapPolicy,
+    fire_time: DateTime<Utc>,
+    buffered: &[DateTime<Utc>],
+    buffer_all_max: usize,
+) -> OverlapAction {
+    match policy {
+        OverlapPolicy::Skip => OverlapAction::Drop {
+            reason: "max_active_runs_reached",
+        },
+        OverlapPolicy::BufferOne => {
+            if buffered.is_empty() {
+                OverlapAction::Buffer { fire_time }
+            } else {
+                OverlapAction::Drop {
+                    reason: "buffered_slot_full",
+                }
+            }
+        }
+        OverlapPolicy::BufferAll => {
+            if buffered.len() < buffer_all_max {
+                OverlapAction::Buffer { fire_time }
+            } else {
+                OverlapAction::Drop {
+                    reason: "buffer_full",
+                }
+            }
+        }
+        OverlapPolicy::CancelOther => OverlapAction::CancelAndProceed,
+        OverlapPolicy::TerminateOther => OverlapAction::TerminateAndProceed,
+    }
+}
+
+/// Deserialize the `buffered_runs` JSONB column into a sorted list of fire times.
+///
+/// Malformed entries are silently skipped so a partial JSON corruption can't
+/// permanently wedge a schedule.
+pub(crate) fn parse_buffered_runs(value: &serde_json::Value) -> Vec<DateTime<Utc>> {
+    let Some(arr) = value.as_array() else {
+        return vec![];
+    };
+    let mut times: Vec<DateTime<Utc>> = arr
+        .iter()
+        .filter_map(|v| v.as_str())
+        .filter_map(|s| s.parse::<DateTime<Utc>>().ok())
+        .collect();
+    times.sort();
+    times
+}
+
+/// Public re-export of `parse_buffered_runs` for the plugin API layer.
+#[must_use]
+pub fn parse_buffered_runs_pub(value: &serde_json::Value) -> Vec<DateTime<Utc>> {
+    parse_buffered_runs(value)
+}
+
+/// Serialize a list of fire times back into the `buffered_runs` JSONB column.
+pub(crate) fn buffered_runs_to_json(runs: &[DateTime<Utc>]) -> serde_json::Value {
+    serde_json::Value::Array(
+        runs.iter()
+            .map(|t| serde_json::Value::String(t.to_rfc3339()))
+            .collect(),
+    )
+}
+
+/// Drain buffered runs for all schedules that have pending buffer entries.
+///
+/// Called on every scheduler tick. For each schedule with a non-empty
+/// `buffered_runs` column, dispatches buffered fire times in order until
+/// `max_active_runs` is reached, then updates the `buffered_runs` column.
+#[cfg(feature = "db")]
+#[allow(clippy::too_many_lines)]
+async fn drain_buffered_schedule_runs(
+    conn: &mut AsyncPgConnection,
+    current_shard: ShardId,
+    registered_dags: &DagCatalog,
+    metrics: &Arc<dyn crate::telemetry::MetricsRecorder>,
+) -> HarvestResult<()> {
+    use crate::schema::harvest_schedules::dsl;
+    use diesel_async::RunQueryDsl;
+
+    let now = Utc::now();
+
+    // Query schedules that have buffered runs and are not paused.
+    let pending: Vec<HarvestSchedule> = dsl::harvest_schedules
+        .filter(dsl::workflow_name.is_not_null())
+        .filter(dsl::is_paused.eq(false))
+        .filter(diesel::dsl::sql::<diesel::sql_types::Bool>(
+            "jsonb_array_length(buffered_runs) > 0",
+        ))
+        .select(HarvestSchedule::as_select())
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    for schedule in pending {
+        let Some(ref wf_name) = schedule.workflow_name else {
+            continue;
+        };
+
+        // Skip DAG-backed schedules whose DAG is no longer registered so that
+        // removing a DAG does not cause its stale buffered slots to be dispatched.
+        if let Some(ref dag_name) = schedule.dag_name
+            && !registered_dags.contains_key(dag_name)
+        {
+            tracing::debug!(
+                workflow_name = %wf_name,
+                dag_name = %dag_name,
+                "harvest: skipping buffered drain for unregistered DAG"
+            );
+            continue;
+        }
+
+        let mut buffered = parse_buffered_runs(&schedule.buffered_runs);
+        if buffered.is_empty() {
+            continue;
+        }
+
+        let running: i64 = harvest_workflow_executions::table
+            .filter(harvest_workflow_executions::workflow_name.eq(wf_name))
+            .filter(harvest_workflow_executions::state.eq("RUNNING"))
+            .count()
+            .get_result(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+
+        let available = i64::from(schedule.max_active_runs).saturating_sub(running);
+        if available <= 0 {
+            continue;
+        }
+
+        let dispatch_queue = schedule.queue_name.as_deref().unwrap_or("default");
+        let mut dispatched: u32 = 0;
+
+        while dispatched < u32::try_from(available).unwrap_or(u32::MAX) && !buffered.is_empty() {
+            let scheduled_for = buffered.remove(0);
+            let workflow_id = scheduled_workflow_id(wf_name, scheduled_for);
+            let exec_id = if schedule.dag_name.is_some() {
+                ExecutionId::new_for_shard(current_shard)
+            } else {
+                ExecutionId::new()
+            };
+            let input = schedule
+                .workflow_input
+                .clone()
+                .unwrap_or(serde_json::Value::Null);
+
+            tracing::info!(
+                workflow_name = %wf_name,
+                workflow_id = %workflow_id,
+                buffered_for = %scheduled_for,
+                "harvest: dispatching buffered scheduled workflow run"
+            );
+
+            let start_result = crate::execution::start_or_load_workflow_execution(
+                conn,
+                crate::execution::StartWorkflowParams {
+                    workflow_name: wf_name,
+                    workflow_id: &workflow_id,
+                    exec_id,
+                    input,
+                    parent_id: None,
+                    queue_name: dispatch_queue,
+                    execution_timeout: None,
+                    memo: None,
+                    search_attrs: None,
+                    reuse_policy: scheduled_workflow_reuse_policy(),
+                    trace_context: None,
+                },
+            )
+            .await;
+
+            match scheduled_start_outcome(start_result) {
+                Ok(outcome) => {
+                    dispatched += 1;
+                    if outcome.created() {
+                        metrics.record_schedule_run("workflow", wf_name);
+                    }
+                    tracing::info!(
+                        workflow_name = %wf_name,
+                        execution_id = %outcome.exec_id(),
+                        state = %outcome.state(),
+                        created = outcome.created(),
+                        "harvest: buffered scheduled workflow run dispatched"
+                    );
+                }
+                Err(error) => {
+                    // Drop the failing slot rather than re-inserting it. Re-queuing a
+                    // permanently-failing slot (e.g. deleted workflow, bad input) would
+                    // create an infinite retry loop on every scheduler tick. Transient
+                    // failures are rare for buffered slots (same path as normal dispatch);
+                    // if they occur the schedule's regular tick will generate fresh firings.
+                    tracing::warn!(
+                        error = %error,
+                        workflow_name = %wf_name,
+                        workflow_id = %workflow_id,
+                        buffered_for = %scheduled_for,
+                        "harvest: failed to dispatch buffered workflow run; dropping slot"
+                    );
+                    break;
+                }
+            }
+        }
+
+        // Persist the updated buffer.
+        diesel::update(dsl::harvest_schedules.find(schedule.id))
+            .set((
+                dsl::buffered_runs.eq(buffered_runs_to_json(&buffered)),
+                dsl::updated_at.eq(now),
+            ))
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1483,8 +1968,9 @@ mod tests {
             default_queue: Some("default"),
             builder: build,
             workflow_handler: None,
-
             jitter: ::std::time::Duration::ZERO,
+            overlap_policy: crate::policy::OverlapPolicy::Skip,
+            buffer_all_max: 100,
         }
     }
 
@@ -1698,5 +2184,130 @@ mod tests {
                 .expect("168-timestamp 7-day backfill should succeed under default limit");
 
         assert_eq!(timestamps.len(), 169); // 0h..168h inclusive = 169 slots
+    }
+
+    // ── apply_overlap_policy ──────────────────────────────────────────────────
+
+    #[test]
+    fn overlap_skip_always_returns_drop_with_max_active_runs_reason() {
+        let fire = parse_utc("2026-05-01T10:00:00Z");
+        let action = apply_overlap_policy(crate::policy::OverlapPolicy::Skip, fire, &[], 100);
+        assert_eq!(
+            action,
+            OverlapAction::Drop {
+                reason: "max_active_runs_reached"
+            }
+        );
+        // Even with empty buffer
+        let action2 = apply_overlap_policy(
+            crate::policy::OverlapPolicy::Skip,
+            fire,
+            &[parse_utc("2026-05-01T09:00:00Z")],
+            100,
+        );
+        assert_eq!(
+            action2,
+            OverlapAction::Drop {
+                reason: "max_active_runs_reached"
+            }
+        );
+    }
+
+    #[test]
+    fn overlap_buffer_one_buffers_when_buffer_is_empty() {
+        let fire = parse_utc("2026-05-01T10:00:00Z");
+        let action = apply_overlap_policy(crate::policy::OverlapPolicy::BufferOne, fire, &[], 100);
+        assert_eq!(action, OverlapAction::Buffer { fire_time: fire });
+    }
+
+    #[test]
+    fn overlap_buffer_one_drops_when_buffer_has_entry() {
+        let fire = parse_utc("2026-05-01T10:00:00Z");
+        let existing = [parse_utc("2026-05-01T09:00:00Z")];
+        let action = apply_overlap_policy(
+            crate::policy::OverlapPolicy::BufferOne,
+            fire,
+            &existing,
+            100,
+        );
+        assert_eq!(
+            action,
+            OverlapAction::Drop {
+                reason: "buffered_slot_full"
+            }
+        );
+    }
+
+    #[test]
+    fn overlap_buffer_all_buffers_within_cap() {
+        let fire = parse_utc("2026-05-01T10:00:00Z");
+        let existing = [
+            parse_utc("2026-05-01T08:00:00Z"),
+            parse_utc("2026-05-01T09:00:00Z"),
+        ];
+        let action =
+            apply_overlap_policy(crate::policy::OverlapPolicy::BufferAll, fire, &existing, 5);
+        assert_eq!(action, OverlapAction::Buffer { fire_time: fire });
+    }
+
+    #[test]
+    fn overlap_buffer_all_drops_when_at_cap() {
+        let fire = parse_utc("2026-05-01T10:00:00Z");
+        let existing = [
+            parse_utc("2026-05-01T06:00:00Z"),
+            parse_utc("2026-05-01T07:00:00Z"),
+            parse_utc("2026-05-01T08:00:00Z"),
+        ];
+        let action =
+            apply_overlap_policy(crate::policy::OverlapPolicy::BufferAll, fire, &existing, 3);
+        assert_eq!(
+            action,
+            OverlapAction::Drop {
+                reason: "buffer_full"
+            }
+        );
+    }
+
+    #[test]
+    fn overlap_cancel_other_returns_cancel_and_proceed() {
+        let fire = parse_utc("2026-05-01T10:00:00Z");
+        let action =
+            apply_overlap_policy(crate::policy::OverlapPolicy::CancelOther, fire, &[], 100);
+        assert_eq!(action, OverlapAction::CancelAndProceed);
+    }
+
+    #[test]
+    fn overlap_terminate_other_returns_terminate_and_proceed() {
+        let fire = parse_utc("2026-05-01T10:00:00Z");
+        let action =
+            apply_overlap_policy(crate::policy::OverlapPolicy::TerminateOther, fire, &[], 100);
+        assert_eq!(action, OverlapAction::TerminateAndProceed);
+    }
+
+    #[test]
+    fn parse_buffered_runs_parses_json_array_of_timestamps() {
+        let json = serde_json::json!(["2026-05-01T08:00:00Z", "2026-05-01T09:00:00Z",]);
+        let parsed = parse_buffered_runs(&json);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0], parse_utc("2026-05-01T08:00:00Z"));
+        assert_eq!(parsed[1], parse_utc("2026-05-01T09:00:00Z"));
+    }
+
+    #[test]
+    fn parse_buffered_runs_returns_empty_for_null_or_invalid() {
+        assert!(parse_buffered_runs(&serde_json::Value::Null).is_empty());
+        assert!(parse_buffered_runs(&serde_json::json!([])).is_empty());
+        assert!(parse_buffered_runs(&serde_json::json!("not-an-array")).is_empty());
+    }
+
+    #[test]
+    fn buffered_runs_to_json_serializes_as_iso_strings() {
+        let runs = vec![
+            parse_utc("2026-05-01T08:00:00Z"),
+            parse_utc("2026-05-01T09:00:00Z"),
+        ];
+        let json = buffered_runs_to_json(&runs);
+        let parsed = parse_buffered_runs(&json);
+        assert_eq!(parsed, runs);
     }
 }

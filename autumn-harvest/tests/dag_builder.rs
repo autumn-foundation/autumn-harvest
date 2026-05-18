@@ -109,8 +109,9 @@ fn harvest_builder_collects_dags() {
         default_queue: Some("etl-workers"),
         builder: build_daily,
         workflow_handler: None,
-
         jitter: ::std::time::Duration::ZERO,
+        overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+        buffer_all_max: 100,
     }]);
 
     assert_eq!(builder.dag_count(), 1);

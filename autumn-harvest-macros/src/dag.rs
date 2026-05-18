@@ -264,6 +264,8 @@ pub fn dag_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 },
                 #workflow_handler_field
                 jitter: #jitter_expr,
+                overlap_policy: ::autumn_harvest::OverlapPolicy::Skip,
+                buffer_all_max: 100u32,
             }
         }
 
