@@ -6315,7 +6315,19 @@ async fn per_key_concurrency_does_not_block_other_keys() {
     const LOUD_KEY: &str = "tenant:loud";
 
     let (database_url, _container) = setup_test_database_url().await;
-    let pool = build_test_pool(&database_url);
+    // Use a larger pool than the default (4) to avoid connection contention.
+    // At any moment: 1 loud-workflow task holds a connection for 5 s, and 4
+    // monitoring background tasks each need a brief connection every poll
+    // interval.  With only 4 pool slots the quiet tasks can't get connections;
+    // 16 gives headroom for all background tasks to run concurrently.
+    let pool = {
+        let manager =
+            AsyncDieselConnectionManager::<AsyncPgConnection>::new(&database_url);
+        deadpool::managed::Pool::builder(manager)
+            .max_size(16)
+            .build()
+            .expect("failed to build test pool")
+    };
     let registry = Arc::new(HandlerRegistry::new(
         vec![
             WorkflowInfo {
