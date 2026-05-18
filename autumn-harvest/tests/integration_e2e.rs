@@ -4653,6 +4653,7 @@ async fn find_by_search_attrs(
 /// 5. `charge` signal is delivered; second cycle sets `phase=charged`.
 /// 6. `phase=awaiting_approval` filter returns nothing; `phase=charged` filter finds it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
 async fn search_attrs_upsert_visible_after_update_and_filterable() {
     let (database_url, _container) = setup_test_database_url().await;
     let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
@@ -5937,6 +5938,7 @@ async fn overlap_policy_buffer_one_survives_scheduler_restart() {
 ///    task queue row is cancelled, and the history ends with
 ///    `WorkflowExecutionTimedOut`.
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn signal_blocked_workflow_times_out_at_deadline() {
     let (database_url, _container) = setup_test_database_url().await;
     let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
