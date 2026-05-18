@@ -633,3 +633,100 @@ pub fn merge_reachability(per_shard: Vec<Vec<BuildReachability>>) -> Vec<BuildRe
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::build_routing::{BuildCompatibilitySet, BuildReachability, merge_reachability};
+
+    #[test]
+    fn test_is_eligible() {
+        let mut set = BuildCompatibilitySet::new();
+
+        // No requirement -> any worker eligible
+        assert!(set.is_eligible("build1", None));
+        assert!(set.is_eligible("", None));
+
+        // Legacy worker (empty build_id) -> eligible for anything
+        assert!(set.is_eligible("", Some("req1")));
+
+        // Same build -> eligible
+        assert!(set.is_eligible("build1", Some("build1")));
+
+        // Different build, no explicit declaration -> not eligible
+        assert!(!set.is_eligible("build2", Some("build1")));
+
+        // Different build, explicit declaration -> eligible
+        set.add_declaration("build2", "build1");
+        assert!(set.is_eligible("build2", Some("build1")));
+
+        // Removal works
+        set.remove_declaration("build2", "build1");
+        assert!(!set.is_eligible("build2", Some("build1")));
+    }
+
+    #[test]
+    fn test_merge_reachability() {
+        let shard1 = vec![
+            BuildReachability {
+                build_id: "buildA".to_string(),
+                open_executions: 1,
+                pending_tasks: 2,
+                active_workers: 3,
+                stale_workers: 4,
+                safe_to_retire: false,
+            },
+            BuildReachability {
+                build_id: "buildB".to_string(),
+                open_executions: 0,
+                pending_tasks: 0,
+                active_workers: 1,
+                stale_workers: 0,
+                safe_to_retire: true,
+            },
+        ];
+
+        let shard2 = vec![
+            BuildReachability {
+                build_id: "buildA".to_string(),
+                open_executions: 10,
+                pending_tasks: 20,
+                active_workers: 30,
+                stale_workers: 40,
+                safe_to_retire: false,
+            },
+            BuildReachability {
+                build_id: "buildC".to_string(),
+                open_executions: 0,
+                pending_tasks: 0,
+                active_workers: 0,
+                stale_workers: 5,
+                safe_to_retire: true,
+            },
+        ];
+
+        let merged = merge_reachability(vec![shard1, shard2]);
+
+        assert_eq!(merged.len(), 3);
+
+        assert_eq!(merged[0].build_id, "buildA");
+        assert_eq!(merged[0].open_executions, 11);
+        assert_eq!(merged[0].pending_tasks, 22);
+        assert_eq!(merged[0].active_workers, 33);
+        assert_eq!(merged[0].stale_workers, 44);
+        assert!(!merged[0].safe_to_retire);
+
+        assert_eq!(merged[1].build_id, "buildB");
+        assert_eq!(merged[1].open_executions, 0);
+        assert_eq!(merged[1].pending_tasks, 0);
+        assert_eq!(merged[1].active_workers, 1);
+        assert_eq!(merged[1].stale_workers, 0);
+        assert!(merged[1].safe_to_retire);
+
+        assert_eq!(merged[2].build_id, "buildC");
+        assert_eq!(merged[2].open_executions, 0);
+        assert_eq!(merged[2].pending_tasks, 0);
+        assert_eq!(merged[2].active_workers, 0);
+        assert_eq!(merged[2].stale_workers, 5);
+        assert!(merged[2].safe_to_retire);
+    }
+}

@@ -652,3 +652,22 @@ struct CountRow {
     #[diesel(sql_type = BigInt)]
     count: i64,
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::retention::RetentionConfig;
+    use std::time::Duration;
+
+    #[test]
+    fn test_retention_config() {
+        let config = RetentionConfig::default();
+        assert!(config.enabled());
+        assert_eq!(config.max_age(), None);
+
+        let config2 =
+            RetentionConfig::with_max_age(Duration::from_secs(3600)).with_audit_retention_days(30);
+        assert!(config2.enabled());
+        assert_eq!(config2.max_age(), Some(Duration::from_secs(3600)));
+        assert_eq!(config2.audit_retention_days, 30);
+    }
+}

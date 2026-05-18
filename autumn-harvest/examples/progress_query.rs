@@ -1,3 +1,4 @@
+#![allow(clippy::used_underscore_binding)]
 //! Example: Read-only Query handlers for live workflow state inspection (issue #234).
 //!
 //! Demonstrates `WorkflowContext::register_query_handler` and the `#[query]`
@@ -9,7 +10,7 @@
 //! many records have been processed so far, while the workflow is still running.
 //!
 //! Run with:
-//!   cargo run --example progress_query
+//!   cargo run --example `progress_query`
 
 use std::sync::{Arc, Mutex};
 
@@ -39,6 +40,7 @@ struct ProgressResponse {
 // ---------------------------------------------------------------------------
 
 #[workflow]
+#[allow(clippy::unused_async, clippy::used_underscore_binding)]
 async fn batch_processor(ctx: &WorkflowContext, _input: ()) -> Result<(), String> {
     let total: u64 = 1_000;
     let processed = Arc::new(Mutex::new(0u64));
@@ -49,8 +51,9 @@ async fn batch_processor(ctx: &WorkflowContext, _input: ()) -> Result<(), String
     let query_state = processed.clone();
     ctx.register_query_handler("progress", move |req: &ProgressQuery| {
         let n = *query_state.lock().unwrap();
+        #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
         let pct = if total > 0 {
-            (n as f32 / total as f32) * 100.0
+            ((n as f64) / (total as f64)) as f32 * 100.0
         } else {
             0.0
         };
@@ -85,9 +88,9 @@ fn main() {
     println!();
     println!("# Typed query with args:");
     println!(
-        r#"  curl -X POST http://localhost:8080/api/harvest/workflows/{{exec_id}}/query/progress \"#
+        r"  curl -X POST http://localhost:8080/api/harvest/workflows/{{exec_id}}/query/progress \"
     );
-    println!(r#"       -H 'Content-Type: application/json' \"#);
+    println!(r"       -H 'Content-Type: application/json' \");
     println!(r#"       -d '{{"args": {{"include_summary": true}}}}'"#);
     println!();
     println!("# Simple no-arg query (GET or POST):");
