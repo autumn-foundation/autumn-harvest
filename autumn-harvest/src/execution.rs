@@ -812,7 +812,17 @@ async fn resolve_effective_signal_with_start_policy(
     ) {
         return Ok(requested);
     }
-    let Some(existing) = try_load_by_key(conn, workflow_name, workflow_id).await? else {
+    // Take the row lock here so the observed state persists through
+    // `start_or_load_workflow_execution`'s own `FOR UPDATE` lookup below.
+    // Without this, a workflow that transitions RUNNING -> terminal between
+    // the resolver's read and the start path's lock could let the
+    // spec-prohibited "attach to terminal, drop signal" outcome re-emerge.
+    // Both calls share the same connection / outer transaction, so the lock
+    // taken here is held through the start path and released only on outer
+    // commit or rollback.
+    let Some(existing) =
+        try_load_active_execution_for_update(conn, workflow_name, workflow_id).await?
+    else {
         return Ok(requested);
     };
     if existing.state == "RUNNING" {
@@ -823,6 +833,29 @@ async fn resolve_effective_signal_with_start_policy(
         // insert fresh, append WorkflowStarted) and the signal can land.
         Ok(WorkflowIdReusePolicy::TerminateIfRunning)
     }
+}
+
+/// Locking variant of [`try_load_by_key`] used by
+/// [`signal_with_start_workflow_execution`]'s resolver. Returns `None` when
+/// no active execution exists. Acquires `FOR UPDATE` so the caller's outer
+/// transaction holds the row lock until commit, preventing a RUNNING ->
+/// terminal race between the resolver decision and the start path's own
+/// `FOR UPDATE` lookup.
+async fn try_load_active_execution_for_update(
+    conn: &mut AsyncPgConnection,
+    workflow_name: &str,
+    workflow_id: &str,
+) -> HarvestResult<Option<WorkflowExecution>> {
+    harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
+        .filter(harvest_workflow_executions::workflow_id.eq(workflow_id))
+        .filter(harvest_workflow_executions::state.ne_all(["CONTINUED_AS_NEW", "TERMINATED"]))
+        .select(WorkflowExecution::as_select())
+        .for_update()
+        .first(conn)
+        .await
+        .optional()
+        .map_err(database_error)
 }
 
 /// Insert a signal row, returning `false` when the idempotency key collides
