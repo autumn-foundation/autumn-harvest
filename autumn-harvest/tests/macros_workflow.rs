@@ -18,10 +18,7 @@ async fn quick_workflow(_ctx: &WorkflowContext) -> Result<(), String> {
 }
 
 #[workflow(concurrency(key = "input.tenant_id", limit = 10))]
-async fn concurrency_workflow(
-    _ctx: &WorkflowContext,
-    _input: String,
-) -> Result<String, String> {
+async fn concurrency_workflow(_ctx: &WorkflowContext, _input: String) -> Result<String, String> {
     Ok("done".into())
 }
 

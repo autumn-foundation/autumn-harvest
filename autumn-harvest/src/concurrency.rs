@@ -75,10 +75,7 @@ pub struct ConcurrencyPolicy {
 /// );
 /// ```
 #[must_use]
-pub fn resolve_concurrency_key(
-    expr: &str,
-    input: &serde_json::Value,
-) -> Option<String> {
+pub fn resolve_concurrency_key(expr: &str, input: &serde_json::Value) -> Option<String> {
     // Strip the "input." prefix so "input.tenant_id" == "tenant_id".
     let path = expr.strip_prefix("input.").unwrap_or(expr);
 
