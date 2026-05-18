@@ -94,6 +94,26 @@ fn priority_deserializes_from_lowercase_string() {
 }
 
 #[test]
+fn priority_deserializes_case_insensitively() {
+    assert_eq!(
+        serde_json::from_str::<Priority>("\"NORMAL\"").unwrap(),
+        Priority::Normal
+    );
+    assert_eq!(
+        serde_json::from_str::<Priority>("\"HIGH\"").unwrap(),
+        Priority::High
+    );
+    assert_eq!(
+        serde_json::from_str::<Priority>("\"Critical\"").unwrap(),
+        Priority::Critical
+    );
+    assert_eq!(
+        serde_json::from_str::<Priority>("\"LOW\"").unwrap(),
+        Priority::Low
+    );
+}
+
+#[test]
 fn priority_display_is_lowercase() {
     assert_eq!(Priority::Normal.to_string(), "normal");
     assert_eq!(Priority::High.to_string(), "high");

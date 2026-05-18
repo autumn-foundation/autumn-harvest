@@ -866,7 +866,7 @@ impl fmt::Display for DeploymentName {
 /// priority is boosted by `+1` for every `aging_secs` it has waited in
 /// `PENDING` state.  This bounds the maximum starvation time for `Low`
 /// priority tasks even under sustained high-priority load.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Priority {
     /// Lower than normal; used for bulk background work that should yield to
@@ -940,6 +940,16 @@ impl std::str::FromStr for Priority {
                 "unknown priority '{other}'; expected low | normal | high | critical"
             )),
         }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Priority {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        s.parse().map_err(serde::de::Error::custom)
     }
 }
 
