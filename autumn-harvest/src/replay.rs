@@ -111,6 +111,15 @@ pub enum HistoryMatch {
         /// The `ExternalSignalId` already recorded in history. Must be reused.
         signal_id: ExternalSignalId,
     },
+    /// History contains an `ExternalSignalFailed` terminal event for a
+    /// `signal_external_workflow` call.  Carries the original `signal_id` from
+    /// history so the replayed error matches the durable event exactly.
+    ExternalSignalFailed {
+        /// The `ExternalSignalId` recorded in the originating `ExternalSignalRequested` event.
+        signal_id: ExternalSignalId,
+        /// The machine-readable reason code from history.
+        reason_code: String,
+    },
 }
 
 /// Walks through recorded workflow events during replay, matching
@@ -743,7 +752,7 @@ impl HistoryMatcher {
     ///
     /// Returns:
     /// - [`HistoryMatch::Matched`] (output = `null`) when the signal was delivered
-    /// - [`HistoryMatch::Failed`] when `ExternalSignalFailed` is found in history
+    /// - [`HistoryMatch::ExternalSignalFailed`] when `ExternalSignalFailed` is found in history
     /// - [`HistoryMatch::ExternalSignalInProgress`] when `ExternalSignalRequested`
     ///   exists but no terminal event yet (crash recovery path)
     /// - [`HistoryMatch::NoMatch`] when past end of history (first-time call)
@@ -822,9 +831,9 @@ impl HistoryMatcher {
                     let reason_code = reason_code.clone();
                     self.cursor = scan_cursor + 1;
                     self.advance_to_next_unconsumed_event();
-                    return HistoryMatch::Failed {
-                        error: reason_code,
-                        attempt: 1,
+                    return HistoryMatch::ExternalSignalFailed {
+                        signal_id,
+                        reason_code,
                     };
                 }
                 // Signals can arrive while the external signal delivery is in-flight.

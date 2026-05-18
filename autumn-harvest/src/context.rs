@@ -1042,7 +1042,8 @@ impl WorkflowContext {
             | HistoryMatch::AwaitingExternalCompletion { .. }
             | HistoryMatch::ChildInProgress { .. }
             | HistoryMatch::LocalActivityInProgress { .. }
-            | HistoryMatch::ExternalSignalInProgress { .. } => {
+            | HistoryMatch::ExternalSignalInProgress { .. }
+            | HistoryMatch::ExternalSignalFailed { .. } => {
                 unreachable!("match_side_effect only returns Matched, Diverged or NoMatch")
             }
 
@@ -1194,7 +1195,8 @@ impl WorkflowContext {
             HistoryMatch::AwaitingExternalCompletion { .. }
             | HistoryMatch::ChildInProgress { .. }
             | HistoryMatch::LocalActivityInProgress { .. }
-            | HistoryMatch::ExternalSignalInProgress { .. } => {
+            | HistoryMatch::ExternalSignalInProgress { .. }
+            | HistoryMatch::ExternalSignalFailed { .. } => {
                 unreachable!(
                     "match_activity never returns AwaitingExternalCompletion, ChildInProgress, \
                      LocalActivityInProgress, or ExternalSignalInProgress"
@@ -1291,7 +1293,8 @@ impl WorkflowContext {
             HistoryMatch::AwaitingExternalCompletion { .. }
             | HistoryMatch::ChildInProgress { .. }
             | HistoryMatch::LocalActivityInProgress { .. }
-            | HistoryMatch::ExternalSignalInProgress { .. } => {
+            | HistoryMatch::ExternalSignalInProgress { .. }
+            | HistoryMatch::ExternalSignalFailed { .. } => {
                 unreachable!(
                     "match_activity never returns AwaitingExternalCompletion, \
                      ChildInProgress, LocalActivityInProgress, or ExternalSignalInProgress"
@@ -1385,7 +1388,8 @@ impl WorkflowContext {
             HistoryMatch::AwaitingExternalCompletion { .. }
             | HistoryMatch::ActivityInProgress { .. }
             | HistoryMatch::ChildInProgress { .. }
-            | HistoryMatch::ExternalSignalInProgress { .. } => {
+            | HistoryMatch::ExternalSignalInProgress { .. }
+            | HistoryMatch::ExternalSignalFailed { .. } => {
                 unreachable!(
                     "match_local_activity never returns AwaitingExternalCompletion, \
                      ChildInProgress, or ExternalSignalInProgress"
@@ -1514,7 +1518,8 @@ impl WorkflowContext {
             | HistoryMatch::AwaitingExternalCompletion { .. }
             | HistoryMatch::ChildInProgress { .. }
             | HistoryMatch::LocalActivityInProgress { .. }
-            | HistoryMatch::ExternalSignalInProgress { .. } => {
+            | HistoryMatch::ExternalSignalInProgress { .. }
+            | HistoryMatch::ExternalSignalFailed { .. } => {
                 unreachable!("timers do not fail or time out in history matching")
             }
 
@@ -1571,7 +1576,8 @@ impl WorkflowContext {
             | HistoryMatch::ActivityInProgress { .. }
             | HistoryMatch::AwaitingExternalCompletion { .. }
             | HistoryMatch::LocalActivityInProgress { .. }
-            | HistoryMatch::ExternalSignalInProgress { .. } => {
+            | HistoryMatch::ExternalSignalInProgress { .. }
+            | HistoryMatch::ExternalSignalFailed { .. } => {
                 unreachable!("child workflows do not time out in match_child_workflow")
             }
             HistoryMatch::Diverged { expected, actual } => Err(HarvestError::NonDeterministic(
@@ -1665,7 +1671,8 @@ impl WorkflowContext {
             | HistoryMatch::AwaitingExternalCompletion { .. }
             | HistoryMatch::ChildInProgress { .. }
             | HistoryMatch::LocalActivityInProgress { .. }
-            | HistoryMatch::ExternalSignalInProgress { .. } => Err(HarvestError::NonDeterministic(
+            | HistoryMatch::ExternalSignalInProgress { .. }
+            | HistoryMatch::ExternalSignalFailed { .. } => Err(HarvestError::NonDeterministic(
                 "signal history contains unexpected failure".into(),
             )),
             HistoryMatch::NoMatch => {
@@ -1738,85 +1745,89 @@ impl WorkflowContext {
         match history_match {
             HistoryMatch::Matched { .. } => Ok(()),
 
-            HistoryMatch::Failed { error, .. } => Err(HarvestError::ExternalSignalFailed {
-                signal_id: ExternalSignalId::new(),
+            HistoryMatch::ExternalSignalFailed {
+                signal_id,
+                reason_code,
+            } => Err(HarvestError::ExternalSignalFailed {
+                signal_id,
                 target,
                 signal_name: signal_name.to_string(),
-                reason_code: error,
+                reason_code,
             }),
 
             HistoryMatch::Diverged { expected, actual } => Err(HarvestError::NonDeterministic(
                 format!("external signal mismatch: expected {expected}, got {actual}"),
             )),
 
+            // Crash-recovery: ExternalSignalRequested is already durable; re-attempt delivery.
             HistoryMatch::ExternalSignalInProgress { signal_id } => {
-                // Crash recovery: ExternalSignalRequested is already in history;
-                // re-attempt delivery without appending a second request event.
-                let payload_json = serde_json::to_value(&payload)?;
-                let (tx, rx) = oneshot::channel();
-                self.push_command(WorkflowCommand::SignalExternalWorkflow {
-                    signal_id,
-                    target,
-                    signal_name: signal_name.to_string(),
-                    payload: payload_json,
-                    result_tx: tx,
-                    already_requested: true,
-                });
-                match rx.await {
-                    Ok(Ok(())) => Ok(()),
-                    Ok(Err(reason_code)) => Err(HarvestError::ExternalSignalFailed {
-                        signal_id,
-                        target,
-                        signal_name: signal_name.to_string(),
-                        reason_code,
-                    }),
-                    Err(_) => Err(HarvestError::Cancelled(format!(
-                        "signal '{signal_name}' to {target}: result channel dropped"
-                    ))),
-                }
+                self.dispatch_signal_command(target, signal_name, payload, signal_id, true)
+                    .await
             }
 
+            // First live call: generate a new signal_id and dispatch.
             HistoryMatch::NoMatch => {
                 self.check_strict_replay_no_match(&format!(
                     "ExternalSignalRequested(target={target}, signal={signal_name})"
                 ))?;
-
-                let signal_id = ExternalSignalId::new();
-                let payload_json = serde_json::to_value(&payload)?;
-                let (tx, rx) = oneshot::channel();
-                self.push_command(WorkflowCommand::SignalExternalWorkflow {
-                    signal_id,
+                self.dispatch_signal_command(
                     target,
-                    signal_name: signal_name.to_string(),
-                    payload: payload_json,
-                    result_tx: tx,
-                    already_requested: false,
-                });
-                match rx.await {
-                    Ok(Ok(())) => Ok(()),
-                    Ok(Err(reason_code)) => Err(HarvestError::ExternalSignalFailed {
-                        signal_id,
-                        target,
-                        signal_name: signal_name.to_string(),
-                        reason_code,
-                    }),
-                    Err(_) => Err(HarvestError::Cancelled(format!(
-                        "signal '{signal_name}' to {target}: result channel dropped"
-                    ))),
-                }
+                    signal_name,
+                    payload,
+                    ExternalSignalId::new(),
+                    false,
+                )
+                .await
             }
 
-            HistoryMatch::ActivityInProgress { .. }
+            HistoryMatch::Failed { .. }
+            | HistoryMatch::ActivityInProgress { .. }
             | HistoryMatch::AwaitingExternalCompletion { .. }
             | HistoryMatch::ChildInProgress { .. }
             | HistoryMatch::LocalActivityInProgress { .. }
             | HistoryMatch::TimedOut { .. } => {
                 unreachable!(
-                    "match_external_signal never returns ActivityInProgress, \
+                    "match_external_signal never returns Failed, ActivityInProgress, \
                      AwaitingExternalCompletion, ChildInProgress, LocalActivityInProgress, \
                      or TimedOut"
                 )
             }
+        }
+    }
+
+    /// Push a `SignalExternalWorkflow` command and await its resolution.
+    ///
+    /// Shared by the crash-recovery (`already_requested = true`) and first-call
+    /// (`already_requested = false`) dispatch paths.
+    async fn dispatch_signal_command<P: serde::Serialize>(
+        &self,
+        target: ExecutionId,
+        signal_name: &str,
+        payload: P,
+        signal_id: ExternalSignalId,
+        already_requested: bool,
+    ) -> HarvestResult<()> {
+        let payload_json = serde_json::to_value(&payload)?;
+        let (tx, rx) = oneshot::channel();
+        self.push_command(WorkflowCommand::SignalExternalWorkflow {
+            signal_id,
+            target,
+            signal_name: signal_name.to_string(),
+            payload: payload_json,
+            result_tx: tx,
+            already_requested,
+        });
+        match rx.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(reason_code)) => Err(HarvestError::ExternalSignalFailed {
+                signal_id,
+                target,
+                signal_name: signal_name.to_string(),
+                reason_code,
+            }),
+            Err(_) => Err(HarvestError::Cancelled(format!(
+                "signal '{signal_name}' to {target}: result channel dropped"
+            ))),
         }
     }
 
@@ -1933,7 +1944,8 @@ impl WorkflowContext {
             HistoryMatch::ActivityInProgress { .. }
             | HistoryMatch::ChildInProgress { .. }
             | HistoryMatch::LocalActivityInProgress { .. }
-            | HistoryMatch::ExternalSignalInProgress { .. } => {
+            | HistoryMatch::ExternalSignalInProgress { .. }
+            | HistoryMatch::ExternalSignalFailed { .. } => {
                 unreachable!(
                     "match_external_activity never returns ChildInProgress, \
                      LocalActivityInProgress, or ExternalSignalInProgress"
@@ -1989,7 +2001,8 @@ impl WorkflowContext {
             | HistoryMatch::AwaitingExternalCompletion { .. }
             | HistoryMatch::ChildInProgress { .. }
             | HistoryMatch::LocalActivityInProgress { .. }
-            | HistoryMatch::ExternalSignalInProgress { .. } => Err(HarvestError::NonDeterministic(
+            | HistoryMatch::ExternalSignalInProgress { .. }
+            | HistoryMatch::ExternalSignalFailed { .. } => Err(HarvestError::NonDeterministic(
                 "continue_as_new history contains unexpected terminal state".into(),
             )),
             HistoryMatch::NoMatch => {
