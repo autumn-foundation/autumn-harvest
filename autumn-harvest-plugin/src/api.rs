@@ -4007,32 +4007,69 @@ async fn signal_with_start_workflow(
     // for an existing non-terminal execution first; only fall back to a fresh
     // shard when none is found. This ensures signal-with-start always attaches
     // to the correct run rather than accidentally starting a second one.
+    //
+    // Two correctness rules apply here:
+    //
+    //   1. Fail closed on shard scan errors. A transient lookup failure on the
+    //      shard that owns the live run must not silently fall through to
+    //      `pick_for_new_workflow`, otherwise a narrowed-writable-shard
+    //      deployment can race into a duplicate start on a different shard.
+    //
+    //   2. Reuse the existing execution UUID *only* when we expect to attach
+    //      to a live run. For terminal priors, or for `TerminateIfRunning`
+    //      against a RUNNING/SUSPENDED prior, the core start path takes the
+    //      `replace_execution` branch which seals the existing row and inserts
+    //      a new one keyed by `request.exec_id`. Passing back the existing
+    //      UUID would hit the primary-key constraint and the request would
+    //      fail with a database error instead of replacing as documented.
     let pool = match api_state.storage_pool() {
         Ok(p) => p,
         Err(e) => return map_error(e).into_response(),
     };
     let mut found_shard: Option<(ShardId, PoolConn, ExecutionId)> = None;
     for (candidate_shard, shard_pool) in pool.iter_shards() {
-        if let Ok(mut shard_conn) = acquire_conn(shard_pool).await {
-            let hit = harvest_workflow_executions::table
-                .filter(harvest_workflow_executions::workflow_name.eq(&workflow_name))
-                .filter(harvest_workflow_executions::workflow_id.eq(&workflow_id))
-                .filter(
-                    harvest_workflow_executions::state.ne_all(["CONTINUED_AS_NEW", "TERMINATED"]),
-                )
-                .select(harvest_workflow_executions::id)
-                .first::<uuid::Uuid>(&mut shard_conn)
-                .await
-                .optional()
-                .unwrap_or(None);
-            if let Some(existing_uuid) = hit {
-                found_shard = Some((
-                    candidate_shard,
-                    shard_conn,
-                    ExecutionId::from_uuid(existing_uuid),
-                ));
-                break;
+        let mut shard_conn = match acquire_conn(shard_pool).await {
+            Ok(c) => c,
+            Err(e) => return e.into_response(),
+        };
+        let hit = match harvest_workflow_executions::table
+            .filter(harvest_workflow_executions::workflow_name.eq(&workflow_name))
+            .filter(harvest_workflow_executions::workflow_id.eq(&workflow_id))
+            .filter(harvest_workflow_executions::state.ne_all(["CONTINUED_AS_NEW", "TERMINATED"]))
+            .select((
+                harvest_workflow_executions::id,
+                harvest_workflow_executions::state,
+            ))
+            .first::<(uuid::Uuid, String)>(&mut shard_conn)
+            .await
+            .optional()
+        {
+            Ok(hit) => hit,
+            Err(e) => {
+                return AutumnError::service_unavailable_msg(format!(
+                    "shard {} lookup failed: {e}",
+                    candidate_shard.as_i32()
+                ))
+                .into_response();
             }
+        };
+        if let Some((existing_uuid, existing_state)) = hit {
+            // Attach (reuse UUID) only when the prior is live AND the policy
+            // expects to attach. Every other path goes through replace_execution
+            // and needs a fresh exec_id keyed for the same shard.
+            let will_attach = matches!(existing_state.as_str(), "RUNNING" | "SUSPENDED")
+                && matches!(
+                    reuse_policy,
+                    WorkflowIdReusePolicy::AllowDuplicate
+                        | WorkflowIdReusePolicy::AllowDuplicateFailedOnly
+                );
+            let exec_id = if will_attach {
+                ExecutionId::from_uuid(existing_uuid)
+            } else {
+                ExecutionId::new_for_shard(candidate_shard)
+            };
+            found_shard = Some((candidate_shard, shard_conn, exec_id));
+            break;
         }
     }
 

@@ -755,30 +755,69 @@ pub async fn signal_with_start_workflow_execution(
             )
             .await?;
 
-            let start_request = StartWorkflowParams {
-                workflow_name: request.workflow_name,
-                workflow_id: request.workflow_id,
-                exec_id: request.exec_id,
-                input: request.input.clone(),
-                parent_id: request.parent_id,
-                queue_name: request.queue_name,
-                execution_timeout: request.execution_timeout,
-                memo: request.memo.clone(),
-                search_attrs: request.search_attrs.clone(),
-                reuse_policy: effective_policy,
-                trace_context: request.trace_context.clone(),
-                max_execution_timeout_ceiling: request.max_execution_timeout_ceiling,
-                concurrency_key: request.concurrency_key.clone(),
-                concurrency_limit: request.concurrency_limit,
-            };
-            let started = start_or_load_workflow_execution(conn, start_request).await?;
+            let build_start_request =
+                |exec_id: ExecutionId, policy: WorkflowIdReusePolicy| StartWorkflowParams {
+                    workflow_name: request.workflow_name,
+                    workflow_id: request.workflow_id,
+                    exec_id,
+                    input: request.input.clone(),
+                    parent_id: request.parent_id,
+                    queue_name: request.queue_name,
+                    execution_timeout: request.execution_timeout,
+                    memo: request.memo.clone(),
+                    search_attrs: request.search_attrs.clone(),
+                    reuse_policy: policy,
+                    trace_context: request.trace_context.clone(),
+                    max_execution_timeout_ceiling: request.max_execution_timeout_ceiling,
+                    concurrency_key: request.concurrency_key.clone(),
+                    concurrency_limit: request.concurrency_limit,
+                };
 
-            // After the policy upgrade above, `started.state` is either RUNNING
-            // (live execution: signal staged for ingest) or a terminal state
-            // only reachable when the caller explicitly chose RejectDuplicate
-            // / TerminateIfRunning and the matrix dictates "attach, no signal"
-            // (not applicable here). In practice we expect RUNNING on every
-            // success path.
+            let started = start_or_load_workflow_execution(
+                conn,
+                build_start_request(request.exec_id, effective_policy),
+            )
+            .await?;
+
+            // The resolver can only take a row lock when the row already
+            // exists. If no row existed at resolver time but another
+            // transaction inserted *and* completed one before this request's
+            // start path grabbed its own `FOR UPDATE`, the start helper
+            // returns the now-terminal row unchanged under
+            // `AllowDuplicate` / `AllowDuplicateFailedOnly`. Without a
+            // second pass the signal would land on a terminal run and be
+            // dropped, violating the "no signal silently dropped"
+            // invariant from issue #244.
+            //
+            // Re-evaluate here: if the result is non-RUNNING and the
+            // caller's original policy was one of the duplicate-allowing
+            // variants, escalate to `TerminateIfRunning` with a fresh
+            // `exec_id` so the existing terminal row is sealed and a new
+            // run is started + signaled. The retry runs inside the same
+            // outer transaction, so the existing row's lock from the start
+            // path's `FOR UPDATE` carries through to the retry's lock and
+            // a third concurrent transaction cannot squeeze in between.
+            let started = if started.state != "RUNNING"
+                && matches!(
+                    request.reuse_policy,
+                    WorkflowIdReusePolicy::AllowDuplicate
+                        | WorkflowIdReusePolicy::AllowDuplicateFailedOnly
+                ) {
+                // The terminal row owns `started.exec_id`'s UUID, so
+                // `replace_execution` needs a fresh id keyed to the same
+                // shard. `ExecutionId::new_for_shard` collapses to the
+                // default-shard sentinel for unencoded ids, matching
+                // pre-sharding test setups.
+                let fresh_exec_id = ExecutionId::new_for_shard(started.exec_id.shard());
+                start_or_load_workflow_execution(
+                    conn,
+                    build_start_request(fresh_exec_id, WorkflowIdReusePolicy::TerminateIfRunning),
+                )
+                .await?
+            } else {
+                started
+            };
+
             let signal_delivered = if started.state == "RUNNING" {
                 stage_signal_with_idempotency(
                     conn,
