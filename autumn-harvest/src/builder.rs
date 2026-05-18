@@ -1598,6 +1598,7 @@ mod tests {
                 name: "report_wf",
                 module: "test",
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+                execution_timeout: None,
                 concurrency: Some(ConcurrencyPolicy {
                     key_expr: "input.tenant_id",
                     limit: 0,
@@ -1624,6 +1625,7 @@ mod tests {
                 name: "report_wf",
                 module: "test",
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+                execution_timeout: None,
                 concurrency: Some(ConcurrencyPolicy {
                     key_expr: "input.tenant_id",
                     limit: 5,

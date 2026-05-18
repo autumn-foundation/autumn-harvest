@@ -41,13 +41,10 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
                     key_expr = Some(value.value());
                     Ok(())
                 } else if inner.path.is_ident("limit") {
-                    let lit: syn::LitInt = inner.value()?.parse()?;
-                    let n: u32 = lit.base10_parse()?;
+                    let value: syn::LitInt = inner.value()?.parse()?;
+                    let n: u32 = value.base10_parse()?;
                     if n == 0 {
-                        return Err(syn::Error::new(
-                            lit.span(),
-                            "concurrency limit must be greater than zero",
-                        ));
+                        return Err(inner.error("concurrency limit must be greater than zero"));
                     }
                     limit = Some(n);
                     Ok(())
@@ -70,9 +67,7 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
             result.concurrency = Some(ConcurrencyArgs { key_expr, limit });
             Ok(())
         } else {
-            Err(meta.error(
-                "unsupported attribute: expected `execution_timeout` or `concurrency`",
-            ))
+            Err(meta.error("unsupported attribute: expected `execution_timeout` or `concurrency`"))
         }
     })
     .parse2(attr)?;
@@ -84,6 +79,7 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
 // Main macro
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_lines)]
 pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let attrs = match parse_attrs(attr) {
         Ok(a) => a,

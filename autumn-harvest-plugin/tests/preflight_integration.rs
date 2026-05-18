@@ -210,9 +210,8 @@ fn workflow_info() -> WorkflowInfo {
         module: "tests",
         handler: |_ctx, input| Box::pin(async move { Ok(input) }),
         execution_timeout: None,
+        concurrency: None,
     }
-
-    concurrency: None,
 }
 
 fn activity_info(queue: Option<&'static str>) -> ActivityInfo {

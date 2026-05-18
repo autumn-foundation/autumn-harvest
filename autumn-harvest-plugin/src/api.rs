@@ -3644,11 +3644,6 @@ async fn start_workflow(
         .workflows
         .get(&workflow_name)
         .and_then(|info| info.concurrency.as_ref())
-        .map(|policy| {
-            let key = autumn_harvest::concurrency::resolve_concurrency_key(
-                policy.key_expr,
-                &input,
-            );
         .map_or((None, None), |policy| {
             let key = autumn_harvest::concurrency::resolve_concurrency_key(policy.key_expr, &input);
             (key, Some(policy.limit))

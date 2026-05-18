@@ -1759,9 +1759,8 @@ fn workflow_info_named(name: &'static str) -> WorkflowInfo {
         module: "tests",
         handler: approval_workflow,
         execution_timeout: None,
+        concurrency: None,
     }
-
-    concurrency: None,
 }
 
 fn unified_manual_dag_info_named(name: &'static str, default_queue: &'static str) -> DagInfo {
