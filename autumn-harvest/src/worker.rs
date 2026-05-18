@@ -1904,6 +1904,18 @@ async fn persist_all_started_child_workflows(
                 );
                 params.workflow_exec_id = Some(child.child_id.as_uuid());
                 params.required_build_id = parent_execution.assigned_build_id.clone();
+                // Resolve per-key concurrency policy for the child workflow (issue #247).
+                (params.concurrency_key, params.max_concurrent) = registry
+                    .workflows
+                    .get(&child.workflow_name)
+                    .and_then(|info| info.concurrency.as_ref())
+                    .map_or((None, None), |policy| {
+                        let key = crate::concurrency::resolve_concurrency_key(
+                            policy.key_expr,
+                            &child.input,
+                        );
+                        (key, Some(policy.limit))
+                    });
                 params.trace_context = child_trace_ctxs
                     .get(&child.child_id.as_uuid())
                     .cloned()
