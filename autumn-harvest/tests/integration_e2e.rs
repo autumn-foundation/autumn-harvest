@@ -6126,16 +6126,16 @@ async fn signal_blocked_workflow_times_out_at_deadline() {
 
 // ── Per-key concurrency fair-share tests (issue #247) ─────────────────────────
 
-/// Blocking workflow that holds a slot until explicitly released via a barrier.
+/// Blocking workflow that holds a slot for 1 s before completing.
 ///
 /// We use `tokio::time::sleep` for simplicity; the worker pool keeps the task
 /// RUNNING while the sleep runs.
-fn blocking_workflow_5s<'a>(
+fn blocking_workflow_1s<'a>(
     _ctx: &'a WorkflowContext,
     _input: serde_json::Value,
 ) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
     Box::pin(async move {
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
         Ok(serde_json::Value::Null)
     })
 }
@@ -6201,7 +6201,7 @@ async fn per_key_concurrency_cap_enforced_across_fleet() {
         vec![WorkflowInfo {
             name: wf_name,
             module: "integration_e2e",
-            handler: blocking_workflow_5s,
+            handler: blocking_workflow_1s,
             concurrency: None,
         }],
         vec![],
@@ -6341,7 +6341,7 @@ async fn per_key_concurrency_does_not_block_other_keys() {
             WorkflowInfo {
                 name: "loud_wf",
                 module: "integration_e2e",
-                handler: blocking_workflow_5s,
+                handler: blocking_workflow_1s,
                 concurrency: None,
             },
             WorkflowInfo {

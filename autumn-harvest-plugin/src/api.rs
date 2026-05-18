@@ -7324,7 +7324,9 @@ async fn concurrency_status(
     let runtime = api_state.runtime().map_err(map_error)?;
     let pool = api_state.storage_pool().map_err(map_error)?;
 
-    let mut merged: std::collections::HashMap<String, ConcurrencyKeyStats> =
+    // Keyed by (concurrency_key, task_type) — same granularity as the claim
+    // query — so workflow and activity caps for the same key are not collapsed.
+    let mut merged: std::collections::HashMap<(String, String), ConcurrencyKeyStats> =
         std::collections::HashMap::new();
 
     for (_shard, shard_pool) in pool.iter_shards() {
@@ -7333,10 +7335,12 @@ async fn concurrency_status(
             .await
             .map_err(map_error)?;
         for stat in stats {
+            let merge_key = (stat.key.clone(), stat.task_type.clone());
             let entry = merged
-                .entry(stat.key.clone())
+                .entry(merge_key)
                 .or_insert_with(|| ConcurrencyKeyStats {
                     key: stat.key.clone(),
+                    task_type: stat.task_type.clone(),
                     max_concurrent: stat.max_concurrent,
                     in_flight: 0,
                     pending: 0,
@@ -7350,7 +7354,7 @@ async fn concurrency_status(
     }
 
     let mut result: Vec<ConcurrencyKeyStats> = merged.into_values().collect();
-    result.sort_by(|a, b| a.key.cmp(&b.key));
+    result.sort_by(|a, b| a.key.cmp(&b.key).then(a.task_type.cmp(&b.task_type)));
     Ok(Json(result))
 }
 

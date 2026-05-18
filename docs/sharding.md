@@ -23,23 +23,13 @@ This means:
 
 ### Achieving a true global cap in a multi-shard deployment
 
-If your use-case requires a hard global cap across all shards (e.g., "at most 10 concurrent workflows for any tenant, regardless of which shard they land on"), route all executions for the same key to a single shard by implementing a custom `ShardRouter`:
+If your use-case requires a hard global cap across all shards (e.g., "at most 10 concurrent workflows for any tenant, regardless of which shard they land on"), route all executions for the same concurrency key to a single shard.
 
-```rust
-use autumn_harvest::{ShardId, ShardRouter};
+`ShardRouter::new` builds a rendezvous router keyed on `(workflow_name, workflow_id)`. To achieve tenant-pinned routing you would need a workflow ID naming convention that incorporates the tenant identifier — for example, always prefixing workflow IDs with the tenant: `"acme::order-42"`. Because rendezvous hashing is deterministic, all workflow IDs with the same prefix will not necessarily land on the same shard (the hash also mixes in `workflow_name`), so this approach only works reliably if you pin both `workflow_name` and the tenant-identifying part of `workflow_id`.
 
-/// Route by tenant_id so all workflows for a given tenant land on the same shard.
-/// This makes per-key concurrency limits globally effective.
-fn tenant_aware_router(shards: Vec<ShardId>) -> ShardRouter {
-    ShardRouter::new(
-        shards.clone(),
-        shards,
-        ShardId::new(0),
-    )
-}
-```
+A fully custom shard-selection strategy is not yet exposed via `ShardRouter`; it is planned as a future API extension.
 
-With a consistent-hashing router keyed on `tenant_id`, every execution for `tenant_id = "acme"` lands on the same shard, so the local `limit` is also the global limit.
+With tenant-consistent placement, every execution for `tenant_id = "acme"` lands on the same shard, so the local `limit` is also the global limit.
 
 **Trade-off**: routing all of one tenant's workflows to the same shard concentrates load. Size shards to handle the worst-case tenant burst, or use rate limiting above Harvest to bound how fast new workflows can be started per tenant.
 

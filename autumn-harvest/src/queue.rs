@@ -312,6 +312,7 @@ pub async fn claim_task(
                        WHERE inner_q.concurrency_key = harvest_task_queue.concurrency_key \
                          AND inner_q.task_type = harvest_task_queue.task_type \
                          AND inner_q.state = 'RUNNING' \
+                         AND inner_q.worker_id IS NOT NULL \
                    ) < harvest_task_queue.concurrency_cap \
                ) \
                AND ( \
@@ -348,6 +349,7 @@ pub async fn claim_task(
                            WHERE recheck.concurrency_key = candidate.concurrency_key \
                              AND recheck.task_type = candidate.task_type \
                              AND recheck.state = 'RUNNING' \
+                             AND recheck.worker_id IS NOT NULL \
                        ) < candidate.concurrency_cap \
                    ) \
                ) \
@@ -368,17 +370,22 @@ pub async fn claim_task(
 // Concurrency-key stats
 // ---------------------------------------------------------------------------
 
-/// Live stats for a single concurrency group key.
+/// Live stats for a single `(concurrency_key, task_type)` pair.
+///
+/// The claim query enforces concurrency caps independently per key+type,
+/// so stats are also reported at that granularity.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ConcurrencyKeyStats {
     /// The concurrency group key.
     pub key: String,
-    /// Declared maximum concurrent tasks for this key.
+    /// Task type this row covers (`"workflow"` or `"activity"`).
+    pub task_type: String,
+    /// Declared maximum concurrent tasks for this key+type.
     pub max_concurrent: i32,
-    /// Number of tasks currently in `RUNNING` state for this key.
+    /// Number of tasks currently in `RUNNING` state for this key+type.
     pub in_flight: i64,
-    /// Number of tasks in `PENDING` state for this key (may be deferred by
-    /// the cap if `in_flight >= max_concurrent`).
+    /// Number of tasks in `PENDING` state for this key+type (may be deferred
+    /// by the cap if `in_flight >= max_concurrent`).
     pub pending: i64,
 }
 
@@ -398,6 +405,8 @@ pub async fn concurrency_key_stats(
     struct Row {
         #[diesel(sql_type = diesel::sql_types::Text)]
         key: String,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        task_type: String,
         #[diesel(sql_type = diesel::sql_types::Integer)]
         max_concurrent: i32,
         #[diesel(sql_type = diesel::sql_types::BigInt)]
@@ -409,6 +418,7 @@ pub async fn concurrency_key_stats(
     let rows: Vec<Row> = diesel::sql_query(
         "SELECT \
              concurrency_key AS key, \
+             task_type, \
              MAX(concurrency_cap)::INT4 AS max_concurrent, \
              COUNT(*) FILTER (WHERE state = 'RUNNING') AS in_flight, \
              COUNT(*) FILTER (WHERE state = 'PENDING') AS pending \
@@ -417,7 +427,7 @@ pub async fn concurrency_key_stats(
            AND concurrency_cap IS NOT NULL \
            AND queue_name = ANY($1) \
            AND state IN ('RUNNING', 'PENDING') \
-         GROUP BY concurrency_key",
+         GROUP BY concurrency_key, task_type",
     )
     .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
     .load(conn)
@@ -428,6 +438,7 @@ pub async fn concurrency_key_stats(
         .into_iter()
         .map(|r| ConcurrencyKeyStats {
             key: r.key,
+            task_type: r.task_type,
             max_concurrent: r.max_concurrent,
             in_flight: r.in_flight,
             pending: r.pending,
