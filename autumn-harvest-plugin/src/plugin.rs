@@ -265,6 +265,8 @@ fn start_harvest_runtime(
     api_state.set_worker_shutdown_timeout(built.worker_config().shutdown_timeout);
     // Propagate the per-query timeout from WorkerConfig (issue #234).
     api_state.set_query_timeout(built.worker_config().query_timeout);
+    // Propagate the server-side execution timeout ceiling (issue #243).
+    api_state.set_max_workflow_execution_timeout(built.max_workflow_execution_timeout);
 
     // Apply the api_state audit retention override only when explicitly set,
     // so that builder-level retention config is not silently clobbered.
@@ -471,6 +473,7 @@ mod tests {
             name: "echo",
             module: "tests",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            execution_timeout: None,
         }
     }
 

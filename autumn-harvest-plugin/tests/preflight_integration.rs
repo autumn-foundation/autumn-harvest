@@ -209,6 +209,7 @@ fn workflow_info() -> WorkflowInfo {
         name: "echo_workflow",
         module: "tests",
         handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+        execution_timeout: None,
     }
 }
 

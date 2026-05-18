@@ -55,6 +55,8 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260509000000_harvest_build_routing/up.sql"),
     "\n",
     include_str!("../migrations/20260513000000_harvest_schedule_pause_metadata/up.sql"),
+    "\n",
+    include_str!("../migrations/20260518000000_harvest_workflow_execution_timeout/up.sql"),
 );
 
 // ---------------------------------------------------------------------------
@@ -97,6 +99,7 @@ async fn insert_execution(conn: &mut AsyncPgConnection, exec_id: ExecutionId, na
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,
+        deadline_at: None,
         memo: None,
         search_attrs: None,
         assigned_build_id: None,

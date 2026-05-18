@@ -1888,6 +1888,7 @@ async fn persist_all_started_child_workflows(
                     parent_id: Some(parent_exec_id.as_uuid()),
                     queue_name: &queue_name,
                     execution_timeout: None,
+                    deadline_at: None,
                     memo: None,
                     search_attrs: None,
                     assigned_build_id: parent_execution.assigned_build_id.clone(),
@@ -2948,6 +2949,9 @@ async fn persist_workflow_continue_as_new(
         new_exec_id,
         input: input.clone(),
     };
+    // Re-anchor deadline to the new execution's start time (issue #243).
+    let new_deadline_at = execution.execution_timeout.map(|d| chrono::Utc::now() + d);
+
     let new_row = NewWorkflowExecution {
         id: new_exec_id.as_uuid(),
         workflow_name: &execution.workflow_name,
@@ -2958,6 +2962,7 @@ async fn persist_workflow_continue_as_new(
         parent_id: None,
         queue_name: &execution.queue_name,
         execution_timeout: execution.execution_timeout,
+        deadline_at: new_deadline_at,
         memo: execution.memo.clone(),
         search_attrs: execution.search_attrs.clone(),
         assigned_build_id: execution.assigned_build_id.clone(),
@@ -4068,6 +4073,7 @@ impl Worker {
             pool.clone(),
             self.shutdown.clone(),
             self.config.poll_interval,
+            self.registry.telemetry().clone(),
         );
 
         WorkerMonitoringHandles {
@@ -4578,6 +4584,7 @@ mod tests {
             name: "onboarding",
             module: "app::workflows",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            execution_timeout: None,
         };
 
         let act = ActivityInfo {

@@ -104,6 +104,7 @@ async fn start_running_workflow(
             search_attrs: None,
             reuse_policy: WorkflowIdReusePolicy::RejectDuplicate,
             trace_context: None,
+            max_execution_timeout_ceiling: None,
         },
     )
     .await

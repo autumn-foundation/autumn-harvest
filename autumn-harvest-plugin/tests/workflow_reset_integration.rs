@@ -76,6 +76,10 @@ const INIT_SQL: &str = concat!(
     ),
     "\n",
     include_str!("../../autumn-harvest/migrations/20260514020000_harvest_task_activity_id/up.sql"),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260518000000_harvest_workflow_execution_timeout/up.sql"
+    ),
 );
 
 type HarvestApiApp = axum::Router;
@@ -192,6 +196,7 @@ async fn seed_execution(
             search_attrs: None,
             reuse_policy: WorkflowIdReusePolicy::default(),
             trace_context: None,
+            max_execution_timeout_ceiling: None,
         },
     )
     .await
@@ -420,6 +425,7 @@ async fn reset_fork_completes_with_current_code_and_observes_buffered_signal() {
             name: "resettable",
             module: "workflow_reset_integration",
             handler: replay_checkpoints_then_signal,
+            execution_timeout: None,
         }],
         vec![],
     ));

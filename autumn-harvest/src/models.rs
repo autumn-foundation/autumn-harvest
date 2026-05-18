@@ -40,6 +40,9 @@ pub struct WorkflowExecution {
     pub started_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
     pub execution_timeout: Option<chrono::Duration>,
+    /// Absolute UTC deadline for execution-level timeout (issue #243).
+    /// Computed at start as `started_at + execution_timeout`. NULL = no deadline.
+    pub deadline_at: Option<DateTime<Utc>>,
     pub memo: Option<serde_json::Value>,
     pub search_attrs: Option<serde_json::Value>,
     pub created_at: DateTime<Utc>,
@@ -60,6 +63,9 @@ pub struct NewWorkflowExecution<'a> {
     pub parent_id: Option<Uuid>,
     pub queue_name: &'a str,
     pub execution_timeout: Option<chrono::Duration>,
+    /// Absolute UTC deadline for execution-level timeout (issue #243).
+    /// NULL = no deadline enforced.
+    pub deadline_at: Option<DateTime<Utc>>,
     pub memo: Option<serde_json::Value>,
     pub search_attrs: Option<serde_json::Value>,
     /// Build ID from the active build policy for this queue at start time.

@@ -75,6 +75,10 @@ const INIT_SQL: &str = concat!(
     ),
     "\n",
     include_str!("../../autumn-harvest/migrations/20260514020000_harvest_task_activity_id/up.sql"),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260518000000_harvest_workflow_execution_timeout/up.sql"
+    ),
 );
 
 type HarvestApiApp = axum::Router;
@@ -184,6 +188,7 @@ async fn seed_workflows(database_url: &str, workflow_name: &str, count: usize) -
                 search_attrs: Some(json!({"tenant": "acme"})),
                 reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
                 trace_context: None,
+                max_execution_timeout_ceiling: None,
             },
         )
         .await

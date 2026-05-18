@@ -185,6 +185,7 @@ async fn insert_version_execution_with_markers(
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,
+        deadline_at: None,
         memo: None,
         search_attrs: None,
         assigned_build_id: None,

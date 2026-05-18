@@ -26,6 +26,9 @@ diesel::table! {
         started_at -> Timestamptz,
         completed_at -> Nullable<Timestamptz>,
         execution_timeout -> Nullable<Interval>,
+        /// Absolute UTC deadline for execution-level timeout (issue #243).
+        /// Computed at start as `started_at + execution_timeout`. NULL = no deadline.
+        deadline_at -> Nullable<Timestamptz>,
         memo -> Nullable<Jsonb>,
         search_attrs -> Nullable<Jsonb>,
         created_at -> Timestamptz,
