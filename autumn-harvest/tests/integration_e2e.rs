@@ -6321,8 +6321,7 @@ async fn per_key_concurrency_does_not_block_other_keys() {
     // interval.  With only 4 pool slots the quiet tasks can't get connections;
     // 16 gives headroom for all background tasks to run concurrently.
     let pool: DbPool = {
-        let manager =
-            AsyncDieselConnectionManager::<AsyncPgConnection>::new(&database_url);
+        let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(&database_url);
         deadpool::managed::Pool::builder(manager)
             .max_size(16)
             .build()
