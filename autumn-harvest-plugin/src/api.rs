@@ -4018,8 +4018,7 @@ async fn signal_with_start_workflow(
                 .filter(harvest_workflow_executions::workflow_name.eq(&workflow_name))
                 .filter(harvest_workflow_executions::workflow_id.eq(&workflow_id))
                 .filter(
-                    harvest_workflow_executions::state
-                        .ne_all(["CONTINUED_AS_NEW", "TERMINATED"]),
+                    harvest_workflow_executions::state.ne_all(["CONTINUED_AS_NEW", "TERMINATED"]),
                 )
                 .select(harvest_workflow_executions::id)
                 .first::<uuid::Uuid>(&mut shard_conn)
@@ -4066,10 +4065,8 @@ async fn signal_with_start_workflow(
         .get(&workflow_name)
         .and_then(|info| info.concurrency.as_ref())
         .map_or((None, None), |policy| {
-            let key = autumn_harvest::concurrency::resolve_concurrency_key(
-                policy.key_expr,
-                &start_input,
-            );
+            let key =
+                autumn_harvest::concurrency::resolve_concurrency_key(policy.key_expr, &start_input);
             (key, Some(policy.limit))
         });
 
