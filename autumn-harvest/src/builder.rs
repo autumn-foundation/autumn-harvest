@@ -729,6 +729,7 @@ impl HarvestBuilder {
             self.worker_config.max_local_activity_start_to_close,
         )?;
         validate_dags_do_not_use_local_activities(&self.dags, &self.activities)?;
+        validate_dag_schedules(&self.dags)?;
 
         Ok(BuiltHarvest {
             workflows: self.workflows,
@@ -869,6 +870,26 @@ fn validate_workflow_schedules(
         if let Err(reason) = crate::policy::validate_jitter(&schedule.schedule, schedule.jitter) {
             return Err(HarvestBuilderError::InvalidWorkflowSchedule {
                 workflow_name: schedule.workflow_name.clone(),
+                reason,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_dag_schedules(dags: &[crate::info::DagInfo]) -> Result<(), HarvestBuilderError> {
+    for dag in dags {
+        let Some(schedule) = &dag.schedule else {
+            continue;
+        };
+        if let crate::policy::Schedule::CronInTimezone { tz, .. } = schedule
+            && tz.parse::<chrono_tz::Tz>().is_err()
+        {
+            return Err(HarvestBuilderError::UnknownTimezone { name: tz.clone() });
+        }
+        if let Err(reason) = crate::policy::validate_schedule(schedule) {
+            return Err(HarvestBuilderError::InvalidWorkflowSchedule {
+                workflow_name: dag.name.to_string(),
                 reason,
             });
         }
@@ -1840,6 +1861,61 @@ mod tests {
         assert!(
             result.is_ok(),
             "valid timezone must be accepted: {result:?}"
+        );
+    }
+
+    #[test]
+    fn builder_rejects_unknown_timezone_in_dag_schedule() {
+        fn build(_dag: &mut DagBuilder) {}
+        let dag = DagInfo {
+            name: "daily_etl",
+            module: "test",
+            schedule: Some(Schedule::CronInTimezone {
+                expr: "0 9 * * 1-5".to_string(),
+                tz: "Not/ATimezone".to_string(),
+            }),
+            catchup: false,
+            max_active_runs: 1,
+            default_queue: None,
+            builder: build,
+            workflow_handler: None,
+            jitter: std::time::Duration::ZERO,
+            overlap_policy: crate::policy::OverlapPolicy::Skip,
+            buffer_all_max: 100,
+        };
+        let result = HarvestBuilder::new().dags(vec![dag]).try_build();
+        assert!(
+            matches!(
+                result,
+                Err(HarvestBuilderError::UnknownTimezone { ref name }) if name == "Not/ATimezone"
+            ),
+            "unknown timezone in DAG schedule must be rejected at build time: {result:?}"
+        );
+    }
+
+    #[test]
+    fn builder_accepts_valid_timezone_in_dag_schedule() {
+        fn build(_dag: &mut DagBuilder) {}
+        let dag = DagInfo {
+            name: "daily_etl",
+            module: "test",
+            schedule: Some(Schedule::CronInTimezone {
+                expr: "0 9 * * 1-5".to_string(),
+                tz: "America/New_York".to_string(),
+            }),
+            catchup: false,
+            max_active_runs: 1,
+            default_queue: None,
+            builder: build,
+            workflow_handler: None,
+            jitter: std::time::Duration::ZERO,
+            overlap_policy: crate::policy::OverlapPolicy::Skip,
+            buffer_all_max: 100,
+        };
+        let result = HarvestBuilder::new().dags(vec![dag]).try_build();
+        assert!(
+            result.is_ok(),
+            "valid timezone in DAG schedule must be accepted: {result:?}"
         );
     }
 }

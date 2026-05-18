@@ -454,6 +454,8 @@ pub async fn register_workflow_schedules(
     schedules: &[WorkflowSchedule],
 ) -> HarvestResult<()> {
     for ws in schedules {
+        crate::policy::validate_schedule(&ws.schedule)
+            .map_err(crate::error::HarvestError::Config)?;
         upsert_workflow_schedule(conn, ws).await?;
     }
     Ok(())

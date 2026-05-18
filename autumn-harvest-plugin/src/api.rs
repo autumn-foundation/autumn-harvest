@@ -6726,7 +6726,17 @@ fn parse_schedule_expr_with_tz(
     use autumn_harvest::policy::Schedule;
 
     let trimmed = expr.trim();
-    let schedule = if let Some(cron) = trimmed.strip_prefix("cron:") {
+    let schedule = if let Some(rest) = trimmed.strip_prefix("cron_tz:") {
+        // Canonical round-trip format emitted by GET /admin/schedules.
+        // The embedded timezone takes precedence over the separate `timezone` field.
+        let (tz, cron_expr) = rest.split_once(':').ok_or_else(|| {
+            format!("malformed cron_tz expression '{expr}'; expected 'cron_tz:<tz>:<expr>'")
+        })?;
+        Schedule::CronInTimezone {
+            expr: cron_expr.to_string(),
+            tz: tz.to_string(),
+        }
+    } else if let Some(cron) = trimmed.strip_prefix("cron:") {
         let cron_expr = cron.trim().to_string();
         if timezone == "UTC" {
             Schedule::Cron(cron_expr)
@@ -10051,6 +10061,29 @@ mod tests {
         assert!(
             err.contains("Not/ATimezone"),
             "error should name the bad timezone: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_schedule_expr_with_tz_cron_tz_prefix_round_trips() {
+        use autumn_harvest::policy::Schedule;
+        // Simulate GET returning the canonical cron_tz: form, then POST-ing it back.
+        let canonical = "cron_tz:America/Los_Angeles:0 9 * * 1-5";
+        let result = parse_schedule_expr_with_tz(canonical, "UTC")
+            .expect("cron_tz: prefixed expr must parse regardless of timezone param");
+        assert!(
+            matches!(&result, Schedule::CronInTimezone { tz, expr }
+                if tz == "America/Los_Angeles" && expr == "0 9 * * 1-5"),
+            "embedded timezone must be preserved: {result:?}"
+        );
+    }
+
+    #[test]
+    fn parse_schedule_expr_with_tz_cron_tz_prefix_malformed_is_rejected() {
+        let result = parse_schedule_expr_with_tz("cron_tz:MissingColonExpr", "UTC");
+        assert!(
+            result.is_err(),
+            "malformed cron_tz: must be rejected: {result:?}"
         );
     }
 
