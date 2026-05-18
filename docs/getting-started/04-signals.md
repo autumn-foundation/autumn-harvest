@@ -100,7 +100,7 @@ immediately without re-issuing any side effect.
 | `reason_code` | Meaning |
 |---|---|
 | `"target_terminal"` | The target workflow is already in a terminal state (completed, failed, cancelled). |
-| `"target_unknown"` | The target `ExecutionId` was not found after the grace lookup window (default 5 s). Usually a typo or a race with a very recent start. |
+| `"target_unknown"` | The target `ExecutionId` was not found. Usually a typo or a race where the target workflow has not yet been persisted. |
 | `"cross_shard_unsupported"` | The target lives on a different database shard. Cross-shard delivery requires the plugin's outbox extension (see below). |
 
 ### Cross-shard delivery guarantee
