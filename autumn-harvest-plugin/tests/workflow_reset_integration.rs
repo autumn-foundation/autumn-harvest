@@ -15,7 +15,7 @@ use autumn_harvest::schema::{
 };
 use autumn_harvest::shard::ShardRouter;
 use autumn_harvest::store;
-use autumn_harvest::types::{ActivityExecId, ExecutionId, ShardId};
+use autumn_harvest::types::{ActivityExecId, ExecutionId, Priority, ShardId};
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{
     StartWorkflowParams, WorkflowContext, WorkflowIdReusePolicy, start_or_load_workflow_execution,
@@ -143,6 +143,7 @@ fn build_reset_worker(registry: Arc<HandlerRegistry>) -> Arc<Worker> {
                 build_id: String::new(),
                 deployment_name: None,
                 workflow_cache_size: 1000,
+                priority_aging_secs: None,
             },
             registry,
         )
@@ -203,7 +204,7 @@ async fn seed_execution(
             max_execution_timeout_ceiling: None,
             concurrency_key: None,
             concurrency_limit: None,
-            priority: Default::default(),
+            priority: Priority::default(),
         },
     )
     .await

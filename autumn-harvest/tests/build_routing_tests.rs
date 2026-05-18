@@ -466,9 +466,15 @@ mod db_tests {
         insert_exec_and_task(&mut conn, exec_id, Some("v1.0")).await;
 
         // Worker running v1.0 should claim its own task.
-        let task = queue::claim_task(&mut conn, &["default".to_string()], "worker-a", "v1.0")
-            .await
-            .expect("claim_task");
+        let task = queue::claim_task(
+            &mut conn,
+            &["default".to_string()],
+            "worker-a",
+            "v1.0",
+            None,
+        )
+        .await
+        .expect("claim_task");
         assert!(task.is_some(), "v1.0 worker should claim v1.0 task");
     }
 
@@ -480,9 +486,15 @@ mod db_tests {
         insert_exec_and_task(&mut conn, exec_id, Some("v1.0")).await;
 
         // Worker running v2.0 with no declared compatibility should get nothing.
-        let task = queue::claim_task(&mut conn, &["default".to_string()], "worker-b", "v2.0")
-            .await
-            .expect("claim_task");
+        let task = queue::claim_task(
+            &mut conn,
+            &["default".to_string()],
+            "worker-b",
+            "v2.0",
+            None,
+        )
+        .await
+        .expect("claim_task");
         assert!(
             task.is_none(),
             "v2.0 worker must not claim v1.0 task without compat declaration"
@@ -498,9 +510,15 @@ mod db_tests {
         let exec_id = Uuid::new_v4();
         insert_exec_and_task(&mut conn, exec_id, Some("v1.0")).await;
 
-        let task = queue::claim_task(&mut conn, &["default".to_string()], "worker-c", "v2.0")
-            .await
-            .expect("claim_task");
+        let task = queue::claim_task(
+            &mut conn,
+            &["default".to_string()],
+            "worker-c",
+            "v2.0",
+            None,
+        )
+        .await
+        .expect("claim_task");
         assert!(
             task.is_some(),
             "v2.0 worker with compat declaration should claim v1.0 task"
@@ -515,9 +533,15 @@ mod db_tests {
         insert_exec_and_task(&mut conn, exec_id, None).await;
 
         // Any worker (including one with a build_id) can claim an untagged task.
-        let task = queue::claim_task(&mut conn, &["default".to_string()], "worker-d", "v99.0")
-            .await
-            .expect("claim_task");
+        let task = queue::claim_task(
+            &mut conn,
+            &["default".to_string()],
+            "worker-d",
+            "v99.0",
+            None,
+        )
+        .await
+        .expect("claim_task");
         assert!(
             task.is_some(),
             "any worker should claim task with no required build"
@@ -532,9 +556,15 @@ mod db_tests {
         insert_exec_and_task(&mut conn, exec_id, Some("v1.0")).await;
 
         // Legacy worker with empty build_id can claim anything.
-        let task = queue::claim_task(&mut conn, &["default".to_string()], "worker-legacy", "")
-            .await
-            .expect("claim_task");
+        let task = queue::claim_task(
+            &mut conn,
+            &["default".to_string()],
+            "worker-legacy",
+            "",
+            None,
+        )
+        .await
+        .expect("claim_task");
         assert!(
             task.is_some(),
             "legacy worker should claim build-tagged task"

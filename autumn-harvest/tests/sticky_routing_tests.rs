@@ -515,6 +515,7 @@ mod db_tests {
             &["default".to_string()],
             "worker-beta",
             "", // legacy build id — claims anything
+            None,
         )
         .await
         .expect("claim_task");
@@ -553,6 +554,7 @@ mod db_tests {
             &["default".to_string()],
             "worker-delta", // not the sticky worker
             "",
+            None,
         )
         .await
         .expect("claim_task");
@@ -597,6 +599,7 @@ mod db_tests {
             &["default".to_string()],
             "worker-zeta", // not the original sticky worker
             "",
+            None,
         )
         .await
         .expect("claim_task");
@@ -630,7 +633,7 @@ mod db_tests {
         let task_id = queue::enqueue(&mut conn, &params).await.expect("enqueue");
 
         // Worker claims the task.
-        queue::claim_task(&mut conn, &["default".to_string()], "worker-eta", "")
+        queue::claim_task(&mut conn, &["default".to_string()], "worker-eta", "", None)
             .await
             .expect("claim_task")
             .expect("must claim");
@@ -676,10 +679,16 @@ mod db_tests {
         let task_id = queue::enqueue(&mut conn, &params).await.expect("enqueue");
 
         // Claim → park with a sticky pin.
-        queue::claim_task(&mut conn, &["default".to_string()], "worker-theta", "")
-            .await
-            .expect("claim_task")
-            .expect("must claim");
+        queue::claim_task(
+            &mut conn,
+            &["default".to_string()],
+            "worker-theta",
+            "",
+            None,
+        )
+        .await
+        .expect("claim_task")
+        .expect("must claim");
 
         let hint = StickyHint::new("worker-theta", Duration::from_secs(30));
         queue::park_workflow_task(&mut conn, task_id, Some(hint))
@@ -785,10 +794,11 @@ mod db_tests {
 
         // Worker-iota claims: must get the STICKY task (higher priority in ORDER BY)
         // even though the unpinned task was enqueued earlier.
-        let claimed = queue::claim_task(&mut conn, &["default".to_string()], "worker-iota", "")
-            .await
-            .expect("claim_task")
-            .expect("must claim something");
+        let claimed =
+            queue::claim_task(&mut conn, &["default".to_string()], "worker-iota", "", None)
+                .await
+                .expect("claim_task")
+                .expect("must claim something");
 
         assert_eq!(
             claimed.id, task_sticky,
@@ -839,9 +849,15 @@ mod db_tests {
         );
 
         // The task is now claimable by any worker.
-        let claimed = queue::claim_task(&mut conn, &["default".to_string()], "worker-lambda", "")
-            .await
-            .expect("claim_task");
+        let claimed = queue::claim_task(
+            &mut conn,
+            &["default".to_string()],
+            "worker-lambda",
+            "",
+            None,
+        )
+        .await
+        .expect("claim_task");
         assert!(
             claimed.is_some(),
             "AC#4: task with cleared pin must be claimable by any worker"

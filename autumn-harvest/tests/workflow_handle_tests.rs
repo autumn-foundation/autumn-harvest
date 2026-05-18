@@ -6,8 +6,8 @@ use autumn_harvest::error::{HarvestError, TimeoutType};
 use autumn_harvest::shard::{ShardRouter, ShardedDbPool};
 use autumn_harvest::worker::DbPool;
 use autumn_harvest::{
-    ExecutionId, StartWorkflowParams, WorkflowHandleClient, WorkflowIdReusePolicy, WorkflowResult,
-    WorkflowResultState, start_or_load_workflow_execution,
+    ExecutionId, Priority, StartWorkflowParams, WorkflowHandleClient, WorkflowIdReusePolicy,
+    WorkflowResult, WorkflowResultState, start_or_load_workflow_execution,
 };
 use diesel::{ExpressionMethods, QueryDsl};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -109,7 +109,7 @@ async fn start_running_workflow(
             max_execution_timeout_ceiling: None,
             concurrency_key: None,
             concurrency_limit: None,
-            priority: Default::default(),
+            priority: Priority::default(),
         },
     )
     .await

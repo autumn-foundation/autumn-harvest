@@ -7857,13 +7857,10 @@ struct PatchTaskPriorityRequest {
 
 #[derive(Debug, Serialize)]
 struct PatchTaskPriorityResponse {
-    /// The task UUID that was targeted.
     task_id: uuid::Uuid,
-    /// The new priority value (as string).
     priority: String,
-    /// `true` when the task was found in `PENDING` state and the priority was
-    /// updated. `false` when the task is already `RUNNING` (the running attempt
-    /// keeps its original priority; the next retry will use the new value).
+    /// `true` when the task row was updated; `false` when the task is in a
+    /// terminal state (the row still exists but is no longer claimable).
     updated: bool,
 }
 
@@ -7878,6 +7875,7 @@ async fn patch_task_priority(
 
     let pool = api_state.storage_pool().map_err(map_error)?;
 
+    // First pass: attempt the update across all shards.
     for (_shard, shard_pool) in pool.iter_shards() {
         let mut conn = acquire_conn(shard_pool).await?;
         let updated =
@@ -7898,18 +7896,28 @@ async fn patch_task_priority(
         }
     }
 
-    // Task found but not in PENDING state (RUNNING or terminal). Return 200
-    // with updated=false so the caller knows the change will take effect on the
-    // next retry claim rather than the current run.
-    Ok((
-        StatusCode::OK,
-        Json(PatchTaskPriorityResponse {
-            task_id,
-            priority: request.priority.to_string(),
-            updated: false,
-        }),
-    )
-        .into_response())
+    // No shard updated the row. Check whether the task exists at all (terminal
+    // state) or is simply not present (404).
+    for (_shard, shard_pool) in pool.iter_shards() {
+        let mut conn = acquire_conn(shard_pool).await?;
+        let exists = autumn_harvest::queue::task_exists(&mut conn, task_id)
+            .await
+            .map_err(map_error)?;
+
+        if exists {
+            return Ok((
+                StatusCode::OK,
+                Json(PatchTaskPriorityResponse {
+                    task_id,
+                    priority: request.priority.to_string(),
+                    updated: false,
+                }),
+            )
+                .into_response());
+        }
+    }
+
+    Err(AutumnError::not_found_msg(format!("task {task_id}")))
 }
 
 async fn health(Extension(api_state): Extension<HarvestApiState>) -> axum::response::Response {

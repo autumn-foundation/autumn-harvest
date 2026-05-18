@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 
 use autumn_harvest::schema::harvest_workflow_executions;
 use autumn_harvest::shard::ShardedDbPool;
-use autumn_harvest::types::{ExecutionId, ShardId};
+use autumn_harvest::types::{ExecutionId, Priority, ShardId};
 use autumn_harvest::worker::DbPool;
 use autumn_harvest::{StartWorkflowParams, start_or_load_workflow_execution};
 use autumn_harvest_plugin::HarvestDbPool;
@@ -170,7 +170,7 @@ async fn seed_workflow(
             max_execution_timeout_ceiling: None,
             concurrency_key: None,
             concurrency_limit: None,
-            priority: Default::default(),
+            priority: Priority::default(),
         },
     )
     .await

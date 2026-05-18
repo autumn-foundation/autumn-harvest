@@ -12,7 +12,7 @@ use autumn_harvest::schema::{
 };
 use autumn_harvest::shard::ShardRouter;
 use autumn_harvest::shard::ShardedDbPool;
-use autumn_harvest::types::{ExecutionId, ShardId};
+use autumn_harvest::types::{ExecutionId, Priority, ShardId};
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{StartWorkflowParams, start_or_load_workflow_execution};
 use autumn_harvest_plugin::HarvestDbPool;
@@ -286,7 +286,7 @@ async fn insert_workflow_on_url(
             max_execution_timeout_ceiling: None,
             concurrency_key: None,
             concurrency_limit: None,
-            priority: Default::default(),
+            priority: Priority::default(),
         },
     )
     .await
@@ -1876,7 +1876,7 @@ async fn insert_child_workflow_on_url(
             max_execution_timeout_ceiling: None,
             concurrency_key: None,
             concurrency_limit: None,
-            priority: Default::default(),
+            priority: Priority::default(),
         },
     )
     .await

@@ -8,8 +8,8 @@ use autumn_harvest::signal;
 use autumn_harvest::store;
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{
-    ActivityContext, HarvestError, StartWorkflowParams, WorkflowContext, cancel_workflow_execution,
-    queue, start_or_load_workflow_execution,
+    ActivityContext, HarvestError, Priority, StartWorkflowParams, WorkflowContext,
+    cancel_workflow_execution, queue, start_or_load_workflow_execution,
 };
 use diesel::ExpressionMethods;
 use diesel::QueryDsl;
@@ -120,7 +120,7 @@ async fn start_test_workflow(conn: &mut AsyncPgConnection) -> autumn_harvest::Ex
             max_execution_timeout_ceiling: None,
             concurrency_key: None,
             concurrency_limit: None,
-            priority: Default::default(),
+            priority: Priority::default(),
         },
     )
     .await
@@ -426,6 +426,7 @@ async fn running_activity_heartbeat_observes_workflow_cancellation() {
                 build_id: String::new(),
                 deployment_name: None,
                 workflow_cache_size: 1000,
+                priority_aging_secs: None,
             },
             registry,
         )
@@ -459,7 +460,7 @@ async fn running_activity_heartbeat_observes_workflow_cancellation() {
             max_execution_timeout_ceiling: None,
             concurrency_key: None,
             concurrency_limit: None,
-            priority: Default::default(),
+            priority: Priority::default(),
         },
     )
     .await
@@ -564,6 +565,7 @@ fn uncooperative_registry(probe: UncooperativeActivityProbe) -> Arc<HandlerRegis
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
 async fn uncooperative_activity_is_hard_aborted_after_grace_period() {
     let (database_url, _container) = setup_test_database_url().await;
     let pool = build_test_pool(&database_url);
@@ -591,6 +593,7 @@ async fn uncooperative_activity_is_hard_aborted_after_grace_period() {
                 build_id: String::new(),
                 deployment_name: None,
                 workflow_cache_size: 1000,
+                priority_aging_secs: None,
             },
             registry,
         )
@@ -624,7 +627,7 @@ async fn uncooperative_activity_is_hard_aborted_after_grace_period() {
             max_execution_timeout_ceiling: None,
             concurrency_key: None,
             concurrency_limit: None,
-            priority: Default::default(),
+            priority: Priority::default(),
         },
     )
     .await

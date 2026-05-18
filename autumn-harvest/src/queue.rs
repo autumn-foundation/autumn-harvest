@@ -987,7 +987,7 @@ pub async fn wake_workflow_task(
 /// found by this filter and the function returns `false`.
 ///
 /// Returns `true` when the update was applied, `false` when the task was not
-/// found or was already running/terminal.
+/// found in an updatable state (terminal tasks return `false`).
 ///
 /// # Errors
 ///
@@ -1002,7 +1002,7 @@ pub async fn update_task_priority(
     let updated = diesel::update(
         dsl::harvest_task_queue
             .find(task_id)
-            .filter(dsl::state.eq("PENDING")),
+            .filter(dsl::state.eq_any(["PENDING", "RUNNING"])),
     )
     .set(dsl::priority.eq(priority.as_i32()))
     .execute(conn)
@@ -1010,6 +1010,25 @@ pub async fn update_task_priority(
     .map_err(crate::error::database_error)?;
 
     Ok(updated > 0)
+}
+
+/// Returns `true` if a task with the given ID exists in the queue (regardless of state).
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub async fn task_exists(conn: &mut AsyncPgConnection, task_id: Uuid) -> HarvestResult<bool> {
+    use crate::schema::harvest_task_queue::dsl;
+
+    let found: Option<Uuid> = dsl::harvest_task_queue
+        .filter(dsl::id.eq(task_id))
+        .select(dsl::id)
+        .first::<Uuid>(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?;
+
+    Ok(found.is_some())
 }
 
 // ---------------------------------------------------------------------------

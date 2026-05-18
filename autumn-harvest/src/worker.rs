@@ -4943,6 +4943,7 @@ mod tests {
             build_id: String::new(),
             deployment_name: None,
             workflow_cache_size: 1000,
+            priority_aging_secs: None,
         }
     }
 
@@ -5000,6 +5001,7 @@ mod tests {
             build_id: String::new(),
             deployment_name: None,
             query_timeout: Duration::from_secs(5),
+            priority_aging_secs: None,
         };
 
         let runtime_cfg: WorkerRuntimeConfig = builder_cfg.into();

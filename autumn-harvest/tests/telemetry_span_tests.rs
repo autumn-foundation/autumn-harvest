@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use autumn_harvest::info::{ActivityInfo, WorkflowInfo};
-use autumn_harvest::types::{ExecutionId, ShardId};
+use autumn_harvest::types::{ExecutionId, Priority, ShardId};
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{
     ActivityContext, StartWorkflowParams, WorkflowContext, WorkflowIdReusePolicy,
@@ -294,7 +294,7 @@ fn all_adr_0001_span_kinds_are_emitted() {
                     max_execution_timeout_ceiling: None,
                     concurrency_key: None,
                     concurrency_limit: None,
-                    priority: Default::default(),
+                    priority: Priority::default(),
                 },
             )
             .await
@@ -322,6 +322,7 @@ fn all_adr_0001_span_kinds_are_emitted() {
                         build_id: String::new(),
                         deployment_name: None,
                         workflow_cache_size: 1000,
+                        priority_aging_secs: None,
                     },
                     registry,
                 )
