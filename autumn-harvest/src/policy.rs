@@ -428,6 +428,10 @@ pub struct WorkflowSchedule {
     /// `reason = "buffer_full"`. Defaults to `100`.
     #[serde(default = "default_buffer_all_max")]
     pub buffer_all_max: u32,
+    /// Per-run execution timeout propagated to every workflow started by this
+    /// schedule. `None` = no deadline enforced (today's behaviour).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_timeout: Option<std::time::Duration>,
 }
 
 const fn default_buffer_all_max() -> u32 {
@@ -454,7 +458,18 @@ impl WorkflowSchedule {
             jitter: Duration::ZERO,
             overlap_policy: OverlapPolicy::Skip,
             buffer_all_max: 100,
+            execution_timeout: None,
         }
+    }
+
+    /// Set the per-run execution timeout for this schedule.
+    ///
+    /// Every workflow started by this schedule will have its `deadline_at` set
+    /// to `started_at + timeout`.  `None` disables the per-run deadline.
+    #[must_use]
+    pub const fn with_execution_timeout(mut self, timeout: Duration) -> Self {
+        self.execution_timeout = Some(timeout);
+        self
     }
 
     /// Set the JSON input passed to each scheduled run.

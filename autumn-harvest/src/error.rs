@@ -30,6 +30,9 @@ pub enum TimeoutType {
     ScheduleToClose,
     /// Activity stopped sending heartbeats.
     Heartbeat,
+    /// Total wall-clock execution time from `WorkflowStarted` to terminal state
+    /// exceeded the configured `execution_timeout` (issue #243).
+    WorkflowExecution,
 }
 
 impl std::fmt::Display for TimeoutType {
@@ -39,6 +42,7 @@ impl std::fmt::Display for TimeoutType {
             Self::ScheduleToStart => write!(f, "ScheduleToStart"),
             Self::ScheduleToClose => write!(f, "ScheduleToClose"),
             Self::Heartbeat => write!(f, "Heartbeat"),
+            Self::WorkflowExecution => write!(f, "WorkflowExecution"),
         }
     }
 }
@@ -299,6 +303,26 @@ mod tests {
         assert_eq!(TimeoutType::ScheduleToStart.to_string(), "ScheduleToStart");
         assert_eq!(TimeoutType::ScheduleToClose.to_string(), "ScheduleToClose");
         assert_eq!(TimeoutType::Heartbeat.to_string(), "Heartbeat");
+        assert_eq!(TimeoutType::WorkflowExecution.to_string(), "WorkflowExecution");
+    }
+
+    #[test]
+    fn timeout_type_workflow_execution_round_trips_serde() {
+        let t = TimeoutType::WorkflowExecution;
+        let json = serde_json::to_string(&t).unwrap();
+        let back: TimeoutType = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, TimeoutType::WorkflowExecution);
+    }
+
+    #[test]
+    fn harvest_error_timeout_workflow_execution_display() {
+        let e = HarvestError::Timeout {
+            timeout_type: TimeoutType::WorkflowExecution,
+            task_name: "billing_reconciliation".into(),
+        };
+        let msg = e.to_string();
+        assert!(msg.contains("billing_reconciliation"));
+        assert!(msg.contains("WorkflowExecution"));
     }
 
     #[test]

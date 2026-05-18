@@ -168,6 +168,7 @@ async fn start_workflow_stores_captured_trace_context_in_task_queue() {
             name: "echo_workflow",
             module: "telemetry_propagation_tests",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            execution_timeout: None,
         }],
         vec![],
         Arc::new(HashMap::new()),
@@ -255,6 +256,7 @@ async fn start_workflow_leaves_trace_context_null_when_no_propagator() {
             name: "echo_workflow",
             module: "telemetry_propagation_tests",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            execution_timeout: None,
         }],
         vec![],
     ));

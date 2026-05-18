@@ -318,6 +318,7 @@ fn approval_registry() -> Arc<HandlerRegistry> {
             name: "approval_workflow",
             module: "tests",
             handler: approval_workflow,
+            execution_timeout: None,
         }],
         vec![],
     ))
@@ -330,11 +331,13 @@ fn approval_and_timer_signal_registry() -> Arc<HandlerRegistry> {
                 name: "approval_workflow",
                 module: "tests",
                 handler: approval_workflow,
+                execution_timeout: None,
             },
             WorkflowInfo {
                 name: "timer_then_signal_workflow",
                 module: "tests",
                 handler: timer_then_signal_workflow,
+                execution_timeout: None,
             },
         ],
         vec![],
@@ -633,6 +636,7 @@ async fn seed_dag_run_on_url(database_url: &str, dag_name: &str) -> uuid::Uuid {
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
+            deadline_at: None,
             memo: None,
             search_attrs: None,
             assigned_build_id: None,
@@ -950,6 +954,7 @@ async fn seed_scheduled_activity_task_from_url(
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
+            deadline_at: None,
             memo: None,
             search_attrs: None,
             assigned_build_id: None,
@@ -1740,6 +1745,7 @@ fn workflow_info_named(name: &'static str) -> WorkflowInfo {
         name,
         module: "tests",
         handler: approval_workflow,
+        execution_timeout: None,
     }
 }
 
@@ -2561,6 +2567,7 @@ async fn external_runner_processes_workflows_started_via_management_api() {
                 name: "approval_workflow",
                 module: "tests",
                 handler: approval_workflow,
+                execution_timeout: None,
             }])
             .build(),
         &HarvestRuntimeConfig {
@@ -2584,6 +2591,7 @@ async fn external_runner_processes_workflows_started_via_management_api() {
                 name: "approval_workflow",
                 module: "tests",
                 handler: approval_workflow,
+                execution_timeout: None,
             }])
             .build(),
         &HarvestRuntimeConfig {
@@ -2650,6 +2658,7 @@ async fn worker_enqueues_multiple_activity_commands_from_one_workflow_task() {
             name: "parallel_activities_workflow",
             module: "tests",
             handler: parallel_activities_workflow,
+            execution_timeout: None,
         }],
         vec![
             recording_activity_info("parallel_a"),
@@ -2693,6 +2702,7 @@ async fn worker_does_not_reschedule_inflight_parallel_activity_after_sibling_com
             name: "staggered_parallel_workflow",
             module: "tests",
             handler: staggered_parallel_workflow,
+            execution_timeout: None,
         }],
         vec![
             recording_activity_info("parallel_fast"),
@@ -2745,6 +2755,7 @@ async fn worker_resolves_parallel_sibling_tasks_that_share_activity_name() {
             name: "parallel_same_activity_workflow",
             module: "tests",
             handler: parallel_same_activity_workflow,
+            execution_timeout: None,
         }],
         vec![recording_activity_info("shared_parallel")],
         Arc::new(state),
@@ -2784,6 +2795,7 @@ async fn worker_serializes_terminal_events_for_parallel_activity_completions() {
             name: "barrier_parallel_workflow",
             module: "tests",
             handler: barrier_parallel_workflow,
+            execution_timeout: None,
         }],
         vec![
             recording_activity_info("barrier_first"),
@@ -2831,6 +2843,7 @@ async fn worker_does_not_append_completion_after_activity_timeout() {
             name: "timeout_completion_race_workflow",
             module: "tests",
             handler: timeout_completion_race_workflow,
+            execution_timeout: None,
         }],
         vec![blocking_activity_info(
             "timeout_completion_race",
@@ -2976,7 +2989,7 @@ async fn timeout_sweeper_does_not_append_timeout_after_activity_completion() {
         .await
         .expect("failed to connect for timeout enforcement");
     let timeout_handle = tokio::spawn(async move {
-        autumn_harvest::timeout::enforce_timeouts_once(&mut timeout_conn).await
+        autumn_harvest::timeout::enforce_timeouts_once(&mut timeout_conn, &autumn_harvest::telemetry::NoOpMetrics).await
     });
     tokio::time::sleep(Duration::from_millis(150)).await;
 
@@ -3428,6 +3441,7 @@ async fn harvest_api_lists_and_triggers_manual_dags() {
             name: "manual_pipeline",
             module: "tests",
             handler: manual_pipeline_workflow,
+            execution_timeout: None,
         }],
         vec![],
     ));
@@ -3690,6 +3704,7 @@ async fn harvest_api_defers_manual_dag_trigger_when_schedule_is_paused() {
         jitter: Duration::ZERO,
         overlap_policy: autumn_harvest::OverlapPolicy::Skip,
         buffer_all_max: 100u32,
+        execution_timeout: None,
     };
     let registry = Arc::new(HandlerRegistry::new(
         vec![workflow_info_named(dag_name)],
@@ -4157,6 +4172,7 @@ async fn harvest_api_backfill_matches_fractional_legacy_dag_workflow_id() {
         jitter: Duration::ZERO,
         overlap_policy: autumn_harvest::OverlapPolicy::Skip,
         buffer_all_max: 100u32,
+        execution_timeout: None,
     };
 
     {
@@ -4242,6 +4258,7 @@ async fn harvest_api_rejects_backfill_for_unregistered_dag_schedule_row() {
         jitter: Duration::ZERO,
         overlap_policy: autumn_harvest::OverlapPolicy::Skip,
         buffer_all_max: 100u32,
+        execution_timeout: None,
     };
 
     {
@@ -4306,6 +4323,7 @@ async fn scheduler_tick_creates_and_executes_due_interval_runs() {
             name: "interval_pipeline",
             module: "tests",
             handler: interval_pipeline_workflow,
+            execution_timeout: None,
         }],
         vec![ActivityInfo {
             name: "interval_step",
@@ -4395,6 +4413,7 @@ async fn concurrent_scheduler_ticks_activate_due_dag_run_once() {
             name: "interval_pipeline",
             module: "tests",
             handler: interval_pipeline_workflow,
+            execution_timeout: None,
         }],
         vec![recording_activity_info("interval_step")],
         Arc::new(state),
@@ -4570,6 +4589,7 @@ async fn register_workflow_schedules_accepts_unified_dag_schedule_rows() {
         jitter: Duration::ZERO,
         overlap_policy: autumn_harvest::OverlapPolicy::Skip,
         buffer_all_max: 100u32,
+        execution_timeout: None,
     };
 
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
@@ -4602,6 +4622,7 @@ async fn register_workflow_schedules_preserves_existing_dag_marker_for_workflow_
         jitter: Duration::ZERO,
         overlap_policy: autumn_harvest::OverlapPolicy::Skip,
         buffer_all_max: 100u32,
+        execution_timeout: None,
     };
     let workflow_only_update = WorkflowSchedule::new(
         "preserve_dag_marker",
@@ -4652,6 +4673,7 @@ async fn register_workflow_schedules_migrates_legacy_workflow_only_dag_row() {
         jitter: Duration::ZERO,
         overlap_policy: autumn_harvest::OverlapPolicy::Skip,
         buffer_all_max: 100u32,
+        execution_timeout: None,
     };
     let unified_dag_row = WorkflowSchedule {
         workflow_name: "legacy_workflow_only_dag".to_string(),
@@ -4665,6 +4687,7 @@ async fn register_workflow_schedules_migrates_legacy_workflow_only_dag_row() {
         jitter: Duration::ZERO,
         overlap_policy: autumn_harvest::OverlapPolicy::Skip,
         buffer_all_max: 100u32,
+        execution_timeout: None,
     };
 
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
@@ -4707,6 +4730,7 @@ async fn ensure_dag_schedule_reuses_paused_legacy_workflow_only_dag_row() {
         jitter: Duration::ZERO,
         overlap_policy: autumn_harvest::OverlapPolicy::Skip,
         buffer_all_max: 100u32,
+        execution_timeout: None,
     };
     let paused_at = chrono::DateTime::parse_from_rfc3339("2026-05-14T02:00:00.123456Z")
         .expect("fixed pause timestamp should parse")
@@ -4813,6 +4837,7 @@ async fn register_workflow_schedules_reuses_existing_dag_schedule_row_on_upgrade
         jitter: Duration::ZERO,
         overlap_policy: autumn_harvest::OverlapPolicy::Skip,
         buffer_all_max: 100u32,
+        execution_timeout: None,
     };
 
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
@@ -4876,6 +4901,7 @@ async fn register_workflow_schedules_merges_split_legacy_dag_rows_before_upgrade
         jitter: Duration::ZERO,
         overlap_policy: autumn_harvest::OverlapPolicy::Skip,
         buffer_all_max: 100u32,
+        execution_timeout: None,
     };
     let unified_dag_row = WorkflowSchedule {
         workflow_name: dag_name.to_string(),
@@ -4889,6 +4915,7 @@ async fn register_workflow_schedules_merges_split_legacy_dag_rows_before_upgrade
         jitter: Duration::ZERO,
         overlap_policy: autumn_harvest::OverlapPolicy::Skip,
         buffer_all_max: 100u32,
+        execution_timeout: None,
     };
 
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
@@ -4965,6 +4992,7 @@ async fn register_workflow_schedules_preserves_pause_metadata_when_merging_split
         jitter: Duration::ZERO,
         overlap_policy: autumn_harvest::OverlapPolicy::Skip,
         buffer_all_max: 100u32,
+        execution_timeout: None,
     };
     let unified_dag_row = WorkflowSchedule {
         workflow_name: dag_name.to_string(),
@@ -4978,6 +5006,7 @@ async fn register_workflow_schedules_preserves_pause_metadata_when_merging_split
         jitter: Duration::ZERO,
         overlap_policy: autumn_harvest::OverlapPolicy::Skip,
         buffer_all_max: 100u32,
+        execution_timeout: None,
     };
 
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
@@ -5049,6 +5078,7 @@ async fn scheduler_tick_dispatches_scheduled_unified_dag_on_dag_shard() {
         jitter: Duration::ZERO,
         overlap_policy: autumn_harvest::OverlapPolicy::Skip,
         buffer_all_max: 100u32,
+        execution_timeout: None,
     };
     let harvest_pool = build_two_shard_pool(&shard0_url, &shard1_url);
     let registry = Arc::new(HandlerRegistry::new(
@@ -5154,6 +5184,7 @@ async fn scheduler_tick_removes_stale_unified_dag_schedule_from_old_shard() {
         jitter: Duration::ZERO,
         overlap_policy: autumn_harvest::OverlapPolicy::Skip,
         buffer_all_max: 100u32,
+        execution_timeout: None,
     };
     let harvest_pool = build_two_shard_pool(&shard0_url, &shard1_url);
     let registry = Arc::new(HandlerRegistry::new(
@@ -5245,6 +5276,7 @@ async fn scheduler_tick_removes_legacy_workflow_only_dag_schedule_from_old_shard
         jitter: Duration::ZERO,
         overlap_policy: autumn_harvest::OverlapPolicy::Skip,
         buffer_all_max: 100u32,
+        execution_timeout: None,
     };
     let harvest_pool = build_two_shard_pool(&shard0_url, &shard1_url);
     let registry = Arc::new(HandlerRegistry::new(
@@ -5266,6 +5298,7 @@ async fn scheduler_tick_removes_legacy_workflow_only_dag_schedule_from_old_shard
             jitter: Duration::ZERO,
             overlap_policy: autumn_harvest::OverlapPolicy::Skip,
             buffer_all_max: 100u32,
+            execution_timeout: None,
         };
         let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&shard0_url)
             .await
@@ -5347,6 +5380,7 @@ async fn scheduler_tick_removes_stale_classic_dag_schedule_from_old_shard() {
         jitter: Duration::ZERO,
         overlap_policy: autumn_harvest::OverlapPolicy::Skip,
         buffer_all_max: 100u32,
+        execution_timeout: None,
     };
     let harvest_pool = build_two_shard_pool(&shard0_url, &shard1_url);
     let registry = Arc::new(HandlerRegistry::new(
@@ -5436,6 +5470,7 @@ async fn scheduler_tick_does_not_dispatch_removed_dag_schedule_rows() {
         jitter: Duration::ZERO,
         overlap_policy: autumn_harvest::OverlapPolicy::Skip,
         buffer_all_max: 100u32,
+        execution_timeout: None,
     };
 
     {

@@ -196,6 +196,7 @@ fn heartbeat_registry(probe: HeartbeatCancellationProbe) -> Arc<HandlerRegistry>
             name: "heartbeat_workflow",
             module: "cancellation_tests",
             handler: heartbeat_workflow,
+            execution_timeout: None,
         }],
         vec![autumn_harvest::info::ActivityInfo {
             name: "heartbeat_activity",
@@ -531,6 +532,7 @@ fn uncooperative_registry(probe: UncooperativeActivityProbe) -> Arc<HandlerRegis
             name: "uncooperative_workflow",
             module: "cancellation_tests",
             handler: uncooperative_workflow,
+            execution_timeout: None,
         }],
         vec![autumn_harvest::info::ActivityInfo {
             name: "uncooperative_activity",

@@ -187,6 +187,12 @@ pub async fn start_or_load_workflow_execution(
     let policy = build_routing::get_build_policy(conn, request.queue_name).await?;
     let assigned_build = policy.map(|p| p.build_id);
 
+    // Compute deadline_at at start time so the scanner can use a simple
+    // indexed range query instead of per-row arithmetic (issue #243).
+    let deadline_at = request
+        .execution_timeout
+        .map(|d| Utc::now() + d);
+
     let row = NewWorkflowExecution {
         id: exec_id.as_uuid(),
         workflow_name: request.workflow_name,
@@ -197,6 +203,7 @@ pub async fn start_or_load_workflow_execution(
         parent_id: request.parent_id,
         queue_name: request.queue_name,
         execution_timeout: request.execution_timeout,
+        deadline_at,
         memo: request.memo.clone(),
         search_attrs: request.search_attrs.clone(),
         assigned_build_id: assigned_build.clone(),

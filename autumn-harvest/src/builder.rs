@@ -53,6 +53,12 @@ pub struct HarvestBuilder {
     retention: RetentionConfig,
     payload_codecs: PayloadCodecs,
     history_policy: WorkflowHistoryPolicy,
+    /// Server-side ceiling on `execution_timeout` (issue #243).
+    ///
+    /// When set, any `start_workflow` call that requests an `execution_timeout`
+    /// larger than this ceiling is rejected with [`BuildError::ExecutionTimeoutExceedsCeiling`].
+    /// `None` means no ceiling is enforced.
+    max_workflow_execution_timeout: Option<Duration>,
 }
 
 impl std::fmt::Debug for HarvestBuilder {
@@ -94,6 +100,8 @@ pub struct BuiltHarvest {
     retention: RetentionConfig,
     payload_codecs: PayloadCodecs,
     history_policy: WorkflowHistoryPolicy,
+    /// Server-side ceiling on `execution_timeout` (issue #243). `None` = no ceiling.
+    pub max_workflow_execution_timeout: Option<Duration>,
 }
 
 impl std::fmt::Debug for BuiltHarvest {
@@ -291,6 +299,15 @@ impl BuiltHarvest {
     #[must_use]
     pub const fn worker_config(&self) -> &WorkerConfig {
         &self.worker_config
+    }
+
+    /// Server-side ceiling on execution timeouts (issue #243).
+    ///
+    /// `None` means no ceiling is enforced; the per-workflow default and
+    /// per-call override are accepted as-is.
+    #[must_use]
+    pub const fn max_workflow_execution_timeout_ceiling(&self) -> Option<Duration> {
+        self.max_workflow_execution_timeout
     }
 
     /// Registered DAG metadata.
@@ -581,6 +598,33 @@ impl HarvestBuilder {
         self
     }
 
+    /// Set a server-side ceiling on `execution_timeout` for all workflows (issue #243).
+    ///
+    /// When set, any `start_workflow` call that provides an `execution_timeout`
+    /// larger than this ceiling is rejected. This acts as a defense against client
+    /// bugs that accidentally request absurdly long deadlines.
+    ///
+    /// `None` (the default) means no ceiling is enforced — per-workflow defaults
+    /// and per-call overrides are accepted as-is.
+    ///
+    /// ## Examples
+    ///
+    /// ```rust
+    /// use autumn_harvest::builder::HarvestBuilder;
+    /// use std::time::Duration;
+    ///
+    /// let built = HarvestBuilder::new()
+    ///     .max_workflow_execution_timeout(Duration::from_secs(86_400)) // 24h ceiling
+    ///     .build();
+    ///
+    /// assert_eq!(built.max_workflow_execution_timeout, Some(Duration::from_secs(86_400)));
+    /// ```
+    #[must_use]
+    pub fn max_workflow_execution_timeout(mut self, ceiling: Duration) -> Self {
+        self.max_workflow_execution_timeout = Some(ceiling);
+        self
+    }
+
     /// Number of registered workflows (used in tests and diagnostics).
     #[must_use]
     pub const fn workflow_count(&self) -> usize {
@@ -665,6 +709,7 @@ impl HarvestBuilder {
             retention: self.retention,
             payload_codecs: self.payload_codecs.clone(),
             history_policy: self.history_policy,
+            max_workflow_execution_timeout: self.max_workflow_execution_timeout,
         })
     }
 }
@@ -1121,6 +1166,7 @@ mod tests {
             name: "test",
             module: "test",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            execution_timeout: None,
         }
     }
 
@@ -1613,5 +1659,41 @@ mod tests {
             }])
             .try_build();
         assert!(result.is_ok());
+    }
+
+    // ── max_workflow_execution_timeout tests (issue #243) ─────────────────────
+
+    #[test]
+    fn builder_max_workflow_execution_timeout_defaults_to_none() {
+        let built = HarvestBuilder::new().build();
+        assert!(
+            built.max_workflow_execution_timeout.is_none(),
+            "default ceiling must be None"
+        );
+    }
+
+    #[test]
+    fn builder_max_workflow_execution_timeout_is_carried_through_build() {
+        let ceiling = Duration::from_secs(86_400);
+        let built = HarvestBuilder::new()
+            .max_workflow_execution_timeout(ceiling)
+            .build();
+        assert_eq!(
+            built.max_workflow_execution_timeout,
+            Some(ceiling),
+            "ceiling must survive build()"
+        );
+    }
+
+    #[test]
+    fn builder_max_workflow_execution_timeout_accessor_matches_field() {
+        let ceiling = Duration::from_secs(3_600);
+        let built = HarvestBuilder::new()
+            .max_workflow_execution_timeout(ceiling)
+            .build();
+        assert_eq!(
+            built.max_workflow_execution_timeout_ceiling(),
+            Some(ceiling)
+        );
     }
 }

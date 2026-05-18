@@ -183,6 +183,7 @@ fn echo_registry() -> Arc<HandlerRegistry> {
             name: "echo_workflow",
             module: "tests",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            execution_timeout: None,
         }],
         vec![],
     ))

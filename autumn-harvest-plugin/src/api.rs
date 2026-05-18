@@ -4976,6 +4976,7 @@ async fn create_workflow_schedule(
         jitter: std::time::Duration::from_secs(request.jitter_secs),
         overlap_policy,
         buffer_all_max: request.buffer_all_max,
+        execution_timeout: None,
     };
     let entry = match upsert_workflow_schedule_and_read_back(&mut conn, &ws).await {
         Ok(e) => e,
@@ -8792,6 +8793,7 @@ mod tests {
                 name: "workflow_only",
                 module: "tests",
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+                execution_timeout: None,
             }],
             vec![],
         ));

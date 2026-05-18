@@ -463,6 +463,7 @@ async fn insert_workflow_execution(conn: &mut AsyncPgConnection) -> ExecutionId 
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,
+        deadline_at: None,
         memo: None,
         search_attrs: None,
         assigned_build_id: None,
@@ -666,11 +667,13 @@ fn child_round_trip_registry() -> Arc<HandlerRegistry> {
                 name: "e2e_test_workflow",
                 module: "integration_e2e",
                 handler: parent_workflow_with_child,
+                execution_timeout: None,
             },
             WorkflowInfo {
                 name: "child_echo_workflow",
                 module: "integration_e2e",
                 handler: child_echo_workflow,
+                execution_timeout: None,
             },
         ],
         vec![],
@@ -684,11 +687,13 @@ fn child_continue_as_new_rejection_registry() -> Arc<HandlerRegistry> {
                 name: "e2e_test_workflow",
                 module: "integration_e2e",
                 handler: parent_workflow_with_continue_as_new_child,
+                execution_timeout: None,
             },
             WorkflowInfo {
                 name: "child_continue_as_new_workflow",
                 module: "integration_e2e",
                 handler: continue_as_new_workflow,
+                execution_timeout: None,
             },
         ],
         vec![],
@@ -1149,6 +1154,7 @@ async fn worker_completes_workflow_task_and_persists_result() {
             name: "e2e_test_workflow",
             module: "integration_e2e",
             handler: echo_workflow,
+            execution_timeout: None,
         }],
         vec![],
     ));
@@ -1246,6 +1252,7 @@ async fn worker_marks_workflow_failed_when_handler_errors() {
             name: "e2e_test_workflow",
             module: "integration_e2e",
             handler: failing_workflow,
+            execution_timeout: None,
         }],
         vec![],
     ));
@@ -1357,6 +1364,7 @@ async fn worker_completes_workflow_with_activity_round_trip() {
             name: "e2e_test_workflow",
             module: "integration_e2e",
             handler: workflow_with_activity,
+            execution_timeout: None,
         }],
         vec![ActivityInfo {
             name: "send_email",
@@ -1477,6 +1485,7 @@ async fn activity_retry_resumes_from_persisted_heartbeat_details() {
             name: "e2e_test_workflow",
             module: "integration_e2e",
             handler: workflow_with_checkpointed_activity,
+            execution_timeout: None,
         }],
         vec![ActivityInfo {
             name: "checkpointed_import",
@@ -1706,7 +1715,7 @@ async fn timeout_enforcement_fails_pending_activity_and_wakes_workflow() {
         .await
         .expect("enqueue timed-out activity task failed");
 
-    let enforced = timeout::enforce_timeouts_once(&mut conn)
+    let enforced = timeout::enforce_timeouts_once(&mut conn, &autumn_harvest::telemetry::NoOpMetrics)
         .await
         .expect("timeout enforcement should succeed");
     assert_eq!(enforced, 1);
@@ -1791,6 +1800,7 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
                     name: "e2e_test_workflow",
                     module: "integration_e2e",
                     handler: workflow_with_slow_activity,
+                    execution_timeout: None,
                 }],
                 vec![ActivityInfo {
                     name: "slow_activity",
@@ -1914,6 +1924,7 @@ async fn worker_completes_workflow_with_timer_round_trip() {
                     name: "e2e_test_workflow",
                     module: "integration_e2e",
                     handler: workflow_with_timer,
+                    execution_timeout: None,
                 }],
                 vec![],
             )),
@@ -2167,16 +2178,19 @@ fn parallel_children_registry() -> Arc<HandlerRegistry> {
                 name: "e2e_test_workflow",
                 module: "integration_e2e",
                 handler: parent_workflow_parallel_children,
+                execution_timeout: None,
             },
             WorkflowInfo {
                 name: "child_alpha",
                 module: "integration_e2e",
                 handler: child_alpha_workflow,
+                execution_timeout: None,
             },
             WorkflowInfo {
                 name: "child_beta",
                 module: "integration_e2e",
                 handler: child_beta_workflow,
+                execution_timeout: None,
             },
         ],
         vec![],
@@ -2292,6 +2306,7 @@ async fn worker_builder_state_is_visible_to_workflow_and_activity() {
             name: "e2e_test_workflow",
             module: "integration_e2e",
             handler: workflow_with_builder_state,
+            execution_timeout: None,
         }])
         .activities(vec![ActivityInfo {
             name: "stateful_activity",
@@ -2774,6 +2789,7 @@ async fn worker_completes_workflow_after_signal_delivery() {
             name: "e2e_test_workflow",
             module: "integration_e2e",
             handler: signal_waiting_workflow,
+            execution_timeout: None,
         }],
         vec![],
     ));
@@ -2882,6 +2898,7 @@ async fn worker_handles_early_ingested_signal_before_activity() {
             name: "e2e_test_workflow",
             module: "integration_e2e",
             handler: activity_then_signal_workflow,
+            execution_timeout: None,
         }],
         vec![ActivityInfo {
             name: "send_email",
@@ -2994,6 +3011,7 @@ async fn insert_named_workflow_execution(
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,
+        deadline_at: None,
         memo: None,
         search_attrs: None,
         assigned_build_id: None,
@@ -3279,6 +3297,7 @@ async fn worker_continues_as_new_with_fresh_history_and_same_workflow_id() {
             name: "e2e_test_workflow",
             module: "integration_e2e",
             handler: continue_as_new_workflow,
+            execution_timeout: None,
         }],
         vec![],
     ));
@@ -3375,6 +3394,7 @@ async fn continue_as_new_down_migration_rewrites_historical_runs_for_rollback() 
             name: "e2e_test_workflow",
             module: "integration_e2e",
             handler: continue_as_new_workflow,
+            execution_timeout: None,
         }],
         vec![],
     ));
@@ -4236,6 +4256,7 @@ async fn workflow_schedule_baseline_dispatches_multiple_runs() {
             name: wf_name,
             module: "integration_e2e",
             handler: instant_workflow,
+            execution_timeout: None,
         }],
         vec![],
     ));
@@ -4333,6 +4354,7 @@ async fn workflow_schedule_max_active_runs_enforced() {
             name: wf_name,
             module: "integration_e2e",
             handler: slow_workflow,
+            execution_timeout: None,
         }],
         vec![],
     ));
@@ -4416,6 +4438,7 @@ async fn workflow_schedule_pause_and_resume() {
             name: wf_name,
             module: "integration_e2e",
             handler: instant_workflow,
+            execution_timeout: None,
         }],
         vec![],
     ));
@@ -4661,6 +4684,7 @@ async fn search_attrs_upsert_visible_after_update_and_filterable() {
             name: "approval_search_attrs_workflow",
             module: "integration_e2e",
             handler: approval_search_attrs_workflow,
+            execution_timeout: None,
         }],
         vec![],
     ));
@@ -4790,6 +4814,7 @@ async fn search_attrs_survive_worker_crash_and_resume() {
                 name: "approval_search_attrs_workflow",
                 module: "integration_e2e",
                 handler: approval_search_attrs_workflow,
+                execution_timeout: None,
             }],
             vec![],
         ))
@@ -4877,6 +4902,7 @@ fn workflow_schedule_builder_rejects_unregistered_workflow() {
             name: "some_other_workflow",
             module: "integration_e2e",
             handler: echo_workflow,
+            execution_timeout: None,
         }])
         .workflow_schedule(ws)
         .worker(WorkerConfig::default())
@@ -5205,6 +5231,7 @@ async fn non_retryable_activity_fails_fast_on_attempt_one() {
             name: "e2e_test_workflow",
             module: "integration_e2e",
             handler: workflow_with_activity,
+            execution_timeout: None,
         }],
         vec![ActivityInfo {
             name: "send_email",
@@ -5329,6 +5356,7 @@ async fn legacy_string_failure_in_non_retryable_errors_fails_fast() {
             name: "e2e_test_workflow",
             module: "integration_e2e",
             handler: workflow_with_activity,
+            execution_timeout: None,
         }],
         vec![ActivityInfo {
             name: "send_email",
@@ -5457,6 +5485,7 @@ async fn overlap_policy_skip_explicitly_drops_new_firings() {
             name: wf_name,
             module: "integration_e2e",
             handler: slow_workflow,
+            execution_timeout: None,
         }],
         vec![],
     ));
@@ -5516,6 +5545,7 @@ async fn overlap_policy_buffer_one_queues_single_slot() {
             name: wf_name,
             module: "integration_e2e",
             handler: slow_workflow,
+            execution_timeout: None,
         }],
         vec![],
     ));
@@ -5584,6 +5614,7 @@ async fn overlap_policy_buffer_all_queues_multiple_slots() {
             name: wf_name,
             module: "integration_e2e",
             handler: slow_workflow,
+            execution_timeout: None,
         }],
         vec![],
     ));
@@ -5656,6 +5687,7 @@ async fn overlap_policy_cancel_other_cancels_inflight_run() {
             name: wf_name,
             module: "integration_e2e",
             handler: slow_workflow,
+            execution_timeout: None,
         }],
         vec![],
     ));
@@ -5723,6 +5755,7 @@ async fn overlap_policy_terminate_other_terminates_inflight_run() {
             name: wf_name,
             module: "integration_e2e",
             handler: slow_workflow,
+            execution_timeout: None,
         }],
         vec![],
     ));
@@ -5793,6 +5826,7 @@ async fn overlap_policy_buffer_one_survives_scheduler_restart() {
             name: wf_name,
             module: "integration_e2e",
             handler: slow_workflow,
+            execution_timeout: None,
         }],
         vec![],
     ));
@@ -5884,4 +5918,147 @@ async fn overlap_policy_buffer_one_survives_scheduler_restart() {
 
     scheduler2.shutdown();
     let _ = scheduler2.join().await;
+}
+
+/// A workflow blocked on `wait_for_signal` with a short `execution_timeout`
+/// must be transitioned to `TIMED_OUT` by the timeout scanner.
+///
+/// Regression guard for issue #243: verifies the full end-to-end path:
+/// 1. Workflow is started with a 200 ms execution timeout.
+/// 2. The workflow runs, hits `wait_for_signal`, and parks (never receiving
+///    a signal — simulating a runaway execution).
+/// 3. `enforce_workflow_execution_timeouts` fires after the deadline elapses.
+/// 4. The execution row transitions to `TIMED_OUT`, the outstanding workflow
+///    task queue row is cancelled, and the history ends with
+///    `WorkflowExecutionTimedOut`.
+#[tokio::test]
+async fn signal_blocked_workflow_times_out_at_deadline() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect to Postgres container");
+
+    // Start the workflow with a short execution deadline.
+    let exec_id = ExecutionId::new();
+    let execution_timeout = chrono::Duration::milliseconds(200);
+    let started_at = Utc::now();
+    let deadline_at = started_at + execution_timeout;
+    let row = NewWorkflowExecution {
+        id: exec_id.as_uuid(),
+        workflow_name: "signal_blocked_wf",
+        workflow_id: "signal-blocked-timeout-001",
+        run_id: uuid::Uuid::new_v4(),
+        shard_id: 0,
+        input: serde_json::json!({}),
+        parent_id: None,
+        queue_name: "default",
+        execution_timeout: Some(execution_timeout),
+        deadline_at: Some(deadline_at),
+        memo: None,
+        search_attrs: None,
+        assigned_build_id: None,
+    };
+    diesel::insert_into(harvest_workflow_executions::table)
+        .values(&row)
+        .execute(&mut conn)
+        .await
+        .expect("insert workflow execution failed");
+
+    // Append WorkflowStarted + SignalWaiting to simulate the workflow parked.
+    store::append_events(
+        &mut conn,
+        exec_id,
+        &[WorkflowEvent::WorkflowStarted {
+            input: serde_json::json!({}),
+            timestamp: Utc::now(),
+        }],
+        0,
+    )
+    .await
+    .expect("append WorkflowStarted failed");
+
+    // Enqueue a RUNNING workflow task (simulating the worker parked the task).
+    let mut params = EnqueueParams::new("default", TaskType::Workflow, serde_json::json!({}));
+    params.workflow_exec_id = Some(exec_id.as_uuid());
+    params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+    let task_id = queue::enqueue(&mut conn, &params)
+        .await
+        .expect("enqueue workflow task failed");
+
+    // Claim and park the task to put it in RUNNING/parked state.
+    let claimed = queue::claim_task(&mut conn, &["default".to_string()], "test-worker-timeout", "")
+        .await
+        .expect("claim task failed")
+        .expect("task should be claimable");
+    assert_eq!(claimed.id, task_id);
+    queue::park_workflow_task(&mut conn, task_id, None)
+        .await
+        .expect("park workflow task failed");
+
+    // Timeout not yet elapsed — scanner should find nothing.
+    let enforced_early = timeout::enforce_workflow_execution_timeouts(
+        &mut conn,
+        &autumn_harvest::telemetry::NoOpMetrics,
+    )
+    .await
+    .expect("early enforcement should succeed");
+    assert_eq!(
+        enforced_early, 0,
+        "scanner should not fire before deadline elapses"
+    );
+
+    // Wait for the deadline to elapse.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    // Now the scanner should detect and enforce the timeout.
+    let enforced = timeout::enforce_workflow_execution_timeouts(
+        &mut conn,
+        &autumn_harvest::telemetry::NoOpMetrics,
+    )
+    .await
+    .expect("timeout enforcement should succeed");
+    assert_eq!(enforced, 1, "scanner should enforce exactly one timeout");
+
+    // Execution must now be in TIMED_OUT state.
+    let execution = load_execution_from_url(&database_url, exec_id).await;
+    assert_eq!(
+        execution.state, "TIMED_OUT",
+        "execution should be TIMED_OUT after deadline elapsed"
+    );
+    assert!(
+        execution.error.as_deref().is_some_and(|e| e.contains("WorkflowExecution")),
+        "execution error should mention WorkflowExecution timeout type"
+    );
+
+    // The outstanding task queue row should be cancelled.
+    let tasks = load_tasks_for_execution_from_url(&database_url, exec_id).await;
+    let workflow_task = tasks.iter().find(|t| t.task_type == "workflow")
+        .expect("workflow task should still be present");
+    assert_eq!(
+        workflow_task.state, "FAILED",
+        "workflow task should be cancelled (FAILED) after execution timeout"
+    );
+
+    // History must end with WorkflowExecutionTimedOut.
+    let history = load_history_from_url(&database_url, exec_id).await;
+    assert!(
+        matches!(
+            history.events.last(),
+            Some(WorkflowEvent::WorkflowExecutionTimedOut { .. })
+        ),
+        "last history event must be WorkflowExecutionTimedOut, got: {:?}",
+        history.events.last()
+    );
+
+    // Verify the deadline fields are surfaced correctly.
+    assert_eq!(
+        execution.deadline_at.map(|d| d.timestamp_millis()),
+        Some(deadline_at.timestamp_millis()),
+        "deadline_at should match what was set at start time"
+    );
+    assert_eq!(
+        execution.execution_timeout,
+        Some(execution_timeout),
+        "execution_timeout should match what was set at start time"
+    );
 }

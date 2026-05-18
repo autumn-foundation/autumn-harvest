@@ -14,7 +14,7 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use chrono::Utc;
-use diesel::{ExpressionMethods, OptionalExtension, QueryDsl, SelectableHelper};
+use diesel::{BoolExpressionMethods, ExpressionMethods, OptionalExtension, QueryDsl, SelectableHelper};
 use diesel_async::RunQueryDsl;
 use diesel_async::pooled_connection::deadpool::Pool;
 use diesel_async::{AsyncConnection, AsyncPgConnection};
@@ -24,7 +24,8 @@ use tokio_util::sync::CancellationToken;
 use crate::error::{HarvestError, HarvestResult, TimeoutType};
 use crate::event::WorkflowEvent;
 use crate::models::{ExternalTask, TaskQueueItem, WorkflowExecution};
-use crate::schema::{harvest_external_tasks, harvest_workflow_executions};
+use crate::schema::{harvest_external_tasks, harvest_task_queue, harvest_workflow_executions};
+use crate::telemetry::MetricsRecorder;
 use crate::types::ActivityExecId;
 use crate::{queue, store};
 
@@ -103,6 +104,24 @@ pub const fn schedule_to_start_timeout_query() -> &'static str {
      WHERE state = 'PENDING' \
      AND schedule_to_start IS NOT NULL \
      AND scheduled_at + schedule_to_start < NOW()"
+}
+
+/// SQL query to find RUNNING workflow executions that have exceeded their
+/// `execution_timeout` wall-clock deadline (issue #243).
+///
+/// A workflow execution is considered timed out when:
+/// - `state = 'RUNNING'`
+/// - `deadline_at IS NOT NULL`
+/// - `deadline_at < NOW()`
+///
+/// `deadline_at` is computed and persisted at start time as
+/// `started_at + execution_timeout`, so this is a simple indexed range scan.
+#[must_use]
+pub const fn workflow_execution_timeout_query() -> &'static str {
+    "SELECT * FROM harvest_workflow_executions \
+     WHERE state = 'RUNNING' \
+     AND deadline_at IS NOT NULL \
+     AND deadline_at < NOW()"
 }
 
 /// Find all tasks that have exceeded their timeout limits.
@@ -549,6 +568,142 @@ pub async fn enforce_external_task_timeouts(conn: &mut AsyncPgConnection) -> Har
     Ok(count)
 }
 
+/// Enforce execution-level timeouts for RUNNING workflow executions whose
+/// `deadline_at` has elapsed (issue #243).
+///
+/// For each expired execution this function:
+/// 1. Appends `WorkflowEvent::WorkflowExecutionTimedOut` to the execution history.
+/// 2. Transitions the execution row to `TIMED_OUT` state.
+/// 3. Cancels/fails the outstanding workflow task in `harvest_task_queue`.
+/// 4. Notifies the parent workflow (if any) via `ChildWorkflowFailed`.
+///
+/// Returns the number of executions that were timed out.
+///
+/// # Errors
+///
+/// Returns the first database or persistence error encountered.
+pub async fn enforce_workflow_execution_timeouts(
+    conn: &mut AsyncPgConnection,
+    metrics: &dyn MetricsRecorder,
+) -> HarvestResult<usize> {
+    let now = Utc::now();
+    let expired: Vec<WorkflowExecution> = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::state.eq("RUNNING"))
+        .filter(harvest_workflow_executions::deadline_at.is_not_null())
+        .filter(harvest_workflow_executions::deadline_at.lt(Some(now)))
+        .select(WorkflowExecution::as_select())
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    let count = expired.len();
+
+    for execution in &expired {
+        let exec_id = execution_id_from_uuid(execution.id);
+        let deadline = execution
+            .deadline_at
+            .expect("workflow_execution_timeout_query guarantees deadline_at IS NOT NULL");
+        let timed_out_at = Utc::now();
+
+        let timeout_event = WorkflowEvent::WorkflowExecutionTimedOut {
+            deadline,
+            timed_out_at,
+        };
+        let error_msg = HarvestError::Timeout {
+            timeout_type: TimeoutType::WorkflowExecution,
+            task_name: execution.workflow_name.clone(),
+        }
+        .to_string();
+
+        let parent_uuid = execution.parent_id;
+        let workflow_name = execution.workflow_name.clone();
+
+        let result = conn
+            .transaction::<(), HarvestError, _>(|conn| {
+                let timeout_event = timeout_event.clone();
+                let error_msg = error_msg.clone();
+                async move {
+                    // Re-check state under lock to guard against concurrent completion.
+                    let current_state: Option<String> = harvest_workflow_executions::table
+                        .find(exec_id.as_uuid())
+                        .for_update()
+                        .select(harvest_workflow_executions::state)
+                        .first(conn)
+                        .await
+                        .optional()
+                        .map_err(crate::error::database_error)?;
+
+                    match current_state.as_deref() {
+                        Some("RUNNING") => {}
+                        _ => return Ok(()), // Already terminal or gone — skip.
+                    }
+
+                    // Append the timeout event to history.
+                    store::append_single_event(conn, exec_id, timeout_event).await?;
+
+                    // Transition execution to TIMED_OUT.
+                    update_workflow_execution_timed_out(conn, exec_id, &error_msg).await?;
+
+                    // Cancel any outstanding workflow task for this execution.
+                    let _rows = diesel::update(
+                        harvest_task_queue::table
+                            .filter(harvest_task_queue::workflow_exec_id.eq(exec_id.as_uuid()))
+                            .filter(harvest_task_queue::task_type.eq("workflow"))
+                            .filter(
+                                harvest_task_queue::state
+                                    .eq("PENDING")
+                                    .or(harvest_task_queue::state.eq("RUNNING")),
+                            ),
+                    )
+                    .set((
+                        harvest_task_queue::state.eq("FAILED"),
+                        harvest_task_queue::error.eq(Some(&error_msg)),
+                        harvest_task_queue::completed_at.eq(Some(Utc::now())),
+                    ))
+                    .execute(conn)
+                    .await
+                    .map_err(crate::error::database_error)?;
+
+                    // Notify parent if this is a child workflow.
+                    if let Some(parent_uuid) = parent_uuid {
+                        wake_parent_for_child_timeout(
+                            conn,
+                            execution_id_from_uuid(parent_uuid),
+                            exec_id,
+                            &error_msg,
+                        )
+                        .await?;
+                    }
+
+                    Ok(())
+                }
+                .scope_boxed()
+            })
+            .await;
+
+        if let Err(error) = result {
+            tracing::error!(
+                exec_id = %exec_id,
+                workflow_name = %workflow_name,
+                error = %error,
+                "failed to enforce workflow execution timeout"
+            );
+            return Err(error);
+        }
+
+        tracing::warn!(
+            exec_id = %exec_id,
+            workflow_name = %workflow_name,
+            deadline = %deadline,
+            "workflow execution timed out"
+        );
+
+        metrics.record_workflow_timeout(&workflow_name, &execution.queue_name);
+    }
+
+    Ok(count)
+}
+
 /// Enforce all currently expired task timeouts against the database state.
 ///
 /// This mutates queue rows and workflow history so timed-out tasks are not
@@ -558,7 +713,10 @@ pub async fn enforce_external_task_timeouts(conn: &mut AsyncPgConnection) -> Har
 /// # Errors
 ///
 /// Returns the first database or persistence error encountered.
-pub async fn enforce_timeouts_once(conn: &mut AsyncPgConnection) -> HarvestResult<usize> {
+pub async fn enforce_timeouts_once(
+    conn: &mut AsyncPgConnection,
+    metrics: &dyn MetricsRecorder,
+) -> HarvestResult<usize> {
     let timed_out = find_timed_out_tasks(conn).await?;
     let mut count = timed_out.len();
 
@@ -588,6 +746,7 @@ pub async fn enforce_timeouts_once(conn: &mut AsyncPgConnection) -> HarvestResul
     }
 
     count += enforce_external_task_timeouts(conn).await?;
+    count += enforce_workflow_execution_timeouts(conn, metrics).await?;
     Ok(count)
 }
 
@@ -602,6 +761,7 @@ pub fn spawn_timeout_checker(
     pool: Pool<AsyncPgConnection>,
     cancel: CancellationToken,
     interval: Duration,
+    telemetry: std::sync::Arc<crate::telemetry::TelemetryConfig>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -616,7 +776,7 @@ pub fn spawn_timeout_checker(
             }
 
             match pool.get().await {
-                Ok(mut conn) => match enforce_timeouts_once(&mut conn).await {
+                Ok(mut conn) => match enforce_timeouts_once(&mut conn, &*telemetry.metrics).await {
                     Ok(enforced_count) if enforced_count > 0 => {
                         tracing::warn!(enforced_count, "enforced timed-out tasks");
                     }
@@ -713,5 +873,22 @@ mod tests {
     fn timeout_reason_equality() {
         assert_eq!(TimeoutReason::Heartbeat, TimeoutReason::Heartbeat);
         assert_ne!(TimeoutReason::Heartbeat, TimeoutReason::StartToClose);
+    }
+
+    // ── Workflow execution timeout query tests (issue #243) ──────────────────
+
+    #[test]
+    fn workflow_execution_timeout_query_references_correct_table_and_columns() {
+        let sql = workflow_execution_timeout_query();
+        assert!(
+            sql.contains("harvest_workflow_executions"),
+            "must query harvest_workflow_executions"
+        );
+        assert!(sql.contains("RUNNING"), "must filter for RUNNING state");
+        assert!(
+            sql.contains("deadline_at"),
+            "must reference deadline_at column"
+        );
+        assert!(sql.contains("NOW()"), "must compare against NOW()");
     }
 }
