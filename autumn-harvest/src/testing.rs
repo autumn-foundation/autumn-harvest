@@ -890,11 +890,11 @@ impl CiReport {
         match &self.fail_on {
             FailOnMode::Any => i32::from(self.report.failed > 0),
             FailOnMode::Rate(threshold) => {
-                let total = self.report.fixtures_total;
-                if total == 0 {
+                let attempted = self.report.succeeded + self.report.failed;
+                if attempted == 0 {
                     return 0;
                 }
-                let pass_rate = self.report.succeeded as f64 / total as f64;
+                let pass_rate = self.report.succeeded as f64 / attempted as f64;
                 i32::from(pass_rate < *threshold)
             }
         }
@@ -989,10 +989,10 @@ impl CiReport {
             r.fixtures_total, r.failed, r.harness_errors, r.skipped,
         );
         for result in &r.results {
-            let file = result.path.file_name().map_or_else(
+            let file = xml_escape(&result.path.file_name().map_or_else(
                 || result.path.to_string_lossy().into_owned(),
                 |n| n.to_string_lossy().into_owned(),
-            );
+            ));
             let classname = xml_escape(&result.workflow_name);
             let _ = writeln!(
                 out,
@@ -1014,7 +1014,10 @@ impl CiReport {
                     );
                     let _ = writeln!(
                         out,
-                        "      kind={kind}, expected={expected:?}, actual={actual:?}, event_index={event_index}"
+                        "      {}",
+                        xml_escape(&format!(
+                            "kind={kind}, expected={expected:?}, actual={actual:?}, event_index={event_index}"
+                        ))
                     );
                     out.push_str("    </failure>\n");
                 }
@@ -1068,19 +1071,32 @@ impl CiReport {
                     actual,
                     event_index,
                 }) => {
-                    let _ = writeln!(
-                        out,
-                        "::error file={file},title={kind}::{kind} at event {event_index}: expected \"{expected}\", got \"{actual}\""
+                    let msg = format!(
+                        "{kind} at event {event_index}: expected \"{expected}\", got \"{actual}\""
                     );
+                    let msg = msg
+                        .replace('%', "%25")
+                        .replace('\n', "%0A")
+                        .replace('\r', "%0D");
+                    let _ = writeln!(out, "::error file={file},title={kind}::{msg}");
                 }
                 FixtureStatus::Failed(ReplayStatus::WorkflowFailed { error, .. }) => {
+                    let msg = error
+                        .replace('%', "%25")
+                        .replace('\n', "%0A")
+                        .replace('\r', "%0D");
                     let _ = writeln!(
                         out,
-                        "::error file={file},title=WorkflowFailed::workflow error: {error}"
+                        "::error file={file},title=WorkflowFailed::workflow error: {msg}"
                     );
                 }
                 FixtureStatus::HarnessError(kind) => {
-                    let _ = writeln!(out, "::error file={file},title=HarnessError::{kind}");
+                    let msg = kind
+                        .to_string()
+                        .replace('%', "%25")
+                        .replace('\n', "%0A")
+                        .replace('\r', "%0D");
+                    let _ = writeln!(out, "::error file={file},title=HarnessError::{msg}");
                 }
             }
         }

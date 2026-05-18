@@ -6,8 +6,10 @@
 //! (c) fixture for an unregistered workflow name (harness error)
 //!
 //! Run with:
+//! ```bash
 //!   cargo test -p autumn-harvest --test replay_verifier_tests \
 //!     --features testing --no-default-features
+//! ```
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -27,7 +29,7 @@ use serde_json::Value;
 // Workflow handler functions for tests
 // ---------------------------------------------------------------------------
 
-/// Canonical: step_one → step_two in that order.
+/// Canonical: `step_one` → `step_two` in that order.
 fn canonical_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -43,7 +45,7 @@ fn canonical_workflow<'a>(
     })
 }
 
-/// Reordered: step_two → step_one — diverges from canonical history.
+/// Reordered: `step_two` → `step_one` — diverges from canonical history.
 fn reordered_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -63,7 +65,7 @@ fn reordered_workflow<'a>(
 // Helper: produce fixture JSON
 // ---------------------------------------------------------------------------
 
-/// Canonical history for `workflow_name`: WorkflowStarted, step_one, step_two.
+/// Canonical history for `workflow_name`: `WorkflowStarted`, `step_one`, `step_two`.
 fn canonical_snapshot_json(workflow_name: &str) -> String {
     let exec_id = ExecutionId::new();
     let id1 = ActivityExecId::new();
@@ -179,15 +181,15 @@ async fn three_fixture_batch_has_expected_counts() {
         fail_result.is_some(),
         "must have exactly one FixtureStatus::Failed result"
     );
-    if let Some(r) = fail_result {
-        if let FixtureStatus::Failed(ReplayStatus::NonDeterminismDetected { kind, .. }) = &r.status
-        {
-            assert_eq!(
-                *kind,
-                NonDeterminismKind::ActivityScheduleMismatch,
-                "failure kind must be ActivityScheduleMismatch, got {kind:?}"
-            );
-        }
+    if let Some(r) = fail_result
+        && let FixtureStatus::Failed(ReplayStatus::NonDeterminismDetected { kind, .. }) =
+            &r.status
+    {
+        assert_eq!(
+            *kind,
+            NonDeterminismKind::ActivityScheduleMismatch,
+            "failure kind must be ActivityScheduleMismatch, got {kind:?}"
+        );
     }
 
     // (c) confirm harness error kind is UnregisteredWorkflow
@@ -442,7 +444,7 @@ async fn text_report_contains_summary_counts() {
 
     // Must mention fixture count and pass/fail status
     assert!(
-        text.contains("2") || text.contains("fixtures"),
+        text.contains('2') || text.contains("fixtures"),
         "text report must mention fixture count: {text}"
     );
     assert!(
