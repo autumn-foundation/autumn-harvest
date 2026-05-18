@@ -322,6 +322,7 @@ fn boundary_validity(
     (valid, unresolved_at_target)
 }
 
+#[allow(clippy::too_many_lines)]
 fn apply_event_to_pending(
     event_id: i64,
     event: &WorkflowEvent,
@@ -421,6 +422,21 @@ fn apply_event_to_pending(
         WorkflowEvent::UpdateCompleted { update_id, .. }
         | WorkflowEvent::UpdateFailed { update_id, .. } => {
             remove_pending(pending, "UpdateAdmitted", &update_id.to_string());
+        }
+        WorkflowEvent::ExternalSignalRequested {
+            signal_id,
+            signal_name,
+            ..
+        } => insert_pending(
+            pending,
+            "ExternalSignalRequested",
+            signal_id.to_string(),
+            Some(signal_name.clone()),
+            event_id,
+        ),
+        WorkflowEvent::ExternalSignalDelivered { signal_id }
+        | WorkflowEvent::ExternalSignalFailed { signal_id, .. } => {
+            remove_pending(pending, "ExternalSignalRequested", &signal_id.to_string());
         }
         _ => {}
     }

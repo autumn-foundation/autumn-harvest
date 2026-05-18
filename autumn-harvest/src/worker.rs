@@ -755,21 +755,31 @@ struct SignalExternalWorkflowRun {
     already_requested: bool,
 }
 
-/// Extract all `SignalExternalWorkflow` commands from an owned command list.
+/// An item in the ordered inline-dispatch batch: either a marker event or a
+/// signal run. Preserving the original command-emission order is required so
+/// that the replay cursor sees events in the exact same sequence as during the
+/// live execution that produced them.
+enum SignalBatchItem {
+    Marker(WorkflowEvent),
+    Signal(SignalExternalWorkflowRun),
+}
+
+/// Extract `SignalExternalWorkflow` and `RecordMarker` commands in emission
+/// order.
 ///
-/// Marker events are also extracted. `result_tx` channels are dropped immediately
-/// — the workflow coroutine is not awaiting them during inline dispatch. All
-/// signals are returned in command-emission order so the history cursor advances
-/// correctly on the replay pass that follows inline dispatch.
-fn extract_signal_external_workflow(
-    commands: Vec<WorkflowCommand>,
-) -> (Vec<WorkflowEvent>, Vec<SignalExternalWorkflowRun>) {
-    let mut markers = Vec::with_capacity(commands.len());
-    let mut signal_runs = Vec::new();
+/// `result_tx` channels are dropped immediately — the workflow coroutine is
+/// not awaiting them during inline dispatch. `RecordUpdateResult` and
+/// `UpsertSearchAttributes` commands are intentionally skipped here because
+/// they were already persisted by the caller before this function is invoked.
+fn extract_signal_external_workflow(commands: Vec<WorkflowCommand>) -> Vec<SignalBatchItem> {
+    let mut items = Vec::with_capacity(commands.len());
     for cmd in commands {
         match cmd {
             WorkflowCommand::RecordMarker { name, details } => {
-                markers.push(WorkflowEvent::MarkerRecorded { name, details });
+                items.push(SignalBatchItem::Marker(WorkflowEvent::MarkerRecorded {
+                    name,
+                    details,
+                }));
             }
             WorkflowCommand::SignalExternalWorkflow {
                 signal_id,
@@ -780,18 +790,18 @@ fn extract_signal_external_workflow(
                 already_requested,
             } => {
                 drop(result_tx);
-                signal_runs.push(SignalExternalWorkflowRun {
+                items.push(SignalBatchItem::Signal(SignalExternalWorkflowRun {
                     signal_id,
                     target,
                     signal_name,
                     payload,
                     already_requested,
-                });
+                }));
             }
             _ => {}
         }
     }
-    (markers, signal_runs)
+    items
 }
 
 /// Deliver all `SignalExternalWorkflow` commands inline and append durability events.
@@ -801,9 +811,9 @@ fn extract_signal_external_workflow(
 /// outside the scope of this function — cross-shard targets are reported as
 /// `target_unknown`.
 ///
-/// Processes each signal run in emission order so the replay cursor advances
-/// correctly. Returns all newly-appended events (markers + per-signal pairs) so
-/// the caller can extend its in-memory replay history without a DB round-trip.
+/// Processes each item in command-emission order so the replay cursor advances
+/// correctly. Returns all newly-appended events in emission order so the caller
+/// can extend its in-memory replay history without a DB round-trip.
 ///
 /// # At-least-once delivery on crash recovery
 ///
@@ -816,61 +826,71 @@ fn extract_signal_external_workflow(
 async fn persist_external_signal_inline(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
-    markers: Vec<WorkflowEvent>,
-    runs: Vec<SignalExternalWorkflowRun>,
+    items: Vec<SignalBatchItem>,
     next_event_id: &mut i32,
 ) -> HarvestResult<Vec<WorkflowEvent>> {
-    let mut new_events: Vec<WorkflowEvent> = markers;
+    let mut new_events: Vec<WorkflowEvent> = Vec::new();
 
-    if !new_events.is_empty() {
-        store::append_events(conn, exec_id, &new_events, *next_event_id).await?;
-        *next_event_id += i32::try_from(new_events.len()).unwrap_or(i32::MAX);
-    }
+    for item in items {
+        match item {
+            SignalBatchItem::Marker(event) => {
+                store::append_events(conn, exec_id, std::slice::from_ref(&event), *next_event_id)
+                    .await?;
+                *next_event_id += 1;
+                new_events.push(event);
+            }
+            SignalBatchItem::Signal(run) => {
+                if !run.already_requested {
+                    let requested = WorkflowEvent::ExternalSignalRequested {
+                        signal_id: run.signal_id,
+                        target: run.target,
+                        signal_name: run.signal_name.clone(),
+                        payload: run.payload.clone(),
+                    };
+                    store::append_events(
+                        conn,
+                        exec_id,
+                        std::slice::from_ref(&requested),
+                        *next_event_id,
+                    )
+                    .await?;
+                    *next_event_id += 1;
+                    new_events.push(requested);
+                }
 
-    for run in runs {
-        if !run.already_requested {
-            let requested = WorkflowEvent::ExternalSignalRequested {
-                signal_id: run.signal_id,
-                target: run.target,
-                signal_name: run.signal_name.clone(),
-                payload: run.payload.clone(),
-            };
-            store::append_events(
-                conn,
-                exec_id,
-                std::slice::from_ref(&requested),
-                *next_event_id,
-            )
-            .await?;
-            *next_event_id += 1;
-            new_events.push(requested);
+                let terminal = match signal::send_signal(
+                    conn,
+                    run.target,
+                    &run.signal_name,
+                    run.payload,
+                )
+                .await
+                {
+                    Ok(()) => WorkflowEvent::ExternalSignalDelivered {
+                        signal_id: run.signal_id,
+                    },
+                    Err(HarvestError::NotFound(_)) => WorkflowEvent::ExternalSignalFailed {
+                        signal_id: run.signal_id,
+                        reason_code: "target_unknown".to_string(),
+                    },
+                    Err(HarvestError::Database(e)) => return Err(HarvestError::Database(e)),
+                    Err(_) => WorkflowEvent::ExternalSignalFailed {
+                        signal_id: run.signal_id,
+                        reason_code: "target_terminal".to_string(),
+                    },
+                };
+
+                store::append_events(
+                    conn,
+                    exec_id,
+                    std::slice::from_ref(&terminal),
+                    *next_event_id,
+                )
+                .await?;
+                *next_event_id += 1;
+                new_events.push(terminal);
+            }
         }
-
-        let terminal =
-            match signal::send_signal(conn, run.target, &run.signal_name, run.payload).await {
-                Ok(()) => WorkflowEvent::ExternalSignalDelivered {
-                    signal_id: run.signal_id,
-                },
-                Err(HarvestError::NotFound(_)) => WorkflowEvent::ExternalSignalFailed {
-                    signal_id: run.signal_id,
-                    reason_code: "target_unknown".to_string(),
-                },
-                Err(HarvestError::Database(e)) => return Err(HarvestError::Database(e)),
-                Err(_) => WorkflowEvent::ExternalSignalFailed {
-                    signal_id: run.signal_id,
-                    reason_code: "target_terminal".to_string(),
-                },
-            };
-
-        store::append_events(
-            conn,
-            exec_id,
-            std::slice::from_ref(&terminal),
-            *next_event_id,
-        )
-        .await?;
-        *next_event_id += 1;
-        new_events.push(terminal);
     }
 
     Ok(new_events)
@@ -3659,11 +3679,24 @@ async fn process_workflow_task(
             WorkflowOutcome::Suspended { commands }
                 if commands
                     .iter()
-                    .any(|c| matches!(c, WorkflowCommand::SignalExternalWorkflow { .. })) =>
+                    .any(|c| matches!(c, WorkflowCommand::SignalExternalWorkflow { .. }))
+                    && commands.iter().all(|c| {
+                        matches!(
+                            c,
+                            WorkflowCommand::SignalExternalWorkflow { .. }
+                                | WorkflowCommand::RecordMarker { .. }
+                                | WorkflowCommand::RecordUpdateResult { .. }
+                                | WorkflowCommand::UpsertSearchAttributes { .. }
+                        )
+                    }) =>
             {
-                // Persist any bookkeeping commands (update-result events, search-attribute
-                // patches) that were emitted before the signal suspension, just as the
-                // RunLocalActivity path does.
+                // Only enters this path when every non-bookkeeping command in the
+                // batch is a SignalExternalWorkflow (or RecordMarker). Mixed batches
+                // that also contain ScheduleActivity / StartTimer / etc. fall through
+                // to the regular suspension path so those commands are not dropped.
+                //
+                // Persist bookkeeping commands (update-result events, search-attribute
+                // patches) first, just as the RunLocalActivity path does.
                 if let Err(e) = persist_update_result_commands(
                     conn,
                     prepared.exec_id,
@@ -3684,12 +3717,11 @@ async fn process_workflow_task(
                     &commands,
                 );
                 drop(execute_span);
-                let (markers, signal_runs) = extract_signal_external_workflow(commands);
+                let items = extract_signal_external_workflow(commands);
                 let new_events = match persist_external_signal_inline(
                     conn,
                     prepared.exec_id,
-                    markers,
-                    signal_runs,
+                    items,
                     &mut next_event_id,
                 )
                 .await
