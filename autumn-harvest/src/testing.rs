@@ -1060,7 +1060,8 @@ impl CiReport {
         use std::fmt::Write as FmtWrite;
         let mut out = String::new();
         for result in &self.report.results {
-            let file = result.path.to_string_lossy();
+            // GitHub command properties are comma/colon-delimited; encode those too.
+            let file = github_escape(&result.path.to_string_lossy());
             match &result.status {
                 FixtureStatus::Passed
                 | FixtureStatus::Skipped { .. }
@@ -1071,31 +1072,18 @@ impl CiReport {
                     actual,
                     event_index,
                 }) => {
-                    let msg = format!(
+                    let title = github_escape(&kind.to_string());
+                    let msg = github_escape(&format!(
                         "{kind} at event {event_index}: expected \"{expected}\", got \"{actual}\""
-                    );
-                    let msg = msg
-                        .replace('%', "%25")
-                        .replace('\n', "%0A")
-                        .replace('\r', "%0D");
-                    let _ = writeln!(out, "::error file={file},title={kind}::{msg}");
+                    ));
+                    let _ = writeln!(out, "::error file={file},title={title}::{msg}");
                 }
                 FixtureStatus::Failed(ReplayStatus::WorkflowFailed { error, .. }) => {
-                    let msg = error
-                        .replace('%', "%25")
-                        .replace('\n', "%0A")
-                        .replace('\r', "%0D");
-                    let _ = writeln!(
-                        out,
-                        "::error file={file},title=WorkflowFailed::workflow error: {msg}"
-                    );
+                    let msg = github_escape(&format!("workflow error: {error}"));
+                    let _ = writeln!(out, "::error file={file},title=WorkflowFailed::{msg}");
                 }
                 FixtureStatus::HarnessError(kind) => {
-                    let msg = kind
-                        .to_string()
-                        .replace('%', "%25")
-                        .replace('\n', "%0A")
-                        .replace('\r', "%0D");
+                    let msg = github_escape(&kind.to_string());
                     let _ = writeln!(out, "::error file={file},title=HarnessError::{msg}");
                 }
             }
@@ -1110,6 +1098,19 @@ fn xml_escape(s: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
+}
+
+/// Escape a string for use in GitHub Actions workflow commands.
+///
+/// The `file=` and `title=` properties are comma-and-colon-delimited; the
+/// message body treats `%`, `\r`, and `\n` as special. Encoding all five keeps
+/// annotations well-formed regardless of fixture path or error content.
+fn github_escape(s: &str) -> String {
+    s.replace('%', "%25")
+        .replace('\r', "%0D")
+        .replace('\n', "%0A")
+        .replace(',', "%2C")
+        .replace(':', "%3A")
 }
 
 // ---------------------------------------------------------------------------
@@ -1247,11 +1248,36 @@ impl ReplayVerifier {
     /// Walk `dir` recursively, collect all `*.json` files, replay each one against
     /// the registered handlers, and return a [`BatchReplayReport`].
     ///
+    /// If `dir` cannot be read (missing, wrong permissions, or a typo in the path),
+    /// the report contains a single `HarnessError` so CI exits 2 instead of silently
+    /// succeeding with zero fixtures.
+    ///
     /// # Panics
     ///
-    /// Panics if a spawned task fails to join (unreachable under normal conditions).
+    /// Panics if the internal semaphore is closed, which cannot happen under normal use.
     pub async fn verify_dir(&self, dir: &std::path::Path) -> BatchReplayReport {
-        let files = collect_json_files(dir);
+        let files = match collect_json_files(dir) {
+            Ok(f) => f,
+            Err(e) => {
+                let result = FixtureResult {
+                    path: dir.to_path_buf(),
+                    workflow_name: String::new(),
+                    execution_id: None,
+                    status: FixtureStatus::HarnessError(HarnessErrorKind::InvalidFixture(format!(
+                        "cannot read fixtures directory: {e}"
+                    ))),
+                };
+                return BatchReplayReport {
+                    fixtures_total: 1,
+                    succeeded: 0,
+                    failed: 0,
+                    harness_errors: 1,
+                    skipped: 0,
+                    results: vec![result],
+                };
+            }
+        };
+
         if files.is_empty() {
             return BatchReplayReport {
                 fixtures_total: 0,
@@ -1284,7 +1310,17 @@ impl ReplayVerifier {
         let mut results: Vec<FixtureResult> = futures::future::join_all(tasks)
             .await
             .into_iter()
-            .filter_map(std::result::Result::ok)
+            .enumerate()
+            .map(|(i, join_result)| {
+                join_result.unwrap_or_else(|e| FixtureResult {
+                    path: std::path::PathBuf::from(format!("<task-{i}>")),
+                    workflow_name: String::new(),
+                    execution_id: None,
+                    status: FixtureStatus::HarnessError(HarnessErrorKind::InvalidFixture(format!(
+                        "task panicked or was cancelled: {e}"
+                    ))),
+                })
+            })
             .collect();
 
         results.sort_by(|a, b| a.path.cmp(&b.path));
@@ -1314,21 +1350,29 @@ impl ReplayVerifier {
 }
 
 /// Recursively collect `*.json` files under `dir`.
-fn collect_json_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+///
+/// Returns `Err` if the top-level `dir` cannot be read so the caller can
+/// surface it as a harness error rather than silently returning zero fixtures.
+fn collect_json_files(dir: &std::path::Path) -> Result<Vec<std::path::PathBuf>, std::io::Error> {
     let mut files = Vec::new();
-    collect_json_files_inner(dir, &mut files);
+    // Probe the top-level directory explicitly so a missing/unreadable path
+    // is distinguishable from a legitimately empty directory.
+    let top = std::fs::read_dir(dir)?;
+    collect_json_files_from(top, &mut files);
     files.sort();
-    files
+    Ok(files)
 }
 
-fn collect_json_files_inner(dir: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
+fn collect_json_files_from(entries: std::fs::ReadDir, files: &mut Vec<std::path::PathBuf>) {
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_dir() {
-            collect_json_files_inner(&path, files);
+        // Use DirEntry::file_type() which does NOT follow symlinks, preventing
+        // infinite recursion on symlink cycles.
+        let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+        if is_dir {
+            if let Ok(sub) = std::fs::read_dir(&path) {
+                collect_json_files_from(sub, files);
+            }
         } else if path.extension().and_then(|s| s.to_str()) == Some("json") {
             files.push(path);
         }

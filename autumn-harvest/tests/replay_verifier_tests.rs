@@ -177,19 +177,18 @@ async fn three_fixture_batch_has_expected_counts() {
             FixtureStatus::Failed(ReplayStatus::NonDeterminismDetected { .. })
         )
     });
+    let r = fail_result.expect("must have exactly one FixtureStatus::Failed result");
     assert!(
-        fail_result.is_some(),
-        "must have exactly one FixtureStatus::Failed result"
+        matches!(
+            &r.status,
+            FixtureStatus::Failed(ReplayStatus::NonDeterminismDetected {
+                kind: NonDeterminismKind::ActivityScheduleMismatch,
+                ..
+            })
+        ),
+        "failure kind must be ActivityScheduleMismatch, got {:?}",
+        r.status
     );
-    if let Some(r) = fail_result
-        && let FixtureStatus::Failed(ReplayStatus::NonDeterminismDetected { kind, .. }) = &r.status
-    {
-        assert_eq!(
-            *kind,
-            NonDeterminismKind::ActivityScheduleMismatch,
-            "failure kind must be ActivityScheduleMismatch, got {kind:?}"
-        );
-    }
 
     // (c) confirm harness error kind is UnregisteredWorkflow
     let harness_err = report.results.iter().find(|r| {
