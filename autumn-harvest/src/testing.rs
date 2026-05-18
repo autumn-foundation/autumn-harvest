@@ -1078,12 +1078,22 @@ impl WorkflowTestEnv {
                     };
                 }
                 WorkflowOutcome::Suspended { commands } => {
-                    let made_progress = self.process_suspension(
+                    let made_progress = match self.process_suspension(
                         commands,
                         &mut history,
                         &mut remaining_signals,
                         &mut call_counts,
-                    );
+                    ) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            return TestRunOutcome {
+                                result: Err(e),
+                                events: history,
+                                exec_id,
+                                state: self.state.clone(),
+                            };
+                        }
+                    };
                     if !made_progress {
                         return TestRunOutcome {
                             result: Err("WorkflowTestEnv: workflow suspended with no resolvable \
@@ -1111,14 +1121,17 @@ impl WorkflowTestEnv {
     }
 
     /// Process one suspension batch: resolve commands and append events.
-    /// Returns `true` if at least one command was resolved.
+    ///
+    /// Returns `Ok(true)` if at least one command was resolved, `Ok(false)` if
+    /// no progress was made, or `Err(msg)` if a harness configuration error was
+    /// encountered (e.g. a missing activity mock or child-workflow stub).
     fn process_suspension(
         &self,
         commands: Vec<WorkflowCommand>,
         history: &mut Vec<WorkflowEvent>,
         remaining_signals: &mut Vec<(String, Value)>,
         call_counts: &mut HashMap<String, u32>,
-    ) -> bool {
+    ) -> Result<bool, String> {
         let signal_will_resolve = commands.iter().any(|cmd| {
             if let WorkflowCommand::WaitForSignal { signal_name, .. } = cmd {
                 remaining_signals.iter().any(|(n, _)| n == signal_name)
@@ -1135,13 +1148,16 @@ impl WorkflowTestEnv {
                 history,
                 remaining_signals,
                 call_counts,
-            );
+            )?;
         }
-        made_progress
+        Ok(made_progress)
     }
 
     /// Resolve a single workflow command and append the resulting events.
-    /// Returns `true` if the command produced progress (events appended).
+    ///
+    /// Returns `Ok(true)` when a command produced progress, `Ok(false)` when
+    /// the command was a no-op, or `Err(msg)` when a mock/stub lookup failed
+    /// (harness configuration error — the test must be fixed, not the workflow).
     fn process_command(
         &self,
         cmd: WorkflowCommand,
@@ -1149,7 +1165,7 @@ impl WorkflowTestEnv {
         history: &mut Vec<WorkflowEvent>,
         remaining_signals: &mut Vec<(String, Value)>,
         call_counts: &mut HashMap<String, u32>,
-    ) -> bool {
+    ) -> Result<bool, String> {
         match cmd {
             WorkflowCommand::ScheduleActivity {
                 activity_id,
@@ -1159,7 +1175,7 @@ impl WorkflowTestEnv {
                 ..
             } => {
                 let call_num = Self::next_call_count(call_counts, &name);
-                let result = self.resolve_activity(&name, act_input.clone(), call_num);
+                let result = self.resolve_activity(&name, act_input.clone(), call_num)?;
                 history.push(WorkflowEvent::ActivityScheduled {
                     activity_id,
                     name: name.clone(),
@@ -1167,7 +1183,7 @@ impl WorkflowTestEnv {
                     queue,
                 });
                 Self::push_activity_terminal(history, activity_id, result);
-                true
+                Ok(true)
             }
 
             WorkflowCommand::RunLocalActivity {
@@ -1177,14 +1193,14 @@ impl WorkflowTestEnv {
                 ..
             } => {
                 let call_num = Self::next_call_count(call_counts, &name);
-                let result = self.resolve_activity(&name, act_input.clone(), call_num);
+                let result = self.resolve_activity(&name, act_input.clone(), call_num)?;
                 history.push(WorkflowEvent::LocalActivityScheduled {
                     activity_id,
                     name: name.clone(),
                     input: act_input,
                 });
                 Self::push_local_activity_terminal(history, activity_id, result);
-                true
+                Ok(true)
             }
 
             WorkflowCommand::StartTimer {
@@ -1195,17 +1211,17 @@ impl WorkflowTestEnv {
                 if signal_will_resolve {
                     // Skip firing the timer — a concurrent signal takes priority
                     // so the workflow takes the signal branch in select!.
-                    return false;
+                    return Ok(false);
                 }
                 history.push(WorkflowEvent::TimerStarted {
                     timer_id: timer_id.clone(),
                     duration_secs,
                 });
                 history.push(WorkflowEvent::TimerFired { timer_id });
-                true
+                Ok(true)
             }
 
-            WorkflowCommand::WaitForSignal { signal_name, .. } => remaining_signals
+            WorkflowCommand::WaitForSignal { signal_name, .. } => Ok(remaining_signals
                 .iter()
                 .position(|(n, _)| n == &signal_name)
                 .is_some_and(|pos| {
@@ -1215,7 +1231,7 @@ impl WorkflowTestEnv {
                         payload,
                     });
                     true
-                }),
+                })),
 
             WorkflowCommand::StartChildWorkflow {
                 child_id,
@@ -1223,7 +1239,7 @@ impl WorkflowTestEnv {
                 input: child_input,
                 ..
             } => {
-                let result = self.resolve_child(&workflow_name, child_input.clone());
+                let result = self.resolve_child(&workflow_name, child_input.clone())?;
                 history.push(WorkflowEvent::ChildWorkflowStarted {
                     child_id,
                     workflow_name,
@@ -1237,7 +1253,7 @@ impl WorkflowTestEnv {
                         history.push(WorkflowEvent::ChildWorkflowFailed { child_id, error });
                     }
                 }
-                true
+                Ok(true)
             }
 
             // WaitForActivity: activity was scheduled in a previous iteration;
@@ -1249,7 +1265,7 @@ impl WorkflowTestEnv {
             | WorkflowCommand::ScheduleExternalActivity { .. }
             | WorkflowCommand::Complete { .. }
             | WorkflowCommand::Fail { .. }
-            | WorkflowCommand::ContinueAsNew { .. } => false,
+            | WorkflowCommand::ContinueAsNew { .. } => Ok(false),
         }
     }
 
@@ -1265,12 +1281,22 @@ impl WorkflowTestEnv {
     /// Resolve an activity (regular or local) using registered mocks.
     ///
     /// Per-call-count results take priority over the general fallback mock.
-    fn resolve_activity(&self, name: &str, input: Value, call_num: u32) -> Result<Value, String> {
+    ///
+    /// Returns `Ok(activity_result)` when a mock is found (the inner `Result`
+    /// is the mock's success/failure value), or `Err(harness_error)` when no
+    /// mock is registered — a harness configuration problem that must be fixed
+    /// in the test, not handled as a workflow-level failure.
+    fn resolve_activity(
+        &self,
+        name: &str,
+        input: Value,
+        call_num: u32,
+    ) -> Result<Result<Value, String>, String> {
         if let Some(result) = self.attempt_results.get(&(name.to_string(), call_num)) {
-            return result.clone();
+            return Ok(result.clone());
         }
         if let Some(mock) = self.activity_mocks.get(name) {
-            return mock(input);
+            return Ok(mock(input));
         }
         Err(format!(
             "WorkflowTestEnv: no mock registered for activity '{name}' \
@@ -1280,9 +1306,12 @@ impl WorkflowTestEnv {
     }
 
     /// Resolve a child workflow using registered stubs.
-    fn resolve_child(&self, name: &str, input: Value) -> Result<Value, String> {
+    ///
+    /// Returns `Ok(child_result)` when a stub is found, or `Err(harness_error)`
+    /// when no stub is registered — must be fixed in the test.
+    fn resolve_child(&self, name: &str, input: Value) -> Result<Result<Value, String>, String> {
         if let Some(mock) = self.child_mocks.get(name) {
-            return mock(input);
+            return Ok(mock(input));
         }
         Err(format!(
             "WorkflowTestEnv: no mock registered for child workflow '{name}'. \
