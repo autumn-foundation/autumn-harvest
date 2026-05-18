@@ -2971,6 +2971,13 @@ async fn persist_workflow_continue_as_new(
         queue::EnqueueParams::new(execution.queue_name.clone(), TaskType::Workflow, input);
     enqueue.workflow_exec_id = Some(new_exec_id.as_uuid());
     enqueue.required_build_id = execution.assigned_build_id.clone();
+    // Propagate the concurrency key from the current task so the new run
+    // continues to be governed by the same fair-share cap (issue #247).
+    enqueue.concurrency_key = persistence.task.concurrency_key.clone();
+    enqueue.max_concurrent = persistence
+        .task
+        .concurrency_cap
+        .map(|cap| u32::try_from(cap).unwrap_or(u32::MAX));
 
     conn.transaction::<(), HarvestError, _>(|conn| {
         async move {
@@ -4585,6 +4592,7 @@ mod tests {
             module: "app::workflows",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             execution_timeout: None,
+            concurrency: None,
         };
 
         let act = ActivityInfo {

@@ -17,6 +17,14 @@ async fn quick_workflow(_ctx: &WorkflowContext) -> Result<(), String> {
     Ok(())
 }
 
+#[workflow(concurrency(key = "input.tenant_id", limit = 10))]
+async fn concurrency_workflow(
+    _ctx: &WorkflowContext,
+    _input: String,
+) -> Result<String, String> {
+    Ok("done".into())
+}
+
 #[test]
 fn workflow_companion_exists_and_returns_info() {
     let info = __autumn_workflow_info_test_workflow();
@@ -24,6 +32,10 @@ fn workflow_companion_exists_and_returns_info() {
     assert!(
         info.execution_timeout.is_none(),
         "no execution_timeout attribute → None"
+    );
+    assert!(
+        info.concurrency.is_none(),
+        "plain workflow should have no concurrency policy"
     );
 }
 
@@ -53,4 +65,15 @@ fn workflow_execution_timeout_attribute_30m() {
         std::time::Duration::from_secs(1_800),
         "30m = 1800 seconds"
     );
+}
+
+#[test]
+fn workflow_concurrency_macro_sets_policy() {
+    let info = __autumn_workflow_info_concurrency_workflow();
+    assert_eq!(info.name, "concurrency_workflow");
+    let policy = info
+        .concurrency
+        .expect("concurrency workflow must have a policy");
+    assert_eq!(policy.key_expr, "input.tenant_id");
+    assert_eq!(policy.limit, 10);
 }

@@ -439,6 +439,7 @@ fn emit_workflow_companion(
                     })
                 },
                 execution_timeout: None,
+                concurrency: ::std::option::Option::None,
             }
         }
     }

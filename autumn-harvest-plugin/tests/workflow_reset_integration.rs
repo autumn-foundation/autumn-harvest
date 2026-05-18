@@ -197,6 +197,8 @@ async fn seed_execution(
             reuse_policy: WorkflowIdReusePolicy::default(),
             trace_context: None,
             max_execution_timeout_ceiling: None,
+            concurrency_key: None,
+            concurrency_limit: None,
         },
     )
     .await
@@ -426,6 +428,7 @@ async fn reset_fork_completes_with_current_code_and_observes_buffered_signal() {
             module: "workflow_reset_integration",
             handler: replay_checkpoints_then_signal,
             execution_timeout: None,
+            concurrency: None,
         }],
         vec![],
     ));

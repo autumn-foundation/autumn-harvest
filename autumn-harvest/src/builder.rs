@@ -1175,6 +1175,7 @@ mod tests {
             module: "test",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             execution_timeout: None,
+            concurrency: None,
         }
     }
 

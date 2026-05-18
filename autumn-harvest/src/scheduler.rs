@@ -697,6 +697,8 @@ pub async fn trigger_unified_dag(
             reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
             trace_context: None,
             max_execution_timeout_ceiling: None,
+            concurrency_key: None,
+            concurrency_limit: None,
         },
     )
     .await
@@ -1591,6 +1593,8 @@ async fn tick_one_workflow_schedule(
                 reuse_policy: scheduled_workflow_reuse_policy(),
                 trace_context: None,
                 max_execution_timeout_ceiling: None,
+                concurrency_key: None,
+                concurrency_limit: None,
             },
         )
         .await;
@@ -1893,6 +1897,8 @@ async fn drain_buffered_schedule_runs(
                     reuse_policy: scheduled_workflow_reuse_policy(),
                     trace_context: None,
                     max_execution_timeout_ceiling: None,
+                    concurrency_key: None,
+                    concurrency_limit: None,
                 },
             )
             .await;

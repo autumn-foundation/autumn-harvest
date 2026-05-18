@@ -16,6 +16,8 @@ pub const MIGRATIONS: diesel_migrations::EmbeddedMigrations =
 
 /// History analyzer and linter.
 pub mod analyzer;
+/// Per-key concurrency limits for tenant fair-share scheduling (issue #247).
+pub mod concurrency;
 /// Audit trail for management API mutations (issue #158).
 #[cfg(feature = "db")]
 pub mod audit;

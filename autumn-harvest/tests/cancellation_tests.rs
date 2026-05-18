@@ -116,6 +116,8 @@ async fn start_test_workflow(conn: &mut AsyncPgConnection) -> autumn_harvest::Ex
             reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
             trace_context: None,
             max_execution_timeout_ceiling: None,
+            concurrency_key: None,
+            concurrency_limit: None,
         },
     )
     .await
@@ -198,6 +200,7 @@ fn heartbeat_registry(probe: HeartbeatCancellationProbe) -> Arc<HandlerRegistry>
             module: "cancellation_tests",
             handler: heartbeat_workflow,
             execution_timeout: None,
+            concurrency: None,
         }],
         vec![autumn_harvest::info::ActivityInfo {
             name: "heartbeat_activity",
@@ -451,6 +454,8 @@ async fn running_activity_heartbeat_observes_workflow_cancellation() {
             reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
             trace_context: None,
             max_execution_timeout_ceiling: None,
+            concurrency_key: None,
+            concurrency_limit: None,
         },
     )
     .await
@@ -535,6 +540,7 @@ fn uncooperative_registry(probe: UncooperativeActivityProbe) -> Arc<HandlerRegis
             module: "cancellation_tests",
             handler: uncooperative_workflow,
             execution_timeout: None,
+            concurrency: None,
         }],
         vec![autumn_harvest::info::ActivityInfo {
             name: "uncooperative_activity",
@@ -612,6 +618,8 @@ async fn uncooperative_activity_is_hard_aborted_after_grace_period() {
             reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
             trace_context: None,
             max_execution_timeout_ceiling: None,
+            concurrency_key: None,
+            concurrency_limit: None,
         },
     )
     .await

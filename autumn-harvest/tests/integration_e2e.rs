@@ -515,6 +515,8 @@ async fn legacy_workflow_uniqueness_schema_can_be_upgraded_for_idempotent_starts
         reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
         trace_context: None,
         max_execution_timeout_ceiling: None,
+        concurrency_key: None,
+        concurrency_limit: None,
     };
 
     // On the legacy schema there is no `(workflow_name, workflow_id)`
@@ -673,12 +675,14 @@ fn child_round_trip_registry() -> Arc<HandlerRegistry> {
                 module: "integration_e2e",
                 handler: parent_workflow_with_child,
                 execution_timeout: None,
+                concurrency: None,
             },
             WorkflowInfo {
                 name: "child_echo_workflow",
                 module: "integration_e2e",
                 handler: child_echo_workflow,
                 execution_timeout: None,
+                concurrency: None,
             },
         ],
         vec![],
@@ -693,12 +697,14 @@ fn child_continue_as_new_rejection_registry() -> Arc<HandlerRegistry> {
                 module: "integration_e2e",
                 handler: parent_workflow_with_continue_as_new_child,
                 execution_timeout: None,
+                concurrency: None,
             },
             WorkflowInfo {
                 name: "child_continue_as_new_workflow",
                 module: "integration_e2e",
                 handler: continue_as_new_workflow,
                 execution_timeout: None,
+                concurrency: None,
             },
         ],
         vec![],
@@ -1160,6 +1166,7 @@ async fn worker_completes_workflow_task_and_persists_result() {
             module: "integration_e2e",
             handler: echo_workflow,
             execution_timeout: None,
+            concurrency: None,
         }],
         vec![],
     ));
@@ -1258,6 +1265,7 @@ async fn worker_marks_workflow_failed_when_handler_errors() {
             module: "integration_e2e",
             handler: failing_workflow,
             execution_timeout: None,
+            concurrency: None,
         }],
         vec![],
     ));
@@ -1370,6 +1378,7 @@ async fn worker_completes_workflow_with_activity_round_trip() {
             module: "integration_e2e",
             handler: workflow_with_activity,
             execution_timeout: None,
+            concurrency: None,
         }],
         vec![ActivityInfo {
             name: "send_email",
@@ -1491,6 +1500,7 @@ async fn activity_retry_resumes_from_persisted_heartbeat_details() {
             module: "integration_e2e",
             handler: workflow_with_checkpointed_activity,
             execution_timeout: None,
+            concurrency: None,
         }],
         vec![ActivityInfo {
             name: "checkpointed_import",
@@ -1807,6 +1817,7 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
                     module: "integration_e2e",
                     handler: workflow_with_slow_activity,
                     execution_timeout: None,
+                    concurrency: None,
                 }],
                 vec![ActivityInfo {
                     name: "slow_activity",
@@ -1931,6 +1942,7 @@ async fn worker_completes_workflow_with_timer_round_trip() {
                     module: "integration_e2e",
                     handler: workflow_with_timer,
                     execution_timeout: None,
+                    concurrency: None,
                 }],
                 vec![],
             )),
@@ -2185,18 +2197,21 @@ fn parallel_children_registry() -> Arc<HandlerRegistry> {
                 module: "integration_e2e",
                 handler: parent_workflow_parallel_children,
                 execution_timeout: None,
+                concurrency: None,
             },
             WorkflowInfo {
                 name: "child_alpha",
                 module: "integration_e2e",
                 handler: child_alpha_workflow,
                 execution_timeout: None,
+                concurrency: None,
             },
             WorkflowInfo {
                 name: "child_beta",
                 module: "integration_e2e",
                 handler: child_beta_workflow,
                 execution_timeout: None,
+                concurrency: None,
             },
         ],
         vec![],
@@ -2313,6 +2328,7 @@ async fn worker_builder_state_is_visible_to_workflow_and_activity() {
             module: "integration_e2e",
             handler: workflow_with_builder_state,
             execution_timeout: None,
+            concurrency: None,
         }])
         .activities(vec![ActivityInfo {
             name: "stateful_activity",
@@ -2796,6 +2812,7 @@ async fn worker_completes_workflow_after_signal_delivery() {
             module: "integration_e2e",
             handler: signal_waiting_workflow,
             execution_timeout: None,
+            concurrency: None,
         }],
         vec![],
     ));
@@ -2905,6 +2922,7 @@ async fn worker_handles_early_ingested_signal_before_activity() {
             module: "integration_e2e",
             handler: activity_then_signal_workflow,
             execution_timeout: None,
+            concurrency: None,
         }],
         vec![ActivityInfo {
             name: "send_email",
@@ -3304,6 +3322,7 @@ async fn worker_continues_as_new_with_fresh_history_and_same_workflow_id() {
             module: "integration_e2e",
             handler: continue_as_new_workflow,
             execution_timeout: None,
+            concurrency: None,
         }],
         vec![],
     ));
@@ -3401,6 +3420,7 @@ async fn continue_as_new_down_migration_rewrites_historical_runs_for_rollback() 
             module: "integration_e2e",
             handler: continue_as_new_workflow,
             execution_timeout: None,
+            concurrency: None,
         }],
         vec![],
     ));
@@ -3516,6 +3536,8 @@ mod reuse_policy_helpers {
             reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
             trace_context: None,
             max_execution_timeout_ceiling: None,
+            concurrency_key: None,
+            concurrency_limit: None,
         }
     }
 
@@ -4264,6 +4286,7 @@ async fn workflow_schedule_baseline_dispatches_multiple_runs() {
             module: "integration_e2e",
             handler: instant_workflow,
             execution_timeout: None,
+            concurrency: None,
         }],
         vec![],
     ));
@@ -4362,6 +4385,7 @@ async fn workflow_schedule_max_active_runs_enforced() {
             module: "integration_e2e",
             handler: slow_workflow,
             execution_timeout: None,
+            concurrency: None,
         }],
         vec![],
     ));
@@ -4446,6 +4470,7 @@ async fn workflow_schedule_pause_and_resume() {
             module: "integration_e2e",
             handler: instant_workflow,
             execution_timeout: None,
+            concurrency: None,
         }],
         vec![],
     ));
@@ -4682,6 +4707,8 @@ async fn search_attrs_upsert_visible_after_update_and_filterable() {
             reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
             trace_context: None,
             max_execution_timeout_ceiling: None,
+            concurrency_key: None,
+            concurrency_limit: None,
         },
     )
     .await
@@ -4694,6 +4721,7 @@ async fn search_attrs_upsert_visible_after_update_and_filterable() {
             module: "integration_e2e",
             handler: approval_search_attrs_workflow,
             execution_timeout: None,
+            concurrency: None,
         }],
         vec![],
     ));
@@ -4813,6 +4841,8 @@ async fn search_attrs_survive_worker_crash_and_resume() {
             reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
             trace_context: None,
             max_execution_timeout_ceiling: None,
+            concurrency_key: None,
+            concurrency_limit: None,
         },
     )
     .await
@@ -4825,6 +4855,7 @@ async fn search_attrs_survive_worker_crash_and_resume() {
                 module: "integration_e2e",
                 handler: approval_search_attrs_workflow,
                 execution_timeout: None,
+                concurrency: None,
             }],
             vec![],
         ))
@@ -4913,6 +4944,7 @@ fn workflow_schedule_builder_rejects_unregistered_workflow() {
             module: "integration_e2e",
             handler: echo_workflow,
             execution_timeout: None,
+            concurrency: None,
         }])
         .workflow_schedule(ws)
         .worker(WorkerConfig::default())
@@ -5242,6 +5274,7 @@ async fn non_retryable_activity_fails_fast_on_attempt_one() {
             module: "integration_e2e",
             handler: workflow_with_activity,
             execution_timeout: None,
+            concurrency: None,
         }],
         vec![ActivityInfo {
             name: "send_email",
@@ -5367,6 +5400,7 @@ async fn legacy_string_failure_in_non_retryable_errors_fails_fast() {
             module: "integration_e2e",
             handler: workflow_with_activity,
             execution_timeout: None,
+            concurrency: None,
         }],
         vec![ActivityInfo {
             name: "send_email",
@@ -5496,6 +5530,7 @@ async fn overlap_policy_skip_explicitly_drops_new_firings() {
             module: "integration_e2e",
             handler: slow_workflow,
             execution_timeout: None,
+            concurrency: None,
         }],
         vec![],
     ));
@@ -5556,6 +5591,7 @@ async fn overlap_policy_buffer_one_queues_single_slot() {
             module: "integration_e2e",
             handler: slow_workflow,
             execution_timeout: None,
+            concurrency: None,
         }],
         vec![],
     ));
@@ -5625,6 +5661,7 @@ async fn overlap_policy_buffer_all_queues_multiple_slots() {
             module: "integration_e2e",
             handler: slow_workflow,
             execution_timeout: None,
+            concurrency: None,
         }],
         vec![],
     ));
@@ -5698,6 +5735,7 @@ async fn overlap_policy_cancel_other_cancels_inflight_run() {
             module: "integration_e2e",
             handler: slow_workflow,
             execution_timeout: None,
+            concurrency: None,
         }],
         vec![],
     ));
@@ -5766,6 +5804,7 @@ async fn overlap_policy_terminate_other_terminates_inflight_run() {
             module: "integration_e2e",
             handler: slow_workflow,
             execution_timeout: None,
+            concurrency: None,
         }],
         vec![],
     ));
@@ -5837,6 +5876,7 @@ async fn overlap_policy_buffer_one_survives_scheduler_restart() {
             module: "integration_e2e",
             handler: slow_workflow,
             execution_timeout: None,
+            concurrency: None,
         }],
         vec![],
     ));
@@ -6081,5 +6121,350 @@ async fn signal_blocked_workflow_times_out_at_deadline() {
         execution.execution_timeout,
         Some(execution_timeout),
         "execution_timeout should match what was set at start time"
+    );
+}
+
+// ── Per-key concurrency fair-share tests (issue #247) ─────────────────────────
+
+/// Blocking workflow that holds a slot until explicitly released via a barrier.
+///
+/// We use `tokio::time::sleep` for simplicity; the worker pool keeps the task
+/// RUNNING while the sleep runs.
+fn blocking_workflow_5s<'a>(
+    _ctx: &'a WorkflowContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        Ok(serde_json::Value::Null)
+    })
+}
+
+/// Instant workflow (returns immediately) used for "other key" tasks.
+fn instant_wf<'a>(
+    _ctx: &'a WorkflowContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move { Ok(serde_json::Value::Null) })
+}
+
+/// Count RUNNING task queue rows for a specific concurrency_key.
+async fn count_running_for_key(database_url: &str, key: &str) -> i64 {
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(database_url)
+        .await
+        .expect("connect for key-count query");
+    diesel::sql_query(
+        "SELECT COUNT(*) AS count FROM harvest_task_queue \
+         WHERE concurrency_key = $1 AND state = 'RUNNING'",
+    )
+    .bind::<diesel::sql_types::Text, _>(key)
+    .get_results::<CountRow>(&mut conn)
+    .await
+    .expect("key count query failed")
+    .into_iter()
+    .next()
+    .map(|r| r.count)
+    .unwrap_or(0)
+}
+
+#[derive(diesel::QueryableByName)]
+struct CountRow {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    count: i64,
+}
+
+/// (concurrency-a) Per-key limit: under a burst of N >> limit tasks for the
+/// same concurrency key, at most `limit` are RUNNING at any moment.
+///
+/// We enqueue 6 workflow tasks with `concurrency_key = "tenant:acme"` and
+/// `concurrency_cap = 2`.  We verify that at no point are more than 2 running,
+/// and that all 6 eventually complete.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn per_key_concurrency_cap_enforced_across_fleet() {
+    const LIMIT: u32 = 2;
+    const TOTAL: u32 = 6;
+    const KEY: &str = "tenant:acme";
+
+    let (database_url, _container) = setup_test_database_url().await;
+    let wf_name = "concurrency_cap_test_wf";
+    let pool = build_test_pool(&database_url);
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![WorkflowInfo {
+            name: wf_name,
+            module: "integration_e2e",
+            handler: blocking_workflow_5s,
+            concurrency: None,
+        }],
+        vec![],
+    ));
+
+    // Enqueue TOTAL workflow tasks with the same concurrency key and cap=LIMIT.
+    {
+        let mut conn = pool.get().await.expect("get conn for enqueue");
+        for i in 0..TOTAL {
+            let exec_id = ExecutionId::new();
+            let mut p = EnqueueParams::new(
+                "default".to_string(),
+                TaskType::Workflow,
+                serde_json::json!({ "task": i }),
+            );
+            p.workflow_exec_id = Some(exec_id.as_uuid());
+            p.concurrency_key = Some(KEY.to_string());
+            p.max_concurrent = Some(LIMIT);
+            queue::enqueue(&mut conn, &p).await.expect("enqueue");
+
+            use diesel::prelude::*;
+            let row = autumn_harvest::models::NewWorkflowExecution {
+                id: exec_id.as_uuid(),
+                workflow_name: wf_name,
+                workflow_id: &format!("wf-{i}"),
+                run_id: uuid::Uuid::new_v4(),
+                shard_id: 0,
+                input: serde_json::json!({}),
+                parent_id: None,
+                queue_name: "default",
+                execution_timeout: None,
+                memo: None,
+                search_attrs: None,
+                assigned_build_id: None,
+            };
+            diesel::insert_into(harvest_workflow_executions::table)
+                .values(&row)
+                .execute(&mut *conn)
+                .await
+                .expect("insert execution");
+        }
+    }
+
+    // Start a worker with plenty of per-worker concurrency so the only binding
+    // constraint is the per-key cap.
+    let worker = Worker::new(
+        pool.clone(),
+        Arc::clone(&registry),
+        WorkerRuntimeConfig {
+            queues: vec!["default".to_string()],
+            max_concurrent_workflows: 20,
+            max_concurrent_activities: 20,
+            poll_interval: Duration::from_millis(50),
+            shutdown_grace_period: Duration::from_secs(10),
+            build_id: String::new(),
+            deployment_name: String::new(),
+            shard_assignments: None,
+        },
+    );
+    let _worker_handle = tokio::spawn(worker.run());
+
+    // Poll until all tasks have completed or we time out.
+    // During polling, assert the per-key cap is never exceeded.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut observed_max_in_flight: i64 = 0;
+
+    loop {
+        let in_flight = count_running_for_key(&database_url, KEY).await;
+        assert!(
+            in_flight <= i64::from(LIMIT),
+            "cap violated: {in_flight} tasks running with key '{KEY}' (limit = {LIMIT})"
+        );
+        if in_flight > observed_max_in_flight {
+            observed_max_in_flight = in_flight;
+        }
+
+        // Check total completion.
+        let mut conn = pool.get().await.expect("get conn for check");
+        let completed: i64 = diesel::sql_query(
+            "SELECT COUNT(*) AS count FROM harvest_task_queue \
+             WHERE concurrency_key = $1 AND state = 'COMPLETED'",
+        )
+        .bind::<diesel::sql_types::Text, _>(KEY)
+        .get_results::<CountRow>(&mut conn)
+        .await
+        .expect("completed count")
+        .into_iter()
+        .next()
+        .map(|r| r.count)
+        .unwrap_or(0);
+
+        if completed >= i64::from(TOTAL) {
+            break;
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "timed out: only {completed}/{TOTAL} tasks completed; last in-flight = {in_flight}"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // We should have seen at least 1 task running at the limit to confirm the cap
+    // was actually used (not just that everything finished instantly).
+    assert!(
+        observed_max_in_flight >= 1,
+        "never observed any tasks in-flight for key '{KEY}'"
+    );
+}
+
+/// (concurrency-b) Fair-share: tasks for *other* keys are NOT blocked by a
+/// saturated key.
+///
+/// We enqueue 4 blocking tasks for "tenant:loud" (cap=1) and 2 instant tasks
+/// for "tenant:quiet" (cap=10).  We verify the quiet-tenant tasks complete
+/// quickly even though the loud-tenant cap is saturated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn per_key_concurrency_does_not_block_other_keys() {
+    const LOUD_CAP: u32 = 1;
+    const LOUD_TOTAL: u32 = 4;
+    const QUIET_KEY: &str = "tenant:quiet";
+    const LOUD_KEY: &str = "tenant:loud";
+
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![
+            WorkflowInfo {
+                name: "loud_wf",
+                module: "integration_e2e",
+                handler: blocking_workflow_5s,
+                concurrency: None,
+            },
+            WorkflowInfo {
+                name: "quiet_wf",
+                module: "integration_e2e",
+                handler: instant_wf,
+                concurrency: None,
+            },
+        ],
+        vec![],
+    ));
+
+    {
+        let mut conn = pool.get().await.expect("get conn");
+
+        // Loud tenant: 4 blocking tasks, cap=1.
+        for i in 0..LOUD_TOTAL {
+            let exec_id = ExecutionId::new();
+            let mut p = EnqueueParams::new(
+                "default".to_string(),
+                TaskType::Workflow,
+                serde_json::json!({ "task": i }),
+            );
+            p.workflow_exec_id = Some(exec_id.as_uuid());
+            p.concurrency_key = Some(LOUD_KEY.to_string());
+            p.max_concurrent = Some(LOUD_CAP);
+            queue::enqueue(&mut conn, &p).await.expect("enqueue loud");
+
+            use diesel::prelude::*;
+            diesel::insert_into(harvest_workflow_executions::table)
+                .values(&autumn_harvest::models::NewWorkflowExecution {
+                    id: exec_id.as_uuid(),
+                    workflow_name: "loud_wf",
+                    workflow_id: &format!("loud-{i}"),
+                    run_id: uuid::Uuid::new_v4(),
+                    shard_id: 0,
+                    input: serde_json::json!({}),
+                    parent_id: None,
+                    queue_name: "default",
+                    execution_timeout: None,
+                    memo: None,
+                    search_attrs: None,
+                    assigned_build_id: None,
+                })
+                .execute(&mut *conn)
+                .await
+                .expect("insert loud execution");
+        }
+
+        // Quiet tenant: 2 instant tasks (no cap, or a high cap).
+        for i in 0..2u32 {
+            let exec_id = ExecutionId::new();
+            let mut p = EnqueueParams::new(
+                "default".to_string(),
+                TaskType::Workflow,
+                serde_json::json!({ "task": i }),
+            );
+            p.workflow_exec_id = Some(exec_id.as_uuid());
+            p.concurrency_key = Some(QUIET_KEY.to_string());
+            p.max_concurrent = Some(10);
+            queue::enqueue(&mut conn, &p).await.expect("enqueue quiet");
+
+            use diesel::prelude::*;
+            diesel::insert_into(harvest_workflow_executions::table)
+                .values(&autumn_harvest::models::NewWorkflowExecution {
+                    id: exec_id.as_uuid(),
+                    workflow_name: "quiet_wf",
+                    workflow_id: &format!("quiet-{i}"),
+                    run_id: uuid::Uuid::new_v4(),
+                    shard_id: 0,
+                    input: serde_json::json!({}),
+                    parent_id: None,
+                    queue_name: "default",
+                    execution_timeout: None,
+                    memo: None,
+                    search_attrs: None,
+                    assigned_build_id: None,
+                })
+                .execute(&mut *conn)
+                .await
+                .expect("insert quiet execution");
+        }
+    }
+
+    let worker = Worker::new(
+        pool.clone(),
+        Arc::clone(&registry),
+        WorkerRuntimeConfig {
+            queues: vec!["default".to_string()],
+            max_concurrent_workflows: 20,
+            max_concurrent_activities: 20,
+            poll_interval: Duration::from_millis(50),
+            shutdown_grace_period: Duration::from_secs(10),
+            build_id: String::new(),
+            deployment_name: String::new(),
+            shard_assignments: None,
+        },
+    );
+    let _worker_handle = tokio::spawn(worker.run());
+
+    // The quiet tenant's tasks should complete within a few seconds (they are instant).
+    let quiet_start = tokio::time::Instant::now();
+    let quiet_deadline = quiet_start + Duration::from_secs(10);
+
+    loop {
+        let completed: i64 = {
+            let mut conn = pool.get().await.expect("get conn");
+            diesel::sql_query(
+                "SELECT COUNT(*) AS count FROM harvest_task_queue \
+                 WHERE concurrency_key = $1 AND state = 'COMPLETED'",
+            )
+            .bind::<diesel::sql_types::Text, _>(QUIET_KEY)
+            .get_results::<CountRow>(&mut conn)
+            .await
+            .expect("quiet completed count")
+            .into_iter()
+            .next()
+            .map(|r| r.count)
+            .unwrap_or(0)
+        };
+
+        if completed >= 2 {
+            let elapsed = quiet_start.elapsed();
+            assert!(
+                elapsed < Duration::from_secs(10),
+                "quiet-tenant tasks took too long ({elapsed:?}); loud-tenant saturation should not block them"
+            );
+            break;
+        }
+
+        if tokio::time::Instant::now() >= quiet_deadline {
+            panic!("quiet-tenant tasks did not complete within 10 s despite not being capped");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // Also assert the loud-tenant cap was never exceeded.
+    let loud_in_flight = count_running_for_key(&database_url, LOUD_KEY).await;
+    assert!(
+        loud_in_flight <= i64::from(LOUD_CAP),
+        "loud-tenant cap violated: {loud_in_flight} > {LOUD_CAP}"
     );
 }

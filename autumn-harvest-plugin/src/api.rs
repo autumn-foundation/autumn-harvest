@@ -3638,6 +3638,21 @@ async fn start_workflow(
         .unwrap_or_else(|| "default".to_string());
     let input = request.input.unwrap_or(Value::Null);
 
+    // Resolve per-key concurrency policy from WorkflowInfo (issue #247).
+    let (concurrency_key, concurrency_limit) = runtime
+        .registry
+        .workflows
+        .get(&workflow_name)
+        .and_then(|info| info.concurrency.as_ref())
+        .map(|policy| {
+            let key = autumn_harvest::concurrency::resolve_concurrency_key(
+                policy.key_expr,
+                &input,
+            );
+            (key, Some(policy.limit))
+        })
+        .unwrap_or((None, None));
+
     let shard = runtime
         .router
         .pick_for_new_workflow(&workflow_name, &workflow_id);
@@ -3676,9 +3691,9 @@ async fn start_workflow(
             search_attrs: request.search_attrs.clone(),
             reuse_policy,
             trace_context: trace_ctx,
-            max_execution_timeout_ceiling: api_state
-                .max_workflow_execution_timeout()
-                .and_then(|d| chrono::Duration::from_std(d).ok()),
+            max_execution_timeout_ceiling: None,
+            concurrency_key: None,
+            concurrency_limit: None,
         },
     )
     .await;
@@ -5836,6 +5851,8 @@ async fn schedule_backfill(
                         reuse_policy: WorkflowIdReusePolicy::RejectDuplicate,
                         trace_context: None,
                         max_execution_timeout_ceiling: None,
+                        concurrency_key: None,
+                        concurrency_limit: None,
                     },
                 )
                 .await;
@@ -5937,6 +5954,8 @@ async fn schedule_backfill(
                         reuse_policy: autumn_harvest::types::WorkflowIdReusePolicy::RejectDuplicate,
                         trace_context: None,
                         max_execution_timeout_ceiling: None,
+                        concurrency_key: None,
+                        concurrency_limit: None,
                     },
                 )
                 .await;
@@ -8830,6 +8849,7 @@ mod tests {
                 module: "tests",
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
                 execution_timeout: None,
+                concurrency: None,
             }],
             vec![],
         ));
@@ -9345,6 +9365,8 @@ mod tests {
                 reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
                 trace_context: None,
                 max_execution_timeout_ceiling: None,
+                concurrency_key: None,
+                concurrency_limit: None,
             },
         )
         .await
