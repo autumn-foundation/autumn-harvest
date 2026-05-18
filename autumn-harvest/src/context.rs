@@ -317,6 +317,7 @@ pub enum WorkflowCommand {
 
 // Manual Debug because oneshot::Sender is not Debug.
 impl std::fmt::Debug for WorkflowCommand {
+    #[allow(clippy::too_many_lines)]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ScheduleActivity {
