@@ -430,6 +430,7 @@ async fn insert_workflow_on_url(
             search_attrs: None,
             reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
             trace_context: None,
+            max_execution_timeout_ceiling: None,
         },
     )
     .await
@@ -495,6 +496,7 @@ async fn insert_child_workflow_on_url(fixture: ChildWorkflowFixture<'_>) -> Exec
             search_attrs: None,
             reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
             trace_context: None,
+            max_execution_timeout_ceiling: None,
         },
     )
     .await
@@ -2989,7 +2991,11 @@ async fn timeout_sweeper_does_not_append_timeout_after_activity_completion() {
         .await
         .expect("failed to connect for timeout enforcement");
     let timeout_handle = tokio::spawn(async move {
-        autumn_harvest::timeout::enforce_timeouts_once(&mut timeout_conn, &autumn_harvest::telemetry::NoOpMetrics).await
+        autumn_harvest::timeout::enforce_timeouts_once(
+            &mut timeout_conn,
+            &autumn_harvest::telemetry::NoOpMetrics,
+        )
+        .await
     });
     tokio::time::sleep(Duration::from_millis(150)).await;
 

@@ -274,6 +274,7 @@ async fn insert_workflow_on_url(
             search_attrs: None,
             reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
             trace_context: None,
+            max_execution_timeout_ceiling: None,
         },
     )
     .await
@@ -1860,6 +1861,7 @@ async fn insert_child_workflow_on_url(
             search_attrs: None,
             reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
             trace_context: None,
+            max_execution_timeout_ceiling: None,
         },
     )
     .await

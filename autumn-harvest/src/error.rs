@@ -303,7 +303,10 @@ mod tests {
         assert_eq!(TimeoutType::ScheduleToStart.to_string(), "ScheduleToStart");
         assert_eq!(TimeoutType::ScheduleToClose.to_string(), "ScheduleToClose");
         assert_eq!(TimeoutType::Heartbeat.to_string(), "Heartbeat");
-        assert_eq!(TimeoutType::WorkflowExecution.to_string(), "WorkflowExecution");
+        assert_eq!(
+            TimeoutType::WorkflowExecution.to_string(),
+            "WorkflowExecution"
+        );
     }
 
     #[test]

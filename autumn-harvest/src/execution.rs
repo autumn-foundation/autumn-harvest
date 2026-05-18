@@ -51,6 +51,12 @@ pub struct StartWorkflowParams<'a> {
     /// `harvest.workflow.schedule` span) and stored on the task row so the worker
     /// can stitch the trace across the queue boundary (ADR-0001 §3).
     pub trace_context: Option<TraceContextCarrier>,
+    /// Server-side ceiling applied to `execution_timeout` (issue #243).
+    ///
+    /// When `Some`, the effective timeout is `execution_timeout.min(ceiling)`.
+    /// `None` means no ceiling is enforced.  Typically populated from
+    /// `BuiltHarvest::max_workflow_execution_timeout` by the plugin layer.
+    pub max_execution_timeout_ceiling: Option<chrono::Duration>,
 }
 
 impl StartWorkflowParams<'_> {
@@ -153,6 +159,7 @@ impl CancelledWorkflowExecution {
 /// - [`HarvestError::AlreadyExists`] when `RejectDuplicate` rejects.
 /// - [`HarvestError::Database`] for insert/query failures.
 /// - Propagates queue/event-store failures from the start transaction.
+#[allow(clippy::too_many_lines)]
 pub async fn start_or_load_workflow_execution(
     conn: &mut AsyncPgConnection,
     request: StartWorkflowParams<'_>,
@@ -187,11 +194,21 @@ pub async fn start_or_load_workflow_execution(
     let policy = build_routing::get_build_policy(conn, request.queue_name).await?;
     let assigned_build = policy.map(|p| p.build_id);
 
+    // Apply the server-side ceiling (if any) before computing the deadline.
+    // The effective timeout is the minimum of the per-call value and the
+    // operator-configured ceiling; this prevents callers from requesting
+    // arbitrarily long SLA windows even when they supply an explicit timeout.
+    let effective_timeout = match (
+        request.execution_timeout,
+        request.max_execution_timeout_ceiling,
+    ) {
+        (Some(t), Some(ceiling)) => Some(t.min(ceiling)),
+        (other, _) => other,
+    };
+
     // Compute deadline_at at start time so the scanner can use a simple
     // indexed range query instead of per-row arithmetic (issue #243).
-    let deadline_at = request
-        .execution_timeout
-        .map(|d| Utc::now() + d);
+    let deadline_at = effective_timeout.map(|d| Utc::now() + d);
 
     let row = NewWorkflowExecution {
         id: exec_id.as_uuid(),
@@ -202,7 +219,7 @@ pub async fn start_or_load_workflow_execution(
         input: request.input.clone(),
         parent_id: request.parent_id,
         queue_name: request.queue_name,
-        execution_timeout: request.execution_timeout,
+        execution_timeout: effective_timeout,
         deadline_at,
         memo: request.memo.clone(),
         search_attrs: request.search_attrs.clone(),

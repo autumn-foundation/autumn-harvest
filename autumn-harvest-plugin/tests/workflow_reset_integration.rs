@@ -192,6 +192,7 @@ async fn seed_execution(
             search_attrs: None,
             reuse_policy: WorkflowIdReusePolicy::default(),
             trace_context: None,
+            max_execution_timeout_ceiling: None,
         },
     )
     .await

@@ -801,9 +801,18 @@ mod tests {
         assert!(event.is_terminal_lifecycle(), "timed-out must be terminal");
 
         let json = serde_json::to_string(&event)?;
-        assert!(json.contains("WorkflowExecutionTimedOut"), "type tag must appear in JSON");
-        assert!(json.contains("deadline"), "deadline field must be serialised");
-        assert!(json.contains("timed_out_at"), "timed_out_at field must be serialised");
+        assert!(
+            json.contains("WorkflowExecutionTimedOut"),
+            "type tag must appear in JSON"
+        );
+        assert!(
+            json.contains("deadline"),
+            "deadline field must be serialised"
+        );
+        assert!(
+            json.contains("timed_out_at"),
+            "timed_out_at field must be serialised"
+        );
 
         let back: WorkflowEvent = serde_json::from_str(&json)?;
         assert!(

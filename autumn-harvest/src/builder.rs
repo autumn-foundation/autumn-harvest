@@ -80,6 +80,10 @@ impl std::fmt::Debug for HarvestBuilder {
             .field("retention", &self.retention)
             .field("payload_codecs", &"configured")
             .field("history_policy", &self.history_policy)
+            .field(
+                "max_workflow_execution_timeout",
+                &self.max_workflow_execution_timeout,
+            )
             .finish()
     }
 }
@@ -119,6 +123,10 @@ impl std::fmt::Debug for BuiltHarvest {
             .field("retention", &self.retention)
             .field("payload_codecs", &"configured")
             .field("history_policy", &self.history_policy)
+            .field(
+                "max_workflow_execution_timeout",
+                &self.max_workflow_execution_timeout,
+            )
             .finish()
     }
 }
@@ -620,7 +628,7 @@ impl HarvestBuilder {
     /// assert_eq!(built.max_workflow_execution_timeout, Some(Duration::from_secs(86_400)));
     /// ```
     #[must_use]
-    pub fn max_workflow_execution_timeout(mut self, ceiling: Duration) -> Self {
+    pub const fn max_workflow_execution_timeout(mut self, ceiling: Duration) -> Self {
         self.max_workflow_execution_timeout = Some(ceiling);
         self
     }

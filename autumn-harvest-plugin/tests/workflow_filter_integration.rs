@@ -163,6 +163,7 @@ async fn seed_workflow(
             search_attrs,
             reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
             trace_context: None,
+            max_execution_timeout_ceiling: None,
         },
     )
     .await

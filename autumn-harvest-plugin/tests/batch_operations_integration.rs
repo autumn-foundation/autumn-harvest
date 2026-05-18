@@ -184,6 +184,7 @@ async fn seed_workflows(database_url: &str, workflow_name: &str, count: usize) -
                 search_attrs: Some(json!({"tenant": "acme"})),
                 reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
                 trace_context: None,
+                max_execution_timeout_ceiling: None,
             },
         )
         .await

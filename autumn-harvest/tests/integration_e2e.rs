@@ -510,6 +510,7 @@ async fn legacy_workflow_uniqueness_schema_can_be_upgraded_for_idempotent_starts
         search_attrs: None,
         reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
         trace_context: None,
+        max_execution_timeout_ceiling: None,
     };
 
     // On the legacy schema there is no `(workflow_name, workflow_id)`
@@ -1715,9 +1716,10 @@ async fn timeout_enforcement_fails_pending_activity_and_wakes_workflow() {
         .await
         .expect("enqueue timed-out activity task failed");
 
-    let enforced = timeout::enforce_timeouts_once(&mut conn, &autumn_harvest::telemetry::NoOpMetrics)
-        .await
-        .expect("timeout enforcement should succeed");
+    let enforced =
+        timeout::enforce_timeouts_once(&mut conn, &autumn_harvest::telemetry::NoOpMetrics)
+            .await
+            .expect("timeout enforcement should succeed");
     assert_eq!(enforced, 1);
 
     let workflow_task = load_task_from_url(&database_url, workflow_task_id).await;
@@ -3509,6 +3511,7 @@ mod reuse_policy_helpers {
             search_attrs: None,
             reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
             trace_context: None,
+            max_execution_timeout_ceiling: None,
         }
     }
 
@@ -4673,6 +4676,7 @@ async fn search_attrs_upsert_visible_after_update_and_filterable() {
             search_attrs: Some(serde_json::json!({"tenant": "acme"})),
             reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
             trace_context: None,
+            max_execution_timeout_ceiling: None,
         },
     )
     .await
@@ -4803,6 +4807,7 @@ async fn search_attrs_survive_worker_crash_and_resume() {
             search_attrs: Some(serde_json::json!({"tenant": "acme"})),
             reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
             trace_context: None,
+            max_execution_timeout_ceiling: None,
         },
     )
     .await
@@ -5986,10 +5991,15 @@ async fn signal_blocked_workflow_times_out_at_deadline() {
         .expect("enqueue workflow task failed");
 
     // Claim and park the task to put it in RUNNING/parked state.
-    let claimed = queue::claim_task(&mut conn, &["default".to_string()], "test-worker-timeout", "")
-        .await
-        .expect("claim task failed")
-        .expect("task should be claimable");
+    let claimed = queue::claim_task(
+        &mut conn,
+        &["default".to_string()],
+        "test-worker-timeout",
+        "",
+    )
+    .await
+    .expect("claim task failed")
+    .expect("task should be claimable");
     assert_eq!(claimed.id, task_id);
     queue::park_workflow_task(&mut conn, task_id, None)
         .await
@@ -6026,13 +6036,18 @@ async fn signal_blocked_workflow_times_out_at_deadline() {
         "execution should be TIMED_OUT after deadline elapsed"
     );
     assert!(
-        execution.error.as_deref().is_some_and(|e| e.contains("WorkflowExecution")),
+        execution
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("WorkflowExecution")),
         "execution error should mention WorkflowExecution timeout type"
     );
 
     // The outstanding task queue row should be cancelled.
     let tasks = load_tasks_for_execution_from_url(&database_url, exec_id).await;
-    let workflow_task = tasks.iter().find(|t| t.task_type == "workflow")
+    let workflow_task = tasks
+        .iter()
+        .find(|t| t.task_type == "workflow")
         .expect("workflow task should still be present");
     assert_eq!(
         workflow_task.state, "FAILED",

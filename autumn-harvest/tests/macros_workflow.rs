@@ -8,10 +8,7 @@ async fn test_workflow(_ctx: &WorkflowContext, _input: String) -> Result<String,
 }
 
 #[workflow(execution_timeout = "24h")]
-async fn billing_reconciliation(
-    _ctx: &WorkflowContext,
-    _run_date: String,
-) -> Result<(), String> {
+async fn billing_reconciliation(_ctx: &WorkflowContext, _run_date: String) -> Result<(), String> {
     Ok(())
 }
 
@@ -51,5 +48,9 @@ fn workflow_execution_timeout_attribute_30m() {
     let timeout = info
         .execution_timeout
         .expect("execution_timeout = '30m' must produce Some(...)");
-    assert_eq!(timeout, std::time::Duration::from_secs(1_800), "30m = 1800 seconds");
+    assert_eq!(
+        timeout,
+        std::time::Duration::from_secs(1_800),
+        "30m = 1800 seconds"
+    );
 }

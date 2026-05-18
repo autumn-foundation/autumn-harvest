@@ -711,9 +711,7 @@ async fn insert_fork_execution(
 ) -> Result<WorkflowExecution, WorkflowResetError> {
     // Re-compute deadline_at from the source execution's timeout so the fork
     // gets a fresh deadline anchored to its own start time (issue #243).
-    let deadline_at = source
-        .execution_timeout
-        .map(|d| chrono::Utc::now() + d);
+    let deadline_at = source.execution_timeout.map(|d| chrono::Utc::now() + d);
 
     let row = NewWorkflowExecution {
         id: new_exec_id.as_uuid(),

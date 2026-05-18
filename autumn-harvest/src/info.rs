@@ -335,7 +335,10 @@ mod tests {
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             execution_timeout: Some(std::time::Duration::from_secs(86_400)),
         };
-        assert_eq!(info.execution_timeout, Some(std::time::Duration::from_secs(86_400)));
+        assert_eq!(
+            info.execution_timeout,
+            Some(std::time::Duration::from_secs(86_400))
+        );
     }
 
     #[test]

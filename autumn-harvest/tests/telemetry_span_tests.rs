@@ -287,6 +287,7 @@ fn all_adr_0001_span_kinds_are_emitted() {
                     search_attrs: None,
                     reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
                     trace_context: None,
+                    max_execution_timeout_ceiling: None,
                 },
             )
             .await

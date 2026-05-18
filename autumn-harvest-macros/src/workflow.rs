@@ -109,12 +109,10 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     // Emit execution_timeout as Option<Duration> using the task_duration helper.
-    let execution_timeout_expr = match &attrs.execution_timeout {
-        Some(s) => quote! {
-            ::autumn_harvest::task_duration(#s)
-        },
-        None => quote! { None },
-    };
+    let execution_timeout_expr = attrs.execution_timeout.as_deref().map_or_else(
+        || quote! { None },
+        |s| quote! { ::autumn_harvest::task_duration(#s) },
+    );
 
     quote! {
         #input_fn

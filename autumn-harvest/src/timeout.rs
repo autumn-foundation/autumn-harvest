@@ -14,7 +14,9 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use chrono::Utc;
-use diesel::{BoolExpressionMethods, ExpressionMethods, OptionalExtension, QueryDsl, SelectableHelper};
+use diesel::{
+    BoolExpressionMethods, ExpressionMethods, OptionalExtension, QueryDsl, SelectableHelper,
+};
 use diesel_async::RunQueryDsl;
 use diesel_async::pooled_connection::deadpool::Pool;
 use diesel_async::{AsyncConnection, AsyncPgConnection};
@@ -644,11 +646,11 @@ pub async fn enforce_workflow_execution_timeouts(
                     // Transition execution to TIMED_OUT.
                     update_workflow_execution_timed_out(conn, exec_id, &error_msg).await?;
 
-                    // Cancel any outstanding workflow task for this execution.
+                    // Cancel all outstanding tasks for this execution (workflow and
+                    // activity) to avoid resource leaks when the deadline fires.
                     let _rows = diesel::update(
                         harvest_task_queue::table
                             .filter(harvest_task_queue::workflow_exec_id.eq(exec_id.as_uuid()))
-                            .filter(harvest_task_queue::task_type.eq("workflow"))
                             .filter(
                                 harvest_task_queue::state
                                     .eq("PENDING")

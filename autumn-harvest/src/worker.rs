@@ -2950,9 +2950,7 @@ async fn persist_workflow_continue_as_new(
         input: input.clone(),
     };
     // Re-anchor deadline to the new execution's start time (issue #243).
-    let new_deadline_at = execution
-        .execution_timeout
-        .map(|d| chrono::Utc::now() + d);
+    let new_deadline_at = execution.execution_timeout.map(|d| chrono::Utc::now() + d);
 
     let new_row = NewWorkflowExecution {
         id: new_exec_id.as_uuid(),
