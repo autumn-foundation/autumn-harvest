@@ -105,14 +105,23 @@ pub struct ResetUnresolvedSideEffect {
 /// Valid reset-boundary plan, also used as dry-run output after DB counts are attached.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResetPlan {
+    /// The event ID representing the new start of the workflow execution fork.
     pub reset_to_event_id: i64,
+    /// Number of events that will be copied over to the new execution history.
     pub events_carried_over: usize,
+    /// List of side effects that were pending resolution at the reset boundary.
     pub unresolved_side_effects: Vec<ResetUnresolvedSideEffect>,
+    /// The closest earlier event ID that is a valid reset boundary.
     pub nearest_valid_before: Option<i64>,
+    /// The closest later event ID that is a valid reset boundary.
     pub nearest_valid_after: Option<i64>,
+    /// Number of scheduled tasks on the original execution that will be cancelled.
     pub source_tasks_to_cancel: usize,
+    /// Number of timers on the original execution that will be removed.
     pub source_timers_to_remove: usize,
+    /// Number of undelivered signals on the original execution that will be dropped.
     pub source_signals_to_drop: usize,
+    /// Number of undelivered signals on the original execution that will be re-buffered.
     pub source_signals_to_buffer: usize,
 }
 
@@ -135,11 +144,17 @@ impl ResetPlan {
 /// Invalid reset-boundary details surfaced by the management API as `400`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResetInvalidPoint {
+    /// Description of why the reset point is invalid.
     pub message: String,
+    /// The event ID requested as the reset boundary.
     pub reset_to_event_id: i64,
+    /// The highest event ID present in the workflow execution history.
     pub last_event_id: i64,
+    /// List of side effects still unresolved at the requested boundary.
     pub unresolved_side_effects: Vec<ResetUnresolvedSideEffect>,
+    /// The closest earlier event ID that is a valid reset boundary.
     pub nearest_valid_before: Option<i64>,
+    /// The closest later event ID that is a valid reset boundary.
     pub nearest_valid_after: Option<i64>,
 }
 
@@ -154,28 +169,47 @@ impl std::error::Error for ResetInvalidPoint {}
 /// Result of a committed workflow reset.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResetResult {
+    /// The ID of the newly created workflow execution fork.
     pub new_exec_id: ExecutionId,
+    /// The ID of the original workflow execution that was reset.
     pub reset_from_exec_id: ExecutionId,
+    /// The event ID acting as the reset boundary.
     pub reset_to_event_id: i64,
+    /// Number of events copied over from the original execution.
     pub events_carried_over: usize,
+    /// Number of pending tasks on the original execution that were cancelled.
     pub source_tasks_cancelled: usize,
+    /// Number of pending timers on the original execution that were removed.
     pub source_timers_removed: usize,
+    /// Number of undelivered signals on the original execution that were dropped.
     pub source_signals_dropped: usize,
+    /// Number of undelivered signals on the original execution that were re-buffered on the new fork.
     pub source_signals_buffered: usize,
 }
 
 /// Errors specific to the reset workflow.
 #[derive(Debug, thiserror::Error)]
 pub enum WorkflowResetError {
+    /// The requested reset point is invalid.
     #[error(transparent)]
     InvalidPoint(#[from] ResetInvalidPoint),
+    /// The execution being reset is already in a terminal state.
     #[error("workflow execution {exec_id} is terminal ({state})")]
-    TerminalSource { exec_id: ExecutionId, state: String },
+    TerminalSource {
+        /// The ID of the terminal workflow execution.
+        exec_id: ExecutionId,
+        /// The stringified terminal state of the execution.
+        state: String,
+    },
+    /// Resetting child workflows is currently not supported.
     #[error("workflow execution {exec_id} is a child workflow; reset the root parent in v1")]
     ChildWorkflow {
+        /// The ID of the child workflow execution.
         exec_id: ExecutionId,
+        /// The execution ID of the parent workflow.
         parent_id: Uuid,
     },
+    /// The history contains a `ContinueAsNew` event, which cannot be reset across.
     #[error("continue-as-new histories cannot be reset in v1")]
     ContinueAsNew,
     /// An underlying storage or database error occurred during the reset operation.
