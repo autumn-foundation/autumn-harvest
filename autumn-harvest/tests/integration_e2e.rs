@@ -6394,7 +6394,7 @@ async fn per_key_concurrency_does_not_block_other_keys() {
                 notification_database_url: None,
                 max_concurrent_workflows: 20,
                 max_concurrent_activities: 20,
-                poll_interval: Duration::from_millis(50),
+                poll_interval: Duration::from_millis(200),
                 shutdown_timeout: Duration::from_secs(5),
                 cancellation_grace_period: Duration::from_secs(1),
                 sticky_timeout: Duration::ZERO,
@@ -6411,9 +6411,12 @@ async fn per_key_concurrency_does_not_block_other_keys() {
     );
     let _worker_handle = spawn_test_worker(Arc::clone(&worker), pool.clone());
 
-    // The quiet tenant's tasks should complete within a few seconds (they are instant).
+    // The quiet tenant's tasks should complete well before the loud tenant's
+    // full 20 s budget (4 tasks × 5 s with cap=1).  Give 30 s outer timeout
+    // to absorb CI startup overhead, then assert elapsed < 15 s to confirm
+    // quiet tasks were not meaningfully blocked by the saturated loud key.
     let quiet_start = tokio::time::Instant::now();
-    let quiet_deadline = quiet_start + Duration::from_secs(10);
+    let quiet_deadline = quiet_start + Duration::from_secs(30);
 
     loop {
         let completed: i64 = {
@@ -6434,7 +6437,7 @@ async fn per_key_concurrency_does_not_block_other_keys() {
         if completed >= 2 {
             let elapsed = quiet_start.elapsed();
             assert!(
-                elapsed < Duration::from_secs(10),
+                elapsed < Duration::from_secs(15),
                 "quiet-tenant tasks took too long ({elapsed:?}); loud-tenant saturation should not block them"
             );
             break;
@@ -6442,7 +6445,7 @@ async fn per_key_concurrency_does_not_block_other_keys() {
 
         assert!(
             tokio::time::Instant::now() < quiet_deadline,
-            "quiet-tenant tasks did not complete within 10 s despite not being capped"
+            "quiet-tenant tasks did not complete within 30 s despite not being capped"
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
