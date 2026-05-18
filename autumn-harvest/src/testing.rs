@@ -296,6 +296,17 @@ impl WorkflowReplayer {
         self
     }
 
+    /// Replace the shared state with a pre-built `SharedState` arc.
+    ///
+    /// Used internally by [`TestRunOutcome::replay_check`] to forward the test
+    /// environment's state to the replayer so the workflow sees the same typed
+    /// state it saw during the original run.
+    #[must_use]
+    fn with_existing_state(mut self, state: SharedState) -> Self {
+        self.state = state;
+        self
+    }
+
     /// Register a batch of workflows from a `workflows![]` macro call.
     ///
     /// ```rust,no_run
@@ -773,6 +784,9 @@ pub struct TestRunOutcome {
     events: Vec<WorkflowEvent>,
     /// Execution ID used for the run (stable for replay checks).
     exec_id: ExecutionId,
+    /// Shared state from the test env — forwarded to `replay_check` so the
+    /// replayer sees the same typed state the workflow saw during the run.
+    state: SharedState,
 }
 
 impl TestRunOutcome {
@@ -801,6 +815,7 @@ impl TestRunOutcome {
             events: self.events.clone(),
         };
         WorkflowReplayer::new()
+            .with_existing_state(self.state.clone())
             .register_fn("__test__", handler)
             .replay_from_snapshot(snapshot)
             .await
@@ -1036,6 +1051,7 @@ impl WorkflowTestEnv {
                         result: Ok(output),
                         events: history,
                         exec_id,
+                        state: self.state.clone(),
                     };
                 }
                 WorkflowOutcome::Failed { error } => {
@@ -1046,6 +1062,7 @@ impl WorkflowTestEnv {
                         result: Err(error),
                         events: history,
                         exec_id,
+                        state: self.state.clone(),
                     };
                 }
                 WorkflowOutcome::ContinuedAsNew { input: new_input } => {
@@ -1057,6 +1074,7 @@ impl WorkflowTestEnv {
                         result: Ok(new_input),
                         events: history,
                         exec_id,
+                        state: self.state.clone(),
                     };
                 }
                 WorkflowOutcome::Suspended { commands } => {
@@ -1074,6 +1092,7 @@ impl WorkflowTestEnv {
                                 .to_string()),
                             events: history,
                             exec_id,
+                            state: self.state.clone(),
                         };
                     }
                 }
@@ -1087,6 +1106,7 @@ impl WorkflowTestEnv {
             )),
             events: history,
             exec_id,
+            state: self.state.clone(),
         }
     }
 
@@ -1146,7 +1166,7 @@ impl WorkflowTestEnv {
                     input: act_input,
                     queue,
                 });
-                Self::push_activity_terminal(history, activity_id, call_num, result);
+                Self::push_activity_terminal(history, activity_id, result);
                 true
             }
 
@@ -1163,7 +1183,7 @@ impl WorkflowTestEnv {
                     name: name.clone(),
                     input: act_input,
                 });
-                Self::push_local_activity_terminal(history, activity_id, call_num, result);
+                Self::push_local_activity_terminal(history, activity_id, result);
                 true
             }
 
@@ -1271,10 +1291,13 @@ impl WorkflowTestEnv {
     }
 
     /// Append `ActivityCompleted` or `ActivityFailed` to history.
+    ///
+    /// `attempt` is always 1 because each explicit call to `execute_activity_raw`
+    /// represents a new scheduling — worker-level retries within one scheduling
+    /// are not modelled by the test harness.
     fn push_activity_terminal(
         history: &mut Vec<WorkflowEvent>,
         activity_id: ActivityExecId,
-        attempt: u32,
         result: Result<Value, String>,
     ) {
         match result {
@@ -1285,7 +1308,7 @@ impl WorkflowTestEnv {
             Err(error) => history.push(WorkflowEvent::ActivityFailed {
                 activity_id,
                 error,
-                attempt,
+                attempt: 1,
                 error_type: "Error".to_string(),
                 non_retryable: false,
                 details: None,
@@ -1293,11 +1316,15 @@ impl WorkflowTestEnv {
         }
     }
 
-    /// Append `LocalActivityCompleted` or `LocalActivityExhausted` to history.
+    /// Append `LocalActivityCompleted`, or `LocalActivityFailed` +
+    /// `LocalActivityExhausted` to history.
+    ///
+    /// Production records one `LocalActivityFailed` per attempt before the
+    /// terminal `LocalActivityExhausted`; the harness models a single attempt
+    /// so it emits exactly one of each on failure.
     fn push_local_activity_terminal(
         history: &mut Vec<WorkflowEvent>,
         activity_id: ActivityExecId,
-        attempt: u32,
         result: Result<Value, String>,
     ) {
         match result {
@@ -1305,11 +1332,18 @@ impl WorkflowTestEnv {
                 activity_id,
                 output,
             }),
-            Err(error) => history.push(WorkflowEvent::LocalActivityExhausted {
-                activity_id,
-                error,
-                attempt,
-            }),
+            Err(error) => {
+                history.push(WorkflowEvent::LocalActivityFailed {
+                    activity_id,
+                    error: error.clone(),
+                    attempt: 1,
+                });
+                history.push(WorkflowEvent::LocalActivityExhausted {
+                    activity_id,
+                    error,
+                    attempt: 1,
+                });
+            }
         }
     }
 }
