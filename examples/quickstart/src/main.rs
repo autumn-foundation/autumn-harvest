@@ -23,11 +23,10 @@ use autumn_web::reexports::axum::extract::State;
 /// history and resumes exactly at the timer — without re-running the activity.
 #[workflow]
 async fn greeting(ctx: &WorkflowContext, name: String) -> HarvestResult<String> {
-    let welcome = ctx
-        .execute_activity_raw(
-            "send_greeting",
+    let welcome: serde_json::Value = ctx
+        .execute_activity(
+            &send_greeting_info(),
             serde_json::json!({ "name": name, "kind": "welcome" }),
-            "default",
         )
         .await?;
 
@@ -36,11 +35,10 @@ async fn greeting(ctx: &WorkflowContext, name: String) -> HarvestResult<String> 
     // the welcome activity above.
     ctx.timer("greeting-pause", 30).await?;
 
-    let farewell = ctx
-        .execute_activity_raw(
-            "send_greeting",
+    let farewell: serde_json::Value = ctx
+        .execute_activity(
+            &send_greeting_info(),
             serde_json::json!({ "name": name, "kind": "farewell" }),
-            "default",
         )
         .await?;
 
@@ -54,11 +52,10 @@ async fn greeting(ctx: &WorkflowContext, name: String) -> HarvestResult<String> 
 /// Fast request/response variant used by `POST /greet`.
 #[workflow]
 async fn instant_greeting(ctx: &WorkflowContext, name: String) -> HarvestResult<String> {
-    let greeting = ctx
-        .execute_activity_raw(
-            "send_greeting",
+    let greeting: serde_json::Value = ctx
+        .execute_activity(
+            &send_greeting_info(),
             serde_json::json!({ "name": name, "kind": "hello" }),
-            "default",
         )
         .await?;
 
@@ -172,7 +169,7 @@ mod tests {
         assert_eq!(wf.name, "greeting");
         assert_eq!(instant.name, "instant_greeting");
         assert_eq!(act.name, "send_greeting");
-        // The default worker listens on "default", matching execute_activity_raw's queue arg.
+        // The activity has no explicit queue attribute, so the typed helper defaults to "default".
         assert!(
             WorkerConfig::default()
                 .queues

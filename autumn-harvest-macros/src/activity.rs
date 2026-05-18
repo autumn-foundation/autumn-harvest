@@ -173,6 +173,7 @@ pub fn activity_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let fn_name = &input_fn.sig.ident;
     let fn_name_str = fn_name.to_string();
     let companion_name = format_ident!("__autumn_activity_info_{fn_name}");
+    let public_info_name = format_ident!("{fn_name}_info");
 
     let retry_expr = attrs
         .retry
@@ -323,6 +324,17 @@ pub fn activity_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     })
                 },
             }
+        }
+
+        /// Returns the [`::autumn_harvest::ActivityInfo`] for this activity.
+        ///
+        /// Pass to typed dispatch helpers on [`::autumn_harvest::WorkflowContext`]:
+        ///
+        /// ```rust,ignore
+        /// ctx.execute_activity(&#public_info_name(), input).await?;
+        /// ```
+        pub fn #public_info_name() -> ::autumn_harvest::ActivityInfo {
+            #companion_name()
         }
     }
 }
