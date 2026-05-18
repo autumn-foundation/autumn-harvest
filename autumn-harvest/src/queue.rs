@@ -420,13 +420,13 @@ pub async fn concurrency_key_stats(
              concurrency_key AS key, \
              task_type, \
              MAX(concurrency_cap)::INT4 AS max_concurrent, \
-             COUNT(*) FILTER (WHERE state = 'RUNNING') AS in_flight, \
+             COUNT(*) FILTER (WHERE state = 'RUNNING' AND worker_id IS NOT NULL) AS in_flight, \
              COUNT(*) FILTER (WHERE state = 'PENDING') AS pending \
          FROM harvest_task_queue \
          WHERE concurrency_key IS NOT NULL \
            AND concurrency_cap IS NOT NULL \
            AND queue_name = ANY($1) \
-           AND state IN ('RUNNING', 'PENDING') \
+           AND (state = 'PENDING' OR (state = 'RUNNING' AND worker_id IS NOT NULL)) \
          GROUP BY concurrency_key, task_type",
     )
     .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)

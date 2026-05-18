@@ -3815,21 +3815,26 @@ fn spawn_concurrency_sampler(
             match queue::concurrency_key_stats(&mut conn, &queues).await {
                 Ok(stats) => {
                     for stat in &stats {
+                        // The stats are grouped by (key, task_type) so workflow
+                        // and activity budgets for the same key don't collide on
+                        // the same metric label.
+                        let metric_key = format!("{}:{}", stat.key, stat.task_type);
                         telemetry.metrics.record_concurrency_key_in_flight(
-                            &stat.key,
+                            &metric_key,
                             u64::try_from(stat.in_flight).unwrap_or(0),
                         );
                         let saturated = stat.in_flight >= i64::from(stat.max_concurrent);
                         if saturated && stat.pending > 0 {
                             tracing::debug!(
                                 concurrency_key = %stat.key,
+                                task_type = %stat.task_type,
                                 in_flight = stat.in_flight,
                                 max_concurrent = stat.max_concurrent,
                                 deferred = stat.pending,
                                 "concurrency cap saturated; pending tasks deferred until a slot frees"
                             );
                             telemetry.metrics.record_concurrency_key_deferred(
-                                &stat.key,
+                                &metric_key,
                                 u64::try_from(stat.pending).unwrap_or(0),
                             );
                         }

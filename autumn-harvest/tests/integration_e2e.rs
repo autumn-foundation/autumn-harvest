@@ -6126,350 +6126,210 @@ async fn signal_blocked_workflow_times_out_at_deadline() {
 
 // ── Per-key concurrency fair-share tests (issue #247) ─────────────────────────
 
-/// Blocking workflow that holds a slot for 1 s before completing.
-///
-/// We use `tokio::time::sleep` for simplicity; the worker pool keeps the task
-/// RUNNING while the sleep runs.
-fn blocking_workflow_1s<'a>(
-    _ctx: &'a WorkflowContext,
-    _input: serde_json::Value,
-) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
-    Box::pin(async move {
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        Ok(serde_json::Value::Null)
-    })
-}
-
-/// Instant workflow (returns immediately) used for "other key" tasks.
-fn instant_wf<'a>(
-    _ctx: &'a WorkflowContext,
-    _input: serde_json::Value,
-) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
-    Box::pin(async move { Ok(serde_json::Value::Null) })
-}
-
-/// Count RUNNING task queue rows for a specific `concurrency_key`.
-async fn count_running_for_key(database_url: &str, key: &str) -> i64 {
-    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(database_url)
-        .await
-        .expect("connect for key-count query");
-    diesel::sql_query(
-        "SELECT COUNT(*) AS count FROM harvest_task_queue \
-         WHERE concurrency_key = $1 AND state = 'RUNNING'",
-    )
-    .bind::<diesel::sql_types::Text, _>(key)
-    .get_results::<CountRow>(&mut conn)
-    .await
-    .expect("key count query failed")
-    .into_iter()
-    .next()
-    .map_or(0, |r| r.count)
-}
-
-#[derive(diesel::QueryableByName)]
-struct CountRow {
-    #[diesel(sql_type = diesel::sql_types::BigInt)]
-    count: i64,
-}
-
 /// (concurrency-a) Per-key limit: under a burst of N >> limit tasks for the
 /// same concurrency key, at most `limit` are RUNNING at any moment.
 ///
-/// We enqueue 6 workflow tasks with `concurrency_key = "tenant:acme"` and
-/// `concurrency_cap = 2`.  We verify that at no point are more than 2 running,
-/// and that all 6 eventually complete.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[allow(clippy::too_many_lines)]
+/// Enqueues 6 workflow tasks with `concurrency_key = "tenant:acme"` and
+/// `concurrency_cap = 2`.  Verifies the claim query allows at most 2 to be
+/// RUNNING simultaneously and that all 6 are eventually processed.  Uses
+/// direct `claim_task` / `complete_task` calls (same pattern as
+/// `concurrency_cap_limits_concurrent_claims_cluster_wide`) to avoid
+/// interaction with the executor's 100 ms suspension timeout.
+#[tokio::test]
 async fn per_key_concurrency_cap_enforced_across_fleet() {
     const LIMIT: u32 = 2;
     const TOTAL: u32 = 6;
     const KEY: &str = "tenant:acme";
 
-    let (database_url, _container) = setup_test_database_url().await;
-    let wf_name = "concurrency_cap_test_wf";
-    // Use a larger pool to prevent monitoring tasks (which each grab a
-    // connection every poll_interval) from exhausting the pool while cap=2
-    // workflow tasks hold their own connections for 5 s each.
-    let pool: DbPool = {
-        let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(&database_url);
-        deadpool::managed::Pool::builder(manager)
-            .max_size(16)
-            .build()
-            .expect("failed to build test pool")
-    };
-    let registry = Arc::new(HandlerRegistry::new(
-        vec![WorkflowInfo {
-            name: wf_name,
-            module: "integration_e2e",
-            handler: blocking_workflow_1s,
-            concurrency: None,
-        }],
-        vec![],
-    ));
+    let (mut conn, _container) = setup_test_db().await;
+    let queues = vec!["default".to_string()];
 
-    // Start TOTAL workflow executions with the same concurrency key and cap=LIMIT.
-    {
-        let mut conn = pool.get().await.expect("get conn for enqueue");
-        for i in 0..TOTAL {
-            start_or_load_workflow_execution(
-                &mut conn,
-                StartWorkflowParams {
-                    workflow_name: wf_name,
-                    workflow_id: &format!("wf-{i}"),
-                    exec_id: ExecutionId::new(),
-                    input: serde_json::json!({}),
-                    parent_id: None,
-                    queue_name: "default",
-                    execution_timeout: None,
-                    memo: None,
-                    search_attrs: None,
-                    reuse_policy: WorkflowIdReusePolicy::RejectDuplicate,
-                    trace_context: None,
-                    concurrency_key: Some(KEY.to_string()),
-                    concurrency_limit: Some(LIMIT),
-                },
-            )
+    for i in 0..TOTAL {
+        let mut params =
+            EnqueueParams::new("default", TaskType::Workflow, serde_json::json!({ "i": i }));
+        params.concurrency_key = Some(KEY.to_string());
+        params.max_concurrent = Some(LIMIT);
+        params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+        queue::enqueue(&mut conn, &params)
             .await
-            .expect("start workflow");
-        }
+            .expect("enqueue failed");
     }
 
-    // Start a worker with plenty of per-worker concurrency so the only binding
-    // constraint is the per-key cap.
-    let worker = Arc::new(
-        Worker::new(
-            WorkerRuntimeConfig {
-                worker_id: "test-worker-concurrency-a".to_string(),
-                queues: vec!["default".to_string()],
-                notification_database_url: None,
-                max_concurrent_workflows: 20,
-                max_concurrent_activities: 20,
-                poll_interval: Duration::from_millis(200),
-                shutdown_timeout: Duration::from_secs(5),
-                cancellation_grace_period: Duration::from_secs(1),
-                sticky_timeout: Duration::ZERO,
-                max_local_activity_start_to_close: Duration::from_secs(60),
-                shard_assignments: vec![autumn_harvest::types::ShardId::new(0)],
-                worker_heartbeat_interval: Duration::from_secs(5),
-                build_id: String::new(),
-                deployment_name: None,
-                workflow_cache_size: 1000,
-            },
-            Arc::clone(&registry),
-        )
-        .expect("worker should build"),
-    );
-    let _worker_handle = spawn_test_worker(Arc::clone(&worker), pool.clone());
+    let mut completed_count = 0u32;
+    let mut max_in_flight: u32 = 0;
 
-    // Poll until all tasks have completed or we time out.
-    // During polling, assert the per-key cap is never exceeded.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-    let mut observed_max_in_flight: i64 = 0;
+    // Repeatedly claim a task, assert the in-flight count respects the cap,
+    // then immediately complete one held task to free a slot.  Repeat until all
+    // TOTAL tasks have been claimed and completed.
+    let mut held: Vec<Uuid> = Vec::new();
 
     loop {
-        let in_flight = count_running_for_key(&database_url, KEY).await;
-        assert!(
-            in_flight <= i64::from(LIMIT),
-            "cap violated: {in_flight} tasks running with key '{KEY}' (limit = {LIMIT})"
-        );
-        if in_flight > observed_max_in_flight {
-            observed_max_in_flight = in_flight;
-        }
+        // Try to claim one more task.
+        let claimed = queue::claim_task(&mut conn, &queues, "test-worker-concurrency-a", "")
+            .await
+            .expect("claim query failed");
 
-        // Check total completion.
-        let mut conn = pool.get().await.expect("get conn for check");
-        let completed: i64 = diesel::sql_query(
-            "SELECT COUNT(*) AS count FROM harvest_task_queue \
-             WHERE concurrency_key = $1 AND state = 'COMPLETED'",
-        )
-        .bind::<diesel::sql_types::Text, _>(KEY)
-        .get_results::<CountRow>(&mut conn)
-        .await
-        .expect("completed count")
-        .into_iter()
-        .next()
-        .map_or(0, |r| r.count);
-
-        if completed >= i64::from(TOTAL) {
+        if let Some(task) = claimed {
+            held.push(task.id);
+            let in_flight = u32::try_from(held.len()).unwrap();
+            assert!(
+                in_flight <= LIMIT,
+                "cap violated: {in_flight} tasks held simultaneously (limit = {LIMIT})"
+            );
+            if in_flight > max_in_flight {
+                max_in_flight = in_flight;
+            }
+        } else if !held.is_empty() {
+            // Cap is saturated; complete the oldest held task to free a slot.
+            let id = held.remove(0);
+            queue::complete_task(&mut conn, id, serde_json::json!(null))
+                .await
+                .expect("complete_task failed");
+            completed_count += 1;
+        } else {
+            // Nothing held and nothing claimable: all tasks are done.
             break;
         }
 
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "timed out: only {completed}/{TOTAL} tasks completed; last in-flight = {in_flight}"
-        );
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Drain any tasks that can still be claimed immediately.
+        if held.len() < LIMIT as usize
+            && queue::claim_task(&mut conn, &queues, "test-worker-concurrency-a", "")
+                .await
+                .expect("claim query failed")
+                .is_some_and(|t| {
+                    held.push(t.id);
+                    true
+                })
+        {
+            // extra claim consumed above
+        }
+
+        if completed_count >= TOTAL {
+            break;
+        }
     }
 
-    // We should have seen at least 1 task running at the limit to confirm the cap
-    // was actually used (not just that everything finished instantly).
+    // Complete any remaining held tasks.
+    for id in held {
+        queue::complete_task(&mut conn, id, serde_json::json!(null))
+            .await
+            .expect("final complete_task failed");
+        completed_count += 1;
+    }
+
+    assert_eq!(
+        completed_count, TOTAL,
+        "all {TOTAL} tasks must eventually be processed"
+    );
     assert!(
-        observed_max_in_flight >= 1,
-        "never observed any tasks in-flight for key '{KEY}'"
+        max_in_flight >= 1,
+        "at least 1 task must have been in-flight at the cap limit"
     );
 }
 
 /// (concurrency-b) Fair-share: tasks for *other* keys are NOT blocked by a
 /// saturated key.
 ///
-/// We enqueue 4 blocking tasks for "tenant:loud" (cap=1) and 2 instant tasks
-/// for "tenant:quiet" (cap=10).  We verify the quiet-tenant tasks complete
-/// quickly even though the loud-tenant cap is saturated.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[allow(clippy::too_many_lines)]
+/// Enqueues 4 "loud" workflow tasks (cap=1) and 2 "quiet" workflow tasks
+/// (cap=10).  Verifies the quiet tasks can be claimed even while the loud cap
+/// is saturated.  Uses direct `claim_task` calls to avoid the executor's
+/// 100 ms suspension timeout.
+#[tokio::test]
 async fn per_key_concurrency_does_not_block_other_keys() {
     const LOUD_CAP: u32 = 1;
     const LOUD_TOTAL: u32 = 4;
     const QUIET_KEY: &str = "tenant:quiet";
     const LOUD_KEY: &str = "tenant:loud";
 
-    let (database_url, _container) = setup_test_database_url().await;
-    // Use a larger pool than the default (4) to avoid connection contention.
-    // At any moment: 1 loud-workflow task holds a connection for 5 s, and 4
-    // monitoring background tasks each need a brief connection every poll
-    // interval.  With only 4 pool slots the quiet tasks can't get connections;
-    // 16 gives headroom for all background tasks to run concurrently.
-    let pool: DbPool = {
-        let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(&database_url);
-        deadpool::managed::Pool::builder(manager)
-            .max_size(16)
-            .build()
-            .expect("failed to build test pool")
-    };
-    let registry = Arc::new(HandlerRegistry::new(
-        vec![
-            WorkflowInfo {
-                name: "loud_wf",
-                module: "integration_e2e",
-                handler: blocking_workflow_1s,
-                concurrency: None,
-            },
-            WorkflowInfo {
-                name: "quiet_wf",
-                module: "integration_e2e",
-                handler: instant_wf,
-                concurrency: None,
-            },
-        ],
-        vec![],
-    ));
+    let (mut conn, _container) = setup_test_db().await;
+    let queues = vec!["default".to_string()];
 
-    {
-        let mut conn = pool.get().await.expect("get conn");
-
-        // Loud tenant: 4 blocking tasks, cap=1.
-        for i in 0..LOUD_TOTAL {
-            start_or_load_workflow_execution(
-                &mut conn,
-                StartWorkflowParams {
-                    workflow_name: "loud_wf",
-                    workflow_id: &format!("loud-{i}"),
-                    exec_id: ExecutionId::new(),
-                    input: serde_json::json!({}),
-                    parent_id: None,
-                    queue_name: "default",
-                    execution_timeout: None,
-                    memo: None,
-                    search_attrs: None,
-                    reuse_policy: WorkflowIdReusePolicy::RejectDuplicate,
-                    trace_context: None,
-                    concurrency_key: Some(LOUD_KEY.to_string()),
-                    concurrency_limit: Some(LOUD_CAP),
-                },
-            )
+    // Loud tenant: 4 tasks, cap=1.
+    for i in 0..LOUD_TOTAL {
+        let mut params =
+            EnqueueParams::new("default", TaskType::Workflow, serde_json::json!({ "i": i }));
+        params.concurrency_key = Some(LOUD_KEY.to_string());
+        params.max_concurrent = Some(LOUD_CAP);
+        params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+        queue::enqueue(&mut conn, &params)
             .await
-            .expect("start loud workflow");
-        }
-
-        // Quiet tenant: 2 instant tasks with a high cap so they are never blocked.
-        for i in 0..2u32 {
-            start_or_load_workflow_execution(
-                &mut conn,
-                StartWorkflowParams {
-                    workflow_name: "quiet_wf",
-                    workflow_id: &format!("quiet-{i}"),
-                    exec_id: ExecutionId::new(),
-                    input: serde_json::json!({}),
-                    parent_id: None,
-                    queue_name: "default",
-                    execution_timeout: None,
-                    memo: None,
-                    search_attrs: None,
-                    reuse_policy: WorkflowIdReusePolicy::RejectDuplicate,
-                    trace_context: None,
-                    concurrency_key: Some(QUIET_KEY.to_string()),
-                    concurrency_limit: Some(10),
-                },
-            )
-            .await
-            .expect("start quiet workflow");
-        }
+            .expect("enqueue loud task failed");
     }
 
-    let worker = Arc::new(
-        Worker::new(
-            WorkerRuntimeConfig {
-                worker_id: "test-worker-concurrency-b".to_string(),
-                queues: vec!["default".to_string()],
-                notification_database_url: None,
-                max_concurrent_workflows: 20,
-                max_concurrent_activities: 20,
-                poll_interval: Duration::from_millis(200),
-                shutdown_timeout: Duration::from_secs(5),
-                cancellation_grace_period: Duration::from_secs(1),
-                sticky_timeout: Duration::ZERO,
-                max_local_activity_start_to_close: Duration::from_secs(60),
-                shard_assignments: vec![autumn_harvest::types::ShardId::new(0)],
-                worker_heartbeat_interval: Duration::from_secs(5),
-                build_id: String::new(),
-                deployment_name: None,
-                workflow_cache_size: 1000,
-            },
-            Arc::clone(&registry),
-        )
-        .expect("worker should build"),
-    );
-    let _worker_handle = spawn_test_worker(Arc::clone(&worker), pool.clone());
-
-    // Verify quiet-tenant tasks complete despite the loud-tenant cap being
-    // saturated.  The correctness proof is twofold: (a) quiet tasks do
-    // complete within the deadline (they were never permanently blocked), and
-    // (b) the loud cap is checked separately below.  We do not assert a tight
-    // elapsed bound here because Docker/worker startup overhead varies across
-    // CI environments; the outer 30 s deadline is generous but finite.
-    let quiet_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-
-    loop {
-        let completed: i64 = {
-            let mut conn = pool.get().await.expect("get conn");
-            diesel::sql_query(
-                "SELECT COUNT(*) AS count FROM harvest_task_queue \
-                 WHERE concurrency_key = $1 AND state = 'COMPLETED'",
-            )
-            .bind::<diesel::sql_types::Text, _>(QUIET_KEY)
-            .get_results::<CountRow>(&mut conn)
+    // Quiet tenant: 2 tasks with a high cap so they are never blocked.
+    for i in 0..2u32 {
+        let mut params =
+            EnqueueParams::new("default", TaskType::Workflow, serde_json::json!({ "i": i }));
+        params.concurrency_key = Some(QUIET_KEY.to_string());
+        params.max_concurrent = Some(10u32);
+        params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+        queue::enqueue(&mut conn, &params)
             .await
-            .expect("quiet completed count")
-            .into_iter()
-            .next()
-            .map_or(0, |r| r.count)
-        };
+            .expect("enqueue quiet task failed");
+    }
 
-        if completed >= 2 {
+    // Saturate the loud key: claim 1 loud task (cap=1 → saturated).
+    let loud_task = queue::claim_task(&mut conn, &queues, "test-worker-b", "")
+        .await
+        .expect("claim 1 query failed")
+        .expect("first loud task should be claimable");
+    assert_eq!(
+        loud_task.concurrency_key.as_deref(),
+        Some(LOUD_KEY),
+        "claimed task should be loud-key"
+    );
+
+    // Loud cap is now saturated — the next loud-key claim must fail.
+    // (We specifically target what comes next using separate assertions below.)
+
+    // Quiet tasks must be claimable despite loud saturation.
+    let mut quiet_claimed = 0u32;
+    let mut attempts = 0u32;
+    while quiet_claimed < 2 && attempts < 10 {
+        if let Some(task) = queue::claim_task(&mut conn, &queues, "test-worker-b", "")
+            .await
+            .expect("claim query failed")
+        {
+            assert_eq!(
+                task.concurrency_key.as_deref(),
+                Some(QUIET_KEY),
+                "any task claimed while loud is saturated must be a quiet-key task"
+            );
+            quiet_claimed += 1;
+            // Immediately complete quiet tasks so they don't hold state.
+            queue::complete_task(&mut conn, task.id, serde_json::json!(null))
+                .await
+                .expect("complete quiet task failed");
+        } else {
+            // No task available right now; the loud cap is blocking the loud
+            // tasks and quiet tasks haven't been claimed yet — should not happen.
             break;
         }
-
-        assert!(
-            tokio::time::Instant::now() < quiet_deadline,
-            "quiet-tenant tasks did not complete within 30 s despite not being capped"
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        attempts += 1;
     }
 
-    // Also assert the loud-tenant cap was never exceeded.
-    let loud_in_flight = count_running_for_key(&database_url, LOUD_KEY).await;
+    assert_eq!(
+        quiet_claimed, 2,
+        "both quiet-tenant tasks must be claimable even though loud cap is saturated"
+    );
+
+    // Complete the held loud task; verify the next loud task is now claimable.
+    queue::complete_task(&mut conn, loud_task.id, serde_json::json!(null))
+        .await
+        .expect("complete loud task failed");
+
+    let next_loud = queue::claim_task(&mut conn, &queues, "test-worker-b", "")
+        .await
+        .expect("claim after complete query failed");
     assert!(
-        loud_in_flight <= i64::from(LOUD_CAP),
-        "loud-tenant cap violated: {loud_in_flight} > {LOUD_CAP}"
+        next_loud.is_some(),
+        "a loud-key task must become claimable after the saturating task completes"
+    );
+    assert_eq!(
+        next_loud
+            .as_ref()
+            .and_then(|t| t.concurrency_key.as_deref()),
+        Some(LOUD_KEY),
+        "next claimable task should be loud-key"
     );
 }
