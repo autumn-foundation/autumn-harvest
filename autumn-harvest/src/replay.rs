@@ -396,6 +396,7 @@ impl HistoryMatcher {
         HistoryMatch::ActivityInProgress { activity_id }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn scan_local_activity_terminal(
         &mut self,
         activity_id: ActivityExecId,
@@ -450,6 +451,56 @@ impl HistoryMatcher {
                     let signal_name = signal_name.clone();
                     let payload = payload.clone();
                     self.stash_signal(scan_cursor, signal_name, payload);
+                    scan_cursor += 1;
+                }
+                // ExternalSignal events can be interleaved before the local
+                // activity's terminal event when a crash recovery case writes
+                // signal events first (the RunLocalActivity + SignalExternalWorkflow
+                // mixed batch).  Stash them so match_external_signal can find them
+                // after the local activity resolves.
+                WorkflowEvent::ExternalSignalRequested {
+                    signal_id,
+                    target,
+                    signal_name,
+                    payload,
+                } => {
+                    let stashed = StashedExternalSignal {
+                        signal_id: *signal_id,
+                        target: *target,
+                        signal_name: signal_name.clone(),
+                        payload: payload.clone(),
+                        terminal: None,
+                    };
+                    self.pending_external_signals.push(stashed);
+                    self.consumed_signal_events.insert(scan_cursor);
+                    scan_cursor += 1;
+                }
+                WorkflowEvent::ExternalSignalDelivered { signal_id } => {
+                    let id = *signal_id;
+                    if let Some(p) = self
+                        .pending_external_signals
+                        .iter_mut()
+                        .find(|p| p.signal_id == id)
+                    {
+                        p.terminal = Some(StashedSignalTerminal::Delivered);
+                    }
+                    self.consumed_signal_events.insert(scan_cursor);
+                    scan_cursor += 1;
+                }
+                WorkflowEvent::ExternalSignalFailed {
+                    signal_id,
+                    reason_code,
+                } => {
+                    let id = *signal_id;
+                    let code = reason_code.clone();
+                    if let Some(p) = self
+                        .pending_external_signals
+                        .iter_mut()
+                        .find(|p| p.signal_id == id)
+                    {
+                        p.terminal = Some(StashedSignalTerminal::Failed(code));
+                    }
+                    self.consumed_signal_events.insert(scan_cursor);
                     scan_cursor += 1;
                 }
                 ev if Self::is_update_event(ev) => {
