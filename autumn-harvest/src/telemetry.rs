@@ -153,6 +153,28 @@ pub const ATTR_TARGET_EXECUTION_ID: &str = "harvest.target.execution.id";
 /// `execution.id` stays span-only per the cardinality rule (ADR-0001 §7).
 pub const METRIC_WORKFLOW_TIMEOUT: &str = "harvest.workflow.timeout";
 
+/// Histogram: observed payload size in bytes at each write boundary (issue #252).
+///
+/// Emitted for every payload written to `harvest_events`, regardless of whether
+/// it was accepted or rejected. Labeled with:
+/// - `payload.kind`: the [`PayloadKind`] variant (e.g. `"ActivityInput"`)
+/// - `workflow.type`: the workflow type name
+/// - `activity.name`: the activity name (empty string when not applicable)
+///
+/// Per ADR-0001 §7, `execution.id` is span-only and must never appear here.
+///
+/// [`PayloadKind`]: crate::error::PayloadKind
+pub const METRIC_PAYLOAD_BYTES: &str = "harvest.payload.bytes";
+
+/// Counter: incremented each time a payload is rejected because it exceeds the
+/// configured size cap (issue #252).
+///
+/// Labeled with `payload.kind` and `workflow.type`. Incrementing once per
+/// rejection event (not per byte) so operators can alert on rejection rate.
+///
+/// Per ADR-0001 §7, `execution.id` is span-only.
+pub const METRIC_PAYLOAD_REJECTED: &str = "harvest.payload.rejected";
+
 // ---------------------------------------------------------------------------
 // Metric label key constants
 // Used by MetricsRecorder implementations to avoid string literals at call
@@ -604,6 +626,36 @@ pub trait MetricsRecorder: Send + Sync {
     /// Maps to the counter `harvest.workflow.timeout{workflow, queue}`.
     fn record_workflow_timeout(&self, workflow_name: &str, queue: &str) {
         let _ = (workflow_name, queue);
+    }
+
+    /// A payload was observed at a write boundary (issue #252).
+    ///
+    /// Called for every payload written (accepted or rejected) to
+    /// `harvest_events`. Maps to the histogram `harvest.payload.bytes`
+    /// with labels `payload.kind`, `workflow.type`, and `activity.name`.
+    ///
+    /// `activity_name` is `None` for non-activity payloads (signal, side-effect,
+    /// workflow-input).
+    fn record_payload_observed(
+        &self,
+        kind: &crate::error::PayloadKind,
+        workflow_type: &str,
+        activity_name: Option<&str>,
+        observed_bytes: u64,
+    ) {
+        let _ = (kind, workflow_type, activity_name, observed_bytes);
+    }
+
+    /// A payload was rejected because it exceeded the configured cap (issue #252).
+    ///
+    /// Maps to the counter `harvest.payload.rejected` with labels
+    /// `payload.kind` and `workflow.type`.
+    fn record_payload_rejected(
+        &self,
+        kind: &crate::error::PayloadKind,
+        workflow_type: &str,
+    ) {
+        let _ = (kind, workflow_type);
     }
 }
 

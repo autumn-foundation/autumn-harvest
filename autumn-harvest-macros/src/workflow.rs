@@ -7,6 +7,8 @@ use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::{ItemFn, LitStr, parse::Parser as _};
 
+use crate::parse_byte_size_macro;
+
 // ---------------------------------------------------------------------------
 // Attribute parsing
 // ---------------------------------------------------------------------------
@@ -19,12 +21,16 @@ struct ConcurrencyArgs {
 struct WorkflowAttrs {
     execution_timeout: Option<String>,
     concurrency: Option<ConcurrencyArgs>,
+    /// Per-workflow-type cap override in bytes (issue #252). Parsed from
+    /// `#[workflow(max_input_bytes = "8MiB")]` at compile time.
+    max_input_bytes: Option<u64>,
 }
 
 fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
     let mut result = WorkflowAttrs {
         execution_timeout: None,
         concurrency: None,
+        max_input_bytes: None,
     };
 
     syn::meta::parser(|meta| {
@@ -66,8 +72,20 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
             })?;
             result.concurrency = Some(ConcurrencyArgs { key_expr, limit });
             Ok(())
+        } else if meta.path.is_ident("max_input_bytes") {
+            let value: LitStr = meta.value()?.parse()?;
+            let s = value.value();
+            let bytes = parse_byte_size_macro(&s).ok_or_else(|| {
+                meta.error(format!(
+                    "invalid byte size '{s}'; expected format like \"2MiB\", \"512KiB\", \"4MB\""
+                ))
+            })?;
+            result.max_input_bytes = Some(bytes);
+            Ok(())
         } else {
-            Err(meta.error("unsupported attribute: expected `execution_timeout` or `concurrency`"))
+            Err(meta.error(
+                "unsupported attribute: expected `execution_timeout`, `concurrency`, or `max_input_bytes`",
+            ))
         }
     })
     .parse2(attr)?;
@@ -179,6 +197,11 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
+    let max_input_bytes_expr = attrs.max_input_bytes.map_or_else(
+        || quote! { None },
+        |b| quote! { Some(#b) },
+    );
+
     quote! {
         #input_fn
 
@@ -194,6 +217,7 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 },
                 execution_timeout: #execution_timeout_expr,
                 concurrency: #concurrency_expr,
+                max_input_bytes: #max_input_bytes_expr,
             }
         }
 

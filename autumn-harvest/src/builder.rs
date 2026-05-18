@@ -36,7 +36,15 @@ use crate::types::ShardId;
 /// assert_eq!(built.workflow_count(), 0);
 /// assert!(built.state::<DatabasePool>().is_some());
 /// ```
-#[derive(Default)]
+/// Default payload cap values (issue #252).
+pub const DEFAULT_MAX_ACTIVITY_INPUT_BYTES: u64 = 2 * 1024 * 1024; // 2 MiB
+/// Default maximum activity result payload size.
+pub const DEFAULT_MAX_ACTIVITY_RESULT_BYTES: u64 = 2 * 1024 * 1024; // 2 MiB
+/// Default maximum signal payload size.
+pub const DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES: u64 = 256 * 1024; // 256 KiB
+/// Default maximum workflow input payload size.
+pub const DEFAULT_MAX_WORKFLOW_INPUT_BYTES: u64 = 2 * 1024 * 1024; // 2 MiB
+
 pub struct HarvestBuilder {
     workflows: Vec<WorkflowInfo>,
     activities: Vec<ActivityInfo>,
@@ -59,6 +67,43 @@ pub struct HarvestBuilder {
     /// larger than this ceiling is rejected with [`BuildError::ExecutionTimeoutExceedsCeiling`].
     /// `None` means no ceiling is enforced.
     max_workflow_execution_timeout: Option<Duration>,
+    /// Maximum allowed byte length for an activity input payload (issue #252).
+    /// Default: 2 MiB.
+    max_activity_input_bytes: u64,
+    /// Maximum allowed byte length for an activity result payload (issue #252).
+    /// Default: 2 MiB.
+    max_activity_result_bytes: u64,
+    /// Maximum allowed byte length for a signal payload (issue #252).
+    /// Default: 256 KiB.
+    max_signal_payload_bytes: u64,
+    /// Maximum allowed byte length for a workflow start input payload (issue #252).
+    /// Default: 2 MiB.
+    max_workflow_input_bytes: u64,
+}
+
+impl Default for HarvestBuilder {
+    fn default() -> Self {
+        Self {
+            workflows: Vec::new(),
+            activities: Vec::new(),
+            dags: Vec::new(),
+            workflow_schedules: Vec::new(),
+            auto_registered_dag_workflows: Vec::new(),
+            query_handlers: Vec::new(),
+            update_handlers: Vec::new(),
+            worker_config: WorkerConfig::default(),
+            state: std::collections::HashMap::new(),
+            telemetry: None,
+            retention: crate::retention::RetentionConfig::default(),
+            payload_codecs: crate::payload_codec::PayloadCodecs::default(),
+            history_policy: crate::context::WorkflowHistoryPolicy::default(),
+            max_workflow_execution_timeout: None,
+            max_activity_input_bytes: DEFAULT_MAX_ACTIVITY_INPUT_BYTES,
+            max_activity_result_bytes: DEFAULT_MAX_ACTIVITY_RESULT_BYTES,
+            max_signal_payload_bytes: DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
+            max_workflow_input_bytes: DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
+        }
+    }
 }
 
 impl std::fmt::Debug for HarvestBuilder {
@@ -84,6 +129,10 @@ impl std::fmt::Debug for HarvestBuilder {
                 "max_workflow_execution_timeout",
                 &self.max_workflow_execution_timeout,
             )
+            .field("max_activity_input_bytes", &self.max_activity_input_bytes)
+            .field("max_activity_result_bytes", &self.max_activity_result_bytes)
+            .field("max_signal_payload_bytes", &self.max_signal_payload_bytes)
+            .field("max_workflow_input_bytes", &self.max_workflow_input_bytes)
             .finish()
     }
 }
@@ -106,6 +155,18 @@ pub struct BuiltHarvest {
     history_policy: WorkflowHistoryPolicy,
     /// Server-side ceiling on `execution_timeout` (issue #243). `None` = no ceiling.
     pub max_workflow_execution_timeout: Option<Duration>,
+    /// Maximum allowed byte length for an activity input payload (issue #252).
+    /// Default: 2 MiB.
+    pub max_activity_input_bytes: u64,
+    /// Maximum allowed byte length for an activity result payload (issue #252).
+    /// Default: 2 MiB.
+    pub max_activity_result_bytes: u64,
+    /// Maximum allowed byte length for a signal payload (issue #252).
+    /// Default: 256 KiB.
+    pub max_signal_payload_bytes: u64,
+    /// Maximum allowed byte length for a workflow start input payload (issue #252).
+    /// Default: 2 MiB.
+    pub max_workflow_input_bytes: u64,
 }
 
 impl std::fmt::Debug for BuiltHarvest {
@@ -127,6 +188,10 @@ impl std::fmt::Debug for BuiltHarvest {
                 "max_workflow_execution_timeout",
                 &self.max_workflow_execution_timeout,
             )
+            .field("max_activity_input_bytes", &self.max_activity_input_bytes)
+            .field("max_activity_result_bytes", &self.max_activity_result_bytes)
+            .field("max_signal_payload_bytes", &self.max_signal_payload_bytes)
+            .field("max_workflow_input_bytes", &self.max_workflow_input_bytes)
             .finish()
     }
 }
@@ -658,6 +723,51 @@ impl HarvestBuilder {
         self
     }
 
+    /// Set the global maximum byte length for activity input payloads (issue #252).
+    ///
+    /// Default: 2 MiB. Per-activity overrides declared via
+    /// `#[activity(max_input_bytes = "…")]` raise (never lower) this ceiling for
+    /// a specific activity.
+    #[must_use]
+    pub const fn max_activity_input_bytes(mut self, bytes: u64) -> Self {
+        self.max_activity_input_bytes = bytes;
+        self
+    }
+
+    /// Set the global maximum byte length for activity result payloads (issue #252).
+    ///
+    /// Default: 2 MiB. Per-activity overrides declared via
+    /// `#[activity(max_result_bytes = "…")]` raise (never lower) this ceiling for
+    /// a specific activity.
+    #[must_use]
+    pub const fn max_activity_result_bytes(mut self, bytes: u64) -> Self {
+        self.max_activity_result_bytes = bytes;
+        self
+    }
+
+    /// Set the global maximum byte length for signal payloads (issue #252).
+    ///
+    /// Default: 256 KiB. Enforcement happens at the management-API
+    /// signal-send boundary before any `SignalReceived` event is appended.
+    #[must_use]
+    pub const fn max_signal_payload_bytes(mut self, bytes: u64) -> Self {
+        self.max_signal_payload_bytes = bytes;
+        self
+    }
+
+    /// Set the global maximum byte length for workflow start input payloads
+    /// (issue #252).
+    ///
+    /// Default: 2 MiB. Enforcement happens at `start_workflow` time before the
+    /// `WorkflowStarted` event or `harvest_workflow_executions` row is inserted.
+    /// Per-workflow-type overrides declared via `#[workflow(max_input_bytes = "…")]`
+    /// raise (never lower) this ceiling for a specific workflow type.
+    #[must_use]
+    pub const fn max_workflow_input_bytes(mut self, bytes: u64) -> Self {
+        self.max_workflow_input_bytes = bytes;
+        self
+    }
+
     /// Number of registered workflows (used in tests and diagnostics).
     #[must_use]
     pub const fn workflow_count(&self) -> usize {
@@ -745,6 +855,10 @@ impl HarvestBuilder {
             payload_codecs: self.payload_codecs.clone(),
             history_policy: self.history_policy,
             max_workflow_execution_timeout: self.max_workflow_execution_timeout,
+            max_activity_input_bytes: self.max_activity_input_bytes,
+            max_activity_result_bytes: self.max_activity_result_bytes,
+            max_signal_payload_bytes: self.max_signal_payload_bytes,
+            max_workflow_input_bytes: self.max_workflow_input_bytes,
         })
     }
 }
@@ -1285,6 +1399,7 @@ mod tests {
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             execution_timeout: None,
             concurrency: None,
+            max_input_bytes: None,
         }
     }
 
@@ -1548,6 +1663,8 @@ mod tests {
             max_concurrent,
             concurrency_key: key,
             is_local: false,
+            max_input_bytes: None,
+            max_result_bytes: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
         }
     }
@@ -1564,6 +1681,8 @@ mod tests {
             max_concurrent: None,
             concurrency_key: None,
             is_local: true,
+            max_input_bytes: None,
+            max_result_bytes: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
         }
     }
@@ -1683,6 +1802,7 @@ mod tests {
                     key_expr: "input.tenant_id",
                     limit: 0,
                 }),
+                max_input_bytes: None,
             }])
             .try_build();
         let err = result.unwrap_err();
@@ -1710,6 +1830,7 @@ mod tests {
                     key_expr: "input.tenant_id",
                     limit: 5,
                 }),
+                max_input_bytes: None,
             }])
             .try_build();
         assert!(result.is_ok());
@@ -1818,6 +1939,8 @@ mod tests {
                 max_concurrent: None,
                 concurrency_key: None,
                 is_local: false,
+                max_input_bytes: None,
+                max_result_bytes: None,
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             }])
             .try_build();

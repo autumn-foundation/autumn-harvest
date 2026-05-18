@@ -336,6 +336,8 @@ mod tests {
                 max_concurrent: None,
                 concurrency_key: None,
                 is_local: false,
+                max_input_bytes: None,
+                max_result_bytes: None,
                 handler: dummy_handler,
             },
         );

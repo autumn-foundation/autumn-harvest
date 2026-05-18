@@ -13,6 +13,39 @@ mod query;
 mod update;
 mod workflow;
 
+/// Parse a human-readable byte-size string into a `u64` byte count (issue #252).
+///
+/// Accepted suffixes: `KiB`, `KB`, `MiB`, `MB`, `GiB`, `GB`, or no suffix
+/// (plain bytes). Used at macro expansion time to validate and embed the byte cap
+/// as a `u64` literal in the generated `WorkflowInfo`/`ActivityInfo`.
+///
+/// Returns `None` for empty strings or strings with unrecognised suffixes.
+#[allow(clippy::option_if_let_else)]
+pub(crate) fn parse_byte_size_macro(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    // Try suffixes in longest-first order to avoid prefix collisions.
+    let (digits, multiplier): (&str, u64) = if let Some(n) = s.strip_suffix("GiB") {
+        (n.trim(), 1024 * 1024 * 1024)
+    } else if let Some(n) = s.strip_suffix("GB") {
+        (n.trim(), 1_000_000_000)
+    } else if let Some(n) = s.strip_suffix("MiB") {
+        (n.trim(), 1024 * 1024)
+    } else if let Some(n) = s.strip_suffix("MB") {
+        (n.trim(), 1_000_000)
+    } else if let Some(n) = s.strip_suffix("KiB") {
+        (n.trim(), 1024)
+    } else if let Some(n) = s.strip_suffix("KB") {
+        (n.trim(), 1_000)
+    } else {
+        (s, 1)
+    };
+    let n: u64 = digits.parse().ok()?;
+    n.checked_mul(multiplier)
+}
+
 /// Marks an async function as a Harvest workflow.
 ///
 /// This macro generates a companion function that returns a `WorkflowInfo`

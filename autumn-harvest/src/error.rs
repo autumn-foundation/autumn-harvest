@@ -10,6 +10,48 @@
 
 use crate::types::{ExecutionId, ExternalSignalId};
 
+// ---------------------------------------------------------------------------
+// PayloadKind
+// ---------------------------------------------------------------------------
+
+/// The category of payload that exceeded a configured size cap (issue #252).
+///
+/// Used in [`HarvestError::PayloadTooLarge`] to identify which boundary
+/// triggered the rejection so operators can attribute the cost to a specific
+/// workflow type or activity.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum PayloadKind {
+    /// Activity input serialized at schedule time.
+    ActivityInput,
+    /// Activity result returned at completion time.
+    ActivityResult,
+    /// Signal payload delivered via the management API.
+    SignalPayload,
+    /// Workflow start input provided via the management API.
+    WorkflowInput,
+    /// Child-workflow input at child-start time.
+    ChildWorkflowInput,
+    /// Child-workflow result at child-complete time.
+    ChildWorkflowResult,
+    /// Value passed to `WorkflowContext::side_effect` at recording time.
+    SideEffectValue,
+}
+
+impl std::fmt::Display for PayloadKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ActivityInput => write!(f, "ActivityInput"),
+            Self::ActivityResult => write!(f, "ActivityResult"),
+            Self::SignalPayload => write!(f, "SignalPayload"),
+            Self::WorkflowInput => write!(f, "WorkflowInput"),
+            Self::ChildWorkflowInput => write!(f, "ChildWorkflowInput"),
+            Self::ChildWorkflowResult => write!(f, "ChildWorkflowResult"),
+            Self::SideEffectValue => write!(f, "SideEffectValue"),
+        }
+    }
+}
+
 /// The kind of timeout that fired.
 ///
 /// ## Examples
@@ -227,6 +269,35 @@ pub enum HarvestError {
         query_name: String,
         /// Configured timeout in milliseconds.
         timeout_ms: u64,
+    },
+
+    /// A payload exceeded the configured size cap at a write boundary.
+    ///
+    /// Returned synchronously at the moment the oversized payload is detected
+    /// (activity input at schedule time, activity result at completion time,
+    /// signal payload at send time, etc.). No event is written to
+    /// `harvest_events` for pre-event rejections.
+    ///
+    /// The cap is enforced **only on new writes**. Payloads already stored in
+    /// history replay correctly even if they exceed the current cap — the replay
+    /// engine never re-checks sizes on existing events.
+    ///
+    #[error(
+        "payload too large: {kind} for workflow '{workflow_type}' exceeded cap of \
+         {cap_bytes} bytes (observed {observed_bytes} bytes)"
+    )]
+    PayloadTooLarge {
+        /// The kind of payload boundary that was violated.
+        kind: PayloadKind,
+        /// Actual byte length of the payload that was rejected.
+        observed_bytes: u64,
+        /// Configured cap (bytes) at the enforcement boundary.
+        cap_bytes: u64,
+        /// The workflow type name that issued the oversized payload.
+        workflow_type: String,
+        /// The activity name, when the violation is activity-scoped.
+        /// `None` for workflow-input, signal-payload, and side-effect violations.
+        activity_name: Option<String>,
     },
 
     /// Delivery of a `signal_external_workflow` call failed permanently.

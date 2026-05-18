@@ -119,6 +119,10 @@ tempfile = "3"
 name = "replay_verifier_tests"
 required-features = ["testing"]
 
+[[test]]
+name = "payload_cap_tests"
+required-features = ["testing"]
+
 [[bench]]
 name = "replay_bench"
 required-features = ["testing"]
