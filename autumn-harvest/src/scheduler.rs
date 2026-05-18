@@ -421,6 +421,10 @@ pub async fn register_schedules(
     #[cfg(not(feature = "unified-dag-execution"))]
     reject_classic_dags_without_unified_execution(dags)?;
     for dag in dags.values() {
+        if let Some(schedule) = &dag.schedule {
+            crate::policy::validate_schedule(schedule)
+                .map_err(crate::error::HarvestError::Config)?;
+        }
         upsert_schedule(conn, dag).await?;
     }
     Ok(())
@@ -437,6 +441,10 @@ async fn register_schedules_for_shard(
     for dag in dags.values() {
         if router.pick_for_dag(&dag.name) != shard {
             continue;
+        }
+        if let Some(schedule) = &dag.schedule {
+            crate::policy::validate_schedule(schedule)
+                .map_err(crate::error::HarvestError::Config)?;
         }
         upsert_schedule(conn, dag).await?;
     }
@@ -470,6 +478,8 @@ async fn register_workflow_schedules_for_shard(
     for ws in schedules {
         let owning_shard = workflow_schedule_shard(ws, router);
         if owning_shard == shard {
+            crate::policy::validate_schedule(&ws.schedule)
+                .map_err(crate::error::HarvestError::Config)?;
             upsert_workflow_schedule(conn, ws).await?;
         } else if ws.dag_name.is_some() {
             delete_stale_dag_workflow_schedule(conn, ws).await?;
