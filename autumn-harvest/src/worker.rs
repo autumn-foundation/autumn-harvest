@@ -333,6 +333,7 @@ const fn workflow_command_name(command: &WorkflowCommand) -> &'static str {
         WorkflowCommand::RunLocalActivity { .. } => "RunLocalActivity",
         WorkflowCommand::RecordUpdateResult { .. } => "RecordUpdateResult",
         WorkflowCommand::UpsertSearchAttributes { .. } => "UpsertSearchAttributes",
+        WorkflowCommand::SignalExternalWorkflow { .. } => "SignalExternalWorkflow",
     }
 }
 
@@ -737,6 +738,120 @@ fn extract_run_local_activity(
         markers,
         local_run.expect("called only after confirming RunLocalActivity is present"),
     )
+}
+
+// ---------------------------------------------------------------------------
+// SignalExternalWorkflow inline dispatch (same-shard)
+// ---------------------------------------------------------------------------
+
+struct SignalExternalWorkflowRun {
+    signal_id: crate::types::ExternalSignalId,
+    target: ExecutionId,
+    signal_name: String,
+    payload: serde_json::Value,
+    /// `true` when `ExternalSignalRequested` is already durable — worker crashed
+    /// after appending it but before recording the terminal event. Skip
+    /// re-appending and go straight to (re-)attempting delivery.
+    already_requested: bool,
+}
+
+/// Extract a `SignalExternalWorkflow` command from an owned command list.
+///
+/// Marker events are also extracted. `result_tx` is dropped immediately — the
+/// workflow coroutine is not awaiting it during inline dispatch.
+fn extract_signal_external_workflow(
+    commands: Vec<WorkflowCommand>,
+) -> (Vec<WorkflowEvent>, SignalExternalWorkflowRun) {
+    let mut markers = Vec::with_capacity(commands.len());
+    let mut signal_run = None;
+    for cmd in commands {
+        match cmd {
+            WorkflowCommand::RecordMarker { name, details } => {
+                markers.push(WorkflowEvent::MarkerRecorded { name, details });
+            }
+            WorkflowCommand::SignalExternalWorkflow {
+                signal_id,
+                target,
+                signal_name,
+                payload,
+                result_tx,
+                already_requested,
+            } => {
+                drop(result_tx);
+                signal_run = Some(SignalExternalWorkflowRun {
+                    signal_id,
+                    target,
+                    signal_name,
+                    payload,
+                    already_requested,
+                });
+            }
+            _ => {}
+        }
+    }
+    (
+        markers,
+        signal_run.expect("called only after confirming SignalExternalWorkflow is present"),
+    )
+}
+
+/// Deliver a `SignalExternalWorkflow` command inline and append durability events.
+///
+/// Same-shard delivery: writes directly to `harvest_signals` and wakes the
+/// target task. Cross-shard delivery requires the plugin's outbox and is
+/// outside the scope of this function — cross-shard targets are reported as
+/// `target_unknown`.
+///
+/// Returns all newly-appended events (markers + requested + terminal) so the
+/// caller can extend its in-memory replay history without a DB round-trip.
+async fn persist_external_signal_inline(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    markers: Vec<WorkflowEvent>,
+    run: SignalExternalWorkflowRun,
+    next_event_id: &mut i32,
+) -> HarvestResult<Vec<WorkflowEvent>> {
+    let mut new_events: Vec<WorkflowEvent> = markers;
+
+    if !new_events.is_empty() {
+        store::append_events(conn, exec_id, &new_events, *next_event_id).await?;
+        *next_event_id += i32::try_from(new_events.len()).unwrap_or(i32::MAX);
+    }
+
+    if !run.already_requested {
+        let requested = WorkflowEvent::ExternalSignalRequested {
+            signal_id: run.signal_id,
+            target: run.target,
+            signal_name: run.signal_name.clone(),
+            payload: run.payload.clone(),
+        };
+        store::append_events(conn, exec_id, std::slice::from_ref(&requested), *next_event_id)
+            .await?;
+        *next_event_id += 1;
+        new_events.push(requested);
+    }
+
+    let terminal = match signal::send_signal(conn, run.target, &run.signal_name, run.payload).await
+    {
+        Ok(()) => WorkflowEvent::ExternalSignalDelivered {
+            signal_id: run.signal_id,
+        },
+        Err(HarvestError::NotFound(_)) => WorkflowEvent::ExternalSignalFailed {
+            signal_id: run.signal_id,
+            reason_code: "target_unknown".to_string(),
+        },
+        Err(HarvestError::Database(e)) => return Err(HarvestError::Database(e)),
+        Err(_) => WorkflowEvent::ExternalSignalFailed {
+            signal_id: run.signal_id,
+            reason_code: "target_terminal".to_string(),
+        },
+    };
+
+    store::append_events(conn, exec_id, std::slice::from_ref(&terminal), *next_event_id).await?;
+    *next_event_id += 1;
+    new_events.push(terminal);
+
+    Ok(new_events)
 }
 
 /// Run a local activity inline, appending durability events to `harvest_events`.
@@ -3494,6 +3609,54 @@ async fn process_workflow_task(
                                 .history_policy()
                                 .event_hard_cap()
                                 .expect("HistoryCapReached requires a configured hard cap"),
+                        )
+                        .await;
+                    }
+                };
+                history_events.extend(new_events);
+                let current_history_event_count =
+                    u64::try_from(history_events.len()).unwrap_or(u64::MAX);
+                if let Some(cap) = registry.history_policy().event_hard_cap()
+                    && current_history_event_count >= cap
+                {
+                    return fail_workflow_for_history_cap(
+                        conn,
+                        &telemetry,
+                        task,
+                        &prepared.execution,
+                        prepared.exec_id,
+                        next_event_id,
+                        worker_id,
+                        started_at,
+                        current_history_event_count,
+                        cap,
+                    )
+                    .await;
+                }
+            }
+            WorkflowOutcome::Suspended { commands }
+                if commands
+                    .iter()
+                    .any(|c| matches!(c, WorkflowCommand::SignalExternalWorkflow { .. })) =>
+            {
+                drop(execute_span);
+                let (markers, signal_run) = extract_signal_external_workflow(commands);
+                let new_events = match persist_external_signal_inline(
+                    conn,
+                    prepared.exec_id,
+                    markers,
+                    signal_run,
+                    &mut next_event_id,
+                )
+                .await
+                {
+                    Ok(events) => events,
+                    Err(e) => {
+                        return fail_execution_on_error(
+                            conn,
+                            task,
+                            worker_id,
+                            Err::<(), _>(e),
                         )
                         .await;
                     }

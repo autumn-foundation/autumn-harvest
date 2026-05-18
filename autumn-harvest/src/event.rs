@@ -13,7 +13,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::TimeoutType;
 use crate::types::{
-    ActivityExecId, ExecutionId, ExternalActivityToken, TimerId, UpdateId, WorkerId,
+    ActivityExecId, ExecutionId, ExternalActivityToken, ExternalSignalId, TimerId, UpdateId,
+    WorkerId,
 };
 
 fn default_error_type() -> String {
@@ -347,6 +348,41 @@ pub enum WorkflowEvent {
         /// Total attempts that were made (equals `max_attempts`).
         attempt: u32,
     },
+
+    // ── External workflow signals (issue #330) ────────────────────────────
+    /// A workflow requested delivery of a named signal to another running
+    /// workflow by `ExecutionId`.
+    ///
+    /// The `signal_id` correlates this request with its terminal outcome event
+    /// (`ExternalSignalDelivered` or `ExternalSignalFailed`). On replay the
+    /// caller's context returns the recorded outcome without re-issuing the
+    /// side effect.
+    ExternalSignalRequested {
+        /// Correlation ID linking this event to its terminal outcome.
+        signal_id: ExternalSignalId,
+        /// The execution ID of the workflow that should receive the signal.
+        target: ExecutionId,
+        /// Name of the signal channel on the receiving workflow.
+        signal_name: String,
+        /// JSON payload to deliver to the receiving workflow.
+        payload: serde_json::Value,
+    },
+    /// The signal was successfully inserted into the target workflow's signal
+    /// queue (or durably queued via the outbox for cross-shard delivery).
+    ExternalSignalDelivered {
+        /// Correlation ID matching the corresponding `ExternalSignalRequested`.
+        signal_id: ExternalSignalId,
+    },
+    /// The signal could not be delivered. The `reason_code` is one of:
+    /// - `"target_terminal"` — the target workflow is already in a terminal state.
+    /// - `"target_unknown"` — no execution with the given ID was found after
+    ///   the configured grace window.
+    ExternalSignalFailed {
+        /// Correlation ID matching the corresponding `ExternalSignalRequested`.
+        signal_id: ExternalSignalId,
+        /// Machine-readable reason code (`"target_terminal"` or `"target_unknown"`).
+        reason_code: String,
+    },
 }
 
 impl WorkflowEvent {
@@ -386,6 +422,9 @@ impl WorkflowEvent {
             Self::WorkflowResetFork { .. } => "WorkflowResetFork",
             Self::WorkflowResetTerminated { .. } => "WorkflowResetTerminated",
             Self::LocalActivityExhausted { .. } => "LocalActivityExhausted",
+            Self::ExternalSignalRequested { .. } => "ExternalSignalRequested",
+            Self::ExternalSignalDelivered { .. } => "ExternalSignalDelivered",
+            Self::ExternalSignalFailed { .. } => "ExternalSignalFailed",
         }
     }
 
@@ -719,11 +758,24 @@ mod tests {
                 reason: "bad deploy".into(),
                 operator_id: "ops".into(),
             },
+            WorkflowEvent::ExternalSignalRequested {
+                signal_id: crate::types::ExternalSignalId::new(),
+                target: ExecutionId::new(),
+                signal_name: "cancel".into(),
+                payload: serde_json::Value::Null,
+            },
+            WorkflowEvent::ExternalSignalDelivered {
+                signal_id: crate::types::ExternalSignalId::new(),
+            },
+            WorkflowEvent::ExternalSignalFailed {
+                signal_id: crate::types::ExternalSignalId::new(),
+                reason_code: "target_terminal".into(),
+            },
         ];
 
-        assert_eq!(events.len(), 30);
+        assert_eq!(events.len(), 33);
         let names: HashSet<_> = events.iter().map(WorkflowEvent::type_name).collect();
-        assert_eq!(names.len(), 30, "duplicate type names detected");
+        assert_eq!(names.len(), 33, "duplicate type names detected");
     }
 
     #[test]
@@ -758,5 +810,111 @@ mod tests {
         ));
 
         Ok(())
+    }
+
+    // ── ExternalSignal event tests (issue #330) ───────────────────────────
+
+    #[test]
+    fn external_signal_requested_round_trips() -> Result<(), serde_json::Error> {
+        let signal_id = crate::types::ExternalSignalId::new();
+        let target = ExecutionId::new();
+        let event = WorkflowEvent::ExternalSignalRequested {
+            signal_id,
+            target,
+            signal_name: "tenant_cancel".into(),
+            payload: serde_json::json!({"reason": "billing_lapse"}),
+        };
+        assert_eq!(event.type_name(), "ExternalSignalRequested");
+        let json = serde_json::to_string(&event)?;
+        let back: WorkflowEvent = serde_json::from_str(&json)?;
+        match back {
+            WorkflowEvent::ExternalSignalRequested {
+                signal_id: sid,
+                target: t,
+                signal_name,
+                payload,
+            } => {
+                assert_eq!(sid, signal_id);
+                assert_eq!(t, target);
+                assert_eq!(signal_name, "tenant_cancel");
+                assert_eq!(payload["reason"], "billing_lapse");
+            }
+            _ => panic!("wrong variant"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn external_signal_delivered_round_trips() -> Result<(), serde_json::Error> {
+        let signal_id = crate::types::ExternalSignalId::new();
+        let event = WorkflowEvent::ExternalSignalDelivered { signal_id };
+        assert_eq!(event.type_name(), "ExternalSignalDelivered");
+        let json = serde_json::to_string(&event)?;
+        let back: WorkflowEvent = serde_json::from_str(&json)?;
+        assert!(matches!(
+            back,
+            WorkflowEvent::ExternalSignalDelivered { signal_id: sid } if sid == signal_id
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn external_signal_failed_round_trips() -> Result<(), serde_json::Error> {
+        let signal_id = crate::types::ExternalSignalId::new();
+        let event = WorkflowEvent::ExternalSignalFailed {
+            signal_id,
+            reason_code: "target_terminal".into(),
+        };
+        assert_eq!(event.type_name(), "ExternalSignalFailed");
+        let json = serde_json::to_string(&event)?;
+        let back: WorkflowEvent = serde_json::from_str(&json)?;
+        match back {
+            WorkflowEvent::ExternalSignalFailed {
+                signal_id: sid,
+                reason_code,
+            } => {
+                assert_eq!(sid, signal_id);
+                assert_eq!(reason_code, "target_terminal");
+            }
+            _ => panic!("wrong variant"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn external_signal_failed_unknown_target_reason_code() -> Result<(), serde_json::Error> {
+        let signal_id = crate::types::ExternalSignalId::new();
+        let event = WorkflowEvent::ExternalSignalFailed {
+            signal_id,
+            reason_code: "target_unknown".into(),
+        };
+        let json = serde_json::to_string(&event)?;
+        let back: WorkflowEvent = serde_json::from_str(&json)?;
+        match back {
+            WorkflowEvent::ExternalSignalFailed { reason_code, .. } => {
+                assert_eq!(reason_code, "target_unknown");
+            }
+            _ => panic!("wrong variant"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn external_signal_events_are_not_terminal_lifecycle() {
+        let signal_id = crate::types::ExternalSignalId::new();
+        let target = ExecutionId::new();
+        assert!(!WorkflowEvent::ExternalSignalRequested {
+            signal_id,
+            target,
+            signal_name: "x".into(),
+            payload: serde_json::Value::Null,
+        }
+        .is_terminal_lifecycle());
+        assert!(!WorkflowEvent::ExternalSignalDelivered { signal_id }.is_terminal_lifecycle());
+        assert!(!WorkflowEvent::ExternalSignalFailed {
+            signal_id,
+            reason_code: "target_terminal".into(),
+        }
+        .is_terminal_lifecycle());
     }
 }

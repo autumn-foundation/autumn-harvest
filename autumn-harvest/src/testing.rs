@@ -75,6 +75,8 @@ pub enum NonDeterminismKind {
     SideEffectMismatch,
     /// An external activity name did not match the recorded event.
     ExternalActivityMismatch,
+    /// A `signal_external_workflow` call did not match the recorded event.
+    ExternalSignalMismatch,
     /// A continue-as-new input differed from history.
     ContinueAsNewMismatch,
     /// The workflow returned before consuming all recorded history events.
@@ -97,6 +99,7 @@ impl std::fmt::Display for NonDeterminismKind {
             Self::ChildWorkflowMismatch => write!(f, "ChildWorkflowMismatch"),
             Self::SideEffectMismatch => write!(f, "SideEffectMismatch"),
             Self::ExternalActivityMismatch => write!(f, "ExternalActivityMismatch"),
+            Self::ExternalSignalMismatch => write!(f, "ExternalSignalMismatch"),
             Self::ContinueAsNewMismatch => write!(f, "ContinueAsNewMismatch"),
             Self::EarlyCompletion => write!(f, "EarlyCompletion"),
             Self::VersionMarkerMismatch => write!(f, "VersionMarkerMismatch"),
@@ -702,6 +705,7 @@ fn classify_kind(kind_str: &str, actual: &str) -> NonDeterminismKind {
         "child workflow" => NonDeterminismKind::ChildWorkflowMismatch,
         "side effect" => NonDeterminismKind::SideEffectMismatch,
         "external activity" => NonDeterminismKind::ExternalActivityMismatch,
+        "external signal" => NonDeterminismKind::ExternalSignalMismatch,
         s if s.contains("continue") => NonDeterminismKind::ContinueAsNewMismatch,
         "early completion" => NonDeterminismKind::EarlyCompletion,
         _ => NonDeterminismKind::Unknown,
@@ -913,6 +917,10 @@ mod tests {
         assert_eq!(
             classify_kind("external activity", "ActivityScheduled"),
             NonDeterminismKind::ExternalActivityMismatch
+        );
+        assert_eq!(
+            classify_kind("external signal", "ActivityScheduled"),
+            NonDeterminismKind::ExternalSignalMismatch
         );
         assert_eq!(
             classify_kind("continue-as-new", ""),

@@ -7,6 +7,7 @@ members = [
     "autumn-harvest-redis",
     "examples/billing-autumn-web",
     "examples/quickstart",
+    "examples/saga-choreography",
     "examples/standalone-runner",
 ]
 resolver = "3"

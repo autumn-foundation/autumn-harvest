@@ -14,7 +14,7 @@ use std::collections::{HashSet, VecDeque};
 
 use crate::error::TimeoutType;
 use crate::event::WorkflowEvent;
-use crate::types::{ActivityExecId, ExecutionId, ExternalActivityToken, UpdateId};
+use crate::types::{ActivityExecId, ExecutionId, ExternalActivityToken, ExternalSignalId, UpdateId};
 
 /// Result of matching a workflow command against the event history.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,6 +97,17 @@ pub enum HistoryMatch {
         /// Error from the last recorded `LocalActivityFailed`, if any.
         /// Returned by the worker when `failed_attempts >= max_attempts`.
         last_error: Option<String>,
+    },
+    /// History has an `ExternalSignalRequested` event but no terminal event
+    /// (`ExternalSignalDelivered` or `ExternalSignalFailed`) yet.
+    ///
+    /// This occurs when the worker crashed after appending the request event
+    /// but before recording the delivery outcome. The caller must re-attempt
+    /// delivery using the **same** `signal_id` so the idempotency key is
+    /// unchanged, and must NOT append a second `ExternalSignalRequested` event.
+    ExternalSignalInProgress {
+        /// The `ExternalSignalId` already recorded in history. Must be reused.
+        signal_id: ExternalSignalId,
     },
 }
 
@@ -720,6 +731,121 @@ impl HistoryMatcher {
 
         // Awaiting event exists in history but no terminal found yet.
         HistoryMatch::AwaitingExternalCompletion { activity_id, token }
+    }
+
+    /// Match a `signal_external_workflow` command against history.
+    ///
+    /// Expects `ExternalSignalRequested { target, signal_name }` at the current
+    /// cursor, then scans forward for `ExternalSignalDelivered` or
+    /// `ExternalSignalFailed` with the same `signal_id`.
+    ///
+    /// Returns:
+    /// - [`HistoryMatch::Matched`] (output = `null`) when the signal was delivered
+    /// - [`HistoryMatch::Failed`] when `ExternalSignalFailed` is found in history
+    /// - [`HistoryMatch::ExternalSignalInProgress`] when `ExternalSignalRequested`
+    ///   exists but no terminal event yet (crash recovery path)
+    /// - [`HistoryMatch::NoMatch`] when past end of history (first-time call)
+    /// - [`HistoryMatch::Diverged`] when a different event is at this position
+    pub fn match_external_signal(
+        &mut self,
+        target: ExecutionId,
+        signal_name: &str,
+    ) -> HistoryMatch {
+        if !self.prepare_match() {
+            return HistoryMatch::NoMatch;
+        }
+
+        let result = match &self.events[self.cursor] {
+            WorkflowEvent::ExternalSignalRequested {
+                signal_id,
+                target: recorded_target,
+                signal_name: recorded_name,
+                ..
+            } => {
+                if *recorded_target != target {
+                    return HistoryMatch::Diverged {
+                        expected: format!("ExternalSignalRequested(target={target}, signal={signal_name})"),
+                        actual: format!(
+                            "ExternalSignalRequested(target={recorded_target}, signal={recorded_name})"
+                        ),
+                    };
+                }
+                if recorded_name != signal_name {
+                    return HistoryMatch::Diverged {
+                        expected: format!(
+                            "ExternalSignalRequested(target={target}, signal={signal_name})"
+                        ),
+                        actual: format!(
+                            "ExternalSignalRequested(target={target}, signal={recorded_name})"
+                        ),
+                    };
+                }
+                Ok(*signal_id)
+            }
+            other => Err(HistoryMatch::Diverged {
+                expected: format!(
+                    "ExternalSignalRequested(target={target}, signal={signal_name})"
+                ),
+                actual: Self::actual_event_name(other),
+            }),
+        };
+
+        let signal_id = match result {
+            Ok(id) => id,
+            Err(diverged) => return diverged,
+        };
+
+        // Advance past the ExternalSignalRequested event.
+        self.cursor += 1;
+        let mut scan_cursor = self.cursor;
+
+        while scan_cursor < self.events.len() {
+            if self.is_consumed(scan_cursor) {
+                scan_cursor += 1;
+                continue;
+            }
+
+            match &self.events[scan_cursor] {
+                WorkflowEvent::ExternalSignalDelivered { signal_id: id } if *id == signal_id => {
+                    self.cursor = scan_cursor + 1;
+                    self.advance_to_next_unconsumed_event();
+                    return HistoryMatch::Matched {
+                        output: serde_json::Value::Null,
+                    };
+                }
+                WorkflowEvent::ExternalSignalFailed {
+                    signal_id: id,
+                    reason_code,
+                } if *id == signal_id => {
+                    let reason_code = reason_code.clone();
+                    self.cursor = scan_cursor + 1;
+                    self.advance_to_next_unconsumed_event();
+                    return HistoryMatch::Failed {
+                        error: reason_code,
+                        attempt: 1,
+                    };
+                }
+                // Signals can arrive while the external signal delivery is in-flight.
+                WorkflowEvent::SignalReceived {
+                    signal_name: sn,
+                    payload,
+                } => {
+                    let sn = sn.clone();
+                    let payload = payload.clone();
+                    self.stash_signal(scan_cursor, sn, payload);
+                    scan_cursor += 1;
+                }
+                // Update events are transparent to the external signal scan.
+                ev if Self::is_update_event(ev) => {
+                    scan_cursor += 1;
+                }
+                _ => break,
+            }
+        }
+
+        // ExternalSignalRequested found in history but no terminal event yet.
+        // Worker crashed between recording the request and the delivery outcome.
+        HistoryMatch::ExternalSignalInProgress { signal_id }
     }
 
     /// Match a timer command against history.
