@@ -971,7 +971,7 @@ impl CiReport {
                     );
                 }
                 FixtureStatus::Skipped { reason } => {
-                    let _ = writeln!(out, "  SKIP  {file} ({}) — {reason}", result.workflow_name,);
+                    let _ = writeln!(out, "  SKIP  {file} ({}) — {reason}", result.workflow_name);
                 }
             }
         }
@@ -1368,7 +1368,7 @@ fn collect_json_files_from(entries: std::fs::ReadDir, files: &mut Vec<std::path:
         let path = entry.path();
         // Use DirEntry::file_type() which does NOT follow symlinks, preventing
         // infinite recursion on symlink cycles.
-        let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+        let is_dir = entry.file_type().is_ok_and(|ft| ft.is_dir());
         if is_dir {
             if let Ok(sub) = std::fs::read_dir(&path) {
                 collect_json_files_from(sub, files);
