@@ -632,6 +632,15 @@ pub struct SignalWithStartParams<'a> {
     pub search_attrs: Option<serde_json::Value>,
     pub reuse_policy: WorkflowIdReusePolicy,
     pub trace_context: Option<TraceContextCarrier>,
+    /// Server-side ceiling applied to `execution_timeout`. Forwarded to
+    /// [`StartWorkflowParams::max_execution_timeout_ceiling`].
+    pub max_execution_timeout_ceiling: Option<chrono::Duration>,
+    /// Pre-resolved concurrency group key. Forwarded to
+    /// [`StartWorkflowParams::concurrency_key`].
+    pub concurrency_key: Option<String>,
+    /// Per-key concurrency cap. Forwarded to
+    /// [`StartWorkflowParams::concurrency_limit`].
+    pub concurrency_limit: Option<u32>,
     pub signal_name: &'a str,
     pub signal_payload: serde_json::Value,
     /// Optional dedup key. When present, repeated calls with the same
@@ -758,6 +767,9 @@ pub async fn signal_with_start_workflow_execution(
                 search_attrs: request.search_attrs.clone(),
                 reuse_policy: effective_policy,
                 trace_context: request.trace_context.clone(),
+                max_execution_timeout_ceiling: request.max_execution_timeout_ceiling,
+                concurrency_key: request.concurrency_key.clone(),
+                concurrency_limit: request.concurrency_limit,
             };
             let started = start_or_load_workflow_execution(conn, start_request).await?;
 

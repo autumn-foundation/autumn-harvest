@@ -4001,13 +4001,53 @@ async fn signal_with_start_workflow(
     let start_input = request.start_input.unwrap_or(Value::Null);
     let signal_payload = request.signal_payload.unwrap_or(Value::Null);
 
-    let shard = runtime
-        .router
-        .pick_for_new_workflow(&workflow_name, &workflow_id);
-    let exec_id = ExecutionId::new_for_shard(shard);
-    let mut conn = match db_conn_for_shard(&api_state, shard).await {
-        Ok(c) => c,
-        Err(e) => return e.into_response(),
+    // In multi-shard deployments with read-only shards the rendezvous hash can
+    // map a (workflow_name, workflow_id) to a different writable shard than the
+    // one that already holds the live execution. Search every readable shard
+    // for an existing non-terminal execution first; only fall back to a fresh
+    // shard when none is found. This ensures signal-with-start always attaches
+    // to the correct run rather than accidentally starting a second one.
+    let pool = match api_state.storage_pool() {
+        Ok(p) => p,
+        Err(e) => return map_error(e).into_response(),
+    };
+    let mut found_shard: Option<(ShardId, PoolConn, ExecutionId)> = None;
+    for (candidate_shard, shard_pool) in pool.iter_shards() {
+        if let Ok(mut shard_conn) = acquire_conn(shard_pool).await {
+            let hit = harvest_workflow_executions::table
+                .filter(harvest_workflow_executions::workflow_name.eq(&workflow_name))
+                .filter(harvest_workflow_executions::workflow_id.eq(&workflow_id))
+                .filter(
+                    harvest_workflow_executions::state
+                        .ne_all(["CONTINUED_AS_NEW", "TERMINATED"]),
+                )
+                .select(harvest_workflow_executions::id)
+                .first::<uuid::Uuid>(&mut shard_conn)
+                .await
+                .optional()
+                .unwrap_or(None);
+            if let Some(existing_uuid) = hit {
+                found_shard = Some((
+                    candidate_shard,
+                    shard_conn,
+                    ExecutionId::from_uuid(existing_uuid),
+                ));
+                break;
+            }
+        }
+    }
+
+    let (shard, mut conn, exec_id) = if let Some(tuple) = found_shard {
+        tuple
+    } else {
+        let shard = runtime
+            .router
+            .pick_for_new_workflow(&workflow_name, &workflow_id);
+        let conn = match db_conn_for_shard(&api_state, shard).await {
+            Ok(c) => c,
+            Err(e) => return e.into_response(),
+        };
+        (shard, conn, ExecutionId::new_for_shard(shard))
     };
 
     let trace_ctx = tracing::info_span!(
@@ -4019,6 +4059,19 @@ async fn signal_with_start_workflow(
         { ATTR_QUEUE } = %queue_name,
     )
     .in_scope(|| runtime.registry.telemetry().capture_trace_context());
+
+    let (concurrency_key, concurrency_limit) = runtime
+        .registry
+        .workflows
+        .get(&workflow_name)
+        .and_then(|info| info.concurrency.as_ref())
+        .map_or((None, None), |policy| {
+            let key = autumn_harvest::concurrency::resolve_concurrency_key(
+                policy.key_expr,
+                &start_input,
+            );
+            (key, Some(policy.limit))
+        });
 
     let result = signal_with_start_workflow_execution(
         &mut conn,
@@ -4036,6 +4089,11 @@ async fn signal_with_start_workflow(
             search_attrs: request.search_attrs,
             reuse_policy,
             trace_context: trace_ctx,
+            max_execution_timeout_ceiling: api_state
+                .max_workflow_execution_timeout()
+                .map(|d| chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX)),
+            concurrency_key,
+            concurrency_limit,
             signal_name: &request.signal_name,
             signal_payload,
             idempotency_key: request.idempotency_key.clone(),

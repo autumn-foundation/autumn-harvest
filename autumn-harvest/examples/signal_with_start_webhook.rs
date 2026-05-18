@@ -93,6 +93,9 @@ async fn handle_webhook_after(
             // starts must never happen (e.g., financial onboarding flows).
             reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
             trace_context: None,
+            max_execution_timeout_ceiling: None,
+            concurrency_key: None,
+            concurrency_limit: None,
             signal_name: "stripe.subscription_created",
             signal_payload: payload,
             // Stripe-Idempotency-Key dedupes upstream retries: two webhook

@@ -100,6 +100,8 @@ fn test_registry() -> Arc<HandlerRegistry> {
             name: "onboarding",
             module: "tests",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            execution_timeout: None,
+            concurrency: None,
         }],
         vec![],
     ))
