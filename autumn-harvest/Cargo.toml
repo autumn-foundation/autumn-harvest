@@ -113,9 +113,19 @@ loom = "0.7.2"
 criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 trybuild = "1"
+tempfile = "3"
+
+[[test]]
+name = "replay_verifier_tests"
+required-features = ["testing"]
 
 [[bench]]
 name = "replay_bench"
+required-features = ["testing"]
+harness = false
+
+[[bench]]
+name = "replay_verifier_bench"
 required-features = ["testing"]
 harness = false
 

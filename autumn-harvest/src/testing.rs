@@ -61,7 +61,7 @@ use crate::types::{ActivityExecId, ExecutionId};
 ///
 /// Each variant maps to a distinct command/event kind so callers can
 /// distinguish (and report on) activity vs timer vs signal divergences.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum NonDeterminismKind {
     /// An activity was scheduled with a different name than what history recorded.
     ActivityScheduleMismatch,
@@ -115,7 +115,7 @@ impl std::fmt::Display for NonDeterminismKind {
 // ---------------------------------------------------------------------------
 
 /// The result classification of a single replay run.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub enum ReplayStatus {
     /// The workflow replayed the entire recorded history without divergence.
     ReplaySucceeded,
@@ -734,6 +734,683 @@ fn find_event_index(events: &[WorkflowEvent], actual: &str) -> usize {
         .iter()
         .position(|e| e.type_name() == target)
         .unwrap_or(0)
+}
+
+// ===========================================================================
+// ReplayVerifier  — batch CI replay gate (issue #251)
+// ===========================================================================
+
+/// Category of non-determinism failure or harness error for a single fixture.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "kind")]
+pub enum FixtureStatus {
+    /// Replay completed without divergence.
+    Passed,
+    /// Replay detected non-determinism or the workflow function returned an error.
+    Failed(ReplayStatus),
+    /// The fixture could not be loaded or the workflow name has no registered handler.
+    HarnessError(HarnessErrorKind),
+    /// Workflow name has no handler but `allow_unregistered = true` — treated as a warning.
+    Skipped { reason: String },
+}
+
+/// Reason a fixture could not be replayed (harness-side, not replay-side).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub enum HarnessErrorKind {
+    /// The fixture's `workflow_name` is not registered in this verifier.
+    UnregisteredWorkflow,
+    /// The fixture file could not be read or is not valid [`HistorySnapshot`] JSON.
+    InvalidFixture(String),
+    /// The replay exceeded the per-fixture timeout.
+    Timeout,
+}
+
+impl std::fmt::Display for HarnessErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnregisteredWorkflow => write!(f, "UnregisteredWorkflow"),
+            Self::InvalidFixture(msg) => write!(f, "InvalidFixture({msg})"),
+            Self::Timeout => write!(f, "Timeout"),
+        }
+    }
+}
+
+/// Result of replaying one fixture file.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FixtureResult {
+    /// Path to the source fixture file.
+    #[serde(serialize_with = "serialize_path")]
+    pub path: std::path::PathBuf,
+    /// Workflow name from the fixture (empty string if the file was unparseable).
+    pub workflow_name: String,
+    /// Execution ID from the fixture (`None` if the file was unparseable).
+    pub execution_id: Option<ExecutionId>,
+    /// Outcome of this fixture replay.
+    pub status: FixtureStatus,
+}
+
+#[allow(clippy::ptr_arg)] // serde requires &FieldType; &PathBuf cannot be replaced by &Path here
+fn serialize_path<S: serde::Serializer>(
+    path: &std::path::PathBuf,
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    s.serialize_str(&path.to_string_lossy())
+}
+
+/// Aggregate report returned by [`ReplayVerifier::verify_dir`] /
+/// [`ReplayVerifier::verify_all`].
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BatchReplayReport {
+    /// Total number of `.json` fixture files discovered.
+    pub fixtures_total: usize,
+    /// Number of fixtures that replayed without divergence.
+    pub succeeded: usize,
+    /// Number of fixtures that failed replay (non-determinism or workflow error).
+    pub failed: usize,
+    /// Number of fixtures that could not be processed (invalid JSON, no handler).
+    pub harness_errors: usize,
+    /// Number of fixtures skipped because `allow_unregistered = true`.
+    pub skipped: usize,
+    /// Per-fixture results in file-path order.
+    pub results: Vec<FixtureResult>,
+}
+
+impl BatchReplayReport {
+    /// Wrap in a [`CiReport`] with the default [`FailOnMode::Any`] exit-code policy.
+    #[must_use]
+    #[allow(clippy::missing_const_for_fn)]
+    pub fn into_ci_report(self) -> CiReport {
+        CiReport {
+            report: self,
+            fail_on: FailOnMode::Any,
+        }
+    }
+
+    /// Wrap in a [`CiReport`] with a pass-rate threshold exit-code policy.
+    ///
+    /// `threshold` is a fraction in `[0.0, 1.0]`. Exit code 1 is returned
+    /// only when the fraction of succeeded fixtures falls below `threshold`.
+    #[must_use]
+    #[allow(clippy::missing_const_for_fn)]
+    pub fn into_ci_report_with_threshold(self, threshold: f64) -> CiReport {
+        CiReport {
+            report: self,
+            fail_on: FailOnMode::Rate(threshold),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CiReport, FailOnMode, ReportFormat
+// ---------------------------------------------------------------------------
+
+/// Controls when [`CiReport::exit_code`] returns `1`.
+#[derive(Debug, Clone)]
+pub enum FailOnMode {
+    /// Exit `1` if any fixture fails (default).
+    Any,
+    /// Exit `1` if the pass rate (`succeeded / fixtures_total`) is below this fraction.
+    Rate(f64),
+}
+
+/// Output format for [`CiReport::format_report`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReportFormat {
+    /// Human-readable summary printed to a string (default).
+    Text,
+    #[allow(clippy::doc_markdown)] // JUnit is a proper name, not a code item
+    /// JUnit XML with one `<testcase>` per fixture.
+    JUnit,
+    /// Structured JSON serialization of [`BatchReplayReport`].
+    Json,
+    /// GitHub Actions `::error file=…` annotations, one per failed/errored fixture.
+    GitHub,
+}
+
+/// CI-shaped wrapper around a [`BatchReplayReport`] that computes exit codes
+/// and formats output for various CI systems.
+pub struct CiReport {
+    /// The underlying batch report.
+    pub report: BatchReplayReport,
+    fail_on: FailOnMode,
+}
+
+impl CiReport {
+    /// Compute the process exit code.
+    ///
+    /// - `0` — every fixture replayed cleanly (or skipped when `allow_unregistered = true`).
+    /// - `1` — one or more replay failures (subject to [`FailOnMode`]).
+    /// - `2` — one or more harness errors (dominates over replay failures).
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)] // fixture counts fit comfortably in f64 mantissa
+    pub fn exit_code(&self) -> i32 {
+        if self.report.harness_errors > 0 {
+            return 2;
+        }
+        match &self.fail_on {
+            FailOnMode::Any => i32::from(self.report.failed > 0),
+            FailOnMode::Rate(threshold) => {
+                let total = self.report.fixtures_total;
+                if total == 0 {
+                    return 0;
+                }
+                let pass_rate = self.report.succeeded as f64 / total as f64;
+                i32::from(pass_rate < *threshold)
+            }
+        }
+    }
+
+    /// Override the exit-code policy after construction.
+    #[must_use]
+    #[allow(clippy::missing_const_for_fn)]
+    pub fn with_fail_on(mut self, mode: FailOnMode) -> Self {
+        self.fail_on = mode;
+        self
+    }
+
+    /// Render the report in the requested format as a `String`.
+    #[must_use]
+    pub fn format_report(&self, format: ReportFormat) -> String {
+        match format {
+            ReportFormat::Text => self.format_text(),
+            ReportFormat::JUnit => self.format_junit(),
+            ReportFormat::Json => self.format_json(),
+            ReportFormat::GitHub => self.format_github(),
+        }
+    }
+
+    fn format_text(&self) -> String {
+        use std::fmt::Write as FmtWrite;
+        let r = &self.report;
+        let mut out = String::new();
+        let _ = writeln!(
+            out,
+            "harvest replay-verify: {} fixture(s) total — {} PASS, {} FAIL, {} error(s), {} skipped",
+            r.fixtures_total, r.succeeded, r.failed, r.harness_errors, r.skipped,
+        );
+        for result in &r.results {
+            let file = result.path.file_name().map_or_else(
+                || result.path.to_string_lossy().into_owned(),
+                |n| n.to_string_lossy().into_owned(),
+            );
+            match &result.status {
+                FixtureStatus::Passed => {
+                    let _ = writeln!(out, "  PASS  {file} ({})", result.workflow_name);
+                }
+                FixtureStatus::Failed(ReplayStatus::NonDeterminismDetected {
+                    kind,
+                    expected,
+                    actual,
+                    event_index,
+                }) => {
+                    let _ = writeln!(
+                        out,
+                        "  FAIL  {file} ({}) — {kind} at event {event_index}: expected \"{expected}\", got \"{actual}\"",
+                        result.workflow_name,
+                    );
+                }
+                FixtureStatus::Failed(ReplayStatus::WorkflowFailed { error, .. }) => {
+                    let _ = writeln!(
+                        out,
+                        "  FAIL  {file} ({}) — workflow error: {error}",
+                        result.workflow_name,
+                    );
+                }
+                FixtureStatus::Failed(ReplayStatus::ReplaySucceeded) => {
+                    let _ = writeln!(
+                        out,
+                        "  FAIL  {file} ({}) — unexpected ReplaySucceeded",
+                        result.workflow_name,
+                    );
+                }
+                FixtureStatus::HarnessError(kind) => {
+                    let _ = writeln!(
+                        out,
+                        "  ERR   {file} ({}) — harness error: {kind}",
+                        result.workflow_name,
+                    );
+                }
+                FixtureStatus::Skipped { reason } => {
+                    let _ = writeln!(out, "  SKIP  {file} ({}) — {reason}", result.workflow_name,);
+                }
+            }
+        }
+        out
+    }
+
+    fn format_junit(&self) -> String {
+        use std::fmt::Write as FmtWrite;
+        let r = &self.report;
+        let mut out = String::new();
+        out.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+        let _ = writeln!(
+            out,
+            "<testsuite name=\"harvest-replay-verify\" tests=\"{}\" failures=\"{}\" errors=\"{}\" skipped=\"{}\">",
+            r.fixtures_total, r.failed, r.harness_errors, r.skipped,
+        );
+        for result in &r.results {
+            let file = result.path.file_name().map_or_else(
+                || result.path.to_string_lossy().into_owned(),
+                |n| n.to_string_lossy().into_owned(),
+            );
+            let classname = xml_escape(&result.workflow_name);
+            let _ = writeln!(
+                out,
+                "  <testcase name=\"{file}\" classname=\"{classname}\">"
+            );
+            match &result.status {
+                FixtureStatus::Passed
+                | FixtureStatus::Skipped { .. }
+                | FixtureStatus::Failed(ReplayStatus::ReplaySucceeded) => {}
+                FixtureStatus::Failed(ReplayStatus::NonDeterminismDetected {
+                    kind,
+                    expected,
+                    actual,
+                    event_index,
+                }) => {
+                    let _ = writeln!(
+                        out,
+                        "    <failure message=\"{kind}\" type=\"NonDeterminismDetected\">"
+                    );
+                    let _ = writeln!(
+                        out,
+                        "      kind={kind}, expected={expected:?}, actual={actual:?}, event_index={event_index}"
+                    );
+                    out.push_str("    </failure>\n");
+                }
+                FixtureStatus::Failed(ReplayStatus::WorkflowFailed { error, .. }) => {
+                    let escaped = xml_escape(error);
+                    let _ = writeln!(
+                        out,
+                        "    <failure message=\"WorkflowFailed\" type=\"WorkflowFailed\">\n      {escaped}\n    </failure>"
+                    );
+                }
+                FixtureStatus::HarnessError(kind) => {
+                    let msg = xml_escape(&kind.to_string());
+                    let detail = match kind {
+                        HarnessErrorKind::UnregisteredWorkflow => format!(
+                            "workflow '{}' not registered in this verifier",
+                            result.workflow_name
+                        ),
+                        HarnessErrorKind::InvalidFixture(e) => e.clone(),
+                        HarnessErrorKind::Timeout => "replay timed out".to_string(),
+                    };
+                    let detail = xml_escape(&detail);
+                    let _ = writeln!(
+                        out,
+                        "    <error message=\"{msg}\" type=\"HarnessError\">\n      {detail}\n    </error>"
+                    );
+                }
+            }
+            out.push_str("  </testcase>\n");
+        }
+        out.push_str("</testsuite>\n");
+        out
+    }
+
+    fn format_json(&self) -> String {
+        serde_json::to_string_pretty(&self.report)
+            .unwrap_or_else(|e| format!("{{\"error\": \"serialization failed: {e}\"}}"))
+    }
+
+    fn format_github(&self) -> String {
+        use std::fmt::Write as FmtWrite;
+        let mut out = String::new();
+        for result in &self.report.results {
+            let file = result.path.to_string_lossy();
+            match &result.status {
+                FixtureStatus::Passed
+                | FixtureStatus::Skipped { .. }
+                | FixtureStatus::Failed(ReplayStatus::ReplaySucceeded) => {}
+                FixtureStatus::Failed(ReplayStatus::NonDeterminismDetected {
+                    kind,
+                    expected,
+                    actual,
+                    event_index,
+                }) => {
+                    let _ = writeln!(
+                        out,
+                        "::error file={file},title={kind}::{kind} at event {event_index}: expected \"{expected}\", got \"{actual}\""
+                    );
+                }
+                FixtureStatus::Failed(ReplayStatus::WorkflowFailed { error, .. }) => {
+                    let _ = writeln!(
+                        out,
+                        "::error file={file},title=WorkflowFailed::workflow error: {error}"
+                    );
+                }
+                FixtureStatus::HarnessError(kind) => {
+                    let _ = writeln!(out, "::error file={file},title=HarnessError::{kind}");
+                }
+            }
+        }
+        out
+    }
+}
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+// ---------------------------------------------------------------------------
+// ReplayVerifier
+// ---------------------------------------------------------------------------
+
+/// Batch CI replay gate for `#[workflow]` functions.
+///
+/// Walk a fixtures directory, replay every `*.json` [`HistorySnapshot`] against
+/// registered workflow handlers, and return a [`BatchReplayReport`] suitable for
+/// CI exit-code gating.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// # use autumn_harvest::testing::{ReplayVerifier, ReportFormat};
+/// # async fn example() {
+/// let report = ReplayVerifier::new()
+///     // .register(workflows![onboarding, refund_saga, billing])
+///     .fixtures_dir("./fixtures/replay")
+///     .verify_all()
+///     .await;
+///
+/// let ci = report.into_ci_report();
+/// println!("{}", ci.format_report(ReportFormat::Text));
+/// std::process::exit(ci.exit_code());
+/// # }
+/// ```
+pub struct ReplayVerifier {
+    handlers: HashMap<String, WorkflowHandlerFn>,
+    state: SharedState,
+    concurrency: usize,
+    timeout: std::time::Duration,
+    allow_unregistered: bool,
+    fixtures_dir: Option<std::path::PathBuf>,
+}
+
+impl Default for ReplayVerifier {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ReplayVerifier {
+    /// Create a new verifier with sensible defaults (concurrency = available CPUs, timeout = 60s).
+    #[must_use]
+    pub fn new() -> Self {
+        let concurrency =
+            std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
+        Self {
+            handlers: HashMap::new(),
+            state: crate::context::empty_shared_state(),
+            concurrency,
+            timeout: std::time::Duration::from_secs(60),
+            allow_unregistered: false,
+            fixtures_dir: None,
+        }
+    }
+
+    /// Register a batch of workflow handlers from a `workflows![…]` collector call.
+    #[must_use]
+    pub fn register(mut self, workflows: Vec<crate::info::WorkflowInfo>) -> Self {
+        for wf in workflows {
+            self.handlers.insert(wf.name.to_string(), wf.handler);
+        }
+        self
+    }
+
+    /// Register a single handler by name.
+    #[must_use]
+    pub fn register_fn(mut self, name: impl Into<String>, handler: WorkflowHandlerFn) -> Self {
+        self.handlers.insert(name.into(), handler);
+        self
+    }
+
+    /// Inject a typed shared-state value available to workflow handlers via
+    /// `ctx.state::<T>()` during replay.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the state `Arc` has already been cloned (unreachable in normal builder usage).
+    #[must_use]
+    pub fn with_state<T: Send + Sync + 'static>(mut self, value: T) -> Self {
+        std::sync::Arc::get_mut(&mut self.state)
+            .expect("state Arc has no other references during ReplayVerifier construction")
+            .insert(std::any::TypeId::of::<T>(), Box::new(value));
+        self
+    }
+
+    /// Set the maximum number of fixtures replayed concurrently (default = available CPUs).
+    #[must_use]
+    pub fn with_concurrency(mut self, n: usize) -> Self {
+        self.concurrency = n.max(1);
+        self
+    }
+
+    /// Set the per-fixture replay timeout (default = 60 seconds).
+    #[must_use]
+    pub const fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// When `true`, fixtures whose `workflow_name` is not registered are counted as
+    /// [`FixtureStatus::Skipped`] rather than a [`HarnessErrorKind::UnregisteredWorkflow`]
+    /// harness error.  Use this when a single fixtures directory holds histories from
+    /// multiple binaries.
+    #[must_use]
+    pub const fn allow_unregistered(mut self, allow: bool) -> Self {
+        self.allow_unregistered = allow;
+        self
+    }
+
+    /// Set the fixtures directory used by [`verify_all`](Self::verify_all).
+    #[must_use]
+    pub fn fixtures_dir(mut self, path: impl AsRef<std::path::Path>) -> Self {
+        self.fixtures_dir = Some(path.as_ref().to_owned());
+        self
+    }
+
+    /// Walk the directory set by [`fixtures_dir`](Self::fixtures_dir) and replay all
+    /// `*.json` fixtures.
+    ///
+    /// # Panics
+    ///
+    /// Panics if [`fixtures_dir`](Self::fixtures_dir) was not called before this method.
+    pub async fn verify_all(&self) -> BatchReplayReport {
+        let dir = self
+            .fixtures_dir
+            .as_deref()
+            .expect("call fixtures_dir(path) before verify_all(), or use verify_dir(path)");
+        self.verify_dir(dir).await
+    }
+
+    /// Walk `dir` recursively, collect all `*.json` files, replay each one against
+    /// the registered handlers, and return a [`BatchReplayReport`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if a spawned task fails to join (unreachable under normal conditions).
+    pub async fn verify_dir(&self, dir: &std::path::Path) -> BatchReplayReport {
+        let files = collect_json_files(dir);
+        if files.is_empty() {
+            return BatchReplayReport {
+                fixtures_total: 0,
+                succeeded: 0,
+                failed: 0,
+                harness_errors: 0,
+                skipped: 0,
+                results: vec![],
+            };
+        }
+
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(self.concurrency));
+        let timeout = self.timeout;
+        let allow_unregistered = self.allow_unregistered;
+        let handlers = Arc::new(self.handlers.clone());
+        let state = self.state.clone();
+
+        let mut tasks = Vec::with_capacity(files.len());
+        for path in files {
+            let sem = Arc::clone(&semaphore);
+            let handlers = Arc::clone(&handlers);
+            let state = state.clone();
+
+            tasks.push(tokio::spawn(async move {
+                let _permit = sem.acquire_owned().await.unwrap();
+                replay_fixture_file(&handlers, state, &path, timeout, allow_unregistered).await
+            }));
+        }
+
+        let mut results: Vec<FixtureResult> = futures::future::join_all(tasks)
+            .await
+            .into_iter()
+            .filter_map(std::result::Result::ok)
+            .collect();
+
+        results.sort_by(|a, b| a.path.cmp(&b.path));
+
+        let mut succeeded = 0usize;
+        let mut failed = 0usize;
+        let mut harness_errors = 0usize;
+        let mut skipped = 0usize;
+        for r in &results {
+            match &r.status {
+                FixtureStatus::Passed => succeeded += 1,
+                FixtureStatus::Failed(_) => failed += 1,
+                FixtureStatus::HarnessError(_) => harness_errors += 1,
+                FixtureStatus::Skipped { .. } => skipped += 1,
+            }
+        }
+
+        BatchReplayReport {
+            fixtures_total: results.len(),
+            succeeded,
+            failed,
+            harness_errors,
+            skipped,
+            results,
+        }
+    }
+}
+
+/// Recursively collect `*.json` files under `dir`.
+fn collect_json_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut files = Vec::new();
+    collect_json_files_inner(dir, &mut files);
+    files.sort();
+    files
+}
+
+fn collect_json_files_inner(dir: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_json_files_inner(&path, files);
+        } else if path.extension().and_then(|s| s.to_str()) == Some("json") {
+            files.push(path);
+        }
+    }
+}
+
+/// Replay a single fixture file and return a [`FixtureResult`].
+async fn replay_fixture_file(
+    handlers: &HashMap<String, WorkflowHandlerFn>,
+    state: SharedState,
+    path: &std::path::Path,
+    timeout: std::time::Duration,
+    allow_unregistered: bool,
+) -> FixtureResult {
+    // Read file.
+    let json = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            return FixtureResult {
+                path: path.to_owned(),
+                workflow_name: String::new(),
+                execution_id: None,
+                status: FixtureStatus::HarnessError(HarnessErrorKind::InvalidFixture(format!(
+                    "failed to read file: {e}"
+                ))),
+            };
+        }
+    };
+
+    // Parse snapshot.
+    let snapshot: HistorySnapshot = match serde_json::from_str(&json) {
+        Ok(s) => s,
+        Err(e) => {
+            return FixtureResult {
+                path: path.to_owned(),
+                workflow_name: String::new(),
+                execution_id: None,
+                status: FixtureStatus::HarnessError(HarnessErrorKind::InvalidFixture(format!(
+                    "invalid HistorySnapshot JSON: {e}"
+                ))),
+            };
+        }
+    };
+
+    let workflow_name = snapshot.workflow_name.clone();
+    let execution_id = snapshot.execution_id;
+
+    // Check handler registration.
+    if !handlers.contains_key(&workflow_name) {
+        if allow_unregistered {
+            return FixtureResult {
+                path: path.to_owned(),
+                status: FixtureStatus::Skipped {
+                    reason: format!(
+                        "workflow '{workflow_name}' not registered (--allow-unregistered)"
+                    ),
+                },
+                workflow_name,
+                execution_id: Some(execution_id),
+            };
+        }
+        return FixtureResult {
+            path: path.to_owned(),
+            workflow_name,
+            execution_id: Some(execution_id),
+            status: FixtureStatus::HarnessError(HarnessErrorKind::UnregisteredWorkflow),
+        };
+    }
+
+    // Build a single-use replayer and run with timeout.
+    let replayer = WorkflowReplayer {
+        handlers: handlers.clone(),
+        state,
+    };
+
+    let replay_result =
+        tokio::time::timeout(timeout, replayer.replay_from_snapshot(snapshot)).await;
+
+    let Ok(report) = replay_result else {
+        return FixtureResult {
+            path: path.to_owned(),
+            workflow_name,
+            execution_id: Some(execution_id),
+            status: FixtureStatus::HarnessError(HarnessErrorKind::Timeout),
+        };
+    };
+
+    let status = match report.status {
+        ReplayStatus::ReplaySucceeded => FixtureStatus::Passed,
+        other => FixtureStatus::Failed(other),
+    };
+
+    FixtureResult {
+        path: path.to_owned(),
+        workflow_name,
+        execution_id: Some(execution_id),
+        status,
+    }
 }
 
 // ===========================================================================
