@@ -17,9 +17,9 @@ use uuid::Uuid;
 use crate::build_routing;
 use crate::error::{HarvestError, HarvestResult, database_error};
 use crate::event::WorkflowEvent;
-use crate::models::{NewWorkflowExecution, WorkflowExecution};
+use crate::models::{NewHarvestSignal, NewWorkflowExecution, WorkflowExecution};
 use crate::queue::{self, EnqueueParams, TaskType};
-use crate::schema::harvest_workflow_executions;
+use crate::schema::{harvest_signals, harvest_workflow_executions};
 use crate::store;
 use crate::telemetry::TraceContextCarrier;
 use crate::types::{ExecutionId, WorkflowIdReusePolicy};
@@ -607,6 +607,410 @@ async fn try_load_by_key(
         .await
         .optional()
         .map_err(database_error)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SignalWithStart (issue #244)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Parameters for the atomic `signal_with_start` primitive.
+///
+/// Combines the inputs of [`StartWorkflowParams`] with the signal name,
+/// payload, and optional idempotency key, so a single shard-local transaction
+/// can either start a fresh execution and stage the signal for its first
+/// dispatch, or attach the signal to an existing live execution.
+#[derive(Debug, Clone)]
+pub struct SignalWithStartParams<'a> {
+    pub workflow_name: &'a str,
+    pub workflow_id: &'a str,
+    pub exec_id: ExecutionId,
+    pub input: serde_json::Value,
+    pub parent_id: Option<Uuid>,
+    pub queue_name: &'a str,
+    pub execution_timeout: Option<chrono::Duration>,
+    pub memo: Option<serde_json::Value>,
+    pub search_attrs: Option<serde_json::Value>,
+    pub reuse_policy: WorkflowIdReusePolicy,
+    pub trace_context: Option<TraceContextCarrier>,
+    /// Server-side ceiling applied to `execution_timeout`. Forwarded to
+    /// [`StartWorkflowParams::max_execution_timeout_ceiling`].
+    pub max_execution_timeout_ceiling: Option<chrono::Duration>,
+    /// Pre-resolved concurrency group key. Forwarded to
+    /// [`StartWorkflowParams::concurrency_key`].
+    pub concurrency_key: Option<String>,
+    /// Per-key concurrency cap. Forwarded to
+    /// [`StartWorkflowParams::concurrency_limit`].
+    pub concurrency_limit: Option<u32>,
+    pub signal_name: &'a str,
+    pub signal_payload: serde_json::Value,
+    /// Optional dedup key. When present, repeated calls with the same
+    /// `(workflow_exec_id, idempotency_key)` deliver the signal exactly once.
+    /// Backed by a partial unique index on `harvest_signals`; the `NULL` case
+    /// preserves the pre-existing `send_signal` behaviour.
+    pub idempotency_key: Option<String>,
+}
+
+/// Result of a [`signal_with_start_workflow_execution`] call.
+///
+/// `started_fresh` distinguishes a freshly inserted run from one attached to
+/// an existing live execution. `signal_delivered` reports whether the signal
+/// row was actually queued: it is `false` when the prior execution is in a
+/// terminal state (no signal can land) or when the idempotency key matched a
+/// row that was already enqueued.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignalWithStartOutcome {
+    pub exec_id: ExecutionId,
+    pub workflow_name: String,
+    pub workflow_id: String,
+    pub state: String,
+    pub started_fresh: bool,
+    pub signal_delivered: bool,
+}
+
+/// Atomically start a workflow if no live run for `(workflow_name, workflow_id)`
+/// exists (subject to `reuse_policy`), or signal the existing run otherwise.
+///
+/// ## Outcome matrix (4 reuse policies × prior execution state)
+///
+/// | Prior state          | `AllowDuplicate`            | `RejectDuplicate`     | `AllowDuplicateFailedOnly`   | `TerminateIfRunning`         |
+/// |----------------------|-----------------------------|-----------------------|------------------------------|------------------------------|
+/// | none                 | start + signal              | start + signal        | start + signal               | start + signal               |
+/// | RUNNING / SUSPENDED  | signal existing             | `Err(AlreadyExists)`  | signal existing              | cancel + start + signal      |
+/// | COMPLETED            | start fresh + signal        | `Err(AlreadyExists)`  | start fresh + signal         | start fresh + signal         |
+/// | FAILED               | start fresh + signal        | `Err(AlreadyExists)`  | start fresh + signal         | start fresh + signal         |
+/// | CANCELLED            | start fresh + signal        | `Err(AlreadyExists)`  | start fresh + signal         | start fresh + signal         |
+/// | TERMINATED           | start fresh + signal        | start fresh + signal  | start fresh + signal         | start fresh + signal         |
+///
+/// "Suspended" workflows are observable to the engine as `RUNNING` — they are
+/// running executions whose handler is awaiting external input — so they
+/// behave identically to `RUNNING` in this matrix.
+///
+/// `TERMINATED` is the *sealed* state set by the reset path (`reset.rs`): the
+/// row is released from the partial unique index over
+/// `(workflow_name, workflow_id) WHERE state NOT IN ('CONTINUED_AS_NEW',
+/// 'TERMINATED')`. A `TERMINATED` row is treated as if the `workflow_id` were
+/// free, including under `RejectDuplicate`. This matches the broader
+/// [`start_or_load_workflow_execution`] semantics; the reset operator
+/// explicitly opted the prior row out of the uniqueness scope.
+///
+/// Note: `AllowDuplicate` and `AllowDuplicateFailedOnly` diverge from the
+/// standalone [`start_or_load_workflow_execution`] behaviour for terminal
+/// priors: the standalone start returns the existing terminal row, while
+/// signal-with-start escalates to a fresh start so the signal can land. This
+/// keeps the spec's "no signal silently dropped" invariant intact.
+/// `RejectDuplicate` and `TerminateIfRunning` keep their original semantics.
+///
+/// ## Event ordering
+///
+/// On a **fresh start**, only `WorkflowStarted` is appended in this call. The
+/// signal is staged as a pending `harvest_signals` row (with the supplied
+/// idempotency key) and the worker's existing `ingest_pending_signals` path
+/// promotes it to a `SignalReceived` event *before* the workflow function is
+/// dispatched on its first tick. No new `WorkflowEvent` variant is needed.
+///
+/// On an **attach**, the signal row is queued in the same transaction and the
+/// running workflow's task is woken; the existing signal-delivery path picks
+/// it up at the next dispatch boundary.
+///
+/// On a **cancel + start** (`TerminateIfRunning` + RUNNING prior), the prior
+/// execution receives a `WorkflowCancelled` event and is moved to `CANCELLED`,
+/// then the fresh start + signal lands — all inside this function's outer
+/// transaction. Diesel-async demotes the inner `conn.transaction(..)` blocks
+/// in `cancel_workflow_execution` and `start_or_load_workflow_execution` to
+/// savepoints under the outer one, so a crash mid-flight rolls back the
+/// cancellation as well: the prior workflow stays RUNNING and the caller can
+/// retry from a clean state. (This is a strictly safer guarantee than the
+/// standalone `start_or_load_workflow_execution` two-transaction shape, which
+/// can leave a CANCELLED orphan on a crash; the wrapping transaction here
+/// turns that into an all-or-nothing operation.)
+///
+/// # Errors
+///
+/// - [`HarvestError::AlreadyExists`] when `RejectDuplicate` rejects.
+/// - Propagates queue/event-store failures from the start transaction.
+pub async fn signal_with_start_workflow_execution(
+    conn: &mut AsyncPgConnection,
+    request: SignalWithStartParams<'_>,
+) -> HarvestResult<SignalWithStartOutcome> {
+    // Wrap the whole operation in a single outer transaction so the entire
+    // outcome — including the `TerminateIfRunning` pre-cancel, the start
+    // (or attach), and the signal insert — commits atomically. Diesel-async
+    // demotes every inner `conn.transaction(..)` call (the cancel inside
+    // `cancel_workflow_execution` and the start inside
+    // `start_or_load_workflow_execution`) to a savepoint under this outer
+    // transaction, so a crash anywhere in the pipeline rolls back the
+    // cancellation alongside the start and the signal. The signal cannot be
+    // observed without its triggering workflow having started, and the prior
+    // run cannot be left CANCELLED-with-no-replacement.
+    conn.transaction::<SignalWithStartOutcome, HarvestError, _>(|conn| {
+        let request = request;
+        async move {
+            // Cross-execution idempotency dedupe. The partial unique index on
+            // `harvest_signals (workflow_exec_id, idempotency_key)` only dedupes
+            // within a single `exec_id`. The fresh-start escalation below and
+            // the reset-buffer path both move signals across `exec_id`s for
+            // the same logical workflow, so a per-exec_id index alone would
+            // re-queue the duplicate signal on a brand-new run. Scope the
+            // dedupe to `(workflow_name, workflow_id, idempotency_key)` by
+            // joining `harvest_signals` to `harvest_workflow_executions` and
+            // short-circuit if any prior signal with this key has already
+            // landed on any execution of this logical workflow.
+            if let Some(key) = request.idempotency_key.as_deref()
+                && let Some(prior) = lookup_idempotent_signal_dedupe(
+                    conn,
+                    request.workflow_name,
+                    request.workflow_id,
+                    key,
+                )
+                .await?
+            {
+                return Ok(SignalWithStartOutcome {
+                    exec_id: ExecutionId::from_uuid(prior.id),
+                    workflow_name: prior.workflow_name,
+                    workflow_id: prior.workflow_id,
+                    state: prior.state,
+                    started_fresh: false,
+                    signal_delivered: false,
+                });
+            }
+
+            // The issue's spec enumerates four outcomes — start fresh, signal
+            // existing, reject, terminate-then-start-and-signal — and requires
+            // that "no signal is silently dropped". The base
+            // `start_or_load_workflow_execution` semantics return an existing
+            // terminal run for `AllowDuplicate`, which would leave us with no
+            // way to deliver the signal. For signal-with-start specifically we
+            // therefore upgrade `AllowDuplicate` and `AllowDuplicateFailedOnly`
+            // to `TerminateIfRunning` whenever the prior run is non-RUNNING
+            // (terminal): the prior is sealed and a fresh run is started, so
+            // the signal lands on a live execution. `RejectDuplicate` and
+            // `TerminateIfRunning` keep their original semantics.
+            let effective_policy = resolve_effective_signal_with_start_policy(
+                conn,
+                request.workflow_name,
+                request.workflow_id,
+                request.reuse_policy,
+            )
+            .await?;
+
+            let build_start_request =
+                |exec_id: ExecutionId, policy: WorkflowIdReusePolicy| StartWorkflowParams {
+                    workflow_name: request.workflow_name,
+                    workflow_id: request.workflow_id,
+                    exec_id,
+                    input: request.input.clone(),
+                    parent_id: request.parent_id,
+                    queue_name: request.queue_name,
+                    execution_timeout: request.execution_timeout,
+                    memo: request.memo.clone(),
+                    search_attrs: request.search_attrs.clone(),
+                    reuse_policy: policy,
+                    trace_context: request.trace_context.clone(),
+                    max_execution_timeout_ceiling: request.max_execution_timeout_ceiling,
+                    concurrency_key: request.concurrency_key.clone(),
+                    concurrency_limit: request.concurrency_limit,
+                };
+
+            let started = start_or_load_workflow_execution(
+                conn,
+                build_start_request(request.exec_id, effective_policy),
+            )
+            .await?;
+
+            // The resolver can only take a row lock when the row already
+            // exists. If no row existed at resolver time but another
+            // transaction inserted *and* completed one before this request's
+            // start path grabbed its own `FOR UPDATE`, the start helper
+            // returns the now-terminal row unchanged under
+            // `AllowDuplicate` / `AllowDuplicateFailedOnly`. Without a
+            // second pass the signal would land on a terminal run and be
+            // dropped, violating the "no signal silently dropped"
+            // invariant from issue #244.
+            //
+            // Re-evaluate here: if the result is non-RUNNING and the
+            // caller's original policy was one of the duplicate-allowing
+            // variants, escalate to `TerminateIfRunning` with a fresh
+            // `exec_id` so the existing terminal row is sealed and a new
+            // run is started + signaled. The retry runs inside the same
+            // outer transaction, so the existing row's lock from the start
+            // path's `FOR UPDATE` carries through to the retry's lock and
+            // a third concurrent transaction cannot squeeze in between.
+            let started = if started.state != "RUNNING"
+                && matches!(
+                    request.reuse_policy,
+                    WorkflowIdReusePolicy::AllowDuplicate
+                        | WorkflowIdReusePolicy::AllowDuplicateFailedOnly
+                ) {
+                // The terminal row owns `started.exec_id`'s UUID, so
+                // `replace_execution` needs a fresh id keyed to the same
+                // shard. `ExecutionId::new_for_shard` collapses to the
+                // default-shard sentinel for unencoded ids, matching
+                // pre-sharding test setups.
+                let fresh_exec_id = ExecutionId::new_for_shard(started.exec_id.shard());
+                start_or_load_workflow_execution(
+                    conn,
+                    build_start_request(fresh_exec_id, WorkflowIdReusePolicy::TerminateIfRunning),
+                )
+                .await?
+            } else {
+                started
+            };
+
+            let signal_delivered = if started.state == "RUNNING" {
+                stage_signal_with_idempotency(
+                    conn,
+                    started.exec_id,
+                    request.signal_name,
+                    request.signal_payload,
+                    request.idempotency_key.as_deref(),
+                )
+                .await?
+            } else {
+                false
+            };
+
+            Ok(SignalWithStartOutcome {
+                exec_id: started.exec_id,
+                workflow_name: started.workflow_name,
+                workflow_id: started.workflow_id,
+                state: started.state,
+                started_fresh: started.created,
+                signal_delivered,
+            })
+        }
+        .scope_boxed()
+    })
+    .await
+}
+
+/// Pick the policy `start_or_load_workflow_execution` is invoked with, given
+/// the caller's requested policy and the current prior-run state. For
+/// signal-with-start, `AllowDuplicate` and `AllowDuplicateFailedOnly` are
+/// upgraded to `TerminateIfRunning` whenever the prior run is non-RUNNING so
+/// that the spec's "no signal silently dropped" invariant holds on terminal
+/// priors. `RejectDuplicate` and `TerminateIfRunning` are returned unchanged.
+async fn resolve_effective_signal_with_start_policy(
+    conn: &mut AsyncPgConnection,
+    workflow_name: &str,
+    workflow_id: &str,
+    requested: WorkflowIdReusePolicy,
+) -> HarvestResult<WorkflowIdReusePolicy> {
+    if !matches!(
+        requested,
+        WorkflowIdReusePolicy::AllowDuplicate | WorkflowIdReusePolicy::AllowDuplicateFailedOnly
+    ) {
+        return Ok(requested);
+    }
+    // Take the row lock here so the observed state persists through
+    // `start_or_load_workflow_execution`'s own `FOR UPDATE` lookup below.
+    // Without this, a workflow that transitions RUNNING -> terminal between
+    // the resolver's read and the start path's lock could let the
+    // spec-prohibited "attach to terminal, drop signal" outcome re-emerge.
+    // Both calls share the same connection / outer transaction, so the lock
+    // taken here is held through the start path and released only on outer
+    // commit or rollback.
+    let Some(existing) =
+        try_load_active_execution_for_update(conn, workflow_name, workflow_id).await?
+    else {
+        return Ok(requested);
+    };
+    if existing.state == "RUNNING" {
+        Ok(requested)
+    } else {
+        // Non-RUNNING prior under a non-rejecting policy: upgrade so the
+        // start transaction takes the `replace_execution` path (seal prior,
+        // insert fresh, append WorkflowStarted) and the signal can land.
+        Ok(WorkflowIdReusePolicy::TerminateIfRunning)
+    }
+}
+
+/// Locking variant of [`try_load_by_key`] used by
+/// [`signal_with_start_workflow_execution`]'s resolver. Returns `None` when
+/// no active execution exists. Acquires `FOR UPDATE` so the caller's outer
+/// transaction holds the row lock until commit, preventing a RUNNING ->
+/// terminal race between the resolver decision and the start path's own
+/// `FOR UPDATE` lookup.
+async fn try_load_active_execution_for_update(
+    conn: &mut AsyncPgConnection,
+    workflow_name: &str,
+    workflow_id: &str,
+) -> HarvestResult<Option<WorkflowExecution>> {
+    harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
+        .filter(harvest_workflow_executions::workflow_id.eq(workflow_id))
+        .filter(harvest_workflow_executions::state.ne_all(["CONTINUED_AS_NEW", "TERMINATED"]))
+        .select(WorkflowExecution::as_select())
+        .for_update()
+        .first(conn)
+        .await
+        .optional()
+        .map_err(database_error)
+}
+
+/// Cross-execution idempotency dedupe for `signal_with_start`.
+///
+/// Returns the most recent workflow execution of `(workflow_name, workflow_id)`
+/// that has a `harvest_signals` row with this `idempotency_key`. The per-shard
+/// partial unique index on `(workflow_exec_id, idempotency_key)` only enforces
+/// uniqueness within one execution; this query scopes the dedupe to the
+/// logical workflow so a webhook retry that arrives after the prior signal
+/// drove its execution to a terminal state is recognised as a duplicate and
+/// short-circuited before any fresh start / replacement happens.
+async fn lookup_idempotent_signal_dedupe(
+    conn: &mut AsyncPgConnection,
+    workflow_name: &str,
+    workflow_id: &str,
+    idempotency_key: &str,
+) -> HarvestResult<Option<WorkflowExecution>> {
+    use diesel::JoinOnDsl;
+
+    harvest_signals::table
+        .inner_join(
+            harvest_workflow_executions::table
+                .on(harvest_signals::workflow_exec_id.eq(harvest_workflow_executions::id)),
+        )
+        .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
+        .filter(harvest_workflow_executions::workflow_id.eq(workflow_id))
+        .filter(harvest_signals::idempotency_key.eq(idempotency_key))
+        .order_by(harvest_signals::received_at.desc())
+        .select(WorkflowExecution::as_select())
+        .first(conn)
+        .await
+        .optional()
+        .map_err(database_error)
+}
+
+/// Insert a signal row, returning `false` when the idempotency key collides
+/// with an already-staged signal for the same execution.
+async fn stage_signal_with_idempotency(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    signal_name: &str,
+    payload: serde_json::Value,
+    idempotency_key: Option<&str>,
+) -> HarvestResult<bool> {
+    let row = NewHarvestSignal {
+        workflow_exec_id: exec_id.as_uuid(),
+        signal_name,
+        payload,
+        idempotency_key,
+    };
+
+    let inserted = diesel::insert_into(harvest_signals::table)
+        .values(&row)
+        .on_conflict_do_nothing()
+        .execute(conn)
+        .await
+        .map_err(database_error)?;
+
+    if inserted == 0 {
+        // Idempotency-key collision — the prior insert already queued an
+        // equivalent signal. This is the dedup happy path.
+        return Ok(false);
+    }
+
+    queue::wake_workflow_task(conn, exec_id).await?;
+    Ok(true)
 }
 
 /// Locking lookup used inside the start transaction when a policy decision may

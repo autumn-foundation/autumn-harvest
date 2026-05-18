@@ -399,6 +399,112 @@
     },
     {
       "method": "POST",
+      "path": "/workflows/{workflow_name}/signal-with-start",
+      "category": "workflow",
+      "read_only": false,
+      "description": "Atomically start a workflow if no live run for (workflow_name, workflow_id) exists, or signal the existing run otherwise (issue #244). The signal lands deterministically before the workflow function is first dispatched on a fresh start, so first-tick author code observes it via the existing recv_signal / signal handler surface.",
+      "idempotency": "Idempotent on (workflow_name, workflow_id) per id_reuse_policy. When idempotency_key is supplied, repeated calls with the same (execution_id, idempotency_key) deliver the signal exactly once.",
+      "params": [
+        {
+          "name": "workflow_name",
+          "in": "path",
+          "required": true,
+          "description": "Registered workflow function name."
+        }
+      ],
+      "request_body": {
+        "required": true,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "workflow_id",
+            "required": true,
+            "description": "Stable identifier used to deduplicate concurrent starts."
+          },
+          {
+            "name": "start_input",
+            "required": false,
+            "description": "Workflow input payload applied only when a fresh execution is started."
+          },
+          {
+            "name": "signal_name",
+            "required": true,
+            "description": "Signal channel name delivered to the execution (fresh or existing)."
+          },
+          {
+            "name": "signal_payload",
+            "required": false,
+            "description": "Signal payload (any JSON value). Defaults to null."
+          },
+          {
+            "name": "queue",
+            "required": false,
+            "description": "Task queue name used only when a fresh execution is started."
+          },
+          {
+            "name": "memo",
+            "required": false,
+            "description": "Non-indexed metadata (JSON object) used only when a fresh execution is started."
+          },
+          {
+            "name": "search_attrs",
+            "required": false,
+            "description": "Indexed search attributes (JSON object) used only when a fresh execution is started."
+          },
+          {
+            "name": "execution_timeout_secs",
+            "required": false,
+            "description": "Overall execution timeout in seconds, applied only on fresh start."
+          },
+          {
+            "name": "id_reuse_policy",
+            "required": false,
+            "description": "Duplicate-id policy: allow_duplicate (default), reject_duplicate, allow_duplicate_failed_only, or terminate_if_running."
+          },
+          {
+            "name": "idempotency_key",
+            "required": false,
+            "description": "Optional dedup key applied to the signal row; second call with the same key on the same execution is a no-op delivery (signal_delivered = false)."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 201,
+        "note": "Returns 200 when an existing live execution is signaled rather than a fresh one started.",
+        "fields": [
+          "execution_id",
+          "workflow_name",
+          "workflow_id",
+          "state",
+          "started_fresh",
+          "signal_delivered"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Invalid request body, workflow name, or id_reuse_policy."
+        },
+        {
+          "status": 401,
+          "description": "id_reuse_policy=terminate_if_running requires admin authentication."
+        },
+        {
+          "status": 404,
+          "description": "Workflow function not registered."
+        },
+        {
+          "status": 409,
+          "description": "Duplicate workflow_id with id_reuse_policy=reject_duplicate."
+        },
+        {
+          "status": 500,
+          "description": "Database or scheduling error."
+        }
+      ]
+    },
+    {
+      "method": "POST",
       "path": "/workflows/{id}/cancel",
       "category": "workflow",
       "read_only": false,

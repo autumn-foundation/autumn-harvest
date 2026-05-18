@@ -254,6 +254,75 @@ Duration strings: `"30s"`, `"5m"`, `"1h"`. Parsed via Harvest core's local `task
 
 `#[workflow]` takes no attributes in Phase 1.
 
+### Embedder Primitives — SignalWithStart (issue #244)
+
+`signal_with_start_workflow_execution` is the atomic *start-or-attach + signal*
+primitive built for webhook receivers and idempotent event-driven flows. It
+collapses the racy fetch-then-start-then-signal trio into one shard-local
+transaction. The same primitive is exposed over HTTP as
+`POST /api/harvest/workflows/{workflow_name}/signal-with-start`.
+
+**Outcome matrix** — `reuse_policy` × prior execution state:
+
+| Prior state | `AllowDuplicate` | `RejectDuplicate` | `AllowDuplicateFailedOnly` | `TerminateIfRunning` |
+|-------------|------------------|-------------------|---------------------------|----------------------|
+| none | start + signal | start + signal | start + signal | start + signal |
+| RUNNING / SUSPENDED | signal existing | `Err(AlreadyExists)` | signal existing | cancel + start + signal |
+| COMPLETED | start fresh + signal | `Err(AlreadyExists)` | start fresh + signal | start fresh + signal |
+| FAILED | start fresh + signal | `Err(AlreadyExists)` | start fresh + signal | start fresh + signal |
+| CANCELLED | start fresh + signal | `Err(AlreadyExists)` | start fresh + signal | start fresh + signal |
+| TERMINATED | start fresh + signal | start fresh + signal | start fresh + signal | start fresh + signal |
+
+For terminal priors, `AllowDuplicate` and `AllowDuplicateFailedOnly` diverge
+from the standalone `start_or_load_workflow_execution` semantics (which return
+the existing terminal run): signal-with-start escalates internally to a
+fresh start so the spec's "no signal silently dropped" invariant holds.
+
+`TERMINATED` is the *sealed* state set by the reset path: the row is released
+from the partial unique index, so `RejectDuplicate` no longer treats it as a
+duplicate. The reset operator explicitly opted the prior row out of the
+uniqueness scope, matching the broader `start_or_load_workflow_execution`
+semantics.
+
+**Idempotency dedupe is scoped to the logical workflow**, not the
+`workflow_exec_id`. A webhook retry carrying the same `idempotency_key` that
+arrives after the original execution has reached a terminal state will be
+recognised as a duplicate and short-circuited: no fresh execution is started
+and no second signal is queued, even though the fresh-start escalation would
+otherwise create a new `exec_id`. The dedupe joins `harvest_signals` to
+`harvest_workflow_executions` so the per-shard partial unique index
+(`workflow_exec_id, idempotency_key`) is augmented with a
+`(workflow_name, workflow_id)` scope.
+
+`SignalWithStartOutcome.started_fresh` distinguishes a freshly inserted run
+from one attached to an existing live execution; `signal_delivered` reports
+whether the signal row was actually queued (it is `false` when the prior
+execution is terminal or the `idempotency_key` matched a row that was
+already enqueued).
+
+**Event ordering.** On fresh start the call appends only `WorkflowStarted` in
+this transaction; the signal is staged as a `harvest_signals` row that the
+worker's existing `ingest_pending_signals` path promotes to `SignalReceived`
+*before* the workflow function is first dispatched. No new `WorkflowEvent`
+variant is introduced — the issue's append-only invariant is preserved by
+construction.
+
+**Idempotency key.** `idempotency_key: Option<String>` is backed by a partial
+unique index on `harvest_signals (workflow_exec_id, idempotency_key) WHERE
+idempotency_key IS NOT NULL`. Two webhook deliveries carrying the same key
+produce exactly one `SignalReceived` event.
+
+HTTP route:
+- `POST /api/harvest/workflows/{workflow_name}/signal-with-start` with body
+  `{ workflow_id, start_input, signal_name, signal_payload, id_reuse_policy?, idempotency_key?, queue?, memo?, search_attrs?, execution_timeout_secs? }`
+  → `201 Created` (fresh start) or `200 OK` (attached) with response
+  `{ execution_id, workflow_name, workflow_id, state, started_fresh, signal_delivered }`.
+- `409 Conflict` when `id_reuse_policy = reject_duplicate` rejects an
+  existing execution.
+
+See `examples/signal_with_start_webhook.rs` for a worked Stripe webhook
+example.
+
 ### Query Handlers
 
 Query handlers let operators and UIs read arbitrary workflow-internal state without writing any event to `harvest_events`. They are pure synchronous functions registered via `WorkflowContext::register_query_handler` (typed) or `register_query` (no-arg shorthand). Use `#[query]` as a documentation marker on the handler function.

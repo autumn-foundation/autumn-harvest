@@ -80,6 +80,7 @@ pub async fn send_signal(
                 workflow_exec_id: exec_id.as_uuid(),
                 signal_name,
                 payload,
+                idempotency_key: None,
             };
 
             diesel::insert_into(harvest_signals::table)

@@ -34,9 +34,9 @@ use autumn_harvest::audit::{
     OP_EXTERNAL_ACTIVITY_COMPLETE, OP_EXTERNAL_ACTIVITY_FAIL, OP_RETENTION_RUN_NOW,
     OP_SCHEDULE_BACKFILL, OP_SCHEDULE_CREATE, OP_SCHEDULE_DELETE, OP_SCHEDULE_PAUSE,
     OP_SCHEDULE_RESUME, OP_WORKER_DRAIN, OP_WORKFLOW_CANCEL, OP_WORKFLOW_RESET, OP_WORKFLOW_SIGNAL,
-    OP_WORKFLOW_START, SOURCE_API, STATUS_FAILED, STATUS_SUCCEEDED, TARGET_BATCH, TARGET_DAG,
-    TARGET_DEAD_LETTER, TARGET_EXTERNAL_ACTIVITY, TARGET_RETENTION, TARGET_SCHEDULE, TARGET_WORKER,
-    TARGET_WORKFLOW,
+    OP_WORKFLOW_SIGNAL_WITH_START, OP_WORKFLOW_START, SOURCE_API, STATUS_FAILED, STATUS_SUCCEEDED,
+    TARGET_BATCH, TARGET_DAG, TARGET_DEAD_LETTER, TARGET_EXTERNAL_ACTIVITY, TARGET_RETENTION,
+    TARGET_SCHEDULE, TARGET_WORKER, TARGET_WORKFLOW,
 };
 use autumn_harvest::batch::{
     self, BatchAction, BatchExecutorConfig, BatchFilter, BatchJobStatus, BatchJobView,
@@ -85,7 +85,8 @@ use autumn_harvest::workers::{
 };
 use autumn_harvest::{HistoryMatch, HistoryMatcher, WorkflowEvent};
 use autumn_harvest::{
-    StartWorkflowParams, WorkflowHandleClient, WorkflowResult, cancel_workflow_execution,
+    SignalWithStartOutcome, SignalWithStartParams, StartWorkflowParams, WorkflowHandleClient,
+    WorkflowResult, cancel_workflow_execution, signal_with_start_workflow_execution,
     start_or_load_workflow_execution,
 };
 
@@ -964,6 +965,58 @@ struct AlreadyExistsResponse {
     existing_state: String,
 }
 
+/// Request body for `POST /workflows/{workflow_name}/signal-with-start` (issue #244).
+#[derive(Debug, Deserialize)]
+struct SignalWithStartRequest {
+    workflow_id: String,
+    #[serde(default)]
+    start_input: Option<Value>,
+    signal_name: String,
+    #[serde(default)]
+    signal_payload: Option<Value>,
+    #[serde(default)]
+    queue: Option<String>,
+    #[serde(default)]
+    memo: Option<Value>,
+    #[serde(default)]
+    search_attrs: Option<Value>,
+    #[serde(default)]
+    execution_timeout_secs: Option<i64>,
+    /// Same wire values as `POST /workflows/.../start` (`allow_duplicate`,
+    /// `reject_duplicate`, `allow_duplicate_failed_only`, `terminate_if_running`).
+    #[serde(default)]
+    id_reuse_policy: Option<String>,
+    /// Optional dedup key applied to the signal row. Repeated requests with
+    /// the same `(execution_id, idempotency_key)` deliver the signal exactly
+    /// once. Typically a stable upstream event id (Stripe `Stripe-Idempotency-Key`,
+    /// GitHub `X-GitHub-Delivery`, etc.).
+    #[serde(default)]
+    idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SignalWithStartResponse {
+    execution_id: String,
+    workflow_name: String,
+    workflow_id: String,
+    state: String,
+    started_fresh: bool,
+    signal_delivered: bool,
+}
+
+impl SignalWithStartResponse {
+    fn from_outcome(outcome: SignalWithStartOutcome) -> Self {
+        Self {
+            execution_id: outcome.exec_id.to_string(),
+            workflow_name: outcome.workflow_name,
+            workflow_id: outcome.workflow_id,
+            state: outcome.state,
+            started_fresh: outcome.started_fresh,
+            signal_delivered: outcome.signal_delivered,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct DagTriggerRequest {
     conf: Option<Value>,
@@ -1309,6 +1362,10 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .route("/workflows/{id}/stack", get(get_workflow_stack))
         .route("/workflows/{workflow_name}/start", post(start_workflow))
         .route(
+            "/workflows/{workflow_name}/signal-with-start",
+            post(signal_with_start_workflow),
+        )
+        .route(
             "/workflows/{id}/cancel",
             post(cancel_workflow).route_layer(require_admin.clone()),
         )
@@ -1461,6 +1518,7 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/workflows/{id}/children"),
         ("GET", "/workflows/{id}/stack"),
         ("POST", "/workflows/{workflow_name}/start"),
+        ("POST", "/workflows/{workflow_name}/signal-with-start"),
         ("POST", "/workflows/{id}/cancel"),
         ("POST", "/workflows/{id}/reset"),
         ("POST", "/workflows/{id}/signal/{signal_name}"),
@@ -1542,6 +1600,22 @@ pub const fn management_api_request_fields()
                 "search_attrs",
                 "execution_timeout_secs",
                 "reuse_policy",
+            ]),
+        ),
+        (
+            "POST",
+            "/workflows/{workflow_name}/signal-with-start",
+            Some(&[
+                "workflow_id",
+                "start_input",
+                "signal_name",
+                "signal_payload",
+                "queue",
+                "memo",
+                "search_attrs",
+                "execution_timeout_secs",
+                "id_reuse_policy",
+                "idempotency_key",
             ]),
         ),
         ("POST", "/workflows/{id}/cancel", Some(&["reason"])),
@@ -1707,6 +1781,18 @@ pub const fn management_api_response_fields()
             "POST",
             "/workflows/{workflow_name}/start",
             Some(&["execution_id", "workflow_name", "workflow_id", "state"]),
+        ),
+        (
+            "POST",
+            "/workflows/{workflow_name}/signal-with-start",
+            Some(&[
+                "execution_id",
+                "workflow_name",
+                "workflow_id",
+                "state",
+                "started_fresh",
+                "signal_delivered",
+            ]),
         ),
         (
             "POST",
@@ -3779,6 +3865,356 @@ async fn start_workflow(
                     workflow_id: start.workflow_id,
                     state: start.state,
                 }),
+            )
+                .into_response()
+        }
+    }
+}
+
+// ── SignalWithStart (issue #244) ──────────────────────────────────────────────
+
+#[allow(clippy::too_many_lines)]
+async fn signal_with_start_workflow(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(workflow_name): Path<String>,
+    maybe_session: Option<Extension<Session>>,
+    headers: axum::http::HeaderMap,
+    Json(request): Json<SignalWithStartRequest>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+
+    let route = "POST /workflows/{workflow_name}/signal-with-start";
+
+    if matches!(
+        request.id_reuse_policy.as_deref(),
+        Some("terminate_if_running")
+    ) && !has_harvest_admin_access(&api_state, maybe_session.map(|Extension(session)| session))
+        .await
+    {
+        let (actor, source, request_id) = audit_context(&headers, &api_state);
+        if let Ok(pool) = api_state.storage_pool()
+            && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+        {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_SIGNAL_WITH_START,
+                target_type: TARGET_WORKFLOW,
+                target_id: Some(workflow_name.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: request.idempotency_key.as_deref(),
+                status: STATUS_FAILED,
+                error_summary: Some("unauthorized: terminate_if_running requires admin access"),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+        }
+        return AutumnError::unauthorized_msg("authentication required").into_response();
+    }
+
+    let runtime = match api_state.runtime() {
+        Ok(r) => r,
+        Err(e) => return map_error(e).into_response(),
+    };
+
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+
+    if !runtime.registry.workflows.contains_key(&workflow_name) {
+        if let Ok(pool) = api_state.storage_pool()
+            && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+        {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_SIGNAL_WITH_START,
+                target_type: TARGET_WORKFLOW,
+                target_id: Some(workflow_name.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: request.idempotency_key.as_deref(),
+                status: STATUS_FAILED,
+                error_summary: Some("workflow not registered"),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+        }
+        return AutumnError::not_found_msg(format!("workflow '{workflow_name}'")).into_response();
+    }
+    if runtime.is_registered_dag(&workflow_name) {
+        if let Ok(pool) = api_state.storage_pool()
+            && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+        {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_SIGNAL_WITH_START,
+                target_type: TARGET_WORKFLOW,
+                target_id: Some(workflow_name.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: request.idempotency_key.as_deref(),
+                status: STATUS_FAILED,
+                error_summary: Some(
+                    "registered DAG cannot receive signal-with-start via workflow route",
+                ),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+        }
+        return AutumnError::bad_request_msg(format!(
+            "workflow '{workflow_name}' is a registered DAG; signal-with-start applies to plain workflows"
+        ))
+        .into_response();
+    }
+
+    let reuse_policy = match parse_reuse_policy(request.id_reuse_policy.as_deref()) {
+        Ok(p) => p,
+        Err(e) => {
+            if let Ok(pool) = api_state.storage_pool()
+                && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+            {
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_SIGNAL_WITH_START,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: Some(workflow_name.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: request.idempotency_key.as_deref(),
+                    status: STATUS_FAILED,
+                    error_summary: Some("invalid id_reuse_policy"),
+                    shard_id: None,
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+            }
+            return e.into_response();
+        }
+    };
+
+    let workflow_id = request.workflow_id;
+    let queue_name = request
+        .queue
+        .or_else(|| runtime.queues.as_slice().first().cloned())
+        .unwrap_or_else(|| "default".to_string());
+    let start_input = request.start_input.unwrap_or(Value::Null);
+    let signal_payload = request.signal_payload.unwrap_or(Value::Null);
+
+    // In multi-shard deployments with read-only shards the rendezvous hash can
+    // map a (workflow_name, workflow_id) to a different writable shard than the
+    // one that already holds the live execution. Search every readable shard
+    // for an existing non-terminal execution first; only fall back to a fresh
+    // shard when none is found. This ensures signal-with-start always attaches
+    // to the correct run rather than accidentally starting a second one.
+    //
+    // Two correctness rules apply here:
+    //
+    //   1. Fail closed on shard scan errors. A transient lookup failure on the
+    //      shard that owns the live run must not silently fall through to
+    //      `pick_for_new_workflow`, otherwise a narrowed-writable-shard
+    //      deployment can race into a duplicate start on a different shard.
+    //
+    //   2. Reuse the existing execution UUID *only* when we expect to attach
+    //      to a live run. For terminal priors, or for `TerminateIfRunning`
+    //      against a RUNNING/SUSPENDED prior, the core start path takes the
+    //      `replace_execution` branch which seals the existing row and inserts
+    //      a new one keyed by `request.exec_id`. Passing back the existing
+    //      UUID would hit the primary-key constraint and the request would
+    //      fail with a database error instead of replacing as documented.
+    let pool = match api_state.storage_pool() {
+        Ok(p) => p,
+        Err(e) => return map_error(e).into_response(),
+    };
+    let mut found_shard: Option<(ShardId, PoolConn, ExecutionId)> = None;
+    for (candidate_shard, shard_pool) in pool.iter_shards() {
+        let mut shard_conn = match acquire_conn(shard_pool).await {
+            Ok(c) => c,
+            Err(e) => return e.into_response(),
+        };
+        let hit = match harvest_workflow_executions::table
+            .filter(harvest_workflow_executions::workflow_name.eq(&workflow_name))
+            .filter(harvest_workflow_executions::workflow_id.eq(&workflow_id))
+            .filter(harvest_workflow_executions::state.ne_all(["CONTINUED_AS_NEW", "TERMINATED"]))
+            .select((
+                harvest_workflow_executions::id,
+                harvest_workflow_executions::state,
+            ))
+            .first::<(uuid::Uuid, String)>(&mut shard_conn)
+            .await
+            .optional()
+        {
+            Ok(hit) => hit,
+            Err(e) => {
+                return AutumnError::service_unavailable_msg(format!(
+                    "shard {} lookup failed: {e}",
+                    candidate_shard.as_i32()
+                ))
+                .into_response();
+            }
+        };
+        if let Some((existing_uuid, existing_state)) = hit {
+            // Attach (reuse UUID) only when the prior is live AND the policy
+            // expects to attach. Every other path goes through replace_execution
+            // and needs a fresh exec_id keyed for the same shard.
+            let will_attach = matches!(existing_state.as_str(), "RUNNING" | "SUSPENDED")
+                && matches!(
+                    reuse_policy,
+                    WorkflowIdReusePolicy::AllowDuplicate
+                        | WorkflowIdReusePolicy::AllowDuplicateFailedOnly
+                );
+            let exec_id = if will_attach {
+                ExecutionId::from_uuid(existing_uuid)
+            } else {
+                ExecutionId::new_for_shard(candidate_shard)
+            };
+            found_shard = Some((candidate_shard, shard_conn, exec_id));
+            break;
+        }
+    }
+
+    let (shard, mut conn, exec_id) = if let Some(tuple) = found_shard {
+        tuple
+    } else {
+        let shard = runtime
+            .router
+            .pick_for_new_workflow(&workflow_name, &workflow_id);
+        let conn = match db_conn_for_shard(&api_state, shard).await {
+            Ok(c) => c,
+            Err(e) => return e.into_response(),
+        };
+        (shard, conn, ExecutionId::new_for_shard(shard))
+    };
+
+    let trace_ctx = tracing::info_span!(
+        "harvest.workflow.schedule",
+        "otel.kind" = "producer",
+        { ATTR_WORKFLOW_ID } = %workflow_name,
+        { ATTR_EXECUTION_ID } = %exec_id,
+        { ATTR_SHARD_ID } = i64::from(shard.as_i32()),
+        { ATTR_QUEUE } = %queue_name,
+    )
+    .in_scope(|| runtime.registry.telemetry().capture_trace_context());
+
+    let (concurrency_key, concurrency_limit) = runtime
+        .registry
+        .workflows
+        .get(&workflow_name)
+        .and_then(|info| info.concurrency.as_ref())
+        .map_or((None, None), |policy| {
+            let key =
+                autumn_harvest::concurrency::resolve_concurrency_key(policy.key_expr, &start_input);
+            (key, Some(policy.limit))
+        });
+
+    let result = signal_with_start_workflow_execution(
+        &mut conn,
+        SignalWithStartParams {
+            workflow_name: &workflow_name,
+            workflow_id: &workflow_id,
+            exec_id,
+            input: start_input,
+            parent_id: None,
+            queue_name: &queue_name,
+            execution_timeout: request
+                .execution_timeout_secs
+                .map(chrono::Duration::seconds),
+            memo: request.memo,
+            search_attrs: request.search_attrs,
+            reuse_policy,
+            trace_context: trace_ctx,
+            max_execution_timeout_ceiling: api_state
+                .max_workflow_execution_timeout()
+                .map(|d| chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX)),
+            concurrency_key,
+            concurrency_limit,
+            signal_name: &request.signal_name,
+            signal_payload,
+            idempotency_key: request.idempotency_key.clone(),
+        },
+    )
+    .await;
+
+    match result {
+        Err(HarvestError::AlreadyExists {
+            existing_exec_id,
+            existing_state,
+        }) => {
+            let exec_id_str = existing_exec_id.to_string();
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_SIGNAL_WITH_START,
+                target_type: TARGET_WORKFLOW,
+                target_id: Some(exec_id_str.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: request.idempotency_key.as_deref(),
+                status: STATUS_FAILED,
+                error_summary: Some("workflow already exists"),
+                shard_id: Some(shard.as_i32()),
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+            (
+                axum::http::StatusCode::CONFLICT,
+                Json(AlreadyExistsResponse {
+                    existing_execution_id: existing_exec_id.to_string(),
+                    existing_state,
+                }),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            let err_str = e.to_string();
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_SIGNAL_WITH_START,
+                target_type: TARGET_WORKFLOW,
+                target_id: None,
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: request.idempotency_key.as_deref(),
+                status: STATUS_FAILED,
+                error_summary: Some(err_str.as_str()),
+                shard_id: Some(shard.as_i32()),
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+            map_error(e).into_response()
+        }
+        Ok(outcome) => {
+            let exec_id_str = outcome.exec_id.to_string();
+            let status_code = if outcome.started_fresh {
+                axum::http::StatusCode::CREATED
+            } else {
+                axum::http::StatusCode::OK
+            };
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_SIGNAL_WITH_START,
+                target_type: TARGET_WORKFLOW,
+                target_id: Some(exec_id_str.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: request.idempotency_key.as_deref(),
+                status: STATUS_SUCCEEDED,
+                error_summary: None,
+                shard_id: Some(shard.as_i32()),
+                source: &source,
+            };
+            if let Err(audit_err) = audit::insert_audit(&mut conn, &ar).await {
+                tracing::error!(
+                    error = %audit_err,
+                    "audit insert failed for workflow.signal_with_start"
+                );
+                return AutumnError::service_unavailable_msg(format!(
+                    "audit insert failed: {audit_err}"
+                ))
+                .into_response();
+            }
+            (
+                status_code,
+                Json(SignalWithStartResponse::from_outcome(outcome)),
             )
                 .into_response()
         }

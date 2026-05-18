@@ -859,6 +859,7 @@ struct SignalForReset {
     id: Uuid,
     signal_name: String,
     payload: Value,
+    idempotency_key: Option<String>,
 }
 
 #[derive(Insertable)]
@@ -867,6 +868,7 @@ struct NewSignalForReset {
     workflow_exec_id: Uuid,
     signal_name: String,
     payload: Value,
+    idempotency_key: Option<String>,
 }
 
 async fn reapply_or_drop_signals(
@@ -886,6 +888,7 @@ async fn reapply_or_drop_signals(
             harvest_signals::id,
             harvest_signals::signal_name,
             harvest_signals::payload,
+            harvest_signals::idempotency_key,
         ))
         .load(conn)
         .await
@@ -898,6 +901,7 @@ async fn reapply_or_drop_signals(
                 workflow_exec_id: new_exec_id.as_uuid(),
                 signal_name: signal.signal_name.clone(),
                 payload: signal.payload.clone(),
+                idempotency_key: signal.idempotency_key.clone(),
             })
             .collect::<Vec<_>>();
         diesel::insert_into(harvest_signals::table)

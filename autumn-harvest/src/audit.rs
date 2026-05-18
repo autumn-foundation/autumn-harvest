@@ -36,6 +36,8 @@ use crate::schema::harvest_audit_log;
 pub const OP_WORKFLOW_START: &str = "workflow.start";
 /// Audit operation: Signaled a running workflow execution.
 pub const OP_WORKFLOW_SIGNAL: &str = "workflow.signal";
+/// Audit operation: Atomic start-or-attach + signal (issue #244).
+pub const OP_WORKFLOW_SIGNAL_WITH_START: &str = "workflow.signal_with_start";
 /// Audit operation: Cancelled a workflow execution.
 pub const OP_WORKFLOW_CANCEL: &str = "workflow.cancel";
 /// Audit operation: Reset a workflow execution to a previous state.
@@ -221,6 +223,10 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
         "POST /workflows/{workflow_name}/start",
         RouteClass::Mutating,
     ),
+    (
+        "POST /workflows/{workflow_name}/signal-with-start",
+        RouteClass::Mutating,
+    ),
     ("POST /workflows/{id}/cancel", RouteClass::Mutating),
     ("POST /workflows/{id}/reset", RouteClass::Mutating),
     (
@@ -273,6 +279,7 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
 pub const AUDITED_OPERATIONS: &[&str] = &[
     OP_WORKFLOW_START,
     OP_WORKFLOW_SIGNAL,
+    OP_WORKFLOW_SIGNAL_WITH_START,
     OP_WORKFLOW_CANCEL,
     OP_WORKFLOW_RESET,
     OP_DAG_TRIGGER,
@@ -354,6 +361,10 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     (
         "POST /workflows/{workflow_name}/start",
         Some(OP_WORKFLOW_START),
+    ),
+    (
+        "POST /workflows/{workflow_name}/signal-with-start",
+        Some(OP_WORKFLOW_SIGNAL_WITH_START),
     ),
     ("POST /workflows/{id}/cancel", Some(OP_WORKFLOW_CANCEL)),
     ("POST /workflows/{id}/reset", Some(OP_WORKFLOW_RESET)),

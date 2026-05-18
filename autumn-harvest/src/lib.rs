@@ -160,8 +160,9 @@ pub use error::{HarvestError, HarvestResult, TimeoutType};
 pub use event::WorkflowEvent;
 #[cfg(feature = "db")]
 pub use execution::{
-    CancelledWorkflowExecution, StartWorkflowParams, StartedWorkflowExecution,
-    cancel_workflow_execution, start_or_load_workflow_execution, terminate_workflow_execution,
+    CancelledWorkflowExecution, SignalWithStartOutcome, SignalWithStartParams, StartWorkflowParams,
+    StartedWorkflowExecution, cancel_workflow_execution, signal_with_start_workflow_execution,
+    start_or_load_workflow_execution, terminate_workflow_execution,
 };
 pub use executor::{WorkflowOutcome, run_workflow};
 pub use guardrail::{

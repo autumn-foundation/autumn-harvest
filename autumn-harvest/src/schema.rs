@@ -129,6 +129,11 @@ diesel::table! {
         payload -> Jsonb,
         received_at -> Timestamptz,
         consumed -> Bool,
+        /// Optional dedup key for `SignalWithStart` (issue #244). When
+        /// present, a partial unique index over
+        /// (`workflow_exec_id`, `idempotency_key`) rejects duplicate inserts
+        /// so upstream webhook retries land exactly one `SignalReceived` event.
+        idempotency_key -> Nullable<Text>,
     }
 }
 

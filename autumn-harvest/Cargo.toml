@@ -92,6 +92,14 @@ required-features = ["db"]
 name = "workflow_handle_tests"
 required-features = ["db"]
 
+[[test]]
+name = "signal_with_start_tests"
+required-features = ["db"]
+
+[[example]]
+name = "signal_with_start_webhook"
+required-features = ["db"]
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 testcontainers = { workspace = true }
