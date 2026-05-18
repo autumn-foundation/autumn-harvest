@@ -75,7 +75,7 @@ use autumn_harvest::signal;
 use autumn_harvest::store;
 use autumn_harvest::telemetry::{ATTR_EXECUTION_ID, ATTR_QUEUE, ATTR_SHARD_ID, ATTR_WORKFLOW_ID};
 use autumn_harvest::types::{
-    ExecutionId, ExternalActivityToken, ShardId, UpdateId, WorkflowIdReusePolicy,
+    ExecutionId, ExternalActivityToken, Priority, ShardId, UpdateId, WorkflowIdReusePolicy,
 };
 use autumn_harvest::worker::{DbPool, HandlerRegistry};
 use autumn_harvest::workers::{
@@ -1485,6 +1485,11 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             post(submit_batch_operation).route_layer(require_admin),
         )
         .route("/batch-operations/{id}", get(get_batch_operation))
+        // Task priority management (issue #249): PATCH /tasks/{id} lets
+        // operators re-prioritize a stuck pending task without restarting the
+        // workflow. Already-running tasks ignore the change; the next retry
+        // attempt uses the updated priority.
+        .route("/tasks/{id}", patch(patch_task_priority))
         // Audit trail (issue #158): read-only endpoint to query management
         // API mutations. See `audit::ALL_MUTATION_ROUTES` for covered paths.
         .route("/admin/audit", get(list_audit_records))
@@ -3792,6 +3797,7 @@ async fn start_workflow(
                 .map(|d| chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX)),
             concurrency_key,
             concurrency_limit,
+            priority: Priority::default(),
         },
     )
     .await;
@@ -6307,6 +6313,7 @@ async fn schedule_backfill(
                         max_execution_timeout_ceiling: None,
                         concurrency_key: None,
                         concurrency_limit: None,
+                        priority: Priority::default(),
                     },
                 )
                 .await;
@@ -6410,6 +6417,7 @@ async fn schedule_backfill(
                         max_execution_timeout_ceiling: None,
                         concurrency_key: None,
                         concurrency_limit: None,
+                        priority: Priority::default(),
                     },
                 )
                 .await;
@@ -7836,6 +7844,72 @@ async fn concurrency_status(
     let mut result: Vec<ConcurrencyKeyStats> = merged.into_values().collect();
     result.sort_by(|a, b| a.key.cmp(&b.key).then(a.task_type.cmp(&b.task_type)));
     Ok(Json(result))
+}
+
+// ---------------------------------------------------------------------------
+// PATCH /tasks/{id} — re-prioritize a pending task (issue #249)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct PatchTaskPriorityRequest {
+    priority: Priority,
+}
+
+#[derive(Debug, Serialize)]
+struct PatchTaskPriorityResponse {
+    /// The task UUID that was targeted.
+    task_id: uuid::Uuid,
+    /// The new priority value (as string).
+    priority: String,
+    /// `true` when the task was found in `PENDING` state and the priority was
+    /// updated. `false` when the task is already `RUNNING` (the running attempt
+    /// keeps its original priority; the next retry will use the new value).
+    updated: bool,
+}
+
+async fn patch_task_priority(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(task_id_str): Path<String>,
+    Json(request): Json<PatchTaskPriorityRequest>,
+) -> Result<impl IntoResponse, AutumnError> {
+    let task_id = task_id_str
+        .parse::<uuid::Uuid>()
+        .map_err(|_| AutumnError::bad_request_msg(format!("invalid task id '{task_id_str}'")))?;
+
+    let pool = api_state.storage_pool().map_err(map_error)?;
+
+    for (_shard, shard_pool) in pool.iter_shards() {
+        let mut conn = acquire_conn(shard_pool).await?;
+        let updated =
+            autumn_harvest::queue::update_task_priority(&mut conn, task_id, request.priority)
+                .await
+                .map_err(map_error)?;
+
+        if updated {
+            return Ok((
+                StatusCode::OK,
+                Json(PatchTaskPriorityResponse {
+                    task_id,
+                    priority: request.priority.to_string(),
+                    updated: true,
+                }),
+            )
+                .into_response());
+        }
+    }
+
+    // Task found but not in PENDING state (RUNNING or terminal). Return 200
+    // with updated=false so the caller knows the change will take effect on the
+    // next retry claim rather than the current run.
+    Ok((
+        StatusCode::OK,
+        Json(PatchTaskPriorityResponse {
+            task_id,
+            priority: request.priority.to_string(),
+            updated: false,
+        }),
+    )
+        .into_response())
 }
 
 async fn health(Extension(api_state): Extension<HarvestApiState>) -> axum::response::Response {
@@ -9859,6 +9933,7 @@ mod tests {
                 max_execution_timeout_ceiling: None,
                 concurrency_key: None,
                 concurrency_limit: None,
+                priority: Priority::default(),
             },
         )
         .await

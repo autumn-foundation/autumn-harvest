@@ -844,6 +844,105 @@ impl fmt::Display for DeploymentName {
     }
 }
 
+// ── Priority ──────────────────────────────────────────────────────────────────
+
+/// Task priority for within-queue ordering (issue #249).
+///
+/// Workers claim tasks in `priority DESC, available_at ASC` order, so
+/// higher-priority tasks are claimed before lower-priority ones that arrived
+/// earlier.  Same-priority tasks are FIFO by `available_at`.
+///
+/// The numeric values are chosen so that `Normal = 0` preserves backward
+/// compatibility: pre-upgrade rows written with `priority = 0` continue to
+/// behave as `Normal` without any data migration.
+///
+/// Priority is **queue metadata**, not workflow history.  Changing a task's
+/// priority via `PATCH /tasks/{id}` does not add a `WorkflowEvent`, does not
+/// affect replay determinism, and takes effect on the next claim attempt.
+///
+/// ## Anti-starvation
+///
+/// When `WorkerConfig::priority_aging_secs` is set, a task's effective
+/// priority is boosted by `+1` for every `aging_secs` it has waited in
+/// `PENDING` state.  This bounds the maximum starvation time for `Low`
+/// priority tasks even under sustained high-priority load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Priority {
+    /// Lower than normal; used for bulk background work that should yield to
+    /// all interactive traffic.  Maps to `-1` in the database so `ORDER BY
+    /// priority DESC` places it behind `Normal`.
+    Low,
+    /// Default priority.  Pre-upgrade rows with `priority = 0` are treated as
+    /// `Normal`.  Maps to `0`.
+    #[default]
+    Normal,
+    /// Above-normal urgency; claim-ordered ahead of `Normal` and `Low` tasks.
+    /// Maps to `1`.
+    High,
+    /// Highest urgency lane; use sparingly for incident-response runbooks and
+    /// latency-SLA paths.  Maps to `2`.
+    Critical,
+}
+
+impl Priority {
+    /// Returns the integer value stored in the `priority` column.
+    ///
+    /// `ORDER BY priority DESC` in the claim query ensures `Critical (2) >
+    /// High (1) > Normal (0) > Low (-1)`.
+    #[must_use]
+    pub const fn as_i32(self) -> i32 {
+        match self {
+            Self::Low => -1,
+            Self::Normal => 0,
+            Self::High => 1,
+            Self::Critical => 2,
+        }
+    }
+
+    /// Convert from a database integer back to a `Priority`.
+    ///
+    /// Returns `None` for values outside the declared range so callers can
+    /// handle unknown values gracefully (e.g. treat as `Normal`).
+    #[must_use]
+    pub const fn from_i32(v: i32) -> Option<Self> {
+        match v {
+            -1 => Some(Self::Low),
+            0 => Some(Self::Normal),
+            1 => Some(Self::High),
+            2 => Some(Self::Critical),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for Priority {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Low => f.write_str("low"),
+            Self::Normal => f.write_str("normal"),
+            Self::High => f.write_str("high"),
+            Self::Critical => f.write_str("critical"),
+        }
+    }
+}
+
+impl std::str::FromStr for Priority {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "low" => Ok(Self::Low),
+            "normal" => Ok(Self::Normal),
+            "high" => Ok(Self::High),
+            "critical" => Ok(Self::Critical),
+            other => Err(format!(
+                "unknown priority '{other}'; expected low | normal | high | critical"
+            )),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

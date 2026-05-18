@@ -444,6 +444,7 @@ async fn insert_workflow_on_url(
             max_execution_timeout_ceiling: None,
             concurrency_key: None,
             concurrency_limit: None,
+            priority: Default::default(),
         },
     )
     .await
@@ -512,6 +513,7 @@ async fn insert_child_workflow_on_url(fixture: ChildWorkflowFixture<'_>) -> Exec
             max_execution_timeout_ceiling: None,
             concurrency_key: None,
             concurrency_limit: None,
+            priority: Default::default(),
         },
     )
     .await

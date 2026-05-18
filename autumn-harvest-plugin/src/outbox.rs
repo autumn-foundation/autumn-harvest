@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 use autumn_harvest::error::{HarvestError, HarvestResult, database_error};
 use autumn_harvest::shard::ShardRouter;
-use autumn_harvest::types::ExecutionId;
+use autumn_harvest::types::{ExecutionId, Priority};
 use autumn_harvest::{StartWorkflowParams, start_or_load_workflow_execution};
 
 use crate::config::HarvestOutboxConfig;
@@ -300,6 +300,7 @@ pub(crate) async fn dispatch_workflow_start_request(
             max_execution_timeout_ceiling: None,
             concurrency_key: None,
             concurrency_limit: None,
+            priority: Priority::default(),
         },
     )
     .await?;

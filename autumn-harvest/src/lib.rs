@@ -221,8 +221,8 @@ pub use testing::{
 #[cfg(feature = "testing")]
 pub use testing::{TestRunOutcome, WorkflowTestEnv};
 pub use types::{
-    ActivityExecId, BuildId, DeploymentName, ExecutionId, ExternalActivityToken, ShardId, TimerId,
-    UpdateId, WorkerId, WorkflowId, WorkflowIdReusePolicy,
+    ActivityExecId, BuildId, DeploymentName, ExecutionId, ExternalActivityToken, Priority, ShardId,
+    TimerId, UpdateId, WorkerId, WorkflowId, WorkflowIdReusePolicy,
 };
 pub use update::UpdateRegistry;
 #[cfg(feature = "db")]

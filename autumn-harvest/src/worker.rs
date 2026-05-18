@@ -103,6 +103,10 @@ pub struct WorkerRuntimeConfig {
     /// Maximum number of entries in the per-worker in-process LRU workflow
     /// state cache (issue #235). Defaults to 1000.
     pub workflow_cache_size: usize,
+    /// Anti-starvation aging period (issue #249). Passed to `claim_task` so
+    /// the claim SQL can boost effective priority for long-waiting tasks.
+    /// `None` disables aging.
+    pub priority_aging_secs: Option<u32>,
 }
 
 impl WorkerRuntimeConfig {
@@ -139,6 +143,7 @@ impl From<WorkerConfig> for WorkerRuntimeConfig {
             build_id: cfg.build_id,
             deployment_name: cfg.deployment_name,
             workflow_cache_size: cfg.workflow_cache_size,
+            priority_aging_secs: cfg.priority_aging_secs,
         }
     }
 }
@@ -1807,6 +1812,7 @@ async fn persist_scheduled_activities(
     sticky: Option<queue::StickyHint<'_>>,
     execute_span: &tracing::Span,
     assigned_build_id: Option<&str>,
+    parent_priority: i32,
 ) -> HarvestResult<()> {
     let marker_events = marker_events_from_commands(commands);
     let mut events = marker_events;
@@ -1835,6 +1841,10 @@ async fn persist_scheduled_activities(
         params.activity_name = Some(scheduled.name.clone());
         params.activity_id = Some(scheduled.activity_id.as_uuid());
         params.required_build_id = assigned_build_id.map(str::to_string);
+        // Inherit priority from the parent workflow task so high-priority
+        // workflows' activities are also claimed ahead of lower-priority work
+        // on the same queue (issue #249).
+        params.priority = parent_priority;
 
         let effective_retry = scheduled
             .retry_policy_override
@@ -2876,6 +2886,7 @@ async fn handle_suspended_workflow(
             sticky,
             context.execute_span,
             context.execution.assigned_build_id.as_deref(),
+            context.persistence.task.priority,
         )
         .await
     } else if let Some(activity_ids) = extract_all_activity_waits(commands) {
@@ -4734,6 +4745,7 @@ impl Worker {
             &self.config.queues,
             &self.config.worker_id,
             &self.config.build_id,
+            self.config.priority_aging_secs,
         )
         .await
         {

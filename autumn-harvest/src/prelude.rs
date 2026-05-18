@@ -30,7 +30,7 @@ pub use crate::telemetry::{
 };
 pub use crate::types::{
     ActivityExecId, BuildId, DeploymentName, ExecutionId, ExternalSignalId, IdempotencyKey,
-    TimerId, WorkerId, WorkflowId,
+    Priority, TimerId, WorkerId, WorkflowId,
 };
 
 // Re-export macros from autumn-harvest-macros.

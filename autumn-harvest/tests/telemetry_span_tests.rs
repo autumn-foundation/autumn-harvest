@@ -294,6 +294,7 @@ fn all_adr_0001_span_kinds_are_emitted() {
                     max_execution_timeout_ceiling: None,
                     concurrency_key: None,
                     concurrency_limit: None,
+                    priority: Default::default(),
                 },
             )
             .await

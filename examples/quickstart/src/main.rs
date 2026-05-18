@@ -121,6 +121,7 @@ async fn greet(
                 max_execution_timeout_ceiling: None,
                 concurrency_key: None,
                 concurrency_limit: None,
+                priority: Default::default(),
             },
         )
         .await

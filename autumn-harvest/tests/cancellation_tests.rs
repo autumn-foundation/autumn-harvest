@@ -120,6 +120,7 @@ async fn start_test_workflow(conn: &mut AsyncPgConnection) -> autumn_harvest::Ex
             max_execution_timeout_ceiling: None,
             concurrency_key: None,
             concurrency_limit: None,
+            priority: Default::default(),
         },
     )
     .await
@@ -458,6 +459,7 @@ async fn running_activity_heartbeat_observes_workflow_cancellation() {
             max_execution_timeout_ceiling: None,
             concurrency_key: None,
             concurrency_limit: None,
+            priority: Default::default(),
         },
     )
     .await
@@ -622,6 +624,7 @@ async fn uncooperative_activity_is_hard_aborted_after_grace_period() {
             max_execution_timeout_ceiling: None,
             concurrency_key: None,
             concurrency_limit: None,
+            priority: Default::default(),
         },
     )
     .await

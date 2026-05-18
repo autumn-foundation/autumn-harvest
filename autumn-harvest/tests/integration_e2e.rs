@@ -519,6 +519,7 @@ async fn legacy_workflow_uniqueness_schema_can_be_upgraded_for_idempotent_starts
         max_execution_timeout_ceiling: None,
         concurrency_key: None,
         concurrency_limit: None,
+        priority: Default::default(),
     };
 
     // On the legacy schema there is no `(workflow_name, workflow_id)`
@@ -3540,6 +3541,7 @@ mod reuse_policy_helpers {
             max_execution_timeout_ceiling: None,
             concurrency_key: None,
             concurrency_limit: None,
+            priority: Default::default(),
         }
     }
 
@@ -4711,6 +4713,7 @@ async fn search_attrs_upsert_visible_after_update_and_filterable() {
             max_execution_timeout_ceiling: None,
             concurrency_key: None,
             concurrency_limit: None,
+            priority: Default::default(),
         },
     )
     .await
@@ -4845,6 +4848,7 @@ async fn search_attrs_survive_worker_crash_and_resume() {
             max_execution_timeout_ceiling: None,
             concurrency_key: None,
             concurrency_limit: None,
+            priority: Default::default(),
         },
     )
     .await

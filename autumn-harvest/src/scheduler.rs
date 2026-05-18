@@ -26,7 +26,7 @@ use crate::models::{HarvestSchedule, NewHarvestSchedule};
 use crate::policy::{OverlapPolicy, Schedule, WorkflowSchedule, compute_jitter_offset};
 use crate::schema::{harvest_schedules, harvest_workflow_executions};
 use crate::shard::{ShardRouter, ShardedDbPool};
-use crate::types::{ExecutionId, ShardId, WorkflowIdReusePolicy};
+use crate::types::{ExecutionId, Priority, ShardId, WorkflowIdReusePolicy};
 use crate::worker::{DbPool, HandlerRegistry};
 
 const DEFAULT_SCHEDULER_TICK_INTERVAL: Duration = Duration::from_secs(1);
@@ -719,6 +719,7 @@ pub async fn trigger_unified_dag(
             max_execution_timeout_ceiling: None,
             concurrency_key: None,
             concurrency_limit: None,
+            priority: Priority::default(),
         },
     )
     .await
@@ -1637,6 +1638,7 @@ async fn tick_one_workflow_schedule(
                 max_execution_timeout_ceiling: None,
                 concurrency_key,
                 concurrency_limit,
+                priority: Priority::default(),
             },
         )
         .await;
@@ -1979,6 +1981,7 @@ async fn drain_buffered_schedule_runs(
                     max_execution_timeout_ceiling: None,
                     concurrency_key,
                     concurrency_limit,
+                    priority: Priority::default(),
                 },
             )
             .await;
