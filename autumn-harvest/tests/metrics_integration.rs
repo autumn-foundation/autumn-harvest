@@ -580,6 +580,7 @@ async fn workflow_and_activity_metrics_are_recorded() {
             module: "metrics_integration",
             handler: metrics_test_workflow,
             execution_timeout: None,
+            concurrency: None,
         }],
         vec![ActivityInfo {
             name: "metrics_activity",
@@ -760,6 +761,7 @@ async fn continue_as_new_records_history_size_and_rotation_metrics() {
             module: "metrics_integration",
             handler: continue_metric_workflow,
             execution_timeout: None,
+            concurrency: None,
         }],
         vec![],
         autumn_harvest::context::empty_shared_state(),
@@ -868,6 +870,7 @@ async fn workflow_hard_cap_moves_offender_to_dlq() {
             module: "metrics_integration",
             handler: history_cap_violator,
             execution_timeout: None,
+            concurrency: None,
         }],
         vec![],
         autumn_harvest::context::empty_shared_state(),
@@ -994,12 +997,14 @@ async fn suspended_commands_that_reach_hard_cap_move_to_dlq_immediately() {
                 module: "metrics_integration",
                 handler: suspended_command_reaches_history_cap,
                 execution_timeout: None,
+                concurrency: None,
             },
             WorkflowInfo {
                 name: "history_cap_never_finishing_child",
                 module: "metrics_integration",
                 handler: history_cap_never_finishing_child,
                 execution_timeout: None,
+                concurrency: None,
             },
         ],
         vec![ActivityInfo {
@@ -1158,6 +1163,7 @@ async fn local_activity_retries_stop_when_hard_cap_is_reached() {
             module: "metrics_integration",
             handler: local_activity_retry_reaches_history_cap,
             execution_timeout: None,
+            concurrency: None,
         }],
         vec![ActivityInfo {
             name: "history_cap_always_failing_local",
@@ -1294,12 +1300,14 @@ async fn child_hard_cap_dlq_notifies_parent_and_stops_inline_growth() {
                 module: "metrics_integration",
                 handler: parent_with_history_capped_child,
                 execution_timeout: None,
+                concurrency: None,
             },
             WorkflowInfo {
                 name: "child_breaches_history_cap_inline",
                 module: "metrics_integration",
                 handler: child_breaches_history_cap_inline,
                 execution_timeout: None,
+                concurrency: None,
             },
         ],
         vec![ActivityInfo {

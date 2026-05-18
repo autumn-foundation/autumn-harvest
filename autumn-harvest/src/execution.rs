@@ -57,6 +57,16 @@ pub struct StartWorkflowParams<'a> {
     /// `None` means no ceiling is enforced.  Typically populated from
     /// `BuiltHarvest::max_workflow_execution_timeout` by the plugin layer.
     pub max_execution_timeout_ceiling: Option<chrono::Duration>,
+    /// Pre-resolved concurrency group key for this workflow run (issue #247).
+    ///
+    /// Callers resolve the key expression from `WorkflowInfo.concurrency.key_expr`
+    /// against the input payload via [`crate::concurrency::resolve_concurrency_key`]
+    /// before constructing `StartWorkflowParams`. When `None`, no per-key cap is
+    /// applied and only the worker-level semaphore limits concurrency.
+    pub concurrency_key: Option<String>,
+    /// Maximum number of RUNNING workflow tasks allowed for [`Self::concurrency_key`].
+    /// Required whenever `concurrency_key` is `Some`; ignored when it is `None`.
+    pub concurrency_limit: Option<u32>,
 }
 
 impl StartWorkflowParams<'_> {
@@ -234,6 +244,8 @@ pub async fn start_or_load_workflow_execution(
     enqueue.required_build_id = assigned_build.clone();
     // ADR-0001 §3: store the caller's trace context so the worker can restore it.
     enqueue.trace_context.clone_from(&request.trace_context);
+    enqueue.concurrency_key.clone_from(&request.concurrency_key);
+    enqueue.max_concurrent = request.concurrency_limit;
 
     conn.transaction::<StartedWorkflowExecution, HarvestError, _>(|conn| {
         let row = row;

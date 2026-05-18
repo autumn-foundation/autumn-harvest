@@ -250,6 +250,18 @@ pub enum HarvestBuilderError {
         activity: String,
     },
 
+    /// A workflow declares `ConcurrencyPolicy { limit: 0 }`, which makes the
+    /// saturation check `(SELECT COUNT(*) ...) < 0` always false, permanently
+    /// deferring every start for that workflow.
+    #[error(
+        "workflow '{workflow}' has a ConcurrencyPolicy with limit = 0; \
+         use limit >= 1 or omit the concurrency policy to disable the cap"
+    )]
+    ZeroWorkflowConcurrencyLimit {
+        /// The workflow name.
+        workflow: String,
+    },
+
     /// A [`WorkerConfig`] field has an invalid value.
     #[error("invalid worker configuration: {0}")]
     InvalidWorkerConfig(String),
@@ -689,6 +701,7 @@ impl HarvestBuilder {
         }
 
         validate_concurrency_keys(&self.activities)?;
+        validate_workflow_concurrency_limits(&self.workflows)?;
         validate_dag_workflow_name_collisions(
             &self.workflows,
             &self.auto_registered_dag_workflows,
@@ -915,6 +928,22 @@ fn validate_local_activity_timeouts(
                 activity: activity.name.to_string(),
                 actual: activity.default_start_to_close.unwrap(),
                 cap,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Reject workflows whose `ConcurrencyPolicy` declares `limit = 0`. A zero
+/// limit makes the claim predicate `running < 0` always false, permanently
+/// deferring every workflow start for that key. Catch it at build time.
+fn validate_workflow_concurrency_limits(
+    workflows: &[crate::info::WorkflowInfo],
+) -> Result<(), HarvestBuilderError> {
+    for wf in workflows {
+        if wf.concurrency.is_some_and(|p| p.limit == 0) {
+            return Err(HarvestBuilderError::ZeroWorkflowConcurrencyLimit {
+                workflow: wf.name.to_string(),
             });
         }
     }
@@ -1175,6 +1204,7 @@ mod tests {
             module: "test",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             execution_timeout: None,
+            concurrency: None,
         }
     }
 
@@ -1558,6 +1588,51 @@ mod tests {
                 if activity == "act_a"
         ));
         assert!(err.to_string().contains("act_a"));
+    }
+
+    #[test]
+    fn builder_rejects_zero_workflow_concurrency_limit() {
+        use crate::concurrency::ConcurrencyPolicy;
+        let result = HarvestBuilder::new()
+            .workflows(vec![WorkflowInfo {
+                name: "report_wf",
+                module: "test",
+                handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+                execution_timeout: None,
+                concurrency: Some(ConcurrencyPolicy {
+                    key_expr: "input.tenant_id",
+                    limit: 0,
+                }),
+            }])
+            .try_build();
+        let err = result.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                HarvestBuilderError::ZeroWorkflowConcurrencyLimit { ref workflow }
+                    if workflow == "report_wf"
+            ),
+            "expected ZeroWorkflowConcurrencyLimit, got: {err}"
+        );
+        assert!(err.to_string().contains("report_wf"));
+    }
+
+    #[test]
+    fn builder_accepts_workflow_with_nonzero_concurrency_limit() {
+        use crate::concurrency::ConcurrencyPolicy;
+        let result = HarvestBuilder::new()
+            .workflows(vec![WorkflowInfo {
+                name: "report_wf",
+                module: "test",
+                handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+                execution_timeout: None,
+                concurrency: Some(ConcurrencyPolicy {
+                    key_expr: "input.tenant_id",
+                    limit: 5,
+                }),
+            }])
+            .try_build();
+        assert!(result.is_ok());
     }
 
     // ── Local activity cap tests ──────────────────────────────────────────

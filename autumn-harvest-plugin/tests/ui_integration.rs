@@ -188,6 +188,7 @@ fn echo_registry() -> Arc<HandlerRegistry> {
             module: "tests",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             execution_timeout: None,
+            concurrency: None,
         }],
         vec![],
     ))
@@ -279,6 +280,8 @@ async fn insert_workflow_on_url(
             reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
             trace_context: None,
             max_execution_timeout_ceiling: None,
+            concurrency_key: None,
+            concurrency_limit: None,
         },
     )
     .await
@@ -1866,6 +1869,8 @@ async fn insert_child_workflow_on_url(
             reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
             trace_context: None,
             max_execution_timeout_ceiling: None,
+            concurrency_key: None,
+            concurrency_limit: None,
         },
     )
     .await

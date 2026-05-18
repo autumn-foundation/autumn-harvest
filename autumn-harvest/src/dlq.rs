@@ -17,6 +17,7 @@ use uuid::Uuid;
 use crate::error::{HarvestError, HarvestResult};
 use crate::models::{DeadLetter, NewDeadLetter};
 use crate::queue::{EnqueueParams, TaskType};
+use crate::worker::HandlerRegistry;
 
 pub const DEFAULT_BULK_LIMIT: u32 = 100;
 /// Maximum number of DLQ rows a single bulk operation can act on.
@@ -250,6 +251,7 @@ pub async fn list_dead_letters(
 pub async fn replay_dead_letter(
     conn: &mut AsyncPgConnection,
     dead_letter_id: Uuid,
+    registry: Option<&HandlerRegistry>,
 ) -> HarvestResult<Uuid> {
     use crate::schema::harvest_dead_letters::dsl;
 
@@ -272,18 +274,36 @@ pub async fn replay_dead_letter(
             params.activity_name = entry.activity_name;
             params.max_attempts = entry.attempts.max(1);
 
-            // Restore required_build_id from the owning execution so the
-            // replayed task is only claimable by a compatible worker build.
+            // Restore required_build_id and concurrency policy from the owning
+            // execution so the replayed task is subject to the same constraints.
             if let Some(exec_id) = params.workflow_exec_id {
                 use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
-                let build_id: Option<Option<String>> = exec_dsl::harvest_workflow_executions
+                let row: Option<(Option<String>, String)> = exec_dsl::harvest_workflow_executions
                     .find(exec_id)
-                    .select(exec_dsl::assigned_build_id)
+                    .select((exec_dsl::assigned_build_id, exec_dsl::workflow_name))
                     .first(conn)
                     .await
                     .optional()
                     .map_err(crate::error::database_error)?;
-                params.required_build_id = build_id.flatten();
+                if let Some((build_id, workflow_name)) = row {
+                    params.required_build_id = build_id;
+                    // Concurrency policy lives on WorkflowInfo and governs
+                    // workflow-task slots only.  Activity tasks are not subject
+                    // to the workflow-level cap (the claim query enforces caps
+                    // per task_type, so mixing them would throttle activities
+                    // against the wrong budget).
+                    if task_type == TaskType::Workflow
+                        && let Some(reg) = registry
+                        && let Some(info) = reg.workflows.get(&workflow_name)
+                        && let Some(policy) = &info.concurrency
+                    {
+                        params.concurrency_key = crate::concurrency::resolve_concurrency_key(
+                            policy.key_expr,
+                            &params.input,
+                        );
+                        params.max_concurrent = Some(policy.limit);
+                    }
+                }
             }
 
             let task_id = crate::queue::enqueue(conn, &params).await?;
@@ -404,6 +424,7 @@ async fn query_dead_letters_for_bulk(
 pub async fn bulk_replay_dead_letters(
     conn: &mut AsyncPgConnection,
     filter: &BulkDlqFilter,
+    registry: Option<&HandlerRegistry>,
 ) -> HarvestResult<BulkDlqResult> {
     let matched = usize::try_from(count_bulk_filter_matches(conn, filter).await?).unwrap_or(0);
     let rows = query_dead_letters_for_bulk(conn, filter).await?;
@@ -426,7 +447,7 @@ pub async fn bulk_replay_dead_letters(
     let mut failures: Vec<BulkDlqFailure> = Vec::with_capacity(rows.len());
 
     for row in &rows {
-        match replay_dead_letter(conn, row.id).await {
+        match replay_dead_letter(conn, row.id, registry).await {
             Ok(_task_id) => {
                 acted_on += 1;
                 acted_ids.push(row.id.to_string());

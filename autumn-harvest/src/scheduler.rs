@@ -580,8 +580,14 @@ pub async fn tick_once_sharded(
         // capacity freed by a just-completed run is consumed by the oldest
         // pending slot first, not by the freshest next_run_at firing.
         #[cfg(feature = "db")]
-        if let Err(error) =
-            drain_buffered_schedule_runs(&mut conn, shard, dags.as_ref(), &metrics).await
+        if let Err(error) = drain_buffered_schedule_runs(
+            &mut conn,
+            shard,
+            dags.as_ref(),
+            registry.as_ref(),
+            &metrics,
+        )
+        .await
         {
             tracing::warn!(
                 error = %error,
@@ -590,7 +596,9 @@ pub async fn tick_once_sharded(
             );
         }
 
-        if let Err(error) = tick_workflow_schedules(&mut conn, shard, dags.as_ref(), &metrics).await
+        if let Err(error) =
+            tick_workflow_schedules(&mut conn, shard, dags.as_ref(), registry.as_ref(), &metrics)
+                .await
         {
             tracing::warn!(
                 error = %error,
@@ -697,6 +705,8 @@ pub async fn trigger_unified_dag(
             reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
             trace_context: None,
             max_execution_timeout_ceiling: None,
+            concurrency_key: None,
+            concurrency_limit: None,
         },
     )
     .await
@@ -1226,6 +1236,7 @@ async fn tick_workflow_schedules(
     conn: &mut AsyncPgConnection,
     current_shard: ShardId,
     registered_dags: &DagCatalog,
+    registry: &crate::worker::HandlerRegistry,
     metrics: &Arc<dyn crate::telemetry::MetricsRecorder>,
 ) -> HarvestResult<()> {
     use crate::schema::harvest_schedules::dsl;
@@ -1286,6 +1297,7 @@ async fn tick_workflow_schedules(
             logical_date,
             now,
             current_shard,
+            registry,
             metrics,
         )
         .await
@@ -1397,6 +1409,7 @@ async fn tick_one_workflow_schedule(
     logical_date: DateTime<Utc>,
     now: DateTime<Utc>,
     current_shard: ShardId,
+    registry: &crate::worker::HandlerRegistry,
     metrics: &Arc<dyn crate::telemetry::MetricsRecorder>,
 ) -> HarvestResult<()> {
     use crate::execution::StartWorkflowParams;
@@ -1572,6 +1585,14 @@ async fn tick_one_workflow_schedule(
             .workflow_input
             .clone()
             .unwrap_or(serde_json::Value::Null);
+        let (concurrency_key, concurrency_limit) = registry
+            .workflows
+            .get(wf_name)
+            .and_then(|info| info.concurrency.as_ref())
+            .map_or((None, None), |policy| {
+                let key = crate::concurrency::resolve_concurrency_key(policy.key_expr, &input);
+                (key, Some(policy.limit))
+            });
         tracing::info!(
             workflow_name = %wf_name, workflow_id = %workflow_id,
             scheduled_for = %scheduled_for, "harvest: dispatching scheduled workflow run"
@@ -1591,6 +1612,8 @@ async fn tick_one_workflow_schedule(
                 reuse_policy: scheduled_workflow_reuse_policy(),
                 trace_context: None,
                 max_execution_timeout_ceiling: None,
+                concurrency_key,
+                concurrency_limit,
             },
         )
         .await;
@@ -1800,6 +1823,7 @@ async fn drain_buffered_schedule_runs(
     conn: &mut AsyncPgConnection,
     current_shard: ShardId,
     registered_dags: &DagCatalog,
+    registry: &crate::worker::HandlerRegistry,
     metrics: &Arc<dyn crate::telemetry::MetricsRecorder>,
 ) -> HarvestResult<()> {
     use crate::schema::harvest_schedules::dsl;
@@ -1870,6 +1894,14 @@ async fn drain_buffered_schedule_runs(
                 .workflow_input
                 .clone()
                 .unwrap_or(serde_json::Value::Null);
+            let (concurrency_key, concurrency_limit) = registry
+                .workflows
+                .get(wf_name)
+                .and_then(|info| info.concurrency.as_ref())
+                .map_or((None, None), |policy| {
+                    let key = crate::concurrency::resolve_concurrency_key(policy.key_expr, &input);
+                    (key, Some(policy.limit))
+                });
 
             tracing::info!(
                 workflow_name = %wf_name,
@@ -1893,6 +1925,8 @@ async fn drain_buffered_schedule_runs(
                     reuse_policy: scheduled_workflow_reuse_policy(),
                     trace_context: None,
                     max_execution_timeout_ceiling: None,
+                    concurrency_key,
+                    concurrency_limit,
                 },
             )
             .await;

@@ -7,13 +7,24 @@ use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::{ItemFn, LitStr, parse::Parser as _};
 
+// ---------------------------------------------------------------------------
+// Attribute parsing
+// ---------------------------------------------------------------------------
+
+struct ConcurrencyArgs {
+    key_expr: String,
+    limit: u32,
+}
+
 struct WorkflowAttrs {
     execution_timeout: Option<String>,
+    concurrency: Option<ConcurrencyArgs>,
 }
 
 fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
     let mut result = WorkflowAttrs {
         execution_timeout: None,
+        concurrency: None,
     };
 
     syn::meta::parser(|meta| {
@@ -21,8 +32,42 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
             let value: LitStr = meta.value()?.parse()?;
             result.execution_timeout = Some(value.value());
             Ok(())
+        } else if meta.path.is_ident("concurrency") {
+            let mut key_expr: Option<String> = None;
+            let mut limit: Option<u32> = None;
+            meta.parse_nested_meta(|inner| {
+                if inner.path.is_ident("key") {
+                    let value: LitStr = inner.value()?.parse()?;
+                    key_expr = Some(value.value());
+                    Ok(())
+                } else if inner.path.is_ident("limit") {
+                    let value: syn::LitInt = inner.value()?.parse()?;
+                    let n: u32 = value.base10_parse()?;
+                    if n == 0 {
+                        return Err(inner.error("concurrency limit must be greater than zero"));
+                    }
+                    limit = Some(n);
+                    Ok(())
+                } else {
+                    Err(inner.error("expected `key` or `limit`"))
+                }
+            })?;
+            let key_expr = key_expr.ok_or_else(|| {
+                syn::Error::new(
+                    proc_macro2::Span::call_site(),
+                    "concurrency requires `key = \"...\"`",
+                )
+            })?;
+            let limit = limit.ok_or_else(|| {
+                syn::Error::new(
+                    proc_macro2::Span::call_site(),
+                    "concurrency requires `limit = N`",
+                )
+            })?;
+            result.concurrency = Some(ConcurrencyArgs { key_expr, limit });
+            Ok(())
         } else {
-            Err(meta.error("unsupported attribute: expected execution_timeout"))
+            Err(meta.error("unsupported attribute: expected `execution_timeout` or `concurrency`"))
         }
     })
     .parse2(attr)?;
@@ -30,6 +75,11 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
     Ok(result)
 }
 
+// ---------------------------------------------------------------------------
+// Main macro
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_lines)]
 pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let attrs = match parse_attrs(attr) {
         Ok(a) => a,
@@ -54,7 +104,6 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let companion_name = format_ident!("__autumn_workflow_info_{fn_name}");
 
     // Collect parameter names after the first (ctx is first, rest are inputs).
-    // For Phase 1 we pass all non-ctx args as a single JSON value.
     let params: Vec<_> = input_fn.sig.inputs.iter().skip(1).collect();
     let param_names: Vec<_> = params
         .iter()
@@ -114,6 +163,21 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         |s| quote! { ::autumn_harvest::task_duration(#s) },
     );
 
+    // Emit concurrency as Option<ConcurrencyPolicy>.
+    let concurrency_expr = match attrs.concurrency {
+        None => quote! { ::std::option::Option::None },
+        Some(ConcurrencyArgs { key_expr, limit }) => {
+            quote! {
+                ::std::option::Option::Some(
+                    ::autumn_harvest::concurrency::ConcurrencyPolicy {
+                        key_expr: #key_expr,
+                        limit: #limit,
+                    }
+                )
+            }
+        }
+    };
+
     quote! {
         #input_fn
 
@@ -128,6 +192,7 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     })
                 },
                 execution_timeout: #execution_timeout_expr,
+                concurrency: #concurrency_expr,
             }
         }
     }

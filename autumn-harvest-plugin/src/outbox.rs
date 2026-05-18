@@ -298,6 +298,8 @@ pub(crate) async fn dispatch_workflow_start_request(
             reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
             trace_context: None,
             max_execution_timeout_ceiling: None,
+            concurrency_key: None,
+            concurrency_limit: None,
         },
     )
     .await?;

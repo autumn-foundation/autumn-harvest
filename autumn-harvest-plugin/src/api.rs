@@ -3638,6 +3638,17 @@ async fn start_workflow(
         .unwrap_or_else(|| "default".to_string());
     let input = request.input.unwrap_or(Value::Null);
 
+    // Resolve per-key concurrency policy from WorkflowInfo (issue #247).
+    let (concurrency_key, concurrency_limit) = runtime
+        .registry
+        .workflows
+        .get(&workflow_name)
+        .and_then(|info| info.concurrency.as_ref())
+        .map_or((None, None), |policy| {
+            let key = autumn_harvest::concurrency::resolve_concurrency_key(policy.key_expr, &input);
+            (key, Some(policy.limit))
+        });
+
     let shard = runtime
         .router
         .pick_for_new_workflow(&workflow_name, &workflow_id);
@@ -3678,7 +3689,9 @@ async fn start_workflow(
             trace_context: trace_ctx,
             max_execution_timeout_ceiling: api_state
                 .max_workflow_execution_timeout()
-                .and_then(|d| chrono::Duration::from_std(d).ok()),
+                .map(|d| chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX)),
+            concurrency_key,
+            concurrency_limit,
         },
     )
     .await;
@@ -3914,8 +3927,10 @@ async fn reset_workflow(
     }
 
     let exec_id_str = exec_id.to_string();
+    let runtime = api_state.runtime().ok();
+    let registry = runtime.as_ref().map(|r| r.registry().as_ref());
 
-    match reset_workflow_execution(&mut conn, exec_id, request).await {
+    match reset_workflow_execution(&mut conn, exec_id, request, registry).await {
         Ok(result) => {
             let new_exec_id_str = result.new_exec_id.to_string();
             let ar = NewAuditRecord {
@@ -5836,6 +5851,8 @@ async fn schedule_backfill(
                         reuse_policy: WorkflowIdReusePolicy::RejectDuplicate,
                         trace_context: None,
                         max_execution_timeout_ceiling: None,
+                        concurrency_key: None,
+                        concurrency_limit: None,
                     },
                 )
                 .await;
@@ -5937,6 +5954,8 @@ async fn schedule_backfill(
                         reuse_policy: autumn_harvest::types::WorkflowIdReusePolicy::RejectDuplicate,
                         trace_context: None,
                         max_execution_timeout_ceiling: None,
+                        concurrency_key: None,
+                        concurrency_limit: None,
                     },
                 )
                 .await;
@@ -6951,6 +6970,8 @@ async fn bulk_replay_from_shards(
     selector: &DlqBulkSelector,
 ) -> Result<dlq::BulkDlqResult, HarvestError> {
     let pool = api_state.storage_pool()?;
+    let runtime = api_state.runtime().ok();
+    let registry = runtime.as_ref().map(|r| r.registry().as_ref());
     let mut total = dlq::BulkDlqResult {
         matched: 0,
         acted_on: 0,
@@ -6990,7 +7011,7 @@ async fn bulk_replay_from_shards(
         let mut shard_selector = selector.clone();
         shard_selector.filter.limit = Some(remaining);
         let shard_result =
-            bulk_replay_dead_letters_for_selector(&mut conn, &shard_selector).await?;
+            bulk_replay_dead_letters_for_selector(&mut conn, &shard_selector, registry).await?;
         // Rows consumed = acted + skipped + failed (or preview ids in dry-run).
         let consumed = shard_result.ids.len() + shard_result.skipped + shard_result.failures.len();
         remaining = remaining.saturating_sub(u32::try_from(consumed).unwrap_or(remaining));
@@ -7122,6 +7143,7 @@ fn apply_api_bulk_filters<'a>(
 async fn bulk_replay_dead_letters_for_selector(
     conn: &mut AsyncPgConnection,
     selector: &DlqBulkSelector,
+    registry: Option<&HandlerRegistry>,
 ) -> HarvestResult<dlq::BulkDlqResult> {
     let matched = count_api_bulk_filter_matches(conn, selector)
         .await
@@ -7143,7 +7165,7 @@ async fn bulk_replay_dead_letters_for_selector(
 
     for row in rows {
         let id = row.id;
-        match dlq::replay_dead_letter(conn, id).await {
+        match dlq::replay_dead_letter(conn, id, registry).await {
             Ok(_) => {
                 result.acted_on += 1;
                 result.ids.push(id.to_string());
@@ -7299,7 +7321,9 @@ async fn concurrency_status(
     let runtime = api_state.runtime().map_err(map_error)?;
     let pool = api_state.storage_pool().map_err(map_error)?;
 
-    let mut merged: std::collections::HashMap<String, ConcurrencyKeyStats> =
+    // Keyed by (concurrency_key, task_type) — same granularity as the claim
+    // query — so workflow and activity caps for the same key are not collapsed.
+    let mut merged: std::collections::HashMap<(String, String), ConcurrencyKeyStats> =
         std::collections::HashMap::new();
 
     for (_shard, shard_pool) in pool.iter_shards() {
@@ -7308,10 +7332,12 @@ async fn concurrency_status(
             .await
             .map_err(map_error)?;
         for stat in stats {
+            let merge_key = (stat.key.clone(), stat.task_type.clone());
             let entry = merged
-                .entry(stat.key.clone())
+                .entry(merge_key)
                 .or_insert_with(|| ConcurrencyKeyStats {
                     key: stat.key.clone(),
+                    task_type: stat.task_type.clone(),
                     max_concurrent: stat.max_concurrent,
                     in_flight: 0,
                     pending: 0,
@@ -7325,7 +7351,7 @@ async fn concurrency_status(
     }
 
     let mut result: Vec<ConcurrencyKeyStats> = merged.into_values().collect();
-    result.sort_by(|a, b| a.key.cmp(&b.key));
+    result.sort_by(|a, b| a.key.cmp(&b.key).then(a.task_type.cmp(&b.task_type)));
     Ok(Json(result))
 }
 
@@ -7814,10 +7840,12 @@ async fn replay_dead_letter_from_shards(
     dead_letter_id: uuid::Uuid,
 ) -> Result<uuid::Uuid, AutumnError> {
     let pool = api_state.storage_pool().map_err(map_error)?;
+    let runtime = api_state.runtime().ok();
+    let registry = runtime.as_ref().map(|r| r.registry().as_ref());
 
     for (_shard, shard_pool) in pool.iter_shards() {
         let mut conn = acquire_conn(shard_pool).await?;
-        match dlq::replay_dead_letter(&mut conn, dead_letter_id).await {
+        match dlq::replay_dead_letter(&mut conn, dead_letter_id, registry).await {
             Ok(task_id) => return Ok(task_id),
             Err(HarvestError::NotFound(_)) => {}
             Err(error) => return Err(map_error(error)),
@@ -8830,6 +8858,7 @@ mod tests {
                 module: "tests",
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
                 execution_timeout: None,
+                concurrency: None,
             }],
             vec![],
         ));
@@ -9345,6 +9374,8 @@ mod tests {
                 reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
                 trace_context: None,
                 max_execution_timeout_ceiling: None,
+                concurrency_key: None,
+                concurrency_limit: None,
             },
         )
         .await

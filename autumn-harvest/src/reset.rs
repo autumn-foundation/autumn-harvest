@@ -21,6 +21,7 @@ use crate::schema::{
     harvest_workflow_executions,
 };
 use crate::types::{ExecutionId, ShardId};
+use crate::worker::HandlerRegistry;
 
 /// How undelivered source signals are handled during reset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -500,6 +501,7 @@ pub async fn reset_workflow_execution(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
     request: WorkflowResetRequest,
+    registry: Option<&HandlerRegistry>,
 ) -> Result<ResetResult, WorkflowResetError> {
     let request = request.normalized();
     conn.transaction::<ResetResult, WorkflowResetError, _>(|conn| {
@@ -531,7 +533,7 @@ pub async fn reset_workflow_execution(
             let signals_buffered =
                 reapply_or_drop_signals(conn, exec_id, new_exec_id, request.signal_reapply).await?;
 
-            enqueue_fork_workflow_task(conn, &fork, new_exec_id).await?;
+            enqueue_fork_workflow_task(conn, &fork, new_exec_id, registry).await?;
 
             Ok(ResetResult {
                 new_exec_id,
@@ -921,6 +923,7 @@ async fn enqueue_fork_workflow_task(
     conn: &mut AsyncPgConnection,
     fork: &WorkflowExecution,
     new_exec_id: ExecutionId,
+    registry: Option<&HandlerRegistry>,
 ) -> Result<(), WorkflowResetError> {
     let mut enqueue = EnqueueParams::new(
         fork.queue_name.clone(),
@@ -929,6 +932,14 @@ async fn enqueue_fork_workflow_task(
     );
     enqueue.workflow_exec_id = Some(new_exec_id.as_uuid());
     enqueue.required_build_id = fork.assigned_build_id.clone();
+    if let Some(reg) = registry
+        && let Some(info) = reg.workflows.get(&fork.workflow_name)
+        && let Some(policy) = &info.concurrency
+    {
+        enqueue.concurrency_key =
+            crate::concurrency::resolve_concurrency_key(policy.key_expr, &fork.input);
+        enqueue.max_concurrent = Some(policy.limit);
+    }
     queue::enqueue(conn, &enqueue).await?;
     Ok(())
 }

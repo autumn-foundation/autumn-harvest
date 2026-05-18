@@ -2102,6 +2102,18 @@ async fn persist_all_started_child_workflows(
                 );
                 params.workflow_exec_id = Some(child.child_id.as_uuid());
                 params.required_build_id = parent_execution.assigned_build_id.clone();
+                // Resolve per-key concurrency policy for the child workflow (issue #247).
+                (params.concurrency_key, params.max_concurrent) = registry
+                    .workflows
+                    .get(&child.workflow_name)
+                    .and_then(|info| info.concurrency.as_ref())
+                    .map_or((None, None), |policy| {
+                        let key = crate::concurrency::resolve_concurrency_key(
+                            policy.key_expr,
+                            &child.input,
+                        );
+                        (key, Some(policy.limit))
+                    });
                 params.trace_context = child_trace_ctxs
                     .get(&child.child_id.as_uuid())
                     .cloned()
@@ -3169,6 +3181,13 @@ async fn persist_workflow_continue_as_new(
         queue::EnqueueParams::new(execution.queue_name.clone(), TaskType::Workflow, input);
     enqueue.workflow_exec_id = Some(new_exec_id.as_uuid());
     enqueue.required_build_id = execution.assigned_build_id.clone();
+    // Propagate the concurrency key from the current task so the new run
+    // continues to be governed by the same fair-share cap (issue #247).
+    enqueue.concurrency_key = persistence.task.concurrency_key.clone();
+    enqueue.max_concurrent = persistence
+        .task
+        .concurrency_cap
+        .and_then(|cap| u32::try_from(cap).ok());
 
     conn.transaction::<(), HarvestError, _>(|conn| {
         async move {
@@ -4203,21 +4222,26 @@ fn spawn_concurrency_sampler(
             match queue::concurrency_key_stats(&mut conn, &queues).await {
                 Ok(stats) => {
                     for stat in &stats {
+                        // The stats are grouped by (key, task_type) so workflow
+                        // and activity budgets for the same key don't collide on
+                        // the same metric label.
+                        let metric_key = format!("{}:{}", stat.key, stat.task_type);
                         telemetry.metrics.record_concurrency_key_in_flight(
-                            &stat.key,
+                            &metric_key,
                             u64::try_from(stat.in_flight).unwrap_or(0),
                         );
                         let saturated = stat.in_flight >= i64::from(stat.max_concurrent);
                         if saturated && stat.pending > 0 {
                             tracing::debug!(
                                 concurrency_key = %stat.key,
+                                task_type = %stat.task_type,
                                 in_flight = stat.in_flight,
                                 max_concurrent = stat.max_concurrent,
                                 deferred = stat.pending,
                                 "concurrency cap saturated; pending tasks deferred until a slot frees"
                             );
                             telemetry.metrics.record_concurrency_key_deferred(
-                                &stat.key,
+                                &metric_key,
                                 u64::try_from(stat.pending).unwrap_or(0),
                             );
                         }
@@ -4992,6 +5016,7 @@ mod tests {
             module: "app::workflows",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             execution_timeout: None,
+            concurrency: None,
         };
 
         let act = ActivityInfo {

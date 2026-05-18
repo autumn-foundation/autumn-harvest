@@ -26,6 +26,8 @@ pub mod batch;
 pub mod build_routing;
 pub mod builder;
 pub mod cache;
+/// Per-key concurrency limits for tenant fair-share scheduling (issue #247).
+pub mod concurrency;
 pub mod context;
 pub mod critical_path;
 pub mod dag;

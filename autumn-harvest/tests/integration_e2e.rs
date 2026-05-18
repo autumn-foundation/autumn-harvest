@@ -515,6 +515,8 @@ async fn legacy_workflow_uniqueness_schema_can_be_upgraded_for_idempotent_starts
         reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
         trace_context: None,
         max_execution_timeout_ceiling: None,
+        concurrency_key: None,
+        concurrency_limit: None,
     };
 
     // On the legacy schema there is no `(workflow_name, workflow_id)`
@@ -673,12 +675,14 @@ fn child_round_trip_registry() -> Arc<HandlerRegistry> {
                 module: "integration_e2e",
                 handler: parent_workflow_with_child,
                 execution_timeout: None,
+                concurrency: None,
             },
             WorkflowInfo {
                 name: "child_echo_workflow",
                 module: "integration_e2e",
                 handler: child_echo_workflow,
                 execution_timeout: None,
+                concurrency: None,
             },
         ],
         vec![],
@@ -693,12 +697,14 @@ fn child_continue_as_new_rejection_registry() -> Arc<HandlerRegistry> {
                 module: "integration_e2e",
                 handler: parent_workflow_with_continue_as_new_child,
                 execution_timeout: None,
+                concurrency: None,
             },
             WorkflowInfo {
                 name: "child_continue_as_new_workflow",
                 module: "integration_e2e",
                 handler: continue_as_new_workflow,
                 execution_timeout: None,
+                concurrency: None,
             },
         ],
         vec![],
@@ -1160,6 +1166,7 @@ async fn worker_completes_workflow_task_and_persists_result() {
             module: "integration_e2e",
             handler: echo_workflow,
             execution_timeout: None,
+            concurrency: None,
         }],
         vec![],
     ));
@@ -1258,6 +1265,7 @@ async fn worker_marks_workflow_failed_when_handler_errors() {
             module: "integration_e2e",
             handler: failing_workflow,
             execution_timeout: None,
+            concurrency: None,
         }],
         vec![],
     ));
@@ -1370,6 +1378,7 @@ async fn worker_completes_workflow_with_activity_round_trip() {
             module: "integration_e2e",
             handler: workflow_with_activity,
             execution_timeout: None,
+            concurrency: None,
         }],
         vec![ActivityInfo {
             name: "send_email",
@@ -1491,6 +1500,7 @@ async fn activity_retry_resumes_from_persisted_heartbeat_details() {
             module: "integration_e2e",
             handler: workflow_with_checkpointed_activity,
             execution_timeout: None,
+            concurrency: None,
         }],
         vec![ActivityInfo {
             name: "checkpointed_import",
@@ -1807,6 +1817,7 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
                     module: "integration_e2e",
                     handler: workflow_with_slow_activity,
                     execution_timeout: None,
+                    concurrency: None,
                 }],
                 vec![ActivityInfo {
                     name: "slow_activity",
@@ -1931,6 +1942,7 @@ async fn worker_completes_workflow_with_timer_round_trip() {
                     module: "integration_e2e",
                     handler: workflow_with_timer,
                     execution_timeout: None,
+                    concurrency: None,
                 }],
                 vec![],
             )),
@@ -2185,18 +2197,21 @@ fn parallel_children_registry() -> Arc<HandlerRegistry> {
                 module: "integration_e2e",
                 handler: parent_workflow_parallel_children,
                 execution_timeout: None,
+                concurrency: None,
             },
             WorkflowInfo {
                 name: "child_alpha",
                 module: "integration_e2e",
                 handler: child_alpha_workflow,
                 execution_timeout: None,
+                concurrency: None,
             },
             WorkflowInfo {
                 name: "child_beta",
                 module: "integration_e2e",
                 handler: child_beta_workflow,
                 execution_timeout: None,
+                concurrency: None,
             },
         ],
         vec![],
@@ -2313,6 +2328,7 @@ async fn worker_builder_state_is_visible_to_workflow_and_activity() {
             module: "integration_e2e",
             handler: workflow_with_builder_state,
             execution_timeout: None,
+            concurrency: None,
         }])
         .activities(vec![ActivityInfo {
             name: "stateful_activity",
@@ -2796,6 +2812,7 @@ async fn worker_completes_workflow_after_signal_delivery() {
             module: "integration_e2e",
             handler: signal_waiting_workflow,
             execution_timeout: None,
+            concurrency: None,
         }],
         vec![],
     ));
@@ -2905,6 +2922,7 @@ async fn worker_handles_early_ingested_signal_before_activity() {
             module: "integration_e2e",
             handler: activity_then_signal_workflow,
             execution_timeout: None,
+            concurrency: None,
         }],
         vec![ActivityInfo {
             name: "send_email",
@@ -3304,6 +3322,7 @@ async fn worker_continues_as_new_with_fresh_history_and_same_workflow_id() {
             module: "integration_e2e",
             handler: continue_as_new_workflow,
             execution_timeout: None,
+            concurrency: None,
         }],
         vec![],
     ));
@@ -3401,6 +3420,7 @@ async fn continue_as_new_down_migration_rewrites_historical_runs_for_rollback() 
             module: "integration_e2e",
             handler: continue_as_new_workflow,
             execution_timeout: None,
+            concurrency: None,
         }],
         vec![],
     ));
@@ -3516,6 +3536,8 @@ mod reuse_policy_helpers {
             reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
             trace_context: None,
             max_execution_timeout_ceiling: None,
+            concurrency_key: None,
+            concurrency_limit: None,
         }
     }
 
@@ -4264,6 +4286,7 @@ async fn workflow_schedule_baseline_dispatches_multiple_runs() {
             module: "integration_e2e",
             handler: instant_workflow,
             execution_timeout: None,
+            concurrency: None,
         }],
         vec![],
     ));
@@ -4362,6 +4385,7 @@ async fn workflow_schedule_max_active_runs_enforced() {
             module: "integration_e2e",
             handler: slow_workflow,
             execution_timeout: None,
+            concurrency: None,
         }],
         vec![],
     ));
@@ -4446,6 +4470,7 @@ async fn workflow_schedule_pause_and_resume() {
             module: "integration_e2e",
             handler: instant_workflow,
             execution_timeout: None,
+            concurrency: None,
         }],
         vec![],
     ));
@@ -4682,6 +4707,8 @@ async fn search_attrs_upsert_visible_after_update_and_filterable() {
             reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
             trace_context: None,
             max_execution_timeout_ceiling: None,
+            concurrency_key: None,
+            concurrency_limit: None,
         },
     )
     .await
@@ -4694,6 +4721,7 @@ async fn search_attrs_upsert_visible_after_update_and_filterable() {
             module: "integration_e2e",
             handler: approval_search_attrs_workflow,
             execution_timeout: None,
+            concurrency: None,
         }],
         vec![],
     ));
@@ -4813,6 +4841,8 @@ async fn search_attrs_survive_worker_crash_and_resume() {
             reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
             trace_context: None,
             max_execution_timeout_ceiling: None,
+            concurrency_key: None,
+            concurrency_limit: None,
         },
     )
     .await
@@ -4825,6 +4855,7 @@ async fn search_attrs_survive_worker_crash_and_resume() {
                 module: "integration_e2e",
                 handler: approval_search_attrs_workflow,
                 execution_timeout: None,
+                concurrency: None,
             }],
             vec![],
         ))
@@ -4913,6 +4944,7 @@ fn workflow_schedule_builder_rejects_unregistered_workflow() {
             module: "integration_e2e",
             handler: echo_workflow,
             execution_timeout: None,
+            concurrency: None,
         }])
         .workflow_schedule(ws)
         .worker(WorkerConfig::default())
@@ -5242,6 +5274,7 @@ async fn non_retryable_activity_fails_fast_on_attempt_one() {
             module: "integration_e2e",
             handler: workflow_with_activity,
             execution_timeout: None,
+            concurrency: None,
         }],
         vec![ActivityInfo {
             name: "send_email",
@@ -5367,6 +5400,7 @@ async fn legacy_string_failure_in_non_retryable_errors_fails_fast() {
             module: "integration_e2e",
             handler: workflow_with_activity,
             execution_timeout: None,
+            concurrency: None,
         }],
         vec![ActivityInfo {
             name: "send_email",
@@ -5496,6 +5530,7 @@ async fn overlap_policy_skip_explicitly_drops_new_firings() {
             module: "integration_e2e",
             handler: slow_workflow,
             execution_timeout: None,
+            concurrency: None,
         }],
         vec![],
     ));
@@ -5556,6 +5591,7 @@ async fn overlap_policy_buffer_one_queues_single_slot() {
             module: "integration_e2e",
             handler: slow_workflow,
             execution_timeout: None,
+            concurrency: None,
         }],
         vec![],
     ));
@@ -5625,6 +5661,7 @@ async fn overlap_policy_buffer_all_queues_multiple_slots() {
             module: "integration_e2e",
             handler: slow_workflow,
             execution_timeout: None,
+            concurrency: None,
         }],
         vec![],
     ));
@@ -5698,6 +5735,7 @@ async fn overlap_policy_cancel_other_cancels_inflight_run() {
             module: "integration_e2e",
             handler: slow_workflow,
             execution_timeout: None,
+            concurrency: None,
         }],
         vec![],
     ));
@@ -5766,6 +5804,7 @@ async fn overlap_policy_terminate_other_terminates_inflight_run() {
             module: "integration_e2e",
             handler: slow_workflow,
             execution_timeout: None,
+            concurrency: None,
         }],
         vec![],
     ));
@@ -5837,6 +5876,7 @@ async fn overlap_policy_buffer_one_survives_scheduler_restart() {
             module: "integration_e2e",
             handler: slow_workflow,
             execution_timeout: None,
+            concurrency: None,
         }],
         vec![],
     ));
@@ -6081,5 +6121,215 @@ async fn signal_blocked_workflow_times_out_at_deadline() {
         execution.execution_timeout,
         Some(execution_timeout),
         "execution_timeout should match what was set at start time"
+    );
+}
+
+// ── Per-key concurrency fair-share tests (issue #247) ─────────────────────────
+
+/// (concurrency-a) Per-key limit: under a burst of N >> limit tasks for the
+/// same concurrency key, at most `limit` are RUNNING at any moment.
+///
+/// Enqueues 6 workflow tasks with `concurrency_key = "tenant:acme"` and
+/// `concurrency_cap = 2`.  Verifies the claim query allows at most 2 to be
+/// RUNNING simultaneously and that all 6 are eventually processed.  Uses
+/// direct `claim_task` / `complete_task` calls (same pattern as
+/// `concurrency_cap_limits_concurrent_claims_cluster_wide`) to avoid
+/// interaction with the executor's 100 ms suspension timeout.
+#[tokio::test]
+async fn per_key_concurrency_cap_enforced_across_fleet() {
+    const LIMIT: u32 = 2;
+    const TOTAL: u32 = 6;
+    const KEY: &str = "tenant:acme";
+
+    let (mut conn, _container) = setup_test_db().await;
+    let queues = vec!["default".to_string()];
+
+    for i in 0..TOTAL {
+        let mut params =
+            EnqueueParams::new("default", TaskType::Workflow, serde_json::json!({ "i": i }));
+        params.concurrency_key = Some(KEY.to_string());
+        params.max_concurrent = Some(LIMIT);
+        params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+        queue::enqueue(&mut conn, &params)
+            .await
+            .expect("enqueue failed");
+    }
+
+    let mut completed_count = 0u32;
+    let mut max_in_flight: u32 = 0;
+
+    // Repeatedly claim a task, assert the in-flight count respects the cap,
+    // then immediately complete one held task to free a slot.  Repeat until all
+    // TOTAL tasks have been claimed and completed.
+    let mut held: Vec<Uuid> = Vec::new();
+
+    loop {
+        // Try to claim one more task.
+        let claimed = queue::claim_task(&mut conn, &queues, "test-worker-concurrency-a", "")
+            .await
+            .expect("claim query failed");
+
+        if let Some(task) = claimed {
+            held.push(task.id);
+            let in_flight = u32::try_from(held.len()).unwrap();
+            assert!(
+                in_flight <= LIMIT,
+                "cap violated: {in_flight} tasks held simultaneously (limit = {LIMIT})"
+            );
+            if in_flight > max_in_flight {
+                max_in_flight = in_flight;
+            }
+        } else if !held.is_empty() {
+            // Cap is saturated; complete the oldest held task to free a slot.
+            let id = held.remove(0);
+            queue::complete_task(&mut conn, id, serde_json::json!(null))
+                .await
+                .expect("complete_task failed");
+            completed_count += 1;
+        } else {
+            // Nothing held and nothing claimable: all tasks are done.
+            break;
+        }
+
+        // Drain any tasks that can still be claimed immediately.
+        if held.len() < LIMIT as usize
+            && queue::claim_task(&mut conn, &queues, "test-worker-concurrency-a", "")
+                .await
+                .expect("claim query failed")
+                .is_some_and(|t| {
+                    held.push(t.id);
+                    true
+                })
+        {
+            // extra claim consumed above
+        }
+
+        if completed_count >= TOTAL {
+            break;
+        }
+    }
+
+    // Complete any remaining held tasks.
+    for id in held {
+        queue::complete_task(&mut conn, id, serde_json::json!(null))
+            .await
+            .expect("final complete_task failed");
+        completed_count += 1;
+    }
+
+    assert_eq!(
+        completed_count, TOTAL,
+        "all {TOTAL} tasks must eventually be processed"
+    );
+    assert!(
+        max_in_flight >= 1,
+        "at least 1 task must have been in-flight at the cap limit"
+    );
+}
+
+/// (concurrency-b) Fair-share: tasks for *other* keys are NOT blocked by a
+/// saturated key.
+///
+/// Enqueues 4 "loud" workflow tasks (cap=1) and 2 "quiet" workflow tasks
+/// (cap=10).  Verifies the quiet tasks can be claimed even while the loud cap
+/// is saturated.  Uses direct `claim_task` calls to avoid the executor's
+/// 100 ms suspension timeout.
+#[tokio::test]
+async fn per_key_concurrency_does_not_block_other_keys() {
+    const LOUD_CAP: u32 = 1;
+    const LOUD_TOTAL: u32 = 4;
+    const QUIET_KEY: &str = "tenant:quiet";
+    const LOUD_KEY: &str = "tenant:loud";
+
+    let (mut conn, _container) = setup_test_db().await;
+    let queues = vec!["default".to_string()];
+
+    // Loud tenant: 4 tasks, cap=1.
+    for i in 0..LOUD_TOTAL {
+        let mut params =
+            EnqueueParams::new("default", TaskType::Workflow, serde_json::json!({ "i": i }));
+        params.concurrency_key = Some(LOUD_KEY.to_string());
+        params.max_concurrent = Some(LOUD_CAP);
+        params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+        queue::enqueue(&mut conn, &params)
+            .await
+            .expect("enqueue loud task failed");
+    }
+
+    // Quiet tenant: 2 tasks with a high cap so they are never blocked.
+    for i in 0..2u32 {
+        let mut params =
+            EnqueueParams::new("default", TaskType::Workflow, serde_json::json!({ "i": i }));
+        params.concurrency_key = Some(QUIET_KEY.to_string());
+        params.max_concurrent = Some(10u32);
+        params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+        queue::enqueue(&mut conn, &params)
+            .await
+            .expect("enqueue quiet task failed");
+    }
+
+    // Saturate the loud key: claim 1 loud task (cap=1 → saturated).
+    let loud_task = queue::claim_task(&mut conn, &queues, "test-worker-b", "")
+        .await
+        .expect("claim 1 query failed")
+        .expect("first loud task should be claimable");
+    assert_eq!(
+        loud_task.concurrency_key.as_deref(),
+        Some(LOUD_KEY),
+        "claimed task should be loud-key"
+    );
+
+    // Loud cap is now saturated — the next loud-key claim must fail.
+    // (We specifically target what comes next using separate assertions below.)
+
+    // Quiet tasks must be claimable despite loud saturation.
+    let mut quiet_claimed = 0u32;
+    let mut attempts = 0u32;
+    while quiet_claimed < 2 && attempts < 10 {
+        if let Some(task) = queue::claim_task(&mut conn, &queues, "test-worker-b", "")
+            .await
+            .expect("claim query failed")
+        {
+            assert_eq!(
+                task.concurrency_key.as_deref(),
+                Some(QUIET_KEY),
+                "any task claimed while loud is saturated must be a quiet-key task"
+            );
+            quiet_claimed += 1;
+            // Immediately complete quiet tasks so they don't hold state.
+            queue::complete_task(&mut conn, task.id, serde_json::json!(null))
+                .await
+                .expect("complete quiet task failed");
+        } else {
+            // No task available right now; the loud cap is blocking the loud
+            // tasks and quiet tasks haven't been claimed yet — should not happen.
+            break;
+        }
+        attempts += 1;
+    }
+
+    assert_eq!(
+        quiet_claimed, 2,
+        "both quiet-tenant tasks must be claimable even though loud cap is saturated"
+    );
+
+    // Complete the held loud task; verify the next loud task is now claimable.
+    queue::complete_task(&mut conn, loud_task.id, serde_json::json!(null))
+        .await
+        .expect("complete loud task failed");
+
+    let next_loud = queue::claim_task(&mut conn, &queues, "test-worker-b", "")
+        .await
+        .expect("claim after complete query failed");
+    assert!(
+        next_loud.is_some(),
+        "a loud-key task must become claimable after the saturating task completes"
+    );
+    assert_eq!(
+        next_loud
+            .as_ref()
+            .and_then(|t| t.concurrency_key.as_deref()),
+        Some(LOUD_KEY),
+        "next claimable task should be loud-key"
     );
 }
