@@ -825,8 +825,13 @@ async fn persist_external_signal_inline(
             signal_name: run.signal_name.clone(),
             payload: run.payload.clone(),
         };
-        store::append_events(conn, exec_id, std::slice::from_ref(&requested), *next_event_id)
-            .await?;
+        store::append_events(
+            conn,
+            exec_id,
+            std::slice::from_ref(&requested),
+            *next_event_id,
+        )
+        .await?;
         *next_event_id += 1;
         new_events.push(requested);
     }
@@ -847,7 +852,13 @@ async fn persist_external_signal_inline(
         },
     };
 
-    store::append_events(conn, exec_id, std::slice::from_ref(&terminal), *next_event_id).await?;
+    store::append_events(
+        conn,
+        exec_id,
+        std::slice::from_ref(&terminal),
+        *next_event_id,
+    )
+    .await?;
     *next_event_id += 1;
     new_events.push(terminal);
 
@@ -3652,13 +3663,8 @@ async fn process_workflow_task(
                 {
                     Ok(events) => events,
                     Err(e) => {
-                        return fail_execution_on_error(
-                            conn,
-                            task,
-                            worker_id,
-                            Err::<(), _>(e),
-                        )
-                        .await;
+                        return fail_execution_on_error(conn, task, worker_id, Err::<(), _>(e))
+                            .await;
                     }
                 };
                 history_events.extend(new_events);

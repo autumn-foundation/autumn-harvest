@@ -1733,8 +1733,7 @@ impl WorkflowContext {
     ) -> HarvestResult<()> {
         use crate::replay::HistoryMatch;
 
-        let history_match =
-            self.match_history(|m| m.match_external_signal(target, signal_name));
+        let history_match = self.match_history(|m| m.match_external_signal(target, signal_name));
 
         match history_match {
             HistoryMatch::Matched { .. } => Ok(()),
@@ -4750,7 +4749,10 @@ mod tests {
             } => {
                 assert_eq!(*target, target_id);
                 assert_eq!(signal_name, "tenant_cancel");
-                assert!(!already_requested, "first call should not be already_requested");
+                assert!(
+                    !already_requested,
+                    "first call should not be already_requested"
+                );
             }
             other => panic!("expected SignalExternalWorkflow, got {other:?}"),
         }
@@ -4777,7 +4779,11 @@ mod tests {
 
         let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
         let result = ctx
-            .signal_external_workflow(target, "tenant_cancel", serde_json::json!({"reason": "billing_lapse"}))
+            .signal_external_workflow(
+                target,
+                "tenant_cancel",
+                serde_json::json!({"reason": "billing_lapse"}),
+            )
             .await;
 
         assert!(result.is_ok(), "delivered history should return Ok(())");
@@ -4967,6 +4973,9 @@ mod tests {
             .signal_external_workflow(target, "cancel", serde_json::Value::Null)
             .await;
         assert!(sig_result.is_ok(), "signal after activity should replay Ok");
-        assert!(ctx.drain_commands().is_empty(), "no live commands after full replay");
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "no live commands after full replay"
+        );
     }
 }

@@ -14,7 +14,9 @@ use std::collections::{HashSet, VecDeque};
 
 use crate::error::TimeoutType;
 use crate::event::WorkflowEvent;
-use crate::types::{ActivityExecId, ExecutionId, ExternalActivityToken, ExternalSignalId, UpdateId};
+use crate::types::{
+    ActivityExecId, ExecutionId, ExternalActivityToken, ExternalSignalId, UpdateId,
+};
 
 /// Result of matching a workflow command against the event history.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -764,7 +766,9 @@ impl HistoryMatcher {
             } => {
                 if *recorded_target != target {
                     return HistoryMatch::Diverged {
-                        expected: format!("ExternalSignalRequested(target={target}, signal={signal_name})"),
+                        expected: format!(
+                            "ExternalSignalRequested(target={target}, signal={signal_name})"
+                        ),
                         actual: format!(
                             "ExternalSignalRequested(target={recorded_target}, signal={recorded_name})"
                         ),
@@ -783,9 +787,7 @@ impl HistoryMatcher {
                 Ok(*signal_id)
             }
             other => Err(HistoryMatch::Diverged {
-                expected: format!(
-                    "ExternalSignalRequested(target={target}, signal={signal_name})"
-                ),
+                expected: format!("ExternalSignalRequested(target={target}, signal={signal_name})"),
                 actual: Self::actual_event_name(other),
             }),
         };

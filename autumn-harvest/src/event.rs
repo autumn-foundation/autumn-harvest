@@ -903,18 +903,22 @@ mod tests {
     fn external_signal_events_are_not_terminal_lifecycle() {
         let signal_id = crate::types::ExternalSignalId::new();
         let target = ExecutionId::new();
-        assert!(!WorkflowEvent::ExternalSignalRequested {
-            signal_id,
-            target,
-            signal_name: "x".into(),
-            payload: serde_json::Value::Null,
-        }
-        .is_terminal_lifecycle());
+        assert!(
+            !WorkflowEvent::ExternalSignalRequested {
+                signal_id,
+                target,
+                signal_name: "x".into(),
+                payload: serde_json::Value::Null,
+            }
+            .is_terminal_lifecycle()
+        );
         assert!(!WorkflowEvent::ExternalSignalDelivered { signal_id }.is_terminal_lifecycle());
-        assert!(!WorkflowEvent::ExternalSignalFailed {
-            signal_id,
-            reason_code: "target_terminal".into(),
-        }
-        .is_terminal_lifecycle());
+        assert!(
+            !WorkflowEvent::ExternalSignalFailed {
+                signal_id,
+                reason_code: "target_terminal".into(),
+            }
+            .is_terminal_lifecycle()
+        );
     }
 }

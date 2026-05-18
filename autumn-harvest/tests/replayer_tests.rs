@@ -1099,7 +1099,11 @@ fn external_signal_workflow<'a>(
         let target_str = input["target"].as_str().unwrap_or("");
         let target: ExecutionId = target_str.parse().unwrap();
         let _result = ctx
-            .signal_external_workflow(target, "tenant_cancel", serde_json::json!({"reason": "billing_lapse"}))
+            .signal_external_workflow(
+                target,
+                "tenant_cancel",
+                serde_json::json!({"reason": "billing_lapse"}),
+            )
             .await;
         Ok(Value::Null)
     })
@@ -1127,13 +1131,16 @@ fn make_external_signal_snapshot(
     events: Vec<WorkflowEvent>,
 ) -> HistorySnapshot {
     // Extract target execution id from the ExternalSignalRequested event
-    let target = events.iter().find_map(|e| {
-        if let WorkflowEvent::ExternalSignalRequested { target, .. } = e {
-            Some(*target)
-        } else {
-            None
-        }
-    }).expect("history must contain ExternalSignalRequested");
+    let target = events
+        .iter()
+        .find_map(|e| {
+            if let WorkflowEvent::ExternalSignalRequested { target, .. } = e {
+                Some(*target)
+            } else {
+                None
+            }
+        })
+        .expect("history must contain ExternalSignalRequested");
 
     HistorySnapshot {
         workflow_name: workflow_name.to_string(),
@@ -1146,13 +1153,16 @@ fn make_external_signal_snapshot(
 async fn replayer_replays_external_signal_delivered_successfully() {
     let (exec_id, events) = external_signal_delivered_history();
     // Extract target from events
-    let target = events.iter().find_map(|e| {
-        if let WorkflowEvent::ExternalSignalRequested { target, .. } = e {
-            Some(*target)
-        } else {
-            None
-        }
-    }).unwrap();
+    let target = events
+        .iter()
+        .find_map(|e| {
+            if let WorkflowEvent::ExternalSignalRequested { target, .. } = e {
+                Some(*target)
+            } else {
+                None
+            }
+        })
+        .unwrap();
 
     let input = serde_json::json!({"target": target.to_string()});
     let snapshot = HistorySnapshot {
@@ -1165,13 +1175,19 @@ async fn replayer_replays_external_signal_delivered_successfully() {
     let report = WorkflowReplayer::new()
         .register_fn("external_signal_workflow", external_signal_workflow)
         .replay_from_events(
-            snapshot.events.iter().map(|e| match e {
-                WorkflowEvent::WorkflowStarted { timestamp, .. } => WorkflowEvent::WorkflowStarted {
-                    input: input.clone(),
-                    timestamp: *timestamp,
-                },
-                other => other.clone(),
-            }).collect()
+            snapshot
+                .events
+                .iter()
+                .map(|e| match e {
+                    WorkflowEvent::WorkflowStarted { timestamp, .. } => {
+                        WorkflowEvent::WorkflowStarted {
+                            input: input.clone(),
+                            timestamp: *timestamp,
+                        }
+                    }
+                    other => other.clone(),
+                })
+                .collect(),
         )
         .await;
 
@@ -1184,25 +1200,34 @@ async fn replayer_replays_external_signal_delivered_successfully() {
 #[tokio::test]
 async fn replayer_detects_external_signal_name_mismatch() {
     let (exec_id, events) = external_signal_delivered_history();
-    let target = events.iter().find_map(|e| {
-        if let WorkflowEvent::ExternalSignalRequested { target, .. } = e {
-            Some(*target)
-        } else {
-            None
-        }
-    }).unwrap();
+    let target = events
+        .iter()
+        .find_map(|e| {
+            if let WorkflowEvent::ExternalSignalRequested { target, .. } = e {
+                Some(*target)
+            } else {
+                None
+            }
+        })
+        .unwrap();
 
     let input = serde_json::json!({"target": target.to_string()});
-    let events_with_input: Vec<_> = events.iter().map(|e| match e {
-        WorkflowEvent::WorkflowStarted { timestamp, .. } => WorkflowEvent::WorkflowStarted {
-            input: input.clone(),
-            timestamp: *timestamp,
-        },
-        other => other.clone(),
-    }).collect();
+    let events_with_input: Vec<_> = events
+        .iter()
+        .map(|e| match e {
+            WorkflowEvent::WorkflowStarted { timestamp, .. } => WorkflowEvent::WorkflowStarted {
+                input: input.clone(),
+                timestamp: *timestamp,
+            },
+            other => other.clone(),
+        })
+        .collect();
 
     let report = WorkflowReplayer::new()
-        .register_fn("external_signal_wrong_name_workflow", external_signal_wrong_name_workflow)
+        .register_fn(
+            "external_signal_wrong_name_workflow",
+            external_signal_wrong_name_workflow,
+        )
         .replay_from_events(events_with_input)
         .await;
 
@@ -1221,22 +1246,28 @@ async fn replayer_detects_external_signal_name_mismatch() {
 #[tokio::test]
 async fn replayer_replays_external_signal_failed_history() {
     let (exec_id, events) = external_signal_failed_history();
-    let target = events.iter().find_map(|e| {
-        if let WorkflowEvent::ExternalSignalRequested { target, .. } = e {
-            Some(*target)
-        } else {
-            None
-        }
-    }).unwrap();
+    let target = events
+        .iter()
+        .find_map(|e| {
+            if let WorkflowEvent::ExternalSignalRequested { target, .. } = e {
+                Some(*target)
+            } else {
+                None
+            }
+        })
+        .unwrap();
 
     let input = serde_json::json!({"target": target.to_string()});
-    let events_with_input: Vec<_> = events.iter().map(|e| match e {
-        WorkflowEvent::WorkflowStarted { timestamp, .. } => WorkflowEvent::WorkflowStarted {
-            input: input.clone(),
-            timestamp: *timestamp,
-        },
-        other => other.clone(),
-    }).collect();
+    let events_with_input: Vec<_> = events
+        .iter()
+        .map(|e| match e {
+            WorkflowEvent::WorkflowStarted { timestamp, .. } => WorkflowEvent::WorkflowStarted {
+                input: input.clone(),
+                timestamp: *timestamp,
+            },
+            other => other.clone(),
+        })
+        .collect();
 
     // The workflow handles the error from signal_external_workflow by ignoring it
     // (the `let _result = ...` pattern), so the workflow itself succeeds.

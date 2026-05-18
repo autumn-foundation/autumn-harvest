@@ -230,7 +230,14 @@ mod tests {
         ]
     }
 
-    async fn run_replay(workflow_name: &str, handler: fn(&WorkflowContext, Value) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + '_>>, events: Vec<WorkflowEvent>) -> ReplayReport {
+    async fn run_replay(
+        workflow_name: &str,
+        handler: fn(
+            &WorkflowContext,
+            Value,
+        ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + '_>>,
+        events: Vec<WorkflowEvent>,
+    ) -> ReplayReport {
         let exec_id = ExecutionId::new();
         let snapshot = HistorySnapshot {
             workflow_name: workflow_name.to_string(),
