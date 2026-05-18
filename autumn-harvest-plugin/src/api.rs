@@ -3688,8 +3688,8 @@ async fn start_workflow(
             reuse_policy,
             trace_context: trace_ctx,
             max_execution_timeout_ceiling: None,
-            concurrency_key: None,
-            concurrency_limit: None,
+            concurrency_key,
+            concurrency_limit,
         },
     )
     .await;
