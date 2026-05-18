@@ -215,6 +215,8 @@ pub use test_generator::TestHarnessGenerator;
 pub use testing::{
     HistorySnapshot, NonDeterminismKind, ReplayReport, ReplayStatus, WorkflowReplayer,
 };
+#[cfg(feature = "testing")]
+pub use testing::{TestRunOutcome, WorkflowTestEnv};
 pub use types::{
     ActivityExecId, BuildId, DeploymentName, ExecutionId, ExternalActivityToken, ShardId, TimerId,
     UpdateId, WorkerId, WorkflowId, WorkflowIdReusePolicy,
