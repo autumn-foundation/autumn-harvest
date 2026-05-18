@@ -3930,8 +3930,10 @@ async fn reset_workflow(
     }
 
     let exec_id_str = exec_id.to_string();
+    let runtime = api_state.runtime().ok();
+    let registry = runtime.as_ref().map(|r| r.registry().as_ref());
 
-    match reset_workflow_execution(&mut conn, exec_id, request).await {
+    match reset_workflow_execution(&mut conn, exec_id, request, registry).await {
         Ok(result) => {
             let new_exec_id_str = result.new_exec_id.to_string();
             let ar = NewAuditRecord {
@@ -6971,6 +6973,8 @@ async fn bulk_replay_from_shards(
     selector: &DlqBulkSelector,
 ) -> Result<dlq::BulkDlqResult, HarvestError> {
     let pool = api_state.storage_pool()?;
+    let runtime = api_state.runtime().ok();
+    let registry = runtime.as_ref().map(|r| r.registry().as_ref());
     let mut total = dlq::BulkDlqResult {
         matched: 0,
         acted_on: 0,
@@ -7010,7 +7014,7 @@ async fn bulk_replay_from_shards(
         let mut shard_selector = selector.clone();
         shard_selector.filter.limit = Some(remaining);
         let shard_result =
-            bulk_replay_dead_letters_for_selector(&mut conn, &shard_selector).await?;
+            bulk_replay_dead_letters_for_selector(&mut conn, &shard_selector, registry).await?;
         // Rows consumed = acted + skipped + failed (or preview ids in dry-run).
         let consumed = shard_result.ids.len() + shard_result.skipped + shard_result.failures.len();
         remaining = remaining.saturating_sub(u32::try_from(consumed).unwrap_or(remaining));
@@ -7142,6 +7146,7 @@ fn apply_api_bulk_filters<'a>(
 async fn bulk_replay_dead_letters_for_selector(
     conn: &mut AsyncPgConnection,
     selector: &DlqBulkSelector,
+    registry: Option<&HandlerRegistry>,
 ) -> HarvestResult<dlq::BulkDlqResult> {
     let matched = count_api_bulk_filter_matches(conn, selector)
         .await
@@ -7163,7 +7168,7 @@ async fn bulk_replay_dead_letters_for_selector(
 
     for row in rows {
         let id = row.id;
-        match dlq::replay_dead_letter(conn, id).await {
+        match dlq::replay_dead_letter(conn, id, registry).await {
             Ok(_) => {
                 result.acted_on += 1;
                 result.ids.push(id.to_string());
@@ -7834,10 +7839,12 @@ async fn replay_dead_letter_from_shards(
     dead_letter_id: uuid::Uuid,
 ) -> Result<uuid::Uuid, AutumnError> {
     let pool = api_state.storage_pool().map_err(map_error)?;
+    let runtime = api_state.runtime().ok();
+    let registry = runtime.as_ref().map(|r| r.registry().as_ref());
 
     for (_shard, shard_pool) in pool.iter_shards() {
         let mut conn = acquire_conn(shard_pool).await?;
-        match dlq::replay_dead_letter(&mut conn, dead_letter_id).await {
+        match dlq::replay_dead_letter(&mut conn, dead_letter_id, registry).await {
             Ok(task_id) => return Ok(task_id),
             Err(HarvestError::NotFound(_)) => {}
             Err(error) => return Err(map_error(error)),

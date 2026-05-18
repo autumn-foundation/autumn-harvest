@@ -917,7 +917,9 @@ async fn reset_workflow_ui(
         signal_reapply: ResetSignalReapplyPolicy::default(),
     };
 
-    let reset_result = reset_workflow_execution(&mut conn, exec_id, request).await;
+    let runtime = api_state.runtime().ok();
+    let registry = runtime.as_ref().map(|r| r.registry().as_ref());
+    let reset_result = reset_workflow_execution(&mut conn, exec_id, request, registry).await;
     let (status, error_summary, flash) = match &reset_result {
         Ok(result) => (
             STATUS_SUCCEEDED,

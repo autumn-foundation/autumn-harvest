@@ -293,7 +293,7 @@ pub async fn claim_task(
     // the worker has an empty build_id (legacy worker — can claim anything).
     let result: Vec<TaskQueueItem> = diesel::sql_query(
         "WITH candidate AS ( \
-             SELECT id, concurrency_key, concurrency_cap \
+             SELECT id, task_type, concurrency_key, concurrency_cap \
              FROM harvest_task_queue \
              WHERE queue_name = ANY($2) \
                AND state = 'PENDING' \
@@ -310,6 +310,7 @@ pub async fn claim_task(
                    OR ( \
                        SELECT COUNT(*) FROM harvest_task_queue inner_q \
                        WHERE inner_q.concurrency_key = harvest_task_queue.concurrency_key \
+                         AND inner_q.task_type = harvest_task_queue.task_type \
                          AND inner_q.state = 'RUNNING' \
                    ) < harvest_task_queue.concurrency_cap \
                ) \
@@ -345,6 +346,7 @@ pub async fn claim_task(
                        OR ( \
                            SELECT COUNT(*) FROM harvest_task_queue recheck \
                            WHERE recheck.concurrency_key = candidate.concurrency_key \
+                             AND recheck.task_type = candidate.task_type \
                              AND recheck.state = 'RUNNING' \
                        ) < candidate.concurrency_cap \
                    ) \
