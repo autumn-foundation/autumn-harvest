@@ -1085,6 +1085,9 @@ struct ScheduleEntry {
     kind: ScheduleKind,
     name: String,
     schedule_expr: Option<String>,
+    /// IANA timezone the cron expression is evaluated in.
+    /// Always `"UTC"` for `Schedule::Cron` and non-cron schedules.
+    timezone: String,
     is_paused: bool,
     paused_at: Option<chrono::DateTime<chrono::Utc>>,
     paused_by: Option<String>,
@@ -1119,6 +1122,13 @@ struct PauseResumeRequest {
 struct CreateWorkflowScheduleRequest {
     workflow_name: String,
     schedule_expr: String,
+    /// IANA timezone the cron expression is evaluated in (e.g.
+    /// `"America/Los_Angeles"`, `"Europe/London"`, `"UTC"`).
+    ///
+    /// Defaults to `"UTC"`, preserving the pre-existing behavior.
+    /// Ignored for `interval:*` and `manual` expressions.
+    #[serde(default = "default_timezone")]
+    timezone: String,
     #[serde(default)]
     input: serde_json::Value,
     #[serde(default)]
@@ -1143,6 +1153,10 @@ struct CreateWorkflowScheduleRequest {
 
 fn default_queue_name() -> String {
     "default".to_string()
+}
+
+fn default_timezone() -> String {
+    "UTC".to_string()
 }
 
 const fn default_max_active_runs() -> u32 {
@@ -4819,6 +4833,7 @@ async fn list_workflow_type_handlers(
 fn schedule_expr_for_summary(schedule: &Schedule) -> String {
     match schedule {
         Schedule::Cron(expr) => format!("cron:{expr}"),
+        Schedule::CronInTimezone { expr, tz } => format!("cron_tz:{tz}:{expr}"),
         Schedule::Interval(interval) => format!("interval:{}", interval.as_secs()),
         Schedule::Manual => "manual".to_string(),
     }
@@ -5130,6 +5145,7 @@ async fn list_schedules(
                 kind,
                 name,
                 schedule_expr: s.schedule_expr,
+                timezone: s.timezone,
                 is_paused: s.is_paused,
                 paused_at: s.paused_at,
                 paused_by: s.paused_by,
@@ -5199,6 +5215,7 @@ async fn get_schedule(
         kind,
         name,
         schedule_expr: s.schedule_expr,
+        timezone: s.timezone,
         is_paused: s.is_paused,
         paused_at: s.paused_at,
         paused_by: s.paused_by,
@@ -5362,6 +5379,7 @@ async fn upsert_workflow_schedule_and_read_back(
         kind: ScheduleKind::Workflow,
         name: ws.workflow_name.clone(),
         schedule_expr: row.schedule_expr,
+        timezone: row.timezone,
         is_paused: row.is_paused,
         paused_at: row.paused_at,
         paused_by: row.paused_by,
@@ -5407,7 +5425,7 @@ async fn create_workflow_schedule(
     )
     .await?;
 
-    let schedule = match parse_schedule_expr(&request.schedule_expr) {
+    let schedule = match parse_schedule_expr_with_tz(&request.schedule_expr, &request.timezone) {
         Ok(s) => s,
         Err(e) => {
             let err_summary = format!("invalid schedule_expr: {e}");
@@ -6701,12 +6719,33 @@ async fn load_schedule_by_id(
     )))
 }
 
-fn parse_schedule_expr(expr: &str) -> Result<autumn_harvest::policy::Schedule, String> {
+fn parse_schedule_expr_with_tz(
+    expr: &str,
+    timezone: &str,
+) -> Result<autumn_harvest::policy::Schedule, String> {
     use autumn_harvest::policy::Schedule;
 
     let trimmed = expr.trim();
-    let schedule = if let Some(cron) = trimmed.strip_prefix("cron:") {
-        Schedule::Cron(cron.trim().to_string())
+    let schedule = if let Some(rest) = trimmed.strip_prefix("cron_tz:") {
+        // Canonical round-trip format emitted by GET /admin/schedules.
+        // The embedded timezone takes precedence over the separate `timezone` field.
+        let (tz, cron_expr) = rest.split_once(':').ok_or_else(|| {
+            format!("malformed cron_tz expression '{expr}'; expected 'cron_tz:<tz>:<expr>'")
+        })?;
+        Schedule::CronInTimezone {
+            expr: cron_expr.to_string(),
+            tz: tz.to_string(),
+        }
+    } else if let Some(cron) = trimmed.strip_prefix("cron:") {
+        let cron_expr = cron.trim().to_string();
+        if timezone == "UTC" {
+            Schedule::Cron(cron_expr)
+        } else {
+            Schedule::CronInTimezone {
+                expr: cron_expr,
+                tz: timezone.to_string(),
+            }
+        }
     } else if let Some(secs_str) = trimmed.strip_prefix("interval:") {
         let secs: u64 = secs_str
             .trim()
@@ -6720,10 +6759,18 @@ fn parse_schedule_expr(expr: &str) -> Result<autumn_harvest::policy::Schedule, S
         Schedule::Manual
     } else {
         // Treat a bare expression as a cron string for convenience.
-        Schedule::Cron(trimmed.to_string())
+        if timezone == "UTC" {
+            Schedule::Cron(trimmed.to_string())
+        } else {
+            Schedule::CronInTimezone {
+                expr: trimmed.to_string(),
+                tz: timezone.to_string(),
+            }
+        }
     };
-    // Validate cron expressions eagerly so callers receive a 400 rather than
-    // silently persisting an expression that will never fire.
+    // Validate cron expressions eagerly (including timezone names) so callers
+    // receive a 400 rather than silently persisting an expression that will
+    // never fire or an unknown timezone that would misfire.
     autumn_harvest::validate_schedule(&schedule)?;
     Ok(schedule)
 }
@@ -9976,6 +10023,114 @@ mod tests {
         assert!(
             !sql.contains("COALESCE(completed_at, started_at, created_at) >="),
             "updated windows must not be based only on workflow row timestamps"
+        );
+    }
+
+    // ── Timezone-aware schedule API ───────────────────────────────────────────
+
+    #[test]
+    fn parse_schedule_expr_with_tz_utc_produces_cron_variant() {
+        use autumn_harvest::policy::Schedule;
+        let result =
+            parse_schedule_expr_with_tz("0 9 * * 1-5", "UTC").expect("valid cron+UTC should parse");
+        assert!(
+            matches!(result, Schedule::Cron(_)),
+            "UTC timezone must produce Schedule::Cron, not CronInTimezone: {result:?}"
+        );
+    }
+
+    #[test]
+    fn parse_schedule_expr_with_tz_non_utc_produces_cron_in_timezone_variant() {
+        use autumn_harvest::policy::Schedule;
+        let result = parse_schedule_expr_with_tz("0 9 * * 1-5", "America/Los_Angeles")
+            .expect("valid cron+timezone should parse");
+        assert!(
+            matches!(&result, Schedule::CronInTimezone { tz, .. } if tz == "America/Los_Angeles"),
+            "non-UTC timezone must produce Schedule::CronInTimezone: {result:?}"
+        );
+    }
+
+    #[test]
+    fn parse_schedule_expr_with_tz_unknown_timezone_is_rejected() {
+        let result = parse_schedule_expr_with_tz("0 9 * * *", "Not/ATimezone");
+        assert!(
+            result.is_err(),
+            "unknown timezone must be rejected with an error, got: {result:?}"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("Not/ATimezone"),
+            "error should name the bad timezone: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_schedule_expr_with_tz_cron_tz_prefix_round_trips() {
+        use autumn_harvest::policy::Schedule;
+        // Simulate GET returning the canonical cron_tz: form, then POST-ing it back.
+        let canonical = "cron_tz:America/Los_Angeles:0 9 * * 1-5";
+        let result = parse_schedule_expr_with_tz(canonical, "UTC")
+            .expect("cron_tz: prefixed expr must parse regardless of timezone param");
+        assert!(
+            matches!(&result, Schedule::CronInTimezone { tz, expr }
+                if tz == "America/Los_Angeles" && expr == "0 9 * * 1-5"),
+            "embedded timezone must be preserved: {result:?}"
+        );
+    }
+
+    #[test]
+    fn parse_schedule_expr_with_tz_cron_tz_prefix_malformed_is_rejected() {
+        let result = parse_schedule_expr_with_tz("cron_tz:MissingColonExpr", "UTC");
+        assert!(
+            result.is_err(),
+            "malformed cron_tz: must be rejected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn create_workflow_schedule_request_timezone_defaults_to_utc() {
+        let json = r#"{"workflow_name":"my_wf","schedule_expr":"0 9 * * *"}"#;
+        let req: CreateWorkflowScheduleRequest =
+            serde_json::from_str(json).expect("should deserialize");
+        assert_eq!(req.timezone, "UTC", "missing timezone must default to UTC");
+    }
+
+    #[test]
+    fn create_workflow_schedule_request_timezone_round_trips() {
+        let json =
+            r#"{"workflow_name":"my_wf","schedule_expr":"0 9 * * *","timezone":"Europe/London"}"#;
+        let req: CreateWorkflowScheduleRequest =
+            serde_json::from_str(json).expect("should deserialize");
+        assert_eq!(req.timezone, "Europe/London");
+    }
+
+    #[test]
+    fn schedule_entry_timezone_field_is_serialized() {
+        let entry = ScheduleEntry {
+            id: uuid::Uuid::nil(),
+            kind: ScheduleKind::Workflow,
+            name: "test".to_string(),
+            schedule_expr: Some("cron:0 9 * * *".to_string()),
+            timezone: "Asia/Tokyo".to_string(),
+            is_paused: false,
+            paused_at: None,
+            paused_by: None,
+            pause_reason: None,
+            next_run_at: None,
+            last_run_at: None,
+            max_active_runs: 1,
+            catchup: false,
+            last_backfill: None,
+            jitter_secs: 0,
+            effective_fire_time: None,
+            overlap_policy: "skip".to_string(),
+            buffered_count: 0,
+            buffer_all_max: 100,
+        };
+        let json = serde_json::to_string(&entry).expect("serialize");
+        assert!(
+            json.contains("\"timezone\":\"Asia/Tokyo\""),
+            "timezone field must be present in JSON: {json}"
         );
     }
 }

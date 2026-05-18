@@ -259,11 +259,67 @@ impl TriggerRule {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Schedule {
     /// Standard cron expression (e.g., `"0 2 * * *"` for daily at 2 AM).
+    ///
+    /// The cron expression is evaluated in **UTC**. This variant is the
+    /// backward-compatible default; existing schedules continue to fire in
+    /// UTC on upgrade.
     Cron(String),
     /// Fixed interval from the end of the previous run.
     Interval(Duration),
     /// Only runs when triggered manually via API.
     Manual,
+    /// Timezone-aware cron expression.
+    ///
+    /// Identical to `Cron` but the expression is evaluated in the declared
+    /// IANA timezone rather than UTC, so `"0 9 * * 1-5"` in
+    /// `"America/Los_Angeles"` fires at **9:00 AM Pacific year-round**,
+    /// regardless of DST transitions.
+    ///
+    /// ## DST disambiguation
+    ///
+    /// - **Spring-forward (clocks skip an hour):** a cron expression whose
+    ///   local-time resolution falls inside the skipped window is **not**
+    ///   back-fired. The scheduler advances to the first valid local instant
+    ///   on the following day (or the next matching wall-clock time after the
+    ///   gap). No spurious firing occurs at the wrong UTC time.
+    /// - **Fall-back (clocks repeat an hour):** a cron expression whose
+    ///   local-time resolution falls inside the repeated window fires exactly
+    ///   **once** — on the first occurrence of that local time (the pre-rollback
+    ///   instant). The repeated hour does not trigger a second firing.
+    ///
+    /// ## Validation
+    ///
+    /// `tz` must be a valid IANA timezone name (e.g. `"America/Los_Angeles"`,
+    /// `"Europe/London"`, `"Asia/Tokyo"`, `"UTC"`). Unknown names are rejected
+    /// at builder/registration time with
+    /// [`HarvestBuilderError::UnknownTimezone`](crate::builder::HarvestBuilderError::UnknownTimezone),
+    /// not at first scheduler tick.
+    ///
+    /// ## Backward compatibility
+    ///
+    /// `Schedule::Cron(expr)` schedules retain UTC semantics on upgrade; the
+    /// new variant is strictly opt-in. Existing persisted schedules are
+    /// unaffected.
+    CronInTimezone {
+        /// The cron expression (same syntax as `Schedule::Cron`).
+        expr: String,
+        /// IANA timezone name (e.g. `"America/Los_Angeles"`).
+        tz: String,
+    },
+}
+
+impl Schedule {
+    /// Returns the IANA timezone name for this schedule.
+    ///
+    /// `Cron`, `Interval`, and `Manual` return `"UTC"` (backward-compatible
+    /// default). `CronInTimezone` returns its declared timezone.
+    #[must_use]
+    pub const fn timezone_str(&self) -> &str {
+        match self {
+            Self::CronInTimezone { tz, .. } => tz.as_str(),
+            Self::Cron(_) | Self::Interval(_) | Self::Manual => "UTC",
+        }
+    }
 }
 
 /// What happens when a new schedule firing collides with a still-running previous
@@ -548,14 +604,26 @@ impl WorkflowSchedule {
 /// Returns a human-readable error string if the cron expression is
 /// syntactically invalid.
 pub fn validate_schedule(schedule: &Schedule) -> Result<(), String> {
-    if let Schedule::Cron(expr) = schedule {
-        Cron::new(expr)
+    match schedule {
+        Schedule::Cron(expr) => Cron::new(expr)
             .with_seconds_optional()
             .parse()
             .map(|_| ())
-            .map_err(|e| format!("invalid cron expression '{expr}': {e}"))
-    } else {
-        Ok(())
+            .map_err(|e| format!("invalid cron expression '{expr}': {e}")),
+        Schedule::CronInTimezone { expr, tz } => {
+            // Validate the IANA timezone name first so callers get a clear error.
+            if tz.parse::<chrono_tz::Tz>().is_err() {
+                return Err(format!(
+                    "unknown timezone '{tz}'; use an IANA timezone name (e.g. \"America/Los_Angeles\", \"UTC\")"
+                ));
+            }
+            Cron::new(expr)
+                .with_seconds_optional()
+                .parse()
+                .map(|_| ())
+                .map_err(|e| format!("invalid cron expression '{expr}': {e}"))
+        }
+        Schedule::Interval(_) | Schedule::Manual => Ok(()),
     }
 }
 
@@ -587,7 +655,7 @@ pub fn validate_jitter(schedule: &Schedule, jitter: Duration) -> Result<(), Stri
                 ));
             }
         }
-        Schedule::Cron(_) => {
+        Schedule::Cron(_) | Schedule::CronInTimezone { .. } => {
             if jitter > MAX_CRON_JITTER {
                 return Err(format!(
                     "jitter ({jitter:?}) exceeds the 1-hour maximum for cron schedules"
@@ -909,6 +977,69 @@ mod tests {
             let back: OverlapPolicy = serde_json::from_str(&json).expect("deserialize");
             assert_eq!(back, policy, "serde round-trip failed for {policy:?}");
         }
+    }
+
+    // ── CronInTimezone schedule ───────────────────────────────────────────────
+
+    #[test]
+    fn cron_in_timezone_validate_ok() {
+        let sched = Schedule::CronInTimezone {
+            expr: "0 9 * * 1-5".to_string(),
+            tz: "America/Los_Angeles".to_string(),
+        };
+        assert!(validate_schedule(&sched).is_ok());
+    }
+
+    #[test]
+    fn cron_in_timezone_unknown_tz_rejected() {
+        let sched = Schedule::CronInTimezone {
+            expr: "0 9 * * *".to_string(),
+            tz: "Not/ATimezone".to_string(),
+        };
+        let err = validate_schedule(&sched).unwrap_err();
+        assert!(
+            err.contains("Not/ATimezone"),
+            "error should name the bad timezone: {err}"
+        );
+    }
+
+    #[test]
+    fn cron_in_timezone_invalid_expr_rejected() {
+        let sched = Schedule::CronInTimezone {
+            expr: "not a cron".to_string(),
+            tz: "UTC".to_string(),
+        };
+        assert!(validate_schedule(&sched).is_err());
+    }
+
+    #[test]
+    fn cron_in_timezone_validate_jitter_applies_cron_rules() {
+        let sched = Schedule::CronInTimezone {
+            expr: "0 * * * *".to_string(),
+            tz: "Europe/London".to_string(),
+        };
+        assert!(
+            validate_jitter(&sched, Duration::from_secs(3601)).is_err(),
+            "jitter > 1 hour must be rejected for CronInTimezone"
+        );
+        assert!(
+            validate_jitter(&sched, Duration::from_secs(3600)).is_ok(),
+            "jitter == 1 hour must be accepted for CronInTimezone"
+        );
+    }
+
+    #[test]
+    fn cron_in_timezone_serde_round_trips() {
+        let sched = Schedule::CronInTimezone {
+            expr: "30 9 * * 1-5".to_string(),
+            tz: "America/New_York".to_string(),
+        };
+        let json = serde_json::to_string(&sched).expect("serialize");
+        let back: Schedule = serde_json::from_str(&json).expect("deserialize");
+        assert!(
+            matches!(&back, Schedule::CronInTimezone { expr, tz } if expr == "30 9 * * 1-5" && tz == "America/New_York"),
+            "serde round-trip failed: {back:?}"
+        );
     }
 
     // ── compute_retry_delay ───────────────────────────────────────────────────

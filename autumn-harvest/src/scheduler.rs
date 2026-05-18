@@ -78,7 +78,7 @@ pub fn plan_backfill_timestamps(
 
     match schedule {
         None | Some(Schedule::Manual) => Ok(vec![]),
-        Some(Schedule::Cron(_)) => {
+        Some(Schedule::Cron(_) | Schedule::CronInTimezone { .. }) => {
             // Find the first cron occurrence at or after `from` by searching from 1 ms before
             // it (cron fires on whole-second boundaries; 1 ms is a safe undercut).
             let reference = from - chrono::Duration::milliseconds(1);
@@ -421,6 +421,10 @@ pub async fn register_schedules(
     #[cfg(not(feature = "unified-dag-execution"))]
     reject_classic_dags_without_unified_execution(dags)?;
     for dag in dags.values() {
+        if let Some(schedule) = &dag.schedule {
+            crate::policy::validate_schedule(schedule)
+                .map_err(crate::error::HarvestError::Config)?;
+        }
         upsert_schedule(conn, dag).await?;
     }
     Ok(())
@@ -438,6 +442,10 @@ async fn register_schedules_for_shard(
         if router.pick_for_dag(&dag.name) != shard {
             continue;
         }
+        if let Some(schedule) = &dag.schedule {
+            crate::policy::validate_schedule(schedule)
+                .map_err(crate::error::HarvestError::Config)?;
+        }
         upsert_schedule(conn, dag).await?;
     }
     Ok(())
@@ -454,6 +462,8 @@ pub async fn register_workflow_schedules(
     schedules: &[WorkflowSchedule],
 ) -> HarvestResult<()> {
     for ws in schedules {
+        crate::policy::validate_schedule(&ws.schedule)
+            .map_err(crate::error::HarvestError::Config)?;
         upsert_workflow_schedule(conn, ws).await?;
     }
     Ok(())
@@ -468,6 +478,8 @@ async fn register_workflow_schedules_for_shard(
     for ws in schedules {
         let owning_shard = workflow_schedule_shard(ws, router);
         if owning_shard == shard {
+            crate::policy::validate_schedule(&ws.schedule)
+                .map_err(crate::error::HarvestError::Config)?;
             upsert_workflow_schedule(conn, ws).await?;
         } else if ws.dag_name.is_some() {
             delete_stale_dag_workflow_schedule(conn, ws).await?;
@@ -842,10 +854,11 @@ async fn upsert_schedule(
         } else {
             serde_json::json!([])
         };
+        let tz = dag.schedule.as_ref().map_or("UTC", Schedule::timezone_str);
         diesel::update(dsl::harvest_schedules.find(existing.id))
             .set((
                 dsl::schedule_expr.eq(expr.clone()),
-                dsl::timezone.eq("UTC"),
+                dsl::timezone.eq(tz),
                 dsl::catchup.eq(dag.catchup),
                 dsl::max_active_runs.eq(i32::try_from(dag.max_active_runs).unwrap_or(i32::MAX)),
                 dsl::dag_name.eq(Some(dag.name.as_str())),
@@ -871,7 +884,7 @@ async fn upsert_schedule(
             id: uuid::Uuid::new_v4(),
             dag_name: Some(&dag.name),
             schedule_expr: expr.as_deref(),
-            timezone: "UTC",
+            timezone: dag.schedule.as_ref().map_or("UTC", Schedule::timezone_str),
             catchup: dag.catchup,
             max_active_runs: i32::try_from(dag.max_active_runs).unwrap_or(i32::MAX),
             is_paused: false,
@@ -970,7 +983,7 @@ async fn insert_dag_workflow_schedule_if_missing(
         id: uuid::Uuid::new_v4(),
         dag_name: Some(dag_name),
         schedule_expr: expr,
-        timezone: "UTC",
+        timezone: ws.schedule.timezone_str(),
         catchup: ws.catchup,
         max_active_runs: i32::try_from(ws.max_active_runs).unwrap_or(i32::MAX),
         is_paused: ws.paused,
@@ -1009,7 +1022,7 @@ async fn insert_workflow_schedule_if_missing(
         id: uuid::Uuid::new_v4(),
         dag_name: None,
         schedule_expr: expr,
-        timezone: "UTC",
+        timezone: ws.schedule.timezone_str(),
         catchup: ws.catchup,
         max_active_runs: i32::try_from(ws.max_active_runs).unwrap_or(i32::MAX),
         // is_paused is set on initial insert only; subsequent upserts preserve the
@@ -1108,7 +1121,7 @@ async fn upsert_workflow_schedule(
     diesel::update(dsl::harvest_schedules.find(existing.id))
         .set((
             dsl::schedule_expr.eq(expr),
-            dsl::timezone.eq("UTC"),
+            dsl::timezone.eq(ws.schedule.timezone_str()),
             dsl::catchup.eq(ws.catchup),
             dsl::max_active_runs.eq(i32::try_from(ws.max_active_runs).unwrap_or(i32::MAX)),
             dsl::dag_name.eq(dag_name),
@@ -1222,6 +1235,16 @@ pub fn parse_schedule_from_expr_pub(expr: &str) -> Option<Schedule> {
 }
 
 fn parse_schedule_from_expr(expr: &str) -> Option<Schedule> {
+    if let Some(rest) = expr.strip_prefix("cron_tz:") {
+        // Format: "cron_tz:<tz>:<expr>" where <tz> is an IANA name that may
+        // contain one colon (e.g. nothing — IANA names use '/'). We split on
+        // the first colon after the prefix to separate tz from the cron expr.
+        let (tz, cron_expr) = rest.split_once(':')?;
+        return Some(Schedule::CronInTimezone {
+            expr: cron_expr.to_string(),
+            tz: tz.to_string(),
+        });
+    }
     expr.strip_prefix("cron:").map_or_else(
         || {
             expr.strip_prefix("interval:")
@@ -1673,6 +1696,7 @@ pub use crate::policy::validate_schedule;
 fn schedule_expr(schedule: Option<&Schedule>) -> Option<String> {
     match schedule {
         Some(Schedule::Cron(expr)) => Some(format!("cron:{expr}")),
+        Some(Schedule::CronInTimezone { expr, tz }) => Some(format!("cron_tz:{tz}:{expr}")),
         Some(Schedule::Interval(interval)) => Some(format!("interval:{}", interval.as_secs())),
         Some(Schedule::Manual) => Some("manual".to_string()),
         None => None,
@@ -1686,6 +1710,34 @@ fn next_run_after(schedule: Option<&Schedule>, reference: DateTime<Utc>) -> Opti
             .parse()
             .ok()
             .and_then(|cron| cron.find_next_occurrence(&reference, false).ok()),
+        Some(Schedule::CronInTimezone { expr, tz }) => {
+            // Parse the IANA timezone; if it's invalid we return None so the
+            // schedule simply doesn't fire (validation should have caught this).
+            let tz: chrono_tz::Tz = tz.parse().ok()?;
+            let cron = Cron::new(expr).with_seconds_optional().parse().ok()?;
+            // Convert the reference instant into the schedule's local timezone.
+            let local_ref = reference.with_timezone(&tz);
+            // First pass: find the candidate next occurrence strictly after the
+            // reference time.
+            let candidate = cron.find_next_occurrence(&local_ref, false).ok()?;
+            // DST spring-forward correction: when `croner` computes a next
+            // occurrence that falls inside a gap (e.g. "02:30 AM" on a day
+            // where 02:00–03:00 is skipped), `chrono_tz` silently advances the
+            // non-existent local time to the first valid second after the gap
+            // (e.g. 03:00:00 PDT).  That instant does NOT match the cron
+            // pattern, so calling `find_next_occurrence` again with
+            // `include_current = true` from the candidate advances to the
+            // actual next matching wall-clock time (e.g. 02:30 on the next day)
+            // without double-advancing on ordinary (non-gap) results.
+            //
+            // Fall-back is handled correctly by the strict `false` on the first
+            // call: `croner` advances past the first occurrence of the repeated
+            // hour when called from it, producing the next-day result.  Calling
+            // `find_next_occurrence(&candidate, true)` on a genuine match
+            // returns the same instant, preserving that behavior.
+            let local_next = cron.find_next_occurrence(&candidate, true).ok()?;
+            Some(local_next.with_timezone(&Utc))
+        }
         Some(Schedule::Interval(interval)) => chrono::Duration::from_std(*interval)
             .ok()
             .map(|duration| reference + duration),
@@ -2346,5 +2398,76 @@ mod tests {
         let json = buffered_runs_to_json(&runs);
         let parsed = parse_buffered_runs(&json);
         assert_eq!(parsed, runs);
+    }
+
+    // ── Timezone-aware schedule: next_run_after ───────────────────────────────
+
+    #[test]
+    fn next_run_after_spring_forward_skips_nonexistent_local_time() {
+        // America/Los_Angeles spring-forward 2026: 2026-03-08 at 2:00 AM PST → 3:00 AM PDT.
+        // "30 2 * * *" has no valid local instant on 2026-03-08; scheduler must
+        // skip that day and fire at 2026-03-09 02:30 PDT = 09:30 UTC.
+        let schedule = Schedule::CronInTimezone {
+            expr: "30 2 * * *".to_string(),
+            tz: "America/Los_Angeles".to_string(),
+        };
+        // Reference: 2026-03-08 01:50 AM PST = 09:50 UTC (just before the gap)
+        let reference = parse_utc("2026-03-08T09:50:00Z");
+        let next =
+            next_run_after(Some(&schedule), reference).expect("should produce a next occurrence");
+        // Expected: 2026-03-09 02:30 PDT = 09:30 UTC
+        let expected = parse_utc("2026-03-09T09:30:00Z");
+        assert_eq!(
+            next, expected,
+            "spring-forward: 02:30 must not fire on Mar 8 (gap), must fire on Mar 9 instead"
+        );
+    }
+
+    #[test]
+    fn next_run_after_fall_back_fires_first_occurrence_only() {
+        // America/Los_Angeles fall-back 2026: 2026-11-01 at 2:00 AM PDT → 1:00 AM PST.
+        // 01:30 appears twice; the cron "30 1 * * *" must fire on the FIRST 01:30 (PDT = UTC-7).
+        let schedule = Schedule::CronInTimezone {
+            expr: "30 1 * * *".to_string(),
+            tz: "America/Los_Angeles".to_string(),
+        };
+        // Reference: 2026-11-01 00:50 AM PDT = 07:50 UTC
+        let reference = parse_utc("2026-11-01T07:50:00Z");
+        let first_next =
+            next_run_after(Some(&schedule), reference).expect("should fire on fall-back day");
+        // First 01:30 PDT (UTC-7) = 2026-11-01T08:30:00Z
+        let expected_first = parse_utc("2026-11-01T08:30:00Z");
+        assert_eq!(
+            first_next, expected_first,
+            "fall-back: 01:30 must fire at first occurrence (PDT)"
+        );
+        // Calling next_run_after again from that instant must NOT return the
+        // same time (no double-fire on the repeated hour).
+        let second_next =
+            next_run_after(Some(&schedule), first_next).expect("should advance past fall-back");
+        assert_ne!(
+            second_next, first_next,
+            "must not double-fire the repeated fall-back hour"
+        );
+        // Next occurrence is 2026-11-02 01:30 PST (UTC-8) = 09:30 UTC
+        let expected_next_day = parse_utc("2026-11-02T09:30:00Z");
+        assert_eq!(
+            second_next, expected_next_day,
+            "fall-back: after first fire, next must be the following day in PST"
+        );
+    }
+
+    #[test]
+    fn schedule_expr_and_parse_round_trip_cron_in_timezone() {
+        let schedule = Schedule::CronInTimezone {
+            expr: "0 9 * * 1-5".to_string(),
+            tz: "America/Los_Angeles".to_string(),
+        };
+        let expr_str = schedule_expr(Some(&schedule)).expect("should produce expr string");
+        let parsed = parse_schedule_from_expr(&expr_str).expect("should round-trip parse");
+        assert!(
+            matches!(&parsed, Schedule::CronInTimezone { tz, .. } if tz == "America/Los_Angeles"),
+            "round-trip failed: {parsed:?}"
+        );
     }
 }

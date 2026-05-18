@@ -35,6 +35,7 @@ base64 = "0.22"
 thiserror = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
+chrono-tz = { workspace = true }
 tracing = { workspace = true }
 futures = { workspace = true }
 lru = "0.16"
@@ -99,6 +100,9 @@ required-features = ["db"]
 [[example]]
 name = "signal_with_start_webhook"
 required-features = ["db"]
+
+[[example]]
+name = "timezone_cron_schedule"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
