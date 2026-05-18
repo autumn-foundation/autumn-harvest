@@ -2977,7 +2977,7 @@ async fn persist_workflow_continue_as_new(
     enqueue.max_concurrent = persistence
         .task
         .concurrency_cap
-        .map(|cap| u32::try_from(cap).unwrap_or(u32::MAX));
+        .and_then(|cap| u32::try_from(cap).ok());
 
     conn.transaction::<(), HarvestError, _>(|conn| {
         async move {

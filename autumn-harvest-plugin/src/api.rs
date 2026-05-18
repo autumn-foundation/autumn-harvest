@@ -3649,9 +3649,10 @@ async fn start_workflow(
                 policy.key_expr,
                 &input,
             );
+        .map_or((None, None), |policy| {
+            let key = autumn_harvest::concurrency::resolve_concurrency_key(policy.key_expr, &input);
             (key, Some(policy.limit))
-        })
-        .unwrap_or((None, None));
+        });
 
     let shard = runtime
         .router

@@ -6148,7 +6148,7 @@ fn instant_wf<'a>(
     Box::pin(async move { Ok(serde_json::Value::Null) })
 }
 
-/// Count RUNNING task queue rows for a specific concurrency_key.
+/// Count RUNNING task queue rows for a specific `concurrency_key`.
 async fn count_running_for_key(database_url: &str, key: &str) -> i64 {
     let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(database_url)
         .await
@@ -6163,8 +6163,7 @@ async fn count_running_for_key(database_url: &str, key: &str) -> i64 {
     .expect("key count query failed")
     .into_iter()
     .next()
-    .map(|r| r.count)
-    .unwrap_or(0)
+    .map_or(0, |r| r.count)
 }
 
 #[derive(diesel::QueryableByName)]
@@ -6180,6 +6179,7 @@ struct CountRow {
 /// `concurrency_cap = 2`.  We verify that at no point are more than 2 running,
 /// and that all 6 eventually complete.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)]
 async fn per_key_concurrency_cap_enforced_across_fleet() {
     const LIMIT: u32 = 2;
     const TOTAL: u32 = 6;
@@ -6198,61 +6198,59 @@ async fn per_key_concurrency_cap_enforced_across_fleet() {
         vec![],
     ));
 
-    // Enqueue TOTAL workflow tasks with the same concurrency key and cap=LIMIT.
+    // Start TOTAL workflow executions with the same concurrency key and cap=LIMIT.
     {
         let mut conn = pool.get().await.expect("get conn for enqueue");
         for i in 0..TOTAL {
-            let exec_id = ExecutionId::new();
-            let mut p = EnqueueParams::new(
-                "default".to_string(),
-                TaskType::Workflow,
-                serde_json::json!({ "task": i }),
-            );
-            p.workflow_exec_id = Some(exec_id.as_uuid());
-            p.concurrency_key = Some(KEY.to_string());
-            p.max_concurrent = Some(LIMIT);
-            queue::enqueue(&mut conn, &p).await.expect("enqueue");
-
-            use diesel::prelude::*;
-            let row = autumn_harvest::models::NewWorkflowExecution {
-                id: exec_id.as_uuid(),
-                workflow_name: wf_name,
-                workflow_id: &format!("wf-{i}"),
-                run_id: uuid::Uuid::new_v4(),
-                shard_id: 0,
-                input: serde_json::json!({}),
-                parent_id: None,
-                queue_name: "default",
-                execution_timeout: None,
-                memo: None,
-                search_attrs: None,
-                assigned_build_id: None,
-            };
-            diesel::insert_into(harvest_workflow_executions::table)
-                .values(&row)
-                .execute(&mut *conn)
-                .await
-                .expect("insert execution");
+            start_or_load_workflow_execution(
+                &mut conn,
+                StartWorkflowParams {
+                    workflow_name: wf_name,
+                    workflow_id: &format!("wf-{i}"),
+                    exec_id: ExecutionId::new(),
+                    input: serde_json::json!({}),
+                    parent_id: None,
+                    queue_name: "default",
+                    execution_timeout: None,
+                    memo: None,
+                    search_attrs: None,
+                    reuse_policy: WorkflowIdReusePolicy::RejectDuplicate,
+                    trace_context: None,
+                    concurrency_key: Some(KEY.to_string()),
+                    concurrency_limit: Some(LIMIT),
+                },
+            )
+            .await
+            .expect("start workflow");
         }
     }
 
     // Start a worker with plenty of per-worker concurrency so the only binding
     // constraint is the per-key cap.
-    let worker = Worker::new(
-        pool.clone(),
-        Arc::clone(&registry),
-        WorkerRuntimeConfig {
-            queues: vec!["default".to_string()],
-            max_concurrent_workflows: 20,
-            max_concurrent_activities: 20,
-            poll_interval: Duration::from_millis(50),
-            shutdown_grace_period: Duration::from_secs(10),
-            build_id: String::new(),
-            deployment_name: String::new(),
-            shard_assignments: None,
-        },
+    let worker = Arc::new(
+        Worker::new(
+            WorkerRuntimeConfig {
+                worker_id: "test-worker-concurrency-a".to_string(),
+                queues: vec!["default".to_string()],
+                notification_database_url: None,
+                max_concurrent_workflows: 20,
+                max_concurrent_activities: 20,
+                poll_interval: Duration::from_millis(50),
+                shutdown_timeout: Duration::from_secs(5),
+                cancellation_grace_period: Duration::from_secs(1),
+                sticky_timeout: Duration::ZERO,
+                max_local_activity_start_to_close: Duration::from_secs(60),
+                shard_assignments: vec![autumn_harvest::types::ShardId::new(0)],
+                worker_heartbeat_interval: Duration::from_secs(5),
+                build_id: String::new(),
+                deployment_name: None,
+                workflow_cache_size: 1000,
+            },
+            Arc::clone(&registry),
+        )
+        .expect("worker should build"),
     );
-    let _worker_handle = tokio::spawn(worker.run());
+    let _worker_handle = spawn_test_worker(Arc::clone(&worker), pool.clone());
 
     // Poll until all tasks have completed or we time out.
     // During polling, assert the per-key cap is never exceeded.
@@ -6281,18 +6279,16 @@ async fn per_key_concurrency_cap_enforced_across_fleet() {
         .expect("completed count")
         .into_iter()
         .next()
-        .map(|r| r.count)
-        .unwrap_or(0);
+        .map_or(0, |r| r.count);
 
         if completed >= i64::from(TOTAL) {
             break;
         }
 
-        if tokio::time::Instant::now() >= deadline {
-            panic!(
-                "timed out: only {completed}/{TOTAL} tasks completed; last in-flight = {in_flight}"
-            );
-        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out: only {completed}/{TOTAL} tasks completed; last in-flight = {in_flight}"
+        );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
@@ -6311,6 +6307,7 @@ async fn per_key_concurrency_cap_enforced_across_fleet() {
 /// for "tenant:quiet" (cap=10).  We verify the quiet-tenant tasks complete
 /// quickly even though the loud-tenant cap is saturated.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)]
 async fn per_key_concurrency_does_not_block_other_keys() {
     const LOUD_CAP: u32 = 1;
     const LOUD_TOTAL: u32 = 4;
@@ -6342,88 +6339,77 @@ async fn per_key_concurrency_does_not_block_other_keys() {
 
         // Loud tenant: 4 blocking tasks, cap=1.
         for i in 0..LOUD_TOTAL {
-            let exec_id = ExecutionId::new();
-            let mut p = EnqueueParams::new(
-                "default".to_string(),
-                TaskType::Workflow,
-                serde_json::json!({ "task": i }),
-            );
-            p.workflow_exec_id = Some(exec_id.as_uuid());
-            p.concurrency_key = Some(LOUD_KEY.to_string());
-            p.max_concurrent = Some(LOUD_CAP);
-            queue::enqueue(&mut conn, &p).await.expect("enqueue loud");
-
-            use diesel::prelude::*;
-            diesel::insert_into(harvest_workflow_executions::table)
-                .values(&autumn_harvest::models::NewWorkflowExecution {
-                    id: exec_id.as_uuid(),
+            start_or_load_workflow_execution(
+                &mut conn,
+                StartWorkflowParams {
                     workflow_name: "loud_wf",
                     workflow_id: &format!("loud-{i}"),
-                    run_id: uuid::Uuid::new_v4(),
-                    shard_id: 0,
+                    exec_id: ExecutionId::new(),
                     input: serde_json::json!({}),
                     parent_id: None,
                     queue_name: "default",
                     execution_timeout: None,
                     memo: None,
                     search_attrs: None,
-                    assigned_build_id: None,
-                })
-                .execute(&mut *conn)
-                .await
-                .expect("insert loud execution");
+                    reuse_policy: WorkflowIdReusePolicy::RejectDuplicate,
+                    trace_context: None,
+                    concurrency_key: Some(LOUD_KEY.to_string()),
+                    concurrency_limit: Some(LOUD_CAP),
+                },
+            )
+            .await
+            .expect("start loud workflow");
         }
 
-        // Quiet tenant: 2 instant tasks (no cap, or a high cap).
+        // Quiet tenant: 2 instant tasks with a high cap so they are never blocked.
         for i in 0..2u32 {
-            let exec_id = ExecutionId::new();
-            let mut p = EnqueueParams::new(
-                "default".to_string(),
-                TaskType::Workflow,
-                serde_json::json!({ "task": i }),
-            );
-            p.workflow_exec_id = Some(exec_id.as_uuid());
-            p.concurrency_key = Some(QUIET_KEY.to_string());
-            p.max_concurrent = Some(10);
-            queue::enqueue(&mut conn, &p).await.expect("enqueue quiet");
-
-            use diesel::prelude::*;
-            diesel::insert_into(harvest_workflow_executions::table)
-                .values(&autumn_harvest::models::NewWorkflowExecution {
-                    id: exec_id.as_uuid(),
+            start_or_load_workflow_execution(
+                &mut conn,
+                StartWorkflowParams {
                     workflow_name: "quiet_wf",
                     workflow_id: &format!("quiet-{i}"),
-                    run_id: uuid::Uuid::new_v4(),
-                    shard_id: 0,
+                    exec_id: ExecutionId::new(),
                     input: serde_json::json!({}),
                     parent_id: None,
                     queue_name: "default",
                     execution_timeout: None,
                     memo: None,
                     search_attrs: None,
-                    assigned_build_id: None,
-                })
-                .execute(&mut *conn)
-                .await
-                .expect("insert quiet execution");
+                    reuse_policy: WorkflowIdReusePolicy::RejectDuplicate,
+                    trace_context: None,
+                    concurrency_key: Some(QUIET_KEY.to_string()),
+                    concurrency_limit: Some(10),
+                },
+            )
+            .await
+            .expect("start quiet workflow");
         }
     }
 
-    let worker = Worker::new(
-        pool.clone(),
-        Arc::clone(&registry),
-        WorkerRuntimeConfig {
-            queues: vec!["default".to_string()],
-            max_concurrent_workflows: 20,
-            max_concurrent_activities: 20,
-            poll_interval: Duration::from_millis(50),
-            shutdown_grace_period: Duration::from_secs(10),
-            build_id: String::new(),
-            deployment_name: String::new(),
-            shard_assignments: None,
-        },
+    let worker = Arc::new(
+        Worker::new(
+            WorkerRuntimeConfig {
+                worker_id: "test-worker-concurrency-b".to_string(),
+                queues: vec!["default".to_string()],
+                notification_database_url: None,
+                max_concurrent_workflows: 20,
+                max_concurrent_activities: 20,
+                poll_interval: Duration::from_millis(50),
+                shutdown_timeout: Duration::from_secs(5),
+                cancellation_grace_period: Duration::from_secs(1),
+                sticky_timeout: Duration::ZERO,
+                max_local_activity_start_to_close: Duration::from_secs(60),
+                shard_assignments: vec![autumn_harvest::types::ShardId::new(0)],
+                worker_heartbeat_interval: Duration::from_secs(5),
+                build_id: String::new(),
+                deployment_name: None,
+                workflow_cache_size: 1000,
+            },
+            Arc::clone(&registry),
+        )
+        .expect("worker should build"),
     );
-    let _worker_handle = tokio::spawn(worker.run());
+    let _worker_handle = spawn_test_worker(Arc::clone(&worker), pool.clone());
 
     // The quiet tenant's tasks should complete within a few seconds (they are instant).
     let quiet_start = tokio::time::Instant::now();
@@ -6442,8 +6428,7 @@ async fn per_key_concurrency_does_not_block_other_keys() {
             .expect("quiet completed count")
             .into_iter()
             .next()
-            .map(|r| r.count)
-            .unwrap_or(0)
+            .map_or(0, |r| r.count)
         };
 
         if completed >= 2 {
@@ -6455,9 +6440,10 @@ async fn per_key_concurrency_does_not_block_other_keys() {
             break;
         }
 
-        if tokio::time::Instant::now() >= quiet_deadline {
-            panic!("quiet-tenant tasks did not complete within 10 s despite not being capped");
-        }
+        assert!(
+            tokio::time::Instant::now() < quiet_deadline,
+            "quiet-tenant tasks did not complete within 10 s despite not being capped"
+        );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 

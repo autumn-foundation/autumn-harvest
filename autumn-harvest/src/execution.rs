@@ -244,7 +244,6 @@ pub async fn start_or_load_workflow_execution(
     enqueue.required_build_id = assigned_build.clone();
     // ADR-0001 §3: store the caller's trace context so the worker can restore it.
     enqueue.trace_context.clone_from(&request.trace_context);
-    // Per-key concurrency cap (issue #247): propagate the resolved key and limit.
     enqueue.concurrency_key.clone_from(&request.concurrency_key);
     enqueue.max_concurrent = request.concurrency_limit;
 
