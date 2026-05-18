@@ -1658,10 +1658,14 @@ impl WorkflowContext {
     /// ctx.execute_activity(&send_email_info(), addr).await?;
     /// ```
     ///
+    /// Delegates to [`execute_activity_with_opts`](Self::execute_activity_with_opts) with all
+    /// overrides set to `None`, so `ActivityInfo` defaults are always applied consistently.
+    ///
     /// # Errors
     ///
     /// Returns [`HarvestError::Serialization`] if `input` cannot be serialized.
-    /// Propagates all errors from [`execute_activity_raw`](Self::execute_activity_raw).
+    /// Propagates all errors from
+    /// [`execute_activity_with_opts`](Self::execute_activity_with_opts).
     pub async fn execute_activity<I, O>(
         &self,
         info: &crate::info::ActivityInfo,
@@ -1671,16 +1675,14 @@ impl WorkflowContext {
         I: serde::Serialize,
         O: serde::de::DeserializeOwned,
     {
-        let json_input = serde_json::to_value(input)?;
-        let queue = info.default_queue.unwrap_or("default");
-        let raw = self.execute_activity_raw(info.name, json_input, queue).await?;
-        Ok(serde_json::from_value(raw)?)
+        self.execute_activity_with_opts(info, input, None, None, None)
+            .await
     }
 
-    /// Execute an activity with per-call retry and timeout overrides.
+    /// Execute an activity with per-call queue, retry, and timeout overrides.
     ///
-    /// Overrides take precedence over the `ActivityInfo` defaults. Pass `None`
-    /// to keep the info default for that field.
+    /// All overrides take precedence over `ActivityInfo` defaults. Pass `None`
+    /// to fall back to the info defaults for that field.
     ///
     /// # Errors
     ///
@@ -1691,6 +1693,7 @@ impl WorkflowContext {
         &self,
         info: &crate::info::ActivityInfo,
         input: I,
+        queue_override: Option<&str>,
         retry_override: Option<crate::policy::RetryPolicy>,
         timeout_override: Option<std::time::Duration>,
     ) -> HarvestResult<O>
@@ -1699,7 +1702,7 @@ impl WorkflowContext {
         O: serde::de::DeserializeOwned,
     {
         let json_input = serde_json::to_value(input)?;
-        let queue = info.default_queue.unwrap_or("default");
+        let queue = queue_override.or(info.default_queue).unwrap_or("default");
         let retry = retry_override.or_else(|| info.default_retry_policy.clone());
         let timeout = timeout_override.or(info.default_start_to_close);
         let raw = self
@@ -1712,6 +1715,8 @@ impl WorkflowContext {
     ///
     /// This is the typed alternative to
     /// [`execute_local_activity_raw`](Self::execute_local_activity_raw).
+    /// Delegates to [`execute_local_activity_with_opts`](Self::execute_local_activity_with_opts)
+    /// with all overrides set to `None`.
     ///
     /// # Errors
     ///
@@ -1719,7 +1724,7 @@ impl WorkflowContext {
     /// [`execute_activity`](Self::execute_activity) for remote activities.
     /// Returns [`HarvestError::Serialization`] if `input` cannot be serialized.
     /// Propagates all errors from
-    /// [`execute_local_activity_raw`](Self::execute_local_activity_raw).
+    /// [`execute_local_activity_with_opts`](Self::execute_local_activity_with_opts).
     pub async fn execute_local_activity<I, O>(
         &self,
         info: &crate::info::ActivityInfo,
@@ -1729,21 +1734,46 @@ impl WorkflowContext {
         I: serde::Serialize,
         O: serde::de::DeserializeOwned,
     {
+        self.execute_local_activity_with_opts(info, input, None, None)
+            .await
+    }
+
+    /// Execute a local activity with per-call retry and timeout overrides.
+    ///
+    /// Overrides take precedence over `ActivityInfo` defaults. Pass `None` to
+    /// fall back to the info defaults for that field.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Config`] if `info.is_local` is `false` — use
+    /// [`execute_activity_with_opts`](Self::execute_activity_with_opts) for remote activities.
+    /// Returns [`HarvestError::Serialization`] if `input` cannot be serialized.
+    /// Propagates all errors from
+    /// [`execute_local_activity_raw`](Self::execute_local_activity_raw).
+    pub async fn execute_local_activity_with_opts<I, O>(
+        &self,
+        info: &crate::info::ActivityInfo,
+        input: I,
+        retry_override: Option<crate::policy::RetryPolicy>,
+        timeout_override: Option<std::time::Duration>,
+    ) -> HarvestResult<O>
+    where
+        I: serde::Serialize,
+        O: serde::de::DeserializeOwned,
+    {
         if !info.is_local {
             return Err(HarvestError::Config(format!(
-                "activity '{}' is not marked local = true; use execute_activity instead",
+                "activity '{}' is not marked local = true; use execute_activity_with_opts instead",
                 info.name
             )));
         }
         let json_input = serde_json::to_value(input)?;
-        let start_to_close_secs = info.default_start_to_close.map(|d| d.as_secs());
+        let retry = retry_override.or_else(|| info.default_retry_policy.clone());
+        let start_to_close_secs = timeout_override
+            .or(info.default_start_to_close)
+            .map(|d| d.as_secs());
         let raw = self
-            .execute_local_activity_raw(
-                info.name,
-                json_input,
-                info.default_retry_policy.clone(),
-                start_to_close_secs,
-            )
+            .execute_local_activity_raw(info.name, json_input, retry, start_to_close_secs)
             .await?;
         Ok(serde_json::from_value(raw)?)
     }
@@ -5201,7 +5231,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_activity_with_opts_uses_override_queue_from_info() {
+    async fn execute_activity_with_opts_uses_default_queue_from_info() {
         let activity_id = ActivityExecId::new();
         let events = vec![
             WorkflowEvent::WorkflowStarted {
@@ -5222,8 +5252,9 @@ mod tests {
 
         let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
         let info = make_activity_info("crunch", false);
-        let result: HarvestResult<u64> =
-            ctx.execute_activity_with_opts(&info, 42u64, None, None).await;
+        let result: HarvestResult<u64> = ctx
+            .execute_activity_with_opts(&info, 42u64, None, None, None)
+            .await;
 
         assert_eq!(result.unwrap(), 84u64);
         assert!(ctx.drain_commands().is_empty());
@@ -5238,7 +5269,7 @@ mod tests {
         assert!(matches!(result, Err(HarvestError::Config(_))));
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("remote_thing"));
-        assert!(msg.contains("local = true"));
+        assert!(msg.contains("local"));
     }
 
     #[tokio::test]

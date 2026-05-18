@@ -102,6 +102,7 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let fn_name = &input_fn.sig.ident;
     let fn_name_str = fn_name.to_string();
     let companion_name = format_ident!("__autumn_workflow_info_{fn_name}");
+    let public_info_name = format_ident!("{fn_name}_info");
 
     // Collect parameter names after the first (ctx is first, rest are inputs).
     let params: Vec<_> = input_fn.sig.inputs.iter().skip(1).collect();
@@ -194,6 +195,17 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 execution_timeout: #execution_timeout_expr,
                 concurrency: #concurrency_expr,
             }
+        }
+
+        /// Returns the [`::autumn_harvest::WorkflowInfo`] for this workflow.
+        ///
+        /// Pass to typed dispatch helpers on [`::autumn_harvest::WorkflowContext`]:
+        ///
+        /// ```rust,ignore
+        /// let result = ctx.spawn_child_workflow(&#public_info_name(), input).await?;
+        /// ```
+        pub fn #public_info_name() -> ::autumn_harvest::WorkflowInfo {
+            #companion_name()
         }
     }
 }

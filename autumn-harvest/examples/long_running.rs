@@ -22,14 +22,13 @@ pub async fn poll_customer_exports(
         let cycle = state.get("cycle").and_then(Value::as_u64).unwrap_or(0);
         let cursor = state.get("cursor").cloned().unwrap_or(Value::Null);
 
-        let page = ctx
-            .execute_activity_raw(
-                "poll_customer_export_page",
+        let page: Value = ctx
+            .execute_activity(
+                &poll_customer_export_page_info(),
                 json!({
                     "cycle": cycle,
                     "cursor": cursor,
                 }),
-                "pollers",
             )
             .await?;
 
