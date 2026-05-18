@@ -334,7 +334,8 @@ impl MermaidExporter {
                 | WorkflowEvent::WorkflowCancelled { .. }
                 | WorkflowEvent::WorkflowContinuedAsNew { .. }
                 | WorkflowEvent::WorkflowResetFork { .. }
-                | WorkflowEvent::WorkflowResetTerminated { .. } => {
+                | WorkflowEvent::WorkflowResetTerminated { .. }
+                | WorkflowEvent::WorkflowExecutionTimedOut { .. } => {
                     self.handle_workflow_event(event)?;
                 }
                 WorkflowEvent::ActivityScheduled { .. }
@@ -429,6 +430,12 @@ impl MermaidExporter {
                 writeln!(
                     self.out,
                     "    Note over WF: Reset Terminated (fork: {reset_to_exec_id}): {safe_reason}"
+                )?;
+            }
+            WorkflowEvent::WorkflowExecutionTimedOut { deadline, .. } => {
+                writeln!(
+                    self.out,
+                    "    Note over WF: Execution Timed Out (deadline: {deadline})"
                 )?;
             }
             _ => unreachable!(),

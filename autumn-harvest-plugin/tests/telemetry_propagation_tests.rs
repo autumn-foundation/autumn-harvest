@@ -81,6 +81,10 @@ const INIT_SQL: &str = concat!(
     ),
     "\n",
     include_str!("../../autumn-harvest/migrations/20260514020000_harvest_task_activity_id/up.sql"),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260518000000_harvest_workflow_execution_timeout/up.sql"
+    ),
 );
 
 // -------------------------------------------------------------------------
@@ -168,6 +172,7 @@ async fn start_workflow_stores_captured_trace_context_in_task_queue() {
             name: "echo_workflow",
             module: "telemetry_propagation_tests",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            execution_timeout: None,
         }],
         vec![],
         Arc::new(HashMap::new()),
@@ -255,6 +260,7 @@ async fn start_workflow_leaves_trace_context_null_when_no_propagator() {
             name: "echo_workflow",
             module: "telemetry_propagation_tests",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            execution_timeout: None,
         }],
         vec![],
     ));

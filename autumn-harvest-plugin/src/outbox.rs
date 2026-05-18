@@ -297,6 +297,7 @@ pub(crate) async fn dispatch_workflow_start_request(
             search_attrs: request.search_attrs.clone(),
             reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
             trace_context: None,
+            max_execution_timeout_ceiling: None,
         },
     )
     .await?;

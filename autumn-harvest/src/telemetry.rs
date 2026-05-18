@@ -146,6 +146,13 @@ pub const ATTR_SIGNAL_NAME: &str = "harvest.signal.name";
 /// never be used as a metric label.
 pub const ATTR_TARGET_EXECUTION_ID: &str = "harvest.target.execution.id";
 
+/// Counter: incremented when a workflow execution is terminated because its
+/// `deadline_at` elapsed before the workflow completed.
+///
+/// Labeled by `workflow` (workflow name) and `queue` (task queue name).
+/// `execution.id` stays span-only per the cardinality rule (ADR-0001 §7).
+pub const METRIC_WORKFLOW_TIMEOUT: &str = "harvest.workflow.timeout";
+
 // ---------------------------------------------------------------------------
 // Metric label key constants
 // Used by MetricsRecorder implementations to avoid string literals at call
@@ -591,6 +598,13 @@ pub trait MetricsRecorder: Send + Sync {
     fn record_workflow_cache_miss(&self, workflow_name: &str, queue: &str) {
         let _ = (workflow_name, queue);
     }
+
+    /// A workflow execution was terminated because its `deadline_at` elapsed.
+    ///
+    /// Maps to the counter `harvest.workflow.timeout{workflow, queue}`.
+    fn record_workflow_timeout(&self, workflow_name: &str, queue: &str) {
+        let _ = (workflow_name, queue);
+    }
 }
 
 /// Default metrics recorder that discards every sample.
@@ -752,6 +766,7 @@ mod tests {
         assert_eq!(METRIC_SCHEDULE_RUNS, "harvest.schedule.runs");
         assert_eq!(METRIC_SCHEDULE_SKIPPED, "harvest.schedule.skipped");
         assert_eq!(METRIC_RETENTION_DELETED, "harvest.retention.deleted");
+        assert_eq!(METRIC_WORKFLOW_TIMEOUT, "harvest.workflow.timeout");
     }
 
     #[test]

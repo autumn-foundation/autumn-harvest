@@ -245,6 +245,9 @@ pub struct HarvestApiState {
     /// Per-query execution timeout (issue #234); derived from `WorkerConfig::query_timeout`
     /// at startup. Defaults to 5 s.
     query_timeout: Arc<Mutex<std::time::Duration>>,
+    /// Server-side ceiling on `execution_timeout` (issue #243).
+    /// `None` = no ceiling enforced.
+    max_workflow_execution_timeout: Arc<Mutex<Option<std::time::Duration>>>,
 }
 
 impl Default for HarvestApiState {
@@ -263,6 +266,7 @@ impl Default for HarvestApiState {
             workflow_result_notification_urls: Arc::default(),
             workflow_result_max_wait: Arc::new(Mutex::new(std::time::Duration::from_secs(30))),
             query_timeout: Arc::new(Mutex::new(std::time::Duration::from_secs(5))),
+            max_workflow_execution_timeout: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -312,6 +316,33 @@ impl HarvestApiState {
     pub fn query_timeout(&self) -> std::time::Duration {
         *self
             .query_timeout
+            .lock()
+            .expect("harvest api state lock poisoned")
+    }
+
+    /// Set the server-side ceiling for workflow execution timeouts (issue #243).
+    ///
+    /// Call this during startup from the plugin to propagate
+    /// `BuiltHarvest::max_workflow_execution_timeout` into the API state so the
+    /// `POST /workflows` handler can apply the cap to every start request.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    pub fn set_max_workflow_execution_timeout(&self, ceiling: Option<std::time::Duration>) {
+        *self
+            .max_workflow_execution_timeout
+            .lock()
+            .expect("harvest api state lock poisoned") = ceiling;
+    }
+
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    #[must_use]
+    pub fn max_workflow_execution_timeout(&self) -> Option<std::time::Duration> {
+        *self
+            .max_workflow_execution_timeout
             .lock()
             .expect("harvest api state lock poisoned")
     }
@@ -3645,6 +3676,9 @@ async fn start_workflow(
             search_attrs: request.search_attrs.clone(),
             reuse_policy,
             trace_context: trace_ctx,
+            max_execution_timeout_ceiling: api_state
+                .max_workflow_execution_timeout()
+                .and_then(|d| chrono::Duration::from_std(d).ok()),
         },
     )
     .await;
@@ -4976,6 +5010,7 @@ async fn create_workflow_schedule(
         jitter: std::time::Duration::from_secs(request.jitter_secs),
         overlap_policy,
         buffer_all_max: request.buffer_all_max,
+        execution_timeout: None,
     };
     let entry = match upsert_workflow_schedule_and_read_back(&mut conn, &ws).await {
         Ok(e) => e,
@@ -5800,6 +5835,7 @@ async fn schedule_backfill(
                         search_attrs: None,
                         reuse_policy: WorkflowIdReusePolicy::RejectDuplicate,
                         trace_context: None,
+                        max_execution_timeout_ceiling: None,
                     },
                 )
                 .await;
@@ -5900,6 +5936,7 @@ async fn schedule_backfill(
                         search_attrs: None,
                         reuse_policy: autumn_harvest::types::WorkflowIdReusePolicy::RejectDuplicate,
                         trace_context: None,
+                        max_execution_timeout_ceiling: None,
                     },
                 )
                 .await;
@@ -8792,6 +8829,7 @@ mod tests {
                 name: "workflow_only",
                 module: "tests",
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+                execution_timeout: None,
             }],
             vec![],
         ));
@@ -9306,6 +9344,7 @@ mod tests {
                 search_attrs: None,
                 reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
                 trace_context: None,
+                max_execution_timeout_ceiling: None,
             },
         )
         .await

@@ -183,11 +183,13 @@ fn build_registry() -> Arc<HandlerRegistry> {
                 name: "telemetry_master_workflow",
                 module: "telemetry_span_tests",
                 handler: telemetry_master_workflow,
+                execution_timeout: None,
             },
             WorkflowInfo {
                 name: "telem_child_wf",
                 module: "telemetry_span_tests",
                 handler: telem_child_wf,
+                execution_timeout: None,
             },
         ],
         vec![
@@ -285,6 +287,7 @@ fn all_adr_0001_span_kinds_are_emitted() {
                     search_attrs: None,
                     reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
                     trace_context: None,
+                    max_execution_timeout_ceiling: None,
                 },
             )
             .await

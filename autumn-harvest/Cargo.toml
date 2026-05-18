@@ -73,6 +73,10 @@ name = "replayer_tests"
 required-features = ["testing"]
 
 [[test]]
+name = "workflow_test_env_tests"
+required-features = ["testing"]
+
+[[test]]
 name = "dag_unified_tests"
 required-features = ["testing", "unified-dag-execution"]
 

@@ -438,6 +438,7 @@ fn emit_workflow_companion(
                         Ok(::autumn_harvest::serde_json::Value::Null)
                     })
                 },
+                execution_timeout: None,
             }
         }
     }

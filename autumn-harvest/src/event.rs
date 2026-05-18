@@ -383,6 +383,26 @@ pub enum WorkflowEvent {
         /// Machine-readable reason code (`"target_terminal"` or `"target_unknown"`).
         reason_code: String,
     },
+
+    // ── Workflow execution timeout (issue #243) ───────────────────────────────
+    /// The workflow execution exceeded its configured `execution_timeout` wall-clock
+    /// deadline and was forcibly terminated by the timeout scanner.
+    ///
+    /// This is a **terminal** lifecycle event: once appended, the execution row
+    /// transitions to `TIMED_OUT` and no further events are written.
+    ///
+    /// ## Replay determinism
+    ///
+    /// The `deadline` field is the absolute UTC instant computed at start time
+    /// (`started_at + execution_timeout`). Re-running history always produces the
+    /// same `WorkflowExecutionTimedOut` event without consulting the live clock —
+    /// the timeout decision is derivable from the stored `deadline` alone.
+    WorkflowExecutionTimedOut {
+        /// The absolute deadline that was exceeded (`started_at + execution_timeout`).
+        deadline: DateTime<Utc>,
+        /// The actual wall-clock time when the scanner detected and enforced the timeout.
+        timed_out_at: DateTime<Utc>,
+    },
 }
 
 impl WorkflowEvent {
@@ -425,6 +445,7 @@ impl WorkflowEvent {
             Self::ExternalSignalRequested { .. } => "ExternalSignalRequested",
             Self::ExternalSignalDelivered { .. } => "ExternalSignalDelivered",
             Self::ExternalSignalFailed { .. } => "ExternalSignalFailed",
+            Self::WorkflowExecutionTimedOut { .. } => "WorkflowExecutionTimedOut",
         }
     }
 
@@ -440,6 +461,7 @@ impl WorkflowEvent {
                 | Self::WorkflowCancelled { .. }
                 | Self::WorkflowContinuedAsNew { .. }
                 | Self::WorkflowResetTerminated { .. }
+                | Self::WorkflowExecutionTimedOut { .. }
         )
     }
 }
@@ -771,11 +793,15 @@ mod tests {
                 signal_id: crate::types::ExternalSignalId::new(),
                 reason_code: "target_terminal".into(),
             },
+            WorkflowEvent::WorkflowExecutionTimedOut {
+                deadline: Utc::now(),
+                timed_out_at: Utc::now(),
+            },
         ];
 
-        assert_eq!(events.len(), 33);
+        assert_eq!(events.len(), 34);
         let names: HashSet<_> = events.iter().map(WorkflowEvent::type_name).collect();
-        assert_eq!(names.len(), 33, "duplicate type names detected");
+        assert_eq!(names.len(), 34, "duplicate type names detected");
     }
 
     #[test]
@@ -920,5 +946,50 @@ mod tests {
             }
             .is_terminal_lifecycle()
         );
+    }
+
+    // ── WorkflowExecutionTimedOut tests (issue #243) ──────────────────────────
+
+    #[test]
+    fn workflow_execution_timed_out_round_trips() -> Result<(), serde_json::Error> {
+        let deadline = Utc::now();
+        let timed_out_at = Utc::now();
+        let event = WorkflowEvent::WorkflowExecutionTimedOut {
+            deadline,
+            timed_out_at,
+        };
+
+        assert_eq!(event.type_name(), "WorkflowExecutionTimedOut");
+        assert!(event.is_terminal_lifecycle(), "timed-out must be terminal");
+
+        let json = serde_json::to_string(&event)?;
+        assert!(
+            json.contains("WorkflowExecutionTimedOut"),
+            "type tag must appear in JSON"
+        );
+        assert!(
+            json.contains("deadline"),
+            "deadline field must be serialised"
+        );
+        assert!(
+            json.contains("timed_out_at"),
+            "timed_out_at field must be serialised"
+        );
+
+        let back: WorkflowEvent = serde_json::from_str(&json)?;
+        assert!(
+            matches!(back, WorkflowEvent::WorkflowExecutionTimedOut { .. }),
+            "must deserialise to the correct variant"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn workflow_execution_timed_out_type_name_is_stable() {
+        let e = WorkflowEvent::WorkflowExecutionTimedOut {
+            deadline: Utc::now(),
+            timed_out_at: Utc::now(),
+        };
+        assert_eq!(e.type_name(), "WorkflowExecutionTimedOut");
     }
 }

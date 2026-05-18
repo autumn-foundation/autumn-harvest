@@ -5,9 +5,37 @@
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
-use syn::ItemFn;
+use syn::{ItemFn, LitStr, parse::Parser as _};
 
-pub fn workflow_macro(_attr: TokenStream, item: TokenStream) -> TokenStream {
+struct WorkflowAttrs {
+    execution_timeout: Option<String>,
+}
+
+fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
+    let mut result = WorkflowAttrs {
+        execution_timeout: None,
+    };
+
+    syn::meta::parser(|meta| {
+        if meta.path.is_ident("execution_timeout") {
+            let value: LitStr = meta.value()?.parse()?;
+            result.execution_timeout = Some(value.value());
+            Ok(())
+        } else {
+            Err(meta.error("unsupported attribute: expected execution_timeout"))
+        }
+    })
+    .parse2(attr)?;
+
+    Ok(result)
+}
+
+pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let attrs = match parse_attrs(attr) {
+        Ok(a) => a,
+        Err(e) => return e.to_compile_error(),
+    };
+
     let input_fn: ItemFn = match syn::parse2(item) {
         Ok(f) => f,
         Err(e) => return e.to_compile_error(),
@@ -80,6 +108,12 @@ pub fn workflow_macro(_attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
+    // Emit execution_timeout as Option<Duration> using the task_duration helper.
+    let execution_timeout_expr = attrs.execution_timeout.as_deref().map_or_else(
+        || quote! { None },
+        |s| quote! { ::autumn_harvest::task_duration(#s) },
+    );
+
     quote! {
         #input_fn
 
@@ -93,6 +127,7 @@ pub fn workflow_macro(_attr: TokenStream, item: TokenStream) -> TokenStream {
                         #dispatch
                     })
                 },
+                execution_timeout: #execution_timeout_expr,
             }
         }
     }

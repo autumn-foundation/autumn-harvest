@@ -121,6 +121,7 @@ async fn greet(
                 search_attrs: None,
                 reuse_policy: WorkflowIdReusePolicy::RejectDuplicate,
                 trace_context: None,
+                max_execution_timeout_ceiling: None,
             },
         )
         .await
