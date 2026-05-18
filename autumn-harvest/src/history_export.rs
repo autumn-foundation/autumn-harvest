@@ -374,6 +374,11 @@ impl MermaidExporter {
                 | WorkflowEvent::UpdateFailed { .. } => {
                     self.handle_update_event(event)?;
                 }
+                WorkflowEvent::ExternalSignalRequested { .. }
+                | WorkflowEvent::ExternalSignalDelivered { .. }
+                | WorkflowEvent::ExternalSignalFailed { .. } => {
+                    self.handle_external_signal_event(event)?;
+                }
             }
         }
         Ok(())
@@ -697,6 +702,42 @@ impl MermaidExporter {
                 writeln!(
                     self.out,
                     "    Note over WF: Update Failed (id: {update_id}): {safe_error}"
+                )?;
+            }
+            _ => unreachable!(),
+        }
+        Ok(())
+    }
+
+    fn handle_external_signal_event(
+        &mut self,
+        event: &WorkflowEvent,
+    ) -> Result<(), std::fmt::Error> {
+        match event {
+            WorkflowEvent::ExternalSignalRequested {
+                signal_id,
+                target,
+                signal_name,
+                ..
+            } => {
+                writeln!(
+                    self.out,
+                    "    Note over WF: Signal Requested: {signal_name} → {target} (id: {signal_id})"
+                )?;
+            }
+            WorkflowEvent::ExternalSignalDelivered { signal_id } => {
+                writeln!(
+                    self.out,
+                    "    Note over WF: Signal Delivered (id: {signal_id})"
+                )?;
+            }
+            WorkflowEvent::ExternalSignalFailed {
+                signal_id,
+                reason_code,
+            } => {
+                writeln!(
+                    self.out,
+                    "    Note over WF: Signal Failed ({reason_code}) (id: {signal_id})"
                 )?;
             }
             _ => unreachable!(),

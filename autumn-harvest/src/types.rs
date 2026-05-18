@@ -461,6 +461,54 @@ impl FromStr for ExternalActivityToken {
     }
 }
 
+/// Unique identifier for a single `signal_external_workflow` invocation.
+///
+/// Generated when the workflow calls `ctx.signal_external_workflow(...)` and
+/// embedded in the `ExternalSignalRequested`, `ExternalSignalDelivered`, and
+/// `ExternalSignalFailed` events so the request can be correlated with its
+/// outcome during replay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ExternalSignalId(Uuid);
+
+impl ExternalSignalId {
+    /// Creates a new, random `ExternalSignalId` using a v4 UUID.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+
+    /// Returns the underlying `Uuid`.
+    #[must_use]
+    pub const fn as_uuid(&self) -> Uuid {
+        self.0
+    }
+
+    /// Wraps an existing `Uuid` as an `ExternalSignalId`.
+    #[must_use]
+    pub const fn from_uuid(id: Uuid) -> Self {
+        Self(id)
+    }
+}
+
+impl Default for ExternalSignalId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for ExternalSignalId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl FromStr for ExternalSignalId {
+    type Err = uuid::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Uuid::parse_str(s).map(Self)
+    }
+}
+
 /// Durable timer handle within a workflow.
 ///
 /// ## Examples

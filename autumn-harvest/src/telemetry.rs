@@ -124,6 +124,28 @@ pub const METRIC_WORKFLOW_CACHE_HIT: &str = "harvest.workflow.cache_hit";
 /// the existing cardinality rule (ADR-0001 §7).
 pub const METRIC_WORKFLOW_CACHE_MISS: &str = "harvest.workflow.cache_miss";
 
+/// Counter: incremented once per `signal_external_workflow` call after the
+/// terminal outcome is recorded in `harvest_events`.
+///
+/// Labels: `outcome` (`"delivered"` or `"failed"`), `reason_code` (only set
+/// when `outcome == "failed"`; values: `"target_terminal"`, `"target_unknown"`).
+///
+/// Per ADR-0001 §7, `harvest.target.execution.id` and `harvest.signal.id` are
+/// **span-only** and must never appear as metric labels.
+pub const METRIC_EXTERNAL_SIGNAL_SENT: &str = "harvest.workflow.external_signal.sent";
+
+/// OpenTelemetry span attribute: the signal name for `signal_external_workflow` spans.
+///
+/// Used in `harvest.signal.send` child spans. Low-cardinality (equals the
+/// string literal passed to `ctx.signal_external_workflow`).
+pub const ATTR_SIGNAL_NAME: &str = "harvest.signal.name";
+
+/// OpenTelemetry span attribute: the target execution ID for cross-workflow signal spans.
+///
+/// Per ADR-0001 §7 cardinality rule this attribute is **span-only** and must
+/// never be used as a metric label.
+pub const ATTR_TARGET_EXECUTION_ID: &str = "harvest.target.execution.id";
+
 /// Counter: incremented when a workflow execution is terminated because its
 /// `deadline_at` elapsed before the workflow completed.
 ///

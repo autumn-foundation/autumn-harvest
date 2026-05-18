@@ -21,7 +21,8 @@ use crate::event::WorkflowEvent;
 use crate::query::QueryRegistry;
 use crate::replay::{HistoryMatch, HistoryMatcher};
 use crate::types::{
-    ActivityExecId, ExecutionId, ExternalActivityToken, IdempotencyKey, TimerId, UpdateId,
+    ActivityExecId, ExecutionId, ExternalActivityToken, ExternalSignalId, IdempotencyKey, TimerId,
+    UpdateId,
 };
 use crate::update::{BoxUpdateHandler, BoxUpdateValidator, UpdateRegistry};
 
@@ -288,10 +289,35 @@ pub enum WorkflowCommand {
         /// Per-key merge patch: `Some(v)` → set/overwrite, `None` → remove.
         patch: std::collections::HashMap<String, Option<Value>>,
     },
+    /// Deliver a named signal to another running workflow by execution ID.
+    ///
+    /// The worker resolves this command by:
+    /// 1. Appending `ExternalSignalRequested` to the caller's history (unless
+    ///    `already_requested == true`, which indicates a crash-recovery cycle).
+    /// 2. Inserting a row in `harvest_signals` (same-shard) or writing to the
+    ///    outbox table (cross-shard).
+    /// 3. Appending `ExternalSignalDelivered` or `ExternalSignalFailed { reason_code }`.
+    /// 4. Sending the outcome through `result_tx`.
+    SignalExternalWorkflow {
+        /// Correlation ID shared across all three history events.
+        signal_id: ExternalSignalId,
+        /// Target workflow execution to signal.
+        target: ExecutionId,
+        /// Signal channel name on the receiver.
+        signal_name: String,
+        /// JSON payload to deliver.
+        payload: Value,
+        /// Outcome channel: `Ok(())` on delivery, `Err(reason_code)` on failure.
+        result_tx: oneshot::Sender<Result<(), String>>,
+        /// When `true`, `ExternalSignalRequested` is already in history and must
+        /// not be appended again (crash-recovery path).
+        already_requested: bool,
+    },
 }
 
 // Manual Debug because oneshot::Sender is not Debug.
 impl std::fmt::Debug for WorkflowCommand {
+    #[allow(clippy::too_many_lines)]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ScheduleActivity {
@@ -382,6 +408,19 @@ impl std::fmt::Debug for WorkflowCommand {
                     &result.as_ref().map(|_| "<output>").map_err(String::as_str),
                 )
                 .finish(),
+            Self::SignalExternalWorkflow {
+                signal_id,
+                target,
+                signal_name,
+                already_requested,
+                ..
+            } => f
+                .debug_struct("SignalExternalWorkflow")
+                .field("signal_id", signal_id)
+                .field("target", target)
+                .field("signal_name", signal_name)
+                .field("already_requested", already_requested)
+                .finish_non_exhaustive(),
         }
     }
 }
@@ -770,7 +809,7 @@ impl WorkflowContext {
         self.matcher
             .lock()
             .expect("matcher lock poisoned")
-            .is_replaying()
+            .has_buffered_history()
     }
 
     /// Access typed shared state (e.g., email clients, config) injected via the builder.
@@ -1002,7 +1041,9 @@ impl WorkflowContext {
             | HistoryMatch::ActivityInProgress { .. }
             | HistoryMatch::AwaitingExternalCompletion { .. }
             | HistoryMatch::ChildInProgress { .. }
-            | HistoryMatch::LocalActivityInProgress { .. } => {
+            | HistoryMatch::LocalActivityInProgress { .. }
+            | HistoryMatch::ExternalSignalInProgress { .. }
+            | HistoryMatch::ExternalSignalFailed { .. } => {
                 unreachable!("match_side_effect only returns Matched, Diverged or NoMatch")
             }
 
@@ -1153,10 +1194,12 @@ impl WorkflowContext {
 
             HistoryMatch::AwaitingExternalCompletion { .. }
             | HistoryMatch::ChildInProgress { .. }
-            | HistoryMatch::LocalActivityInProgress { .. } => {
+            | HistoryMatch::LocalActivityInProgress { .. }
+            | HistoryMatch::ExternalSignalInProgress { .. }
+            | HistoryMatch::ExternalSignalFailed { .. } => {
                 unreachable!(
                     "match_activity never returns AwaitingExternalCompletion, ChildInProgress, \
-                     or LocalActivityInProgress"
+                     LocalActivityInProgress, or ExternalSignalInProgress"
                 )
             }
 
@@ -1249,10 +1292,12 @@ impl WorkflowContext {
             }
             HistoryMatch::AwaitingExternalCompletion { .. }
             | HistoryMatch::ChildInProgress { .. }
-            | HistoryMatch::LocalActivityInProgress { .. } => {
+            | HistoryMatch::LocalActivityInProgress { .. }
+            | HistoryMatch::ExternalSignalInProgress { .. }
+            | HistoryMatch::ExternalSignalFailed { .. } => {
                 unreachable!(
                     "match_activity never returns AwaitingExternalCompletion, \
-                     ChildInProgress, or LocalActivityInProgress"
+                     ChildInProgress, LocalActivityInProgress, or ExternalSignalInProgress"
                 )
             }
             HistoryMatch::NoMatch => {
@@ -1342,9 +1387,12 @@ impl WorkflowContext {
 
             HistoryMatch::AwaitingExternalCompletion { .. }
             | HistoryMatch::ActivityInProgress { .. }
-            | HistoryMatch::ChildInProgress { .. } => {
+            | HistoryMatch::ChildInProgress { .. }
+            | HistoryMatch::ExternalSignalInProgress { .. }
+            | HistoryMatch::ExternalSignalFailed { .. } => {
                 unreachable!(
-                    "match_local_activity never returns AwaitingExternalCompletion or ChildInProgress"
+                    "match_local_activity never returns AwaitingExternalCompletion, \
+                     ChildInProgress, or ExternalSignalInProgress"
                 )
             }
 
@@ -1469,7 +1517,9 @@ impl WorkflowContext {
             | HistoryMatch::ActivityInProgress { .. }
             | HistoryMatch::AwaitingExternalCompletion { .. }
             | HistoryMatch::ChildInProgress { .. }
-            | HistoryMatch::LocalActivityInProgress { .. } => {
+            | HistoryMatch::LocalActivityInProgress { .. }
+            | HistoryMatch::ExternalSignalInProgress { .. }
+            | HistoryMatch::ExternalSignalFailed { .. } => {
                 unreachable!("timers do not fail or time out in history matching")
             }
 
@@ -1525,7 +1575,9 @@ impl WorkflowContext {
             HistoryMatch::TimedOut { .. }
             | HistoryMatch::ActivityInProgress { .. }
             | HistoryMatch::AwaitingExternalCompletion { .. }
-            | HistoryMatch::LocalActivityInProgress { .. } => {
+            | HistoryMatch::LocalActivityInProgress { .. }
+            | HistoryMatch::ExternalSignalInProgress { .. }
+            | HistoryMatch::ExternalSignalFailed { .. } => {
                 unreachable!("child workflows do not time out in match_child_workflow")
             }
             HistoryMatch::Diverged { expected, actual } => Err(HarvestError::NonDeterministic(
@@ -1618,7 +1670,9 @@ impl WorkflowContext {
             | HistoryMatch::ActivityInProgress { .. }
             | HistoryMatch::AwaitingExternalCompletion { .. }
             | HistoryMatch::ChildInProgress { .. }
-            | HistoryMatch::LocalActivityInProgress { .. } => Err(HarvestError::NonDeterministic(
+            | HistoryMatch::LocalActivityInProgress { .. }
+            | HistoryMatch::ExternalSignalInProgress { .. }
+            | HistoryMatch::ExternalSignalFailed { .. } => Err(HarvestError::NonDeterministic(
                 "signal history contains unexpected failure".into(),
             )),
             HistoryMatch::NoMatch => {
@@ -1635,6 +1689,150 @@ impl WorkflowContext {
                     ))
                 })
             }
+        }
+    }
+
+    // ── Cross-workflow signal dispatch ────────────────────────────────────
+
+    /// Send a named signal with a typed payload to another running workflow.
+    ///
+    /// This is the deterministic, replay-safe primitive for saga choreography.
+    /// Unlike calling the management API from inside an activity, this method
+    /// leaves a durable audit trail in `harvest_events` and returns the recorded
+    /// outcome on replay without re-issuing any side effects.
+    ///
+    /// # Determinism contract
+    ///
+    /// - **First live call**: appends `ExternalSignalRequested` to the caller's
+    ///   history, attempts delivery, then appends `ExternalSignalDelivered` or
+    ///   `ExternalSignalFailed { reason_code }`.
+    /// - **Replay**: returns the recorded outcome directly from history.
+    /// - **Crash recovery**: if `ExternalSignalRequested` is in history but no
+    ///   terminal event follows, the worker re-attempts delivery and appends the
+    ///   terminal event.
+    ///
+    /// # Cross-shard delivery
+    ///
+    /// When `target.shard()` differs from the caller's shard, the worker uses
+    /// the outbox pattern (no cross-shard transaction). Delivery is at-least-once
+    /// from the caller's perspective.
+    ///
+    /// # Errors
+    ///
+    /// - [`HarvestError::ExternalSignalFailed`] with `reason_code = "target_terminal"`
+    ///   if the target workflow is already in a terminal state.
+    /// - [`HarvestError::ExternalSignalFailed`] with `reason_code = "target_unknown"`
+    ///   if no execution with `target` is found within the grace window.
+    /// - [`HarvestError::NonDeterministic`] if the history at this position does
+    ///   not match the requested target/signal combination.
+    /// - [`HarvestError::Cancelled`] if the result channel is dropped before the
+    ///   worker resolves this command.
+    /// - [`HarvestError::Serialization`] if `payload` cannot be serialized to JSON.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    pub async fn signal_external_workflow<P: serde::Serialize>(
+        &self,
+        target: ExecutionId,
+        signal_name: &str,
+        payload: P,
+    ) -> HarvestResult<()> {
+        use crate::replay::HistoryMatch;
+
+        let history_match = self.match_history(|m| m.match_external_signal(target, signal_name));
+
+        match history_match {
+            HistoryMatch::Matched { .. } => Ok(()),
+
+            HistoryMatch::ExternalSignalFailed {
+                signal_id,
+                reason_code,
+            } => Err(HarvestError::ExternalSignalFailed {
+                signal_id,
+                target,
+                signal_name: signal_name.to_string(),
+                reason_code,
+            }),
+
+            HistoryMatch::Diverged { expected, actual } => Err(HarvestError::NonDeterministic(
+                format!("external signal mismatch: expected {expected}, got {actual}"),
+            )),
+
+            // Crash-recovery: ExternalSignalRequested is already durable; re-attempt delivery
+            // using the recorded payload so the target receives the same data regardless of
+            // any code changes to the payload expression between the crash and recovery.
+            HistoryMatch::ExternalSignalInProgress {
+                signal_id,
+                payload: recorded_payload,
+            } => {
+                self.dispatch_signal_command(target, signal_name, recorded_payload, signal_id, true)
+                    .await
+            }
+
+            // First live call: generate a new signal_id and dispatch.
+            HistoryMatch::NoMatch => {
+                self.check_strict_replay_no_match(&format!(
+                    "ExternalSignalRequested(target={target}, signal={signal_name})"
+                ))?;
+                self.dispatch_signal_command(
+                    target,
+                    signal_name,
+                    payload,
+                    ExternalSignalId::new(),
+                    false,
+                )
+                .await
+            }
+
+            HistoryMatch::Failed { .. }
+            | HistoryMatch::ActivityInProgress { .. }
+            | HistoryMatch::AwaitingExternalCompletion { .. }
+            | HistoryMatch::ChildInProgress { .. }
+            | HistoryMatch::LocalActivityInProgress { .. }
+            | HistoryMatch::TimedOut { .. } => {
+                unreachable!(
+                    "match_external_signal never returns Failed, ActivityInProgress, \
+                     AwaitingExternalCompletion, ChildInProgress, LocalActivityInProgress, \
+                     or TimedOut"
+                )
+            }
+        }
+    }
+
+    /// Push a `SignalExternalWorkflow` command and await its resolution.
+    ///
+    /// Shared by the crash-recovery (`already_requested = true`) and first-call
+    /// (`already_requested = false`) dispatch paths.
+    async fn dispatch_signal_command<P: serde::Serialize>(
+        &self,
+        target: ExecutionId,
+        signal_name: &str,
+        payload: P,
+        signal_id: ExternalSignalId,
+        already_requested: bool,
+    ) -> HarvestResult<()> {
+        let payload_json = serde_json::to_value(&payload)?;
+        let (tx, rx) = oneshot::channel();
+        self.push_command(WorkflowCommand::SignalExternalWorkflow {
+            signal_id,
+            target,
+            signal_name: signal_name.to_string(),
+            payload: payload_json,
+            result_tx: tx,
+            already_requested,
+        });
+        match rx.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(reason_code)) => Err(HarvestError::ExternalSignalFailed {
+                signal_id,
+                target,
+                signal_name: signal_name.to_string(),
+                reason_code,
+            }),
+            Err(_) => Err(HarvestError::Cancelled(format!(
+                "signal '{signal_name}' to {target}: result channel dropped"
+            ))),
         }
     }
 
@@ -1750,9 +1948,12 @@ impl WorkflowContext {
 
             HistoryMatch::ActivityInProgress { .. }
             | HistoryMatch::ChildInProgress { .. }
-            | HistoryMatch::LocalActivityInProgress { .. } => {
+            | HistoryMatch::LocalActivityInProgress { .. }
+            | HistoryMatch::ExternalSignalInProgress { .. }
+            | HistoryMatch::ExternalSignalFailed { .. } => {
                 unreachable!(
-                    "match_external_activity never returns ChildInProgress or LocalActivityInProgress"
+                    "match_external_activity never returns ChildInProgress, \
+                     LocalActivityInProgress, or ExternalSignalInProgress"
                 )
             }
         }
@@ -1804,7 +2005,9 @@ impl WorkflowContext {
             | HistoryMatch::ActivityInProgress { .. }
             | HistoryMatch::AwaitingExternalCompletion { .. }
             | HistoryMatch::ChildInProgress { .. }
-            | HistoryMatch::LocalActivityInProgress { .. } => Err(HarvestError::NonDeterministic(
+            | HistoryMatch::LocalActivityInProgress { .. }
+            | HistoryMatch::ExternalSignalInProgress { .. }
+            | HistoryMatch::ExternalSignalFailed { .. } => Err(HarvestError::NonDeterministic(
                 "continue_as_new history contains unexpected terminal state".into(),
             )),
             HistoryMatch::NoMatch => {
@@ -4523,6 +4726,273 @@ mod tests {
         assert!(
             ctx.drain_commands().is_empty(),
             "empty patch emits no command"
+        );
+    }
+
+    // ── signal_external_workflow tests (issue #330) ───────────────────────
+
+    #[tokio::test]
+    async fn signal_external_workflow_live_mode_emits_command() {
+        let target = ExecutionId::new();
+
+        // Signal delivery never happens in live mode without a worker resolving
+        // the oneshot. We just want to verify the command is pushed and serialization
+        // works. We do this by dropping the context after pushing the command.
+        let target_clone = target;
+        let (cmds, target_id) = {
+            // Spawn a task so we can drive the future without blocking.
+            let ctx = WorkflowContext::new_test();
+            let ctx_ref = &ctx;
+            // Run signal_external_workflow concurrently; collect the command
+            // before it awaits.
+            let cmd_fut = ctx_ref.signal_external_workflow(
+                target_clone,
+                "tenant_cancel",
+                serde_json::json!({"reason": "billing_lapse"}),
+            );
+            // The future won't finish without a worker; we just need the command pushed.
+            // Drop the future after yielding once.
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(1), cmd_fut).await;
+            (ctx.drain_commands(), target_clone)
+        };
+
+        assert_eq!(cmds.len(), 1, "one SignalExternalWorkflow command expected");
+        match &cmds[0] {
+            WorkflowCommand::SignalExternalWorkflow {
+                target,
+                signal_name,
+                already_requested,
+                ..
+            } => {
+                assert_eq!(*target, target_id);
+                assert_eq!(signal_name, "tenant_cancel");
+                assert!(
+                    !already_requested,
+                    "first call should not be already_requested"
+                );
+            }
+            other => panic!("expected SignalExternalWorkflow, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn signal_external_workflow_replays_delivered_outcome() {
+        let signal_id = crate::types::ExternalSignalId::new();
+        let target = ExecutionId::new();
+
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::ExternalSignalRequested {
+                signal_id,
+                target,
+                signal_name: "tenant_cancel".into(),
+                payload: serde_json::json!({"reason": "billing_lapse"}),
+            },
+            WorkflowEvent::ExternalSignalDelivered { signal_id },
+        ];
+
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let result = ctx
+            .signal_external_workflow(
+                target,
+                "tenant_cancel",
+                serde_json::json!({"reason": "billing_lapse"}),
+            )
+            .await;
+
+        assert!(result.is_ok(), "delivered history should return Ok(())");
+        assert!(ctx.drain_commands().is_empty(), "replay emits no commands");
+    }
+
+    #[tokio::test]
+    async fn signal_external_workflow_replays_failed_outcome_target_terminal() {
+        let signal_id = crate::types::ExternalSignalId::new();
+        let target = ExecutionId::new();
+
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::ExternalSignalRequested {
+                signal_id,
+                target,
+                signal_name: "cancel".into(),
+                payload: Value::Null,
+            },
+            WorkflowEvent::ExternalSignalFailed {
+                signal_id,
+                reason_code: "target_terminal".into(),
+            },
+        ];
+
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let result = ctx
+            .signal_external_workflow(target, "cancel", serde_json::Value::Null)
+            .await;
+
+        assert!(result.is_err(), "failed history should return Err");
+        match result.unwrap_err() {
+            HarvestError::ExternalSignalFailed { reason_code, .. } => {
+                assert_eq!(reason_code, "target_terminal");
+            }
+            other => panic!("expected ExternalSignalFailed, got {other:?}"),
+        }
+        assert!(ctx.drain_commands().is_empty(), "replay emits no commands");
+    }
+
+    #[tokio::test]
+    async fn signal_external_workflow_replays_failed_outcome_target_unknown() {
+        let signal_id = crate::types::ExternalSignalId::new();
+        let target = ExecutionId::new();
+
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::ExternalSignalRequested {
+                signal_id,
+                target,
+                signal_name: "notify".into(),
+                payload: Value::Null,
+            },
+            WorkflowEvent::ExternalSignalFailed {
+                signal_id,
+                reason_code: "target_unknown".into(),
+            },
+        ];
+
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let result = ctx
+            .signal_external_workflow(target, "notify", serde_json::Value::Null)
+            .await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            HarvestError::ExternalSignalFailed { reason_code, .. } => {
+                assert_eq!(reason_code, "target_unknown");
+            }
+            other => panic!("expected ExternalSignalFailed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn signal_external_workflow_nondeterminism_wrong_signal_name() {
+        let signal_id = crate::types::ExternalSignalId::new();
+        let target = ExecutionId::new();
+
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::ExternalSignalRequested {
+                signal_id,
+                target,
+                signal_name: "cancel".into(),
+                payload: Value::Null,
+            },
+            WorkflowEvent::ExternalSignalDelivered { signal_id },
+        ];
+
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        // Wrong signal name: should detect non-determinism
+        let result = ctx
+            .signal_external_workflow(target, "different_signal", serde_json::Value::Null)
+            .await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            HarvestError::NonDeterministic(msg) => {
+                assert!(msg.contains("external signal mismatch"), "msg: {msg}");
+            }
+            other => panic!("expected NonDeterministic, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn signal_external_workflow_nondeterminism_wrong_target() {
+        let signal_id = crate::types::ExternalSignalId::new();
+        let target = ExecutionId::new();
+        let other_target = ExecutionId::new();
+
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::ExternalSignalRequested {
+                signal_id,
+                target,
+                signal_name: "cancel".into(),
+                payload: Value::Null,
+            },
+            WorkflowEvent::ExternalSignalDelivered { signal_id },
+        ];
+
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        // Wrong target: should detect non-determinism
+        let result = ctx
+            .signal_external_workflow(other_target, "cancel", serde_json::Value::Null)
+            .await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            HarvestError::NonDeterministic(msg) => {
+                assert!(msg.contains("external signal mismatch"), "msg: {msg}");
+            }
+            other => panic!("expected NonDeterministic, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn signal_external_workflow_after_activity_replays_correctly() {
+        let signal_id = crate::types::ExternalSignalId::new();
+        let activity_id = ActivityExecId::new();
+        let target = ExecutionId::new();
+
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "step_one".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: serde_json::json!("done"),
+            },
+            WorkflowEvent::ExternalSignalRequested {
+                signal_id,
+                target,
+                signal_name: "cancel".into(),
+                payload: Value::Null,
+            },
+            WorkflowEvent::ExternalSignalDelivered { signal_id },
+        ];
+
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let r = ctx
+            .execute_activity_raw("step_one", Value::Null, "default")
+            .await
+            .expect("activity replay ok");
+        assert_eq!(r, "done");
+
+        let sig_result = ctx
+            .signal_external_workflow(target, "cancel", serde_json::Value::Null)
+            .await;
+        assert!(sig_result.is_ok(), "signal after activity should replay Ok");
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "no live commands after full replay"
         );
     }
 }

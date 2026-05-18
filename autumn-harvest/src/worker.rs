@@ -333,6 +333,7 @@ const fn workflow_command_name(command: &WorkflowCommand) -> &'static str {
         WorkflowCommand::RunLocalActivity { .. } => "RunLocalActivity",
         WorkflowCommand::RecordUpdateResult { .. } => "RecordUpdateResult",
         WorkflowCommand::UpsertSearchAttributes { .. } => "UpsertSearchAttributes",
+        WorkflowCommand::SignalExternalWorkflow { .. } => "SignalExternalWorkflow",
     }
 }
 
@@ -737,6 +738,203 @@ fn extract_run_local_activity(
         markers,
         local_run.expect("called only after confirming RunLocalActivity is present"),
     )
+}
+
+// ---------------------------------------------------------------------------
+// SignalExternalWorkflow inline dispatch (same-shard)
+// ---------------------------------------------------------------------------
+
+struct SignalExternalWorkflowRun {
+    signal_id: crate::types::ExternalSignalId,
+    target: ExecutionId,
+    signal_name: String,
+    payload: serde_json::Value,
+    /// `true` when `ExternalSignalRequested` is already durable — worker crashed
+    /// after appending it but before recording the terminal event. Skip
+    /// re-appending and go straight to (re-)attempting delivery.
+    already_requested: bool,
+}
+
+/// An item in the ordered inline-dispatch batch: either a marker event or a
+/// signal run. Preserving the original command-emission order is required so
+/// that the replay cursor sees events in the exact same sequence as during the
+/// live execution that produced them.
+enum SignalBatchItem {
+    Marker(WorkflowEvent),
+    Signal(SignalExternalWorkflowRun),
+}
+
+/// Extract `SignalExternalWorkflow` and `RecordMarker` commands in emission
+/// order.
+///
+/// `result_tx` channels are dropped immediately — the workflow coroutine is
+/// not awaiting them during inline dispatch. `RecordUpdateResult` and
+/// `UpsertSearchAttributes` commands are intentionally skipped here because
+/// they were already persisted by the caller before this function is invoked.
+fn extract_signal_external_workflow(commands: Vec<WorkflowCommand>) -> Vec<SignalBatchItem> {
+    let mut items = Vec::with_capacity(commands.len());
+    for cmd in commands {
+        match cmd {
+            WorkflowCommand::RecordMarker { name, details } => {
+                items.push(SignalBatchItem::Marker(WorkflowEvent::MarkerRecorded {
+                    name,
+                    details,
+                }));
+            }
+            WorkflowCommand::SignalExternalWorkflow {
+                signal_id,
+                target,
+                signal_name,
+                payload,
+                result_tx,
+                already_requested,
+            } => {
+                drop(result_tx);
+                items.push(SignalBatchItem::Signal(SignalExternalWorkflowRun {
+                    signal_id,
+                    target,
+                    signal_name,
+                    payload,
+                    already_requested,
+                }));
+            }
+            _ => {}
+        }
+    }
+    items
+}
+
+/// Split a mixed command batch into signal-batch items and remaining workflow commands.
+///
+/// Used when a batch contains both `SignalExternalWorkflow` and other durable
+/// commands (e.g. `ScheduleActivity`, `StartTimer`). The signal items are written
+/// to history inline first; the remaining commands are passed to
+/// `handle_suspended_workflow` for normal suspension.
+///
+/// `RecordUpdateResult` and `UpsertSearchAttributes` commands are dropped because
+/// the caller persists them before invoking this function.
+fn split_mixed_signal_batch(
+    commands: Vec<WorkflowCommand>,
+) -> (Vec<SignalBatchItem>, Vec<WorkflowCommand>) {
+    let mut signal_items = Vec::new();
+    let mut remaining = Vec::new();
+    for cmd in commands {
+        match cmd {
+            WorkflowCommand::SignalExternalWorkflow {
+                signal_id,
+                target,
+                signal_name,
+                payload,
+                result_tx,
+                already_requested,
+            } => {
+                drop(result_tx);
+                signal_items.push(SignalBatchItem::Signal(SignalExternalWorkflowRun {
+                    signal_id,
+                    target,
+                    signal_name,
+                    payload,
+                    already_requested,
+                }));
+            }
+            WorkflowCommand::RecordUpdateResult { .. }
+            | WorkflowCommand::UpsertSearchAttributes { .. } => {}
+            other => remaining.push(other),
+        }
+    }
+    (signal_items, remaining)
+}
+
+/// Deliver all `SignalExternalWorkflow` commands inline and append durability events.
+///
+/// Same-shard delivery: writes directly to `harvest_signals` and wakes the
+/// target task. Cross-shard delivery requires the plugin's outbox and is
+/// outside the scope of this function — cross-shard targets are reported as
+/// `target_unknown`.
+///
+/// Processes each item in command-emission order so the replay cursor advances
+/// correctly. Returns all newly-appended events in emission order so the caller
+/// can extend its in-memory replay history without a DB round-trip.
+///
+/// # At-least-once delivery on crash recovery
+///
+/// When `run.already_requested` is `true` the worker crashed after writing
+/// `ExternalSignalRequested` but before the terminal event. Re-calling
+/// `send_signal` may insert a duplicate row into `harvest_signals` if the
+/// original insert committed before the crash. Exact-once delivery requires
+/// storing the `signal_id` as a unique key on `harvest_signals`; that schema
+/// change is deferred to a follow-up migration.
+async fn persist_external_signal_inline(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    items: Vec<SignalBatchItem>,
+    next_event_id: &mut i32,
+) -> HarvestResult<Vec<WorkflowEvent>> {
+    let mut new_events: Vec<WorkflowEvent> = Vec::new();
+
+    for item in items {
+        match item {
+            SignalBatchItem::Marker(event) => {
+                store::append_events(conn, exec_id, std::slice::from_ref(&event), *next_event_id)
+                    .await?;
+                *next_event_id += 1;
+                new_events.push(event);
+            }
+            SignalBatchItem::Signal(run) => {
+                if !run.already_requested {
+                    let requested = WorkflowEvent::ExternalSignalRequested {
+                        signal_id: run.signal_id,
+                        target: run.target,
+                        signal_name: run.signal_name.clone(),
+                        payload: run.payload.clone(),
+                    };
+                    store::append_events(
+                        conn,
+                        exec_id,
+                        std::slice::from_ref(&requested),
+                        *next_event_id,
+                    )
+                    .await?;
+                    *next_event_id += 1;
+                    new_events.push(requested);
+                }
+
+                let terminal = match signal::send_signal(
+                    conn,
+                    run.target,
+                    &run.signal_name,
+                    run.payload,
+                )
+                .await
+                {
+                    Ok(()) => WorkflowEvent::ExternalSignalDelivered {
+                        signal_id: run.signal_id,
+                    },
+                    Err(HarvestError::NotFound(_)) => WorkflowEvent::ExternalSignalFailed {
+                        signal_id: run.signal_id,
+                        reason_code: "target_unknown".to_string(),
+                    },
+                    Err(HarvestError::Database(e)) => return Err(HarvestError::Database(e)),
+                    Err(_) => WorkflowEvent::ExternalSignalFailed {
+                        signal_id: run.signal_id,
+                        reason_code: "target_terminal".to_string(),
+                    },
+                };
+
+                store::append_events(
+                    conn,
+                    exec_id,
+                    std::slice::from_ref(&terminal),
+                    *next_event_id,
+                )
+                .await?;
+                *next_event_id += 1;
+                new_events.push(terminal);
+            }
+        }
+    }
+
+    Ok(new_events)
 }
 
 /// Run a local activity inline, appending durability events to `harvest_events`.
@@ -3467,6 +3665,61 @@ async fn process_workflow_task(
                 // Local-activity re-run: drop this iteration's execute span
                 // so the OTel span closes before we start inline execution.
                 drop(execute_span);
+                // If the batch also contains SignalExternalWorkflow commands,
+                // write their history events BEFORE the local-activity events.
+                // This preserves correct replay ordering: on the next run
+                // drain_early_signals stashes the signal events so
+                // match_external_signal sees them before LocalActivityScheduled.
+                let commands = if commands
+                    .iter()
+                    .any(|c| matches!(c, WorkflowCommand::SignalExternalWorkflow { .. }))
+                {
+                    let (signal_items, remaining) = split_mixed_signal_batch(commands);
+                    if !signal_items.is_empty() {
+                        let new_events = match persist_external_signal_inline(
+                            conn,
+                            prepared.exec_id,
+                            signal_items,
+                            &mut next_event_id,
+                        )
+                        .await
+                        {
+                            Ok(events) => events,
+                            Err(e) => {
+                                return fail_execution_on_error(
+                                    conn,
+                                    task,
+                                    worker_id,
+                                    Err::<(), _>(e),
+                                )
+                                .await;
+                            }
+                        };
+                        history_events.extend(new_events);
+                        let current_history_event_count =
+                            u64::try_from(history_events.len()).unwrap_or(u64::MAX);
+                        if let Some(cap) = registry.history_policy().event_hard_cap()
+                            && current_history_event_count >= cap
+                        {
+                            return fail_workflow_for_history_cap(
+                                conn,
+                                &telemetry,
+                                task,
+                                &prepared.execution,
+                                prepared.exec_id,
+                                next_event_id,
+                                worker_id,
+                                started_at,
+                                current_history_event_count,
+                                cap,
+                            )
+                            .await;
+                        }
+                    }
+                    remaining
+                } else {
+                    commands
+                };
                 let (markers, local_run) = extract_run_local_activity(commands);
                 let inline_outcome = run_local_activity_inline(
                     conn,
@@ -3523,6 +3776,160 @@ async fn process_workflow_task(
                     )
                     .await;
                 }
+            }
+            WorkflowOutcome::Suspended { commands }
+                if commands
+                    .iter()
+                    .any(|c| matches!(c, WorkflowCommand::SignalExternalWorkflow { .. }))
+                    && commands.iter().all(|c| {
+                        matches!(
+                            c,
+                            WorkflowCommand::SignalExternalWorkflow { .. }
+                                | WorkflowCommand::RecordMarker { .. }
+                                | WorkflowCommand::RecordUpdateResult { .. }
+                                | WorkflowCommand::UpsertSearchAttributes { .. }
+                        )
+                    }) =>
+            {
+                // Only enters this path when every non-bookkeeping command in the
+                // batch is a SignalExternalWorkflow (or RecordMarker). Mixed batches
+                // that also contain ScheduleActivity / StartTimer / etc. fall through
+                // to the regular suspension path so those commands are not dropped.
+                //
+                // Persist bookkeeping commands (update-result events, search-attribute
+                // patches) first, just as the RunLocalActivity path does.
+                if let Err(e) = persist_update_result_commands(
+                    conn,
+                    prepared.exec_id,
+                    &commands,
+                    &mut next_event_id,
+                )
+                .await
+                {
+                    return fail_execution_on_error(conn, task, worker_id, Err::<(), _>(e)).await;
+                }
+                if let Err(e) =
+                    persist_search_attrs_from_commands(conn, prepared.exec_id, &commands).await
+                {
+                    return fail_execution_on_error(conn, task, worker_id, Err::<(), _>(e)).await;
+                }
+                prepared.execution.search_attrs = apply_search_attrs_patch_in_memory(
+                    prepared.execution.search_attrs.take(),
+                    &commands,
+                );
+                drop(execute_span);
+                let items = extract_signal_external_workflow(commands);
+                let new_events = match persist_external_signal_inline(
+                    conn,
+                    prepared.exec_id,
+                    items,
+                    &mut next_event_id,
+                )
+                .await
+                {
+                    Ok(events) => events,
+                    Err(e) => {
+                        return fail_execution_on_error(conn, task, worker_id, Err::<(), _>(e))
+                            .await;
+                    }
+                };
+                history_events.extend(new_events);
+                let current_history_event_count =
+                    u64::try_from(history_events.len()).unwrap_or(u64::MAX);
+                if let Some(cap) = registry.history_policy().event_hard_cap()
+                    && current_history_event_count >= cap
+                {
+                    return fail_workflow_for_history_cap(
+                        conn,
+                        &telemetry,
+                        task,
+                        &prepared.execution,
+                        prepared.exec_id,
+                        next_event_id,
+                        worker_id,
+                        started_at,
+                        current_history_event_count,
+                        cap,
+                    )
+                    .await;
+                }
+            }
+            // Mixed batch: contains SignalExternalWorkflow AND other durable commands
+            // (ScheduleActivity, StartTimer, etc.). The "all signals" guard above did
+            // not match because not all commands are signals/markers. Write signal events
+            // to history FIRST (so drain_early_signals stashes them on the next replay
+            // pass), then break with the remaining commands for handle_suspended_workflow.
+            WorkflowOutcome::Suspended { commands }
+                if commands
+                    .iter()
+                    .any(|c| matches!(c, WorkflowCommand::SignalExternalWorkflow { .. })) =>
+            {
+                if let Err(e) = persist_update_result_commands(
+                    conn,
+                    prepared.exec_id,
+                    &commands,
+                    &mut next_event_id,
+                )
+                .await
+                {
+                    return fail_execution_on_error(conn, task, worker_id, Err::<(), _>(e)).await;
+                }
+                if let Err(e) =
+                    persist_search_attrs_from_commands(conn, prepared.exec_id, &commands).await
+                {
+                    return fail_execution_on_error(conn, task, worker_id, Err::<(), _>(e)).await;
+                }
+                prepared.execution.search_attrs = apply_search_attrs_patch_in_memory(
+                    prepared.execution.search_attrs.take(),
+                    &commands,
+                );
+                drop(execute_span);
+                let (signal_items, remaining_commands) = split_mixed_signal_batch(commands);
+                let new_events = match persist_external_signal_inline(
+                    conn,
+                    prepared.exec_id,
+                    signal_items,
+                    &mut next_event_id,
+                )
+                .await
+                {
+                    Ok(events) => events,
+                    Err(e) => {
+                        return fail_execution_on_error(conn, task, worker_id, Err::<(), _>(e))
+                            .await;
+                    }
+                };
+                history_events.extend(new_events);
+                let current_history_event_count =
+                    u64::try_from(history_events.len()).unwrap_or(u64::MAX);
+                if let Some(cap) = registry.history_policy().event_hard_cap()
+                    && current_history_event_count >= cap
+                {
+                    return fail_workflow_for_history_cap(
+                        conn,
+                        &telemetry,
+                        task,
+                        &prepared.execution,
+                        prepared.exec_id,
+                        next_event_id,
+                        worker_id,
+                        started_at,
+                        current_history_event_count,
+                        cap,
+                    )
+                    .await;
+                }
+                // Re-acquire a fresh execute_span so persist_workflow_outcome
+                // (via handle_suspended_workflow) gets a valid span reference.
+                // The original span was dropped above.
+                let execute_span = tracing::Span::none();
+                break (
+                    WorkflowOutcome::Suspended {
+                        commands: remaining_commands,
+                    },
+                    pending_cmds,
+                    execute_span,
+                );
             }
             other => break (other, pending_cmds, execute_span),
         }

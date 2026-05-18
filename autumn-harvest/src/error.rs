@@ -8,7 +8,7 @@
 //! — it's an HTTP response wrapper. `HarvestError` converts to `AutumnError` via
 //! the blanket `From<E: Error> for AutumnError` impl automatically.
 
-use crate::types::ExecutionId;
+use crate::types::{ExecutionId, ExternalSignalId};
 
 /// The kind of timeout that fired.
 ///
@@ -228,6 +228,26 @@ pub enum HarvestError {
         /// Configured timeout in milliseconds.
         timeout_ms: u64,
     },
+
+    /// Delivery of a `signal_external_workflow` call failed permanently.
+    ///
+    /// `reason_code` is one of:
+    /// - `"target_terminal"` — the target workflow is already in a terminal state.
+    /// - `"target_unknown"` — no execution matching `target` was found within
+    ///   the configured grace window.
+    #[error(
+        "external signal '{signal_name}' to {target} failed: {reason_code} (signal_id={signal_id})"
+    )]
+    ExternalSignalFailed {
+        /// The `ExternalSignalId` recorded in the initiating event.
+        signal_id: ExternalSignalId,
+        /// The target workflow execution ID.
+        target: ExecutionId,
+        /// The signal channel name.
+        signal_name: String,
+        /// Machine-readable failure reason (`"target_terminal"` or `"target_unknown"`).
+        reason_code: String,
+    },
 }
 
 /// Standard result type for internal harvest engine operations.
@@ -446,5 +466,37 @@ mod tests {
         };
         let msg = e.to_string();
         assert!(msg.contains("key too long"));
+    }
+
+    #[test]
+    fn harvest_error_external_signal_failed_display() {
+        use crate::types::ExternalSignalId;
+        let signal_id = ExternalSignalId::new();
+        let target = ExecutionId::new_for_shard(crate::types::ShardId::new(0));
+        let e = HarvestError::ExternalSignalFailed {
+            signal_id,
+            target,
+            signal_name: "tenant_cancel".into(),
+            reason_code: "target_terminal".into(),
+        };
+        let msg = e.to_string();
+        assert!(msg.contains("tenant_cancel"));
+        assert!(msg.contains("target_terminal"));
+        assert!(msg.contains(&target.to_string()));
+    }
+
+    #[test]
+    fn harvest_error_external_signal_failed_unknown_target() {
+        use crate::types::ExternalSignalId;
+        let signal_id = ExternalSignalId::new();
+        let target = ExecutionId::new();
+        let e = HarvestError::ExternalSignalFailed {
+            signal_id,
+            target,
+            signal_name: "notify".into(),
+            reason_code: "target_unknown".into(),
+        };
+        assert!(e.to_string().contains("target_unknown"));
+        assert!(e.to_string().contains("notify"));
     }
 }
