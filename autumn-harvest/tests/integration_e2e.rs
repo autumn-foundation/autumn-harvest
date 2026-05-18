@@ -6187,7 +6187,16 @@ async fn per_key_concurrency_cap_enforced_across_fleet() {
 
     let (database_url, _container) = setup_test_database_url().await;
     let wf_name = "concurrency_cap_test_wf";
-    let pool = build_test_pool(&database_url);
+    // Use a larger pool to prevent monitoring tasks (which each grab a
+    // connection every poll_interval) from exhausting the pool while cap=2
+    // workflow tasks hold their own connections for 5 s each.
+    let pool: DbPool = {
+        let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(&database_url);
+        deadpool::managed::Pool::builder(manager)
+            .max_size(16)
+            .build()
+            .expect("failed to build test pool")
+    };
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
             name: wf_name,
@@ -6235,7 +6244,7 @@ async fn per_key_concurrency_cap_enforced_across_fleet() {
                 notification_database_url: None,
                 max_concurrent_workflows: 20,
                 max_concurrent_activities: 20,
-                poll_interval: Duration::from_millis(50),
+                poll_interval: Duration::from_millis(200),
                 shutdown_timeout: Duration::from_secs(5),
                 cancellation_grace_period: Duration::from_secs(1),
                 sticky_timeout: Duration::ZERO,
