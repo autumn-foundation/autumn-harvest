@@ -1539,7 +1539,7 @@ async fn tick_one_workflow_schedule(
                 // Firing proceeds. If the adjusted date differs from the original,
                 // rebase logical_date so downstream dispatch uses the correct day.
                 if adjusted != fire_date {
-                    logical_date = rebase_logical_date(logical_date, adjusted);
+                    logical_date = rebase_logical_date(logical_date, adjusted, parsed_schedule);
                 }
             }
         }
@@ -1661,12 +1661,12 @@ async fn tick_one_workflow_schedule(
     // Set to the first slot we could not dispatch due to max_active_runs or jitter; if Some,
     // it becomes next_run_at so catchup slots are not silently dropped.
     let mut deferred_next_run_at: Option<DateTime<Utc>> = None;
-    for scheduled_for in &run_dates {
+    for original_slot in &run_dates {
         // Re-apply calendar filtering for each catchup slot.  The pre-loop check
         // already handled `logical_date` (the first slot); subsequent catchup slots
         // are independent fire times and must be filtered independently.
         let effective_scheduled_for = if schedule.calendar_name.is_some() && run_dates.len() > 1 {
-            let slot_date = scheduled_for.date_naive();
+            let slot_date = original_slot.date_naive();
             match crate::calendar::apply_skip_policy(
                 slot_date,
                 calendar_skip_policy,
@@ -1678,17 +1678,17 @@ async fn tick_one_workflow_schedule(
                     continue;
                 }
                 Some(adjusted) if adjusted != slot_date => {
-                    rebase_logical_date(*scheduled_for, adjusted)
+                    rebase_logical_date(*original_slot, adjusted, parsed_schedule)
                 }
-                Some(_) => *scheduled_for,
+                Some(_) => *original_slot,
             }
         } else {
-            *scheduled_for
+            *original_slot
         };
         let scheduled_for = &effective_scheduled_for;
 
         if running + i64::from(dispatched) >= i64::from(schedule.max_active_runs) {
-            deferred_next_run_at = Some(*scheduled_for);
+            deferred_next_run_at = Some(*original_slot);
             tracing::info!(
                 workflow_name = %wf_name,
                 max_active_runs = schedule.max_active_runs,
@@ -1709,7 +1709,7 @@ async fn tick_one_workflow_schedule(
         });
         let effective_fire_time = *scheduled_for + chrono_jitter;
         if now < effective_fire_time {
-            deferred_next_run_at = Some(*scheduled_for);
+            deferred_next_run_at = Some(*original_slot);
             tracing::debug!(
                 workflow_name = %wf_name,
                 logical_date = %scheduled_for,
@@ -1718,7 +1718,7 @@ async fn tick_one_workflow_schedule(
             );
             break;
         }
-        let workflow_id = scheduled_workflow_id(wf_name, *scheduled_for);
+        let workflow_id = scheduled_workflow_id(wf_name, *original_slot);
         let exec_id = if schedule.dag_name.is_some() {
             ExecutionId::new_for_shard(current_shard)
         } else {
@@ -1828,7 +1828,25 @@ fn schedule_expr(schedule: Option<&Schedule>) -> Option<String> {
 /// Rebase a `DateTime<Utc>` to a different date while preserving the time-of-day.
 /// Used by the calendar check to shift `logical_date` when a skip policy defers
 /// the fire to a different day.
-fn rebase_logical_date(ts: DateTime<Utc>, date: chrono::NaiveDate) -> DateTime<Utc> {
+fn rebase_logical_date(
+    ts: DateTime<Utc>,
+    date: chrono::NaiveDate,
+    schedule: Option<&Schedule>,
+) -> DateTime<Utc> {
+    // For timezone-aware schedules preserve the wall-clock time in the schedule's
+    // timezone so DST transitions don't shift the effective dispatch hour.
+    if let Some(Schedule::CronInTimezone { tz, .. }) = schedule
+        && let Ok(tz) = tz.parse::<chrono_tz::Tz>()
+    {
+        let local_ts = ts.with_timezone(&tz);
+        if let Some(local_dt) = date
+            .and_time(local_ts.time())
+            .and_local_timezone(tz)
+            .earliest()
+        {
+            return local_dt.with_timezone(&Utc);
+        }
+    }
     let naive = date.and_time(ts.time());
     chrono::Utc.from_utc_datetime(&naive)
 }

@@ -2762,13 +2762,8 @@
         ]
       },
       "success_response": {
-        "status": 200,
-        "free_form": false,
-        "fields": [
-          { "name": "name", "type": "string", "description": "Calendar name." },
-          { "name": "description", "type": "string", "description": "Optional description." },
-          { "name": "exclusion_dates", "type": "array", "description": "Updated exclusion dates." }
-        ]
+        "status": 204,
+        "free_form": true
       },
       "error_responses": [
         { "status": 404, "description": "Calendar not found." },

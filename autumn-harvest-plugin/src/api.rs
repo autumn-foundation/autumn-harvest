@@ -1793,7 +1793,7 @@ pub const fn management_api_request_fields()
         ("DELETE", "/admin/schedules/{id}", Some(&[])),
         // ── calendars (issue #337) ────────────────────────────────────────────
         ("POST", "/calendars", Some(&["name", "description"])),
-        ("PUT", "/calendars/{name}", Some(&["exclusion_dates"])),
+        ("PUT", "/calendars/{name}", None), // 204 No Content
         ("DELETE", "/calendars/{name}", Some(&[])),
     ]
 }
@@ -5599,6 +5599,17 @@ async fn create_workflow_schedule(
             return Err(AutumnError::bad_request_msg(err_summary));
         }
     };
+
+    // Validate calendar name exists before storing to return a helpful 400 rather than
+    // a generic FK-violation 503 from the database.
+    if let Some(cal_name) = &request.calendar {
+        get_calendar(&mut conn, cal_name).await.map_err(|_| {
+            AutumnError::bad_request_msg(format!(
+                "calendar '{cal_name}' not found; create it first with POST /calendars"
+            ))
+        })?;
+    }
+
     let ws = WorkflowSchedule {
         workflow_name: request.workflow_name.clone(),
         dag_name: None,
@@ -8757,7 +8768,7 @@ async fn get_calendar_handler(
     let cal = get_calendar(&mut conn, &name).await.map_err(map_error)?;
     let exclusions = load_exclusions_for_calendar(&mut conn, &name)
         .await
-        .unwrap_or_default();
+        .map_err(map_error)?;
     Ok((
         StatusCode::OK,
         Json(CalendarDetailResponse {
@@ -8884,7 +8895,7 @@ async fn preview_schedule_firings_handler(
     let excluded_dates = if let Some(cal_name) = calendar_name {
         load_exclusions_for_calendar(&mut conn, cal_name)
             .await
-            .unwrap_or_default()
+            .map_err(map_error)?
     } else {
         vec![]
     };
