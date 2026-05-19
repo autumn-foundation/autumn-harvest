@@ -196,6 +196,7 @@ async fn seed_workflows(database_url: &str, workflow_name: &str, count: usize) -
                 concurrency_key: None,
                 concurrency_limit: None,
                 priority: Priority::default(),
+                max_workflow_input_bytes: 0,
             },
         )
         .await

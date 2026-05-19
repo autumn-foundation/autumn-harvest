@@ -301,6 +301,7 @@ pub(crate) async fn dispatch_workflow_start_request(
             concurrency_key: None,
             concurrency_limit: None,
             priority: Priority::default(),
+            max_workflow_input_bytes: 0,
         },
     )
     .await?;

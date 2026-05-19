@@ -266,6 +266,7 @@ async fn wait_for_state(database_url: &str, exec_id: ExecutionId, state: &str) {
 ///
 /// This is a plain `#[test]` (not `#[tokio::test]`) so we control the runtime
 /// and can wrap the entire async block in `with_default`.
+#[allow(clippy::too_many_lines)]
 #[test]
 fn all_adr_0001_span_kinds_are_emitted() {
     let (names, _guard) = install_span_capture();
@@ -301,6 +302,7 @@ fn all_adr_0001_span_kinds_are_emitted() {
                     concurrency_key: None,
                     concurrency_limit: None,
                     priority: Priority::default(),
+                    max_workflow_input_bytes: 0,
                 },
             )
             .await

@@ -73,6 +73,12 @@ pub struct StartWorkflowParams<'a> {
     /// replay determinism. Defaults to [`Priority::Normal`] so pre-upgrade
     /// callers that do not set this field are unaffected.
     pub priority: Priority,
+    /// Maximum allowed byte size for the workflow input payload (issue #252).
+    ///
+    /// Enforced only on the fresh-insert path: duplicate collisions resolve
+    /// against the existing execution without touching the input. Zero means
+    /// uncapped (the default for callers that do not configure a cap).
+    pub max_workflow_input_bytes: u64,
 }
 
 impl StartWorkflowParams<'_> {
@@ -276,6 +282,21 @@ pub async fn start_or_load_workflow_execution(
                 .map_err(database_error)?;
 
             if let Some(execution) = inserted {
+                // Enforce the input cap only on the fresh-insert path. Duplicates
+                // never reach here so the reuse-policy outcome is unaffected.
+                if request.max_workflow_input_bytes > 0 {
+                    let observed =
+                        serde_json::to_string(&request.input).map_or(0, |s| s.len() as u64);
+                    if observed > request.max_workflow_input_bytes {
+                        return Err(crate::error::HarvestError::PayloadTooLarge {
+                            kind: crate::error::PayloadKind::WorkflowInput,
+                            observed_bytes: observed,
+                            cap_bytes: request.max_workflow_input_bytes,
+                            workflow_type: request.workflow_name.to_string(),
+                            activity_name: None,
+                        });
+                    }
+                }
                 let started_event = WorkflowEvent::WorkflowStarted {
                     input: request.input.clone(),
                     timestamp: Utc::now(),
@@ -823,6 +844,7 @@ pub async fn signal_with_start_workflow_execution(
                     concurrency_key: request.concurrency_key.clone(),
                     concurrency_limit: request.concurrency_limit,
                     priority: Priority::default(),
+                    max_workflow_input_bytes: 0,
                 };
 
             let started = start_or_load_workflow_execution(

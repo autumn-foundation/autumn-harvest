@@ -3743,30 +3743,16 @@ async fn start_workflow(
         .unwrap_or_else(|| "default".to_string());
     let input = request.input.unwrap_or(Value::Null);
 
-    // Issue #252: enforce workflow input payload cap before writing any rows.
-    {
-        let effective_cap = runtime
-            .registry
-            .workflows
-            .get(&workflow_name)
-            .and_then(|info| info.max_input_bytes)
-            .map_or(runtime.registry.max_workflow_input_bytes, |per_wf| {
-                per_wf.max(runtime.registry.max_workflow_input_bytes)
-            });
-        let observed_bytes = serde_json::to_string(&input).map_or(0, |s| s.len() as u64);
-        if observed_bytes > effective_cap {
-            return (
-                axum::http::StatusCode::PAYLOAD_TOO_LARGE,
-                Json(serde_json::json!({
-                    "kind": "WorkflowInput",
-                    "observed_bytes": observed_bytes,
-                    "cap_bytes": effective_cap,
-                    "workflow_type": workflow_name,
-                })),
-            )
-                .into_response();
-        }
-    }
+    // Issue #252: compute effective cap; enforcement happens inside
+    // start_or_load_workflow_execution so duplicate-resolution (409) runs first.
+    let effective_wf_cap = runtime
+        .registry
+        .workflows
+        .get(&workflow_name)
+        .and_then(|info| info.max_input_bytes)
+        .map_or(runtime.registry.max_workflow_input_bytes, |per_wf| {
+            per_wf.max(runtime.registry.max_workflow_input_bytes)
+        });
 
     // Resolve per-key concurrency policy from WorkflowInfo (issue #247).
     let (concurrency_key, concurrency_limit) = runtime
@@ -3823,6 +3809,7 @@ async fn start_workflow(
             concurrency_key,
             concurrency_limit,
             priority: Priority::default(),
+            max_workflow_input_bytes: effective_wf_cap,
         },
     )
     .await;
@@ -6359,6 +6346,7 @@ async fn schedule_backfill(
                         concurrency_key: None,
                         concurrency_limit: None,
                         priority: Priority::default(),
+                        max_workflow_input_bytes: 0,
                     },
                 )
                 .await;
@@ -6463,6 +6451,7 @@ async fn schedule_backfill(
                         concurrency_key: None,
                         concurrency_limit: None,
                         priority: Priority::default(),
+                        max_workflow_input_bytes: 0,
                     },
                 )
                 .await;
@@ -8551,7 +8540,7 @@ fn parse_uuid(raw: &str, label: &str) -> Result<uuid::Uuid, AutumnError> {
 
 fn check_signal_payload_cap(payload: &Value, cap: u64) -> Result<(), AutumnError> {
     let observed_bytes = serde_json::to_string(payload).map_or(0, |s| s.len() as u64);
-    if observed_bytes > cap {
+    if cap > 0 && observed_bytes > cap {
         return Err(map_error(autumn_harvest::HarvestError::PayloadTooLarge {
             kind: autumn_harvest::error::PayloadKind::SignalPayload,
             observed_bytes,
@@ -10013,6 +10002,7 @@ mod tests {
                 concurrency_key: None,
                 concurrency_limit: None,
                 priority: Priority::default(),
+                max_workflow_input_bytes: 0,
             },
         )
         .await

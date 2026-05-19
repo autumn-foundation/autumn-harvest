@@ -520,6 +520,7 @@ async fn legacy_workflow_uniqueness_schema_can_be_upgraded_for_idempotent_starts
         concurrency_key: None,
         concurrency_limit: None,
         priority: Priority::default(),
+        max_workflow_input_bytes: 0,
     };
 
     // On the legacy schema there is no `(workflow_name, workflow_id)`
@@ -3579,6 +3580,7 @@ mod reuse_policy_helpers {
             concurrency_key: None,
             concurrency_limit: None,
             priority: Priority::default(),
+            max_workflow_input_bytes: 0,
         }
     }
 
@@ -4757,6 +4759,7 @@ async fn search_attrs_upsert_visible_after_update_and_filterable() {
             concurrency_key: None,
             concurrency_limit: None,
             priority: Priority::default(),
+            max_workflow_input_bytes: 0,
         },
     )
     .await
@@ -4893,6 +4896,7 @@ async fn search_attrs_survive_worker_crash_and_resume() {
             concurrency_key: None,
             concurrency_limit: None,
             priority: Priority::default(),
+            max_workflow_input_bytes: 0,
         },
     )
     .await
