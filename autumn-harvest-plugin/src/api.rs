@@ -363,8 +363,12 @@ impl HarvestApiState {
     ///
     /// # Panics
     ///
-    /// Panics if the internal mutex is poisoned.
+    /// Panics if `interval` is zero or if the internal mutex is poisoned.
     pub fn set_sse_keepalive_interval(&self, interval: std::time::Duration) {
+        assert!(
+            !interval.is_zero(),
+            "SSE keepalive interval must be non-zero"
+        );
         *self
             .sse_keepalive_interval
             .lock()
@@ -637,17 +641,13 @@ impl HarvestApiState {
     }
 
     /// Return the LISTEN/NOTIFY database URL for the given shard (issue #324).
-    ///
-    /// Falls back to the first configured URL for single-shard deployments.
     pub(crate) fn sse_notification_url(&self, shard: ShardId) -> HarvestResult<String> {
         let urls = self.workflow_result_notification_database_urls()?;
-        if let Some(url) = urls.get(&shard) {
-            return Ok(url.clone());
-        }
-        // Single-shard fallback: use the first available URL
-        urls.into_values()
-            .next()
-            .ok_or_else(|| HarvestError::Config("no SSE notification URL configured".to_string()))
+        urls.get(&shard).cloned().ok_or_else(|| {
+            HarvestError::Config(format!(
+                "no SSE notification URL configured for shard {shard:?}"
+            ))
+        })
     }
 
     fn workflow_handle_client(&self) -> HarvestResult<WorkflowHandleClient> {
@@ -9032,6 +9032,9 @@ async fn stream_execution_events(
             };
 
         // ── 1. Send backfill events (events already committed before this request) ──
+        // Also track whether a terminal event appears in the backfill: the execution
+        // may have transitioned between load_execution and load_events_after_row_id.
+        let mut backfill_terminal: Option<&'static str> = None;
         for row in &backfill {
             let sse_event = Event::default()
                 .id(row.id.to_string())
@@ -9058,11 +9061,23 @@ async fn stream_execution_events(
                 }
                 return;
             }
+            if is_terminal_event_type(&row.event_type) {
+                backfill_terminal = Some(terminal_event_type_to_state(&row.event_type));
+            }
         }
 
-        // ── 2. If already terminal, emit stream-end and close ─────────────────
-        if terminal {
-            let end_data = serde_json::json!({"reason": execution_state}).to_string();
+        // ── 2. If already terminal (or backfill contained a terminal event), emit
+        //       stream-end and close.  Use the backfill-detected state when present
+        //       because it reflects the actual transition even if load_execution ran
+        //       before the row was committed.
+        let effective_terminal: Option<&str> =
+            backfill_terminal.map(|s| s as &str).or(if terminal {
+                Some(execution_state.as_str())
+            } else {
+                None
+            });
+        if let Some(state) = effective_terminal {
+            let end_data = serde_json::json!({"reason": state}).to_string();
             let _ = tx
                 .send(Ok(Event::default().event("stream-end").data(end_data)))
                 .await;
@@ -9155,6 +9170,14 @@ async fn stream_execution_events(
                             send_rows(&missed, last_seen_id, &mut tx);
                         last_seen_id = new_id;
                         if should_break {
+                            let err_data = serde_json::json!({
+                                "error": "slow_consumer",
+                                "drop_after_event_id": last_seen_id,
+                            })
+                            .to_string();
+                            let _ = tx.try_send(Ok(Event::default()
+                                .event("stream-error")
+                                .data(err_data)));
                             break 'notify;
                         }
                         if let Some(state) = terminal_state {
@@ -9190,6 +9213,14 @@ async fn stream_execution_events(
                             send_rows(&missed, last_seen_id, &mut tx);
                         last_seen_id = new_id;
                         if should_break {
+                            let err_data = serde_json::json!({
+                                "error": "slow_consumer",
+                                "drop_after_event_id": last_seen_id,
+                            })
+                            .to_string();
+                            let _ = tx.try_send(Ok(Event::default()
+                                .event("stream-error")
+                                .data(err_data)));
                             break 'notify;
                         }
                         if let Some(state) = terminal_state {

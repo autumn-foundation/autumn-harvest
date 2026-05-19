@@ -269,6 +269,13 @@ pub enum CliError {
         /// Last observed lifecycle status.
         last_status: String,
     },
+
+    /// The SSE event stream closed abnormally (e.g. slow consumer).
+    #[error("SSE stream closed by server: {message}")]
+    SseStreamError {
+        /// Server-supplied error detail.
+        message: String,
+    },
 }
 
 impl CliError {
@@ -1369,6 +1376,11 @@ async fn run_events_tail(
                     println!("{display_type}: {ev_data}");
                     if ev_type == "stream-end" {
                         return Ok(());
+                    }
+                    if ev_type == "stream-error" {
+                        return Err(CliError::SseStreamError {
+                            message: ev_data.clone(),
+                        });
                     }
                 }
                 ev_id.clear();
