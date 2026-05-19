@@ -104,9 +104,8 @@ async fn sse_stream_returns_service_unavailable_when_not_configured() {
     use autumn_web::reexports::http::{Method, Request, StatusCode};
     use tower::ServiceExt;
 
-    let app =
-        autumn_harvest_plugin::api::harvest_api_router(HarvestApiState::new())
-            .with_state(autumn_web::AppState::for_test());
+    let app = autumn_harvest_plugin::api::harvest_api_router(HarvestApiState::new())
+        .with_state(autumn_web::AppState::for_test());
 
     let req = Request::builder()
         .method(Method::GET)
@@ -130,9 +129,8 @@ async fn sse_stream_route_exists_in_router() {
     use autumn_web::reexports::http::{Method, Request, StatusCode};
     use tower::ServiceExt;
 
-    let app =
-        autumn_harvest_plugin::api::harvest_api_router(HarvestApiState::new())
-            .with_state(autumn_web::AppState::for_test());
+    let app = autumn_harvest_plugin::api::harvest_api_router(HarvestApiState::new())
+        .with_state(autumn_web::AppState::for_test());
 
     let req = Request::builder()
         .method(Method::GET)
