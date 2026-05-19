@@ -483,7 +483,8 @@ impl BuiltHarvest {
                 self.telemetry,
             )
             .with_handler_infos(self.query_handlers, self.update_handlers)
-            .with_history_policy(self.history_policy),
+            .with_history_policy(self.history_policy)
+            .with_payload_caps(self.max_activity_input_bytes, self.max_workflow_input_bytes),
             self.dags,
             self.workflow_schedules,
             self.worker_config,
@@ -512,7 +513,8 @@ impl BuiltHarvest {
                 self.telemetry,
             )
             .with_handler_infos(self.query_handlers, self.update_handlers)
-            .with_history_policy(self.history_policy),
+            .with_history_policy(self.history_policy)
+            .with_payload_caps(self.max_activity_input_bytes, self.max_workflow_input_bytes),
             self.dags,
             self.workflow_schedules,
             self.worker_config,
@@ -1624,6 +1626,8 @@ mod tests {
                 max_concurrent: None,
                 concurrency_key: None,
                 is_local: false,
+                max_input_bytes: None,
+                max_result_bytes: None,
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             }])
             .state(String::from("haunted"))

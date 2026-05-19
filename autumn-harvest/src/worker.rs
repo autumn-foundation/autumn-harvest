@@ -29,7 +29,7 @@ use crate::dlq::{self, DeadLetterReason, NewDeadLetterEntry};
 use crate::error::{HarvestError, HarvestResult};
 use crate::event::WorkflowEvent;
 use crate::executor::{
-    WorkflowExecuteSpanMeta, WorkflowOutcome, run_workflow_with_state_and_history_policy,
+    WorkflowExecuteSpanMeta, WorkflowOutcome, run_workflow_with_state_history_policy_and_caps,
 };
 use crate::external_task;
 use crate::failure::{parse_error_payload, parse_error_payload_full, parse_typed_payload};
@@ -172,6 +172,10 @@ pub struct HandlerRegistry {
     telemetry: Arc<crate::telemetry::TelemetryConfig>,
     /// History-size thresholds visible to workflow contexts.
     history_policy: WorkflowHistoryPolicy,
+    /// Maximum allowed bytes for a single activity input payload (enforced at schedule time).
+    pub max_activity_input_bytes: u64,
+    /// Maximum allowed bytes for a child workflow input payload (enforced at schedule time).
+    pub max_workflow_input_bytes: u64,
 }
 
 impl HandlerRegistry {
@@ -225,6 +229,8 @@ impl HandlerRegistry {
             state,
             telemetry,
             history_policy: WorkflowHistoryPolicy::default(),
+            max_activity_input_bytes: crate::builder::DEFAULT_MAX_ACTIVITY_INPUT_BYTES,
+            max_workflow_input_bytes: crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
         }
     }
 
@@ -257,6 +263,18 @@ impl HandlerRegistry {
     #[must_use]
     pub const fn with_history_policy(mut self, history_policy: WorkflowHistoryPolicy) -> Self {
         self.history_policy = history_policy;
+        self
+    }
+
+    /// Set the payload size caps propagated from [`crate::builder::BuiltHarvest`].
+    #[must_use]
+    pub const fn with_payload_caps(
+        mut self,
+        max_activity_input_bytes: u64,
+        max_workflow_input_bytes: u64,
+    ) -> Self {
+        self.max_activity_input_bytes = max_activity_input_bytes;
+        self.max_workflow_input_bytes = max_workflow_input_bytes;
         self
     }
 
@@ -295,6 +313,8 @@ impl std::fmt::Debug for HandlerRegistry {
             .field("state_count", &self.state.len())
             .field("telemetry", &self.telemetry)
             .field("history_policy", &self.history_policy)
+            .field("max_activity_input_bytes", &self.max_activity_input_bytes)
+            .field("max_workflow_input_bytes", &self.max_workflow_input_bytes)
             .finish()
     }
 }
@@ -3663,18 +3683,22 @@ async fn process_workflow_task(
             .filter(|h| h.workflow == wf_name)
             .collect();
 
-        let (run_outcome, pending_cmds, execute_span) = run_workflow_with_state_and_history_policy(
-            prepared.exec_id,
-            history_events.clone(),
-            workflow.handler,
-            task.input.clone(),
-            registry.shared_state(),
-            registry.history_policy(),
-            Some(&span_meta),
-            &dq,
-            &du,
-        )
-        .await;
+        let (run_outcome, pending_cmds, execute_span) =
+            run_workflow_with_state_history_policy_and_caps(
+                prepared.exec_id,
+                history_events.clone(),
+                workflow.handler,
+                task.input.clone(),
+                registry.shared_state(),
+                registry.history_policy(),
+                Some(&span_meta),
+                &dq,
+                &du,
+                wf_name,
+                registry.max_activity_input_bytes,
+                registry.max_workflow_input_bytes,
+            )
+            .await;
 
         match run_outcome {
             WorkflowOutcome::Suspended { commands }
@@ -5031,6 +5055,7 @@ mod tests {
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             execution_timeout: None,
             concurrency: None,
+            max_input_bytes: None,
         };
 
         let act = ActivityInfo {
@@ -5044,6 +5069,8 @@ mod tests {
             max_concurrent: None,
             concurrency_key: None,
             is_local: false,
+            max_input_bytes: None,
+            max_result_bytes: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
         };
 

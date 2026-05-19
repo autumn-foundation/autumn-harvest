@@ -813,6 +813,16 @@ impl WorkflowContext {
         self
     }
 
+    /// Set the logical workflow type name used in `PayloadTooLarge` error messages.
+    ///
+    /// Called by the worker after creating the context so that cap-enforcement
+    /// errors carry the correct workflow type name for observability.
+    #[must_use]
+    pub fn with_workflow_name(mut self, name: impl Into<String>) -> Self {
+        self.workflow_name = name.into();
+        self
+    }
+
     // ── Accessors ─────────────────────────────────────────────────────
 
     /// Deterministic "wall clock" -- returns the `WorkflowStarted` timestamp
