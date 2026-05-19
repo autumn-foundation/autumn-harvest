@@ -860,11 +860,20 @@ pub async fn signal_with_start_workflow_execution(
                         | WorkflowIdReusePolicy::AllowDuplicateFailedOnly
                 ) {
                 let fresh_exec_id = ExecutionId::new_for_shard(started.exec_id.shard());
-                start_or_load_workflow_execution(
+                let fresh = start_or_load_workflow_execution(
                     conn,
                     build_start_request(fresh_exec_id, WorkflowIdReusePolicy::TerminateIfRunning),
                 )
-                .await?
+                .await?;
+                if fresh.created {
+                    check_sws_payload_cap(
+                        &request.input,
+                        crate::error::PayloadKind::WorkflowInput,
+                        request.max_workflow_input_bytes,
+                        request.workflow_name,
+                    )?;
+                }
+                fresh
             } else {
                 started
             };

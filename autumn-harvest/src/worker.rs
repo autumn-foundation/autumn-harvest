@@ -3735,7 +3735,11 @@ async fn process_workflow_task(
                 &du,
                 wf_name,
                 registry.max_activity_input_bytes,
-                registry.max_workflow_input_bytes,
+                workflow
+                    .max_input_bytes
+                    .map_or(registry.max_workflow_input_bytes, |per| {
+                        per.max(registry.max_workflow_input_bytes)
+                    }),
             )
             .await;
 

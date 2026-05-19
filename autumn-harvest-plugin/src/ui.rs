@@ -849,19 +849,31 @@ async fn signal_workflow_ui(
     let (status, error_summary, flash) = match payload_result {
         Err(e) => (STATUS_FAILED, Some(e.clone()), url_encode(&e)),
         Ok(payload_json) => {
-            match send_signal(&mut conn, exec_id, &form.signal_name, payload_json).await {
-                Ok(()) => (
-                    STATUS_SUCCEEDED,
-                    None,
-                    url_encode(&format!("Signal '{}' sent", form.signal_name)),
-                ),
-                Err(e) => {
-                    let msg = e.to_string();
-                    (
-                        STATUS_FAILED,
-                        Some(msg.clone()),
-                        url_encode(&format!("Signal failed: {msg}")),
-                    )
+            let cap = api_state
+                .runtime()
+                .ok()
+                .map_or(0, |r| r.registry().max_signal_payload_bytes);
+            let observed = serde_json::to_string(&payload_json).map_or(0, |s| s.len() as u64);
+            if cap > 0 && observed > cap {
+                let msg = format!(
+                    "signal payload too large: {observed} bytes exceeds cap of {cap} bytes"
+                );
+                (STATUS_FAILED, Some(msg.clone()), url_encode(&msg))
+            } else {
+                match send_signal(&mut conn, exec_id, &form.signal_name, payload_json).await {
+                    Ok(()) => (
+                        STATUS_SUCCEEDED,
+                        None,
+                        url_encode(&format!("Signal '{}' sent", form.signal_name)),
+                    ),
+                    Err(e) => {
+                        let msg = e.to_string();
+                        (
+                            STATUS_FAILED,
+                            Some(msg.clone()),
+                            url_encode(&format!("Signal failed: {msg}")),
+                        )
+                    }
                 }
             }
         }
