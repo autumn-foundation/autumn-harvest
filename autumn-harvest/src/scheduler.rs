@@ -1654,6 +1654,10 @@ async fn tick_one_workflow_schedule(
 
     let mut dispatched: u32 = 0;
     let mut last_dispatched_at: Option<DateTime<Utc>> = None;
+    // Tracks the pre-rebase original slot of the last dispatched run. Used to
+    // anchor next_run_at when a calendar rebases the fire time forward, so the
+    // natural next cron slot after the original due slot is not skipped.
+    let mut last_original_slot_dispatched: Option<DateTime<Utc>> = None;
     // Set to the first slot we could not dispatch due to max_active_runs or jitter; if Some,
     // it becomes next_run_at so catchup slots are not silently dropped.
     let mut deferred_next_run_at: Option<DateTime<Utc>> = None;
@@ -1662,20 +1666,26 @@ async fn tick_one_workflow_schedule(
         // the pre-loop check no longer rebases `logical_date`).
         let effective_scheduled_for = if schedule.calendar_name.is_some() {
             let slot_date = original_slot.date_naive();
-            match crate::calendar::apply_skip_policy(
+            let Some(adjusted) = crate::calendar::apply_skip_policy(
                 slot_date,
                 calendar_skip_policy,
                 &calendar_excluded,
                 calendar_exclude_weekends,
-            ) {
-                None => {
-                    metrics.record_schedule_skipped("workflow", wf_name, "calendar");
+            ) else {
+                metrics.record_schedule_skipped("workflow", wf_name, "calendar");
+                continue;
+            };
+            if adjusted == slot_date {
+                *original_slot
+            } else {
+                let rebased = rebase_logical_date(*original_slot, adjusted, parsed_schedule);
+                // RunPrevBusinessDay can shift backward into the past. Skip such
+                // slots to avoid firing a retroactive run on an excluded day.
+                if rebased < now {
+                    metrics.record_schedule_skipped("workflow", wf_name, "calendar_prev_expired");
                     continue;
                 }
-                Some(adjusted) if adjusted != slot_date => {
-                    rebase_logical_date(*original_slot, adjusted, parsed_schedule)
-                }
-                Some(_) => *original_slot,
+                rebased
             }
         } else {
             *original_slot
@@ -1761,6 +1771,7 @@ async fn tick_one_workflow_schedule(
             Ok(outcome) => {
                 dispatched += 1;
                 last_dispatched_at = Some(*scheduled_for);
+                last_original_slot_dispatched = Some(*original_slot);
                 if outcome.created() {
                     metrics.record_schedule_run("workflow", wf_name);
                 }
@@ -1787,7 +1798,20 @@ async fn tick_one_workflow_schedule(
     // Deferred catchup slots become next_run_at so the next tick retries them.
     // last_run_at only advances to the last slot actually started.
     let effective_last_run_at = last_dispatched_at.or(schedule.last_run_at);
-    let effective_next_run_at = deferred_next_run_at.or(next_run_after_plan);
+    // When calendar rebasing is active, next_run_after_plan was anchored to the
+    // original due slot and its `filter(t > now)` guard can spuriously fail when
+    // `now` has advanced past the rebased fire time, causing the natural next
+    // cron slot to be skipped. Re-anchor from the last original (pre-rebase)
+    // slot to guarantee the correct successor slot.
+    let effective_next_run_at = deferred_next_run_at.or_else(|| {
+        if schedule.calendar_name.is_some() {
+            last_original_slot_dispatched
+                .and_then(|slot| next_run_after(parsed_schedule, slot))
+                .or(next_run_after_plan)
+        } else {
+            next_run_after_plan
+        }
+    });
     diesel::update(dsl::harvest_schedules.find(schedule.id))
         .set((
             dsl::last_run_at.eq(effective_last_run_at),

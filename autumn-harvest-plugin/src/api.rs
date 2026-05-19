@@ -43,8 +43,9 @@ use autumn_harvest::batch::{
     BatchSubmission,
 };
 use autumn_harvest::calendar::{
-    create_calendar, delete_calendar, get_calendar, list_calendars, load_exclusions_for_calendar,
-    preview_schedule_firings, replace_calendar_exclusions,
+    calendar_excludes_weekends, create_calendar, delete_calendar, get_calendar, list_calendars,
+    load_exclusions_for_calendar, plan_backfill_with_calendar, preview_schedule_firings,
+    replace_calendar_exclusions,
 };
 use autumn_harvest::context::WorkflowContext;
 use autumn_harvest::dlq;
@@ -6189,17 +6190,37 @@ async fn schedule_backfill(
 
     let max_count = request.max_count.unwrap_or(DEFAULT_BACKFILL_MAX_COUNT);
 
-    let timestamps = plan_backfill_timestamps(
-        parsed_schedule.as_ref(),
-        request.from,
-        request.to,
-        max_count,
-    )
-    .map_err(|e| match e {
+    let limit_err = |e| match e {
         BackfillPlanError::LimitExceeded { limit } => AutumnError::bad_request_msg(format!(
             "backfill window contains more than {limit} timestamps; lower the window or pass a higher max_count"
         )),
-    })?;
+    };
+    let timestamps = if let Some(ref cal_name) = schedule.calendar_name {
+        let mut conn = acquire_conn(pool.default_pool()).await?;
+        let excluded_dates = load_exclusions_for_calendar(&mut conn, cal_name)
+            .await
+            .map_err(map_error)?;
+        let skip_policy = SkipPolicy::from_db(&schedule.skip_policy);
+        let exclude_weekends = calendar_excludes_weekends(cal_name);
+        plan_backfill_with_calendar(
+            parsed_schedule.as_ref(),
+            request.from,
+            request.to,
+            max_count,
+            &excluded_dates,
+            skip_policy,
+            exclude_weekends,
+        )
+        .map_err(limit_err)?
+    } else {
+        plan_backfill_timestamps(
+            parsed_schedule.as_ref(),
+            request.from,
+            request.to,
+            max_count,
+        )
+        .map_err(limit_err)?
+    };
 
     let total = timestamps.len();
     let (kind, name) = if let Some(ref dag_name) = schedule.dag_name {
@@ -8818,10 +8839,18 @@ async fn create_calendar_handler(
     Json(body): Json<CreateCalendarRequest>,
 ) -> Result<impl IntoResponse, AutumnError> {
     let pool = api_state.storage_pool().map_err(map_error)?;
-    let mut conn = acquire_conn(pool.default_pool()).await?;
-    let cal = create_calendar(&mut conn, &body.name, body.description.as_deref())
-        .await
-        .map_err(map_error)?;
+    let mut first_cal = None;
+    for (_, shard_pool) in pool.iter_shards() {
+        let mut conn = acquire_conn(shard_pool).await?;
+        let cal = create_calendar(&mut conn, &body.name, body.description.as_deref())
+            .await
+            .map_err(map_error)?;
+        if first_cal.is_none() {
+            first_cal = Some(cal);
+        }
+    }
+    let cal =
+        first_cal.ok_or_else(|| AutumnError::service_unavailable_msg("no shards available"))?;
     Ok((StatusCode::CREATED, Json(CalendarResponse::from(cal))))
 }
 
@@ -8839,10 +8868,12 @@ async fn update_calendar_exclusions_handler(
     Json(body): Json<UpdateCalendarRequest>,
 ) -> Result<impl IntoResponse, AutumnError> {
     let pool = api_state.storage_pool().map_err(map_error)?;
-    let mut conn = acquire_conn(pool.default_pool()).await?;
-    replace_calendar_exclusions(&mut conn, &name, &body.exclusion_dates)
-        .await
-        .map_err(map_error)?;
+    for (_, shard_pool) in pool.iter_shards() {
+        let mut conn = acquire_conn(shard_pool).await?;
+        replace_calendar_exclusions(&mut conn, &name, &body.exclusion_dates)
+            .await
+            .map_err(map_error)?;
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -8852,8 +8883,10 @@ async fn delete_calendar_handler(
     Path(name): Path<String>,
 ) -> Result<impl IntoResponse, AutumnError> {
     let pool = api_state.storage_pool().map_err(map_error)?;
-    let mut conn = acquire_conn(pool.default_pool()).await?;
-    delete_calendar(&mut conn, &name).await.map_err(map_error)?;
+    for (_, shard_pool) in pool.iter_shards() {
+        let mut conn = acquire_conn(shard_pool).await?;
+        delete_calendar(&mut conn, &name).await.map_err(map_error)?;
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -8882,23 +8915,9 @@ async fn preview_schedule_firings_handler(
 
     let count = params.count.clamp(1, 100);
     let pool = api_state.storage_pool().map_err(map_error)?;
+    // load_schedule_by_id fans out across all shards so schedules on any shard are found.
+    let schedule = load_schedule_by_id(&api_state, id).await?;
     let mut conn = acquire_conn(pool.default_pool()).await?;
-
-    let schedule = {
-        use autumn_harvest::schema::harvest_schedules;
-        use diesel::{QueryDsl, SelectableHelper};
-        use diesel_async::RunQueryDsl;
-
-        harvest_schedules::table
-            .find(id)
-            .select(HarvestSchedule::as_select())
-            .first(&mut conn)
-            .await
-            .optional()
-            .map_err(database_error)
-            .map_err(map_error)?
-            .ok_or_else(|| AutumnError::not_found_msg("schedule not found"))?
-    };
 
     let parsed_schedule = schedule
         .schedule_expr
