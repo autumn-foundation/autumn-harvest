@@ -4812,7 +4812,7 @@ mod tests {
             "label should still appear when threshold is None"
         );
         assert!(
-            html.contains("5"),
+            html.contains('5'),
             "event count 5 should appear even without threshold"
         );
     }
@@ -4836,10 +4836,7 @@ mod tests {
         )
         .into_string();
 
-        assert!(
-            html.contains("300"),
-            "event count 300 must appear in HTML"
-        );
+        assert!(html.contains("300"), "event count 300 must appear in HTML");
         assert!(
             html.contains("500"),
             "custom threshold 500 must appear in HTML"

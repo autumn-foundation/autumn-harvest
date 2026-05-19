@@ -2371,8 +2371,7 @@ async fn detail_page_has_jump_to_event_n_control() {
 #[tokio::test]
 async fn detail_page_shows_history_event_count_and_threshold() {
     let (database_url, _container) = setup_test_database_url().await;
-    let exec_id =
-        insert_workflow_on_url(&database_url, ShardId::new(0), "hist_wf", "hist-1").await;
+    let exec_id = insert_workflow_on_url(&database_url, ShardId::new(0), "hist_wf", "hist-1").await;
     // Insert 7 events so we have a known, non-zero count.
     append_test_events(&database_url, exec_id, "hist", 7).await;
 
@@ -2386,7 +2385,7 @@ async fn detail_page_shows_history_event_count_and_threshold() {
         "metadata card should have a 'History events' label: {html}"
     );
     assert!(
-        html.contains("7"),
+        html.contains('7'),
         "metadata card should show the count 7: {html}"
     );
 
@@ -2402,13 +2401,13 @@ async fn detail_page_shows_history_event_count_and_threshold() {
 /// reflect that value rather than the default 10 000.
 #[tokio::test]
 async fn detail_page_shows_custom_continue_as_new_threshold() {
+    const CUSTOM_THRESHOLD: u64 = 500;
+
     let (database_url, _container) = setup_test_database_url().await;
-    let exec_id =
-        insert_workflow_on_url(&database_url, ShardId::new(0), "cust_wf", "cust-1").await;
+    let exec_id = insert_workflow_on_url(&database_url, ShardId::new(0), "cust_wf", "cust-1").await;
     append_test_events(&database_url, exec_id, "cust", 3).await;
 
     // Build an app whose registry uses a distinctive non-default threshold.
-    const CUSTOM_THRESHOLD: u64 = 500;
     let pool = build_test_pool(&database_url);
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(HarvestDbPool::from(pool));
@@ -2425,8 +2424,7 @@ async fn detail_page_shows_custom_continue_as_new_threshold() {
             vec![],
         )
         .with_history_policy(
-            WorkflowHistoryPolicy::default()
-                .with_continue_as_new_threshold(CUSTOM_THRESHOLD),
+            WorkflowHistoryPolicy::default().with_continue_as_new_threshold(CUSTOM_THRESHOLD),
         ),
     );
     api_state.install(HarvestApiRuntime::new(
@@ -2456,7 +2454,7 @@ async fn detail_page_shows_custom_continue_as_new_threshold() {
     // (It could appear elsewhere, e.g. as an event count or ID, so we verify
     // the custom value is present rather than asserting the default is absent.)
     assert!(
-        html.contains("3"),
+        html.contains('3'),
         "metadata card should show the event count 3: {html}"
     );
 }
