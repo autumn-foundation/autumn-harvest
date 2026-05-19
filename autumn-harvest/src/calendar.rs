@@ -751,7 +751,7 @@ mod tests {
                 false,
             )
             .unwrap();
-            let dates: Vec<_> = result.iter().map(chrono::DateTime::date_naive).collect();
+            let dates: Vec<_> = result.iter().map(|(_, ft)| ft.date_naive()).collect();
             assert!(
                 !dates.contains(&date("2026-07-04")),
                 "Jul 4 should be excluded"
@@ -782,7 +782,7 @@ mod tests {
                 false,
             )
             .unwrap();
-            let dates: Vec<_> = result.iter().map(chrono::DateTime::date_naive).collect();
+            let dates: Vec<_> = result.iter().map(|(_, ft)| ft.date_naive()).collect();
             assert!(
                 dates.iter().filter(|&&d| d == date("2026-07-05")).count() >= 1,
                 "Jul 5 should appear (as adjusted Jul 4 and/or natural Jul 5)"
@@ -814,8 +814,9 @@ mod tests {
                 false,
             )
             .unwrap();
+            let with_cal_times: Vec<_> = with_cal.into_iter().map(|(_, ft)| ft).collect();
             assert_eq!(
-                plain, with_cal,
+                plain, with_cal_times,
                 "empty exclusion list must not change results"
             );
         }
