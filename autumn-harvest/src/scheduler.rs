@@ -1484,8 +1484,7 @@ async fn tick_one_workflow_schedule(
             .await
             .unwrap_or_default();
         let fire_date = logical_date.date_naive();
-        let skip_policy =
-            crate::policy::SkipPolicy::from_db(&schedule.skip_policy);
+        let skip_policy = crate::policy::SkipPolicy::from_db(&schedule.skip_policy);
 
         match crate::calendar::apply_skip_policy(fire_date, skip_policy, &excluded) {
             None => {

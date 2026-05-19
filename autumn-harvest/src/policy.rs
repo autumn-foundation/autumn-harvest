@@ -1017,11 +1017,7 @@ mod tests {
         ];
         for (policy, s) in cases {
             assert_eq!(policy.as_str(), s, "as_str mismatch for {policy:?}");
-            assert_eq!(
-                SkipPolicy::from_db(s),
-                policy,
-                "from_db mismatch for {s}"
-            );
+            assert_eq!(SkipPolicy::from_db(s), policy, "from_db mismatch for {s}");
         }
     }
 
