@@ -90,6 +90,8 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260517000001_harvest_schedule_overlap_policy/up.sql"),
     "\n",
     include_str!("../migrations/20260518000000_harvest_workflow_execution_timeout/up.sql"),
+    "\n",
+    include_str!("../migrations/20260519000000_harvest_calendar_awareness/up.sql"),
 );
 
 /// The minimal "legacy" migration set used by the upgrade-path regression
