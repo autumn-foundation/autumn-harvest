@@ -1407,6 +1407,26 @@ impl WorkflowContext {
             }
             HistoryMatch::NoMatch => {
                 self.check_strict_replay_no_match(&format!("ActivityScheduled({name})"))?;
+
+                // Enforce activity input payload cap before scheduling.
+                let effective_cap = {
+                    let global = self.payload_max_activity_input;
+                    self.activity_input_cap_overrides
+                        .get(name)
+                        .copied()
+                        .map_or(global, |ov| global.max(ov))
+                };
+                let observed = serde_json::to_string(&input).map_or(0, |s| s.len() as u64);
+                if observed > effective_cap {
+                    return Err(HarvestError::PayloadTooLarge {
+                        kind: PayloadKind::ActivityInput,
+                        observed_bytes: observed,
+                        cap_bytes: effective_cap,
+                        workflow_type: self.workflow_name.clone(),
+                        activity_name: Some(name.to_string()),
+                    });
+                }
+
                 let activity_id = self.next_activity_id();
                 let (tx, rx) = oneshot::channel();
                 self.push_command(WorkflowCommand::ScheduleActivity {
@@ -1560,6 +1580,25 @@ impl WorkflowContext {
 
             HistoryMatch::NoMatch => {
                 self.check_strict_replay_no_match(&format!("LocalActivityScheduled({name})"))?;
+
+                // Enforce activity input payload cap for local activities too.
+                let effective_cap = {
+                    let global = self.payload_max_activity_input;
+                    self.activity_input_cap_overrides
+                        .get(name)
+                        .copied()
+                        .map_or(global, |ov| global.max(ov))
+                };
+                let observed = serde_json::to_string(&input).map_or(0, |s| s.len() as u64);
+                if observed > effective_cap {
+                    return Err(HarvestError::PayloadTooLarge {
+                        kind: PayloadKind::ActivityInput,
+                        observed_bytes: observed,
+                        cap_bytes: effective_cap,
+                        workflow_type: self.workflow_name.clone(),
+                        activity_name: Some(name.to_string()),
+                    });
+                }
 
                 let activity_id = self.next_activity_id();
                 let (tx, rx) = oneshot::channel();

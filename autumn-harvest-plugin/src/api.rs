@@ -3743,6 +3743,33 @@ async fn start_workflow(
         .unwrap_or_else(|| "default".to_string());
     let input = request.input.unwrap_or(Value::Null);
 
+    // Issue #252: enforce workflow input payload cap before writing any rows.
+    {
+        let effective_cap = runtime
+            .registry
+            .workflows
+            .get(&workflow_name)
+            .and_then(|info| info.max_input_bytes)
+            .map_or(runtime.registry.max_workflow_input_bytes, |per_wf| {
+                per_wf.max(runtime.registry.max_workflow_input_bytes)
+            });
+        let observed_bytes = serde_json::to_string(&input)
+            .map(|s| s.len() as u64)
+            .unwrap_or(0);
+        if observed_bytes > effective_cap {
+            return (
+                axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+                Json(serde_json::json!({
+                    "kind": "WorkflowInput",
+                    "observed_bytes": observed_bytes,
+                    "cap_bytes": effective_cap,
+                    "workflow_type": workflow_name,
+                })),
+            )
+                .into_response();
+        }
+    }
+
     // Resolve per-key concurrency policy from WorkflowInfo (issue #247).
     let (concurrency_key, concurrency_limit) = runtime
         .registry
@@ -4527,6 +4554,11 @@ async fn signal_workflow(
         };
         let _ = audit::insert_audit(&mut conn, &ar).await;
         return Err(map_error(e));
+    }
+
+    // Issue #252: enforce signal payload cap before inserting the signal row.
+    if let Ok(runtime) = api_state.runtime() {
+        check_signal_payload_cap(&payload, runtime.registry.max_signal_payload_bytes)?;
     }
 
     // Signal payload is intentionally not stored in the audit record (no PII).
@@ -8504,6 +8536,22 @@ fn parse_uuid(raw: &str, label: &str) -> Result<uuid::Uuid, AutumnError> {
         .map_err(|_| AutumnError::bad_request_msg(format!("invalid {label} '{raw}'")))
 }
 
+fn check_signal_payload_cap(payload: &Value, cap: u64) -> Result<(), AutumnError> {
+    let observed_bytes = serde_json::to_string(payload)
+        .map(|s| s.len() as u64)
+        .unwrap_or(0);
+    if observed_bytes > cap {
+        return Err(map_error(autumn_harvest::HarvestError::PayloadTooLarge {
+            kind: autumn_harvest::error::PayloadKind::SignalPayload,
+            observed_bytes,
+            cap_bytes: cap,
+            workflow_type: String::new(),
+            activity_name: None,
+        }));
+    }
+    Ok(())
+}
+
 pub(crate) fn map_error(error: HarvestError) -> AutumnError {
     match error {
         HarvestError::NotFound(message)
@@ -8536,6 +8584,17 @@ pub(crate) fn map_error(error: HarvestError) -> AutumnError {
         HarvestError::UpdateRejected { reason } => {
             AutumnError::bad_request_msg(reason).with_status(axum::http::StatusCode::CONFLICT)
         }
+        HarvestError::PayloadTooLarge {
+            kind,
+            observed_bytes,
+            cap_bytes,
+            workflow_type,
+            ..
+        } => AutumnError::bad_request_msg(format!(
+            "payload too large: {kind} for workflow '{workflow_type}' exceeded cap of \
+             {cap_bytes} bytes (observed {observed_bytes} bytes)"
+        ))
+        .with_status(axum::http::StatusCode::PAYLOAD_TOO_LARGE),
         HarvestError::AlreadyExists {
             existing_exec_id,
             existing_state,

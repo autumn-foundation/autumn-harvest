@@ -484,7 +484,12 @@ impl BuiltHarvest {
             )
             .with_handler_infos(self.query_handlers, self.update_handlers)
             .with_history_policy(self.history_policy)
-            .with_payload_caps(self.max_activity_input_bytes, self.max_workflow_input_bytes),
+            .with_payload_caps(
+                self.max_activity_input_bytes,
+                self.max_workflow_input_bytes,
+                self.max_activity_result_bytes,
+                self.max_signal_payload_bytes,
+            ),
             self.dags,
             self.workflow_schedules,
             self.worker_config,
@@ -514,7 +519,12 @@ impl BuiltHarvest {
             )
             .with_handler_infos(self.query_handlers, self.update_handlers)
             .with_history_policy(self.history_policy)
-            .with_payload_caps(self.max_activity_input_bytes, self.max_workflow_input_bytes),
+            .with_payload_caps(
+                self.max_activity_input_bytes,
+                self.max_workflow_input_bytes,
+                self.max_activity_result_bytes,
+                self.max_signal_payload_bytes,
+            ),
             self.dags,
             self.workflow_schedules,
             self.worker_config,
