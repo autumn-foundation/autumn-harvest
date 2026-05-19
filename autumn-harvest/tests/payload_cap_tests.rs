@@ -196,13 +196,13 @@ fn builder_custom_payload_caps_survive_build() {
         .max_activity_input_bytes(4 * 1024 * 1024) // 4 MiB
         .max_activity_result_bytes(8 * 1024 * 1024) // 8 MiB
         .max_signal_payload_bytes(512 * 1024) // 512 KiB
-        .max_workflow_input_bytes(1 * 1024 * 1024) // 1 MiB
+        .max_workflow_input_bytes(1024 * 1024) // 1 MiB
         .build();
 
     assert_eq!(built.max_activity_input_bytes, 4 * 1024 * 1024);
     assert_eq!(built.max_activity_result_bytes, 8 * 1024 * 1024);
     assert_eq!(built.max_signal_payload_bytes, 512 * 1024);
-    assert_eq!(built.max_workflow_input_bytes, 1 * 1024 * 1024);
+    assert_eq!(built.max_workflow_input_bytes, 1024 * 1024);
 }
 
 // ---------------------------------------------------------------------------
@@ -279,7 +279,7 @@ fn metric_payload_rejected_constant_exists() {
 async fn context_rejects_oversized_activity_input_at_schedule_time() {
     // A 3 MiB input should be rejected when cap is 1 MiB
     let ctx = WorkflowContext::new_test().with_payload_caps(
-        1 * 1024 * 1024,
+        1024 * 1024,
         2 * 1024 * 1024,
         256 * 1024,
         2 * 1024 * 1024,
@@ -301,8 +301,8 @@ async fn context_rejects_oversized_activity_input_at_schedule_time() {
         }
         Ok(Ok(_)) => panic!("Should have rejected oversized input"),
         Ok(Err(e)) => panic!("Wrong error: {e}"),
-        Err(_timeout) => {
-            panic!("Timed out — the cap check should be synchronous before the suspend")
+        Err(timeout) => {
+            panic!("Timed out ({timeout}) — the cap check should be synchronous before the suspend")
         }
     }
 }
@@ -332,8 +332,7 @@ async fn context_accepts_activity_input_within_cap() {
         Ok(Err(HarvestError::PayloadTooLarge { .. })) => {
             panic!("Should not reject small input as PayloadTooLarge")
         }
-        Ok(Err(HarvestError::Cancelled(_))) => {} // Cancelled is fine too
-        Ok(Ok(_)) => {}                           // fine
+        Ok(Err(HarvestError::Cancelled(_)) | Ok(_)) => {}
         Ok(Err(e)) => panic!("Unexpected error: {e}"),
     }
 }
@@ -345,10 +344,10 @@ async fn context_accepts_activity_input_within_cap() {
 #[test]
 fn context_rejects_oversized_side_effect_value() {
     let ctx = WorkflowContext::new_test().with_payload_caps(
-        1 * 1024 * 1024,
-        1 * 1024 * 1024,
+        1024 * 1024,
+        1024 * 1024,
         256 * 1024,
-        1 * 1024 * 1024,
+        1024 * 1024,
     );
 
     // Make a large string that exceeds the cap
@@ -396,7 +395,7 @@ fn replay_does_not_recheck_cap_on_existing_events() {
         },
         WorkflowEvent::MarkerRecorded {
             name: "side_effect:big_value".to_string(),
-            details: large_payload.clone(),
+            details: large_payload,
         },
     ];
 
@@ -404,10 +403,10 @@ fn replay_does_not_recheck_cap_on_existing_events() {
 
     // Create a replay context with a TIGHT cap (1 MiB) — LOWER than the stored payload
     let ctx = WorkflowContext::for_replay(exec_id, events).with_payload_caps(
-        1 * 1024 * 1024,
-        1 * 1024 * 1024,
+        1024 * 1024,
+        1024 * 1024,
         256 * 1024,
-        1 * 1024 * 1024,
+        1024 * 1024,
     );
 
     // Replaying the side_effect should return the stored large value WITHOUT
@@ -441,12 +440,7 @@ async fn activity_cap_override_raises_global_cap() {
     // Per-activity override: 4 MiB (raised)
     // Payload: 2 MiB — should pass with override, fail without
     let ctx = WorkflowContext::new_test()
-        .with_payload_caps(
-            1 * 1024 * 1024,
-            2 * 1024 * 1024,
-            256 * 1024,
-            2 * 1024 * 1024,
-        )
+        .with_payload_caps(1024 * 1024, 2 * 1024 * 1024, 256 * 1024, 2 * 1024 * 1024)
         .with_activity_input_override("big_activity", 4 * 1024 * 1024);
 
     let two_mib = make_large_json(2 * 1024 * 1024);
@@ -463,8 +457,7 @@ async fn activity_cap_override_raises_global_cap() {
         Ok(Err(HarvestError::PayloadTooLarge { .. })) => {
             panic!("Should NOT reject — the per-activity override raises cap to 4 MiB")
         }
-        Ok(Err(HarvestError::Cancelled(_))) => {}
-        Ok(Ok(_)) => {}
+        Ok(Err(HarvestError::Cancelled(_)) | Ok(_)) => {}
         Ok(Err(e)) => panic!("Unexpected error: {e}"),
     }
 }
@@ -481,7 +474,7 @@ async fn activity_cap_override_does_not_lower_global_cap() {
             256 * 1024,
             4 * 1024 * 1024,
         )
-        .with_activity_input_override("small_activity", 1 * 1024 * 1024); // attempt to lower
+        .with_activity_input_override("small_activity", 1024 * 1024); // attempt to lower
 
     let two_mib = make_large_json(2 * 1024 * 1024);
 
@@ -497,8 +490,7 @@ async fn activity_cap_override_does_not_lower_global_cap() {
         Ok(Err(HarvestError::PayloadTooLarge { .. })) => {
             panic!("Global cap (4 MiB) must not be lowered by per-activity override (1 MiB)")
         }
-        Ok(Err(HarvestError::Cancelled(_))) => {}
-        Ok(Ok(_)) => {}
+        Ok(Err(HarvestError::Cancelled(_)) | Ok(_)) => {}
         Ok(Err(e)) => panic!("Unexpected error: {e}"),
     }
 }
@@ -510,10 +502,10 @@ async fn activity_cap_override_does_not_lower_global_cap() {
 #[tokio::test]
 async fn context_rejects_oversized_child_workflow_input() {
     let ctx = WorkflowContext::new_test().with_payload_caps(
-        1 * 1024 * 1024,
-        1 * 1024 * 1024,
+        1024 * 1024,
+        1024 * 1024,
         256 * 1024,
-        1 * 1024 * 1024,
+        1024 * 1024,
     );
 
     let oversized = make_large_json(2 * 1024 * 1024); // 2 MiB, above 1 MiB cap
@@ -530,7 +522,7 @@ async fn context_rejects_oversized_child_workflow_input() {
         }
         Ok(Ok(_)) => panic!("Should reject oversized child workflow input"),
         Ok(Err(e)) => panic!("Wrong error: {e}"),
-        Err(_timeout) => panic!("Timed out — cap check should be synchronous"),
+        Err(timeout) => panic!("Timed out ({timeout}) — cap check should be synchronous"),
     }
 }
 
