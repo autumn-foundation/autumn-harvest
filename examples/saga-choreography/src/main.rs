@@ -108,6 +108,11 @@ pub async fn tenant_cancel(ctx: &WorkflowContext, input: Value) -> HarvestResult
 // ---------------------------------------------------------------------------
 // Replay tests — exercise the cross-workflow signal path under WorkflowReplayer
 // ---------------------------------------------------------------------------
+fn main() {
+    println!("Saga-choreography example — run with `cargo test -p saga-choreography`");
+    println!("For an end-to-end demo against a live Postgres instance,");
+    println!("wire these workflow handlers into the standalone-runner.");
+}
 
 #[cfg(test)]
 mod tests {
@@ -232,10 +237,7 @@ mod tests {
 
     async fn run_replay(
         workflow_name: &str,
-        handler: fn(
-            &WorkflowContext,
-            Value,
-        ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + '_>>,
+        handler: autumn_harvest::info::WorkflowHandlerFn,
         events: Vec<WorkflowEvent>,
     ) -> ReplayReport {
         let exec_id = ExecutionId::new();
@@ -297,10 +299,4 @@ mod tests {
             "replay regression: {report}"
         );
     }
-}
-
-fn main() {
-    println!("Saga-choreography example — run with `cargo test -p saga-choreography`");
-    println!("For an end-to-end demo against a live Postgres instance,");
-    println!("wire these workflow handlers into the standalone-runner.");
 }

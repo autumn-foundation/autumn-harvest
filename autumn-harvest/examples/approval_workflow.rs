@@ -1,5 +1,7 @@
 //! Declarative approval workflow: `#[update]`, `#[query]`, `updates![]`, `queries![]`.
 
+#![allow(clippy::used_underscore_binding)]
+
 use autumn_harvest::prelude::*;
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
@@ -29,12 +31,18 @@ fn validate_decision(input: &serde_json::Value) -> Result<(), String> {
 
 // Declarative update handler — auto-registered before the workflow runs.
 #[update(workflow = "approval_workflow", validator = validate_decision)]
+#[allow(
+    clippy::unused_async,
+    clippy::used_underscore_binding,
+    clippy::missing_errors_doc
+)]
 pub async fn decide(_ctx: &WorkflowContext, _input: Decision) -> Result<(), String> {
     Ok(())
 }
 
 // Declarative query handler — auto-registered before the workflow runs.
 #[query(workflow = "approval_workflow")]
+#[allow(clippy::missing_const_for_fn, clippy::missing_errors_doc)]
 pub fn approval_status(_ctx: &WorkflowContext) -> Result<StatusResponse, String> {
     Ok(StatusResponse {
         pending: true,
@@ -43,6 +51,11 @@ pub fn approval_status(_ctx: &WorkflowContext) -> Result<StatusResponse, String>
 }
 
 #[workflow]
+#[allow(
+    clippy::unused_async,
+    clippy::used_underscore_binding,
+    clippy::missing_errors_doc
+)]
 pub async fn approval_workflow(
     _ctx: &WorkflowContext,
     _id: String,
