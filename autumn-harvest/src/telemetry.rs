@@ -650,11 +650,7 @@ pub trait MetricsRecorder: Send + Sync {
     ///
     /// Maps to the counter `harvest.payload.rejected` with labels
     /// `payload.kind` and `workflow.type`.
-    fn record_payload_rejected(
-        &self,
-        kind: &crate::error::PayloadKind,
-        workflow_type: &str,
-    ) {
+    fn record_payload_rejected(&self, kind: &crate::error::PayloadKind, workflow_type: &str) {
         let _ = (kind, workflow_type);
     }
 }

@@ -16,9 +16,7 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 use tokio::sync::oneshot;
 
-use crate::builder::{
-    DEFAULT_MAX_ACTIVITY_INPUT_BYTES, DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
-};
+use crate::builder::{DEFAULT_MAX_ACTIVITY_INPUT_BYTES, DEFAULT_MAX_WORKFLOW_INPUT_BYTES};
 use crate::error::{HarvestError, HarvestResult, PayloadKind};
 use crate::event::WorkflowEvent;
 use crate::query::QueryRegistry;

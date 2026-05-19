@@ -89,10 +89,20 @@ fn payload_too_large_variant_has_all_fields() {
         activity_name: Some("send_email".to_string()),
     };
     let msg = e.to_string();
-    assert!(msg.contains("payload too large") || msg.contains("PayloadTooLarge") || msg.contains("onboarding"),
-        "Error message should mention the relevant context: {msg}");
-    assert!(msg.contains("5000000") || msg.contains("5_000_000"), "should include observed bytes: {msg}");
-    assert!(msg.contains("2097152") || msg.contains("2_097_152"), "should include cap bytes: {msg}");
+    assert!(
+        msg.contains("payload too large")
+            || msg.contains("PayloadTooLarge")
+            || msg.contains("onboarding"),
+        "Error message should mention the relevant context: {msg}"
+    );
+    assert!(
+        msg.contains("5000000") || msg.contains("5_000_000"),
+        "should include observed bytes: {msg}"
+    );
+    assert!(
+        msg.contains("2097152") || msg.contains("2_097_152"),
+        "should include cap bytes: {msg}"
+    );
 }
 
 #[test]
@@ -118,7 +128,12 @@ fn payload_too_large_is_non_exhaustive() {
         workflow_type: "wf".to_string(),
         activity_name: None,
     }) {
-        HarvestError::PayloadTooLarge { kind, observed_bytes, cap_bytes, .. } => {
+        HarvestError::PayloadTooLarge {
+            kind,
+            observed_bytes,
+            cap_bytes,
+            ..
+        } => {
             assert_eq!(kind, PayloadKind::SignalPayload);
             assert_eq!(observed_bytes, 1000);
             assert_eq!(cap_bytes, 500);
@@ -135,41 +150,53 @@ fn payload_too_large_is_non_exhaustive() {
 fn builder_default_max_activity_input_bytes() {
     let built = HarvestBuilder::new().build();
     // Default: 2 MiB
-    assert_eq!(built.max_activity_input_bytes, 2 * 1024 * 1024,
-        "Default max_activity_input_bytes must be 2 MiB");
+    assert_eq!(
+        built.max_activity_input_bytes,
+        2 * 1024 * 1024,
+        "Default max_activity_input_bytes must be 2 MiB"
+    );
 }
 
 #[test]
 fn builder_default_max_activity_result_bytes() {
     let built = HarvestBuilder::new().build();
     // Default: 2 MiB
-    assert_eq!(built.max_activity_result_bytes, 2 * 1024 * 1024,
-        "Default max_activity_result_bytes must be 2 MiB");
+    assert_eq!(
+        built.max_activity_result_bytes,
+        2 * 1024 * 1024,
+        "Default max_activity_result_bytes must be 2 MiB"
+    );
 }
 
 #[test]
 fn builder_default_max_signal_payload_bytes() {
     let built = HarvestBuilder::new().build();
     // Default: 256 KiB
-    assert_eq!(built.max_signal_payload_bytes, 256 * 1024,
-        "Default max_signal_payload_bytes must be 256 KiB");
+    assert_eq!(
+        built.max_signal_payload_bytes,
+        256 * 1024,
+        "Default max_signal_payload_bytes must be 256 KiB"
+    );
 }
 
 #[test]
 fn builder_default_max_workflow_input_bytes() {
     let built = HarvestBuilder::new().build();
     // Default: 2 MiB
-    assert_eq!(built.max_workflow_input_bytes, 2 * 1024 * 1024,
-        "Default max_workflow_input_bytes must be 2 MiB");
+    assert_eq!(
+        built.max_workflow_input_bytes,
+        2 * 1024 * 1024,
+        "Default max_workflow_input_bytes must be 2 MiB"
+    );
 }
 
 #[test]
 fn builder_custom_payload_caps_survive_build() {
     let built = HarvestBuilder::new()
-        .max_activity_input_bytes(4 * 1024 * 1024)   // 4 MiB
-        .max_activity_result_bytes(8 * 1024 * 1024)   // 8 MiB
-        .max_signal_payload_bytes(512 * 1024)          // 512 KiB
-        .max_workflow_input_bytes(1 * 1024 * 1024)     // 1 MiB
+        .max_activity_input_bytes(4 * 1024 * 1024) // 4 MiB
+        .max_activity_result_bytes(8 * 1024 * 1024) // 8 MiB
+        .max_signal_payload_bytes(512 * 1024) // 512 KiB
+        .max_workflow_input_bytes(1 * 1024 * 1024) // 1 MiB
         .build();
 
     assert_eq!(built.max_activity_input_bytes, 4 * 1024 * 1024);
@@ -251,8 +278,12 @@ fn metric_payload_rejected_constant_exists() {
 #[tokio::test]
 async fn context_rejects_oversized_activity_input_at_schedule_time() {
     // A 3 MiB input should be rejected when cap is 1 MiB
-    let ctx = WorkflowContext::new_test()
-        .with_payload_caps(1 * 1024 * 1024, 2 * 1024 * 1024, 256 * 1024, 2 * 1024 * 1024);
+    let ctx = WorkflowContext::new_test().with_payload_caps(
+        1 * 1024 * 1024,
+        2 * 1024 * 1024,
+        256 * 1024,
+        2 * 1024 * 1024,
+    );
 
     let oversized = make_large_json(2 * 1024 * 1024); // ~2 MiB JSON (above 1 MiB cap)
 
@@ -260,7 +291,8 @@ async fn context_rejects_oversized_activity_input_at_schedule_time() {
     let result = tokio::time::timeout(
         std::time::Duration::from_millis(50),
         ctx.execute_activity_raw("send_email", oversized, "default"),
-    ).await;
+    )
+    .await;
 
     // Should get a PayloadTooLarge error, NOT a timeout
     match result {
@@ -269,14 +301,20 @@ async fn context_rejects_oversized_activity_input_at_schedule_time() {
         }
         Ok(Ok(_)) => panic!("Should have rejected oversized input"),
         Ok(Err(e)) => panic!("Wrong error: {e}"),
-        Err(_timeout) => panic!("Timed out — the cap check should be synchronous before the suspend"),
+        Err(_timeout) => {
+            panic!("Timed out — the cap check should be synchronous before the suspend")
+        }
     }
 }
 
 #[tokio::test]
 async fn context_accepts_activity_input_within_cap() {
-    let ctx = WorkflowContext::new_test()
-        .with_payload_caps(4 * 1024 * 1024, 4 * 1024 * 1024, 256 * 1024, 4 * 1024 * 1024);
+    let ctx = WorkflowContext::new_test().with_payload_caps(
+        4 * 1024 * 1024,
+        4 * 1024 * 1024,
+        256 * 1024,
+        4 * 1024 * 1024,
+    );
 
     let small_input = json!({ "email": "user@example.com" });
 
@@ -284,7 +322,8 @@ async fn context_accepts_activity_input_within_cap() {
     let result = tokio::time::timeout(
         std::time::Duration::from_millis(50),
         ctx.execute_activity_raw("send_email", small_input, "default"),
-    ).await;
+    )
+    .await;
 
     // A timeout means it properly suspended (waiting for a worker to complete the activity)
     // which is correct — cap check passed
@@ -294,7 +333,7 @@ async fn context_accepts_activity_input_within_cap() {
             panic!("Should not reject small input as PayloadTooLarge")
         }
         Ok(Err(HarvestError::Cancelled(_))) => {} // Cancelled is fine too
-        Ok(Ok(_)) => {}  // fine
+        Ok(Ok(_)) => {}                           // fine
         Ok(Err(e)) => panic!("Unexpected error: {e}"),
     }
 }
@@ -305,8 +344,12 @@ async fn context_accepts_activity_input_within_cap() {
 
 #[test]
 fn context_rejects_oversized_side_effect_value() {
-    let ctx = WorkflowContext::new_test()
-        .with_payload_caps(1 * 1024 * 1024, 1 * 1024 * 1024, 256 * 1024, 1 * 1024 * 1024);
+    let ctx = WorkflowContext::new_test().with_payload_caps(
+        1 * 1024 * 1024,
+        1 * 1024 * 1024,
+        256 * 1024,
+        1 * 1024 * 1024,
+    );
 
     // Make a large string that exceeds the cap
     let large_value = "y".repeat(2 * 1024 * 1024); // 2 MiB string
@@ -323,8 +366,12 @@ fn context_rejects_oversized_side_effect_value() {
 
 #[test]
 fn context_accepts_small_side_effect_value() {
-    let ctx = WorkflowContext::new_test()
-        .with_payload_caps(2 * 1024 * 1024, 2 * 1024 * 1024, 256 * 1024, 2 * 1024 * 1024);
+    let ctx = WorkflowContext::new_test().with_payload_caps(
+        2 * 1024 * 1024,
+        2 * 1024 * 1024,
+        256 * 1024,
+        2 * 1024 * 1024,
+    );
 
     let small_value = "hello".to_string();
     let result: autumn_harvest::error::HarvestResult<String> =
@@ -356,8 +403,12 @@ fn replay_does_not_recheck_cap_on_existing_events() {
     let exec_id = autumn_harvest::types::ExecutionId::new();
 
     // Create a replay context with a TIGHT cap (1 MiB) — LOWER than the stored payload
-    let ctx = WorkflowContext::for_replay(exec_id, events)
-        .with_payload_caps(1 * 1024 * 1024, 1 * 1024 * 1024, 256 * 1024, 1 * 1024 * 1024);
+    let ctx = WorkflowContext::for_replay(exec_id, events).with_payload_caps(
+        1 * 1024 * 1024,
+        1 * 1024 * 1024,
+        256 * 1024,
+        1 * 1024 * 1024,
+    );
 
     // Replaying the side_effect should return the stored large value WITHOUT
     // triggering a PayloadTooLarge error — the cap only applies to new writes.
@@ -367,7 +418,11 @@ fn replay_does_not_recheck_cap_on_existing_events() {
     match result {
         Ok(v) => {
             // The stored value should be returned intact
-            assert_eq!(v.len(), 3 * 1024 * 1024, "Should return the full stored value");
+            assert_eq!(
+                v.len(),
+                3 * 1024 * 1024,
+                "Should return the full stored value"
+            );
         }
         Err(HarvestError::PayloadTooLarge { .. }) => {
             panic!("Must NOT reject stored payloads during replay — replay safety broken!");
@@ -386,7 +441,12 @@ async fn activity_cap_override_raises_global_cap() {
     // Per-activity override: 4 MiB (raised)
     // Payload: 2 MiB — should pass with override, fail without
     let ctx = WorkflowContext::new_test()
-        .with_payload_caps(1 * 1024 * 1024, 2 * 1024 * 1024, 256 * 1024, 2 * 1024 * 1024)
+        .with_payload_caps(
+            1 * 1024 * 1024,
+            2 * 1024 * 1024,
+            256 * 1024,
+            2 * 1024 * 1024,
+        )
         .with_activity_input_override("big_activity", 4 * 1024 * 1024);
 
     let two_mib = make_large_json(2 * 1024 * 1024);
@@ -395,7 +455,8 @@ async fn activity_cap_override_raises_global_cap() {
     let result = tokio::time::timeout(
         std::time::Duration::from_millis(50),
         ctx.execute_activity_raw("big_activity", two_mib, "default"),
-    ).await;
+    )
+    .await;
 
     match result {
         Err(_timeout) => {} // Correctly suspended (cap check passed, waiting for worker)
@@ -414,7 +475,12 @@ async fn activity_cap_override_does_not_lower_global_cap() {
     // "Per-activity override": 1 MiB (trying to lower — should be ignored, global wins)
     // Payload: 2 MiB — should STILL pass because effective cap = max(4 MiB, 1 MiB) = 4 MiB
     let ctx = WorkflowContext::new_test()
-        .with_payload_caps(4 * 1024 * 1024, 4 * 1024 * 1024, 256 * 1024, 4 * 1024 * 1024)
+        .with_payload_caps(
+            4 * 1024 * 1024,
+            4 * 1024 * 1024,
+            256 * 1024,
+            4 * 1024 * 1024,
+        )
         .with_activity_input_override("small_activity", 1 * 1024 * 1024); // attempt to lower
 
     let two_mib = make_large_json(2 * 1024 * 1024);
@@ -422,7 +488,8 @@ async fn activity_cap_override_does_not_lower_global_cap() {
     let result = tokio::time::timeout(
         std::time::Duration::from_millis(50),
         ctx.execute_activity_raw("small_activity", two_mib, "default"),
-    ).await;
+    )
+    .await;
 
     // 2 MiB is within the 4 MiB global cap, so should suspend (pass)
     match result {
@@ -442,15 +509,20 @@ async fn activity_cap_override_does_not_lower_global_cap() {
 
 #[tokio::test]
 async fn context_rejects_oversized_child_workflow_input() {
-    let ctx = WorkflowContext::new_test()
-        .with_payload_caps(1 * 1024 * 1024, 1 * 1024 * 1024, 256 * 1024, 1 * 1024 * 1024);
+    let ctx = WorkflowContext::new_test().with_payload_caps(
+        1 * 1024 * 1024,
+        1 * 1024 * 1024,
+        256 * 1024,
+        1 * 1024 * 1024,
+    );
 
     let oversized = make_large_json(2 * 1024 * 1024); // 2 MiB, above 1 MiB cap
 
     let result = tokio::time::timeout(
         std::time::Duration::from_millis(50),
         ctx.spawn_child_workflow_raw("child_workflow", oversized),
-    ).await;
+    )
+    .await;
 
     match result {
         Ok(Err(HarvestError::PayloadTooLarge { kind, .. })) => {
@@ -474,8 +546,14 @@ fn parse_byte_size_parses_kib() {
 
 #[test]
 fn parse_byte_size_parses_mib() {
-    assert_eq!(autumn_harvest::parse_byte_size("2MiB"), Some(2 * 1024 * 1024));
-    assert_eq!(autumn_harvest::parse_byte_size("8MiB"), Some(8 * 1024 * 1024));
+    assert_eq!(
+        autumn_harvest::parse_byte_size("2MiB"),
+        Some(2 * 1024 * 1024)
+    );
+    assert_eq!(
+        autumn_harvest::parse_byte_size("8MiB"),
+        Some(8 * 1024 * 1024)
+    );
 }
 
 #[test]
@@ -505,8 +583,10 @@ fn parse_byte_size_rejects_invalid() {
 #[test]
 fn workflow_info_max_input_bytes_none_by_default() {
     let info = fake_workflow_info("test_wf");
-    assert!(info.max_input_bytes.is_none(),
-        "max_input_bytes should default to None (uses global cap)");
+    assert!(
+        info.max_input_bytes.is_none(),
+        "max_input_bytes should default to None (uses global cap)"
+    );
 }
 
 #[test]
@@ -522,8 +602,8 @@ fn activity_info_max_bytes_none_by_default() {
 
 #[test]
 fn metrics_recorder_has_payload_methods() {
-    use autumn_harvest::telemetry::{NoOpMetrics, MetricsRecorder};
     use autumn_harvest::error::PayloadKind;
+    use autumn_harvest::telemetry::{MetricsRecorder, NoOpMetrics};
 
     let recorder = NoOpMetrics;
     // These should compile and not panic
@@ -533,8 +613,5 @@ fn metrics_recorder_has_payload_methods() {
         Some("send_email"),
         1024,
     );
-    recorder.record_payload_rejected(
-        &PayloadKind::ActivityInput,
-        "onboarding",
-    );
+    recorder.record_payload_rejected(&PayloadKind::ActivityInput, "onboarding");
 }
