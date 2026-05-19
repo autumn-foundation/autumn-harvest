@@ -2,12 +2,54 @@
 //!
 //! Provides utilities to calculate the longest execution path through a DAG,
 //! identifying the bottleneck tasks that determine the overall execution duration.
+//! This is extremely useful for capacity planning and identifying which activities
+//! to optimize to speed up the overall workflow.
+//!
+//! ## Examples
+//!
+//! ```rust
+//! use autumn_harvest::dag::DagBuilder;
+//! use autumn_harvest::critical_path::CriticalPathAnalyzer;
+//! use std::time::Duration;
+//!
+//! const fn fast_task() {}
+//! const fn slow_task() {}
+//!
+//! let mut builder = DagBuilder::new();
+//! let a = builder.activity(fast_task);
+//! let b = builder.activity(slow_task).upstream(&a);
+//! let dag = builder.build().unwrap();
+//!
+//! let result = CriticalPathAnalyzer::new(dag)
+//!     .mock_duration("slow_task", Duration::from_secs(10))
+//!     .analyze();
+//!
+//! assert_eq!(result.total_duration, Duration::from_secs(11));
+//! ```
 
 use crate::dag::DagDefinition;
 use std::collections::HashMap;
 use std::time::Duration;
 
 /// Result of a critical path analysis.
+///
+/// This struct holds the calculated total duration and the exact sequence of
+/// activities that form the critical path. If any activity on this path takes
+/// longer than expected, the entire DAG's duration will increase.
+///
+/// ## Examples
+///
+/// ```rust
+/// use autumn_harvest::critical_path::CriticalPathResult;
+/// use std::time::Duration;
+///
+/// let result = CriticalPathResult {
+///     total_duration: Duration::from_secs(42),
+///     path_indices: vec![0, 1],
+///     path_names: vec!["setup".to_string(), "process".to_string()],
+/// };
+/// assert_eq!(result.total_duration, Duration::from_secs(42));
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CriticalPathResult {
     /// The total estimated duration of the critical path.
@@ -19,6 +61,19 @@ pub struct CriticalPathResult {
 }
 
 /// Analyzer to determine the critical path of a DAG.
+///
+/// Computes the longest execution path through a [`DagDefinition`]. You can configure
+/// expected durations for specific activities using [`CriticalPathAnalyzer::mock_duration`].
+///
+/// ## Examples
+///
+/// ```rust
+/// use autumn_harvest::dag::DagBuilder;
+/// use autumn_harvest::critical_path::CriticalPathAnalyzer;
+///
+/// let dag = DagBuilder::new().build().unwrap();
+/// let analyzer = CriticalPathAnalyzer::new(dag);
+/// ```
 pub struct CriticalPathAnalyzer {
     dag: DagDefinition,
     activity_durations: HashMap<String, Duration>,
@@ -27,6 +82,18 @@ pub struct CriticalPathAnalyzer {
 
 impl CriticalPathAnalyzer {
     /// Create a new analyzer for the given DAG definition.
+    ///
+    /// By default, any activity whose duration is not mocked is assumed to take 1 second.
+    ///
+    /// ## Examples
+    ///
+    /// ```rust
+    /// use autumn_harvest::dag::DagBuilder;
+    /// use autumn_harvest::critical_path::CriticalPathAnalyzer;
+    ///
+    /// let dag = DagBuilder::new().build().unwrap();
+    /// let analyzer = CriticalPathAnalyzer::new(dag);
+    /// ```
     #[must_use]
     pub fn new(dag: DagDefinition) -> Self {
         Self {
@@ -37,6 +104,18 @@ impl CriticalPathAnalyzer {
     }
 
     /// Set a default duration for activities whose duration is not explicitly mocked.
+    ///
+    /// ## Examples
+    ///
+    /// ```rust
+    /// use autumn_harvest::dag::DagBuilder;
+    /// use autumn_harvest::critical_path::CriticalPathAnalyzer;
+    /// use std::time::Duration;
+    ///
+    /// let dag = DagBuilder::new().build().unwrap();
+    /// let analyzer = CriticalPathAnalyzer::new(dag)
+    ///     .with_default_duration(Duration::from_secs(5));
+    /// ```
     #[must_use]
     pub const fn with_default_duration(mut self, duration: Duration) -> Self {
         self.default_duration = duration;
@@ -44,6 +123,22 @@ impl CriticalPathAnalyzer {
     }
 
     /// Mock the expected duration of an activity by name.
+    ///
+    /// This overrides the default duration for any activity matching `name`. If an activity
+    /// has a `start_to_close` timeout configured on the DAG itself, that timeout will take
+    /// precedence over this mock.
+    ///
+    /// ## Examples
+    ///
+    /// ```rust
+    /// use autumn_harvest::dag::DagBuilder;
+    /// use autumn_harvest::critical_path::CriticalPathAnalyzer;
+    /// use std::time::Duration;
+    ///
+    /// let dag = DagBuilder::new().build().unwrap();
+    /// let analyzer = CriticalPathAnalyzer::new(dag)
+    ///     .mock_duration("heavy_computation", Duration::from_secs(60));
+    /// ```
     #[must_use]
     pub fn mock_duration(mut self, name: &str, duration: Duration) -> Self {
         self.activity_durations.insert(name.to_string(), duration);
@@ -54,6 +149,16 @@ impl CriticalPathAnalyzer {
     ///
     /// The critical path is the longest path through the graph from any source node
     /// to any sink node, which dictates the minimum possible execution time of the entire DAG.
+    ///
+    /// ## Examples
+    ///
+    /// ```rust
+    /// use autumn_harvest::dag::DagBuilder;
+    /// use autumn_harvest::critical_path::CriticalPathAnalyzer;
+    ///
+    /// let dag = DagBuilder::new().build().unwrap();
+    /// let result = CriticalPathAnalyzer::new(dag).analyze();
+    /// ```
     #[must_use]
     pub fn analyze(&self) -> CriticalPathResult {
         let tasks = self.dag.tasks();
