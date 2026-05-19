@@ -1312,7 +1312,7 @@ impl WorkflowContext {
                         .map_or(global, |ov| global.max(ov))
                 };
                 let observed = serde_json::to_string(&input).map_or(0, |s| s.len() as u64);
-                if observed > effective_cap {
+                if effective_cap > 0 && observed > effective_cap {
                     return Err(HarvestError::PayloadTooLarge {
                         kind: PayloadKind::ActivityInput,
                         observed_bytes: observed,
@@ -1426,7 +1426,7 @@ impl WorkflowContext {
                         .map_or(global, |ov| global.max(ov))
                 };
                 let observed = serde_json::to_string(&input).map_or(0, |s| s.len() as u64);
-                if observed > effective_cap {
+                if effective_cap > 0 && observed > effective_cap {
                     return Err(HarvestError::PayloadTooLarge {
                         kind: PayloadKind::ActivityInput,
                         observed_bytes: observed,
@@ -1599,7 +1599,7 @@ impl WorkflowContext {
                         .map_or(global, |ov| global.max(ov))
                 };
                 let observed = serde_json::to_string(&input).map_or(0, |s| s.len() as u64);
-                if observed > effective_cap {
+                if effective_cap > 0 && observed > effective_cap {
                     return Err(HarvestError::PayloadTooLarge {
                         kind: PayloadKind::ActivityInput,
                         observed_bytes: observed,
@@ -1778,7 +1778,8 @@ impl WorkflowContext {
 
                 // Enforce child-workflow input payload cap before scheduling.
                 let observed = serde_json::to_string(&input).map_or(0, |s| s.len() as u64);
-                if observed > self.payload_max_workflow_input {
+                if self.payload_max_workflow_input > 0 && observed > self.payload_max_workflow_input
+                {
                     return Err(HarvestError::PayloadTooLarge {
                         kind: PayloadKind::ChildWorkflowInput,
                         observed_bytes: observed,
@@ -2367,7 +2368,8 @@ impl WorkflowContext {
             HistoryMatch::NoMatch => {
                 self.check_strict_replay_no_match("ContinueAsNew")?;
                 let observed = serde_json::to_string(&input).map_or(0, |s| s.len() as u64);
-                if observed > self.payload_max_workflow_input {
+                if self.payload_max_workflow_input > 0 && observed > self.payload_max_workflow_input
+                {
                     return Err(HarvestError::PayloadTooLarge {
                         kind: crate::error::PayloadKind::WorkflowInput,
                         observed_bytes: observed,

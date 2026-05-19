@@ -389,6 +389,18 @@ async fn replace_execution(
         .await
         .map_err(database_error)?;
 
+    if request.max_workflow_input_bytes > 0 {
+        let observed = serde_json::to_string(&request.input).map_or(0, |s| s.len() as u64);
+        if observed > request.max_workflow_input_bytes {
+            return Err(crate::error::HarvestError::PayloadTooLarge {
+                kind: crate::error::PayloadKind::WorkflowInput,
+                observed_bytes: observed,
+                cap_bytes: request.max_workflow_input_bytes,
+                workflow_type: request.workflow_name.to_string(),
+                activity_name: None,
+            });
+        }
+    }
     let started_event = WorkflowEvent::WorkflowStarted {
         input: request.input.clone(),
         timestamp: Utc::now(),
