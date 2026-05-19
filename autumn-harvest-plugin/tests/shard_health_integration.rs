@@ -157,6 +157,7 @@ fn workflow_info() -> WorkflowInfo {
         handler: |_ctx, input| Box::pin(async move { Ok(input) }),
         execution_timeout: None,
         concurrency: None,
+        max_input_bytes: None,
     }
 }
 
@@ -172,6 +173,8 @@ fn activity_info(queue: Option<&'static str>) -> ActivityInfo {
         max_concurrent: None,
         concurrency_key: None,
         is_local: false,
+        max_input_bytes: None,
+        max_result_bytes: None,
         handler: |_ctx, input| Box::pin(async move { Ok(input) }),
     }
 }

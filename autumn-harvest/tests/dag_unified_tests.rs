@@ -605,6 +605,7 @@ fn builder_rejects_workflow_name_collision_with_auto_registered_dag() {
         handler: __autumn_workflow_info_scheduled_dag().handler,
         execution_timeout: None,
         concurrency: None,
+        max_input_bytes: None,
     };
 
     let result = HarvestBuilder::new()

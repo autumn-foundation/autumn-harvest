@@ -29,7 +29,7 @@ use crate::dlq::{self, DeadLetterReason, NewDeadLetterEntry};
 use crate::error::{HarvestError, HarvestResult};
 use crate::event::WorkflowEvent;
 use crate::executor::{
-    WorkflowExecuteSpanMeta, WorkflowOutcome, run_workflow_with_state_and_history_policy,
+    WorkflowExecuteSpanMeta, WorkflowOutcome, run_workflow_with_state_history_policy_and_caps,
 };
 use crate::external_task;
 use crate::failure::{parse_error_payload, parse_error_payload_full, parse_typed_payload};
@@ -172,6 +172,14 @@ pub struct HandlerRegistry {
     telemetry: Arc<crate::telemetry::TelemetryConfig>,
     /// History-size thresholds visible to workflow contexts.
     history_policy: WorkflowHistoryPolicy,
+    /// Maximum allowed bytes for a single activity input payload (enforced at schedule time).
+    pub max_activity_input_bytes: u64,
+    /// Maximum allowed bytes for a child workflow input payload (enforced at schedule time).
+    pub max_workflow_input_bytes: u64,
+    /// Maximum allowed bytes for a single activity result payload (enforced at completion time).
+    pub max_activity_result_bytes: u64,
+    /// Maximum allowed bytes for a signal payload (enforced at signal-send time).
+    pub max_signal_payload_bytes: u64,
 }
 
 impl HandlerRegistry {
@@ -225,6 +233,10 @@ impl HandlerRegistry {
             state,
             telemetry,
             history_policy: WorkflowHistoryPolicy::default(),
+            max_activity_input_bytes: crate::builder::DEFAULT_MAX_ACTIVITY_INPUT_BYTES,
+            max_workflow_input_bytes: crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
+            max_activity_result_bytes: crate::builder::DEFAULT_MAX_ACTIVITY_RESULT_BYTES,
+            max_signal_payload_bytes: crate::builder::DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
         }
     }
 
@@ -257,6 +269,22 @@ impl HandlerRegistry {
     #[must_use]
     pub const fn with_history_policy(mut self, history_policy: WorkflowHistoryPolicy) -> Self {
         self.history_policy = history_policy;
+        self
+    }
+
+    /// Set the payload size caps propagated from [`crate::builder::BuiltHarvest`].
+    #[must_use]
+    pub const fn with_payload_caps(
+        mut self,
+        max_activity_input_bytes: u64,
+        max_workflow_input_bytes: u64,
+        max_activity_result_bytes: u64,
+        max_signal_payload_bytes: u64,
+    ) -> Self {
+        self.max_activity_input_bytes = max_activity_input_bytes;
+        self.max_workflow_input_bytes = max_workflow_input_bytes;
+        self.max_activity_result_bytes = max_activity_result_bytes;
+        self.max_signal_payload_bytes = max_signal_payload_bytes;
         self
     }
 
@@ -295,6 +323,10 @@ impl std::fmt::Debug for HandlerRegistry {
             .field("state_count", &self.state.len())
             .field("telemetry", &self.telemetry)
             .field("history_policy", &self.history_policy)
+            .field("max_activity_input_bytes", &self.max_activity_input_bytes)
+            .field("max_workflow_input_bytes", &self.max_workflow_input_bytes)
+            .field("max_activity_result_bytes", &self.max_activity_result_bytes)
+            .field("max_signal_payload_bytes", &self.max_signal_payload_bytes)
             .finish()
     }
 }
@@ -2540,9 +2572,26 @@ async fn handle_activity_result(
     worker_id: &str,
     retry_policy: Option<&crate::policy::RetryPolicy>,
     activity_result: Result<serde_json::Value, String>,
+    max_result_bytes: u64,
+    activity_name_for_cap: &str,
 ) -> HarvestResult<()> {
     match activity_result {
-        Ok(output) => finalize_activity_completion(conn, task, exec_id, activity_id, output).await,
+        Ok(output) => {
+            let observed_bytes = serde_json::to_string(&output).map_or(0, |s| s.len() as u64);
+            if max_result_bytes > 0 && observed_bytes > max_result_bytes {
+                use crate::failure::IntoActivityErrorString as _;
+                let error = crate::failure::ActivityFailure::non_retryable(
+                    "PayloadTooLarge",
+                    format!(
+                        "activity '{activity_name_for_cap}' result exceeds cap: \
+                         {observed_bytes} bytes (cap {max_result_bytes} bytes)"
+                    ),
+                )
+                .into_error_payload();
+                return finalize_activity_failure(conn, task, exec_id, activity_id, &error).await;
+            }
+            finalize_activity_completion(conn, task, exec_id, activity_id, output).await
+        }
         Err(error) => {
             let delay_result = next_retry_delay(task, &error, retry_policy);
             let delay = fail_execution_on_error(conn, task, worker_id, delay_result).await?;
@@ -2683,6 +2732,37 @@ async fn process_activity_task(
     )
     .await;
 
+    let effective_result_cap = registry
+        .activities
+        .get(activity_name)
+        .and_then(|a| a.max_result_bytes)
+        .map_or(registry.max_activity_result_bytes, |per_activity| {
+            per_activity.max(registry.max_activity_result_bytes)
+        });
+
+    // Pre-normalize oversized results to non-retryable failures BEFORE emitting
+    // metrics so that an Ok result above the cap is counted as Failed, not Completed.
+    let activity_result = match activity_result {
+        Ok(output) if effective_result_cap > 0 => {
+            let observed = serde_json::to_string(&output).map_or(0, |s| s.len() as u64);
+            if observed > effective_result_cap {
+                use crate::failure::IntoActivityErrorString as _;
+                let error = crate::failure::ActivityFailure::non_retryable(
+                    "PayloadTooLarge",
+                    format!(
+                        "activity '{activity_name}' result exceeds cap: \
+                         {observed} bytes (cap {effective_result_cap} bytes)"
+                    ),
+                )
+                .into_error_payload();
+                Err(error)
+            } else {
+                Ok(output)
+            }
+        }
+        other => other,
+    };
+
     let duration_secs = started_at.elapsed().as_secs_f64();
     let status = if activity_result.is_ok() {
         ActivityStatus::Completed
@@ -2720,6 +2800,8 @@ async fn process_activity_task(
     let retry_policy_result = configured_retry_policy(task);
     let retry_policy = fail_execution_on_error(conn, task, worker_id, retry_policy_result).await?;
 
+    // activity_result is already cap-normalized (oversized Ok → non-retryable Err);
+    // pass 0 so handle_activity_result skips the redundant cap check.
     handle_activity_result(
         conn,
         task,
@@ -2728,6 +2810,8 @@ async fn process_activity_task(
         worker_id,
         retry_policy.as_ref(),
         activity_result,
+        0,
+        activity_name,
     )
     .await
 }
@@ -3663,18 +3747,27 @@ async fn process_workflow_task(
             .filter(|h| h.workflow == wf_name)
             .collect();
 
-        let (run_outcome, pending_cmds, execute_span) = run_workflow_with_state_and_history_policy(
-            prepared.exec_id,
-            history_events.clone(),
-            workflow.handler,
-            task.input.clone(),
-            registry.shared_state(),
-            registry.history_policy(),
-            Some(&span_meta),
-            &dq,
-            &du,
-        )
-        .await;
+        let (run_outcome, pending_cmds, execute_span) =
+            run_workflow_with_state_history_policy_and_caps(
+                prepared.exec_id,
+                history_events.clone(),
+                workflow.handler,
+                task.input.clone(),
+                registry.shared_state(),
+                registry.history_policy(),
+                Some(&span_meta),
+                &dq,
+                &du,
+                wf_name,
+                registry.max_activity_input_bytes,
+                registry.max_signal_payload_bytes,
+                workflow
+                    .max_input_bytes
+                    .map_or(registry.max_workflow_input_bytes, |per| {
+                        per.max(registry.max_workflow_input_bytes)
+                    }),
+            )
+            .await;
 
         match run_outcome {
             WorkflowOutcome::Suspended { commands }
@@ -5031,6 +5124,7 @@ mod tests {
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             execution_timeout: None,
             concurrency: None,
+            max_input_bytes: None,
         };
 
         let act = ActivityInfo {
@@ -5044,6 +5138,8 @@ mod tests {
             max_concurrent: None,
             concurrency_key: None,
             is_local: false,
+            max_input_bytes: None,
+            max_result_bytes: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
         };
 

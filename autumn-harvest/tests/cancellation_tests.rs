@@ -121,6 +121,7 @@ async fn start_test_workflow(conn: &mut AsyncPgConnection) -> autumn_harvest::Ex
             concurrency_key: None,
             concurrency_limit: None,
             priority: Priority::default(),
+            max_workflow_input_bytes: 0,
         },
     )
     .await
@@ -204,6 +205,7 @@ fn heartbeat_registry(probe: HeartbeatCancellationProbe) -> Arc<HandlerRegistry>
             handler: heartbeat_workflow,
             execution_timeout: None,
             concurrency: None,
+            max_input_bytes: None,
         }],
         vec![autumn_harvest::info::ActivityInfo {
             name: "heartbeat_activity",
@@ -216,6 +218,8 @@ fn heartbeat_registry(probe: HeartbeatCancellationProbe) -> Arc<HandlerRegistry>
             max_concurrent: None,
             concurrency_key: None,
             is_local: false,
+            max_input_bytes: None,
+            max_result_bytes: None,
             handler: heartbeat_activity,
         }],
         Arc::new(state),
@@ -461,6 +465,7 @@ async fn running_activity_heartbeat_observes_workflow_cancellation() {
             concurrency_key: None,
             concurrency_limit: None,
             priority: Priority::default(),
+            max_workflow_input_bytes: 0,
         },
     )
     .await
@@ -546,6 +551,7 @@ fn uncooperative_registry(probe: UncooperativeActivityProbe) -> Arc<HandlerRegis
             handler: uncooperative_workflow,
             execution_timeout: None,
             concurrency: None,
+            max_input_bytes: None,
         }],
         vec![autumn_harvest::info::ActivityInfo {
             name: "uncooperative_activity",
@@ -558,6 +564,8 @@ fn uncooperative_registry(probe: UncooperativeActivityProbe) -> Arc<HandlerRegis
             max_concurrent: None,
             concurrency_key: None,
             is_local: false,
+            max_input_bytes: None,
+            max_result_bytes: None,
             handler: uncooperative_activity,
         }],
         Arc::new(state),
@@ -628,6 +636,7 @@ async fn uncooperative_activity_is_hard_aborted_after_grace_period() {
             concurrency_key: None,
             concurrency_limit: None,
             priority: Priority::default(),
+            max_workflow_input_bytes: 0,
         },
     )
     .await

@@ -248,6 +248,45 @@ pub use serde_json;
 #[doc(hidden)]
 pub use futures;
 
+/// Parse a human-readable byte-size string like `"2MiB"`, `"256KiB"`, `"4MB"`.
+///
+/// Accepted suffixes: `KiB`, `KB`, `MiB`, `MB`, `GiB`, `GB`, or no suffix for
+/// plain bytes. Returns `None` for empty strings or unrecognised suffixes.
+///
+/// ## Examples
+///
+/// ```rust
+/// assert_eq!(autumn_harvest::parse_byte_size("2MiB"), Some(2 * 1024 * 1024));
+/// assert_eq!(autumn_harvest::parse_byte_size("256KiB"), Some(256 * 1024));
+/// assert_eq!(autumn_harvest::parse_byte_size("4MB"), Some(4_000_000));
+/// assert_eq!(autumn_harvest::parse_byte_size("invalid"), None);
+/// ```
+#[must_use]
+#[allow(clippy::option_if_let_else)]
+pub fn parse_byte_size(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let (digits, multiplier): (&str, u64) = if let Some(n) = s.strip_suffix("GiB") {
+        (n.trim(), 1024 * 1024 * 1024)
+    } else if let Some(n) = s.strip_suffix("GB") {
+        (n.trim(), 1_000_000_000)
+    } else if let Some(n) = s.strip_suffix("MiB") {
+        (n.trim(), 1024 * 1024)
+    } else if let Some(n) = s.strip_suffix("MB") {
+        (n.trim(), 1_000_000)
+    } else if let Some(n) = s.strip_suffix("KiB") {
+        (n.trim(), 1024)
+    } else if let Some(n) = s.strip_suffix("KB") {
+        (n.trim(), 1_000)
+    } else {
+        (s, 1)
+    };
+    let n: u64 = digits.parse().ok()?;
+    n.checked_mul(multiplier)
+}
+
 /// Parse a human-readable duration string like `"5m"`, `"30s"`, `"1h"`.
 ///
 /// Used by macro-generated code — not intended for direct use.

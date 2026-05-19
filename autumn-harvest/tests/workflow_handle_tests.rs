@@ -110,6 +110,7 @@ async fn start_running_workflow(
             concurrency_key: None,
             concurrency_limit: None,
             priority: Priority::default(),
+            max_workflow_input_bytes: 0,
         },
     )
     .await

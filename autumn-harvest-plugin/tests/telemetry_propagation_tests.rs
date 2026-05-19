@@ -178,6 +178,7 @@ async fn start_workflow_stores_captured_trace_context_in_task_queue() {
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             execution_timeout: None,
             concurrency: None,
+            max_input_bytes: None,
         }],
         vec![],
         Arc::new(HashMap::new()),
@@ -267,6 +268,7 @@ async fn start_workflow_leaves_trace_context_null_when_no_propagator() {
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             execution_timeout: None,
             concurrency: None,
+            max_input_bytes: None,
         }],
         vec![],
     ));

@@ -4,6 +4,8 @@ use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::{Expr, ItemFn, LitInt, LitStr, parse::Parser as _};
 
+use crate::parse_byte_size_macro;
+
 struct ActivityAttrs {
     retry: Option<Expr>,
     start_to_close: Option<String>,
@@ -13,6 +15,10 @@ struct ActivityAttrs {
     max_concurrent: Option<u32>,
     concurrency_key: Option<String>,
     local: bool,
+    /// Per-activity input size cap override in bytes (issue #252).
+    max_input_bytes: Option<u64>,
+    /// Per-activity result size cap override in bytes (issue #252).
+    max_result_bytes: Option<u64>,
 }
 
 fn parse_attrs(attr: TokenStream) -> syn::Result<ActivityAttrs> {
@@ -25,6 +31,8 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<ActivityAttrs> {
         max_concurrent: None,
         concurrency_key: None,
         local: false,
+        max_input_bytes: None,
+        max_result_bytes: None,
     };
 
     syn::meta::parser(|meta| {
@@ -66,8 +74,32 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<ActivityAttrs> {
             let value: syn::LitBool = meta.value()?.parse()?;
             result.local = value.value();
             Ok(())
+        } else if meta.path.is_ident("max_input_bytes") {
+            let value: LitStr = meta.value()?.parse()?;
+            let s = value.value();
+            let bytes = parse_byte_size_macro(&s).ok_or_else(|| {
+                meta.error(format!(
+                    "invalid byte size '{s}'; expected format like \"2MiB\", \"512KiB\", \"4MB\""
+                ))
+            })?;
+            result.max_input_bytes = Some(bytes);
+            Ok(())
+        } else if meta.path.is_ident("max_result_bytes") {
+            let value: LitStr = meta.value()?.parse()?;
+            let s = value.value();
+            let bytes = parse_byte_size_macro(&s).ok_or_else(|| {
+                meta.error(format!(
+                    "invalid byte size '{s}'; expected format like \"2MiB\", \"512KiB\", \"4MB\""
+                ))
+            })?;
+            result.max_result_bytes = Some(bytes);
+            Ok(())
         } else {
-            Err(meta.error("unsupported attribute: expected retry, start_to_close, heartbeat_timeout, schedule_to_start, queue, max_concurrent, concurrency_key, or local"))
+            Err(meta.error(
+                "unsupported attribute: expected retry, start_to_close, heartbeat_timeout, \
+                 schedule_to_start, queue, max_concurrent, concurrency_key, local, \
+                 max_input_bytes, or max_result_bytes",
+            ))
         }
     })
     .parse2(attr)?;
@@ -302,6 +334,13 @@ pub fn activity_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let is_local = attrs.local;
 
+    let max_input_bytes_expr = attrs
+        .max_input_bytes
+        .map_or_else(|| quote! { None }, |b| quote! { Some(#b) });
+    let max_result_bytes_expr = attrs
+        .max_result_bytes
+        .map_or_else(|| quote! { None }, |b| quote! { Some(#b) });
+
     quote! {
         #input_fn
 
@@ -318,6 +357,8 @@ pub fn activity_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 max_concurrent: #max_concurrent_expr,
                 concurrency_key: #concurrency_key_expr,
                 is_local: #is_local,
+                max_input_bytes: #max_input_bytes_expr,
+                max_result_bytes: #max_result_bytes_expr,
                 handler: |ctx, input| {
                     ::std::boxed::Box::pin(async move {
                         #dispatch

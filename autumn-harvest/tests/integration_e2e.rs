@@ -520,6 +520,7 @@ async fn legacy_workflow_uniqueness_schema_can_be_upgraded_for_idempotent_starts
         concurrency_key: None,
         concurrency_limit: None,
         priority: Priority::default(),
+        max_workflow_input_bytes: 0,
     };
 
     // On the legacy schema there is no `(workflow_name, workflow_id)`
@@ -680,6 +681,7 @@ fn child_round_trip_registry() -> Arc<HandlerRegistry> {
                 handler: parent_workflow_with_child,
                 execution_timeout: None,
                 concurrency: None,
+                max_input_bytes: None,
             },
             WorkflowInfo {
                 name: "child_echo_workflow",
@@ -687,6 +689,7 @@ fn child_round_trip_registry() -> Arc<HandlerRegistry> {
                 handler: child_echo_workflow,
                 execution_timeout: None,
                 concurrency: None,
+                max_input_bytes: None,
             },
         ],
         vec![],
@@ -702,6 +705,7 @@ fn child_continue_as_new_rejection_registry() -> Arc<HandlerRegistry> {
                 handler: parent_workflow_with_continue_as_new_child,
                 execution_timeout: None,
                 concurrency: None,
+                max_input_bytes: None,
             },
             WorkflowInfo {
                 name: "child_continue_as_new_workflow",
@@ -709,6 +713,7 @@ fn child_continue_as_new_rejection_registry() -> Arc<HandlerRegistry> {
                 handler: continue_as_new_workflow,
                 execution_timeout: None,
                 concurrency: None,
+                max_input_bytes: None,
             },
         ],
         vec![],
@@ -1171,6 +1176,7 @@ async fn worker_completes_workflow_task_and_persists_result() {
             handler: echo_workflow,
             execution_timeout: None,
             concurrency: None,
+            max_input_bytes: None,
         }],
         vec![],
     ));
@@ -1271,6 +1277,7 @@ async fn worker_marks_workflow_failed_when_handler_errors() {
             handler: failing_workflow,
             execution_timeout: None,
             concurrency: None,
+            max_input_bytes: None,
         }],
         vec![],
     ));
@@ -1385,6 +1392,7 @@ async fn worker_completes_workflow_with_activity_round_trip() {
             handler: workflow_with_activity,
             execution_timeout: None,
             concurrency: None,
+            max_input_bytes: None,
         }],
         vec![ActivityInfo {
             name: "send_email",
@@ -1397,6 +1405,8 @@ async fn worker_completes_workflow_with_activity_round_trip() {
             max_concurrent: None,
             concurrency_key: None,
             is_local: false,
+            max_input_bytes: None,
+            max_result_bytes: None,
             handler: send_email_activity,
         }],
     ));
@@ -1508,6 +1518,7 @@ async fn activity_retry_resumes_from_persisted_heartbeat_details() {
             handler: workflow_with_checkpointed_activity,
             execution_timeout: None,
             concurrency: None,
+            max_input_bytes: None,
         }],
         vec![ActivityInfo {
             name: "checkpointed_import",
@@ -1523,6 +1534,8 @@ async fn activity_retry_resumes_from_persisted_heartbeat_details() {
             max_concurrent: None,
             concurrency_key: None,
             is_local: false,
+            max_input_bytes: None,
+            max_result_bytes: None,
             handler: checkpointed_import_activity,
         }],
         heartbeat_resume_state(Arc::clone(&stats)),
@@ -1619,6 +1632,8 @@ async fn worker_fails_orphaned_activity_task_without_scheduled_event() {
                     max_concurrent: None,
                     concurrency_key: None,
                     is_local: false,
+                    max_input_bytes: None,
+                    max_result_bytes: None,
                     handler: send_email_activity,
                 }],
             )),
@@ -1827,6 +1842,7 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
                     handler: workflow_with_slow_activity,
                     execution_timeout: None,
                     concurrency: None,
+                    max_input_bytes: None,
                 }],
                 vec![ActivityInfo {
                     name: "slow_activity",
@@ -1839,6 +1855,8 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
                     max_concurrent: None,
                     concurrency_key: None,
                     is_local: false,
+                    max_input_bytes: None,
+                    max_result_bytes: None,
                     handler: slow_activity,
                 }],
             )),
@@ -1953,6 +1971,7 @@ async fn worker_completes_workflow_with_timer_round_trip() {
                     handler: workflow_with_timer,
                     execution_timeout: None,
                     concurrency: None,
+                    max_input_bytes: None,
                 }],
                 vec![],
             )),
@@ -2208,6 +2227,7 @@ fn parallel_children_registry() -> Arc<HandlerRegistry> {
                 handler: parent_workflow_parallel_children,
                 execution_timeout: None,
                 concurrency: None,
+                max_input_bytes: None,
             },
             WorkflowInfo {
                 name: "child_alpha",
@@ -2215,6 +2235,7 @@ fn parallel_children_registry() -> Arc<HandlerRegistry> {
                 handler: child_alpha_workflow,
                 execution_timeout: None,
                 concurrency: None,
+                max_input_bytes: None,
             },
             WorkflowInfo {
                 name: "child_beta",
@@ -2222,6 +2243,7 @@ fn parallel_children_registry() -> Arc<HandlerRegistry> {
                 handler: child_beta_workflow,
                 execution_timeout: None,
                 concurrency: None,
+                max_input_bytes: None,
             },
         ],
         vec![],
@@ -2339,6 +2361,7 @@ async fn worker_builder_state_is_visible_to_workflow_and_activity() {
             handler: workflow_with_builder_state,
             execution_timeout: None,
             concurrency: None,
+            max_input_bytes: None,
         }])
         .activities(vec![ActivityInfo {
             name: "stateful_activity",
@@ -2351,6 +2374,8 @@ async fn worker_builder_state_is_visible_to_workflow_and_activity() {
             max_concurrent: None,
             concurrency_key: None,
             is_local: false,
+            max_input_bytes: None,
+            max_result_bytes: None,
             handler: stateful_activity,
         }])
         .state(String::from("haunted"))
@@ -2823,6 +2848,7 @@ async fn worker_completes_workflow_after_signal_delivery() {
             handler: signal_waiting_workflow,
             execution_timeout: None,
             concurrency: None,
+            max_input_bytes: None,
         }],
         vec![],
     ));
@@ -2933,6 +2959,7 @@ async fn worker_handles_early_ingested_signal_before_activity() {
             handler: activity_then_signal_workflow,
             execution_timeout: None,
             concurrency: None,
+            max_input_bytes: None,
         }],
         vec![ActivityInfo {
             name: "send_email",
@@ -2945,6 +2972,8 @@ async fn worker_handles_early_ingested_signal_before_activity() {
             max_concurrent: None,
             concurrency_key: None,
             is_local: false,
+            max_input_bytes: None,
+            max_result_bytes: None,
             handler: send_email_activity,
         }],
     ));
@@ -3333,6 +3362,7 @@ async fn worker_continues_as_new_with_fresh_history_and_same_workflow_id() {
             handler: continue_as_new_workflow,
             execution_timeout: None,
             concurrency: None,
+            max_input_bytes: None,
         }],
         vec![],
     ));
@@ -3431,6 +3461,7 @@ async fn continue_as_new_down_migration_rewrites_historical_runs_for_rollback() 
             handler: continue_as_new_workflow,
             execution_timeout: None,
             concurrency: None,
+            max_input_bytes: None,
         }],
         vec![],
     ));
@@ -3549,6 +3580,7 @@ mod reuse_policy_helpers {
             concurrency_key: None,
             concurrency_limit: None,
             priority: Priority::default(),
+            max_workflow_input_bytes: 0,
         }
     }
 
@@ -4298,6 +4330,7 @@ async fn workflow_schedule_baseline_dispatches_multiple_runs() {
             handler: instant_workflow,
             execution_timeout: None,
             concurrency: None,
+            max_input_bytes: None,
         }],
         vec![],
     ));
@@ -4398,6 +4431,7 @@ async fn workflow_schedule_max_active_runs_enforced() {
             handler: slow_workflow,
             execution_timeout: None,
             concurrency: None,
+            max_input_bytes: None,
         }],
         vec![],
     ));
@@ -4484,6 +4518,7 @@ async fn workflow_schedule_pause_and_resume() {
             handler: instant_workflow,
             execution_timeout: None,
             concurrency: None,
+            max_input_bytes: None,
         }],
         vec![],
     ));
@@ -4724,6 +4759,7 @@ async fn search_attrs_upsert_visible_after_update_and_filterable() {
             concurrency_key: None,
             concurrency_limit: None,
             priority: Priority::default(),
+            max_workflow_input_bytes: 0,
         },
     )
     .await
@@ -4737,6 +4773,7 @@ async fn search_attrs_upsert_visible_after_update_and_filterable() {
             handler: approval_search_attrs_workflow,
             execution_timeout: None,
             concurrency: None,
+            max_input_bytes: None,
         }],
         vec![],
     ));
@@ -4859,6 +4896,7 @@ async fn search_attrs_survive_worker_crash_and_resume() {
             concurrency_key: None,
             concurrency_limit: None,
             priority: Priority::default(),
+            max_workflow_input_bytes: 0,
         },
     )
     .await
@@ -4872,6 +4910,7 @@ async fn search_attrs_survive_worker_crash_and_resume() {
                 handler: approval_search_attrs_workflow,
                 execution_timeout: None,
                 concurrency: None,
+                max_input_bytes: None,
             }],
             vec![],
         ))
@@ -4961,6 +5000,7 @@ fn workflow_schedule_builder_rejects_unregistered_workflow() {
             handler: echo_workflow,
             execution_timeout: None,
             concurrency: None,
+            max_input_bytes: None,
         }])
         .workflow_schedule(ws)
         .worker(WorkerConfig::default())
@@ -5291,6 +5331,7 @@ async fn non_retryable_activity_fails_fast_on_attempt_one() {
             handler: workflow_with_activity,
             execution_timeout: None,
             concurrency: None,
+            max_input_bytes: None,
         }],
         vec![ActivityInfo {
             name: "send_email",
@@ -5308,6 +5349,8 @@ async fn non_retryable_activity_fails_fast_on_attempt_one() {
             max_concurrent: None,
             concurrency_key: None,
             is_local: false,
+            max_input_bytes: None,
+            max_result_bytes: None,
             handler: always_non_retryable_activity,
         }],
     ));
@@ -5417,6 +5460,7 @@ async fn legacy_string_failure_in_non_retryable_errors_fails_fast() {
             handler: workflow_with_activity,
             execution_timeout: None,
             concurrency: None,
+            max_input_bytes: None,
         }],
         vec![ActivityInfo {
             name: "send_email",
@@ -5429,6 +5473,8 @@ async fn legacy_string_failure_in_non_retryable_errors_fails_fast() {
             max_concurrent: None,
             concurrency_key: None,
             is_local: false,
+            max_input_bytes: None,
+            max_result_bytes: None,
             handler: always_legacy_string_failure_activity,
         }],
     ));
@@ -5547,6 +5593,7 @@ async fn overlap_policy_skip_explicitly_drops_new_firings() {
             handler: slow_workflow,
             execution_timeout: None,
             concurrency: None,
+            max_input_bytes: None,
         }],
         vec![],
     ));
@@ -5608,6 +5655,7 @@ async fn overlap_policy_buffer_one_queues_single_slot() {
             handler: slow_workflow,
             execution_timeout: None,
             concurrency: None,
+            max_input_bytes: None,
         }],
         vec![],
     ));
@@ -5678,6 +5726,7 @@ async fn overlap_policy_buffer_all_queues_multiple_slots() {
             handler: slow_workflow,
             execution_timeout: None,
             concurrency: None,
+            max_input_bytes: None,
         }],
         vec![],
     ));
@@ -5752,6 +5801,7 @@ async fn overlap_policy_cancel_other_cancels_inflight_run() {
             handler: slow_workflow,
             execution_timeout: None,
             concurrency: None,
+            max_input_bytes: None,
         }],
         vec![],
     ));
@@ -5821,6 +5871,7 @@ async fn overlap_policy_terminate_other_terminates_inflight_run() {
             handler: slow_workflow,
             execution_timeout: None,
             concurrency: None,
+            max_input_bytes: None,
         }],
         vec![],
     ));
@@ -5893,6 +5944,7 @@ async fn overlap_policy_buffer_one_survives_scheduler_restart() {
             handler: slow_workflow,
             execution_timeout: None,
             concurrency: None,
+            max_input_bytes: None,
         }],
         vec![],
     ));

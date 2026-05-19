@@ -17,6 +17,7 @@ fn workflow_info_has_concurrency_fields() {
         handler: |_ctx, input| Box::pin(async move { Ok(input) }),
         execution_timeout: None,
         concurrency: None,
+        max_input_bytes: None,
     };
     assert!(info.concurrency.is_none());
 }
@@ -32,6 +33,7 @@ fn workflow_info_with_concurrency_policy() {
             key_expr: "input.tenant_id",
             limit: 10,
         }),
+        max_input_bytes: None,
     };
     let policy = info.concurrency.expect("should have concurrency policy");
     assert_eq!(policy.key_expr, "input.tenant_id");

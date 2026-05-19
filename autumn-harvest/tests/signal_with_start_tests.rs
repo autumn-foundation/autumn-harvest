@@ -85,6 +85,8 @@ fn params<'a>(
         signal_name,
         signal_payload,
         idempotency_key: None,
+        max_workflow_input_bytes: 0,
+        max_signal_payload_bytes: 0,
     }
 }
 

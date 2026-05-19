@@ -239,6 +239,7 @@ fn start_workflow_params_has_priority_field() {
         concurrency_key: None,
         concurrency_limit: None,
         priority: Priority::High,
+        max_workflow_input_bytes: 0,
     };
 
     assert_eq!(params.priority, Priority::High);
@@ -266,6 +267,7 @@ fn start_workflow_params_default_priority_is_normal() {
         concurrency_key: None,
         concurrency_limit: None,
         priority: Priority::default(),
+        max_workflow_input_bytes: 0,
     };
 
     assert_eq!(params.priority, Priority::Normal);

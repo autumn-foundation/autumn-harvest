@@ -193,6 +193,7 @@ fn echo_registry() -> Arc<HandlerRegistry> {
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             execution_timeout: None,
             concurrency: None,
+            max_input_bytes: None,
         }],
         vec![],
     ))
@@ -287,6 +288,7 @@ async fn insert_workflow_on_url(
             concurrency_key: None,
             concurrency_limit: None,
             priority: Priority::default(),
+            max_workflow_input_bytes: 0,
         },
     )
     .await
@@ -1877,6 +1879,7 @@ async fn insert_child_workflow_on_url(
             concurrency_key: None,
             concurrency_limit: None,
             priority: Priority::default(),
+            max_workflow_input_bytes: 0,
         },
     )
     .await

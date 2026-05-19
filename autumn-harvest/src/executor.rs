@@ -201,8 +201,8 @@ pub async fn run_workflow_with_state(
     .await
 }
 
-/// Like [`run_workflow_with_state`] but installs explicit history guardrails
-/// into the [`WorkflowContext`].
+/// Like [`run_workflow_with_state`] but installs explicit history guardrails,
+/// workflow name, and payload size caps into the [`WorkflowContext`].
 #[allow(clippy::too_many_arguments)]
 pub async fn run_workflow_with_state_and_history_policy(
     exec_id: ExecutionId,
@@ -215,11 +215,54 @@ pub async fn run_workflow_with_state_and_history_policy(
     declarative_query_handlers: &[&QueryHandlerInfo],
     declarative_update_handlers: &[&UpdateHandlerInfo],
 ) -> (WorkflowOutcome, Vec<WorkflowCommand>, tracing::Span) {
+    run_workflow_with_state_history_policy_and_caps(
+        exec_id,
+        history,
+        handler,
+        input,
+        state,
+        history_policy,
+        span_meta,
+        declarative_query_handlers,
+        declarative_update_handlers,
+        "",
+        crate::builder::DEFAULT_MAX_ACTIVITY_INPUT_BYTES,
+        crate::builder::DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
+        crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
+    )
+    .await
+}
+
+/// Full executor entry point used by the worker, which injects the workflow name
+/// and payload size caps configured on the `BuiltHarvest` instance.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_workflow_with_state_history_policy_and_caps(
+    exec_id: ExecutionId,
+    history: Vec<WorkflowEvent>,
+    handler: WorkflowHandlerFn,
+    input: Value,
+    state: SharedState,
+    history_policy: WorkflowHistoryPolicy,
+    span_meta: Option<&WorkflowExecuteSpanMeta>,
+    declarative_query_handlers: &[&QueryHandlerInfo],
+    declarative_update_handlers: &[&UpdateHandlerInfo],
+    workflow_name: &str,
+    max_activity_input_bytes: u64,
+    max_signal_payload_bytes: u64,
+    max_workflow_input_bytes: u64,
+) -> (WorkflowOutcome, Vec<WorkflowCommand>, tracing::Span) {
     let ctx = WorkflowContext::for_replay_with_state_and_history_policy(
         exec_id,
         history,
         state,
         history_policy,
+    )
+    .with_workflow_name(workflow_name)
+    .with_payload_caps(
+        max_activity_input_bytes,
+        0,
+        max_signal_payload_bytes,
+        max_workflow_input_bytes,
     );
 
     // Auto-register declarative handlers before any workflow code runs.
