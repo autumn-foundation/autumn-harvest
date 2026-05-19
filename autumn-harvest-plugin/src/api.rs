@@ -8885,10 +8885,7 @@ async fn stream_execution_events(
     // Extract Last-Event-ID for resume (harvest_events.id BIGSERIAL cursor).
     // An absent header means "start from the beginning" (cursor = -1).
     // A present but non-parseable value is a client error → 400.
-    let last_row_id: i64 = match headers
-        .get("last-event-id")
-        .and_then(|v| v.to_str().ok())
-    {
+    let last_row_id: i64 = match headers.get("last-event-id").and_then(|v| v.to_str().ok()) {
         None => -1,
         Some(s) => match s.parse::<i64>() {
             Ok(n) => n,
@@ -9012,28 +9009,27 @@ async fn stream_execution_events(
         // or breaks early if the channel is full / dropped.
         // Using a macro-style closure here because closures can't easily `break 'notify`.
         // We use a boolean return: (last_id, terminal_state, should_break).
-        let send_rows = |rows: &[autumn_harvest::models::HarvestEvent],
-                         mut cur_last_seen: i64,
-                         tx: &mut futures::channel::mpsc::Sender<
-            Result<Event, std::convert::Infallible>,
-        >|
-         -> (i64, Option<&'static str>, bool) {
-            let mut found_terminal: Option<&'static str> = None;
-            for row in rows {
-                let sse_event = Event::default()
-                    .id(row.id.to_string())
-                    .event(row.event_type.as_str())
-                    .data(sse_data(&row.event_data));
-                if tx.try_send(Ok(sse_event)).is_err() {
-                    return (cur_last_seen, None, true);
+        let send_rows =
+            |rows: &[autumn_harvest::models::HarvestEvent],
+             mut cur_last_seen: i64,
+             tx: &mut futures::channel::mpsc::Sender<Result<Event, std::convert::Infallible>>|
+             -> (i64, Option<&'static str>, bool) {
+                let mut found_terminal: Option<&'static str> = None;
+                for row in rows {
+                    let sse_event = Event::default()
+                        .id(row.id.to_string())
+                        .event(row.event_type.as_str())
+                        .data(sse_data(&row.event_data));
+                    if tx.try_send(Ok(sse_event)).is_err() {
+                        return (cur_last_seen, None, true);
+                    }
+                    cur_last_seen = row.id;
+                    if is_terminal_event_type(&row.event_type) {
+                        found_terminal = Some(terminal_event_type_to_state(&row.event_type));
+                    }
                 }
-                cur_last_seen = row.id;
-                if is_terminal_event_type(&row.event_type) {
-                    found_terminal = Some(terminal_event_type_to_state(&row.event_type));
-                }
-            }
-            (cur_last_seen, found_terminal, false)
-        };
+                (cur_last_seen, found_terminal, false)
+            };
 
         // ── 1. Send backfill events (events already committed before this request) ──
         for row in &backfill {
@@ -9080,10 +9076,7 @@ async fn stream_execution_events(
                 // Use 2× keepalive as notification timeout so the KeepAlive wrapper
                 // has time to send its ping before this loop wakes and re-checks
                 let wait_timeout = keepalive_interval.saturating_mul(2);
-                match listener
-                    .wait_for_notification_timeout(wait_timeout)
-                    .await
-                {
+                match listener.wait_for_notification_timeout(wait_timeout).await {
                     Ok(WorkflowEventWaitOutcome::Notification(payload)) => {
                         // The harvest_events channel notifies for ALL executions on
                         // this shard; filter to ours
@@ -9093,26 +9086,25 @@ async fn stream_execution_events(
 
                         // Load new events from the pool — capped to buffer_depth so
                         // rapid bursts between notifications stay bounded in memory.
-                        let new_rows =
-                            match db_conn_for_execution(&api_clone, exec_id).await {
-                                Ok(mut conn) => {
-                                    match store::load_events_after_row_id(
-                                        &mut conn,
-                                        exec_id,
-                                        last_seen_id,
-                                        buf_limit,
-                                    )
-                                    .await
-                                    {
-                                        Ok(rows) => rows,
-                                        // DB failure: skip this notification batch.
-                                        // The periodic TimedOut poll will catch missed
-                                        // events if no further notifications arrive.
-                                        Err(_) => continue,
-                                    }
+                        let new_rows = match db_conn_for_execution(&api_clone, exec_id).await {
+                            Ok(mut conn) => {
+                                match store::load_events_after_row_id(
+                                    &mut conn,
+                                    exec_id,
+                                    last_seen_id,
+                                    buf_limit,
+                                )
+                                .await
+                                {
+                                    Ok(rows) => rows,
+                                    // DB failure: skip this notification batch.
+                                    // The periodic TimedOut poll will catch missed
+                                    // events if no further notifications arrive.
+                                    Err(_) => continue,
                                 }
-                                Err(_) => continue,
-                            };
+                            }
+                            Err(_) => continue,
+                        };
 
                         let (new_id, terminal_state, should_break) =
                             send_rows(&new_rows, last_seen_id, &mut tx);
@@ -9131,12 +9123,9 @@ async fn stream_execution_events(
                         }
 
                         if let Some(state) = terminal_state {
-                            let end_data =
-                                serde_json::json!({"reason": state}).to_string();
+                            let end_data = serde_json::json!({"reason": state}).to_string();
                             let _ = tx
-                                .send(Ok(
-                                    Event::default().event("stream-end").data(end_data)
-                                ))
+                                .send(Ok(Event::default().event("stream-end").data(end_data)))
                                 .await;
                             break 'notify;
                         }
@@ -9149,9 +9138,7 @@ async fn stream_execution_events(
                         }
                         // Periodic safety-net poll: catch any events missed due to a
                         // prior DB failure on a notification (e.g. terminal event).
-                        let Ok(mut conn) =
-                            db_conn_for_execution(&api_clone, exec_id).await
-                        else {
+                        let Ok(mut conn) = db_conn_for_execution(&api_clone, exec_id).await else {
                             continue 'notify;
                         };
                         let Ok(missed) = store::load_events_after_row_id(
@@ -9181,15 +9168,12 @@ async fn stream_execution_events(
                     Ok(WorkflowEventWaitOutcome::ChannelClosed) => {
                         // LISTEN connection dropped; reconnect and backfill any events
                         // that may have been committed while the connection was down.
-                        let Ok(l) = WorkflowEventListener::connect(&notification_url).await
-                        else {
+                        let Ok(l) = WorkflowEventListener::connect(&notification_url).await else {
                             break 'notify;
                         };
                         listener = l;
                         // Backfill events missed during reconnection window
-                        let Ok(mut conn) =
-                            db_conn_for_execution(&api_clone, exec_id).await
-                        else {
+                        let Ok(mut conn) = db_conn_for_execution(&api_clone, exec_id).await else {
                             continue 'notify;
                         };
                         let Ok(missed) = store::load_events_after_row_id(
@@ -9209,8 +9193,7 @@ async fn stream_execution_events(
                             break 'notify;
                         }
                         if let Some(state) = terminal_state {
-                            let end_data =
-                                serde_json::json!({"reason": state}).to_string();
+                            let end_data = serde_json::json!({"reason": state}).to_string();
                             let _ = tx
                                 .send(Ok(Event::default().event("stream-end").data(end_data)))
                                 .await;

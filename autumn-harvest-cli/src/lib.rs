@@ -1173,10 +1173,11 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
 
     // SSE streaming: bypasses JSON execute path.
     if let Commands::Events {
-        command: EventsCommand::Tail {
-            execution_id,
-            last_event_id,
-        },
+        command:
+            EventsCommand::Tail {
+                execution_id,
+                last_event_id,
+            },
     } = &cli.command
     {
         return run_events_tail(&cli, execution_id, *last_event_id).await;
@@ -1353,9 +1354,7 @@ async fn run_events_tail(
             };
             let line_bytes = &buf[..nl];
             // Strip trailing CR for CRLF line endings.
-            let line_bytes = line_bytes
-                .strip_suffix(b"\r")
-                .unwrap_or(line_bytes);
+            let line_bytes = line_bytes.strip_suffix(b"\r").unwrap_or(line_bytes);
             let line = String::from_utf8_lossy(line_bytes).into_owned();
             buf.drain(..=nl);
 
