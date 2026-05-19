@@ -1678,14 +1678,7 @@ async fn tick_one_workflow_schedule(
             if adjusted == slot_date {
                 *original_slot
             } else {
-                let rebased = rebase_logical_date(*original_slot, adjusted, parsed_schedule);
-                // RunPrevBusinessDay can shift backward into the past. Skip such
-                // slots to avoid firing a retroactive run on an excluded day.
-                if rebased < now {
-                    metrics.record_schedule_skipped("workflow", wf_name, "calendar_prev_expired");
-                    continue;
-                }
-                rebased
+                rebase_logical_date(*original_slot, adjusted, parsed_schedule)
             }
         } else {
             *original_slot

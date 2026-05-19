@@ -139,13 +139,14 @@ pub use builder::{
     BuiltHarvest, HarvestBuilder, HarvestBuilderError, StickyRoutingConfig, WorkerConfig,
 };
 pub use cache::{CachedWorkflowState, WorkflowCache};
-pub use calendar::{
-    Calendar, ScheduleFirePreview, apply_skip_policy, calendar_excludes_weekends, is_excluded_date,
-};
 #[cfg(feature = "db")]
 pub use calendar::{
-    create_calendar, delete_calendar, get_calendar, list_calendars, load_exclusions_for_calendar,
-    plan_backfill_with_calendar, preview_schedule_firings, replace_calendar_exclusions,
+    BackfillSlot, create_calendar, delete_calendar, get_calendar, list_calendars,
+    load_exclusions_for_calendar, plan_backfill_with_calendar, preview_schedule_firings,
+    replace_calendar_exclusions,
+};
+pub use calendar::{
+    Calendar, ScheduleFirePreview, apply_skip_policy, calendar_excludes_weekends, is_excluded_date,
 };
 pub use context::{
     ActivityContext, DEFAULT_HISTORY_CONTINUE_AS_NEW_THRESHOLD, WorkflowCommand, WorkflowContext,

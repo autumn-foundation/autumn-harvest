@@ -43,9 +43,9 @@ use autumn_harvest::batch::{
     BatchSubmission,
 };
 use autumn_harvest::calendar::{
-    calendar_excludes_weekends, create_calendar, delete_calendar, get_calendar, list_calendars,
-    load_exclusions_for_calendar, plan_backfill_with_calendar, preview_schedule_firings,
-    replace_calendar_exclusions,
+    BackfillSlot, calendar_excludes_weekends, create_calendar, delete_calendar, get_calendar,
+    list_calendars, load_exclusions_for_calendar, plan_backfill_with_calendar,
+    preview_schedule_firings, replace_calendar_exclusions,
 };
 use autumn_harvest::context::WorkflowContext;
 use autumn_harvest::dlq;
@@ -6195,7 +6195,11 @@ async fn schedule_backfill(
             "backfill window contains more than {limit} timestamps; lower the window or pass a higher max_count"
         )),
     };
-    let timestamps = if let Some(ref cal_name) = schedule.calendar_name {
+    // Each entry is (original_slot, fire_time). original_slot is the raw cron timestamp
+    // used for deterministic workflow-ID generation so that calendar rebasing (e.g.
+    // RunNextBusinessDay / RunPrevBusinessDay) cannot cause two distinct logical slots
+    // that adjust to the same day to collide on the derived workflow ID.
+    let timestamp_pairs: Vec<BackfillSlot> = if let Some(ref cal_name) = schedule.calendar_name {
         let mut conn = acquire_conn(pool.default_pool()).await?;
         let excluded_dates = load_exclusions_for_calendar(&mut conn, cal_name)
             .await
@@ -6220,9 +6224,15 @@ async fn schedule_backfill(
             max_count,
         )
         .map_err(limit_err)?
+        .into_iter()
+        .map(|ts| (ts, ts))
+        .collect()
     };
+    // fire_times is the calendar-adjusted list used for display and dedup checks.
+    let fire_times: Vec<chrono::DateTime<chrono::Utc>> =
+        timestamp_pairs.iter().map(|(_, ft)| *ft).collect();
 
-    let total = timestamps.len();
+    let total = timestamp_pairs.len();
     let (kind, name) = if let Some(ref dag_name) = schedule.dag_name {
         (ScheduleKind::Dag, dag_name.clone())
     } else if let Some(ref wf_name) = schedule.workflow_name {
@@ -6251,7 +6261,7 @@ async fn schedule_backfill(
     // Dry-run: query current running count and project what would happen.
     if request.dry_run {
         let running = query_running_count_best_effort(&pool, &kind, &name).await;
-        let already_exists = count_existing_in_window(&pool, &kind, &name, &timestamps).await;
+        let already_exists = count_existing_in_window(&pool, &kind, &name, &fire_times).await;
         let remaining = total.saturating_sub(already_exists);
         let available_slots = usize::try_from((max_active - running).max(0)).unwrap_or(0);
         let would_dispatch = remaining.min(available_slots);
@@ -6310,7 +6320,7 @@ async fn schedule_backfill(
             name,
             from: request.from,
             to: request.to,
-            planned_timestamps: timestamps,
+            planned_timestamps: fire_times.clone(),
             total,
             dispatched: would_dispatch,
             skipped: would_skip,
@@ -6397,7 +6407,7 @@ async fn schedule_backfill(
                 name,
                 from: request.from,
                 to: request.to,
-                planned_timestamps: timestamps,
+                planned_timestamps: fire_times.clone(),
                 total,
                 dispatched: 0,
                 skipped: 0,
@@ -6419,7 +6429,7 @@ async fn schedule_backfill(
             // unique index on (workflow_name, workflow_id) prevents the scheduler from
             // creating a second run for the same timestamp after the backfill window.
             let wf_shard_pool = pool.default_pool();
-            for scheduled_for in &timestamps {
+            for (original_slot, _fire_time) in &timestamp_pairs {
                 // Respect max_active_runs: skip if we've already saturated the limit.
                 if running_at_start + dispatched_this_call >= max_active {
                     skipped += 1;
@@ -6429,7 +6439,9 @@ async fn schedule_backfill(
                     continue;
                 }
 
-                let workflow_id = scheduled_workflow_id_pub(&wf_name, *scheduled_for);
+                // Use original_slot (pre-calendar-rebase) for ID so that two distinct
+                // logical slots that calendar-adjust to the same fire_time do not collide.
+                let workflow_id = scheduled_workflow_id_pub(&wf_name, *original_slot);
                 // Match the scheduler: ExecutionId::new() encodes ShardId::UNENCODED so
                 // the execution lands on the default shard, same as tick_one_workflow_schedule.
                 let exec_id = ExecutionId::new();
@@ -6527,7 +6539,7 @@ async fn schedule_backfill(
             let shard_id = runtime.router().pick_for_dag(&dag_name);
             let shard_pool = pool.pool_for(shard_id);
 
-            for scheduled_for in &timestamps {
+            for (original_slot, _fire_time) in &timestamp_pairs {
                 // Respect max_active_runs for DAGs (now counted via workflow executions).
                 if running_at_start + dispatched_this_call >= max_active {
                     skipped += 1;
@@ -6545,7 +6557,8 @@ async fn schedule_backfill(
                     failed += 1;
                     continue;
                 };
-                let workflow_id = scheduled_workflow_id_pub(&dag_name, *scheduled_for);
+                // Use original_slot for ID, same as the workflow path above.
+                let workflow_id = scheduled_workflow_id_pub(&dag_name, *original_slot);
                 let exec_id = autumn_harvest::types::ExecutionId::new_for_shard(shard_id);
                 let dag_queue = schedule
                     .queue_name
@@ -6688,7 +6701,7 @@ async fn schedule_backfill(
         name,
         from: request.from,
         to: request.to,
-        planned_timestamps: timestamps,
+        planned_timestamps: fire_times,
         total,
         dispatched,
         skipped,
@@ -8838,13 +8851,28 @@ async fn create_calendar_handler(
     Extension(api_state): Extension<HarvestApiState>,
     Json(body): Json<CreateCalendarRequest>,
 ) -> Result<impl IntoResponse, AutumnError> {
+    if body.name.is_empty() {
+        return Err(AutumnError::bad_request_msg(
+            "calendar name must not be empty",
+        ));
+    }
     let pool = api_state.storage_pool().map_err(map_error)?;
     let mut first_cal = None;
     for (_, shard_pool) in pool.iter_shards() {
         let mut conn = acquire_conn(shard_pool).await?;
-        let cal = create_calendar(&mut conn, &body.name, body.description.as_deref())
-            .await
-            .map_err(map_error)?;
+        // Treat "already exists" as idempotent so that retries after a partial
+        // shard failure converge rather than returning 400 on already-written shards.
+        let cal = match create_calendar(&mut conn, &body.name, body.description.as_deref()).await {
+            Ok(cal) => cal,
+            Err(autumn_harvest::HarvestError::Config(ref msg))
+                if msg.contains("already exists") =>
+            {
+                get_calendar(&mut conn, &body.name)
+                    .await
+                    .map_err(map_error)?
+            }
+            Err(e) => return Err(map_error(e)),
+        };
         if first_cal.is_none() {
             first_cal = Some(cal);
         }
@@ -8868,11 +8896,28 @@ async fn update_calendar_exclusions_handler(
     Json(body): Json<UpdateCalendarRequest>,
 ) -> Result<impl IntoResponse, AutumnError> {
     let pool = api_state.storage_pool().map_err(map_error)?;
-    for (_, shard_pool) in pool.iter_shards() {
-        let mut conn = acquire_conn(shard_pool).await?;
-        replace_calendar_exclusions(&mut conn, &name, &body.exclusion_dates)
-            .await
-            .map_err(map_error)?;
+    // Attempt all shards even on error so that a transient failure on one shard
+    // does not leave others stale. replace_calendar_exclusions is idempotent
+    // (runs in a transaction), so retrying a partial fanout converges correctly.
+    let mut shard_errors: Vec<String> = Vec::new();
+    for (shard_id, shard_pool) in pool.iter_shards() {
+        let mut conn = match acquire_conn(shard_pool).await {
+            Ok(c) => c,
+            Err(e) => {
+                shard_errors.push(format!("shard {shard_id}: {e}"));
+                continue;
+            }
+        };
+        if let Err(e) = replace_calendar_exclusions(&mut conn, &name, &body.exclusion_dates).await {
+            shard_errors.push(format!("shard {shard_id}: {e}"));
+        }
+    }
+    if !shard_errors.is_empty() {
+        return Err(AutumnError::service_unavailable_msg(format!(
+            "calendar exclusion update failed on {} shard(s); retry to converge: {}",
+            shard_errors.len(),
+            shard_errors.join("; ")
+        )));
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -8885,7 +8930,12 @@ async fn delete_calendar_handler(
     let pool = api_state.storage_pool().map_err(map_error)?;
     for (_, shard_pool) in pool.iter_shards() {
         let mut conn = acquire_conn(shard_pool).await?;
-        delete_calendar(&mut conn, &name).await.map_err(map_error)?;
+        // NotFound is treated as success so that retries after a partial delete
+        // converge: already-deleted shards no longer hold the calendar row.
+        match delete_calendar(&mut conn, &name).await {
+            Ok(()) | Err(autumn_harvest::HarvestError::NotFound(_)) => {}
+            Err(e) => return Err(map_error(e)),
+        }
     }
     Ok(StatusCode::NO_CONTENT)
 }

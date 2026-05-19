@@ -210,6 +210,13 @@ pub fn preview_schedule_firings(
     entries
 }
 
+/// Backfill slot returned by [`plan_backfill_with_calendar`]: `(original_slot, fire_time)`.
+///
+/// `original_slot` is the raw cron-generated timestamp used for deterministic
+/// workflow-ID generation. `fire_time` is the calendar-adjusted dispatch time
+/// (may equal `original_slot` when the slot is not excluded).
+pub type BackfillSlot = (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>);
+
 /// Like [`crate::scheduler::plan_backfill_timestamps`] but respects a calendar.
 ///
 /// Excluded dates are filtered out or adjusted per the skip policy:
@@ -222,6 +229,13 @@ pub fn preview_schedule_firings(
 /// Returns [`crate::scheduler::BackfillPlanError::LimitExceeded`] when the raw
 /// timestamp window would exceed `max_count` before calendar filtering.
 #[cfg(feature = "db")]
+/// Returns `(original_slot, fire_time)` pairs.
+///
+/// `original_slot` is the raw cron-generated timestamp used for deterministic
+/// workflow-ID generation. `fire_time` is the calendar-adjusted dispatch time
+/// (may equal `original_slot` for unaffected slots). Keeping both prevents
+/// two logical slots that rebase onto the same calendar day from colliding on
+/// the derived workflow ID.
 pub fn plan_backfill_with_calendar(
     schedule: Option<&crate::policy::Schedule>,
     from: chrono::DateTime<chrono::Utc>,
@@ -230,22 +244,22 @@ pub fn plan_backfill_with_calendar(
     excluded_dates: &[NaiveDate],
     skip_policy: SkipPolicy,
     exclude_weekends: bool,
-) -> Result<Vec<chrono::DateTime<chrono::Utc>>, crate::scheduler::BackfillPlanError> {
+) -> Result<Vec<BackfillSlot>, crate::scheduler::BackfillPlanError> {
     let raw = crate::scheduler::plan_backfill_timestamps(schedule, from, to, max_count)?;
-    let adjusted = raw
+    let pairs = raw
         .into_iter()
         .filter_map(|ts| {
             let date = ts.date_naive();
             apply_skip_policy(date, skip_policy, excluded_dates, exclude_weekends).map(|adj_date| {
                 if adj_date == date {
-                    ts
+                    (ts, ts)
                 } else {
-                    rebase_to_date(ts, adj_date, schedule)
+                    (ts, rebase_to_date(ts, adj_date, schedule))
                 }
             })
         })
         .collect();
-    Ok(adjusted)
+    Ok(pairs)
 }
 
 // ── DB helpers (require `db` feature) ─────────────────────────────────────────
