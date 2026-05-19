@@ -6261,7 +6261,10 @@ async fn schedule_backfill(
     // Dry-run: query current running count and project what would happen.
     if request.dry_run {
         let running = query_running_count_best_effort(&pool, &kind, &name).await;
-        let already_exists = count_existing_in_window(&pool, &kind, &name, &fire_times).await;
+        // Workflow IDs are derived from original_slot (not fire_time), so duplicate
+        // detection must use the same set of timestamps that dispatch will use.
+        let original_slots: Vec<_> = timestamp_pairs.iter().map(|(orig, _)| *orig).collect();
+        let already_exists = count_existing_in_window(&pool, &kind, &name, &original_slots).await;
         let remaining = total.saturating_sub(already_exists);
         let available_slots = usize::try_from((max_active - running).max(0)).unwrap_or(0);
         let would_dispatch = remaining.min(available_slots);
@@ -8899,6 +8902,8 @@ async fn update_calendar_exclusions_handler(
     // Attempt all shards even on error so that a transient failure on one shard
     // does not leave others stale. replace_calendar_exclusions is idempotent
     // (runs in a transaction), so retrying a partial fanout converges correctly.
+    // NotFound from any shard means the calendar does not exist → return 404
+    // immediately so callers fix input rather than retrying.
     let mut shard_errors: Vec<String> = Vec::new();
     for (shard_id, shard_pool) in pool.iter_shards() {
         let mut conn = match acquire_conn(shard_pool).await {
@@ -8908,8 +8913,14 @@ async fn update_calendar_exclusions_handler(
                 continue;
             }
         };
-        if let Err(e) = replace_calendar_exclusions(&mut conn, &name, &body.exclusion_dates).await {
-            shard_errors.push(format!("shard {shard_id}: {e}"));
+        match replace_calendar_exclusions(&mut conn, &name, &body.exclusion_dates).await {
+            Ok(()) => {}
+            Err(autumn_harvest::HarvestError::NotFound(_)) => {
+                return Err(AutumnError::not_found_msg(format!(
+                    "calendar '{name}' not found"
+                )));
+            }
+            Err(e) => shard_errors.push(format!("shard {shard_id}: {e}")),
         }
     }
     if !shard_errors.is_empty() {
@@ -8928,14 +8939,26 @@ async fn delete_calendar_handler(
     Path(name): Path<String>,
 ) -> Result<impl IntoResponse, AutumnError> {
     let pool = api_state.storage_pool().map_err(map_error)?;
+    let mut any_deleted = false;
+    let mut all_not_found = true;
     for (_, shard_pool) in pool.iter_shards() {
         let mut conn = acquire_conn(shard_pool).await?;
-        // NotFound is treated as success so that retries after a partial delete
-        // converge: already-deleted shards no longer hold the calendar row.
         match delete_calendar(&mut conn, &name).await {
-            Ok(()) | Err(autumn_harvest::HarvestError::NotFound(_)) => {}
+            Ok(()) => {
+                any_deleted = true;
+                all_not_found = false;
+            }
+            // NotFound on this shard is idempotent for retry: if at least one shard
+            // deleted successfully, the overall operation succeeded.
+            Err(autumn_harvest::HarvestError::NotFound(_)) => {}
             Err(e) => return Err(map_error(e)),
         }
+    }
+    // If every shard reported not-found the calendar never existed; return 404.
+    if all_not_found && !any_deleted {
+        return Err(AutumnError::not_found_msg(format!(
+            "calendar '{name}' not found"
+        )));
     }
     Ok(StatusCode::NO_CONTENT)
 }
