@@ -1793,7 +1793,7 @@ pub const fn management_api_request_fields()
         ("DELETE", "/admin/schedules/{id}", Some(&[])),
         // ── calendars (issue #337) ────────────────────────────────────────────
         ("POST", "/calendars", Some(&["name", "description"])),
-        ("PUT", "/calendars/{name}", None), // 204 No Content
+        ("PUT", "/calendars/{name}", Some(&["exclusion_dates"])),
         ("DELETE", "/calendars/{name}", Some(&[])),
     ]
 }
@@ -2113,19 +2113,28 @@ pub const fn management_api_response_fields()
         (
             "GET",
             "/calendars/{name}",
-            Some(&["name", "description", "exclusion_dates"]),
+            Some(&[
+                "name",
+                "description",
+                "built_in",
+                "created_at",
+                "updated_at",
+                "exclusion_dates",
+            ]),
         ),
         (
             "POST",
             "/calendars",
-            Some(&["name", "description", "exclusion_dates"]),
+            Some(&[
+                "name",
+                "description",
+                "built_in",
+                "created_at",
+                "updated_at",
+            ]),
         ),
-        (
-            "PUT",
-            "/calendars/{name}",
-            Some(&["name", "description", "exclusion_dates"]),
-        ),
-        ("DELETE", "/calendars/{name}", Some(&["ok"])),
+        ("PUT", "/calendars/{name}", None),    // 204 No Content
+        ("DELETE", "/calendars/{name}", None), // 204 No Content
         // ── audit ─────────────────────────────────────────────────────────────
         ("GET", "/admin/audit", None), // Vec<AuditRecord> (external model)
     ]
@@ -5600,14 +5609,28 @@ async fn create_workflow_schedule(
         }
     };
 
-    // Validate calendar name exists before storing to return a helpful 400 rather than
-    // a generic FK-violation 503 from the database.
+    // Validate calendar name exists before storing. Return 400 for NotFound so
+    // clients distinguish invalid input from transient DB failures (503).
     if let Some(cal_name) = &request.calendar {
-        get_calendar(&mut conn, cal_name).await.map_err(|_| {
-            AutumnError::bad_request_msg(format!(
-                "calendar '{cal_name}' not found; create it first with POST /calendars"
-            ))
-        })?;
+        match get_calendar(&mut conn, cal_name).await {
+            Ok(_) => {}
+            Err(autumn_harvest::HarvestError::NotFound(_)) => {
+                let err_summary = format!(
+                    "calendar '{cal_name}' not found; create it first with POST /calendars"
+                );
+                schedule_create_audit_failed(
+                    &api_state,
+                    &actor,
+                    &source,
+                    request_id.as_deref(),
+                    &request.workflow_name,
+                    &err_summary,
+                )
+                .await;
+                return Err(AutumnError::bad_request_msg(err_summary));
+            }
+            Err(e) => return Err(map_error(e)),
+        }
     }
 
     let ws = WorkflowSchedule {

@@ -1459,10 +1459,6 @@ async fn tick_one_workflow_schedule(
     use crate::execution::StartWorkflowParams;
     use crate::schema::harvest_schedules::dsl;
 
-    // Calendar adjustment may shift the logical fire date; shadow the parameter
-    // as mutable so the calendar block can rebase it when needed.
-    let mut logical_date = logical_date;
-
     // Compute jitter window once so it can be reused in the dispatch loop below.
     let jitter_window =
         std::time::Duration::from_secs(u64::try_from(schedule.jitter_secs.max(0)).unwrap_or(0));
@@ -1535,12 +1531,12 @@ async fn tick_one_workflow_schedule(
                     .map_err(crate::error::database_error)?;
                 return Ok(());
             }
-            Some(adjusted) => {
-                // Firing proceeds. If the adjusted date differs from the original,
-                // rebase logical_date so downstream dispatch uses the correct day.
-                if adjusted != fire_date {
-                    logical_date = rebase_logical_date(logical_date, adjusted, parsed_schedule);
-                }
+            Some(_adjusted) => {
+                // Firing proceeds on `_adjusted` day. Do NOT rebase `logical_date`
+                // here — `due_run_plan` must start from the original slot so that
+                // catchup planning covers the full overdue window. Per-slot
+                // adjustment happens in the dispatch loop below for every slot
+                // (including this first one) via `effective_scheduled_for`.
             }
         }
         (excluded, exclude_weekends, skip_policy)
@@ -1662,10 +1658,9 @@ async fn tick_one_workflow_schedule(
     // it becomes next_run_at so catchup slots are not silently dropped.
     let mut deferred_next_run_at: Option<DateTime<Utc>> = None;
     for original_slot in &run_dates {
-        // Re-apply calendar filtering for each catchup slot.  The pre-loop check
-        // already handled `logical_date` (the first slot); subsequent catchup slots
-        // are independent fire times and must be filtered independently.
-        let effective_scheduled_for = if schedule.calendar_name.is_some() && run_dates.len() > 1 {
+        // Apply calendar filtering for every slot (including the first one, since
+        // the pre-loop check no longer rebases `logical_date`).
+        let effective_scheduled_for = if schedule.calendar_name.is_some() {
             let slot_date = original_slot.date_naive();
             match crate::calendar::apply_skip_policy(
                 slot_date,

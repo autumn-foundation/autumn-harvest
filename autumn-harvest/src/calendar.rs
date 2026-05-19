@@ -107,13 +107,30 @@ pub fn calendar_excludes_weekends(calendar_name: &str) -> bool {
 
 /// Rebase a `DateTime<Utc>` to a different date, preserving the time-of-day.
 ///
+/// For `CronInTimezone` schedules the wall-clock time in the schedule's timezone
+/// is preserved across DST boundaries instead of the raw UTC clock time. Falls
+/// back to naive UTC rebasing for plain `Cron`/`Interval`/`None` schedules.
+///
 /// Returns the original datetime if the date cannot be combined with the time.
 #[cfg(feature = "db")]
 #[must_use]
 fn rebase_to_date(
     ts: chrono::DateTime<chrono::Utc>,
     date: NaiveDate,
+    schedule: Option<&crate::policy::Schedule>,
 ) -> chrono::DateTime<chrono::Utc> {
+    if let Some(crate::policy::Schedule::CronInTimezone { tz, .. }) = schedule
+        && let Ok(tz) = tz.parse::<chrono_tz::Tz>()
+    {
+        let local_ts = ts.with_timezone(&tz);
+        if let Some(local_dt) = date
+            .and_time(local_ts.time())
+            .and_local_timezone(tz)
+            .earliest()
+        {
+            return local_dt.with_timezone(&chrono::Utc);
+        }
+    }
     let naive = date.and_time(ts.time());
     chrono::Utc.from_utc_datetime(&naive)
 }
@@ -177,7 +194,7 @@ pub fn preview_schedule_firings(
                 None => (None, format!("SkippedByCalendar:{cal_name}")),
                 Some(adjusted) if adjusted == fire_date => (Some(fire_time), "Fired".to_string()),
                 Some(adjusted) => (
-                    Some(rebase_to_date(fire_time, adjusted)),
+                    Some(rebase_to_date(fire_time, adjusted, Some(schedule))),
                     format!("DeferredFrom:{}", fire_date.format("%Y-%m-%d")),
                 ),
             },
@@ -223,7 +240,7 @@ pub fn plan_backfill_with_calendar(
                 if adj_date == date {
                     ts
                 } else {
-                    rebase_to_date(ts, adj_date)
+                    rebase_to_date(ts, adj_date, schedule)
                 }
             })
         })
