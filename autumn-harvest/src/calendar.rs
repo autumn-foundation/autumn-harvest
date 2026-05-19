@@ -89,7 +89,10 @@ pub fn apply_skip_policy(
 /// Returns the original datetime if the date cannot be combined with the time.
 #[cfg(feature = "db")]
 #[must_use]
-fn rebase_to_date(ts: chrono::DateTime<chrono::Utc>, date: NaiveDate) -> chrono::DateTime<chrono::Utc> {
+fn rebase_to_date(
+    ts: chrono::DateTime<chrono::Utc>,
+    date: NaiveDate,
+) -> chrono::DateTime<chrono::Utc> {
     let naive = date.and_time(ts.time());
     chrono::Utc.from_utc_datetime(&naive)
 }
@@ -569,7 +572,9 @@ mod tests {
 
         #[test]
         fn preview_firings_no_calendar_all_fired() {
-            let from = "2026-07-01T00:00:00Z".parse::<chrono::DateTime<Utc>>().unwrap();
+            let from = "2026-07-01T00:00:00Z"
+                .parse::<chrono::DateTime<Utc>>()
+                .unwrap();
             let schedule = Schedule::Cron("0 9 * * *".to_string());
             let previews =
                 preview_schedule_firings(&schedule, from, 3, None, &[], SkipPolicy::Skip);
@@ -652,18 +657,18 @@ mod tests {
                 .unwrap();
             let schedule = Schedule::Cron("0 9 * * *".to_string());
             let exc = excluded(&["2026-07-04"]);
-            let result = plan_backfill_with_calendar(
-                Some(&schedule),
-                from,
-                to,
-                100,
-                &exc,
-                SkipPolicy::Skip,
-            )
-            .unwrap();
-            let dates: Vec<_> = result.iter().map(|ts| ts.date_naive()).collect();
-            assert!(!dates.contains(&date("2026-07-04")), "Jul 4 should be excluded");
-            assert!(dates.contains(&date("2026-07-05")), "Jul 5 should be present");
+            let result =
+                plan_backfill_with_calendar(Some(&schedule), from, to, 100, &exc, SkipPolicy::Skip)
+                    .unwrap();
+            let dates: Vec<_> = result.iter().map(chrono::DateTime::date_naive).collect();
+            assert!(
+                !dates.contains(&date("2026-07-04")),
+                "Jul 4 should be excluded"
+            );
+            assert!(
+                dates.contains(&date("2026-07-05")),
+                "Jul 5 should be present"
+            );
         }
 
         #[test]
@@ -685,7 +690,7 @@ mod tests {
                 SkipPolicy::RunNextBusinessDay,
             )
             .unwrap();
-            let dates: Vec<_> = result.iter().map(|ts| ts.date_naive()).collect();
+            let dates: Vec<_> = result.iter().map(chrono::DateTime::date_naive).collect();
             assert!(
                 dates.iter().filter(|&&d| d == date("2026-07-05")).count() >= 1,
                 "Jul 5 should appear (as adjusted Jul 4 and/or natural Jul 5)"
@@ -706,12 +711,14 @@ mod tests {
                 .unwrap();
             let schedule = Schedule::Cron("0 9 * * *".to_string());
             let plain =
-                crate::scheduler::plan_backfill_timestamps(Some(&schedule), from, to, 100)
-                    .unwrap();
+                crate::scheduler::plan_backfill_timestamps(Some(&schedule), from, to, 100).unwrap();
             let with_cal =
                 plan_backfill_with_calendar(Some(&schedule), from, to, 100, &[], SkipPolicy::Skip)
                     .unwrap();
-            assert_eq!(plain, with_cal, "empty exclusion list must not change results");
+            assert_eq!(
+                plain, with_cal,
+                "empty exclusion list must not change results"
+            );
         }
     }
 }

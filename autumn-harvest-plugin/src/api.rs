@@ -28,10 +28,6 @@ use diesel_async::RunQueryDsl;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use autumn_harvest::calendar::{
-    create_calendar, delete_calendar, get_calendar, list_calendars, load_exclusions_for_calendar,
-    preview_schedule_firings, replace_calendar_exclusions,
-};
 use autumn_harvest::audit::{
     self, AuditFilters, HEADER_ACTOR, HEADER_REQUEST_ID, HEADER_SOURCE, OP_BATCH_SUBMIT,
     OP_DAG_PATCH, OP_DAG_TRIGGER, OP_DLQ_DISCARD_BULK, OP_DLQ_REPLAY, OP_DLQ_REPLAY_BULK,
@@ -46,6 +42,10 @@ use autumn_harvest::batch::{
     self, BatchAction, BatchExecutorConfig, BatchFilter, BatchJobStatus, BatchJobView,
     BatchSubmission,
 };
+use autumn_harvest::calendar::{
+    create_calendar, delete_calendar, get_calendar, list_calendars, load_exclusions_for_calendar,
+    preview_schedule_firings, replace_calendar_exclusions,
+};
 use autumn_harvest::context::WorkflowContext;
 use autumn_harvest::dlq;
 use autumn_harvest::error::{HarvestError, HarvestResult, database_error};
@@ -55,8 +55,8 @@ use autumn_harvest::history_export::{
     HistoryExportRequest, HistoryPayloadPolicy, export_history,
 };
 use autumn_harvest::models::{
-    AuditRecord, BackfillLogRow, DeadLetter, HarvestCalendar,
-    HarvestSchedule, NewAuditRecord, NewBackfillLogRow, WorkflowExecution,
+    AuditRecord, BackfillLogRow, DeadLetter, HarvestCalendar, HarvestSchedule, NewAuditRecord,
+    NewBackfillLogRow, WorkflowExecution,
 };
 use autumn_harvest::policy::{Schedule, SkipPolicy, WorkflowSchedule, compute_jitter_offset};
 use autumn_harvest::queue::{self, ConcurrencyKeyStats};
@@ -1469,7 +1469,10 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .route("/admin/schedules/{id}/resume", post(resume_schedule))
         .route("/admin/schedules/{id}/backfill", post(schedule_backfill))
         .route("/admin/schedules/{id}", delete(delete_schedule))
-        .route("/admin/schedules/{id}/preview", get(preview_schedule_firings_handler))
+        .route(
+            "/admin/schedules/{id}/preview",
+            get(preview_schedule_firings_handler),
+        )
         // Calendar management (issue #337): named exclusion sets for business-day aware scheduling.
         .route("/calendars", get(list_calendars_handler))
         .route(
@@ -8784,9 +8787,7 @@ async fn delete_calendar_handler(
 ) -> Result<impl IntoResponse, AutumnError> {
     let pool = api_state.storage_pool().map_err(map_error)?;
     let mut conn = acquire_conn(pool.default_pool()).await?;
-    delete_calendar(&mut conn, &name)
-        .await
-        .map_err(map_error)?;
+    delete_calendar(&mut conn, &name).await.map_err(map_error)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -8865,7 +8866,10 @@ async fn preview_schedule_firings_handler(
         skip_policy,
     );
 
-    Ok((StatusCode::OK, Json(serde_json::json!({"entries": entries}))))
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({"entries": entries})),
+    ))
 }
 
 // ── External activity completion (issue #92) ──────────────────────────────────
@@ -10532,6 +10536,8 @@ mod tests {
             overlap_policy: "skip".to_string(),
             buffered_count: 0,
             buffer_all_max: 100,
+            calendar_name: None,
+            skip_policy: "skip".to_string(),
         };
         let json = serde_json::to_string(&entry).expect("serialize");
         assert!(
