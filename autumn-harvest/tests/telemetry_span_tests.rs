@@ -187,6 +187,7 @@ fn build_registry() -> Arc<HandlerRegistry> {
                 handler: telemetry_master_workflow,
                 execution_timeout: None,
                 concurrency: None,
+                max_input_bytes: None,
             },
             WorkflowInfo {
                 name: "telem_child_wf",
@@ -194,6 +195,7 @@ fn build_registry() -> Arc<HandlerRegistry> {
                 handler: telem_child_wf,
                 execution_timeout: None,
                 concurrency: None,
+                max_input_bytes: None,
             },
         ],
         vec![
@@ -208,6 +210,8 @@ fn build_registry() -> Arc<HandlerRegistry> {
                 max_concurrent: None,
                 concurrency_key: None,
                 is_local: false,
+                max_input_bytes: None,
+                max_result_bytes: None,
                 handler: telem_activity,
             },
             ActivityInfo {
@@ -221,6 +225,8 @@ fn build_registry() -> Arc<HandlerRegistry> {
                 max_concurrent: None,
                 concurrency_key: None,
                 is_local: false,
+                max_input_bytes: None,
+                max_result_bytes: None,
                 handler: telem_activity,
             },
         ],

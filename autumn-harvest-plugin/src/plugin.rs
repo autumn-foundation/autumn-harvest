@@ -475,6 +475,7 @@ mod tests {
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             execution_timeout: None,
             concurrency: None,
+            max_input_bytes: None,
         }
     }
 
@@ -490,6 +491,8 @@ mod tests {
             max_concurrent: None,
             concurrency_key: None,
             is_local: false,
+            max_input_bytes: None,
+            max_result_bytes: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
         }
     }

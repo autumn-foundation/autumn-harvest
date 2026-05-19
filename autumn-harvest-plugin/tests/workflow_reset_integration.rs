@@ -435,6 +435,7 @@ async fn reset_fork_completes_with_current_code_and_observes_buffered_signal() {
             handler: replay_checkpoints_then_signal,
             execution_timeout: None,
             concurrency: None,
+            max_input_bytes: None,
         }],
         vec![],
     ));

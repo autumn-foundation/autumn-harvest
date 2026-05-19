@@ -334,14 +334,12 @@ pub fn activity_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let is_local = attrs.local;
 
-    let max_input_bytes_expr = attrs.max_input_bytes.map_or_else(
-        || quote! { None },
-        |b| quote! { Some(#b) },
-    );
-    let max_result_bytes_expr = attrs.max_result_bytes.map_or_else(
-        || quote! { None },
-        |b| quote! { Some(#b) },
-    );
+    let max_input_bytes_expr = attrs
+        .max_input_bytes
+        .map_or_else(|| quote! { None }, |b| quote! { Some(#b) });
+    let max_result_bytes_expr = attrs
+        .max_result_bytes
+        .map_or_else(|| quote! { None }, |b| quote! { Some(#b) });
 
     quote! {
         #input_fn

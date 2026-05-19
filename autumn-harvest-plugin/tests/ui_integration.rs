@@ -193,6 +193,7 @@ fn echo_registry() -> Arc<HandlerRegistry> {
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             execution_timeout: None,
             concurrency: None,
+            max_input_bytes: None,
         }],
         vec![],
     ))
