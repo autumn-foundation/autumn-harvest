@@ -146,6 +146,24 @@ async fn eris_unauthenticated_start_workflow_terminate_if_running_is_blocked() {
 }
 
 #[tokio::test]
+async fn eris_bulk_dlq_enforces_payload_size_limit() {
+    let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(true); // skips inner auth block
+    let app = autumn_harvest_plugin::api::harvest_api_router(api_state)
+        .with_state(autumn_web::AppState::for_test());
+
+    let large_body = "a".repeat(2 * 1024 * 1024 + 10);
+
+    let req_discard = post_json("/dead-letters/discard", &large_body);
+    let resp_discard = app.clone().oneshot(req_discard).await.unwrap();
+    assert_eq!(resp_discard.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+    let req_replay = post_json("/dead-letters/replay", &large_body);
+    let resp_replay = app.oneshot(req_replay).await.unwrap();
+    assert_eq!(resp_replay.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
 async fn eris_start_workflow_terminate_if_running_honors_configured_session_key() {
     let api_state = HarvestApiState::new();
     api_state.set_admin_auth_session_key("operator_id");

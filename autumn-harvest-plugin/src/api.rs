@@ -1192,6 +1192,7 @@ const DEFAULT_EXTERNAL_HANDOFF_LIMIT: i64 = 100;
 const MAX_EXTERNAL_HANDOFF_LIMIT: i64 = 500;
 const DEFAULT_HISTORY_BATCH_EXPORT_LIMIT: usize = 100;
 const MAX_HISTORY_BATCH_EXPORT_LIMIT: usize = 1_000;
+const MAX_API_PAYLOAD_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Debug, Default, Clone)]
 pub(crate) struct WorkflowFilters {
@@ -7274,14 +7275,23 @@ fn url_encode_for_redirect(input: &str) -> String {
     out
 }
 
+#[allow(clippy::too_many_lines)]
 async fn bulk_replay_dead_letters_handler(
     Extension(api_state): Extension<HarvestApiState>,
     headers: axum::http::HeaderMap,
-    body: axum::body::Bytes,
+    body: axum::body::Body,
 ) -> axum::response::Response {
     use axum::response::IntoResponse as _;
 
-    let request = match parse_bulk_dlq_request(&headers, &body) {
+    let Ok(body_bytes) = axum::body::to_bytes(body, MAX_API_PAYLOAD_BYTES).await else {
+        return AutumnError::bad_request_msg(format!(
+            "payload too large ({MAX_API_PAYLOAD_BYTES} bytes max)"
+        ))
+        .with_status(axum::http::StatusCode::PAYLOAD_TOO_LARGE)
+        .into_response();
+    };
+
+    let request = match parse_bulk_dlq_request(&headers, &body_bytes) {
         Ok(request) => request,
         Err(error) => return error.into_response(),
     };
@@ -7382,14 +7392,23 @@ async fn bulk_replay_dead_letters_handler(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn bulk_discard_dead_letters_handler(
     Extension(api_state): Extension<HarvestApiState>,
     headers: axum::http::HeaderMap,
-    body: axum::body::Bytes,
+    body: axum::body::Body,
 ) -> axum::response::Response {
     use axum::response::IntoResponse as _;
 
-    let request = match parse_bulk_dlq_request(&headers, &body) {
+    let Ok(body_bytes) = axum::body::to_bytes(body, MAX_API_PAYLOAD_BYTES).await else {
+        return AutumnError::bad_request_msg(format!(
+            "payload too large ({MAX_API_PAYLOAD_BYTES} bytes max)"
+        ))
+        .with_status(axum::http::StatusCode::PAYLOAD_TOO_LARGE)
+        .into_response();
+    };
+
+    let request = match parse_bulk_dlq_request(&headers, &body_bytes) {
         Ok(request) => request,
         Err(error) => return error.into_response(),
     };
