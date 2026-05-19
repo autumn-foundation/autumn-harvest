@@ -411,11 +411,17 @@ pub async fn load_events_after_row_id(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
     after_row_id: i64,
+    limit: Option<i64>,
 ) -> HarvestResult<Vec<crate::models::HarvestEvent>> {
-    harvest_events::table
+    let mut query = harvest_events::table
         .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
         .filter(harvest_events::id.gt(after_row_id))
         .order(harvest_events::id.asc())
+        .into_boxed();
+    if let Some(n) = limit {
+        query = query.limit(n);
+    }
+    query
         .select(crate::models::HarvestEvent::as_select())
         .load(conn)
         .await
