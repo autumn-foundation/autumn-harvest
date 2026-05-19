@@ -1629,6 +1629,13 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("POST", "/admin/schedules/{id}/resume"),
         ("POST", "/admin/schedules/{id}/backfill"),
         ("DELETE", "/admin/schedules/{id}"),
+        ("GET", "/admin/schedules/{id}/preview"),
+        // ── calendars (issue #337) ────────────────────────────────────────────
+        ("GET", "/calendars"),
+        ("GET", "/calendars/{name}"),
+        ("POST", "/calendars"),
+        ("PUT", "/calendars/{name}"),
+        ("DELETE", "/calendars/{name}"),
         // ── audit (issue #158) ────────────────────────────────────────────────
         ("GET", "/admin/audit"),
     ]
@@ -1770,6 +1777,8 @@ pub const fn management_api_request_fields()
                 "catchup",
                 "paused",
                 "queue_name",
+                "calendar",
+                "skip_policy",
             ]),
         ),
         ("POST", "/admin/schedules/{id}/pause", Some(&["reason"])),
@@ -1782,6 +1791,10 @@ pub const fn management_api_request_fields()
             Some(&["from", "to", "dry_run", "include_paused", "max_count"]),
         ),
         ("DELETE", "/admin/schedules/{id}", Some(&[])),
+        // ── calendars (issue #337) ────────────────────────────────────────────
+        ("POST", "/calendars", Some(&["name", "description"])),
+        ("PUT", "/calendars/{name}", Some(&["exclusion_dates"])),
+        ("DELETE", "/calendars/{name}", Some(&[])),
     ]
 }
 
@@ -2094,6 +2107,25 @@ pub const fn management_api_response_fields()
             ]),
         ),
         ("DELETE", "/admin/schedules/{id}", Some(&["ok"])),
+        ("GET", "/admin/schedules/{id}/preview", Some(&["entries"])),
+        // ── calendars (issue #337) ────────────────────────────────────────────
+        ("GET", "/calendars", None), // Vec<CalendarSummary>
+        (
+            "GET",
+            "/calendars/{name}",
+            Some(&["name", "description", "exclusion_dates"]),
+        ),
+        (
+            "POST",
+            "/calendars",
+            Some(&["name", "description", "exclusion_dates"]),
+        ),
+        (
+            "PUT",
+            "/calendars/{name}",
+            Some(&["name", "description", "exclusion_dates"]),
+        ),
+        ("DELETE", "/calendars/{name}", Some(&["ok"])),
         // ── audit ─────────────────────────────────────────────────────────────
         ("GET", "/admin/audit", None), // Vec<AuditRecord> (external model)
     ]
@@ -8857,7 +8889,9 @@ async fn preview_schedule_firings_handler(
         vec![]
     };
 
-    let entries = preview_schedule_firings(
+    let jitter_secs = schedule.jitter_secs;
+    let schedule_id = schedule.id;
+    let mut entries = preview_schedule_firings(
         sched,
         from,
         count,
@@ -8865,6 +8899,19 @@ async fn preview_schedule_firings_handler(
         &excluded_dates,
         skip_policy,
     );
+
+    // Apply schedule jitter to each effective_at (mirrors effective_fire_time logic).
+    if jitter_secs > 0 {
+        let jitter_window = std::time::Duration::from_secs(jitter_secs.cast_unsigned());
+        for entry in &mut entries {
+            if let Some(t) = entry.effective_at {
+                let offset = compute_jitter_offset(schedule_id, t, jitter_window);
+                if let Ok(d) = chrono::Duration::from_std(offset) {
+                    entry.effective_at = Some(t + d);
+                }
+            }
+        }
+    }
 
     Ok((
         StatusCode::OK,

@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use croner::Cron;
 use diesel::OptionalExtension;
 use diesel::QueryDsl;
@@ -1459,6 +1459,10 @@ async fn tick_one_workflow_schedule(
     use crate::execution::StartWorkflowParams;
     use crate::schema::harvest_schedules::dsl;
 
+    // Calendar adjustment may shift the logical fire date; shadow the parameter
+    // as mutable so the calendar block can rebase it when needed.
+    let mut logical_date = logical_date;
+
     // Compute jitter window once so it can be reused in the dispatch loop below.
     let jitter_window =
         std::time::Duration::from_secs(u64::try_from(schedule.jitter_secs.max(0)).unwrap_or(0));
@@ -1478,17 +1482,40 @@ async fn tick_one_workflow_schedule(
     // If the schedule has a named calendar, load its exclusion dates and apply
     // the skip policy to the logical fire date. Suppressed firings (SkipPolicy::Skip)
     // are recorded as skipped with `reason = "calendar"` and the scheduler advances
-    // past this slot. Deferred firings are allowed through with the adjusted date.
-    if let Some(ref cal_name) = schedule.calendar_name {
+    // past this slot. Deferred firings proceed with the adjusted date.
+    //
+    // `excluded` and `exclude_weekends` are kept for re-use in the dispatch loop
+    // below so that individual catchup slots are also calendar-filtered.
+    let (calendar_excluded, calendar_exclude_weekends, calendar_skip_policy) = if let Some(
+        ref cal_name,
+    ) =
+        schedule.calendar_name
+    {
         let excluded = crate::calendar::load_exclusions_for_calendar(conn, cal_name)
-            .await
-            .unwrap_or_default();
-        let fire_date = logical_date.date_naive();
+                .await
+                .map_err(|e| {
+                    tracing::error!(
+                        workflow_name = %wf_name,
+                        calendar = %cal_name,
+                        error = %e,
+                        "harvest: failed to load calendar exclusions; aborting tick to preserve calendar guarantees"
+                    );
+                    e
+                })?;
+        let exclude_weekends = crate::calendar::calendar_excludes_weekends(cal_name);
         let skip_policy = crate::policy::SkipPolicy::from_db(&schedule.skip_policy);
 
-        match crate::calendar::apply_skip_policy(fire_date, skip_policy, &excluded) {
+        let fire_date = logical_date.date_naive();
+        match crate::calendar::apply_skip_policy(
+            fire_date,
+            skip_policy,
+            &excluded,
+            exclude_weekends,
+        ) {
             None => {
-                // Firing is suppressed. Advance past this slot.
+                // Firing is suppressed. For catchup schedules advance to the next
+                // slot after the excluded date so overdue non-excluded slots are
+                // not dropped; for non-catchup schedules advance from now.
                 tracing::info!(
                     workflow_name = %wf_name,
                     calendar = %cal_name,
@@ -1496,7 +1523,11 @@ async fn tick_one_workflow_schedule(
                     "harvest: workflow schedule firing suppressed by calendar"
                 );
                 metrics.record_schedule_skipped("workflow", wf_name, "calendar");
-                let next = next_run_after(parsed_schedule, now);
+                let next = if catchup {
+                    next_run_after(parsed_schedule, logical_date)
+                } else {
+                    next_run_after(parsed_schedule, now)
+                };
                 diesel::update(dsl::harvest_schedules.find(schedule.id))
                     .set((dsl::next_run_at.eq(next), dsl::updated_at.eq(now)))
                     .execute(conn)
@@ -1504,13 +1535,18 @@ async fn tick_one_workflow_schedule(
                     .map_err(crate::error::database_error)?;
                 return Ok(());
             }
-            Some(_adjusted) => {
-                // Firing proceeds (possibly with an adjusted date — the workflow
-                // gets the original `logical_date`; the calendar adjustment only
-                // affects the fire-date check, not the scheduled run ID).
+            Some(adjusted) => {
+                // Firing proceeds. If the adjusted date differs from the original,
+                // rebase logical_date so downstream dispatch uses the correct day.
+                if adjusted != fire_date {
+                    logical_date = rebase_logical_date(logical_date, adjusted);
+                }
             }
         }
-    }
+        (excluded, exclude_weekends, skip_policy)
+    } else {
+        (vec![], false, crate::policy::SkipPolicy::Skip)
+    };
 
     let mut running: i64 = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::workflow_name.eq(wf_name))
@@ -1626,6 +1662,31 @@ async fn tick_one_workflow_schedule(
     // it becomes next_run_at so catchup slots are not silently dropped.
     let mut deferred_next_run_at: Option<DateTime<Utc>> = None;
     for scheduled_for in &run_dates {
+        // Re-apply calendar filtering for each catchup slot.  The pre-loop check
+        // already handled `logical_date` (the first slot); subsequent catchup slots
+        // are independent fire times and must be filtered independently.
+        let effective_scheduled_for = if schedule.calendar_name.is_some() && run_dates.len() > 1 {
+            let slot_date = scheduled_for.date_naive();
+            match crate::calendar::apply_skip_policy(
+                slot_date,
+                calendar_skip_policy,
+                &calendar_excluded,
+                calendar_exclude_weekends,
+            ) {
+                None => {
+                    metrics.record_schedule_skipped("workflow", wf_name, "calendar");
+                    continue;
+                }
+                Some(adjusted) if adjusted != slot_date => {
+                    rebase_logical_date(*scheduled_for, adjusted)
+                }
+                Some(_) => *scheduled_for,
+            }
+        } else {
+            *scheduled_for
+        };
+        let scheduled_for = &effective_scheduled_for;
+
         if running + i64::from(dispatched) >= i64::from(schedule.max_active_runs) {
             deferred_next_run_at = Some(*scheduled_for);
             tracing::info!(
@@ -1762,6 +1823,14 @@ fn schedule_expr(schedule: Option<&Schedule>) -> Option<String> {
         Some(Schedule::Manual) => Some("manual".to_string()),
         None => None,
     }
+}
+
+/// Rebase a `DateTime<Utc>` to a different date while preserving the time-of-day.
+/// Used by the calendar check to shift `logical_date` when a skip policy defers
+/// the fire to a different day.
+fn rebase_logical_date(ts: DateTime<Utc>, date: chrono::NaiveDate) -> DateTime<Utc> {
+    let naive = date.and_time(ts.time());
+    chrono::Utc.from_utc_datetime(&naive)
 }
 
 fn next_run_after(schedule: Option<&Schedule>, reference: DateTime<Utc>) -> Option<DateTime<Utc>> {

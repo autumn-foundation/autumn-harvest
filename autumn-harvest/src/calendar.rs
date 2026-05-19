@@ -12,9 +12,9 @@
 //! - [`preview_schedule_firings`] — generates a preview of upcoming fire times
 //! - [`plan_backfill_with_calendar`] — like `plan_backfill_timestamps` but calendar-aware
 
-use chrono::NaiveDate;
 #[cfg(feature = "db")]
 use chrono::TimeZone;
+use chrono::{Datelike, NaiveDate};
 use serde::{Deserialize, Serialize};
 
 use crate::policy::SkipPolicy;
@@ -40,12 +40,24 @@ pub fn is_excluded_date(date: NaiveDate, excluded_dates: &[NaiveDate]) -> bool {
     excluded_dates.contains(&date)
 }
 
+/// Internal helper: returns `true` if `date` should be treated as excluded,
+/// checking both the explicit exclusion list and the weekend flag.
+fn is_excluded_impl(date: NaiveDate, excluded_dates: &[NaiveDate], exclude_weekends: bool) -> bool {
+    (exclude_weekends && matches!(date.weekday(), chrono::Weekday::Sat | chrono::Weekday::Sun))
+        || excluded_dates.contains(&date)
+}
+
 /// Adjust a scheduled fire date according to a calendar and skip policy.
 ///
 /// - When `date` is not excluded, returns `Some(date)` unchanged.
 /// - `SkipPolicy::Skip` → `None` (firing is suppressed).
-/// - `SkipPolicy::RunNextBusinessDay` → first subsequent non-excluded date.
-/// - `SkipPolicy::RunPrevBusinessDay` → most recent preceding non-excluded date.
+/// - `SkipPolicy::RunNextBusinessDay` → first subsequent non-excluded weekday.
+/// - `SkipPolicy::RunPrevBusinessDay` → most recent preceding non-excluded weekday.
+///
+/// Set `exclude_weekends = true` when the attached calendar is `"weekends-off"`
+/// (or any calendar that implies Saturday/Sunday are always excluded). When
+/// `true`, Saturday and Sunday are treated as excluded regardless of whether they
+/// appear in `excluded_dates`.
 ///
 /// Scans up to 365 days in either direction; returns `None` if no non-excluded
 /// day can be found within that window (degenerate calendar with 365 consecutive
@@ -55,8 +67,9 @@ pub fn apply_skip_policy(
     date: NaiveDate,
     skip_policy: SkipPolicy,
     excluded_dates: &[NaiveDate],
+    exclude_weekends: bool,
 ) -> Option<NaiveDate> {
-    if !is_excluded_date(date, excluded_dates) {
+    if !is_excluded_impl(date, excluded_dates, exclude_weekends) {
         return Some(date);
     }
     match skip_policy {
@@ -64,7 +77,7 @@ pub fn apply_skip_policy(
         SkipPolicy::RunNextBusinessDay => {
             let mut candidate = date + chrono::Duration::days(1);
             for _ in 0..365 {
-                if !is_excluded_date(candidate, excluded_dates) {
+                if !is_excluded_impl(candidate, excluded_dates, exclude_weekends) {
                     return Some(candidate);
                 }
                 candidate += chrono::Duration::days(1);
@@ -74,7 +87,7 @@ pub fn apply_skip_policy(
         SkipPolicy::RunPrevBusinessDay => {
             let mut candidate = date - chrono::Duration::days(1);
             for _ in 0..365 {
-                if !is_excluded_date(candidate, excluded_dates) {
+                if !is_excluded_impl(candidate, excluded_dates, exclude_weekends) {
                     return Some(candidate);
                 }
                 candidate -= chrono::Duration::days(1);
@@ -82,6 +95,14 @@ pub fn apply_skip_policy(
             None
         }
     }
+}
+
+/// Returns `true` when the calendar name implies Saturday/Sunday are always excluded.
+///
+/// Used to derive the `exclude_weekends` flag without a separate DB lookup.
+#[must_use]
+pub fn calendar_excludes_weekends(calendar_name: &str) -> bool {
+    calendar_name == "weekends-off"
 }
 
 /// Rebase a `DateTime<Utc>` to a different date, preserving the time-of-day.
@@ -144,9 +165,15 @@ pub fn preview_schedule_firings(
         cursor = fire_time;
         let fire_date = fire_time.date_naive();
 
+        let exclude_weekends = calendar_name.is_some_and(calendar_excludes_weekends);
         let (effective_at, reason) = calendar_name.map_or_else(
             || (Some(fire_time), "Fired".to_string()),
-            |cal_name| match apply_skip_policy(fire_date, skip_policy, excluded_dates) {
+            |cal_name| match apply_skip_policy(
+                fire_date,
+                skip_policy,
+                excluded_dates,
+                exclude_weekends,
+            ) {
                 None => (None, format!("SkippedByCalendar:{cal_name}")),
                 Some(adjusted) if adjusted == fire_date => (Some(fire_time), "Fired".to_string()),
                 Some(adjusted) => (
@@ -185,13 +212,14 @@ pub fn plan_backfill_with_calendar(
     max_count: usize,
     excluded_dates: &[NaiveDate],
     skip_policy: SkipPolicy,
+    exclude_weekends: bool,
 ) -> Result<Vec<chrono::DateTime<chrono::Utc>>, crate::scheduler::BackfillPlanError> {
     let raw = crate::scheduler::plan_backfill_timestamps(schedule, from, to, max_count)?;
     let adjusted = raw
         .into_iter()
         .filter_map(|ts| {
             let date = ts.date_naive();
-            apply_skip_policy(date, skip_policy, excluded_dates).map(|adj_date| {
+            apply_skip_policy(date, skip_policy, excluded_dates, exclude_weekends).map(|adj_date| {
                 if adj_date == date {
                     ts
                 } else {
@@ -342,18 +370,10 @@ pub async fn replace_calendar_exclusions(
     use crate::models::NewHarvestCalendarExclusion;
     use crate::schema::harvest_calendar_exclusions;
     use diesel::{ExpressionMethods, QueryDsl};
-    use diesel_async::RunQueryDsl;
+    use diesel_async::{AsyncConnection, RunQueryDsl};
 
-    // Validate the calendar exists.
+    // Validate the calendar exists before opening a transaction.
     get_calendar(conn, calendar_name).await?;
-
-    diesel::delete(
-        harvest_calendar_exclusions::table
-            .filter(harvest_calendar_exclusions::calendar_name.eq(calendar_name)),
-    )
-    .execute(conn)
-    .await
-    .map_err(crate::error::database_error)?;
 
     let rows: Vec<NewHarvestCalendarExclusion<'_>> = dates
         .iter()
@@ -363,20 +383,33 @@ pub async fn replace_calendar_exclusions(
         })
         .collect();
 
-    if !rows.is_empty() {
-        diesel::insert_into(harvest_calendar_exclusions::table)
-            .values(&rows)
-            .on_conflict((
-                harvest_calendar_exclusions::calendar_name,
-                harvest_calendar_exclusions::excluded_date,
-            ))
-            .do_nothing()
-            .execute(conn)
+    conn.transaction(|tx| {
+        Box::pin(async move {
+            diesel::delete(
+                harvest_calendar_exclusions::table
+                    .filter(harvest_calendar_exclusions::calendar_name.eq(calendar_name)),
+            )
+            .execute(tx)
             .await
             .map_err(crate::error::database_error)?;
-    }
 
-    Ok(())
+            if !rows.is_empty() {
+                diesel::insert_into(harvest_calendar_exclusions::table)
+                    .values(&rows)
+                    .on_conflict((
+                        harvest_calendar_exclusions::calendar_name,
+                        harvest_calendar_exclusions::excluded_date,
+                    ))
+                    .do_nothing()
+                    .execute(tx)
+                    .await
+                    .map_err(crate::error::database_error)?;
+            }
+
+            Ok(())
+        })
+    })
+    .await
 }
 
 /// Delete a custom calendar (built-in calendars cannot be deleted).
@@ -510,9 +543,9 @@ mod tests {
     fn apply_skip_policy_non_excluded_returns_same() {
         let exc = excluded(&["2026-07-04"]);
         let d = date("2026-07-05");
-        assert_eq!(apply_skip_policy(d, SkipPolicy::Skip, &exc), Some(d));
+        assert_eq!(apply_skip_policy(d, SkipPolicy::Skip, &exc, false), Some(d));
         assert_eq!(
-            apply_skip_policy(d, SkipPolicy::RunNextBusinessDay, &exc),
+            apply_skip_policy(d, SkipPolicy::RunNextBusinessDay, &exc, false),
             Some(d)
         );
     }
@@ -521,7 +554,7 @@ mod tests {
     fn apply_skip_policy_skip_suppresses_excluded() {
         let exc = excluded(&["2026-07-04"]);
         assert_eq!(
-            apply_skip_policy(date("2026-07-04"), SkipPolicy::Skip, &exc),
+            apply_skip_policy(date("2026-07-04"), SkipPolicy::Skip, &exc, false),
             None
         );
     }
@@ -530,7 +563,12 @@ mod tests {
     fn apply_skip_policy_next_business_day_finds_next() {
         let exc = excluded(&["2026-07-04"]);
         assert_eq!(
-            apply_skip_policy(date("2026-07-04"), SkipPolicy::RunNextBusinessDay, &exc),
+            apply_skip_policy(
+                date("2026-07-04"),
+                SkipPolicy::RunNextBusinessDay,
+                &exc,
+                false
+            ),
             Some(date("2026-07-05"))
         );
     }
@@ -539,7 +577,12 @@ mod tests {
     fn apply_skip_policy_prev_business_day_finds_prev() {
         let exc = excluded(&["2026-07-04"]);
         assert_eq!(
-            apply_skip_policy(date("2026-07-04"), SkipPolicy::RunPrevBusinessDay, &exc),
+            apply_skip_policy(
+                date("2026-07-04"),
+                SkipPolicy::RunPrevBusinessDay,
+                &exc,
+                false
+            ),
             Some(date("2026-07-03"))
         );
     }
@@ -548,7 +591,12 @@ mod tests {
     fn apply_skip_policy_chains_through_multiple_consecutive_exclusions() {
         let exc = excluded(&["2026-08-06", "2026-08-07", "2026-08-08"]);
         assert_eq!(
-            apply_skip_policy(date("2026-08-06"), SkipPolicy::RunNextBusinessDay, &exc),
+            apply_skip_policy(
+                date("2026-08-06"),
+                SkipPolicy::RunNextBusinessDay,
+                &exc,
+                false
+            ),
             Some(date("2026-08-09"))
         );
     }
@@ -557,7 +605,12 @@ mod tests {
     fn apply_skip_policy_prev_chains_through_multiple_consecutive_exclusions() {
         let exc = excluded(&["2026-08-06", "2026-08-07", "2026-08-08"]);
         assert_eq!(
-            apply_skip_policy(date("2026-08-08"), SkipPolicy::RunPrevBusinessDay, &exc),
+            apply_skip_policy(
+                date("2026-08-08"),
+                SkipPolicy::RunPrevBusinessDay,
+                &exc,
+                false
+            ),
             Some(date("2026-08-05"))
         );
     }
@@ -657,9 +710,16 @@ mod tests {
                 .unwrap();
             let schedule = Schedule::Cron("0 9 * * *".to_string());
             let exc = excluded(&["2026-07-04"]);
-            let result =
-                plan_backfill_with_calendar(Some(&schedule), from, to, 100, &exc, SkipPolicy::Skip)
-                    .unwrap();
+            let result = plan_backfill_with_calendar(
+                Some(&schedule),
+                from,
+                to,
+                100,
+                &exc,
+                SkipPolicy::Skip,
+                false,
+            )
+            .unwrap();
             let dates: Vec<_> = result.iter().map(chrono::DateTime::date_naive).collect();
             assert!(
                 !dates.contains(&date("2026-07-04")),
@@ -688,6 +748,7 @@ mod tests {
                 100,
                 &exc,
                 SkipPolicy::RunNextBusinessDay,
+                false,
             )
             .unwrap();
             let dates: Vec<_> = result.iter().map(chrono::DateTime::date_naive).collect();
@@ -712,9 +773,16 @@ mod tests {
             let schedule = Schedule::Cron("0 9 * * *".to_string());
             let plain =
                 crate::scheduler::plan_backfill_timestamps(Some(&schedule), from, to, 100).unwrap();
-            let with_cal =
-                plan_backfill_with_calendar(Some(&schedule), from, to, 100, &[], SkipPolicy::Skip)
-                    .unwrap();
+            let with_cal = plan_backfill_with_calendar(
+                Some(&schedule),
+                from,
+                to,
+                100,
+                &[],
+                SkipPolicy::Skip,
+                false,
+            )
+            .unwrap();
             assert_eq!(
                 plain, with_cal,
                 "empty exclusion list must not change results"

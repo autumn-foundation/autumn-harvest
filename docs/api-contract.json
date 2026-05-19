@@ -2617,6 +2617,193 @@
     },
     {
       "method": "GET",
+      "path": "/admin/schedules/{id}/preview",
+      "category": "schedule",
+      "read_only": true,
+      "description": "Preview the next N fire times for a schedule, applying calendar exclusions and skip policy. Does not trigger any executions.",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Schedule UUID."
+        },
+        {
+          "name": "count",
+          "in": "query",
+          "required": false,
+          "description": "Number of fire-time entries to return. Defaults to 10, max 100."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "entries",
+            "type": "array",
+            "description": "Array of ScheduleFirePreview objects, each with scheduled_at, effective_at (null if suppressed), and reason."
+          }
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 404,
+          "description": "Schedule not found."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/calendars",
+      "category": "calendar",
+      "read_only": true,
+      "description": "List all named calendars (exclusion sets) available for schedule filtering.",
+      "params": [],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "free_form": true
+      },
+      "error_responses": [
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/calendars/{name}",
+      "category": "calendar",
+      "read_only": true,
+      "description": "Get a named calendar including its exclusion date list.",
+      "params": [
+        {
+          "name": "name",
+          "in": "path",
+          "required": true,
+          "description": "Calendar name."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "free_form": false,
+        "fields": [
+          { "name": "name", "type": "string", "description": "Calendar name." },
+          { "name": "description", "type": "string", "description": "Optional description." },
+          { "name": "exclusion_dates", "type": "array", "description": "List of excluded dates (YYYY-MM-DD)." }
+        ]
+      },
+      "error_responses": [
+        { "status": 404, "description": "Calendar not found." },
+        { "status": 500, "description": "Database error." }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/calendars",
+      "category": "calendar",
+      "read_only": false,
+      "description": "Create a new named calendar.",
+      "params": [],
+      "request_body": {
+        "required": true,
+        "free_form": false,
+        "fields": [
+          { "name": "name", "type": "string", "required": true, "description": "Unique calendar name." },
+          { "name": "description", "type": "string", "required": false, "description": "Optional description." }
+        ]
+      },
+      "success_response": {
+        "status": 201,
+        "free_form": false,
+        "fields": [
+          { "name": "name", "type": "string", "description": "Calendar name." },
+          { "name": "description", "type": "string", "description": "Optional description." },
+          { "name": "exclusion_dates", "type": "array", "description": "Initially empty." }
+        ]
+      },
+      "error_responses": [
+        { "status": 409, "description": "Calendar name already exists." },
+        { "status": 500, "description": "Database error." }
+      ]
+    },
+    {
+      "method": "PUT",
+      "path": "/calendars/{name}",
+      "category": "calendar",
+      "read_only": false,
+      "description": "Replace the exclusion date list for a calendar.",
+      "params": [
+        {
+          "name": "name",
+          "in": "path",
+          "required": true,
+          "description": "Calendar name."
+        }
+      ],
+      "request_body": {
+        "required": true,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "exclusion_dates",
+            "type": "array",
+            "required": true,
+            "description": "New full list of excluded dates (YYYY-MM-DD strings). Replaces the existing list atomically."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 200,
+        "free_form": false,
+        "fields": [
+          { "name": "name", "type": "string", "description": "Calendar name." },
+          { "name": "description", "type": "string", "description": "Optional description." },
+          { "name": "exclusion_dates", "type": "array", "description": "Updated exclusion dates." }
+        ]
+      },
+      "error_responses": [
+        { "status": 404, "description": "Calendar not found." },
+        { "status": 500, "description": "Database error." }
+      ]
+    },
+    {
+      "method": "DELETE",
+      "path": "/calendars/{name}",
+      "category": "calendar",
+      "read_only": false,
+      "description": "Delete a named calendar. Schedules referencing this calendar will no longer be filtered.",
+      "params": [
+        {
+          "name": "name",
+          "in": "path",
+          "required": true,
+          "description": "Calendar name."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "free_form": false,
+        "fields": [
+          { "name": "ok", "type": "boolean", "description": "true on success." }
+        ]
+      },
+      "error_responses": [
+        { "status": 404, "description": "Calendar not found." },
+        { "status": 500, "description": "Database error." }
+      ]
+    },
+    {
+      "method": "GET",
       "path": "/admin/audit",
       "category": "audit",
       "read_only": true,

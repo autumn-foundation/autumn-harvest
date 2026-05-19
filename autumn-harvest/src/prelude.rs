@@ -5,7 +5,9 @@
 //! ```
 
 pub use crate::builder::{HarvestBuilder, WorkerConfig};
-pub use crate::calendar::{Calendar, ScheduleFirePreview, apply_skip_policy, is_excluded_date};
+pub use crate::calendar::{
+    Calendar, ScheduleFirePreview, apply_skip_policy, calendar_excludes_weekends, is_excluded_date,
+};
 pub use crate::context::{ActivityContext, WorkflowContext};
 pub use crate::dag::{DagBuildError, DagBuilder, DagDefinition, DagTask, DagTaskRef};
 pub use crate::error::{HarvestError, HarvestResult, TimeoutType};

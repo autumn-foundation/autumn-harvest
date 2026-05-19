@@ -139,7 +139,9 @@ pub use builder::{
     BuiltHarvest, HarvestBuilder, HarvestBuilderError, StickyRoutingConfig, WorkerConfig,
 };
 pub use cache::{CachedWorkflowState, WorkflowCache};
-pub use calendar::{Calendar, ScheduleFirePreview, apply_skip_policy, is_excluded_date};
+pub use calendar::{
+    Calendar, ScheduleFirePreview, apply_skip_policy, calendar_excludes_weekends, is_excluded_date,
+};
 #[cfg(feature = "db")]
 pub use calendar::{
     create_calendar, delete_calendar, get_calendar, list_calendars, load_exclusions_for_calendar,
