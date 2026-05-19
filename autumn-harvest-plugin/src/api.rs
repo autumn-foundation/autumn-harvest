@@ -6,6 +6,8 @@ use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+const MAX_API_PAYLOAD_BYTES: usize = 2 * 1024 * 1024; // 2MB
+
 use autumn_web::AppState;
 use autumn_web::error::AutumnError;
 use autumn_web::reexports::axum;
@@ -1494,6 +1496,7 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         // API mutations. See `audit::ALL_MUTATION_ROUTES` for covered paths.
         .route("/admin/audit", get(list_audit_records))
         .layer(Extension(api_state))
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_API_PAYLOAD_BYTES))
 }
 
 pub(crate) async fn require_harvest_admin(
@@ -4735,6 +4738,7 @@ async fn query_workflow_post(
     let exec_id = parse_execution_id(&id)?;
     let ctx = hydrate_ctx_for_query(&api_state, exec_id).await?;
     let start = Instant::now(); // measure handler invocation latency, not hydration cost
+
     let args: Value = if body.is_empty() {
         Value::Null
     } else {
@@ -7240,6 +7244,7 @@ fn url_encode_for_redirect(input: &str) -> String {
     out
 }
 
+#[allow(clippy::too_many_lines)]
 async fn bulk_replay_dead_letters_handler(
     Extension(api_state): Extension<HarvestApiState>,
     headers: axum::http::HeaderMap,
@@ -7348,6 +7353,7 @@ async fn bulk_replay_dead_letters_handler(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn bulk_discard_dead_letters_handler(
     Extension(api_state): Extension<HarvestApiState>,
     headers: axum::http::HeaderMap,
@@ -10215,5 +10221,27 @@ mod tests {
             json.contains("\"timezone\":\"Asia/Tokyo\""),
             "timezone field must be present in JSON: {json}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_havoc_dos_bytes_payload_limit() {
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let api_state = HarvestApiState::default();
+        let app = super::harvest_api_router(api_state).with_state(autumn_web::AppState::detached());
+
+        let large_payload = vec![b'a'; super::MAX_API_PAYLOAD_BYTES + 1];
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/workflows/uuid-1234/query/some_query")
+            .header("Content-Type", "application/json")
+            .body(axum::body::Body::from(large_payload))
+            .unwrap();
+
+        let response = app.oneshot(req).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 }
