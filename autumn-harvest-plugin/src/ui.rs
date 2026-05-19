@@ -2767,8 +2767,7 @@ fn render_workflow_detail(
                     (kv("Execution timeout", &format!("{}s", timeout.num_seconds()), false))
                 }
                 @if let Some(threshold) = continue_as_new_threshold {
-                    div.k { "History events" }
-                    div.v { (total_events) " / threshold: " (threshold) }
+                    (kv("History events", &format!("{total_events} / threshold: {threshold}"), false))
                 } @else {
                     (kv("History events", &total_events.to_string(), false))
                 }
