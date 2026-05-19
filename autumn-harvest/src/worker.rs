@@ -2578,7 +2578,7 @@ async fn handle_activity_result(
     match activity_result {
         Ok(output) => {
             let observed_bytes = serde_json::to_string(&output).map_or(0, |s| s.len() as u64);
-            if observed_bytes > max_result_bytes {
+            if max_result_bytes > 0 && observed_bytes > max_result_bytes {
                 use crate::failure::IntoActivityErrorString as _;
                 let error = crate::failure::ActivityFailure::non_retryable(
                     "PayloadTooLarge",
@@ -2732,6 +2732,37 @@ async fn process_activity_task(
     )
     .await;
 
+    let effective_result_cap = registry
+        .activities
+        .get(activity_name)
+        .and_then(|a| a.max_result_bytes)
+        .map_or(registry.max_activity_result_bytes, |per_activity| {
+            per_activity.max(registry.max_activity_result_bytes)
+        });
+
+    // Pre-normalize oversized results to non-retryable failures BEFORE emitting
+    // metrics so that an Ok result above the cap is counted as Failed, not Completed.
+    let activity_result = match activity_result {
+        Ok(output) if effective_result_cap > 0 => {
+            let observed = serde_json::to_string(&output).map_or(0, |s| s.len() as u64);
+            if observed > effective_result_cap {
+                use crate::failure::IntoActivityErrorString as _;
+                let error = crate::failure::ActivityFailure::non_retryable(
+                    "PayloadTooLarge",
+                    format!(
+                        "activity '{activity_name}' result exceeds cap: \
+                         {observed} bytes (cap {effective_result_cap} bytes)"
+                    ),
+                )
+                .into_error_payload();
+                Err(error)
+            } else {
+                Ok(output)
+            }
+        }
+        other => other,
+    };
+
     let duration_secs = started_at.elapsed().as_secs_f64();
     let status = if activity_result.is_ok() {
         ActivityStatus::Completed
@@ -2769,14 +2800,8 @@ async fn process_activity_task(
     let retry_policy_result = configured_retry_policy(task);
     let retry_policy = fail_execution_on_error(conn, task, worker_id, retry_policy_result).await?;
 
-    let effective_result_cap = registry
-        .activities
-        .get(activity_name)
-        .and_then(|a| a.max_result_bytes)
-        .map_or(registry.max_activity_result_bytes, |per_activity| {
-            per_activity.max(registry.max_activity_result_bytes)
-        });
-
+    // activity_result is already cap-normalized (oversized Ok → non-retryable Err);
+    // pass 0 so handle_activity_result skips the redundant cap check.
     handle_activity_result(
         conn,
         task,
@@ -2785,7 +2810,7 @@ async fn process_activity_task(
         worker_id,
         retry_policy.as_ref(),
         activity_result,
-        effective_result_cap,
+        0,
         activity_name,
     )
     .await
@@ -3735,6 +3760,7 @@ async fn process_workflow_task(
                 &du,
                 wf_name,
                 registry.max_activity_input_bytes,
+                registry.max_signal_payload_bytes,
                 workflow
                     .max_input_bytes
                     .map_or(registry.max_workflow_input_bytes, |per| {

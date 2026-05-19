@@ -795,14 +795,6 @@ pub async fn signal_with_start_workflow_execution(
                 });
             }
 
-            // After idempotency dedupe: reject oversized signal payloads.
-            check_sws_payload_cap(
-                &request.signal_payload,
-                crate::error::PayloadKind::SignalPayload,
-                request.max_signal_payload_bytes,
-                request.workflow_name,
-            )?;
-
             // Upgrade AllowDuplicate / AllowDuplicateFailedOnly to TerminateIfRunning
             // when the prior run is terminal so the signal always lands on a live
             // execution ("no signal silently dropped" invariant from issue #244).
@@ -877,6 +869,18 @@ pub async fn signal_with_start_workflow_execution(
             } else {
                 started
             };
+
+            // Check signal payload cap here — after start/attach/AlreadyExists
+            // resolution — so RejectDuplicate conflicts surface as 409 AlreadyExists
+            // rather than 413 PayloadTooLarge when the payload happens to be oversized.
+            if started.state == "RUNNING" {
+                check_sws_payload_cap(
+                    &request.signal_payload,
+                    crate::error::PayloadKind::SignalPayload,
+                    request.max_signal_payload_bytes,
+                    request.workflow_name,
+                )?;
+            }
 
             let signal_delivered = if started.state == "RUNNING" {
                 stage_signal_with_idempotency(
