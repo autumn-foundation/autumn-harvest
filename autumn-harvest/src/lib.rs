@@ -26,6 +26,9 @@ pub mod batch;
 pub mod build_routing;
 pub mod builder;
 pub mod cache;
+/// Calendar-aware schedule filtering: named exclusion sets, skip policies, and
+/// schedule preview generation (issue #337).
+pub mod calendar;
 /// Per-key concurrency limits for tenant fair-share scheduling (issue #247).
 pub mod concurrency;
 pub mod context;
@@ -136,6 +139,15 @@ pub use builder::{
     BuiltHarvest, HarvestBuilder, HarvestBuilderError, StickyRoutingConfig, WorkerConfig,
 };
 pub use cache::{CachedWorkflowState, WorkflowCache};
+#[cfg(feature = "db")]
+pub use calendar::{
+    BackfillSlot, create_calendar, delete_calendar, get_calendar, list_calendars,
+    load_exclusions_for_calendar, plan_backfill_with_calendar, preview_schedule_firings,
+    replace_calendar_exclusions,
+};
+pub use calendar::{
+    Calendar, ScheduleFirePreview, apply_skip_policy, calendar_excludes_weekends, is_excluded_date,
+};
 pub use context::{
     ActivityContext, DEFAULT_HISTORY_CONTINUE_AS_NEW_THRESHOLD, WorkflowCommand, WorkflowContext,
     WorkflowHistoryPolicy,
@@ -185,7 +197,9 @@ pub use info::{
 };
 pub use payload_codec::{CodecError, IdentityCodec, PayloadCodec, PayloadCodecs};
 pub use policy::validate_schedule;
-pub use policy::{OverlapPolicy, RetryPolicy, Schedule, TaskStatus, TriggerRule, WorkflowSchedule};
+pub use policy::{
+    OverlapPolicy, RetryPolicy, Schedule, SkipPolicy, TaskStatus, TriggerRule, WorkflowSchedule,
+};
 pub use pool::{HarvestPoolConfig, compute_pool_sizes};
 pub use query::QueryRegistry;
 pub use replay::{HistoryMatch, HistoryMatcher};

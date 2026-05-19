@@ -18,7 +18,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::IntoResponse;
-use axum::routing::{delete, get, patch, post};
+use axum::routing::{delete, get, patch, post, put};
 use diesel::ExpressionMethods;
 use diesel::OptionalExtension;
 use diesel::QueryDsl;
@@ -42,6 +42,11 @@ use autumn_harvest::batch::{
     self, BatchAction, BatchExecutorConfig, BatchFilter, BatchJobStatus, BatchJobView,
     BatchSubmission,
 };
+use autumn_harvest::calendar::{
+    BackfillSlot, calendar_excludes_weekends, create_calendar, delete_calendar, get_calendar,
+    list_calendars, load_exclusions_for_calendar, plan_backfill_with_calendar,
+    preview_schedule_firings, replace_calendar_exclusions,
+};
 use autumn_harvest::context::WorkflowContext;
 use autumn_harvest::dlq;
 use autumn_harvest::error::{HarvestError, HarvestResult, database_error};
@@ -51,10 +56,10 @@ use autumn_harvest::history_export::{
     HistoryExportRequest, HistoryPayloadPolicy, export_history,
 };
 use autumn_harvest::models::{
-    AuditRecord, BackfillLogRow, DeadLetter, HarvestSchedule, NewAuditRecord, NewBackfillLogRow,
-    WorkflowExecution,
+    AuditRecord, BackfillLogRow, DeadLetter, HarvestCalendar, HarvestSchedule, NewAuditRecord,
+    NewBackfillLogRow, WorkflowExecution,
 };
-use autumn_harvest::policy::{Schedule, WorkflowSchedule, compute_jitter_offset};
+use autumn_harvest::policy::{Schedule, SkipPolicy, WorkflowSchedule, compute_jitter_offset};
 use autumn_harvest::queue::{self, ConcurrencyKeyStats};
 use autumn_harvest::reset::{
     ResetInvalidPoint, ResetResult, WorkflowResetError, WorkflowResetRequest,
@@ -1108,6 +1113,10 @@ struct ScheduleEntry {
     buffered_count: usize,
     /// Maximum buffered slots under `buffer_all`. 0 for other policies.
     buffer_all_max: i32,
+    /// Optional named calendar attached to this schedule (issue #337). `null` = no filtering.
+    calendar_name: Option<String>,
+    /// What to do when the fire date is calendar-excluded (issue #337).
+    skip_policy: String,
 }
 
 /// Optional request body for `POST /admin/schedules/{id}/pause` and `…/resume`.
@@ -1149,6 +1158,13 @@ struct CreateWorkflowScheduleRequest {
     /// Maximum buffered slots under `BufferAll`. Defaults to `100`.
     #[serde(default = "default_buffer_all_max")]
     buffer_all_max: u32,
+    /// Optional named calendar for business-day / holiday filtering (issue #337).
+    #[serde(default)]
+    calendar: Option<String>,
+    /// What to do when the fire date is excluded by the calendar.
+    /// Valid values: `"skip"`, `"run_next_business_day"`, `"run_prev_business_day"`.
+    #[serde(default = "default_skip_policy")]
+    skip_policy: String,
 }
 
 fn default_queue_name() -> String {
@@ -1164,6 +1180,10 @@ const fn default_max_active_runs() -> u32 {
 }
 
 fn default_overlap_policy() -> String {
+    "skip".to_string()
+}
+
+fn default_skip_policy() -> String {
     "skip".to_string()
 }
 
@@ -1450,6 +1470,25 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .route("/admin/schedules/{id}/resume", post(resume_schedule))
         .route("/admin/schedules/{id}/backfill", post(schedule_backfill))
         .route("/admin/schedules/{id}", delete(delete_schedule))
+        .route(
+            "/admin/schedules/{id}/preview",
+            get(preview_schedule_firings_handler),
+        )
+        // Calendar management (issue #337): named exclusion sets for business-day aware scheduling.
+        .route("/calendars", get(list_calendars_handler))
+        .route(
+            "/calendars",
+            post(create_calendar_handler).route_layer(require_admin.clone()),
+        )
+        .route("/calendars/{name}", get(get_calendar_handler))
+        .route(
+            "/calendars/{name}",
+            put(update_calendar_exclusions_handler).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/calendars/{name}",
+            delete(delete_calendar_handler).route_layer(require_admin.clone()),
+        )
         // External activity completion (issue #92): async task-token API.
         .route(
             "/activities/external/{token}/complete",
@@ -1591,6 +1630,13 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("POST", "/admin/schedules/{id}/resume"),
         ("POST", "/admin/schedules/{id}/backfill"),
         ("DELETE", "/admin/schedules/{id}"),
+        ("GET", "/admin/schedules/{id}/preview"),
+        // ── calendars (issue #337) ────────────────────────────────────────────
+        ("GET", "/calendars"),
+        ("GET", "/calendars/{name}"),
+        ("POST", "/calendars"),
+        ("PUT", "/calendars/{name}"),
+        ("DELETE", "/calendars/{name}"),
         // ── audit (issue #158) ────────────────────────────────────────────────
         ("GET", "/admin/audit"),
     ]
@@ -1732,6 +1778,8 @@ pub const fn management_api_request_fields()
                 "catchup",
                 "paused",
                 "queue_name",
+                "calendar",
+                "skip_policy",
             ]),
         ),
         ("POST", "/admin/schedules/{id}/pause", Some(&["reason"])),
@@ -1744,6 +1792,10 @@ pub const fn management_api_request_fields()
             Some(&["from", "to", "dry_run", "include_paused", "max_count"]),
         ),
         ("DELETE", "/admin/schedules/{id}", Some(&[])),
+        // ── calendars (issue #337) ────────────────────────────────────────────
+        ("POST", "/calendars", Some(&["name", "description"])),
+        ("PUT", "/calendars/{name}", Some(&["exclusion_dates"])),
+        ("DELETE", "/calendars/{name}", Some(&[])),
     ]
 }
 
@@ -2056,6 +2108,34 @@ pub const fn management_api_response_fields()
             ]),
         ),
         ("DELETE", "/admin/schedules/{id}", Some(&["ok"])),
+        ("GET", "/admin/schedules/{id}/preview", Some(&["entries"])),
+        // ── calendars (issue #337) ────────────────────────────────────────────
+        ("GET", "/calendars", None), // Vec<CalendarSummary>
+        (
+            "GET",
+            "/calendars/{name}",
+            Some(&[
+                "name",
+                "description",
+                "built_in",
+                "created_at",
+                "updated_at",
+                "exclusion_dates",
+            ]),
+        ),
+        (
+            "POST",
+            "/calendars",
+            Some(&[
+                "name",
+                "description",
+                "built_in",
+                "created_at",
+                "updated_at",
+            ]),
+        ),
+        ("PUT", "/calendars/{name}", None),    // 204 No Content
+        ("DELETE", "/calendars/{name}", None), // 204 No Content
         // ── audit ─────────────────────────────────────────────────────────────
         ("GET", "/admin/audit", None), // Vec<AuditRecord> (external model)
     ]
@@ -5195,9 +5275,11 @@ async fn list_schedules(
                 last_backfill,
                 jitter_secs: s.jitter_secs,
                 effective_fire_time: eft,
-                overlap_policy: s.overlap_policy.clone(),
+                overlap_policy: s.overlap_policy,
                 buffered_count,
                 buffer_all_max: s.buffer_all_max,
+                calendar_name: s.calendar_name,
+                skip_policy: s.skip_policy,
             }
         })
         .collect();
@@ -5266,6 +5348,8 @@ async fn get_schedule(
         overlap_policy: s.overlap_policy.clone(),
         buffered_count,
         buffer_all_max: s.buffer_all_max,
+        calendar_name: s.calendar_name.clone(),
+        skip_policy: s.skip_policy.clone(),
     }))
 }
 
@@ -5427,9 +5511,11 @@ async fn upsert_workflow_schedule_and_read_back(
         max_active_runs: row.max_active_runs,
         catchup: row.catchup,
         last_backfill: None, // newly created; no backfill history yet
-        overlap_policy: row.overlap_policy.clone(),
+        overlap_policy: row.overlap_policy,
         buffered_count,
         buffer_all_max: row.buffer_all_max,
+        calendar_name: row.calendar_name,
+        skip_policy: row.skip_policy,
     })
 }
 
@@ -5505,6 +5591,49 @@ async fn create_workflow_schedule(
             return Err(AutumnError::bad_request_msg(err_summary));
         }
     };
+    let skip_policy = match SkipPolicy::from_user_input(&request.skip_policy) {
+        Ok(p) => p,
+        Err(v) => {
+            let err_summary = format!(
+                "invalid skip_policy '{v}'; valid values: skip, run_next_business_day, run_prev_business_day"
+            );
+            schedule_create_audit_failed(
+                &api_state,
+                &actor,
+                &source,
+                request_id.as_deref(),
+                &request.workflow_name,
+                &err_summary,
+            )
+            .await;
+            return Err(AutumnError::bad_request_msg(err_summary));
+        }
+    };
+
+    // Validate calendar name exists before storing. Return 400 for NotFound so
+    // clients distinguish invalid input from transient DB failures (503).
+    if let Some(cal_name) = &request.calendar {
+        match get_calendar(&mut conn, cal_name).await {
+            Ok(_) => {}
+            Err(autumn_harvest::HarvestError::NotFound(_)) => {
+                let err_summary = format!(
+                    "calendar '{cal_name}' not found; create it first with POST /calendars"
+                );
+                schedule_create_audit_failed(
+                    &api_state,
+                    &actor,
+                    &source,
+                    request_id.as_deref(),
+                    &request.workflow_name,
+                    &err_summary,
+                )
+                .await;
+                return Err(AutumnError::bad_request_msg(err_summary));
+            }
+            Err(e) => return Err(map_error(e)),
+        }
+    }
+
     let ws = WorkflowSchedule {
         workflow_name: request.workflow_name.clone(),
         dag_name: None,
@@ -5518,6 +5647,8 @@ async fn create_workflow_schedule(
         overlap_policy,
         buffer_all_max: request.buffer_all_max,
         execution_timeout: None,
+        calendar: request.calendar.clone(),
+        skip_policy,
     };
     let entry = match upsert_workflow_schedule_and_read_back(&mut conn, &ws).await {
         Ok(e) => e,
@@ -6059,19 +6190,49 @@ async fn schedule_backfill(
 
     let max_count = request.max_count.unwrap_or(DEFAULT_BACKFILL_MAX_COUNT);
 
-    let timestamps = plan_backfill_timestamps(
-        parsed_schedule.as_ref(),
-        request.from,
-        request.to,
-        max_count,
-    )
-    .map_err(|e| match e {
+    let limit_err = |e| match e {
         BackfillPlanError::LimitExceeded { limit } => AutumnError::bad_request_msg(format!(
             "backfill window contains more than {limit} timestamps; lower the window or pass a higher max_count"
         )),
-    })?;
+    };
+    // Each entry is (original_slot, fire_time). original_slot is the raw cron timestamp
+    // used for deterministic workflow-ID generation so that calendar rebasing (e.g.
+    // RunNextBusinessDay / RunPrevBusinessDay) cannot cause two distinct logical slots
+    // that adjust to the same day to collide on the derived workflow ID.
+    let timestamp_pairs: Vec<BackfillSlot> = if let Some(ref cal_name) = schedule.calendar_name {
+        let mut conn = acquire_conn(pool.default_pool()).await?;
+        let excluded_dates = load_exclusions_for_calendar(&mut conn, cal_name)
+            .await
+            .map_err(map_error)?;
+        let skip_policy = SkipPolicy::from_db(&schedule.skip_policy);
+        let exclude_weekends = calendar_excludes_weekends(cal_name);
+        plan_backfill_with_calendar(
+            parsed_schedule.as_ref(),
+            request.from,
+            request.to,
+            max_count,
+            &excluded_dates,
+            skip_policy,
+            exclude_weekends,
+        )
+        .map_err(limit_err)?
+    } else {
+        plan_backfill_timestamps(
+            parsed_schedule.as_ref(),
+            request.from,
+            request.to,
+            max_count,
+        )
+        .map_err(limit_err)?
+        .into_iter()
+        .map(|ts| (ts, ts))
+        .collect()
+    };
+    // fire_times is the calendar-adjusted list used for display and dedup checks.
+    let fire_times: Vec<chrono::DateTime<chrono::Utc>> =
+        timestamp_pairs.iter().map(|(_, ft)| *ft).collect();
 
-    let total = timestamps.len();
+    let total = timestamp_pairs.len();
     let (kind, name) = if let Some(ref dag_name) = schedule.dag_name {
         (ScheduleKind::Dag, dag_name.clone())
     } else if let Some(ref wf_name) = schedule.workflow_name {
@@ -6100,7 +6261,10 @@ async fn schedule_backfill(
     // Dry-run: query current running count and project what would happen.
     if request.dry_run {
         let running = query_running_count_best_effort(&pool, &kind, &name).await;
-        let already_exists = count_existing_in_window(&pool, &kind, &name, &timestamps).await;
+        // Workflow IDs are derived from original_slot (not fire_time), so duplicate
+        // detection must use the same set of timestamps that dispatch will use.
+        let original_slots: Vec<_> = timestamp_pairs.iter().map(|(orig, _)| *orig).collect();
+        let already_exists = count_existing_in_window(&pool, &kind, &name, &original_slots).await;
         let remaining = total.saturating_sub(already_exists);
         let available_slots = usize::try_from((max_active - running).max(0)).unwrap_or(0);
         let would_dispatch = remaining.min(available_slots);
@@ -6159,7 +6323,7 @@ async fn schedule_backfill(
             name,
             from: request.from,
             to: request.to,
-            planned_timestamps: timestamps,
+            planned_timestamps: fire_times.clone(),
             total,
             dispatched: would_dispatch,
             skipped: would_skip,
@@ -6246,7 +6410,7 @@ async fn schedule_backfill(
                 name,
                 from: request.from,
                 to: request.to,
-                planned_timestamps: timestamps,
+                planned_timestamps: fire_times.clone(),
                 total,
                 dispatched: 0,
                 skipped: 0,
@@ -6268,7 +6432,7 @@ async fn schedule_backfill(
             // unique index on (workflow_name, workflow_id) prevents the scheduler from
             // creating a second run for the same timestamp after the backfill window.
             let wf_shard_pool = pool.default_pool();
-            for scheduled_for in &timestamps {
+            for (original_slot, _fire_time) in &timestamp_pairs {
                 // Respect max_active_runs: skip if we've already saturated the limit.
                 if running_at_start + dispatched_this_call >= max_active {
                     skipped += 1;
@@ -6278,7 +6442,9 @@ async fn schedule_backfill(
                     continue;
                 }
 
-                let workflow_id = scheduled_workflow_id_pub(&wf_name, *scheduled_for);
+                // Use original_slot (pre-calendar-rebase) for ID so that two distinct
+                // logical slots that calendar-adjust to the same fire_time do not collide.
+                let workflow_id = scheduled_workflow_id_pub(&wf_name, *original_slot);
                 // Match the scheduler: ExecutionId::new() encodes ShardId::UNENCODED so
                 // the execution lands on the default shard, same as tick_one_workflow_schedule.
                 let exec_id = ExecutionId::new();
@@ -6376,7 +6542,7 @@ async fn schedule_backfill(
             let shard_id = runtime.router().pick_for_dag(&dag_name);
             let shard_pool = pool.pool_for(shard_id);
 
-            for scheduled_for in &timestamps {
+            for (original_slot, _fire_time) in &timestamp_pairs {
                 // Respect max_active_runs for DAGs (now counted via workflow executions).
                 if running_at_start + dispatched_this_call >= max_active {
                     skipped += 1;
@@ -6394,7 +6560,8 @@ async fn schedule_backfill(
                     failed += 1;
                     continue;
                 };
-                let workflow_id = scheduled_workflow_id_pub(&dag_name, *scheduled_for);
+                // Use original_slot for ID, same as the workflow path above.
+                let workflow_id = scheduled_workflow_id_pub(&dag_name, *original_slot);
                 let exec_id = autumn_harvest::types::ExecutionId::new_for_shard(shard_id);
                 let dag_queue = schedule
                     .queue_name
@@ -6537,7 +6704,7 @@ async fn schedule_backfill(
         name,
         from: request.from,
         to: request.to,
-        planned_timestamps: timestamps,
+        planned_timestamps: fire_times,
         total,
         dispatched,
         skipped,
@@ -8606,6 +8773,345 @@ pub(crate) fn map_error(error: HarvestError) -> AutumnError {
     }
 }
 
+// ── Calendar management (issue #337) ─────────────────────────────────────────
+
+/// Response body for calendar CRUD endpoints.
+#[derive(Debug, Serialize)]
+struct CalendarResponse {
+    name: String,
+    description: Option<String>,
+    built_in: bool,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl From<HarvestCalendar> for CalendarResponse {
+    fn from(c: HarvestCalendar) -> Self {
+        Self {
+            name: c.name,
+            description: c.description,
+            built_in: c.built_in,
+            created_at: c.created_at,
+            updated_at: c.updated_at,
+        }
+    }
+}
+
+/// `GET /calendars` — list all calendars.
+async fn list_calendars_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+) -> Result<impl IntoResponse, AutumnError> {
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    let mut conn = acquire_conn(pool.default_pool()).await?;
+    let calendars = list_calendars(&mut conn).await.map_err(map_error)?;
+    let response: Vec<CalendarResponse> = calendars.into_iter().map(Into::into).collect();
+    Ok((StatusCode::OK, Json(response)))
+}
+
+/// `GET /calendars/{name}` — get a single calendar with its exclusions.
+#[derive(Debug, Serialize)]
+struct CalendarDetailResponse {
+    name: String,
+    description: Option<String>,
+    built_in: bool,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+    exclusion_dates: Vec<chrono::NaiveDate>,
+}
+
+async fn get_calendar_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(name): Path<String>,
+) -> Result<impl IntoResponse, AutumnError> {
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    let mut conn = acquire_conn(pool.default_pool()).await?;
+    let cal = get_calendar(&mut conn, &name).await.map_err(map_error)?;
+    let exclusions = load_exclusions_for_calendar(&mut conn, &name)
+        .await
+        .map_err(map_error)?;
+    Ok((
+        StatusCode::OK,
+        Json(CalendarDetailResponse {
+            name: cal.name,
+            description: cal.description,
+            built_in: cal.built_in,
+            created_at: cal.created_at,
+            updated_at: cal.updated_at,
+            exclusion_dates: exclusions,
+        }),
+    ))
+}
+
+/// Request body for `POST /calendars`.
+#[derive(Debug, Deserialize)]
+struct CreateCalendarRequest {
+    name: String,
+    description: Option<String>,
+}
+
+/// `POST /calendars` — create a custom calendar.
+async fn create_calendar_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+    Json(body): Json<CreateCalendarRequest>,
+) -> Result<impl IntoResponse, AutumnError> {
+    if body.name.is_empty() {
+        return Err(AutumnError::bad_request_msg(
+            "calendar name must not be empty",
+        ));
+    }
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    // Track whether at least one shard performed a fresh insert so we can
+    // distinguish a successful new create from a duplicate-name conflict.
+    let mut fresh_insert_cal: Option<_> = None;
+    let mut conflict_cal: Option<_> = None;
+    let mut shard_errors: Vec<String> = Vec::new();
+    for (shard_id, shard_pool) in pool.iter_shards() {
+        let mut conn = match acquire_conn(shard_pool).await {
+            Ok(c) => c,
+            Err(e) => {
+                // Connection failure: continue so later shards are attempted;
+                // collect the error so we can surface it if nothing succeeded.
+                shard_errors.push(format!("shard {shard_id}: {e}"));
+                continue;
+            }
+        };
+        match create_calendar(&mut conn, &body.name, body.description.as_deref()).await {
+            Ok(cal) => {
+                if fresh_insert_cal.is_none() {
+                    fresh_insert_cal = Some(cal);
+                }
+            }
+            // "Already exists" on a later shard is an idempotent retry-safe no-op
+            // (the shard already has the calendar from a prior attempt). Record
+            // the existing row so we can return it if no shard performed a fresh
+            // insert.
+            Err(autumn_harvest::HarvestError::Config(ref msg))
+                if msg.contains("already exists") =>
+            {
+                if conflict_cal.is_none() {
+                    conflict_cal = Some(
+                        get_calendar(&mut conn, &body.name)
+                            .await
+                            .map_err(map_error)?,
+                    );
+                }
+            }
+            Err(e) => return Err(map_error(e)),
+        }
+    }
+    // At least one shard performed a fresh insert: this was a new calendar.
+    if let Some(cal) = fresh_insert_cal {
+        return Ok((StatusCode::CREATED, Json(CalendarResponse::from(cal))));
+    }
+    // Every reachable shard already had the calendar: the name is taken.
+    if conflict_cal.is_some() {
+        return Err(AutumnError::bad_request_msg(format!(
+            "calendar '{}' already exists",
+            body.name
+        ))
+        .with_status(axum::http::StatusCode::CONFLICT));
+    }
+    // Only connection errors (no shard was reached at all).
+    if !shard_errors.is_empty() {
+        return Err(AutumnError::service_unavailable_msg(format!(
+            "calendar create could not reach all shards; retry to converge: {}",
+            shard_errors.join("; ")
+        )));
+    }
+    Err(AutumnError::service_unavailable_msg("no shards available"))
+}
+
+/// Request body for `PUT /calendars/{name}` — replace exclusion dates.
+#[derive(Debug, Deserialize)]
+struct UpdateCalendarRequest {
+    /// Complete set of exclusion dates (replaces existing). Format: `"YYYY-MM-DD"`.
+    exclusion_dates: Vec<chrono::NaiveDate>,
+}
+
+/// `PUT /calendars/{name}` — replace the exclusion set for a calendar.
+async fn update_calendar_exclusions_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(name): Path<String>,
+    Json(body): Json<UpdateCalendarRequest>,
+) -> Result<impl IntoResponse, AutumnError> {
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    // Preflight: verify the calendar exists on every reachable shard before
+    // writing to any. This ensures a 404 is returned cleanly without leaving
+    // partial exclusion updates on earlier shards.
+    for (_, shard_pool) in pool.iter_shards() {
+        let mut conn = acquire_conn(shard_pool).await?;
+        match get_calendar(&mut conn, &name).await {
+            Ok(_) => {}
+            Err(autumn_harvest::HarvestError::NotFound(_)) => {
+                return Err(AutumnError::not_found_msg(format!(
+                    "calendar '{name}' not found"
+                )));
+            }
+            Err(e) => return Err(map_error(e)),
+        }
+    }
+    // Fanout: attempt all shards; collect failures so retries converge.
+    // replace_calendar_exclusions is transactional so retrying a partial
+    // fanout is safe.
+    let mut shard_errors: Vec<String> = Vec::new();
+    for (shard_id, shard_pool) in pool.iter_shards() {
+        let mut conn = match acquire_conn(shard_pool).await {
+            Ok(c) => c,
+            Err(e) => {
+                shard_errors.push(format!("shard {shard_id}: {e}"));
+                continue;
+            }
+        };
+        if let Err(e) = replace_calendar_exclusions(&mut conn, &name, &body.exclusion_dates).await {
+            shard_errors.push(format!("shard {shard_id}: {e}"));
+        }
+    }
+    if !shard_errors.is_empty() {
+        return Err(AutumnError::service_unavailable_msg(format!(
+            "calendar exclusion update failed on {} shard(s); retry to converge: {}",
+            shard_errors.len(),
+            shard_errors.join("; ")
+        )));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `DELETE /calendars/{name}` — delete a custom calendar.
+async fn delete_calendar_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(name): Path<String>,
+) -> Result<impl IntoResponse, AutumnError> {
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    let mut any_deleted = false;
+    let mut all_not_found = true;
+    let mut shard_errors: Vec<String> = Vec::new();
+    for (shard_id, shard_pool) in pool.iter_shards() {
+        let mut conn = match acquire_conn(shard_pool).await {
+            Ok(c) => c,
+            Err(e) => {
+                shard_errors.push(format!("shard {shard_id}: {e}"));
+                all_not_found = false;
+                continue;
+            }
+        };
+        match delete_calendar(&mut conn, &name).await {
+            Ok(()) => {
+                any_deleted = true;
+                all_not_found = false;
+            }
+            // NotFound on this shard is idempotent: a prior partial delete or
+            // the calendar was never on this shard. Continue so all shards
+            // are attempted before deciding the response.
+            Err(autumn_harvest::HarvestError::NotFound(_)) => {}
+            // Config error means the calendar is built-in and cannot be deleted:
+            // return 400 immediately since this is a client error, not transient.
+            Err(autumn_harvest::HarvestError::Config(msg)) => {
+                return Err(AutumnError::bad_request_msg(msg));
+            }
+            Err(e) => {
+                shard_errors.push(format!("shard {shard_id}: {e}"));
+                all_not_found = false;
+            }
+        }
+    }
+    // Every shard reported not-found and no errors: calendar never existed.
+    if all_not_found && !any_deleted && shard_errors.is_empty() {
+        return Err(AutumnError::not_found_msg(format!(
+            "calendar '{name}' not found"
+        )));
+    }
+    if !shard_errors.is_empty() {
+        return Err(AutumnError::service_unavailable_msg(format!(
+            "calendar delete failed on {} shard(s); retry to converge: {}",
+            shard_errors.len(),
+            shard_errors.join("; ")
+        )));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ── Schedule preview (issue #337) ─────────────────────────────────────────────
+
+/// Query parameters for `GET /admin/schedules/{id}/preview`.
+#[derive(Debug, Deserialize)]
+struct SchedulePreviewQuery {
+    /// Number of fire-time entries to return. Defaults to 10, max 100.
+    #[serde(default = "default_preview_count")]
+    count: usize,
+}
+
+const fn default_preview_count() -> usize {
+    10
+}
+
+/// `GET /admin/schedules/{id}/preview?count=N` — preview next N fire times.
+async fn preview_schedule_firings_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id): Path<uuid::Uuid>,
+    Query(params): Query<SchedulePreviewQuery>,
+) -> Result<impl IntoResponse, AutumnError> {
+    use autumn_harvest::policy::SkipPolicy;
+    use autumn_harvest::scheduler::parse_schedule_from_expr_pub;
+
+    let count = params.count.clamp(1, 100);
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    // load_schedule_by_id fans out across all shards so schedules on any shard are found.
+    let schedule = load_schedule_by_id(&api_state, id).await?;
+    let mut conn = acquire_conn(pool.default_pool()).await?;
+
+    let parsed_schedule = schedule
+        .schedule_expr
+        .as_deref()
+        .and_then(parse_schedule_from_expr_pub);
+    let Some(ref sched) = parsed_schedule else {
+        return Ok((
+            StatusCode::OK,
+            Json(serde_json::json!({"entries": [], "reason": "manual or no schedule"})),
+        ));
+    };
+
+    let from = chrono::Utc::now();
+    let calendar_name = schedule.calendar_name.as_deref();
+    let skip_policy = SkipPolicy::from_db(&schedule.skip_policy);
+
+    let excluded_dates = if let Some(cal_name) = calendar_name {
+        load_exclusions_for_calendar(&mut conn, cal_name)
+            .await
+            .map_err(map_error)?
+    } else {
+        vec![]
+    };
+
+    let jitter_secs = schedule.jitter_secs;
+    let schedule_id = schedule.id;
+    let mut entries = preview_schedule_firings(
+        sched,
+        from,
+        count,
+        calendar_name,
+        &excluded_dates,
+        skip_policy,
+    );
+
+    // Apply schedule jitter to each effective_at (mirrors effective_fire_time logic).
+    if jitter_secs > 0 {
+        let jitter_window = std::time::Duration::from_secs(jitter_secs.cast_unsigned());
+        for entry in &mut entries {
+            if let Some(t) = entry.effective_at {
+                let offset = compute_jitter_offset(schedule_id, t, jitter_window);
+                if let Ok(d) = chrono::Duration::from_std(offset) {
+                    entry.effective_at = Some(t + d);
+                }
+            }
+        }
+    }
+
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({"entries": entries})),
+    ))
+}
+
 // ── External activity completion (issue #92) ──────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -10270,6 +10776,8 @@ mod tests {
             overlap_policy: "skip".to_string(),
             buffered_count: 0,
             buffer_all_max: 100,
+            calendar_name: None,
+            skip_policy: "skip".to_string(),
         };
         let json = serde_json::to_string(&entry).expect("serialize");
         assert!(

@@ -246,6 +246,8 @@ impl DagInfo {
             overlap_policy: self.overlap_policy,
             buffer_all_max: self.buffer_all_max,
             execution_timeout: None,
+            calendar: None,
+            skip_policy: crate::policy::SkipPolicy::Skip,
         })
     }
 

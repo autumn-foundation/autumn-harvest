@@ -4477,6 +4477,8 @@ mod tests {
             overlap_policy: "skip".to_string(),
             buffered_runs: serde_json::json!([]),
             buffer_all_max: 100,
+            calendar_name: None,
+            skip_policy: "skip".to_string(),
         }
     }
 

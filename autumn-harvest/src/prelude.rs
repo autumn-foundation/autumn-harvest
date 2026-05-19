@@ -5,6 +5,9 @@
 //! ```
 
 pub use crate::builder::{HarvestBuilder, WorkerConfig};
+pub use crate::calendar::{
+    Calendar, ScheduleFirePreview, apply_skip_policy, calendar_excludes_weekends, is_excluded_date,
+};
 pub use crate::context::{ActivityContext, WorkflowContext};
 pub use crate::dag::{DagBuildError, DagBuilder, DagDefinition, DagTask, DagTaskRef};
 pub use crate::error::{HarvestError, HarvestResult, TimeoutType};
@@ -16,7 +19,9 @@ pub use crate::handle::{
     WorkflowResultState, start_or_load_workflow_execution_with_handle,
 };
 pub use crate::info::{ActivityInfo, DagInfo, QueryHandlerInfo, UpdateHandlerInfo, WorkflowInfo};
-pub use crate::policy::{RetryPolicy, Schedule, TaskStatus, TriggerRule};
+pub use crate::policy::{
+    OverlapPolicy, RetryPolicy, Schedule, SkipPolicy, TaskStatus, TriggerRule, WorkflowSchedule,
+};
 pub use crate::query::QueryRegistry;
 pub use crate::saga::Saga;
 #[cfg(feature = "db")]

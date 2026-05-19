@@ -11,10 +11,59 @@ use uuid::Uuid;
 
 use crate::schema::{
     harvest_audit_log, harvest_backfill_log, harvest_batch_jobs, harvest_build_compat,
-    harvest_build_policies, harvest_dead_letters, harvest_events, harvest_external_tasks,
-    harvest_schedules, harvest_signals, harvest_task_queue, harvest_timers, harvest_workers,
-    harvest_workflow_executions,
+    harvest_build_policies, harvest_calendar_exclusions, harvest_calendars, harvest_dead_letters,
+    harvest_events, harvest_external_tasks, harvest_schedules, harvest_signals, harvest_task_queue,
+    harvest_timers, harvest_workers, harvest_workflow_executions,
 };
+
+// ── Calendar ──────────────────────────────────────────────────────────────────
+
+/// A named calendar row from `harvest_calendars`.
+#[derive(
+    Debug, Clone, Queryable, Selectable, Identifiable, serde::Serialize, serde::Deserialize,
+)]
+#[diesel(table_name = harvest_calendars)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct HarvestCalendar {
+    pub id: Uuid,
+    pub name: String,
+    pub description: Option<String>,
+    /// `true` for built-in calendars that operators cannot delete.
+    pub built_in: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Insert struct for creating a new calendar.
+#[derive(Debug, Insertable, serde::Serialize, serde::Deserialize)]
+#[diesel(table_name = harvest_calendars)]
+pub struct NewHarvestCalendar<'a> {
+    pub id: Uuid,
+    pub name: &'a str,
+    pub description: Option<&'a str>,
+    pub built_in: bool,
+}
+
+/// A single date exclusion row from `harvest_calendar_exclusions`.
+#[derive(
+    Debug, Clone, Queryable, Selectable, Identifiable, serde::Serialize, serde::Deserialize,
+)]
+#[diesel(table_name = harvest_calendar_exclusions)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct HarvestCalendarExclusion {
+    pub id: Uuid,
+    pub calendar_name: String,
+    pub excluded_date: chrono::NaiveDate,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Insert struct for adding a date to a calendar's exclusion set.
+#[derive(Debug, Insertable, serde::Serialize, serde::Deserialize)]
+#[diesel(table_name = harvest_calendar_exclusions)]
+pub struct NewHarvestCalendarExclusion<'a> {
+    pub calendar_name: &'a str,
+    pub excluded_date: chrono::NaiveDate,
+}
 
 // ── WorkflowExecution ─────────────────────────────────────────────────────────
 
@@ -220,6 +269,10 @@ pub struct HarvestSchedule {
     pub buffered_runs: serde_json::Value,
     /// Maximum buffered slots under `BufferAll` (issue #241). Default 100.
     pub buffer_all_max: i32,
+    /// Optional named calendar for this schedule (issue #337). NULL = no filtering.
+    pub calendar_name: Option<String>,
+    /// What to do when the fire date is calendar-excluded (issue #337).
+    pub skip_policy: String,
 }
 
 /// Insert struct for registering a new schedule (DAG or workflow).
@@ -247,6 +300,10 @@ pub struct NewHarvestSchedule<'a> {
     pub buffered_runs: serde_json::Value,
     /// Maximum buffered slots under `BufferAll` (issue #241).
     pub buffer_all_max: i32,
+    /// Optional named calendar for this schedule (issue #337).
+    pub calendar_name: Option<&'a str>,
+    /// What to do when the fire date is calendar-excluded (issue #337).
+    pub skip_policy: &'a str,
 }
 
 // ── Signal ────────────────────────────────────────────────────────────────────
