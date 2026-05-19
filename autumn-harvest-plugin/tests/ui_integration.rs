@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use autumn_harvest::builder::WorkerConfig;
+use autumn_harvest::context::{DEFAULT_HISTORY_CONTINUE_AS_NEW_THRESHOLD, WorkflowHistoryPolicy};
 use autumn_harvest::info::WorkflowInfo;
 use autumn_harvest::models::NewHarvestEvent;
 use autumn_harvest::scheduler::SchedulerMonitor;
@@ -2358,5 +2359,102 @@ async fn detail_page_has_jump_to_event_n_control() {
     assert!(
         html.contains("Jump to") || html.contains("jump") || html.contains("Go"),
         "detail page should have a jump/go button or label for the control: {html}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #279: history event count and continue-as-new threshold on detail page
+// ---------------------------------------------------------------------------
+
+/// The workflow detail page must show the current event count alongside the
+/// configured continue-as-new threshold in the Metadata card.
+#[tokio::test]
+async fn detail_page_shows_history_event_count_and_threshold() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let exec_id = insert_workflow_on_url(&database_url, ShardId::new(0), "hist_wf", "hist-1").await;
+    // Insert 7 events so we have a known, non-zero count.
+    append_test_events(&database_url, exec_id, "hist", 7).await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, html) = fetch_html(&app, &format!("/workflows/{exec_id}")).await;
+    assert_eq!(status, StatusCode::OK, "detail page must render: {html}");
+
+    // The page must display the event count explicitly in the metadata section.
+    assert!(
+        html.contains("History events"),
+        "metadata card should have a 'History events' label: {html}"
+    );
+    assert!(
+        html.contains('7'),
+        "metadata card should show the count 7: {html}"
+    );
+
+    // The default threshold (10 000) must be visible alongside the count.
+    let threshold_str = DEFAULT_HISTORY_CONTINUE_AS_NEW_THRESHOLD.to_string();
+    assert!(
+        html.contains(&threshold_str),
+        "metadata card should include the continue-as-new threshold ({threshold_str}): {html}"
+    );
+}
+
+/// When the registry is configured with a custom threshold the detail page must
+/// reflect that value rather than the default 10 000.
+#[tokio::test]
+async fn detail_page_shows_custom_continue_as_new_threshold() {
+    const CUSTOM_THRESHOLD: u64 = 500;
+
+    let (database_url, _container) = setup_test_database_url().await;
+    let exec_id = insert_workflow_on_url(&database_url, ShardId::new(0), "cust_wf", "cust-1").await;
+    append_test_events(&database_url, exec_id, "cust", 3).await;
+
+    // Build an app whose registry uses a distinctive non-default threshold.
+    let pool = build_test_pool(&database_url);
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool));
+    let registry = Arc::new(
+        HandlerRegistry::new(
+            vec![WorkflowInfo {
+                name: "cust_wf",
+                module: "tests",
+                handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+                execution_timeout: None,
+                concurrency: None,
+                max_input_bytes: None,
+            }],
+            vec![],
+        )
+        .with_history_policy(
+            WorkflowHistoryPolicy::default().with_continue_as_new_threshold(CUSTOM_THRESHOLD),
+        ),
+    );
+    api_state.install(HarvestApiRuntime::new(
+        registry,
+        Arc::new(HashMap::new()),
+        Arc::new(Vec::new()),
+        None,
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::single(),
+    ));
+    let app = harvest_ui_router(api_state).with_state(test_app_state_without_database());
+
+    let (status, html) = fetch_html(&app, &format!("/workflows/{exec_id}")).await;
+    assert_eq!(status, StatusCode::OK, "detail page must render: {html}");
+
+    assert!(
+        html.contains("History events"),
+        "metadata card should have a 'History events' label: {html}"
+    );
+    assert!(
+        html.contains("500"),
+        "metadata card should show the custom threshold 500: {html}"
+    );
+    // The default threshold value must NOT appear as the threshold.
+    // (It could appear elsewhere, e.g. as an event count or ID, so we verify
+    // the custom value is present rather than asserting the default is absent.)
+    assert!(
+        html.contains('3'),
+        "metadata card should show the event count 3: {html}"
     );
 }

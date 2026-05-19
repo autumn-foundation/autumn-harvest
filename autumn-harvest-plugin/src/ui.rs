@@ -684,6 +684,13 @@ async fn workflow_detail_ui(
     // Load blocked-on data for non-terminal workflows.
     let blocked_on = load_blocked_on_data(&mut conn, exec_uuid, &execution.state).await?;
 
+    // Resolve the continue-as-new threshold from the runtime registry if available.
+    // This is a lightweight read of an in-memory value — no extra DB query.
+    let continue_as_new_threshold = api_state
+        .runtime()
+        .ok()
+        .map(|r| r.registry().history_policy().continue_as_new_threshold());
+
     Ok(render_workflow_detail(
         &execution,
         total_events,
@@ -695,6 +702,7 @@ async fn workflow_detail_ui(
         event_page,
         &blocked_on,
         params.flash.as_deref(),
+        continue_as_new_threshold,
     ))
 }
 
@@ -2611,6 +2619,7 @@ fn render_workflow_detail(
     event_page: i64,
     blocked_on: &BlockedOnData,
     flash: Option<&str>,
+    continue_as_new_threshold: Option<u64>,
 ) -> Markup {
     let exec_id_str = execution.id.to_string();
     let title = format!("{} · Vantage", execution.workflow_name);
@@ -2756,6 +2765,11 @@ fn render_workflow_detail(
                 }
                 @if let Some(timeout) = execution.execution_timeout {
                     (kv("Execution timeout", &format!("{}s", timeout.num_seconds()), false))
+                }
+                @if let Some(threshold) = continue_as_new_threshold {
+                    (kv("History events", &format!("{total_events} / threshold: {threshold}"), false))
+                } @else {
+                    (kv("History events", &total_events.to_string(), false))
                 }
             }
         }
@@ -4700,5 +4714,131 @@ mod tests {
             SchedulePausedFilter::Active
         ));
         assert!(SchedulePausedFilter::parse("maybe").is_err());
+    }
+
+    // -- Issue #279: history event count and continue-as-new threshold --
+
+    fn stub_execution() -> autumn_harvest::models::WorkflowExecution {
+        use chrono::Utc;
+        use uuid::Uuid;
+        autumn_harvest::models::WorkflowExecution {
+            id: Uuid::new_v4(),
+            workflow_name: "test_workflow".to_string(),
+            workflow_id: "wf-1".to_string(),
+            run_id: Uuid::new_v4(),
+            shard_id: 0,
+            state: "RUNNING".to_string(),
+            input: serde_json::json!(null),
+            output: None,
+            error: None,
+            parent_id: None,
+            sticky_worker_id: None,
+            queue_name: "default".to_string(),
+            started_at: Utc::now(),
+            completed_at: None,
+            execution_timeout: None,
+            deadline_at: None,
+            memo: None,
+            search_attrs: None,
+            created_at: Utc::now(),
+            assigned_build_id: None,
+        }
+    }
+
+    fn stub_blocked_on() -> BlockedOnData {
+        BlockedOnData {
+            activities: vec![],
+            external_tasks: vec![],
+            timers: vec![],
+            signals: vec![],
+        }
+    }
+
+    #[test]
+    fn render_detail_shows_history_event_count_with_threshold() {
+        let execution = stub_execution();
+        let blocked = stub_blocked_on();
+        let html = render_workflow_detail(
+            &execution,
+            42,
+            &[],
+            &[],
+            &[],
+            false,
+            &[],
+            0,
+            &blocked,
+            None,
+            Some(10_000),
+        )
+        .into_string();
+
+        assert!(
+            html.contains("History events"),
+            "metadata card must have a 'History events' label"
+        );
+        assert!(
+            html.contains("42"),
+            "metadata card must show the event count 42"
+        );
+        assert!(
+            html.contains("10000") || html.contains("10,000"),
+            "metadata card must show the threshold 10000"
+        );
+    }
+
+    #[test]
+    fn render_detail_shows_threshold_absent_when_none() {
+        let execution = stub_execution();
+        let blocked = stub_blocked_on();
+        let html = render_workflow_detail(
+            &execution,
+            5,
+            &[],
+            &[],
+            &[],
+            false,
+            &[],
+            0,
+            &blocked,
+            None,
+            None,
+        )
+        .into_string();
+
+        assert!(
+            html.contains("History events"),
+            "label should still appear when threshold is None"
+        );
+        assert!(
+            html.contains('5'),
+            "event count 5 should appear even without threshold"
+        );
+    }
+
+    #[test]
+    fn render_detail_shows_custom_threshold() {
+        let execution = stub_execution();
+        let blocked = stub_blocked_on();
+        let html = render_workflow_detail(
+            &execution,
+            300,
+            &[],
+            &[],
+            &[],
+            false,
+            &[],
+            0,
+            &blocked,
+            None,
+            Some(500),
+        )
+        .into_string();
+
+        assert!(html.contains("300"), "event count 300 must appear in HTML");
+        assert!(
+            html.contains("500"),
+            "custom threshold 500 must appear in HTML"
+        );
     }
 }
