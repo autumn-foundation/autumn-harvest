@@ -88,11 +88,40 @@ Event fields are extracted from the inner `data` object of the adjacently-tagged
 | `/schedules` | Cron/interval schedules |
 | `/dlq` | Dead letter queue |
 
+## Live Event Streaming (feature toggle)
+
+The workflow detail page can show events in real-time as they land in `harvest_events`, using the `GET /executions/{exec_id}/events/stream` SSE endpoint.
+
+### Enabling the toggle
+
+Set the `AUTUMN_HARVEST_UI_LIVE_STREAM=true` environment variable (or the equivalent `harvest.ui.live_stream = true` config key) before starting your application. When the toggle is on and the browser supports `EventSource`, the detail page replaces the manual **Refresh** button with a **Live** / **Paused** indicator:
+
+- **Live** (green dot): the `EventSource` connection is open and events are streaming in real time.
+- **Paused** (grey dot): the user clicked the indicator to freeze the view, or `EventSource` is not supported; the existing polled-refresh path is used instead.
+
+When the toggle is **off** (the default), the v1 polled-refresh behaviour is used unchanged — the detail page auto-refreshes at the configured interval and shows the **Refresh** button. No JavaScript is executed in this mode.
+
+### Fallback rules
+
+1. Toggle off → polled refresh (default, no change from v1).
+2. Toggle on, browser lacks `EventSource` → polled refresh.
+3. Toggle on, browser supports `EventSource`, endpoint returns 4xx/5xx → polled refresh with a "stream unavailable" notice.
+4. Execution reaches a terminal state → `event: stream-end` closes the `EventSource`; the page transitions to a static "completed" view without reconnecting.
+
+### Browser / proxy notes
+
+See `docs/management-api.md` for a full list of reverse-proxy and CDN considerations (nginx buffering, Cloudflare, ALB idle timeouts). In short:
+
+- nginx: add `proxy_set_header X-Accel-Buffering no;` on the upstream location block.
+- Cloudflare: SSE is proxied without special configuration since 2024; no extra headers needed.
+- AWS ALB: set idle timeout ≥ 65 s (the SSE keepalive default is 15 s, well inside this window).
+
 ## Accessibility
 
 - Status badges on the detail page include `aria-label` and `role="status"`.
 - All filter and action forms use standard `<form>` / `<button>` elements navigable by keyboard.
-- The dashboard has no JavaScript; all interactions are plain HTTP form submissions or link navigations.
+- The **Live / Paused** SSE indicator is a `<button>` with `aria-label` and `aria-pressed` attributes.
+- When SSE is disabled the dashboard has no JavaScript; all interactions are plain HTTP form submissions or link navigations.
 
 ## Security
 

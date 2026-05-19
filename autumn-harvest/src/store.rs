@@ -397,6 +397,31 @@ pub async fn load_history_since(
     })
 }
 
+/// Load raw `harvest_events` rows for `exec_id` with `id > after_row_id`.
+///
+/// Returns rows ordered by `id ASC`. The `id` column is the `BIGSERIAL` primary
+/// key and serves as the SSE resume cursor (`Last-Event-ID`). Pass `-1` for
+/// `after_row_id` to load all events.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+#[cfg(feature = "db")]
+pub async fn load_events_after_row_id(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    after_row_id: i64,
+) -> HarvestResult<Vec<crate::models::HarvestEvent>> {
+    harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
+        .filter(harvest_events::id.gt(after_row_id))
+        .order(harvest_events::id.asc())
+        .select(crate::models::HarvestEvent::as_select())
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)
+}
+
 /// Load the direct children of `parent_id` from one shard.
 ///
 /// Callers that need cross-shard discovery should call this once per shard and

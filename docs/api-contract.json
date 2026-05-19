@@ -2946,6 +2946,56 @@
           "description": "Database error."
         }
       ]
+    },
+    {
+      "method": "GET",
+      "path": "/executions/{exec_id}/events/stream",
+      "category": "workflow",
+      "read_only": true,
+      "description": "Server-Sent Events stream of WorkflowEvent history for one execution. Emits every newly persisted event as id/event/data SSE messages. Resume via Last-Event-ID header. Closes with event:stream-end on terminal state. Keepalive :ping comments every 15 s (default). Returns 409 Conflict when Last-Event-ID implies more than buffer_depth events to replay (slow consumer).",
+      "params": [
+        {
+          "name": "exec_id",
+          "in": "path",
+          "required": true,
+          "description": "Execution UUID."
+        }
+      ],
+      "headers": [
+        {
+          "name": "Last-Event-ID",
+          "required": false,
+          "description": "harvest_events.id BIGSERIAL cursor. When present, the server replays events with id > n before entering live-tail mode."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "note": "Content-Type: text/event-stream. Each SSE message carries id (BIGSERIAL), event (WorkflowEvent type name), and data (JSON event value). A final event:stream-end message signals terminal execution state. Returns 409 Conflict with {error:slow_consumer, drop_after_event_id} when the client is too far behind.",
+        "free_form": true
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Invalid execution ID."
+        },
+        {
+          "status": 401,
+          "description": "Unauthenticated request."
+        },
+        {
+          "status": 404,
+          "description": "Execution not found."
+        },
+        {
+          "status": 409,
+          "description": "Slow consumer: too many events to replay. Reconnect with Last-Event-ID: drop_after_event_id."
+        },
+        {
+          "status": 503,
+          "description": "SSE notification URL not configured."
+        }
+      ]
     }
   ]
 }

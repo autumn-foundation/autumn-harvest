@@ -72,6 +72,10 @@ pub const OP_EXTERNAL_ACTIVITY_COMPLETE: &str = "external_activity.complete";
 pub const OP_EXTERNAL_ACTIVITY_FAIL: &str = "external_activity.fail";
 /// Audit operation: Initiated draining of a worker fleet.
 pub const OP_WORKER_DRAIN: &str = "worker.drain";
+/// Audit operation: Opened an SSE execution event stream (issue #324).
+pub const OP_EXECUTION_STREAM_OPEN: &str = "execution.stream.open";
+/// Audit operation: Closed an SSE execution event stream (issue #324).
+pub const OP_EXECUTION_STREAM_CLOSE: &str = "execution.stream.close";
 
 // ── Target type constants ─────────────────────────────────────────────────────
 
@@ -216,6 +220,11 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     ("GET /workers/{worker_id}", RouteClass::ReadOnly),
     ("GET /batch-operations", RouteClass::ReadOnly),
     ("GET /batch-operations/{id}", RouteClass::ReadOnly),
+    // SSE execution event stream (issue #324): read-only long-poll, never mutates state.
+    (
+        "GET /executions/{exec_id}/events/stream",
+        RouteClass::ReadOnly,
+    ),
     // ── Mutating ── modifies workflow execution or system configuration ───────
     // All of these are covered by the audit trail (harvest_audit_log) or are
     // explicitly listed in EXCLUDED_ROUTES with an audit disposition note.
@@ -341,6 +350,8 @@ pub const EXCLUDED_ROUTES: &[&str] = &[
     "GET /batch-operations/{id}",
     // The audit list endpoint itself is read-only.
     "GET /admin/audit",
+    // SSE stream is read-only; stream open/close are audited manually in the handler.
+    "GET /executions/{exec_id}/events/stream",
 ];
 
 /// Declarative manifest of every route in `harvest_api_router`.
@@ -435,6 +446,8 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ("GET /batch-operations/{id}", None),
     // Audit log (read-only)
     ("GET /admin/audit", None),
+    // SSE execution event stream (issue #324): read-only; open/close audited in handler.
+    ("GET /executions/{exec_id}/events/stream", None),
 ];
 
 // ── Query filters ─────────────────────────────────────────────────────────────
