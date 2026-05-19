@@ -655,6 +655,11 @@ pub struct SignalWithStartParams<'a> {
     /// Backed by a partial unique index on `harvest_signals`; the `NULL` case
     /// preserves the pre-existing `send_signal` behaviour.
     pub idempotency_key: Option<String>,
+    /// Payload cap for `start_input` (bytes). Enforced only on the fresh-start
+    /// path — attach paths ignore this field. Zero means no cap.
+    pub max_workflow_input_bytes: u64,
+    /// Payload cap for `signal_payload` (bytes). Zero means no cap.
+    pub max_signal_payload_bytes: u64,
 }
 
 /// Result of a [`signal_with_start_workflow_execution`] call.
@@ -731,37 +736,46 @@ pub struct SignalWithStartOutcome {
 /// can leave a CANCELLED orphan on a crash; the wrapping transaction here
 /// turns that into an all-or-nothing operation.)
 ///
+/// Check a payload value against a byte cap, returning `PayloadTooLarge` when exceeded.
+/// Zero cap means uncapped (no check performed).
+fn check_sws_payload_cap(
+    value: &serde_json::Value,
+    kind: crate::error::PayloadKind,
+    cap: u64,
+    workflow_type: &str,
+) -> HarvestResult<()> {
+    if cap == 0 {
+        return Ok(());
+    }
+    let observed = serde_json::to_string(value).map_or(0, |s| s.len() as u64);
+    if observed > cap {
+        return Err(crate::error::HarvestError::PayloadTooLarge {
+            kind,
+            observed_bytes: observed,
+            cap_bytes: cap,
+            workflow_type: workflow_type.to_string(),
+            activity_name: None,
+        });
+    }
+    Ok(())
+}
+
 /// # Errors
 ///
 /// - [`HarvestError::AlreadyExists`] when `RejectDuplicate` rejects.
 /// - Propagates queue/event-store failures from the start transaction.
+#[allow(clippy::too_many_lines)] // orchestrates idempotency, cap checks, start, TOCTOU retry, and signal atomically
 pub async fn signal_with_start_workflow_execution(
     conn: &mut AsyncPgConnection,
     request: SignalWithStartParams<'_>,
 ) -> HarvestResult<SignalWithStartOutcome> {
-    // Wrap the whole operation in a single outer transaction so the entire
-    // outcome — including the `TerminateIfRunning` pre-cancel, the start
-    // (or attach), and the signal insert — commits atomically. Diesel-async
-    // demotes every inner `conn.transaction(..)` call (the cancel inside
-    // `cancel_workflow_execution` and the start inside
-    // `start_or_load_workflow_execution`) to a savepoint under this outer
-    // transaction, so a crash anywhere in the pipeline rolls back the
-    // cancellation alongside the start and the signal. The signal cannot be
-    // observed without its triggering workflow having started, and the prior
-    // run cannot be left CANCELLED-with-no-replacement.
+    // Single outer transaction: pre-cancel + start (or attach) + signal insert commit
+    // atomically. Inner conn.transaction calls become savepoints under this wrapper.
     conn.transaction::<SignalWithStartOutcome, HarvestError, _>(|conn| {
         let request = request;
         async move {
-            // Cross-execution idempotency dedupe. The partial unique index on
-            // `harvest_signals (workflow_exec_id, idempotency_key)` only dedupes
-            // within a single `exec_id`. The fresh-start escalation below and
-            // the reset-buffer path both move signals across `exec_id`s for
-            // the same logical workflow, so a per-exec_id index alone would
-            // re-queue the duplicate signal on a brand-new run. Scope the
-            // dedupe to `(workflow_name, workflow_id, idempotency_key)` by
-            // joining `harvest_signals` to `harvest_workflow_executions` and
-            // short-circuit if any prior signal with this key has already
-            // landed on any execution of this logical workflow.
+            // Cross-execution dedupe: scope by (workflow_name, workflow_id, key)
+            // so escalation/reset paths on a new exec_id don't re-queue the signal.
             if let Some(key) = request.idempotency_key.as_deref()
                 && let Some(prior) = lookup_idempotent_signal_dedupe(
                     conn,
@@ -781,17 +795,17 @@ pub async fn signal_with_start_workflow_execution(
                 });
             }
 
-            // The issue's spec enumerates four outcomes — start fresh, signal
-            // existing, reject, terminate-then-start-and-signal — and requires
-            // that "no signal is silently dropped". The base
-            // `start_or_load_workflow_execution` semantics return an existing
-            // terminal run for `AllowDuplicate`, which would leave us with no
-            // way to deliver the signal. For signal-with-start specifically we
-            // therefore upgrade `AllowDuplicate` and `AllowDuplicateFailedOnly`
-            // to `TerminateIfRunning` whenever the prior run is non-RUNNING
-            // (terminal): the prior is sealed and a fresh run is started, so
-            // the signal lands on a live execution. `RejectDuplicate` and
-            // `TerminateIfRunning` keep their original semantics.
+            // After idempotency dedupe: reject oversized signal payloads.
+            check_sws_payload_cap(
+                &request.signal_payload,
+                crate::error::PayloadKind::SignalPayload,
+                request.max_signal_payload_bytes,
+                request.workflow_name,
+            )?;
+
+            // Upgrade AllowDuplicate / AllowDuplicateFailedOnly to TerminateIfRunning
+            // when the prior run is terminal so the signal always lands on a live
+            // execution ("no signal silently dropped" invariant from issue #244).
             let effective_policy = resolve_effective_signal_with_start_policy(
                 conn,
                 request.workflow_name,
@@ -825,35 +839,26 @@ pub async fn signal_with_start_workflow_execution(
             )
             .await?;
 
-            // The resolver can only take a row lock when the row already
-            // exists. If no row existed at resolver time but another
-            // transaction inserted *and* completed one before this request's
-            // start path grabbed its own `FOR UPDATE`, the start helper
-            // returns the now-terminal row unchanged under
-            // `AllowDuplicate` / `AllowDuplicateFailedOnly`. Without a
-            // second pass the signal would land on a terminal run and be
-            // dropped, violating the "no signal silently dropped"
-            // invariant from issue #244.
-            //
-            // Re-evaluate here: if the result is non-RUNNING and the
-            // caller's original policy was one of the duplicate-allowing
-            // variants, escalate to `TerminateIfRunning` with a fresh
-            // `exec_id` so the existing terminal row is sealed and a new
-            // run is started + signaled. The retry runs inside the same
-            // outer transaction, so the existing row's lock from the start
-            // path's `FOR UPDATE` carries through to the retry's lock and
-            // a third concurrent transaction cannot squeeze in between.
+            // On fresh start only: enforce workflow input cap (tx rollback on error).
+            if started.created {
+                check_sws_payload_cap(
+                    &request.input,
+                    crate::error::PayloadKind::WorkflowInput,
+                    request.max_workflow_input_bytes,
+                    request.workflow_name,
+                )?;
+            }
+
+            // TOCTOU guard: if a concurrent transaction completed the run between
+            // the policy resolver's lock and our start, the start helper returns
+            // a terminal row. Escalate to TerminateIfRunning so the signal always
+            // lands on a live execution rather than being silently dropped.
             let started = if started.state != "RUNNING"
                 && matches!(
                     request.reuse_policy,
                     WorkflowIdReusePolicy::AllowDuplicate
                         | WorkflowIdReusePolicy::AllowDuplicateFailedOnly
                 ) {
-                // The terminal row owns `started.exec_id`'s UUID, so
-                // `replace_execution` needs a fresh id keyed to the same
-                // shard. `ExecutionId::new_for_shard` collapses to the
-                // default-shard sentinel for unencoded ids, matching
-                // pre-sharding test setups.
                 let fresh_exec_id = ExecutionId::new_for_shard(started.exec_id.shard());
                 start_or_load_workflow_execution(
                     conn,

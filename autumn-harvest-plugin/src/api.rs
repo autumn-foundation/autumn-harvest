@@ -4046,35 +4046,18 @@ async fn signal_with_start_workflow(
     let start_input = request.start_input.unwrap_or(Value::Null);
     let signal_payload = request.signal_payload.unwrap_or(Value::Null);
 
-    // Issue #252: enforce workflow input and signal payload caps before any DB write.
-    {
-        let effective_wf_cap = runtime
-            .registry
-            .workflows
-            .get(&workflow_name)
-            .and_then(|info| info.max_input_bytes)
-            .map_or(runtime.registry.max_workflow_input_bytes, |per_wf| {
-                per_wf.max(runtime.registry.max_workflow_input_bytes)
-            });
-        let observed_wf = serde_json::to_string(&start_input).map_or(0, |s| s.len() as u64);
-        if observed_wf > effective_wf_cap {
-            return (
-                axum::http::StatusCode::PAYLOAD_TOO_LARGE,
-                Json(serde_json::json!({
-                    "kind": "WorkflowInput",
-                    "observed_bytes": observed_wf,
-                    "cap_bytes": effective_wf_cap,
-                    "workflow_type": workflow_name,
-                })),
-            )
-                .into_response();
-        }
-        if let Err(e) =
-            check_signal_payload_cap(&signal_payload, runtime.registry.max_signal_payload_bytes)
-        {
-            return e.into_response();
-        }
-    }
+    // Issue #252: resolve cap values. Both caps are enforced inside
+    // signal_with_start_workflow_execution — after idempotency dedupe and
+    // only on the fresh-start path for start_input — to avoid spurious 413s
+    // on attach requests where start_input is never written.
+    let effective_wf_cap = runtime
+        .registry
+        .workflows
+        .get(&workflow_name)
+        .and_then(|info| info.max_input_bytes)
+        .map_or(runtime.registry.max_workflow_input_bytes, |per_wf| {
+            per_wf.max(runtime.registry.max_workflow_input_bytes)
+        });
 
     // In multi-shard deployments with read-only shards the rendezvous hash can
     // map a (workflow_name, workflow_id) to a different writable shard than the
@@ -4206,6 +4189,8 @@ async fn signal_with_start_workflow(
             signal_name: &request.signal_name,
             signal_payload,
             idempotency_key: request.idempotency_key.clone(),
+            max_workflow_input_bytes: effective_wf_cap,
+            max_signal_payload_bytes: runtime.registry.max_signal_payload_bytes,
         },
     )
     .await;

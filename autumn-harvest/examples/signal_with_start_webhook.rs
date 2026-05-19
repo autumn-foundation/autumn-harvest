@@ -102,6 +102,8 @@ async fn handle_webhook_after(
             // deliveries with the same event id yield exactly one
             // SignalReceived event in the workflow's history.
             idempotency_key: Some(stripe_event_id),
+            max_workflow_input_bytes: 0,
+            max_signal_payload_bytes: 0,
         },
     )
     .await?;

@@ -16,7 +16,10 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 use tokio::sync::oneshot;
 
-use crate::builder::{DEFAULT_MAX_ACTIVITY_INPUT_BYTES, DEFAULT_MAX_WORKFLOW_INPUT_BYTES};
+use crate::builder::{
+    DEFAULT_MAX_ACTIVITY_INPUT_BYTES, DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
+    DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
+};
 use crate::error::{HarvestError, HarvestResult, PayloadKind};
 use crate::event::WorkflowEvent;
 use crate::query::QueryRegistry;
@@ -561,6 +564,8 @@ pub struct WorkflowContext {
     /// Global cap on `side_effect` value payloads (bytes).
     /// Uses the workflow-input cap as a reasonable default.
     payload_max_side_effect: u64,
+    /// Global cap on signal payloads sent via `signal_external_workflow`.
+    payload_max_signal: u64,
     /// Per-activity input cap overrides: `activity_name → max_bytes`.
     /// When an entry exists, the effective cap is `max(global, override)`.
     activity_input_cap_overrides: HashMap<String, u64>,
@@ -667,6 +672,7 @@ impl WorkflowContext {
             payload_max_activity_input: DEFAULT_MAX_ACTIVITY_INPUT_BYTES,
             payload_max_workflow_input: DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
             payload_max_side_effect: DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
+            payload_max_signal: DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
             activity_input_cap_overrides: HashMap::new(),
         }
     }
@@ -746,6 +752,7 @@ impl WorkflowContext {
             payload_max_activity_input: DEFAULT_MAX_ACTIVITY_INPUT_BYTES,
             payload_max_workflow_input: DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
             payload_max_side_effect: DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
+            payload_max_signal: DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
             activity_input_cap_overrides: HashMap::new(),
         })
     }
@@ -775,6 +782,7 @@ impl WorkflowContext {
             payload_max_activity_input: DEFAULT_MAX_ACTIVITY_INPUT_BYTES,
             payload_max_workflow_input: DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
             payload_max_side_effect: DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
+            payload_max_signal: DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
             activity_input_cap_overrides: HashMap::new(),
         }
     }
@@ -786,19 +794,20 @@ impl WorkflowContext {
     /// - `max_activity_input` caps activity inputs at schedule time.
     /// - `max_workflow_input` caps child-workflow inputs and side-effect values.
     ///
-    /// `max_activity_result` and `max_signal` are accepted for API symmetry but
-    /// are enforced by the worker and management API, not by `WorkflowContext`.
+    /// `max_activity_result` is accepted for API symmetry but is enforced by
+    /// the worker, not by `WorkflowContext`.
     #[must_use]
     pub const fn with_payload_caps(
         mut self,
         max_activity_input: u64,
         _max_activity_result: u64,
-        _max_signal: u64,
+        max_signal: u64,
         max_workflow_input: u64,
     ) -> Self {
         self.payload_max_activity_input = max_activity_input;
         self.payload_max_workflow_input = max_workflow_input;
         self.payload_max_side_effect = max_workflow_input;
+        self.payload_max_signal = max_signal;
         self
     }
 
@@ -2109,10 +2118,21 @@ impl WorkflowContext {
                 self.check_strict_replay_no_match(&format!(
                     "ExternalSignalRequested(target={target}, signal={signal_name})"
                 ))?;
+                let payload_json = serde_json::to_value(&payload)?;
+                let observed = serde_json::to_string(&payload_json).map_or(0, |s| s.len() as u64);
+                if observed > self.payload_max_signal {
+                    return Err(HarvestError::PayloadTooLarge {
+                        kind: crate::error::PayloadKind::SignalPayload,
+                        observed_bytes: observed,
+                        cap_bytes: self.payload_max_signal,
+                        workflow_type: self.workflow_name.clone(),
+                        activity_name: None,
+                    });
+                }
                 self.dispatch_signal_command(
                     target,
                     signal_name,
-                    payload,
+                    payload_json,
                     ExternalSignalId::new(),
                     false,
                 )
@@ -2346,6 +2366,16 @@ impl WorkflowContext {
             )),
             HistoryMatch::NoMatch => {
                 self.check_strict_replay_no_match("ContinueAsNew")?;
+                let observed = serde_json::to_string(&input).map_or(0, |s| s.len() as u64);
+                if observed > self.payload_max_workflow_input {
+                    return Err(HarvestError::PayloadTooLarge {
+                        kind: crate::error::PayloadKind::WorkflowInput,
+                        observed_bytes: observed,
+                        cap_bytes: self.payload_max_workflow_input,
+                        workflow_type: self.workflow_name.clone(),
+                        activity_name: None,
+                    });
+                }
                 self.push_command(WorkflowCommand::ContinueAsNew { input });
                 park_until_dropped().await
             }
