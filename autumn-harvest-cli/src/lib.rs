@@ -1357,7 +1357,7 @@ async fn run_events_tail(
                 .strip_suffix(b"\r")
                 .unwrap_or(line_bytes);
             let line = String::from_utf8_lossy(line_bytes).into_owned();
-            buf.drain(..nl + 1);
+            buf.drain(..=nl);
 
             if line.is_empty() {
                 // Empty line = dispatch event block.
