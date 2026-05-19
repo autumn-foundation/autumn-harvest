@@ -1795,11 +1795,14 @@ async fn tick_one_workflow_schedule(
     // original due slot and its `filter(t > now)` guard can spuriously fail when
     // `now` has advanced past the rebased fire time, causing the natural next
     // cron slot to be skipped. Re-anchor from the last original (pre-rebase)
-    // slot to guarantee the correct successor slot.
+    // slot instead, but preserve the non-catchup skip-overdue semantics by
+    // filtering out past successors and falling back to next_run_after_plan
+    // (which already contains the `or_else(next_run_after(now))` fallback).
     let effective_next_run_at = deferred_next_run_at.or_else(|| {
         if schedule.calendar_name.is_some() {
             last_original_slot_dispatched
                 .and_then(|slot| next_run_after(parsed_schedule, slot))
+                .filter(|&t| t > now)
                 .or(next_run_after_plan)
         } else {
             next_run_after_plan

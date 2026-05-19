@@ -8864,8 +8864,17 @@ async fn create_calendar_handler(
     // distinguish a successful new create from a duplicate-name conflict.
     let mut fresh_insert_cal: Option<_> = None;
     let mut conflict_cal: Option<_> = None;
-    for (_, shard_pool) in pool.iter_shards() {
-        let mut conn = acquire_conn(shard_pool).await?;
+    let mut shard_errors: Vec<String> = Vec::new();
+    for (shard_id, shard_pool) in pool.iter_shards() {
+        let mut conn = match acquire_conn(shard_pool).await {
+            Ok(c) => c,
+            Err(e) => {
+                // Connection failure: continue so later shards are attempted;
+                // collect the error so we can surface it if nothing succeeded.
+                shard_errors.push(format!("shard {shard_id}: {e}"));
+                continue;
+            }
+        };
         match create_calendar(&mut conn, &body.name, body.description.as_deref()).await {
             Ok(cal) => {
                 if fresh_insert_cal.is_none() {
@@ -8894,13 +8903,20 @@ async fn create_calendar_handler(
     if let Some(cal) = fresh_insert_cal {
         return Ok((StatusCode::CREATED, Json(CalendarResponse::from(cal))));
     }
-    // Every shard already had the calendar: the name is taken.
+    // Every reachable shard already had the calendar: the name is taken.
     if conflict_cal.is_some() {
         return Err(AutumnError::bad_request_msg(format!(
             "calendar '{}' already exists",
             body.name
         ))
         .with_status(axum::http::StatusCode::CONFLICT));
+    }
+    // Only connection errors (no shard was reached at all).
+    if !shard_errors.is_empty() {
+        return Err(AutumnError::service_unavailable_msg(format!(
+            "calendar create could not reach all shards; retry to converge: {}",
+            shard_errors.join("; ")
+        )));
     }
     Err(AutumnError::service_unavailable_msg("no shards available"))
 }
@@ -8987,6 +9003,11 @@ async fn delete_calendar_handler(
             // the calendar was never on this shard. Continue so all shards
             // are attempted before deciding the response.
             Err(autumn_harvest::HarvestError::NotFound(_)) => {}
+            // Config error means the calendar is built-in and cannot be deleted:
+            // return 400 immediately since this is a client error, not transient.
+            Err(autumn_harvest::HarvestError::Config(msg)) => {
+                return Err(AutumnError::bad_request_msg(msg));
+            }
             Err(e) => {
                 shard_errors.push(format!("shard {shard_id}: {e}"));
                 all_not_found = false;
