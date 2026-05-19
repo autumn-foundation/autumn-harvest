@@ -2577,9 +2577,7 @@ async fn handle_activity_result(
 ) -> HarvestResult<()> {
     match activity_result {
         Ok(output) => {
-            let observed_bytes = serde_json::to_string(&output)
-                .map(|s| s.len() as u64)
-                .unwrap_or(0);
+            let observed_bytes = serde_json::to_string(&output).map_or(0, |s| s.len() as u64);
             if observed_bytes > max_result_bytes {
                 use crate::failure::IntoActivityErrorString as _;
                 let error = crate::failure::ActivityFailure::non_retryable(

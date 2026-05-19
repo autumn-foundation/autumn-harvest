@@ -3753,9 +3753,7 @@ async fn start_workflow(
             .map_or(runtime.registry.max_workflow_input_bytes, |per_wf| {
                 per_wf.max(runtime.registry.max_workflow_input_bytes)
             });
-        let observed_bytes = serde_json::to_string(&input)
-            .map(|s| s.len() as u64)
-            .unwrap_or(0);
+        let observed_bytes = serde_json::to_string(&input).map_or(0, |s| s.len() as u64);
         if observed_bytes > effective_cap {
             return (
                 axum::http::StatusCode::PAYLOAD_TOO_LARGE,
@@ -4047,6 +4045,36 @@ async fn signal_with_start_workflow(
         .unwrap_or_else(|| "default".to_string());
     let start_input = request.start_input.unwrap_or(Value::Null);
     let signal_payload = request.signal_payload.unwrap_or(Value::Null);
+
+    // Issue #252: enforce workflow input and signal payload caps before any DB write.
+    {
+        let effective_wf_cap = runtime
+            .registry
+            .workflows
+            .get(&workflow_name)
+            .and_then(|info| info.max_input_bytes)
+            .map_or(runtime.registry.max_workflow_input_bytes, |per_wf| {
+                per_wf.max(runtime.registry.max_workflow_input_bytes)
+            });
+        let observed_wf = serde_json::to_string(&start_input).map_or(0, |s| s.len() as u64);
+        if observed_wf > effective_wf_cap {
+            return (
+                axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+                Json(serde_json::json!({
+                    "kind": "WorkflowInput",
+                    "observed_bytes": observed_wf,
+                    "cap_bytes": effective_wf_cap,
+                    "workflow_type": workflow_name,
+                })),
+            )
+                .into_response();
+        }
+        if let Err(e) =
+            check_signal_payload_cap(&signal_payload, runtime.registry.max_signal_payload_bytes)
+        {
+            return e.into_response();
+        }
+    }
 
     // In multi-shard deployments with read-only shards the rendezvous hash can
     // map a (workflow_name, workflow_id) to a different writable shard than the
@@ -8537,9 +8565,7 @@ fn parse_uuid(raw: &str, label: &str) -> Result<uuid::Uuid, AutumnError> {
 }
 
 fn check_signal_payload_cap(payload: &Value, cap: u64) -> Result<(), AutumnError> {
-    let observed_bytes = serde_json::to_string(payload)
-        .map(|s| s.len() as u64)
-        .unwrap_or(0);
+    let observed_bytes = serde_json::to_string(payload).map_or(0, |s| s.len() as u64);
     if observed_bytes > cap {
         return Err(map_error(autumn_harvest::HarvestError::PayloadTooLarge {
             kind: autumn_harvest::error::PayloadKind::SignalPayload,
