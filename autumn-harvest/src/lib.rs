@@ -19,6 +19,9 @@ pub mod analyzer;
 /// Audit trail for management API mutations (issue #158).
 #[cfg(feature = "db")]
 pub mod audit;
+/// Calendar-aware schedule filtering: named exclusion sets, skip policies, and
+/// schedule preview generation (issue #337).
+pub mod calendar;
 /// Batch operations for fleet-wide workflow cancel/terminate/signal (issue #102).
 pub mod batch;
 /// Worker build-id routing for safe rolling deploys (issue #171).
@@ -184,8 +187,17 @@ pub use info::{
     UpdateHandlerInfo, UpdateValidatorFn, WorkflowHandlerFn, WorkflowInfo,
 };
 pub use payload_codec::{CodecError, IdentityCodec, PayloadCodec, PayloadCodecs};
+pub use calendar::{Calendar, ScheduleFirePreview, apply_skip_policy, is_excluded_date};
+#[cfg(feature = "db")]
+pub use calendar::{
+    create_calendar, delete_calendar, get_calendar, list_calendars,
+    load_exclusions_for_calendar, plan_backfill_with_calendar, preview_schedule_firings,
+    replace_calendar_exclusions,
+};
 pub use policy::validate_schedule;
-pub use policy::{OverlapPolicy, RetryPolicy, Schedule, TaskStatus, TriggerRule, WorkflowSchedule};
+pub use policy::{
+    OverlapPolicy, RetryPolicy, Schedule, SkipPolicy, TaskStatus, TriggerRule, WorkflowSchedule,
+};
 pub use pool::{HarvestPoolConfig, compute_pool_sizes};
 pub use query::QueryRegistry;
 pub use replay::{HistoryMatch, HistoryMatcher};

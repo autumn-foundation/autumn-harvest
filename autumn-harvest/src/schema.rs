@@ -91,6 +91,31 @@ diesel::table! {
 diesel::table! {
     use diesel::sql_types::*;
 
+    harvest_calendars (id) {
+        id -> Uuid,
+        name -> Text,
+        description -> Nullable<Text>,
+        /// `true` for built-in calendars that operators cannot delete.
+        built_in -> Bool,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    use diesel::sql_types::*;
+
+    harvest_calendar_exclusions (id) {
+        id -> Uuid,
+        calendar_name -> Text,
+        excluded_date -> Date,
+        created_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    use diesel::sql_types::*;
+
     harvest_schedules (id) {
         id -> Uuid,
         dag_name -> Nullable<Text>,
@@ -116,6 +141,10 @@ diesel::table! {
         buffered_runs -> Jsonb,
         /// Maximum buffered slots under `BufferAll` (issue #241).
         buffer_all_max -> Int4,
+        /// Optional named calendar for this schedule (issue #337). NULL = no filtering.
+        calendar_name -> Nullable<Text>,
+        /// What to do when the fire date is calendar-excluded (issue #337).
+        skip_policy -> Text,
     }
 }
 
@@ -301,6 +330,8 @@ diesel::joinable!(harvest_task_queue -> harvest_workflow_executions (workflow_ex
 diesel::joinable!(harvest_signals -> harvest_workflow_executions (workflow_exec_id));
 diesel::joinable!(harvest_timers -> harvest_workflow_executions (workflow_exec_id));
 diesel::joinable!(harvest_external_tasks -> harvest_workflow_executions (workflow_exec_id));
+// harvest_calendar_exclusions references harvest_calendars(name), not the PK(id),
+// so diesel::joinable! cannot be used here. Queries use explicit filter conditions.
 
 diesel::allow_tables_to_appear_in_same_query!(
     harvest_workflow_executions,
@@ -317,4 +348,6 @@ diesel::allow_tables_to_appear_in_same_query!(
     harvest_build_policies,
     harvest_build_compat,
     harvest_backfill_log,
+    harvest_calendars,
+    harvest_calendar_exclusions,
 );

@@ -870,6 +870,8 @@ async fn upsert_schedule(
                 dsl::overlap_policy.eq(dag.overlap_policy.as_str()),
                 dsl::buffer_all_max.eq(i32::try_from(dag.buffer_all_max).unwrap_or(i32::MAX)),
                 dsl::buffered_runs.eq(new_buffered_runs),
+                // calendar_name and skip_policy are not set by DAG registration;
+                // they are operator-managed via the CRUD API.
             ))
             .execute(conn)
             .await
@@ -897,6 +899,8 @@ async fn upsert_schedule(
             overlap_policy: dag.overlap_policy.as_str(),
             buffered_runs: serde_json::json!([]),
             buffer_all_max: i32::try_from(dag.buffer_all_max).unwrap_or(i32::MAX),
+            calendar_name: None,
+            skip_policy: crate::policy::SkipPolicy::Skip.as_str(),
         };
         diesel::insert_into(harvest_schedules::table)
             .values(&row)
@@ -996,6 +1000,8 @@ async fn insert_dag_workflow_schedule_if_missing(
         overlap_policy: ws.overlap_policy.as_str(),
         buffered_runs: serde_json::json!([]),
         buffer_all_max: i32::try_from(ws.buffer_all_max).unwrap_or(i32::MAX),
+        calendar_name: ws.calendar.as_deref(),
+        skip_policy: ws.skip_policy.as_str(),
     };
     diesel::insert_into(harvest_schedules::table)
         .values(&row)
@@ -1037,6 +1043,8 @@ async fn insert_workflow_schedule_if_missing(
         overlap_policy: ws.overlap_policy.as_str(),
         buffered_runs: serde_json::json!([]),
         buffer_all_max: i32::try_from(ws.buffer_all_max).unwrap_or(i32::MAX),
+        calendar_name: ws.calendar.as_deref(),
+        skip_policy: ws.skip_policy.as_str(),
     };
     diesel::insert_into(harvest_schedules::table)
         .values(&row)
@@ -1136,6 +1144,8 @@ async fn upsert_workflow_schedule(
             dsl::overlap_policy.eq(ws.overlap_policy.as_str()),
             dsl::buffer_all_max.eq(i32::try_from(ws.buffer_all_max).unwrap_or(i32::MAX)),
             dsl::buffered_runs.eq(new_buffered_runs),
+            dsl::calendar_name.eq(ws.calendar.as_deref()),
+            dsl::skip_policy.eq(ws.skip_policy.as_str()),
         ))
         .execute(conn)
         .await
@@ -1172,6 +1182,15 @@ fn scheduled_workflow_id(workflow_name: &str, scheduled_for: DateTime<Utc>) -> S
 #[must_use]
 pub fn scheduled_workflow_id_pub(workflow_name: &str, scheduled_for: DateTime<Utc>) -> String {
     scheduled_workflow_id(workflow_name, scheduled_for)
+}
+
+/// Public re-export of `next_run_after` for use in [`crate::calendar`] preview helpers.
+#[must_use]
+pub fn next_run_after_pub(
+    schedule: Option<&Schedule>,
+    reference: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    next_run_after(schedule, reference)
 }
 
 const fn scheduled_workflow_reuse_policy() -> WorkflowIdReusePolicy {
@@ -1452,6 +1471,45 @@ async fn tick_one_workflow_schedule(
             logical_date + chrono::Duration::from_std(jitter_offset).unwrap_or_default();
         if now < effective_fire_time {
             return Ok(());
+        }
+    }
+
+    // ── Calendar check ────────────────────────────────────────────────────────
+    // If the schedule has a named calendar, load its exclusion dates and apply
+    // the skip policy to the logical fire date. Suppressed firings (SkipPolicy::Skip)
+    // are recorded as skipped with `reason = "calendar"` and the scheduler advances
+    // past this slot. Deferred firings are allowed through with the adjusted date.
+    if let Some(ref cal_name) = schedule.calendar_name {
+        let excluded = crate::calendar::load_exclusions_for_calendar(conn, cal_name)
+            .await
+            .unwrap_or_default();
+        let fire_date = logical_date.date_naive();
+        let skip_policy =
+            crate::policy::SkipPolicy::from_db(&schedule.skip_policy);
+
+        match crate::calendar::apply_skip_policy(fire_date, skip_policy, &excluded) {
+            None => {
+                // Firing is suppressed. Advance past this slot.
+                tracing::info!(
+                    workflow_name = %wf_name,
+                    calendar = %cal_name,
+                    fire_date = %fire_date,
+                    "harvest: workflow schedule firing suppressed by calendar"
+                );
+                metrics.record_schedule_skipped("workflow", wf_name, "calendar");
+                let next = next_run_after(parsed_schedule, now);
+                diesel::update(dsl::harvest_schedules.find(schedule.id))
+                    .set((dsl::next_run_at.eq(next), dsl::updated_at.eq(now)))
+                    .execute(conn)
+                    .await
+                    .map_err(crate::error::database_error)?;
+                return Ok(());
+            }
+            Some(_adjusted) => {
+                // Firing proceeds (possibly with an adjusted date — the workflow
+                // gets the original `logical_date`; the calendar adjustment only
+                // affects the fire-date check, not the scheduled run ID).
+            }
         }
     }
 

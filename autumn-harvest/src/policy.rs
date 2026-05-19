@@ -410,6 +410,64 @@ impl OverlapPolicy {
     }
 }
 
+/// What the scheduler does when a fire date falls on a calendar-excluded day.
+///
+/// Calendars are sets of dates (e.g. federal holidays) that a schedule should
+/// avoid. `SkipPolicy` declares the fallback when the natural fire date is one
+/// of those excluded days.
+///
+/// See [`crate::calendar`] for the [`crate::calendar::apply_skip_policy`] implementation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkipPolicy {
+    /// Suppress the firing entirely (increment `harvest.schedule.skipped`).
+    #[default]
+    Skip,
+    /// Defer to the first subsequent non-excluded day.
+    RunNextBusinessDay,
+    /// Advance to the most recent preceding non-excluded day.
+    RunPrevBusinessDay,
+}
+
+impl SkipPolicy {
+    /// The `snake_case` string used to store this policy in `harvest_schedules`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Skip => "skip",
+            Self::RunNextBusinessDay => "run_next_business_day",
+            Self::RunPrevBusinessDay => "run_prev_business_day",
+        }
+    }
+
+    /// Parse a `skip_policy` column value from the database.
+    ///
+    /// Unknown values fall back to [`Skip`](Self::Skip) to preserve the
+    /// append-only-schema invariant.
+    #[must_use]
+    pub fn from_db(s: &str) -> Self {
+        match s {
+            "run_next_business_day" => Self::RunNextBusinessDay,
+            "run_prev_business_day" => Self::RunPrevBusinessDay,
+            _ => Self::Skip,
+        }
+    }
+
+    /// Parse a `skip_policy` value from user-supplied input (e.g. an API request).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(s)` when `s` is not a recognised variant name.
+    pub fn from_user_input(s: &str) -> Result<Self, &str> {
+        match s {
+            "skip" => Ok(Self::Skip),
+            "run_next_business_day" => Ok(Self::RunNextBusinessDay),
+            "run_prev_business_day" => Ok(Self::RunPrevBusinessDay),
+            _ => Err(s),
+        }
+    }
+}
+
 /// Per-workflow cron/interval schedule — the lightweight alternative to a
 /// single-node DAG when all you need is "run this workflow on a schedule."
 ///
@@ -488,6 +546,20 @@ pub struct WorkflowSchedule {
     /// schedule. `None` = no deadline enforced (today's behaviour).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_timeout: Option<std::time::Duration>,
+    /// Optional named calendar to consult before each firing.
+    ///
+    /// When `Some("us-federal-holidays")`, the scheduler looks up the
+    /// `harvest_calendars` row with that name and applies [`skip_policy`](Self::skip_policy)
+    /// on fire dates that fall on an excluded day. `None` = today's behaviour
+    /// (no calendar filtering).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calendar: Option<String>,
+    /// What to do when the fire date falls on a calendar-excluded day.
+    ///
+    /// Ignored when [`calendar`](Self::calendar) is `None`.
+    /// Default: [`SkipPolicy::Skip`] (suppress the firing).
+    #[serde(default)]
+    pub skip_policy: SkipPolicy,
 }
 
 const fn default_buffer_all_max() -> u32 {
@@ -499,7 +571,7 @@ impl WorkflowSchedule {
     ///
     /// Defaults: `input = null`, `catchup = false`, `max_active_runs = 1`,
     /// `paused = false`, `queue_name = "default"`, `overlap_policy = Skip`,
-    /// `buffer_all_max = 100`.
+    /// `buffer_all_max = 100`, `calendar = None`, `skip_policy = Skip`.
     #[must_use]
     pub fn new(workflow_name: impl Into<String>, schedule: Schedule) -> Self {
         Self {
@@ -515,6 +587,8 @@ impl WorkflowSchedule {
             overlap_policy: OverlapPolicy::Skip,
             buffer_all_max: 100,
             execution_timeout: None,
+            calendar: None,
+            skip_policy: SkipPolicy::Skip,
         }
     }
 
@@ -589,6 +663,27 @@ impl WorkflowSchedule {
     #[must_use]
     pub const fn with_jitter(mut self, jitter: Duration) -> Self {
         self.jitter = jitter;
+        self
+    }
+
+    /// Attach a named calendar to this schedule.
+    ///
+    /// On each firing the scheduler consults the `harvest_calendars` table for
+    /// a calendar with this name and applies [`skip_policy`](Self::skip_policy)
+    /// when the fire date is excluded. Pass `None` to remove a previously set
+    /// calendar (disables calendar filtering).
+    #[must_use]
+    pub fn with_calendar(mut self, calendar: impl Into<Option<String>>) -> Self {
+        self.calendar = calendar.into();
+        self
+    }
+
+    /// Set the skip policy applied when the fire date falls on an excluded calendar day.
+    ///
+    /// Has no effect when [`calendar`](Self::calendar) is `None`.
+    #[must_use]
+    pub const fn with_skip_policy(mut self, policy: SkipPolicy) -> Self {
+        self.skip_policy = policy;
         self
     }
 }
@@ -904,6 +999,76 @@ mod tests {
         // All rules fire vacuously when there are no upstreams
         assert!(TriggerRule::AllSuccess.should_run(&[]));
         assert!(TriggerRule::AllDone.should_run(&[]));
+    }
+
+    // ── SkipPolicy ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn skip_policy_default_is_skip() {
+        assert_eq!(SkipPolicy::default(), SkipPolicy::Skip);
+    }
+
+    #[test]
+    fn skip_policy_as_str_round_trips() {
+        let cases = [
+            (SkipPolicy::Skip, "skip"),
+            (SkipPolicy::RunNextBusinessDay, "run_next_business_day"),
+            (SkipPolicy::RunPrevBusinessDay, "run_prev_business_day"),
+        ];
+        for (policy, s) in cases {
+            assert_eq!(policy.as_str(), s, "as_str mismatch for {policy:?}");
+            assert_eq!(
+                SkipPolicy::from_db(s),
+                policy,
+                "from_db mismatch for {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn skip_policy_from_db_unknown_defaults_to_skip() {
+        assert_eq!(SkipPolicy::from_db("unknown"), SkipPolicy::Skip);
+        assert_eq!(SkipPolicy::from_db(""), SkipPolicy::Skip);
+    }
+
+    #[test]
+    fn skip_policy_serde_round_trips() {
+        let policies = [
+            SkipPolicy::Skip,
+            SkipPolicy::RunNextBusinessDay,
+            SkipPolicy::RunPrevBusinessDay,
+        ];
+        for policy in policies {
+            let json = serde_json::to_string(&policy).expect("serialize");
+            let back: SkipPolicy = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(back, policy, "serde round-trip failed for {policy:?}");
+        }
+    }
+
+    #[test]
+    fn workflow_schedule_calendar_defaults_to_none() {
+        let sched = WorkflowSchedule::new("my_wf", Schedule::Manual);
+        assert!(sched.calendar.is_none());
+    }
+
+    #[test]
+    fn workflow_schedule_with_calendar_sets_field() {
+        let sched = WorkflowSchedule::new("my_wf", Schedule::Manual)
+            .with_calendar("us-federal-holidays".to_string());
+        assert_eq!(sched.calendar.as_deref(), Some("us-federal-holidays"));
+    }
+
+    #[test]
+    fn workflow_schedule_skip_policy_defaults_to_skip() {
+        let sched = WorkflowSchedule::new("my_wf", Schedule::Manual);
+        assert_eq!(sched.skip_policy, SkipPolicy::Skip);
+    }
+
+    #[test]
+    fn workflow_schedule_with_skip_policy_sets_field() {
+        let sched = WorkflowSchedule::new("my_wf", Schedule::Manual)
+            .with_skip_policy(SkipPolicy::RunNextBusinessDay);
+        assert_eq!(sched.skip_policy, SkipPolicy::RunNextBusinessDay);
     }
 
     // ── OverlapPolicy ─────────────────────────────────────────────────────────
