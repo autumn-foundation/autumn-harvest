@@ -9,7 +9,7 @@
 //! many records have been processed so far, while the workflow is still running.
 //!
 //! Run with:
-//!   cargo run --example progress_query
+//!   cargo run --example `progress_query`
 
 use std::sync::{Arc, Mutex};
 
