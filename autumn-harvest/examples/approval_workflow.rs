@@ -28,24 +28,42 @@ fn validate_decision(input: &serde_json::Value) -> Result<(), String> {
 }
 
 // Declarative update handler — auto-registered before the workflow runs.
+/// Approves or rejects the workflow.
+///
+/// # Errors
+/// Returns an error if the reason is missing or invalid.
 #[update(workflow = "approval_workflow", validator = validate_decision)]
-pub async fn decide(_ctx: &WorkflowContext, _input: Decision) -> Result<(), String> {
+#[allow(clippy::used_underscore_binding, clippy::unused_async)]
+#[allow(unused_variables)]
+pub async fn decide(ctx: &WorkflowContext, input: Decision) -> Result<(), String> {
     Ok(())
 }
 
 // Declarative query handler — auto-registered before the workflow runs.
+/// Returns the current approval status.
+///
+/// # Errors
+/// Never returns an error, but uses `Result` to satisfy the handler trait.
 #[query(workflow = "approval_workflow")]
-pub fn approval_status(_ctx: &WorkflowContext) -> Result<StatusResponse, String> {
+#[allow(clippy::used_underscore_binding, clippy::missing_const_for_fn)]
+#[allow(unused_variables)]
+pub fn approval_status(ctx: &WorkflowContext) -> Result<StatusResponse, String> {
     Ok(StatusResponse {
         pending: true,
         approved: None,
     })
 }
 
+/// The main workflow logic.
+///
+/// # Errors
+/// Never returns an error in this example.
 #[workflow]
+#[allow(clippy::used_underscore_binding, clippy::unused_async)]
+#[allow(unused_variables)]
 pub async fn approval_workflow(
-    _ctx: &WorkflowContext,
-    _id: String,
+    ctx: &WorkflowContext,
+    id: String,
 ) -> Result<StatusResponse, String> {
     // The worker injects declarative handlers before this fn runs on every replay.
     // Business logic (e.g. wait for the "decide" signal) would go here.

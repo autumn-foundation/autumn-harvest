@@ -109,6 +109,8 @@ pub async fn tenant_cancel(ctx: &WorkflowContext, input: Value) -> HarvestResult
 // Replay tests — exercise the cross-workflow signal path under WorkflowReplayer
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::items_after_test_module)]
+#[allow(clippy::type_complexity)]
 #[cfg(test)]
 mod tests {
     use std::future::Future;
