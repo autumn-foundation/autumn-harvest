@@ -108,17 +108,24 @@ pub struct RetirementBlockerReportRow {
 /// Per-row shard coverage metadata.
 #[derive(Debug, Clone, Serialize)]
 pub struct RetirementShardCoverage {
+    /// The shard IDs that were successfully queried.
     pub inspected_shards: Vec<i32>,
+    /// The shard IDs that contained at least one blocker.
     pub matched_shards: Vec<i32>,
+    /// The shard IDs that could not be queried due to errors.
     pub unavailable_shards: Vec<i32>,
 }
 
 /// Per-shard inspection summary included in every report.
 #[derive(Debug, Clone, Serialize)]
 pub struct RetirementShardInspection {
+    /// The ID of the shard.
     pub shard_id: i32,
+    /// Whether the shard was successfully inspected or was unavailable.
     pub status: RetirementShardInspectionStatus,
+    /// The number of distinct `(workflow_name, recorded_version)` groups found on this shard, if successful.
     pub matched_groups: Option<usize>,
+    /// Detailed error message if the shard was unavailable.
     pub error: Option<String>,
 }
 
