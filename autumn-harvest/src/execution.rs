@@ -333,12 +333,10 @@ pub async fn start_or_load_workflow_execution(
                 .map_err(database_error)?;
 
             if let Some(execution) = inserted {
-                if let Some(sa) = request.start_at {
-                    if sa < now {
-                        return Err(HarvestError::Config(
-                            "Requested start_at is in the past".to_string(),
-                        ));
-                    }
+                if request.start_at.is_some_and(|sa| sa < now) {
+                    return Err(HarvestError::Config(
+                        "Requested start_at is in the past".to_string(),
+                    ));
                 }
                 // Enforce the input cap only on the fresh-insert path. Duplicates
                 // never reach here so the reuse-policy outcome is unaffected.
@@ -387,8 +385,10 @@ pub async fn start_or_load_workflow_execution(
                     match existing.state.as_str() {
                         "FAILED" | "CANCELLED" => {
                             // Only these two explicitly abnormal states start fresh.
-                            replace_execution(conn, existing, &row, &enqueue, exec_id, &request, now)
-                                .await
+                            replace_execution(
+                                conn, existing, &row, &enqueue, exec_id, &request, now,
+                            )
+                            .await
                         }
                         _ => {
                             // RUNNING, COMPLETED, TIMED_OUT, or any other state:
@@ -429,12 +429,10 @@ async fn replace_execution(
     request: &StartWorkflowParams<'_>,
     now: chrono::DateTime<Utc>,
 ) -> HarvestResult<StartedWorkflowExecution> {
-    if let Some(sa) = request.start_at {
-        if sa < now {
-            return Err(HarvestError::Config(
-                "Requested start_at is in the past".to_string(),
-            ));
-        }
+    if request.start_at.is_some_and(|sa| sa < now) {
+        return Err(HarvestError::Config(
+            "Requested start_at is in the past".to_string(),
+        ));
     }
 
     // Seal the prior execution row as CONTINUED_AS_NEW. This removes it from
@@ -468,7 +466,9 @@ async fn replace_execution(
             });
         }
     }
-    let start_timestamp = if request.delay.is_some_and(|d| d > chrono::Duration::zero()) || request.start_at.is_some() {
+    let start_timestamp = if request.delay.is_some_and(|d| d > chrono::Duration::zero())
+        || request.start_at.is_some()
+    {
         enqueue.scheduled_at
     } else {
         Utc::now()
