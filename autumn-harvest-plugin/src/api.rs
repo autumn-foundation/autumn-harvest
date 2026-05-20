@@ -254,6 +254,10 @@ pub struct HarvestApiState {
     /// Server-side ceiling on `execution_timeout` (issue #243).
     /// `None` = no ceiling enforced.
     max_workflow_execution_timeout: Arc<Mutex<Option<std::time::Duration>>>,
+    /// SSE keepalive comment interval (issue #324). Default 15 s.
+    sse_keepalive_interval: Arc<Mutex<std::time::Duration>>,
+    /// Maximum SSE event buffer depth per stream (issue #324). Default 1024.
+    sse_buffer_depth: Arc<Mutex<usize>>,
 }
 
 impl Default for HarvestApiState {
@@ -273,6 +277,8 @@ impl Default for HarvestApiState {
             workflow_result_max_wait: Arc::new(Mutex::new(std::time::Duration::from_secs(30))),
             query_timeout: Arc::new(Mutex::new(std::time::Duration::from_secs(5))),
             max_workflow_execution_timeout: Arc::new(Mutex::new(None)),
+            sse_keepalive_interval: Arc::new(Mutex::new(std::time::Duration::from_secs(15))),
+            sse_buffer_depth: Arc::new(Mutex::new(1024)),
         }
     }
 }
@@ -349,6 +355,63 @@ impl HarvestApiState {
     pub fn max_workflow_execution_timeout(&self) -> Option<std::time::Duration> {
         *self
             .max_workflow_execution_timeout
+            .lock()
+            .expect("harvest api state lock poisoned")
+    }
+
+    /// Override the SSE keepalive comment interval (default 15 s, issue #324).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `interval` is zero or if the internal mutex is poisoned.
+    pub fn set_sse_keepalive_interval(&self, interval: std::time::Duration) {
+        assert!(
+            !interval.is_zero(),
+            "SSE keepalive interval must be non-zero"
+        );
+        *self
+            .sse_keepalive_interval
+            .lock()
+            .expect("harvest api state lock poisoned") = interval;
+    }
+
+    /// Current SSE keepalive comment interval.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    #[must_use]
+    pub fn sse_keepalive_interval(&self) -> std::time::Duration {
+        *self
+            .sse_keepalive_interval
+            .lock()
+            .expect("harvest api state lock poisoned")
+    }
+
+    /// Override the SSE per-stream event buffer depth (default 1024, issue #324).
+    ///
+    /// When the producer falls behind by more than this many events the stream
+    /// closes with a slow-consumer response.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    pub fn set_sse_buffer_depth(&self, depth: usize) {
+        *self
+            .sse_buffer_depth
+            .lock()
+            .expect("harvest api state lock poisoned") = depth;
+    }
+
+    /// Current SSE per-stream event buffer depth.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    #[must_use]
+    pub fn sse_buffer_depth(&self) -> usize {
+        *self
+            .sse_buffer_depth
             .lock()
             .expect("harvest api state lock poisoned")
     }
@@ -575,6 +638,16 @@ impl HarvestApiState {
             ));
         }
         Ok(urls)
+    }
+
+    /// Return the LISTEN/NOTIFY database URL for the given shard (issue #324).
+    pub(crate) fn sse_notification_url(&self, shard: ShardId) -> HarvestResult<String> {
+        let urls = self.workflow_result_notification_database_urls()?;
+        urls.get(&shard).cloned().ok_or_else(|| {
+            HarvestError::Config(format!(
+                "no SSE notification URL configured for shard {shard:?}"
+            ))
+        })
     }
 
     fn workflow_handle_client(&self) -> HarvestResult<WorkflowHandleClient> {
@@ -846,7 +919,7 @@ struct RedactedPayloadSummary {
     summary: &'static str,
 }
 
-fn is_terminal_state(state: &str) -> bool {
+pub(crate) fn is_terminal_state(state: &str) -> bool {
     matches!(
         state,
         "COMPLETED" | "FAILED" | "CANCELLED" | "TIMED_OUT" | "CONTINUED_AS_NEW" | "TERMINATED"
@@ -1521,7 +1594,7 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .route("/batch-operations", get(list_batch_operations))
         .route(
             "/batch-operations",
-            post(submit_batch_operation).route_layer(require_admin),
+            post(submit_batch_operation).route_layer(require_admin.clone()),
         )
         .route("/batch-operations/{id}", get(get_batch_operation))
         // Task priority management (issue #249): PATCH /tasks/{id} lets
@@ -1532,6 +1605,12 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         // Audit trail (issue #158): read-only endpoint to query management
         // API mutations. See `audit::ALL_MUTATION_ROUTES` for covered paths.
         .route("/admin/audit", get(list_audit_records))
+        // SSE execution event stream (issue #324): live workflow event tail.
+        // Gated behind the same mgmt auth provider as other management routes.
+        .route(
+            "/executions/{exec_id}/events/stream",
+            get(stream_execution_events).route_layer(require_admin),
+        )
         .layer(Extension(api_state))
 }
 
@@ -1548,7 +1627,10 @@ pub(crate) async fn require_harvest_admin(
     }
 }
 
-async fn has_harvest_admin_access(api_state: &HarvestApiState, session: Option<Session>) -> bool {
+pub(crate) async fn has_harvest_admin_access(
+    api_state: &HarvestApiState,
+    session: Option<Session>,
+) -> bool {
     if api_state.admin_auth_boundary() {
         return true;
     }
@@ -1639,6 +1721,8 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("DELETE", "/calendars/{name}"),
         // ── audit (issue #158) ────────────────────────────────────────────────
         ("GET", "/admin/audit"),
+        // ── SSE execution event stream (issue #324) ───────────────────────────
+        ("GET", "/executions/{exec_id}/events/stream"),
     ]
 }
 
@@ -2138,6 +2222,8 @@ pub const fn management_api_response_fields()
         ("DELETE", "/calendars/{name}", None), // 204 No Content
         // ── audit ─────────────────────────────────────────────────────────────
         ("GET", "/admin/audit", None), // Vec<AuditRecord> (external model)
+        // ── SSE execution event stream (issue #324) ───────────────────────────
+        ("GET", "/executions/{exec_id}/events/stream", None), // text/event-stream
     ]
 }
 
@@ -2462,7 +2548,7 @@ fn parse_audit_datetime(raw: &str) -> Result<chrono::DateTime<chrono::Utc>, Autu
 // ── Audit emission helpers ─────────────────────────────────────────────────────
 
 /// Extract audit context (`actor`, `source`, `request_id`) from request headers.
-fn audit_context(
+pub(crate) fn audit_context(
     headers: &axum::http::HeaderMap,
     api_state: &HarvestApiState,
 ) -> (String, String, Option<String>) {
@@ -8717,6 +8803,464 @@ fn check_signal_payload_cap(payload: &Value, cap: u64) -> Result<(), AutumnError
         }));
     }
     Ok(())
+}
+
+// ── SSE execution event stream (issue #324) ──────────────────────────────────
+
+/// Whether an event type name signals a terminal lifecycle transition.
+fn is_terminal_event_type(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        "WorkflowCompleted"
+            | "WorkflowFailed"
+            | "WorkflowCancelled"
+            | "WorkflowContinuedAsNew"
+            | "WorkflowResetTerminated"
+            | "WorkflowExecutionTimedOut"
+    )
+}
+
+/// Map a terminal `WorkflowEvent` type name to a short state string.
+fn terminal_event_type_to_state(event_type: &str) -> &'static str {
+    match event_type {
+        "WorkflowCompleted" => "completed",
+        "WorkflowFailed" => "failed",
+        "WorkflowCancelled" => "cancelled",
+        "WorkflowContinuedAsNew" => "continued-as-new",
+        "WorkflowResetTerminated" => "terminated",
+        "WorkflowExecutionTimedOut" => "timed-out",
+        _ => "terminal",
+    }
+}
+
+/// `GET /executions/{exec_id}/events/stream`
+///
+/// Returns a `text/event-stream` response that tails every `WorkflowEvent`
+/// appended to `harvest_events` for the given execution.  Uses Postgres
+/// LISTEN/NOTIFY for sub-second delivery without holding a DB connection
+/// between notifications (issue #324).
+///
+/// SSE wire format:
+/// ```text
+/// id: <harvest_events.id BIGSERIAL>
+/// event: <WorkflowEvent::type_name()>
+/// data: <JSON event value>
+///
+/// ```
+///
+/// Resume: send `Last-Event-ID: <id>` to replay events with `id > n` before
+/// switching to live-tail mode.
+///
+/// Keepalive: `: ping\n\n` comments every `sse_keepalive_interval` (default 15 s).
+///
+/// Stream termination: `event: stream-end` followed by HTTP close when the
+/// execution reaches a terminal state.
+///
+/// Backpressure: if the client reconnects with a `Last-Event-ID` that implies
+/// more than `sse_buffer_depth` events to replay, returns `409 Conflict`.
+#[allow(clippy::too_many_lines)]
+async fn stream_execution_events(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(exec_id_raw): Path<String>,
+    headers: axum::http::HeaderMap,
+    session: Option<axum::extract::Extension<Session>>,
+) -> axum::response::Response {
+    use autumn_harvest::audit::{OP_EXECUTION_STREAM_OPEN, STATUS_SUCCEEDED, TARGET_WORKFLOW};
+    use autumn_harvest::models::NewAuditRecord;
+    use autumn_harvest::notify::{WorkflowEventListener, WorkflowEventWaitOutcome};
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    use futures::SinkExt as _;
+
+    // Parse execution ID
+    let exec_id = match parse_execution_id(&exec_id_raw) {
+        Ok(id) => id,
+        Err(e) => return e.into_response(),
+    };
+
+    // Auth check — rejects unauthenticated requests with 401 (issue #174)
+    if !has_harvest_admin_access(&api_state, session.map(|s| s.0)).await {
+        return AutumnError::unauthorized_msg("authentication required").into_response();
+    }
+
+    // Extract Last-Event-ID for resume (harvest_events.id BIGSERIAL cursor).
+    // An absent header means "start from the beginning" (cursor = -1).
+    // A present but non-parseable value is a client error → 400.
+    let last_row_id: i64 = match headers.get("last-event-id").and_then(|v| v.to_str().ok()) {
+        None => -1,
+        Some(s) => match s.parse::<i64>() {
+            Ok(n) => n,
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "invalid_last_event_id",
+                        "message": "Last-Event-ID must be a valid i64"
+                    })),
+                )
+                    .into_response();
+            }
+        },
+    };
+
+    // Resolve the LISTEN/NOTIFY database URL for this execution's shard
+    let shard = exec_id.shard();
+    let notification_url = match api_state.sse_notification_url(shard) {
+        Ok(url) => url,
+        Err(e) => return map_error(e).into_response(),
+    };
+
+    // Establish LISTEN connection before the backfill query to avoid the
+    // race where new events are committed between the query and LISTEN setup
+    let listener = match WorkflowEventListener::connect(&notification_url).await {
+        Ok(l) => l,
+        Err(e) => return map_error(e).into_response(),
+    };
+
+    // Get a pooled connection for the initial verification and backfill
+    let mut conn = match db_conn_for_execution(&api_state, exec_id).await {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+
+    // Verify the execution exists
+    let execution = match load_execution(&mut conn, exec_id).await {
+        Ok(e) => e,
+        Err(e) => return map_error(e).into_response(),
+    };
+
+    // Load backfill events, capped at buffer_depth + 1. Fetching one extra lets
+    // us distinguish "exactly buffer_depth events" from "client is too far behind"
+    // without loading an unbounded history into memory.
+    let buffer_depth = api_state.sse_buffer_depth();
+    let backfill = match store::load_events_after_row_id(
+        &mut conn,
+        exec_id,
+        last_row_id,
+        i64::try_from(buffer_depth + 1).ok(),
+    )
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => return map_error(e).into_response(),
+    };
+
+    // Slow-consumer check: if reconnecting client is too far behind, return 409
+    if backfill.len() > buffer_depth {
+        let drop_id = backfill.last().map_or(last_row_id, |r| r.id);
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "slow_consumer",
+                "drop_after_event_id": drop_id,
+            })),
+        )
+            .into_response();
+    }
+
+    let terminal = is_terminal_state(&execution.state);
+    let execution_state = execution.state.to_lowercase().replace('_', "-");
+
+    // Audit stream open (issue #158: only stream open/close are audited, not per-event)
+    // Capture audit context now so the producer task can write stream-close on exit.
+    let (audit_actor, audit_source, audit_request_id) = audit_context(&headers, &api_state);
+    {
+        let target = exec_id.to_string();
+        let ar = NewAuditRecord {
+            actor: &audit_actor,
+            operation: OP_EXECUTION_STREAM_OPEN,
+            target_type: TARGET_WORKFLOW,
+            target_id: Some(target.as_str()),
+            route_or_command: "GET /executions/{exec_id}/events/stream",
+            request_id: audit_request_id.as_deref(),
+            idempotency_key: None,
+            status: STATUS_SUCCEEDED,
+            error_summary: None,
+            shard_id: Some(shard.as_i32()),
+            source: &audit_source,
+        };
+        let _ = audit::insert_audit(&mut conn, &ar).await;
+    }
+
+    // Release the pooled DB connection — SSE streams must not hold connections while idle
+    drop(conn);
+
+    // Bounded channel: capacity = buffer_depth.  When the receiver (axum SSE) drops,
+    // further sends fail and the producer task shuts down cleanly.
+    let (mut tx, rx) =
+        futures::channel::mpsc::channel::<Result<Event, std::convert::Infallible>>(buffer_depth);
+
+    let keepalive_interval = api_state.sse_keepalive_interval();
+    let api_clone = api_state.clone();
+
+    // Producer task: runs independently of the HTTP handler after we return
+    tokio::spawn(async move {
+        use autumn_harvest::audit::OP_EXECUTION_STREAM_CLOSE;
+
+        // Helper: extract the inner payload from the adjacently-tagged envelope
+        // `{"type":"...","data":{...}}` — the `event:` field already carries the
+        // type, so `data:` should contain only the payload object.
+        let sse_data = |event_data: &serde_json::Value| -> String {
+            let inner = event_data.get("data").unwrap_or(event_data);
+            serde_json::to_string(inner).unwrap_or_default()
+        };
+
+        // Helper: flush a slice of DB rows into the SSE channel.
+        // Returns the last `row.id` seen and the first terminal state name found,
+        // or breaks early if the channel is full / dropped.
+        // Using a macro-style closure here because closures can't easily `break 'notify`.
+        // We use a boolean return: (last_id, terminal_state, should_break).
+        let send_rows =
+            |rows: &[autumn_harvest::models::HarvestEvent],
+             mut cur_last_seen: i64,
+             tx: &mut futures::channel::mpsc::Sender<Result<Event, std::convert::Infallible>>|
+             -> (i64, Option<&'static str>, bool) {
+                let mut found_terminal: Option<&'static str> = None;
+                for row in rows {
+                    let sse_event = Event::default()
+                        .id(row.id.to_string())
+                        .event(row.event_type.as_str())
+                        .data(sse_data(&row.event_data));
+                    if tx.try_send(Ok(sse_event)).is_err() {
+                        return (cur_last_seen, None, true);
+                    }
+                    cur_last_seen = row.id;
+                    if is_terminal_event_type(&row.event_type) {
+                        found_terminal = Some(terminal_event_type_to_state(&row.event_type));
+                    }
+                }
+                (cur_last_seen, found_terminal, false)
+            };
+
+        // ── 1. Send backfill events (events already committed before this request) ──
+        // Also track whether a terminal event appears in the backfill: the execution
+        // may have transitioned between load_execution and load_events_after_row_id.
+        let mut backfill_terminal: Option<&'static str> = None;
+        for row in &backfill {
+            let sse_event = Event::default()
+                .id(row.id.to_string())
+                .event(row.event_type.as_str())
+                .data(sse_data(&row.event_data));
+            if tx.send(Ok(sse_event)).await.is_err() {
+                // Client disconnected during backfill — skip straight to close audit
+                if let Ok(mut conn) = db_conn_for_execution(&api_clone, exec_id).await {
+                    let target = exec_id.to_string();
+                    let ar = NewAuditRecord {
+                        actor: &audit_actor,
+                        operation: OP_EXECUTION_STREAM_CLOSE,
+                        target_type: TARGET_WORKFLOW,
+                        target_id: Some(target.as_str()),
+                        route_or_command: "GET /executions/{exec_id}/events/stream",
+                        request_id: audit_request_id.as_deref(),
+                        idempotency_key: None,
+                        status: STATUS_SUCCEEDED,
+                        error_summary: None,
+                        shard_id: Some(shard.as_i32()),
+                        source: &audit_source,
+                    };
+                    let _ = audit::insert_audit(&mut conn, &ar).await;
+                }
+                return;
+            }
+            if is_terminal_event_type(&row.event_type) {
+                backfill_terminal = Some(terminal_event_type_to_state(&row.event_type));
+            }
+        }
+
+        // ── 2. If already terminal (or backfill contained a terminal event), emit
+        //       stream-end and close.  Use the backfill-detected state when present
+        //       because it reflects the actual transition even if load_execution ran
+        //       before the row was committed.
+        let effective_terminal: Option<&str> =
+            backfill_terminal.map(|s| s as &str).or(if terminal {
+                Some(execution_state.as_str())
+            } else {
+                None
+            });
+        if let Some(state) = effective_terminal {
+            let end_data = serde_json::json!({"reason": state}).to_string();
+            let _ = tx
+                .send(Ok(Event::default().event("stream-end").data(end_data)))
+                .await;
+        } else {
+            // ── 3. Live-tail: LISTEN/NOTIFY loop ─────────────────────────────
+            let mut last_seen_id = backfill.last().map_or(last_row_id, |r| r.id);
+            let mut listener = listener;
+            let buf_limit = i64::try_from(api_clone.sse_buffer_depth()).ok();
+
+            'notify: loop {
+                // Use 2× keepalive as notification timeout so the KeepAlive wrapper
+                // has time to send its ping before this loop wakes and re-checks
+                let wait_timeout = keepalive_interval.saturating_mul(2);
+                match listener.wait_for_notification_timeout(wait_timeout).await {
+                    Ok(WorkflowEventWaitOutcome::Notification(payload)) => {
+                        // The harvest_events channel notifies for ALL executions on
+                        // this shard; filter to ours
+                        if payload.workflow_exec_id != exec_id.as_uuid() {
+                            continue;
+                        }
+
+                        // Load new events from the pool — capped to buffer_depth so
+                        // rapid bursts between notifications stay bounded in memory.
+                        let new_rows = match db_conn_for_execution(&api_clone, exec_id).await {
+                            Ok(mut conn) => {
+                                match store::load_events_after_row_id(
+                                    &mut conn,
+                                    exec_id,
+                                    last_seen_id,
+                                    buf_limit,
+                                )
+                                .await
+                                {
+                                    Ok(rows) => rows,
+                                    // DB failure: skip this notification batch.
+                                    // The periodic TimedOut poll will catch missed
+                                    // events if no further notifications arrive.
+                                    Err(_) => continue,
+                                }
+                            }
+                            Err(_) => continue,
+                        };
+
+                        let (new_id, terminal_state, should_break) =
+                            send_rows(&new_rows, last_seen_id, &mut tx);
+                        last_seen_id = new_id;
+
+                        if should_break {
+                            let err_data = serde_json::json!({
+                                "error": "slow_consumer",
+                                "drop_after_event_id": last_seen_id,
+                            })
+                            .to_string();
+                            let _ = tx.try_send(Ok(Event::default()
+                                .event("stream-error")
+                                .data(err_data)));
+                            break 'notify;
+                        }
+
+                        if let Some(state) = terminal_state {
+                            let end_data = serde_json::json!({"reason": state}).to_string();
+                            let _ = tx
+                                .send(Ok(Event::default().event("stream-end").data(end_data)))
+                                .await;
+                            break 'notify;
+                        }
+                    }
+                    Ok(WorkflowEventWaitOutcome::TimedOut) => {
+                        // Check whether the client has disconnected while idle
+                        // (send/try_send only detect disconnect on a write attempt).
+                        if tx.is_closed() {
+                            break 'notify;
+                        }
+                        // Periodic safety-net poll: catch any events missed due to a
+                        // prior DB failure on a notification (e.g. terminal event).
+                        let Ok(mut conn) = db_conn_for_execution(&api_clone, exec_id).await else {
+                            continue 'notify;
+                        };
+                        let Ok(missed) = store::load_events_after_row_id(
+                            &mut conn,
+                            exec_id,
+                            last_seen_id,
+                            buf_limit,
+                        )
+                        .await
+                        else {
+                            continue 'notify;
+                        };
+                        let (new_id, terminal_state, should_break) =
+                            send_rows(&missed, last_seen_id, &mut tx);
+                        last_seen_id = new_id;
+                        if should_break {
+                            let err_data = serde_json::json!({
+                                "error": "slow_consumer",
+                                "drop_after_event_id": last_seen_id,
+                            })
+                            .to_string();
+                            let _ = tx.try_send(Ok(Event::default()
+                                .event("stream-error")
+                                .data(err_data)));
+                            break 'notify;
+                        }
+                        if let Some(state) = terminal_state {
+                            let end_data = serde_json::json!({"reason": state}).to_string();
+                            let _ = tx
+                                .send(Ok(Event::default().event("stream-end").data(end_data)))
+                                .await;
+                            break 'notify;
+                        }
+                    }
+                    Ok(WorkflowEventWaitOutcome::ChannelClosed) => {
+                        // LISTEN connection dropped; reconnect and backfill any events
+                        // that may have been committed while the connection was down.
+                        let Ok(l) = WorkflowEventListener::connect(&notification_url).await else {
+                            break 'notify;
+                        };
+                        listener = l;
+                        // Backfill events missed during reconnection window
+                        let Ok(mut conn) = db_conn_for_execution(&api_clone, exec_id).await else {
+                            continue 'notify;
+                        };
+                        let Ok(missed) = store::load_events_after_row_id(
+                            &mut conn,
+                            exec_id,
+                            last_seen_id,
+                            buf_limit,
+                        )
+                        .await
+                        else {
+                            continue 'notify;
+                        };
+                        let (new_id, terminal_state, should_break) =
+                            send_rows(&missed, last_seen_id, &mut tx);
+                        last_seen_id = new_id;
+                        if should_break {
+                            let err_data = serde_json::json!({
+                                "error": "slow_consumer",
+                                "drop_after_event_id": last_seen_id,
+                            })
+                            .to_string();
+                            let _ = tx.try_send(Ok(Event::default()
+                                .event("stream-error")
+                                .data(err_data)));
+                            break 'notify;
+                        }
+                        if let Some(state) = terminal_state {
+                            let end_data = serde_json::json!({"reason": state}).to_string();
+                            let _ = tx
+                                .send(Ok(Event::default().event("stream-end").data(end_data)))
+                                .await;
+                            break 'notify;
+                        }
+                    }
+                    Err(_) => break 'notify,
+                }
+            }
+        }
+
+        // Audit stream close (issue #158) — fires on every producer exit path
+        if let Ok(mut conn) = db_conn_for_execution(&api_clone, exec_id).await {
+            let target = exec_id.to_string();
+            let ar = NewAuditRecord {
+                actor: &audit_actor,
+                operation: OP_EXECUTION_STREAM_CLOSE,
+                target_type: TARGET_WORKFLOW,
+                target_id: Some(target.as_str()),
+                route_or_command: "GET /executions/{exec_id}/events/stream",
+                request_id: audit_request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_SUCCEEDED,
+                error_summary: None,
+                shard_id: Some(shard.as_i32()),
+                source: &audit_source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+        }
+    });
+
+    // Return the SSE response. axum's KeepAlive wrapper sends `: ping\n\n`
+    // comments every keepalive_interval so proxies don't idle the connection.
+    Sse::new(rx)
+        .keep_alive(KeepAlive::new().interval(keepalive_interval).text("ping"))
+        .into_response()
 }
 
 pub(crate) fn map_error(error: HarvestError) -> AutumnError {

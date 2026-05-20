@@ -269,6 +269,13 @@ pub enum CliError {
         /// Last observed lifecycle status.
         last_status: String,
     },
+
+    /// The SSE event stream closed abnormally (e.g. slow consumer).
+    #[error("SSE stream closed by server: {message}")]
+    SseStreamError {
+        /// Server-supplied error detail.
+        message: String,
+    },
 }
 
 impl CliError {
@@ -404,6 +411,12 @@ enum Commands {
     Worker {
         #[command(subcommand)]
         command: WorkerCommand,
+    },
+    /// Stream live workflow execution events.
+    #[command(alias = "event")]
+    Events {
+        #[command(subcommand)]
+        command: EventsCommand,
     },
 }
 
@@ -1050,6 +1063,24 @@ enum WorkerCommand {
     Health,
 }
 
+/// Subcommands for `harvest events`.
+#[derive(Debug, Subcommand)]
+enum EventsCommand {
+    /// Open the SSE stream for a workflow execution and print events to stdout.
+    ///
+    /// Each SSE event block is printed as `<event-type>: <json-data>`.
+    /// The stream terminates when the execution reaches a terminal state
+    /// (`event: stream-end`) or when the connection is closed.
+    Tail {
+        /// Workflow execution ID to watch.
+        execution_id: String,
+        /// Resume from this event row ID (Last-Event-ID header).
+        /// Events with id > this value are replayed before entering live-tail mode.
+        #[arg(long)]
+        last_event_id: Option<i64>,
+    },
+}
+
 impl Cli {
     /// Build the management API request represented by these CLI arguments.
     ///
@@ -1103,6 +1134,7 @@ impl Cli {
                 *shard_id,
             )),
             Commands::Tui => unreachable!("Tui command handles its own requests"),
+            Commands::Events { .. } => unreachable!("Events command handles its own requests"),
         }
     }
 }
@@ -1144,6 +1176,18 @@ pub mod tui;
 pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
     if matches!(cli.command, Commands::Tui) {
         return tui::run_tui(&cli).await;
+    }
+
+    // SSE streaming: bypasses JSON execute path.
+    if let Commands::Events {
+        command:
+            EventsCommand::Tail {
+                execution_id,
+                last_event_id,
+            },
+    } = &cli.command
+    {
+        return run_events_tail(&cli, execution_id, *last_event_id).await;
     }
 
     // --wait mode: issue drain then poll until Stopped or timeout.
@@ -1256,6 +1300,106 @@ pub async fn execute(cli: &Cli) -> Result<Value, CliError> {
     }
 
     serde_json::from_str(&body).map_err(CliError::ParseResponse)
+}
+
+/// Open the SSE stream for `execution_id` and print events to stdout.
+///
+/// Each complete SSE event block is printed as `<event-type>: <data>`.
+/// The function returns when the server sends `event: stream-end` or the
+/// connection closes. SSE comment lines (keepalives) are silently discarded.
+async fn run_events_tail(
+    cli: &Cli,
+    execution_id: &str,
+    last_event_id: Option<i64>,
+) -> Result<(), CliError> {
+    let path = format!("/executions/{}", path_segment(execution_id));
+    let url = format!(
+        "{}{}/events/stream",
+        cli.base_url.trim_end_matches('/'),
+        path
+    );
+
+    let client = reqwest::Client::new();
+    let mut builder = client
+        .get(&url)
+        .header("Accept", "text/event-stream")
+        .header("Cache-Control", "no-cache");
+
+    if let Some(token) = &cli.token {
+        builder = builder.bearer_auth(token);
+    }
+    if let Some(id) = last_event_id {
+        builder = builder.header("Last-Event-ID", id.to_string());
+    }
+
+    let response = builder.send().await?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await?;
+        return Err(CliError::Http { status, body });
+    }
+
+    let mut response = response;
+    let mut buf: Vec<u8> = Vec::new();
+    // SSE fields for the current event block.
+    let mut ev_id = String::new();
+    let mut ev_type = String::new();
+    let mut ev_data = String::new();
+
+    loop {
+        let chunk = response.chunk().await?;
+        let Some(bytes) = chunk else {
+            // Server closed the connection.
+            break;
+        };
+        buf.extend_from_slice(&bytes);
+
+        // Process complete lines from buf.
+        loop {
+            let Some(nl) = buf.iter().position(|&b| b == b'\n') else {
+                break;
+            };
+            let line_bytes = &buf[..nl];
+            // Strip trailing CR for CRLF line endings.
+            let line_bytes = line_bytes.strip_suffix(b"\r").unwrap_or(line_bytes);
+            let line = String::from_utf8_lossy(line_bytes).into_owned();
+            buf.drain(..=nl);
+
+            if line.is_empty() {
+                // Empty line = dispatch event block.
+                if !ev_data.is_empty() || !ev_type.is_empty() {
+                    let display_type = if ev_type.is_empty() {
+                        "message"
+                    } else {
+                        &ev_type
+                    };
+                    println!("{display_type}: {ev_data}");
+                    if ev_type == "stream-end" {
+                        return Ok(());
+                    }
+                    if ev_type == "stream-error" {
+                        return Err(CliError::SseStreamError {
+                            message: ev_data.clone(),
+                        });
+                    }
+                }
+                ev_id.clear();
+                ev_type.clear();
+                ev_data.clear();
+            } else if line.starts_with(':') {
+                // SSE comment (keepalive ping) — discard silently.
+            } else if let Some(value) = line.strip_prefix("id: ") {
+                ev_id = value.to_string();
+                let _ = &ev_id; // suppress unused warning; stored for protocol correctness
+            } else if let Some(value) = line.strip_prefix("event: ") {
+                ev_type = value.to_string();
+            } else if let Some(value) = line.strip_prefix("data: ") {
+                ev_data = value.to_string();
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Issue drain then poll `GET /workers/{id}` until status reaches `Stopped`
