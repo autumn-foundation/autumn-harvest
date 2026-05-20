@@ -91,6 +91,106 @@ pub fn export_dot(dag: &DagDefinition) -> Result<String, std::fmt::Error> {
     Ok(out)
 }
 
+use crate::critical_path::CriticalPathResult;
+
+/// Exports the DAG definition to a Mermaid.js flowchart, highlighting the critical path.
+///
+/// # Errors
+/// Returns `std::fmt::Error` if string formatting fails.
+pub fn export_mermaid_with_critical_path(
+    dag: &DagDefinition,
+    critical_path: &CriticalPathResult,
+) -> Result<String, std::fmt::Error> {
+    let mut out = String::new();
+    writeln!(out, "graph TD")?;
+
+    let tasks = dag.tasks();
+    let cp_nodes: std::collections::HashSet<usize> =
+        critical_path.path_indices.iter().copied().collect();
+    // Only edges that are *consecutive* steps along the critical path are
+    // critical transitions. Membership in `cp_nodes` alone is not enough: a
+    // DAG can have a non-critical "shortcut" edge between two nodes that both
+    // happen to lie on the critical path (e.g. `A->B->C` plus a direct `A->C`).
+    let cp_edges: std::collections::HashSet<(usize, usize)> = critical_path
+        .path_indices
+        .windows(2)
+        .map(|w| (w[0], w[1]))
+        .collect();
+
+    writeln!(
+        out,
+        "    classDef critical fill:#ffcccc,stroke:#ff0000,stroke-width:2px;"
+    )?;
+
+    for (i, task) in tasks.iter().enumerate() {
+        if cp_nodes.contains(&i) {
+            writeln!(out, "    t{i}[\"{}\"]:::critical", task.activity_name)?;
+        } else {
+            writeln!(out, "    t{i}[\"{}\"]", task.activity_name)?;
+        }
+    }
+
+    let mut link_index = 0;
+    for (i, task) in tasks.iter().enumerate() {
+        for &upstream in &task.upstreams {
+            writeln!(out, "    t{upstream} --> t{i}")?;
+
+            if cp_edges.contains(&(upstream, i)) {
+                writeln!(
+                    out,
+                    "    linkStyle {link_index} stroke:#ff0000,stroke-width:2px;"
+                )?;
+            }
+            link_index += 1;
+        }
+    }
+
+    Ok(out)
+}
+
+#[cfg(feature = "testing")]
+use crate::dag_profiler::{DagProfile, ProfilerEventKind};
+
+/// Exports a simulated DAG profile to a Mermaid.js Gantt chart.
+///
+/// # Errors
+/// Returns `std::fmt::Error` if string formatting fails.
+#[cfg(feature = "testing")]
+pub fn export_profile_mermaid_gantt(profile: &DagProfile) -> Result<String, std::fmt::Error> {
+    let mut out = String::new();
+    writeln!(out, "gantt")?;
+    writeln!(out, "    title DAG Execution Profile")?;
+    writeln!(out, "    dateFormat  X")?;
+    writeln!(out, "    axisFormat  %S")?;
+
+    let mut starts = std::collections::HashMap::new();
+    let mut output_lines = Vec::new();
+
+    for event in &profile.timeline {
+        match &event.kind {
+            ProfilerEventKind::TaskStarted(idx, name) => {
+                starts.insert(*idx, (name.clone(), event.time));
+            }
+            ProfilerEventKind::TaskCompleted(idx, _) => {
+                if let Some((name, start_time)) = starts.remove(idx) {
+                    // Use fractional seconds so sub-second tasks are not
+                    // truncated to a zero-length bar (Mermaid renders decimal
+                    // seconds correctly under `dateFormat X`).
+                    let start_sec = start_time.as_secs_f64();
+                    let duration_sec = event.time.saturating_sub(start_time).as_secs_f64();
+                    output_lines.push(format!("    {name} :t{idx}, {start_sec}, {duration_sec}s"));
+                }
+            }
+        }
+    }
+
+    for line in output_lines {
+        writeln!(out, "{line}")?;
+    }
+
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,5 +253,56 @@ digraph DAG {
 }
 ";
         assert_eq!(dot, expected_dot);
+    }
+
+    const fn dummy_activity4() {}
+    const fn dummy_activity5() {}
+
+    #[test]
+    fn test_export_mermaid_with_critical_path() {
+        use crate::critical_path::CriticalPathAnalyzer;
+        use crate::dag::DagBuilder;
+        use std::time::Duration;
+
+        let mut builder = DagBuilder::new();
+        let a = builder.activity(dummy_activity);
+        let _b = builder.activity(dummy_activity4).upstream(&a);
+        let _c = builder.activity(dummy_activity5).upstream(&a);
+        let dag = builder.build().unwrap();
+
+        let analyzer = CriticalPathAnalyzer::new(dag.clone())
+            .mock_duration("dummy_activity4", Duration::from_secs(10))
+            .mock_duration("dummy_activity5", Duration::from_secs(2));
+        let cp_result = analyzer.analyze();
+
+        let mermaid = export_mermaid_with_critical_path(&dag, &cp_result).unwrap();
+        assert!(mermaid.contains("classDef critical"));
+        assert!(mermaid.contains("stroke:#ff0000"));
+        assert!(mermaid.contains("t0[\"dummy_activity\"]:::critical"));
+        assert!(mermaid.contains("t1[\"dummy_activity4\"]:::critical"));
+        assert!(!mermaid.contains("t2[\"dummy_activity5\"]:::critical"));
+    }
+
+    #[test]
+    #[cfg(feature = "testing")]
+    fn test_export_profile_mermaid_gantt() {
+        use crate::dag::DagBuilder;
+        use crate::dag_profiler::DagProfiler;
+        use std::time::Duration;
+
+        let mut builder = DagBuilder::new();
+        let a = builder.activity(dummy_activity);
+        let _b = builder.activity(dummy_activity4).upstream(&a);
+        let dag = builder.build().unwrap();
+
+        let profiler =
+            DagProfiler::new(dag).mock_duration("dummy_activity", Duration::from_secs(2));
+        let profile = profiler.profile();
+
+        let gantt = export_profile_mermaid_gantt(&profile).unwrap();
+        assert!(gantt.contains("gantt"));
+        assert!(gantt.contains("dateFormat  X"));
+        assert!(gantt.contains("axisFormat  %S"));
+        assert!(gantt.contains("dummy_activity"));
     }
 }

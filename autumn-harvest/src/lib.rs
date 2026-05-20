@@ -238,7 +238,9 @@ pub use dag::{
     DagBuildError, DagBuilder, DagCondition, DagDefinition, DagDispatchDecision, DagMapTaskRef,
     DagTask, DagTaskRef,
 };
-pub use dag_export::{export_dot, export_mermaid};
+#[cfg(feature = "testing")]
+pub use dag_export::export_profile_mermaid_gantt;
+pub use dag_export::{export_dot, export_mermaid, export_mermaid_with_critical_path};
 pub use dag_linter::{
     DagLinter, DagRule, DagWarning, ExcessiveParallelismRule, MissingRetryPolicyRule,
     MissingTimeoutRule,
