@@ -166,6 +166,39 @@ async fn test_delayed_start_validation() {
     // Actually, execution.rs validates against the configured max delay of the WorkerConfig.
     // In our implementation plan, HarvestBuilder or WorkerConfig holds the configured delay.
     // For unit/core tests, we want to see that exceeding the cap fails.
+
+    // 3. Past start_at timestamps are rejected
+    let err = start_or_load_workflow_execution(
+        &mut conn,
+        StartWorkflowParams {
+            workflow_name: "delay_workflow",
+            workflow_id: "past-001",
+            exec_id: autumn_harvest::ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0)),
+            input: serde_json::json!({}),
+            parent_id: None,
+            queue_name: "default",
+            execution_timeout: None,
+            memo: None,
+            search_attrs: None,
+            reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
+            trace_context: None,
+            max_execution_timeout_ceiling: None,
+            concurrency_key: None,
+            concurrency_limit: None,
+            priority: Priority::default(),
+            max_workflow_input_bytes: 0,
+            start_at: Some(chrono::Utc::now() - chrono::Duration::seconds(10)),
+            delay: None,
+            max_workflow_start_delay: None,
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        matches!(err, HarvestError::Config(ref msg) if msg.contains("Requested start_at is in the past")),
+        "Expected config error about past start_at, got: {err:?}",
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -349,4 +382,115 @@ async fn test_delayed_start_cancel_before_firing() {
             WorkflowEvent::WorkflowCancelled { reason }
         ] if reason == "user request before start"
     ));
+}
+
+#[tokio::test]
+async fn test_delayed_start_workflow_started_event_timestamp() {
+    let (mut conn, _container) = setup_test_db().await;
+
+    let exec_id = autumn_harvest::ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    let target_future = chrono::Utc::now() + chrono::Duration::hours(2);
+
+    start_or_load_workflow_execution(
+        &mut conn,
+        StartWorkflowParams {
+            workflow_name: "delay_workflow",
+            workflow_id: "delay-timestamp-001",
+            exec_id,
+            input: serde_json::json!({}),
+            parent_id: None,
+            queue_name: "default",
+            execution_timeout: None,
+            memo: None,
+            search_attrs: None,
+            reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
+            trace_context: None,
+            max_execution_timeout_ceiling: None,
+            concurrency_key: None,
+            concurrency_limit: None,
+            priority: Priority::default(),
+            max_workflow_input_bytes: 0,
+            start_at: Some(target_future),
+            delay: None,
+            max_workflow_start_delay: None,
+        },
+    )
+    .await
+    .expect("should start successfully");
+
+    // Verify history events
+    let history = store::load_history(&mut conn, exec_id).await.unwrap();
+    match history.events.as_slice() {
+        [WorkflowEvent::WorkflowStarted { timestamp, .. }] => {
+            // Timestamp should be exactly target_future (stamped with delayed time)
+            assert_eq!(*timestamp, target_future);
+        }
+        other => panic!("expected one WorkflowStarted event, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_immediate_start_skew_tolerance() {
+    let (mut conn, _container) = setup_test_db().await;
+
+    let exec_id = autumn_harvest::ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    let now = chrono::Utc::now();
+
+    start_or_load_workflow_execution(
+        &mut conn,
+        StartWorkflowParams {
+            workflow_name: "delay_workflow",
+            workflow_id: "immediate-skew-001",
+            exec_id,
+            input: serde_json::json!({}),
+            parent_id: None,
+            queue_name: "default",
+            execution_timeout: None,
+            memo: None,
+            search_attrs: None,
+            reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
+            trace_context: None,
+            max_execution_timeout_ceiling: None,
+            concurrency_key: None,
+            concurrency_limit: None,
+            priority: Priority::default(),
+            max_workflow_input_bytes: 0,
+            start_at: None,
+            delay: None,
+            max_workflow_start_delay: None,
+        },
+    )
+    .await
+    .expect("should start successfully");
+
+    let tasks = load_tasks(&mut conn, exec_id).await;
+    assert_eq!(tasks.len(), 1);
+
+    // Scheduled_at should be approximately now - 5 seconds to tolerate skew
+    let scheduled_at = tasks[0].scheduled_at;
+    let expected_skew_scheduled = now - chrono::Duration::seconds(5);
+
+    // It should be within a 2 second window of expected_skew_scheduled
+    let diff = (scheduled_at - expected_skew_scheduled).num_seconds().abs();
+    assert!(
+        diff <= 2,
+        "scheduled_at={scheduled_at:?} expected_skew_scheduled={expected_skew_scheduled:?}"
+    );
+}
+
+#[test]
+fn test_builder_honors_worker_config_max_start_delay() {
+    use autumn_harvest::builder::{HarvestBuilder, WorkerConfig};
+    use std::time::Duration;
+
+    let custom_delay = Duration::from_secs(12345);
+    let worker_config = WorkerConfig::default().with_max_workflow_start_delay(custom_delay);
+
+    let built = HarvestBuilder::new()
+        .worker(worker_config)
+        .try_build()
+        .expect("build should succeed");
+
+    assert_eq!(built.worker_config().max_workflow_start_delay, custom_delay);
+    assert_eq!(built.max_workflow_start_delay, custom_delay);
 }

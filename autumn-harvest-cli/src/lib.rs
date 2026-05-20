@@ -1361,10 +1361,7 @@ async fn run_events_tail(
         buf.extend_from_slice(&bytes);
 
         // Process complete lines from buf.
-        loop {
-            let Some(nl) = buf.iter().position(|&b| b == b'\n') else {
-                break;
-            };
+        while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
             let line_bytes = &buf[..nl];
             // Strip trailing CR for CRLF line endings.
             let line_bytes = line_bytes.strip_suffix(b"\r").unwrap_or(line_bytes);

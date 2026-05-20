@@ -83,7 +83,7 @@ pub struct HarvestBuilder {
     max_workflow_input_bytes: u64,
     /// Server-side ceiling on workflow start delay (issue #322).
     /// Default: 365 days.
-    max_workflow_start_delay: Duration,
+    max_workflow_start_delay: Option<Duration>,
 }
 
 impl Default for HarvestBuilder {
@@ -107,7 +107,7 @@ impl Default for HarvestBuilder {
             max_activity_result_bytes: DEFAULT_MAX_ACTIVITY_RESULT_BYTES,
             max_signal_payload_bytes: DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
             max_workflow_input_bytes: DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
-            max_workflow_start_delay: DEFAULT_MAX_WORKFLOW_START_DELAY,
+            max_workflow_start_delay: None,
         }
     }
 }
@@ -796,7 +796,7 @@ impl HarvestBuilder {
     /// Default: 365 days.
     #[must_use]
     pub const fn max_workflow_start_delay(mut self, delay: Duration) -> Self {
-        self.max_workflow_start_delay = delay;
+        self.max_workflow_start_delay = Some(delay);
         self
     }
 
@@ -874,7 +874,10 @@ impl HarvestBuilder {
         validate_dag_schedules(&self.dags)?;
 
         let mut worker_config = self.worker_config;
-        worker_config.max_workflow_start_delay = self.max_workflow_start_delay;
+        let max_workflow_start_delay = self
+            .max_workflow_start_delay
+            .unwrap_or(worker_config.max_workflow_start_delay);
+        worker_config.max_workflow_start_delay = max_workflow_start_delay;
 
         Ok(BuiltHarvest {
             workflows: self.workflows,
@@ -894,7 +897,7 @@ impl HarvestBuilder {
             max_activity_result_bytes: self.max_activity_result_bytes,
             max_signal_payload_bytes: self.max_signal_payload_bytes,
             max_workflow_input_bytes: self.max_workflow_input_bytes,
-            max_workflow_start_delay: self.max_workflow_start_delay,
+            max_workflow_start_delay,
         })
     }
 }

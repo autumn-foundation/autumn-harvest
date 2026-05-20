@@ -219,8 +219,10 @@ pub async fn start_or_load_workflow_execution(
         }
     }
 
+    let now = Utc::now();
+
     if let Some(sa) = request.start_at {
-        let max_start_at = Utc::now() + max_delay;
+        let max_start_at = now + max_delay;
         if sa > max_start_at {
             return Err(HarvestError::Config(format!(
                 "Requested start_at ({sa:?}) exceeds maximum permitted delay ({max_start_at:?})",
@@ -228,7 +230,6 @@ pub async fn start_or_load_workflow_execution(
         }
     }
 
-    let now = Utc::now();
     let target_start_time = if let Some(d) = request.delay {
         now + d
     } else if let Some(sa) = request.start_at {
@@ -306,7 +307,9 @@ pub async fn start_or_load_workflow_execution(
     enqueue.concurrency_key.clone_from(&request.concurrency_key);
     enqueue.max_concurrent = request.concurrency_limit;
     enqueue.priority = request.priority.as_i32();
-    enqueue.scheduled_at = target_start_time;
+    if request.delay.is_some_and(|d| d > chrono::Duration::zero()) || request.start_at.is_some() {
+        enqueue.scheduled_at = target_start_time;
+    }
 
     conn.transaction::<StartedWorkflowExecution, HarvestError, _>(|conn| {
         let row = row;
@@ -330,6 +333,13 @@ pub async fn start_or_load_workflow_execution(
                 .map_err(database_error)?;
 
             if let Some(execution) = inserted {
+                if let Some(sa) = request.start_at {
+                    if sa < now {
+                        return Err(HarvestError::Config(
+                            "Requested start_at is in the past".to_string(),
+                        ));
+                    }
+                }
                 // Enforce the input cap only on the fresh-insert path. Duplicates
                 // never reach here so the reuse-policy outcome is unaffected.
                 if request.max_workflow_input_bytes > 0 {
@@ -347,7 +357,7 @@ pub async fn start_or_load_workflow_execution(
                 }
                 let started_event = WorkflowEvent::WorkflowStarted {
                     input: request.input.clone(),
-                    timestamp: Utc::now(),
+                    timestamp: target_start_time,
                 };
                 store::append_events(conn, exec_id, &[started_event], 0).await?;
                 queue::enqueue(conn, &enqueue).await?;
@@ -377,7 +387,7 @@ pub async fn start_or_load_workflow_execution(
                     match existing.state.as_str() {
                         "FAILED" | "CANCELLED" => {
                             // Only these two explicitly abnormal states start fresh.
-                            replace_execution(conn, existing, &row, &enqueue, exec_id, &request)
+                            replace_execution(conn, existing, &row, &enqueue, exec_id, &request, now)
                                 .await
                         }
                         _ => {
@@ -398,7 +408,7 @@ pub async fn start_or_load_workflow_execution(
                     if existing.state == "RUNNING" {
                         inline_cancel(conn, ExecutionId::from_uuid(existing.id)).await?;
                     }
-                    replace_execution(conn, existing, &row, &enqueue, exec_id, &request).await
+                    replace_execution(conn, existing, &row, &enqueue, exec_id, &request, now).await
                 }
             }
         }
@@ -417,7 +427,16 @@ async fn replace_execution(
     enqueue: &EnqueueParams,
     new_exec_id: ExecutionId,
     request: &StartWorkflowParams<'_>,
+    now: chrono::DateTime<Utc>,
 ) -> HarvestResult<StartedWorkflowExecution> {
+    if let Some(sa) = request.start_at {
+        if sa < now {
+            return Err(HarvestError::Config(
+                "Requested start_at is in the past".to_string(),
+            ));
+        }
+    }
+
     // Seal the prior execution row as CONTINUED_AS_NEW. This removes it from
     // the partial unique index scope (WHERE state NOT IN sealed states),
     // allowing the new row to be inserted without violating the constraint.
@@ -449,9 +468,14 @@ async fn replace_execution(
             });
         }
     }
+    let start_timestamp = if request.delay.is_some_and(|d| d > chrono::Duration::zero()) || request.start_at.is_some() {
+        enqueue.scheduled_at
+    } else {
+        Utc::now()
+    };
     let started_event = WorkflowEvent::WorkflowStarted {
         input: request.input.clone(),
-        timestamp: Utc::now(),
+        timestamp: start_timestamp,
     };
     store::append_events(conn, new_exec_id, &[started_event], 0).await?;
     queue::enqueue(conn, enqueue).await?;
