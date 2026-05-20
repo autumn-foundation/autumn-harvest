@@ -82,7 +82,7 @@ const INIT_SQL: &str = concat!(
     ),
     "\n",
     include_str!(
-        "../../autumn-harvest/migrations/20260518000000_harvest_workflow_execution_timeout/up.sql"
+        "../../autumn-harvest/migrations/20260518000001_harvest_workflow_execution_timeout/up.sql"
     ),
 );
 
@@ -206,6 +206,9 @@ async fn seed_execution(
             concurrency_limit: None,
             priority: Priority::default(),
             max_workflow_input_bytes: 0,
+            start_at: None,
+            delay: None,
+            max_workflow_start_delay: None,
         },
     )
     .await

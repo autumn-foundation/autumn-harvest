@@ -79,6 +79,12 @@ pub struct StartWorkflowParams<'a> {
     /// against the existing execution without touching the input. Zero means
     /// uncapped (the default for callers that do not configure a cap).
     pub max_workflow_input_bytes: u64,
+    /// Optional timestamp to start the workflow at (issue #322).
+    pub start_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Optional duration delay before starting the workflow (issue #322).
+    pub delay: Option<chrono::Duration>,
+    /// Server-side ceiling on start delay (issue #322).
+    pub max_workflow_start_delay: Option<chrono::Duration>,
 }
 
 impl StartWorkflowParams<'_> {
@@ -189,6 +195,48 @@ pub async fn start_or_load_workflow_execution(
     let exec_id = request.exec_id;
     let shard_id_value = request.shard_id();
 
+    // Validate delayed start parameters (issue #322)
+    if request.start_at.is_some() && request.delay.is_some() {
+        return Err(HarvestError::Config(
+            "Cannot specify both start_at and delay".to_string(),
+        ));
+    }
+
+    let max_delay = request
+        .max_workflow_start_delay
+        .unwrap_or_else(|| chrono::Duration::days(365));
+
+    if let Some(d) = request.delay {
+        if d < chrono::Duration::zero() {
+            return Err(HarvestError::Config(
+                "Start delay cannot be negative".to_string(),
+            ));
+        }
+        if d > max_delay {
+            return Err(HarvestError::Config(format!(
+                "Requested delay ({d:?}) exceeds maximum permitted delay ({max_delay:?})",
+            )));
+        }
+    }
+
+    if let Some(sa) = request.start_at {
+        let max_start_at = Utc::now() + max_delay;
+        if sa > max_start_at {
+            return Err(HarvestError::Config(format!(
+                "Requested start_at ({sa:?}) exceeds maximum permitted delay ({max_start_at:?})",
+            )));
+        }
+    }
+
+    let now = Utc::now();
+    let target_start_time = if let Some(d) = request.delay {
+        now + d
+    } else if let Some(sa) = request.start_at {
+        sa
+    } else {
+        now
+    };
+
     // For TerminateIfRunning: if there is an existing RUNNING execution, cancel
     // it (Transaction 1) before the start transaction below (Transaction 2). A
     // crash between the two leaves the prior workflow CANCELLED with no new run;
@@ -228,9 +276,8 @@ pub async fn start_or_load_workflow_execution(
         (other, _) => other,
     };
 
-    // Compute deadline_at at start time so the scanner can use a simple
-    // indexed range query instead of per-row arithmetic (issue #243).
-    let deadline_at = effective_timeout.map(|d| Utc::now() + d);
+    // Compute deadline_at relative to target_start_time (issue #322).
+    let deadline_at = effective_timeout.map(|d| target_start_time + d);
 
     let row = NewWorkflowExecution {
         id: exec_id.as_uuid(),
@@ -259,6 +306,7 @@ pub async fn start_or_load_workflow_execution(
     enqueue.concurrency_key.clone_from(&request.concurrency_key);
     enqueue.max_concurrent = request.concurrency_limit;
     enqueue.priority = request.priority.as_i32();
+    enqueue.scheduled_at = target_start_time;
 
     conn.transaction::<StartedWorkflowExecution, HarvestError, _>(|conn| {
         let row = row;
@@ -491,6 +539,20 @@ pub async fn cancel_workflow_execution(
                 }
             }
 
+            let deleted_pending = diesel::delete(
+                crate::schema::harvest_task_queue::table
+                    .filter(
+                        crate::schema::harvest_task_queue::workflow_exec_id
+                            .eq(Some(exec_id.as_uuid())),
+                    )
+                    .filter(crate::schema::harvest_task_queue::task_type.eq("workflow"))
+                    .filter(crate::schema::harvest_task_queue::state.eq("PENDING"))
+                    .filter(crate::schema::harvest_task_queue::scheduled_at.gt(Utc::now())),
+            )
+            .execute(conn)
+            .await
+            .map_err(database_error)?;
+
             let history = store::load_history(conn, exec_id).await?;
             store::append_events(
                 conn,
@@ -528,10 +590,12 @@ pub async fn cancel_workflow_execution(
             )
             .await?;
 
+            let total_failed_or_deleted = deleted_pending + failed_task_count;
+
             Ok(CancelledWorkflowExecution::newly_cancelled(
                 exec_id,
                 reason,
-                failed_task_count,
+                total_failed_or_deleted,
             ))
         }
         .scope_boxed()
@@ -857,6 +921,9 @@ pub async fn signal_with_start_workflow_execution(
                     concurrency_limit: request.concurrency_limit,
                     priority: Priority::default(),
                     max_workflow_input_bytes: 0,
+                    start_at: None,
+                    delay: None,
+                    max_workflow_start_delay: None,
                 };
 
             let started = start_or_load_workflow_execution(

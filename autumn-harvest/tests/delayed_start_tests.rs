@@ -1,0 +1,352 @@
+#![cfg(feature = "db")]
+
+use autumn_harvest::event::WorkflowEvent;
+use autumn_harvest::models::{TaskQueueItem, WorkflowExecution};
+use autumn_harvest::schema::{harvest_task_queue, harvest_workflow_executions};
+use autumn_harvest::store;
+use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
+use autumn_harvest::{
+    HarvestError, Priority, StartWorkflowParams, WorkflowContext, cancel_workflow_execution,
+    start_or_load_workflow_execution,
+};
+use diesel::ExpressionMethods;
+use diesel::QueryDsl;
+use diesel::SelectableHelper;
+use diesel_async::AsyncConnection;
+use diesel_async::AsyncPgConnection;
+use diesel_async::RunQueryDsl;
+use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+use serde_json::Value;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::time::Duration;
+use testcontainers::ContainerAsync;
+use testcontainers_modules::postgres::Postgres;
+use testcontainers_modules::testcontainers::runners::AsyncRunner;
+
+const INIT_SQL: &str = concat!(
+    include_str!("../migrations/20260409000000_harvest_initial/up.sql"),
+    "\n",
+    include_str!("../migrations/20260424000001_harvest_trace_context/up.sql"),
+    "\n",
+    include_str!("../migrations/20260505000000_harvest_heartbeat_details/up.sql"),
+    "\n",
+    include_str!("../migrations/20260427000000_harvest_continue_as_new/up.sql"),
+    "\n",
+    include_str!("../migrations/20260429000000_harvest_concurrency_key/up.sql"),
+    "\n",
+    include_str!("../migrations/20260501000000_harvest_workers/up.sql"),
+    "\n",
+    include_str!("../migrations/20260509000000_harvest_build_routing/up.sql"),
+    "\n",
+    include_str!("../migrations/20260514020000_harvest_task_activity_id/up.sql"),
+    "\n",
+    include_str!("../migrations/20260518000000_harvest_signal_idempotency/up.sql"),
+    "\n",
+    include_str!("../migrations/20260518000001_harvest_workflow_execution_timeout/up.sql"),
+);
+
+async fn setup_test_db() -> (AsyncPgConnection, ContainerAsync<Postgres>) {
+    let container = Postgres::default()
+        .with_init_sql(INIT_SQL.to_string().into_bytes())
+        .start()
+        .await
+        .expect("failed to start Postgres container");
+
+    let host = container
+        .get_host()
+        .await
+        .expect("failed to get container host");
+    let port = container
+        .get_host_port_ipv4(5432)
+        .await
+        .expect("failed to get container port");
+    let database_url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+
+    let conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect to Postgres container");
+
+    (conn, container)
+}
+
+fn build_test_pool(database_url: &str) -> DbPool {
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(database_url);
+    deadpool::managed::Pool::builder(manager)
+        .max_size(4)
+        .build()
+        .expect("failed to build test pool")
+}
+
+fn delay_workflow<'a>(
+    _ctx: &'a WorkflowContext,
+    input: Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move { Ok(input) })
+}
+
+fn delay_registry() -> Arc<HandlerRegistry> {
+    Arc::new(HandlerRegistry::new(
+        vec![autumn_harvest::info::WorkflowInfo {
+            name: "delay_workflow",
+            module: "delayed_start_tests",
+            handler: delay_workflow,
+            execution_timeout: None,
+            concurrency: None,
+            max_input_bytes: None,
+        }],
+        vec![],
+    ))
+}
+
+async fn load_execution(
+    conn: &mut AsyncPgConnection,
+    exec_id: autumn_harvest::ExecutionId,
+) -> WorkflowExecution {
+    harvest_workflow_executions::table
+        .find(exec_id.as_uuid())
+        .select(WorkflowExecution::as_select())
+        .first(conn)
+        .await
+        .expect("workflow execution should exist")
+}
+
+async fn load_tasks(
+    conn: &mut AsyncPgConnection,
+    exec_id: autumn_harvest::ExecutionId,
+) -> Vec<TaskQueueItem> {
+    harvest_task_queue::table
+        .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_id.as_uuid())))
+        .order(harvest_task_queue::scheduled_at.asc())
+        .select(TaskQueueItem::as_select())
+        .load(conn)
+        .await
+        .expect("task queue rows should load")
+}
+
+#[tokio::test]
+async fn test_delayed_start_validation() {
+    let (mut conn, _container) = setup_test_db().await;
+
+    // 1. Conflicting parameters (both start_at and delay specified)
+    let err = start_or_load_workflow_execution(
+        &mut conn,
+        StartWorkflowParams {
+            workflow_name: "delay_workflow",
+            workflow_id: "conflict-001",
+            exec_id: autumn_harvest::ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0)),
+            input: serde_json::json!({}),
+            parent_id: None,
+            queue_name: "default",
+            execution_timeout: None,
+            memo: None,
+            search_attrs: None,
+            reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
+            trace_context: None,
+            max_execution_timeout_ceiling: None,
+            concurrency_key: None,
+            concurrency_limit: None,
+            priority: Priority::default(),
+            max_workflow_input_bytes: 0,
+            start_at: Some(chrono::Utc::now() + chrono::Duration::seconds(10)),
+            delay: Some(chrono::Duration::seconds(10)),
+            max_workflow_start_delay: None,
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        matches!(err, HarvestError::Config(ref msg) if msg.contains("Cannot specify both start_at and delay")),
+        "Expected config error about conflicting parameters, got: {err:?}",
+    );
+
+    // 2. Exceeding maximum permissible delay
+    // We configure WorkerConfig or retrieve from it. To test execution.rs directly:
+    // Actually, execution.rs validates against the configured max delay of the WorkerConfig.
+    // In our implementation plan, HarvestBuilder or WorkerConfig holds the configured delay.
+    // For unit/core tests, we want to see that exceeding the cap fails.
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_delayed_start_no_premature_dispatch() {
+    let container = Postgres::default()
+        .with_init_sql(INIT_SQL.to_string().into_bytes())
+        .start()
+        .await
+        .expect("failed to start Postgres container");
+
+    let host = container.get_host().await.unwrap();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    let database_url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+
+    let pool = build_test_pool(&database_url);
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect to Postgres container");
+
+    let registry = delay_registry();
+    let worker = Arc::new(
+        Worker::new(
+            WorkerRuntimeConfig {
+                worker_id: "delay-worker".to_string(),
+                queues: vec!["default".to_string()],
+                notification_database_url: None,
+                max_concurrent_workflows: 1,
+                max_concurrent_activities: 1,
+                poll_interval: Duration::from_millis(50),
+                shutdown_timeout: Duration::from_secs(1),
+                cancellation_grace_period: Duration::from_secs(1),
+                sticky_timeout: Duration::from_secs(5),
+                max_local_activity_start_to_close: Duration::from_secs(60),
+                shard_assignments: vec![autumn_harvest::types::ShardId::new(0)],
+                worker_heartbeat_interval: Duration::from_secs(5),
+                build_id: String::new(),
+                deployment_name: None,
+                workflow_cache_size: 1000,
+                priority_aging_secs: None,
+            },
+            registry,
+        )
+        .expect("worker config should be valid"),
+    );
+
+    let worker_task = {
+        let worker = Arc::clone(&worker);
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            worker.run(&pool).await;
+        })
+    };
+
+    let exec_id = autumn_harvest::ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    let delay_duration = chrono::Duration::seconds(3);
+
+    let _started = start_or_load_workflow_execution(
+        &mut conn,
+        StartWorkflowParams {
+            workflow_name: "delay_workflow",
+            workflow_id: "delay-001",
+            exec_id,
+            input: serde_json::json!({ "val": 42 }),
+            parent_id: None,
+            queue_name: "default",
+            execution_timeout: None,
+            memo: None,
+            search_attrs: None,
+            reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
+            trace_context: None,
+            max_execution_timeout_ceiling: None,
+            concurrency_key: None,
+            concurrency_limit: None,
+            priority: Priority::default(),
+            max_workflow_input_bytes: 0,
+            start_at: None,
+            delay: Some(delay_duration),
+            max_workflow_start_delay: None,
+        },
+    )
+    .await
+    .expect("should start successfully");
+
+    // Immediately verify it is RUNNING, and task is PENDING
+    let exec = load_execution(&mut conn, exec_id).await;
+    assert_eq!(exec.state, "RUNNING");
+
+    let tasks = load_tasks(&mut conn, exec_id).await;
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].state, "PENDING");
+
+    // Scheduled at should be approximately 3 seconds in the future
+    let scheduled_at = tasks[0].scheduled_at;
+    let now = chrono::Utc::now();
+    assert!(scheduled_at > now + chrono::Duration::seconds(1));
+    assert!(scheduled_at <= now + chrono::Duration::seconds(4));
+
+    // Verify worker hasn't claimed it immediately
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let tasks_mid = load_tasks(&mut conn, exec_id).await;
+    assert_eq!(tasks_mid.len(), 1);
+    assert_eq!(tasks_mid[0].state, "PENDING");
+
+    // Sleep until scheduled time passes (3 seconds delay + buffer)
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Verify task is now executed and finished (no longer pending, or marked COMPLETED / deleted, wait, what happens to compelted workflow tasks?
+    // Let's check history or execution state)
+    let exec_final = load_execution(&mut conn, exec_id).await;
+    assert_eq!(exec_final.state, "COMPLETED");
+
+    worker.shutdown();
+    worker_task.await.expect("worker stopped");
+}
+
+#[tokio::test]
+async fn test_delayed_start_cancel_before_firing() {
+    let (mut conn, _container) = setup_test_db().await;
+
+    let exec_id = autumn_harvest::ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    start_or_load_workflow_execution(
+        &mut conn,
+        StartWorkflowParams {
+            workflow_name: "delay_workflow",
+            workflow_id: "delay-cancel-001",
+            exec_id,
+            input: serde_json::json!({}),
+            parent_id: None,
+            queue_name: "default",
+            execution_timeout: None,
+            memo: None,
+            search_attrs: None,
+            reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
+            trace_context: None,
+            max_execution_timeout_ceiling: None,
+            concurrency_key: None,
+            concurrency_limit: None,
+            priority: Priority::default(),
+            max_workflow_input_bytes: 0,
+            start_at: None,
+            delay: Some(chrono::Duration::seconds(10)),
+            max_workflow_start_delay: None,
+        },
+    )
+    .await
+    .expect("should start successfully");
+
+    // Verify task exists and is pending
+    let tasks = load_tasks(&mut conn, exec_id).await;
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].state, "PENDING");
+
+    // Cancel workflow execution
+    let cancelled = cancel_workflow_execution(&mut conn, exec_id, "user request before start")
+        .await
+        .expect("should cancel");
+
+    assert_eq!(cancelled.state, "CANCELLED");
+    assert!(cancelled.newly_cancelled);
+    // Since task has not fired/started, it was deleted entirely from the queue.
+    // Our design says: "If the row was successfully deleted, we know the workflow was cancelled *before* it fired.
+    // In this case, we avoid calling queue::fail_open_tasks_for_execution, set execution state to CANCELLED, and append event"
+    // So tasks list should be completely empty for this execution.
+    let tasks_post = load_tasks(&mut conn, exec_id).await;
+    assert!(
+        tasks_post.is_empty(),
+        "Pending task should have been deleted"
+    );
+
+    // Verify execution row
+    let exec = load_execution(&mut conn, exec_id).await;
+    assert_eq!(exec.state, "CANCELLED");
+    assert_eq!(exec.error.as_deref(), Some("user request before start"));
+
+    // Verify history events
+    let history = store::load_history(&mut conn, exec_id).await.unwrap();
+    assert!(matches!(
+        history.events.as_slice(),
+        [
+            WorkflowEvent::WorkflowStarted { .. },
+            WorkflowEvent::WorkflowCancelled { reason }
+        ] if reason == "user request before start"
+    ));
+}

@@ -1,7 +1,7 @@
 //! Integration tests for the `#[query]` and `#[update]` declarative macros (issue #346).
 //!
 //! Run with:
-//!   `cargo test -p autumn-harvest --test macros_query_update --features testing`
+//!   `cargo test -p autumn-harvest --test macros_query_handlers --features testing`
 // Test handler functions are constrained by the macro interface (must return
 // Result, take args by value, etc.) so several pedantic lints don't apply here.
 #![allow(

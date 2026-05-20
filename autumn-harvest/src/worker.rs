@@ -5095,6 +5095,7 @@ mod tests {
             deployment_name: None,
             query_timeout: Duration::from_secs(5),
             priority_aging_secs: None,
+            max_workflow_start_delay: Duration::from_secs(365 * 24 * 3600),
         };
 
         let runtime_cfg: WorkerRuntimeConfig = builder_cfg.into();

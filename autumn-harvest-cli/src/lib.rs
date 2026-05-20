@@ -601,6 +601,12 @@ enum WorkflowCommand {
         /// `allow_duplicate_failed_only`, `terminate_if_running`.
         #[arg(long, value_name = "POLICY")]
         reuse_policy: Option<String>,
+        /// Target ISO 8601 / RFC 3339 timestamp to start the workflow.
+        #[arg(long)]
+        start_at: Option<String>,
+        /// Delay duration before starting the workflow (e.g. "10s", "5m").
+        #[arg(long)]
+        delay: Option<String>,
     },
     /// Cancel a workflow execution.
     Cancel {
@@ -2376,6 +2382,8 @@ fn workflow_request(command: &WorkflowCommand) -> Result<ApiRequest, CliError> {
             search_attrs_file,
             execution_timeout_secs,
             reuse_policy,
+            start_at,
+            delay,
         } => {
             let mut body = Map::new();
             insert_string(&mut body, "workflow_id", workflow_id.as_deref());
@@ -2407,6 +2415,8 @@ fn workflow_request(command: &WorkflowCommand) -> Result<ApiRequest, CliError> {
                 body.insert("execution_timeout_secs".to_string(), json!(timeout));
             }
             insert_string(&mut body, "reuse_policy", reuse_policy.as_deref());
+            insert_string(&mut body, "start_at", start_at.as_deref());
+            insert_string(&mut body, "delay", delay.as_deref());
 
             Ok(ApiRequest::post(
                 format!("/workflows/{}/start", path_segment(workflow_name)),

@@ -44,6 +44,8 @@ pub const DEFAULT_MAX_ACTIVITY_RESULT_BYTES: u64 = 2 * 1024 * 1024; // 2 MiB
 pub const DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES: u64 = 256 * 1024; // 256 KiB
 /// Default maximum workflow input payload size.
 pub const DEFAULT_MAX_WORKFLOW_INPUT_BYTES: u64 = 2 * 1024 * 1024; // 2 MiB
+/// Default maximum workflow start delay (365 days).
+pub const DEFAULT_MAX_WORKFLOW_START_DELAY: Duration = Duration::from_secs(365 * 24 * 3600);
 
 pub struct HarvestBuilder {
     workflows: Vec<WorkflowInfo>,
@@ -79,6 +81,9 @@ pub struct HarvestBuilder {
     /// Maximum allowed byte length for a workflow start input payload (issue #252).
     /// Default: 2 MiB.
     max_workflow_input_bytes: u64,
+    /// Server-side ceiling on workflow start delay (issue #322).
+    /// Default: 365 days.
+    max_workflow_start_delay: Duration,
 }
 
 impl Default for HarvestBuilder {
@@ -102,6 +107,7 @@ impl Default for HarvestBuilder {
             max_activity_result_bytes: DEFAULT_MAX_ACTIVITY_RESULT_BYTES,
             max_signal_payload_bytes: DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
             max_workflow_input_bytes: DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
+            max_workflow_start_delay: DEFAULT_MAX_WORKFLOW_START_DELAY,
         }
     }
 }
@@ -133,6 +139,7 @@ impl std::fmt::Debug for HarvestBuilder {
             .field("max_activity_result_bytes", &self.max_activity_result_bytes)
             .field("max_signal_payload_bytes", &self.max_signal_payload_bytes)
             .field("max_workflow_input_bytes", &self.max_workflow_input_bytes)
+            .field("max_workflow_start_delay", &self.max_workflow_start_delay)
             .finish()
     }
 }
@@ -167,6 +174,9 @@ pub struct BuiltHarvest {
     /// Maximum allowed byte length for a workflow start input payload (issue #252).
     /// Default: 2 MiB.
     pub max_workflow_input_bytes: u64,
+    /// Server-side ceiling on workflow start delay (issue #322).
+    /// Default: 365 days.
+    pub max_workflow_start_delay: Duration,
 }
 
 impl std::fmt::Debug for BuiltHarvest {
@@ -192,6 +202,7 @@ impl std::fmt::Debug for BuiltHarvest {
             .field("max_activity_result_bytes", &self.max_activity_result_bytes)
             .field("max_signal_payload_bytes", &self.max_signal_payload_bytes)
             .field("max_workflow_input_bytes", &self.max_workflow_input_bytes)
+            .field("max_workflow_start_delay", &self.max_workflow_start_delay)
             .finish()
     }
 }
@@ -780,6 +791,15 @@ impl HarvestBuilder {
         self
     }
 
+    /// Set the global maximum allowed start delay for a workflow (issue #322).
+    ///
+    /// Default: 365 days.
+    #[must_use]
+    pub const fn max_workflow_start_delay(mut self, delay: Duration) -> Self {
+        self.max_workflow_start_delay = delay;
+        self
+    }
+
     /// Number of registered workflows (used in tests and diagnostics).
     #[must_use]
     pub const fn workflow_count(&self) -> usize {
@@ -853,6 +873,9 @@ impl HarvestBuilder {
         validate_dags_do_not_use_local_activities(&self.dags, &self.activities)?;
         validate_dag_schedules(&self.dags)?;
 
+        let mut worker_config = self.worker_config;
+        worker_config.max_workflow_start_delay = self.max_workflow_start_delay;
+
         Ok(BuiltHarvest {
             workflows: self.workflows,
             activities: self.activities,
@@ -860,7 +883,7 @@ impl HarvestBuilder {
             workflow_schedules: self.workflow_schedules,
             query_handlers: self.query_handlers,
             update_handlers: self.update_handlers,
-            worker_config: self.worker_config,
+            worker_config,
             state: self.state,
             telemetry: Arc::new(self.telemetry.unwrap_or_default()),
             retention: self.retention,
@@ -871,6 +894,7 @@ impl HarvestBuilder {
             max_activity_result_bytes: self.max_activity_result_bytes,
             max_signal_payload_bytes: self.max_signal_payload_bytes,
             max_workflow_input_bytes: self.max_workflow_input_bytes,
+            max_workflow_start_delay: self.max_workflow_start_delay,
         })
     }
 }
@@ -1217,6 +1241,9 @@ pub struct WorkerConfig {
     /// A value of `0` is normalized to `None` (no aging). `None` is the
     /// default — existing deployments are unaffected.
     pub priority_aging_secs: Option<u32>,
+    /// Maximum allowed start delay for a workflow (issue #322).
+    /// Default: 365 days.
+    pub max_workflow_start_delay: Duration,
 }
 
 impl Default for WorkerConfig {
@@ -1237,6 +1264,7 @@ impl Default for WorkerConfig {
             deployment_name: None,
             query_timeout: Duration::from_secs(5),
             priority_aging_secs: None,
+            max_workflow_start_delay: DEFAULT_MAX_WORKFLOW_START_DELAY,
         }
     }
 }
@@ -1359,6 +1387,15 @@ impl WorkerConfig {
     #[must_use]
     pub const fn with_priority_aging_secs(mut self, secs: u32) -> Self {
         self.priority_aging_secs = if secs == 0 { None } else { Some(secs) };
+        self
+    }
+
+    /// Override the maximum start delay for a workflow (issue #322).
+    ///
+    /// Default: 365 days.
+    #[must_use]
+    pub const fn with_max_workflow_start_delay(mut self, delay: Duration) -> Self {
+        self.max_workflow_start_delay = delay;
         self
     }
 

@@ -48,6 +48,8 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260514020000_harvest_task_activity_id/up.sql"),
     "\n",
     include_str!("../migrations/20260518000000_harvest_signal_idempotency/up.sql"),
+    "\n",
+    include_str!("../migrations/20260518000001_harvest_workflow_execution_timeout/up.sql"),
 );
 
 async fn setup_test_db() -> (AsyncPgConnection, ContainerAsync<Postgres>) {
@@ -122,6 +124,9 @@ async fn start_test_workflow(conn: &mut AsyncPgConnection) -> autumn_harvest::Ex
             concurrency_limit: None,
             priority: Priority::default(),
             max_workflow_input_bytes: 0,
+            start_at: None,
+            delay: None,
+            max_workflow_start_delay: None,
         },
     )
     .await
@@ -466,6 +471,9 @@ async fn running_activity_heartbeat_observes_workflow_cancellation() {
             concurrency_limit: None,
             priority: Priority::default(),
             max_workflow_input_bytes: 0,
+            start_at: None,
+            delay: None,
+            max_workflow_start_delay: None,
         },
     )
     .await
@@ -637,6 +645,9 @@ async fn uncooperative_activity_is_hard_aborted_after_grace_period() {
             concurrency_limit: None,
             priority: Priority::default(),
             max_workflow_input_bytes: 0,
+            start_at: None,
+            delay: None,
+            max_workflow_start_delay: None,
         },
     )
     .await

@@ -369,6 +369,16 @@
             "name": "reuse_policy",
             "required": false,
             "description": "Duplicate-id policy: allow_duplicate, reject_duplicate, allow_duplicate_failed_only, or terminate_if_running."
+          },
+          {
+            "name": "start_at",
+            "required": false,
+            "description": "Target ISO 8601 / RFC 3339 timestamp to start the workflow."
+          },
+          {
+            "name": "delay",
+            "required": false,
+            "description": "Delay duration before starting the workflow (e.g. \"10s\", \"5m\")."
           }
         ]
       },
@@ -2321,6 +2331,16 @@
             "name": "queue_name",
             "required": false,
             "description": "Task queue name for scheduled runs (default: 'default')."
+          },
+          {
+            "name": "calendar",
+            "required": false,
+            "description": "Optional named calendar for business-day / holiday filtering (issue #337)."
+          },
+          {
+            "name": "skip_policy",
+            "required": false,
+            "description": "What to do when the fire date is calendar-excluded (issue #337)."
           }
         ]
       },
@@ -2747,6 +2767,7 @@
       "category": "calendar",
       "read_only": false,
       "description": "Create a new named calendar.",
+      "idempotency": "Not idempotent: attempting to create an already-existing calendar returns 409.",
       "params": [],
       "request_body": {
         "required": true,
@@ -2814,6 +2835,7 @@
       "category": "calendar",
       "read_only": false,
       "description": "Replace the exclusion date list for a calendar.",
+      "idempotency": "Idempotent: replacing the exclusion dates list with the same values is a no-op.",
       "params": [
         {
           "name": "name",
@@ -2855,6 +2877,7 @@
       "category": "calendar",
       "read_only": false,
       "description": "Delete a named calendar. Schedules referencing this calendar will no longer be filtered.",
+      "idempotency": "Not idempotent: a second call after successful deletion returns 404.",
       "params": [
         {
           "name": "name",
@@ -2863,7 +2886,11 @@
           "description": "Calendar name."
         }
       ],
-      "request_body": null,
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": []
+      },
       "success_response": {
         "status": 204,
         "free_form": true

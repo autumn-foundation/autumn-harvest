@@ -50,7 +50,7 @@ tokio-postgres = { version = "0.7", optional = true }
 metrics = { version = "0.24", optional = true }
 
 [[test]]
-name = "macros_query_update"
+name = "macros_query_handlers"
 required-features = ["testing"]
 
 [[test]]

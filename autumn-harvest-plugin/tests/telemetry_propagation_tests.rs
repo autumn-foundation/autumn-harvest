@@ -87,7 +87,7 @@ const INIT_SQL: &str = concat!(
     ),
     "\n",
     include_str!(
-        "../../autumn-harvest/migrations/20260518000000_harvest_workflow_execution_timeout/up.sql"
+        "../../autumn-harvest/migrations/20260518000001_harvest_workflow_execution_timeout/up.sql"
     ),
 );
 
