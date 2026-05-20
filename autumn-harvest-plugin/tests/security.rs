@@ -146,6 +146,48 @@ async fn eris_unauthenticated_start_workflow_terminate_if_running_is_blocked() {
 }
 
 #[tokio::test]
+async fn bulk_dlq_endpoints_reject_oversized_payloads() {
+    // Generate an 11MB string
+    let oversized_payload = "a".repeat(11 * 1024 * 1024);
+
+    let app = authenticated_app();
+    // Test replay endpoint
+    let mut request = Request::builder()
+        .uri("/dead-letters/replay")
+        .method(Method::POST)
+        .header("content-type", "application/json")
+        .body(Body::from(oversized_payload.clone()))
+        .unwrap();
+
+    let mut session_data = std::collections::HashMap::new();
+    session_data.insert("user_id".to_string(), "admin_user".to_string());
+    request.extensions_mut().insert(Session::new_for_test(
+        "harvest-test-session".to_string(),
+        session_data.clone(),
+    ));
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // Test discard endpoint
+    let app = authenticated_app();
+    let mut request = Request::builder()
+        .uri("/dead-letters/discard")
+        .method(Method::POST)
+        .header("content-type", "application/json")
+        .body(Body::from(oversized_payload))
+        .unwrap();
+
+    request.extensions_mut().insert(Session::new_for_test(
+        "harvest-test-session".to_string(),
+        session_data,
+    ));
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn eris_start_workflow_terminate_if_running_honors_configured_session_key() {
     let api_state = HarvestApiState::new();
     api_state.set_admin_auth_session_key("operator_id");
