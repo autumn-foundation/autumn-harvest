@@ -22,6 +22,7 @@ pub enum VersionExecutionStateGroup {
 }
 
 impl VersionExecutionStateGroup {
+    /// Returns the string representation of the state group.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -50,23 +51,36 @@ impl std::str::FromStr for VersionExecutionStateGroup {
 /// Filters applied when reading version-gate marker usage from one shard.
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
 pub struct VersionUsageFilters {
+    /// The workflow type name to filter by.
     pub workflow_name: Option<String>,
+    /// The change ID used in `ctx.version(change_id, ...)`.
     pub change_id: Option<String>,
+    /// The specific version number to filter by.
     pub recorded_version: Option<u32>,
+    /// The execution state group to query (active, terminal, or all).
     pub state_group: VersionExecutionStateGroup,
+    /// The specific shard ID to query.
     pub shard_id: Option<i32>,
 }
 
 /// One grouped version-gate usage row read from a single database shard.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 pub struct VersionUsageShardRow {
+    /// The workflow type name.
     pub workflow_name: String,
+    /// The change ID.
     pub change_id: String,
+    /// The specific version number recorded.
     pub recorded_version: u32,
+    /// Number of active executions still using this version.
     pub active_executions: i64,
+    /// Number of terminal executions that used this version.
     pub terminal_executions: i64,
+    /// The start time of the oldest matching execution on this shard.
     pub oldest_matching_started_at: DateTime<Utc>,
+    /// The start time of the newest matching execution on this shard.
     pub newest_matching_started_at: DateTime<Utc>,
+    /// The shard where these executions reside.
     pub shard_id: i32,
 }
 

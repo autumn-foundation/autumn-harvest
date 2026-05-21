@@ -25,14 +25,23 @@ pub const KNOWN_EXTERNAL_TASK_STATES: &[&str] =
 /// Filters for operator-facing external activity handoff queries.
 #[derive(Debug, Clone)]
 pub struct ExternalHandoffFilters {
+    /// List of task states to match (e.g. `PENDING`, `COMPLETED`).
     pub states: Vec<String>,
+    /// Match a specific workflow name.
     pub workflow_name: Option<String>,
+    /// Match a specific workflow execution.
     pub execution_id: Option<ExecutionId>,
+    /// Match a specific activity name.
     pub activity_name: Option<String>,
+    /// Match a specific task token.
     pub token: Option<ExternalActivityToken>,
+    /// Match tasks on a specific shard.
     pub shard_id: Option<i32>,
+    /// Match tasks due before a given time.
     pub due_before: Option<chrono::DateTime<Utc>>,
+    /// Match tasks last updated before a given time.
     pub updated_before: Option<chrono::DateTime<Utc>>,
+    /// Maximum number of records to return.
     pub limit: i64,
 }
 
@@ -54,6 +63,7 @@ impl Default for ExternalHandoffFilters {
 
 impl ExternalHandoffFilters {
     #[must_use]
+    /// Sets the maximum number of records to return.
     pub const fn with_limit(mut self, limit: i64) -> Self {
         self.limit = limit;
         self
@@ -62,17 +72,29 @@ impl ExternalHandoffFilters {
 
 /// Redacted, operator-facing external handoff row.
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Read-only snapshot of a pending external activity task.
 pub struct ExternalHandoffRow {
+    /// Opaque token used by the external system to complete the task.
     pub token: ExternalActivityToken,
+    /// Execution ID of the parent workflow.
     pub workflow_exec_id: ExecutionId,
+    /// Business identifier of the parent workflow.
     pub workflow_id: String,
+    /// Type name of the parent workflow.
     pub workflow_name: String,
+    /// Execution ID of the activity.
     pub activity_id: ActivityExecId,
+    /// Type name of the activity.
     pub activity_name: String,
+    /// Current operational state (e.g. `PENDING`, `COMPLETED`).
     pub state: String,
+    /// When the task was scheduled.
     pub created_at: chrono::DateTime<Utc>,
+    /// When the task was last updated.
     pub updated_at: chrono::DateTime<Utc>,
+    /// When the task will implicitly time out.
     pub deadline_at: chrono::DateTime<Utc>,
+    /// The shard ID the task is assigned to.
     pub shard_id: i32,
 }
 

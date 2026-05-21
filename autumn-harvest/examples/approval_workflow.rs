@@ -1,3 +1,9 @@
+#![allow(
+    clippy::used_underscore_binding,
+    clippy::unused_async,
+    clippy::missing_errors_doc,
+    clippy::missing_const_for_fn
+)]
 //! Declarative approval workflow: `#[update]`, `#[query]`, `updates![]`, `queries![]`.
 
 use autumn_harvest::prelude::*;

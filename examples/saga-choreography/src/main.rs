@@ -109,7 +109,13 @@ pub async fn tenant_cancel(ctx: &WorkflowContext, input: Value) -> HarvestResult
 // Replay tests — exercise the cross-workflow signal path under WorkflowReplayer
 // ---------------------------------------------------------------------------
 
+fn main() {
+    println!("Saga-choreography example — run with `cargo test -p saga-choreography`");
+    println!("For an end-to-end demo against a live Postgres instance,");
+    println!("wire these workflow handlers into the standalone-runner.");
+}
 #[cfg(test)]
+#[allow(clippy::type_complexity)]
 mod tests {
     use std::future::Future;
     use std::pin::Pin;
@@ -297,10 +303,4 @@ mod tests {
             "replay regression: {report}"
         );
     }
-}
-
-fn main() {
-    println!("Saga-choreography example — run with `cargo test -p saga-choreography`");
-    println!("For an end-to-end demo against a live Postgres instance,");
-    println!("wire these workflow handlers into the standalone-runner.");
 }

@@ -32,8 +32,11 @@ use serde_json::Value;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum BatchAction {
+    /// Gracefully cancels the target workflows.
     Cancel,
+    /// Forcibly terminates the target workflows without running cancellation handlers.
     Terminate,
+    /// Sends a signal to the target workflows.
     Signal,
 }
 
@@ -74,14 +77,20 @@ impl FromStr for BatchAction {
 /// translate into a SQL query).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
+/// Operational state of a batch job.
 pub enum BatchJobStatus {
+    /// Job is queued but background execution has not started.
     Pending,
+    /// Job is actively querying targets and applying actions.
     Running,
+    /// Job has scanned all matching targets.
     Completed,
+    /// Job aborted due to a framework or database error. Per-target failures do not trigger this.
     Failed,
 }
 
 impl BatchJobStatus {
+    /// Returns the string representation of the batch job status.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -181,11 +190,17 @@ mod db {
     /// resolves to the same job, preventing the "double-cancel" foot-gun.
     #[derive(Debug, Clone)]
     pub struct BatchSubmission {
+        /// The operation to apply to each matched target.
         pub action: BatchAction,
+        /// Criteria defining the targets for the batch job.
         pub filter: BatchFilter,
+        /// The name of the signal to send, required if `action` is `BatchAction::Signal`.
         pub signal_name: Option<String>,
+        /// The payload of the signal, used if `action` is `BatchAction::Signal`.
         pub signal_payload: Option<Value>,
+        /// Idempotency key to safely retry the submission of the batch job itself.
         pub idempotency_key: Option<String>,
+        /// Identity of the operator creating the batch.
         pub created_by: Option<String>,
     }
 
