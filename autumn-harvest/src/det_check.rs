@@ -508,8 +508,8 @@ fn scan_braces_outside_literals(line: &str, depth: &mut u32) -> Option<usize> {
             '\'' => {
                 pos = char_literal_end(line, pos).unwrap_or(next_pos);
             }
-            '/' if line[next_pos..].starts_with('/') => break,
-            '/' if line[next_pos..].starts_with('*') => {
+            '/' if line.as_bytes().get(next_pos) == Some(&b'/') => break,
+            '/' if line.as_bytes().get(next_pos) == Some(&b'*') => {
                 pos = block_comment_end(line, next_pos + 1);
             }
             '{' => {
@@ -550,8 +550,8 @@ fn line_comment_start(line: &str) -> Option<usize> {
             '\'' => {
                 pos = char_literal_end(line, pos).unwrap_or(next_pos);
             }
-            '/' if line[next_pos..].starts_with('/') => return Some(pos),
-            '/' if line[next_pos..].starts_with('*') => {
+            '/' if line.as_bytes().get(next_pos) == Some(&b'/') => return Some(pos),
+            '/' if line.as_bytes().get(next_pos) == Some(&b'*') => {
                 pos = block_comment_end(line, next_pos + 1);
             }
             _ => pos = next_pos,
@@ -701,7 +701,7 @@ fn strip_unparseable_content(line: &str) -> String {
         match ch {
             '"' => pos = normal_string_end(code, pos),
             '\'' => pos = char_literal_end(code, pos).unwrap_or(next_pos),
-            '/' if code[next_pos..].starts_with('*') => {
+            '/' if code.as_bytes().get(next_pos) == Some(&b'*') => {
                 pos = block_comment_end(code, next_pos + 1);
             }
             _ => {
