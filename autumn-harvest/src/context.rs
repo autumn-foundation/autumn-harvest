@@ -657,7 +657,7 @@ impl WorkflowContext {
         Self {
             exec_id,
             matcher: Mutex::new(matcher),
-            commands: Mutex::new(Vec::new()),
+            commands: Mutex::new(Vec::with_capacity(4)),
             start_time,
             history_policy,
             activity_seq: Mutex::new(0),
@@ -737,7 +737,7 @@ impl WorkflowContext {
         std::sync::Arc::new(Self {
             exec_id,
             matcher: Mutex::new(crate::replay::HistoryMatcher::new(vec![])),
-            commands: Mutex::new(Vec::new()),
+            commands: Mutex::new(Vec::with_capacity(4)),
             start_time,
             history_policy: WorkflowHistoryPolicy::default(),
             activity_seq: Mutex::new(0),
@@ -767,7 +767,7 @@ impl WorkflowContext {
         Self {
             exec_id,
             matcher: Mutex::new(HistoryMatcher::new(vec![])),
-            commands: Mutex::new(Vec::new()),
+            commands: Mutex::new(Vec::with_capacity(4)),
             start_time,
             history_policy: WorkflowHistoryPolicy::default(),
             activity_seq: Mutex::new(0),

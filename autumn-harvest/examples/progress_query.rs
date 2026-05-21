@@ -1,3 +1,4 @@
+#![allow(clippy::needless_raw_string_hashes, clippy::doc_markdown, clippy::cast_precision_loss, clippy::used_underscore_binding, clippy::unused_async)]
 //! Example: Read-only Query handlers for live workflow state inspection (issue #234).
 //!
 //! Demonstrates `WorkflowContext::register_query_handler` and the `#[query]`
