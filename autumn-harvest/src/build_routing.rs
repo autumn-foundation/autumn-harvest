@@ -633,3 +633,111 @@ pub fn merge_reachability(per_shard: Vec<Vec<BuildReachability>>) -> Vec<BuildRe
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_compatibility_set_eligibility() {
+        let mut compat = BuildCompatibilitySet::new();
+
+        // No requirement -> always eligible
+        assert!(compat.is_eligible("worker-v1", None));
+        assert!(compat.is_eligible("", None));
+
+        // Legacy worker (empty build_id) -> always eligible
+        assert!(compat.is_eligible("", Some("required-v2")));
+
+        // Exact match -> always eligible
+        assert!(compat.is_eligible("required-v2", Some("required-v2")));
+
+        // Not explicitly declared -> ineligible
+        assert!(!compat.is_eligible("worker-v2", Some("required-v1")));
+
+        // Add declaration
+        compat.add_declaration("worker-v2", "required-v1");
+        assert!(compat.is_eligible("worker-v2", Some("required-v1")));
+
+        // Remove declaration
+        compat.remove_declaration("worker-v2", "required-v1");
+        assert!(!compat.is_eligible("worker-v2", Some("required-v1")));
+    }
+
+    #[test]
+    fn test_merge_reachability_sums_and_safe_to_retire() {
+        let shard1 = vec![
+            BuildReachability {
+                build_id: "build-A".to_string(),
+                open_executions: 5,
+                pending_tasks: 2,
+                active_workers: 10,
+                stale_workers: 1,
+                safe_to_retire: false,
+            },
+            BuildReachability {
+                build_id: "build-B".to_string(),
+                open_executions: 0,
+                pending_tasks: 0,
+                active_workers: 2,
+                stale_workers: 5,
+                safe_to_retire: true,
+            },
+        ];
+
+        let shard2 = vec![
+            BuildReachability {
+                build_id: "build-A".to_string(),
+                open_executions: 3,
+                pending_tasks: 0,
+                active_workers: 2,
+                stale_workers: 0,
+                safe_to_retire: false,
+            },
+            BuildReachability {
+                build_id: "build-B".to_string(),
+                open_executions: 0,
+                pending_tasks: 0,
+                active_workers: 1,
+                stale_workers: 0,
+                safe_to_retire: true,
+            },
+            BuildReachability {
+                build_id: "build-C".to_string(),
+                open_executions: 0,
+                pending_tasks: 1, // prevents safe_to_retire
+                active_workers: 1,
+                stale_workers: 0,
+                safe_to_retire: false,
+            },
+        ];
+
+        let merged = merge_reachability(vec![shard1, shard2]);
+
+        assert_eq!(merged.len(), 3);
+
+        // build-A: sums correctly, not safe to retire
+        let a = merged.iter().find(|x| x.build_id == "build-A").unwrap();
+        assert_eq!(a.open_executions, 8);
+        assert_eq!(a.pending_tasks, 2);
+        assert_eq!(a.active_workers, 12);
+        assert_eq!(a.stale_workers, 1);
+        assert!(!a.safe_to_retire);
+
+        // build-B: zeroes, safe to retire
+        let b = merged.iter().find(|x| x.build_id == "build-B").unwrap();
+        assert_eq!(b.open_executions, 0);
+        assert_eq!(b.pending_tasks, 0);
+        assert_eq!(b.active_workers, 3);
+        assert_eq!(b.stale_workers, 5);
+        assert!(b.safe_to_retire);
+
+        // build-C: one pending task prevents retirement
+        let c = merged.iter().find(|x| x.build_id == "build-C").unwrap();
+        assert_eq!(c.open_executions, 0);
+        assert_eq!(c.pending_tasks, 1);
+        assert_eq!(c.active_workers, 1);
+        assert_eq!(c.stale_workers, 0);
+        assert!(!c.safe_to_retire);
+    }
+}
