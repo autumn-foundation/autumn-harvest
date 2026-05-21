@@ -370,37 +370,32 @@ impl BannerState {
 }
 
 fn compute_fleet_stats(shard_results: &[ShardWorkerResult]) -> WorkerFleetStats {
-    let any_shard_errored = shard_results.iter().any(|(_, r)| r.is_err());
-    let mut total = 0usize;
-    let mut active = 0usize;
-    let mut draining = 0usize;
-    let mut stopped = 0usize;
-    let mut stale = 0usize;
+    let mut stats = WorkerFleetStats {
+        total: 0,
+        active: 0,
+        draining: 0,
+        stopped: 0,
+        stale: 0,
+        any_shard_errored: shard_results.iter().any(|(_, r)| r.is_err()),
+    };
 
-    for (_, result) in shard_results {
-        if let Ok(rows) = result {
-            for row in rows {
-                total += 1;
-                match row.worker.status.as_str() {
-                    "Active" => active += 1,
-                    "Draining" => draining += 1,
-                    _ => stopped += 1,
-                }
-                if row.health == WorkerHealth::Stale {
-                    stale += 1;
-                }
-            }
+    for row in shard_results
+        .iter()
+        .filter_map(|(_, r)| r.as_ref().ok())
+        .flatten()
+    {
+        stats.total += 1;
+        match row.worker.status.as_str() {
+            "Active" => stats.active += 1,
+            "Draining" => stats.draining += 1,
+            _ => stats.stopped += 1,
+        }
+        if row.health == WorkerHealth::Stale {
+            stats.stale += 1;
         }
     }
 
-    WorkerFleetStats {
-        total,
-        active,
-        draining,
-        stopped,
-        stale,
-        any_shard_errored,
-    }
+    stats
 }
 
 const fn determine_banner_state(stats: &WorkerFleetStats) -> Option<BannerState> {
@@ -1907,12 +1902,10 @@ fn dead_letter_task_kind_label(task_type: &str) -> &'static str {
 
 fn truncate_error(error: &str) -> String {
     const LIMIT: usize = 96;
-    let mut chars = error.chars();
-    let truncated = chars.by_ref().take(LIMIT).collect::<String>();
-    if chars.next().is_some() {
-        format!("{truncated}...")
+    if let Some((idx, _)) = error.char_indices().nth(LIMIT) {
+        format!("{}...", &error[..idx])
     } else {
-        truncated
+        error.to_string()
     }
 }
 

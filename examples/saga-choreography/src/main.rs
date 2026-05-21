@@ -14,6 +14,8 @@
 //! The integration tests in this file exercise the cross-workflow signal path
 //! under replay using `WorkflowReplayer`.
 
+#![allow(clippy::items_after_test_module, clippy::type_complexity)]
+
 use autumn_harvest::prelude::*;
 use serde_json::{Value, json};
 

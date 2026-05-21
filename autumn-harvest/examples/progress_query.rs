@@ -9,7 +9,7 @@
 //! many records have been processed so far, while the workflow is still running.
 //!
 //! Run with:
-//!   cargo run --example progress_query
+//!   cargo run --example `progress_query`
 
 use std::sync::{Arc, Mutex};
 
@@ -38,8 +38,10 @@ struct ProgressResponse {
 // Workflow definition
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::unused_async, clippy::cast_precision_loss)]
 #[workflow]
-async fn batch_processor(ctx: &WorkflowContext, _input: ()) -> Result<(), String> {
+async fn batch_processor(ctx: &WorkflowContext, input: ()) -> Result<(), String> {
+    let () = input;
     let total: u64 = 1_000;
     let processed = Arc::new(Mutex::new(0u64));
 
@@ -85,9 +87,9 @@ fn main() {
     println!();
     println!("# Typed query with args:");
     println!(
-        r#"  curl -X POST http://localhost:8080/api/harvest/workflows/{{exec_id}}/query/progress \"#
+        r"  curl -X POST http://localhost:8080/api/harvest/workflows/{{exec_id}}/query/progress \"
     );
-    println!(r#"       -H 'Content-Type: application/json' \"#);
+    println!(r"       -H 'Content-Type: application/json' \");
     println!(r#"       -d '{{"args": {{"include_summary": true}}}}'"#);
     println!();
     println!("# Simple no-arg query (GET or POST):");

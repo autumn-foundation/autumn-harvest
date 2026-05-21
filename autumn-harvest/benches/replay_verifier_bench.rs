@@ -5,7 +5,7 @@
 //!
 //! Run with:
 //!   cargo bench -p autumn-harvest --features testing --no-default-features \
-//!     --bench replay_verifier_bench
+//!     --bench `replay_verifier_bench`
 
 use std::future::Future;
 use std::pin::Pin;

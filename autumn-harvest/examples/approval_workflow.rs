@@ -29,13 +29,18 @@ fn validate_decision(input: &serde_json::Value) -> Result<(), String> {
 
 // Declarative update handler — auto-registered before the workflow runs.
 #[update(workflow = "approval_workflow", validator = validate_decision)]
-pub async fn decide(_ctx: &WorkflowContext, _input: Decision) -> Result<(), String> {
+#[allow(clippy::missing_errors_doc, clippy::unused_async)]
+pub async fn decide(ctx: &WorkflowContext, input: Decision) -> Result<(), String> {
+    let _ = ctx;
+    let _ = input;
     Ok(())
 }
 
 // Declarative query handler — auto-registered before the workflow runs.
 #[query(workflow = "approval_workflow")]
-pub fn approval_status(_ctx: &WorkflowContext) -> Result<StatusResponse, String> {
+#[allow(clippy::missing_errors_doc, clippy::missing_const_for_fn)]
+pub fn approval_status(ctx: &WorkflowContext) -> Result<StatusResponse, String> {
+    let _ = ctx;
     Ok(StatusResponse {
         pending: true,
         approved: None,
@@ -43,10 +48,13 @@ pub fn approval_status(_ctx: &WorkflowContext) -> Result<StatusResponse, String>
 }
 
 #[workflow]
+#[allow(clippy::missing_errors_doc, clippy::unused_async)]
 pub async fn approval_workflow(
-    _ctx: &WorkflowContext,
-    _id: String,
+    ctx: &WorkflowContext,
+    id: String,
 ) -> Result<StatusResponse, String> {
+    let _ = ctx;
+    let _ = id;
     // The worker injects declarative handlers before this fn runs on every replay.
     // Business logic (e.g. wait for the "decide" signal) would go here.
     Ok(StatusResponse {

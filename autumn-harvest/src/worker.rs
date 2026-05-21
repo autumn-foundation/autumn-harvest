@@ -809,36 +809,32 @@ enum SignalBatchItem {
 /// `UpsertSearchAttributes` commands are intentionally skipped here because
 /// they were already persisted by the caller before this function is invoked.
 fn extract_signal_external_workflow(commands: Vec<WorkflowCommand>) -> Vec<SignalBatchItem> {
-    let mut items = Vec::with_capacity(commands.len());
-    for cmd in commands {
-        match cmd {
+    commands
+        .into_iter()
+        .filter_map(|cmd| match cmd {
             WorkflowCommand::RecordMarker { name, details } => {
-                items.push(SignalBatchItem::Marker(WorkflowEvent::MarkerRecorded {
+                Some(SignalBatchItem::Marker(WorkflowEvent::MarkerRecorded {
                     name,
                     details,
-                }));
+                }))
             }
             WorkflowCommand::SignalExternalWorkflow {
                 signal_id,
                 target,
                 signal_name,
                 payload,
-                result_tx,
                 already_requested,
-            } => {
-                drop(result_tx);
-                items.push(SignalBatchItem::Signal(SignalExternalWorkflowRun {
-                    signal_id,
-                    target,
-                    signal_name,
-                    payload,
-                    already_requested,
-                }));
-            }
-            _ => {}
-        }
-    }
-    items
+                ..
+            } => Some(SignalBatchItem::Signal(SignalExternalWorkflowRun {
+                signal_id,
+                target,
+                signal_name,
+                payload,
+                already_requested,
+            })),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Split a mixed command batch into signal-batch items and remaining workflow commands.
