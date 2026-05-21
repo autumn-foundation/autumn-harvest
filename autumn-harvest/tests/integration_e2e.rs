@@ -89,7 +89,7 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../migrations/20260517000001_harvest_schedule_overlap_policy/up.sql"),
     "\n",
-    include_str!("../migrations/20260518000000_harvest_workflow_execution_timeout/up.sql"),
+    include_str!("../migrations/20260518000001_harvest_workflow_execution_timeout/up.sql"),
     "\n",
     include_str!("../migrations/20260519000000_harvest_calendar_awareness/up.sql"),
 );
@@ -122,7 +122,7 @@ const LEGACY_INIT_SQL: &str = concat!(
     "\n",
     include_str!("../migrations/20260514020000_harvest_task_activity_id/up.sql"),
     "\n",
-    include_str!("../migrations/20260518000000_harvest_workflow_execution_timeout/up.sql"),
+    include_str!("../migrations/20260518000001_harvest_workflow_execution_timeout/up.sql"),
 );
 
 /// Start a Postgres container with the harvest schema applied and return
@@ -523,6 +523,9 @@ async fn legacy_workflow_uniqueness_schema_can_be_upgraded_for_idempotent_starts
         concurrency_limit: None,
         priority: Priority::default(),
         max_workflow_input_bytes: 0,
+        start_at: None,
+        delay: None,
+        max_workflow_start_delay: None,
     };
 
     // On the legacy schema there is no `(workflow_name, workflow_id)`
@@ -3583,6 +3586,9 @@ mod reuse_policy_helpers {
             concurrency_limit: None,
             priority: Priority::default(),
             max_workflow_input_bytes: 0,
+            start_at: None,
+            delay: None,
+            max_workflow_start_delay: None,
         }
     }
 
@@ -4762,6 +4768,9 @@ async fn search_attrs_upsert_visible_after_update_and_filterable() {
             concurrency_limit: None,
             priority: Priority::default(),
             max_workflow_input_bytes: 0,
+            start_at: None,
+            delay: None,
+            max_workflow_start_delay: None,
         },
     )
     .await
@@ -4899,6 +4908,9 @@ async fn search_attrs_survive_worker_crash_and_resume() {
             concurrency_limit: None,
             priority: Priority::default(),
             max_workflow_input_bytes: 0,
+            start_at: None,
+            delay: None,
+            max_workflow_start_delay: None,
         },
     )
     .await

@@ -19,6 +19,10 @@ const OUTBOX_INIT_SQL: &str =
 const HARVEST_INIT_SQL: &str = concat!(
     include_str!("../../autumn-harvest/migrations/20260409000000_harvest_initial/up.sql"),
     "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260410010000_harvest_workflow_start_uniqueness/up.sql"
+    ),
+    "\n",
     include_str!("../../autumn-harvest/migrations/20260424000001_harvest_trace_context/up.sql"),
     "\n",
     include_str!("../../autumn-harvest/migrations/20260427000000_harvest_continue_as_new/up.sql"),
@@ -33,8 +37,14 @@ const HARVEST_INIT_SQL: &str = concat!(
     "\n",
     include_str!("../../autumn-harvest/migrations/20260509000000_harvest_build_routing/up.sql"),
     "\n",
+    include_str!("../../autumn-harvest/migrations/20260514020000_harvest_task_activity_id/up.sql"),
+    "\n",
     include_str!(
         "../../autumn-harvest/migrations/20260518000000_harvest_signal_idempotency/up.sql"
+    ),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260518000001_harvest_workflow_execution_timeout/up.sql"
     ),
 );
 

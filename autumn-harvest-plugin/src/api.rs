@@ -258,6 +258,9 @@ pub struct HarvestApiState {
     sse_keepalive_interval: Arc<Mutex<std::time::Duration>>,
     /// Maximum SSE event buffer depth per stream (issue #324). Default 1024.
     sse_buffer_depth: Arc<Mutex<usize>>,
+    /// Maximum allowed workflow start delay (issue #322).
+    /// Defaults to 365 days.
+    max_workflow_start_delay: Arc<Mutex<std::time::Duration>>,
 }
 
 impl Default for HarvestApiState {
@@ -279,6 +282,9 @@ impl Default for HarvestApiState {
             max_workflow_execution_timeout: Arc::new(Mutex::new(None)),
             sse_keepalive_interval: Arc::new(Mutex::new(std::time::Duration::from_secs(15))),
             sse_buffer_depth: Arc::new(Mutex::new(1024)),
+            max_workflow_start_delay: Arc::new(Mutex::new(std::time::Duration::from_secs(
+                365 * 24 * 60 * 60,
+            ))),
         }
     }
 }
@@ -412,6 +418,31 @@ impl HarvestApiState {
     pub fn sse_buffer_depth(&self) -> usize {
         *self
             .sse_buffer_depth
+            .lock()
+            .expect("harvest api state lock poisoned")
+    }
+
+    /// Set the maximum start delay allowed (issue #322).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    pub fn set_max_workflow_start_delay(&self, delay: std::time::Duration) {
+        *self
+            .max_workflow_start_delay
+            .lock()
+            .expect("harvest api state lock poisoned") = delay;
+    }
+
+    /// Maximum allowed workflow start delay.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    #[must_use]
+    pub fn max_workflow_start_delay(&self) -> std::time::Duration {
+        *self
+            .max_workflow_start_delay
             .lock()
             .expect("harvest api state lock poisoned")
     }
@@ -1034,6 +1065,10 @@ struct StartWorkflowRequest {
     /// An unknown string value returns `400 Bad Request` with the offending value
     /// echoed in the response body.
     reuse_policy: Option<String>,
+    #[serde(default)]
+    start_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    delay: Option<String>,
 }
 
 /// Response body for a 409 Conflict returned by `RejectDuplicate` policy.
@@ -1749,6 +1784,8 @@ pub const fn management_api_request_fields()
                 "search_attrs",
                 "execution_timeout_secs",
                 "reuse_policy",
+                "start_at",
+                "delay",
             ]),
         ),
         (
@@ -2034,6 +2071,19 @@ pub const fn management_api_response_fields()
         // ── workers ───────────────────────────────────────────────────────────
         ("GET", "/workers", None), // Vec<WorkerRow> (external model)
         ("GET", "/workers/{worker_id}", None), // WorkerRow (external model)
+        (
+            "GET",
+            "/workers/{worker_id}/pinned",
+            Some(&[
+                "execution_id",
+                "workflow_name",
+                "workflow_id",
+                "state",
+                "queue_name",
+                "started_at",
+                "sticky_until",
+            ]),
+        ),
         (
             "GET",
             "/workers/health",
@@ -3802,6 +3852,39 @@ async fn get_workflow_stack(
     }))
 }
 
+fn parse_delay_duration(raw: &str) -> Result<std::time::Duration, AutumnError> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return Err(AutumnError::bad_request_msg(
+            "invalid delay duration ''; expected milliseconds, seconds, minutes, or hours",
+        ));
+    }
+
+    if let Some(ms) = value.strip_suffix("ms") {
+        return parse_duration_amount(ms, "delay", std::time::Duration::from_millis);
+    }
+    if let Some(seconds) = value.strip_suffix('s') {
+        return parse_duration_amount(seconds, "delay", std::time::Duration::from_secs);
+    }
+    if let Some(minutes) = value.strip_suffix('m') {
+        return parse_duration_amount(minutes, "delay", |amount| {
+            std::time::Duration::from_secs(amount.saturating_mul(60))
+        });
+    }
+    if let Some(hours) = value.strip_suffix('h') {
+        return parse_duration_amount(hours, "delay", |amount| {
+            std::time::Duration::from_secs(amount.saturating_mul(60 * 60))
+        });
+    }
+    if let Some(days) = value.strip_suffix('d') {
+        return parse_duration_amount(days, "delay", |amount| {
+            std::time::Duration::from_secs(amount.saturating_mul(24 * 60 * 60))
+        });
+    }
+
+    parse_duration_amount(value, "delay", std::time::Duration::from_secs)
+}
+
 #[allow(clippy::too_many_lines)]
 async fn start_workflow(
     Extension(api_state): Extension<HarvestApiState>,
@@ -3909,6 +3992,121 @@ async fn start_workflow(
         .unwrap_or_else(|| "default".to_string());
     let input = request.input.unwrap_or(Value::Null);
 
+    // Validate delayed start parameters (issue #322)
+    if request.start_at.is_some() && request.delay.is_some() {
+        if let Ok(pool) = api_state.storage_pool()
+            && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+        {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_START,
+                target_type: TARGET_WORKFLOW,
+                target_id: Some(workflow_name.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_FAILED,
+                error_summary: Some("Cannot specify both start_at and delay"),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+        }
+        return AutumnError::bad_request_msg("Cannot specify both start_at and delay")
+            .into_response();
+    }
+
+    let max_delay = api_state.max_workflow_start_delay();
+
+    let delay = if let Some(ref delay_str) = request.delay {
+        let std_d = match parse_delay_duration(delay_str) {
+            Ok(d) => d,
+            Err(e) => {
+                if let Ok(pool) = api_state.storage_pool()
+                    && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+                {
+                    let ar = NewAuditRecord {
+                        actor: &actor,
+                        operation: OP_WORKFLOW_START,
+                        target_type: TARGET_WORKFLOW,
+                        target_id: Some(workflow_name.as_str()),
+                        route_or_command: route,
+                        request_id: request_id.as_deref(),
+                        idempotency_key: None,
+                        status: STATUS_FAILED,
+                        error_summary: Some("invalid delay duration"),
+                        shard_id: None,
+                        source: &source,
+                    };
+                    let _ = audit::insert_audit(&mut conn, &ar).await;
+                }
+                return e.into_response();
+            }
+        };
+        if std_d > max_delay {
+            let err_msg = format!(
+                "Requested delay ({std_d:?}) exceeds maximum permitted delay ({max_delay:?})",
+            );
+            if let Ok(pool) = api_state.storage_pool()
+                && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+            {
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_START,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: Some(workflow_name.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: None,
+                    status: STATUS_FAILED,
+                    error_summary: Some("delay exceeds maximum permitted delay"),
+                    shard_id: None,
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+            }
+            return AutumnError::bad_request_msg(err_msg).into_response();
+        }
+        let Ok(chrono_d) = chrono::Duration::from_std(std_d) else {
+            return AutumnError::bad_request_msg("delay duration overflow").into_response();
+        };
+        Some(chrono_d)
+    } else {
+        None
+    };
+
+    if let Some(sa) = request.start_at {
+        let max_delay_chrono =
+            chrono::Duration::from_std(max_delay).unwrap_or_else(|_| chrono::Duration::days(365));
+        let max_start_at = chrono::Utc::now() + max_delay_chrono;
+        if sa > max_start_at {
+            let err_msg = format!(
+                "Requested start_at ({sa:?}) exceeds maximum permitted delay ({max_start_at:?})",
+            );
+            if let Ok(pool) = api_state.storage_pool()
+                && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+            {
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_START,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: Some(workflow_name.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: None,
+                    status: STATUS_FAILED,
+                    error_summary: Some("start_at exceeds maximum permitted delay"),
+                    shard_id: None,
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+            }
+            return AutumnError::bad_request_msg(err_msg).into_response();
+        }
+    }
+
+    let max_delay_chrono = chrono::Duration::from_std(max_delay).ok();
+
     // Issue #252: compute effective cap; enforcement happens inside
     // start_or_load_workflow_execution so duplicate-resolution (409) runs first.
     let effective_wf_cap = runtime
@@ -3976,6 +4174,9 @@ async fn start_workflow(
             concurrency_limit,
             priority: Priority::default(),
             max_workflow_input_bytes: effective_wf_cap,
+            start_at: request.start_at,
+            delay,
+            max_workflow_start_delay: max_delay_chrono,
         },
     )
     .await;
@@ -6599,6 +6800,9 @@ async fn schedule_backfill(
                         concurrency_limit: None,
                         priority: Priority::default(),
                         max_workflow_input_bytes: 0,
+                        start_at: None,
+                        delay: None,
+                        max_workflow_start_delay: None,
                     },
                 )
                 .await;
@@ -6705,6 +6909,9 @@ async fn schedule_backfill(
                         concurrency_limit: None,
                         priority: Priority::default(),
                         max_workflow_input_bytes: 0,
+                        start_at: None,
+                        delay: None,
+                        max_workflow_start_delay: None,
                     },
                 )
                 .await;
@@ -11053,6 +11260,9 @@ mod tests {
                 concurrency_limit: None,
                 priority: Priority::default(),
                 max_workflow_input_bytes: 0,
+                start_at: None,
+                delay: None,
+                max_workflow_start_delay: None,
             },
         )
         .await

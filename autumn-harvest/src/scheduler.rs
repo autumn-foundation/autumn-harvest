@@ -721,6 +721,9 @@ pub async fn trigger_unified_dag(
             concurrency_limit: None,
             priority: Priority::default(),
             max_workflow_input_bytes: 0,
+            start_at: None,
+            delay: None,
+            max_workflow_start_delay: None,
         },
     )
     .await
@@ -1757,6 +1760,9 @@ async fn tick_one_workflow_schedule(
                 concurrency_limit,
                 priority: Priority::default(),
                 max_workflow_input_bytes: 0,
+                start_at: None,
+                delay: None,
+                max_workflow_start_delay: None,
             },
         )
         .await;
@@ -2144,6 +2150,9 @@ async fn drain_buffered_schedule_runs(
                     concurrency_limit,
                     priority: Priority::default(),
                     max_workflow_input_bytes: 0,
+                    start_at: None,
+                    delay: None,
+                    max_workflow_start_delay: None,
                 },
             )
             .await;
