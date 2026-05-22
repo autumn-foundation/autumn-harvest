@@ -640,6 +640,7 @@ mod tests {
 
         let names = SpanNames::default();
         let subscriber = tracing_subscriber::registry().with(SpanNameLayer(names.clone()));
+        let _guard = tracing::subscriber::set_default(subscriber);
 
         let exec_id = ExecutionId::new();
         let history = vec![WorkflowEvent::WorkflowStarted {
@@ -647,13 +648,11 @@ mod tests {
             timestamp: Utc::now(),
         }];
 
-        tracing::subscriber::with_default(subscriber, || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(run_workflow(exec_id, history, echo_workflow, Value::Null))
-        });
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(run_workflow(exec_id, history, echo_workflow, Value::Null));
 
         assert!(
             names.has("harvest.workflow.execute"),
@@ -672,6 +671,7 @@ mod tests {
 
         let names = SpanNames::default();
         let subscriber = tracing_subscriber::registry().with(SpanNameLayer(names.clone()));
+        let _guard = tracing::subscriber::set_default(subscriber);
 
         let exec_id = ExecutionId::new();
         let history = vec![WorkflowEvent::WorkflowStarted {
@@ -679,13 +679,11 @@ mod tests {
             timestamp: Utc::now(),
         }];
 
-        tracing::subscriber::with_default(subscriber, || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(run_workflow(exec_id, history, echo_workflow, Value::Null))
-        });
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(run_workflow(exec_id, history, echo_workflow, Value::Null));
 
         assert!(
             !names.has("harvest.workflow.run"),
@@ -708,6 +706,7 @@ mod tests {
 
         let fields = SpanFields::default();
         let subscriber = tracing_subscriber::registry().with(SpanFieldLayer(fields.clone()));
+        let _guard = tracing::subscriber::set_default(subscriber);
 
         let exec_id = ExecutionId::new();
         let history = vec![WorkflowEvent::WorkflowStarted {
@@ -715,13 +714,11 @@ mod tests {
             timestamp: Utc::now(),
         }];
 
-        tracing::subscriber::with_default(subscriber, || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(run_workflow(exec_id, history, echo_workflow, Value::Null))
-        });
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(run_workflow(exec_id, history, echo_workflow, Value::Null));
 
         let span_fields = fields.fields_for("harvest.workflow.execute");
         assert!(
@@ -752,6 +749,7 @@ mod tests {
 
         let fields = SpanFields::default();
         let subscriber = tracing_subscriber::registry().with(SpanFieldLayer(fields.clone()));
+        let _guard = tracing::subscriber::set_default(subscriber);
 
         let exec_id = ExecutionId::new();
         // Provide a complete single-event history so the strict executor
@@ -761,19 +759,17 @@ mod tests {
             timestamp: Utc::now(),
         }];
 
-        tracing::subscriber::with_default(subscriber, || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(run_workflow_strict(
-                    exec_id,
-                    history,
-                    echo_workflow,
-                    Value::Null,
-                    empty_shared_state(),
-                ))
-        });
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(run_workflow_strict(
+                exec_id,
+                history,
+                echo_workflow,
+                Value::Null,
+                empty_shared_state(),
+            ));
 
         // 1. Span must be named correctly.
         let span_fields = fields.fields_for("harvest.workflow.execute");
@@ -813,6 +809,7 @@ mod tests {
 
         let fields = SpanFields::default();
         let subscriber = tracing_subscriber::registry().with(SpanFieldLayer(fields.clone()));
+        let _guard = tracing::subscriber::set_default(subscriber);
 
         let exec_id = ExecutionId::new();
         let history = vec![WorkflowEvent::WorkflowStarted {
@@ -820,13 +817,11 @@ mod tests {
             timestamp: Utc::now(),
         }];
 
-        tracing::subscriber::with_default(subscriber, || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(run_workflow(exec_id, history, echo_workflow, Value::Null))
-        });
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(run_workflow(exec_id, history, echo_workflow, Value::Null));
 
         let span_fields = fields.fields_for("harvest.workflow.execute");
         let any_has_replay_false = span_fields.iter().any(|field_set| {

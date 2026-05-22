@@ -2037,6 +2037,51 @@
     },
     {
       "method": "GET",
+      "path": "/admin/queues/scaling",
+      "category": "admin",
+      "read_only": true,
+      "description": "Return worker-pool scaling signal per-queue statistics, including backlog, in-flight, scheduled, and active worker counts.",
+      "params": [
+        {
+          "name": "format",
+          "in": "query",
+          "required": false,
+          "description": "Output format: json (default) or prometheus plain-text."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "free_form": true
+      },
+      "error_responses": [
+        {
+          "status": 500,
+          "description": "Database or shard error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/admin/metrics",
+      "category": "admin",
+      "read_only": true,
+      "description": "Return Prometheus-compatible metrics scrapable by autoscalers or monitoring systems.",
+      "params": [],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "free_form": true
+      },
+      "error_responses": [
+        {
+          "status": 500,
+          "description": "Database or shard error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
       "path": "/admin/history/exports",
       "category": "admin",
       "read_only": true,

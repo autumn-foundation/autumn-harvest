@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Worker-pool scaling signal and metrics endpoints** (issue #325).
+  Expose KEDA/HPA compatible worker-pool scaling signal endpoint (`GET /admin/queues/scaling`)
+  and Prometheus metrics scraping endpoint (`GET /admin/metrics`). Per-queue metrics include
+  `backlog` (pending, ready now), `in_flight` (currently running), `scheduled` (pending in future),
+  and `active_workers` (healthy, non-draining). Automatically aggregates across all database shards.
+
 - **Timezone-aware cron schedules** (`Schedule::CronInTimezone`, issue #245).
   A new `Schedule` variant lets schedule authors anchor a cron expression to an
   IANA timezone so that jobs like `"0 9 * * 1-5"` fire at 9 AM local time
