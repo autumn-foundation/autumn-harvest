@@ -8531,10 +8531,11 @@ fn format_prometheus_metrics(signals: &[::autumn_harvest::queue::QueueScalingSig
     writeln!(out, "# HELP harvest_queue_backlog Count of pending tasks ready for execution (scheduled_at <= NOW)").unwrap();
     writeln!(out, "# TYPE harvest_queue_backlog gauge").unwrap();
     for sig in signals {
+        let escaped_queue = sig.queue.replace('\\', "\\\\").replace('"', "\\\"");
         writeln!(
             out,
             "harvest_queue_backlog{{queue=\"{}\"}} {}",
-            sig.queue, sig.backlog
+            escaped_queue, sig.backlog
         )
         .unwrap();
     }
@@ -8547,10 +8548,11 @@ fn format_prometheus_metrics(signals: &[::autumn_harvest::queue::QueueScalingSig
     .unwrap();
     writeln!(out, "# TYPE harvest_queue_in_flight gauge").unwrap();
     for sig in signals {
+        let escaped_queue = sig.queue.replace('\\', "\\\\").replace('"', "\\\"");
         writeln!(
             out,
             "harvest_queue_in_flight{{queue=\"{}\"}} {}",
-            sig.queue, sig.in_flight
+            escaped_queue, sig.in_flight
         )
         .unwrap();
     }
@@ -8563,10 +8565,11 @@ fn format_prometheus_metrics(signals: &[::autumn_harvest::queue::QueueScalingSig
     .unwrap();
     writeln!(out, "# TYPE harvest_queue_scheduled gauge").unwrap();
     for sig in signals {
+        let escaped_queue = sig.queue.replace('\\', "\\\\").replace('"', "\\\"");
         writeln!(
             out,
             "harvest_queue_scheduled{{queue=\"{}\"}} {}",
-            sig.queue, sig.scheduled
+            escaped_queue, sig.scheduled
         )
         .unwrap();
     }
@@ -8575,10 +8578,11 @@ fn format_prometheus_metrics(signals: &[::autumn_harvest::queue::QueueScalingSig
     writeln!(out, "# HELP harvest_queue_active_workers Count of healthy, non-draining worker processes polling this queue").unwrap();
     writeln!(out, "# TYPE harvest_queue_active_workers gauge").unwrap();
     for sig in signals {
+        let escaped_queue = sig.queue.replace('\\', "\\\\").replace('"', "\\\"");
         writeln!(
             out,
             "harvest_queue_active_workers{{queue=\"{}\"}} {}",
-            sig.queue, sig.active_workers
+            escaped_queue, sig.active_workers
         )
         .unwrap();
     }

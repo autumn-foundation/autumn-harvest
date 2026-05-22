@@ -261,21 +261,36 @@ async fn single_shard_scaling_signals_endpoint_correctly_categorizes_tasks_and_w
     seed_task(&pool, "queue-b", "PENDING", "NOW() - INTERVAL '3 seconds'").await;
     seed_task(&pool, "queue-b", "RUNNING", "NOW()").await;
 
+    // Escaping test queue:
+    // - 1 Backlog task on queue"\\a (represented in Rust as "queue\"\\\\a")
+    seed_task(
+        &pool,
+        "queue\"\\\\a",
+        "PENDING",
+        "NOW() - INTERVAL '5 seconds'",
+    )
+    .await;
+
     // Register workers:
     // - worker-1: healthy active on queue-a
     // - worker-2: healthy active on queue-a & queue-b
     // - worker-3: draining on queue-a
     // - worker-4: stale on queue-b
+    // - worker-escape: healthy active on queue"\\a
     register_active_worker(&pool, "worker-1", &["queue-a"], &[0]).await;
     register_active_worker(&pool, "worker-2", &["queue-a", "queue-b"], &[0]).await;
     register_active_worker(&pool, "worker-3", &["queue-a"], &[0]).await;
     mark_worker_draining(&pool, "worker-3").await;
     register_active_worker(&pool, "worker-4", &["queue-b"], &[0]).await;
     mark_worker_stale(&pool, "worker-4").await;
+    register_active_worker(&pool, "worker-escape", &["queue\"\\\\a"], &[0]).await;
 
     let state = api_state(
         HarvestDbPool::from(pool),
-        runtime_for(&["queue-a", "queue-b"], ShardRouter::single()),
+        runtime_for(
+            &["queue-a", "queue-b", "queue\"\\\\a"],
+            ShardRouter::single(),
+        ),
     );
     let app = harvest_api_router(state).with_state(AppState::for_test().with_profile("test"));
 
@@ -284,7 +299,7 @@ async fn single_shard_scaling_signals_endpoint_correctly_categorizes_tasks_and_w
     assert_eq!(status, StatusCode::OK);
     assert!(body.is_array());
     let arr = body.as_array().unwrap();
-    assert_eq!(arr.len(), 2);
+    assert_eq!(arr.len(), 3);
 
     let qa = arr
         .iter()
@@ -304,6 +319,15 @@ async fn single_shard_scaling_signals_endpoint_correctly_categorizes_tasks_and_w
     assert_eq!(qb["scheduled"], 0);
     assert_eq!(qb["active_workers"], 1); // only worker-2 is healthy & active on queue-b
 
+    let qescape = arr
+        .iter()
+        .find(|q| q["queue"] == "queue\"\\a")
+        .expect("missing escaped queue");
+    assert_eq!(qescape["backlog"], 1);
+    assert_eq!(qescape["in_flight"], 0);
+    assert_eq!(qescape["scheduled"], 0);
+    assert_eq!(qescape["active_workers"], 1);
+
     // 2. Query format=prometheus
     let (status_prom_q, text_prom_q) =
         get_text(&app, "/admin/queues/scaling?format=prometheus").await;
@@ -316,6 +340,8 @@ async fn single_shard_scaling_signals_endpoint_correctly_categorizes_tasks_and_w
     assert!(text_prom_q.contains("harvest_queue_in_flight{queue=\"queue-b\"} 1"));
     assert!(text_prom_q.contains("harvest_queue_scheduled{queue=\"queue-b\"} 0"));
     assert!(text_prom_q.contains("harvest_queue_active_workers{queue=\"queue-b\"} 1"));
+    assert!(text_prom_q.contains("harvest_queue_backlog{queue=\"queue\\\"\\\\a\"} 1"));
+    assert!(text_prom_q.contains("harvest_queue_active_workers{queue=\"queue\\\"\\\\a\"} 1"));
 
     // 3. /admin/metrics endpoint
     let (status_metrics, text_metrics) = get_text(&app, "/admin/metrics").await;
@@ -328,6 +354,8 @@ async fn single_shard_scaling_signals_endpoint_correctly_categorizes_tasks_and_w
     assert!(text_metrics.contains("harvest_queue_in_flight{queue=\"queue-b\"} 1"));
     assert!(text_metrics.contains("harvest_queue_scheduled{queue=\"queue-b\"} 0"));
     assert!(text_metrics.contains("harvest_queue_active_workers{queue=\"queue-b\"} 1"));
+    assert!(text_metrics.contains("harvest_queue_backlog{queue=\"queue\\\"\\\\a\"} 1"));
+    assert!(text_metrics.contains("harvest_queue_active_workers{queue=\"queue\\\"\\\\a\"} 1"));
 }
 
 #[tokio::test]
