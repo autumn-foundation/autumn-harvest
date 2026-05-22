@@ -60,3 +60,27 @@ fn test_havoc_external_task_duration_panic() {
     });
     assert!(res.is_ok());
 }
+
+#[test]
+fn test_havoc_update_deadlock_loom_2() {
+    loom::model(|| {
+        let ctx = loom::sync::Arc::new(autumn_harvest::WorkflowContext::for_replay(
+            autumn_harvest::types::ExecutionId::new(),
+            vec![],
+        ));
+
+        let ctx_clone1 = ctx.clone();
+
+        ctx.register_update_handler_no_validator("action", move |_| {
+            let ctx_clone1 = ctx_clone1.clone();
+            async move {
+                let _ = ctx_clone1.validate_update("action", &serde_json::json!({}));
+                Ok(serde_json::json!("running"))
+            }
+        });
+
+        loom::thread::spawn(move || {
+            let _ = ctx.validate_update("action", &serde_json::json!({}));
+        });
+    });
+}
