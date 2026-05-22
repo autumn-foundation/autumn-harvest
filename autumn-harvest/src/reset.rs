@@ -35,6 +35,7 @@ pub enum ResetSignalReapplyPolicy {
 
 impl ResetSignalReapplyPolicy {
     #[must_use]
+    /// Returns the string representation of the reset signal reapply policy.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Drop => "drop",
@@ -71,9 +72,13 @@ impl<'de> Deserialize<'de> for ResetSignalReapplyPolicy {
 /// Request body for resetting one workflow execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowResetRequest {
+    /// The event ID to reset to.
     pub reset_to_event_id: i64,
+    /// The reason for the reset.
     pub reason: String,
+    /// The operator performing the reset.
     pub operator_id: String,
+    /// The policy for reapplying signals.
     #[serde(default)]
     pub signal_reapply: ResetSignalReapplyPolicy,
 }
@@ -97,23 +102,36 @@ fn non_empty_or(value: &str, fallback: &str) -> String {
 /// A side effect that is still unresolved at a proposed reset boundary.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResetUnresolvedSideEffect {
+    /// The kind of side effect.
     pub kind: String,
+    /// The ID of the side effect.
     pub side_effect_id: String,
+    /// The name of the side effect.
     pub name: Option<String>,
+    /// The event ID when the side effect was scheduled.
     pub scheduled_event_id: i64,
 }
 
 /// Valid reset-boundary plan, also used as dry-run output after DB counts are attached.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResetPlan {
+    /// The event ID to reset to.
     pub reset_to_event_id: i64,
+    /// The number of events to carry over.
     pub events_carried_over: usize,
+    /// Unresolved side effects at the reset point.
     pub unresolved_side_effects: Vec<ResetUnresolvedSideEffect>,
+    /// The nearest valid boundary before the requested event, if any.
     pub nearest_valid_before: Option<i64>,
+    /// The nearest valid boundary after the requested event, if any.
     pub nearest_valid_after: Option<i64>,
+    /// The number of source tasks to cancel.
     pub source_tasks_to_cancel: usize,
+    /// The number of source timers to remove.
     pub source_timers_to_remove: usize,
+    /// The number of source signals to drop.
     pub source_signals_to_drop: usize,
+    /// The number of source signals to buffer.
     pub source_signals_to_buffer: usize,
 }
 
@@ -136,11 +154,17 @@ impl ResetPlan {
 /// Invalid reset-boundary details surfaced by the management API as `400`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResetInvalidPoint {
+    /// Human-readable explanation of why the boundary is invalid.
     pub message: String,
+    /// The requested reset point.
     pub reset_to_event_id: i64,
+    /// The last event ID in the workflow's history.
     pub last_event_id: i64,
+    /// List of side effects that are unresolved at the requested boundary.
     pub unresolved_side_effects: Vec<ResetUnresolvedSideEffect>,
+    /// The nearest valid boundary before the requested event, if any.
     pub nearest_valid_before: Option<i64>,
+    /// The nearest valid boundary after the requested event, if any.
     pub nearest_valid_after: Option<i64>,
 }
 
@@ -155,28 +179,47 @@ impl std::error::Error for ResetInvalidPoint {}
 /// Result of a committed workflow reset.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResetResult {
+    /// The execution ID of the new reset execution.
     pub new_exec_id: ExecutionId,
+    /// The execution ID of the original source execution.
     pub reset_from_exec_id: ExecutionId,
+    /// The event ID that was reset to.
     pub reset_to_event_id: i64,
+    /// The number of events carried over.
     pub events_carried_over: usize,
+    /// The number of source tasks cancelled.
     pub source_tasks_cancelled: usize,
+    /// The number of source timers removed.
     pub source_timers_removed: usize,
+    /// The number of source signals dropped.
     pub source_signals_dropped: usize,
+    /// The number of source signals buffered.
     pub source_signals_buffered: usize,
 }
 
 /// Errors specific to the reset workflow.
 #[derive(Debug, thiserror::Error)]
 pub enum WorkflowResetError {
+    /// The requested reset boundary is invalid.
     #[error(transparent)]
     InvalidPoint(#[from] ResetInvalidPoint),
+    /// The source workflow execution has already reached a terminal state.
     #[error("workflow execution {exec_id} is terminal ({state})")]
-    TerminalSource { exec_id: ExecutionId, state: String },
+    TerminalSource {
+        /// The ID of the terminal workflow execution.
+        exec_id: ExecutionId,
+        /// The terminal state it reached.
+        state: String,
+    },
+    /// The workflow execution is a child workflow, which cannot be reset directly in v1.
     #[error("workflow execution {exec_id} is a child workflow; reset the root parent in v1")]
     ChildWorkflow {
+        /// The ID of the child workflow execution.
         exec_id: ExecutionId,
+        /// The ID of its parent workflow.
         parent_id: Uuid,
     },
+    /// The workflow history includes continue-as-new, which cannot be reset in v1.
     #[error("continue-as-new histories cannot be reset in v1")]
     ContinueAsNew,
     /// An underlying storage or database error occurred during the reset operation.

@@ -29,6 +29,7 @@ pub enum HistoryPayloadPolicy {
 
 impl HistoryPayloadPolicy {
     #[must_use]
+    /// Returns the wire format string.
     pub const fn as_wire(self) -> &'static str {
         match self {
             Self::Full => "full",

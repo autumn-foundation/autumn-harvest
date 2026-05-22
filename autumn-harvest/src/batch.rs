@@ -440,23 +440,37 @@ mod db {
     /// `{ id, action, filter, status, total, completed, failed, started_at, completed_at, errors[] }`.
     #[derive(Debug, Clone, Serialize)]
     pub struct BatchJobView {
+        /// The job ID.
         pub id: String,
+        /// The action to perform.
         pub action: String,
+        /// The filter to match targets.
         pub filter: Value,
+        /// The signal name if the action is signal.
         pub signal_name: Option<String>,
+        /// The current status.
         pub status: String,
+        /// The total number of targets.
         pub total: i64,
+        /// The number of completed targets.
         pub completed: i64,
+        /// The number of failed targets.
         pub failed: i64,
+        /// The start time.
         pub started_at: Option<DateTime<Utc>>,
+        /// The completion time.
         pub completed_at: Option<DateTime<Utc>>,
+        /// Any errors encountered.
         pub errors: Vec<BatchTargetError>,
+        /// The creation time.
         pub created_at: DateTime<Utc>,
+        /// The creator of the job.
         pub created_by: Option<String>,
     }
 
     impl BatchJobView {
         #[must_use]
+        /// Convert a database row to the API response format.
         pub fn from_row(row: BatchJob) -> Self {
             let errors: Vec<BatchTargetError> =
                 serde_json::from_value(row.errors.clone()).unwrap_or_default();
@@ -764,6 +778,7 @@ mod db {
         Ok(())
     }
 
+    /// Mark a batch job as failed with the given reason.
     pub async fn mark_failed(
         conn: &mut AsyncPgConnection,
         id: Uuid,

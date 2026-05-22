@@ -54,6 +54,7 @@ impl Default for ExternalHandoffFilters {
 
 impl ExternalHandoffFilters {
     #[must_use]
+    /// Updates the limit and returns `Self`.
     pub const fn with_limit(mut self, limit: i64) -> Self {
         self.limit = limit;
         self

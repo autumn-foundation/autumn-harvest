@@ -47,6 +47,7 @@ pub const DEFAULT_MAX_WORKFLOW_INPUT_BYTES: u64 = 2 * 1024 * 1024; // 2 MiB
 /// Default maximum workflow start delay (365 days).
 pub const DEFAULT_MAX_WORKFLOW_START_DELAY: Duration = Duration::from_secs(365 * 24 * 3600);
 
+/// The primary builder for configuring a new harvest engine.
 pub struct HarvestBuilder {
     workflows: Vec<WorkflowInfo>,
     activities: Vec<ActivityInfo>,
@@ -358,6 +359,7 @@ pub enum HarvestBuilderError {
 
 impl BuiltHarvest {
     #[must_use]
+    /// Returns a reference to the configured payload codecs.
     pub const fn payload_codecs(&self) -> &PayloadCodecs {
         &self.payload_codecs
     }
@@ -690,6 +692,7 @@ impl HarvestBuilder {
     }
 
     #[must_use]
+    /// Sets the telemetry configuration.
     pub fn telemetry(mut self, telemetry: TelemetryConfig) -> Self {
         self.telemetry = Some(telemetry);
         self
@@ -1231,7 +1234,7 @@ pub struct WorkerConfig {
     /// Per-query execution timeout (issue #234).
     ///
     /// When a query handler takes longer than this to complete, the engine
-    /// terminates the handler and returns [`HarvestError::QueryTimedOut`] to
+    /// terminates the handler and returns [`crate::error::HarvestError::QueryTimedOut`] to
     /// the caller. Defaults to **5 seconds**.
     pub query_timeout: Duration,
     /// Anti-starvation aging period for the priority claim query (issue #249).

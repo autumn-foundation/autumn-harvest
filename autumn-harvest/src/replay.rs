@@ -43,6 +43,7 @@ pub enum HistoryMatch {
         /// The activity execution ID already recorded in history.
         activity_id: ActivityExecId,
     },
+    /// No match was found.
     NoMatch,
     /// The command does not match what was recorded at this position,
     /// indicating non-determinism in the workflow code.
@@ -782,7 +783,7 @@ impl HistoryMatcher {
 
     /// Like [`match_activity`](Self::match_activity) but also verifies the input payload.
     ///
-    /// Used by the [`WorkflowReplayer`](crate::testing::WorkflowReplayer) to detect
+    /// Used by the `WorkflowReplayer` to detect
     /// non-determinism caused by changing an activity's input arguments across deployments.
     #[allow(clippy::too_many_lines)]
     pub fn match_activity_strict(&mut self, activity_name: &str, input: &Value) -> HistoryMatch {
@@ -1639,7 +1640,7 @@ impl HistoryMatcher {
 
     /// Like [`match_local_activity`](Self::match_local_activity) but also verifies the input payload.
     ///
-    /// Used by the [`WorkflowReplayer`](crate::testing::WorkflowReplayer) in strict replay mode.
+    /// Used by the `WorkflowReplayer` in strict replay mode.
     pub fn match_local_activity_strict(
         &mut self,
         activity_name: &str,
