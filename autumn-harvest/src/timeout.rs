@@ -735,15 +735,15 @@ pub async fn enforce_external_signals_outbox(
         shard_assignments.iter().map(|s| s.as_i32()).collect()
     };
 
-    let mut excluded_signal_ids: Vec<String> = Vec::new();
+    let mut excluded_event_ids: Vec<i64> = Vec::new();
 
     loop {
         let shards_clone = shards.clone();
         let codecs_clone = codecs.clone();
-        let excluded_clone = excluded_signal_ids.clone();
+        let excluded_clone = excluded_event_ids.clone();
 
-        let step_res: Result<Option<(bool, Option<String>)>, HarvestError> = conn
-            .transaction::<Option<(bool, Option<String>)>, HarvestError, _>(|conn| {
+        let step_res: Result<Option<(bool, Option<i64>)>, HarvestError> = conn
+            .transaction::<Option<(bool, Option<i64>)>, HarvestError, _>(|conn| {
                 let shards = shards_clone;
                 let codecs = codecs_clone;
                 let excluded = excluded_clone;
@@ -754,7 +754,7 @@ pub async fn enforce_external_signals_outbox(
                                  AND execs.state = 'RUNNING' \
                                  AND execs.shard_id = ANY($1) \
                                  AND (e.event_data->'data'->>'signal_id') IS NOT NULL \
-                                 AND NOT (e.event_data->'data'->>'signal_id' = ANY($2)) \
+                                 AND NOT (e.id = ANY($2)) \
                                  AND NOT EXISTS ( \
                                      SELECT 1 FROM harvest_events res \
                                      WHERE res.workflow_exec_id = e.workflow_exec_id \
@@ -766,7 +766,7 @@ pub async fn enforce_external_signals_outbox(
 
                     let row_opt: Option<crate::models::HarvestEvent> = diesel::sql_query(sql)
                         .bind::<diesel::sql_types::Array<diesel::sql_types::Integer>, _>(&shards)
-                        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(&excluded)
+                        .bind::<diesel::sql_types::Array<diesel::sql_types::BigInt>, _>(&excluded)
                         .get_result(conn)
                         .await
                         .optional()
@@ -787,16 +787,15 @@ pub async fn enforce_external_signals_outbox(
                         }) => (signal_id, target, signal_name, payload),
                         Ok(other) => {
                             tracing::error!(event = ?other, "outbox sweep: query returned non-ExternalSignalRequested event");
-                            return Ok(Some((false, None)));
+                            return Ok(Some((false, Some(row.id))));
                         }
                         Err(e) => {
                             tracing::error!(error = %e, "outbox sweep: failed to decode event_data");
-                            return Ok(Some((false, None)));
+                            return Ok(Some((false, Some(row.id))));
                         }
                     };
 
                     let (signal_id, target, signal_name, payload) = event;
-                    let signal_id_str = signal_id.to_string();
 
                     let age = Utc::now() - row.timestamp;
                     let grace_chrono = chrono::Duration::from_std(unknown_target_grace_window)
@@ -809,7 +808,7 @@ pub async fn enforce_external_signals_outbox(
                             reason_code: "target_unknown".to_string(),
                         };
 
-                        let history = store::load_history(conn, caller_exec_id).await?;
+                        let history = lock_workflow_execution_and_load_history(conn, caller_exec_id).await?;
                         store::append_events(
                             conn,
                             caller_exec_id,
@@ -824,57 +823,92 @@ pub async fn enforce_external_signals_outbox(
                     }
 
                     // Try to route target using the config's sharded pool if configured
-                    let target_pool = sharded_pool
-                        .as_ref()
-                        .and_then(|pool| pool.exact_pool_for_execution(target).cloned())
+                    let active_sharded_pool = sharded_pool
+                        .clone()
                         .or_else(|| {
-                            crate::shard::GLOBAL_SHARDED_POOL.read().map_or_else(
-                                |_| None,
-                                |lock| {
-                                    lock.as_ref()
-                                        .and_then(|pool| pool.exact_pool_for_execution(target).cloned())
-                                },
-                            )
+                            crate::shard::GLOBAL_SHARDED_POOL.read().ok()
+                                .and_then(|lock| lock.clone())
                         });
 
-                    let Some(pool) = target_pool else {
-                        tracing::warn!(
-                            target_shard = %target.shard(),
-                            "outbox sweep: target shard is not configured locally; leaving row locked/pending for other workers"
-                        );
-                        return Ok(Some((false, Some(signal_id_str))));
-                    };
+                    let same_pool = active_sharded_pool.as_ref().is_none_or(|pool| {
+                        if let (Some(t_pool), Some(c_pool)) = (
+                            pool.exact_pool_for_execution(target),
+                            pool.exact_pool_for_execution(caller_exec_id),
+                        ) {
+                            std::ptr::eq(t_pool, c_pool)
+                        } else {
+                            false
+                        }
+                    });
 
-                    let mut target_conn = match pool.get().await {
-                        Ok(c) => c,
-                        Err(e) => {
-                            tracing::error!(error = %e, "outbox sweep: failed to acquire target connection");
-                            return Ok(Some((false, Some(signal_id_str))));
+                    let terminal_opt = if same_pool {
+                        match crate::signal::send_signal(
+                            conn,
+                            target,
+                            &signal_name,
+                            payload.clone(),
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                Some(WorkflowEvent::ExternalSignalDelivered { signal_id })
+                            }
+                            Err(HarvestError::NotFound(_)) => {
+                                None
+                            }
+                            Err(HarvestError::Database(e)) => {
+                                tracing::error!(error = %e, "outbox sweep: db error during local signal delivery");
+                                None
+                            }
+                            Err(_) => Some(WorkflowEvent::ExternalSignalFailed {
+                                signal_id,
+                                reason_code: "target_terminal".to_string(),
+                            }),
                         }
-                    };
+                    } else {
+                        // Different pools, so we must have a target_pool resolved
+                        let Some(pool) = active_sharded_pool
+                            .as_ref()
+                            .and_then(|p| p.exact_pool_for_execution(target))
+                        else {
+                            tracing::warn!(
+                                target_shard = %target.shard(),
+                                "outbox sweep: target shard is not configured locally; leaving row locked/pending for other workers"
+                            );
+                            return Ok(Some((false, Some(row.id))));
+                        };
 
-                    let terminal_opt = match crate::signal::send_signal(
-                        &mut target_conn,
-                        target,
-                        &signal_name,
-                        payload.clone(),
-                    )
-                    .await
-                    {
-                        Ok(()) => {
-                            Some(WorkflowEvent::ExternalSignalDelivered { signal_id })
+                        let mut target_conn = match pool.get().await {
+                            Ok(c) => c,
+                            Err(e) => {
+                                tracing::error!(error = %e, "outbox sweep: failed to acquire target connection");
+                                return Ok(Some((false, Some(row.id))));
+                            }
+                        };
+
+                        match crate::signal::send_signal(
+                            &mut target_conn,
+                            target,
+                            &signal_name,
+                            payload.clone(),
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                Some(WorkflowEvent::ExternalSignalDelivered { signal_id })
+                            }
+                            Err(HarvestError::NotFound(_)) => {
+                                None
+                            }
+                            Err(HarvestError::Database(e)) => {
+                                tracing::error!(error = %e, "outbox sweep: db error during remote signal delivery");
+                                None
+                            }
+                            Err(_) => Some(WorkflowEvent::ExternalSignalFailed {
+                                signal_id,
+                                reason_code: "target_terminal".to_string(),
+                            }),
                         }
-                        Err(HarvestError::NotFound(_)) => {
-                            None
-                        }
-                        Err(HarvestError::Database(e)) => {
-                            tracing::error!(error = %e, "outbox sweep: db error during signal delivery");
-                            None
-                        }
-                        Err(_) => Some(WorkflowEvent::ExternalSignalFailed {
-                            signal_id,
-                            reason_code: "target_terminal".to_string(),
-                        }),
                     };
 
                     if let Some(terminal_event) = terminal_opt {
@@ -889,7 +923,7 @@ pub async fn enforce_external_signals_outbox(
                             _ => None,
                         };
 
-                        let history = store::load_history(conn, caller_exec_id).await?;
+                        let history = lock_workflow_execution_and_load_history(conn, caller_exec_id).await?;
                         store::append_events(
                             conn,
                             caller_exec_id,
@@ -902,7 +936,7 @@ pub async fn enforce_external_signals_outbox(
                         metrics.record_external_signal_sent(outcome, reason_code.as_deref());
                         Ok(Some((true, None)))
                     } else {
-                        Ok(Some((false, Some(signal_id_str))))
+                        Ok(Some((false, Some(row.id))))
                     }
                 }
                 .scope_boxed()
@@ -915,7 +949,7 @@ pub async fn enforce_external_signals_outbox(
                     count += 1;
                 }
                 if let Some(id) = skipped_id {
-                    excluded_signal_ids.push(id);
+                    excluded_event_ids.push(id);
                 }
             }
             Ok(None) => {
