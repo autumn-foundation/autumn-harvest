@@ -1025,6 +1025,7 @@ pub async fn wake_workflow_task(
                  worker_id = NULL, \
                  started_at = NULL, \
                  scheduled_at = $2, \
+                 activity_name = NULL, \
                  sticky_until = CASE \
                      WHEN sticky_worker_id IS NOT NULL AND sticky_timeout IS NOT NULL \
                      THEN NOW() + sticky_timeout \
@@ -1032,9 +1033,10 @@ pub async fn wake_workflow_task(
                  END \
              WHERE workflow_exec_id = $1 \
                AND task_type = 'workflow' \
-               AND state = 'RUNNING' \
-               AND worker_id IS NULL \
-               AND started_at IS NULL \
+               AND ( \
+                   (state = 'RUNNING' AND worker_id IS NULL AND started_at IS NULL) \
+                   OR (state = 'PENDING' AND scheduled_at > $2 AND activity_name = 'mixed_signal_suspension') \
+               ) \
              RETURNING queue_name",
         )
         .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())

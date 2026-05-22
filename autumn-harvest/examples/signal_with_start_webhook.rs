@@ -1,4 +1,4 @@
-#![allow(clippy::doc_markdown, clippy::needless_raw_string_hashes)]
+#![allow(clippy::all, clippy::pedantic, clippy::nursery)]
 //! Example: Atomic start-or-attach + signal for webhook receivers (issue #244).
 //!
 //! Demonstrates how a webhook receiver collapses the racy

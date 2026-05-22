@@ -529,6 +529,7 @@ impl HistoryMatcher {
     fn prepare_match(&mut self) -> bool {
         self.advance_to_next_unconsumed_event();
         self.drain_early_signals();
+        self.scan_ahead_for_external_signal_terminals();
         self.is_replaying()
     }
 
@@ -710,6 +711,55 @@ impl HistoryMatcher {
                 }
                 _ => break,
             }
+        }
+    }
+
+    /// Scan remaining unconsumed history events to resolve and consume
+    /// terminal events (delivered or failed) for any in-progress stashed signals.
+    /// This ensures we resolve signals that are finished but blocked by subsequent
+    /// un-fired timers or un-executed activities (mixed batch).
+    fn scan_ahead_for_external_signal_terminals(&mut self) {
+        if self.pending_external_signals.is_empty() {
+            return;
+        }
+
+        let mut scan_cursor = self.cursor;
+        while scan_cursor < self.events.len() {
+            if self.is_consumed(scan_cursor) {
+                scan_cursor += 1;
+                continue;
+            }
+
+            match &self.events[scan_cursor] {
+                WorkflowEvent::ExternalSignalDelivered { signal_id } => {
+                    let id = *signal_id;
+                    if let Some(p) = self
+                        .pending_external_signals
+                        .iter_mut()
+                        .find(|p| p.signal_id == id)
+                    {
+                        p.terminal = Some(StashedSignalTerminal::Delivered);
+                        self.consumed_signal_events.insert(scan_cursor);
+                    }
+                }
+                WorkflowEvent::ExternalSignalFailed {
+                    signal_id,
+                    reason_code,
+                } => {
+                    let id = *signal_id;
+                    let code = reason_code.clone();
+                    if let Some(p) = self
+                        .pending_external_signals
+                        .iter_mut()
+                        .find(|p| p.signal_id == id)
+                    {
+                        p.terminal = Some(StashedSignalTerminal::Failed(code));
+                        self.consumed_signal_events.insert(scan_cursor);
+                    }
+                }
+                _ => {}
+            }
+            scan_cursor += 1;
         }
     }
 
@@ -1049,8 +1099,18 @@ impl HistoryMatcher {
             })
         };
 
-        // Check stash populated by a PRIOR prepare_match call
-        // (e.g. scan_activity_terminal or match_signal interleaved past these events).
+        // prepare_match calls drain_early_signals which eagerly stashes any
+        // ExternalSignal events sitting at the current cursor. This ensures
+        // terminal events at the current cursor are paired with their start
+        // events before we check the stash.
+        // Track the stash size so we can distinguish "no history at all"
+        // from "history had a different signal here" after the drain.
+        let stash_size_before = self.pending_external_signals.len();
+        let has_history = self.prepare_match();
+
+        // Check the stash (which now includes any newly drained events from
+        // the current cursor position, as well as events stashed by prior
+        // prepare_match calls).
         //
         // Note: stash-based matching is position-independent — if two concurrent
         // signal_external calls share a drain batch, swapping their call order in
@@ -1058,17 +1118,6 @@ impl HistoryMatcher {
         // accepted trade-off: concurrent signals have no authoritative ordering in
         // history; sequential calls (each in their own execution cycle) always reach
         // cursor-based matching below and DO detect reordering.
-        if let Some(result) = try_stash(&mut self.pending_external_signals) {
-            return result;
-        }
-
-        // prepare_match calls drain_early_signals which eagerly stashes any
-        // ExternalSignal events sitting at the current cursor.  Check the
-        // stash again immediately after to consume what was just drained.
-        // Track the stash size so we can distinguish "no history at all"
-        // from "history had a different signal here" after the drain.
-        let stash_size_before = self.pending_external_signals.len();
-        let has_history = self.prepare_match();
         if let Some(result) = try_stash(&mut self.pending_external_signals) {
             return result;
         }

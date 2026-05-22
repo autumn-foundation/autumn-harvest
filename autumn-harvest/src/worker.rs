@@ -107,6 +107,11 @@ pub struct WorkerRuntimeConfig {
     /// the claim SQL can boost effective priority for long-waiting tasks.
     /// `None` disables aging.
     pub priority_aging_secs: Option<u32>,
+    /// Grace window before cross-workflow signaling fails for unknown target (issue #330).
+    pub unknown_target_grace_window: Duration,
+    #[cfg(feature = "db")]
+    /// Optional sharded database pool for exact shard routing.
+    pub sharded_pool: Option<crate::shard::ShardedDbPool>,
 }
 
 impl WorkerRuntimeConfig {
@@ -144,6 +149,9 @@ impl From<WorkerConfig> for WorkerRuntimeConfig {
             deployment_name: cfg.deployment_name,
             workflow_cache_size: cfg.workflow_cache_size,
             priority_aging_secs: cfg.priority_aging_secs,
+            unknown_target_grace_window: cfg.unknown_target_grace_window,
+            #[cfg(feature = "db")]
+            sharded_pool: cfg.sharded_pool,
         }
     }
 }
@@ -403,15 +411,19 @@ fn should_requeue_signal_wait(commands: &[WorkflowCommand]) -> bool {
         return false;
     }
 
-    let has_wait = commands
-        .iter()
-        .any(|cmd| matches!(cmd, WorkflowCommand::WaitForSignal { .. }));
+    let has_wait = commands.iter().any(|cmd| {
+        matches!(
+            cmd,
+            WorkflowCommand::WaitForSignal { .. } | WorkflowCommand::SignalExternalWorkflow { .. }
+        )
+    });
     // RecordUpdateResult and UpsertSearchAttributes are bookkeeping already
     // handled before this check; they don't affect the signal-wait decision.
     let only_wait_or_bookkeeping = commands.iter().all(|cmd| {
         matches!(
             cmd,
             WorkflowCommand::WaitForSignal { .. }
+                | WorkflowCommand::SignalExternalWorkflow { .. }
                 | WorkflowCommand::RecordMarker { .. }
                 | WorkflowCommand::RecordUpdateResult { .. }
                 | WorkflowCommand::UpsertSearchAttributes { .. }
@@ -781,6 +793,7 @@ fn extract_run_local_activity(
 // SignalExternalWorkflow inline dispatch (same-shard)
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 struct SignalExternalWorkflowRun {
     signal_id: crate::types::ExternalSignalId,
     target: ExecutionId,
@@ -796,6 +809,7 @@ struct SignalExternalWorkflowRun {
 /// signal run. Preserving the original command-emission order is required so
 /// that the replay cursor sees events in the exact same sequence as during the
 /// live execution that produced them.
+#[derive(Clone)]
 enum SignalBatchItem {
     Marker(WorkflowEvent),
     Signal(SignalExternalWorkflowRun),
@@ -936,7 +950,13 @@ async fn persist_external_signal_inline(
                     new_events.push(requested);
                 }
 
-                let terminal = match signal::send_signal(
+                // If cross-shard, skip inline delivery entirely and let the background outbox handle it.
+                if run.target.shard() != exec_id.shard() {
+                    continue;
+                }
+
+                // Same-shard delivery attempt
+                let terminal_opt = match signal::send_signal(
                     conn,
                     run.target,
                     &run.signal_name,
@@ -944,29 +964,31 @@ async fn persist_external_signal_inline(
                 )
                 .await
                 {
-                    Ok(()) => WorkflowEvent::ExternalSignalDelivered {
+                    Ok(()) => Some(WorkflowEvent::ExternalSignalDelivered {
                         signal_id: run.signal_id,
-                    },
-                    Err(HarvestError::NotFound(_)) => WorkflowEvent::ExternalSignalFailed {
-                        signal_id: run.signal_id,
-                        reason_code: "target_unknown".to_string(),
-                    },
+                    }),
+                    Err(HarvestError::NotFound(_)) => {
+                        // Same-shard target not found: suspend inline delivery and leave resolution to outbox.
+                        None
+                    }
                     Err(HarvestError::Database(e)) => return Err(HarvestError::Database(e)),
-                    Err(_) => WorkflowEvent::ExternalSignalFailed {
+                    Err(_) => Some(WorkflowEvent::ExternalSignalFailed {
                         signal_id: run.signal_id,
                         reason_code: "target_terminal".to_string(),
-                    },
+                    }),
                 };
 
-                store::append_events(
-                    conn,
-                    exec_id,
-                    std::slice::from_ref(&terminal),
-                    *next_event_id,
-                )
-                .await?;
-                *next_event_id += 1;
-                new_events.push(terminal);
+                if let Some(terminal) = terminal_opt {
+                    store::append_events(
+                        conn,
+                        exec_id,
+                        std::slice::from_ref(&terminal),
+                        *next_event_id,
+                    )
+                    .await?;
+                    *next_event_id += 1;
+                    new_events.push(terminal);
+                }
             }
         }
     }
@@ -1990,6 +2012,8 @@ async fn persist_started_timer(
 
     conn.transaction::<(), HarvestError, _>(|conn| {
         async move {
+            use crate::schema::harvest_task_queue::dsl as queue_dsl;
+
             store::append_events(conn, exec_id, &events, next_event_id).await?;
             diesel::insert_into(harvest_timers::table)
                 .values(&new_timer)
@@ -1997,6 +2021,50 @@ async fn persist_started_timer(
                 .await
                 .map_err(crate::error::database_error)?;
             queue::reschedule_task(conn, task_id, fires_at).await?;
+            let mut is_mixed = commands.iter().any(|cmd| {
+                matches!(
+                    cmd,
+                    WorkflowCommand::WaitForSignal { .. } | WorkflowCommand::SignalExternalWorkflow { .. }
+                )
+            });
+            if !is_mixed {
+                #[derive(diesel::deserialize::QueryableByName)]
+                struct DummyRow {
+                    #[diesel(sql_type = diesel::sql_types::Integer)]
+                    #[allow(dead_code)]
+                    dummy: i32,
+                }
+                let unresolved_exists: Result<Vec<DummyRow>, diesel::result::Error> = diesel::sql_query(
+                    "SELECT 1 AS dummy FROM harvest_events e \
+                     WHERE e.workflow_exec_id = $1 \
+                       AND e.event_type = 'ExternalSignalRequested' \
+                       AND NOT EXISTS ( \
+                           SELECT 1 FROM harvest_events res \
+                           WHERE res.workflow_exec_id = e.workflow_exec_id \
+                             AND res.event_type IN ('ExternalSignalDelivered', 'ExternalSignalFailed') \
+                             AND res.event_data->'data'->>'signal_id' = e.event_data->'data'->>'signal_id' \
+                       ) \
+                     LIMIT 1"
+                )
+                .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+                .load(conn)
+                .await;
+                if let Ok(rows) = unresolved_exists
+                    && !rows.is_empty()
+                {
+                    is_mixed = true;
+                }
+            }
+            let activity_name_val = if is_mixed {
+                Some("mixed_signal_suspension".to_string())
+            } else {
+                None
+            };
+            diesel::update(queue_dsl::harvest_task_queue.find(task_id))
+                .set(queue_dsl::activity_name.eq(activity_name_val))
+                .execute(conn)
+                .await
+                .map_err(crate::error::database_error)?;
             if sticky.is_some() {
                 queue::set_task_sticky_affinity(conn, task_id, sticky).await?;
             }
@@ -3942,6 +4010,7 @@ async fn process_workflow_task(
                 );
                 drop(execute_span);
                 let items = extract_signal_external_workflow(commands);
+                let items_clone = items.clone();
                 let new_events = match persist_external_signal_inline(
                     conn,
                     prepared.exec_id,
@@ -3956,7 +4025,7 @@ async fn process_workflow_task(
                             .await;
                     }
                 };
-                history_events.extend(new_events);
+                history_events.extend(new_events.clone());
                 let current_history_event_count =
                     u64::try_from(history_events.len()).unwrap_or(u64::MAX);
                 if let Some(cap) = registry.history_policy().event_hard_cap()
@@ -3975,6 +4044,61 @@ async fn process_workflow_task(
                         cap,
                     )
                     .await;
+                }
+
+                // If any signal in the batch was not resolved inline (remains pending/suspended),
+                // we must break the loop and suspend the workflow task.
+                let mut all_resolved = true;
+                for item in &items_clone {
+                    if let SignalBatchItem::Signal(run) = item {
+                        let resolved = new_events.iter().any(|e| match e {
+                            WorkflowEvent::ExternalSignalDelivered { signal_id }
+                            | WorkflowEvent::ExternalSignalFailed { signal_id, .. } => {
+                                *signal_id == run.signal_id
+                            }
+                            _ => false,
+                        });
+                        if !resolved {
+                            all_resolved = false;
+                            break;
+                        }
+                    }
+                }
+
+                if !all_resolved {
+                    let mut reconstructed_commands = Vec::with_capacity(items_clone.len());
+                    for item in items_clone {
+                        match item {
+                            SignalBatchItem::Marker(_) => {
+                                // Already persisted via persist_external_signal_inline.
+                                // Do not reconstruct or re-append to avoid duplicate marker events in history.
+                            }
+                            SignalBatchItem::Signal(run) => {
+                                let (dummy_tx, _) = tokio::sync::oneshot::channel();
+                                reconstructed_commands.push(
+                                    WorkflowCommand::SignalExternalWorkflow {
+                                        signal_id: run.signal_id,
+                                        target: run.target,
+                                        signal_name: run.signal_name,
+                                        payload: run.payload,
+                                        result_tx: dummy_tx,
+                                        already_requested: run.already_requested,
+                                    },
+                                );
+                            }
+                        }
+                    }
+
+                    // Re-acquire a fresh execute_span so persist_workflow_outcome
+                    // (via handle_suspended_workflow) gets a valid span reference.
+                    let execute_span = tracing::Span::none();
+                    break (
+                        WorkflowOutcome::Suspended {
+                            commands: reconstructed_commands,
+                        },
+                        pending_cmds,
+                        execute_span,
+                    );
                 }
             }
             // Mixed batch: contains SignalExternalWorkflow AND other durable commands
@@ -4022,6 +4146,7 @@ async fn process_workflow_task(
                             .await;
                     }
                 };
+                let remaining_commands_with_unresolved = remaining_commands;
                 history_events.extend(new_events);
                 let current_history_event_count =
                     u64::try_from(history_events.len()).unwrap_or(u64::MAX);
@@ -4048,7 +4173,7 @@ async fn process_workflow_task(
                 let execute_span = tracing::Span::none();
                 break (
                     WorkflowOutcome::Suspended {
-                        commands: remaining_commands,
+                        commands: remaining_commands_with_unresolved,
                     },
                     pending_cmds,
                     execute_span,
@@ -4609,6 +4734,9 @@ impl Worker {
             self.shutdown.clone(),
             self.config.poll_interval,
             self.registry.telemetry().clone(),
+            self.config.unknown_target_grace_window,
+            self.config.sharded_pool.clone(),
+            self.config.shard_assignments.clone(),
         );
 
         WorkerMonitoringHandles {
@@ -5037,6 +5165,9 @@ mod tests {
             deployment_name: None,
             workflow_cache_size: 1000,
             priority_aging_secs: None,
+            unknown_target_grace_window: Duration::from_secs(5),
+            #[cfg(feature = "db")]
+            sharded_pool: None,
         }
     }
 
@@ -5096,6 +5227,9 @@ mod tests {
             query_timeout: Duration::from_secs(5),
             priority_aging_secs: None,
             max_workflow_start_delay: Duration::from_secs(365 * 24 * 3600),
+            unknown_target_grace_window: Duration::from_secs(5),
+            #[cfg(feature = "db")]
+            sharded_pool: None,
         };
 
         let runtime_cfg: WorkerRuntimeConfig = builder_cfg.into();
@@ -5112,6 +5246,10 @@ mod tests {
         assert_eq!(
             runtime_cfg.cancellation_grace_period,
             Duration::from_secs(10)
+        );
+        assert_eq!(
+            runtime_cfg.unknown_target_grace_window,
+            Duration::from_secs(5)
         );
         // worker_id should be a valid UUID
         assert!(uuid::Uuid::parse_str(&runtime_cfg.worker_id).is_ok());

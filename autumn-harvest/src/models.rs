@@ -126,7 +126,14 @@ pub struct NewWorkflowExecution<'a> {
 
 /// A single event in the workflow execution history (append-only).
 #[derive(
-    Debug, Clone, Queryable, Selectable, Identifiable, serde::Serialize, serde::Deserialize,
+    Debug,
+    Clone,
+    Queryable,
+    QueryableByName,
+    Selectable,
+    Identifiable,
+    serde::Serialize,
+    serde::Deserialize,
 )]
 #[diesel(table_name = harvest_events)]
 #[diesel(check_for_backend(diesel::pg::Pg))]

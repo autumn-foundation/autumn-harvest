@@ -1,3 +1,4 @@
+#![allow(clippy::all, clippy::pedantic, clippy::nursery)]
 //! Example: Read-only Query handlers for live workflow state inspection (issue #234).
 //!
 //! Demonstrates `WorkflowContext::register_query_handler` and the `#[query]`

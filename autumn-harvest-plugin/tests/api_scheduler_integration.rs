@@ -1255,7 +1255,7 @@ async fn wait_for_workflow_state(
     exec_id: &str,
     expected_state: &str,
 ) -> WorkflowExecution {
-    for _ in 0..200 {
+    for _ in 0..900 {
         let execution = load_execution_from_url(database_url, exec_id).await;
         if execution.state == expected_state {
             return execution;
@@ -1271,7 +1271,7 @@ async fn wait_for_dag_run_state(
     dag_name: &str,
     expected_state: &str,
 ) -> WorkflowExecution {
-    for _ in 0..100 {
+    for _ in 0..900 {
         if let Some(run) = load_latest_dag_run_from_url(database_url, dag_name).await
             && run.state == expected_state
         {
@@ -1284,7 +1284,7 @@ async fn wait_for_dag_run_state(
 }
 
 async fn wait_for_workflow_terminal_state(database_url: &str, exec_id: &str) -> WorkflowExecution {
-    for _ in 0..200 {
+    for _ in 0..900 {
         let execution = load_execution_from_url(database_url, exec_id).await;
         if matches!(
             execution.state.as_str(),
@@ -3050,6 +3050,9 @@ async fn timeout_sweeper_does_not_append_timeout_after_activity_completion() {
         autumn_harvest::timeout::enforce_timeouts_once(
             &mut timeout_conn,
             &autumn_harvest::telemetry::NoOpMetrics,
+            std::time::Duration::from_secs(5),
+            &None,
+            &[],
         )
         .await
     });

@@ -645,6 +645,8 @@ fn build_runtime_worker(
                 deployment_name: None,
                 workflow_cache_size: 1000,
                 priority_aging_secs: None,
+                unknown_target_grace_window: Duration::from_secs(5),
+                sharded_pool: None,
             },
             registry,
         )
@@ -1204,6 +1206,8 @@ async fn worker_completes_workflow_task_and_persists_result() {
                 deployment_name: None,
                 workflow_cache_size: 1000,
                 priority_aging_secs: None,
+                unknown_target_grace_window: Duration::from_secs(5),
+                sharded_pool: None,
             },
             registry,
         )
@@ -1305,6 +1309,8 @@ async fn worker_marks_workflow_failed_when_handler_errors() {
                 deployment_name: None,
                 workflow_cache_size: 1000,
                 priority_aging_secs: None,
+                unknown_target_grace_window: Duration::from_secs(5),
+                sharded_pool: None,
             },
             registry,
         )
@@ -1434,6 +1440,8 @@ async fn worker_completes_workflow_with_activity_round_trip() {
                 deployment_name: None,
                 workflow_cache_size: 1000,
                 priority_aging_secs: None,
+                unknown_target_grace_window: Duration::from_secs(5),
+                sharded_pool: None,
             },
             registry,
         )
@@ -1578,6 +1586,7 @@ async fn activity_retry_resumes_from_persisted_heartbeat_details() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
 async fn worker_fails_orphaned_activity_task_without_scheduled_event() {
     let (database_url, _container) = setup_test_database_url().await;
     let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
@@ -1623,6 +1632,8 @@ async fn worker_fails_orphaned_activity_task_without_scheduled_event() {
                 deployment_name: None,
                 workflow_cache_size: 1000,
                 priority_aging_secs: None,
+                unknown_target_grace_window: Duration::from_secs(5),
+                sharded_pool: None,
             },
             Arc::new(HandlerRegistry::new(
                 vec![],
@@ -1758,10 +1769,15 @@ async fn timeout_enforcement_fails_pending_activity_and_wakes_workflow() {
         .await
         .expect("enqueue timed-out activity task failed");
 
-    let enforced =
-        timeout::enforce_timeouts_once(&mut conn, &autumn_harvest::telemetry::NoOpMetrics)
-            .await
-            .expect("timeout enforcement should succeed");
+    let enforced = timeout::enforce_timeouts_once(
+        &mut conn,
+        &autumn_harvest::telemetry::NoOpMetrics,
+        std::time::Duration::from_secs(5),
+        &None,
+        &[],
+    )
+    .await
+    .expect("timeout enforcement should succeed");
     assert_eq!(enforced, 1);
 
     let workflow_task = load_task_from_url(&database_url, workflow_task_id).await;
@@ -1839,6 +1855,8 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
                 deployment_name: None,
                 workflow_cache_size: 1000,
                 priority_aging_secs: None,
+                unknown_target_grace_window: Duration::from_secs(5),
+                sharded_pool: None,
             },
             Arc::new(HandlerRegistry::new(
                 vec![WorkflowInfo {
@@ -1968,6 +1986,8 @@ async fn worker_completes_workflow_with_timer_round_trip() {
                 deployment_name: None,
                 workflow_cache_size: 1000,
                 priority_aging_secs: None,
+                unknown_target_grace_window: Duration::from_secs(5),
+                sharded_pool: None,
             },
             Arc::new(HandlerRegistry::new(
                 vec![WorkflowInfo {
@@ -4380,6 +4400,8 @@ async fn workflow_schedule_baseline_dispatches_multiple_runs() {
                 deployment_name: None,
                 workflow_cache_size: 1000,
                 priority_aging_secs: None,
+                unknown_target_grace_window: Duration::from_secs(5),
+                sharded_pool: None,
             },
             Arc::clone(&registry),
         )
@@ -4480,6 +4502,8 @@ async fn workflow_schedule_max_active_runs_enforced() {
                 deployment_name: None,
                 workflow_cache_size: 1000,
                 priority_aging_secs: None,
+                unknown_target_grace_window: Duration::from_secs(5),
+                sharded_pool: None,
             },
             Arc::clone(&registry),
         )
@@ -4568,6 +4592,8 @@ async fn workflow_schedule_pause_and_resume() {
                 deployment_name: None,
                 workflow_cache_size: 1000,
                 priority_aging_secs: None,
+                unknown_target_grace_window: Duration::from_secs(5),
+                sharded_pool: None,
             },
             Arc::clone(&registry),
         )

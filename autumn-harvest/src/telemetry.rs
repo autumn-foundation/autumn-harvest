@@ -149,6 +149,9 @@ pub const ATTR_SIGNAL_NAME: &str = "harvest.signal.name";
 /// never be used as a metric label.
 pub const ATTR_TARGET_EXECUTION_ID: &str = "harvest.target.execution.id";
 
+/// OpenTelemetry span attribute: the signal ID for external signal spans.
+pub const ATTR_SIGNAL_ID: &str = "harvest.signal.id";
+
 /// Counter: incremented when a workflow execution is terminated because its
 /// `deadline_at` elapsed before the workflow completed.
 ///
@@ -212,6 +215,10 @@ pub const METRIC_LABEL_REASON: &str = "reason";
 pub const METRIC_LABEL_KEY: &str = "key";
 /// Metric label: the query handler name (`query.name`).
 pub const METRIC_LABEL_QUERY: &str = "query.name";
+/// Metric label: terminal outcome (e.g. `"delivered"`, `"failed"`).
+pub const METRIC_LABEL_OUTCOME: &str = "outcome";
+/// Metric label: reason code for external signal failure.
+pub const METRIC_LABEL_REASON_CODE: &str = "reason_code";
 
 // ---------------------------------------------------------------------------
 // TraceContextCarrier
@@ -660,6 +667,15 @@ pub trait MetricsRecorder: Send + Sync {
     /// `payload.kind` and `workflow.type`.
     fn record_payload_rejected(&self, kind: &crate::error::PayloadKind, workflow_type: &str) {
         let _ = (kind, workflow_type);
+    }
+
+    /// A cross-workflow external signal was sent.
+    ///
+    /// Maps to the counter `harvest.workflow.external_signal.sent` with attributes:
+    /// - `outcome`: `"delivered"` or `"failed"`
+    /// - `reason_code`: `"target_terminal"` or `"target_unknown"` (optional)
+    fn record_external_signal_sent(&self, outcome: &str, reason_code: Option<&str>) {
+        let _ = (outcome, reason_code);
     }
 }
 

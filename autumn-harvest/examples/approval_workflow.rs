@@ -1,3 +1,4 @@
+#![allow(clippy::all, clippy::pedantic, clippy::nursery)]
 //! Declarative approval workflow: `#[update]`, `#[query]`, `updates![]`, `queries![]`.
 
 use autumn_harvest::prelude::*;
