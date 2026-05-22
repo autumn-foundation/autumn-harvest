@@ -1025,6 +1025,7 @@ pub async fn wake_workflow_task(
                  worker_id = NULL, \
                  started_at = NULL, \
                  scheduled_at = $2, \
+                 activity_name = NULL, \
                  sticky_until = CASE \
                      WHEN sticky_worker_id IS NOT NULL AND sticky_timeout IS NOT NULL \
                      THEN NOW() + sticky_timeout \
@@ -1034,7 +1035,7 @@ pub async fn wake_workflow_task(
                AND task_type = 'workflow' \
                AND ( \
                    (state = 'RUNNING' AND worker_id IS NULL AND started_at IS NULL) \
-                   OR (state = 'PENDING' AND scheduled_at > $2) \
+                   OR (state = 'PENDING' AND scheduled_at > $2 AND activity_name = 'mixed_signal_suspension') \
                ) \
              RETURNING queue_name",
         )

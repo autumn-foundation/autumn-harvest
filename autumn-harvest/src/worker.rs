@@ -2012,6 +2012,8 @@ async fn persist_started_timer(
 
     conn.transaction::<(), HarvestError, _>(|conn| {
         async move {
+            use crate::schema::harvest_task_queue::dsl as queue_dsl;
+
             store::append_events(conn, exec_id, &events, next_event_id).await?;
             diesel::insert_into(harvest_timers::table)
                 .values(&new_timer)
@@ -2019,6 +2021,50 @@ async fn persist_started_timer(
                 .await
                 .map_err(crate::error::database_error)?;
             queue::reschedule_task(conn, task_id, fires_at).await?;
+            let mut is_mixed = commands.iter().any(|cmd| {
+                matches!(
+                    cmd,
+                    WorkflowCommand::WaitForSignal { .. } | WorkflowCommand::SignalExternalWorkflow { .. }
+                )
+            });
+            if !is_mixed {
+                #[derive(diesel::deserialize::QueryableByName)]
+                struct DummyRow {
+                    #[diesel(sql_type = diesel::sql_types::Integer)]
+                    #[allow(dead_code)]
+                    dummy: i32,
+                }
+                let unresolved_exists: Result<Vec<DummyRow>, diesel::result::Error> = diesel::sql_query(
+                    "SELECT 1 AS dummy FROM harvest_events e \
+                     WHERE e.workflow_exec_id = $1 \
+                       AND e.event_type = 'ExternalSignalRequested' \
+                       AND NOT EXISTS ( \
+                           SELECT 1 FROM harvest_events res \
+                           WHERE res.workflow_exec_id = e.workflow_exec_id \
+                             AND res.event_type IN ('ExternalSignalDelivered', 'ExternalSignalFailed') \
+                             AND res.event_data->'data'->>'signal_id' = e.event_data->'data'->>'signal_id' \
+                       ) \
+                     LIMIT 1"
+                )
+                .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+                .load(conn)
+                .await;
+                if let Ok(rows) = unresolved_exists
+                    && !rows.is_empty()
+                {
+                    is_mixed = true;
+                }
+            }
+            let activity_name_val = if is_mixed {
+                Some("mixed_signal_suspension".to_string())
+            } else {
+                None
+            };
+            diesel::update(queue_dsl::harvest_task_queue.find(task_id))
+                .set(queue_dsl::activity_name.eq(activity_name_val))
+                .execute(conn)
+                .await
+                .map_err(crate::error::database_error)?;
             if sticky.is_some() {
                 queue::set_task_sticky_affinity(conn, task_id, sticky).await?;
             }

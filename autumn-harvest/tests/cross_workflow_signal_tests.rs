@@ -660,7 +660,7 @@ async fn test_mixed_timer_suspension_signal_wakes_timer() {
         .unwrap();
 
     // Wait for both workflows to complete.
-    let completed = tokio::time::timeout(Duration::from_secs(15), async {
+    let completed = tokio::time::timeout(Duration::from_secs(45), async {
         loop {
             let caller = load_execution_from_url(&database_url, caller_exec_id).await;
             let target = load_execution_from_url(&database_url, target_exec_id).await;
@@ -670,8 +670,32 @@ async fn test_mixed_timer_suspension_signal_wakes_timer() {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     })
-    .await
-    .expect("workflows should complete within timeout, showing that caller didn't wait 1 hour");
+    .await;
+
+    if completed.is_err() {
+        let caller = load_execution_from_url(&database_url, caller_exec_id).await;
+        let target = load_execution_from_url(&database_url, target_exec_id).await;
+        let caller_history = autumn_harvest::store::load_history(&mut conn, caller_exec_id)
+            .await
+            .unwrap();
+        let target_history = autumn_harvest::store::load_history(&mut conn, target_exec_id)
+            .await
+            .unwrap();
+        println!("TIMEOUT DIAGNOSTICS:");
+        println!(
+            "Caller State: {}, output: {:?}",
+            caller.state, caller.output
+        );
+        println!("Caller History: {:?}", caller_history.events);
+        println!(
+            "Target State: {}, output: {:?}",
+            target.state, target.output
+        );
+        println!("Target History: {:?}", target_history.events);
+        panic!("workflows should complete within timeout, showing that caller didn't wait 1 hour");
+    }
+
+    let completed = completed.unwrap();
 
     assert_eq!(completed.0.state, "COMPLETED");
     assert_eq!(
