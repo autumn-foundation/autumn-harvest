@@ -321,7 +321,7 @@ async fn single_shard_scaling_signals_endpoint_correctly_categorizes_tasks_and_w
 
     let qescape = arr
         .iter()
-        .find(|q| q["queue"] == "queue\"\\a")
+        .find(|q| q["queue"] == "queue\"\\\\a")
         .expect("missing escaped queue");
     assert_eq!(qescape["backlog"], 1);
     assert_eq!(qescape["in_flight"], 0);
@@ -340,8 +340,8 @@ async fn single_shard_scaling_signals_endpoint_correctly_categorizes_tasks_and_w
     assert!(text_prom_q.contains("harvest_queue_in_flight{queue=\"queue-b\"} 1"));
     assert!(text_prom_q.contains("harvest_queue_scheduled{queue=\"queue-b\"} 0"));
     assert!(text_prom_q.contains("harvest_queue_active_workers{queue=\"queue-b\"} 1"));
-    assert!(text_prom_q.contains("harvest_queue_backlog{queue=\"queue\\\"\\\\a\"} 1"));
-    assert!(text_prom_q.contains("harvest_queue_active_workers{queue=\"queue\\\"\\\\a\"} 1"));
+    assert!(text_prom_q.contains("harvest_queue_backlog{queue=\"queue\\\"\\\\\\\\a\"} 1"));
+    assert!(text_prom_q.contains("harvest_queue_active_workers{queue=\"queue\\\"\\\\\\\\a\"} 1"));
 
     // 3. /admin/metrics endpoint
     let (status_metrics, text_metrics) = get_text(&app, "/admin/metrics").await;
@@ -354,8 +354,8 @@ async fn single_shard_scaling_signals_endpoint_correctly_categorizes_tasks_and_w
     assert!(text_metrics.contains("harvest_queue_in_flight{queue=\"queue-b\"} 1"));
     assert!(text_metrics.contains("harvest_queue_scheduled{queue=\"queue-b\"} 0"));
     assert!(text_metrics.contains("harvest_queue_active_workers{queue=\"queue-b\"} 1"));
-    assert!(text_metrics.contains("harvest_queue_backlog{queue=\"queue\\\"\\\\a\"} 1"));
-    assert!(text_metrics.contains("harvest_queue_active_workers{queue=\"queue\\\"\\\\a\"} 1"));
+    assert!(text_metrics.contains("harvest_queue_backlog{queue=\"queue\\\"\\\\\\\\a\"} 1"));
+    assert!(text_metrics.contains("harvest_queue_active_workers{queue=\"queue\\\"\\\\\\\\a\"} 1"));
 }
 
 #[tokio::test]
