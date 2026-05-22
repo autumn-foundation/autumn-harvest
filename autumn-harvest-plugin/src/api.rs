@@ -13,7 +13,6 @@ use autumn_web::session::Session;
 use axum::Extension;
 use axum::Json;
 use axum::Router;
-use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
@@ -1320,6 +1319,7 @@ const DEFAULT_EXTERNAL_HANDOFF_LIMIT: i64 = 100;
 const MAX_EXTERNAL_HANDOFF_LIMIT: i64 = 500;
 const DEFAULT_HISTORY_BATCH_EXPORT_LIMIT: usize = 100;
 const MAX_HISTORY_BATCH_EXPORT_LIMIT: usize = 1_000;
+const MAX_API_PAYLOAD_BYTES: usize = 10 * 1024 * 1024;
 
 #[derive(Debug, Default, Clone)]
 pub(crate) struct WorkflowFilters {
@@ -5140,15 +5140,18 @@ struct QueryWorkflowResponse {
 async fn query_workflow_post(
     Extension(api_state): Extension<HarvestApiState>,
     Path((id, query_name)): Path<(String, String)>,
-    body: Bytes,
+    body: axum::body::Body,
 ) -> Result<Json<QueryWorkflowResponse>, AutumnError> {
+    let bytes = axum::body::to_bytes(body, MAX_API_PAYLOAD_BYTES)
+        .await
+        .map_err(|e| AutumnError::bad_request_msg(format!("failed to read body: {e}")))?;
     let exec_id = parse_execution_id(&id)?;
     let ctx = hydrate_ctx_for_query(&api_state, exec_id).await?;
     let start = Instant::now(); // measure handler invocation latency, not hydration cost
-    let args: Value = if body.is_empty() {
+    let args: Value = if bytes.is_empty() {
         Value::Null
     } else {
-        serde_json::from_slice::<QueryWorkflowRequest>(&body)
+        serde_json::from_slice::<QueryWorkflowRequest>(&bytes)
             .map(|r| r.args)
             .map_err(|e| AutumnError::bad_request_msg(format!("invalid JSON body: {e}")))?
     };
@@ -7877,14 +7880,23 @@ fn url_encode_for_redirect(input: &str) -> String {
     out
 }
 
+#[allow(clippy::too_many_lines)]
 async fn bulk_replay_dead_letters_handler(
     Extension(api_state): Extension<HarvestApiState>,
     headers: axum::http::HeaderMap,
-    body: axum::body::Bytes,
+    body: axum::body::Body,
 ) -> axum::response::Response {
     use axum::response::IntoResponse as _;
 
-    let request = match parse_bulk_dlq_request(&headers, &body) {
+    let bytes = match axum::body::to_bytes(body, MAX_API_PAYLOAD_BYTES).await {
+        Ok(b) => b,
+        Err(e) => {
+            return AutumnError::bad_request_msg(format!("failed to read body: {e}"))
+                .into_response();
+        }
+    };
+
+    let request = match parse_bulk_dlq_request(&headers, &bytes) {
         Ok(request) => request,
         Err(error) => return error.into_response(),
     };
@@ -7985,14 +7997,23 @@ async fn bulk_replay_dead_letters_handler(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn bulk_discard_dead_letters_handler(
     Extension(api_state): Extension<HarvestApiState>,
     headers: axum::http::HeaderMap,
-    body: axum::body::Bytes,
+    body: axum::body::Body,
 ) -> axum::response::Response {
     use axum::response::IntoResponse as _;
 
-    let request = match parse_bulk_dlq_request(&headers, &body) {
+    let bytes = match axum::body::to_bytes(body, MAX_API_PAYLOAD_BYTES).await {
+        Ok(b) => b,
+        Err(e) => {
+            return AutumnError::bad_request_msg(format!("failed to read body: {e}"))
+                .into_response();
+        }
+    };
+
+    let request = match parse_bulk_dlq_request(&headers, &bytes) {
         Ok(request) => request,
         Err(error) => return error.into_response(),
     };
@@ -11467,6 +11488,26 @@ mod tests {
 
         let f = parse_worker_filters_api(&pairs(&[("limit", "0")])).unwrap();
         assert_eq!(f.limit, 1);
+    }
+
+    #[tokio::test]
+    async fn warden_dos_payload_exploit_test() {
+        use axum::body::Body;
+        let handler =
+            axum::routing::post(query_workflow_post).layer(axum::Extension(HarvestApiState::new()));
+        let app = axum::Router::new().route("/workflows/{id}/query/{query_name}", handler);
+
+        let payload_size = MAX_API_PAYLOAD_BYTES + 10;
+        let request = axum::http::Request::builder()
+            .method(axum::http::Method::POST)
+            .uri("/workflows/test/query/q")
+            .body(Body::from(vec![0u8; payload_size]))
+            .unwrap();
+
+        use tower::ServiceExt;
+        let response = app.oneshot(request).await.unwrap();
+        // Memory limit should block request and return BAD_REQUEST
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
     }
 
     #[test]
