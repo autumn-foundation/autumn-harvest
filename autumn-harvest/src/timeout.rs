@@ -723,187 +723,207 @@ pub async fn enforce_external_signals_outbox(
     conn: &mut AsyncPgConnection,
     metrics: &dyn MetricsRecorder,
     unknown_target_grace_window: Duration,
+    sharded_pool: &Option<crate::shard::ShardedDbPool>,
+    shard_assignments: &[crate::types::ShardId],
 ) -> HarvestResult<usize> {
-    let sql = "SELECT * FROM harvest_events \
-               WHERE event_type = 'ExternalSignalRequested' \
-               AND NOT EXISTS ( \
-                   SELECT 1 FROM harvest_events res \
-                   WHERE res.workflow_exec_id = harvest_events.workflow_exec_id \
-                   AND res.event_type IN ('ExternalSignalDelivered', 'ExternalSignalFailed') \
-                   AND res.event_data->'data'->>'signal_id' = harvest_events.event_data->'data'->>'signal_id' \
-               )";
-    let pending_rows: Vec<crate::models::HarvestEvent> = diesel::sql_query(sql)
-        .load(conn)
-        .await
-        .map_err(crate::error::database_error)?;
-
-    tracing::debug!(
-        "enforce_external_signals_outbox: found {} pending outbox rows",
-        pending_rows.len()
-    );
-
     let mut count = 0;
     let codecs = crate::payload_codec::PayloadCodecs::default();
 
-    for row in pending_rows {
-        let caller_exec_id = crate::types::ExecutionId::from_uuid(row.workflow_exec_id);
+    let shards: Vec<i32> = if shard_assignments.is_empty() {
+        vec![0]
+    } else {
+        shard_assignments.iter().map(|s| s.as_i32()).collect()
+    };
 
-        match codecs.decode_event(row.event_data.clone()) {
-            Ok(WorkflowEvent::ExternalSignalRequested {
-                signal_id,
-                target,
-                signal_name,
-                payload,
-            }) => {
-                let age = Utc::now() - row.timestamp;
-                let grace_chrono = chrono::Duration::from_std(unknown_target_grace_window)
-                    .map_or(chrono::Duration::MAX, |d| d);
+    let mut excluded_signal_ids: Vec<String> = Vec::new();
 
-                tracing::debug!(
-                    caller = %caller_exec_id,
-                    target = %target,
-                    signal = %signal_name,
-                    age_ms = %age.num_milliseconds(),
-                    grace_ms = %grace_chrono.num_milliseconds(),
-                    "outbox sweep: processing requested signal"
-                );
+    loop {
+        let shards_clone = shards.clone();
+        let codecs_clone = codecs.clone();
+        let excluded_clone = excluded_signal_ids.clone();
 
-                if age > grace_chrono {
-                    // Grace window expired!
-                    let failed_event = WorkflowEvent::ExternalSignalFailed {
-                        signal_id,
-                        reason_code: "target_unknown".to_string(),
+        let step_res: Result<Option<(bool, Option<String>)>, HarvestError> = conn
+            .transaction::<Option<(bool, Option<String>)>, HarvestError, _>(|conn| {
+                let shards = shards_clone;
+                let codecs = codecs_clone;
+                let excluded = excluded_clone;
+                async move {
+                    let sql = "SELECT e.* FROM harvest_events e \
+                               INNER JOIN harvest_workflow_executions execs ON e.workflow_exec_id = execs.id \
+                               WHERE e.event_type = 'ExternalSignalRequested' \
+                                 AND execs.state = 'RUNNING' \
+                                 AND execs.shard_id = ANY($1) \
+                                 AND (e.event_data->'data'->>'signal_id') IS NOT NULL \
+                                 AND NOT (e.event_data->'data'->>'signal_id' = ANY($2)) \
+                                 AND NOT EXISTS ( \
+                                     SELECT 1 FROM harvest_events res \
+                                     WHERE res.workflow_exec_id = e.workflow_exec_id \
+                                       AND res.event_type IN ('ExternalSignalDelivered', 'ExternalSignalFailed') \
+                                       AND res.event_data->'data'->>'signal_id' = e.event_data->'data'->>'signal_id' \
+                                 ) \
+                               LIMIT 1 \
+                               FOR UPDATE OF e SKIP LOCKED";
+
+                    let row_opt: Option<crate::models::HarvestEvent> = diesel::sql_query(sql)
+                        .bind::<diesel::sql_types::Array<diesel::sql_types::Integer>, _>(&shards)
+                        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(&excluded)
+                        .get_result(conn)
+                        .await
+                        .optional()
+                        .map_err(crate::error::database_error)?;
+
+                    let Some(row) = row_opt else {
+                        return Ok(None);
                     };
 
-                    let res = conn
-                        .transaction::<(), HarvestError, _>(|conn| {
-                            let failed_event = failed_event.clone();
-                            async move {
-                                let history = store::load_history(conn, caller_exec_id).await?;
-                                store::append_events(
-                                    conn,
-                                    caller_exec_id,
-                                    &[failed_event],
-                                    history.next_event_id,
-                                )
-                                .await?;
-                                queue::wake_workflow_task(conn, caller_exec_id).await?;
-                                Ok(())
-                            }
-                            .scope_boxed()
-                        })
-                        .await;
+                    let caller_exec_id = crate::types::ExecutionId::from_uuid(row.workflow_exec_id);
 
-                    match res {
-                        Ok(()) => {
-                            count += 1;
-                            metrics.record_external_signal_sent("failed", Some("target_unknown"));
+                    let event = match codecs.decode_event(row.event_data.clone()) {
+                        Ok(WorkflowEvent::ExternalSignalRequested {
+                            signal_id,
+                            target,
+                            signal_name,
+                            payload,
+                        }) => (signal_id, target, signal_name, payload),
+                        Ok(other) => {
+                            tracing::error!(event = ?other, "outbox sweep: query returned non-ExternalSignalRequested event");
+                            return Ok(Some((false, None)));
                         }
                         Err(e) => {
-                            tracing::error!(error = %e, "outbox sweep: failed to fail signal after grace window expiration");
+                            tracing::error!(error = %e, "outbox sweep: failed to decode event_data");
+                            return Ok(Some((false, None)));
                         }
+                    };
+
+                    let (signal_id, target, signal_name, payload) = event;
+                    let signal_id_str = signal_id.to_string();
+
+                    let age = Utc::now() - row.timestamp;
+                    let grace_chrono = chrono::Duration::from_std(unknown_target_grace_window)
+                        .map_or(chrono::Duration::MAX, |d| d);
+
+                    if age > grace_chrono {
+                        // Grace window expired!
+                        let failed_event = WorkflowEvent::ExternalSignalFailed {
+                            signal_id,
+                            reason_code: "target_unknown".to_string(),
+                        };
+
+                        let history = store::load_history(conn, caller_exec_id).await?;
+                        store::append_events(
+                            conn,
+                            caller_exec_id,
+                            &[failed_event],
+                            history.next_event_id,
+                        )
+                        .await?;
+                        queue::wake_workflow_task(conn, caller_exec_id).await?;
+
+                        metrics.record_external_signal_sent("failed", Some("target_unknown"));
+                        return Ok(Some((true, None)));
                     }
-                } else {
-                    // Try to route target
-                    let target_pool = crate::shard::GLOBAL_SHARDED_POOL.read().map_or_else(
-                        |_| None,
-                        |lock| {
-                            lock.as_ref()
-                                .map(|pool| pool.pool_for_execution(target).clone())
-                        },
-                    );
 
-                    if let Some(pool) = target_pool {
-                        match pool.get().await {
-                            Ok(mut target_conn) => {
-                                let terminal_opt = match crate::signal::send_signal(
-                                    &mut target_conn,
-                                    target,
-                                    &signal_name,
-                                    payload.clone(),
-                                )
-                                .await
-                                {
-                                    Ok(()) => {
-                                        Some(WorkflowEvent::ExternalSignalDelivered { signal_id })
-                                    }
-                                    Err(HarvestError::NotFound(_)) => {
-                                        // Target not found: wait until next sweep
-                                        None
-                                    }
-                                    Err(HarvestError::Database(e)) => {
-                                        tracing::error!(error = %e, "outbox sweep: db error during signal delivery");
-                                        None
-                                    }
-                                    Err(_) => Some(WorkflowEvent::ExternalSignalFailed {
-                                        signal_id,
-                                        reason_code: "target_terminal".to_string(),
-                                    }),
-                                };
+                    // Try to route target using the config's sharded pool if configured
+                    let target_pool = sharded_pool
+                        .as_ref()
+                        .and_then(|pool| pool.exact_pool_for_execution(target).cloned())
+                        .or_else(|| {
+                            crate::shard::GLOBAL_SHARDED_POOL.read().map_or_else(
+                                |_| None,
+                                |lock| {
+                                    lock.as_ref()
+                                        .and_then(|pool| pool.exact_pool_for_execution(target).cloned())
+                                },
+                            )
+                        });
 
-                                if let Some(terminal_event) = terminal_opt {
-                                    let outcome = match &terminal_event {
-                                        WorkflowEvent::ExternalSignalDelivered { .. } => {
-                                            "delivered"
-                                        }
-                                        _ => "failed",
-                                    };
-                                    let reason_code = match &terminal_event {
-                                        WorkflowEvent::ExternalSignalFailed {
-                                            reason_code, ..
-                                        } => Some(reason_code.as_str()),
-                                        _ => None,
-                                    };
+                    let Some(pool) = target_pool else {
+                        tracing::warn!(
+                            target_shard = %target.shard(),
+                            "outbox sweep: target shard is not configured locally; leaving row locked/pending for other workers"
+                        );
+                        return Ok(Some((false, Some(signal_id_str))));
+                    };
 
-                                    let res = conn
-                                        .transaction::<(), HarvestError, _>(|conn| {
-                                            let terminal_event = terminal_event.clone();
-                                            async move {
-                                                let history =
-                                                    store::load_history(conn, caller_exec_id)
-                                                        .await?;
-                                                store::append_events(
-                                                    conn,
-                                                    caller_exec_id,
-                                                    &[terminal_event],
-                                                    history.next_event_id,
-                                                )
-                                                .await?;
-                                                queue::wake_workflow_task(conn, caller_exec_id)
-                                                    .await?;
-                                                Ok(())
-                                            }
-                                            .scope_boxed()
-                                        })
-                                        .await;
-
-                                    match res {
-                                        Ok(()) => {
-                                            count += 1;
-                                            metrics
-                                                .record_external_signal_sent(outcome, reason_code);
-                                        }
-                                        Err(e) => {
-                                            tracing::error!(error = %e, "outbox sweep: failed to write terminal event to caller");
-                                        }
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                tracing::error!(error = %e, "outbox sweep: failed to acquire target connection");
-                            }
+                    let mut target_conn = match pool.get().await {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::error!(error = %e, "outbox sweep: failed to acquire target connection");
+                            return Ok(Some((false, Some(signal_id_str))));
                         }
+                    };
+
+                    let terminal_opt = match crate::signal::send_signal(
+                        &mut target_conn,
+                        target,
+                        &signal_name,
+                        payload.clone(),
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            Some(WorkflowEvent::ExternalSignalDelivered { signal_id })
+                        }
+                        Err(HarvestError::NotFound(_)) => {
+                            None
+                        }
+                        Err(HarvestError::Database(e)) => {
+                            tracing::error!(error = %e, "outbox sweep: db error during signal delivery");
+                            None
+                        }
+                        Err(_) => Some(WorkflowEvent::ExternalSignalFailed {
+                            signal_id,
+                            reason_code: "target_terminal".to_string(),
+                        }),
+                    };
+
+                    if let Some(terminal_event) = terminal_opt {
+                        let outcome = match &terminal_event {
+                            WorkflowEvent::ExternalSignalDelivered { .. } => "delivered",
+                            _ => "failed",
+                        };
+                        let reason_code = match &terminal_event {
+                            WorkflowEvent::ExternalSignalFailed {
+                                reason_code, ..
+                            } => Some(reason_code.clone()),
+                            _ => None,
+                        };
+
+                        let history = store::load_history(conn, caller_exec_id).await?;
+                        store::append_events(
+                            conn,
+                            caller_exec_id,
+                            &[terminal_event],
+                            history.next_event_id,
+                        )
+                        .await?;
+                        queue::wake_workflow_task(conn, caller_exec_id).await?;
+
+                        metrics.record_external_signal_sent(outcome, reason_code.as_deref());
+                        Ok(Some((true, None)))
                     } else {
-                        // Target shard not configured locally, treat as unknown
-                        tracing::warn!(target_shard = %target.shard(), "outbox sweep: target shard is not configured locally");
+                        Ok(Some((false, Some(signal_id_str))))
                     }
                 }
+                .scope_boxed()
+            })
+            .await;
+
+        match step_res {
+            Ok(Some((processed, skipped_id))) => {
+                if processed {
+                    count += 1;
+                }
+                if let Some(id) = skipped_id {
+                    excluded_signal_ids.push(id);
+                }
             }
-            Ok(other) => {
-                tracing::error!(event = ?other, "outbox sweep: query returned non-ExternalSignalRequested event");
+            Ok(None) => {
+                break;
             }
             Err(e) => {
-                tracing::error!(error = %e, "outbox sweep: failed to decode event_data");
+                tracing::error!(error = %e, "outbox sweep error in transaction step");
+                return Err(e);
             }
         }
     }
@@ -916,6 +936,8 @@ pub async fn enforce_timeouts_once(
     conn: &mut AsyncPgConnection,
     metrics: &dyn MetricsRecorder,
     unknown_target_grace_window: Duration,
+    sharded_pool: &Option<crate::shard::ShardedDbPool>,
+    shard_assignments: &[crate::types::ShardId],
 ) -> HarvestResult<usize> {
     let timed_out = find_timed_out_tasks(conn).await?;
     let mut count = timed_out.len();
@@ -947,7 +969,14 @@ pub async fn enforce_timeouts_once(
 
     count += enforce_external_task_timeouts(conn).await?;
     count += enforce_workflow_execution_timeouts(conn, metrics).await?;
-    count += enforce_external_signals_outbox(conn, metrics, unknown_target_grace_window).await?;
+    count += enforce_external_signals_outbox(
+        conn,
+        metrics,
+        unknown_target_grace_window,
+        sharded_pool,
+        shard_assignments,
+    )
+    .await?;
     Ok(count)
 }
 
@@ -964,6 +993,8 @@ pub fn spawn_timeout_checker(
     interval: Duration,
     telemetry: std::sync::Arc<crate::telemetry::TelemetryConfig>,
     unknown_target_grace_window: Duration,
+    sharded_pool: Option<crate::shard::ShardedDbPool>,
+    shard_assignments: Vec<crate::types::ShardId>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -982,6 +1013,8 @@ pub fn spawn_timeout_checker(
                     &mut conn,
                     &*telemetry.metrics,
                     unknown_target_grace_window,
+                    &sharded_pool,
+                    &shard_assignments,
                 )
                 .await
                 {

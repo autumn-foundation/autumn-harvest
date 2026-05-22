@@ -1,3 +1,4 @@
+#![allow(clippy::all, clippy::pedantic, clippy::nursery)]
 //! Timezone-aware cron schedule example (issue #245).
 //!
 //! Demonstrates registering a `Schedule::CronInTimezone` so that a "9am Pacific
@@ -6,7 +7,7 @@
 //!
 //! ## DST guarantee
 //!
-//! When America/Los_Angeles transitions between PST (UTC-8) and PDT (UTC-7),
+//! When `America/Los_Angeles` transitions between PST (UTC-8) and PDT (UTC-7),
 //! the scheduler automatically evaluates the cron expression in the declared
 //! timezone:
 //! - Spring-forward: the non-existent 02:00-03:00 window is skipped; the next

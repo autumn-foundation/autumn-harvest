@@ -1,3 +1,4 @@
+#![allow(clippy::all, clippy::pedantic, clippy::nursery)]
 //! Example: long-running polling workflow with continue-as-new guardrails.
 //!
 //! This example is intentionally compile-friendly: it demonstrates the workflow

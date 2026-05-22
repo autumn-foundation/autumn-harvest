@@ -3051,6 +3051,8 @@ async fn timeout_sweeper_does_not_append_timeout_after_activity_completion() {
             &mut timeout_conn,
             &autumn_harvest::telemetry::NoOpMetrics,
             std::time::Duration::from_secs(5),
+            &None,
+            &[],
         )
         .await
     });

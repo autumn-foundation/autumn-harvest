@@ -678,6 +678,14 @@ impl HarvestBuilder {
         self
     }
 
+    #[cfg(feature = "db")]
+    /// Set the sharded database pool on the worker config.
+    #[must_use]
+    pub fn with_sharded_pool(mut self, pool: crate::shard::ShardedDbPool) -> Self {
+        self.worker_config.sharded_pool = Some(pool);
+        self
+    }
+
     /// Register typed shared state visible to workflow and activity handlers.
     ///
     /// State injected here can be retrieved in your handlers by calling
@@ -1278,6 +1286,9 @@ pub struct WorkerConfig {
     /// Grace window before cross-workflow signaling fails for unknown target (issue #330).
     /// Default: 5 seconds.
     pub unknown_target_grace_window: Duration,
+    #[cfg(feature = "db")]
+    /// Optional sharded database pool for exact shard routing.
+    pub sharded_pool: Option<crate::shard::ShardedDbPool>,
 }
 
 impl Default for WorkerConfig {
@@ -1300,6 +1311,8 @@ impl Default for WorkerConfig {
             priority_aging_secs: None,
             max_workflow_start_delay: DEFAULT_MAX_WORKFLOW_START_DELAY,
             unknown_target_grace_window: Duration::from_secs(5),
+            #[cfg(feature = "db")]
+            sharded_pool: None,
         }
     }
 }
@@ -1474,6 +1487,14 @@ impl WorkerConfig {
     #[must_use]
     pub const fn with_sticky_routing(mut self, config: StickyRoutingConfig) -> Self {
         self.sticky_timeout = config.lease_ttl;
+        self
+    }
+
+    #[cfg(feature = "db")]
+    /// Set the sharded database pool for exact shard routing.
+    #[must_use]
+    pub fn with_sharded_pool(mut self, pool: crate::shard::ShardedDbPool) -> Self {
+        self.sharded_pool = Some(pool);
         self
     }
 }

@@ -292,6 +292,12 @@ impl ShardedDbPool {
             .expect("default shard pool is always present")
     }
 
+    /// Look up the pool for a shard exactly, with no default fallback.
+    #[must_use]
+    pub fn exact_pool_for(&self, shard: ShardId) -> Option<&DbPool> {
+        self.pools.get(&shard)
+    }
+
     /// Resolve the pool that owns a given `ExecutionId`.
     #[must_use]
     pub fn pool_for_execution(&self, exec_id: ExecutionId) -> &DbPool {
@@ -300,6 +306,16 @@ impl ShardedDbPool {
             return self.pool_for(self.default_shard);
         }
         self.pool_for(shard)
+    }
+
+    /// Resolve the pool that owns a given `ExecutionId` exactly, with no default fallback.
+    #[must_use]
+    pub fn exact_pool_for_execution(&self, exec_id: ExecutionId) -> Option<&DbPool> {
+        let shard = exec_id.shard();
+        if shard.is_unencoded() {
+            return self.pools.get(&self.default_shard);
+        }
+        self.pools.get(&shard)
     }
 
     /// Iterate over `(shard, pool)` pairs in ascending shard order.

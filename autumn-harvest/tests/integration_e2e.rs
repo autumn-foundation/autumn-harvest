@@ -646,6 +646,7 @@ fn build_runtime_worker(
                 workflow_cache_size: 1000,
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
+                sharded_pool: None,
             },
             registry,
         )
@@ -1206,6 +1207,7 @@ async fn worker_completes_workflow_task_and_persists_result() {
                 workflow_cache_size: 1000,
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
+                sharded_pool: None,
             },
             registry,
         )
@@ -1308,6 +1310,7 @@ async fn worker_marks_workflow_failed_when_handler_errors() {
                 workflow_cache_size: 1000,
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
+                sharded_pool: None,
             },
             registry,
         )
@@ -1438,6 +1441,7 @@ async fn worker_completes_workflow_with_activity_round_trip() {
                 workflow_cache_size: 1000,
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
+                sharded_pool: None,
             },
             registry,
         )
@@ -1629,6 +1633,7 @@ async fn worker_fails_orphaned_activity_task_without_scheduled_event() {
                 workflow_cache_size: 1000,
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
+                sharded_pool: None,
             },
             Arc::new(HandlerRegistry::new(
                 vec![],
@@ -1768,6 +1773,8 @@ async fn timeout_enforcement_fails_pending_activity_and_wakes_workflow() {
         &mut conn,
         &autumn_harvest::telemetry::NoOpMetrics,
         std::time::Duration::from_secs(5),
+        &None,
+        &[],
     )
     .await
     .expect("timeout enforcement should succeed");
@@ -1849,6 +1856,7 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
                 workflow_cache_size: 1000,
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
+                sharded_pool: None,
             },
             Arc::new(HandlerRegistry::new(
                 vec![WorkflowInfo {
@@ -1979,6 +1987,7 @@ async fn worker_completes_workflow_with_timer_round_trip() {
                 workflow_cache_size: 1000,
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
+                sharded_pool: None,
             },
             Arc::new(HandlerRegistry::new(
                 vec![WorkflowInfo {
@@ -4392,6 +4401,7 @@ async fn workflow_schedule_baseline_dispatches_multiple_runs() {
                 workflow_cache_size: 1000,
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
+                sharded_pool: None,
             },
             Arc::clone(&registry),
         )
@@ -4493,6 +4503,7 @@ async fn workflow_schedule_max_active_runs_enforced() {
                 workflow_cache_size: 1000,
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
+                sharded_pool: None,
             },
             Arc::clone(&registry),
         )
@@ -4582,6 +4593,7 @@ async fn workflow_schedule_pause_and_resume() {
                 workflow_cache_size: 1000,
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
+                sharded_pool: None,
             },
             Arc::clone(&registry),
         )

@@ -239,6 +239,7 @@ async fn test_delayed_start_no_premature_dispatch() {
                 workflow_cache_size: 1000,
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
+                sharded_pool: None,
             },
             registry,
         )

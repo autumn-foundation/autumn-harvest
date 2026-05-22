@@ -1,3 +1,4 @@
+#![allow(clippy::items_after_test_module, clippy::type_complexity)]
 //! Saga choreography example: tenant-cancel fan-out.
 //!
 //! A `tenant_cancel` workflow discovers all in-flight onboarding workflows for

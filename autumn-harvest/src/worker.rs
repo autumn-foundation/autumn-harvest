@@ -109,6 +109,9 @@ pub struct WorkerRuntimeConfig {
     pub priority_aging_secs: Option<u32>,
     /// Grace window before cross-workflow signaling fails for unknown target (issue #330).
     pub unknown_target_grace_window: Duration,
+    #[cfg(feature = "db")]
+    /// Optional sharded database pool for exact shard routing.
+    pub sharded_pool: Option<crate::shard::ShardedDbPool>,
 }
 
 impl WorkerRuntimeConfig {
@@ -147,6 +150,8 @@ impl From<WorkerConfig> for WorkerRuntimeConfig {
             workflow_cache_size: cfg.workflow_cache_size,
             priority_aging_secs: cfg.priority_aging_secs,
             unknown_target_grace_window: cfg.unknown_target_grace_window,
+            #[cfg(feature = "db")]
+            sharded_pool: cfg.sharded_pool,
         }
     }
 }
@@ -4018,16 +4023,9 @@ async fn process_workflow_task(
                     let mut reconstructed_commands = Vec::with_capacity(items_clone.len());
                     for item in items_clone {
                         match item {
-                            SignalBatchItem::Marker(WorkflowEvent::MarkerRecorded {
-                                name,
-                                details,
-                            }) => {
-                                reconstructed_commands
-                                    .push(WorkflowCommand::RecordMarker { name, details });
-                            }
                             SignalBatchItem::Marker(_) => {
-                                // Other WorkflowEvent variants are unreachable because we only
-                                // construct MarkerRecorded inside SignalBatchItem::Marker.
+                                // Already persisted via persist_external_signal_inline.
+                                // Do not reconstruct or re-append to avoid duplicate marker events in history.
                             }
                             SignalBatchItem::Signal(run) => {
                                 let (dummy_tx, _) = tokio::sync::oneshot::channel();
@@ -4690,6 +4688,8 @@ impl Worker {
             self.config.poll_interval,
             self.registry.telemetry().clone(),
             self.config.unknown_target_grace_window,
+            self.config.sharded_pool.clone(),
+            self.config.shard_assignments.clone(),
         );
 
         WorkerMonitoringHandles {
@@ -5119,6 +5119,8 @@ mod tests {
             workflow_cache_size: 1000,
             priority_aging_secs: None,
             unknown_target_grace_window: Duration::from_secs(5),
+            #[cfg(feature = "db")]
+            sharded_pool: None,
         }
     }
 
@@ -5179,6 +5181,8 @@ mod tests {
             priority_aging_secs: None,
             max_workflow_start_delay: Duration::from_secs(365 * 24 * 3600),
             unknown_target_grace_window: Duration::from_secs(5),
+            #[cfg(feature = "db")]
+            sharded_pool: None,
         };
 
         let runtime_cfg: WorkerRuntimeConfig = builder_cfg.into();
