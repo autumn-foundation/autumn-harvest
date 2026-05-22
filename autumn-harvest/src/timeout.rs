@@ -805,14 +805,13 @@ pub async fn enforce_external_signals_outbox(
                     }
                 } else {
                     // Try to route target
-                    let target_pool = crate::shard::GLOBAL_SHARDED_POOL
-                        .read()
-                        .map_or_else(
-                            |_| None,
-                            |lock| {
-                                lock.as_ref().map(|pool| pool.pool_for_execution(target).clone())
-                            },
-                        );
+                    let target_pool = crate::shard::GLOBAL_SHARDED_POOL.read().map_or_else(
+                        |_| None,
+                        |lock| {
+                            lock.as_ref()
+                                .map(|pool| pool.pool_for_execution(target).clone())
+                        },
+                    );
 
                     if let Some(pool) = target_pool {
                         match pool.get().await {
@@ -825,9 +824,9 @@ pub async fn enforce_external_signals_outbox(
                                 )
                                 .await
                                 {
-                                    Ok(()) => Some(WorkflowEvent::ExternalSignalDelivered {
-                                        signal_id,
-                                    }),
+                                    Ok(()) => {
+                                        Some(WorkflowEvent::ExternalSignalDelivered { signal_id })
+                                    }
                                     Err(HarvestError::NotFound(_)) => {
                                         // Target not found: wait until next sweep
                                         None
