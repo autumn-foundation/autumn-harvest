@@ -436,6 +436,7 @@ async fn running_activity_heartbeat_observes_workflow_cancellation() {
                 deployment_name: None,
                 workflow_cache_size: 1000,
                 priority_aging_secs: None,
+                unknown_target_grace_window: Duration::from_secs(5),
             },
             registry,
         )
@@ -610,6 +611,7 @@ async fn uncooperative_activity_is_hard_aborted_after_grace_period() {
                 deployment_name: None,
                 workflow_cache_size: 1000,
                 priority_aging_secs: None,
+                unknown_target_grace_window: Duration::from_secs(5),
             },
             registry,
         )

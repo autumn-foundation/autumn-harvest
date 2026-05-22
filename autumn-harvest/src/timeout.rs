@@ -714,10 +714,208 @@ pub async fn enforce_workflow_execution_timeouts(
 ///
 /// # Errors
 ///
+/// Background outbox scanner that polls pending external signal requests,
+/// attempts same-shard and cross-shard delivery via `GLOBAL_SHARDED_POOL`,
+/// fails with `"target_unknown"` after `unknown_target_grace_window` has elapsed,
+/// and wakes up the caller workflow.
+pub async fn enforce_external_signals_outbox(
+    conn: &mut AsyncPgConnection,
+    metrics: &dyn MetricsRecorder,
+    unknown_target_grace_window: Duration,
+) -> HarvestResult<usize> {
+    let sql = "SELECT * FROM harvest_events \
+               WHERE event_type = 'ExternalSignalRequested' \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM harvest_events res \
+                   WHERE res.workflow_exec_id = harvest_events.workflow_exec_id \
+                   AND res.event_type IN ('ExternalSignalDelivered', 'ExternalSignalFailed') \
+                   AND res.event_data->'data'->>'signal_id' = harvest_events.event_data->'data'->>'signal_id' \
+               )";
+    let pending_rows: Vec<crate::models::HarvestEvent> = diesel::sql_query(sql)
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    tracing::debug!(
+        "enforce_external_signals_outbox: found {} pending outbox rows",
+        pending_rows.len()
+    );
+
+    let mut count = 0;
+    let codecs = crate::payload_codec::PayloadCodecs::default();
+
+    for row in pending_rows {
+        let caller_exec_id = crate::types::ExecutionId::from_uuid(row.workflow_exec_id);
+
+        match codecs.decode_event(row.event_data.clone()) {
+            Ok(WorkflowEvent::ExternalSignalRequested {
+                signal_id,
+                target,
+                signal_name,
+                payload,
+            }) => {
+                let age = Utc::now() - row.timestamp;
+                let grace_chrono = match chrono::Duration::from_std(unknown_target_grace_window) {
+                    Ok(d) => d,
+                    Err(_) => chrono::Duration::MAX,
+                };
+
+                tracing::debug!(
+                    caller = %caller_exec_id,
+                    target = %target,
+                    signal = %signal_name,
+                    age_ms = %age.num_milliseconds(),
+                    grace_ms = %grace_chrono.num_milliseconds(),
+                    "outbox sweep: processing requested signal"
+                );
+
+                if age > grace_chrono {
+                    // Grace window expired!
+                    let failed_event = WorkflowEvent::ExternalSignalFailed {
+                        signal_id: signal_id.clone(),
+                        reason_code: "target_unknown".to_string(),
+                    };
+
+                    let res = conn
+                        .transaction::<(), HarvestError, _>(|conn| {
+                            let failed_event = failed_event.clone();
+                            async move {
+                                let history = store::load_history(conn, caller_exec_id).await?;
+                                store::append_events(
+                                    conn,
+                                    caller_exec_id,
+                                    &[failed_event],
+                                    history.next_event_id,
+                                )
+                                .await?;
+                                queue::wake_workflow_task(conn, caller_exec_id).await?;
+                                Ok(())
+                            }
+                            .scope_boxed()
+                        })
+                        .await;
+
+                    match res {
+                        Ok(()) => {
+                            count += 1;
+                            metrics.record_external_signal_sent("failed", Some("target_unknown"));
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "outbox sweep: failed to fail signal after grace window expiration");
+                        }
+                    }
+                } else {
+                    // Try to route target
+                    let target_pool = if let Ok(lock) = crate::shard::GLOBAL_SHARDED_POOL.read() {
+                        lock.as_ref()
+                            .map(|pool| pool.pool_for_execution(target).clone())
+                    } else {
+                        None
+                    };
+
+                    if let Some(pool) = target_pool {
+                        match pool.get().await {
+                            Ok(mut target_conn) => {
+                                let terminal_opt = match crate::signal::send_signal(
+                                    &mut target_conn,
+                                    target,
+                                    &signal_name,
+                                    payload.clone(),
+                                )
+                                .await
+                                {
+                                    Ok(()) => Some(WorkflowEvent::ExternalSignalDelivered {
+                                        signal_id: signal_id.clone(),
+                                    }),
+                                    Err(HarvestError::NotFound(_)) => {
+                                        // Target not found: wait until next sweep
+                                        None
+                                    }
+                                    Err(HarvestError::Database(e)) => {
+                                        tracing::error!(error = %e, "outbox sweep: db error during signal delivery");
+                                        None
+                                    }
+                                    Err(_) => Some(WorkflowEvent::ExternalSignalFailed {
+                                        signal_id: signal_id.clone(),
+                                        reason_code: "target_terminal".to_string(),
+                                    }),
+                                };
+
+                                if let Some(terminal_event) = terminal_opt {
+                                    let outcome = match &terminal_event {
+                                        WorkflowEvent::ExternalSignalDelivered { .. } => {
+                                            "delivered"
+                                        }
+                                        _ => "failed",
+                                    };
+                                    let reason_code = match &terminal_event {
+                                        WorkflowEvent::ExternalSignalFailed {
+                                            reason_code, ..
+                                        } => Some(reason_code.as_str()),
+                                        _ => None,
+                                    };
+
+                                    let res = conn
+                                        .transaction::<(), HarvestError, _>(|conn| {
+                                            let terminal_event = terminal_event.clone();
+                                            async move {
+                                                let history =
+                                                    store::load_history(conn, caller_exec_id)
+                                                        .await?;
+                                                store::append_events(
+                                                    conn,
+                                                    caller_exec_id,
+                                                    &[terminal_event],
+                                                    history.next_event_id,
+                                                )
+                                                .await?;
+                                                queue::wake_workflow_task(conn, caller_exec_id)
+                                                    .await?;
+                                                Ok(())
+                                            }
+                                            .scope_boxed()
+                                        })
+                                        .await;
+
+                                    match res {
+                                        Ok(()) => {
+                                            count += 1;
+                                            metrics
+                                                .record_external_signal_sent(outcome, reason_code);
+                                        }
+                                        Err(e) => {
+                                            tracing::error!(error = %e, "outbox sweep: failed to write terminal event to caller");
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!(error = %e, "outbox sweep: failed to acquire target connection");
+                            }
+                        }
+                    } else {
+                        // Target shard not configured locally, treat as unknown
+                        tracing::warn!(target_shard = %target.shard(), "outbox sweep: target shard is not configured locally");
+                    }
+                }
+            }
+            Ok(other) => {
+                tracing::error!(event = ?other, "outbox sweep: query returned non-ExternalSignalRequested event");
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "outbox sweep: failed to decode event_data");
+            }
+        }
+    }
+
+    Ok(count)
+}
+
 /// Returns the first database or persistence error encountered.
 pub async fn enforce_timeouts_once(
     conn: &mut AsyncPgConnection,
     metrics: &dyn MetricsRecorder,
+    unknown_target_grace_window: Duration,
 ) -> HarvestResult<usize> {
     let timed_out = find_timed_out_tasks(conn).await?;
     let mut count = timed_out.len();
@@ -749,6 +947,7 @@ pub async fn enforce_timeouts_once(
 
     count += enforce_external_task_timeouts(conn).await?;
     count += enforce_workflow_execution_timeouts(conn, metrics).await?;
+    count += enforce_external_signals_outbox(conn, metrics, unknown_target_grace_window).await?;
     Ok(count)
 }
 
@@ -764,6 +963,7 @@ pub fn spawn_timeout_checker(
     cancel: CancellationToken,
     interval: Duration,
     telemetry: std::sync::Arc<crate::telemetry::TelemetryConfig>,
+    unknown_target_grace_window: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -778,7 +978,13 @@ pub fn spawn_timeout_checker(
             }
 
             match pool.get().await {
-                Ok(mut conn) => match enforce_timeouts_once(&mut conn, &*telemetry.metrics).await {
+                Ok(mut conn) => match enforce_timeouts_once(
+                    &mut conn,
+                    &*telemetry.metrics,
+                    unknown_target_grace_window,
+                )
+                .await
+                {
                     Ok(enforced_count) if enforced_count > 0 => {
                         tracing::warn!(enforced_count, "enforced timed-out tasks");
                     }

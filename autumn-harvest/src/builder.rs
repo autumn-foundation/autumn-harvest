@@ -84,6 +84,8 @@ pub struct HarvestBuilder {
     /// Server-side ceiling on workflow start delay (issue #322).
     /// Default: 365 days.
     max_workflow_start_delay: Option<Duration>,
+    /// Grace window before cross-workflow signaling fails for unknown target (issue #330).
+    unknown_target_grace_window: Option<Duration>,
 }
 
 impl Default for HarvestBuilder {
@@ -108,6 +110,7 @@ impl Default for HarvestBuilder {
             max_signal_payload_bytes: DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
             max_workflow_input_bytes: DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
             max_workflow_start_delay: None,
+            unknown_target_grace_window: None,
         }
     }
 }
@@ -140,6 +143,10 @@ impl std::fmt::Debug for HarvestBuilder {
             .field("max_signal_payload_bytes", &self.max_signal_payload_bytes)
             .field("max_workflow_input_bytes", &self.max_workflow_input_bytes)
             .field("max_workflow_start_delay", &self.max_workflow_start_delay)
+            .field(
+                "unknown_target_grace_window",
+                &self.unknown_target_grace_window,
+            )
             .finish()
     }
 }
@@ -177,6 +184,8 @@ pub struct BuiltHarvest {
     /// Server-side ceiling on workflow start delay (issue #322).
     /// Default: 365 days.
     pub max_workflow_start_delay: Duration,
+    /// Grace window before cross-workflow signaling fails for unknown target (issue #330).
+    pub unknown_target_grace_window: Duration,
 }
 
 impl std::fmt::Debug for BuiltHarvest {
@@ -203,6 +212,10 @@ impl std::fmt::Debug for BuiltHarvest {
             .field("max_signal_payload_bytes", &self.max_signal_payload_bytes)
             .field("max_workflow_input_bytes", &self.max_workflow_input_bytes)
             .field("max_workflow_start_delay", &self.max_workflow_start_delay)
+            .field(
+                "unknown_target_grace_window",
+                &self.unknown_target_grace_window,
+            )
             .finish()
     }
 }
@@ -800,6 +813,15 @@ impl HarvestBuilder {
         self
     }
 
+    /// Set the grace window before cross-workflow signaling fails for unknown target (issue #330).
+    ///
+    /// Default: 5 seconds.
+    #[must_use]
+    pub const fn unknown_target_grace_window(mut self, window: Duration) -> Self {
+        self.unknown_target_grace_window = Some(window);
+        self
+    }
+
     /// Number of registered workflows (used in tests and diagnostics).
     #[must_use]
     pub const fn workflow_count(&self) -> usize {
@@ -879,6 +901,11 @@ impl HarvestBuilder {
             .unwrap_or(worker_config.max_workflow_start_delay);
         worker_config.max_workflow_start_delay = max_workflow_start_delay;
 
+        let unknown_target_grace_window = self
+            .unknown_target_grace_window
+            .unwrap_or(worker_config.unknown_target_grace_window);
+        worker_config.unknown_target_grace_window = unknown_target_grace_window;
+
         Ok(BuiltHarvest {
             workflows: self.workflows,
             activities: self.activities,
@@ -898,6 +925,7 @@ impl HarvestBuilder {
             max_signal_payload_bytes: self.max_signal_payload_bytes,
             max_workflow_input_bytes: self.max_workflow_input_bytes,
             max_workflow_start_delay,
+            unknown_target_grace_window,
         })
     }
 }
@@ -1247,6 +1275,9 @@ pub struct WorkerConfig {
     /// Maximum allowed start delay for a workflow (issue #322).
     /// Default: 365 days.
     pub max_workflow_start_delay: Duration,
+    /// Grace window before cross-workflow signaling fails for unknown target (issue #330).
+    /// Default: 5 seconds.
+    pub unknown_target_grace_window: Duration,
 }
 
 impl Default for WorkerConfig {
@@ -1268,6 +1299,7 @@ impl Default for WorkerConfig {
             query_timeout: Duration::from_secs(5),
             priority_aging_secs: None,
             max_workflow_start_delay: DEFAULT_MAX_WORKFLOW_START_DELAY,
+            unknown_target_grace_window: Duration::from_secs(5),
         }
     }
 }
@@ -1399,6 +1431,15 @@ impl WorkerConfig {
     #[must_use]
     pub const fn with_max_workflow_start_delay(mut self, delay: Duration) -> Self {
         self.max_workflow_start_delay = delay;
+        self
+    }
+
+    /// Override the unknown target grace window for cross-workflow signaling (issue #330).
+    ///
+    /// Default: 5 seconds.
+    #[must_use]
+    pub const fn with_unknown_target_grace_window(mut self, window: Duration) -> Self {
+        self.unknown_target_grace_window = window;
         self
     }
 
