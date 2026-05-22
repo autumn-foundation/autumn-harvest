@@ -1032,9 +1032,10 @@ pub async fn wake_workflow_task(
                  END \
              WHERE workflow_exec_id = $1 \
                AND task_type = 'workflow' \
-               AND state = 'RUNNING' \
-               AND worker_id IS NULL \
-               AND started_at IS NULL \
+               AND ( \
+                   (state = 'RUNNING' AND worker_id IS NULL AND started_at IS NULL) \
+                   OR (state = 'PENDING' AND scheduled_at > $2) \
+               ) \
              RETURNING queue_name",
         )
         .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())

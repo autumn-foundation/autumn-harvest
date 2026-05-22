@@ -138,6 +138,33 @@ fn target_workflow<'a>(
     })
 }
 
+fn mixed_suspension_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let target_uuid_str = input["target"].as_str().ok_or("missing target")?;
+        let target = ExecutionId::from_uuid(
+            uuid::Uuid::parse_str(target_uuid_str).map_err(|e| e.to_string())?,
+        );
+
+        let timer_fut = ctx.timer("long_timer", 3600);
+        let signal_fut =
+            ctx.signal_external_workflow(target, "my_signal", serde_json::json!({"data": "hello"}));
+
+        tokio::select! {
+            res = timer_fut => {
+                res.map_err(|e| e.to_string())?;
+                Ok(serde_json::json!({"status": "timer_fired"}))
+            }
+            res = signal_fut => {
+                res.map_err(|e| e.to_string())?;
+                Ok(serde_json::json!({"status": "signaled"}))
+            }
+        }
+    })
+}
+
 #[tokio::test]
 async fn test_config_validation() {
     let config = WorkerConfig::default();
@@ -517,6 +544,141 @@ async fn test_grace_window_expiration() {
     if let Some(WorkflowEvent::ExternalSignalFailed { reason_code, .. }) = failed_event {
         assert_eq!(reason_code, "target_unknown");
     }
+
+    worker.shutdown();
+    let _ = handle.await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn test_mixed_timer_suspension_signal_wakes_timer() {
+    let _guard = TEST_MUTEX.lock().await;
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let _sharded_pool = autumn_harvest::shard::ShardedDbPool::single(pool.clone());
+
+    // Target workflow ID and ExecutionId
+    let target_exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+
+    // Caller workflow ExecutionId
+    let caller_exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+
+    let built = HarvestBuilder::new()
+        .workflows(vec![
+            WorkflowInfo {
+                name: "mixed_suspension_workflow",
+                module: "cross_workflow_signal_tests",
+                handler: mixed_suspension_workflow,
+                execution_timeout: None,
+                concurrency: None,
+                max_input_bytes: None,
+            },
+            WorkflowInfo {
+                name: "target_workflow",
+                module: "cross_workflow_signal_tests",
+                handler: target_workflow,
+                execution_timeout: None,
+                concurrency: None,
+                max_input_bytes: None,
+            },
+        ])
+        .worker(WorkerConfig::default())
+        .build();
+
+    let (registry, _dags, _workflow_schedules, worker_config) = built.into_worker_parts();
+    let mut runtime_config: WorkerRuntimeConfig = worker_config.into();
+    runtime_config.worker_id = "worker-mixed-suspension".to_string();
+    runtime_config.poll_interval = Duration::from_millis(50);
+    runtime_config.shutdown_timeout = Duration::from_secs(1);
+
+    let worker =
+        Arc::new(Worker::new(runtime_config, Arc::new(registry)).expect("worker should build"));
+    let runner = Arc::clone(&worker);
+    let pool_for_run = pool.clone();
+    let handle = tokio::spawn(async move {
+        runner.run(&pool_for_run).await;
+    });
+
+    // Start caller first. Target does not exist yet!
+    let mut conn = pool.get().await.unwrap();
+    let start_params = StartWorkflowParams {
+        exec_id: caller_exec_id,
+        workflow_name: "mixed_suspension_workflow",
+        workflow_id: "caller-mixed-1",
+        input: serde_json::json!({"target": target_exec_id.to_string()}),
+        parent_id: None,
+        queue_name: "default",
+        execution_timeout: None,
+        memo: None,
+        search_attrs: None,
+        reuse_policy: autumn_harvest::types::WorkflowIdReusePolicy::default(),
+        trace_context: None,
+        max_execution_timeout_ceiling: None,
+        concurrency_key: None,
+        concurrency_limit: None,
+        priority: autumn_harvest::types::Priority::default(),
+        max_workflow_input_bytes: 0,
+        start_at: None,
+        delay: None,
+        max_workflow_start_delay: None,
+    };
+    start_or_load_workflow_execution(&mut conn, start_params)
+        .await
+        .unwrap();
+
+    // Give it a moment to run and suspend (park), waiting for outbox delivery/timer.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    // Verify caller execution is running/suspended (not failed immediately).
+    let caller_state = load_execution_from_url(&database_url, caller_exec_id).await;
+    assert_eq!(caller_state.state, "RUNNING");
+
+    // Now start the target workflow.
+    let start_target_params = StartWorkflowParams {
+        exec_id: target_exec_id,
+        workflow_name: "target_workflow",
+        workflow_id: "target-mixed-1",
+        input: serde_json::json!({}),
+        parent_id: None,
+        queue_name: "default",
+        execution_timeout: None,
+        memo: None,
+        search_attrs: None,
+        reuse_policy: autumn_harvest::types::WorkflowIdReusePolicy::default(),
+        trace_context: None,
+        max_execution_timeout_ceiling: None,
+        concurrency_key: None,
+        concurrency_limit: None,
+        priority: autumn_harvest::types::Priority::default(),
+        max_workflow_input_bytes: 0,
+        start_at: None,
+        delay: None,
+        max_workflow_start_delay: None,
+    };
+    start_or_load_workflow_execution(&mut conn, start_target_params)
+        .await
+        .unwrap();
+
+    // Wait for both workflows to complete.
+    let completed = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let caller = load_execution_from_url(&database_url, caller_exec_id).await;
+            let target = load_execution_from_url(&database_url, target_exec_id).await;
+            if caller.state == "COMPLETED" && target.state == "COMPLETED" {
+                break (caller, target);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("workflows should complete within timeout, showing that caller didn't wait 1 hour");
+
+    assert_eq!(completed.0.state, "COMPLETED");
+    assert_eq!(
+        completed.0.output.unwrap()["status"].as_str(),
+        Some("signaled")
+    );
+    assert_eq!(completed.1.state, "COMPLETED");
 
     worker.shutdown();
     let _ = handle.await;

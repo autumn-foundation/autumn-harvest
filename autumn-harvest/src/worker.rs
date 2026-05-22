@@ -4086,7 +4086,6 @@ async fn process_workflow_task(
                 );
                 drop(execute_span);
                 let (signal_items, remaining_commands) = split_mixed_signal_batch(commands);
-                let signal_items_clone = signal_items.clone();
                 let new_events = match persist_external_signal_inline(
                     conn,
                     prepared.exec_id,
@@ -4101,31 +4100,7 @@ async fn process_workflow_task(
                             .await;
                     }
                 };
-                let mut remaining_commands_with_unresolved = remaining_commands;
-                for item in signal_items_clone {
-                    if let SignalBatchItem::Signal(run) = item {
-                        let resolved = new_events.iter().any(|e| match e {
-                            WorkflowEvent::ExternalSignalDelivered { signal_id }
-                            | WorkflowEvent::ExternalSignalFailed { signal_id, .. } => {
-                                *signal_id == run.signal_id
-                            }
-                            _ => false,
-                        });
-                        if !resolved {
-                            let (dummy_tx, _) = tokio::sync::oneshot::channel();
-                            remaining_commands_with_unresolved.push(
-                                WorkflowCommand::SignalExternalWorkflow {
-                                    signal_id: run.signal_id,
-                                    target: run.target,
-                                    signal_name: run.signal_name,
-                                    payload: run.payload,
-                                    result_tx: dummy_tx,
-                                    already_requested: run.already_requested,
-                                },
-                            );
-                        }
-                    }
-                }
+                let remaining_commands_with_unresolved = remaining_commands;
                 history_events.extend(new_events);
                 let current_history_event_count =
                     u64::try_from(history_events.len()).unwrap_or(u64::MAX);
