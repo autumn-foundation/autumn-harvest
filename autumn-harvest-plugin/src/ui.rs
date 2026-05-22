@@ -546,12 +546,14 @@ async fn dag_detail_ui(
         ..WorkflowFilters::default()
     };
     let runs = load_workflows_from_shards(&api_state, &filters).await?;
-    let selected_run = params
+    let requested_run = params
         .run
         .as_deref()
-        .and_then(|raw| uuid::Uuid::parse_str(raw).ok())
+        .and_then(|raw| uuid::Uuid::parse_str(raw).ok());
+    let selected_run = requested_run
+        .filter(|candidate| runs.iter().any(|run| run.id == *candidate))
         .or_else(|| runs.as_slice().first().map(|r| r.id));
-    let mut node_states = HashMap::new();
+    let mut node_states = HashMap::<usize, DagNodeState>::new();
     if let Some(exec_id) = selected_run {
         let mut conn = db_conn_for_execution(
             &api_state,
@@ -3320,7 +3322,7 @@ fn render_dag_list(dags: &[DagUiSummary]) -> Markup {
             }
         }
     };
-    layout("DAGs · Vantage", &body, "")
+    layout_dag_detail("DAGs · Vantage", &body, "", None)
 }
 
 fn dag_summary_from_registered(name: &str, dag: &RegisteredDag) -> DagUiSummary {
@@ -3338,7 +3340,17 @@ fn dag_summary_from_registered(name: &str, dag: &RegisteredDag) -> DagUiSummary 
 fn schedule_expr_for_ui_summary(schedule: &Schedule) -> String {
     match schedule {
         Schedule::Cron(expr) => expr.clone(),
-        Schedule::Interval(duration) => format!("@every {}s", duration.as_secs()),
+        Schedule::Interval(duration) => {
+            if duration.subsec_nanos() == 0 {
+                format!("@every {}s", duration.as_secs())
+            } else {
+                format!(
+                    "@every {}.{:09}s",
+                    duration.as_secs(),
+                    duration.subsec_nanos()
+                )
+            }
+        }
         Schedule::Manual => "@manual".to_string(),
         Schedule::CronInTimezone { expr, tz } => format!("{expr} [{tz}]"),
     }
@@ -3361,10 +3373,13 @@ fn render_dag_detail(
     selected_run: Option<uuid::Uuid>,
     selected_node: Option<usize>,
     refresh: Option<u64>,
-    node_states: &HashMap<String, DagNodeState>,
+    node_states: &HashMap<usize, DagNodeState>,
 ) -> Markup {
     let too_large = dag.definition.tasks().len() > 200;
     let selected_task = selected_node.and_then(|idx| dag.definition.tasks().get(idx));
+    let selected_node_state = selected_node
+        .and_then(|idx| node_states.get(&idx).copied())
+        .unwrap_or(DagNodeState::Unknown);
     let body = html! {
         h2 { "DAG " code { (dag_name) } " runs" }
         @if let Some(run_id) = selected_run {
@@ -3379,10 +3394,16 @@ fn render_dag_detail(
                 tbody {
                     @for (idx, task) in dag.definition.tasks().iter().enumerate() {
                         tr {
-                            td { a href={ "?node=" (idx) } { (idx) } }
+                            td {
+                                @if let Some(run_id) = selected_run {
+                                    a href={ "?run=" (run_id) "&node=" (idx) } { (idx) }
+                                } @else {
+                                    a href={ "?node=" (idx) } { (idx) }
+                                }
+                            }
                             td { (task.activity_name.as_str()) }
                             td { (format!("{:?}", task.trigger_rule)) }
-                            td { (format!("{:?}", node_states.get(&task.activity_name).copied().unwrap_or(DagNodeState::Unknown))) }
+                            td { (format!("{:?}", node_states.get(&idx).copied().unwrap_or(DagNodeState::Unknown))) }
                             td {
                                 @for (n, upstream) in task.upstreams.iter().enumerate() {
                                     @if n > 0 { ", " }
@@ -3397,7 +3418,7 @@ fn render_dag_detail(
                 h3 { "Node panel" }
                 p { "Activity: " code { (task.activity_name.as_str()) } }
                 p { "Trigger rule: " (format!("{:?}", task.trigger_rule)) }
-                p { "Current state: " (format!("{:?}", node_states.get(&task.activity_name).copied().unwrap_or(DagNodeState::Unknown))) }
+                p { "Current state: " (format!("{selected_node_state:?}")) }
             }
         }
         table {
@@ -3415,7 +3436,7 @@ fn render_dag_detail(
                         td { a href={ "../workflows/" (run.id) } { code { (run.id) } } }
                         td { span class={ "badge " (run.state.to_uppercase()) } { (run.state.as_str()) } }
                         td { (format_timestamp(Some(run.started_at))) }
-                        td { (format_timestamp(run.completed_at)) }
+                        td { (format_run_duration(run.started_at, run.completed_at)) }
                     }
                 }
             }
@@ -3456,9 +3477,9 @@ fn layout_dag_detail(title: &str, body: &Markup, base_href: &str, refresh: Optio
 fn map_node_states(
     dag: &autumn_harvest::dag::DagDefinition,
     tasks: &[TaskQueueItem],
-) -> HashMap<String, DagNodeState> {
+) -> HashMap<usize, DagNodeState> {
     let mut out = HashMap::new();
-    for node in dag.tasks() {
+    for (idx, node) in dag.tasks().iter().enumerate() {
         let mut state = DagNodeState::Unknown;
         for task in tasks
             .iter()
@@ -3473,9 +3494,23 @@ fn map_node_states(
                 _ => state,
             };
         }
-        out.insert(node.activity_name.clone(), state);
+        out.insert(idx, state);
     }
     out
+}
+
+fn format_run_duration(started_at: DateTime<Utc>, completed_at: Option<DateTime<Utc>>) -> String {
+    let Some(end) = completed_at else {
+        return "—".to_string();
+    };
+    let secs = (end - started_at).num_seconds().max(0);
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m {}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5100,6 +5135,28 @@ mod tests {
         let html = layout_dag_detail("D", &body, "", Some(30)).into_string();
         assert!(html.contains("http-equiv=\"refresh\""));
         assert!(html.contains("content=\"30\""));
+    }
+
+    #[test]
+    fn render_dag_list_uses_dag_active_nav() {
+        let dags = vec![];
+        let html = render_dag_list(&dags).into_string();
+        assert!(html.contains("a.active href=\"dags\""));
+    }
+
+    #[test]
+    fn format_run_duration_renders_elapsed_time() {
+        let start = Utc::now();
+        let end = start + chrono::Duration::seconds(125);
+        assert_eq!(format_run_duration(start, Some(end)), "2m 5s");
+    }
+
+    #[test]
+    fn schedule_expr_preserves_subsecond_interval() {
+        let expr = schedule_expr_for_ui_summary(&Schedule::Interval(
+            std::time::Duration::from_millis(500),
+        ));
+        assert_eq!(expr, "@every 0.500000000s");
     }
 
     #[test]
