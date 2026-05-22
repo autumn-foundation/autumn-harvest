@@ -595,7 +595,7 @@ fn char_literal_end(line: &str, start: usize) -> Option<usize> {
 
     if is_lifetime_start(first) {
         let ident_end = consume_lifetime_ident(line, first_end);
-        if !line[ident_end..].starts_with('\'') {
+        if !line.is_char_boundary(ident_end) || !line[ident_end..].starts_with('\'') {
             return None;
         }
     }
@@ -867,6 +867,13 @@ mod tests {
     #[test]
     fn check_source_no_workflow_annotation_produces_no_findings() {
         let src = "async fn foo() { let _ = std::time::SystemTime::now(); }\n";
+        let report = check_source(src, "test.rs");
+        assert!(report.findings.is_empty());
+    }
+
+    #[test]
+    fn check_source_handles_emojis_in_char_literals_without_panic() {
+        let src = "#[workflow]\nasync fn test() {\n    let x = '🦀';\n}";
         let report = check_source(src, "test.rs");
         assert!(report.findings.is_empty());
     }
