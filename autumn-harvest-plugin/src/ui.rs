@@ -518,7 +518,9 @@ async fn list_dags_ui(
                     max_active_runs: row.max_active_runs,
                     catchup: row.catchup,
                 });
-            entry.schedule_expr = row.schedule_expr.clone();
+            if entry.schedule_expr.is_none() {
+                entry.schedule_expr.clone_from(&row.schedule_expr);
+            }
             entry.is_paused = row.is_paused;
             entry.next_run_at = row.next_run_at;
             entry.max_active_runs = row.max_active_runs;
@@ -550,11 +552,32 @@ async fn dag_detail_ui(
         .run
         .as_deref()
         .and_then(|raw| uuid::Uuid::parse_str(raw).ok());
-    let selected_run = requested_run
-        .filter(|candidate| runs.iter().any(|run| run.id == *candidate))
-        .or_else(|| runs.as_slice().first().map(|r| r.id));
-    let mut node_states = HashMap::<usize, DagNodeState>::new();
-    if let Some(exec_id) = selected_run {
+    let selected_run = if let Some(candidate) = requested_run {
+        if runs.iter().any(|run| run.id == candidate) {
+            Some(candidate)
+        } else {
+            let mut conn = db_conn_for_execution(
+                &api_state,
+                autumn_harvest::types::ExecutionId::from_uuid(candidate),
+            )
+            .await?;
+            let exists = harvest_workflow_executions::table
+                .filter(harvest_workflow_executions::id.eq(candidate))
+                .select(WorkflowExecution::as_select())
+                .first::<WorkflowExecution>(&mut conn)
+                .await
+                .optional()
+                .map_err(database_error)
+                .map_err(map_error)?;
+            exists
+                .filter(|run| run.workflow_name == dag_name)
+                .map(|run| run.id)
+                .or_else(|| runs.as_slice().first().map(|r| r.id))
+        }
+    } else {
+        runs.as_slice().first().map(|r| r.id)
+    };
+    let node_states = if let Some(exec_id) = selected_run {
         let mut conn = db_conn_for_execution(
             &api_state,
             autumn_harvest::types::ExecutionId::from_uuid(exec_id),
@@ -567,8 +590,10 @@ async fn dag_detail_ui(
             .await
             .map_err(database_error)
             .map_err(map_error)?;
-        node_states = map_node_states(&dag.definition, &task_rows);
-    }
+        map_node_states(&dag.definition, &task_rows)
+    } else {
+        HashMap::<usize, DagNodeState>::new()
+    };
     Ok(render_dag_detail(
         &dag_name,
         &dag,
