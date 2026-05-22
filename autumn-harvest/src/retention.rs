@@ -268,6 +268,7 @@ impl RetentionRuntime {
     /// Panics inside the spawned task if the enabled config is missing `max_age`
     /// (which cannot happen when `config.enabled()` is `true`).
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn spawn(
         pools: ShardedDbPool,
         config: RetentionConfig,

@@ -3362,30 +3362,40 @@ async fn load_recent_decisions(
         return std::collections::HashMap::new();
     };
 
-    let mut map: std::collections::HashMap<uuid::Uuid, Vec<ScheduleDecision>> =
-        std::collections::HashMap::new();
+    let mut all_rows: Vec<ScheduleDecision> = Vec::new();
 
     for (_shard, shard_pool) in pool.iter_shards() {
         let Ok(mut conn) = acquire_conn(shard_pool).await else {
             continue;
         };
-        let rows: Vec<ScheduleDecision> = dsl::harvest_schedule_decisions
+        let mut rows: Vec<ScheduleDecision> = dsl::harvest_schedule_decisions
             .filter(dsl::schedule_id.eq_any(schedule_ids))
-            .order((dsl::schedule_id, dsl::occurred_at.desc()))
             .select(ScheduleDecision::as_select())
             .load(&mut conn)
             .await
             .unwrap_or_default();
 
-        for row in rows {
-            if let Some(sched_id) = row.schedule_id {
-                let entry = map.entry(sched_id).or_default();
-                if entry.len() < 10 {
-                    entry.push(row);
-                }
-            }
+        all_rows.append(&mut rows);
+    }
+
+    let mut map: std::collections::HashMap<uuid::Uuid, Vec<ScheduleDecision>> =
+        std::collections::HashMap::new();
+
+    for row in all_rows {
+        if let Some(sched_id) = row.schedule_id {
+            map.entry(sched_id).or_default().push(row);
         }
     }
+
+    for decisions in map.values_mut() {
+        decisions.sort_by(|a, b| {
+            b.occurred_at
+                .cmp(&a.occurred_at)
+                .then_with(|| b.id.cmp(&a.id))
+        });
+        decisions.truncate(10);
+    }
+
     map
 }
 

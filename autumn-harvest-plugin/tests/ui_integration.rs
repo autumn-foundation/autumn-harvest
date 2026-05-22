@@ -2081,11 +2081,11 @@ async fn detail_page_events_paginated_for_large_history() {
     let (database_url, _container) = setup_test_database_url().await;
     let exec_id = insert_workflow_on_url(&database_url, ShardId::new(0), "big_wf", "big-1").await;
 
-    // Insert 150 signal events so the pagination threshold is crossed.
+    // Insert 150 marker events so the pagination threshold is crossed.
     let many_events: Vec<autumn_harvest::WorkflowEvent> = (0..150)
-        .map(|i| autumn_harvest::WorkflowEvent::SignalReceived {
-            signal_name: format!("signal_{i}"),
-            payload: serde_json::json!({}),
+        .map(|i| autumn_harvest::WorkflowEvent::MarkerRecorded {
+            name: format!("marker_{i}"),
+            details: serde_json::json!({}),
         })
         .collect();
     insert_workflow_events(&database_url, exec_id, &many_events, 1).await;
@@ -2094,14 +2094,14 @@ async fn detail_page_events_paginated_for_large_history() {
     let (status, html) = fetch_html(&app, &format!("/workflows/{exec_id}")).await;
     assert_eq!(status, StatusCode::OK, "detail page should render: {html}");
 
-    // The first page shows events 0–99; signal_149 is on page 1 and must not appear.
+    // The first page shows events 0–99; marker_149 is on page 1 and must not appear.
     assert!(
-        !html.contains("signal_149"),
-        "signal_149 is on page 1 (event 150 of 150) and should not render on page 0: {html}"
+        !html.contains("marker_149"),
+        "marker_149 is on page 1 (event 150 of 150) and should not render on page 0: {html}"
     );
     assert!(
-        !html.contains("signal_100"),
-        "signal_100 is on page 1 (event 101 of 150) and should not render on page 0: {html}"
+        !html.contains("marker_100"),
+        "marker_100 is on page 1 (event 101 of 150) and should not render on page 0: {html}"
     );
 
     // Pagination controls must be visible.

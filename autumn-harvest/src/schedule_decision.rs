@@ -50,6 +50,10 @@ pub async fn record_decision_graceful(
 }
 
 /// Purge schedule decisions older than a specified number of days.
+///
+/// # Errors
+///
+/// Returns a [`database_error`] if the database query execution fails.
 pub async fn purge_old_schedule_decisions(
     conn: &mut AsyncPgConnection,
     retention_days: i64,
@@ -58,11 +62,7 @@ pub async fn purge_old_schedule_decisions(
     use diesel::ExpressionMethods;
     use diesel::QueryDsl;
 
-    let cutoff = Utc::now()
-        - chrono::Duration::from_std(std::time::Duration::from_secs(
-            retention_days.max(0) as u64 * 86400,
-        ))
-        .unwrap_or_else(|_| chrono::Duration::zero());
+    let cutoff = Utc::now() - chrono::Duration::days(retention_days.max(0));
 
     let deleted = diesel::delete(
         harvest_schedule_decisions::table
