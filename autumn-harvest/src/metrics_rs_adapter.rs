@@ -49,10 +49,11 @@ use crate::telemetry::{
     METRIC_LABEL_NAME, METRIC_LABEL_NON_RETRYABLE, METRIC_LABEL_QUERY, METRIC_LABEL_QUEUE,
     METRIC_LABEL_REASON, METRIC_LABEL_SHARD, METRIC_LABEL_STATUS, METRIC_LABEL_WORKFLOW,
     METRIC_LABEL_WORKFLOW_TYPE, METRIC_QUERY_DURATION, METRIC_QUEUE_DEPTH,
-    METRIC_RETENTION_DELETED, METRIC_SCHEDULE_RUNS, METRIC_SCHEDULE_SKIPPED, METRIC_TIMER_DURATION,
-    METRIC_TIMER_STARTED, METRIC_WORKFLOW_CACHE_HIT, METRIC_WORKFLOW_CACHE_MISS,
-    METRIC_WORKFLOW_CONTINUE_AS_NEW, METRIC_WORKFLOW_DURATION, METRIC_WORKFLOW_HISTORY_SIZE,
-    METRIC_WORKFLOW_STARTED, MetricsRecorder, WorkflowStatus,
+    METRIC_RETENTION_DELETED, METRIC_SCHEDULE_DECISION_WRITE_FAILED, METRIC_SCHEDULE_RUNS,
+    METRIC_SCHEDULE_SKIPPED, METRIC_TIMER_DURATION, METRIC_TIMER_STARTED,
+    METRIC_WORKFLOW_CACHE_HIT, METRIC_WORKFLOW_CACHE_MISS, METRIC_WORKFLOW_CONTINUE_AS_NEW,
+    METRIC_WORKFLOW_DURATION, METRIC_WORKFLOW_HISTORY_SIZE, METRIC_WORKFLOW_STARTED,
+    MetricsRecorder, WorkflowStatus,
 };
 
 /// [`MetricsRecorder`] implementation that forwards every sample to the
@@ -205,6 +206,10 @@ impl MetricsRecorder for MetricsRsRecorder {
         .increment(1);
     }
 
+    fn record_schedule_decision_write_failed(&self) {
+        counter!(METRIC_SCHEDULE_DECISION_WRITE_FAILED).increment(1);
+    }
+
     fn record_retention_tick(
         &self,
         shard: u16,
@@ -306,6 +311,7 @@ mod tests {
         rec.record_dlq_entries(0, 2);
         rec.record_schedule_run("workflow", "nightly");
         rec.record_schedule_skipped("workflow", "nightly", "paused");
+        rec.record_schedule_decision_write_failed();
         rec.record_retention_tick(0, 100, 50, 0.01);
         rec.record_concurrency_key_in_flight("cap", 3);
         rec.record_concurrency_key_deferred("cap", 1);

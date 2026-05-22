@@ -57,7 +57,7 @@ use autumn_harvest::history_export::{
 };
 use autumn_harvest::models::{
     AuditRecord, BackfillLogRow, DeadLetter, HarvestCalendar, HarvestSchedule, NewAuditRecord,
-    NewBackfillLogRow, WorkflowExecution,
+    NewBackfillLogRow, ScheduleDecision, WorkflowExecution,
 };
 use autumn_harvest::policy::{Schedule, SkipPolicy, WorkflowSchedule, compute_jitter_offset};
 use autumn_harvest::queue::{self, ConcurrencyKeyStats};
@@ -1578,6 +1578,11 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .route("/admin/schedules/{id}/resume", post(resume_schedule))
         .route("/admin/schedules/{id}/backfill", post(schedule_backfill))
         .route("/admin/schedules/{id}", delete(delete_schedule))
+        .route("/admin/schedules/decisions", get(list_fleet_decisions))
+        .route(
+            "/admin/schedules/{id}/decisions",
+            get(get_schedule_decisions),
+        )
         .route(
             "/admin/schedules/{id}/preview",
             get(preview_schedule_firings_handler),
@@ -5638,6 +5643,138 @@ async fn get_schedule(
         calendar_name: s.calendar_name.clone(),
         skip_policy: s.skip_policy.clone(),
     }))
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct DecisionsQuery {
+    since: Option<String>,
+    decision: Option<String>,
+    reason: Option<String>,
+    limit: Option<i64>,
+}
+
+async fn get_schedule_decisions(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id_str): Path<String>,
+    Query(query): Query<DecisionsQuery>,
+) -> Result<Json<Vec<ScheduleDecision>>, AutumnError> {
+    use autumn_harvest::schema::harvest_schedule_decisions::dsl;
+
+    let id = parse_uuid(&id_str, "schedule id")?;
+    let pool = api_state.storage_pool().map_err(map_error)?;
+
+    let limit = query.limit.unwrap_or(50).clamp(1, 500);
+    let since = query
+        .since
+        .as_deref()
+        .map(parse_audit_datetime)
+        .transpose()?;
+
+    let mut records: Vec<ScheduleDecision> = Vec::new();
+
+    for (_shard, shard_pool) in pool.iter_shards() {
+        let mut conn = acquire_conn(shard_pool).await?;
+        let mut q = dsl::harvest_schedule_decisions.into_boxed();
+
+        q = q.filter(dsl::schedule_id.eq(id));
+
+        if let Some(ref since_dt) = since {
+            q = q.filter(dsl::occurred_at.ge(*since_dt));
+        }
+        if let Some(ref dec_val) = query.decision {
+            q = q.filter(dsl::decision.eq(dec_val));
+        }
+        if let Some(ref reason_val) = query.reason {
+            q = q.filter(dsl::reason_code.eq(reason_val));
+        }
+
+        let mut rows: Vec<ScheduleDecision> = q
+            .order(dsl::occurred_at.desc())
+            .limit(limit)
+            .select(ScheduleDecision::as_select())
+            .load(&mut conn)
+            .await
+            .map_err(database_error)
+            .map_err(map_error)?;
+
+        records.append(&mut rows);
+    }
+
+    // Merge shards: sort by occurred_at DESC, then id for determinism.
+    records.sort_by(|a, b| {
+        b.occurred_at
+            .cmp(&a.occurred_at)
+            .then_with(|| b.id.cmp(&a.id))
+    });
+    records.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+
+    Ok(Json(records))
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct FleetDecisionsQuery {
+    schedule_name: Option<String>,
+    since: Option<String>,
+    decision: Option<String>,
+    reason: Option<String>,
+    limit: Option<i64>,
+}
+
+async fn list_fleet_decisions(
+    Extension(api_state): Extension<HarvestApiState>,
+    Query(query): Query<FleetDecisionsQuery>,
+) -> Result<Json<Vec<ScheduleDecision>>, AutumnError> {
+    use autumn_harvest::schema::harvest_schedule_decisions::dsl;
+
+    let pool = api_state.storage_pool().map_err(map_error)?;
+
+    let limit = query.limit.unwrap_or(50).clamp(1, 500);
+    let since = query
+        .since
+        .as_deref()
+        .map(parse_audit_datetime)
+        .transpose()?;
+
+    let mut records: Vec<ScheduleDecision> = Vec::new();
+
+    for (_shard, shard_pool) in pool.iter_shards() {
+        let mut conn = acquire_conn(shard_pool).await?;
+        let mut q = dsl::harvest_schedule_decisions.into_boxed();
+
+        if let Some(ref name_val) = query.schedule_name {
+            q = q.filter(dsl::schedule_name.eq(name_val));
+        }
+        if let Some(ref since_dt) = since {
+            q = q.filter(dsl::occurred_at.ge(*since_dt));
+        }
+        if let Some(ref dec_val) = query.decision {
+            q = q.filter(dsl::decision.eq(dec_val));
+        }
+        if let Some(ref reason_val) = query.reason {
+            q = q.filter(dsl::reason_code.eq(reason_val));
+        }
+
+        let mut rows: Vec<ScheduleDecision> = q
+            .order(dsl::occurred_at.desc())
+            .limit(limit)
+            .select(ScheduleDecision::as_select())
+            .load(&mut conn)
+            .await
+            .map_err(database_error)
+            .map_err(map_error)?;
+
+        records.append(&mut rows);
+    }
+
+    // Merge shards: sort by occurred_at DESC, then id for determinism.
+    records.sort_by(|a, b| {
+        b.occurred_at
+            .cmp(&a.occurred_at)
+            .then_with(|| b.id.cmp(&a.id))
+    });
+    records.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+
+    Ok(Json(records))
 }
 
 /// Load the most recent backfill log row for each of the given schedule IDs.

@@ -1317,6 +1317,22 @@ async fn tick_workflow_schedules(
                 "harvest DAG workflow schedule skipped: DAG is no longer registered"
             );
             metrics.record_schedule_skipped("dag", dag_name, "dag_not_registered");
+            crate::schedule_decision::record_decision_graceful(
+                conn,
+                Some(&**metrics),
+                Some(schedule.id),
+                dag_name,
+                "dag",
+                "skipped",
+                "dag_not_registered",
+                Some(serde_json::json!({
+                    "workflow_name": wf_name,
+                })),
+                now,
+                now,
+                i16::try_from(current_shard.as_i32()).unwrap_or(0),
+            )
+            .await;
             diesel::update(dsl::harvest_schedules.find(schedule.id))
                 .set((
                     dsl::next_run_at.eq(Option::<DateTime<Utc>>::None),
@@ -1527,6 +1543,23 @@ async fn tick_one_workflow_schedule(
                 } else {
                     next_run_after(parsed_schedule, now)
                 };
+                crate::schedule_decision::record_decision_graceful(
+                    conn,
+                    Some(&**metrics),
+                    Some(schedule.id),
+                    wf_name,
+                    "workflow",
+                    "skipped",
+                    "calendar",
+                    Some(serde_json::json!({
+                        "calendar": cal_name,
+                        "fire_date": fire_date,
+                    })),
+                    now,
+                    next.unwrap_or(now),
+                    i16::try_from(current_shard.as_i32()).unwrap_or(0),
+                )
+                .await;
                 diesel::update(dsl::harvest_schedules.find(schedule.id))
                     .set((dsl::next_run_at.eq(next), dsl::updated_at.eq(now)))
                     .execute(conn)
@@ -1584,6 +1617,24 @@ async fn tick_one_workflow_schedule(
                 } else {
                     next_run_after(parsed_schedule, now)
                 };
+                crate::schedule_decision::record_decision_graceful(
+                    conn,
+                    Some(&**metrics),
+                    Some(schedule.id),
+                    wf_name,
+                    "workflow",
+                    "skipped",
+                    reason,
+                    Some(serde_json::json!({
+                        "overlap_policy": overlap_policy.as_str(),
+                        "running_runs": running,
+                        "max_active_runs": schedule.max_active_runs,
+                    })),
+                    now,
+                    next.unwrap_or(now),
+                    i16::try_from(current_shard.as_i32()).unwrap_or(0),
+                )
+                .await;
                 diesel::update(dsl::harvest_schedules.find(schedule.id))
                     .set((dsl::next_run_at.eq(next), dsl::updated_at.eq(now)))
                     .execute(conn)
@@ -1606,6 +1657,25 @@ async fn tick_one_workflow_schedule(
                 } else {
                     next_run_after(parsed_schedule, now)
                 };
+                crate::schedule_decision::record_decision_graceful(
+                    conn,
+                    Some(&**metrics),
+                    Some(schedule.id),
+                    wf_name,
+                    "workflow",
+                    "skipped",
+                    "overlap_buffered",
+                    Some(serde_json::json!({
+                        "overlap_policy": overlap_policy.as_str(),
+                        "buffered_runs": buffered.len(),
+                        "running_runs": running,
+                        "max_active_runs": schedule.max_active_runs,
+                    })),
+                    now,
+                    next.unwrap_or(now),
+                    i16::try_from(current_shard.as_i32()).unwrap_or(0),
+                )
+                .await;
                 diesel::update(dsl::harvest_schedules.find(schedule.id))
                     .set((
                         dsl::next_run_at.eq(next),
@@ -1695,6 +1765,25 @@ async fn tick_one_workflow_schedule(
                 max_active_runs = schedule.max_active_runs,
                 "harvest workflow schedule: max_active_runs reached during catchup; deferring remaining"
             );
+            crate::schedule_decision::record_decision_graceful(
+                conn,
+                Some(&**metrics),
+                Some(schedule.id),
+                wf_name,
+                "workflow",
+                "skipped",
+                "max_active_runs_reached",
+                Some(serde_json::json!({
+                    "running_runs": running,
+                    "dispatched_runs": dispatched,
+                    "max_active_runs": schedule.max_active_runs,
+                    "deferred_slot": original_slot,
+                })),
+                now,
+                *original_slot,
+                i16::try_from(current_shard.as_i32()).unwrap_or(0),
+            )
+            .await;
             break;
         }
         // Jitter: stall dispatch until the effective fire time has elapsed.
@@ -1781,6 +1870,25 @@ async fn tick_one_workflow_schedule(
                     created = outcome.created(),
                     "harvest: scheduled workflow run dispatched"
                 );
+                let next_slot = next_run_after(parsed_schedule, *original_slot).unwrap_or(now);
+                crate::schedule_decision::record_decision_graceful(
+                    conn,
+                    Some(&**metrics),
+                    Some(schedule.id),
+                    wf_name,
+                    "workflow",
+                    "fired",
+                    "fired_ok",
+                    Some(serde_json::json!({
+                        "execution_id": outcome.exec_id(),
+                        "state": outcome.state().to_string(),
+                        "created": outcome.created(),
+                    })),
+                    now,
+                    next_slot,
+                    i16::try_from(current_shard.as_i32()).unwrap_or(0),
+                )
+                .await;
             }
             Err(error) => {
                 // Propagate the error so last_run_at is not advanced — the next
@@ -2170,6 +2278,25 @@ async fn drain_buffered_schedule_runs(
                         created = outcome.created(),
                         "harvest: buffered scheduled workflow run dispatched"
                     );
+                    crate::schedule_decision::record_decision_graceful(
+                        conn,
+                        Some(&**metrics),
+                        Some(schedule.id),
+                        wf_name,
+                        "workflow",
+                        "fired",
+                        "fired_ok",
+                        Some(serde_json::json!({
+                            "execution_id": outcome.exec_id(),
+                            "state": outcome.state().to_string(),
+                            "created": outcome.created(),
+                            "buffered": true,
+                        })),
+                        now,
+                        schedule.next_run_at.unwrap_or(now),
+                        i16::try_from(current_shard.as_i32()).unwrap_or(0),
+                    )
+                    .await;
                 }
                 Err(error) => {
                     // Drop the failing slot rather than re-inserting it. Re-queuing a

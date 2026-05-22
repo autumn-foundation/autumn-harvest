@@ -48,15 +48,25 @@ const INIT_SQL: &str = concat!(
         "../../autumn-harvest/migrations/20260430000000_harvest_workflow_schedules/up.sql"
     ),
     "\n",
-    include_str!("../../autumn-harvest/migrations/20260501000000_harvest_workers/up.sql"),
+    include_str!("../../autumn-harvest/migrations/20260430000001_harvest_external_tasks/up.sql"),
     "\n",
     include_str!(
-        "../../autumn-harvest/migrations/20260508010000_harvest_workers_drain_deadline/up.sql"
+        "../../autumn-harvest/migrations/20260508000000_harvest_external_task_updated_at/up.sql"
+    ),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260504000000_harvest_workflow_parent_children/up.sql"
     ),
     "\n",
     include_str!("../../autumn-harvest/migrations/20260505000000_harvest_heartbeat_details/up.sql"),
     "\n",
     include_str!("../../autumn-harvest/migrations/20260506000000_harvest_audit_log/up.sql"),
+    "\n",
+    include_str!("../../autumn-harvest/migrations/20260501000000_harvest_workers/up.sql"),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260508010000_harvest_workers_drain_deadline/up.sql"
+    ),
     "\n",
     include_str!("../../autumn-harvest/migrations/20260509000000_harvest_build_routing/up.sql"),
     "\n",
@@ -64,14 +74,30 @@ const INIT_SQL: &str = concat!(
         "../../autumn-harvest/migrations/20260513000000_harvest_schedule_pause_metadata/up.sql"
     ),
     "\n",
+    include_str!("../../autumn-harvest/migrations/20260514010000_unified_dag_schedule_kind/up.sql"),
+    "\n",
     include_str!("../../autumn-harvest/migrations/20260514020000_harvest_task_activity_id/up.sql"),
     "\n",
     include_str!(
         "../../autumn-harvest/migrations/20260518000000_harvest_signal_idempotency/up.sql"
     ),
     "\n",
+    include_str!("../../autumn-harvest/migrations/20260517000000_harvest_schedule_jitter/up.sql"),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260517000001_harvest_schedule_overlap_policy/up.sql"
+    ),
+    "\n",
     include_str!(
         "../../autumn-harvest/migrations/20260518000001_harvest_workflow_execution_timeout/up.sql"
+    ),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260519000000_harvest_calendar_awareness/up.sql"
+    ),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260522000000_harvest_schedule_decisions/up.sql"
     ),
 );
 
@@ -2462,5 +2488,56 @@ async fn detail_page_shows_custom_continue_as_new_threshold() {
     assert!(
         html.contains('3'),
         "metadata card should show the event count 3: {html}"
+    );
+}
+
+#[tokio::test]
+async fn ui_schedules_displays_recent_decisions() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let id = insert_test_schedule(&database_url, "Workflow", "decision_ui_workflow", false).await;
+
+    // Connect to database and insert a decision
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("connect");
+
+    let occurred_at = chrono::Utc::now();
+    let next_fire_at = occurred_at + chrono::Duration::hours(1);
+
+    autumn_harvest::schedule_decision::record_decision_graceful(
+        &mut conn,
+        None,
+        Some(id),
+        "decision_ui_workflow",
+        "workflow",
+        "fired",
+        "fired_ok",
+        Some(serde_json::json!({ "run_id": "run-xyz-456" })),
+        occurred_at,
+        next_fire_at,
+        0,
+    )
+    .await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, html) = fetch_html(&app, "/schedules").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "schedules page must return 200: {html}"
+    );
+
+    // Verify recent decisions collapsible is rendered in HTML
+    assert!(
+        html.contains("Recent Decisions (1)"),
+        "recent decisions collapsible summary missing: {html}"
+    );
+    assert!(
+        html.contains("fired"),
+        "decision type 'fired' missing from page: {html}"
+    );
+    assert!(
+        html.contains("fired_ok"),
+        "reason code 'fired_ok' missing from page: {html}"
     );
 }

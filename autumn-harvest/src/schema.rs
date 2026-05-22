@@ -325,11 +325,29 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    use diesel::sql_types::*;
+
+    harvest_schedule_decisions (id) {
+        id -> Uuid,
+        schedule_id -> Nullable<Uuid>,
+        schedule_name -> Text,
+        target_kind -> Text,
+        decision -> Text,
+        reason_code -> Text,
+        detail -> Nullable<Jsonb>,
+        occurred_at -> Timestamptz,
+        next_fire_at -> Timestamptz,
+        shard_id -> Int2,
+    }
+}
+
 diesel::joinable!(harvest_events -> harvest_workflow_executions (workflow_exec_id));
 diesel::joinable!(harvest_task_queue -> harvest_workflow_executions (workflow_exec_id));
 diesel::joinable!(harvest_signals -> harvest_workflow_executions (workflow_exec_id));
 diesel::joinable!(harvest_timers -> harvest_workflow_executions (workflow_exec_id));
 diesel::joinable!(harvest_external_tasks -> harvest_workflow_executions (workflow_exec_id));
+diesel::joinable!(harvest_schedule_decisions -> harvest_schedules (schedule_id));
 // harvest_calendar_exclusions references harvest_calendars(name), not the PK(id),
 // so diesel::joinable! cannot be used here. Queries use explicit filter conditions.
 
@@ -350,4 +368,5 @@ diesel::allow_tables_to_appear_in_same_query!(
     harvest_backfill_log,
     harvest_calendars,
     harvest_calendar_exclusions,
+    harvest_schedule_decisions,
 );

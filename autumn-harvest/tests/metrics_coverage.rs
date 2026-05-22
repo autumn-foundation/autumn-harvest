@@ -12,9 +12,10 @@ use std::sync::{Arc, Mutex};
 
 use autumn_harvest::telemetry::{
     ActivityStatus, METRIC_ACTIVITY_DURATION, METRIC_DLQ_ENTRIES, METRIC_QUEUE_DEPTH,
-    METRIC_RETENTION_DELETED, METRIC_SCHEDULE_RUNS, METRIC_SCHEDULE_SKIPPED, METRIC_TIMER_STARTED,
-    METRIC_WORKFLOW_CONTINUE_AS_NEW, METRIC_WORKFLOW_DURATION, METRIC_WORKFLOW_HISTORY_SIZE,
-    METRIC_WORKFLOW_STARTED, MetricsRecorder, NoOpMetrics, WorkflowStatus,
+    METRIC_RETENTION_DELETED, METRIC_SCHEDULE_DECISION_WRITE_FAILED, METRIC_SCHEDULE_RUNS,
+    METRIC_SCHEDULE_SKIPPED, METRIC_TIMER_STARTED, METRIC_WORKFLOW_CONTINUE_AS_NEW,
+    METRIC_WORKFLOW_DURATION, METRIC_WORKFLOW_HISTORY_SIZE, METRIC_WORKFLOW_STARTED,
+    MetricsRecorder, NoOpMetrics, WorkflowStatus,
 };
 
 // ---------------------------------------------------------------------------
@@ -148,6 +149,13 @@ impl MetricsRecorder for RecordingMetrics {
         });
     }
 
+    fn record_schedule_decision_write_failed(&self) {
+        self.samples.lock().unwrap().push(MetricSample {
+            name: METRIC_SCHEDULE_DECISION_WRITE_FAILED,
+            labels: vec![],
+        });
+    }
+
     fn record_retention_tick(
         &self,
         shard: u16,
@@ -186,11 +194,16 @@ fn all_catalogue_metrics_are_reachable_via_trait() {
     rec.record_dlq_entries(0, 2);
     rec.record_schedule_run("workflow", "nightly");
     rec.record_schedule_skipped("workflow", "nightly", "paused");
+    rec.record_schedule_decision_write_failed();
     rec.record_retention_tick(0, 100, 50, 0.01);
 
     let samples = rec.drain();
     let names: Vec<&str> = samples.iter().map(|s| s.name).collect();
 
+    assert!(
+        names.contains(&METRIC_SCHEDULE_DECISION_WRITE_FAILED),
+        "harvest.schedule.decision_write_failed not sampled"
+    );
     assert!(
         names.contains(&METRIC_WORKFLOW_STARTED),
         "harvest.workflow.started not sampled"
@@ -268,6 +281,7 @@ fn cardinality_no_execution_id_label_on_any_metric() {
     rec.record_dlq_entries(0, 0);
     rec.record_schedule_run("dag", "my_dag");
     rec.record_schedule_skipped("dag", "my_dag", "max_active_runs_reached");
+    rec.record_schedule_decision_write_failed();
     rec.record_retention_tick(0, 0, 0, 0.0);
 
     for sample in rec.drain() {
@@ -363,6 +377,7 @@ fn noop_metrics_implements_all_catalogue_methods() {
     rec.record_dlq_entries(0, 0);
     rec.record_schedule_run("workflow", "wf");
     rec.record_schedule_skipped("workflow", "wf", "paused");
+    rec.record_schedule_decision_write_failed();
     rec.record_retention_tick(0, 0, 0, 0.0);
     rec.record_concurrency_key_in_flight("key", 0);
     rec.record_concurrency_key_deferred("key", 0);
