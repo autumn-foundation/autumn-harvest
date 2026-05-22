@@ -112,6 +112,10 @@ const INIT_SQL: &str = concat!(
     include_str!(
         "../../autumn-harvest/migrations/20260519000000_harvest_calendar_awareness/up.sql"
     ),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260522000000_harvest_schedule_decisions/up.sql"
+    ),
 );
 type HarvestApiApp = axum::Router;
 
@@ -3176,6 +3180,7 @@ async fn retention_janitor_deletes_only_rows_older_than_max_age_and_cascades_chi
                 batch_size: 1000,
                 dry_run: false,
                 audit_retention_days: 90,
+                schedule_decision_retention_days: 7,
             })
             .build(),
         &HarvestRuntimeConfig {
@@ -5961,4 +5966,57 @@ async fn get_schedule_by_id_returns_entry_with_pause_fields() {
         StatusCode::NOT_FOUND,
         "unknown id must return 404"
     );
+}
+
+#[tokio::test]
+async fn get_schedule_decisions_api_endpoints() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool));
+    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+
+    let id = seed_workflow_schedule_and_get_id(&database_url, "decision_test_wf").await;
+
+    // Connect to database and insert some decisions
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("connect");
+
+    let occurred_at = chrono::Utc::now();
+    let next_fire_at = occurred_at + chrono::Duration::hours(1);
+
+    autumn_harvest::schedule_decision::record_decision_graceful(
+        &mut conn,
+        None,
+        Some(id),
+        "decision_test_wf",
+        "workflow",
+        "fired",
+        "fired_ok",
+        Some(serde_json::json!({ "run_id": "run-abc-123" })),
+        occurred_at,
+        next_fire_at,
+        0,
+    )
+    .await;
+
+    // 1. Test fleet-wide decisions endpoint
+    let (status, fleet_decisions) = get_json(&app, "/admin/schedules/decisions").await;
+    assert_eq!(status, StatusCode::OK);
+    let list = fleet_decisions.as_array().expect("array");
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0]["schedule_name"], "decision_test_wf");
+    assert_eq!(list[0]["decision"], "fired");
+    assert_eq!(list[0]["reason_code"], "fired_ok");
+
+    // 2. Test single schedule decisions endpoint
+    let (status2, single_decisions) =
+        get_json(&app, format!("/admin/schedules/{id}/decisions")).await;
+    assert_eq!(status2, StatusCode::OK);
+    let list2 = single_decisions.as_array().expect("array");
+    assert_eq!(list2.len(), 1);
+    assert_eq!(list2[0]["schedule_id"], id.to_string());
+    assert_eq!(list2[0]["decision"], "fired");
+    assert_eq!(list2[0]["reason_code"], "fired_ok");
 }

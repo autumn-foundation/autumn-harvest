@@ -99,6 +99,9 @@ pub const METRIC_SCHEDULE_RUNS: &str = "harvest.schedule.runs";
 /// Counter: incremented each time a scheduled run is skipped.
 pub const METRIC_SCHEDULE_SKIPPED: &str = "harvest.schedule.skipped";
 
+/// Counter: incremented when a schedule decision write fails due to a database error.
+pub const METRIC_SCHEDULE_DECISION_WRITE_FAILED: &str = "harvest.schedule.decision_write_failed";
+
 /// Counter: number of rows deleted by the retention janitor in one tick.
 pub const METRIC_RETENTION_DELETED: &str = "harvest.retention.deleted";
 
@@ -584,6 +587,11 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = (kind, name, reason);
     }
 
+    /// A scheduler decision write failed due to a database error.
+    ///
+    /// Maps to the counter `harvest.schedule.decision_write_failed`.
+    fn record_schedule_decision_write_failed(&self) {}
+
     /// A query handler invocation completed (issue #234).
     ///
     /// `query_name` is the handler name registered via `register_query` /
@@ -813,6 +821,10 @@ mod tests {
         assert_eq!(METRIC_DLQ_ENTRIES, "harvest.dlq.entries");
         assert_eq!(METRIC_SCHEDULE_RUNS, "harvest.schedule.runs");
         assert_eq!(METRIC_SCHEDULE_SKIPPED, "harvest.schedule.skipped");
+        assert_eq!(
+            METRIC_SCHEDULE_DECISION_WRITE_FAILED,
+            "harvest.schedule.decision_write_failed"
+        );
         assert_eq!(METRIC_RETENTION_DELETED, "harvest.retention.deleted");
         assert_eq!(METRIC_WORKFLOW_TIMEOUT, "harvest.workflow.timeout");
     }

@@ -48,15 +48,25 @@ const INIT_SQL: &str = concat!(
         "../../autumn-harvest/migrations/20260430000000_harvest_workflow_schedules/up.sql"
     ),
     "\n",
-    include_str!("../../autumn-harvest/migrations/20260501000000_harvest_workers/up.sql"),
+    include_str!("../../autumn-harvest/migrations/20260430000001_harvest_external_tasks/up.sql"),
     "\n",
     include_str!(
-        "../../autumn-harvest/migrations/20260508010000_harvest_workers_drain_deadline/up.sql"
+        "../../autumn-harvest/migrations/20260508000000_harvest_external_task_updated_at/up.sql"
+    ),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260504000000_harvest_workflow_parent_children/up.sql"
     ),
     "\n",
     include_str!("../../autumn-harvest/migrations/20260505000000_harvest_heartbeat_details/up.sql"),
     "\n",
     include_str!("../../autumn-harvest/migrations/20260506000000_harvest_audit_log/up.sql"),
+    "\n",
+    include_str!("../../autumn-harvest/migrations/20260501000000_harvest_workers/up.sql"),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260508010000_harvest_workers_drain_deadline/up.sql"
+    ),
     "\n",
     include_str!("../../autumn-harvest/migrations/20260509000000_harvest_build_routing/up.sql"),
     "\n",
@@ -64,14 +74,30 @@ const INIT_SQL: &str = concat!(
         "../../autumn-harvest/migrations/20260513000000_harvest_schedule_pause_metadata/up.sql"
     ),
     "\n",
+    include_str!("../../autumn-harvest/migrations/20260514010000_unified_dag_schedule_kind/up.sql"),
+    "\n",
     include_str!("../../autumn-harvest/migrations/20260514020000_harvest_task_activity_id/up.sql"),
     "\n",
     include_str!(
         "../../autumn-harvest/migrations/20260518000000_harvest_signal_idempotency/up.sql"
     ),
     "\n",
+    include_str!("../../autumn-harvest/migrations/20260517000000_harvest_schedule_jitter/up.sql"),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260517000001_harvest_schedule_overlap_policy/up.sql"
+    ),
+    "\n",
     include_str!(
         "../../autumn-harvest/migrations/20260518000001_harvest_workflow_execution_timeout/up.sql"
+    ),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260519000000_harvest_calendar_awareness/up.sql"
+    ),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260522000000_harvest_schedule_decisions/up.sql"
     ),
 );
 
@@ -2055,11 +2081,11 @@ async fn detail_page_events_paginated_for_large_history() {
     let (database_url, _container) = setup_test_database_url().await;
     let exec_id = insert_workflow_on_url(&database_url, ShardId::new(0), "big_wf", "big-1").await;
 
-    // Insert 150 signal events so the pagination threshold is crossed.
+    // Insert 150 marker events so the pagination threshold is crossed.
     let many_events: Vec<autumn_harvest::WorkflowEvent> = (0..150)
-        .map(|i| autumn_harvest::WorkflowEvent::SignalReceived {
-            signal_name: format!("signal_{i}"),
-            payload: serde_json::json!({}),
+        .map(|i| autumn_harvest::WorkflowEvent::MarkerRecorded {
+            name: format!("marker_{i}"),
+            details: serde_json::json!({}),
         })
         .collect();
     insert_workflow_events(&database_url, exec_id, &many_events, 1).await;
@@ -2068,14 +2094,14 @@ async fn detail_page_events_paginated_for_large_history() {
     let (status, html) = fetch_html(&app, &format!("/workflows/{exec_id}")).await;
     assert_eq!(status, StatusCode::OK, "detail page should render: {html}");
 
-    // The first page shows events 0–99; signal_149 is on page 1 and must not appear.
+    // The first page shows events 0–99; marker_149 is on page 1 and must not appear.
     assert!(
-        !html.contains("signal_149"),
-        "signal_149 is on page 1 (event 150 of 150) and should not render on page 0: {html}"
+        !html.contains("marker_149"),
+        "marker_149 is on page 1 (event 150 of 150) and should not render on page 0: {html}"
     );
     assert!(
-        !html.contains("signal_100"),
-        "signal_100 is on page 1 (event 101 of 150) and should not render on page 0: {html}"
+        !html.contains("marker_100"),
+        "marker_100 is on page 1 (event 101 of 150) and should not render on page 0: {html}"
     );
 
     // Pagination controls must be visible.
@@ -2462,5 +2488,56 @@ async fn detail_page_shows_custom_continue_as_new_threshold() {
     assert!(
         html.contains('3'),
         "metadata card should show the event count 3: {html}"
+    );
+}
+
+#[tokio::test]
+async fn ui_schedules_displays_recent_decisions() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let id = insert_test_schedule(&database_url, "Workflow", "decision_ui_workflow", false).await;
+
+    // Connect to database and insert a decision
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("connect");
+
+    let occurred_at = chrono::Utc::now();
+    let next_fire_at = occurred_at + chrono::Duration::hours(1);
+
+    autumn_harvest::schedule_decision::record_decision_graceful(
+        &mut conn,
+        None,
+        Some(id),
+        "decision_ui_workflow",
+        "workflow",
+        "fired",
+        "fired_ok",
+        Some(serde_json::json!({ "run_id": "run-xyz-456" })),
+        occurred_at,
+        next_fire_at,
+        0,
+    )
+    .await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, html) = fetch_html(&app, "/schedules").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "schedules page must return 200: {html}"
+    );
+
+    // Verify recent decisions collapsible is rendered in HTML
+    assert!(
+        html.contains("Recent Decisions (1)"),
+        "recent decisions collapsible summary missing: {html}"
+    );
+    assert!(
+        html.contains("fired"),
+        "decision type 'fired' missing from page: {html}"
+    );
+    assert!(
+        html.contains("fired_ok"),
+        "reason code 'fired_ok' missing from page: {html}"
     );
 }

@@ -39,7 +39,7 @@ use autumn_harvest::cancel_workflow_execution;
 use autumn_harvest::error::{HarvestResult, database_error};
 use autumn_harvest::models::{
     DeadLetter, ExternalTask, HarvestEvent, HarvestSchedule, HarvestSignal, HarvestTimer,
-    NewAuditRecord, TaskQueueItem, WorkflowExecution,
+    NewAuditRecord, ScheduleDecision, TaskQueueItem, WorkflowExecution,
 };
 use autumn_harvest::reset::{
     ResetSignalReapplyPolicy, WorkflowResetRequest, reset_workflow_execution,
@@ -3349,6 +3349,56 @@ async fn load_schedules_from_shards_ui(api_state: &HarvestApiState) -> Vec<Shard
     futures::future::join_all(futs).await
 }
 
+async fn load_recent_decisions(
+    api_state: &HarvestApiState,
+    schedule_ids: &[uuid::Uuid],
+) -> std::collections::HashMap<uuid::Uuid, Vec<ScheduleDecision>> {
+    use autumn_harvest::schema::harvest_schedule_decisions::dsl;
+
+    if schedule_ids.is_empty() {
+        return std::collections::HashMap::new();
+    }
+    let Ok(pool) = api_state.storage_pool() else {
+        return std::collections::HashMap::new();
+    };
+
+    let mut all_rows: Vec<ScheduleDecision> = Vec::new();
+
+    for (_shard, shard_pool) in pool.iter_shards() {
+        let Ok(mut conn) = acquire_conn(shard_pool).await else {
+            continue;
+        };
+        let mut rows: Vec<ScheduleDecision> = dsl::harvest_schedule_decisions
+            .filter(dsl::schedule_id.eq_any(schedule_ids))
+            .select(ScheduleDecision::as_select())
+            .load(&mut conn)
+            .await
+            .unwrap_or_default();
+
+        all_rows.append(&mut rows);
+    }
+
+    let mut map: std::collections::HashMap<uuid::Uuid, Vec<ScheduleDecision>> =
+        std::collections::HashMap::new();
+
+    for row in all_rows {
+        if let Some(sched_id) = row.schedule_id {
+            map.entry(sched_id).or_default().push(row);
+        }
+    }
+
+    for decisions in map.values_mut() {
+        decisions.sort_by(|a, b| {
+            b.occurred_at
+                .cmp(&a.occurred_at)
+                .then_with(|| b.id.cmp(&a.id))
+        });
+        decisions.truncate(10);
+    }
+
+    map
+}
+
 async fn list_schedules_ui(
     Extension(api_state): Extension<HarvestApiState>,
     Query(params): Query<ScheduleListParams>,
@@ -3441,11 +3491,15 @@ async fn list_schedules_ui(
         .take(limit_usize)
         .collect();
 
+    let schedule_ids: Vec<uuid::Uuid> = page_rows.iter().map(|(_, r)| r.id).collect();
+    let decisions = load_recent_decisions(&api_state, &schedule_ids).await;
+
     Ok(render_schedules_page(
         &page_rows,
         &shard_errors,
         is_multi_shard,
         &filters,
+        &decisions,
         page,
         limit,
         has_next,
@@ -3878,6 +3932,7 @@ fn render_schedules_page(
     shard_errors: &[(ShardId, String)],
     is_multi_shard: bool,
     filters: &ScheduleUiFilters,
+    decisions: &std::collections::HashMap<uuid::Uuid, Vec<ScheduleDecision>>,
     page: i64,
     limit: i64,
     has_next: bool,
@@ -3915,7 +3970,7 @@ fn render_schedules_page(
                     (error)
                 }
             }
-            (render_schedule_table(rows, is_multi_shard))
+            (render_schedule_table(rows, is_multi_shard, decisions))
         }
 
         (render_schedule_pagination(page, limit, has_next, filters, refresh))
@@ -4035,7 +4090,11 @@ fn render_schedule_hidden_filters(filters: &ScheduleUiFilters) -> Markup {
     }
 }
 
-fn render_schedule_table(rows: &[(ShardId, HarvestSchedule)], is_multi_shard: bool) -> Markup {
+fn render_schedule_table(
+    rows: &[(ShardId, HarvestSchedule)],
+    is_multi_shard: bool,
+    decisions: &std::collections::HashMap<uuid::Uuid, Vec<ScheduleDecision>>,
+) -> Markup {
     html! {
         table {
             thead {
@@ -4063,7 +4122,34 @@ fn render_schedule_table(rows: &[(ShardId, HarvestSchedule)], is_multi_shard: bo
                     tr {
                         td { code { (short_id(&id_str)) } }
                         td { (kind_label) }
-                        td { code { (target_name) } }
+                        td {
+                            code { (target_name) }
+                            @if let Some(s_decisions) = decisions.get(&row.id) {
+                                @if !s_decisions.is_empty() {
+                                    div style="margin-top: 6px" {
+                                        details {
+                                            summary style="font-size: 11px; color: #93c5fd; cursor: pointer" { "Recent Decisions (" (s_decisions.len()) ")" }
+                                            div style="display: flex; flex-direction: column; gap: 4px; padding: 6px; background: #0f172a; border-radius: 4px; margin-top: 4px; font-size: 11px; max-width: 400px" {
+                                                @for dec in s_decisions {
+                                                    @let dec_badge_class = match dec.decision.as_str() {
+                                                        "fired" => "badge COMPLETED",
+                                                        "skipped" => "badge Active",
+                                                        "suppressed_paused" => "badge CANCELLED",
+                                                        "backfilled" => "badge RUNNING",
+                                                        _ => "badge UNKNOWN",
+                                                    };
+                                                    div style="display: flex; align-items: center; justify-content: space-between; gap: 8px" {
+                                                        span class=(dec_badge_class) style="font-size: 10px; padding: 1px 6px" { (dec.decision) }
+                                                        span style="color: #cbd5e1; font-family: monospace" { (dec.reason_code) }
+                                                        span style="color: #64748b" { (format_timestamp(Some(dec.occurred_at))) }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         td { code { (expr) } }
                         td { (format_timestamp(row.next_run_at)) }
                         td { (format_timestamp(row.last_run_at)) }

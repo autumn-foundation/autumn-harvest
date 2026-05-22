@@ -111,6 +111,8 @@ pub mod notify;
 #[doc(hidden)]
 pub mod queue;
 #[cfg(feature = "db")]
+pub mod schedule_decision;
+#[cfg(feature = "db")]
 pub mod scheduler;
 #[cfg(feature = "db")]
 #[allow(clippy::wildcard_imports)]
@@ -213,6 +215,8 @@ pub use retention::RetentionConfig;
 #[cfg(feature = "db")]
 pub use retention::{RetentionMonitor, RetentionRuntime, RetentionStatus, RetentionTickResult};
 pub use saga::Saga;
+#[cfg(feature = "db")]
+pub use schedule_decision::record_decision_graceful;
 #[cfg(feature = "db")]
 pub use scheduler::{
     DagCatalog, RegisteredDag, SchedulerMonitor, SchedulerRuntime, compile_dag_catalog,

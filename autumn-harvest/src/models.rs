@@ -12,8 +12,9 @@ use uuid::Uuid;
 use crate::schema::{
     harvest_audit_log, harvest_backfill_log, harvest_batch_jobs, harvest_build_compat,
     harvest_build_policies, harvest_calendar_exclusions, harvest_calendars, harvest_dead_letters,
-    harvest_events, harvest_external_tasks, harvest_schedules, harvest_signals, harvest_task_queue,
-    harvest_timers, harvest_workers, harvest_workflow_executions,
+    harvest_events, harvest_external_tasks, harvest_schedule_decisions, harvest_schedules,
+    harvest_signals, harvest_task_queue, harvest_timers, harvest_workers,
+    harvest_workflow_executions,
 };
 
 // ── Calendar ──────────────────────────────────────────────────────────────────
@@ -655,4 +656,41 @@ pub struct NewBackfillLogRow {
     pub error_summary: Option<String>,
     pub started_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
+}
+
+// ── Schedule Decisions ────────────────────────────────────────────────────────
+
+/// A queryable decision record for a scheduler tick (issue #325).
+#[derive(
+    Debug, Clone, Queryable, Selectable, Identifiable, serde::Serialize, serde::Deserialize,
+)]
+#[diesel(table_name = harvest_schedule_decisions)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct ScheduleDecision {
+    pub id: Uuid,
+    pub schedule_id: Option<Uuid>,
+    pub schedule_name: String,
+    pub target_kind: String,
+    pub decision: String,
+    pub reason_code: String,
+    pub detail: Option<serde_json::Value>,
+    pub occurred_at: DateTime<Utc>,
+    pub next_fire_at: DateTime<Utc>,
+    pub shard_id: i16,
+}
+
+/// Insertable model for creating a schedule decision record.
+#[derive(Debug, Insertable, serde::Serialize, serde::Deserialize)]
+#[diesel(table_name = harvest_schedule_decisions)]
+pub struct NewScheduleDecision {
+    pub id: Uuid,
+    pub schedule_id: Option<Uuid>,
+    pub schedule_name: String,
+    pub target_kind: String,
+    pub decision: String,
+    pub reason_code: String,
+    pub detail: Option<serde_json::Value>,
+    pub occurred_at: DateTime<Utc>,
+    pub next_fire_at: DateTime<Utc>,
+    pub shard_id: i16,
 }

@@ -72,6 +72,9 @@ pub struct RetentionConfig {
     /// Audit log retention in days, independent of workflow-history retention.
     /// Defaults to 90 days (3 months). Set to 0 to disable audit purging.
     pub audit_retention_days: i64,
+    /// Schedule decisions retention in days.
+    /// Defaults to 7 days. Set to 0 to disable schedule decision purging.
+    pub schedule_decision_retention_days: i64,
 }
 
 impl Default for RetentionConfig {
@@ -82,6 +85,7 @@ impl Default for RetentionConfig {
             batch_size: DEFAULT_BATCH_SIZE,
             dry_run: false,
             audit_retention_days: 90,
+            schedule_decision_retention_days: 7,
         }
     }
 }
@@ -100,6 +104,13 @@ impl RetentionConfig {
     #[must_use]
     pub const fn with_audit_retention_days(mut self, days: i64) -> Self {
         self.audit_retention_days = days;
+        self
+    }
+
+    /// Override the schedule decision retention window.
+    #[must_use]
+    pub const fn with_schedule_decision_retention_days(mut self, days: i64) -> Self {
+        self.schedule_decision_retention_days = days;
         self
     }
 
@@ -139,10 +150,12 @@ impl RetentionConfig {
         Ok(())
     }
 
-    /// Returns `true` if any retention features (workflow history or audit log purging) are enabled.
+    /// Returns `true` if any retention features (workflow history, audit log, or schedule decision purging) are enabled.
     #[must_use]
     pub const fn enabled(&self) -> bool {
-        self.max_age_secs.is_some() || self.audit_retention_days > 0
+        self.max_age_secs.is_some()
+            || self.audit_retention_days > 0
+            || self.schedule_decision_retention_days > 0
     }
 }
 
@@ -255,6 +268,7 @@ impl RetentionRuntime {
     /// Panics inside the spawned task if the enabled config is missing `max_age`
     /// (which cannot happen when `config.enabled()` is `true`).
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn spawn(
         pools: ShardedDbPool,
         config: RetentionConfig,
@@ -356,6 +370,22 @@ impl RetentionRuntime {
                             .await
                         {
                             tracing::warn!(error = %err, "harvest audit log purge failed");
+                        }
+                    }
+                }
+
+                // Purge old schedule decisions once per tick, best-effort.
+                if config.schedule_decision_retention_days > 0 && !config.dry_run {
+                    for (_, pool) in pools.iter_shards() {
+                        if let Ok(mut conn) = pool.get().await
+                            && let Err(err) =
+                                crate::schedule_decision::purge_old_schedule_decisions(
+                                    &mut conn,
+                                    config.schedule_decision_retention_days,
+                                )
+                                .await
+                        {
+                            tracing::warn!(error = %err, "harvest schedule decisions purge failed");
                         }
                     }
                 }
