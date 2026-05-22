@@ -1563,6 +1563,8 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .route("/admin/retention", get(retention_status))
         .route("/admin/retention/run-now", post(retention_run_now))
         .route("/admin/concurrency", get(concurrency_status))
+        .route("/admin/queues/scaling", get(queues_scaling_signal))
+        .route("/admin/metrics", get(prometheus_metrics))
         .route("/admin/history/exports", get(export_workflow_histories))
         .route("/admin/external-handoffs", get(list_external_handoffs))
         .route(
@@ -1741,6 +1743,8 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/admin/retention"),
         ("POST", "/admin/retention/run-now"),
         ("GET", "/admin/concurrency"),
+        ("GET", "/admin/queues/scaling"),
+        ("GET", "/admin/metrics"),
         ("GET", "/admin/history/exports"),
         ("GET", "/admin/external-handoffs"),
         ("GET", "/admin/external-handoffs/{token}"),
@@ -2161,6 +2165,8 @@ pub const fn management_api_response_fields()
         ("GET", "/admin/retention", None), // RetentionStatus (external model)
         ("POST", "/admin/retention/run-now", Some(&["ok"])),
         ("GET", "/admin/concurrency", None), // Vec<ConcurrencyKeyStats> (external model)
+        ("GET", "/admin/queues/scaling", None),
+        ("GET", "/admin/metrics", None),
         (
             "GET",
             "/admin/history/exports",
@@ -8475,6 +8481,195 @@ async fn concurrency_status(
     let mut result: Vec<ConcurrencyKeyStats> = merged.into_values().collect();
     result.sort_by(|a, b| a.key.cmp(&b.key).then(a.task_type.cmp(&b.task_type)));
     Ok(Json(result))
+}
+
+// ---------------------------------------------------------------------------
+// Worker-pool scaling signal and Prometheus metrics (KEDA/HPA autoscalers)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct ScalingQuery {
+    format: Option<String>,
+}
+
+async fn queues_scaling_signal(
+    Extension(api_state): Extension<HarvestApiState>,
+    Query(query): Query<ScalingQuery>,
+) -> Result<axum::response::Response, AutumnError> {
+    let signals = get_aggregated_scaling_signals(&api_state).await?;
+
+    if query.format.as_deref() == Some("prometheus") {
+        let body = format_prometheus_metrics(&signals);
+        return Ok((
+            StatusCode::OK,
+            [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
+            body,
+        )
+            .into_response());
+    }
+
+    Ok(Json(signals).into_response())
+}
+
+async fn prometheus_metrics(
+    Extension(api_state): Extension<HarvestApiState>,
+) -> Result<axum::response::Response, AutumnError> {
+    let signals = get_aggregated_scaling_signals(&api_state).await?;
+    let body = format_prometheus_metrics(&signals);
+    Ok((
+        StatusCode::OK,
+        [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
+        body,
+    )
+        .into_response())
+}
+
+fn format_prometheus_metrics(signals: &[::autumn_harvest::queue::QueueScalingSignal]) -> String {
+    let mut out = String::new();
+
+    // 1. backlog
+    writeln!(out, "# HELP harvest_queue_backlog Count of pending tasks ready for execution (scheduled_at <= NOW)").unwrap();
+    writeln!(out, "# TYPE harvest_queue_backlog gauge").unwrap();
+    for sig in signals {
+        writeln!(
+            out,
+            "harvest_queue_backlog{{queue=\"{}\"}} {}",
+            sig.queue, sig.backlog
+        )
+        .unwrap();
+    }
+
+    // 2. in_flight
+    writeln!(
+        out,
+        "# HELP harvest_queue_in_flight Count of currently executing tasks"
+    )
+    .unwrap();
+    writeln!(out, "# TYPE harvest_queue_in_flight gauge").unwrap();
+    for sig in signals {
+        writeln!(
+            out,
+            "harvest_queue_in_flight{{queue=\"{}\"}} {}",
+            sig.queue, sig.in_flight
+        )
+        .unwrap();
+    }
+
+    // 3. scheduled
+    writeln!(
+        out,
+        "# HELP harvest_queue_scheduled Count of future-scheduled tasks (scheduled_at > NOW)"
+    )
+    .unwrap();
+    writeln!(out, "# TYPE harvest_queue_scheduled gauge").unwrap();
+    for sig in signals {
+        writeln!(
+            out,
+            "harvest_queue_scheduled{{queue=\"{}\"}} {}",
+            sig.queue, sig.scheduled
+        )
+        .unwrap();
+    }
+
+    // 4. active_workers
+    writeln!(out, "# HELP harvest_queue_active_workers Count of healthy, non-draining worker processes polling this queue").unwrap();
+    writeln!(out, "# TYPE harvest_queue_active_workers gauge").unwrap();
+    for sig in signals {
+        writeln!(
+            out,
+            "harvest_queue_active_workers{{queue=\"{}\"}} {}",
+            sig.queue, sig.active_workers
+        )
+        .unwrap();
+    }
+
+    out
+}
+
+async fn get_aggregated_scaling_signals(
+    api_state: &HarvestApiState,
+) -> Result<Vec<::autumn_harvest::queue::QueueScalingSignal>, AutumnError> {
+    use ::autumn_harvest::models::HarvestWorker;
+    use ::autumn_harvest::schema::harvest_workers;
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    let stale_threshold = api_state.worker_stale_threshold();
+
+    // We'll group stats by queue name in-memory
+    let mut task_stats: std::collections::HashMap<
+        String,
+        ::autumn_harvest::queue::QueueTaskCounts,
+    > = std::collections::HashMap::new();
+    let mut worker_stats: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+
+    for (_shard, shard_pool) in pool.iter_shards() {
+        let mut conn = acquire_conn(shard_pool).await?;
+
+        // 1. Fetch task counts per queue on this shard
+        let shard_counts = ::autumn_harvest::queue::queue_task_counts(&mut conn)
+            .await
+            .map_err(map_error)?;
+        for stat in shard_counts {
+            let entry = task_stats.entry(stat.queue.clone()).or_insert_with(|| {
+                ::autumn_harvest::queue::QueueTaskCounts {
+                    queue: stat.queue.clone(),
+                    backlog: 0,
+                    in_flight: 0,
+                    scheduled: 0,
+                }
+            });
+            entry.backlog += stat.backlog;
+            entry.in_flight += stat.in_flight;
+            entry.scheduled += stat.scheduled;
+        }
+
+        // 2. Fetch workers on this shard
+        let workers = harvest_workers::table
+            .select(HarvestWorker::as_select())
+            .load::<HarvestWorker>(&mut conn)
+            .await
+            .map_err(|e| map_error(::autumn_harvest::error::database_error(e)))?;
+
+        for w in workers {
+            let health = ::autumn_harvest::workers::WorkerHealth::classify(
+                w.last_heartbeat_at,
+                stale_threshold,
+            );
+            let is_active = w.status == ::autumn_harvest::workers::WorkerStatus::Active.as_str()
+                && health == ::autumn_harvest::workers::WorkerHealth::Healthy;
+            let queues = if is_active { w.queues.as_array() } else { None };
+            if let Some(queues) = queues {
+                for q in queues {
+                    if let Some(name) = q.as_str() {
+                        *worker_stats.entry(name.to_string()).or_default() += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // Merge task stats and worker stats
+    let mut all_queues: std::collections::HashSet<String> = std::collections::HashSet::new();
+    all_queues.extend(task_stats.keys().cloned());
+    all_queues.extend(worker_stats.keys().cloned());
+
+    let mut signals = Vec::new();
+    for q in all_queues {
+        let task_stat = task_stats.get(&q);
+        let active_workers = worker_stats.get(&q).copied().unwrap_or(0);
+        signals.push(::autumn_harvest::queue::QueueScalingSignal {
+            queue: q.clone(),
+            backlog: task_stat.map_or(0, |s| s.backlog),
+            in_flight: task_stat.map_or(0, |s| s.in_flight),
+            scheduled: task_stat.map_or(0, |s| s.scheduled),
+            active_workers,
+        });
+    }
+
+    signals.sort_by(|a, b| a.queue.cmp(&b.queue));
+    Ok(signals)
 }
 
 // ---------------------------------------------------------------------------

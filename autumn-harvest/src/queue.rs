@@ -397,6 +397,83 @@ pub async fn claim_task(
 }
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Worker-pool scaling signals
+// ---------------------------------------------------------------------------
+
+/// Live scaling signals for a task queue.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct QueueScalingSignal {
+    /// The task queue name.
+    pub queue: String,
+    /// Number of tasks in `PENDING` state with `scheduled_at <= NOW()`.
+    pub backlog: i64,
+    /// Number of tasks in `RUNNING` state.
+    pub in_flight: i64,
+    /// Number of tasks in `PENDING` state with `scheduled_at > NOW()`.
+    pub scheduled: i64,
+    /// Number of active (healthy, non-draining) workers currently polling this queue.
+    pub active_workers: i64,
+}
+
+/// Helper struct for queue task counts.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct QueueTaskCounts {
+    /// The task queue name.
+    pub queue: String,
+    /// Number of tasks in `PENDING` state with `scheduled_at <= NOW()`.
+    pub backlog: i64,
+    /// Number of tasks in `RUNNING` state.
+    pub in_flight: i64,
+    /// Number of tasks in `PENDING` state with `scheduled_at > NOW()`.
+    pub scheduled: i64,
+}
+
+/// Return backlog, in-flight, and scheduled task counts per queue on this shard.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub async fn queue_task_counts(
+    conn: &mut AsyncPgConnection,
+) -> HarvestResult<Vec<QueueTaskCounts>> {
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        queue: String,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        backlog: i64,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        in_flight: i64,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        scheduled: i64,
+    }
+
+    let rows: Vec<Row> = diesel::sql_query(
+        "SELECT \
+             queue_name AS queue, \
+             COUNT(*) FILTER (WHERE state = 'PENDING' AND scheduled_at <= $1) AS backlog, \
+             COUNT(*) FILTER (WHERE state = 'RUNNING') AS in_flight, \
+             COUNT(*) FILTER (WHERE state = 'PENDING' AND scheduled_at > $1) AS scheduled \
+         FROM harvest_task_queue \
+         GROUP BY queue_name",
+    )
+    .bind::<diesel::sql_types::Timestamptz, _>(Utc::now())
+    .load(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| QueueTaskCounts {
+            queue: r.queue,
+            backlog: r.backlog,
+            in_flight: r.in_flight,
+            scheduled: r.scheduled,
+        })
+        .collect())
+}
+
 // Concurrency-key stats
 // ---------------------------------------------------------------------------
 

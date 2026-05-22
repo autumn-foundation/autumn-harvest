@@ -258,7 +258,7 @@ pub use store::EventHistory;
 pub use models::{AuditRecord, NewAuditRecord};
 
 #[cfg(feature = "db")]
-pub use queue::ConcurrencyKeyStats;
+pub use queue::{ConcurrencyKeyStats, QueueScalingSignal, QueueTaskCounts, queue_task_counts};
 
 // Allow macro-generated code to use ::autumn_harvest::serde_json
 pub use serde_json;
