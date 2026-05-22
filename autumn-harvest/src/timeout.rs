@@ -718,6 +718,7 @@ pub async fn enforce_workflow_execution_timeouts(
 /// attempts same-shard and cross-shard delivery via `GLOBAL_SHARDED_POOL`,
 /// fails with `"target_unknown"` after `unknown_target_grace_window` has elapsed,
 /// and wakes up the caller workflow.
+#[allow(clippy::too_many_lines)]
 pub async fn enforce_external_signals_outbox(
     conn: &mut AsyncPgConnection,
     metrics: &dyn MetricsRecorder,
@@ -755,10 +756,8 @@ pub async fn enforce_external_signals_outbox(
                 payload,
             }) => {
                 let age = Utc::now() - row.timestamp;
-                let grace_chrono = match chrono::Duration::from_std(unknown_target_grace_window) {
-                    Ok(d) => d,
-                    Err(_) => chrono::Duration::MAX,
-                };
+                let grace_chrono = chrono::Duration::from_std(unknown_target_grace_window)
+                    .map_or(chrono::Duration::MAX, |d| d);
 
                 tracing::debug!(
                     caller = %caller_exec_id,
@@ -772,7 +771,7 @@ pub async fn enforce_external_signals_outbox(
                 if age > grace_chrono {
                     // Grace window expired!
                     let failed_event = WorkflowEvent::ExternalSignalFailed {
-                        signal_id: signal_id.clone(),
+                        signal_id,
                         reason_code: "target_unknown".to_string(),
                     };
 
@@ -806,12 +805,14 @@ pub async fn enforce_external_signals_outbox(
                     }
                 } else {
                     // Try to route target
-                    let target_pool = if let Ok(lock) = crate::shard::GLOBAL_SHARDED_POOL.read() {
-                        lock.as_ref()
-                            .map(|pool| pool.pool_for_execution(target).clone())
-                    } else {
-                        None
-                    };
+                    let target_pool = crate::shard::GLOBAL_SHARDED_POOL
+                        .read()
+                        .map_or_else(
+                            |_| None,
+                            |lock| {
+                                lock.as_ref().map(|pool| pool.pool_for_execution(target).clone())
+                            },
+                        );
 
                     if let Some(pool) = target_pool {
                         match pool.get().await {
@@ -825,7 +826,7 @@ pub async fn enforce_external_signals_outbox(
                                 .await
                                 {
                                     Ok(()) => Some(WorkflowEvent::ExternalSignalDelivered {
-                                        signal_id: signal_id.clone(),
+                                        signal_id,
                                     }),
                                     Err(HarvestError::NotFound(_)) => {
                                         // Target not found: wait until next sweep
@@ -836,7 +837,7 @@ pub async fn enforce_external_signals_outbox(
                                         None
                                     }
                                     Err(_) => Some(WorkflowEvent::ExternalSignalFailed {
-                                        signal_id: signal_id.clone(),
+                                        signal_id,
                                         reason_code: "target_terminal".to_string(),
                                     }),
                                 };

@@ -158,6 +158,7 @@ async fn test_config_validation() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn test_same_shard_not_found_retry() {
     let _guard = TEST_MUTEX.lock().await;
     let (database_url, _container) = setup_test_database_url().await;
@@ -288,6 +289,7 @@ async fn test_same_shard_not_found_retry() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn test_cross_shard_outbox_delivery() {
     let _guard = TEST_MUTEX.lock().await;
     let (database_url, _container) = setup_test_database_url().await;

@@ -4001,10 +4001,8 @@ async fn process_workflow_task(
                 for item in &items_clone {
                     if let SignalBatchItem::Signal(run) = item {
                         let resolved = new_events.iter().any(|e| match e {
-                            WorkflowEvent::ExternalSignalDelivered { signal_id } => {
-                                *signal_id == run.signal_id
-                            }
-                            WorkflowEvent::ExternalSignalFailed { signal_id, .. } => {
+                            WorkflowEvent::ExternalSignalDelivered { signal_id }
+                            | WorkflowEvent::ExternalSignalFailed { signal_id, .. } => {
                                 *signal_id == run.signal_id
                             }
                             _ => false,
