@@ -42,9 +42,8 @@ const MAX_MAX_AGE: Duration = Duration::from_secs(60 * 60 * 24 * 365 * 10);
 /// Future type returned by [`HistoryArchiver::archive`].
 pub type ArchiverFuture = std::pin::Pin<
     Box<
-        dyn std::future::Future<
-                Output = Result<(), Box<dyn std::error::Error + Send + Sync>>,
-            > + Send,
+        dyn std::future::Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>>
+            + Send,
     >,
 >;
 
@@ -59,10 +58,7 @@ pub trait HistoryArchiver: Send + Sync + 'static {
     /// If this returns `Err`, the retention janitor skips deleting the
     /// workflow execution and its associated events on this tick, retrying
     /// on the next tick to prevent data loss.
-    fn archive(
-        &self,
-        doc: &crate::history_export::HistoryExportDocument,
-    ) -> ArchiverFuture;
+    fn archive(&self, doc: &crate::history_export::HistoryExportDocument) -> ArchiverFuture;
 }
 
 /// Configuration for the background retention job.
