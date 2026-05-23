@@ -173,9 +173,9 @@ pub struct ActivityInfo {
     /// `None` means the global cap applies.
     pub max_result_bytes: Option<u64>,
     /// Cluster-wide rate limit (requests per second). `None` = no rate limit.
-    pub rate_limit_rps: Option<u32>,
+    pub rate_limit_rps: Option<f64>,
     /// Cluster-wide rate limit burst capacity (tokens). `None` = no burst capability or equal to `rate_limit_rps`.
-    pub rate_limit_burst: Option<u32>,
+    pub rate_limit_burst: Option<f64>,
     /// Rate limit bucket key. Multiple activities sharing a key share the
     /// rate limit. Defaults to the activity's own name when rate limits are set.
     pub rate_limit_key: Option<&'static str>,

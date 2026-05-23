@@ -220,6 +220,25 @@ impl std::fmt::Debug for BuiltHarvest {
     }
 }
 
+/// A float wrapper that implements `Eq` and `PartialEq` by doing bitwise comparison.
+/// Useful for keeping errors `Eq`-compliant.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub struct FloatEq(pub f64);
+
+impl PartialEq for FloatEq {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.to_bits() == other.0.to_bits()
+    }
+}
+
+impl Eq for FloatEq {}
+
+impl std::fmt::Display for FloatEq {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// Builder-time configuration errors.
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 #[non_exhaustive]
@@ -377,7 +396,7 @@ pub enum HarvestBuilderError {
         /// The shared rate limit key.
         key: String,
         /// Each `(activity_name, rate_limit_rps, Option<rate_limit_burst>)` pair with a conflicting value.
-        activities: Vec<(String, u32, Option<u32>)>,
+        activities: Vec<(String, FloatEq, Option<FloatEq>)>,
     },
 
     /// An activity declares a `rate_limit_key` but no `rate_limit_rps`.
@@ -1171,9 +1190,9 @@ fn validate_concurrency_keys(
 }
 
 struct RateLimitKeyEntry {
-    first_rps: u32,
-    first_burst: Option<u32>,
-    contributors: Vec<(String, u32, Option<u32>)>,
+    first_rps: f64,
+    first_burst: f64,
+    contributors: Vec<(String, f64, Option<f64>)>,
 }
 
 /// Verify that rate limiting attributes on activities are consistent and valid.
@@ -1205,22 +1224,30 @@ fn validate_rate_limit_keys(
             continue;
         };
 
+        let effective_burst = activity.rate_limit_burst.unwrap_or(rps);
         let effective_key: &str = activity.rate_limit_key.unwrap_or(activity.name);
         let entry = seen
             .entry(effective_key)
             .or_insert_with(|| RateLimitKeyEntry {
                 first_rps: rps,
-                first_burst: activity.rate_limit_burst,
+                first_burst: effective_burst,
                 contributors: Vec::new(),
             });
         entry
             .contributors
             .push((activity.name.to_string(), rps, activity.rate_limit_burst));
 
-        if entry.first_rps != rps || entry.first_burst != activity.rate_limit_burst {
+        if (entry.first_rps - rps).abs() > 1e-9
+            || (entry.first_burst - effective_burst).abs() > 1e-9
+        {
+            let mapped = entry
+                .contributors
+                .iter()
+                .map(|(name, r, b)| (name.clone(), FloatEq(*r), b.map(FloatEq)))
+                .collect();
             return Err(HarvestBuilderError::RateLimitKeyMismatch {
                 key: effective_key.to_string(),
-                activities: entry.contributors.clone(),
+                activities: mapped,
             });
         }
     }
@@ -2302,8 +2329,8 @@ mod tests {
             default_queue: None,
             max_concurrent: None,
             concurrency_key: None,
-            rate_limit_rps: Some(10),
-            rate_limit_burst: Some(5),
+            rate_limit_rps: Some(10.0),
+            rate_limit_burst: Some(5.0),
             rate_limit_key: Some("stripe"),
             is_local: false,
             max_input_bytes: None,
@@ -2320,8 +2347,8 @@ mod tests {
             default_queue: None,
             max_concurrent: None,
             concurrency_key: None,
-            rate_limit_rps: Some(20), // mismatched rps!
-            rate_limit_burst: Some(5),
+            rate_limit_rps: Some(20.0), // mismatched rps!
+            rate_limit_burst: Some(5.0),
             rate_limit_key: Some("stripe"),
             is_local: false,
             max_input_bytes: None,

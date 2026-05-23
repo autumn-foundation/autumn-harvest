@@ -5047,8 +5047,8 @@ impl Worker {
                          ON CONFLICT (key) DO NOTHING"
                     )
                     .bind::<diesel::sql_types::Text, _>(key)
-                    .bind::<diesel::sql_types::Double, _>(f64::from(refill_rate))
-                    .bind::<diesel::sql_types::Double, _>(f64::from(burst));
+                    .bind::<diesel::sql_types::Double, _>(refill_rate)
+                    .bind::<diesel::sql_types::Double, _>(burst);
 
                     if let Err(error) = q.execute(&mut conn).await {
                         tracing::warn!(

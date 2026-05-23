@@ -376,43 +376,38 @@ pub async fn claim_task(
                  scheduled_at ASC \
              LIMIT 1 FOR UPDATE SKIP LOCKED \
         ), \
+        claimed AS ( \
+            UPDATE harvest_task_queue \
+            SET state = 'RUNNING', worker_id = $1, started_at = NOW(), attempt = attempt + 1 \
+            FROM candidate \
+            WHERE harvest_task_queue.id = candidate.id \
+              AND ( \
+                  candidate.concurrency_key IS NULL \
+                  OR ( \
+                      pg_try_advisory_xact_lock(hashtext(candidate.concurrency_key)::bigint) \
+                      AND ( \
+                          candidate.concurrency_cap IS NULL \
+                          OR ( \
+                              SELECT COUNT(*) FROM harvest_task_queue recheck \
+                              WHERE recheck.concurrency_key = candidate.concurrency_key \
+                                AND recheck.task_type = candidate.task_type \
+                                AND recheck.state = 'RUNNING' \
+                                AND recheck.worker_id IS NOT NULL \
+                          ) < candidate.concurrency_cap \
+                      ) \
+                  ) \
+              ) \
+            RETURNING harvest_task_queue.* \
+        ), \
         decrement_bucket AS ( \
             UPDATE harvest_rate_limit_buckets b \
             SET tokens = LEAST(b.burst, b.tokens + EXTRACT(EPOCH FROM (NOW() - b.last_refilled_at)) * b.refill_rate) - 1.0, \
                 last_refilled_at = NOW() \
-            FROM candidate \
-            WHERE b.key = candidate.rate_limit_key \
-              AND LEAST(b.burst, b.tokens + EXTRACT(EPOCH FROM (NOW() - b.last_refilled_at)) * b.refill_rate) >= 1.0 \
+            FROM claimed \
+            WHERE b.key = claimed.rate_limit_key \
             RETURNING b.key \
         ) \
-        UPDATE harvest_task_queue \
-        SET state = 'RUNNING', worker_id = $1, started_at = NOW(), attempt = attempt + 1 \
-        FROM candidate \
-        WHERE harvest_task_queue.id = candidate.id \
-          AND ( \
-              candidate.concurrency_key IS NULL \
-              OR ( \
-                  pg_try_advisory_xact_lock(hashtext(candidate.concurrency_key)::bigint) \
-                  AND ( \
-                      candidate.concurrency_cap IS NULL \
-                      OR ( \
-                          SELECT COUNT(*) FROM harvest_task_queue recheck \
-                          WHERE recheck.concurrency_key = candidate.concurrency_key \
-                            AND recheck.task_type = candidate.task_type \
-                            AND recheck.state = 'RUNNING' \
-                            AND recheck.worker_id IS NOT NULL \
-                      ) < candidate.concurrency_cap \
-                  ) \
-              ) \
-          ) \
-          AND ( \
-              candidate.rate_limit_key IS NULL \
-              OR EXISTS ( \
-                  SELECT 1 FROM decrement_bucket \
-                  WHERE decrement_bucket.key = candidate.rate_limit_key \
-              ) \
-          ) \
-        RETURNING harvest_task_queue.*",
+        SELECT * FROM claimed",
     )
     .bind::<diesel::sql_types::Text, _>(worker_id)
     .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)

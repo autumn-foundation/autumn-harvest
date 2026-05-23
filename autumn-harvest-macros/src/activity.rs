@@ -19,8 +19,8 @@ struct ActivityAttrs {
     max_input_bytes: Option<u64>,
     /// Per-activity result size cap override in bytes (issue #252).
     max_result_bytes: Option<u64>,
-    rate_limit_rps: Option<u32>,
-    rate_limit_burst: Option<u32>,
+    rate_limit_rps: Option<f64>,
+    rate_limit_burst: Option<f64>,
     rate_limit_key: Option<String>,
 }
 
@@ -102,17 +102,25 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<ActivityAttrs> {
             result.max_result_bytes = Some(bytes);
             Ok(())
         } else if meta.path.is_ident("rate_limit_rps") {
-            let value: LitInt = meta.value()?.parse()?;
-            let n: u32 = value.base10_parse()?;
-            if n == 0 {
+            let value: syn::Lit = meta.value()?.parse()?;
+            let n = match value {
+                syn::Lit::Float(f) => f.base10_parse::<f64>()?,
+                syn::Lit::Int(i) => i.base10_parse::<f64>()?,
+                _ => return Err(meta.error("rate_limit_rps must be an integer or float")),
+            };
+            if n <= 0.0 {
                 return Err(meta.error("rate_limit_rps must be greater than zero"));
             }
             result.rate_limit_rps = Some(n);
             Ok(())
         } else if meta.path.is_ident("rate_limit_burst") {
-            let value: LitInt = meta.value()?.parse()?;
-            let n: u32 = value.base10_parse()?;
-            if n == 0 {
+            let value: syn::Lit = meta.value()?.parse()?;
+            let n = match value {
+                syn::Lit::Float(f) => f.base10_parse::<f64>()?,
+                syn::Lit::Int(i) => i.base10_parse::<f64>()?,
+                _ => return Err(meta.error("rate_limit_burst must be an integer or float")),
+            };
+            if n <= 0.0 {
                 return Err(meta.error("rate_limit_burst must be greater than zero"));
             }
             result.rate_limit_burst = Some(n);

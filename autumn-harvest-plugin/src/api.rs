@@ -8574,6 +8574,15 @@ async fn set_rate_limit(
     Path(key_param): Path<String>,
     Json(request): Json<SetRateLimitRequest>,
 ) -> Result<Json<BasicAck>, AutumnError> {
+    if request.refill_rate <= 0.0 {
+        return Err(AutumnError::bad_request_msg(
+            "refill_rate must be greater than zero",
+        ));
+    }
+    if request.burst < 1.0 {
+        return Err(AutumnError::bad_request_msg("burst must be at least 1.0"));
+    }
+
     let (actor, source, request_id) = audit_context(&headers, &api_state);
     let route = "POST /admin/rate-limits/{key}";
 
@@ -8587,6 +8596,7 @@ async fn set_rate_limit(
          SET refill_rate = EXCLUDED.refill_rate, \
              burst = EXCLUDED.burst, \
              tokens = LEAST(EXCLUDED.burst, harvest_rate_limit_buckets.tokens), \
+             last_refilled_at = NOW(), \
              updated_at = NOW()"
     )
     .bind::<diesel::sql_types::Text, _>(&key_param)
