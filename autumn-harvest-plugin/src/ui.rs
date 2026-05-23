@@ -2049,12 +2049,13 @@ fn dead_letter_task_kind_label(task_type: &str) -> &'static str {
 
 fn truncate_error(error: &str) -> String {
     const LIMIT: usize = 96;
-    let mut chars = error.chars();
-    let truncated = chars.by_ref().take(LIMIT).collect::<String>();
-    if chars.next().is_some() {
-        format!("{truncated}...")
+    if let Some((idx, _)) = error.char_indices().nth(LIMIT) {
+        let mut s = String::with_capacity(idx + 3);
+        s.push_str(&error[..idx]);
+        s.push_str("...");
+        s
     } else {
-        truncated
+        error.to_string()
     }
 }
 
@@ -3271,7 +3272,17 @@ fn badge_class(state: &str) -> &'static str {
 }
 
 fn short_id(id: &str) -> String {
-    id.chars().take(8).collect::<String>() + "…"
+    if let Some((idx, _)) = id.char_indices().nth(8) {
+        let mut s = String::with_capacity(idx + 3);
+        s.push_str(&id[..idx]);
+        s.push('…');
+        s
+    } else {
+        let mut s = String::with_capacity(id.len() + 3);
+        s.push_str(id);
+        s.push('…');
+        s
+    }
 }
 
 fn url_encode(input: &str) -> String {

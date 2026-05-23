@@ -582,12 +582,19 @@ pub async fn update_search_attrs<S: std::hash::BuildHasher + Sync>(
 fn summarize_error(error: Option<String>) -> Option<String> {
     const MAX_ERROR_SUMMARY_CHARS: usize = 240;
 
-    let first_line = error?.lines().next()?.trim().to_string();
+    let error_str = error?;
+    let first_line = error_str.lines().next()?.trim();
     if first_line.is_empty() {
         return None;
     }
 
-    Some(first_line.chars().take(MAX_ERROR_SUMMARY_CHARS).collect())
+    Some(
+        first_line
+            .char_indices()
+            .nth(MAX_ERROR_SUMMARY_CHARS)
+            .map_or(first_line, |(idx, _)| &first_line[..idx])
+            .to_string(),
+    )
 }
 
 #[cfg(test)]
