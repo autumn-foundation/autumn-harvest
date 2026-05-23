@@ -1941,6 +1941,21 @@ async fn persist_scheduled_activities(
             params.max_concurrent = activity.max_concurrent;
         }
 
+        let effective_rate_limit_key =
+            activity
+                .rate_limit_key
+                .map(ToString::to_string)
+                .or_else(|| {
+                    if activity.rate_limit_rps.is_some() || activity.rate_limit_burst.is_some() {
+                        Some(activity.name.to_string())
+                    } else {
+                        None
+                    }
+                });
+        if let Some(key) = effective_rate_limit_key {
+            params.rate_limit_key = Some(key);
+        }
+
         events.push(WorkflowEvent::ActivityScheduled {
             activity_id: scheduled.activity_id,
             name: scheduled.name.clone(),
@@ -3351,6 +3366,7 @@ async fn persist_workflow_continue_as_new(
         .task
         .concurrency_cap
         .and_then(|cap| u32::try_from(cap).ok());
+    enqueue.rate_limit_key = persistence.task.rate_limit_key.clone();
 
     conn.transaction::<(), HarvestError, _>(|conn| {
         async move {
@@ -4488,6 +4504,78 @@ fn spawn_concurrency_sampler(
     })
 }
 
+/// Periodically sample rate limit buckets from the `harvest_rate_limit_buckets` table
+/// and forward available tokens and refill rates to the configured [`MetricsRecorder`](crate::telemetry::MetricsRecorder).
+///
+/// Stops when the cancellation token fires.
+fn spawn_rate_limit_sampler(
+    pool: DbPool,
+    cancel: CancellationToken,
+    telemetry: Arc<crate::telemetry::TelemetryConfig>,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    #[derive(diesel::QueryableByName)]
+    struct BucketRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        key: String,
+        #[diesel(sql_type = diesel::sql_types::Double)]
+        refill_rate: f64,
+        #[diesel(sql_type = diesel::sql_types::Double)]
+        estimated_tokens: f64,
+    }
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                () = cancel.cancelled() => break,
+                () = tokio::time::sleep(interval) => {}
+            }
+
+            let mut conn = match pool.get().await {
+                Ok(conn) => conn,
+                Err(error) => {
+                    tracing::debug!(
+                        error = %error,
+                        "rate limit sampler could not acquire DB connection"
+                    );
+                    continue;
+                }
+            };
+
+            let result: Result<Vec<BucketRow>, _> = diesel::sql_query(
+                "SELECT \
+                     key, \
+                     refill_rate, \
+                     LEAST(burst, tokens + EXTRACT(EPOCH FROM (NOW() - last_refilled_at)) * refill_rate) AS estimated_tokens \
+                 FROM harvest_rate_limit_buckets"
+            )
+            .load(&mut conn)
+            .await;
+
+            match result {
+                Ok(buckets) => {
+                    for bucket in buckets {
+                        telemetry.metrics.record_rate_limit_tokens_available(
+                            &bucket.key,
+                            bucket.estimated_tokens,
+                        );
+                        telemetry
+                            .metrics
+                            .record_rate_limit_refill_rate(&bucket.key, bucket.refill_rate);
+                    }
+                }
+                Err(error) => {
+                    tracing::debug!(error = %error, "rate limit sampler query failed");
+                }
+            }
+
+            if cancel.is_cancelled() {
+                break;
+            }
+        }
+    })
+}
+
 /// Periodically sample the dead-letter queue entry count and forward it to
 /// the configured [`MetricsRecorder`](crate::telemetry::MetricsRecorder).
 ///
@@ -4574,6 +4662,7 @@ pub struct Worker {
 struct WorkerMonitoringHandles {
     queue_depth_sampler: tokio::task::JoinHandle<()>,
     concurrency_sampler: tokio::task::JoinHandle<()>,
+    rate_limit_sampler: tokio::task::JoinHandle<()>,
     dlq_depth_samplers: Vec<tokio::task::JoinHandle<()>>,
     timeout_checker: tokio::task::JoinHandle<()>,
 }
@@ -4654,6 +4743,9 @@ impl Worker {
         // Register this worker in the fleet table.
         self.register_in_fleet(pool).await;
 
+        // Auto-register rate limit buckets for the activities configured on this worker.
+        self.register_rate_limit_buckets(pool).await;
+
         let monitors = self.spawn_monitoring_tasks(pool);
         let heartbeat_cancel = CancellationToken::new();
         let heartbeat_handle = self.spawn_heartbeat_task(pool, heartbeat_cancel.clone());
@@ -4729,6 +4821,12 @@ impl Worker {
             }
             handles
         };
+        let rate_limit_sampler = spawn_rate_limit_sampler(
+            pool.clone(),
+            self.shutdown.clone(),
+            self.registry.telemetry().clone(),
+            self.config.poll_interval,
+        );
         let timeout_checker = crate::timeout::spawn_timeout_checker(
             pool.clone(),
             self.shutdown.clone(),
@@ -4742,6 +4840,7 @@ impl Worker {
         WorkerMonitoringHandles {
             queue_depth_sampler,
             concurrency_sampler,
+            rate_limit_sampler,
             dlq_depth_samplers,
             timeout_checker,
         }
@@ -4857,6 +4956,13 @@ impl Worker {
                 "concurrency sampler failed during shutdown"
             );
         }
+        if let Err(error) = monitors.rate_limit_sampler.await {
+            tracing::warn!(
+                worker_id = %self.config.worker_id,
+                error = %error,
+                "rate limit sampler failed during shutdown"
+            );
+        }
         for sampler in monitors.dlq_depth_samplers {
             if let Err(error) = sampler.await {
                 tracing::warn!(
@@ -4922,6 +5028,48 @@ impl Worker {
         }
     }
 
+    /// Auto-upsert rate-limiting buckets for activities registered on this worker.
+    async fn register_rate_limit_buckets(&self, pool: &DbPool) {
+        match pool.get().await {
+            Ok(mut conn) => {
+                for activity in self.registry.activities.values() {
+                    let Some(refill_rate) = activity.rate_limit_rps else {
+                        continue;
+                    };
+                    let burst = activity.rate_limit_burst.unwrap_or(refill_rate);
+                    let key = activity.rate_limit_key.unwrap_or(activity.name);
+
+                    // Insert rate limit bucket if it doesn't already exist.
+                    // This preserves operator overrides.
+                    let q = diesel::sql_query(
+                        "INSERT INTO harvest_rate_limit_buckets (key, refill_rate, burst, tokens, last_refilled_at) \
+                         VALUES ($1, $2, $3, $3, NOW()) \
+                         ON CONFLICT (key) DO NOTHING"
+                    )
+                    .bind::<diesel::sql_types::Text, _>(key)
+                    .bind::<diesel::sql_types::Double, _>(refill_rate)
+                    .bind::<diesel::sql_types::Double, _>(burst);
+
+                    if let Err(error) = q.execute(&mut conn).await {
+                        tracing::warn!(
+                            worker_id = %self.config.worker_id,
+                            key = %key,
+                            error = %error,
+                            "failed to auto-register rate limit bucket; continuing"
+                        );
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    worker_id = %self.config.worker_id,
+                    error = %error,
+                    "failed to acquire connection for rate limit bucket registration"
+                );
+            }
+        }
+    }
+
     /// Transition this worker's status in the fleet table.
     async fn transition_fleet_status(&self, pool: &DbPool, status: crate::workers::WorkerStatus) {
         match pool.get().await {
@@ -4980,7 +5128,19 @@ impl Worker {
                 self.dispatch_task(task, pool);
                 true
             }
-            Ok(None) => false,
+            Ok(None) => {
+                if let Ok(throttled_keys) =
+                    queue::check_throttled_keys(&mut conn, &self.config.queues).await
+                {
+                    for key in throttled_keys {
+                        self.registry
+                            .telemetry()
+                            .metrics
+                            .record_rate_limit_throttled(&key);
+                    }
+                }
+                false
+            }
             Err(e) => {
                 tracing::error!(error = %e, "failed to claim task");
                 false
@@ -5279,6 +5439,9 @@ mod tests {
             is_local: false,
             max_input_bytes: None,
             max_result_bytes: None,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
         };
 

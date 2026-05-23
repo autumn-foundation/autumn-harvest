@@ -172,6 +172,13 @@ pub struct ActivityInfo {
     ///
     /// `None` means the global cap applies.
     pub max_result_bytes: Option<u64>,
+    /// Cluster-wide rate limit (requests per second). `None` = no rate limit.
+    pub rate_limit_rps: Option<f64>,
+    /// Cluster-wide rate limit burst capacity (tokens). `None` = no burst capability or equal to `rate_limit_rps`.
+    pub rate_limit_burst: Option<f64>,
+    /// Rate limit bucket key. Multiple activities sharing a key share the
+    /// rate limit. Defaults to the activity's own name when rate limits are set.
+    pub rate_limit_key: Option<&'static str>,
     /// Type-erased dispatch function.
     pub handler: ActivityHandlerFn,
 }
@@ -297,6 +304,9 @@ impl std::fmt::Debug for ActivityInfo {
             .field("is_local", &self.is_local)
             .field("max_input_bytes", &self.max_input_bytes)
             .field("max_result_bytes", &self.max_result_bytes)
+            .field("rate_limit_rps", &self.rate_limit_rps)
+            .field("rate_limit_burst", &self.rate_limit_burst)
+            .field("rate_limit_key", &self.rate_limit_key)
             .field("handler", &"<fn>")
             .finish()
     }
@@ -399,6 +409,9 @@ mod tests {
             is_local: false,
             max_input_bytes: None,
             max_result_bytes: None,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
         };
         assert!(info.default_retry_policy.is_none());
@@ -423,6 +436,9 @@ mod tests {
             is_local: true,
             max_input_bytes: None,
             max_result_bytes: None,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
         };
         assert!(info.is_local);
@@ -455,6 +471,9 @@ mod tests {
             is_local: false,
             max_input_bytes: None,
             max_result_bytes: None,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
         };
         assert_eq!(info.max_concurrent, Some(5));
@@ -523,6 +542,9 @@ mod tests {
             is_local: false,
             max_input_bytes: None,
             max_result_bytes: None,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
         };
         let debug_str = format!("{activity_info:?}");

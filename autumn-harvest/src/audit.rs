@@ -72,6 +72,8 @@ pub const OP_EXTERNAL_ACTIVITY_COMPLETE: &str = "external_activity.complete";
 pub const OP_EXTERNAL_ACTIVITY_FAIL: &str = "external_activity.fail";
 /// Audit operation: Initiated draining of a worker fleet.
 pub const OP_WORKER_DRAIN: &str = "worker.drain";
+/// Audit operation: Overrode rate-limiting parameters.
+pub const OP_RATE_LIMIT_OVERRIDE: &str = "rate_limit_override";
 /// Audit operation: Opened an SSE execution event stream (issue #324).
 pub const OP_EXECUTION_STREAM_OPEN: &str = "execution.stream.open";
 /// Audit operation: Closed an SSE execution event stream (issue #324).
@@ -87,6 +89,7 @@ pub const TARGET_BATCH: &str = "batch";
 pub const TARGET_RETENTION: &str = "retention";
 pub const TARGET_EXTERNAL_ACTIVITY: &str = "external_activity";
 pub const TARGET_WORKER: &str = "worker";
+pub const TARGET_RATE_LIMIT: &str = "rate_limit";
 
 // ── Status constants ──────────────────────────────────────────────────────────
 
@@ -213,6 +216,7 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     ("GET /admin/external-handoffs", RouteClass::ReadOnly),
     ("GET /admin/external-handoffs/{token}", RouteClass::ReadOnly),
     ("GET /admin/schedules", RouteClass::ReadOnly),
+    ("GET /admin/rate-limits", RouteClass::ReadOnly),
     ("GET /admin/audit", RouteClass::ReadOnly),
     ("GET /workers/health", RouteClass::ReadOnly),
     ("GET /workers/drain-preview", RouteClass::ReadOnly),
@@ -275,6 +279,7 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
         RouteClass::Mutating,
     ),
     ("POST /workers/{worker_id}/drain", RouteClass::Mutating),
+    ("POST /admin/rate-limits/{key}", RouteClass::Mutating),
     ("POST /batch-operations", RouteClass::Mutating),
 ];
 
@@ -306,6 +311,7 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
     OP_EXTERNAL_ACTIVITY_COMPLETE,
     OP_EXTERNAL_ACTIVITY_FAIL,
     OP_WORKER_DRAIN,
+    OP_RATE_LIMIT_OVERRIDE,
 ];
 
 /// Routes explicitly excluded from audit.
@@ -340,6 +346,7 @@ pub const EXCLUDED_ROUTES: &[&str] = &[
     "GET /admin/external-handoffs",
     "GET /admin/external-handoffs/{token}",
     "GET /admin/schedules",
+    "GET /admin/rate-limits",
     // Heartbeats are high-volume liveness pings, not operator mutations.
     "POST /activities/external/{token}/heartbeat",
     "GET /workers",
@@ -413,6 +420,7 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ("GET /admin/external-handoffs/{token}", None),
     // Schedule management
     ("GET /admin/schedules", None),
+    ("GET /admin/rate-limits", None),
     ("POST /admin/schedules/workflow", Some(OP_SCHEDULE_CREATE)),
     ("POST /admin/schedules/{id}/pause", Some(OP_SCHEDULE_PAUSE)),
     (
@@ -440,6 +448,10 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ("GET /workers/{worker_id}", None),
     ("GET /workers/drain-preview", None),
     ("POST /workers/{worker_id}/drain", Some(OP_WORKER_DRAIN)),
+    (
+        "POST /admin/rate-limits/{key}",
+        Some(OP_RATE_LIMIT_OVERRIDE),
+    ),
     // Batch operations
     ("GET /batch-operations", None),
     ("POST /batch-operations", Some(OP_BATCH_SUBMIT)),

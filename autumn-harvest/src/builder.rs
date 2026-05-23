@@ -220,6 +220,25 @@ impl std::fmt::Debug for BuiltHarvest {
     }
 }
 
+/// A float wrapper that implements `Eq` and `PartialEq` by doing bitwise comparison.
+/// Useful for keeping errors `Eq`-compliant.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub struct FloatEq(pub f64);
+
+impl PartialEq for FloatEq {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.to_bits() == other.0.to_bits()
+    }
+}
+
+impl Eq for FloatEq {}
+
+impl std::fmt::Display for FloatEq {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// Builder-time configuration errors.
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 #[non_exhaustive]
@@ -366,6 +385,30 @@ pub enum HarvestBuilderError {
     UnknownTimezone {
         /// The unrecognised IANA timezone name.
         name: String,
+    },
+
+    /// Two activities sharing a `rate_limit_key` declare different
+    /// `rate_limit_rps` or `rate_limit_burst` values.
+    #[error(
+        "rate_limit_key '{key}' has conflicting rate limit values across activities: {activities:?}"
+    )]
+    RateLimitKeyMismatch {
+        /// The shared rate limit key.
+        key: String,
+        /// Each `(activity_name, rate_limit_rps, Option<rate_limit_burst>)` pair with a conflicting value.
+        activities: Vec<(String, FloatEq, Option<FloatEq>)>,
+    },
+
+    /// An activity declares a `rate_limit_key` but no `rate_limit_rps`.
+    #[error(
+        "activity '{activity}' sets rate_limit_key = \"{key}\" but has no rate_limit_rps; \
+         add rate_limit_rps or remove the rate_limit_key"
+    )]
+    RateLimitKeyWithoutCap {
+        /// The activity name.
+        activity: String,
+        /// The orphaned rate limit key.
+        key: String,
     },
 }
 
@@ -902,6 +945,7 @@ impl HarvestBuilder {
         )?;
         validate_dags_do_not_use_local_activities(&self.dags, &self.activities)?;
         validate_dag_schedules(&self.dags)?;
+        validate_rate_limit_keys(&self.activities)?;
 
         let mut worker_config = self.worker_config;
         let max_workflow_start_delay = self
@@ -1138,6 +1182,72 @@ fn validate_concurrency_keys(
             return Err(HarvestBuilderError::ConcurrencyKeyMismatch {
                 key: effective_key.to_string(),
                 activities: entry.contributors.clone(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+struct RateLimitKeyEntry {
+    first_rps: f64,
+    first_burst: f64,
+    contributors: Vec<(String, f64, Option<f64>)>,
+}
+
+/// Verify that rate limiting attributes on activities are consistent and valid.
+fn validate_rate_limit_keys(
+    activities: &[crate::info::ActivityInfo],
+) -> Result<(), HarvestBuilderError> {
+    use std::collections::HashMap;
+
+    let mut seen: HashMap<&str, RateLimitKeyEntry> = HashMap::new();
+
+    for activity in activities {
+        // rate_limit_key without rate_limit_rps silently bypasses or breaks — reject it.
+        if let (Some(key), None) = (activity.rate_limit_key, activity.rate_limit_rps) {
+            return Err(HarvestBuilderError::RateLimitKeyWithoutCap {
+                activity: activity.name.to_string(),
+                key: key.to_string(),
+            });
+        }
+
+        // rate_limit_burst without rate_limit_rps is invalid.
+        if activity.rate_limit_burst.is_some() && activity.rate_limit_rps.is_none() {
+            return Err(HarvestBuilderError::InvalidWorkerConfig(format!(
+                "activity '{}' declares rate_limit_burst but no rate_limit_rps",
+                activity.name
+            )));
+        }
+
+        let Some(rps) = activity.rate_limit_rps else {
+            continue;
+        };
+
+        let effective_burst = activity.rate_limit_burst.unwrap_or(rps);
+        let effective_key: &str = activity.rate_limit_key.unwrap_or(activity.name);
+        let entry = seen
+            .entry(effective_key)
+            .or_insert_with(|| RateLimitKeyEntry {
+                first_rps: rps,
+                first_burst: effective_burst,
+                contributors: Vec::new(),
+            });
+        entry
+            .contributors
+            .push((activity.name.to_string(), rps, activity.rate_limit_burst));
+
+        if (entry.first_rps - rps).abs() > 1e-9
+            || (entry.first_burst - effective_burst).abs() > 1e-9
+        {
+            let mapped = entry
+                .contributors
+                .iter()
+                .map(|(name, r, b)| (name.clone(), FloatEq(*r), b.map(FloatEq)))
+                .collect();
+            return Err(HarvestBuilderError::RateLimitKeyMismatch {
+                key: effective_key.to_string(),
+                activities: mapped,
             });
         }
     }
@@ -1740,6 +1850,9 @@ mod tests {
                 is_local: false,
                 max_input_bytes: None,
                 max_result_bytes: None,
+                rate_limit_rps: None,
+                rate_limit_burst: None,
+                rate_limit_key: None,
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             }])
             .state(String::from("haunted"))
@@ -1781,6 +1894,9 @@ mod tests {
             is_local: false,
             max_input_bytes: None,
             max_result_bytes: None,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
         }
     }
@@ -1799,6 +1915,9 @@ mod tests {
             is_local: true,
             max_input_bytes: None,
             max_result_bytes: None,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
         }
     }
@@ -2057,6 +2176,9 @@ mod tests {
                 is_local: false,
                 max_input_bytes: None,
                 max_result_bytes: None,
+                rate_limit_rps: None,
+                rate_limit_burst: None,
+                rate_limit_key: None,
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             }])
             .try_build();
@@ -2192,6 +2314,89 @@ mod tests {
         assert!(
             result.is_ok(),
             "valid timezone in DAG schedule must be accepted: {result:?}"
+        );
+    }
+
+    #[test]
+    fn builder_rejects_disagreeing_rate_limits_on_same_key() {
+        let act1 = ActivityInfo {
+            name: "act1",
+            module: "test",
+            default_retry_policy: None,
+            default_start_to_close: None,
+            default_heartbeat_timeout: None,
+            default_schedule_to_start: None,
+            default_queue: None,
+            max_concurrent: None,
+            concurrency_key: None,
+            rate_limit_rps: Some(10.0),
+            rate_limit_burst: Some(5.0),
+            rate_limit_key: Some("stripe"),
+            is_local: false,
+            max_input_bytes: None,
+            max_result_bytes: None,
+            handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+        };
+        let act2 = ActivityInfo {
+            name: "act2",
+            module: "test",
+            default_retry_policy: None,
+            default_start_to_close: None,
+            default_heartbeat_timeout: None,
+            default_schedule_to_start: None,
+            default_queue: None,
+            max_concurrent: None,
+            concurrency_key: None,
+            rate_limit_rps: Some(20.0), // mismatched rps!
+            rate_limit_burst: Some(5.0),
+            rate_limit_key: Some("stripe"),
+            is_local: false,
+            max_input_bytes: None,
+            max_result_bytes: None,
+            handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+        };
+
+        let result = HarvestBuilder::new()
+            .activities(vec![act1, act2])
+            .try_build();
+        assert!(
+            matches!(
+                result,
+                Err(HarvestBuilderError::RateLimitKeyMismatch { ref key, .. }) if key == "stripe"
+            ),
+            "expected RateLimitKeyMismatch error, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn builder_rejects_rate_limit_key_without_cap() {
+        let act = ActivityInfo {
+            name: "act1",
+            module: "test",
+            default_retry_policy: None,
+            default_start_to_close: None,
+            default_heartbeat_timeout: None,
+            default_schedule_to_start: None,
+            default_queue: None,
+            max_concurrent: None,
+            concurrency_key: None,
+            rate_limit_rps: None, // Missing RPS!
+            rate_limit_burst: None,
+            rate_limit_key: Some("stripe"),
+            is_local: false,
+            max_input_bytes: None,
+            max_result_bytes: None,
+            handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+        };
+
+        let result = HarvestBuilder::new().activities(vec![act]).try_build();
+        assert!(
+            matches!(
+                result,
+                Err(HarvestBuilderError::RateLimitKeyWithoutCap { ref activity, ref key })
+                    if activity == "act1" && key == "stripe"
+            ),
+            "expected RateLimitKeyWithoutCap error, got: {result:?}"
         );
     }
 }

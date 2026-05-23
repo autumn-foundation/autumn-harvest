@@ -57,7 +57,7 @@ use autumn_harvest::history_export::{
 };
 use autumn_harvest::models::{
     AuditRecord, BackfillLogRow, DeadLetter, HarvestCalendar, HarvestSchedule, NewAuditRecord,
-    NewBackfillLogRow, ScheduleDecision, WorkflowExecution,
+    NewBackfillLogRow, RateLimitBucket, ScheduleDecision, WorkflowExecution,
 };
 use autumn_harvest::policy::{Schedule, SkipPolicy, WorkflowSchedule, compute_jitter_offset};
 use autumn_harvest::queue::{self, ConcurrencyKeyStats};
@@ -1563,6 +1563,11 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .route("/admin/retention", get(retention_status))
         .route("/admin/retention/run-now", post(retention_run_now))
         .route("/admin/concurrency", get(concurrency_status))
+        .route("/admin/rate-limits", get(list_rate_limits))
+        .route(
+            "/admin/rate-limits/{key}",
+            post(set_rate_limit).route_layer(require_admin.clone()),
+        )
         .route("/admin/queues/scaling", get(queues_scaling_signal))
         .route("/admin/metrics", get(prometheus_metrics))
         .route("/admin/history/exports", get(export_workflow_histories))
@@ -1743,6 +1748,8 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/admin/retention"),
         ("POST", "/admin/retention/run-now"),
         ("GET", "/admin/concurrency"),
+        ("GET", "/admin/rate-limits"),
+        ("POST", "/admin/rate-limits/{key}"),
         ("GET", "/admin/queues/scaling"),
         ("GET", "/admin/metrics"),
         ("GET", "/admin/history/exports"),
@@ -1897,6 +1904,11 @@ pub const fn management_api_request_fields()
         ),
         // ── admin ─────────────────────────────────────────────────────────────
         ("POST", "/admin/retention/run-now", Some(&[])),
+        (
+            "POST",
+            "/admin/rate-limits/{key}",
+            Some(&["refill_rate", "burst"]),
+        ),
         (
             "POST",
             "/admin/schedules/workflow",
@@ -2165,6 +2177,8 @@ pub const fn management_api_response_fields()
         ("GET", "/admin/retention", None), // RetentionStatus (external model)
         ("POST", "/admin/retention/run-now", Some(&["ok"])),
         ("GET", "/admin/concurrency", None), // Vec<ConcurrencyKeyStats> (external model)
+        ("GET", "/admin/rate-limits", None), // Vec<RateLimitBucket> (external model)
+        ("POST", "/admin/rate-limits/{key}", Some(&["ok"])),
         ("GET", "/admin/queues/scaling", None),
         ("GET", "/admin/metrics", None),
         (
@@ -3657,25 +3671,70 @@ async fn get_workflow_stack(
         .load::<autumn_harvest::models::TaskQueueItem>(&mut conn)
         .await
         .map_err(database_error)?;
+
+    let rate_limit_keys: Vec<String> = tasks
+        .iter()
+        .filter(|t| t.state == "PENDING")
+        .filter_map(|t| t.rate_limit_key.as_ref())
+        .cloned()
+        .collect();
+
+    let mut blocked_keys = HashSet::new();
+    if !rate_limit_keys.is_empty() {
+        #[derive(diesel::QueryableByName)]
+        struct KeyRow {
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            key: String,
+        }
+        let rows: Vec<KeyRow> = diesel::sql_query(
+            "SELECT key FROM harvest_rate_limit_buckets \
+             WHERE key = ANY($1) \
+               AND LEAST(burst, tokens + EXTRACT(EPOCH FROM (NOW() - last_refilled_at)) * refill_rate) < 1.0"
+        )
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(&rate_limit_keys)
+        .load(&mut conn)
+        .await
+        .map_err(database_error)?;
+        for r in rows {
+            blocked_keys.insert(r.key);
+        }
+    }
+
     let pending_activities = tasks
         .into_iter()
-        .map(|t| PendingActivity {
-            activity_exec_id: t.id.to_string(),
-            activity_name: t.activity_name.unwrap_or_default(),
-            queue: t.queue_name,
-            scheduled_at: t.scheduled_at,
-            attempt: t.attempt,
-            max_attempts: t.max_attempts,
-            task_status: t.state,
-            claimed_by_worker_id: t.worker_id,
-            last_heartbeat_at: t.last_heartbeat_at,
-            next_retry_at: None,
-            schedule_to_start_deadline: t.schedule_to_start.map(|d| t.scheduled_at + d),
-            start_to_close_deadline: t.started_at.zip(t.start_to_close).map(|(s, d)| s + d),
-            heartbeat_deadline: t
-                .last_heartbeat_at
-                .zip(t.heartbeat_timeout)
-                .map(|(h, d)| h + d),
+        .map(|t| {
+            let task_status = if t.state == "PENDING" {
+                if let Some(ref key) = t.rate_limit_key {
+                    if blocked_keys.contains(key) {
+                        format!("waiting on rate_limit_key={key}")
+                    } else {
+                        t.state
+                    }
+                } else {
+                    t.state
+                }
+            } else {
+                t.state
+            };
+
+            PendingActivity {
+                activity_exec_id: t.id.to_string(),
+                activity_name: t.activity_name.unwrap_or_default(),
+                queue: t.queue_name,
+                scheduled_at: t.scheduled_at,
+                attempt: t.attempt,
+                max_attempts: t.max_attempts,
+                task_status,
+                claimed_by_worker_id: t.worker_id,
+                last_heartbeat_at: t.last_heartbeat_at,
+                next_retry_at: None,
+                schedule_to_start_deadline: t.schedule_to_start.map(|d| t.scheduled_at + d),
+                start_to_close_deadline: t.started_at.zip(t.start_to_close).map(|(s, d)| s + d),
+                heartbeat_deadline: t
+                    .last_heartbeat_at
+                    .zip(t.heartbeat_timeout)
+                    .map(|(h, d)| h + d),
+            }
         })
         .collect::<Vec<_>>();
     let handoff_filters = external_task::ExternalHandoffFilters {
@@ -8481,6 +8540,105 @@ async fn concurrency_status(
     let mut result: Vec<ConcurrencyKeyStats> = merged.into_values().collect();
     result.sort_by(|a, b| a.key.cmp(&b.key).then(a.task_type.cmp(&b.task_type)));
     Ok(Json(result))
+}
+
+// ── Rate Limit Management ──────────────────────────────────────────────────
+
+async fn list_rate_limits(
+    Extension(api_state): Extension<HarvestApiState>,
+) -> Result<Json<Vec<RateLimitBucket>>, AutumnError> {
+    use autumn_harvest::schema::harvest_rate_limit_buckets::dsl::harvest_rate_limit_buckets;
+
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    let mut conn = acquire_conn(pool.default_pool()).await?;
+
+    let buckets = harvest_rate_limit_buckets
+        .select(RateLimitBucket::as_select())
+        .load::<RateLimitBucket>(&mut conn)
+        .await
+        .map_err(database_error)
+        .map_err(map_error)?;
+
+    Ok(Json(buckets))
+}
+
+#[derive(Debug, Deserialize)]
+struct SetRateLimitRequest {
+    refill_rate: f64,
+    burst: f64,
+}
+
+async fn set_rate_limit(
+    Extension(api_state): Extension<HarvestApiState>,
+    headers: axum::http::HeaderMap,
+    Path(key_param): Path<String>,
+    Json(request): Json<SetRateLimitRequest>,
+) -> Result<Json<BasicAck>, AutumnError> {
+    if request.refill_rate <= 0.0 {
+        return Err(AutumnError::bad_request_msg(
+            "refill_rate must be greater than zero",
+        ));
+    }
+    if request.burst < 1.0 {
+        return Err(AutumnError::bad_request_msg("burst must be at least 1.0"));
+    }
+
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+    let route = "POST /admin/rate-limits/{key}";
+
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    let mut conn = acquire_conn(pool.default_pool()).await?;
+
+    let query_result = diesel::sql_query(
+        "INSERT INTO harvest_rate_limit_buckets (key, refill_rate, burst, tokens, last_refilled_at, created_at, updated_at) \
+         VALUES ($1, $2, $3, $3, NOW(), NOW(), NOW()) \
+         ON CONFLICT (key) DO UPDATE \
+         SET refill_rate = EXCLUDED.refill_rate, \
+             burst = EXCLUDED.burst, \
+             tokens = LEAST(EXCLUDED.burst, harvest_rate_limit_buckets.tokens), \
+             last_refilled_at = NOW(), \
+             updated_at = NOW()"
+    )
+    .bind::<diesel::sql_types::Text, _>(&key_param)
+    .bind::<diesel::sql_types::Double, _>(request.refill_rate)
+    .bind::<diesel::sql_types::Double, _>(request.burst)
+    .execute(&mut conn)
+    .await;
+
+    if let Err(e) = query_result {
+        let err_str = e.to_string();
+        let ar = NewAuditRecord {
+            actor: &actor,
+            operation: "rate_limit_override",
+            target_type: "rate_limit",
+            target_id: Some(&key_param),
+            route_or_command: route,
+            request_id: request_id.as_deref(),
+            idempotency_key: None,
+            status: STATUS_FAILED,
+            error_summary: Some(err_str.as_str()),
+            shard_id: None,
+            source: &source,
+        };
+        let _ = audit::insert_audit(&mut conn, &ar).await;
+        Err(map_error(database_error(e)))
+    } else {
+        let ar = NewAuditRecord {
+            actor: &actor,
+            operation: "rate_limit_override",
+            target_type: "rate_limit",
+            target_id: Some(&key_param),
+            route_or_command: route,
+            request_id: request_id.as_deref(),
+            idempotency_key: None,
+            status: STATUS_SUCCEEDED,
+            error_summary: None,
+            shard_id: None,
+            source: &source,
+        };
+        let _ = audit::insert_audit(&mut conn, &ar).await;
+        Ok(Json(BasicAck { ok: true }))
+    }
 }
 
 // ---------------------------------------------------------------------------
