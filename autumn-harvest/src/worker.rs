@@ -1256,11 +1256,17 @@ fn task_attempt(task: &TaskQueueItem) -> u32 {
 fn retry_stream_seed(task: &TaskQueueItem) -> u64 {
     let mut seed = 0xcbf2_9ce4_8422_2325_u64;
     if let Some(exec) = task.workflow_exec_id {
-        seed ^= u64::from_le_bytes(exec.as_bytes()[..8].try_into().unwrap_or([0_u8; 8]));
+        let raw = exec.as_u128();
+        seed ^= (raw >> 64) as u64;
+        seed = seed.wrapping_mul(0x1000_0000_01b3);
+        seed ^= raw as u64;
         seed = seed.wrapping_mul(0x1000_0000_01b3);
     }
     if let Some(activity) = task.activity_id {
-        seed ^= u64::from_le_bytes(activity.as_bytes()[..8].try_into().unwrap_or([0_u8; 8]));
+        let raw = activity.as_u128();
+        seed ^= (raw >> 64) as u64;
+        seed = seed.wrapping_mul(0x1000_0000_01b3);
+        seed ^= raw as u64;
         seed = seed.wrapping_mul(0x1000_0000_01b3);
     }
     seed

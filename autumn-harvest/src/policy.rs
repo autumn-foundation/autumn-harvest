@@ -49,6 +49,16 @@ fn mix64(mut x: u64) -> u64 {
     x ^ (x >> 31)
 }
 
+fn uniform_inclusive(seed: u64, lo: u64, hi: u64) -> u64 {
+    let range = hi.wrapping_sub(lo).wrapping_add(1);
+    let offset = if range == 0 {
+        mix64(seed)
+    } else {
+        mix64(seed) % range
+    };
+    lo.wrapping_add(offset)
+}
+
 /// Compute deterministic retry delay with jitter.
 #[must_use]
 pub fn compute_retry_delay_with_seed(
@@ -65,19 +75,19 @@ pub fn compute_retry_delay_with_seed(
     match policy.jitter {
         JitterPolicy::None => base,
         JitterPolicy::Full => {
-            let span = u64::try_from(base.as_nanos()).unwrap_or(u64::MAX);
-            if span == 0 {
+            let hi = u64::try_from(base.as_nanos()).unwrap_or(u64::MAX);
+            if hi == 0 {
                 return Duration::ZERO;
             }
-            Duration::from_nanos(mix64(stream_seed ^ u64::from(attempt)) % span)
+            Duration::from_nanos(uniform_inclusive(stream_seed ^ u64::from(attempt), 0, hi))
         }
         JitterPolicy::Equal => {
-            let span = u64::try_from(base.as_nanos()).unwrap_or(u64::MAX);
-            if span <= 1 {
+            let hi = u64::try_from(base.as_nanos()).unwrap_or(u64::MAX);
+            if hi <= 1 {
                 return base;
             }
-            let half = span / 2;
-            Duration::from_nanos(half + (mix64(stream_seed ^ u64::from(attempt)) % (span - half)))
+            let lo = hi / 2;
+            Duration::from_nanos(uniform_inclusive(stream_seed ^ u64::from(attempt), lo, hi))
         }
         JitterPolicy::Decorrelated => {
             let prev = if attempt <= 1 {
@@ -96,7 +106,7 @@ pub fn compute_retry_delay_with_seed(
             }
             let lo = u64::try_from(policy.initial_interval.as_nanos()).unwrap_or(u64::MAX);
             let hi = u64::try_from(upper.as_nanos()).unwrap_or(u64::MAX);
-            Duration::from_nanos(lo + (mix64(stream_seed ^ u64::from(attempt)) % (hi - lo + 1)))
+            Duration::from_nanos(uniform_inclusive(stream_seed ^ u64::from(attempt), lo, hi))
         }
     }
 }
@@ -124,6 +134,7 @@ pub struct RetryPolicy {
     pub max_interval: Duration,
     /// Error type names that must not be retried.
     pub non_retryable_errors: Vec<String>,
+    #[serde(default)]
     pub jitter: JitterPolicy,
 }
 
@@ -1041,17 +1052,20 @@ mod tests {
             let base_delay = base.next_delay(attempt).unwrap();
             for seed in 0..10_000_u64 {
                 let full = base
+                    .clone()
                     .with_jitter(JitterPolicy::Full)
                     .next_delay_with_seed(attempt, seed)
                     .unwrap();
                 assert!(full <= base_delay);
                 let equal = base
+                    .clone()
                     .with_jitter(JitterPolicy::Equal)
                     .next_delay_with_seed(attempt, seed)
                     .unwrap();
                 assert!(equal >= base_delay / 2);
                 assert!(equal <= base_delay);
                 let deco = base
+                    .clone()
                     .with_jitter(JitterPolicy::Decorrelated)
                     .next_delay_with_seed(attempt, seed)
                     .unwrap();
