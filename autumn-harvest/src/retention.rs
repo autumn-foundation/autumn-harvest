@@ -658,47 +658,45 @@ async fn run_shard_tick(
             }
 
             let mut doc = None;
-            if !config.dry_run {
-                if archiver.is_some() {
-                    let exec_id = crate::types::ExecutionId::from_uuid(candidate.id);
-                    match crate::store::load_history(&mut conn, exec_id).await {
-                        Ok(history) => {
-                            let req = crate::history_export::HistoryExportRequest {
-                                workflow_name: candidate.workflow_name.clone(),
-                                execution_id: exec_id,
-                                shard_id: shard.as_i32(),
-                                state: candidate.state.clone(),
-                                events: history.events,
-                                exported_at: chrono::Utc::now(),
-                                payload_policy: crate::history_export::HistoryPayloadPolicy::Full,
-                                max_bytes: Some(usize::MAX),
-                            };
-                            match crate::history_export::export_history(req) {
-                                Ok(document) => {
-                                    doc = Some((exec_id, document));
-                                }
-                                Err(error) => {
-                                    tracing::error!(
-                                        execution_id = %exec_id,
-                                        error = %error,
-                                        "failed to serialize history export; skipping deletion"
-                                    );
-                                    has_failed = true;
-                                    batch_failed = true;
-                                    break;
-                                }
+            if !config.dry_run && archiver.is_some() {
+                let exec_id = crate::types::ExecutionId::from_uuid(candidate.id);
+                match crate::store::load_history(&mut conn, exec_id).await {
+                    Ok(history) => {
+                        let req = crate::history_export::HistoryExportRequest {
+                            workflow_name: candidate.workflow_name.clone(),
+                            execution_id: exec_id,
+                            shard_id: shard.as_i32(),
+                            state: candidate.state.clone(),
+                            events: history.events,
+                            exported_at: chrono::Utc::now(),
+                            payload_policy: crate::history_export::HistoryPayloadPolicy::Full,
+                            max_bytes: Some(usize::MAX),
+                        };
+                        match crate::history_export::export_history(req) {
+                            Ok(document) => {
+                                doc = Some((exec_id, document));
+                            }
+                            Err(error) => {
+                                tracing::error!(
+                                    execution_id = %exec_id,
+                                    error = %error,
+                                    "failed to serialize history export; skipping deletion"
+                                );
+                                has_failed = true;
+                                batch_failed = true;
+                                break;
                             }
                         }
-                        Err(error) => {
-                            tracing::error!(
-                                execution_id = %exec_id,
-                                error = %error,
-                                "failed to load history events for retention candidate; skipping deletion"
-                            );
-                            has_failed = true;
-                            batch_failed = true;
-                            break;
-                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            execution_id = %exec_id,
+                            error = %error,
+                            "failed to load history events for retention candidate; skipping deletion"
+                        );
+                        has_failed = true;
+                        batch_failed = true;
+                        break;
                     }
                 }
             }
@@ -707,25 +705,25 @@ async fn run_shard_tick(
             drop(conn);
 
             let mut archive_success = true;
-            if let Some((exec_id, document)) = doc {
-                if let Some(archiver) = &archiver {
-                    match archiver.archive(&document).await {
-                        Ok(()) => {
-                            tracing::debug!(
-                                execution_id = %exec_id,
-                                "pre-retention archival hook completed successfully"
-                            );
-                        }
-                        Err(error) => {
-                            tracing::error!(
-                                execution_id = %exec_id,
-                                error = %error,
-                                "pre-retention archival hook failed; skipping deletion"
-                            );
-                            has_failed = true;
-                            archive_success = false;
-                            batch_failed = true;
-                        }
+            if let Some((exec_id, document)) = doc
+                && let Some(archiver) = &archiver
+            {
+                match archiver.archive(&document).await {
+                    Ok(()) => {
+                        tracing::debug!(
+                            execution_id = %exec_id,
+                            "pre-retention archival hook completed successfully"
+                        );
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            execution_id = %exec_id,
+                            error = %error,
+                            "pre-retention archival hook failed; skipping deletion"
+                        );
+                        has_failed = true;
+                        archive_success = false;
+                        batch_failed = true;
                     }
                 }
             }
@@ -913,18 +911,24 @@ mod tests {
         assert!(config.validate().is_ok());
 
         // Test tick_interval = 0 is invalid
-        let mut config = RetentionConfig::default();
-        config.tick_interval_secs = 0;
+        let config = RetentionConfig {
+            tick_interval_secs: 0,
+            ..Default::default()
+        };
         assert!(config.validate().is_err());
 
         // Test batch_size = 0 is invalid
-        let mut config = RetentionConfig::default();
-        config.batch_size = 0;
+        let config = RetentionConfig {
+            batch_size: 0,
+            ..Default::default()
+        };
         assert!(config.validate().is_err());
 
         // Test max_age validation bounds
-        let mut config = RetentionConfig::default();
-        config.max_age_secs = Some(0); // under MIN_MAX_AGE (1s)
+        let mut config = RetentionConfig {
+            max_age_secs: Some(0), // under MIN_MAX_AGE (1s)
+            ..Default::default()
+        };
         assert!(config.validate().is_err());
 
         config.max_age_secs = Some(60 * 60 * 24 * 365 * 20); // over MAX_MAX_AGE (10 years)
@@ -936,21 +940,32 @@ mod tests {
 
     #[test]
     fn test_retention_config_enabled() {
-        let mut config = RetentionConfig::default();
-        config.audit_retention_days = 0;
-        config.schedule_decision_retention_days = 0;
+        let config = RetentionConfig {
+            audit_retention_days: 0,
+            schedule_decision_retention_days: 0,
+            ..Default::default()
+        };
         // default with no purging is not enabled
         assert!(!config.enabled());
 
-        config.max_age_secs = Some(3600);
+        let config = RetentionConfig {
+            max_age_secs: Some(3600),
+            audit_retention_days: 0,
+            schedule_decision_retention_days: 0,
+            ..Default::default()
+        };
         assert!(config.enabled());
 
-        let mut config = RetentionConfig::default();
-        config.audit_retention_days = 30;
+        let config = RetentionConfig {
+            audit_retention_days: 30,
+            ..Default::default()
+        };
         assert!(config.enabled());
 
-        let mut config = RetentionConfig::default();
-        config.schedule_decision_retention_days = 7;
+        let config = RetentionConfig {
+            schedule_decision_retention_days: 7,
+            ..Default::default()
+        };
         assert!(config.enabled());
     }
 
