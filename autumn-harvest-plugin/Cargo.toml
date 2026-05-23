@@ -39,6 +39,7 @@ autumn-harvest = { version = "0.3.0", path = "../autumn-harvest", features = ["d
 tower = "0.5"
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
+tracing-subscriber = "0.3"
 
 [lints]
 workspace = true
