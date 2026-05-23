@@ -3385,6 +3385,7 @@ fn schedule_expr_for_ui_summary(schedule: &Schedule) -> String {
 enum DagNodeState {
     Succeeded,
     Failed,
+    Cancelled,
     Running,
     Queued,
     Skipped,
@@ -3512,6 +3513,7 @@ fn map_node_states(
         {
             state = match task.state.as_str() {
                 "FAILED" => DagNodeState::Failed,
+                "CANCELLED" if !matches!(state, DagNodeState::Failed) => DagNodeState::Cancelled,
                 "RUNNING" if state != DagNodeState::Failed => DagNodeState::Running,
                 "PENDING" | "QUEUED" if state == DagNodeState::Unknown => DagNodeState::Queued,
                 "COMPLETED" if state == DagNodeState::Unknown => DagNodeState::Succeeded,
@@ -5166,7 +5168,8 @@ mod tests {
     fn render_dag_list_uses_dag_active_nav() {
         let dags = vec![];
         let html = render_dag_list(&dags).into_string();
-        assert!(html.contains("a.active href=\"dags\""));
+        assert!(html.contains("href=\"dags\">DAGs</a>"));
+        assert!(html.contains("class=\"active\""));
     }
 
     #[test]
