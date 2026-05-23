@@ -379,7 +379,7 @@ pub enum HarvestBuilderError {
 
     /// A [`crate::policy::Schedule::CronInTimezone`] variant declares a
     /// timezone name that is not a valid IANA entry. The name is rejected at
-    /// build time so the operator sees a error rather than silently
+    /// build time so the operator sees a clear error rather than silently
     /// misfiring at the wrong time.
     #[error(
         "unknown timezone '{name}'; use an IANA timezone name \
@@ -751,7 +751,7 @@ impl HarvestBuilder {
         self
     }
 
-    /// Install a [`PayloadCodec`] so the worker captures trace context at
+    /// Install a [`TelemetryConfig`] so the worker captures trace context at
     /// enqueue, reinstates it on claim, and emits workflow / activity / timer
     /// metrics through the supplied recorder.
     ///
@@ -1165,7 +1165,7 @@ fn validate_concurrency_keys(
 
     for activity in activities {
         // max_concurrent = 0 makes the cap predicate always-true, permanently
-        // deferring every task for this activity. Reject at build time.
+        // deferring every task for that activity. Reject at build time.
         if activity.max_concurrent == Some(0) {
             return Err(HarvestBuilderError::ZeroConcurrencyCap {
                 activity: activity.name.to_string(),
@@ -1474,7 +1474,7 @@ impl WorkerConfig {
     /// After a workflow is cancelled, any running activity gets this long to
     /// notice cooperative cancellation (via [`crate::context::ActivityContext::is_cancelled`]
     /// or [`crate::context::ActivityContext::heartbeat`]) and unwind cleanly. If it is still
-    /// running at the end of the grace period the worker aborts the handler
+    /// running at the end of the grace period the worker hard-aborts the handler
     /// task and marks the activity as cancelled.
     #[must_use]
     pub const fn with_cancellation_grace_period(mut self, grace_period: Duration) -> Self {
