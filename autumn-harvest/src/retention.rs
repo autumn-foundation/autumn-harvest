@@ -39,6 +39,32 @@ const DEFAULT_BATCH_SIZE: usize = 1_000;
 const MIN_MAX_AGE: Duration = Duration::from_secs(1);
 const MAX_MAX_AGE: Duration = Duration::from_secs(60 * 60 * 24 * 365 * 10);
 
+/// Future type returned by [`HistoryArchiver::archive`].
+pub type ArchiverFuture = std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = Result<(), Box<dyn std::error::Error + Send + Sync>>,
+            > + Send,
+    >,
+>;
+
+/// Trait for pre-retention workflow history cold storage archivers.
+///
+/// Implementations of this trait are invoked by the retention janitor to ship
+/// a completed workflow execution's event history to cold storage *before* it
+/// is permanently deleted from the database.
+pub trait HistoryArchiver: Send + Sync + 'static {
+    /// Ship the history export document to cold storage.
+    ///
+    /// If this returns `Err`, the retention janitor skips deleting the
+    /// workflow execution and its associated events on this tick, retrying
+    /// on the next tick to prevent data loss.
+    fn archive(
+        &self,
+        doc: &crate::history_export::HistoryExportDocument,
+    ) -> ArchiverFuture;
+}
+
 /// Configuration for the background retention job.
 ///
 /// **Why does this exist?**
@@ -273,6 +299,7 @@ impl RetentionRuntime {
         pools: ShardedDbPool,
         config: RetentionConfig,
         metrics: Arc<dyn MetricsRecorder>,
+        archiver: Option<Arc<dyn HistoryArchiver>>,
     ) -> Option<Self> {
         if !config.enabled() {
             return None;
@@ -301,6 +328,7 @@ impl RetentionRuntime {
                         let pool = pool.clone();
                         let config = config.clone();
                         let metrics = Arc::clone(&metrics);
+                        let archiver = archiver.clone();
                         let cursor = scan_cursors.get(&shard).copied().flatten();
                         async move {
                             let started = Instant::now();
@@ -309,6 +337,7 @@ impl RetentionRuntime {
                                 shard,
                                 cutoff,
                                 &config,
+                                archiver,
                                 cursor,
                                 Arc::clone(&metrics),
                             )
@@ -450,6 +479,8 @@ struct CandidateExecution {
     workflow_name: String,
     #[diesel(sql_type = Text)]
     workflow_id: String,
+    #[diesel(sql_type = Text)]
+    state: String,
     #[diesel(sql_type = Nullable<Timestamptz>) ]
     completed_at: Option<DateTime<Utc>>,
 }
@@ -462,11 +493,13 @@ struct RetentionScanCursor {
 }
 
 #[cfg(feature = "db")]
+#[allow(clippy::too_many_lines)]
 async fn run_shard_tick(
     pool: crate::worker::DbPool,
     shard: ShardId,
     cutoff: DateTime<Utc>,
     config: &RetentionConfig,
+    archiver: Option<Arc<dyn HistoryArchiver>>,
     start_cursor: Option<RetentionScanCursor>,
     _metrics: Arc<dyn MetricsRecorder>,
 ) -> HarvestResult<ShardTickOutcome> {
@@ -481,7 +514,7 @@ async fn run_shard_tick(
 
     while remaining > 0 {
         let candidates = diesel::sql_query(
-            "SELECT id, workflow_name, workflow_id, completed_at
+            "SELECT id, workflow_name, workflow_id, state, completed_at
              FROM harvest_workflow_executions
              WHERE state IN ('COMPLETED','FAILED','CANCELLED','TIMED_OUT','CONTINUED_AS_NEW','TERMINATED')
                AND completed_at IS NOT NULL
@@ -536,6 +569,58 @@ async fn run_shard_tick(
                         .map_or(age, |existing| existing.max(age)),
                 );
                 continue;
+            }
+
+            if let Some(archiver) = &archiver {
+                let exec_id = crate::types::ExecutionId::from_uuid(candidate.id);
+                match crate::store::load_history(&mut conn, exec_id).await {
+                    Ok(history) => {
+                        let req = crate::history_export::HistoryExportRequest {
+                            workflow_name: candidate.workflow_name.clone(),
+                            execution_id: exec_id,
+                            shard_id: shard.as_i32(),
+                            state: candidate.state.clone(),
+                            events: history.events,
+                            exported_at: chrono::Utc::now(),
+                            payload_policy: crate::history_export::HistoryPayloadPolicy::Full,
+                            max_bytes: None,
+                        };
+                        match crate::history_export::export_history(req) {
+                            Ok(document) => match archiver.archive(&document).await {
+                                Ok(()) => {
+                                    tracing::debug!(
+                                        execution_id = %exec_id,
+                                        "pre-retention archival hook completed successfully"
+                                    );
+                                }
+                                Err(error) => {
+                                    tracing::error!(
+                                        execution_id = %exec_id,
+                                        error = %error,
+                                        "pre-retention archival hook failed; skipping deletion"
+                                    );
+                                    continue;
+                                }
+                            },
+                            Err(error) => {
+                                tracing::error!(
+                                    execution_id = %exec_id,
+                                    error = %error,
+                                    "failed to serialize history export; skipping deletion"
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            execution_id = %exec_id,
+                            error = %error,
+                            "failed to load history events for retention candidate; skipping deletion"
+                        );
+                        continue;
+                    }
+                }
             }
 
             if config.dry_run {
