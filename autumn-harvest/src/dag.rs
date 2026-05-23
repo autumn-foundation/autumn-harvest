@@ -1,4 +1,8 @@
-//! DAG definition primitives for Harvest.
+//! Directed Acyclic Graph (DAG) definitions and builder.
+//!
+//! This module provides the core types for defining complex task workflows
+//! as a graph of dependencies. A DAG ensures tasks are executed in the correct
+//! topological order, maximizing concurrency while respecting upstream requirements.
 //!
 //! DAGs are compiled in memory into immutable execution metadata. Runtime
 //! scheduling can consume the resulting [`DagDefinition`] without rebuilding

@@ -33,6 +33,33 @@ pub struct DagProfile {
 }
 
 /// A discrete-event simulator to profile DAG execution.
+///
+/// Evaluates the concurrency profile of a DAG over time by simulating execution with task duration bounds.
+/// Useful for predicting peak parallelism and identifying bottlenecks before deploying to production.
+///
+/// ## Examples
+///
+/// ```rust
+/// use autumn_harvest::dag::DagBuilder;
+/// use autumn_harvest::dag_profiler::DagProfiler;
+/// use std::time::Duration;
+///
+/// const fn task_a() {}
+/// const fn task_b() {}
+///
+/// let mut builder = DagBuilder::new();
+/// builder.activity(task_a);
+/// builder.activity(task_b);
+/// let dag = builder.build().unwrap();
+///
+/// // Since neither task depends on the other, they run concurrently.
+/// let profiler = DagProfiler::new(dag)
+///     .with_default_duration(Duration::from_secs(5));
+///
+/// let profile = profiler.profile();
+/// assert_eq!(profile.peak_concurrency, 2);
+/// assert_eq!(profile.total_duration, Duration::from_secs(5));
+/// ```
 pub struct DagProfiler {
     dag: DagDefinition,
     activity_durations: HashMap<String, Duration>,

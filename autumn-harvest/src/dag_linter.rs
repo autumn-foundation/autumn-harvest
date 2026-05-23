@@ -29,6 +29,29 @@ pub trait DagRule: Send + Sync {
 }
 
 /// The main entry point for statically analyzing DAG definitions.
+///
+/// Provides a framework for validating DAG topologies and configurations against common anti-patterns
+/// (e.g., missing timeouts, unbounded concurrency).
+///
+/// ## Examples
+///
+/// ```rust
+/// use autumn_harvest::dag::DagBuilder;
+/// use autumn_harvest::dag_linter::{DagLinter, MissingRetryPolicyRule};
+/// use std::collections::HashMap;
+///
+/// const fn frail_task() {}
+///
+/// let mut builder = DagBuilder::new();
+/// builder.activity(frail_task); // Omit retry policy intentionally
+/// let dag = builder.build().unwrap();
+///
+/// let linter = DagLinter::new().with_rule(MissingRetryPolicyRule);
+/// let warnings = linter.analyze(&dag, &HashMap::new());
+///
+/// assert_eq!(warnings.len(), 1);
+/// assert_eq!(warnings[0].rule_name, "MissingRetryPolicy");
+/// ```
 pub struct DagLinter {
     rules: Vec<Box<dyn DagRule>>,
 }

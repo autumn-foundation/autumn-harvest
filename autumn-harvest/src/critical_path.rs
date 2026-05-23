@@ -19,6 +19,36 @@ pub struct CriticalPathResult {
 }
 
 /// Analyzer to determine the critical path of a DAG.
+///
+/// The critical path represents the sequence of dependent tasks that determines the total execution
+/// time of the graph. Understanding the critical path is essential for optimizing workflow performance.
+///
+/// ## Examples
+///
+/// ```rust
+/// use autumn_harvest::dag::DagBuilder;
+/// use autumn_harvest::critical_path::CriticalPathAnalyzer;
+/// use std::time::Duration;
+///
+/// const fn fast_task() {}
+/// const fn slow_task() {}
+/// const fn final_task() {}
+///
+/// let mut builder = DagBuilder::new();
+/// let fast = builder.activity(fast_task);
+/// let slow = builder.activity(slow_task);
+/// let fin = builder.activity(final_task).upstream(&fast).upstream(&slow);
+/// let dag = builder.build().unwrap();
+///
+/// let analyzer = CriticalPathAnalyzer::new(dag)
+///     .mock_duration("fast_task", Duration::from_secs(1))
+///     .mock_duration("slow_task", Duration::from_secs(10))
+///     .mock_duration("final_task", Duration::from_secs(2));
+///
+/// let result = analyzer.analyze();
+/// assert_eq!(result.total_duration, Duration::from_secs(12));
+/// assert_eq!(result.path_names, vec!["slow_task", "final_task"]);
+/// ```
 pub struct CriticalPathAnalyzer {
     dag: DagDefinition,
     activity_durations: HashMap<String, Duration>,

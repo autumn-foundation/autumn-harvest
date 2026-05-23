@@ -13,6 +13,9 @@ use crate::policy::TaskStatus;
 pub type DagActivityMockFn = Box<dyn Fn() -> Result<(), String> + Send + Sync>;
 
 /// The result of a simulated DAG execution.
+///
+/// Contains the final execution states of all tasks in the DAG, allowing you to assert
+/// that your trigger rules and topologies behave correctly under specific mocked conditions.
 #[derive(Debug, Clone)]
 pub struct DagSimulatorResult {
     /// The final status of each task in the DAG, indexed by their topological order index.
@@ -31,6 +34,29 @@ impl DagSimulatorResult {
 ///
 /// Executes the DAG topologically level-by-level, evaluating trigger rules
 /// for each task. Activity behavior is stubbed via `.mock_activity()`.
+///
+/// ## Examples
+///
+/// ```rust
+/// use autumn_harvest::dag::DagBuilder;
+/// use autumn_harvest::dag_simulator::DagSimulator;
+/// use autumn_harvest::policy::{TaskStatus, TriggerRule};
+///
+/// const fn activity_a() {}
+/// const fn activity_b() {}
+///
+/// let mut builder = DagBuilder::new();
+/// let a = builder.activity(activity_a);
+/// let b = builder.activity(activity_b).upstream(&a).trigger_rule(TriggerRule::AllDone);
+/// let dag = builder.build().unwrap();
+///
+/// // Simulate a scenario where 'a' fails. Because 'b' uses `AllDone`, it still runs.
+/// let sim = DagSimulator::new(dag).mock_activity("activity_a", || Err("Simulated failure".into()));
+/// let result = sim.run();
+///
+/// assert_eq!(result.get_status(a.index()), Some(&TaskStatus::Failed));
+/// assert_eq!(result.get_status(b.index()), Some(&TaskStatus::Succeeded));
+/// ```
 pub struct DagSimulator {
     dag: DagDefinition,
     activity_mocks: HashMap<String, DagActivityMockFn>,
