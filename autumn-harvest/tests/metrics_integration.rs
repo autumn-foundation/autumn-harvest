@@ -992,18 +992,20 @@ async fn workflow_hard_cap_dlq_preserves_terminal_attempt_count() {
         .expect("failed to force attempt");
 
     let policy = WorkflowHistoryPolicy::default().with_event_hard_cap(2);
-    let registry = Arc::new(HandlerRegistry::with_history_policy(
-        vec![WorkflowInfo {
-            name: "history_cap_violator",
-            module: "metrics_integration",
-            handler: history_cap_violator,
-            execution_timeout: None,
-            concurrency: None,
-            max_input_bytes: None,
-        }],
-        vec![],
-        policy,
-    ));
+    let registry = Arc::new(
+        HandlerRegistry::new(
+            vec![WorkflowInfo {
+                name: "history_cap_violator",
+                module: "metrics_integration",
+                handler: history_cap_violator,
+                execution_timeout: None,
+                concurrency: None,
+                max_input_bytes: None,
+            }],
+            vec![],
+        )
+        .with_history_policy(policy),
+    );
 
     let worker = build_worker("metrics-worker-hard-cap-attempt", registry);
     let pool = build_test_pool(&database_url);

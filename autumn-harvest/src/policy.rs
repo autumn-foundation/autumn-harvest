@@ -41,7 +41,7 @@ pub enum JitterPolicy {
     Decorrelated,
 }
 
-fn mix64(mut x: u64) -> u64 {
+const fn mix64(mut x: u64) -> u64 {
     x ^= x >> 30;
     x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
     x ^= x >> 27;
