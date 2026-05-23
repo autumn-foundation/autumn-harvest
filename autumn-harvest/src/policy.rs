@@ -49,7 +49,7 @@ const fn mix64(mut x: u64) -> u64 {
     x ^ (x >> 31)
 }
 
-fn uniform_inclusive(seed: u64, lo: u64, hi: u64) -> u64 {
+const fn uniform_inclusive(seed: u64, lo: u64, hi: u64) -> u64 {
     let range = hi.wrapping_sub(lo).wrapping_add(1);
     let offset = if range == 0 {
         mix64(seed)
