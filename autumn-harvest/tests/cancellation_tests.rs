@@ -50,6 +50,12 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260518000000_harvest_signal_idempotency/up.sql"),
     "\n",
     include_str!("../migrations/20260518000001_harvest_workflow_execution_timeout/up.sql"),
+    "\n",
+    include_str!("../migrations/20260519000000_harvest_calendar_awareness/up.sql"),
+    "\n",
+    include_str!("../migrations/20260522000000_harvest_schedule_decisions/up.sql"),
+    "\n",
+    include_str!("../migrations/20260522000001_harvest_rate_limiting/up.sql"),
 );
 
 async fn setup_test_db() -> (AsyncPgConnection, ContainerAsync<Postgres>) {
@@ -225,6 +231,9 @@ fn heartbeat_registry(probe: HeartbeatCancellationProbe) -> Arc<HandlerRegistry>
             is_local: false,
             max_input_bytes: None,
             max_result_bytes: None,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
             handler: heartbeat_activity,
         }],
         Arc::new(state),
@@ -576,6 +585,9 @@ fn uncooperative_registry(probe: UncooperativeActivityProbe) -> Arc<HandlerRegis
             is_local: false,
             max_input_bytes: None,
             max_result_bytes: None,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
             handler: uncooperative_activity,
         }],
         Arc::new(state),

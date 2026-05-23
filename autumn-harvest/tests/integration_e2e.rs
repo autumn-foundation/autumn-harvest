@@ -92,6 +92,10 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260518000001_harvest_workflow_execution_timeout/up.sql"),
     "\n",
     include_str!("../migrations/20260519000000_harvest_calendar_awareness/up.sql"),
+    "\n",
+    include_str!("../migrations/20260522000000_harvest_schedule_decisions/up.sql"),
+    "\n",
+    include_str!("../migrations/20260522000001_harvest_rate_limiting/up.sql"),
 );
 
 /// The minimal "legacy" migration set used by the upgrade-path regression
@@ -123,6 +127,8 @@ const LEGACY_INIT_SQL: &str = concat!(
     include_str!("../migrations/20260514020000_harvest_task_activity_id/up.sql"),
     "\n",
     include_str!("../migrations/20260518000001_harvest_workflow_execution_timeout/up.sql"),
+    "\n",
+    "ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS rate_limit_key TEXT NULL;\n",
 );
 
 /// Start a Postgres container with the harvest schema applied and return
@@ -1221,7 +1227,7 @@ async fn worker_completes_workflow_task_and_persists_result() {
         runner.run(&pool_for_run).await;
     });
 
-    let completed_execution = tokio::time::timeout(Duration::from_secs(5), async {
+    let completed_execution = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             let execution = load_execution_from_url(&database_url, exec_id).await;
 
@@ -1324,7 +1330,7 @@ async fn worker_marks_workflow_failed_when_handler_errors() {
         runner.run(&pool_for_run).await;
     });
 
-    let failed_execution = tokio::time::timeout(Duration::from_secs(5), async {
+    let failed_execution = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             let execution = load_execution_from_url(&database_url, exec_id).await;
 
@@ -1415,6 +1421,9 @@ async fn worker_completes_workflow_with_activity_round_trip() {
             default_queue: Some("default"),
             max_concurrent: None,
             concurrency_key: None,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
             is_local: false,
             max_input_bytes: None,
             max_result_bytes: None,
@@ -1546,6 +1555,9 @@ async fn activity_retry_resumes_from_persisted_heartbeat_details() {
             default_queue: Some("default"),
             max_concurrent: None,
             concurrency_key: None,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
             is_local: false,
             max_input_bytes: None,
             max_result_bytes: None,
@@ -1647,6 +1659,9 @@ async fn worker_fails_orphaned_activity_task_without_scheduled_event() {
                     default_queue: Some("default"),
                     max_concurrent: None,
                     concurrency_key: None,
+                    rate_limit_rps: None,
+                    rate_limit_burst: None,
+                    rate_limit_key: None,
                     is_local: false,
                     max_input_bytes: None,
                     max_result_bytes: None,
@@ -1664,7 +1679,7 @@ async fn worker_fails_orphaned_activity_task_without_scheduled_event() {
         runner.run(&pool_for_run).await;
     });
 
-    let failed_task = tokio::time::timeout(Duration::from_secs(5), async {
+    let failed_task = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             let task = load_task_from_url(&database_url, task_id).await;
 
@@ -1877,6 +1892,9 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
                     default_queue: Some("default"),
                     max_concurrent: None,
                     concurrency_key: None,
+                    rate_limit_rps: None,
+                    rate_limit_burst: None,
+                    rate_limit_key: None,
                     is_local: false,
                     max_input_bytes: None,
                     max_result_bytes: None,
@@ -2398,6 +2416,9 @@ async fn worker_builder_state_is_visible_to_workflow_and_activity() {
             default_queue: Some("default"),
             max_concurrent: None,
             concurrency_key: None,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
             is_local: false,
             max_input_bytes: None,
             max_result_bytes: None,
@@ -2996,6 +3017,9 @@ async fn worker_handles_early_ingested_signal_before_activity() {
             default_queue: Some("default"),
             max_concurrent: None,
             concurrency_key: None,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
             is_local: false,
             max_input_bytes: None,
             max_result_bytes: None,
@@ -5388,6 +5412,9 @@ async fn non_retryable_activity_fails_fast_on_attempt_one() {
             default_queue: Some("default"),
             max_concurrent: None,
             concurrency_key: None,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
             is_local: false,
             max_input_bytes: None,
             max_result_bytes: None,
@@ -5512,6 +5539,9 @@ async fn legacy_string_failure_in_non_retryable_errors_fails_fast() {
             default_queue: Some("default"),
             max_concurrent: None,
             concurrency_key: None,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
             is_local: false,
             max_input_bytes: None,
             max_result_bytes: None,

@@ -1829,6 +1829,73 @@
     },
     {
       "method": "GET",
+      "path": "/admin/rate-limits",
+      "category": "admin",
+      "read_only": true,
+      "description": "List all active rate limit token buckets and current token levels.",
+      "params": [],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "free_form": true
+      },
+      "error_responses": [
+        {
+          "status": 500,
+          "description": "Database query failure."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/admin/rate-limits/{key}",
+      "category": "admin",
+      "read_only": false,
+      "idempotency": "Idempotent; multiple identical calls yield the same rate limit value and overwrite tokens to at most the new burst value.",
+      "description": "Insert or dynamically override a rate limit configuration.",
+      "params": [
+        {
+          "name": "key",
+          "in": "path",
+          "required": true,
+          "description": "Opaque rate limit identifier key."
+        }
+      ],
+      "request_body": {
+        "required": true,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "refill_rate",
+            "required": true,
+            "description": "Rate at which tokens are added to the bucket per second."
+          },
+          {
+            "name": "burst",
+            "required": true,
+            "description": "Maximum capacity of the token bucket."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "ok"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Invalid burst or refill_rate parameters."
+        },
+        {
+          "status": 500,
+          "description": "Database write error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
       "path": "/admin/shards/health",
       "category": "admin",
       "read_only": true,

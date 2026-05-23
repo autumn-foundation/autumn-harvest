@@ -181,6 +181,15 @@ pub const METRIC_PAYLOAD_BYTES: &str = "harvest.payload.bytes";
 /// Per ADR-0001 §7, `execution.id` is span-only.
 pub const METRIC_PAYLOAD_REJECTED: &str = "harvest.payload.rejected";
 
+/// Gauge: current available tokens in a rate limit bucket.
+pub const METRIC_RATE_LIMIT_TOKENS_AVAILABLE: &str = "harvest.rate_limit.tokens_available";
+
+/// Gauge: refill rate (tokens per second) for a rate limit bucket.
+pub const METRIC_RATE_LIMIT_REFILL_RATE: &str = "harvest.rate_limit.refill_rate";
+
+/// Counter: incremented when a task claim is throttled/skipped due to rate limiting.
+pub const METRIC_RATE_LIMIT_THROTTLED: &str = "harvest.rate_limit.throttled";
+
 // ---------------------------------------------------------------------------
 // Metric label key constants
 // Used by MetricsRecorder implementations to avoid string literals at call
@@ -562,6 +571,27 @@ pub trait MetricsRecorder: Send + Sync {
     /// this alongside queue depth to detect saturation-induced backlog.
     fn record_concurrency_key_deferred(&self, key: &str, deferred: u64) {
         let _ = (key, deferred);
+    }
+
+    /// Record the current available tokens for a rate limit bucket key.
+    ///
+    /// Maps to the gauge `harvest.rate_limit.tokens_available{key}`.
+    fn record_rate_limit_tokens_available(&self, key: &str, tokens: f64) {
+        let _ = (key, tokens);
+    }
+
+    /// Record the refill rate (tokens per second) for a rate limit bucket key.
+    ///
+    /// Maps to the gauge `harvest.rate_limit.refill_rate{key}`.
+    fn record_rate_limit_refill_rate(&self, key: &str, refill_rate: f64) {
+        let _ = (key, refill_rate);
+    }
+
+    /// Record that a task claim was throttled/skipped due to rate limiting.
+    ///
+    /// Maps to the counter `harvest.rate_limit.throttled{key}`.
+    fn record_rate_limit_throttled(&self, key: &str) {
+        let _ = key;
     }
 
     /// Current number of entries in the dead-letter queue on one shard.

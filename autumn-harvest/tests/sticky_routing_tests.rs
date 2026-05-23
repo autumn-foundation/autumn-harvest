@@ -399,6 +399,12 @@ mod db_tests {
         include_str!("../migrations/20260514020000_harvest_task_activity_id/up.sql"),
         "\n",
         include_str!("../migrations/20260518000001_harvest_workflow_execution_timeout/up.sql"),
+        "\n",
+        include_str!("../migrations/20260519000000_harvest_calendar_awareness/up.sql"),
+        "\n",
+        include_str!("../migrations/20260522000000_harvest_schedule_decisions/up.sql"),
+        "\n",
+        include_str!("../migrations/20260522000001_harvest_rate_limiting/up.sql"),
     );
 
     async fn setup() -> (AsyncPgConnection, ContainerAsync<Postgres>) {

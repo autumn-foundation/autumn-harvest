@@ -101,6 +101,8 @@ pub struct EnqueueParams {
     /// will skip this task. `None` = any worker may claim (pre-policy / legacy
     /// executions).
     pub required_build_id: Option<String>,
+    /// Optional rate limit key to throttle execution throughput.
+    pub rate_limit_key: Option<String>,
 }
 
 impl EnqueueParams {
@@ -133,6 +135,7 @@ impl EnqueueParams {
             concurrency_key: None,
             max_concurrent: None,
             required_build_id: None,
+            rate_limit_key: None,
         }
     }
 
@@ -226,6 +229,7 @@ pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> Ha
         concurrency_key: params.concurrency_key.as_deref(),
         concurrency_cap,
         required_build_id: params.required_build_id.as_deref(),
+        rate_limit_key: params.rate_limit_key.as_deref(),
     };
 
     diesel::insert_into(harvest_task_queue::table)
@@ -279,6 +283,7 @@ pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> Ha
 /// # Errors
 ///
 /// Returns [`crate::error::HarvestError::Database`] on query failure.
+#[allow(clippy::too_many_lines)]
 pub async fn claim_task(
     conn: &mut AsyncPgConnection,
     queues: &[String],
@@ -318,7 +323,7 @@ pub async fn claim_task(
 
     let result: Vec<TaskQueueItem> = diesel::sql_query(
         "WITH candidate AS ( \
-             SELECT id, task_type, concurrency_key, concurrency_cap \
+             SELECT id, task_type, concurrency_key, concurrency_cap, rate_limit_key \
              FROM harvest_task_queue \
              WHERE queue_name = ANY($2) \
                AND state = 'PENDING' \
@@ -350,6 +355,14 @@ pub async fn claim_task(
                          AND compatible_with = harvest_task_queue.required_build_id \
                    ) \
                ) \
+               AND ( \
+                   rate_limit_key IS NULL \
+                   OR EXISTS ( \
+                       SELECT 1 FROM harvest_rate_limit_buckets b \
+                       WHERE b.key = harvest_task_queue.rate_limit_key \
+                         AND LEAST(b.burst, b.tokens + EXTRACT(EPOCH FROM (NOW() - b.last_refilled_at)) * b.refill_rate) >= 1.0 \
+                   ) \
+               ) \
              ORDER BY \
                  CASE \
                      WHEN sticky_worker_id = $1 AND sticky_until > NOW() THEN 1 \
@@ -362,28 +375,44 @@ pub async fn claim_task(
                  END DESC, \
                  scheduled_at ASC \
              LIMIT 1 FOR UPDATE SKIP LOCKED \
-         ) \
-         UPDATE harvest_task_queue \
-         SET state = 'RUNNING', worker_id = $1, started_at = NOW(), attempt = attempt + 1 \
-         FROM candidate \
-         WHERE harvest_task_queue.id = candidate.id \
-           AND ( \
-               candidate.concurrency_key IS NULL \
-               OR ( \
-                   pg_try_advisory_xact_lock(hashtext(candidate.concurrency_key)::bigint) \
-                   AND ( \
-                       candidate.concurrency_cap IS NULL \
-                       OR ( \
-                           SELECT COUNT(*) FROM harvest_task_queue recheck \
-                           WHERE recheck.concurrency_key = candidate.concurrency_key \
-                             AND recheck.task_type = candidate.task_type \
-                             AND recheck.state = 'RUNNING' \
-                             AND recheck.worker_id IS NOT NULL \
-                       ) < candidate.concurrency_cap \
-                   ) \
-               ) \
-           ) \
-         RETURNING harvest_task_queue.*",
+        ), \
+        decrement_bucket AS ( \
+            UPDATE harvest_rate_limit_buckets b \
+            SET tokens = LEAST(b.burst, b.tokens + EXTRACT(EPOCH FROM (NOW() - b.last_refilled_at)) * b.refill_rate) - 1.0, \
+                last_refilled_at = NOW() \
+            FROM candidate \
+            WHERE b.key = candidate.rate_limit_key \
+              AND LEAST(b.burst, b.tokens + EXTRACT(EPOCH FROM (NOW() - b.last_refilled_at)) * b.refill_rate) >= 1.0 \
+            RETURNING b.key \
+        ) \
+        UPDATE harvest_task_queue \
+        SET state = 'RUNNING', worker_id = $1, started_at = NOW(), attempt = attempt + 1 \
+        FROM candidate \
+        WHERE harvest_task_queue.id = candidate.id \
+          AND ( \
+              candidate.concurrency_key IS NULL \
+              OR ( \
+                  pg_try_advisory_xact_lock(hashtext(candidate.concurrency_key)::bigint) \
+                  AND ( \
+                      candidate.concurrency_cap IS NULL \
+                      OR ( \
+                          SELECT COUNT(*) FROM harvest_task_queue recheck \
+                          WHERE recheck.concurrency_key = candidate.concurrency_key \
+                            AND recheck.task_type = candidate.task_type \
+                            AND recheck.state = 'RUNNING' \
+                            AND recheck.worker_id IS NOT NULL \
+                      ) < candidate.concurrency_cap \
+                  ) \
+              ) \
+          ) \
+          AND ( \
+              candidate.rate_limit_key IS NULL \
+              OR EXISTS ( \
+                  SELECT 1 FROM decrement_bucket \
+                  WHERE decrement_bucket.key = candidate.rate_limit_key \
+              ) \
+          ) \
+        RETURNING harvest_task_queue.*",
     )
     .bind::<diesel::sql_types::Text, _>(worker_id)
     .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
@@ -1108,6 +1137,40 @@ pub async fn task_exists(conn: &mut AsyncPgConnection, task_id: Uuid) -> Harvest
         .map_err(crate::error::database_error)?;
 
     Ok(found.is_some())
+}
+
+/// Check if any pending tasks in the specified queues are throttled due to rate limits.
+///
+/// Returns the rate limit keys that are currently saturated (have < 1.0 tokens).
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub async fn check_throttled_keys(
+    conn: &mut AsyncPgConnection,
+    queues: &[String],
+) -> HarvestResult<Vec<String>> {
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        rate_limit_key: String,
+    }
+
+    let rows: Vec<Row> = diesel::sql_query(
+        "SELECT DISTINCT q.rate_limit_key \
+         FROM harvest_task_queue q \
+         JOIN harvest_rate_limit_buckets b ON b.key = q.rate_limit_key \
+         WHERE q.queue_name = ANY($1) \
+           AND q.state = 'PENDING' \
+           AND q.scheduled_at <= NOW() \
+           AND LEAST(b.burst, b.tokens + EXTRACT(EPOCH FROM (NOW() - b.last_refilled_at)) * b.refill_rate) < 1.0"
+    )
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
+    .load(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+
+    Ok(rows.into_iter().map(|r| r.rate_limit_key).collect())
 }
 
 // ---------------------------------------------------------------------------

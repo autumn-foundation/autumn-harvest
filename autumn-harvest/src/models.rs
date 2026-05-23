@@ -12,8 +12,8 @@ use uuid::Uuid;
 use crate::schema::{
     harvest_audit_log, harvest_backfill_log, harvest_batch_jobs, harvest_build_compat,
     harvest_build_policies, harvest_calendar_exclusions, harvest_calendars, harvest_dead_letters,
-    harvest_events, harvest_external_tasks, harvest_schedule_decisions, harvest_schedules,
-    harvest_signals, harvest_task_queue, harvest_timers, harvest_workers,
+    harvest_events, harvest_external_tasks, harvest_rate_limit_buckets, harvest_schedule_decisions,
+    harvest_schedules, harvest_signals, harvest_task_queue, harvest_timers, harvest_workers,
     harvest_workflow_executions,
 };
 
@@ -205,6 +205,8 @@ pub struct TaskQueueItem {
     pub concurrency_cap: Option<i32>,
     /// Build ID required to claim this task (issue #171). NULL = any worker.
     pub required_build_id: Option<String>,
+    /// Optional rate limit key to throttle execution throughput.
+    pub rate_limit_key: Option<String>,
 }
 
 /// Insert struct for enqueuing a new task.
@@ -234,6 +236,44 @@ pub struct NewTaskQueueItem<'a> {
     pub concurrency_cap: Option<i32>,
     /// Build ID required to claim this task. `None` = any worker may claim.
     pub required_build_id: Option<&'a str>,
+    /// Optional rate limit key to throttle execution throughput.
+    pub rate_limit_key: Option<&'a str>,
+}
+
+/// Database representation of a rate limit bucket.
+#[derive(
+    Debug,
+    Clone,
+    Queryable,
+    Selectable,
+    Identifiable,
+    Insertable,
+    AsChangeset,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[diesel(table_name = harvest_rate_limit_buckets)]
+#[diesel(primary_key(key))]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct RateLimitBucket {
+    pub key: String,
+    pub refill_rate: f64,
+    pub burst: f64,
+    pub tokens: f64,
+    pub last_refilled_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Insert struct for a rate limit bucket.
+#[derive(Debug, Insertable, AsChangeset, serde::Serialize, serde::Deserialize)]
+#[diesel(table_name = harvest_rate_limit_buckets)]
+pub struct NewRateLimitBucket<'a> {
+    pub key: &'a str,
+    pub refill_rate: f64,
+    pub burst: f64,
+    pub tokens: f64,
+    pub last_refilled_at: DateTime<Utc>,
 }
 
 // ── Schedule ──────────────────────────────────────────────────────────────────

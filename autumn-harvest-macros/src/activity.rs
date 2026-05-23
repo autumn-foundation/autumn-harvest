@@ -19,8 +19,12 @@ struct ActivityAttrs {
     max_input_bytes: Option<u64>,
     /// Per-activity result size cap override in bytes (issue #252).
     max_result_bytes: Option<u64>,
+    rate_limit_rps: Option<u32>,
+    rate_limit_burst: Option<u32>,
+    rate_limit_key: Option<String>,
 }
 
+#[allow(clippy::too_many_lines)]
 fn parse_attrs(attr: TokenStream) -> syn::Result<ActivityAttrs> {
     let mut result = ActivityAttrs {
         retry: None,
@@ -33,6 +37,9 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<ActivityAttrs> {
         local: false,
         max_input_bytes: None,
         max_result_bytes: None,
+        rate_limit_rps: None,
+        rate_limit_burst: None,
+        rate_limit_key: None,
     };
 
     syn::meta::parser(|meta| {
@@ -94,11 +101,32 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<ActivityAttrs> {
             })?;
             result.max_result_bytes = Some(bytes);
             Ok(())
+        } else if meta.path.is_ident("rate_limit_rps") {
+            let value: LitInt = meta.value()?.parse()?;
+            let n: u32 = value.base10_parse()?;
+            if n == 0 {
+                return Err(meta.error("rate_limit_rps must be greater than zero"));
+            }
+            result.rate_limit_rps = Some(n);
+            Ok(())
+        } else if meta.path.is_ident("rate_limit_burst") {
+            let value: LitInt = meta.value()?.parse()?;
+            let n: u32 = value.base10_parse()?;
+            if n == 0 {
+                return Err(meta.error("rate_limit_burst must be greater than zero"));
+            }
+            result.rate_limit_burst = Some(n);
+            Ok(())
+        } else if meta.path.is_ident("rate_limit_key") {
+            let value: LitStr = meta.value()?.parse()?;
+            result.rate_limit_key = Some(value.value());
+            Ok(())
         } else {
             Err(meta.error(
                 "unsupported attribute: expected retry, start_to_close, heartbeat_timeout, \
                  schedule_to_start, queue, max_concurrent, concurrency_key, local, \
-                 max_input_bytes, or max_result_bytes",
+                 max_input_bytes, max_result_bytes, rate_limit_rps, rate_limit_burst, \
+                 or rate_limit_key",
             ))
         }
     })
@@ -341,6 +369,23 @@ pub fn activity_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         .max_result_bytes
         .map_or_else(|| quote! { None }, |b| quote! { Some(#b) });
 
+    let rate_limit_rps_expr = attrs
+        .rate_limit_rps
+        .map_or_else(|| quote! { None }, |n| quote! { Some(#n) });
+    let rate_limit_burst_expr = attrs
+        .rate_limit_burst
+        .map_or_else(|| quote! { None }, |n| quote! { Some(#n) });
+    let rate_limit_key_expr = match attrs.rate_limit_key.as_deref() {
+        Some(key) => quote! { Some(#key) },
+        None => {
+            if attrs.rate_limit_rps.is_some() || attrs.rate_limit_burst.is_some() {
+                quote! { Some(#fn_name_str) }
+            } else {
+                quote! { None }
+            }
+        }
+    };
+
     quote! {
         #input_fn
 
@@ -359,6 +404,9 @@ pub fn activity_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 is_local: #is_local,
                 max_input_bytes: #max_input_bytes_expr,
                 max_result_bytes: #max_result_bytes_expr,
+                rate_limit_rps: #rate_limit_rps_expr,
+                rate_limit_burst: #rate_limit_burst_expr,
+                rate_limit_key: #rate_limit_key_expr,
                 handler: |ctx, input| {
                     ::std::boxed::Box::pin(async move {
                         #dispatch

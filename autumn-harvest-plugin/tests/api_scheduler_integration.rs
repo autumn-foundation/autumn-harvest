@@ -116,6 +116,8 @@ const INIT_SQL: &str = concat!(
     include_str!(
         "../../autumn-harvest/migrations/20260522000000_harvest_schedule_decisions/up.sql"
     ),
+    "\n",
+    include_str!("../../autumn-harvest/migrations/20260522000001_harvest_rate_limiting/up.sql"),
 );
 type HarvestApiApp = axum::Router;
 
@@ -380,6 +382,9 @@ fn recording_activity_info(name: &'static str) -> ActivityInfo {
         is_local: false,
         max_input_bytes: None,
         max_result_bytes: None,
+        rate_limit_rps: None,
+        rate_limit_burst: None,
+        rate_limit_key: None,
         handler: record_activity,
     }
 }
@@ -398,6 +403,9 @@ fn blocking_activity_info(name: &'static str, start_to_close: Duration) -> Activ
         is_local: false,
         max_input_bytes: None,
         max_result_bytes: None,
+        rate_limit_rps: None,
+        rate_limit_burst: None,
+        rate_limit_key: None,
         handler: wait_on_barrier_activity,
     }
 }
@@ -2510,6 +2518,73 @@ async fn harvest_api_stack_endpoint_returns_shape() {
 }
 
 #[tokio::test]
+async fn harvest_api_stack_endpoint_surfaces_rate_limit_throttling() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let registry = approval_registry();
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
+    api_state.install(HarvestApiRuntime::new(
+        Arc::clone(&registry),
+        Arc::new(HashMap::new()),
+        Arc::new(Vec::new()),
+        Some("test-worker".to_string()),
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::single(),
+    ));
+    let app = harvest_api_router(api_state).with_state(test_app_state(pool));
+
+    let exec_id = insert_workflow_on_url(
+        &database_url,
+        ShardId::new(0),
+        "approval_workflow",
+        "stack-throttling",
+    )
+    .await;
+
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect for test setup");
+
+    // Insert a saturated rate limit bucket
+    diesel::sql_query(
+        "INSERT INTO harvest_rate_limit_buckets (key, refill_rate, burst, tokens, last_refilled_at, created_at, updated_at) \
+         VALUES ('test_rate_limit_bucket', 0.0, 10.0, 0.0, NOW(), NOW(), NOW())"
+    )
+    .execute(&mut conn)
+    .await
+    .expect("failed to insert rate limit bucket");
+
+    // Insert a pending activity task with the rate limit key
+    diesel::sql_query(
+        "INSERT INTO harvest_task_queue ( \
+            id, queue_name, task_type, workflow_exec_id, activity_name, input, state, priority, attempt, max_attempts, scheduled_at, rate_limit_key \
+         ) VALUES ( \
+            gen_random_uuid(), 'default', 'activity', $1, 'some_activity', '{}'::jsonb, 'PENDING', 0, 0, 5, NOW(), 'test_rate_limit_bucket' \
+         )"
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut conn)
+    .await
+    .expect("failed to insert rate limited task");
+
+    let (status, payload) = get_json(&app, format!("/workflows/{exec_id}/stack")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["exec_id"], exec_id.to_string());
+
+    let pending = payload["pending_activities"]
+        .as_array()
+        .expect("pending_activities must be an array");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(
+        pending[0]["task_status"],
+        "waiting on rate_limit_key=test_rate_limit_bucket"
+    );
+}
+
+#[tokio::test]
 async fn harvest_api_cancels_workflows_and_rejects_late_signals() {
     let (database_url, _container) = setup_test_database_url().await;
     let pool = build_test_pool(&database_url);
@@ -4414,6 +4489,9 @@ async fn scheduler_tick_creates_and_executes_due_interval_runs() {
             is_local: false,
             max_input_bytes: None,
             max_result_bytes: None,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
             handler: record_activity,
         }],
         Arc::new(state),

@@ -99,6 +99,10 @@ const INIT_SQL: &str = concat!(
     include_str!(
         "../../autumn-harvest/migrations/20260522000000_harvest_schedule_decisions/up.sql"
     ),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260522000001_harvest_rate_limiting/up.sql"
+    ),
 );
 
 async fn setup_test_database_url() -> (String, ContainerAsync<Postgres>) {
