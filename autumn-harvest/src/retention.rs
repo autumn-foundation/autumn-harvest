@@ -499,10 +499,6 @@ async fn run_shard_tick(
     start_cursor: Option<RetentionScanCursor>,
     _metrics: Arc<dyn MetricsRecorder>,
 ) -> HarvestResult<ShardTickOutcome> {
-    let mut conn = pool
-        .get()
-        .await
-        .map_err(|error| HarvestError::Database(error.to_string()))?;
     let mut outcome = ShardTickOutcome {
         next_cursor: start_cursor,
         ..ShardTickOutcome::default()
@@ -510,9 +506,15 @@ async fn run_shard_tick(
     let mut cursor = start_cursor;
     let mut wrapped = false;
     let mut remaining = config.batch_size;
-    let mut has_skipped = false;
+    let mut has_failed = false;
 
     while remaining > 0 {
+        // Check out a short-lived connection just to load this batch of candidates
+        let mut conn = pool
+            .get()
+            .await
+            .map_err(|error| HarvestError::Database(error.to_string()))?;
+
         let candidates = diesel::sql_query(
             "SELECT id, workflow_name, workflow_id, state, completed_at
              FROM harvest_workflow_executions
@@ -535,8 +537,12 @@ async fn run_shard_tick(
         .await
         .map_err(database_error)?;
 
+        // Release the checked-out connection immediately back to the pool
+        drop(conn);
+
         if candidates.is_empty() {
-            if cursor.is_some() && !wrapped {
+            // Prevent same-tick rescanning/wrapping if we have encountered any failures
+            if cursor.is_some() && !wrapped && !has_failed {
                 cursor = None;
                 wrapped = true;
                 continue;
@@ -553,11 +559,17 @@ async fn run_shard_tick(
                 completed_at,
                 id: candidate.id,
             });
-            if !has_skipped {
+            if !has_failed {
                 outcome.next_cursor = cursor;
             }
             outcome.candidate_count += 1;
             remaining = remaining.saturating_sub(1);
+
+            // Checkout a connection to run candidate dependency validations
+            let mut conn = pool
+                .get()
+                .await
+                .map_err(|error| HarvestError::Database(error.to_string()))?;
 
             if should_skip_candidate(&mut conn, &candidate, cutoff).await? {
                 let age = Utc::now()
@@ -570,12 +582,12 @@ async fn run_shard_tick(
                         .oldest_age_secs_skipped
                         .map_or(age, |existing| existing.max(age)),
                 );
-                has_skipped = true;
                 continue;
             }
 
+            let mut doc = None;
             if !config.dry_run {
-                if let Some(archiver) = &archiver {
+                if archiver.is_some() {
                     let exec_id = crate::types::ExecutionId::from_uuid(candidate.id);
                     match crate::store::load_history(&mut conn, exec_id).await {
                         Ok(history) => {
@@ -590,30 +602,16 @@ async fn run_shard_tick(
                                 max_bytes: Some(usize::MAX),
                             };
                             match crate::history_export::export_history(req) {
-                                Ok(document) => match archiver.archive(&document).await {
-                                    Ok(()) => {
-                                        tracing::debug!(
-                                            execution_id = %exec_id,
-                                            "pre-retention archival hook completed successfully"
-                                        );
-                                    }
-                                    Err(error) => {
-                                        tracing::error!(
-                                            execution_id = %exec_id,
-                                            error = %error,
-                                            "pre-retention archival hook failed; skipping deletion"
-                                        );
-                                        has_skipped = true;
-                                        continue;
-                                    }
-                                },
+                                Ok(document) => {
+                                    doc = Some((exec_id, document));
+                                }
                                 Err(error) => {
                                     tracing::error!(
                                         execution_id = %exec_id,
                                         error = %error,
                                         "failed to serialize history export; skipping deletion"
                                     );
-                                    has_skipped = true;
+                                    has_failed = true;
                                     continue;
                                 }
                             }
@@ -624,17 +622,53 @@ async fn run_shard_tick(
                                 error = %error,
                                 "failed to load history events for retention candidate; skipping deletion"
                             );
-                            has_skipped = true;
+                            has_failed = true;
                             continue;
                         }
                     }
                 }
             }
 
+            // Drop/release the DB connection back to the pool before executing the slow network/filesystem archival await!
+            drop(conn);
+
+            let mut archive_success = true;
+            if let Some((exec_id, document)) = doc {
+                if let Some(archiver) = &archiver {
+                    match archiver.archive(&document).await {
+                        Ok(()) => {
+                            tracing::debug!(
+                                execution_id = %exec_id,
+                                "pre-retention archival hook completed successfully"
+                            );
+                        }
+                        Err(error) => {
+                            tracing::error!(
+                                execution_id = %exec_id,
+                                error = %error,
+                                "pre-retention archival hook failed; skipping deletion"
+                            );
+                            has_failed = true;
+                            archive_success = false;
+                        }
+                    }
+                }
+            }
+
+            if !archive_success {
+                continue;
+            }
+
             if config.dry_run {
                 outcome.deleted_count += 1;
                 continue;
             }
+
+            // Check out a short-lived connection exclusively to execute the candidate deletion transaction
+            let mut conn = pool
+                .get()
+                .await
+                .map_err(|error| HarvestError::Database(error.to_string()))?;
 
             delete_candidate_execution(&mut conn, candidate.id).await?;
             outcome.deleted_count += 1;
