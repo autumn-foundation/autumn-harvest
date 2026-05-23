@@ -1474,7 +1474,7 @@ impl WorkerConfig {
     /// After a workflow is cancelled, any running activity gets this long to
     /// notice cooperative cancellation (via [`crate::context::ActivityContext::is_cancelled`]
     /// or [`crate::context::ActivityContext::heartbeat`]) and unwind cleanly. If it is still
-    /// running at the end of the grace period the worker hard-aborts the handler
+    /// running at the end of the grace period the worker aborts the handler
     /// task and marks the activity as cancelled.
     #[must_use]
     pub const fn with_cancellation_grace_period(mut self, grace_period: Duration) -> Self {
