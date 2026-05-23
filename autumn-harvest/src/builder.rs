@@ -61,6 +61,7 @@ pub struct HarvestBuilder {
     state: SharedStateMap,
     telemetry: Option<TelemetryConfig>,
     retention: RetentionConfig,
+    history_archiver: Option<Arc<dyn crate::retention::HistoryArchiver>>,
     payload_codecs: PayloadCodecs,
     history_policy: WorkflowHistoryPolicy,
     /// Server-side ceiling on `execution_timeout` (issue #243).
@@ -102,6 +103,7 @@ impl Default for HarvestBuilder {
             state: std::collections::HashMap::new(),
             telemetry: None,
             retention: crate::retention::RetentionConfig::default(),
+            history_archiver: None,
             payload_codecs: crate::payload_codec::PayloadCodecs::default(),
             history_policy: crate::context::WorkflowHistoryPolicy::default(),
             max_workflow_execution_timeout: None,
@@ -147,7 +149,7 @@ impl std::fmt::Debug for HarvestBuilder {
                 "unknown_target_grace_window",
                 &self.unknown_target_grace_window,
             )
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -165,6 +167,7 @@ pub struct BuiltHarvest {
     state: SharedStateMap,
     telemetry: Arc<TelemetryConfig>,
     retention: RetentionConfig,
+    history_archiver: Option<Arc<dyn crate::retention::HistoryArchiver>>,
     payload_codecs: PayloadCodecs,
     history_policy: WorkflowHistoryPolicy,
     /// Server-side ceiling on `execution_timeout` (issue #243). `None` = no ceiling.
@@ -216,12 +219,12 @@ impl std::fmt::Debug for BuiltHarvest {
                 "unknown_target_grace_window",
                 &self.unknown_target_grace_window,
             )
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
 /// A float wrapper that implements `Eq` and `PartialEq` by doing bitwise comparison.
-/// Useful for keeping errors `Eq`-compliant.
+/// Used for keeping errors `Eq`-compliant.
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct FloatEq(pub f64);
 
@@ -523,6 +526,12 @@ impl BuiltHarvest {
         &self.retention
     }
 
+    /// Get the registered pre-retention history archiver hook.
+    #[must_use]
+    pub fn history_archiver(&self) -> Option<&Arc<dyn crate::retention::HistoryArchiver>> {
+        self.history_archiver.as_ref()
+    }
+
     /// Override the audit log retention window after the build step.
     ///
     /// Use this to apply a runtime-configured value (e.g. from `HarvestApiState`)
@@ -742,7 +751,7 @@ impl HarvestBuilder {
         self
     }
 
-    /// Install a [`TelemetryConfig`] so the worker captures trace context at
+    /// Install a [`PayloadCodec`] so the worker captures trace context at
     /// enqueue, reinstates it on claim, and emits workflow / activity / timer
     /// metrics through the supplied recorder.
     ///
@@ -763,6 +772,13 @@ impl HarvestBuilder {
     #[must_use]
     pub const fn retention(mut self, retention: RetentionConfig) -> Self {
         self.retention = retention;
+        self
+    }
+
+    /// Register a pre-retention history archiver hook.
+    #[must_use]
+    pub fn history_archiver(mut self, archiver: impl crate::retention::HistoryArchiver) -> Self {
+        self.history_archiver = Some(Arc::new(archiver));
         self
     }
 
@@ -969,6 +985,7 @@ impl HarvestBuilder {
             state: self.state,
             telemetry: Arc::new(self.telemetry.unwrap_or_default()),
             retention: self.retention,
+            history_archiver: self.history_archiver,
             payload_codecs: self.payload_codecs.clone(),
             history_policy: self.history_policy,
             max_workflow_execution_timeout: self.max_workflow_execution_timeout,
@@ -1148,7 +1165,7 @@ fn validate_concurrency_keys(
 
     for activity in activities {
         // max_concurrent = 0 makes the cap predicate always-true, permanently
-        // deferring every task for that activity. Reject at build time.
+        // deferring every task for this activity. Reject at build time.
         if activity.max_concurrent == Some(0) {
             return Err(HarvestBuilderError::ZeroConcurrencyCap {
                 activity: activity.name.to_string(),
