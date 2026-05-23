@@ -379,7 +379,7 @@ pub enum HarvestBuilderError {
 
     /// A [`crate::policy::Schedule::CronInTimezone`] variant declares a
     /// timezone name that is not a valid IANA entry. The name is rejected at
-    /// build time so the operator sees a clear error rather than silently
+    /// build time so the operator sees a error rather than silently
     /// misfiring at the wrong time.
     #[error(
         "unknown timezone '{name}'; use an IANA timezone name \
