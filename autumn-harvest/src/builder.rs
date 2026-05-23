@@ -224,7 +224,7 @@ impl std::fmt::Debug for BuiltHarvest {
 }
 
 /// A float wrapper that implements `Eq` and `PartialEq` by doing bitwise comparison.
-/// Used for keeping errors `Eq`-compliant.
+/// Useful for keeping errors `Eq`-compliant.
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct FloatEq(pub f64);
 
