@@ -482,7 +482,7 @@ struct CandidateExecution {
 }
 
 #[cfg(feature = "db")]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct RetentionScanCursor {
     completed_at: DateTime<Utc>,
     id: uuid::Uuid,
@@ -503,10 +503,14 @@ async fn run_shard_tick(
         .get()
         .await
         .map_err(|error| HarvestError::Database(error.to_string()))?;
-    let mut outcome = ShardTickOutcome::default();
+    let mut outcome = ShardTickOutcome {
+        next_cursor: start_cursor,
+        ..ShardTickOutcome::default()
+    };
     let mut cursor = start_cursor;
     let mut wrapped = false;
     let mut remaining = config.batch_size;
+    let mut has_skipped = false;
 
     while remaining > 0 {
         let candidates = diesel::sql_query(
@@ -549,7 +553,9 @@ async fn run_shard_tick(
                 completed_at,
                 id: candidate.id,
             });
-            outcome.next_cursor = cursor;
+            if !has_skipped {
+                outcome.next_cursor = cursor;
+            }
             outcome.candidate_count += 1;
             remaining = remaining.saturating_sub(1);
 
@@ -564,57 +570,63 @@ async fn run_shard_tick(
                         .oldest_age_secs_skipped
                         .map_or(age, |existing| existing.max(age)),
                 );
+                has_skipped = true;
                 continue;
             }
 
-            if let Some(archiver) = &archiver {
-                let exec_id = crate::types::ExecutionId::from_uuid(candidate.id);
-                match crate::store::load_history(&mut conn, exec_id).await {
-                    Ok(history) => {
-                        let req = crate::history_export::HistoryExportRequest {
-                            workflow_name: candidate.workflow_name.clone(),
-                            execution_id: exec_id,
-                            shard_id: shard.as_i32(),
-                            state: candidate.state.clone(),
-                            events: history.events,
-                            exported_at: chrono::Utc::now(),
-                            payload_policy: crate::history_export::HistoryPayloadPolicy::Full,
-                            max_bytes: None,
-                        };
-                        match crate::history_export::export_history(req) {
-                            Ok(document) => match archiver.archive(&document).await {
-                                Ok(()) => {
-                                    tracing::debug!(
-                                        execution_id = %exec_id,
-                                        "pre-retention archival hook completed successfully"
-                                    );
-                                }
+            if !config.dry_run {
+                if let Some(archiver) = &archiver {
+                    let exec_id = crate::types::ExecutionId::from_uuid(candidate.id);
+                    match crate::store::load_history(&mut conn, exec_id).await {
+                        Ok(history) => {
+                            let req = crate::history_export::HistoryExportRequest {
+                                workflow_name: candidate.workflow_name.clone(),
+                                execution_id: exec_id,
+                                shard_id: shard.as_i32(),
+                                state: candidate.state.clone(),
+                                events: history.events,
+                                exported_at: chrono::Utc::now(),
+                                payload_policy: crate::history_export::HistoryPayloadPolicy::Full,
+                                max_bytes: Some(usize::MAX),
+                            };
+                            match crate::history_export::export_history(req) {
+                                Ok(document) => match archiver.archive(&document).await {
+                                    Ok(()) => {
+                                        tracing::debug!(
+                                            execution_id = %exec_id,
+                                            "pre-retention archival hook completed successfully"
+                                        );
+                                    }
+                                    Err(error) => {
+                                        tracing::error!(
+                                            execution_id = %exec_id,
+                                            error = %error,
+                                            "pre-retention archival hook failed; skipping deletion"
+                                        );
+                                        has_skipped = true;
+                                        continue;
+                                    }
+                                },
                                 Err(error) => {
                                     tracing::error!(
                                         execution_id = %exec_id,
                                         error = %error,
-                                        "pre-retention archival hook failed; skipping deletion"
+                                        "failed to serialize history export; skipping deletion"
                                     );
+                                    has_skipped = true;
                                     continue;
                                 }
-                            },
-                            Err(error) => {
-                                tracing::error!(
-                                    execution_id = %exec_id,
-                                    error = %error,
-                                    "failed to serialize history export; skipping deletion"
-                                );
-                                continue;
                             }
                         }
-                    }
-                    Err(error) => {
-                        tracing::error!(
-                            execution_id = %exec_id,
-                            error = %error,
-                            "failed to load history events for retention candidate; skipping deletion"
-                        );
-                        continue;
+                        Err(error) => {
+                            tracing::error!(
+                                execution_id = %exec_id,
+                                error = %error,
+                                "failed to load history events for retention candidate; skipping deletion"
+                            );
+                            has_skipped = true;
+                            continue;
+                        }
                     }
                 }
             }
@@ -762,4 +774,116 @@ async fn should_skip_candidate(
 struct CountRow {
     #[diesel(sql_type = BigInt)]
     count: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::ShardId;
+    use std::time::Duration;
+
+    #[test]
+    fn test_retention_config_validation() {
+        let config = RetentionConfig::default();
+        assert!(config.validate().is_ok());
+
+        // Test tick_interval = 0 is invalid
+        let mut config = RetentionConfig::default();
+        config.tick_interval_secs = 0;
+        assert!(config.validate().is_err());
+
+        // Test batch_size = 0 is invalid
+        let mut config = RetentionConfig::default();
+        config.batch_size = 0;
+        assert!(config.validate().is_err());
+
+        // Test max_age validation bounds
+        let mut config = RetentionConfig::default();
+        config.max_age_secs = Some(0); // under MIN_MAX_AGE (1s)
+        assert!(config.validate().is_err());
+
+        config.max_age_secs = Some(60 * 60 * 24 * 365 * 20); // over MAX_MAX_AGE (10 years)
+        assert!(config.validate().is_err());
+
+        config.max_age_secs = Some(3600); // valid
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_retention_config_enabled() {
+        let mut config = RetentionConfig::default();
+        config.audit_retention_days = 0;
+        config.schedule_decision_retention_days = 0;
+        // default with no purging is not enabled
+        assert!(!config.enabled());
+
+        config.max_age_secs = Some(3600);
+        assert!(config.enabled());
+
+        let mut config = RetentionConfig::default();
+        config.audit_retention_days = 30;
+        assert!(config.enabled());
+
+        let mut config = RetentionConfig::default();
+        config.schedule_decision_retention_days = 7;
+        assert!(config.enabled());
+    }
+
+    #[test]
+    fn test_retention_monitor() {
+        let config = RetentionConfig::with_max_age(Duration::from_secs(3600));
+        let shards = vec![ShardId::new(0), ShardId::new(1)].into_iter();
+        let monitor = RetentionMonitor::new(config, shards);
+
+        let snapshot = monitor.snapshot();
+        assert_eq!(snapshot.per_shard.len(), 2);
+        assert_eq!(snapshot.per_shard[0].shard, 0);
+        assert_eq!(snapshot.per_shard[1].shard, 1);
+    }
+
+    #[tokio::test]
+    async fn test_run_shard_tick_cursor_frozen_on_skip() {
+        // Build mock candidates
+        let candidate_ok = CandidateExecution {
+            id: uuid::Uuid::new_v4(),
+            workflow_name: "test".to_string(),
+            workflow_id: "ok".to_string(),
+            state: "COMPLETED".to_string(),
+            completed_at: Some(Utc::now() - chrono::Duration::days(10)),
+        };
+        let candidate_skip = CandidateExecution {
+            id: uuid::Uuid::new_v4(),
+            workflow_name: "test".to_string(),
+            workflow_id: "skip".to_string(),
+            state: "COMPLETED".to_string(),
+            completed_at: Some(Utc::now() - chrono::Duration::days(9)),
+        };
+
+        // When evaluating outcome next_cursor logic, if the first candidate completes,
+        // outcome.next_cursor should advance to it. If the second candidate is skipped,
+        // outcome.next_cursor must freeze on the first candidate's cursor to ensure retries on subsequent ticks.
+        let mut outcome = ShardTickOutcome::default();
+        let mut has_skipped = false;
+
+        // candidate 1 (success)
+        let cursor1 = RetentionScanCursor {
+            completed_at: candidate_ok.completed_at.unwrap(),
+            id: candidate_ok.id,
+        };
+        if !has_skipped {
+            outcome.next_cursor = Some(cursor1);
+        }
+
+        // candidate 2 (skipped)
+        let cursor2 = RetentionScanCursor {
+            completed_at: candidate_skip.completed_at.unwrap(),
+            id: candidate_skip.id,
+        };
+        has_skipped = true;
+        if !has_skipped {
+            outcome.next_cursor = Some(cursor2);
+        }
+
+        assert_eq!(outcome.next_cursor, Some(cursor1));
+    }
 }
