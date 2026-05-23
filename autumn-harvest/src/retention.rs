@@ -489,6 +489,35 @@ struct RetentionScanCursor {
 }
 
 #[cfg(feature = "db")]
+struct RetentionLeaseGuard {
+    pool: crate::worker::DbPool,
+    lease_id: String,
+    active: bool,
+}
+
+#[cfg(feature = "db")]
+impl Drop for RetentionLeaseGuard {
+    fn drop(&mut self) {
+        if self.active {
+            let pool = self.pool.clone();
+            let lease_id = self.lease_id.clone();
+            tokio::spawn(async move {
+                if let Ok(mut conn) = pool.get().await {
+                    let _ = diesel::update(
+                        harvest_workflow_executions::table.filter(
+                            harvest_workflow_executions::sticky_worker_id.eq(Some(lease_id)),
+                        ),
+                    )
+                    .set(harvest_workflow_executions::sticky_worker_id.eq::<Option<String>>(None))
+                    .execute(&mut conn)
+                    .await;
+                }
+            });
+        }
+    }
+}
+
+#[cfg(feature = "db")]
 #[allow(clippy::too_many_lines)]
 async fn run_shard_tick(
     pool: crate::worker::DbPool,
@@ -508,34 +537,63 @@ async fn run_shard_tick(
     let mut remaining = config.batch_size;
     let mut has_failed = false;
 
+    let lease_id = format!("retention-lease-{}", uuid::Uuid::new_v4());
+    let mut _guard = RetentionLeaseGuard {
+        pool: pool.clone(),
+        lease_id: lease_id.clone(),
+        active: true,
+    };
+
     while remaining > 0 {
-        // Check out a short-lived connection just to load this batch of candidates
+        // Check out a short-lived connection just to load and claim this batch of candidates in a single transaction
         let mut conn = pool
             .get()
             .await
             .map_err(|error| HarvestError::Database(error.to_string()))?;
 
-        let candidates = diesel::sql_query(
-            "SELECT id, workflow_name, workflow_id, state, completed_at
-             FROM harvest_workflow_executions
-             WHERE state IN ('COMPLETED','FAILED','CANCELLED','TIMED_OUT','CONTINUED_AS_NEW','TERMINATED')
-               AND completed_at IS NOT NULL
-               AND completed_at < $1
-               AND (
-                   $2 IS NULL
-                   OR completed_at > $2
-                   OR (completed_at = $2 AND id > $3)
-               )
-             ORDER BY completed_at ASC, id ASC
-             LIMIT $4",
-        )
-        .bind::<Timestamptz, _>(cutoff)
-        .bind::<Nullable<Timestamptz>, _>(cursor.map(|it| it.completed_at))
-        .bind::<Nullable<SqlUuid>, _>(cursor.map(|it| it.id))
-        .bind::<BigInt, _>(i64::try_from(remaining).unwrap_or(i64::MAX))
-        .load::<CandidateExecution>(&mut conn)
-        .await
-        .map_err(database_error)?;
+        let lease_id_inner = lease_id.clone();
+        let candidates = conn.transaction::<Vec<CandidateExecution>, HarvestError, _>(|conn| {
+            Box::pin(async move {
+                let rows = diesel::sql_query(
+                    "SELECT id, workflow_name, workflow_id, state, completed_at
+                     FROM harvest_workflow_executions
+                     WHERE state IN ('COMPLETED','FAILED','CANCELLED','TIMED_OUT','CONTINUED_AS_NEW','TERMINATED')
+                       AND completed_at IS NOT NULL
+                       AND completed_at < $1
+                       AND sticky_worker_id IS NULL
+                       AND (
+                           $2 IS NULL
+                           OR completed_at > $2
+                           OR (completed_at = $2 AND id > $3)
+                       )
+                     ORDER BY completed_at ASC, id ASC
+                     LIMIT $4
+                     FOR UPDATE SKIP LOCKED",
+                )
+                .bind::<Timestamptz, _>(cutoff)
+                .bind::<Nullable<Timestamptz>, _>(cursor.map(|it| it.completed_at))
+                .bind::<Nullable<SqlUuid>, _>(cursor.map(|it| it.id))
+                .bind::<BigInt, _>(i64::try_from(remaining).unwrap_or(i64::MAX))
+                .load::<CandidateExecution>(conn)
+                .await
+                .map_err(database_error)?;
+
+                if !rows.is_empty() {
+                    let ids: Vec<uuid::Uuid> = rows.iter().map(|r| r.id).collect();
+                    diesel::update(
+                        harvest_workflow_executions::table
+                            .filter(harvest_workflow_executions::id.eq_any(ids)),
+                    )
+                    .set(harvest_workflow_executions::sticky_worker_id.eq(Some(lease_id_inner)))
+                    .execute(conn)
+                    .await
+                    .map_err(database_error)?;
+                }
+
+                Ok(rows)
+            })
+        })
+        .await?;
 
         // Release the checked-out connection immediately back to the pool
         drop(conn);
@@ -551,17 +609,16 @@ async fn run_shard_tick(
             break;
         }
 
+        let mut batch_failed = false;
         for candidate in candidates {
             let completed_at = candidate
                 .completed_at
                 .expect("retention candidate query enforces completed_at IS NOT NULL");
-            cursor = Some(RetentionScanCursor {
+            let candidate_cursor = RetentionScanCursor {
                 completed_at,
                 id: candidate.id,
-            });
-            if !has_failed {
-                outcome.next_cursor = cursor;
-            }
+            };
+            cursor = Some(candidate_cursor);
             outcome.candidate_count += 1;
             remaining = remaining.saturating_sub(1);
 
@@ -582,6 +639,21 @@ async fn run_shard_tick(
                         .oldest_age_secs_skipped
                         .map_or(age, |existing| existing.max(age)),
                 );
+
+                // Release its lease immediately so it can be picked up on subsequent ticks
+                diesel::update(
+                    harvest_workflow_executions::table
+                        .filter(harvest_workflow_executions::id.eq(candidate.id)),
+                )
+                .set(harvest_workflow_executions::sticky_worker_id.eq::<Option<String>>(None))
+                .execute(&mut conn)
+                .await
+                .map_err(database_error)?;
+
+                // Advance cursor for routine skips
+                if !has_failed {
+                    outcome.next_cursor = Some(candidate_cursor);
+                }
                 continue;
             }
 
@@ -612,7 +684,8 @@ async fn run_shard_tick(
                                         "failed to serialize history export; skipping deletion"
                                     );
                                     has_failed = true;
-                                    continue;
+                                    batch_failed = true;
+                                    break;
                                 }
                             }
                         }
@@ -623,7 +696,8 @@ async fn run_shard_tick(
                                 "failed to load history events for retention candidate; skipping deletion"
                             );
                             has_failed = true;
-                            continue;
+                            batch_failed = true;
+                            break;
                         }
                     }
                 }
@@ -650,17 +724,21 @@ async fn run_shard_tick(
                             );
                             has_failed = true;
                             archive_success = false;
+                            batch_failed = true;
                         }
                     }
                 }
             }
 
             if !archive_success {
-                continue;
+                break;
             }
 
             if config.dry_run {
                 outcome.deleted_count += 1;
+                if !has_failed {
+                    outcome.next_cursor = Some(candidate_cursor);
+                }
                 continue;
             }
 
@@ -670,8 +748,21 @@ async fn run_shard_tick(
                 .await
                 .map_err(|error| HarvestError::Database(error.to_string()))?;
 
-            delete_candidate_execution(&mut conn, candidate.id).await?;
+            if let Err(err) = delete_candidate_execution(&mut conn, candidate.id).await {
+                has_failed = true;
+                batch_failed = true;
+                tracing::error!(candidate_id = %candidate.id, error = %err, "failed to delete candidate execution");
+                break;
+            }
             outcome.deleted_count += 1;
+
+            if !has_failed {
+                outcome.next_cursor = Some(candidate_cursor);
+            }
+        }
+
+        if batch_failed {
+            break;
         }
     }
 
@@ -876,6 +967,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "db")]
     async fn test_run_shard_tick_cursor_frozen_on_skip() {
         // Build mock candidates
         let candidate_ok = CandidateExecution {
