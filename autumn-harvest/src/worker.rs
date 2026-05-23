@@ -1294,12 +1294,14 @@ fn find_pending_scheduled_activity(
 
     let mut pending = None;
     for event in history {
-        if let WorkflowEvent::ActivityScheduled {
+        let WorkflowEvent::ActivityScheduled {
             activity_id, name, ..
         } = event
-            && name == activity_name
-            && !terminal_ids.contains(activity_id)
-        {
+        else {
+            continue;
+        };
+
+        if name == activity_name && !terminal_ids.contains(activity_id) {
             if pending.is_some() {
                 return Err(HarvestError::NonDeterministic(format!(
                     "multiple pending scheduled activities named '{activity_name}' found in history"
@@ -1648,16 +1650,16 @@ async fn persist_update_result_commands(
     let events: Vec<WorkflowEvent> = commands
         .iter()
         .filter_map(|cmd| match cmd {
-            WorkflowCommand::RecordUpdateResult { update_id, result } => Some(match result {
-                Ok(output) => WorkflowEvent::UpdateCompleted {
+            WorkflowCommand::RecordUpdateResult { update_id, result } => match result {
+                Ok(output) => Some(WorkflowEvent::UpdateCompleted {
                     update_id: *update_id,
                     output: output.clone(),
-                },
-                Err(error) => WorkflowEvent::UpdateFailed {
+                }),
+                Err(error) => Some(WorkflowEvent::UpdateFailed {
                     update_id: *update_id,
                     error: error.clone(),
-                },
-            }),
+                }),
+            },
             _ => None,
         })
         .collect();
