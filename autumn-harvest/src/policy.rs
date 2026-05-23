@@ -31,6 +31,76 @@ pub fn compute_retry_delay(
     delay.min(max_interval)
 }
 
+/// Retry jitter strategy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum JitterPolicy {
+    #[default]
+    None,
+    Full,
+    Equal,
+    Decorrelated,
+}
+
+fn mix64(mut x: u64) -> u64 {
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^ (x >> 31)
+}
+
+/// Compute deterministic retry delay with jitter.
+#[must_use]
+pub fn compute_retry_delay_with_seed(
+    policy: &RetryPolicy,
+    attempt: u32,
+    stream_seed: u64,
+) -> Duration {
+    let base = compute_retry_delay(
+        policy.initial_interval,
+        policy.backoff_coefficient,
+        policy.max_interval,
+        attempt,
+    );
+    match policy.jitter {
+        JitterPolicy::None => base,
+        JitterPolicy::Full => {
+            let span = u64::try_from(base.as_nanos()).unwrap_or(u64::MAX);
+            if span == 0 {
+                return Duration::ZERO;
+            }
+            Duration::from_nanos(mix64(stream_seed ^ u64::from(attempt)) % span)
+        }
+        JitterPolicy::Equal => {
+            let span = u64::try_from(base.as_nanos()).unwrap_or(u64::MAX);
+            if span <= 1 {
+                return base;
+            }
+            let half = span / 2;
+            Duration::from_nanos(half + (mix64(stream_seed ^ u64::from(attempt)) % (span - half)))
+        }
+        JitterPolicy::Decorrelated => {
+            let prev = if attempt <= 1 {
+                policy.initial_interval
+            } else {
+                compute_retry_delay(
+                    policy.initial_interval,
+                    policy.backoff_coefficient,
+                    policy.max_interval,
+                    attempt - 1,
+                )
+            };
+            let upper = prev.saturating_mul(3).min(policy.max_interval);
+            if upper <= policy.initial_interval {
+                return upper;
+            }
+            let lo = u64::try_from(policy.initial_interval.as_nanos()).unwrap_or(u64::MAX);
+            let hi = u64::try_from(upper.as_nanos()).unwrap_or(u64::MAX);
+            Duration::from_nanos(lo + (mix64(stream_seed ^ u64::from(attempt)) % (hi - lo + 1)))
+        }
+    }
+}
+
 /// How an activity failure is retried.
 ///
 /// ## Examples
@@ -54,6 +124,7 @@ pub struct RetryPolicy {
     pub max_interval: Duration,
     /// Error type names that must not be retried.
     pub non_retryable_errors: Vec<String>,
+    pub jitter: JitterPolicy,
 }
 
 impl RetryPolicy {
@@ -77,6 +148,7 @@ impl RetryPolicy {
             backoff_coefficient: 2.0,
             max_interval: Duration::from_secs(300),
             non_retryable_errors: vec![],
+            jitter: JitterPolicy::None,
         }
     }
 
@@ -100,6 +172,7 @@ impl RetryPolicy {
             backoff_coefficient: 1.0,
             max_interval: interval,
             non_retryable_errors: vec![],
+            jitter: JitterPolicy::None,
         }
     }
 
@@ -122,12 +195,21 @@ impl RetryPolicy {
         if attempt >= self.max_attempts {
             return None;
         }
-        Some(compute_retry_delay(
-            self.initial_interval,
-            self.backoff_coefficient,
-            self.max_interval,
-            attempt,
-        ))
+        Some(compute_retry_delay_with_seed(self, attempt, 0))
+    }
+
+    #[must_use]
+    pub const fn with_jitter(mut self, jitter: JitterPolicy) -> Self {
+        self.jitter = jitter;
+        self
+    }
+
+    #[must_use]
+    pub fn next_delay_with_seed(&self, attempt: u32, stream_seed: u64) -> Option<Duration> {
+        if attempt >= self.max_attempts {
+            return None;
+        }
+        Some(compute_retry_delay_with_seed(self, attempt, stream_seed))
     }
 
     /// Returns `true` when a failure should skip remaining retries because it
@@ -942,6 +1024,50 @@ mod tests {
     }
 
     #[test]
+    fn retry_jitter_none_is_bit_identical_default() {
+        let policy = RetryPolicy::exponential(5, Duration::from_secs(1));
+        for attempt in 1..5 {
+            assert_eq!(
+                policy.next_delay(attempt),
+                policy.next_delay_with_seed(attempt, 123_456_789)
+            );
+        }
+    }
+
+    #[test]
+    fn retry_jitter_bounds_over_10k_seeds() {
+        let base = RetryPolicy::exponential(8, Duration::from_millis(200));
+        for attempt in 1..6 {
+            let base_delay = base.next_delay(attempt).unwrap();
+            for seed in 0..10_000_u64 {
+                let full = base
+                    .with_jitter(JitterPolicy::Full)
+                    .next_delay_with_seed(attempt, seed)
+                    .unwrap();
+                assert!(full <= base_delay);
+                let equal = base
+                    .with_jitter(JitterPolicy::Equal)
+                    .next_delay_with_seed(attempt, seed)
+                    .unwrap();
+                assert!(equal >= base_delay / 2);
+                assert!(equal <= base_delay);
+                let deco = base
+                    .with_jitter(JitterPolicy::Decorrelated)
+                    .next_delay_with_seed(attempt, seed)
+                    .unwrap();
+                let prev = if attempt == 1 {
+                    base.initial_interval
+                } else {
+                    base.next_delay(attempt - 1).unwrap()
+                };
+                let upper = prev.saturating_mul(3).min(base.max_interval);
+                assert!(deco >= base.initial_interval);
+                assert!(deco <= upper);
+            }
+        }
+    }
+
+    #[test]
     fn exponential_caps_at_max_interval() -> Result<(), String> {
         let policy = RetryPolicy {
             max_attempts: 10,
@@ -949,6 +1075,7 @@ mod tests {
             backoff_coefficient: 2.0,
             max_interval: Duration::from_secs(120),
             non_retryable_errors: vec![],
+            jitter: JitterPolicy::None,
         };
         assert_eq!(
             policy.next_delay(6).ok_or("no delay")?,

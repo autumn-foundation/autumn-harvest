@@ -12,6 +12,7 @@ use std::pin::Pin;
 
 use autumn_harvest::context::WorkflowContext;
 use autumn_harvest::event::WorkflowEvent;
+use autumn_harvest::policy::{JitterPolicy, RetryPolicy};
 use autumn_harvest::testing::{
     HistorySnapshot, NonDeterminismKind, ReplayStatus, WorkflowReplayer,
 };
@@ -126,6 +127,28 @@ fn timer_first_workflow<'a>(
     })
 }
 
+/// Workflow that derives a timer duration from deterministic retry-jitter math.
+fn jitter_timer_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let attempt = input["attempt"].as_u64().unwrap_or(1) as u32;
+        let seed = input["seed"].as_u64().unwrap_or(0);
+        let policy = RetryPolicy::exponential(8, std::time::Duration::from_secs(2))
+            .with_jitter(JitterPolicy::Equal);
+        let delay = policy
+            .next_delay_with_seed(attempt, seed)
+            .ok_or_else(|| "no delay for attempt".to_string())?;
+        let secs = delay.as_secs().max(1);
+        let timer_name = format!("retry_jitter_{attempt}_{seed}");
+        ctx.timer(&timer_name, secs)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({"timer_secs": secs, "timer_name": timer_name}))
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Helper: build canonical event history
 // ---------------------------------------------------------------------------
@@ -176,6 +199,7 @@ fn build_replayer() -> WorkflowReplayer {
         .register_fn("versioned_workflow_fenced", versioned_workflow_fenced)
         .register_fn("versioned_workflow_unfenced", versioned_workflow_unfenced)
         .register_fn("timer_first_workflow", timer_first_workflow)
+        .register_fn("jitter_timer_workflow", jitter_timer_workflow)
 }
 
 /// Build a snapshot from a `(exec_id, events)` pair with a given workflow name.
@@ -233,6 +257,69 @@ async fn replay_reordered_activities_detects_non_determinism() {
         }
         other => panic!("expected NonDeterminismDetected, got: {other:?}\nreport: {report}"),
     }
+}
+
+#[tokio::test]
+async fn replay_jitter_timer_is_exact_and_deterministic() {
+    let replayer = build_replayer();
+    let exec_id = ExecutionId::new();
+    let attempt = 3u32;
+    let seed = 0xfeed_beefu64;
+    let policy = RetryPolicy::exponential(8, std::time::Duration::from_secs(2))
+        .with_jitter(JitterPolicy::Equal);
+    let expected_delay = policy
+        .next_delay_with_seed(attempt, seed)
+        .expect("delay must exist");
+    let timer_secs = expected_delay.as_secs().max(1);
+    let timer_id = TimerId::new(format!("retry_jitter_{attempt}_{seed}"));
+    let input = serde_json::json!({"attempt": attempt, "seed": seed});
+
+    let ok_history = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: input.clone(),
+            timestamp: Utc::now(),
+        },
+        WorkflowEvent::TimerStarted {
+            timer_id: timer_id.clone(),
+            duration_secs: timer_secs,
+        },
+        WorkflowEvent::TimerFired { timer_id },
+    ];
+    let ok = replayer
+        .replay_from_snapshot(make_snapshot("jitter_timer_workflow", exec_id, ok_history))
+        .await;
+    assert!(matches!(ok.status, ReplayStatus::ReplaySucceeded), "{ok}");
+
+    let bad_history = vec![
+        WorkflowEvent::WorkflowStarted {
+            input,
+            timestamp: Utc::now(),
+        },
+        WorkflowEvent::TimerStarted {
+            timer_id: TimerId::new(format!("retry_jitter_{attempt}_{seed}")),
+            duration_secs: timer_secs.saturating_add(1),
+        },
+        WorkflowEvent::TimerFired {
+            timer_id: TimerId::new(format!("retry_jitter_{attempt}_{seed}")),
+        },
+    ];
+    let bad = replayer
+        .replay_from_snapshot(make_snapshot(
+            "jitter_timer_workflow",
+            ExecutionId::new(),
+            bad_history,
+        ))
+        .await;
+    assert!(
+        matches!(
+            bad.status,
+            ReplayStatus::NonDeterminismDetected {
+                kind: NonDeterminismKind::TimerMismatch,
+                ..
+            }
+        ),
+        "timer duration mismatch must be detected as TimerMismatch, got: {bad}"
+    );
 }
 
 // ---------------------------------------------------------------------------

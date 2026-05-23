@@ -921,6 +921,113 @@ async fn workflow_hard_cap_moves_offender_to_dlq() {
         "DLQ reason should identify hard cap, got: {}",
         dlq_row.error
     );
+    assert_eq!(
+        dlq_row.attempts, 1,
+        "DLQ attempts must match the terminal task attempt"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workflow_hard_cap_dlq_preserves_terminal_attempt_count() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = AsyncPgConnection::establish(&database_url)
+        .await
+        .expect("failed to connect");
+
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    let workflow_input = serde_json::json!({"case":"attempt-regression"});
+    let workflow_id = format!("hard-cap-attempt-{}", Uuid::new_v4());
+
+    diesel::insert_into(harvest_workflow_executions::table)
+        .values(NewWorkflowExecution {
+            id: exec_id.as_uuid(),
+            workflow_name: "history_cap_violator",
+            workflow_id: &workflow_id,
+            run_id: Uuid::new_v4(),
+            shard_id: 0,
+            input: workflow_input.clone(),
+            parent_id: None,
+            queue_name: "default",
+            execution_timeout: None,
+            deadline_at: None,
+            memo: None,
+            search_attrs: None,
+            assigned_build_id: None,
+        })
+        .execute(&mut conn)
+        .await
+        .expect("failed to insert workflow execution row");
+
+    store::append_events(
+        &mut conn,
+        exec_id,
+        &[
+            WorkflowEvent::WorkflowStarted {
+                input: workflow_input.clone(),
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "already-large".into(),
+                details: serde_json::json!({}),
+            },
+        ],
+        0,
+    )
+    .await
+    .expect("append initial history failed");
+
+    let mut enqueue_params =
+        EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
+    enqueue_params.workflow_exec_id = Some(exec_id.as_uuid());
+    enqueue_params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+    let task_id = queue_mod::enqueue(&mut conn, &enqueue_params)
+        .await
+        .expect("enqueue failed");
+
+    use autumn_harvest::schema::harvest_task_queue::dsl as queue_dsl;
+    diesel::update(queue_dsl::harvest_task_queue.find(task_id))
+        .set(queue_dsl::attempt.eq(3))
+        .execute(&mut conn)
+        .await
+        .expect("failed to force attempt");
+
+    let policy = WorkflowHistoryPolicy::default().with_event_hard_cap(2);
+    let registry = Arc::new(HandlerRegistry::with_history_policy(
+        vec![WorkflowInfo {
+            name: "history_cap_violator",
+            module: "metrics_integration",
+            handler: history_cap_violator,
+            execution_timeout: None,
+            concurrency: None,
+            max_input_bytes: None,
+        }],
+        vec![],
+        policy,
+    ));
+
+    let worker = build_worker("metrics-worker-hard-cap-attempt", registry);
+    let pool = build_test_pool(&database_url);
+    let runner = Arc::clone(&worker);
+    let pool_for_run = pool.clone();
+    let handle = tokio::spawn(async move {
+        runner.run(&pool_for_run).await;
+    });
+
+    let _execution = wait_for_state(&database_url, exec_id, "FAILED").await;
+    worker.shutdown();
+    handle.await.expect("worker task should join cleanly");
+
+    let dead_letters = dlq::list_dead_letters(&mut conn, 10)
+        .await
+        .expect("failed to list DLQ rows");
+    let dlq_row = dead_letters
+        .iter()
+        .find(|row| row.workflow_exec_id == Some(exec_id.as_uuid()))
+        .expect("hard-cap offender must be moved to DLQ");
+    assert_eq!(
+        dlq_row.attempts, 3,
+        "DLQ attempts must preserve terminal task attempt count"
+    );
 }
 
 // ---------------------------------------------------------------------------
