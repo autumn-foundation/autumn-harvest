@@ -1253,6 +1253,26 @@ fn task_attempt(task: &TaskQueueItem) -> u32 {
     u32::try_from(task.attempt.max(1)).unwrap_or(1)
 }
 
+#[allow(clippy::missing_const_for_fn)]
+fn retry_stream_seed(task: &TaskQueueItem) -> u64 {
+    let mut seed = 0xcbf2_9ce4_8422_2325_u64;
+    if let Some(exec) = task.workflow_exec_id {
+        let raw = exec.as_u128().to_le_bytes();
+        seed ^= u64::from_le_bytes(raw[..8].try_into().unwrap_or([0_u8; 8]));
+        seed = seed.wrapping_mul(0x1000_0000_01b3);
+        seed ^= u64::from_le_bytes(raw[8..].try_into().unwrap_or([0_u8; 8]));
+        seed = seed.wrapping_mul(0x1000_0000_01b3);
+    }
+    if let Some(activity) = task.activity_id {
+        let raw = activity.as_u128().to_le_bytes();
+        seed ^= u64::from_le_bytes(raw[..8].try_into().unwrap_or([0_u8; 8]));
+        seed = seed.wrapping_mul(0x1000_0000_01b3);
+        seed ^= u64::from_le_bytes(raw[8..].try_into().unwrap_or([0_u8; 8]));
+        seed = seed.wrapping_mul(0x1000_0000_01b3);
+    }
+    seed
+}
+
 pub(crate) fn chrono_duration_from_secs(
     seconds: u64,
     field_name: &str,
@@ -1288,7 +1308,7 @@ fn next_retry_delay(
         }
 
         return policy
-            .next_delay(task_attempt(task))
+            .next_delay_with_seed(task_attempt(task), retry_stream_seed(task))
             .map(|delay| chrono_duration_from_std(delay, "retry delay"))
             .transpose();
     }
