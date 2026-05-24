@@ -216,7 +216,7 @@ pub struct RetentionStatus {
     /// The active retention configuration.
     pub config: RetentionConfig,
     /// The latest execution results for each active shard.
-    pub per_shard: Vec<RetentionTickResult>,
+         pub per_shard: Vec<RetentionTickResult>,
 }
 
 /// A thread-safe monitor for observing the background retention process.
@@ -492,6 +492,7 @@ struct RetentionScanCursor {
 struct RetentionLeaseGuard {
     pool: crate::worker::DbPool,
     lease_id: String,
+    active_ids: Arc<Mutex<Vec<uuid::Uuid>>>,
     active: bool,
 }
 
@@ -501,18 +502,24 @@ impl Drop for RetentionLeaseGuard {
         if self.active {
             let pool = self.pool.clone();
             let lease_id = self.lease_id.clone();
-            tokio::spawn(async move {
-                if let Ok(mut conn) = pool.get().await {
-                    let _ = diesel::update(
-                        harvest_workflow_executions::table.filter(
-                            harvest_workflow_executions::sticky_worker_id.eq(Some(lease_id)),
-                        ),
-                    )
-                    .set(harvest_workflow_executions::sticky_worker_id.eq::<Option<String>>(None))
-                    .execute(&mut conn)
-                    .await;
-                }
-            });
+            let ids = {
+                let guard = self.active_ids.lock().expect("lease guard lock poisoned");
+                guard.clone()
+            };
+            if !ids.is_empty() {
+                tokio::spawn(async move {
+                    if let Ok(mut conn) = pool.get().await {
+                        let _ = diesel::update(
+                            harvest_workflow_executions::table
+                                .filter(harvest_workflow_executions::id.eq_any(ids))
+                                .filter(harvest_workflow_executions::sticky_worker_id.eq(Some(lease_id))),
+                        )
+                        .set(harvest_workflow_executions::sticky_worker_id.eq::<Option<String>>(None))
+                        .execute(&mut conn)
+                        .await;
+                    }
+                });
+            }
         }
     }
 }
@@ -538,9 +545,10 @@ async fn run_shard_tick(
     let mut has_failed = false;
 
     let lease_id = format!("retention-lease-{}", uuid::Uuid::new_v4());
-    let mut _guard = RetentionLeaseGuard {
+    let guard = RetentionLeaseGuard {
         pool: pool.clone(),
         lease_id: lease_id.clone(),
+        active_ids: Arc::new(Mutex::new(Vec::new())),
         active: true,
     };
 
@@ -598,6 +606,11 @@ async fn run_shard_tick(
         // Release the checked-out connection immediately back to the pool
         drop(conn);
 
+        if !candidates.is_empty() {
+            let ids: Vec<uuid::Uuid> = candidates.iter().map(|r| r.id).collect();
+            guard.active_ids.lock().expect("lease guard lock poisoned").extend(ids);
+        }
+
         if candidates.is_empty() {
             // Prevent same-tick rescanning/wrapping if we have encountered any failures
             if cursor.is_some() && !wrapped && !has_failed {
@@ -653,6 +666,13 @@ async fn run_shard_tick(
                 // Advance cursor for routine skips
                 if !has_failed {
                     outcome.next_cursor = Some(candidate_cursor);
+                }
+
+                {
+                    let mut active_guard = guard.active_ids.lock().expect("lease guard lock poisoned");
+                    if let Some(pos) = active_guard.iter().position(|&x| x == candidate.id) {
+                        active_guard.swap_remove(pos);
+                    }
                 }
                 continue;
             }
@@ -753,6 +773,13 @@ async fn run_shard_tick(
                 break;
             }
             outcome.deleted_count += 1;
+
+            {
+                let mut active_guard = guard.active_ids.lock().expect("lease guard lock poisoned");
+                if let Some(pos) = active_guard.iter().position(|&x| x == candidate.id) {
+                    active_guard.swap_remove(pos);
+                }
+            }
 
             if !has_failed {
                 outcome.next_cursor = Some(candidate_cursor);
