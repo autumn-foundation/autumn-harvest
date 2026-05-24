@@ -77,9 +77,8 @@ pub async fn collect_approvals(
     tokio::pin!(timer_res);
 
     // In parallel, we process incoming signals, racing them with our deadline timer.
-    let mut met = false;
-    let mut signal_count = 0;
-    while signal_count < 5 {
+    let met;
+    loop {
         // Check if our condition/timer already resolved early
         if let std::task::Poll::Ready(met_val) = futures::poll!(&mut timer_res) {
             met = met_val.map_err(|e| e.to_string())?;
@@ -98,19 +97,12 @@ pub async fn collect_approvals(
                         approvers.lock().unwrap().insert(sig.approver);
                     }
                 }
-                signal_count += 1;
             }
             futures::future::Either::Right((timeout_res, _)) => {
                 met = timeout_res.map_err(|e| e.to_string())?;
                 break;
             }
         }
-    }
-
-    // If we completed the loop (got 5 signals) but the condition/timer hasn't resolved yet,
-    // await it now to get the final outcome.
-    if signal_count >= 5 && !met {
-        met = timer_res.await.map_err(|e| e.to_string())?;
     }
 
     let final_approvers: Vec<String> = approvers.lock().unwrap().iter().cloned().collect();

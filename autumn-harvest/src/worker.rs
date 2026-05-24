@@ -408,7 +408,7 @@ fn all_commands_wait_for_signal(commands: &[WorkflowCommand]) -> bool {
 
 fn should_requeue_signal_wait(commands: &[WorkflowCommand]) -> bool {
     if commands.is_empty() {
-        return true;
+        return false;
     }
 
     let has_wait = commands.iter().any(|cmd| {
@@ -2033,6 +2033,7 @@ async fn persist_scheduled_activities(
     .await
 }
 
+#[allow(clippy::too_many_lines)]
 async fn persist_started_timer(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
@@ -2044,9 +2045,34 @@ async fn persist_started_timer(
 ) -> HarvestResult<()> {
     use tracing::Instrument;
 
+    // Check if the timer already exists in the database.
+    let existing: Option<HarvestTimer> = harvest_timers::table
+        .filter(harvest_timers::workflow_exec_id.eq(exec_id.as_uuid()))
+        .filter(harvest_timers::timer_id.eq(timer.timer_id.as_str()))
+        .first::<HarvestTimer>(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?;
+
+    let fires_at = if let Some(ref ext) = existing {
+        ext.fires_at
+    } else {
+        let fire_delay = chrono_duration_from_secs(timer.duration_secs, "timer duration")?;
+        chrono::Utc::now() + fire_delay
+    };
+
+    let is_new = existing.is_none();
     let marker_events = marker_events_from_commands(commands);
-    let fire_delay = chrono_duration_from_secs(timer.duration_secs, "timer duration")?;
-    let fires_at = chrono::Utc::now() + fire_delay;
+    let mut events = marker_events;
+
+    if is_new {
+        let timer_started = WorkflowEvent::TimerStarted {
+            timer_id: timer.timer_id.clone(),
+            duration_secs: timer.duration_secs,
+        };
+        events.push(timer_started);
+    }
+
     // Emit a span for the timer placement (not to be confused with
     // harvest.timer.fire which is emitted when the timer actually fires).
     let span = tracing::info_span!(
@@ -2056,29 +2082,30 @@ async fn persist_started_timer(
         timer.duration_secs = timer.duration_secs,
         { ATTR_EXECUTION_ID } = %exec_id,
     );
-    let timer_started = WorkflowEvent::TimerStarted {
-        timer_id: timer.timer_id.clone(),
-        duration_secs: timer.duration_secs,
-    };
-    let mut events = marker_events;
-    events.push(timer_started);
 
-    let new_timer = NewHarvestTimer {
-        workflow_exec_id: exec_id.as_uuid(),
-        timer_id: timer.timer_id.as_str(),
-        fires_at,
-    };
+    let has_events = !events.is_empty();
 
     conn.transaction::<(), HarvestError, _>(|conn| {
         async move {
             use crate::schema::harvest_task_queue::dsl as queue_dsl;
 
-            store::append_events(conn, exec_id, &events, next_event_id).await?;
-            diesel::insert_into(harvest_timers::table)
-                .values(&new_timer)
-                .execute(conn)
-                .await
-                .map_err(crate::error::database_error)?;
+            if has_events {
+                store::append_events(conn, exec_id, &events, next_event_id).await?;
+            }
+
+            if is_new {
+                let new_timer = NewHarvestTimer {
+                    workflow_exec_id: exec_id.as_uuid(),
+                    timer_id: timer.timer_id.as_str(),
+                    fires_at,
+                };
+                diesel::insert_into(harvest_timers::table)
+                    .values(&new_timer)
+                    .execute(conn)
+                    .await
+                    .map_err(crate::error::database_error)?;
+            }
+
             queue::reschedule_task(conn, task_id, fires_at).await?;
             let mut is_mixed = commands.iter().any(|cmd| {
                 matches!(
