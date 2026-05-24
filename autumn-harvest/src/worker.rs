@@ -2045,10 +2045,11 @@ async fn persist_started_timer(
 ) -> HarvestResult<()> {
     use tracing::Instrument;
 
-    // Check if the timer already exists in the database.
+    // Check if the timer already exists and is active (unfired) in the database.
     let existing: Option<HarvestTimer> = harvest_timers::table
         .filter(harvest_timers::workflow_exec_id.eq(exec_id.as_uuid()))
         .filter(harvest_timers::timer_id.eq(timer.timer_id.as_str()))
+        .filter(harvest_timers::fired.eq(false))
         .first::<HarvestTimer>(conn)
         .await
         .optional()
@@ -3652,6 +3653,7 @@ async fn suspended_command_event_count(
             let existing: Option<HarvestTimer> = harvest_timers::table
                 .filter(harvest_timers::workflow_exec_id.eq(exec_uuid))
                 .filter(harvest_timers::timer_id.eq(timer.timer_id.as_str()))
+                .filter(harvest_timers::fired.eq(false))
                 .first::<HarvestTimer>(conn)
                 .await
                 .optional()
