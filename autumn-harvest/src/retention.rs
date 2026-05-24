@@ -38,6 +38,7 @@ const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const DEFAULT_BATCH_SIZE: usize = 1_000;
 const MIN_MAX_AGE: Duration = Duration::from_secs(1);
 const MAX_MAX_AGE: Duration = Duration::from_secs(60 * 60 * 24 * 365 * 10);
+const DEFAULT_ARCHIVAL_TIMEOUT_SECS: u64 = 30;
 
 /// Future type returned by [`HistoryArchiver::archive`].
 pub type ArchiverFuture = std::pin::Pin<
@@ -97,6 +98,9 @@ pub struct RetentionConfig {
     /// Schedule decisions retention in days.
     /// Defaults to 7 days. Set to 0 to disable schedule decision purging.
     pub schedule_decision_retention_days: i64,
+    /// The timeout in seconds for executing the pre-retention archival hook.
+    /// Defaults to 30 seconds.
+    pub archival_timeout_secs: u64,
 }
 
 impl Default for RetentionConfig {
@@ -108,6 +112,7 @@ impl Default for RetentionConfig {
             dry_run: false,
             audit_retention_days: 90,
             schedule_decision_retention_days: 7,
+            archival_timeout_secs: DEFAULT_ARCHIVAL_TIMEOUT_SECS,
         }
     }
 }
@@ -136,6 +141,13 @@ impl RetentionConfig {
         self
     }
 
+    /// Override the archival hook execution timeout.
+    #[must_use]
+    pub const fn with_archival_timeout_secs(mut self, secs: u64) -> Self {
+        self.archival_timeout_secs = secs;
+        self
+    }
+
     /// Safely unpacks the raw configuration integer into a standard rust [`Duration`], gracefully
     /// handling systems where the feature is entirely turned off.
     #[must_use]
@@ -147,6 +159,12 @@ impl RetentionConfig {
     #[must_use]
     pub const fn tick_interval(&self) -> Duration {
         Duration::from_secs(self.tick_interval_secs)
+    }
+
+    /// Translates the raw archival timeout value into a standard [`Duration`] for timeout enforcement.
+    #[must_use]
+    pub const fn archival_timeout(&self) -> Duration {
+        Duration::from_secs(self.archival_timeout_secs)
     }
 
     /// # Errors
@@ -739,18 +757,29 @@ async fn run_shard_tick(
             if let Some((exec_id, document)) = doc
                 && let Some(archiver) = &archiver
             {
-                match archiver.archive(&document).await {
-                    Ok(()) => {
+                let timeout_dur = config.archival_timeout();
+                match tokio::time::timeout(timeout_dur, archiver.archive(&document)).await {
+                    Ok(Ok(())) => {
                         tracing::debug!(
                             execution_id = %exec_id,
                             "pre-retention archival hook completed successfully"
                         );
                     }
-                    Err(error) => {
+                    Ok(Err(error)) => {
                         tracing::error!(
                             execution_id = %exec_id,
                             error = %error,
                             "pre-retention archival hook failed; skipping deletion"
+                        );
+                        has_failed = true;
+                        archive_success = false;
+                        batch_failed = true;
+                    }
+                    Err(_) => {
+                        tracing::error!(
+                            execution_id = %exec_id,
+                            timeout_secs = timeout_dur.as_secs(),
+                            "pre-retention archival hook timed out; skipping deletion"
                         );
                         has_failed = true;
                         archive_success = false;

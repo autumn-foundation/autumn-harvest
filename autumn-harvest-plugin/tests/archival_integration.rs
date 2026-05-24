@@ -249,6 +249,7 @@ async fn archival_hook_executes_successfully_and_preserves_on_failure() {
                 dry_run: false,
                 audit_retention_days: 90,
                 schedule_decision_retention_days: 7,
+                archival_timeout_secs: 30,
             })
             .history_archiver(archiver)
             .build(),
@@ -355,6 +356,96 @@ async fn archival_hook_executes_successfully_and_preserves_on_failure() {
     assert_eq!(
         count, 1,
         "Workflow execution must NOT be deleted if archive hook fails"
+    );
+
+    runner.stop().await;
+}
+
+#[tokio::test]
+async fn archival_hook_times_out_and_preserves_execution() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let api_state = HarvestApiState::new();
+
+    // A mock archiver that sleeps for 5 seconds to trigger the timeout
+    struct SlowArchiver;
+    impl HistoryArchiver for SlowArchiver {
+        fn archive(
+            &self,
+            _doc: &autumn_harvest::history_export::HistoryExportDocument,
+        ) -> Pin<
+            Box<dyn Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send>,
+        > {
+            Box::pin(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                Ok(())
+            })
+        }
+    }
+
+    let runner = HarvestRunner::start(
+        autumn_harvest::HarvestBuilder::new()
+            .retention(RetentionConfig {
+                max_age_secs: Some(7 * 24 * 60 * 60),
+                tick_interval_secs: 60 * 60,
+                batch_size: 1000,
+                dry_run: false,
+                audit_retention_days: 90,
+                schedule_decision_retention_days: 7,
+                archival_timeout_secs: 1, // 1 second timeout
+            })
+            .history_archiver(SlowArchiver)
+            .build(),
+        &HarvestRuntimeConfig {
+            mode: HarvestMode::External,
+            worker_enabled: false,
+            scheduler_enabled: false,
+            database: autumn_harvest_plugin::HarvestDatabaseConfig {
+                url: Some(database_url.clone()),
+            },
+            outbox: autumn_harvest_plugin::HarvestOutboxConfig::default(),
+            batch: autumn_harvest_plugin::HarvestBatchConfig::default(),
+            readiness: autumn_harvest_plugin::HarvestReadinessConfig::default(),
+        },
+        HarvestRunnerResources::new(pool.clone()),
+    )
+    .expect("runner with retention and slow archiver should start");
+
+    let slow_exec = uuid::Uuid::new_v4();
+
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect for retention fixture");
+
+    // Insert old completed workflow (eligible for retention/archival)
+    insert_retention_fixture_execution(
+        &mut conn,
+        slow_exec,
+        "slow-archival",
+        "COMPLETED",
+        "NOW() - INTERVAL '10 days'",
+    )
+    .await;
+
+    api_state.install_storage_pool(runner.storage_pool());
+    api_state.install(runner.api_runtime());
+    let app = harvest_api_router(api_state).with_state(autumn_web::AppState::for_test());
+
+    // Trigger retention
+    let (run_now_status, run_now_json) =
+        post_json(&app, "/admin/retention/run-now", json!({})).await;
+    assert_eq!(run_now_status, StatusCode::OK);
+    assert_eq!(run_now_json["ok"], true);
+
+    // Wait 2.5 seconds (longer than the 1s timeout but shorter than the 5s sleep)
+    // and verify that the database row is NOT deleted.
+    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+
+    let count = count_execution_rows(&mut conn, slow_exec).await;
+    assert_eq!(
+        count, 1,
+        "Workflow execution must NOT be deleted if the archival hook times out"
     );
 
     runner.stop().await;
