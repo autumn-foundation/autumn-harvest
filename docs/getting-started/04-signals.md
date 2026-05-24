@@ -91,18 +91,42 @@ async fn collect_approvals_clean(ctx: &WorkflowContext) -> HarvestResult<Value> 
     let mut approvals = 0;
 
     // Await condition timeout races our condition closure against a timer
-    let met = ctx.await_condition_timeout("deadline", 86400, || {
+    let met_fut = ctx.await_condition_timeout("deadline", 86400, || {
         approvals >= 2
     });
+    tokio::pin!(met_fut);
 
-    // In parallel, receive signals to update local state
+    let mut success = false;
     while approvals < 2 {
-        if let Ok(_) = ctx.wait_for_signal("approved").await {
-            approvals += 1;
+        // Check if our condition/timer already resolved early
+        if let std::task::Poll::Ready(val) = futures::poll!(&mut met_fut) {
+            success = val?;
+            break;
+        }
+
+        // Wait for the next approved signal, raced against the timeout deadline
+        let sig_fut = ctx.wait_for_signal("approved");
+        tokio::pin!(sig_fut);
+
+        match futures::future::select(sig_fut, &mut met_fut).await {
+            futures::future::Either::Left((sig_res, _)) => {
+                if sig_res.is_ok() {
+                    approvals += 1;
+                }
+            }
+            futures::future::Either::Right((timeout_res, _)) => {
+                success = timeout_res?;
+                break;
+            }
         }
     }
 
-    let success = met.await?;
+    // If we completed the loop (approvals >= 2) but didn't resolve met_fut yet,
+    // await it now to get the final outcome.
+    if approvals >= 2 && !success {
+        success = met_fut.await?;
+    }
+
     Ok(json!({ "status": if success { "approved" } else { "timed_out" } }))
 }
 ```

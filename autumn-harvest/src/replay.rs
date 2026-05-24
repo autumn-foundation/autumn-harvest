@@ -1243,6 +1243,35 @@ impl HistoryMatcher {
         }
     }
 
+    /// Peek forward to determine if TimerStarted for the requested ID is the next active deterministic event in history.
+    pub fn is_timer_started_next(&self, timer_id: &str) -> bool {
+        let mut idx = self.cursor;
+        while idx < self.events.len() {
+            if self.is_consumed(idx) {
+                idx += 1;
+                continue;
+            }
+            match &self.events[idx] {
+                WorkflowEvent::SignalReceived { .. } => {
+                    idx += 1;
+                }
+                ev if Self::is_update_event(ev) => {
+                    idx += 1;
+                }
+                WorkflowEvent::ExternalSignalRequested { .. }
+                | WorkflowEvent::ExternalSignalDelivered { .. }
+                | WorkflowEvent::ExternalSignalFailed { .. } => {
+                    idx += 1;
+                }
+                WorkflowEvent::TimerStarted { timer_id: id, .. } => {
+                    return id.as_str() == timer_id;
+                }
+                _ => return false,
+            }
+        }
+        false
+    }
+
     /// Match a timer command against history.
     ///
     /// Expects `TimerStarted { timer_id }` at cursor, then scans for

@@ -408,7 +408,7 @@ fn all_commands_wait_for_signal(commands: &[WorkflowCommand]) -> bool {
 
 fn should_requeue_signal_wait(commands: &[WorkflowCommand]) -> bool {
     if commands.is_empty() {
-        return false;
+        return true;
     }
 
     let has_wait = commands.iter().any(|cmd| {
@@ -417,8 +417,7 @@ fn should_requeue_signal_wait(commands: &[WorkflowCommand]) -> bool {
             WorkflowCommand::WaitForSignal { .. } | WorkflowCommand::SignalExternalWorkflow { .. }
         )
     });
-    // RecordUpdateResult and UpsertSearchAttributes are bookkeeping already
-    // handled before this check; they don't affect the signal-wait decision.
+
     let only_wait_or_bookkeeping = commands.iter().all(|cmd| {
         matches!(
             cmd,

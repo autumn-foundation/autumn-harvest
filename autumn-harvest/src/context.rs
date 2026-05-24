@@ -592,6 +592,11 @@ impl WorkflowContext {
         f(&mut matcher)
     }
 
+    pub(crate) fn is_timer_started_next(&self, timer_id: &str) -> bool {
+        let matcher = self.matcher.lock().expect("matcher lock poisoned");
+        matcher.is_timer_started_next(timer_id)
+    }
+
     // ── Constructors ──────────────────────────────────────────────────
 
     /// Create a context for replaying a workflow from its event history.
@@ -1992,9 +1997,9 @@ impl WorkflowContext {
     }
 
     /// Block until a predicate over workflow local state evaluates to true.
-    pub const fn await_condition<F>(&self, predicate: F) -> AwaitConditionFut<F>
+    pub fn await_condition<F>(&self, predicate: F) -> AwaitConditionFut<F>
     where
-        F: FnMut() -> bool,
+        F: FnMut() -> bool + Unpin,
     {
         AwaitConditionFut { predicate }
     }
@@ -2007,10 +2012,12 @@ impl WorkflowContext {
         predicate: F,
     ) -> AwaitConditionTimeoutFut<'a, F>
     where
-        F: FnMut() -> bool,
+        F: FnMut() -> bool + Unpin,
     {
         let timer_fut = self.timer(timer_id, duration_secs);
         AwaitConditionTimeoutFut {
+            context: self,
+            timer_id: timer_id.to_string(),
             predicate,
             timer_fut: Box::pin(timer_fut),
         }
@@ -2917,13 +2924,14 @@ impl WorkflowContext {
 }
 
 /// Future returned by [`WorkflowContext::await_condition`].
+#[must_use = "futures do nothing unless you .await or poll them"]
 pub struct AwaitConditionFut<F> {
     predicate: F,
 }
 
 impl<F> std::future::Future for AwaitConditionFut<F>
 where
-    F: FnMut() -> bool,
+    F: FnMut() -> bool + Unpin,
 {
     type Output = HarvestResult<()>;
 
@@ -2931,7 +2939,7 @@ where
         self: std::pin::Pin<&mut Self>,
         _cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        let this = unsafe { self.get_unchecked_mut() };
+        let this = self.get_mut();
         if (this.predicate)() {
             std::task::Poll::Ready(Ok(()))
         } else {
@@ -2941,14 +2949,17 @@ where
 }
 
 /// Future returned by [`WorkflowContext::await_condition_timeout`].
+#[must_use = "futures do nothing unless you .await or poll them"]
 pub struct AwaitConditionTimeoutFut<'a, F> {
+    context: &'a WorkflowContext,
+    timer_id: String,
     predicate: F,
     timer_fut: std::pin::Pin<Box<dyn std::future::Future<Output = HarvestResult<()>> + Send + 'a>>,
 }
 
 impl<F> std::future::Future for AwaitConditionTimeoutFut<'_, F>
 where
-    F: FnMut() -> bool,
+    F: FnMut() -> bool + Unpin,
 {
     type Output = HarvestResult<bool>;
 
@@ -2956,12 +2967,19 @@ where
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        let this = unsafe { self.get_unchecked_mut() };
-        if (this.predicate)() {
+        let this = self.get_mut();
+
+        let cond_met = (this.predicate)();
+
+        if cond_met {
+            // Consuming any pending timer started event in history so replay matches correctly.
+            if this.context.is_timer_started_next(&this.timer_id) {
+                let _ = this.timer_fut.as_mut().poll(cx);
+            }
             return std::task::Poll::Ready(Ok(true));
         }
 
-        match std::pin::Pin::new(&mut this.timer_fut).poll(cx) {
+        match this.timer_fut.as_mut().poll(cx) {
             std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Ok(false)),
             std::task::Poll::Ready(Err(err)) => std::task::Poll::Ready(Err(err)),
             std::task::Poll::Pending => std::task::Poll::Pending,

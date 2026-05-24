@@ -74,32 +74,44 @@ pub async fn collect_approvals(
             let set = state_check.lock().unwrap();
             has_quorum_and_admin(&set, input.required_approvals)
         });
+    tokio::pin!(timer_res);
 
-    // In parallel, we process incoming signals.
-    // Because we are event-sourced, every time a new signal event is appended,
-    // the workflow re-executes from the top.
-    // We consume up to 5 signals or until we have quorum.
+    // In parallel, we process incoming signals, racing them with our deadline timer.
+    let mut met = false;
     let mut signal_count = 0;
     while signal_count < 5 {
-        // Wait for the next approval signal.
-        if let Ok(sig_val) = ctx.wait_for_signal("approve").await {
-            if let Ok(sig) = serde_json::from_value::<ApproveSignal>(sig_val) {
-                println!("[Workflow] Received approval signal from: {}", sig.approver);
-                approvers.lock().unwrap().insert(sig.approver);
-            }
-        }
-        signal_count += 1;
-
-        // Check if our condition is already met.
-        let set = approvers.lock().unwrap();
-        if has_quorum_and_admin(&set, input.required_approvals) {
-            println!("[Workflow] Quorum and admin requirements met early!");
+        // Check if our condition/timer already resolved early
+        if let std::task::Poll::Ready(met_val) = futures::poll!(&mut timer_res) {
+            met = met_val.map_err(|e| e.to_string())?;
             break;
+        }
+
+        // Wait for the next approval signal, or the timer deadline.
+        let sig_fut = ctx.wait_for_signal("approve");
+        tokio::pin!(sig_fut);
+
+        match futures::future::select(sig_fut, &mut timer_res).await {
+            futures::future::Either::Left((sig_res, _)) => {
+                if let Ok(sig_val) = sig_res {
+                    if let Ok(sig) = serde_json::from_value::<ApproveSignal>(sig_val) {
+                        println!("[Workflow] Received approval signal from: {}", sig.approver);
+                        approvers.lock().unwrap().insert(sig.approver);
+                    }
+                }
+                signal_count += 1;
+            }
+            futures::future::Either::Right((timeout_res, _)) => {
+                met = timeout_res.map_err(|e| e.to_string())?;
+                break;
+            }
         }
     }
 
-    // Finally, check the outcome of our raced condition timeout.
-    let met = timer_res.await.map_err(|e| e.to_string())?;
+    // If we completed the loop (got 5 signals) but the condition/timer hasn't resolved yet,
+    // await it now to get the final outcome.
+    if signal_count >= 5 && !met {
+        met = timer_res.await.map_err(|e| e.to_string())?;
+    }
 
     let final_approvers: Vec<String> = approvers.lock().unwrap().iter().cloned().collect();
 
