@@ -133,7 +133,7 @@ fn jitter_timer_workflow<'a>(
     input: Value,
 ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
     Box::pin(async move {
-        let attempt = input["attempt"].as_u64().unwrap_or(1) as u32;
+        let attempt = u32::try_from(input["attempt"].as_u64().unwrap_or(1)).unwrap_or(1);
         let seed = input["seed"].as_u64().unwrap_or(0);
         let policy = RetryPolicy::exponential(8, std::time::Duration::from_secs(2))
             .with_jitter(JitterPolicy::Equal);
