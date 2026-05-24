@@ -216,7 +216,7 @@ pub struct RetentionStatus {
     /// The active retention configuration.
     pub config: RetentionConfig,
     /// The latest execution results for each active shard.
-         pub per_shard: Vec<RetentionTickResult>,
+    pub per_shard: Vec<RetentionTickResult>,
 }
 
 /// A thread-safe monitor for observing the background retention process.
@@ -512,9 +512,15 @@ impl Drop for RetentionLeaseGuard {
                         let _ = diesel::update(
                             harvest_workflow_executions::table
                                 .filter(harvest_workflow_executions::id.eq_any(ids))
-                                .filter(harvest_workflow_executions::sticky_worker_id.eq(Some(lease_id))),
+                                .filter(
+                                    harvest_workflow_executions::sticky_worker_id
+                                        .eq(Some(lease_id)),
+                                ),
                         )
-                        .set(harvest_workflow_executions::sticky_worker_id.eq::<Option<String>>(None))
+                        .set(
+                            harvest_workflow_executions::sticky_worker_id
+                                .eq::<Option<String>>(None),
+                        )
                         .execute(&mut conn)
                         .await;
                     }
@@ -608,7 +614,11 @@ async fn run_shard_tick(
 
         if !candidates.is_empty() {
             let ids: Vec<uuid::Uuid> = candidates.iter().map(|r| r.id).collect();
-            guard.active_ids.lock().expect("lease guard lock poisoned").extend(ids);
+            guard
+                .active_ids
+                .lock()
+                .expect("lease guard lock poisoned")
+                .extend(ids);
         }
 
         if candidates.is_empty() {
@@ -669,7 +679,8 @@ async fn run_shard_tick(
                 }
 
                 {
-                    let mut active_guard = guard.active_ids.lock().expect("lease guard lock poisoned");
+                    let mut active_guard =
+                        guard.active_ids.lock().expect("lease guard lock poisoned");
                     if let Some(pos) = active_guard.iter().position(|&x| x == candidate.id) {
                         active_guard.swap_remove(pos);
                     }
