@@ -1243,7 +1243,8 @@ impl HistoryMatcher {
         }
     }
 
-    /// Peek forward to determine if TimerStarted for the requested ID is the next active deterministic event in history.
+    /// Peek forward to determine if `TimerStarted` for the requested ID is the next active deterministic event in history.
+    #[must_use]
     pub fn is_timer_started_next(&self, timer_id: &str) -> bool {
         let mut idx = self.cursor;
         while idx < self.events.len() {

@@ -613,22 +613,47 @@ fn extract_all_activity_waits(commands: &[WorkflowCommand]) -> Option<Vec<Activi
     }
 }
 
-fn extract_single_started_timer(commands: &[WorkflowCommand]) -> Option<StartedTimerCommand> {
-    extract_single_command(commands, |cmd| {
-        let WorkflowCommand::StartTimer {
+fn extract_started_timer_for_suspension(
+    commands: &[WorkflowCommand],
+) -> Option<StartedTimerCommand> {
+    // Find all StartTimer commands.
+    let mut timers = commands.iter().filter_map(|cmd| {
+        if let WorkflowCommand::StartTimer {
             timer_id,
             duration_secs,
             ..
         } = cmd
-        else {
-            return None;
-        };
+        {
+            Some(StartedTimerCommand {
+                timer_id: timer_id.clone(),
+                duration_secs: *duration_secs,
+            })
+        } else {
+            None
+        }
+    });
 
-        Some(StartedTimerCommand {
-            timer_id: timer_id.clone(),
-            duration_secs: *duration_secs,
-        })
-    })
+    let first_timer = timers.next()?;
+
+    // If there is more than one StartTimer command, we don't support parallel timers in this branch.
+    if timers.next().is_some() {
+        return None;
+    }
+
+    // Now verify that all other commands in the batch are either bookkeeping OR signal waits.
+    let is_valid = commands.iter().all(|cmd| {
+        matches!(
+            cmd,
+            WorkflowCommand::StartTimer { .. }
+                | WorkflowCommand::WaitForSignal { .. }
+                | WorkflowCommand::SignalExternalWorkflow { .. }
+                | WorkflowCommand::RecordMarker { .. }
+                | WorkflowCommand::RecordUpdateResult { .. }
+                | WorkflowCommand::UpsertSearchAttributes { .. }
+        )
+    });
+
+    if is_valid { Some(first_timer) } else { None }
 }
 
 /// Extract all `StartChildWorkflow` commands when every non-bookkeeping command is
@@ -3085,7 +3110,7 @@ async fn handle_suspended_workflow(
             sticky,
         )
         .await
-    } else if let Some(timer) = extract_single_started_timer(commands) {
+    } else if let Some(timer) = extract_started_timer_for_suspension(commands) {
         let res = persist_started_timer(
             conn,
             context.persistence.exec_id,
@@ -3594,7 +3619,7 @@ async fn suspended_command_event_count(
     if extract_all_activity_waits(commands).is_some() {
         return Ok(bookkeeping_events);
     }
-    if extract_single_started_timer(commands).is_some() {
+    if extract_started_timer_for_suspension(commands).is_some() {
         return Ok(bookkeeping_events.saturating_add(1));
     }
     if let Some(children) = extract_all_started_child_workflows(commands) {

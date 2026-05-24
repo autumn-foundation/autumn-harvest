@@ -1997,7 +1997,7 @@ impl WorkflowContext {
     }
 
     /// Block until a predicate over workflow local state evaluates to true.
-    pub fn await_condition<F>(&self, predicate: F) -> AwaitConditionFut<F>
+    pub const fn await_condition<F>(&self, predicate: F) -> AwaitConditionFut<F>
     where
         F: FnMut() -> bool + Unpin,
     {
@@ -2973,8 +2973,10 @@ where
 
         if cond_met {
             // Consuming any pending timer started event in history so replay matches correctly.
-            if this.context.is_timer_started_next(&this.timer_id) {
-                let _ = this.timer_fut.as_mut().poll(cx);
+            if this.context.is_timer_started_next(&this.timer_id)
+                && let std::task::Poll::Ready(Err(err)) = this.timer_fut.as_mut().poll(cx)
+            {
+                return std::task::Poll::Ready(Err(err));
             }
             return std::task::Poll::Ready(Ok(true));
         }
