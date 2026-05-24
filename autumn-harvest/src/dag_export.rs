@@ -91,6 +91,46 @@ pub fn export_dot(dag: &DagDefinition) -> Result<String, std::fmt::Error> {
     Ok(out)
 }
 
+/// Exports a DAG execution profile to Google Trace Event Format (Chrome Tracing).
+///
+/// This format can be loaded in `chrome://tracing` or `https://ui.perfetto.dev/`
+/// to visualize the execution timeline of the DAG in a Gantt chart.
+///
+/// # Errors
+/// Returns `std::fmt::Error` if string formatting fails.
+#[cfg(feature = "testing")]
+pub fn export_chrome_trace(
+    profile: &crate::dag_profiler::DagProfile,
+) -> Result<String, std::fmt::Error> {
+    use crate::dag_profiler::ProfilerEventKind;
+
+    let mut events = Vec::new();
+
+    for event in &profile.timeline {
+        let ts_micros = event.time.as_micros();
+
+        let (task_idx, name, ph) = match &event.kind {
+            ProfilerEventKind::TaskStarted(idx, name) => (*idx, name, "B"),
+            ProfilerEventKind::TaskCompleted(idx, name) => (*idx, name, "E"),
+        };
+
+        // We assign each task a unique thread ID (`tid`) matching its index.
+        // This ensures tasks render on separate lanes in the trace viewer.
+        let json_event = format!(
+            r#"{{"name":"{name}","cat":"task","ph":"{ph}","pid":1,"tid":{task_idx},"ts":{ts_micros}}}"#
+        );
+        events.push(json_event);
+    }
+
+    let mut out = String::new();
+    writeln!(out, "[")?;
+    if !events.is_empty() {
+        writeln!(out, "  {}", events.join(",\n  "))?;
+    }
+    writeln!(out, "]")?;
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,5 +193,37 @@ digraph DAG {
 }
 ";
         assert_eq!(dot, expected_dot);
+    }
+
+    #[test]
+    #[cfg(feature = "testing")]
+    fn test_export_chrome_trace() {
+        use crate::dag_profiler::{DagProfile, ProfilerEvent, ProfilerEventKind};
+        use std::time::Duration;
+
+        let profile = DagProfile {
+            total_duration: Duration::from_secs(1),
+            peak_concurrency: 1,
+            timeline: vec![
+                ProfilerEvent {
+                    time: Duration::from_secs(0),
+                    kind: ProfilerEventKind::TaskStarted(0, "task_a".to_string()),
+                },
+                ProfilerEvent {
+                    time: Duration::from_secs(1),
+                    kind: ProfilerEventKind::TaskCompleted(0, "task_a".to_string()),
+                },
+            ],
+        };
+
+        let trace = export_chrome_trace(&profile).unwrap();
+        assert!(trace.starts_with('['));
+        assert!(trace.contains(r#""name":"task_a""#));
+        assert!(trace.contains(r#""ph":"B""#));
+        assert!(trace.contains(r#""ph":"E""#));
+        assert!(trace.contains(r#""tid":0"#));
+        assert!(trace.contains(r#""ts":0"#));
+        assert!(trace.contains(r#""ts":1000000"#));
+        assert!(trace.ends_with("]\n"));
     }
 }
