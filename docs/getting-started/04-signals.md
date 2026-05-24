@@ -62,6 +62,56 @@ The workflow wakes up, runs `fulfill_order`, and completes.
 
 ---
 
+## Condition Waiting: `await_condition` and `await_condition_timeout`
+
+Often, a workflow needs to wait until a complex combination of local state changes (e.g., collecting a quorum of approvals) is met. Instead of writing tedious manual loops, you can use the `await_condition` and `await_condition_timeout` primitives.
+
+Below is a comparison of collecting a quorum of 2 approvals manually vs. using `await_condition`.
+
+### Manual Signal-Looping vs. `await_condition`
+
+```rust
+// --- Manual Signal-Looping ---
+#[workflow]
+async fn collect_approvals_manual(ctx: &WorkflowContext) -> HarvestResult<Value> {
+    let mut approvals = 0;
+    while approvals < 2 {
+        let _payload = ctx.wait_for_signal("approved").await?;
+        approvals += 1;
+    }
+    // Perform subsequent action...
+    Ok(json!({ "status": "approved" }))
+}
+```
+
+```rust
+// --- Clean Declarative await_condition ---
+#[workflow]
+async fn collect_approvals_clean(ctx: &WorkflowContext) -> HarvestResult<Value> {
+    let mut approvals = 0;
+
+    // Await condition timeout races our condition closure against a timer
+    let met = ctx.await_condition_timeout("deadline", 86400, || {
+        approvals >= 2
+    });
+
+    // In parallel, receive signals to update local state
+    while approvals < 2 {
+        if let Ok(_) = ctx.wait_for_signal("approved").await {
+            approvals += 1;
+        }
+    }
+
+    let success = met.await?;
+    Ok(json!({ "status": if success { "approved" } else { "timed_out" } }))
+}
+```
+
+### Determinism Warning
+The predicate closure passed to `await_condition` is evaluated multiple times during replay. It **must be deterministic** and rely purely on rehydrated local variables. Never read system time (`Instant::now()`) or generate random values inside the closure, otherwise you will trigger non-determinism replay failures (see rule `HVG008` in the [Workflow Determinism Guide](../workflow-determinism-guide.md)).
+
+---
+
 ## Signaling another workflow
 
 You can push a typed signal to any other running workflow directly from inside

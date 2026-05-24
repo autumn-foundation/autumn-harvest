@@ -21,6 +21,7 @@
 //! | HVG005 | BackgroundTask| HardBlocker  | Background task spawning             |
 //! | HVG006 | DirectIo      | HardBlocker  | Direct network / DB / filesystem I/O |
 //! | HVG007 | ProcessGlobal | HardBlocker  | Process-global state mutation        |
+//! | HVG008 | NonDeterministicPredicate| HardBlocker | Non-deterministic predicate closures|
 
 /// Severity of a guardrail rule violation.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -48,6 +49,8 @@ pub enum RuleCategory {
     DirectIo,
     /// Mutation of process-global state (`static mut`, shared atomics, global registries).
     ProcessGlobal,
+    /// Non-deterministic predicate evaluated inside `await_condition` closures.
+    NonDeterministicPredicate,
 }
 
 /// A single entry in the guardrail rule catalog.
@@ -165,6 +168,19 @@ static CATALOG: &[RuleEntry] = &[
             ctx.execute_activity_raw() boundaries. If you need to emit metrics or update a \
             registry, do so inside an activity where the side-effect is bounded to a single \
             retryable execution unit and is not re-applied on replay.",
+    },
+    RuleEntry {
+        id: "HVG008",
+        severity: Severity::HardBlocker,
+        category: RuleCategory::NonDeterministicPredicate,
+        explanation: "Evaluating non-deterministic predicates inside await_condition or \
+            await_condition_timeout (such as checking Instant::now(), SystemTime::now(), or \
+            calling random generators inside the closure) leads to non-deterministic execution \
+            paths during replay. Predicates must be pure projections of deterministic workflow \
+            local state variables rehydrated by replaying events.",
+        alternative: "Use durable timers (ctx.timer()) for time-based pauses, and ensure the \
+            predicate closure relies purely on local variables mutated by deterministic signals or \
+            activities.",
     },
 ];
 

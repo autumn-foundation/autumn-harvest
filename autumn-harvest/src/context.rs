@@ -1656,7 +1656,8 @@ impl WorkflowContext {
     ///
     /// Panics if the internal matcher or commands mutex is poisoned.
     pub async fn timer(&self, timer_id: &str, duration_secs: u64) -> HarvestResult<()> {
-        let history_match = self.match_history(|m| m.match_timer(timer_id));
+        let history_match =
+            self.match_history(|m| m.match_timer_strict(timer_id, Some(duration_secs)));
 
         match history_match {
             HistoryMatch::Matched { .. } => Ok(()),
@@ -1988,6 +1989,31 @@ impl WorkflowContext {
     {
         let raw = self.wait_for_signal(signal_name).await?;
         Ok(serde_json::from_value(raw)?)
+    }
+
+    /// Block until a predicate over workflow local state evaluates to true.
+    pub const fn await_condition<F>(&self, predicate: F) -> AwaitConditionFut<F>
+    where
+        F: FnMut() -> bool,
+    {
+        AwaitConditionFut { predicate }
+    }
+
+    /// Block until a predicate over workflow local state evaluates to true, or the timeout expires.
+    pub fn await_condition_timeout<'a, F>(
+        &'a self,
+        timer_id: &'a str,
+        duration_secs: u64,
+        predicate: F,
+    ) -> AwaitConditionTimeoutFut<'a, F>
+    where
+        F: FnMut() -> bool,
+    {
+        let timer_fut = self.timer(timer_id, duration_secs);
+        AwaitConditionTimeoutFut {
+            predicate,
+            timer_fut: Box::pin(timer_fut),
+        }
     }
 
     /// Wait for the next delivered signal with the given name.
@@ -2887,6 +2913,59 @@ impl WorkflowContext {
             .lock()
             .expect("commands lock poisoned")
             .push(cmd);
+    }
+}
+
+/// Future returned by [`WorkflowContext::await_condition`].
+pub struct AwaitConditionFut<F> {
+    predicate: F,
+}
+
+impl<F> std::future::Future for AwaitConditionFut<F>
+where
+    F: FnMut() -> bool,
+{
+    type Output = HarvestResult<()>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let this = unsafe { self.get_unchecked_mut() };
+        if (this.predicate)() {
+            std::task::Poll::Ready(Ok(()))
+        } else {
+            std::task::Poll::Pending
+        }
+    }
+}
+
+/// Future returned by [`WorkflowContext::await_condition_timeout`].
+pub struct AwaitConditionTimeoutFut<'a, F> {
+    predicate: F,
+    timer_fut: std::pin::Pin<Box<dyn std::future::Future<Output = HarvestResult<()>> + Send + 'a>>,
+}
+
+impl<F> std::future::Future for AwaitConditionTimeoutFut<'_, F>
+where
+    F: FnMut() -> bool,
+{
+    type Output = HarvestResult<bool>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let this = unsafe { self.get_unchecked_mut() };
+        if (this.predicate)() {
+            return std::task::Poll::Ready(Ok(true));
+        }
+
+        match std::pin::Pin::new(&mut this.timer_fut).poll(cx) {
+            std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Ok(false)),
+            std::task::Poll::Ready(Err(err)) => std::task::Poll::Ready(Err(err)),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
     }
 }
 

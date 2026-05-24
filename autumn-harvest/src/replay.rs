@@ -1247,15 +1247,24 @@ impl HistoryMatcher {
     ///
     /// Expects `TimerStarted { timer_id }` at cursor, then scans for
     /// `TimerFired` with the same `timer_id`.
-    #[allow(clippy::too_many_lines)]
     pub fn match_timer(&mut self, timer_id: &str) -> HistoryMatch {
+        self.match_timer_strict(timer_id, None)
+    }
+
+    /// Match a timer command against history, strictly checking duration if provided.
+    #[allow(clippy::too_many_lines)]
+    pub fn match_timer_strict(
+        &mut self,
+        timer_id: &str,
+        expected_duration: Option<u64>,
+    ) -> HistoryMatch {
         if !self.prepare_match() {
             return HistoryMatch::NoMatch;
         }
 
         let WorkflowEvent::TimerStarted {
             timer_id: recorded_id,
-            ..
+            duration_secs: recorded_duration,
         } = &self.events[self.cursor]
         else {
             return HistoryMatch::Diverged {
@@ -1268,6 +1277,15 @@ impl HistoryMatcher {
             return HistoryMatch::Diverged {
                 expected: format!("TimerStarted({timer_id})"),
                 actual: format!("TimerStarted({recorded_id})"),
+            };
+        }
+
+        if let Some(expected) = expected_duration
+            && *recorded_duration != expected
+        {
+            return HistoryMatch::Diverged {
+                expected: format!("TimerStarted({timer_id}, duration={expected}s)"),
+                actual: format!("TimerStarted({recorded_id}, duration={recorded_duration}s)"),
             };
         }
 
