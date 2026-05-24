@@ -22,6 +22,7 @@ use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::info::{ActivityInfo, WorkflowInfo};
 use autumn_harvest::models::{NewWorkflowExecution, WorkflowExecution};
 use autumn_harvest::queue::{self as queue_mod, EnqueueParams, TaskType};
+use autumn_harvest::schema::harvest_task_queue::dsl as queue_dsl;
 use autumn_harvest::schema::harvest_workflow_executions;
 use autumn_harvest::store;
 use autumn_harvest::telemetry::{
@@ -811,6 +812,7 @@ async fn continue_as_new_records_history_size_and_rotation_metrics() {
     );
 }
 
+#[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn workflow_hard_cap_moves_offender_to_dlq() {
     let (database_url, _container) = setup_test_database_url().await;
@@ -984,7 +986,6 @@ async fn workflow_hard_cap_dlq_preserves_terminal_attempt_count() {
         .await
         .expect("enqueue failed");
 
-    use autumn_harvest::schema::harvest_task_queue::dsl as queue_dsl;
     diesel::update(queue_dsl::harvest_task_queue.find(task_id))
         .set(queue_dsl::attempt.eq(3))
         .execute(&mut conn)
