@@ -778,6 +778,7 @@ async fn replay_await_condition_timeout_resolves_false_if_timer_fires_first() {
     }
 }
 
+#[cfg(feature = "testing")]
 fn non_deterministic_await_condition_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -798,6 +799,7 @@ fn non_deterministic_await_condition_workflow<'a>(
     })
 }
 
+#[cfg(feature = "testing")]
 #[tokio::test]
 async fn replay_await_condition_non_deterministic_divergence_fails() {
     use autumn_harvest::testing::{HistorySnapshot, ReplayStatus, WorkflowReplayer};
