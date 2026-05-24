@@ -100,7 +100,7 @@ impl<'ctx> Saga<'ctx> {
     /// use autumn_harvest::context::WorkflowContext;
     /// use autumn_harvest::saga::Saga;
     ///
-    /// # let ctx = WorkflowContext::new_test();
+    /// # let ctx = WorkflowContext::for_replay(autumn_harvest::ExecutionId::new(), vec![]);
     /// let saga = Saga::new(&ctx);
     /// ```
     #[must_use]
@@ -119,7 +119,7 @@ impl<'ctx> Saga<'ctx> {
     /// use autumn_harvest::context::WorkflowContext;
     /// use autumn_harvest::saga::Saga;
     ///
-    /// # let ctx = WorkflowContext::new_test();
+    /// # let ctx = WorkflowContext::for_replay(autumn_harvest::ExecutionId::new(), vec![]);
     /// let saga = Saga::new(&ctx);
     /// assert!(!saga.context().is_cancelled());
     /// ```
@@ -136,7 +136,7 @@ impl<'ctx> Saga<'ctx> {
     /// use autumn_harvest::context::WorkflowContext;
     /// use autumn_harvest::saga::Saga;
     ///
-    /// # let ctx = WorkflowContext::new_test();
+    /// # let ctx = WorkflowContext::for_replay(autumn_harvest::ExecutionId::new(), vec![]);
     /// let saga = Saga::new(&ctx);
     /// assert_eq!(saga.pending_compensation_count(), 0);
     /// ```
@@ -187,7 +187,7 @@ impl<'ctx> Saga<'ctx> {
     /// use autumn_harvest::error::HarvestError;
     ///
     /// # async fn doc_example() -> Result<(), HarvestError> {
-    /// # let ctx = WorkflowContext::new_test();
+    /// # let ctx = WorkflowContext::for_replay(autumn_harvest::ExecutionId::new(), vec![]);
     /// let mut saga = Saga::new(&ctx);
     ///
     /// saga.step(
@@ -253,7 +253,7 @@ impl<'ctx> Saga<'ctx> {
     /// use autumn_harvest::error::HarvestError;
     ///
     /// # async fn doc_example() -> Result<(), HarvestError> {
-    /// # let ctx = WorkflowContext::new_test();
+    /// # let ctx = WorkflowContext::for_replay(autumn_harvest::ExecutionId::new(), vec![]);
     /// let mut saga = Saga::new(&ctx);
     ///
     /// // simulate a failure or cancellation
