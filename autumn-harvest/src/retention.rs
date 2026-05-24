@@ -178,6 +178,9 @@ impl RetentionConfig {
         if self.batch_size == 0 {
             return Err("batch_size must be >= 1".to_string());
         }
+        if self.archival_timeout_secs == 0 {
+            return Err("archival_timeout_secs must be >= 1s".to_string());
+        }
         if let Some(max_age) = self.max_age()
             && !(MIN_MAX_AGE..=MAX_MAX_AGE).contains(&max_age)
         {
@@ -1003,6 +1006,13 @@ mod tests {
 
         config.max_age_secs = Some(3600); // valid
         assert!(config.validate().is_ok());
+
+        // Test archival_timeout_secs = 0 is invalid
+        let config = RetentionConfig {
+            archival_timeout_secs: 0,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
     }
 
     #[test]

@@ -361,28 +361,27 @@ async fn archival_hook_executes_successfully_and_preserves_on_failure() {
     runner.stop().await;
 }
 
+// A mock archiver that sleeps for 5 seconds to trigger the timeout
+struct SlowArchiver;
+impl HistoryArchiver for SlowArchiver {
+    fn archive(
+        &self,
+        _doc: &autumn_harvest::history_export::HistoryExportDocument,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send>>
+    {
+        Box::pin(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            Ok(())
+        })
+    }
+}
+
 #[tokio::test]
 async fn archival_hook_times_out_and_preserves_execution() {
     let _ = tracing_subscriber::fmt::try_init();
     let (database_url, _container) = setup_test_database_url().await;
     let pool = build_test_pool(&database_url);
     let api_state = HarvestApiState::new();
-
-    // A mock archiver that sleeps for 5 seconds to trigger the timeout
-    struct SlowArchiver;
-    impl HistoryArchiver for SlowArchiver {
-        fn archive(
-            &self,
-            _doc: &autumn_harvest::history_export::HistoryExportDocument,
-        ) -> Pin<
-            Box<dyn Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send>,
-        > {
-            Box::pin(async move {
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                Ok(())
-            })
-        }
-    }
 
     let runner = HarvestRunner::start(
         autumn_harvest::HarvestBuilder::new()
