@@ -3705,6 +3705,22 @@ async fn fail_workflow_for_history_cap(
 }
 
 #[allow(clippy::too_many_lines)]
+
+struct SuspensionContext<'a> {
+    registry: &'a HandlerRegistry,
+    task: &'a TaskQueueItem,
+    worker_id: &'a str,
+    started_at: std::time::Instant,
+    max_local_activity_start_to_close: std::time::Duration,
+    telemetry: &'a Arc<crate::telemetry::TelemetryConfig>,
+    execute_span: tracing::Span,
+}
+
+enum SuspensionAction {
+    Continue,
+    Break(WorkflowOutcome, Vec<WorkflowCommand>, tracing::Span),
+    ReturnOk,
+}
 async fn process_workflow_task(
     conn: &mut AsyncPgConnection,
     registry: &HandlerRegistry,
@@ -3873,349 +3889,35 @@ async fn process_workflow_task(
             )
             .await;
 
-        match run_outcome {
-            WorkflowOutcome::Suspended { commands }
-                if commands
-                    .iter()
-                    .any(|c| matches!(c, WorkflowCommand::RunLocalActivity { .. })) =>
-            {
-                // Apply any search-attribute patches before running the local
-                // activity so that attributes are visible even if the worker
-                // crashes during inline execution.
-                persist_search_attrs_from_commands(conn, prepared.exec_id, &commands).await?;
-                // Sync in-memory snapshot so a subsequent continue_as_new in the
-                // same task copies the patched attrs to the successor row.
-                prepared.execution.search_attrs = apply_search_attrs_patch_in_memory(
-                    prepared.execution.search_attrs.take(),
-                    &commands,
-                );
-                // Local-activity re-run: drop this iteration's execute span
-                // so the OTel span closes before we start inline execution.
-                drop(execute_span);
-                // If the batch also contains SignalExternalWorkflow commands,
-                // write their history events BEFORE the local-activity events.
-                // This preserves correct replay ordering: on the next run
-                // drain_early_signals stashes the signal events so
-                // match_external_signal sees them before LocalActivityScheduled.
-                let commands = if commands
-                    .iter()
-                    .any(|c| matches!(c, WorkflowCommand::SignalExternalWorkflow { .. }))
-                {
-                    let (signal_items, remaining) = split_mixed_signal_batch(commands);
-                    if !signal_items.is_empty() {
-                        let new_events = match persist_external_signal_inline(
-                            conn,
-                            prepared.exec_id,
-                            signal_items,
-                            &mut next_event_id,
-                        )
-                        .await
-                        {
-                            Ok(events) => events,
-                            Err(e) => {
-                                return fail_execution_on_error(
-                                    conn,
-                                    task,
-                                    worker_id,
-                                    Err::<(), _>(e),
-                                )
-                                .await;
-                            }
-                        };
-                        history_events.extend(new_events);
-                        let current_history_event_count =
-                            u64::try_from(history_events.len()).unwrap_or(u64::MAX);
-                        if let Some(cap) = registry.history_policy().event_hard_cap()
-                            && current_history_event_count >= cap
-                        {
-                            return fail_workflow_for_history_cap(
-                                conn,
-                                &telemetry,
-                                task,
-                                &prepared.execution,
-                                prepared.exec_id,
-                                next_event_id,
-                                worker_id,
-                                started_at,
-                                current_history_event_count,
-                                cap,
-                            )
-                            .await;
-                        }
-                    }
-                    remaining
-                } else {
-                    commands
-                };
-                let (markers, local_run) = extract_run_local_activity(commands);
-                let inline_outcome = run_local_activity_inline(
-                    conn,
-                    registry,
-                    prepared.exec_id,
-                    markers,
-                    local_run,
-                    max_local_activity_start_to_close,
-                    &mut next_event_id,
-                )
-                .await?;
-                let new_events = match inline_outcome {
-                    LocalActivityInlineOutcome::Complete(events) => events,
-                    LocalActivityInlineOutcome::HistoryCapReached {
-                        events,
-                        event_count,
-                    } => {
-                        history_events.extend(events);
-                        return fail_workflow_for_history_cap(
-                            conn,
-                            &telemetry,
-                            task,
-                            &prepared.execution,
-                            prepared.exec_id,
-                            next_event_id,
-                            worker_id,
-                            started_at,
-                            event_count,
-                            registry
-                                .history_policy()
-                                .event_hard_cap()
-                                .expect("HistoryCapReached requires a configured hard cap"),
-                        )
-                        .await;
-                    }
-                };
-                history_events.extend(new_events);
-                let current_history_event_count =
-                    u64::try_from(history_events.len()).unwrap_or(u64::MAX);
-                if let Some(cap) = registry.history_policy().event_hard_cap()
-                    && current_history_event_count >= cap
-                {
-                    return fail_workflow_for_history_cap(
-                        conn,
-                        &telemetry,
-                        task,
-                        &prepared.execution,
-                        prepared.exec_id,
-                        next_event_id,
-                        worker_id,
-                        started_at,
-                        current_history_event_count,
-                        cap,
-                    )
-                    .await;
-                }
-            }
-            WorkflowOutcome::Suspended { commands }
-                if commands
-                    .iter()
-                    .any(|c| matches!(c, WorkflowCommand::SignalExternalWorkflow { .. }))
-                    && commands.iter().all(|c| {
-                        matches!(
-                            c,
-                            WorkflowCommand::SignalExternalWorkflow { .. }
-                                | WorkflowCommand::RecordMarker { .. }
-                                | WorkflowCommand::RecordUpdateResult { .. }
-                                | WorkflowCommand::UpsertSearchAttributes { .. }
-                        )
-                    }) =>
-            {
-                // Only enters this path when every non-bookkeeping command in the
-                // batch is a SignalExternalWorkflow (or RecordMarker). Mixed batches
-                // that also contain ScheduleActivity / StartTimer / etc. fall through
-                // to the regular suspension path so those commands are not dropped.
-                //
-                // Persist bookkeeping commands (update-result events, search-attribute
-                // patches) first, just as the RunLocalActivity path does.
-                if let Err(e) = persist_update_result_commands(
-                    conn,
-                    prepared.exec_id,
-                    &commands,
-                    &mut next_event_id,
-                )
-                .await
-                {
-                    return fail_execution_on_error(conn, task, worker_id, Err::<(), _>(e)).await;
-                }
-                if let Err(e) =
-                    persist_search_attrs_from_commands(conn, prepared.exec_id, &commands).await
-                {
-                    return fail_execution_on_error(conn, task, worker_id, Err::<(), _>(e)).await;
-                }
-                prepared.execution.search_attrs = apply_search_attrs_patch_in_memory(
-                    prepared.execution.search_attrs.take(),
-                    &commands,
-                );
-                drop(execute_span);
-                let items = extract_signal_external_workflow(commands);
-                let items_clone = items.clone();
-                let new_events = match persist_external_signal_inline(
-                    conn,
-                    prepared.exec_id,
-                    items,
-                    &mut next_event_id,
-                )
-                .await
-                {
-                    Ok(events) => events,
-                    Err(e) => {
-                        return fail_execution_on_error(conn, task, worker_id, Err::<(), _>(e))
-                            .await;
-                    }
-                };
-                history_events.extend(new_events.clone());
-                let current_history_event_count =
-                    u64::try_from(history_events.len()).unwrap_or(u64::MAX);
-                if let Some(cap) = registry.history_policy().event_hard_cap()
-                    && current_history_event_count >= cap
-                {
-                    return fail_workflow_for_history_cap(
-                        conn,
-                        &telemetry,
-                        task,
-                        &prepared.execution,
-                        prepared.exec_id,
-                        next_event_id,
-                        worker_id,
-                        started_at,
-                        current_history_event_count,
-                        cap,
-                    )
-                    .await;
-                }
+        let ctx = SuspensionContext {
+            registry,
+            task,
+            worker_id,
+            started_at,
+            max_local_activity_start_to_close,
+            telemetry: &telemetry,
+            execute_span: execute_span.clone(),
+        };
 
-                // If any signal in the batch was not resolved inline (remains pending/suspended),
-                // we must break the loop and suspend the workflow task.
-                let mut all_resolved = true;
-                for item in &items_clone {
-                    if let SignalBatchItem::Signal(run) = item {
-                        let resolved = new_events.iter().any(|e| match e {
-                            WorkflowEvent::ExternalSignalDelivered { signal_id }
-                            | WorkflowEvent::ExternalSignalFailed { signal_id, .. } => {
-                                *signal_id == run.signal_id
-                            }
-                            _ => false,
-                        });
-                        if !resolved {
-                            all_resolved = false;
-                            break;
-                        }
-                    }
-                }
-
-                if !all_resolved {
-                    let mut reconstructed_commands = Vec::with_capacity(items_clone.len());
-                    for item in items_clone {
-                        match item {
-                            SignalBatchItem::Marker(_) => {
-                                // Already persisted via persist_external_signal_inline.
-                                // Do not reconstruct or re-append to avoid duplicate marker events in history.
-                            }
-                            SignalBatchItem::Signal(run) => {
-                                let (dummy_tx, _) = tokio::sync::oneshot::channel();
-                                reconstructed_commands.push(
-                                    WorkflowCommand::SignalExternalWorkflow {
-                                        signal_id: run.signal_id,
-                                        target: run.target,
-                                        signal_name: run.signal_name,
-                                        payload: run.payload,
-                                        result_tx: dummy_tx,
-                                        already_requested: run.already_requested,
-                                    },
-                                );
-                            }
-                        }
-                    }
-
-                    // Re-acquire a fresh execute_span so persist_workflow_outcome
-                    // (via handle_suspended_workflow) gets a valid span reference.
-                    let execute_span = tracing::Span::none();
-                    break (
-                        WorkflowOutcome::Suspended {
-                            commands: reconstructed_commands,
-                        },
-                        pending_cmds,
-                        execute_span,
-                    );
-                }
-            }
-            // Mixed batch: contains SignalExternalWorkflow AND other durable commands
-            // (ScheduleActivity, StartTimer, etc.). The "all signals" guard above did
-            // not match because not all commands are signals/markers. Write signal events
-            // to history FIRST (so drain_early_signals stashes them on the next replay
-            // pass), then break with the remaining commands for handle_suspended_workflow.
-            WorkflowOutcome::Suspended { commands }
-                if commands
-                    .iter()
-                    .any(|c| matches!(c, WorkflowCommand::SignalExternalWorkflow { .. })) =>
-            {
-                if let Err(e) = persist_update_result_commands(
-                    conn,
-                    prepared.exec_id,
-                    &commands,
-                    &mut next_event_id,
-                )
-                .await
-                {
-                    return fail_execution_on_error(conn, task, worker_id, Err::<(), _>(e)).await;
-                }
-                if let Err(e) =
-                    persist_search_attrs_from_commands(conn, prepared.exec_id, &commands).await
-                {
-                    return fail_execution_on_error(conn, task, worker_id, Err::<(), _>(e)).await;
-                }
-                prepared.execution.search_attrs = apply_search_attrs_patch_in_memory(
-                    prepared.execution.search_attrs.take(),
-                    &commands,
-                );
+        match handle_workflow_suspension_commands(
+            conn,
+            &ctx,
+            &mut prepared.execution,
+            prepared.exec_id,
+            &mut history_events,
+            &mut next_event_id,
+            run_outcome,
+            pending_cmds,
+        )
+        .await
+        {
+            Ok(SuspensionAction::Break(outcome, cmds, span)) => break (outcome, cmds, span),
+            Ok(SuspensionAction::Continue) => {
                 drop(execute_span);
-                let (signal_items, remaining_commands) = split_mixed_signal_batch(commands);
-                let new_events = match persist_external_signal_inline(
-                    conn,
-                    prepared.exec_id,
-                    signal_items,
-                    &mut next_event_id,
-                )
-                .await
-                {
-                    Ok(events) => events,
-                    Err(e) => {
-                        return fail_execution_on_error(conn, task, worker_id, Err::<(), _>(e))
-                            .await;
-                    }
-                };
-                let remaining_commands_with_unresolved = remaining_commands;
-                history_events.extend(new_events);
-                let current_history_event_count =
-                    u64::try_from(history_events.len()).unwrap_or(u64::MAX);
-                if let Some(cap) = registry.history_policy().event_hard_cap()
-                    && current_history_event_count >= cap
-                {
-                    return fail_workflow_for_history_cap(
-                        conn,
-                        &telemetry,
-                        task,
-                        &prepared.execution,
-                        prepared.exec_id,
-                        next_event_id,
-                        worker_id,
-                        started_at,
-                        current_history_event_count,
-                        cap,
-                    )
-                    .await;
-                }
-                // Re-acquire a fresh execute_span so persist_workflow_outcome
-                // (via handle_suspended_workflow) gets a valid span reference.
-                // The original span was dropped above.
-                let execute_span = tracing::Span::none();
-                break (
-                    WorkflowOutcome::Suspended {
-                        commands: remaining_commands_with_unresolved,
-                    },
-                    pending_cmds,
-                    execute_span,
-                );
+                continue;
             }
-            other => break (other, pending_cmds, execute_span),
+            Ok(SuspensionAction::ReturnOk) => return Ok(()),
+            Err(e) => return Err(e),
         }
     };
 
@@ -5582,5 +5284,328 @@ mod tests {
                 .to_string()
                 .contains("exceeds chrono::Duration bounds")
         );
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+async fn handle_workflow_suspension_commands(
+    conn: &mut AsyncPgConnection,
+    ctx: &SuspensionContext<'_>,
+    execution: &mut WorkflowExecution,
+    exec_id: ExecutionId,
+    history_events: &mut Vec<WorkflowEvent>,
+    next_event_id: &mut i32,
+    run_outcome: WorkflowOutcome,
+    pending_cmds: Vec<WorkflowCommand>,
+) -> HarvestResult<SuspensionAction> {
+    match run_outcome {
+        WorkflowOutcome::Suspended { commands }
+            if commands
+                .iter()
+                .any(|c| matches!(c, WorkflowCommand::RunLocalActivity { .. })) =>
+        {
+            persist_search_attrs_from_commands(conn, exec_id, &commands).await?;
+            execution.search_attrs = apply_search_attrs_patch_in_memory(
+                execution.search_attrs.take(),
+                &commands,
+            );
+            drop(ctx.execute_span.clone());
+            let commands = if commands
+                .iter()
+                .any(|c| matches!(c, WorkflowCommand::SignalExternalWorkflow { .. }))
+            {
+                let (signal_items, remaining) = split_mixed_signal_batch(commands);
+                if !signal_items.is_empty() {
+                    let new_events = match persist_external_signal_inline(
+                        conn,
+                        exec_id,
+                        signal_items,
+                        next_event_id,
+                    )
+                    .await
+                    {
+                        Ok(events) => events,
+                        Err(e) => {
+                            fail_execution_on_error(conn, ctx.task, ctx.worker_id, Err::<(), _>(e)).await?;
+                            return Ok(SuspensionAction::ReturnOk);
+                        }
+                    };
+                    history_events.extend(new_events);
+                    let current_history_event_count =
+                        u64::try_from(history_events.len()).unwrap_or(u64::MAX);
+                    if let Some(cap) = ctx.registry.history_policy().event_hard_cap()
+                        && current_history_event_count >= cap
+                    {
+                        fail_workflow_for_history_cap(
+                            conn,
+                            ctx.telemetry,
+                            ctx.task,
+                            execution,
+                            exec_id,
+                            *next_event_id,
+                            ctx.worker_id,
+                            ctx.started_at,
+                            current_history_event_count,
+                            cap,
+                        )
+                        .await?;
+                        return Ok(SuspensionAction::ReturnOk);
+                    }
+                }
+                remaining
+            } else {
+                commands
+            };
+            let (markers, local_run) = extract_run_local_activity(commands);
+            let inline_outcome = run_local_activity_inline(
+                conn,
+                ctx.registry,
+                exec_id,
+                markers,
+                local_run,
+                ctx.max_local_activity_start_to_close,
+                next_event_id,
+            )
+            .await?;
+            let new_events = match inline_outcome {
+                LocalActivityInlineOutcome::Complete(events) => events,
+                LocalActivityInlineOutcome::HistoryCapReached {
+                    events,
+                    event_count,
+                } => {
+                    history_events.extend(events);
+                    fail_workflow_for_history_cap(
+                        conn,
+                        ctx.telemetry,
+                        ctx.task,
+                        execution,
+                        exec_id,
+                        *next_event_id,
+                        ctx.worker_id,
+                        ctx.started_at,
+                        event_count,
+                        ctx.registry
+                            .history_policy()
+                            .event_hard_cap()
+                            .expect("HistoryCapReached requires a configured hard cap"),
+                    )
+                    .await?;
+                    return Ok(SuspensionAction::ReturnOk);
+                }
+            };
+            history_events.extend(new_events);
+            let current_history_event_count =
+                u64::try_from(history_events.len()).unwrap_or(u64::MAX);
+            if let Some(cap) = ctx.registry.history_policy().event_hard_cap()
+                && current_history_event_count >= cap
+            {
+                fail_workflow_for_history_cap(
+                    conn,
+                    ctx.telemetry,
+                    ctx.task,
+                    execution,
+                    exec_id,
+                    *next_event_id,
+                    ctx.worker_id,
+                    ctx.started_at,
+                    current_history_event_count,
+                    cap,
+                )
+                .await?;
+                return Ok(SuspensionAction::ReturnOk);
+            }
+            Ok(SuspensionAction::Continue)
+        }
+        WorkflowOutcome::Suspended { commands }
+            if commands
+                .iter()
+                .any(|c| matches!(c, WorkflowCommand::SignalExternalWorkflow { .. }))
+                && commands.iter().all(|c| {
+                    matches!(
+                        c,
+                        WorkflowCommand::SignalExternalWorkflow { .. }
+                            | WorkflowCommand::RecordMarker { .. }
+                            | WorkflowCommand::RecordUpdateResult { .. }
+                            | WorkflowCommand::UpsertSearchAttributes { .. }
+                    )
+                }) =>
+        {
+            if let Err(e) = persist_update_result_commands(
+                conn,
+                exec_id,
+                &commands,
+                next_event_id,
+            )
+            .await
+            {
+                fail_execution_on_error(conn, ctx.task, ctx.worker_id, Err::<(), _>(e)).await?;
+                return Ok(SuspensionAction::ReturnOk);
+            }
+            if let Err(e) =
+                persist_search_attrs_from_commands(conn, exec_id, &commands).await
+            {
+                fail_execution_on_error(conn, ctx.task, ctx.worker_id, Err::<(), _>(e)).await?;
+                return Ok(SuspensionAction::ReturnOk);
+            }
+            execution.search_attrs = apply_search_attrs_patch_in_memory(
+                execution.search_attrs.take(),
+                &commands,
+            );
+            drop(ctx.execute_span.clone());
+            let items = extract_signal_external_workflow(commands);
+            let items_clone = items.clone();
+            let new_events = match persist_external_signal_inline(
+                conn,
+                exec_id,
+                items,
+                next_event_id,
+            )
+            .await
+            {
+                Ok(events) => events,
+                Err(e) => {
+                    fail_execution_on_error(conn, ctx.task, ctx.worker_id, Err::<(), _>(e)).await?;
+                    return Ok(SuspensionAction::ReturnOk);
+                }
+            };
+            history_events.extend(new_events.clone());
+            let current_history_event_count =
+                u64::try_from(history_events.len()).unwrap_or(u64::MAX);
+            if let Some(cap) = ctx.registry.history_policy().event_hard_cap()
+                && current_history_event_count >= cap
+            {
+                fail_workflow_for_history_cap(
+                    conn,
+                    ctx.telemetry,
+                    ctx.task,
+                    execution,
+                    exec_id,
+                    *next_event_id,
+                    ctx.worker_id,
+                    ctx.started_at,
+                    current_history_event_count,
+                    cap,
+                )
+                .await?;
+                return Ok(SuspensionAction::ReturnOk);
+            }
+
+            let mut all_resolved = true;
+            for item in &items_clone {
+                if let SignalBatchItem::Signal(run) = item {
+                    let resolved = new_events.iter().any(|e| match e {
+                        WorkflowEvent::ExternalSignalDelivered { signal_id }
+                        | WorkflowEvent::ExternalSignalFailed { signal_id, .. } => {
+                            *signal_id == run.signal_id
+                        }
+                        _ => false,
+                    });
+                    if !resolved {
+                        all_resolved = false;
+                        break;
+                    }
+                }
+            }
+
+            if all_resolved {
+                Ok(SuspensionAction::Continue)
+            } else {
+                let mut reconstructed_commands = Vec::with_capacity(items_clone.len());
+                for item in items_clone {
+                    match item {
+                        SignalBatchItem::Marker(_) => {}
+                        SignalBatchItem::Signal(run) => {
+                            let (dummy_tx, _) = tokio::sync::oneshot::channel();
+                            reconstructed_commands.push(WorkflowCommand::SignalExternalWorkflow {
+                                signal_id: run.signal_id,
+                                target: run.target.clone(),
+                                signal_name: run.signal_name.clone(),
+                                payload: run.payload.clone(),
+                                result_tx: dummy_tx,
+                                already_requested: run.already_requested,
+                            });
+                        }
+                    }
+                }
+                let execute_span = tracing::Span::none();
+                Ok(SuspensionAction::Break(
+                    WorkflowOutcome::Suspended {
+                        commands: reconstructed_commands,
+                    },
+                    pending_cmds,
+                    execute_span,
+                ))
+            }
+        }
+        WorkflowOutcome::Suspended { commands }
+            if commands
+                .iter()
+                .any(|c| matches!(c, WorkflowCommand::SignalExternalWorkflow { .. })) =>
+        {
+            if let Err(e) =
+                persist_update_result_commands(conn, exec_id, &commands, next_event_id)
+                    .await
+            {
+                fail_execution_on_error(conn, ctx.task, ctx.worker_id, Err::<(), _>(e)).await?;
+                return Ok(SuspensionAction::ReturnOk);
+            }
+            if let Err(e) =
+                persist_search_attrs_from_commands(conn, exec_id, &commands).await
+            {
+                fail_execution_on_error(conn, ctx.task, ctx.worker_id, Err::<(), _>(e)).await?;
+                return Ok(SuspensionAction::ReturnOk);
+            }
+            execution.search_attrs = apply_search_attrs_patch_in_memory(
+                execution.search_attrs.take(),
+                &commands,
+            );
+            drop(ctx.execute_span.clone());
+            let (signal_items, remaining_commands) = split_mixed_signal_batch(commands);
+            let new_events = match persist_external_signal_inline(
+                conn,
+                exec_id,
+                signal_items,
+                next_event_id,
+            )
+            .await
+            {
+                Ok(events) => events,
+                Err(e) => {
+                    fail_execution_on_error(conn, ctx.task, ctx.worker_id, Err::<(), _>(e)).await?;
+                    return Ok(SuspensionAction::ReturnOk);
+                }
+            };
+            let remaining_commands_with_unresolved = remaining_commands;
+            history_events.extend(new_events);
+            let current_history_event_count =
+                u64::try_from(history_events.len()).unwrap_or(u64::MAX);
+            if let Some(cap) = ctx.registry.history_policy().event_hard_cap()
+                && current_history_event_count >= cap
+            {
+                fail_workflow_for_history_cap(
+                    conn,
+                    ctx.telemetry,
+                    ctx.task,
+                    execution,
+                    exec_id,
+                    *next_event_id,
+                    ctx.worker_id,
+                    ctx.started_at,
+                    current_history_event_count,
+                    cap,
+                )
+                .await?;
+                return Ok(SuspensionAction::ReturnOk);
+            }
+            let execute_span = tracing::Span::none();
+            Ok(SuspensionAction::Break(
+                WorkflowOutcome::Suspended {
+                    commands: remaining_commands_with_unresolved,
+                },
+                pending_cmds,
+                execute_span,
+            ))
+        }
+        other => Ok(SuspensionAction::Break(other, pending_cmds, ctx.execute_span.clone())),
     }
 }
