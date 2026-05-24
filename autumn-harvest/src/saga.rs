@@ -93,6 +93,16 @@ pub struct Saga<'ctx> {
 
 impl<'ctx> Saga<'ctx> {
     /// Create a saga builder tied to the current workflow context.
+    ///
+    /// ## Examples
+    ///
+    /// ```rust
+    /// use autumn_harvest::context::WorkflowContext;
+    /// use autumn_harvest::saga::Saga;
+    ///
+    /// # let ctx = WorkflowContext::new_test();
+    /// let saga = Saga::new(&ctx);
+    /// ```
     #[must_use]
     pub const fn new(ctx: &'ctx WorkflowContext) -> Self {
         Self {
@@ -102,12 +112,34 @@ impl<'ctx> Saga<'ctx> {
     }
 
     /// Return the workflow context this saga is associated with.
+    ///
+    /// ## Examples
+    ///
+    /// ```rust
+    /// use autumn_harvest::context::WorkflowContext;
+    /// use autumn_harvest::saga::Saga;
+    ///
+    /// # let ctx = WorkflowContext::new_test();
+    /// let saga = Saga::new(&ctx);
+    /// assert!(!saga.context().is_cancelled());
+    /// ```
     #[must_use]
     pub const fn context(&self) -> &'ctx WorkflowContext {
         self.ctx
     }
 
     /// Return the number of successful steps that can still be compensated.
+    ///
+    /// ## Examples
+    ///
+    /// ```rust
+    /// use autumn_harvest::context::WorkflowContext;
+    /// use autumn_harvest::saga::Saga;
+    ///
+    /// # let ctx = WorkflowContext::new_test();
+    /// let saga = Saga::new(&ctx);
+    /// assert_eq!(saga.pending_compensation_count(), 0);
+    /// ```
     #[must_use]
     pub fn pending_compensation_count(&self) -> usize {
         self.compensations.len()
@@ -146,6 +178,26 @@ impl<'ctx> Saga<'ctx> {
     ///
     /// `T` must be [`Clone`] because the forward result is both returned to the
     /// workflow and retained for the compensation callback.
+    ///
+    /// ## Examples
+    ///
+    /// ```rust
+    /// use autumn_harvest::context::WorkflowContext;
+    /// use autumn_harvest::saga::Saga;
+    /// use autumn_harvest::error::HarvestError;
+    ///
+    /// # async fn doc_example() -> Result<(), HarvestError> {
+    /// # let ctx = WorkflowContext::new_test();
+    /// let mut saga = Saga::new(&ctx);
+    ///
+    /// saga.step(
+    ///     || async { Ok::<_, HarvestError>("success") },
+    ///     |_| async { Ok::<_, HarvestError>(()) },
+    /// ).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[doc(alias = "add_step")]
     pub async fn step<T, C, Step, StepFuture, Compensate, CompensationFuture>(
         &mut self,
         step: Step,
@@ -192,6 +244,24 @@ impl<'ctx> Saga<'ctx> {
     ///
     /// Returns [`HarvestError::SagaCompensationFailed`] if any compensation
     /// fails. All pending compensations are still attempted before returning.
+    ///
+    /// ## Examples
+    ///
+    /// ```rust
+    /// use autumn_harvest::context::WorkflowContext;
+    /// use autumn_harvest::saga::Saga;
+    /// use autumn_harvest::error::HarvestError;
+    ///
+    /// # async fn doc_example() -> Result<(), HarvestError> {
+    /// # let ctx = WorkflowContext::new_test();
+    /// let mut saga = Saga::new(&ctx);
+    ///
+    /// // simulate a failure or cancellation
+    /// saga.compensate_all().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[doc(alias = "compensate")]
     pub async fn compensate_all(&mut self) -> HarvestResult<()> {
         match self.run_compensations().await {
             Ok(()) => Ok(()),
