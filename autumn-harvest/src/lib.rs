@@ -36,6 +36,8 @@ pub mod critical_path;
 pub mod dag;
 /// Export format types for Directed Acyclic Graphs (DAGs) representing workflows.
 pub mod dag_export;
+#[cfg(feature = "testing")]
+pub mod dag_gantt;
 pub mod dag_linter;
 #[cfg(feature = "testing")]
 pub mod dag_profiler;
