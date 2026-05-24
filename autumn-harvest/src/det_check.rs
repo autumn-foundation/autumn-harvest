@@ -377,7 +377,11 @@ fn extract_workflow_bodies<'a>(lines: &[&'a str]) -> Vec<(String, Vec<(u32, &'a 
 
             if let Some(pos) = scan_braces_outside_literals(line, &mut depth) {
                 // Include any code on the closing-brace line that precedes the `}`
-                let before = &line[..pos];
+                let mut valid_pos = pos;
+                while valid_pos > 0 && !line.is_char_boundary(valid_pos) {
+                    valid_pos -= 1;
+                }
+                let before = &line[..valid_pos];
                 if !before.trim().is_empty() {
                     body.push((line_num, before));
                 }
@@ -468,7 +472,13 @@ fn check_body(wf_name: &str, body_lines: &[(u32, &str)], file: &str) -> DetCheck
 /// Returns the portion of `line` that precedes the first `//` (if any).
 /// This avoids flagging patterns that appear only inside comments.
 fn strip_line_comment(line: &str) -> &str {
-    line_comment_start(line).map_or(line, |pos| &line[..pos])
+    line_comment_start(line).map_or(line, |pos| {
+        let mut valid_pos = pos;
+        while valid_pos > 0 && !line.is_char_boundary(valid_pos) {
+            valid_pos -= 1;
+        }
+        &line[..valid_pos]
+    })
 }
 
 /// Returns the byte position immediately after the closing `*/` of a block
@@ -591,11 +601,14 @@ fn normal_string_end(line: &str, start: usize) -> usize {
 
 fn char_literal_end(line: &str, start: usize) -> Option<usize> {
     let content_start = start + 1;
+    if !line.is_char_boundary(content_start) {
+        return None;
+    }
     let (first, first_end) = next_char(line, content_start)?;
 
     if is_lifetime_start(first) {
         let ident_end = consume_lifetime_ident(line, first_end);
-        if !line[ident_end..].starts_with('\'') {
+        if line.is_char_boundary(ident_end) && !line[ident_end..].starts_with('\'') {
             return None;
         }
     }
@@ -721,8 +734,13 @@ fn strip_unparseable_content(line: &str) -> String {
 /// (no code before `//`). A trailing inline comment on `prev_line` is
 /// scoped to that line only and must not suppress violations on the next line.
 fn find_suppression(rule_id: &str, line: &str, prev_line: &str) -> Option<String> {
-    let prev_is_standalone =
-        line_comment_start(prev_line).is_some_and(|pos| prev_line[..pos].trim().is_empty());
+    let prev_is_standalone = line_comment_start(prev_line).is_some_and(|pos| {
+        let mut valid_pos = pos;
+        while valid_pos > 0 && !prev_line.is_char_boundary(valid_pos) {
+            valid_pos -= 1;
+        }
+        prev_line[..valid_pos].trim().is_empty()
+    });
     if prev_is_standalone {
         parse_suppression_comment(rule_id, prev_line)
     } else {
