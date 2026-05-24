@@ -3629,6 +3629,7 @@ async fn new_child_workflow_event_count(
 
 async fn suspended_command_event_count(
     conn: &mut AsyncPgConnection,
+    workflow_exec_id: Option<uuid::Uuid>,
     commands: &[WorkflowCommand],
 ) -> HarvestResult<u64> {
     let update_events = pending_update_result_event_count(commands);
@@ -3646,8 +3647,21 @@ async fn suspended_command_event_count(
     if extract_all_activity_waits(commands).is_some() {
         return Ok(bookkeeping_events);
     }
-    if extract_started_timer_for_suspension(commands).is_some() {
-        return Ok(bookkeeping_events.saturating_add(1));
+    if let Some(timer) = extract_started_timer_for_suspension(commands) {
+        let is_new = if let Some(exec_uuid) = workflow_exec_id {
+            let existing: Option<HarvestTimer> = harvest_timers::table
+                .filter(harvest_timers::workflow_exec_id.eq(exec_uuid))
+                .filter(harvest_timers::timer_id.eq(timer.timer_id.as_str()))
+                .first::<HarvestTimer>(conn)
+                .await
+                .optional()
+                .map_err(crate::error::database_error)?;
+            existing.is_none()
+        } else {
+            true
+        };
+        let timer_event = u64::from(is_new);
+        return Ok(bookkeeping_events.saturating_add(timer_event));
     }
     if let Some(children) = extract_all_started_child_workflows(commands) {
         return Ok(bookkeeping_events
@@ -4273,7 +4287,7 @@ async fn process_workflow_task(
     let (outcome, pending_cmds, execute_span) = loop_result;
     let pending_durable_event_count = match &outcome {
         WorkflowOutcome::Suspended { commands } => {
-            match suspended_command_event_count(conn, commands).await {
+            match suspended_command_event_count(conn, task.workflow_exec_id, commands).await {
                 Ok(count) => count,
                 Err(error) => {
                     return fail_execution_on_error(conn, task, worker_id, Err::<(), _>(error))

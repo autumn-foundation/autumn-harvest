@@ -105,7 +105,8 @@ pub async fn collect_approvals(
         }
     }
 
-    let final_approvers: Vec<String> = approvers.lock().unwrap().iter().cloned().collect();
+    let mut final_approvers: Vec<String> = approvers.lock().unwrap().iter().cloned().collect();
+    final_approvers.sort();
 
     if met {
         println!("[Workflow] Approval quorum SUCCESS: {:?}", final_approvers);

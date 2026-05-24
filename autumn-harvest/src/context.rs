@@ -2973,19 +2973,20 @@ where
 
         if cond_met {
             // Consuming any pending timer started event in history so replay matches correctly.
-            if this.context.is_timer_started_next(&this.timer_id) {
-                if let std::task::Poll::Ready(Err(err)) = this.timer_fut.as_mut().poll(cx) {
-                    return std::task::Poll::Ready(Err(err));
-                }
-                if let Ok(mut cmds) = this.context.commands.lock() {
-                    cmds.retain(|cmd| {
-                        if let WorkflowCommand::StartTimer { timer_id: id, .. } = cmd {
-                            id.as_str() != this.timer_id
-                        } else {
-                            true
-                        }
-                    });
-                }
+            if this.context.is_timer_started_next(&this.timer_id)
+                && let std::task::Poll::Ready(Err(err)) = this.timer_fut.as_mut().poll(cx)
+            {
+                return std::task::Poll::Ready(Err(err));
+            }
+            // Unconditionally clean up any stale StartTimer command pushed to commands queue.
+            if let Ok(mut cmds) = this.context.commands.lock() {
+                cmds.retain(|cmd| {
+                    if let WorkflowCommand::StartTimer { timer_id: id, .. } = cmd {
+                        id.as_str() != this.timer_id
+                    } else {
+                        true
+                    }
+                });
             }
             return std::task::Poll::Ready(Ok(true));
         }
