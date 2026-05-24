@@ -211,7 +211,7 @@ pub use reset::{
     WorkflowResetError, WorkflowResetRequest, preview_workflow_reset, reset_workflow_execution,
     validate_reset_point,
 };
-pub use retention::{HistoryArchiver, RetentionConfig};
+pub use retention::{ArchiverFuture, HistoryArchiver, RetentionConfig};
 #[cfg(feature = "db")]
 pub use retention::{RetentionMonitor, RetentionRuntime, RetentionStatus, RetentionTickResult};
 pub use saga::Saga;

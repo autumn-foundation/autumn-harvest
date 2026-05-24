@@ -1,5 +1,3 @@
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -103,8 +101,7 @@ impl HistoryArchiver for TestArchiver {
     fn archive(
         &self,
         doc: &autumn_harvest::history_export::HistoryExportDocument,
-    ) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send>>
-    {
+    ) -> autumn_harvest::ArchiverFuture<'_> {
         let calls = self.calls.clone();
         let should_fail = std::sync::atomic::AtomicBool::load(
             &self.should_fail,
@@ -367,8 +364,7 @@ impl HistoryArchiver for SlowArchiver {
     fn archive(
         &self,
         _doc: &autumn_harvest::history_export::HistoryExportDocument,
-    ) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send>>
-    {
+    ) -> autumn_harvest::ArchiverFuture<'_> {
         Box::pin(async move {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             Ok(())
