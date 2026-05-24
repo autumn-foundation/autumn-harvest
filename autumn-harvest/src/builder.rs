@@ -61,6 +61,7 @@ pub struct HarvestBuilder {
     state: SharedStateMap,
     telemetry: Option<TelemetryConfig>,
     retention: RetentionConfig,
+    history_archiver: Option<Arc<dyn crate::retention::HistoryArchiver>>,
     payload_codecs: PayloadCodecs,
     history_policy: WorkflowHistoryPolicy,
     /// Server-side ceiling on `execution_timeout` (issue #243).
@@ -102,6 +103,7 @@ impl Default for HarvestBuilder {
             state: std::collections::HashMap::new(),
             telemetry: None,
             retention: crate::retention::RetentionConfig::default(),
+            history_archiver: None,
             payload_codecs: crate::payload_codec::PayloadCodecs::default(),
             history_policy: crate::context::WorkflowHistoryPolicy::default(),
             max_workflow_execution_timeout: None,
@@ -147,7 +149,7 @@ impl std::fmt::Debug for HarvestBuilder {
                 "unknown_target_grace_window",
                 &self.unknown_target_grace_window,
             )
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -165,6 +167,7 @@ pub struct BuiltHarvest {
     state: SharedStateMap,
     telemetry: Arc<TelemetryConfig>,
     retention: RetentionConfig,
+    history_archiver: Option<Arc<dyn crate::retention::HistoryArchiver>>,
     payload_codecs: PayloadCodecs,
     history_policy: WorkflowHistoryPolicy,
     /// Server-side ceiling on `execution_timeout` (issue #243). `None` = no ceiling.
@@ -216,7 +219,7 @@ impl std::fmt::Debug for BuiltHarvest {
                 "unknown_target_grace_window",
                 &self.unknown_target_grace_window,
             )
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -523,6 +526,12 @@ impl BuiltHarvest {
         &self.retention
     }
 
+    /// Get the registered pre-retention history archiver hook.
+    #[must_use]
+    pub fn history_archiver(&self) -> Option<&Arc<dyn crate::retention::HistoryArchiver>> {
+        self.history_archiver.as_ref()
+    }
+
     /// Override the audit log retention window after the build step.
     ///
     /// Use this to apply a runtime-configured value (e.g. from `HarvestApiState`)
@@ -766,6 +775,13 @@ impl HarvestBuilder {
         self
     }
 
+    /// Register a pre-retention history archiver hook.
+    #[must_use]
+    pub fn history_archiver(mut self, archiver: impl crate::retention::HistoryArchiver) -> Self {
+        self.history_archiver = Some(Arc::new(archiver));
+        self
+    }
+
     /// Override the soft history-size threshold used by
     /// [`crate::context::WorkflowContext::should_continue_as_new`].
     #[must_use]
@@ -969,6 +985,7 @@ impl HarvestBuilder {
             state: self.state,
             telemetry: Arc::new(self.telemetry.unwrap_or_default()),
             retention: self.retention,
+            history_archiver: self.history_archiver,
             payload_codecs: self.payload_codecs.clone(),
             history_policy: self.history_policy,
             max_workflow_execution_timeout: self.max_workflow_execution_timeout,

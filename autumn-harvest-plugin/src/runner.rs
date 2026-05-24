@@ -83,6 +83,7 @@ struct PreparedHarvestRuntime {
     storage_pool: HarvestDbPool,
     shard_router: ShardRouter,
     retention_config: RetentionConfig,
+    history_archiver: Option<Arc<dyn autumn_harvest::HistoryArchiver>>,
 }
 
 impl PreparedHarvestRuntime {
@@ -92,6 +93,7 @@ impl PreparedHarvestRuntime {
     ) -> autumn_web::AutumnResult<Self> {
         let shard_router = resources.shard_router.clone().unwrap_or_default();
         let retention_config = built.retention().clone();
+        let history_archiver = built.history_archiver().cloned();
         let classic_dag_names = built
             .dags()
             .iter()
@@ -133,6 +135,7 @@ impl PreparedHarvestRuntime {
             storage_pool: HarvestDbPool::from(resources.harvest_pool),
             shard_router,
             retention_config,
+            history_archiver,
         })
     }
 }
@@ -265,6 +268,7 @@ impl HarvestRunner {
                 prepared.storage_pool.sharded_pool().clone(),
                 prepared.retention_config.clone(),
                 Arc::clone(&registry.telemetry().metrics),
+                prepared.history_archiver,
             )
         } else {
             tracing::info!(
