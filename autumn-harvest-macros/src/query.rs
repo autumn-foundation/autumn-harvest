@@ -108,8 +108,14 @@ pub fn query_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let dispatch = build_query_dispatch(fn_name, &param_names);
 
-    let parts: Vec<&str> = workflow_name.split("::").collect();
-    let workflow_simple_name = parts.last().unwrap_or(&"").to_string();
+    let parsed_path = match crate::parse_and_validate_workflow_path(
+        &workflow_name,
+        proc_macro2::Span::call_site(),
+    ) {
+        Ok(p) => p,
+        Err(e) => return e.to_compile_error(),
+    };
+    let workflow_simple_name = parsed_path.workflow_simple_name;
     let camel_wf = to_pascal_case(&workflow_simple_name);
     let stub_ident = format_ident!("{camel_wf}Stub");
     let method_name = format_ident!("query_{fn_name}");
@@ -125,38 +131,14 @@ pub fn query_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     let mod_name = format_ident!("__autumn_query_impl_{fn_name}");
-    let impl_block = if parts.len() > 1 {
-        let module_parts = &parts[..parts.len() - 1];
-        let path_tokens: Vec<proc_macro2::TokenStream> = module_parts
-            .iter()
-            .map(|p| {
-                let id = format_ident!("{}", p);
-                quote! { #id }
-            })
-            .collect();
-        quote! {
-            ::autumn_harvest::cfg_db! {
-                mod #mod_name {
-                    use super::*;
-                    use #(#path_tokens::)*#stub_ident;
-                    impl #stub_ident {
-                        /// Execute this typed query in-process.
-                        pub async fn #method_name(
-                            handle: &::autumn_harvest::WorkflowHandle,
-                            #(#params),*
-                        ) -> ::autumn_harvest::HarvestResult<#ok_type> {
-                            let args = #serialize_payload;
-                            let info = #stub_ident::info();
-                            let q_info = #companion_name();
-                            let raw = handle.execute_query_in_process(&info, &q_info, #fn_name_str, args).await?;
-                            ::autumn_harvest::serde_json::from_value(raw)
-                                .map_err(::autumn_harvest::error::HarvestError::Serialization)
-                        }
-                    }
-                }
-            }
-        }
+    let path_tokens = parsed_path.path_tokens;
+    let is_absolute = parsed_path.is_absolute;
+    let leading_colon = if is_absolute {
+        quote! { :: }
     } else {
+        quote! {}
+    };
+    let impl_block = if path_tokens.is_empty() {
         quote! {
             ::autumn_harvest::cfg_db! {
                 impl #stub_ident {
@@ -171,6 +153,29 @@ pub fn query_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         let raw = handle.execute_query_in_process(&info, &q_info, #fn_name_str, args).await?;
                         ::autumn_harvest::serde_json::from_value(raw)
                             .map_err(::autumn_harvest::error::HarvestError::Serialization)
+                    }
+                }
+            }
+        }
+    } else {
+        quote! {
+            ::autumn_harvest::cfg_db! {
+                mod #mod_name {
+                    use super::*;
+                    use #leading_colon #(#path_tokens::)*#stub_ident;
+                    impl #stub_ident {
+                        /// Execute this typed query in-process.
+                        pub async fn #method_name(
+                            handle: &::autumn_harvest::WorkflowHandle,
+                            #(#params),*
+                        ) -> ::autumn_harvest::HarvestResult<#ok_type> {
+                            let args = #serialize_payload;
+                            let info = #stub_ident::info();
+                            let q_info = #companion_name();
+                            let raw = handle.execute_query_in_process(&info, &q_info, #fn_name_str, args).await?;
+                            ::autumn_harvest::serde_json::from_value(raw)
+                                .map_err(::autumn_harvest::error::HarvestError::Serialization)
+                        }
                     }
                 }
             }

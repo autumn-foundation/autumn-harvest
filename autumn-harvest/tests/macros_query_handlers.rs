@@ -417,3 +417,43 @@ fn bare_query_macro_still_passes_through() {
     let resp = my_old_style_query(&StatusRequest { verbose: false }).unwrap();
     assert_eq!(resp.status, "normal");
 }
+
+// ── Tests: Qualified absolute paths ────────────────────────────────────────────
+
+pub mod flows {
+    pub struct MyAbsoluteWfStub;
+    impl MyAbsoluteWfStub {
+        #[must_use]
+        pub fn info() -> ::autumn_harvest::WorkflowInfo {
+            ::autumn_harvest::WorkflowInfo {
+                name: "my_absolute_wf",
+                module: "flows",
+                handler: |_, _| Box::pin(async { Ok(::autumn_harvest::serde_json::Value::Null) }),
+                execution_timeout: None,
+                concurrency: None,
+                max_input_bytes: None,
+            }
+        }
+    }
+}
+
+#[query(workflow = "crate::flows::my_absolute_wf")]
+fn query_absolute(_ctx: &WorkflowContext) -> Result<bool, String> {
+    Ok(true)
+}
+
+#[update(workflow = "crate::flows::my_absolute_wf")]
+async fn update_absolute(_ctx: &WorkflowContext) -> Result<bool, String> {
+    Ok(true)
+}
+
+#[test]
+fn absolute_workflow_paths_compile_successfully() {
+    let q_info = __autumn_query_handler_info_query_absolute();
+    assert_eq!(q_info.name, "query_absolute");
+    assert_eq!(q_info.workflow, "my_absolute_wf");
+
+    let u_info = __autumn_update_handler_info_update_absolute();
+    assert_eq!(u_info.name, "update_absolute");
+    assert_eq!(u_info.workflow, "my_absolute_wf");
+}

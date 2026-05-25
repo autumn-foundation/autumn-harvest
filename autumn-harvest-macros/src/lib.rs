@@ -199,3 +199,75 @@ pub fn queries(input: TokenStream) -> TokenStream {
 pub fn updates(input: TokenStream) -> TokenStream {
     collect::updates_macro(input.into()).into()
 }
+
+pub(crate) struct WorkflowPath {
+    pub(crate) is_absolute: bool,
+    pub(crate) workflow_simple_name: String,
+    pub(crate) path_tokens: Vec<proc_macro2::TokenStream>,
+}
+
+pub(crate) fn parse_and_validate_workflow_path(
+    workflow_name: &str,
+    span: proc_macro2::Span,
+) -> Result<WorkflowPath, syn::Error> {
+    let is_absolute = workflow_name.starts_with("::");
+    let parts: Vec<&str> = workflow_name.split("::").collect();
+
+    // Validate segments
+    for (idx, part) in parts.iter().enumerate() {
+        if part.is_empty() {
+            // An empty segment is only allowed at the very start for absolute paths
+            if idx > 0 || !is_absolute {
+                return Err(syn::Error::new(
+                    span,
+                    format!("invalid workflow path: contains empty segment in '{workflow_name}'"),
+                ));
+            }
+        }
+    }
+
+    let non_empty_parts: Vec<&str> = parts.into_iter().filter(|s| !s.is_empty()).collect();
+    if non_empty_parts.is_empty() {
+        return Err(syn::Error::new(
+            span,
+            format!("invalid workflow path: '{workflow_name}' has no segments"),
+        ));
+    }
+
+    let workflow_simple_name = non_empty_parts.last().unwrap().to_string();
+    let module_parts = &non_empty_parts[..non_empty_parts.len() - 1];
+
+    let mut path_tokens = Vec::new();
+    for p in module_parts {
+        // Validate that each part is a valid identifier (must start with letter/underscore and contain letters/numbers/underscores)
+        if p.is_empty() {
+            return Err(syn::Error::new(
+                span,
+                format!("invalid workflow path: contains empty segment in '{workflow_name}'"),
+            ));
+        }
+        let first_char = p.chars().next().unwrap();
+        if !first_char.is_alphabetic() && first_char != '_' {
+            return Err(syn::Error::new(
+                span,
+                format!("invalid path segment '{p}' in workflow path '{workflow_name}'"),
+            ));
+        }
+        for c in p.chars().skip(1) {
+            if !c.is_alphanumeric() && c != '_' {
+                return Err(syn::Error::new(
+                    span,
+                    format!("invalid path segment '{p}' in workflow path '{workflow_name}'"),
+                ));
+            }
+        }
+        let id = quote::format_ident!("{}", p);
+        path_tokens.push(quote::quote! { #id });
+    }
+
+    Ok(WorkflowPath {
+        is_absolute,
+        workflow_simple_name,
+        path_tokens,
+    })
+}

@@ -129,8 +129,14 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         },
     );
 
-    let parts: Vec<&str> = workflow_name.split("::").collect();
-    let workflow_simple_name = parts.last().unwrap_or(&"").to_string();
+    let parsed_path = match crate::parse_and_validate_workflow_path(
+        &workflow_name,
+        proc_macro2::Span::call_site(),
+    ) {
+        Ok(p) => p,
+        Err(e) => return e.to_compile_error(),
+    };
+    let workflow_simple_name = parsed_path.workflow_simple_name;
     let camel_wf = to_pascal_case(&workflow_simple_name);
     let stub_ident = format_ident!("{camel_wf}Stub");
     let method_name = format_ident!("update_{fn_name}");
@@ -148,57 +154,14 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let method_name_with_timeout = format_ident!("{}_with_timeout", method_name);
 
     let mod_name = format_ident!("__autumn_update_impl_{fn_name}");
-    let impl_block = if parts.len() > 1 {
-        let module_parts = &parts[..parts.len() - 1];
-        let path_tokens: Vec<proc_macro2::TokenStream> = module_parts
-            .iter()
-            .map(|p| {
-                let id = format_ident!("{}", p);
-                quote! { #id }
-            })
-            .collect();
-        quote! {
-            ::autumn_harvest::cfg_db! {
-                mod #mod_name {
-                    use super::*;
-                    use #(#path_tokens::)*#stub_ident;
-                    impl #stub_ident {
-                        /// Execute this typed update handler in-process with a default 30-second timeout.
-                        pub async fn #method_name(
-                            conn: &mut ::autumn_harvest::diesel_async::AsyncPgConnection,
-                            handle: &::autumn_harvest::WorkflowHandle,
-                            #(#params),*
-                        ) -> ::autumn_harvest::HarvestResult<#ok_type> {
-                            Self::#method_name_with_timeout(
-                                conn,
-                                handle,
-                                #(#param_names,)*
-                                ::std::time::Duration::from_secs(30)
-                            ).await
-                        }
-
-                        /// Execute this typed update handler in-process with a custom timeout.
-                        pub async fn #method_name_with_timeout(
-                            conn: &mut ::autumn_harvest::diesel_async::AsyncPgConnection,
-                            handle: &::autumn_harvest::WorkflowHandle,
-                            #(#params,)*
-                            timeout: ::std::time::Duration,
-                        ) -> ::autumn_harvest::HarvestResult<#ok_type> {
-                            let args = #serialize_payload;
-                            let raw = handle.execute_update_in_process(
-                                conn,
-                                #fn_name_str,
-                                args,
-                                timeout
-                            ).await?;
-                            ::autumn_harvest::serde_json::from_value(raw)
-                                .map_err(::autumn_harvest::error::HarvestError::Serialization)
-                        }
-                    }
-                }
-            }
-        }
+    let path_tokens = parsed_path.path_tokens;
+    let is_absolute = parsed_path.is_absolute;
+    let leading_colon = if is_absolute {
+        quote! { :: }
     } else {
+        quote! {}
+    };
+    let impl_block = if path_tokens.is_empty() {
         quote! {
             ::autumn_harvest::cfg_db! {
                 impl #stub_ident {
@@ -232,6 +195,48 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         ).await?;
                         ::autumn_harvest::serde_json::from_value(raw)
                             .map_err(::autumn_harvest::error::HarvestError::Serialization)
+                    }
+                }
+            }
+        }
+    } else {
+        quote! {
+            ::autumn_harvest::cfg_db! {
+                mod #mod_name {
+                    use super::*;
+                    use #leading_colon #(#path_tokens::)*#stub_ident;
+                    impl #stub_ident {
+                        /// Execute this typed update handler in-process with a default 30-second timeout.
+                        pub async fn #method_name(
+                            conn: &mut ::autumn_harvest::diesel_async::AsyncPgConnection,
+                            handle: &::autumn_harvest::WorkflowHandle,
+                            #(#params),*
+                        ) -> ::autumn_harvest::HarvestResult<#ok_type> {
+                            Self::#method_name_with_timeout(
+                                conn,
+                                handle,
+                                #(#param_names,)*
+                                ::std::time::Duration::from_secs(30)
+                            ).await
+                        }
+
+                        /// Execute this typed update handler in-process with a custom timeout.
+                        pub async fn #method_name_with_timeout(
+                            conn: &mut ::autumn_harvest::diesel_async::AsyncPgConnection,
+                            handle: &::autumn_harvest::WorkflowHandle,
+                            #(#params,)*
+                            timeout: ::std::time::Duration,
+                        ) -> ::autumn_harvest::HarvestResult<#ok_type> {
+                            let args = #serialize_payload;
+                            let raw = handle.execute_update_in_process(
+                                conn,
+                                #fn_name_str,
+                                args,
+                                timeout
+                            ).await?;
+                            ::autumn_harvest::serde_json::from_value(raw)
+                                .map_err(::autumn_harvest::error::HarvestError::Serialization)
+                        }
                     }
                 }
             }

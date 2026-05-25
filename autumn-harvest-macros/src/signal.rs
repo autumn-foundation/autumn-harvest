@@ -61,8 +61,14 @@ pub fn signal_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let fn_name_str = fn_name.to_string();
     let method_name = format_ident!("signal_{fn_name}");
 
-    let parts: Vec<&str> = workflow_name.split("::").collect();
-    let workflow_simple_name = parts.last().unwrap_or(&"").to_string();
+    let parsed_path = match crate::parse_and_validate_workflow_path(
+        &workflow_name,
+        proc_macro2::Span::call_site(),
+    ) {
+        Ok(p) => p,
+        Err(e) => return e.to_compile_error(),
+    };
+    let workflow_simple_name = parsed_path.workflow_simple_name;
     let camel_wf = to_pascal_case(&workflow_simple_name);
     let stub_ident = format_ident!("{camel_wf}Stub");
 
@@ -90,41 +96,14 @@ pub fn signal_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     let mod_name = format_ident!("__autumn_signal_impl_{fn_name}");
-    let impl_block = if parts.len() > 1 {
-        let module_parts = &parts[..parts.len() - 1];
-        let path_tokens: Vec<proc_macro2::TokenStream> = module_parts
-            .iter()
-            .map(|p| {
-                let id = format_ident!("{}", p);
-                quote! { #id }
-            })
-            .collect();
-        quote! {
-            ::autumn_harvest::cfg_db! {
-                mod #mod_name {
-                    use super::*;
-                    use #(#path_tokens::)*#stub_ident;
-                    impl #stub_ident {
-                        /// Send a type-safe signal to this workflow execution.
-                        pub async fn #method_name(
-                            conn: &mut ::autumn_harvest::diesel_async::AsyncPgConnection,
-                            handle: &::autumn_harvest::WorkflowHandle,
-                            #(#params),*
-                        ) -> ::autumn_harvest::HarvestResult<()> {
-                            let payload = #serialize_payload;
-                            ::autumn_harvest::signal::send_signal(
-                                conn,
-                                handle.exec_id(),
-                                #fn_name_str,
-                                payload,
-                            )
-                            .await
-                        }
-                    }
-                }
-            }
-        }
+    let path_tokens = parsed_path.path_tokens;
+    let is_absolute = parsed_path.is_absolute;
+    let leading_colon = if is_absolute {
+        quote! { :: }
     } else {
+        quote! {}
+    };
+    let impl_block = if path_tokens.is_empty() {
         quote! {
             ::autumn_harvest::cfg_db! {
                 impl #stub_ident {
@@ -142,6 +121,32 @@ pub fn signal_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             payload,
                         )
                         .await
+                    }
+                }
+            }
+        }
+    } else {
+        quote! {
+            ::autumn_harvest::cfg_db! {
+                mod #mod_name {
+                    use super::*;
+                    use #leading_colon #(#path_tokens::)*#stub_ident;
+                    impl #stub_ident {
+                        /// Send a type-safe signal to this workflow execution.
+                        pub async fn #method_name(
+                            conn: &mut ::autumn_harvest::diesel_async::AsyncPgConnection,
+                            handle: &::autumn_harvest::WorkflowHandle,
+                            #(#params),*
+                        ) -> ::autumn_harvest::HarvestResult<()> {
+                            let payload = #serialize_payload;
+                            ::autumn_harvest::signal::send_signal(
+                                conn,
+                                handle.exec_id(),
+                                #fn_name_str,
+                                payload,
+                            )
+                            .await
+                        }
                     }
                 }
             }

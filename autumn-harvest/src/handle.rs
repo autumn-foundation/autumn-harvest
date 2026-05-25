@@ -594,10 +594,14 @@ impl WorkflowHandle {
         let handler_fut = (workflow_info.handler)(&ctx, execution.input.clone());
         tokio::pin!(handler_fut);
 
+        let mut replay_result = None;
         loop {
             flag.store(false, std::sync::atomic::Ordering::Release);
             match handler_fut.as_mut().poll(&mut poll_cx) {
-                std::task::Poll::Ready(_) => break,
+                std::task::Poll::Ready(res) => {
+                    replay_result = Some(res);
+                    break;
+                }
                 std::task::Poll::Pending => {
                     let was_woken = std::sync::atomic::AtomicBool::load(
                         &flag,
@@ -610,6 +614,13 @@ impl WorkflowHandle {
             }
         }
 
+        if let Some(Err(reason)) = replay_result {
+            return Err(HarvestError::WorkflowFailed {
+                name: self.exec_id.to_string(),
+                reason,
+            });
+        }
+
         ctx.execute_query_with_args(query_name, args)
     }
 
@@ -620,15 +631,31 @@ impl WorkflowHandle {
     /// Returns update execution, admission, or polling timeout errors.
     pub async fn execute_update_in_process(
         &self,
-        conn: &mut AsyncPgConnection,
+        _conn: &mut AsyncPgConnection,
         name: &str,
         input: Value,
         timeout: Duration,
     ) -> HarvestResult<Value> {
+        let shard = self.shard();
+        let mut own_conn = self
+            .client
+            .inner
+            .pools
+            .pool_for(shard)
+            .get()
+            .await
+            .map_err(|error| HarvestError::Database(error.to_string()))?;
+
         let update_id = crate::types::UpdateId::new();
-        crate::store::admit_update_event(conn, self.exec_id, update_id, name.to_string(), input)
-            .await?;
-        crate::queue::wake_workflow_task(conn, self.exec_id).await?;
+        crate::store::admit_update_event(
+            &mut own_conn,
+            self.exec_id,
+            update_id,
+            name.to_string(),
+            input,
+        )
+        .await?;
+        crate::queue::wake_workflow_task(&mut own_conn, self.exec_id).await?;
 
         let start = Instant::now();
         let poll_interval = Duration::from_millis(100);
@@ -636,7 +663,7 @@ impl WorkflowHandle {
         loop {
             let result = {
                 let h = crate::store::load_history_with_codecs(
-                    conn,
+                    &mut own_conn,
                     self.exec_id,
                     &self.client.inner.payload_codecs,
                 )
