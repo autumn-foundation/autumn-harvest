@@ -89,6 +89,7 @@ pub fn signal_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     quote! {
         #func
 
+        #[cfg(feature = "db")]
         impl #stub_name {
             /// Send a type-safe signal to this workflow execution.
             pub async fn #method_name(

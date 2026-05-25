@@ -244,10 +244,12 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             #companion_name()
         }
 
+        #[cfg(feature = "db")]
         /// Zero-cost typed client stub for the workflow.
         #[derive(Debug, Clone, Copy)]
         pub struct #stub_name;
 
+        #[cfg(feature = "db")]
         impl #stub_name {
             /// Start this workflow using default options and return an awaitable typed handle.
             pub async fn start(

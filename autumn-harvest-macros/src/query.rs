@@ -144,6 +144,7 @@ pub fn query_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         }
 
+        #[cfg(feature = "db")]
         impl #stub_name {
             /// Execute this typed query in-process.
             pub async fn #method_name(

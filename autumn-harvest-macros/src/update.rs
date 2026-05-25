@@ -173,6 +173,7 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         }
 
+        #[cfg(feature = "db")]
         impl #stub_name {
             /// Execute this typed update handler in-process.
             pub async fn #method_name(
