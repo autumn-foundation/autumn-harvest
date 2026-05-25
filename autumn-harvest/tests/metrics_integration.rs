@@ -320,7 +320,6 @@ fn build_worker(worker_id: &str, registry: Arc<HandlerRegistry>) -> Arc<Worker> 
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(2),
                 cancellation_grace_period: Duration::from_secs(1),
-                shutdown_grace_period: Duration::from_secs(1),
                 sticky_timeout: Duration::from_secs(5),
                 max_local_activity_start_to_close: Duration::from_secs(60),
                 shard_assignments: vec![ShardId::new(0)],
