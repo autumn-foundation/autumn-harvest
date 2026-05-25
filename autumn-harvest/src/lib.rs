@@ -156,7 +156,7 @@ pub use context::{
 };
 pub use critical_path::{CriticalPathAnalyzer, CriticalPathResult};
 pub use dag::{DagBuildError, DagBuilder, DagDefinition, DagTask, DagTaskRef};
-pub use dag_export::{export_dot, export_mermaid};
+pub use dag_export::{export_dot, export_mermaid, export_mermaid_critical_path};
 pub use dag_linter::{
     DagLinter, DagRule, DagWarning, ExcessiveParallelismRule, MissingRetryPolicyRule,
     MissingTimeoutRule,

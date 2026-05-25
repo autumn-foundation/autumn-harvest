@@ -48,6 +48,97 @@ pub fn export_mermaid(dag: &DagDefinition) -> Result<String, std::fmt::Error> {
     Ok(out)
 }
 
+use crate::critical_path::CriticalPathResult;
+
+/// Exports the DAG definition to a Mermaid.js flowchart, highlighting the critical path.
+///
+/// Nodes and edges that are part of the critical path will be styled distinctly
+/// so they stand out in the visualization.
+///
+/// # Examples
+///
+/// ```rust
+/// use autumn_harvest::dag::DagBuilder;
+/// use autumn_harvest::dag_export::export_mermaid_critical_path;
+/// use autumn_harvest::critical_path::CriticalPathResult;
+/// use std::time::Duration;
+///
+/// fn my_activity() {}
+/// fn my_other_activity() {}
+///
+/// let mut builder = DagBuilder::new();
+/// let a = builder.activity(my_activity);
+/// let b = builder.activity(my_other_activity).upstream(&a);
+/// let dag = builder.build().unwrap();
+///
+/// let critical_path = CriticalPathResult {
+///     total_duration: Duration::from_secs(10),
+///     path_indices: vec![0, 1],
+///     path_names: vec!["my_activity".to_string(), "my_other_activity".to_string()],
+/// };
+///
+/// let mermaid = export_mermaid_critical_path(&dag, &critical_path).unwrap();
+/// assert!(mermaid.contains("classDef critical"));
+/// ```
+///
+/// # Errors
+/// Returns `std::fmt::Error` if string formatting fails.
+pub fn export_mermaid_critical_path(
+    dag: &DagDefinition,
+    critical_path: &CriticalPathResult,
+) -> Result<String, std::fmt::Error> {
+    let mut out = String::new();
+    writeln!(out, "graph TD")?;
+
+    let tasks = dag.tasks();
+
+    for (i, task) in tasks.iter().enumerate() {
+        writeln!(out, "    t{i}[\"{}\"]", task.activity_name)?;
+    }
+
+    let mut link_idx = 0;
+    let mut critical_links = Vec::new();
+
+    for (i, task) in tasks.iter().enumerate() {
+        for &upstream in &task.upstreams {
+            writeln!(out, "    t{upstream} --> t{i}")?;
+
+            if let Some(pos) = critical_path
+                .path_indices
+                .iter()
+                .position(|&x| x == upstream)
+            {
+                #[allow(clippy::collapsible_if)]
+                if pos + 1 < critical_path.path_indices.len()
+                    && critical_path.path_indices[pos + 1] == i
+                {
+                    critical_links.push(link_idx);
+                }
+            }
+            link_idx += 1;
+        }
+    }
+
+    if !critical_path.path_indices.is_empty() {
+        writeln!(
+            out,
+            "    classDef critical fill:#ffcccc,stroke:#ff0000,stroke-width:2px;"
+        )?;
+        let nodes: Vec<String> = critical_path
+            .path_indices
+            .iter()
+            .map(|&node| format!("t{node}"))
+            .collect();
+        writeln!(out, "    class {} critical", nodes.join(","))?;
+
+        for link in critical_links {
+            writeln!(out, "    linkStyle {link} stroke:#ff0000,stroke-width:2px;")?;
+        }
+    }
+
+    Ok(out)
+}
+
 /// Exports the DAG definition to Graphviz DOT format.
 ///
 /// # Examples
@@ -110,6 +201,35 @@ mod tests {
 
         let dot = export_dot(&dag).unwrap();
         assert_eq!(dot, "digraph DAG {\n}\n");
+    }
+
+    #[test]
+    fn test_export_mermaid_critical_path() {
+        let mut builder = DagBuilder::new();
+        let a = builder.activity(dummy_activity);
+        let b = builder.activity(dummy_activity2).upstream(&a);
+        let _c = builder.activity(dummy_activity3).upstream(&b);
+
+        let dag = builder.build().unwrap();
+
+        let cp_result = crate::critical_path::CriticalPathResult {
+            total_duration: std::time::Duration::from_secs(10),
+            path_indices: vec![0, 1, 2],
+            path_names: vec![
+                "dummy_activity".to_string(),
+                "dummy_activity2".to_string(),
+                "dummy_activity3".to_string(),
+            ],
+        };
+
+        let mermaid = export_mermaid_critical_path(&dag, &cp_result).unwrap();
+
+        assert!(
+            mermaid.contains("classDef critical fill:#ffcccc,stroke:#ff0000,stroke-width:2px;")
+        );
+        assert!(mermaid.contains("class t0,t1,t2 critical"));
+        assert!(mermaid.contains("linkStyle 0 stroke:#ff0000,stroke-width:2px;"));
+        assert!(mermaid.contains("linkStyle 1 stroke:#ff0000,stroke-width:2px;"));
     }
 
     #[test]
