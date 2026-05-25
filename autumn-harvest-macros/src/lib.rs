@@ -10,6 +10,7 @@ mod activity;
 mod collect;
 mod dag;
 mod query;
+mod signal;
 mod update;
 mod workflow;
 
@@ -143,6 +144,14 @@ pub fn query(attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn update(attr: TokenStream, item: TokenStream) -> TokenStream {
     update::update_macro(attr.into(), item.into()).into()
+}
+
+/// Marks a function as a Harvest workflow signal handler.
+///
+/// Generates a typed signal sender method `signal_[signal_name]` on the sibling `[WorkflowName]Stub` struct.
+#[proc_macro_attribute]
+pub fn signal(attr: TokenStream, item: TokenStream) -> TokenStream {
+    signal::signal_macro(attr.into(), item.into()).into()
 }
 
 /// Collects multiple workflow functions into a `Vec<WorkflowInfo>`.

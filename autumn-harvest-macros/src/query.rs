@@ -107,6 +107,21 @@ pub fn query_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let dispatch = build_query_dispatch(fn_name, &param_names);
 
+    let camel_wf = to_pascal_case(&workflow_name);
+    let stub_name = format_ident!("{camel_wf}Stub");
+    let method_name = format_ident!("query_{fn_name}");
+    let ok_type = extract_ok_type(&func.sig.output);
+    let info_fn_name = format_ident!("{}_info", workflow_name);
+
+    let serialize_payload = if param_names.is_empty() {
+        quote! { ::autumn_harvest::serde_json::Value::Null }
+    } else if param_names.len() == 1 {
+        let name = &param_names[0];
+        quote! { ::autumn_harvest::serde_json::to_value(&#name).map_err(::autumn_harvest::error::HarvestError::Serialization)? }
+    } else {
+        quote! { ::autumn_harvest::serde_json::json!([#(&#param_names),*]) }
+    };
+
     quote! {
         #func
 
@@ -126,6 +141,21 @@ pub fn query_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 input_type_hint: #input_type_hint,
                 output_type_hint: #output_type_hint,
                 handler: __dispatch,
+            }
+        }
+
+        impl #stub_name {
+            /// Execute this typed query in-process.
+            pub async fn #method_name(
+                handle: &::autumn_harvest::WorkflowHandle,
+                #(#params),*
+            ) -> ::autumn_harvest::HarvestResult<#ok_type> {
+                let args = #serialize_payload;
+                let info = #info_fn_name();
+                let q_info = #companion_name();
+                let raw = handle.execute_query_in_process(&info, &q_info, #fn_name_str, args).await?;
+                ::autumn_harvest::serde_json::from_value(raw)
+                    .map_err(::autumn_harvest::error::HarvestError::Serialization)
             }
         }
     }
@@ -289,4 +319,47 @@ fn type_name_hint(ty: &syn::Type) -> String {
         }
         _ => "?".to_string(),
     }
+}
+
+fn to_pascal_case(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(first) => {
+            let mut out = first.to_uppercase().collect::<String>();
+            let mut capitalize_next = false;
+            for c in chars {
+                if c == '_' {
+                    capitalize_next = true;
+                } else if capitalize_next {
+                    out.push_str(&c.to_uppercase().collect::<String>());
+                    capitalize_next = false;
+                } else {
+                    out.push(c);
+                }
+            }
+            out
+        }
+    }
+}
+
+fn extract_ok_type(output: &syn::ReturnType) -> syn::Type {
+    let syn::ReturnType::Type(_, ty) = output else {
+        return syn::parse_quote! { () };
+    };
+    let syn::Type::Path(type_path) = &**ty else {
+        return *ty.clone();
+    };
+    let Some(last) = type_path.path.segments.last() else {
+        return *ty.clone();
+    };
+    if last.ident != "Result" && last.ident != "HarvestResult" {
+        return *ty.clone();
+    }
+    if let syn::PathArguments::AngleBracketed(ref args) = last.arguments
+        && let Some(syn::GenericArgument::Type(ok_ty)) = args.args.first()
+    {
+        return ok_ty.clone();
+    }
+    syn::parse_quote! { () }
 }
