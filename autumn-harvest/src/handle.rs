@@ -160,6 +160,7 @@ struct WorkflowHandleClientInner {
     shared_state: crate::context::SharedState,
     update_handlers: Vec<crate::info::UpdateHandlerInfo>,
     query_handlers: Vec<crate::info::QueryHandlerInfo>,
+    max_workflow_input_bytes: u64,
 }
 
 impl std::fmt::Debug for WorkflowHandleClientInner {
@@ -175,6 +176,7 @@ impl std::fmt::Debug for WorkflowHandleClientInner {
             .field("shared_state", &"<SharedState>")
             .field("update_handlers_count", &self.update_handlers.len())
             .field("query_handlers_count", &self.query_handlers.len())
+            .field("max_workflow_input_bytes", &self.max_workflow_input_bytes)
             .finish()
     }
 }
@@ -227,6 +229,7 @@ impl WorkflowHandleClient {
                 shared_state: crate::context::empty_shared_state(),
                 update_handlers: Vec::new(),
                 query_handlers: Vec::new(),
+                max_workflow_input_bytes: crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
             }),
         }
     }
@@ -264,6 +267,24 @@ impl WorkflowHandleClient {
         Self {
             inner: Arc::new(inner),
         }
+    }
+
+    /// Add the global max workflow input bytes to the client.
+    #[must_use]
+    pub fn with_max_workflow_input_bytes(self, bytes: u64) -> Self {
+        let mut inner = (*self.inner).clone();
+        inner.max_workflow_input_bytes = bytes;
+        Self {
+            inner: Arc::new(inner),
+        }
+    }
+
+    /// Get the effective max workflow input bytes for a workflow.
+    #[must_use]
+    pub fn max_workflow_input_bytes(&self, per_workflow_override: Option<u64>) -> u64 {
+        per_workflow_override.map_or(self.inner.max_workflow_input_bytes, |per_wf| {
+            per_wf.max(self.inner.max_workflow_input_bytes)
+        })
     }
 
     /// Pick which shard a new workflow execution with `(name, id)` should land on.

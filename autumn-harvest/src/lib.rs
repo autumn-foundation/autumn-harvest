@@ -11,6 +11,20 @@
 /// resolution local to this crate, where the `migrations/` directory always
 /// ships alongside.
 #[cfg(feature = "db")]
+#[macro_export]
+macro_rules! cfg_db {
+    ($($item:item)*) => {
+        $($item)*
+    };
+}
+
+#[cfg(not(feature = "db"))]
+#[macro_export]
+macro_rules! cfg_db {
+    ($($item:item)*) => {};
+}
+
+#[cfg(feature = "db")]
 pub const MIGRATIONS: diesel_migrations::EmbeddedMigrations =
     diesel_migrations::embed_migrations!();
 

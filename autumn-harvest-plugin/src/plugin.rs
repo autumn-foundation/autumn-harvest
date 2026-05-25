@@ -287,6 +287,7 @@ fn start_harvest_runtime(
     let payload_codecs = built.payload_codecs().clone();
     let query_handlers = built.query_handlers().to_vec();
     let update_handlers = built.update_handlers().to_vec();
+    let max_workflow_input_bytes = built.max_workflow_input_bytes;
     let runner = HarvestRunner::start(built, &harvest_config, runner_resources)?;
     let harvest_db_pool = runner.storage_pool();
     let workflow_handle_client = WorkflowHandleClient::new(
@@ -299,7 +300,8 @@ fn start_harvest_runtime(
     )
     .with_codecs(payload_codecs)
     .with_shared_state(runner.api_runtime().registry().shared_state())
-    .with_handlers(query_handlers, update_handlers);
+    .with_handlers(query_handlers, update_handlers)
+    .with_max_workflow_input_bytes(max_workflow_input_bytes);
     state.insert_extension(harvest_db_pool.clone());
     state.insert_extension(workflow_handle_client);
     api_state.install_storage_pool(harvest_db_pool);

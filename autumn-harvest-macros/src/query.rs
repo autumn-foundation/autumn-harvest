@@ -121,7 +121,7 @@ pub fn query_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         let name = &param_names[0];
         quote! { ::autumn_harvest::serde_json::to_value(&#name).map_err(::autumn_harvest::error::HarvestError::Serialization)? }
     } else {
-        quote! { ::autumn_harvest::serde_json::json!([#(&#param_names),*]) }
+        quote! { ::autumn_harvest::serde_json::to_value((#(&#param_names),*)).map_err(::autumn_harvest::error::HarvestError::Serialization)? }
     };
 
     let mod_name = format_ident!("__autumn_query_impl_{fn_name}");
@@ -135,10 +135,30 @@ pub fn query_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             })
             .collect();
         quote! {
-            #[cfg(feature = "db")]
-            mod #mod_name {
-                use super::*;
-                use #(#path_tokens)::*::#stub_ident;
+            ::autumn_harvest::cfg_db! {
+                mod #mod_name {
+                    use super::*;
+                    use #(#path_tokens::)*#stub_ident;
+                    impl #stub_ident {
+                        /// Execute this typed query in-process.
+                        pub async fn #method_name(
+                            handle: &::autumn_harvest::WorkflowHandle,
+                            #(#params),*
+                        ) -> ::autumn_harvest::HarvestResult<#ok_type> {
+                            let args = #serialize_payload;
+                            let info = #stub_ident::info();
+                            let q_info = #companion_name();
+                            let raw = handle.execute_query_in_process(&info, &q_info, #fn_name_str, args).await?;
+                            ::autumn_harvest::serde_json::from_value(raw)
+                                .map_err(::autumn_harvest::error::HarvestError::Serialization)
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        quote! {
+            ::autumn_harvest::cfg_db! {
                 impl #stub_ident {
                     /// Execute this typed query in-process.
                     pub async fn #method_name(
@@ -152,24 +172,6 @@ pub fn query_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         ::autumn_harvest::serde_json::from_value(raw)
                             .map_err(::autumn_harvest::error::HarvestError::Serialization)
                     }
-                }
-            }
-        }
-    } else {
-        quote! {
-            #[cfg(feature = "db")]
-            impl #stub_ident {
-                /// Execute this typed query in-process.
-                pub async fn #method_name(
-                    handle: &::autumn_harvest::WorkflowHandle,
-                    #(#params),*
-                ) -> ::autumn_harvest::HarvestResult<#ok_type> {
-                    let args = #serialize_payload;
-                    let info = #stub_ident::info();
-                    let q_info = #companion_name();
-                    let raw = handle.execute_query_in_process(&info, &q_info, #fn_name_str, args).await?;
-                    ::autumn_harvest::serde_json::from_value(raw)
-                        .map_err(::autumn_harvest::error::HarvestError::Serialization)
                 }
             }
         }
