@@ -401,46 +401,10 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 }
 
-#[allow(clippy::option_if_let_else)]
 fn to_pascal_case(s: &str) -> String {
-    let mut chars = s.chars();
-    match chars.next() {
-        None => String::new(),
-        Some(first) => {
-            let mut out = first.to_uppercase().collect::<String>();
-            let mut capitalize_next = false;
-            for c in chars {
-                if c == '_' {
-                    capitalize_next = true;
-                } else if capitalize_next {
-                    out.push_str(&c.to_uppercase().collect::<String>());
-                    capitalize_next = false;
-                } else {
-                    out.push(c);
-                }
-            }
-            out
-        }
-    }
+    crate::to_pascal_case(s)
 }
 
 fn extract_ok_type(output: &syn::ReturnType) -> syn::Type {
-    let syn::ReturnType::Type(_, ty) = output else {
-        return syn::parse_quote! { () };
-    };
-    let syn::Type::Path(type_path) = &**ty else {
-        return *ty.clone();
-    };
-    let Some(last) = type_path.path.segments.last() else {
-        return *ty.clone();
-    };
-    if last.ident != "Result" && last.ident != "HarvestResult" {
-        return *ty.clone();
-    }
-    if let syn::PathArguments::AngleBracketed(ref args) = last.arguments
-        && let Some(syn::GenericArgument::Type(ok_ty)) = args.args.first()
-    {
-        return ok_ty.clone();
-    }
-    syn::parse_quote! { () }
+    crate::extract_ok_type(output)
 }

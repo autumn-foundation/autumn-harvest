@@ -179,25 +179,6 @@ fn first_param_is_ctx(inputs: &syn::punctuated::Punctuated<syn::FnArg, syn::toke
         .is_some_and(|s| s.ident == "WorkflowContext")
 }
 
-#[allow(clippy::option_if_let_else)]
 fn to_pascal_case(s: &str) -> String {
-    let mut chars = s.chars();
-    match chars.next() {
-        None => String::new(),
-        Some(first) => {
-            let mut out = first.to_uppercase().collect::<String>();
-            let mut capitalize_next = false;
-            for c in chars {
-                if c == '_' {
-                    capitalize_next = true;
-                } else if capitalize_next {
-                    out.push_str(&c.to_uppercase().collect::<String>());
-                    capitalize_next = false;
-                } else {
-                    out.push(c);
-                }
-            }
-            out
-        }
-    }
+    crate::to_pascal_case(s)
 }

@@ -309,105 +309,18 @@ fn build_input_type_hint(params: &[&syn::FnArg]) -> String {
 
 /// Extracts the `T` from `Result<T, E>` for use as `output_type_hint`.
 fn extract_ok_type_hint(output: &syn::ReturnType) -> String {
-    let syn::ReturnType::Type(_, ty) = output else {
-        return "()".to_string();
-    };
-    let syn::Type::Path(type_path) = &**ty else {
-        return type_name_hint(ty);
-    };
-    let Some(last) = type_path.path.segments.last() else {
-        return "()".to_string();
-    };
-    if last.ident != "Result" {
-        return last.ident.to_string();
-    }
-    if let syn::PathArguments::AngleBracketed(ref args) = last.arguments
-        && let Some(syn::GenericArgument::Type(ok_ty)) = args.args.first()
-    {
-        return type_name_hint(ok_ty);
-    }
-    "()".to_string()
+    crate::extract_ok_type_hint(output)
 }
 
 /// Returns the human-readable name of a type suitable for type hints.
 fn type_name_hint(ty: &syn::Type) -> String {
-    match ty {
-        syn::Type::Path(tp) => tp.path.segments.last().map_or_else(
-            || "?".to_string(),
-            |s| {
-                let ident = s.ident.to_string();
-                if let syn::PathArguments::AngleBracketed(ref args) = s.arguments {
-                    let inner: Vec<_> = args
-                        .args
-                        .iter()
-                        .filter_map(|a| {
-                            if let syn::GenericArgument::Type(t) = a {
-                                Some(type_name_hint(t))
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-                    if inner.is_empty() {
-                        ident
-                    } else {
-                        format!("{ident}<{}>", inner.join(", "))
-                    }
-                } else {
-                    ident
-                }
-            },
-        ),
-        syn::Type::Reference(r) => type_name_hint(&r.elem),
-        syn::Type::Tuple(t) if t.elems.is_empty() => "()".to_string(),
-        syn::Type::Tuple(t) => {
-            let parts: Vec<_> = t.elems.iter().map(type_name_hint).collect();
-            format!("({})", parts.join(", "))
-        }
-        _ => "?".to_string(),
-    }
+    crate::type_name_hint(ty)
 }
 
-#[allow(clippy::option_if_let_else)]
 fn to_pascal_case(s: &str) -> String {
-    let mut chars = s.chars();
-    match chars.next() {
-        None => String::new(),
-        Some(first) => {
-            let mut out = first.to_uppercase().collect::<String>();
-            let mut capitalize_next = false;
-            for c in chars {
-                if c == '_' {
-                    capitalize_next = true;
-                } else if capitalize_next {
-                    out.push_str(&c.to_uppercase().collect::<String>());
-                    capitalize_next = false;
-                } else {
-                    out.push(c);
-                }
-            }
-            out
-        }
-    }
+    crate::to_pascal_case(s)
 }
 
 fn extract_ok_type(output: &syn::ReturnType) -> syn::Type {
-    let syn::ReturnType::Type(_, ty) = output else {
-        return syn::parse_quote! { () };
-    };
-    let syn::Type::Path(type_path) = &**ty else {
-        return *ty.clone();
-    };
-    let Some(last) = type_path.path.segments.last() else {
-        return *ty.clone();
-    };
-    if last.ident != "Result" && last.ident != "HarvestResult" {
-        return *ty.clone();
-    }
-    if let syn::PathArguments::AngleBracketed(ref args) = last.arguments
-        && let Some(syn::GenericArgument::Type(ok_ty)) = args.args.first()
-    {
-        return ok_ty.clone();
-    }
-    syn::parse_quote! { () }
+    crate::extract_ok_type(output)
 }
