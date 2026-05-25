@@ -126,7 +126,8 @@ pub fn query_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let mod_name = format_ident!("__autumn_query_impl_{fn_name}");
     let impl_block = if parts.len() > 1 {
-        let path_tokens: Vec<proc_macro2::TokenStream> = parts
+        let module_parts = &parts[..parts.len() - 1];
+        let path_tokens: Vec<proc_macro2::TokenStream> = module_parts
             .iter()
             .map(|p| {
                 let id = format_ident!("{}", p);

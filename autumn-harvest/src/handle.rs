@@ -614,17 +614,8 @@ impl WorkflowHandle {
 
         loop {
             let result = {
-                let shard = self.shard();
-                let mut c = self
-                    .client
-                    .inner
-                    .pools
-                    .pool_for(shard)
-                    .get()
-                    .await
-                    .map_err(|e| HarvestError::Database(e.to_string()))?;
                 let h = crate::store::load_history_with_codecs(
-                    &mut c,
+                    conn,
                     self.exec_id,
                     &self.client.inner.payload_codecs,
                 )

@@ -145,9 +145,12 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! { ::autumn_harvest::serde_json::json!([#(&#param_names),*]) }
     };
 
+    let method_name_with_timeout = format_ident!("{}_with_timeout", method_name);
+
     let mod_name = format_ident!("__autumn_update_impl_{fn_name}");
     let impl_block = if parts.len() > 1 {
-        let path_tokens: Vec<proc_macro2::TokenStream> = parts
+        let module_parts = &parts[..parts.len() - 1];
+        let path_tokens: Vec<proc_macro2::TokenStream> = module_parts
             .iter()
             .map(|p| {
                 let id = format_ident!("{}", p);
@@ -160,18 +163,33 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 use super::*;
                 use #(#path_tokens)::*::#stub_ident;
                 impl #stub_ident {
-                    /// Execute this typed update handler in-process.
+                    /// Execute this typed update handler in-process with a default 30-second timeout.
                     pub async fn #method_name(
                         conn: &mut ::autumn_harvest::diesel_async::AsyncPgConnection,
                         handle: &::autumn_harvest::WorkflowHandle,
                         #(#params),*
                     ) -> ::autumn_harvest::HarvestResult<#ok_type> {
+                        Self::#method_name_with_timeout(
+                            conn,
+                            handle,
+                            #(#param_names,)*
+                            ::std::time::Duration::from_secs(30)
+                        ).await
+                    }
+
+                    /// Execute this typed update handler in-process with a custom timeout.
+                    pub async fn #method_name_with_timeout(
+                        conn: &mut ::autumn_harvest::diesel_async::AsyncPgConnection,
+                        handle: &::autumn_harvest::WorkflowHandle,
+                        #(#params,)*
+                        timeout: ::std::time::Duration,
+                    ) -> ::autumn_harvest::HarvestResult<#ok_type> {
                         let args = #serialize_payload;
                         let raw = handle.execute_update_in_process(
                             conn,
-                            #workflow_simple_name,
+                            #fn_name_str,
                             args,
-                            ::std::time::Duration::from_secs(30)
+                            timeout
                         ).await?;
                         ::autumn_harvest::serde_json::from_value(raw)
                             .map_err(::autumn_harvest::error::HarvestError::Serialization)
@@ -183,18 +201,33 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {
             #[cfg(feature = "db")]
             impl #stub_ident {
-                /// Execute this typed update handler in-process.
+                /// Execute this typed update handler in-process with a default 30-second timeout.
                 pub async fn #method_name(
                     conn: &mut ::autumn_harvest::diesel_async::AsyncPgConnection,
                     handle: &::autumn_harvest::WorkflowHandle,
                     #(#params),*
                 ) -> ::autumn_harvest::HarvestResult<#ok_type> {
+                    Self::#method_name_with_timeout(
+                        conn,
+                        handle,
+                        #(#param_names,)*
+                        ::std::time::Duration::from_secs(30)
+                    ).await
+                }
+
+                /// Execute this typed update handler in-process with a custom timeout.
+                pub async fn #method_name_with_timeout(
+                    conn: &mut ::autumn_harvest::diesel_async::AsyncPgConnection,
+                    handle: &::autumn_harvest::WorkflowHandle,
+                    #(#params,)*
+                    timeout: ::std::time::Duration,
+                ) -> ::autumn_harvest::HarvestResult<#ok_type> {
                     let args = #serialize_payload;
                     let raw = handle.execute_update_in_process(
                         conn,
-                        #workflow_simple_name,
+                        #fn_name_str,
                         args,
-                        ::std::time::Duration::from_secs(30)
+                        timeout
                     ).await?;
                     ::autumn_harvest::serde_json::from_value(raw)
                         .map_err(::autumn_harvest::error::HarvestError::Serialization)
