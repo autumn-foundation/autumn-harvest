@@ -204,6 +204,7 @@ pub(crate) struct WorkflowPath {
     pub(crate) is_absolute: bool,
     pub(crate) workflow_simple_name: String,
     pub(crate) path_tokens: Vec<proc_macro2::TokenStream>,
+    pub(crate) original_module_parts: Vec<String>,
 }
 
 pub(crate) fn parse_and_validate_workflow_path(
@@ -238,6 +239,7 @@ pub(crate) fn parse_and_validate_workflow_path(
     let module_parts = &non_empty_parts[..non_empty_parts.len() - 1];
 
     let mut path_tokens = Vec::new();
+    let mut original_module_parts = Vec::new();
     for p in module_parts {
         // Validate that each part is a valid identifier (must start with letter/underscore and contain letters/numbers/underscores)
         if p.is_empty() {
@@ -263,12 +265,14 @@ pub(crate) fn parse_and_validate_workflow_path(
         }
         let id = quote::format_ident!("{}", p);
         path_tokens.push(quote::quote! { #id });
+        original_module_parts.push(p.to_string());
     }
 
     Ok(WorkflowPath {
         is_absolute,
         workflow_simple_name,
         path_tokens,
+        original_module_parts,
     })
 }
 

@@ -457,3 +457,137 @@ fn absolute_workflow_paths_compile_successfully() {
     assert_eq!(u_info.name, "update_absolute");
     assert_eq!(u_info.workflow, "my_absolute_wf");
 }
+
+// ── Tests: Relative paths (self::, super::, and plain relative) ────────────────
+
+pub mod relative_test_self {
+    use super::*;
+
+    pub mod flows {
+        pub struct MyRelativeWfStub;
+        impl MyRelativeWfStub {
+            #[must_use]
+            pub fn info() -> ::autumn_harvest::WorkflowInfo {
+                ::autumn_harvest::WorkflowInfo {
+                    name: "my_relative_wf",
+                    module: "relative_test_self::flows",
+                    handler: |_, _| {
+                        Box::pin(async { Ok(::autumn_harvest::serde_json::Value::Null) })
+                    },
+                    execution_timeout: None,
+                    concurrency: None,
+                    max_input_bytes: None,
+                }
+            }
+        }
+    }
+
+    #[query(workflow = "self::flows::my_relative_wf")]
+    fn query_relative_self(_ctx: &WorkflowContext) -> Result<bool, String> {
+        Ok(true)
+    }
+
+    #[update(workflow = "self::flows::my_relative_wf")]
+    async fn update_relative_self(_ctx: &WorkflowContext) -> Result<bool, String> {
+        Ok(true)
+    }
+}
+
+pub mod relative_test_super {
+    use super::*;
+
+    pub mod flows {
+        pub struct MyRelativeWfStub;
+        impl MyRelativeWfStub {
+            #[must_use]
+            pub fn info() -> ::autumn_harvest::WorkflowInfo {
+                ::autumn_harvest::WorkflowInfo {
+                    name: "my_relative_wf",
+                    module: "relative_test_super::flows",
+                    handler: |_, _| {
+                        Box::pin(async { Ok(::autumn_harvest::serde_json::Value::Null) })
+                    },
+                    execution_timeout: None,
+                    concurrency: None,
+                    max_input_bytes: None,
+                }
+            }
+        }
+    }
+
+    pub mod nested_child {
+        use super::*;
+
+        #[query(workflow = "super::flows::my_relative_wf")]
+        fn query_relative_super(_ctx: &WorkflowContext) -> Result<bool, String> {
+            Ok(true)
+        }
+
+        #[update(workflow = "super::flows::my_relative_wf")]
+        async fn update_relative_super(_ctx: &WorkflowContext) -> Result<bool, String> {
+            Ok(true)
+        }
+    }
+}
+
+pub mod relative_test_plain {
+    use super::*;
+
+    pub mod flows {
+        pub struct MyRelativeWfStub;
+        impl MyRelativeWfStub {
+            #[must_use]
+            pub fn info() -> ::autumn_harvest::WorkflowInfo {
+                ::autumn_harvest::WorkflowInfo {
+                    name: "my_relative_wf",
+                    module: "relative_test_plain::flows",
+                    handler: |_, _| {
+                        Box::pin(async { Ok(::autumn_harvest::serde_json::Value::Null) })
+                    },
+                    execution_timeout: None,
+                    concurrency: None,
+                    max_input_bytes: None,
+                }
+            }
+        }
+    }
+
+    #[query(workflow = "flows::my_relative_wf")]
+    fn query_relative_plain(_ctx: &WorkflowContext) -> Result<bool, String> {
+        Ok(true)
+    }
+
+    #[update(workflow = "flows::my_relative_wf")]
+    async fn update_relative_plain(_ctx: &WorkflowContext) -> Result<bool, String> {
+        Ok(true)
+    }
+}
+
+#[test]
+fn relative_workflow_paths_compile_and_resolve_successfully() {
+    let q_self = relative_test_self::__autumn_query_handler_info_query_relative_self();
+    assert_eq!(q_self.name, "query_relative_self");
+    assert_eq!(q_self.workflow, "my_relative_wf");
+
+    let u_self = relative_test_self::__autumn_update_handler_info_update_relative_self();
+    assert_eq!(u_self.name, "update_relative_self");
+    assert_eq!(u_self.workflow, "my_relative_wf");
+
+    let q_super =
+        relative_test_super::nested_child::__autumn_query_handler_info_query_relative_super();
+    assert_eq!(q_super.name, "query_relative_super");
+    assert_eq!(q_super.workflow, "my_relative_wf");
+
+    let u_super =
+        relative_test_super::nested_child::__autumn_update_handler_info_update_relative_super();
+    assert_eq!(u_super.name, "update_relative_super");
+    assert_eq!(u_super.workflow, "my_relative_wf");
+
+    let q_plain = relative_test_plain::__autumn_query_handler_info_query_relative_plain();
+    assert_eq!(q_plain.name, "query_relative_plain");
+    assert_eq!(q_plain.workflow, "my_relative_wf");
+
+    let u_plain = relative_test_plain::__autumn_update_handler_info_update_relative_plain();
+    assert_eq!(u_plain.name, "update_relative_plain");
+    assert_eq!(u_plain.workflow, "my_relative_wf");
+}

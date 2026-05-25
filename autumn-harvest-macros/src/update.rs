@@ -161,6 +161,32 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     } else {
         quote! {}
     };
+    let nested_path_tokens = if is_absolute
+        || parsed_path
+            .original_module_parts
+            .first()
+            .is_some_and(|s| s == "crate")
+    {
+        path_tokens.clone()
+    } else if parsed_path.original_module_parts.is_empty() {
+        Vec::new()
+    } else {
+        let mut tokens = Vec::new();
+        tokens.push(quote! { super });
+        let first = parsed_path.original_module_parts.first().unwrap();
+        if first == "self" {
+            for p in parsed_path.original_module_parts.iter().skip(1) {
+                let id = format_ident!("{}", p);
+                tokens.push(quote! { #id });
+            }
+        } else {
+            for p in &parsed_path.original_module_parts {
+                let id = format_ident!("{}", p);
+                tokens.push(quote! { #id });
+            }
+        }
+        tokens
+    };
     let impl_block = if path_tokens.is_empty() {
         quote! {
             ::autumn_harvest::cfg_db! {
@@ -204,7 +230,7 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             ::autumn_harvest::cfg_db! {
                 mod #mod_name {
                     use super::*;
-                    use #leading_colon #(#path_tokens::)*#stub_ident;
+                    use #leading_colon #(#nested_path_tokens::)*#stub_ident;
                     impl #stub_ident {
                         /// Execute this typed update handler in-process with a default 30-second timeout.
                         pub async fn #method_name(
