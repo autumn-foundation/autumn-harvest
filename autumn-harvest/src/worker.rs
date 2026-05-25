@@ -3771,6 +3771,55 @@ async fn fail_workflow_for_history_cap(
     .await
 }
 
+/// Checks if any signal in the batch was not resolved inline (remains pending/suspended).
+/// If unresolved signals exist, reconstructs the suspended commands and returns them.
+fn reconstruct_unresolved_signals(
+    items_clone: Vec<SignalBatchItem>,
+    new_events: &[WorkflowEvent],
+) -> Option<Vec<WorkflowCommand>> {
+    let mut all_resolved = true;
+    for item in &items_clone {
+        if let SignalBatchItem::Signal(run) = item {
+            let resolved = new_events.iter().any(|e| match e {
+                WorkflowEvent::ExternalSignalDelivered { signal_id }
+                | WorkflowEvent::ExternalSignalFailed { signal_id, .. } => {
+                    *signal_id == run.signal_id
+                }
+                _ => false,
+            });
+            if !resolved {
+                all_resolved = false;
+                break;
+            }
+        }
+    }
+
+    if !all_resolved {
+        let mut reconstructed_commands = Vec::with_capacity(items_clone.len());
+        for item in items_clone {
+            match item {
+                SignalBatchItem::Marker(_) => {
+                    // Already persisted via persist_external_signal_inline.
+                    // Do not reconstruct or re-append to avoid duplicate marker events in history.
+                }
+                SignalBatchItem::Signal(run) => {
+                    let (dummy_tx, _) = tokio::sync::oneshot::channel();
+                    reconstructed_commands.push(WorkflowCommand::SignalExternalWorkflow {
+                        signal_id: run.signal_id,
+                        target: run.target,
+                        signal_name: run.signal_name,
+                        payload: run.payload,
+                        result_tx: dummy_tx,
+                        already_requested: run.already_requested,
+                    });
+                }
+            }
+        }
+        return Some(reconstructed_commands);
+    }
+    None
+}
+
 #[allow(clippy::too_many_lines)]
 async fn process_workflow_task(
     conn: &mut AsyncPgConnection,
@@ -4149,49 +4198,9 @@ async fn process_workflow_task(
                     .await;
                 }
 
-                // If any signal in the batch was not resolved inline (remains pending/suspended),
-                // we must break the loop and suspend the workflow task.
-                let mut all_resolved = true;
-                for item in &items_clone {
-                    if let SignalBatchItem::Signal(run) = item {
-                        let resolved = new_events.iter().any(|e| match e {
-                            WorkflowEvent::ExternalSignalDelivered { signal_id }
-                            | WorkflowEvent::ExternalSignalFailed { signal_id, .. } => {
-                                *signal_id == run.signal_id
-                            }
-                            _ => false,
-                        });
-                        if !resolved {
-                            all_resolved = false;
-                            break;
-                        }
-                    }
-                }
-
-                if !all_resolved {
-                    let mut reconstructed_commands = Vec::with_capacity(items_clone.len());
-                    for item in items_clone {
-                        match item {
-                            SignalBatchItem::Marker(_) => {
-                                // Already persisted via persist_external_signal_inline.
-                                // Do not reconstruct or re-append to avoid duplicate marker events in history.
-                            }
-                            SignalBatchItem::Signal(run) => {
-                                let (dummy_tx, _) = tokio::sync::oneshot::channel();
-                                reconstructed_commands.push(
-                                    WorkflowCommand::SignalExternalWorkflow {
-                                        signal_id: run.signal_id,
-                                        target: run.target,
-                                        signal_name: run.signal_name,
-                                        payload: run.payload,
-                                        result_tx: dummy_tx,
-                                        already_requested: run.already_requested,
-                                    },
-                                );
-                            }
-                        }
-                    }
-
+                if let Some(reconstructed_commands) =
+                    reconstruct_unresolved_signals(items_clone, &new_events)
+                {
                     // Re-acquire a fresh execute_span so persist_workflow_outcome
                     // (via handle_suspended_workflow) gets a valid span reference.
                     let execute_span = tracing::Span::none();
