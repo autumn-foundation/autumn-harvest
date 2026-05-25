@@ -102,7 +102,7 @@ pub async fn run_workflow(
 /// Uses [`WorkflowContext::for_replay_strict`] so that activity and local-activity
 /// dispatch additionally compare input payloads against the recorded history,
 /// returning a non-determinism error on any mismatch.  This is used by
-/// [`WorkflowReplayer`](crate::testing::WorkflowReplayer) to catch
+/// `WorkflowReplayer` to catch
 /// input-changing code changes before deployment.
 pub async fn run_workflow_strict(
     exec_id: ExecutionId,
