@@ -251,6 +251,11 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         #[cfg(feature = "db")]
         impl #stub_name {
+            /// Get the WorkflowInfo for this workflow.
+            pub fn info() -> ::autumn_harvest::WorkflowInfo {
+                #companion_name()
+            }
+
             /// Start this workflow using default options and return an awaitable typed handle.
             pub async fn start(
                 conn: &mut ::autumn_harvest::diesel_async::AsyncPgConnection,
@@ -287,6 +292,16 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     (None, None)
                 };
 
+                let execution_timeout = match opts.execution_timeout.or(info.execution_timeout) {
+                    ::std::option::Option::Some(d) => ::std::option::Option::Some(
+                        ::autumn_harvest::chrono::Duration::from_std(d)
+                            .map_err(|_| ::autumn_harvest::error::HarvestError::Config(
+                                "execution_timeout exceeds chrono duration range".to_string()
+                            ))?
+                    ),
+                    ::std::option::Option::None => ::std::option::Option::None,
+                };
+
                 let params = ::autumn_harvest::execution::StartWorkflowParams {
                     workflow_name: info.name,
                     workflow_id: &workflow_id,
@@ -294,7 +309,7 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     input,
                     parent_id: opts.parent_id,
                     queue_name: opts.queue_name.as_deref().unwrap_or("default"),
-                    execution_timeout: opts.execution_timeout.or(info.execution_timeout).and_then(|d| ::autumn_harvest::chrono::Duration::from_std(d).ok()),
+                    execution_timeout,
                     memo: opts.memo,
                     search_attrs: opts.search_attrs,
                     reuse_policy: opts.reuse_policy.unwrap_or(::autumn_harvest::types::WorkflowIdReusePolicy::AllowDuplicate),
@@ -338,6 +353,16 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     (None, None)
                 };
 
+                let execution_timeout = match opts.execution_timeout.or(info.execution_timeout) {
+                    ::std::option::Option::Some(d) => ::std::option::Option::Some(
+                        ::autumn_harvest::chrono::Duration::from_std(d)
+                            .map_err(|_| ::autumn_harvest::error::HarvestError::Config(
+                                "execution_timeout exceeds chrono duration range".to_string()
+                            ))?
+                    ),
+                    ::std::option::Option::None => ::std::option::Option::None,
+                };
+
                 let payload = ::autumn_harvest::serde_json::to_value(&signal_payload)
                     .map_err(::autumn_harvest::error::HarvestError::Serialization)?;
 
@@ -348,7 +373,7 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     input,
                     parent_id: opts.parent_id,
                     queue_name: opts.queue_name.as_deref().unwrap_or("default"),
-                    execution_timeout: opts.execution_timeout.or(info.execution_timeout).and_then(|d| ::autumn_harvest::chrono::Duration::from_std(d).ok()),
+                    execution_timeout,
                     memo: opts.memo,
                     search_attrs: opts.search_attrs,
                     reuse_policy: opts.reuse_policy.unwrap_or(::autumn_harvest::types::WorkflowIdReusePolicy::AllowDuplicate),
@@ -360,7 +385,7 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     signal_payload: payload,
                     idempotency_key: opts.idempotency_key,
                     max_workflow_input_bytes: info.max_input_bytes.unwrap_or(0),
-                    max_signal_payload_bytes: 0,
+                    max_signal_payload_bytes: opts.max_signal_payload_bytes.unwrap_or(::autumn_harvest::builder::DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES),
                 };
 
                 let outcome = ::autumn_harvest::execution::signal_with_start_workflow_execution(conn, params).await?;

@@ -167,4 +167,6 @@ pub struct TypedSignalWithStartOptions {
     pub trace_context: Option<crate::telemetry::TraceContextCarrier>,
     /// Dedup key for this signal event.
     pub idempotency_key: Option<String>,
+    /// Limit the maximum size of the signal payload (defaults to 256 KiB).
+    pub max_signal_payload_bytes: Option<u64>,
 }

@@ -520,6 +520,7 @@ impl WorkflowHandle {
         let update_id = crate::types::UpdateId::new();
         crate::store::admit_update_event(conn, self.exec_id, update_id, name.to_string(), input)
             .await?;
+        crate::queue::wake_workflow_task(conn, self.exec_id).await?;
 
         let start = Instant::now();
         let poll_interval = Duration::from_millis(100);

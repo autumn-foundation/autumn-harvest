@@ -111,7 +111,6 @@ pub fn query_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let stub_name = format_ident!("{camel_wf}Stub");
     let method_name = format_ident!("query_{fn_name}");
     let ok_type = extract_ok_type(&func.sig.output);
-    let info_fn_name = format_ident!("{}_info", workflow_name);
 
     let serialize_payload = if param_names.is_empty() {
         quote! { ::autumn_harvest::serde_json::Value::Null }
@@ -152,7 +151,7 @@ pub fn query_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 #(#params),*
             ) -> ::autumn_harvest::HarvestResult<#ok_type> {
                 let args = #serialize_payload;
-                let info = #info_fn_name();
+                let info = #stub_name::info();
                 let q_info = #companion_name();
                 let raw = handle.execute_query_in_process(&info, &q_info, #fn_name_str, args).await?;
                 ::autumn_harvest::serde_json::from_value(raw)

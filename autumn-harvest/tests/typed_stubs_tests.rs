@@ -260,3 +260,69 @@ async fn test_typed_workflow_client_stubs_signal_with_start() {
 
     assert_eq!(handle.exec_id(), handle.inner().exec_id());
 }
+
+#[tokio::test]
+async fn test_typed_workflow_client_stubs_invalid_timeout() {
+    let (db_url, _container) = setup_database_url().await;
+    let pool = build_pool(&db_url);
+    let mut conn = pool.get().await.unwrap();
+
+    let client = WorkflowHandleClient::single(pool, db_url.clone());
+
+    let workflow_id = "onboarding-user-4";
+    let input = OnboardingInput { user_id: 1340 };
+    // Pass overflowed execution_timeout
+    let opts = TypedStartOptions {
+        execution_timeout: Some(Duration::from_secs(u64::MAX)),
+        ..Default::default()
+    };
+
+    let err = OnboardingStub::start_with_options(&mut conn, &client, workflow_id, input, opts)
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, autumn_harvest::error::HarvestError::Config(_)),
+        "expected HarvestError::Config due to duration overflow, got: {:?}",
+        err
+    );
+}
+
+#[tokio::test]
+async fn test_typed_workflow_client_stubs_signal_with_start_payload_cap() {
+    let (db_url, _container) = setup_database_url().await;
+    let pool = build_pool(&db_url);
+    let mut conn = pool.get().await.unwrap();
+
+    let client = WorkflowHandleClient::single(pool, db_url.clone());
+
+    let workflow_id = "onboarding-user-5";
+    let input = OnboardingInput { user_id: 1341 };
+
+    // Set max_signal_payload_bytes to 1 byte, and pass payload: 99999 (5 bytes)
+    let opts = TypedSignalWithStartOptions {
+        max_signal_payload_bytes: Some(1),
+        ..Default::default()
+    };
+
+    let err = OnboardingStub::signal_with_start(
+        &mut conn,
+        &client,
+        workflow_id,
+        input,
+        "subscription_active",
+        99999,
+        opts,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        matches!(
+            err,
+            autumn_harvest::error::HarvestError::PayloadTooLarge { .. }
+        ),
+        "expected HarvestError::PayloadTooLarge due to signal payload size enforcement, got: {:?}",
+        err
+    );
+}
