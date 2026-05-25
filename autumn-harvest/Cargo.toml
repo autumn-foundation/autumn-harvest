@@ -108,6 +108,9 @@ required-features = ["db"]
 [[example]]
 name = "timezone_cron_schedule"
 
+[[example]]
+name = "collect_approvals"
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 testcontainers = { workspace = true }

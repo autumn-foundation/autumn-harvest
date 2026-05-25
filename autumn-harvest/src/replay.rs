@@ -1243,19 +1243,58 @@ impl HistoryMatcher {
         }
     }
 
+    /// Peek forward to determine if `TimerStarted` for the requested ID is the next active deterministic event in history.
+    #[must_use]
+    pub fn is_timer_started_next(&self, timer_id: &str) -> bool {
+        let mut idx = self.cursor;
+        while idx < self.events.len() {
+            if self.is_consumed(idx) {
+                idx += 1;
+                continue;
+            }
+            match &self.events[idx] {
+                WorkflowEvent::SignalReceived { .. } => {
+                    idx += 1;
+                }
+                ev if Self::is_update_event(ev) => {
+                    idx += 1;
+                }
+                WorkflowEvent::ExternalSignalRequested { .. }
+                | WorkflowEvent::ExternalSignalDelivered { .. }
+                | WorkflowEvent::ExternalSignalFailed { .. } => {
+                    idx += 1;
+                }
+                WorkflowEvent::TimerStarted { timer_id: id, .. } => {
+                    return id.as_str() == timer_id;
+                }
+                _ => return false,
+            }
+        }
+        false
+    }
+
     /// Match a timer command against history.
     ///
     /// Expects `TimerStarted { timer_id }` at cursor, then scans for
     /// `TimerFired` with the same `timer_id`.
-    #[allow(clippy::too_many_lines)]
     pub fn match_timer(&mut self, timer_id: &str) -> HistoryMatch {
+        self.match_timer_strict(timer_id, None)
+    }
+
+    /// Match a timer command against history, strictly checking duration if provided.
+    #[allow(clippy::too_many_lines)]
+    pub fn match_timer_strict(
+        &mut self,
+        timer_id: &str,
+        expected_duration: Option<u64>,
+    ) -> HistoryMatch {
         if !self.prepare_match() {
             return HistoryMatch::NoMatch;
         }
 
         let WorkflowEvent::TimerStarted {
             timer_id: recorded_id,
-            ..
+            duration_secs: recorded_duration,
         } = &self.events[self.cursor]
         else {
             return HistoryMatch::Diverged {
@@ -1268,6 +1307,15 @@ impl HistoryMatcher {
             return HistoryMatch::Diverged {
                 expected: format!("TimerStarted({timer_id})"),
                 actual: format!("TimerStarted({recorded_id})"),
+            };
+        }
+
+        if let Some(expected) = expected_duration
+            && *recorded_duration != expected
+        {
+            return HistoryMatch::Diverged {
+                expected: format!("TimerStarted({timer_id}, duration={expected}s)"),
+                actual: format!("TimerStarted({recorded_id}, duration={recorded_duration}s)"),
             };
         }
 

@@ -417,8 +417,7 @@ fn should_requeue_signal_wait(commands: &[WorkflowCommand]) -> bool {
             WorkflowCommand::WaitForSignal { .. } | WorkflowCommand::SignalExternalWorkflow { .. }
         )
     });
-    // RecordUpdateResult and UpsertSearchAttributes are bookkeeping already
-    // handled before this check; they don't affect the signal-wait decision.
+
     let only_wait_or_bookkeeping = commands.iter().all(|cmd| {
         matches!(
             cmd,
@@ -614,22 +613,47 @@ fn extract_all_activity_waits(commands: &[WorkflowCommand]) -> Option<Vec<Activi
     }
 }
 
-fn extract_single_started_timer(commands: &[WorkflowCommand]) -> Option<StartedTimerCommand> {
-    extract_single_command(commands, |cmd| {
-        let WorkflowCommand::StartTimer {
+fn extract_started_timer_for_suspension(
+    commands: &[WorkflowCommand],
+) -> Option<StartedTimerCommand> {
+    // Find all StartTimer commands.
+    let mut timers = commands.iter().filter_map(|cmd| {
+        if let WorkflowCommand::StartTimer {
             timer_id,
             duration_secs,
             ..
         } = cmd
-        else {
-            return None;
-        };
+        {
+            Some(StartedTimerCommand {
+                timer_id: timer_id.clone(),
+                duration_secs: *duration_secs,
+            })
+        } else {
+            None
+        }
+    });
 
-        Some(StartedTimerCommand {
-            timer_id: timer_id.clone(),
-            duration_secs: *duration_secs,
-        })
-    })
+    let first_timer = timers.next()?;
+
+    // If there is more than one StartTimer command, we don't support parallel timers in this branch.
+    if timers.next().is_some() {
+        return None;
+    }
+
+    // Now verify that all other commands in the batch are either bookkeeping OR signal waits.
+    let is_valid = commands.iter().all(|cmd| {
+        matches!(
+            cmd,
+            WorkflowCommand::StartTimer { .. }
+                | WorkflowCommand::WaitForSignal { .. }
+                | WorkflowCommand::SignalExternalWorkflow { .. }
+                | WorkflowCommand::RecordMarker { .. }
+                | WorkflowCommand::RecordUpdateResult { .. }
+                | WorkflowCommand::UpsertSearchAttributes { .. }
+        )
+    });
+
+    if is_valid { Some(first_timer) } else { None }
 }
 
 /// Extract all `StartChildWorkflow` commands when every non-bookkeeping command is
@@ -2009,6 +2033,7 @@ async fn persist_scheduled_activities(
     .await
 }
 
+#[allow(clippy::too_many_lines)]
 async fn persist_started_timer(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
@@ -2020,9 +2045,35 @@ async fn persist_started_timer(
 ) -> HarvestResult<()> {
     use tracing::Instrument;
 
+    // Check if the timer already exists and is active (unfired) in the database.
+    let existing: Option<HarvestTimer> = harvest_timers::table
+        .filter(harvest_timers::workflow_exec_id.eq(exec_id.as_uuid()))
+        .filter(harvest_timers::timer_id.eq(timer.timer_id.as_str()))
+        .filter(harvest_timers::fired.eq(false))
+        .first::<HarvestTimer>(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?;
+
+    let fires_at = if let Some(ref ext) = existing {
+        ext.fires_at
+    } else {
+        let fire_delay = chrono_duration_from_secs(timer.duration_secs, "timer duration")?;
+        chrono::Utc::now() + fire_delay
+    };
+
+    let is_new = existing.is_none();
     let marker_events = marker_events_from_commands(commands);
-    let fire_delay = chrono_duration_from_secs(timer.duration_secs, "timer duration")?;
-    let fires_at = chrono::Utc::now() + fire_delay;
+    let mut events = marker_events;
+
+    if is_new {
+        let timer_started = WorkflowEvent::TimerStarted {
+            timer_id: timer.timer_id.clone(),
+            duration_secs: timer.duration_secs,
+        };
+        events.push(timer_started);
+    }
+
     // Emit a span for the timer placement (not to be confused with
     // harvest.timer.fire which is emitted when the timer actually fires).
     let span = tracing::info_span!(
@@ -2032,29 +2083,30 @@ async fn persist_started_timer(
         timer.duration_secs = timer.duration_secs,
         { ATTR_EXECUTION_ID } = %exec_id,
     );
-    let timer_started = WorkflowEvent::TimerStarted {
-        timer_id: timer.timer_id.clone(),
-        duration_secs: timer.duration_secs,
-    };
-    let mut events = marker_events;
-    events.push(timer_started);
 
-    let new_timer = NewHarvestTimer {
-        workflow_exec_id: exec_id.as_uuid(),
-        timer_id: timer.timer_id.as_str(),
-        fires_at,
-    };
+    let has_events = !events.is_empty();
 
     conn.transaction::<(), HarvestError, _>(|conn| {
         async move {
             use crate::schema::harvest_task_queue::dsl as queue_dsl;
 
-            store::append_events(conn, exec_id, &events, next_event_id).await?;
-            diesel::insert_into(harvest_timers::table)
-                .values(&new_timer)
-                .execute(conn)
-                .await
-                .map_err(crate::error::database_error)?;
+            if has_events {
+                store::append_events(conn, exec_id, &events, next_event_id).await?;
+            }
+
+            if is_new {
+                let new_timer = NewHarvestTimer {
+                    workflow_exec_id: exec_id.as_uuid(),
+                    timer_id: timer.timer_id.as_str(),
+                    fires_at,
+                };
+                diesel::insert_into(harvest_timers::table)
+                    .values(&new_timer)
+                    .execute(conn)
+                    .await
+                    .map_err(crate::error::database_error)?;
+            }
+
             queue::reschedule_task(conn, task_id, fires_at).await?;
             let mut is_mixed = commands.iter().any(|cmd| {
                 matches!(
@@ -3086,7 +3138,7 @@ async fn handle_suspended_workflow(
             sticky,
         )
         .await
-    } else if let Some(timer) = extract_single_started_timer(commands) {
+    } else if let Some(timer) = extract_started_timer_for_suspension(commands) {
         let res = persist_started_timer(
             conn,
             context.persistence.exec_id,
@@ -3578,6 +3630,7 @@ async fn new_child_workflow_event_count(
 
 async fn suspended_command_event_count(
     conn: &mut AsyncPgConnection,
+    workflow_exec_id: Option<uuid::Uuid>,
     commands: &[WorkflowCommand],
 ) -> HarvestResult<u64> {
     let update_events = pending_update_result_event_count(commands);
@@ -3595,8 +3648,22 @@ async fn suspended_command_event_count(
     if extract_all_activity_waits(commands).is_some() {
         return Ok(bookkeeping_events);
     }
-    if extract_single_started_timer(commands).is_some() {
-        return Ok(bookkeeping_events.saturating_add(1));
+    if let Some(timer) = extract_started_timer_for_suspension(commands) {
+        let is_new = if let Some(exec_uuid) = workflow_exec_id {
+            let existing: Option<HarvestTimer> = harvest_timers::table
+                .filter(harvest_timers::workflow_exec_id.eq(exec_uuid))
+                .filter(harvest_timers::timer_id.eq(timer.timer_id.as_str()))
+                .filter(harvest_timers::fired.eq(false))
+                .first::<HarvestTimer>(conn)
+                .await
+                .optional()
+                .map_err(crate::error::database_error)?;
+            existing.is_none()
+        } else {
+            true
+        };
+        let timer_event = u64::from(is_new);
+        return Ok(bookkeeping_events.saturating_add(timer_event));
     }
     if let Some(children) = extract_all_started_child_workflows(commands) {
         return Ok(bookkeeping_events
@@ -4222,7 +4289,7 @@ async fn process_workflow_task(
     let (outcome, pending_cmds, execute_span) = loop_result;
     let pending_durable_event_count = match &outcome {
         WorkflowOutcome::Suspended { commands } => {
-            match suspended_command_event_count(conn, commands).await {
+            match suspended_command_event_count(conn, task.workflow_exec_id, commands).await {
                 Ok(count) => count,
                 Err(error) => {
                     return fail_execution_on_error(conn, task, worker_id, Err::<(), _>(error))
