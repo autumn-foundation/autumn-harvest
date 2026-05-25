@@ -321,6 +321,7 @@ fn type_name_hint(ty: &syn::Type) -> String {
     }
 }
 
+#[allow(clippy::option_if_let_else)]
 fn to_pascal_case(s: &str) -> String {
     let mut chars = s.chars();
     match chars.next() {

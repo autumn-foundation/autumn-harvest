@@ -479,12 +479,6 @@ impl WorkflowHandle {
         ctx.register_declarative_query_handler(query_info);
 
         let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        struct WakerFlag(Arc<std::sync::atomic::AtomicBool>);
-        impl futures::task::ArcWake for WakerFlag {
-            fn wake_by_ref(arc_self: &Arc<Self>) {
-                arc_self.0.store(true, std::sync::atomic::Ordering::Release);
-            }
-        }
         let waker_arc = Arc::new(WakerFlag(flag.clone()));
         let waker = futures::task::waker_ref(&waker_arc);
         let mut poll_cx = std::task::Context::from_waker(&waker);
@@ -498,7 +492,7 @@ impl WorkflowHandle {
                 std::task::Poll::Ready(_) => break,
                 std::task::Poll::Pending => {
                     let was_woken = std::sync::atomic::AtomicBool::load(
-                        &*flag,
+                        &flag,
                         std::sync::atomic::Ordering::Acquire,
                     );
                     if !was_woken {
@@ -623,6 +617,14 @@ pub async fn start_or_load_workflow_execution_with_handle(
     client: &WorkflowHandleClient,
 ) -> HarvestResult<StartedWorkflowHandle> {
     client.start_or_load(conn, request).await
+}
+
+struct WakerFlag(Arc<std::sync::atomic::AtomicBool>);
+
+impl futures::task::ArcWake for WakerFlag {
+    fn wake_by_ref(arc_self: &Arc<Self>) {
+        arc_self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
 }
 
 #[cfg(test)]

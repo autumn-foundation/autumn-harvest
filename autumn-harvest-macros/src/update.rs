@@ -49,6 +49,7 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<UpdateAttrs> {
     Ok(result)
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let attrs = match parse_attrs(attr) {
         Ok(a) => a,
@@ -348,6 +349,7 @@ fn type_name_hint(ty: &syn::Type) -> String {
     }
 }
 
+#[allow(clippy::option_if_let_else)]
 fn to_pascal_case(s: &str) -> String {
     let mut chars = s.chars();
     match chars.next() {

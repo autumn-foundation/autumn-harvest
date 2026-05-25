@@ -368,6 +368,7 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 }
 
+#[allow(clippy::option_if_let_else)]
 fn to_pascal_case(s: &str) -> String {
     let mut chars = s.chars();
     match chars.next() {

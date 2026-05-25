@@ -128,6 +128,7 @@ fn first_param_is_ctx(inputs: &syn::punctuated::Punctuated<syn::FnArg, syn::toke
         .is_some_and(|s| s.ident == "WorkflowContext")
 }
 
+#[allow(clippy::option_if_let_else)]
 fn to_pascal_case(s: &str) -> String {
     let mut chars = s.chars();
     match chars.next() {
