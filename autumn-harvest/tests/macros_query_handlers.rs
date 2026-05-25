@@ -19,6 +19,16 @@ use autumn_harvest::context::{WorkflowContext, empty_shared_state};
 use autumn_harvest::prelude::*;
 use autumn_harvest::types::ExecutionId;
 
+#[workflow]
+async fn my_workflow(_ctx: &WorkflowContext) -> Result<(), String> {
+    Ok(())
+}
+
+#[workflow]
+async fn state_wf(_ctx: &WorkflowContext) -> Result<(), String> {
+    Ok(())
+}
+
 // ── Helper types ──────────────────────────────────────────────────────────────
 
 #[derive(serde::Deserialize, serde::Serialize, Clone)]
