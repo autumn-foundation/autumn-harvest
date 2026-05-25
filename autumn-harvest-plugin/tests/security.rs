@@ -749,3 +749,20 @@ async fn eris_require_auth_blocks_submit_batch_operation() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 }
+
+#[tokio::test]
+async fn reject_payload_larger_than_max_api_payload_bytes() {
+    let state = HarvestApiState::new();
+    let app = harvest_api_router(state).with_state(autumn_web::AppState::for_test());
+
+    let oversized_payload = vec![0u8; 2 * 1024 * 1024 + 10];
+    let request = Request::builder()
+        .method("POST")
+        .uri("/workflows/test-id/query/test-query")
+        .header("content-type", "application/json")
+        .body(Body::from(oversized_payload))
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
