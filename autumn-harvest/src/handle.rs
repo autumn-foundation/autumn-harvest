@@ -445,6 +445,129 @@ impl WorkflowHandle {
             .map_err(database_error)?
             .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {}", self.exec_id)))
     }
+
+    /// Execute a registered query handler in-process by replaying event history.
+    ///
+    /// # Errors
+    ///
+    /// Returns query execution or hydration errors.
+    pub async fn execute_query_in_process(
+        &self,
+        workflow_info: &crate::info::WorkflowInfo,
+        query_info: &crate::info::QueryHandlerInfo,
+        query_name: &str,
+        args: Value,
+    ) -> HarvestResult<Value> {
+        let execution = self.load_execution().await?;
+        if WorkflowResultState::from_execution_state(&execution.state).is_terminal() {
+            return Err(HarvestError::WorkflowNotRunning(self.exec_id));
+        }
+
+        let shard = self.shard();
+        let mut conn = self
+            .client
+            .inner
+            .pools
+            .pool_for(shard)
+            .get()
+            .await
+            .map_err(|error| HarvestError::Database(error.to_string()))?;
+        let history = crate::store::load_history(&mut conn, self.exec_id).await?;
+        drop(conn);
+
+        let ctx = crate::context::WorkflowContext::for_replay(self.exec_id, history.events);
+        ctx.register_declarative_query_handler(query_info);
+
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        struct WakerFlag(Arc<std::sync::atomic::AtomicBool>);
+        impl futures::task::ArcWake for WakerFlag {
+            fn wake_by_ref(arc_self: &Arc<Self>) {
+                arc_self.0.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+        let waker_arc = Arc::new(WakerFlag(flag.clone()));
+        let waker = futures::task::waker_ref(&waker_arc);
+        let mut poll_cx = std::task::Context::from_waker(&waker);
+
+        let handler_fut = (workflow_info.handler)(&ctx, execution.input.clone());
+        tokio::pin!(handler_fut);
+
+        loop {
+            flag.store(false, std::sync::atomic::Ordering::Release);
+            match handler_fut.as_mut().poll(&mut poll_cx) {
+                std::task::Poll::Ready(_) => break,
+                std::task::Poll::Pending => {
+                    let was_woken = std::sync::atomic::AtomicBool::load(
+                        &*flag,
+                        std::sync::atomic::Ordering::Acquire,
+                    );
+                    if !was_woken {
+                        break;
+                    }
+                }
+            }
+        }
+
+        ctx.execute_query_with_args(query_name, args)
+    }
+
+    /// Durably admit a workflow update and poll until it completes or fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns update execution, admission, or polling timeout errors.
+    pub async fn execute_update_in_process(
+        &self,
+        conn: &mut AsyncPgConnection,
+        name: &str,
+        input: Value,
+        timeout: Duration,
+    ) -> HarvestResult<Value> {
+        let update_id = crate::types::UpdateId::new();
+        crate::store::admit_update_event(conn, self.exec_id, update_id, name.to_string(), input)
+            .await?;
+
+        let start = Instant::now();
+        let poll_interval = Duration::from_millis(100);
+
+        loop {
+            let result = {
+                let shard = self.shard();
+                let mut c = self
+                    .client
+                    .inner
+                    .pools
+                    .pool_for(shard)
+                    .get()
+                    .await
+                    .map_err(|e| HarvestError::Database(e.to_string()))?;
+                let h = crate::store::load_history(&mut c, self.exec_id).await?;
+                match crate::replay::HistoryMatcher::new(h.events).match_update(update_id) {
+                    crate::replay::HistoryMatch::Matched { output } => Some(Ok(output)),
+                    crate::replay::HistoryMatch::Failed { error, .. } => {
+                        Some(Err(HarvestError::WorkflowFailed {
+                            name: self.exec_id.to_string(),
+                            reason: error,
+                        }))
+                    }
+                    _ => None,
+                }
+            };
+
+            if let Some(res) = result {
+                return res;
+            }
+
+            if start.elapsed() >= timeout {
+                return Err(HarvestError::Timeout {
+                    timeout_type: TimeoutType::ScheduleToClose,
+                    task_name: format!("update {name}"),
+                });
+            }
+
+            tokio::time::sleep(poll_interval).await;
+        }
+    }
 }
 
 fn terminal_raw_result(execution: &WorkflowExecution) -> Option<HarvestResult<Value>> {

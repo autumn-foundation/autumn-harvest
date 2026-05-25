@@ -18,6 +18,10 @@ pub use crate::handle::{
     StartedWorkflowHandle, WorkflowHandle, WorkflowHandleClient, WorkflowResult,
     WorkflowResultState, start_or_load_workflow_execution_with_handle,
 };
+#[cfg(feature = "db")]
+pub use crate::handle_typed::{
+    TypedSignalWithStartOptions, TypedStartOptions, TypedWorkflowHandle, TypedWorkflowResult,
+};
 pub use crate::info::{ActivityInfo, DagInfo, QueryHandlerInfo, UpdateHandlerInfo, WorkflowInfo};
 pub use crate::policy::{
     OverlapPolicy, RetryPolicy, Schedule, SkipPolicy, TaskStatus, TriggerRule, WorkflowSchedule,
@@ -40,5 +44,5 @@ pub use crate::types::{
 
 // Re-export macros from autumn-harvest-macros.
 pub use autumn_harvest_macros::{
-    activities, activity, dag, dags, queries, query, update, updates, workflow, workflows,
+    activities, activity, dag, dags, queries, query, signal, update, updates, workflow, workflows,
 };
