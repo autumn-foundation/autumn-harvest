@@ -129,8 +129,10 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         },
     );
 
-    let camel_wf = to_pascal_case(&workflow_name);
-    let stub_name = format_ident!("{camel_wf}Stub");
+    let parts: Vec<&str> = workflow_name.split("::").collect();
+    let workflow_simple_name = parts.last().unwrap_or(&"").to_string();
+    let camel_wf = to_pascal_case(&workflow_simple_name);
+    let stub_ident = format_ident!("{camel_wf}Stub");
     let method_name = format_ident!("update_{fn_name}");
     let ok_type = extract_ok_type(&func.sig.output);
 
@@ -141,6 +143,64 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! { ::autumn_harvest::serde_json::to_value(&#name).map_err(::autumn_harvest::error::HarvestError::Serialization)? }
     } else {
         quote! { ::autumn_harvest::serde_json::json!([#(&#param_names),*]) }
+    };
+
+    let mod_name = format_ident!("__autumn_update_impl_{fn_name}");
+    let impl_block = if parts.len() > 1 {
+        let path_tokens: Vec<proc_macro2::TokenStream> = parts
+            .iter()
+            .map(|p| {
+                let id = format_ident!("{}", p);
+                quote! { #id }
+            })
+            .collect();
+        quote! {
+            #[cfg(feature = "db")]
+            mod #mod_name {
+                use super::*;
+                use #(#path_tokens)::*::#stub_ident;
+                impl #stub_ident {
+                    /// Execute this typed update handler in-process.
+                    pub async fn #method_name(
+                        conn: &mut ::autumn_harvest::diesel_async::AsyncPgConnection,
+                        handle: &::autumn_harvest::WorkflowHandle,
+                        #(#params),*
+                    ) -> ::autumn_harvest::HarvestResult<#ok_type> {
+                        let args = #serialize_payload;
+                        let raw = handle.execute_update_in_process(
+                            conn,
+                            #workflow_simple_name,
+                            args,
+                            ::std::time::Duration::from_secs(30)
+                        ).await?;
+                        ::autumn_harvest::serde_json::from_value(raw)
+                            .map_err(::autumn_harvest::error::HarvestError::Serialization)
+                    }
+                }
+            }
+        }
+    } else {
+        quote! {
+            #[cfg(feature = "db")]
+            impl #stub_ident {
+                /// Execute this typed update handler in-process.
+                pub async fn #method_name(
+                    conn: &mut ::autumn_harvest::diesel_async::AsyncPgConnection,
+                    handle: &::autumn_harvest::WorkflowHandle,
+                    #(#params),*
+                ) -> ::autumn_harvest::HarvestResult<#ok_type> {
+                    let args = #serialize_payload;
+                    let raw = handle.execute_update_in_process(
+                        conn,
+                        #workflow_simple_name,
+                        args,
+                        ::std::time::Duration::from_secs(30)
+                    ).await?;
+                    ::autumn_harvest::serde_json::from_value(raw)
+                        .map_err(::autumn_harvest::error::HarvestError::Serialization)
+                }
+            }
+        }
     };
 
     quote! {
@@ -163,7 +223,7 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
             ::autumn_harvest::UpdateHandlerInfo {
                 name: #fn_name_str,
-                workflow: #workflow_name,
+                workflow: #workflow_simple_name,
                 module: module_path!(),
                 input_type_hint: #input_type_hint,
                 output_type_hint: #output_type_hint,
@@ -173,25 +233,7 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         }
 
-        #[cfg(feature = "db")]
-        impl #stub_name {
-            /// Execute this typed update handler in-process.
-            pub async fn #method_name(
-                conn: &mut ::autumn_harvest::diesel_async::AsyncPgConnection,
-                handle: &::autumn_harvest::WorkflowHandle,
-                #(#params),*
-            ) -> ::autumn_harvest::HarvestResult<#ok_type> {
-                let args = #serialize_payload;
-                let raw = handle.execute_update_in_process(
-                    conn,
-                    #fn_name_str,
-                    args,
-                    ::std::time::Duration::from_secs(30)
-                ).await?;
-                ::autumn_harvest::serde_json::from_value(raw)
-                    .map_err(::autumn_harvest::error::HarvestError::Serialization)
-            }
-        }
+        #impl_block
     }
 }
 

@@ -283,7 +283,10 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let workflow_id = workflow_id.into();
                 let input = #serialize_args;
                 let info = #public_info_name();
-                let exec_id = opts.exec_id.unwrap_or_else(|| ::autumn_harvest::types::ExecutionId::new());
+                let exec_id = opts.exec_id.unwrap_or_else(|| {
+                    let shard = client.pick_shard_for_new_workflow(info.name, &workflow_id);
+                    ::autumn_harvest::types::ExecutionId::new_for_shard(shard)
+                });
 
                 let (concurrency_key, concurrency_limit) = if let Some(ref policy) = info.concurrency {
                     let key = ::autumn_harvest::concurrency::resolve_concurrency_key(&policy.key_expr, &input);
@@ -344,7 +347,10 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let workflow_id = workflow_id.into();
                 let input = #serialize_args;
                 let info = #public_info_name();
-                let exec_id = opts.exec_id.unwrap_or_else(|| ::autumn_harvest::types::ExecutionId::new());
+                let exec_id = opts.exec_id.unwrap_or_else(|| {
+                    let shard = client.pick_shard_for_new_workflow(info.name, &workflow_id);
+                    ::autumn_harvest::types::ExecutionId::new_for_shard(shard)
+                });
 
                 let (concurrency_key, concurrency_limit) = if let Some(ref policy) = info.concurrency {
                     let key = ::autumn_harvest::concurrency::resolve_concurrency_key(&policy.key_expr, &input);

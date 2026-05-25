@@ -63,6 +63,7 @@ pub type UpdateValidatorFn = fn(&serde_json::Value) -> Result<(), String>;
 ///
 /// Collected by the `queries![…]` bang macro and registered on
 /// [`HarvestBuilder`](crate::builder::HarvestBuilder) via `.queries(…)`.
+#[derive(Clone)]
 pub struct QueryHandlerInfo {
     /// The query name (the function name), used as the key in the query registry.
     pub name: &'static str,
@@ -82,6 +83,7 @@ pub struct QueryHandlerInfo {
 ///
 /// Collected by the `updates![…]` bang macro and registered on
 /// [`HarvestBuilder`](crate::builder::HarvestBuilder) via `.updates(…)`.
+#[derive(Clone)]
 pub struct UpdateHandlerInfo {
     /// The update name (the function name), used as the key in the update registry.
     pub name: &'static str,

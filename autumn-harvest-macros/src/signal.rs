@@ -28,6 +28,7 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<SignalAttrs> {
     Ok(result)
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn signal_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let attrs = match parse_attrs(attr) {
         Ok(a) => a,
@@ -60,8 +61,10 @@ pub fn signal_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let fn_name_str = fn_name.to_string();
     let method_name = format_ident!("signal_{fn_name}");
 
-    let camel_wf = to_pascal_case(&workflow_name);
-    let stub_name = format_ident!("{camel_wf}Stub");
+    let parts: Vec<&str> = workflow_name.split("::").collect();
+    let workflow_simple_name = parts.last().unwrap_or(&"").to_string();
+    let camel_wf = to_pascal_case(&workflow_simple_name);
+    let stub_ident = format_ident!("{camel_wf}Stub");
 
     // Skip the leading ctx param when building signal args.
     let params: Vec<_> = func.sig.inputs.iter().skip(1).collect();
@@ -86,27 +89,66 @@ pub fn signal_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! { ::autumn_harvest::serde_json::json!([#(&#param_names),*]) }
     };
 
+    let mod_name = format_ident!("__autumn_signal_impl_{fn_name}");
+    let impl_block = if parts.len() > 1 {
+        let path_tokens: Vec<proc_macro2::TokenStream> = parts
+            .iter()
+            .map(|p| {
+                let id = format_ident!("{}", p);
+                quote! { #id }
+            })
+            .collect();
+        quote! {
+            #[cfg(feature = "db")]
+            mod #mod_name {
+                use super::*;
+                use #(#path_tokens)::*::#stub_ident;
+                impl #stub_ident {
+                    /// Send a type-safe signal to this workflow execution.
+                    pub async fn #method_name(
+                        conn: &mut ::autumn_harvest::diesel_async::AsyncPgConnection,
+                        handle: &::autumn_harvest::WorkflowHandle,
+                        #(#params),*
+                    ) -> ::autumn_harvest::HarvestResult<()> {
+                        let payload = #serialize_payload;
+                        ::autumn_harvest::signal::send_signal(
+                            conn,
+                            handle.exec_id(),
+                            #fn_name_str,
+                            payload,
+                        )
+                        .await
+                    }
+                }
+            }
+        }
+    } else {
+        quote! {
+            #[cfg(feature = "db")]
+            impl #stub_ident {
+                /// Send a type-safe signal to this workflow execution.
+                pub async fn #method_name(
+                    conn: &mut ::autumn_harvest::diesel_async::AsyncPgConnection,
+                    handle: &::autumn_harvest::WorkflowHandle,
+                    #(#params),*
+                ) -> ::autumn_harvest::HarvestResult<()> {
+                    let payload = #serialize_payload;
+                    ::autumn_harvest::signal::send_signal(
+                        conn,
+                        handle.exec_id(),
+                        #fn_name_str,
+                        payload,
+                    )
+                    .await
+                }
+            }
+        }
+    };
+
     quote! {
         #func
 
-        #[cfg(feature = "db")]
-        impl #stub_name {
-            /// Send a type-safe signal to this workflow execution.
-            pub async fn #method_name(
-                conn: &mut ::autumn_harvest::diesel_async::AsyncPgConnection,
-                handle: &::autumn_harvest::WorkflowHandle,
-                #(#params),*
-            ) -> ::autumn_harvest::HarvestResult<()> {
-                let payload = #serialize_payload;
-                ::autumn_harvest::signal::send_signal(
-                    conn,
-                    handle.exec_id(),
-                    #fn_name_str,
-                    payload,
-                )
-                .await
-            }
-        }
+        #impl_block
     }
 }
 

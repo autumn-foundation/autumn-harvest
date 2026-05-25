@@ -151,11 +151,32 @@ impl WorkflowResult {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct WorkflowHandleClientInner {
     pools: ShardedDbPool,
     router: ShardRouter,
     notification_database_urls: BTreeMap<ShardId, String>,
+    payload_codecs: crate::payload_codec::PayloadCodecs,
+    shared_state: crate::context::SharedState,
+    update_handlers: Vec<crate::info::UpdateHandlerInfo>,
+    query_handlers: Vec<crate::info::QueryHandlerInfo>,
+}
+
+impl std::fmt::Debug for WorkflowHandleClientInner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkflowHandleClientInner")
+            .field("pools", &self.pools)
+            .field("router", &self.router)
+            .field(
+                "notification_database_urls",
+                &self.notification_database_urls,
+            )
+            .field("payload_codecs", &"<PayloadCodecs>")
+            .field("shared_state", &"<SharedState>")
+            .field("update_handlers_count", &self.update_handlers.len())
+            .field("query_handlers_count", &self.query_handlers.len())
+            .finish()
+    }
 }
 
 /// Factory for shard-aware workflow handles.
@@ -202,8 +223,55 @@ impl WorkflowHandleClient {
                     .into_iter()
                     .map(|(shard, url)| (shard, url.into()))
                     .collect(),
+                payload_codecs: crate::payload_codec::PayloadCodecs::default(),
+                shared_state: crate::context::empty_shared_state(),
+                update_handlers: Vec::new(),
+                query_handlers: Vec::new(),
             }),
         }
+    }
+
+    /// Add custom payload codecs to the client.
+    #[must_use]
+    pub fn with_codecs(self, codecs: crate::payload_codec::PayloadCodecs) -> Self {
+        let mut inner = (*self.inner).clone();
+        inner.payload_codecs = codecs;
+        Self {
+            inner: Arc::new(inner),
+        }
+    }
+
+    /// Add shared state to the client.
+    #[must_use]
+    pub fn with_shared_state(self, shared_state: crate::context::SharedState) -> Self {
+        let mut inner = (*self.inner).clone();
+        inner.shared_state = shared_state;
+        Self {
+            inner: Arc::new(inner),
+        }
+    }
+
+    /// Add query and update handlers to the client.
+    #[must_use]
+    pub fn with_handlers(
+        self,
+        query_handlers: Vec<crate::info::QueryHandlerInfo>,
+        update_handlers: Vec<crate::info::UpdateHandlerInfo>,
+    ) -> Self {
+        let mut inner = (*self.inner).clone();
+        inner.query_handlers = query_handlers;
+        inner.update_handlers = update_handlers;
+        Self {
+            inner: Arc::new(inner),
+        }
+    }
+
+    /// Pick which shard a new workflow execution with `(name, id)` should land on.
+    #[must_use]
+    pub fn pick_shard_for_new_workflow(&self, workflow_name: &str, workflow_id: &str) -> ShardId {
+        self.inner
+            .router
+            .pick_for_new_workflow(workflow_name, workflow_id)
     }
 
     /// Create a handle for an existing workflow execution.
@@ -472,10 +540,29 @@ impl WorkflowHandle {
             .get()
             .await
             .map_err(|error| HarvestError::Database(error.to_string()))?;
-        let history = crate::store::load_history(&mut conn, self.exec_id).await?;
+        let history = crate::store::load_history_with_codecs(
+            &mut conn,
+            self.exec_id,
+            &self.client.inner.payload_codecs,
+        )
+        .await?;
         drop(conn);
 
-        let ctx = crate::context::WorkflowContext::for_replay(self.exec_id, history.events);
+        let ctx = crate::context::WorkflowContext::for_replay_with_state(
+            self.exec_id,
+            history.events,
+            self.client.inner.shared_state.clone(),
+        );
+        for q_info in &self.client.inner.query_handlers {
+            if q_info.workflow == workflow_info.name {
+                ctx.register_declarative_query_handler(q_info);
+            }
+        }
+        for u_info in &self.client.inner.update_handlers {
+            if u_info.workflow == workflow_info.name {
+                ctx.register_declarative_update_handler(u_info);
+            }
+        }
         ctx.register_declarative_query_handler(query_info);
 
         let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -536,7 +623,12 @@ impl WorkflowHandle {
                     .get()
                     .await
                     .map_err(|e| HarvestError::Database(e.to_string()))?;
-                let h = crate::store::load_history(&mut c, self.exec_id).await?;
+                let h = crate::store::load_history_with_codecs(
+                    &mut c,
+                    self.exec_id,
+                    &self.client.inner.payload_codecs,
+                )
+                .await?;
                 match crate::replay::HistoryMatcher::new(h.events).match_update(update_id) {
                     crate::replay::HistoryMatch::Matched { output } => Some(Ok(output)),
                     crate::replay::HistoryMatch::Failed { error, .. } => {

@@ -284,6 +284,9 @@ fn start_harvest_runtime(
     if let Some(app_pool) = app_pool.as_ref() {
         runner_resources = runner_resources.with_app_pool(app_pool.clone());
     }
+    let payload_codecs = built.payload_codecs().clone();
+    let query_handlers = built.query_handlers().to_vec();
+    let update_handlers = built.update_handlers().to_vec();
     let runner = HarvestRunner::start(built, &harvest_config, runner_resources)?;
     let harvest_db_pool = runner.storage_pool();
     let workflow_handle_client = WorkflowHandleClient::new(
@@ -293,7 +296,10 @@ fn start_harvest_runtime(
             autumn_harvest::ShardId::new(0),
             workflow_result_notification_url,
         )],
-    );
+    )
+    .with_codecs(payload_codecs)
+    .with_shared_state(runner.api_runtime().registry().shared_state())
+    .with_handlers(query_handlers, update_handlers);
     state.insert_extension(harvest_db_pool.clone());
     state.insert_extension(workflow_handle_client);
     api_state.install_storage_pool(harvest_db_pool);
