@@ -78,13 +78,16 @@ impl DagProfiler {
             };
         }
 
-        let mut timeline = Vec::new();
+        /// ⚡ Bolt: Pre-allocate vectors to avoid O(log N) intermediate heap reallocations.
+        /// Each task will generate exactly 2 events (start and complete).
+        let mut timeline = Vec::with_capacity(tasks.len() * 2);
         let mut peak_concurrency = 0;
         let mut task_start_times = vec![None; tasks.len()];
         let mut task_end_times = vec![None; tasks.len()];
 
         // Priority queue-like behavior using a sorted vector of (time, kind)
-        let mut event_queue: Vec<(Duration, usize, bool)> = Vec::new(); // bool: true = start, false = end
+        /// ⚡ Bolt: Pre-allocate event queue matching the expected number of events.
+        let mut event_queue: Vec<(Duration, usize, bool)> = Vec::with_capacity(tasks.len() * 2); // bool: true = start, false = end
 
         for level in levels {
             for &task_index in level {
