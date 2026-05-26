@@ -180,7 +180,10 @@ impl std::fmt::Debug for WorkflowHandleClientInner {
             .field("update_handlers_count", &self.update_handlers.len())
             .field("query_handlers_count", &self.query_handlers.len())
             .field("max_workflow_input_bytes", &self.max_workflow_input_bytes)
-            .field("max_workflow_execution_timeout", &self.max_workflow_execution_timeout)
+            .field(
+                "max_workflow_execution_timeout",
+                &self.max_workflow_execution_timeout,
+            )
             .field("max_workflow_start_delay", &self.max_workflow_start_delay)
             .field("max_signal_payload_bytes", &self.max_signal_payload_bytes)
             .finish()
