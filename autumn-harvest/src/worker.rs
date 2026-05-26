@@ -514,7 +514,14 @@ struct SuspendedWorkflowContext<'a> {
     execute_span: &'a tracing::Span,
 }
 
-fn marker_events_from_commands(commands: &[WorkflowCommand]) -> Vec<WorkflowEvent> {
+/// Collect pre-suspension events from the command list, preserving command order.
+///
+/// Includes both `MarkerRecorded` (from `RecordMarker`) and
+/// `ChildWorkflowSpawnedDetached` (from `SpawnDetachedChildWorkflow`) so that
+/// the parent history reflects the exact command emission order. All other
+/// command types produce their events through the suspension-path persistence
+/// functions and are not included here.
+fn pre_suspension_events_from_commands(commands: &[WorkflowCommand]) -> Vec<WorkflowEvent> {
     commands
         .iter()
         .filter_map(|cmd| match cmd {
@@ -524,6 +531,17 @@ fn marker_events_from_commands(commands: &[WorkflowCommand]) -> Vec<WorkflowEven
                     details: details.clone(),
                 })
             }
+            WorkflowCommand::SpawnDetachedChildWorkflow {
+                child_id,
+                workflow_name,
+                input,
+                parent_close_policy,
+            } => Some(WorkflowEvent::ChildWorkflowSpawnedDetached {
+                child_id: *child_id,
+                workflow_name: workflow_name.clone(),
+                input: input.clone(),
+                parent_close_policy: *parent_close_policy,
+            }),
             _ => None,
         })
         .collect()
@@ -533,15 +551,17 @@ fn extract_single_command<T>(
     commands: &[WorkflowCommand],
     extractor: impl Fn(&WorkflowCommand) -> Option<T>,
 ) -> Option<T> {
-    // RecordUpdateResult, RecordMarker, and UpsertSearchAttributes are
-    // bookkeeping commands that have already been (or are about to be)
-    // processed; they do not count toward the suspension-type determination.
+    // RecordUpdateResult, RecordMarker, UpsertSearchAttributes, and
+    // SpawnDetachedChildWorkflow are bookkeeping / fire-and-forget commands
+    // that have already been (or are about to be) processed; they do not count
+    // toward the suspension-type determination.
     let mut iter = commands.iter().filter(|cmd| {
         !matches!(
             cmd,
             WorkflowCommand::RecordMarker { .. }
                 | WorkflowCommand::RecordUpdateResult { .. }
                 | WorkflowCommand::UpsertSearchAttributes { .. }
+                | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
         )
     });
 
@@ -565,7 +585,8 @@ fn extract_all_scheduled_activities(
         match cmd {
             WorkflowCommand::RecordMarker { .. }
             | WorkflowCommand::RecordUpdateResult { .. }
-            | WorkflowCommand::UpsertSearchAttributes { .. } => {}
+            | WorkflowCommand::UpsertSearchAttributes { .. }
+            | WorkflowCommand::SpawnDetachedChildWorkflow { .. } => {}
             WorkflowCommand::ScheduleActivity {
                 activity_id,
                 name,
@@ -602,7 +623,8 @@ fn extract_all_activity_waits(commands: &[WorkflowCommand]) -> Option<Vec<Activi
         match cmd {
             WorkflowCommand::RecordMarker { .. }
             | WorkflowCommand::RecordUpdateResult { .. }
-            | WorkflowCommand::UpsertSearchAttributes { .. } => {}
+            | WorkflowCommand::UpsertSearchAttributes { .. }
+            | WorkflowCommand::SpawnDetachedChildWorkflow { .. } => {}
             WorkflowCommand::WaitForActivity { activity_id, .. } => activity_ids.push(*activity_id),
             _ => return None,
         }
@@ -652,6 +674,7 @@ fn extract_started_timer_for_suspension(
                 | WorkflowCommand::RecordMarker { .. }
                 | WorkflowCommand::RecordUpdateResult { .. }
                 | WorkflowCommand::UpsertSearchAttributes { .. }
+                | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
         )
     });
 
@@ -673,6 +696,7 @@ fn extract_all_started_child_workflows(
                 WorkflowCommand::RecordMarker { .. }
                     | WorkflowCommand::RecordUpdateResult { .. }
                     | WorkflowCommand::UpsertSearchAttributes { .. }
+                    | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
             )
         })
         .collect();
@@ -1872,7 +1896,7 @@ async fn persist_activity_wait_park(
     activity_ids: &[ActivityExecId],
     sticky: Option<queue::StickyHint<'_>>,
 ) -> HarvestResult<()> {
-    let marker_events = marker_events_from_commands(commands);
+    let marker_events = pre_suspension_events_from_commands(commands);
 
     conn.transaction::<(), HarvestError, _>(|conn| {
         async move {
@@ -1920,7 +1944,7 @@ async fn persist_scheduled_activities(
     assigned_build_id: Option<&str>,
     parent_priority: i32,
 ) -> HarvestResult<()> {
-    let marker_events = marker_events_from_commands(commands);
+    let marker_events = pre_suspension_events_from_commands(commands);
     let mut events = marker_events;
     let mut enqueued = Vec::with_capacity(scheduled_activities.len());
 
@@ -2071,7 +2095,7 @@ async fn persist_started_timer(
     };
 
     let is_new = existing.is_none();
-    let marker_events = marker_events_from_commands(commands);
+    let marker_events = pre_suspension_events_from_commands(commands);
     let mut events = marker_events;
 
     if is_new {
@@ -2202,7 +2226,7 @@ async fn persist_all_started_child_workflows(
     let queue_name = parent_execution.queue_name.clone();
     let children = children.to_vec();
     // Compute marker events outside the transaction (WorkflowCommand is not Clone).
-    let marker_events = marker_events_from_commands(commands);
+    let marker_events = pre_suspension_events_from_commands(commands);
     let shard_id = parent_execution.shard_id;
 
     // Clone telemetry and execute_span before the transaction closure so they
@@ -2691,26 +2715,22 @@ async fn persist_child_workflow_failure(
     .await
 }
 
-/// Create child workflow executions for all `SpawnDetachedChildWorkflow` commands
-/// in `commands`.
+/// Perform the DB side-effects for all `SpawnDetachedChildWorkflow` commands in
+/// `commands`: insert a child execution row, start the child's event log with
+/// `WorkflowStarted`, and enqueue the child task.
 ///
-/// For each command: validates the workflow is registered, inserts a child
-/// execution row with `parent_close_policy` set (so cascades can find it),
-/// appends a `ChildWorkflowSpawnedDetached` event to the parent history, starts
-/// the child's event log with `WorkflowStarted`, and enqueues the child task.
+/// The `ChildWorkflowSpawnedDetached` event written to the **parent** history is
+/// handled separately by `pre_suspension_events_from_commands` so that it lands
+/// at the correct position relative to `RecordMarker` events.
 ///
-/// `next_event_id` is advanced by the number of `ChildWorkflowSpawnedDetached`
-/// events appended. Non-detached-spawn commands in `commands` are silently skipped.
-/// Already-existing child rows (idempotent re-run) are also skipped.
+/// Non-detached-spawn commands in `commands` are silently skipped. Already-existing
+/// child rows (idempotent re-run after a crash) are also skipped.
 async fn create_detached_child_executions(
     conn: &mut AsyncPgConnection,
     registry: &HandlerRegistry,
     parent_execution: &WorkflowExecution,
     commands: &[WorkflowCommand],
-    next_event_id: &mut i32,
 ) -> HarvestResult<()> {
-    let parent_exec_id = execution_id_from_uuid(parent_execution.id);
-
     for cmd in commands {
         let WorkflowCommand::SpawnDetachedChildWorkflow {
             child_id,
@@ -2764,22 +2784,10 @@ async fn create_detached_child_executions(
             .await
             .map_err(crate::error::database_error)?;
 
-        // Append ChildWorkflowSpawnedDetached to parent history.
-        store::append_events(
-            conn,
-            parent_exec_id,
-            &[WorkflowEvent::ChildWorkflowSpawnedDetached {
-                child_id: *child_id,
-                workflow_name: workflow_name.clone(),
-                input: input.clone(),
-                parent_close_policy: *parent_close_policy,
-            }],
-            *next_event_id,
-        )
-        .await?;
-        *next_event_id = next_event_id.saturating_add(1);
-
         // Start child history.
+        // Note: the ChildWorkflowSpawnedDetached event for the PARENT history is
+        // written by the caller's pre_suspension_events_from_commands batch so
+        // that it appears at the correct position relative to RecordMarker events.
         store::append_events(
             conn,
             *child_id,
@@ -3128,7 +3136,7 @@ async fn persist_scheduled_external_activity(
                 // start (when next_event_id was sampled) and here.  Using
                 // append_single_event serialises each append against concurrent
                 // writers via the per-execution FOR UPDATE it acquires.
-                let marker_events = marker_events_from_commands(commands);
+                let marker_events = pre_suspension_events_from_commands(commands);
                 for event in marker_events {
                     store::append_single_event(conn, exec_id, event).await?;
                 }
@@ -3150,7 +3158,7 @@ async fn persist_scheduled_external_activity(
         return Ok(());
     }
 
-    let marker_events = marker_events_from_commands(commands);
+    let marker_events = pre_suspension_events_from_commands(commands);
     let awaiting_event = WorkflowEvent::ActivityAwaitingExternal {
         activity_id: scheduled.activity_id,
         token: scheduled.token,
@@ -3226,7 +3234,7 @@ async fn handle_suspended_workflow(
     let sticky = context.persistence.sticky_hint();
 
     let result = if should_requeue_signal_wait(commands) {
-        let marker_events = marker_events_from_commands(commands);
+        let marker_events = pre_suspension_events_from_commands(commands);
         persist_signal_wait_park(
             conn,
             context.persistence.task.id,
@@ -3626,7 +3634,7 @@ async fn persist_workflow_outcome(
     conn: &mut AsyncPgConnection,
     registry: &HandlerRegistry,
     execution: &WorkflowExecution,
-    mut persistence: WorkflowTaskPersistence<'_>,
+    persistence: WorkflowTaskPersistence<'_>,
     outcome: WorkflowOutcome,
     execute_span: &tracing::Span,
 ) -> HarvestResult<()> {
@@ -3685,22 +3693,17 @@ async fn persist_workflow_outcome(
             .await
         }
         (WorkflowOutcome::Suspended { commands }, _) => {
-            // Separate detached-spawn commands from the suspension commands.
-            // SpawnDetachedChildWorkflow does not suspend the parent — it is a
-            // fire-and-forget primitive that creates a child row and enqueues its
-            // first task, then the parent continues with the remaining suspension.
-            let (detached_cmds, remaining_cmds): (Vec<_>, Vec<_>) = commands
-                .into_iter()
-                .partition(|c| matches!(c, WorkflowCommand::SpawnDetachedChildWorkflow { .. }));
-            if !detached_cmds.is_empty() {
-                create_detached_child_executions(
-                    conn,
-                    registry,
-                    execution,
-                    &detached_cmds,
-                    &mut persistence.next_event_id,
-                )
-                .await?;
+            // Create child execution rows for any detached-spawn commands BEFORE
+            // handle_suspended_workflow writes events. Doing it first ensures
+            // that on a crash-restart the already_exists idempotency check can
+            // skip re-creating the row, even though the ChildWorkflowSpawnedDetached
+            // parent-history event is written as part of the pre_suspension_events
+            // batch inside the suspension path (in the correct command order).
+            if commands
+                .iter()
+                .any(|c| matches!(c, WorkflowCommand::SpawnDetachedChildWorkflow { .. }))
+            {
+                create_detached_child_executions(conn, registry, execution, &commands).await?;
             }
             handle_suspended_workflow(
                 conn,
@@ -3710,7 +3713,7 @@ async fn persist_workflow_outcome(
                     persistence,
                     execute_span,
                 },
-                &remaining_cmds,
+                &commands,
             )
             .await
         }
@@ -4501,17 +4504,23 @@ async fn process_workflow_task(
         persist_update_result_commands(conn, prepared.exec_id, &pending_cmds, &mut next_event_id)
             .await?;
         persist_search_attrs_from_commands(conn, prepared.exec_id, &pending_cmds).await?;
+        // Write pre-terminal events (markers + detached-spawn) in command order,
+        // before the terminal event. next_event_id is advanced so persist_workflow_outcome
+        // places the terminal event immediately after them.
+        let pre_terminal = pre_suspension_events_from_commands(&pending_cmds);
+        if !pre_terminal.is_empty() {
+            store::append_events(conn, prepared.exec_id, &pre_terminal, next_event_id).await?;
+            next_event_id = next_event_id
+                .checked_add(i32::try_from(pre_terminal.len()).unwrap_or(i32::MAX))
+                .ok_or_else(|| {
+                    crate::error::HarvestError::Database("Event ID overflow".to_string())
+                })?;
+        }
         // Create any detached child executions emitted alongside the terminal outcome.
         // SpawnDetachedChildWorkflow is fire-and-forget: the parent does not suspend,
         // so the command appears in pending_cmds alongside Complete/Fail/ContinuedAsNew.
-        create_detached_child_executions(
-            conn,
-            registry,
-            &prepared.execution,
-            &pending_cmds,
-            &mut next_event_id,
-        )
-        .await?;
+        create_detached_child_executions(conn, registry, &prepared.execution, &pending_cmds)
+            .await?;
         // Keep the in-memory execution snapshot current so that
         // persist_workflow_continue_as_new copies the patched attrs to the
         // successor row rather than the stale pre-patch snapshot.
