@@ -542,9 +542,8 @@ fn workflow_child_row_from_parts(
     depth: u8,
     parent_close_policy_str: Option<&str>,
 ) -> WorkflowChildRow {
-    let parent_close_policy = parent_close_policy_str.and_then(|s| {
-        s.parse::<crate::types::ParentClosePolicy>().ok()
-    });
+    let parent_close_policy =
+        parent_close_policy_str.and_then(|s| s.parse::<crate::types::ParentClosePolicy>().ok());
     let await_mode = if parent_close_policy.is_some() {
         AwaitMode::Detached
     } else {

@@ -1943,7 +1943,9 @@ impl WorkflowContext {
             HistoryMatch::Diverged { expected, actual } => Err(HarvestError::NonDeterministic(
                 format!("detached child workflow mismatch: expected {expected}, got {actual}"),
             )),
-            _ => unreachable!("match_detached_child_spawn only returns DetachedChildSpawned, NoMatch, or Diverged"),
+            _ => unreachable!(
+                "match_detached_child_spawn only returns DetachedChildSpawned, NoMatch, or Diverged"
+            ),
         }
     }
 

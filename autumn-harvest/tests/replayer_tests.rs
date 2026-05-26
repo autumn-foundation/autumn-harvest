@@ -1381,11 +1381,7 @@ fn detached_spawn_then_activity_workflow<'a>(
 ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
     Box::pin(async move {
         let child_id = ctx
-            .spawn_child_workflow_detached_raw(
-                "monitor",
-                Value::Null,
-                ParentClosePolicy::Abandon,
-            )
+            .spawn_child_workflow_detached_raw("monitor", Value::Null, ParentClosePolicy::Abandon)
             .map_err(|e| e.to_string())?;
         let result = ctx
             .execute_activity_raw("do_work", Value::Null, "default")
@@ -1451,8 +1447,10 @@ fn detached_spawn_then_activity_history() -> (ExecutionId, ExecutionId, Vec<Work
 #[tokio::test]
 async fn replay_detached_spawn_returns_recorded_child_id() {
     let (exec_id, child_id, events) = detached_spawn_history(ParentClosePolicy::Abandon);
-    let replayer = WorkflowReplayer::new()
-        .register_fn("detached_spawn_abandon_workflow", detached_spawn_abandon_workflow);
+    let replayer = WorkflowReplayer::new().register_fn(
+        "detached_spawn_abandon_workflow",
+        detached_spawn_abandon_workflow,
+    );
 
     let report = replayer
         .replay_from_snapshot(HistorySnapshot {
@@ -1466,7 +1464,10 @@ async fn replay_detached_spawn_returns_recorded_child_id() {
         matches!(report.status, ReplayStatus::ReplaySucceeded),
         "detached spawn replay must succeed: {report}"
     );
-    assert!(report.events_replayed > 0, "events_replayed must be positive");
+    assert!(
+        report.events_replayed > 0,
+        "events_replayed must be positive"
+    );
     let _ = child_id; // child_id is used above and the replay returned same id
 }
 
@@ -1531,11 +1532,7 @@ fn reordered_detached_spawn_workflow<'a>(
             .await
             .map_err(|e| e.to_string())?;
         let child_id = ctx
-            .spawn_child_workflow_detached_raw(
-                "monitor",
-                Value::Null,
-                ParentClosePolicy::Abandon,
-            )
+            .spawn_child_workflow_detached_raw("monitor", Value::Null, ParentClosePolicy::Abandon)
             .map_err(|e| e.to_string())?;
         Ok(serde_json::json!({ "result": result, "child_id": child_id.to_string() }))
     })
@@ -1544,8 +1541,10 @@ fn reordered_detached_spawn_workflow<'a>(
 #[tokio::test]
 async fn replay_reordered_detached_spawn_detects_non_determinism() {
     let (exec_id, _child_id, events) = detached_spawn_then_activity_history();
-    let replayer = WorkflowReplayer::new()
-        .register_fn("reordered_detached_spawn_workflow", reordered_detached_spawn_workflow);
+    let replayer = WorkflowReplayer::new().register_fn(
+        "reordered_detached_spawn_workflow",
+        reordered_detached_spawn_workflow,
+    );
 
     let report = replayer
         .replay_from_snapshot(HistorySnapshot {
@@ -1556,10 +1555,7 @@ async fn replay_reordered_detached_spawn_detects_non_determinism() {
         .await;
 
     assert!(
-        matches!(
-            report.status,
-            ReplayStatus::NonDeterminismDetected { .. }
-        ),
+        matches!(report.status, ReplayStatus::NonDeterminismDetected { .. }),
         "reordered detached spawn must detect non-determinism: {report}"
     );
 }
@@ -1620,5 +1616,8 @@ async fn replay_backwards_compat_awaited_child_workflow() {
         matches!(report.status, ReplayStatus::ReplaySucceeded),
         "pre-#347 awaited child history must still replay correctly: {report}"
     );
-    assert!(report.events_replayed > 0, "events_replayed must be positive");
+    assert!(
+        report.events_replayed > 0,
+        "events_replayed must be positive"
+    );
 }

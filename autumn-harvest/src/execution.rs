@@ -540,8 +540,8 @@ pub async fn cancel_workflow_execution(
         reason.to_string()
     };
 
-    let cancel_result =
-        conn.transaction::<CancelledWorkflowExecution, HarvestError, _>(|conn| {
+    let cancel_result = conn
+        .transaction::<CancelledWorkflowExecution, HarvestError, _>(|conn| {
             async move {
                 let execution = harvest_workflow_executions::table
                     .find(exec_id.as_uuid())
@@ -575,9 +575,7 @@ pub async fn cancel_workflow_execution(
                         )
                         .filter(crate::schema::harvest_task_queue::task_type.eq("workflow"))
                         .filter(crate::schema::harvest_task_queue::state.eq("PENDING"))
-                        .filter(
-                            crate::schema::harvest_task_queue::scheduled_at.gt(Utc::now()),
-                        ),
+                        .filter(crate::schema::harvest_task_queue::scheduled_at.gt(Utc::now())),
                 )
                 .execute(conn)
                 .await

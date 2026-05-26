@@ -11,8 +11,8 @@ use autumn_harvest::info::WorkflowInfo;
 use autumn_harvest::types::ParentClosePolicy;
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{
-    ExecutionId, Priority, ShardId, StartWorkflowParams,
-    WorkflowContext, cancel_workflow_execution, start_or_load_workflow_execution,
+    ExecutionId, Priority, ShardId, StartWorkflowParams, WorkflowContext,
+    cancel_workflow_execution, start_or_load_workflow_execution,
 };
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
@@ -374,7 +374,9 @@ async fn child_workflow_cancel_cascade_request_cancel() {
     assert!(!child_states.is_empty(), "at least one child should exist");
 
     // At least one child should be CANCELLED or FAILED (cascade applied).
-    let cascade_applied = child_states.iter().any(|s| s == "CANCELLED" || s == "FAILED");
+    let cascade_applied = child_states
+        .iter()
+        .any(|s| s == "CANCELLED" || s == "FAILED");
     assert!(
         cascade_applied,
         "cascade should have cancelled/failed the child; states: {:?}",
@@ -508,7 +510,10 @@ fn parent_close_policy_serde_round_trip() {
 
 #[test]
 fn parent_close_policy_default_is_request_cancel() {
-    assert_eq!(ParentClosePolicy::default(), ParentClosePolicy::RequestCancel);
+    assert_eq!(
+        ParentClosePolicy::default(),
+        ParentClosePolicy::RequestCancel
+    );
 }
 
 #[test]

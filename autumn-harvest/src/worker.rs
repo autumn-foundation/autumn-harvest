@@ -25,10 +25,10 @@ use crate::builder::WorkerConfig;
 use crate::context::{
     ActivityContext, SharedState, WorkflowCommand, WorkflowHistoryPolicy, empty_shared_state,
 };
-use crate::execution::apply_parent_close_cascade;
 use crate::dlq::{self, DeadLetterReason, NewDeadLetterEntry};
 use crate::error::{HarvestError, HarvestResult};
 use crate::event::WorkflowEvent;
+use crate::execution::apply_parent_close_cascade;
 use crate::executor::{
     WorkflowExecuteSpanMeta, WorkflowOutcome, run_workflow_with_state_history_policy_and_caps,
 };
@@ -3689,10 +3689,9 @@ async fn persist_workflow_outcome(
             // SpawnDetachedChildWorkflow does not suspend the parent — it is a
             // fire-and-forget primitive that creates a child row and enqueues its
             // first task, then the parent continues with the remaining suspension.
-            let (detached_cmds, remaining_cmds): (Vec<_>, Vec<_>) =
-                commands.into_iter().partition(|c| {
-                    matches!(c, WorkflowCommand::SpawnDetachedChildWorkflow { .. })
-                });
+            let (detached_cmds, remaining_cmds): (Vec<_>, Vec<_>) = commands
+                .into_iter()
+                .partition(|c| matches!(c, WorkflowCommand::SpawnDetachedChildWorkflow { .. }));
             if !detached_cmds.is_empty() {
                 create_detached_child_executions(
                     conn,

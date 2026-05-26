@@ -593,9 +593,7 @@ impl MermaidExporter {
                 )?;
             }
             WorkflowEvent::ChildWorkflowCascadeApplied {
-                child_id,
-                action,
-                ..
+                child_id, action, ..
             } => {
                 writeln!(
                     self.out,

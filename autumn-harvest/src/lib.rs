@@ -246,6 +246,8 @@ pub use shard::ShardRouter;
 #[cfg(feature = "db")]
 pub use shard::ShardedDbPool;
 pub use simulator::{SimulatorResult, WorkflowSimulator};
+#[cfg(feature = "db")]
+pub use store::AwaitMode;
 pub use telemetry::{
     ActivityStatus, MetricsRecorder, NoOpMetrics, NoOpPropagator, TelemetryConfig,
     TelemetryConfigBuilder, TraceContextCarrier, TraceContextPropagator, WorkflowStatus,
@@ -265,8 +267,6 @@ pub use types::{
     ActivityExecId, BuildId, DeploymentName, ExecutionId, ExternalActivityToken, ParentClosePolicy,
     Priority, ShardId, TimerId, UpdateId, WorkerId, WorkflowId, WorkflowIdReusePolicy,
 };
-#[cfg(feature = "db")]
-pub use store::AwaitMode;
 pub use update::UpdateRegistry;
 #[cfg(feature = "db")]
 pub use version_usage::{
