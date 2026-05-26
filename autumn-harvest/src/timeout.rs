@@ -25,6 +25,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::{HarvestError, HarvestResult, TimeoutType};
 use crate::event::WorkflowEvent;
+use crate::execution::apply_parent_close_cascade;
 use crate::models::{ExternalTask, TaskQueueItem, WorkflowExecution};
 use crate::schema::{harvest_external_tasks, harvest_task_queue, harvest_workflow_executions};
 use crate::telemetry::MetricsRecorder;
@@ -692,6 +693,11 @@ pub async fn enforce_workflow_execution_timeouts(
             );
             return Err(error);
         }
+
+        // Cascade parent-close policy to any running detached children now that
+        // the parent is committed as TIMED_OUT. Errors are suppressed — the parent
+        // is already terminal and cascade is idempotent.
+        let _ = apply_parent_close_cascade(conn, exec_id).await;
 
         tracing::warn!(
             exec_id = %exec_id,

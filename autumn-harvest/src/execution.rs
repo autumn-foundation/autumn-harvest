@@ -802,7 +802,7 @@ pub async fn terminate_workflow_execution(
         reason.to_string()
     };
 
-    conn.transaction::<CancelledWorkflowExecution, HarvestError, _>(|conn| {
+    let cancel_result = conn.transaction::<CancelledWorkflowExecution, HarvestError, _>(|conn| {
         async move {
             let execution = harvest_workflow_executions::table
                 .find(exec_id.as_uuid())
@@ -856,7 +856,14 @@ pub async fn terminate_workflow_execution(
         }
         .scope_boxed()
     })
-    .await
+    .await?;
+
+    // Apply parent-close cascade to any running detached children after the
+    // parent is committed as CANCELLED/TERMINATED. Errors are suppressed —
+    // the parent is already terminal and cascade is idempotent.
+    let _ = apply_parent_close_cascade(conn, exec_id).await;
+
+    Ok(cancel_result)
 }
 
 /// Non-locking lookup used for the `TerminateIfRunning` pre-check outside any

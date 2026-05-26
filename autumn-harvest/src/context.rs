@@ -1931,7 +1931,7 @@ impl WorkflowContext {
                     });
                 }
 
-                let child_id = ExecutionId::new();
+                let child_id = ExecutionId::new_for_shard(self.exec_id.shard());
                 self.push_command(WorkflowCommand::SpawnDetachedChildWorkflow {
                     child_id,
                     workflow_name: workflow_name.to_string(),
