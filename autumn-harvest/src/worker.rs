@@ -1002,17 +1002,16 @@ async fn persist_external_signal_inline(
                     }),
                 };
 
-                if let Some(terminal) = terminal_opt {
-                    store::append_events(
-                        conn,
-                        exec_id,
-                        std::slice::from_ref(&terminal),
-                        *next_event_id,
-                    )
-                    .await?;
-                    *next_event_id += 1;
-                    new_events.push(terminal);
-                }
+                let Some(terminal) = terminal_opt else { continue };
+                store::append_events(
+                    conn,
+                    exec_id,
+                    std::slice::from_ref(&terminal),
+                    *next_event_id,
+                )
+                .await?;
+                *next_event_id += 1;
+                new_events.push(terminal);
             }
         }
     }
@@ -1325,23 +1324,22 @@ fn next_retry_delay(
         return Ok(None);
     }
 
-    if let Some(policy) = retry_policy {
-        let typed_error_type = typed.as_ref().map(|f| f.error_type.as_str());
-        if policy.is_non_retryable(typed_error_type, error) {
-            return Ok(None);
+    let Some(policy) = retry_policy else {
+        if task.attempt < task.max_attempts {
+            return Ok(Some(chrono::Duration::seconds(1)));
         }
+        return Ok(None);
+    };
 
-        return policy
-            .next_delay_with_seed(task_attempt(task), retry_stream_seed(task))
-            .map(|delay| chrono_duration_from_std(delay, "retry delay"))
-            .transpose();
+    let typed_error_type = typed.as_ref().map(|f| f.error_type.as_str());
+    if policy.is_non_retryable(typed_error_type, error) {
+        return Ok(None);
     }
 
-    if task.attempt < task.max_attempts {
-        return Ok(Some(chrono::Duration::seconds(1)));
-    }
-
-    Ok(None)
+    policy
+        .next_delay_with_seed(task_attempt(task), retry_stream_seed(task))
+        .map(|delay| chrono_duration_from_std(delay, "retry delay"))
+        .transpose()
 }
 
 fn find_pending_scheduled_activity(
