@@ -3774,14 +3774,16 @@ async fn build_routing_retire_ui(
     let pool = api_state.storage_pool().map_err(map_error)?;
     let stale_threshold = api_state.worker_stale_threshold();
 
-    // Check reachability across all shards before allowing retire.
+    // Check reachability across all shards before allowing retire. Any shard
+    // error propagates immediately — silently skipping a shard could allow
+    // retire when that shard still has active executions.
     let mut per_shard_reach: Vec<Vec<BuildReachability>> = Vec::new();
     for (_, shard_pool) in pool.iter_shards() {
-        if let Ok(mut conn) = acquire_conn(shard_pool).await {
-            if let Ok(r) = all_build_reachability(&mut conn, stale_threshold).await {
-                per_shard_reach.push(r);
-            }
-        }
+        let mut conn = acquire_conn(shard_pool).await?;
+        let r = all_build_reachability(&mut conn, stale_threshold)
+            .await
+            .map_err(map_error)?;
+        per_shard_reach.push(r);
     }
     let merged = merge_reachability(per_shard_reach);
     let build_reach = merged.iter().find(|r| r.build_id == form.build_id.trim());
@@ -3808,6 +3810,180 @@ async fn build_routing_retire_ui(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn render_build_policies_card(policies: &[BuildPolicy]) -> Markup {
+    html! {
+        div.card {
+            h3 { "Build Policies" }
+            @if policies.is_empty() {
+                p.empty { "No build policies registered." }
+            } @else {
+                table {
+                    thead { tr { th { "Queue" } th { "Active Build ID" } th { "Deployment" } th { "Last Updated" } } }
+                    tbody {
+                        @for policy in policies {
+                            tr {
+                                td { code { (policy.queue_name.clone()) } }
+                                td { code { (policy.build_id.clone()) } }
+                                td {
+                                    @if let Some(ref dep) = policy.deployment_name {
+                                        code { (dep) }
+                                    } @else {
+                                        span style="color:#475569" { "—" }
+                                    }
+                                }
+                                td { (format_timestamp(Some(policy.updated_at))) }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn render_build_reachability_card(reachability: &[BuildReachability]) -> Markup {
+    html! {
+        div.card {
+            h3 { "Build Reachability" }
+            @if reachability.is_empty() {
+                p.empty { "No build-tagged executions or workers found." }
+            } @else {
+                table {
+                    thead { tr { th { "Build ID" } th { "Open Executions" } th { "Pending Tasks" } th { "Active Workers" } th { "Stale Workers" } th { "Status" } th { "Actions" } } }
+                    tbody {
+                        @for r in reachability {
+                            @let status_color = if r.safe_to_retire { "#166534" } else { "#991b1b" };
+                            @let status_bg = if r.safe_to_retire { "#dcfce7" } else { "#fee2e2" };
+                            @let status_label = if r.safe_to_retire { "✓ Safe to retire" } else { "⚠ In use" };
+                            tr {
+                                td { code { (r.build_id.clone()) } }
+                                td { (r.open_executions) }
+                                td { (r.pending_tasks) }
+                                td { (r.active_workers) }
+                                td { (r.stale_workers) }
+                                td {
+                                    span style={ "background:" (status_bg) ";color:" (status_color) ";padding:2px 8px;border-radius:999px;font-size:11px;font-weight:600" } {
+                                        (status_label)
+                                    }
+                                }
+                                td {
+                                    @if r.safe_to_retire {
+                                        form method="post" action="build-routing/retire"
+                                              onsubmit={ "return confirm('Confirm retirement of build " (r.build_id) "? All workers running this build should be stopped after confirmation.')" }
+                                              style="margin:0" {
+                                            input type="hidden" name="build_id" value=(r.build_id.clone());
+                                            button.danger type="submit"
+                                                style="background:#166534;color:#dcfce7;border:0;border-radius:6px;padding:4px 10px;font-size:11px;cursor:pointer" {
+                                                "Retire"
+                                            }
+                                        }
+                                    } @else {
+                                        span style="color:#475569;font-size:12px" { "Not yet safe" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn render_compat_card(all_compat: &[BuildCompatEntry]) -> Markup {
+    html! {
+        div.card {
+            h3 { "Compatibility Declarations" }
+            p style="color:#94a3b8;font-size:12px;margin-bottom:12px" {
+                "Workers running build " strong { "A" } " can claim tasks assigned to build " strong { "B" }
+                " when a declaration " code { "A → B" } " exists here."
+            }
+            @if all_compat.is_empty() {
+                p.empty { "No compatibility declarations. Workers only claim tasks assigned to their own build." }
+            } @else {
+                table {
+                    thead { tr { th { "Worker Build (A)" } th { "Compatible With (B)" } th { "Declared" } th { "Actions" } } }
+                    tbody {
+                        @for entry in all_compat {
+                            tr {
+                                td { code { (entry.build_id.clone()) } }
+                                td { code { (entry.compatible_with.clone()) } }
+                                td { (format_timestamp(Some(entry.declared_at))) }
+                                td {
+                                    form method="post" action="build-routing/revoke-compat"
+                                          onsubmit={ "return confirm('Revoke compatibility: " (entry.build_id) " → " (entry.compatible_with) "?')" }
+                                          style="margin:0" {
+                                        input type="hidden" name="build_id" value=(entry.build_id.clone());
+                                        input type="hidden" name="compatible_with" value=(entry.compatible_with.clone());
+                                        button type="submit"
+                                            style="background:#450a0a;color:#fca5a5;border:1px solid #991b1b;border-radius:6px;padding:3px 8px;font-size:11px;cursor:pointer" {
+                                            "Revoke"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn render_build_routing_action_forms() -> Markup {
+    let input_style = "display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
+    let btn_style = "background:#2563eb;color:#fff;border:0;border-radius:6px;padding:8px 14px;font-size:13px;cursor:pointer;align-self:flex-start";
+    let label_style = "font-size:12px;color:#94a3b8";
+    html! {
+        div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:16px" {
+            div.card {
+                h3 style="margin-top:0" { "Set Build Policy" }
+                p style="color:#94a3b8;font-size:12px;margin-bottom:12px" {
+                    "Sets which build ID is assigned to new workflow starts on a queue. "
+                    "Does not affect in-flight executions."
+                }
+                form method="post" action="build-routing/set-policy"
+                      style="display:flex;flex-direction:column;gap:10px" {
+                    label style=(label_style) { "Queue name"
+                        input type="text" name="queue_name" required placeholder="e.g. default" style=(input_style);
+                    }
+                    label style=(label_style) { "Build ID"
+                        input type="text" name="build_id" required placeholder="e.g. sha-abc123" style=(input_style);
+                    }
+                    label style=(label_style) { "Deployment name (optional)"
+                        input type="text" name="deployment_name" placeholder="e.g. prod-v2" style=(input_style);
+                    }
+                    button type="submit" style=(btn_style)
+                        onclick="return confirm('Set build policy? New executions on this queue will use the specified build ID.')" {
+                        "Set Policy"
+                    }
+                }
+            }
+            div.card {
+                h3 style="margin-top:0" { "Declare Compatibility" }
+                p style="color:#94a3b8;font-size:12px;margin-bottom:12px" {
+                    "Declares that workers running build " strong { "A" }
+                    " can safely replay histories assigned to build " strong { "B" }
+                    ". Only declare after replay tests confirm safety."
+                }
+                form method="post" action="build-routing/declare-compat"
+                      style="display:flex;flex-direction:column;gap:10px" {
+                    label style=(label_style) { "Worker build (A)"
+                        input type="text" name="build_id" required placeholder="e.g. sha-new" style=(input_style);
+                    }
+                    label style=(label_style) { "Compatible with (B)"
+                        input type="text" name="compatible_with" required placeholder="e.g. sha-old" style=(input_style);
+                    }
+                    button type="submit" style=(btn_style)
+                        onclick="return confirm('Declare compatibility? Ensure replay tests have confirmed the new build can handle histories from the old build.')" {
+                        "Declare"
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn render_build_routing_page(
     policies: &[BuildPolicy],
     all_compat: &[BuildCompatEntry],
@@ -3816,7 +3992,6 @@ fn render_build_routing_page(
     is_multi_shard: bool,
     flash: Option<&str>,
 ) -> Markup {
-    // Collect all known build IDs from policies and reachability.
     let is_empty = policies.is_empty() && reachability.is_empty() && all_compat.is_empty();
 
     let body = html! {
@@ -3826,7 +4001,6 @@ fn render_build_routing_page(
             div.flash { (msg) }
         }
 
-        // Shard errors
         @for (shard_id, error) in shard_errors {
             div.shard-error {
                 @if is_multi_shard {
@@ -3839,7 +4013,6 @@ fn render_build_routing_page(
         }
 
         @if is_empty && shard_errors.is_empty() {
-            // Empty state — no build policies, no tagged workers/executions
             div.card {
                 h3 { "No build routing configured" }
                 p style="color:#94a3b8;font-size:13px;line-height:1.6" {
@@ -3853,204 +4026,12 @@ fn render_build_routing_page(
                 }
             }
         } @else {
-            // Build Policies per queue
-            div.card {
-                h3 { "Build Policies" }
-                @if policies.is_empty() {
-                    p.empty { "No build policies registered." }
-                } @else {
-                    table {
-                        thead {
-                            tr {
-                                th { "Queue" }
-                                th { "Active Build ID" }
-                                th { "Deployment" }
-                                th { "Last Updated" }
-                            }
-                        }
-                        tbody {
-                            @for policy in policies {
-                                tr {
-                                    td { code { (policy.queue_name.clone()) } }
-                                    td { code { (policy.build_id.clone()) } }
-                                    td {
-                                        @if let Some(ref dep) = policy.deployment_name {
-                                            code { (dep) }
-                                        } @else {
-                                            span style="color:#475569" { "—" }
-                                        }
-                                    }
-                                    td { (format_timestamp(Some(policy.updated_at))) }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Build Reachability (aggregated across shards)
-            div.card {
-                h3 { "Build Reachability" }
-                @if reachability.is_empty() {
-                    p.empty { "No build-tagged executions or workers found." }
-                } @else {
-                    table {
-                        thead {
-                            tr {
-                                th { "Build ID" }
-                                th { "Open Executions" }
-                                th { "Pending Tasks" }
-                                th { "Active Workers" }
-                                th { "Stale Workers" }
-                                th { "Status" }
-                                th { "Actions" }
-                            }
-                        }
-                        tbody {
-                            @for r in reachability {
-                                @let status_color = if r.safe_to_retire { "#166534" } else { "#991b1b" };
-                                @let status_bg = if r.safe_to_retire { "#dcfce7" } else { "#fee2e2" };
-                                @let status_label = if r.safe_to_retire { "✓ Safe to retire" } else { "⚠ In use" };
-                                tr {
-                                    td { code { (r.build_id.clone()) } }
-                                    td { (r.open_executions) }
-                                    td { (r.pending_tasks) }
-                                    td { (r.active_workers) }
-                                    td { (r.stale_workers) }
-                                    td {
-                                        span style={ "background:" (status_bg) ";color:" (status_color) ";padding:2px 8px;border-radius:999px;font-size:11px;font-weight:600" } {
-                                            (status_label)
-                                        }
-                                    }
-                                    td {
-                                        @if r.safe_to_retire {
-                                            form method="post" action="build-routing/retire"
-                                                  onsubmit={ "return confirm('Confirm retirement of build " (r.build_id) "? All workers running this build should be stopped after confirmation.')" }
-                                                  style="margin:0" {
-                                                input type="hidden" name="build_id" value=(r.build_id.clone());
-                                                button.danger type="submit"
-                                                    style="background:#166534;color:#dcfce7;border:0;border-radius:6px;padding:4px 10px;font-size:11px;cursor:pointer" {
-                                                    "Retire"
-                                                }
-                                            }
-                                        } @else {
-                                            span style="color:#475569;font-size:12px" { "Not yet safe" }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Compatibility Graph
-            div.card {
-                h3 { "Compatibility Declarations" }
-                p style="color:#94a3b8;font-size:12px;margin-bottom:12px" {
-                    "Workers running build " strong { "A" } " can claim tasks assigned to build " strong { "B" }
-                    " when a declaration " code { "A → B" } " exists here."
-                }
-                @if all_compat.is_empty() {
-                    p.empty { "No compatibility declarations. Workers only claim tasks assigned to their own build." }
-                } @else {
-                    table {
-                        thead {
-                            tr {
-                                th { "Worker Build (A)" }
-                                th { "Compatible With (B)" }
-                                th { "Declared" }
-                                th { "Actions" }
-                            }
-                        }
-                        tbody {
-                            @for entry in all_compat {
-                                tr {
-                                    td { code { (entry.build_id.clone()) } }
-                                    td { code { (entry.compatible_with.clone()) } }
-                                    td { (format_timestamp(Some(entry.declared_at))) }
-                                    td {
-                                        form method="post" action="build-routing/revoke-compat"
-                                              onsubmit={ "return confirm('Revoke compatibility: " (entry.build_id) " → " (entry.compatible_with) "?')" }
-                                              style="margin:0" {
-                                            input type="hidden" name="build_id" value=(entry.build_id.clone());
-                                            input type="hidden" name="compatible_with" value=(entry.compatible_with.clone());
-                                            button type="submit"
-                                                style="background:#450a0a;color:#fca5a5;border:1px solid #991b1b;border-radius:6px;padding:3px 8px;font-size:11px;cursor:pointer" {
-                                                "Revoke"
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            (render_build_policies_card(policies))
+            (render_build_reachability_card(reachability))
+            (render_compat_card(all_compat))
         }
 
-        // Action forms — always visible so operators can configure from an empty state
-        div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:16px" {
-            // Set Build Policy
-            div.card {
-                h3 style="margin-top:0" { "Set Build Policy" }
-                p style="color:#94a3b8;font-size:12px;margin-bottom:12px" {
-                    "Sets which build ID is assigned to new workflow starts on a queue. "
-                    "Does not affect in-flight executions."
-                }
-                form method="post" action="build-routing/set-policy"
-                      style="display:flex;flex-direction:column;gap:10px" {
-                    label style="font-size:12px;color:#94a3b8" {
-                        "Queue name"
-                        input type="text" name="queue_name" required placeholder="e.g. default"
-                            style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
-                    }
-                    label style="font-size:12px;color:#94a3b8" {
-                        "Build ID"
-                        input type="text" name="build_id" required placeholder="e.g. sha-abc123"
-                            style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
-                    }
-                    label style="font-size:12px;color:#94a3b8" {
-                        "Deployment name (optional)"
-                        input type="text" name="deployment_name" placeholder="e.g. prod-v2"
-                            style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
-                    }
-                    button type="submit"
-                        style="background:#2563eb;color:#fff;border:0;border-radius:6px;padding:8px 14px;font-size:13px;cursor:pointer;align-self:flex-start"
-                        onclick="return confirm('Set build policy? New executions on this queue will use the specified build ID.')" {
-                        "Set Policy"
-                    }
-                }
-            }
-
-            // Declare Compatibility
-            div.card {
-                h3 style="margin-top:0" { "Declare Compatibility" }
-                p style="color:#94a3b8;font-size:12px;margin-bottom:12px" {
-                    "Declares that workers running build " strong { "A" }
-                    " can safely replay histories assigned to build " strong { "B" }
-                    ". Only declare after replay tests confirm safety."
-                }
-                form method="post" action="build-routing/declare-compat"
-                      style="display:flex;flex-direction:column;gap:10px" {
-                    label style="font-size:12px;color:#94a3b8" {
-                        "Worker build (A)"
-                        input type="text" name="build_id" required placeholder="e.g. sha-new"
-                            style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
-                    }
-                    label style="font-size:12px;color:#94a3b8" {
-                        "Compatible with (B)"
-                        input type="text" name="compatible_with" required placeholder="e.g. sha-old"
-                            style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
-                    }
-                    button type="submit"
-                        style="background:#2563eb;color:#fff;border:0;border-radius:6px;padding:8px 14px;font-size:13px;cursor:pointer;align-self:flex-start"
-                        onclick="return confirm('Declare compatibility? Ensure replay tests have confirmed the new build can handle histories from the old build.')" {
-                        "Declare"
-                    }
-                }
-            }
-        }
+        (render_build_routing_action_forms())
     };
 
     layout_build_routing("Build Routing · Vantage", &body, None)

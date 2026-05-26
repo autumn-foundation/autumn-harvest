@@ -11504,19 +11504,26 @@ async fn retire_build_handler(
     let stale_threshold = api_state.worker_stale_threshold();
     let mut per_shard = Vec::new();
 
-    for (_, shard_pool) in pool.iter_shards() {
-        if let Ok(mut conn) = acquire_conn(shard_pool).await {
-            if let Ok(r) = all_build_reachability(&mut conn, stale_threshold).await {
-                per_shard.push(r);
+    for (shard_id, shard_pool) in pool.iter_shards() {
+        let mut conn = match acquire_conn(shard_pool).await {
+            Ok(c) => c,
+            Err(e) => return e.into_response(),
+        };
+        let r = match all_build_reachability(&mut conn, stale_threshold).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(shard = shard_id.as_i32(), "build reachability query failed during retire check");
+                return map_error(e).into_response();
             }
-        }
+        };
+        per_shard.push(r);
     }
     let merged = merge_reachability(per_shard);
     let reach = merged
         .iter()
         .find(|r| r.build_id == body.build_id.trim())
         .cloned()
-        .unwrap_or(autumn_harvest::build_routing::BuildReachability {
+        .unwrap_or_else(|| autumn_harvest::build_routing::BuildReachability {
             build_id: body.build_id.trim().to_string(),
             open_executions: 0,
             pending_tasks: 0,
