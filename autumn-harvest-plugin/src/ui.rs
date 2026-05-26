@@ -4092,6 +4092,127 @@ async fn schedule_delete_ui(
     schedule_redirect(&flash)
 }
 
+/// Inner logic for `schedule_trigger_now_ui` after the connection is acquired.
+/// Handles the Skip overlap check, start call, audit write, and metric emit,
+/// then returns the redirect response so the outer handler stays compact.
+#[allow(clippy::too_many_arguments)]
+async fn execute_schedule_trigger_ui(
+    conn: &mut crate::api::PoolConn,
+    runtime: &HarvestApiRuntime,
+    row: &HarvestSchedule,
+    id_str: &str,
+    name: &str,
+    workflow_name: &str,
+    input: serde_json::Value,
+    queue: &str,
+) -> axum::response::Response {
+    let running: i64 = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
+        .filter(harvest_workflow_executions::state.eq("RUNNING"))
+        .count()
+        .get_result(conn)
+        .await
+        .unwrap_or(0);
+    if autumn_harvest::OverlapPolicy::from_db(&row.overlap_policy)
+        == autumn_harvest::OverlapPolicy::Skip
+        && running >= i64::from(row.max_active_runs)
+    {
+        let ar = build_trigger_audit("ui", id_str, STATUS_SUCCEEDED, Some("skipped_overlap"));
+        let _ = insert_audit(conn, &ar).await;
+        runtime
+            .registry()
+            .telemetry()
+            .metrics
+            .record_schedule_manual_trigger(name, "skipped_overlap");
+        return schedule_redirect(&format!("Skipped {name}: max_active_runs already reached"));
+    }
+    let triggered_at = chrono::Utc::now();
+    let workflow_id = format!(
+        "manual-{}-{}-{}",
+        row.id,
+        triggered_at.timestamp_millis(),
+        uuid::Uuid::new_v4().simple()
+    );
+    let exec_id = HarvestExecutionId::new();
+    let result = start_or_load_workflow_execution(
+        conn,
+        StartWorkflowParams {
+            workflow_name,
+            workflow_id: &workflow_id,
+            exec_id,
+            input,
+            parent_id: None,
+            queue_name: queue,
+            execution_timeout: None,
+            memo: None,
+            search_attrs: None,
+            reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
+            trace_context: None,
+            max_execution_timeout_ceiling: None,
+            concurrency_key: None,
+            concurrency_limit: None,
+            priority: Priority::default(),
+            max_workflow_input_bytes: 0,
+            start_at: None,
+            delay: None,
+            max_workflow_start_delay: None,
+        },
+    )
+    .await;
+    let outcome = if result.is_ok() {
+        "fired"
+    } else {
+        "start_failed"
+    };
+    let ar = build_trigger_audit(
+        "ui",
+        id_str,
+        if result.is_ok() {
+            STATUS_SUCCEEDED
+        } else {
+            STATUS_FAILED
+        },
+        if result.is_err() {
+            Some("start_failed")
+        } else {
+            None
+        },
+    );
+    let _ = insert_audit(conn, &ar).await;
+    runtime
+        .registry()
+        .telemetry()
+        .metrics
+        .record_schedule_manual_trigger(name, outcome);
+    let flash = match result {
+        Ok(_) => format!("Triggered run of {name}"),
+        Err(e) => format!("Failed to trigger {name}: {e}"),
+    };
+    schedule_redirect(&flash)
+}
+
+/// Build a `NewAuditRecord` for UI schedule trigger operations.
+const fn build_trigger_audit<'a>(
+    actor: &'a str,
+    target_id: &'a str,
+    status: &'a str,
+    error_summary: Option<&'a str>,
+) -> NewAuditRecord<'a> {
+    NewAuditRecord {
+        actor,
+        operation: OP_SCHEDULE_TRIGGER,
+        target_type: TARGET_SCHEDULE,
+        target_id: Some(target_id),
+        route_or_command: "POST /ui/schedules/trigger-now",
+        request_id: None,
+        idempotency_key: None,
+        status,
+        error_summary,
+        shard_id: None,
+        source: SOURCE_API,
+    }
+}
+
 /// Resolve `(workflow_name, input, queue)` for a manual trigger, consulting the
 /// runtime registry for DAG-backed schedules so the correct default queue is used.
 fn resolve_trigger_params(
@@ -4131,85 +4252,42 @@ async fn schedule_trigger_now_ui(
         Ok(f) => f,
         Err(response) => return response,
     };
-
-    let flash = if let Some((row, _)) = found {
-        let name = schedule_name(&row);
-        let runtime = match api_state.runtime() {
-            Ok(r) => r,
-            Err(e) => return schedule_redirect(&format!("Failed to trigger {name}: {e}")),
-        };
-        let (workflow_name, input, queue) = match resolve_trigger_params(&row, &runtime) {
-            Ok(p) => p,
-            Err(e) => return schedule_redirect(&format!("Failed to trigger {name}: {e}")),
-        };
-        let pool = match api_state.storage_pool() {
-            Ok(p) => p,
-            Err(e) => return schedule_redirect(&format!("Failed to trigger {name}: {e}")),
-        };
-        // Use default_pool() so ExecutionId::new() (ShardId::UNENCODED) and the
-        // connection target agree — consistent with the API handler's routing.
-        let mut conn = match acquire_conn(pool.default_pool()).await {
-            Ok(c) => c,
-            Err(e) => return schedule_redirect(&format!("Failed to trigger {name}: {e}")),
-        };
-        let triggered_at = chrono::Utc::now();
-        let workflow_id = format!("manual-{}-{}", row.id, triggered_at.timestamp_millis());
-        let exec_id = HarvestExecutionId::new();
-        let result = start_or_load_workflow_execution(
-            &mut conn,
-            StartWorkflowParams {
-                workflow_name: &workflow_name,
-                workflow_id: &workflow_id,
-                exec_id,
-                input,
-                parent_id: None,
-                queue_name: &queue,
-                execution_timeout: None,
-                memo: None,
-                search_attrs: None,
-                reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
-                trace_context: None,
-                max_execution_timeout_ceiling: None,
-                concurrency_key: None,
-                concurrency_limit: None,
-                priority: Priority::default(),
-                max_workflow_input_bytes: 0,
-                start_at: None,
-                delay: None,
-                max_workflow_start_delay: None,
-            },
-        )
-        .await;
-        let ar = NewAuditRecord {
-            actor: "ui",
-            operation: OP_SCHEDULE_TRIGGER,
-            target_type: TARGET_SCHEDULE,
-            target_id: Some(id_str.as_str()),
-            route_or_command: "POST /ui/schedules/trigger-now",
-            request_id: None,
-            idempotency_key: None,
-            status: if result.is_ok() {
-                STATUS_SUCCEEDED
-            } else {
-                STATUS_FAILED
-            },
-            error_summary: if result.is_err() {
-                Some("start_failed")
-            } else {
-                None
-            },
-            shard_id: None,
-            source: SOURCE_API,
-        };
-        let _ = insert_audit(&mut conn, &ar).await;
-        match result {
-            Ok(_) => format!("Triggered run of {name}"),
-            Err(e) => format!("Failed to trigger {name}: {e}"),
-        }
-    } else {
-        format!("Schedule {} not found", &id_str[..8.min(id_str.len())])
+    let Some((row, _)) = found else {
+        return schedule_redirect(&format!(
+            "Schedule {} not found",
+            &id_str[..8.min(id_str.len())]
+        ));
     };
-    schedule_redirect(&flash)
+    let name = schedule_name(&row);
+    let runtime = match api_state.runtime() {
+        Ok(r) => r,
+        Err(e) => return schedule_redirect(&format!("Failed to trigger {name}: {e}")),
+    };
+    let (workflow_name, input, queue) = match resolve_trigger_params(&row, &runtime) {
+        Ok(p) => p,
+        Err(e) => return schedule_redirect(&format!("Failed to trigger {name}: {e}")),
+    };
+    let pool = match api_state.storage_pool() {
+        Ok(p) => p,
+        Err(e) => return schedule_redirect(&format!("Failed to trigger {name}: {e}")),
+    };
+    // Use default_pool() so ExecutionId::new() (ShardId::UNENCODED) and the
+    // connection target agree — consistent with the API handler's routing.
+    let mut conn = match acquire_conn(pool.default_pool()).await {
+        Ok(c) => c,
+        Err(e) => return schedule_redirect(&format!("Failed to trigger {name}: {e}")),
+    };
+    execute_schedule_trigger_ui(
+        &mut conn,
+        &runtime,
+        &row,
+        &id_str,
+        &name,
+        &workflow_name,
+        input,
+        &queue,
+    )
+    .await
 }
 
 async fn schedule_bulk_pause_ui(

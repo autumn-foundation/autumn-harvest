@@ -6715,17 +6715,41 @@ async fn trigger_schedule_now(
     };
 
     let triggered_at = chrono::Utc::now();
-    // Derive a unique workflow_id from the schedule id and the trigger timestamp
-    // so that retrying the same request within the same millisecond is idempotent.
-    let workflow_id = format!("manual-{schedule_id}-{}", triggered_at.timestamp_millis());
+    // Append a UUID v4 so concurrent trigger calls within the same millisecond each
+    // produce a distinct workflow_id and start independent executions.
+    let workflow_id = format!(
+        "manual-{schedule_id}-{}-{}",
+        triggered_at.timestamp_millis(),
+        uuid::Uuid::new_v4().simple()
+    );
 
-    // For Skip policy, count running executions across all shards and short-circuit
-    // before creating the execution row. Other policies are handled by the underlying
-    // start_or_load path (which uses AllowDuplicate on the per-call workflow_id).
+    // Acquire the DB connection early so it is available for both the overlap-skip
+    // audit record and the normal start call.
+    let mut conn = acquire_conn(pool.default_pool()).await?;
+
+    // For Skip policy, fail closed: if the running-count query fails on any shard,
+    // treat it as saturated rather than silently firing through.
     if effective_overlap_policy == autumn_harvest::OverlapPolicy::Skip {
-        let running =
-            query_running_count_best_effort(&pool, &ScheduleKind::Workflow, &workflow_name).await;
-        if running >= i64::from(schedule.max_active_runs) {
+        let is_saturated =
+            match query_running_count(&pool, &ScheduleKind::Workflow, &workflow_name).await {
+                Ok(running) => running >= i64::from(schedule.max_active_runs),
+                Err(_) => true,
+            };
+        if is_saturated {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_SCHEDULE_TRIGGER,
+                target_type: TARGET_SCHEDULE,
+                target_id: Some(id.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_SUCCEEDED,
+                error_summary: Some("skipped_overlap"),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
             runtime
                 .registry
                 .telemetry()
@@ -6746,7 +6770,6 @@ async fn trigger_schedule_now(
     // deployments; multi-shard schedule pinning is a follow-up to issue #171).
     let exec_id = ExecutionId::new();
 
-    let mut conn = acquire_conn(pool.default_pool()).await?;
     let result = start_or_load_workflow_execution(
         &mut conn,
         StartWorkflowParams {

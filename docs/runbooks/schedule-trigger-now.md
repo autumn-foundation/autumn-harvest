@@ -93,9 +93,12 @@ curl -X POST 'https://example.com/api/harvest/admin/schedules/<UUID>/trigger?for
 
 The trigger emits `harvest.schedule.manual_trigger{schedule.name, outcome}` where
 `outcome` is one of:
-- `fired` — execution started successfully
+- `fired` — a new execution was started successfully
+- `skipped_overlap` — the effective overlap policy (Skip) suppressed the run because
+  `max_active_runs` is already saturated
 - `rejected_paused` — schedule is paused and `force=true` was not passed
-- `skipped_overlap` — execution could not be started (e.g. a DB error)
+- `start_failed` — the workflow start call failed (e.g. a DB error)
 
-Monitor the `rejected_paused` and `skipped_overlap` outcomes to detect misconfigured
-automation that calls this endpoint blindly.
+Monitor `rejected_paused` and `start_failed` to detect misconfigured automation or
+infrastructure problems. Monitor `skipped_overlap` to understand how often operators
+trigger schedules that already have active runs.
