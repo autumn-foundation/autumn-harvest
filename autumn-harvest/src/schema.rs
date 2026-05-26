@@ -34,6 +34,8 @@ diesel::table! {
         created_at -> Timestamptz,
         /// Build ID assigned to this execution at start time (issue #171).
         assigned_build_id -> Nullable<Text>,
+        /// Parent-close policy for detached children (issue #347). NULL for awaited children.
+        parent_close_policy -> Nullable<Text>,
     }
 }
 

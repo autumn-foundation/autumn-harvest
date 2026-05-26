@@ -25,6 +25,7 @@ use crate::builder::WorkerConfig;
 use crate::context::{
     ActivityContext, SharedState, WorkflowCommand, WorkflowHistoryPolicy, empty_shared_state,
 };
+use crate::execution::apply_parent_close_cascade;
 use crate::dlq::{self, DeadLetterReason, NewDeadLetterEntry};
 use crate::error::{HarvestError, HarvestResult};
 use crate::event::WorkflowEvent;
@@ -379,6 +380,7 @@ const fn workflow_command_name(command: &WorkflowCommand) -> &'static str {
         WorkflowCommand::RecordUpdateResult { .. } => "RecordUpdateResult",
         WorkflowCommand::UpsertSearchAttributes { .. } => "UpsertSearchAttributes",
         WorkflowCommand::SignalExternalWorkflow { .. } => "SignalExternalWorkflow",
+        WorkflowCommand::SpawnDetachedChildWorkflow { .. } => "SpawnDetachedChildWorkflow",
     }
 }
 
@@ -1668,7 +1670,10 @@ async fn persist_workflow_completion(
         }
         .scope_boxed()
     })
-    .await
+    .await?;
+    // Cascade parent-close policy to any running detached children.
+    let _ = apply_parent_close_cascade(conn, exec_id).await;
+    Ok(())
 }
 
 async fn persist_workflow_failure(
@@ -1696,7 +1701,10 @@ async fn persist_workflow_failure(
         }
         .scope_boxed()
     })
-    .await
+    .await?;
+    // Cascade parent-close policy to any running detached children.
+    let _ = apply_parent_close_cascade(conn, exec_id).await;
+    Ok(())
 }
 
 /// Append `UpdateCompleted` or `UpdateFailed` events for each
@@ -2287,6 +2295,7 @@ async fn persist_all_started_child_workflows(
                     memo: None,
                     search_attrs: None,
                     assigned_build_id: parent_execution.assigned_build_id.clone(),
+                    parent_close_policy: None, // awaited child
                 };
                 let child_started_event = WorkflowEvent::WorkflowStarted {
                     input: child.input.clone(),
@@ -2680,6 +2689,120 @@ async fn persist_child_workflow_failure(
         .scope_boxed()
     })
     .await
+}
+
+/// Create child workflow executions for all `SpawnDetachedChildWorkflow` commands
+/// in `commands`.
+///
+/// For each command: validates the workflow is registered, inserts a child
+/// execution row with `parent_close_policy` set (so cascades can find it),
+/// appends a `ChildWorkflowSpawnedDetached` event to the parent history, starts
+/// the child's event log with `WorkflowStarted`, and enqueues the child task.
+///
+/// `next_event_id` is advanced by the number of `ChildWorkflowSpawnedDetached`
+/// events appended. Non-detached-spawn commands in `commands` are silently skipped.
+/// Already-existing child rows (idempotent re-run) are also skipped.
+async fn create_detached_child_executions(
+    conn: &mut AsyncPgConnection,
+    registry: &HandlerRegistry,
+    parent_execution: &WorkflowExecution,
+    commands: &[WorkflowCommand],
+    next_event_id: &mut i32,
+) -> HarvestResult<()> {
+    let parent_exec_id = execution_id_from_uuid(parent_execution.id);
+
+    for cmd in commands {
+        let WorkflowCommand::SpawnDetachedChildWorkflow {
+            child_id,
+            workflow_name,
+            input,
+            parent_close_policy,
+        } = cmd
+        else {
+            continue;
+        };
+
+        if !registry.workflows.contains_key(workflow_name.as_str()) {
+            return Err(HarvestError::Config(format!(
+                "no workflow handler registered for '{workflow_name}'"
+            )));
+        }
+
+        // Idempotent: skip if already created (crash-restart replay).
+        let already_exists: bool = harvest_workflow_executions::table
+            .filter(harvest_workflow_executions::id.eq(child_id.as_uuid()))
+            .count()
+            .get_result::<i64>(conn)
+            .await
+            .map_err(crate::error::database_error)?
+            > 0;
+        if already_exists {
+            continue;
+        }
+
+        let child_workflow_id = child_id.to_string();
+        let child_row = NewWorkflowExecution {
+            id: child_id.as_uuid(),
+            workflow_name: workflow_name.as_str(),
+            workflow_id: &child_workflow_id,
+            run_id: uuid::Uuid::new_v4(),
+            shard_id: parent_execution.shard_id,
+            input: input.clone(),
+            parent_id: Some(parent_execution.id),
+            queue_name: &parent_execution.queue_name,
+            execution_timeout: None,
+            deadline_at: None,
+            memo: None,
+            search_attrs: None,
+            assigned_build_id: parent_execution.assigned_build_id.clone(),
+            parent_close_policy: Some(parent_close_policy.as_str().to_string()),
+        };
+
+        diesel::insert_into(harvest_workflow_executions::table)
+            .values(&child_row)
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+
+        // Append ChildWorkflowSpawnedDetached to parent history.
+        store::append_events(
+            conn,
+            parent_exec_id,
+            &[WorkflowEvent::ChildWorkflowSpawnedDetached {
+                child_id: *child_id,
+                workflow_name: workflow_name.clone(),
+                input: input.clone(),
+                parent_close_policy: *parent_close_policy,
+            }],
+            *next_event_id,
+        )
+        .await?;
+        *next_event_id = next_event_id.saturating_add(1);
+
+        // Start child history.
+        store::append_events(
+            conn,
+            *child_id,
+            &[WorkflowEvent::WorkflowStarted {
+                input: input.clone(),
+                timestamp: chrono::Utc::now(),
+            }],
+            0,
+        )
+        .await?;
+
+        // Enqueue child task.
+        let mut params = queue::EnqueueParams::new(
+            parent_execution.queue_name.clone(),
+            TaskType::Workflow,
+            input.clone(),
+        );
+        params.workflow_exec_id = Some(child_id.as_uuid());
+        params.required_build_id = parent_execution.assigned_build_id.clone();
+        queue::enqueue(conn, &params).await?;
+    }
+
+    Ok(())
 }
 
 /// Poll the task queue row for `task_id` until its state leaves `RUNNING`,
@@ -3426,6 +3549,7 @@ async fn persist_workflow_continue_as_new(
         memo: execution.memo.clone(),
         search_attrs: execution.search_attrs.clone(),
         assigned_build_id: execution.assigned_build_id.clone(),
+        parent_close_policy: None, // root workflow
     };
     let mut enqueue =
         queue::EnqueueParams::new(execution.queue_name.clone(), TaskType::Workflow, input);
@@ -3502,14 +3626,17 @@ async fn persist_workflow_outcome(
     conn: &mut AsyncPgConnection,
     registry: &HandlerRegistry,
     execution: &WorkflowExecution,
-    persistence: WorkflowTaskPersistence<'_>,
+    mut persistence: WorkflowTaskPersistence<'_>,
     outcome: WorkflowOutcome,
     execute_span: &tracing::Span,
 ) -> HarvestResult<()> {
     let parent_exec_id = execution.parent_id.map(execution_id_from_uuid);
+    // A detached child has parent_close_policy set (non-null). Detached children
+    // do NOT wake their parent on completion or failure.
+    let is_detached_child = execution.parent_close_policy.is_some();
 
     match (outcome, parent_exec_id) {
-        (WorkflowOutcome::Completed { output }, Some(parent_id)) => {
+        (WorkflowOutcome::Completed { output }, Some(parent_id)) if !is_detached_child => {
             persist_child_workflow_completion(
                 conn,
                 persistence.task.id,
@@ -3521,7 +3648,8 @@ async fn persist_workflow_outcome(
             )
             .await
         }
-        (WorkflowOutcome::Completed { output }, None) => {
+        (WorkflowOutcome::Completed { output }, _) => {
+            // Root workflow or detached child completing — no parent wake.
             persist_workflow_completion(
                 conn,
                 persistence.task.id,
@@ -3532,7 +3660,7 @@ async fn persist_workflow_outcome(
             )
             .await
         }
-        (WorkflowOutcome::Failed { error }, Some(parent_id)) => {
+        (WorkflowOutcome::Failed { error }, Some(parent_id)) if !is_detached_child => {
             persist_child_workflow_failure(
                 conn,
                 persistence.task.id,
@@ -3544,7 +3672,8 @@ async fn persist_workflow_outcome(
             )
             .await
         }
-        (WorkflowOutcome::Failed { error }, None) => {
+        (WorkflowOutcome::Failed { error }, _) => {
+            // Root workflow or detached child failing — no parent wake.
             persist_workflow_failure(
                 conn,
                 persistence.task.id,
@@ -3556,6 +3685,24 @@ async fn persist_workflow_outcome(
             .await
         }
         (WorkflowOutcome::Suspended { commands }, _) => {
+            // Separate detached-spawn commands from the suspension commands.
+            // SpawnDetachedChildWorkflow does not suspend the parent — it is a
+            // fire-and-forget primitive that creates a child row and enqueues its
+            // first task, then the parent continues with the remaining suspension.
+            let (detached_cmds, remaining_cmds): (Vec<_>, Vec<_>) =
+                commands.into_iter().partition(|c| {
+                    matches!(c, WorkflowCommand::SpawnDetachedChildWorkflow { .. })
+                });
+            if !detached_cmds.is_empty() {
+                create_detached_child_executions(
+                    conn,
+                    registry,
+                    execution,
+                    &detached_cmds,
+                    &mut persistence.next_event_id,
+                )
+                .await?;
+            }
             handle_suspended_workflow(
                 conn,
                 registry,
@@ -3564,7 +3711,7 @@ async fn persist_workflow_outcome(
                     persistence,
                     execute_span,
                 },
-                &commands,
+                &remaining_cmds,
             )
             .await
         }
@@ -4355,6 +4502,17 @@ async fn process_workflow_task(
         persist_update_result_commands(conn, prepared.exec_id, &pending_cmds, &mut next_event_id)
             .await?;
         persist_search_attrs_from_commands(conn, prepared.exec_id, &pending_cmds).await?;
+        // Create any detached child executions emitted alongside the terminal outcome.
+        // SpawnDetachedChildWorkflow is fire-and-forget: the parent does not suspend,
+        // so the command appears in pending_cmds alongside Complete/Fail/ContinuedAsNew.
+        create_detached_child_executions(
+            conn,
+            registry,
+            &prepared.execution,
+            &pending_cmds,
+            &mut next_event_id,
+        )
+        .await?;
         // Keep the in-memory execution snapshot current so that
         // persist_workflow_continue_as_new copies the patched attrs to the
         // successor row rather than the stale pre-patch snapshot.

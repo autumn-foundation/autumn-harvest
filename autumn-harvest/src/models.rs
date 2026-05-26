@@ -98,6 +98,8 @@ pub struct WorkflowExecution {
     pub created_at: DateTime<Utc>,
     /// Build ID assigned at workflow start time (issue #171). `None` = pre-policy.
     pub assigned_build_id: Option<String>,
+    /// Parent-close policy for detached children (issue #347). `None` = awaited.
+    pub parent_close_policy: Option<String>,
 }
 
 /// Insert struct for creating a new workflow execution.
@@ -120,6 +122,8 @@ pub struct NewWorkflowExecution<'a> {
     pub search_attrs: Option<serde_json::Value>,
     /// Build ID from the active build policy for this queue at start time.
     pub assigned_build_id: Option<String>,
+    /// Parent-close policy for detached children (issue #347). `None` = awaited.
+    pub parent_close_policy: Option<String>,
 }
 
 // ── HarvestEvent ──────────────────────────────────────────────────────────────

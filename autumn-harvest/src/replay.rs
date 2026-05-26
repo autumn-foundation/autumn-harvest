@@ -126,6 +126,13 @@ pub enum HistoryMatch {
         /// The machine-readable reason code from history.
         reason_code: String,
     },
+    /// History contains a `ChildWorkflowSpawnedDetached` event for a detached
+    /// spawn.  Carries the `child_id` recorded in that event so the workflow
+    /// function gets back the same [`ExecutionId`] it got on the first run.
+    DetachedChildSpawned {
+        /// The `ExecutionId` recorded in the `ChildWorkflowSpawnedDetached` event.
+        child_id: ExecutionId,
+    },
 }
 
 /// Terminal outcome for an early-drained external signal.
@@ -1647,6 +1654,56 @@ impl HistoryMatcher {
         self.cursor = start_cursor + 1;
         self.advance_to_next_unconsumed_event();
         HistoryMatch::ChildInProgress { child_id }
+    }
+
+    /// Match a detached child workflow spawn against history.
+    ///
+    /// Expects `ChildWorkflowSpawnedDetached { workflow_name, input }` at the
+    /// current cursor position. Returns the recorded `child_id` so the workflow
+    /// function gets back the same [`ExecutionId`] across replay cycles.
+    ///
+    /// Returns:
+    /// - `DetachedChildSpawned { child_id }` when the event matches
+    /// - `NoMatch` when the cursor is past the end of history (new live spawn)
+    /// - `Diverged` when the event at cursor is not the expected spawn event
+    pub fn match_detached_child_spawn(
+        &mut self,
+        workflow_name: &str,
+        input: &Value,
+    ) -> HistoryMatch {
+        if !self.prepare_match() {
+            return HistoryMatch::NoMatch;
+        }
+
+        match &self.events[self.cursor] {
+            WorkflowEvent::ChildWorkflowSpawnedDetached {
+                child_id,
+                workflow_name: recorded_name,
+                input: recorded_input,
+                ..
+            } => {
+                if recorded_name != workflow_name {
+                    return HistoryMatch::Diverged {
+                        expected: format!("ChildWorkflowSpawnedDetached({workflow_name})"),
+                        actual: format!("ChildWorkflowSpawnedDetached({recorded_name})"),
+                    };
+                }
+                if recorded_input != input {
+                    return HistoryMatch::Diverged {
+                        expected: format!("DetachedChildWorkflowInput({input})"),
+                        actual: format!("DetachedChildWorkflowInput({recorded_input})"),
+                    };
+                }
+                let child_id = *child_id;
+                self.cursor += 1;
+                self.advance_to_next_unconsumed_event();
+                HistoryMatch::DetachedChildSpawned { child_id }
+            }
+            other => HistoryMatch::Diverged {
+                expected: format!("ChildWorkflowSpawnedDetached({workflow_name})"),
+                actual: Self::actual_event_name(other),
+            },
+        }
     }
 
     /// Match a version gate against history.

@@ -384,6 +384,43 @@ pub enum WorkflowEvent {
         reason_code: String,
     },
 
+    // ── Detached child workflow spawn (issue #347) ───────────────────────────
+    /// A child workflow was spawned in **detached** mode: the parent does not
+    /// suspend awaiting the child's terminal result. The `parent_close_policy`
+    /// determines what happens to this child when the parent reaches a terminal
+    /// state.
+    ///
+    /// This is an **append-only** variant — old histories that contain only
+    /// `ChildWorkflowStarted` rows will still deserialize correctly because
+    /// this variant is new and independent.
+    ChildWorkflowSpawnedDetached {
+        /// The execution ID of the spawned child.
+        child_id: ExecutionId,
+        /// The name of the child workflow handler.
+        workflow_name: String,
+        /// The input passed to the child workflow.
+        input: serde_json::Value,
+        /// Policy applied to this child when the parent reaches a terminal state.
+        parent_close_policy: crate::types::ParentClosePolicy,
+    },
+
+    /// The executor applied a parent-close cascade policy to a detached child.
+    ///
+    /// Recorded once per child immediately after the cascade action is taken so
+    /// that replay is deterministic — re-running the history never re-fires the
+    /// cascade.
+    ///
+    /// `action` is one of `"request_cancel"` or `"terminate"` (never `"abandon"`,
+    /// which is a no-op).
+    ChildWorkflowCascadeApplied {
+        /// The execution ID of the child to which cascade was applied.
+        child_id: ExecutionId,
+        /// The policy that triggered this cascade.
+        policy: crate::types::ParentClosePolicy,
+        /// Machine-readable action taken: `"request_cancel"` or `"terminate"`.
+        action: String,
+    },
+
     // ── Workflow execution timeout (issue #243) ───────────────────────────────
     /// The workflow execution exceeded its configured `execution_timeout` wall-clock
     /// deadline and was forcibly terminated by the timeout scanner.
@@ -446,6 +483,8 @@ impl WorkflowEvent {
             Self::ExternalSignalDelivered { .. } => "ExternalSignalDelivered",
             Self::ExternalSignalFailed { .. } => "ExternalSignalFailed",
             Self::WorkflowExecutionTimedOut { .. } => "WorkflowExecutionTimedOut",
+            Self::ChildWorkflowSpawnedDetached { .. } => "ChildWorkflowSpawnedDetached",
+            Self::ChildWorkflowCascadeApplied { .. } => "ChildWorkflowCascadeApplied",
         }
     }
 

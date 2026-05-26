@@ -262,9 +262,11 @@ pub use testing::{
     HistorySnapshot, NonDeterminismKind, ReplayReport, ReplayStatus, WorkflowReplayer,
 };
 pub use types::{
-    ActivityExecId, BuildId, DeploymentName, ExecutionId, ExternalActivityToken, Priority, ShardId,
-    TimerId, UpdateId, WorkerId, WorkflowId, WorkflowIdReusePolicy,
+    ActivityExecId, BuildId, DeploymentName, ExecutionId, ExternalActivityToken, ParentClosePolicy,
+    Priority, ShardId, TimerId, UpdateId, WorkerId, WorkflowId, WorkflowIdReusePolicy,
 };
+#[cfg(feature = "db")]
+pub use store::AwaitMode;
 pub use update::UpdateRegistry;
 #[cfg(feature = "db")]
 pub use version_usage::{

@@ -2019,6 +2019,24 @@ impl WorkflowTestEnv {
                 Ok(true)
             }
 
+            // Detached child spawn: record the event in history so replay can return
+            // the same child_id. The simulator does not create actual child executions
+            // — it just simulates the parent's history as if the child was spawned.
+            WorkflowCommand::SpawnDetachedChildWorkflow {
+                child_id,
+                workflow_name,
+                input,
+                parent_close_policy,
+            } => {
+                history.push(WorkflowEvent::ChildWorkflowSpawnedDetached {
+                    child_id,
+                    workflow_name,
+                    input,
+                    parent_close_policy,
+                });
+                Ok(true)
+            }
+
             // WaitForActivity: activity was scheduled in a previous iteration;
             // its terminal event is already in history and will be matched on replay.
             WorkflowCommand::WaitForActivity { .. }
