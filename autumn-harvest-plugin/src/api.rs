@@ -11523,7 +11523,20 @@ async fn set_build_policy_handler(
     }
 }
 
+/// Partial-success response for `GET /admin/build-routing/compat` when the
+/// default shard is temporarily unreachable.
+#[derive(serde::Serialize)]
+struct CompatResponse {
+    entries: Vec<autumn_harvest::build_routing::BuildCompatEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
 /// `GET /admin/build-routing/compat` — list all compatibility declarations.
+///
+/// Reads from the default shard (compat declarations are written to all shards so
+/// any shard holds the same data). Falls back to an empty list with a shard error
+/// on default-pool failure so callers retain partial visibility.
 async fn list_build_compat_handler(
     Extension(api_state): Extension<HarvestApiState>,
 ) -> impl axum::response::IntoResponse {
@@ -11533,13 +11546,27 @@ async fn list_build_compat_handler(
         Ok(p) => p,
         Err(e) => return e.into_response(),
     };
-    let mut conn = match acquire_conn(pool.default_pool()).await {
-        Ok(c) => c,
-        Err(e) => return e.into_response(),
-    };
-    match list_build_compat(&mut conn).await.map_err(map_error) {
-        Ok(entries) => axum::Json(entries).into_response(),
-        Err(e) => e.into_response(),
+
+    match acquire_conn(pool.default_pool()).await {
+        Ok(mut conn) => match list_build_compat(&mut conn).await.map_err(map_error) {
+            Ok(entries) => axum::Json(entries).into_response(),
+            Err(e) => (
+                axum::http::StatusCode::PARTIAL_CONTENT,
+                axum::Json(CompatResponse {
+                    entries: vec![],
+                    error: Some(e.to_string()),
+                }),
+            )
+                .into_response(),
+        },
+        Err(e) => (
+            axum::http::StatusCode::PARTIAL_CONTENT,
+            axum::Json(CompatResponse {
+                entries: vec![],
+                error: Some(e.to_string()),
+            }),
+        )
+            .into_response(),
     }
 }
 

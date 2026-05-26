@@ -3397,6 +3397,15 @@ fn url_encode(input: &str) -> String {
     out
 }
 
+/// Escape a string for safe embedding inside a single-quoted JavaScript string literal.
+///
+/// Replaces `\` with `\\` and `'` with `\'` so the value cannot break out of the
+/// surrounding `confirm('...')` or similar inline handler, preventing XSS via
+/// operator-supplied build IDs or queue names.
+fn js_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('\'', "\\'")
+}
+
 fn layout(title: &str, body: &Markup, base_href: &str) -> Markup {
     html! {
         (PreEscaped("<!DOCTYPE html>"))
@@ -4078,7 +4087,7 @@ fn render_build_reachability_card(reachability: &[BuildReachability]) -> Markup 
                                 td {
                                     @if r.safe_to_retire {
                                         form method="post" action="build-routing/retire"
-                                              onsubmit={ "return confirm('Confirm retirement of build " (r.build_id) "? All workers running this build should be stopped after confirmation.')" }
+                                              onsubmit={ "return confirm('Confirm retirement of build " (js_escape(&r.build_id)) "? All workers running this build should be stopped after confirmation.')" }
                                               style="margin:0" {
                                             input type="hidden" name="build_id" value=(r.build_id.clone());
                                             button.danger type="submit"
@@ -4120,7 +4129,7 @@ fn render_compat_card(all_compat: &[BuildCompatEntry]) -> Markup {
                                 td { (format_timestamp(Some(entry.declared_at))) }
                                 td {
                                     form method="post" action="build-routing/revoke-compat"
-                                          onsubmit={ "return confirm('Revoke compatibility: " (entry.build_id) " → " (entry.compatible_with) "?')" }
+                                          onsubmit={ "return confirm('Revoke compatibility: " (js_escape(&entry.build_id)) " → " (js_escape(&entry.compatible_with)) "?')" }
                                           style="margin:0" {
                                         input type="hidden" name="build_id" value=(entry.build_id.clone());
                                         input type="hidden" name="compatible_with" value=(entry.compatible_with.clone());
@@ -4232,15 +4241,23 @@ fn render_build_routing_page(
 
         @if is_empty && shard_errors.is_empty() {
             div.card {
-                h3 { "No build routing configured" }
-                p style="color:#94a3b8;font-size:13px;line-height:1.6" {
-                    "No build policies have been set and no executions carry a build tag. "
-                    "Build routing is inactive — all workers can claim any task."
-                }
-                p style="color:#94a3b8;font-size:13px" {
-                    "To start a rolling deploy, follow the operator playbook: "
-                    a href="../../docs/runbooks/safe-deploy.md" { "docs/runbooks/safe-deploy.md" }
-                    "."
+                @if build_id_filter.is_some() {
+                    h3 { "No results" }
+                    p style="color:#94a3b8;font-size:13px;line-height:1.6" {
+                        "No policies, reachability entries, or compat declarations match the active filter. "
+                        "The build may not exist or may already be retired."
+                    }
+                } @else {
+                    h3 { "No build routing configured" }
+                    p style="color:#94a3b8;font-size:13px;line-height:1.6" {
+                        "No build policies have been set and no executions carry a build tag. "
+                        "Build routing is inactive — all workers can claim any task."
+                    }
+                    p style="color:#94a3b8;font-size:13px" {
+                        "To start a rolling deploy, follow the operator playbook in "
+                        code { "docs/runbooks/safe-deploy.md" }
+                        "."
+                    }
                 }
             }
         } @else {
