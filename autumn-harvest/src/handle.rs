@@ -164,6 +164,7 @@ struct WorkflowHandleClientInner {
     max_workflow_execution_timeout: Option<Duration>,
     max_workflow_start_delay: Duration,
     max_signal_payload_bytes: u64,
+    query_timeout: Duration,
 }
 
 impl std::fmt::Debug for WorkflowHandleClientInner {
@@ -186,6 +187,7 @@ impl std::fmt::Debug for WorkflowHandleClientInner {
             )
             .field("max_workflow_start_delay", &self.max_workflow_start_delay)
             .field("max_signal_payload_bytes", &self.max_signal_payload_bytes)
+            .field("query_timeout", &self.query_timeout)
             .finish()
     }
 }
@@ -242,6 +244,7 @@ impl WorkflowHandleClient {
                 max_workflow_execution_timeout: None,
                 max_workflow_start_delay: crate::builder::DEFAULT_MAX_WORKFLOW_START_DELAY,
                 max_signal_payload_bytes: crate::builder::DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
+                query_timeout: Duration::from_secs(5),
             }),
         }
     }
@@ -321,6 +324,16 @@ impl WorkflowHandleClient {
         }
     }
 
+    /// Add the global query timeout to the client.
+    #[must_use]
+    pub fn with_query_timeout(self, timeout: Duration) -> Self {
+        let mut inner = (*self.inner).clone();
+        inner.query_timeout = timeout;
+        Self {
+            inner: Arc::new(inner),
+        }
+    }
+
     /// Get the maximum allowed execution timeout.
     #[must_use]
     pub fn max_workflow_execution_timeout(&self) -> Option<Duration> {
@@ -337,6 +350,12 @@ impl WorkflowHandleClient {
     #[must_use]
     pub fn max_signal_payload_bytes(&self) -> u64 {
         self.inner.max_signal_payload_bytes
+    }
+
+    /// Get the query timeout.
+    #[must_use]
+    pub fn query_timeout(&self) -> Duration {
+        self.inner.query_timeout
     }
 
     /// Get the effective max workflow input bytes for a workflow.
@@ -697,7 +716,15 @@ impl WorkflowHandle {
         tokio::pin!(handler_fut);
 
         let mut replay_result = None;
+        let deadline = Instant::now() + self.client.query_timeout();
         loop {
+            if Instant::now() >= deadline {
+                return Err(HarvestError::QueryTimedOut {
+                    query_name: query_name.to_string(),
+                    timeout_ms: u64::try_from(self.client.query_timeout().as_millis())
+                        .unwrap_or(u64::MAX),
+                });
+            }
             flag.store(false, std::sync::atomic::Ordering::Release);
             match handler_fut.as_mut().poll(&mut poll_cx) {
                 std::task::Poll::Ready(res) => {
@@ -740,26 +767,10 @@ impl WorkflowHandle {
         timeout: Duration,
     ) -> HarvestResult<Value> {
         self.validate_workflow_type(conn, workflow_name).await?;
-        let shard = self.shard();
-        let mut own_conn = self
-            .client
-            .inner
-            .pools
-            .pool_for(shard)
-            .get()
-            .await
-            .map_err(|error| HarvestError::Database(error.to_string()))?;
-
         let update_id = crate::types::UpdateId::new();
-        crate::store::admit_update_event(
-            &mut own_conn,
-            self.exec_id,
-            update_id,
-            name.to_string(),
-            input,
-        )
-        .await?;
-        crate::queue::wake_workflow_task(&mut own_conn, self.exec_id).await?;
+        crate::store::admit_update_event(conn, self.exec_id, update_id, name.to_string(), input)
+            .await?;
+        crate::queue::wake_workflow_task(conn, self.exec_id).await?;
 
         let start = Instant::now();
         let poll_interval = Duration::from_millis(100);
@@ -767,7 +778,7 @@ impl WorkflowHandle {
         loop {
             let result = {
                 let h = crate::store::load_history_with_codecs(
-                    &mut own_conn,
+                    conn,
                     self.exec_id,
                     &self.client.inner.payload_codecs,
                 )

@@ -291,6 +291,7 @@ fn start_harvest_runtime(
     let max_workflow_execution_timeout = built.max_workflow_execution_timeout;
     let max_workflow_start_delay = built.max_workflow_start_delay;
     let max_signal_payload_bytes = built.max_signal_payload_bytes;
+    let query_timeout = built.worker_config().query_timeout;
     let runner = HarvestRunner::start(built, &harvest_config, runner_resources)?;
     let harvest_db_pool = runner.storage_pool();
     let workflow_handle_client = WorkflowHandleClient::new(
@@ -307,7 +308,8 @@ fn start_harvest_runtime(
     .with_max_workflow_input_bytes(max_workflow_input_bytes)
     .with_max_workflow_execution_timeout(max_workflow_execution_timeout)
     .with_max_workflow_start_delay(max_workflow_start_delay)
-    .with_max_signal_payload_bytes(max_signal_payload_bytes);
+    .with_max_signal_payload_bytes(max_signal_payload_bytes)
+    .with_query_timeout(query_timeout);
     state.insert_extension(harvest_db_pool.clone());
     state.insert_extension(workflow_handle_client);
     api_state.install_storage_pool(harvest_db_pool);
