@@ -3671,6 +3671,7 @@ fn format_run_duration(started_at: DateTime<Utc>, completed_at: Option<DateTime<
 // Build Routing UI page (issue #362)
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_lines)]
 async fn list_build_routing_ui(
     Extension(api_state): Extension<HarvestApiState>,
     Query(params): Query<BuildRoutingListParams>,
@@ -3679,44 +3680,78 @@ async fn list_build_routing_ui(
     let is_multi_shard = pool.iter_shards().count() > 1;
     let stale_threshold = api_state.worker_stale_threshold();
 
-    // Load policies and compat from the default shard. On failure, record the
-    // error and continue — the page still renders cross-shard reachability.
+    // Fan out to every shard to read policies, compat, and reachability.
+    // Policy and compat mutations go to all shards; reading from a single shard
+    // can hide partial-write divergence. We merge by queue_name / (build_id,
+    // compatible_with) and detect queues whose active build_id differs across shards.
     let mut shard_errors: Vec<(ShardId, String)> = Vec::new();
-    let (policies, all_compat) = match acquire_conn(pool.default_pool()).await {
-        Ok(mut conn) => {
-            let p = list_build_policies(&mut conn)
-                .await
-                .map_err(map_error)
-                .unwrap_or_else(|e| {
-                    shard_errors.push((ShardId::UNENCODED, e.to_string()));
-                    vec![]
-                });
-            let c = list_build_compat(&mut conn)
-                .await
-                .map_err(map_error)
-                .unwrap_or_else(|e| {
-                    shard_errors.push((ShardId::UNENCODED, e.to_string()));
-                    vec![]
-                });
-            (p, c)
-        }
-        Err(e) => {
-            shard_errors.push((ShardId::UNENCODED, e.to_string()));
-            (vec![], vec![])
-        }
-    };
-
-    // Load reachability aggregated across all shards.
+    let mut policy_map: std::collections::HashMap<String, BuildPolicy> =
+        std::collections::HashMap::new();
+    let mut diverged_queues: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut compat_map: std::collections::HashMap<(String, String), BuildCompatEntry> =
+        std::collections::HashMap::new();
     let mut per_shard_reach: Vec<Vec<BuildReachability>> = Vec::new();
+
     for (shard_id, shard_pool) in pool.iter_shards() {
         match acquire_conn(shard_pool).await {
-            Ok(mut conn) => match all_build_reachability(&mut conn, stale_threshold).await {
-                Ok(r) => per_shard_reach.push(r),
-                Err(e) => shard_errors.push((shard_id, e.to_string())),
-            },
+            Ok(mut conn) => {
+                match list_build_policies(&mut conn).await {
+                    Ok(shard_policies) => {
+                        for policy in shard_policies {
+                            match policy_map.get(&policy.queue_name) {
+                                Some(existing) if existing.build_id != policy.build_id => {
+                                    diverged_queues.insert(policy.queue_name.clone());
+                                    if policy.updated_at > existing.updated_at {
+                                        policy_map.insert(policy.queue_name.clone(), policy);
+                                    }
+                                }
+                                Some(existing) if policy.updated_at > existing.updated_at => {
+                                    policy_map.insert(policy.queue_name.clone(), policy);
+                                }
+                                None => {
+                                    policy_map.insert(policy.queue_name.clone(), policy);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    Err(e) => shard_errors.push((shard_id, e.to_string())),
+                }
+                match list_build_compat(&mut conn).await {
+                    Ok(entries) => {
+                        for entry in entries {
+                            let key = (entry.build_id.clone(), entry.compatible_with.clone());
+                            compat_map
+                                .entry(key)
+                                .and_modify(|e| {
+                                    if entry.declared_at > e.declared_at {
+                                        *e = entry.clone();
+                                    }
+                                })
+                                .or_insert(entry);
+                        }
+                    }
+                    Err(e) => shard_errors.push((shard_id, e.to_string())),
+                }
+                match all_build_reachability(&mut conn, stale_threshold).await {
+                    Ok(r) => per_shard_reach.push(r),
+                    Err(e) => shard_errors.push((shard_id, e.to_string())),
+                }
+            }
             Err(e) => shard_errors.push((shard_id, e.to_string())),
         }
     }
+
+    let mut policies: Vec<BuildPolicy> = policy_map.into_values().collect();
+    policies.sort_by(|a, b| a.queue_name.cmp(&b.queue_name));
+    let mut all_compat: Vec<BuildCompatEntry> = compat_map.into_values().collect();
+    all_compat.sort_by(|a, b| {
+        a.build_id
+            .cmp(&b.build_id)
+            .then(a.compatible_with.cmp(&b.compatible_with))
+    });
+    let mut diverged_list: Vec<String> = diverged_queues.into_iter().collect();
+    diverged_list.sort();
     let reachability = merge_reachability(per_shard_reach);
 
     let shard_error_refs: Vec<(ShardId, &str)> =
@@ -3751,6 +3786,7 @@ async fn list_build_routing_ui(
         &filtered_compat,
         &filtered_reach,
         &shard_error_refs,
+        &diverged_list,
         is_multi_shard,
         params.flash.as_deref(),
         build_id_filter,
@@ -4207,11 +4243,13 @@ fn render_build_routing_action_forms() -> Markup {
     }
 }
 
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn render_build_routing_page(
     policies: &[BuildPolicy],
     all_compat: &[BuildCompatEntry],
     reachability: &[BuildReachability],
     shard_errors: &[(ShardId, &str)],
+    diverged_queues: &[String],
     is_multi_shard: bool,
     flash: Option<&str>,
     build_id_filter: Option<&str>,
@@ -4231,6 +4269,18 @@ fn render_build_routing_page(
 
         @if let Some(msg) = flash {
             div.flash { (msg) }
+        }
+
+        @if !diverged_queues.is_empty() {
+            div style="background:#431407;border:1px solid #ea580c;border-radius:8px;padding:10px 14px;margin-bottom:12px;font-size:13px;color:#fed7aa" {
+                strong { "Policy divergence detected" }
+                " — the following queues have different active build IDs across shards, "
+                "indicating a partial write failure. Re-apply the policy to resync: "
+                @for (i, q) in diverged_queues.iter().enumerate() {
+                    @if i > 0 { ", " }
+                    code style="color:#fdba74" { (q) }
+                }
+            }
         }
 
         @for (shard_id, error) in shard_errors {
@@ -6410,7 +6460,8 @@ mod tests {
 
     #[test]
     fn render_build_routing_page_empty_state_shows_docs_link() {
-        let html = render_build_routing_page(&[], &[], &[], &[], false, None, None).into_string();
+        let html =
+            render_build_routing_page(&[], &[], &[], &[], &[], false, None, None).into_string();
         assert!(
             html.contains("No build routing configured") || html.contains("No build policies"),
             "empty state must show a 'no policies' message"
@@ -6431,8 +6482,8 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
-        let html =
-            render_build_routing_page(&[policy], &[], &[], &[], false, None, None).into_string();
+        let html = render_build_routing_page(&[policy], &[], &[], &[], &[], false, None, None)
+            .into_string();
         assert!(html.contains("test-queue"), "must show queue name");
         assert!(html.contains("abc123"), "must show build_id");
         assert!(html.contains("prod-v2"), "must show deployment name");
@@ -6448,8 +6499,8 @@ mod tests {
             stale_workers: 1,
             safe_to_retire: false,
         };
-        let html =
-            render_build_routing_page(&[], &[], &[reach], &[], false, None, None).into_string();
+        let html = render_build_routing_page(&[], &[], &[reach], &[], &[], false, None, None)
+            .into_string();
         assert!(html.contains("sha-old"), "must show build_id");
         assert!(html.contains("42"), "must show open_executions count");
         assert!(
@@ -6468,8 +6519,8 @@ mod tests {
             stale_workers: 0,
             safe_to_retire: true,
         };
-        let html =
-            render_build_routing_page(&[], &[], &[reach], &[], false, None, None).into_string();
+        let html = render_build_routing_page(&[], &[], &[reach], &[], &[], false, None, None)
+            .into_string();
         assert!(
             html.contains("Retire"),
             "retire button must appear when safe_to_retire"
@@ -6488,8 +6539,8 @@ mod tests {
             compatible_with: "sha-old".to_string(),
             declared_at: chrono::Utc::now(),
         };
-        let html =
-            render_build_routing_page(&[], &[entry], &[], &[], false, None, None).into_string();
+        let html = render_build_routing_page(&[], &[entry], &[], &[], &[], false, None, None)
+            .into_string();
         assert!(
             html.contains("sha-new"),
             "must show worker build in compat table"
@@ -6507,7 +6558,7 @@ mod tests {
     #[test]
     fn render_build_routing_page_flash_message_shown() {
         let html =
-            render_build_routing_page(&[], &[], &[], &[], false, Some("Policy updated"), None)
+            render_build_routing_page(&[], &[], &[], &[], &[], false, Some("Policy updated"), None)
                 .into_string();
         assert!(
             html.contains("Policy updated"),
@@ -6517,7 +6568,8 @@ mod tests {
 
     #[test]
     fn render_build_routing_page_has_set_policy_form() {
-        let html = render_build_routing_page(&[], &[], &[], &[], false, None, None).into_string();
+        let html =
+            render_build_routing_page(&[], &[], &[], &[], &[], false, None, None).into_string();
         assert!(
             html.contains("set-policy"),
             "page must include Set Policy form action"
@@ -6534,7 +6586,8 @@ mod tests {
 
     #[test]
     fn render_build_routing_page_has_declare_compat_form() {
-        let html = render_build_routing_page(&[], &[], &[], &[], false, None, None).into_string();
+        let html =
+            render_build_routing_page(&[], &[], &[], &[], &[], false, None, None).into_string();
         assert!(
             html.contains("declare-compat"),
             "page must include Declare Compat form action"

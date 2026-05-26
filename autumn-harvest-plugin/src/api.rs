@@ -11598,7 +11598,16 @@ async fn get_update_result(
 struct BuildRoutingResponse {
     policies: Vec<autumn_harvest::build_routing::BuildPolicy>,
     reachability: Vec<autumn_harvest::build_routing::BuildReachability>,
-    /// Shards that could not be reached; per-shard reachability data is incomplete.
+    /// Queues whose active `build_id` differs across shards, indicating a partial-write incident.
+    diverged_queues: Vec<String>,
+    /// Shards that could not be reached; per-shard data may be incomplete.
+    shard_errors: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct CompatListResponse {
+    entries: Vec<autumn_harvest::build_routing::BuildCompatEntry>,
+    /// Shards that could not be reached during this read; the list may be incomplete.
     shard_errors: Vec<serde_json::Value>,
 }
 
@@ -11638,8 +11647,10 @@ struct RetireBuildResponse {
 async fn list_build_routing_handler(
     Extension(api_state): Extension<HarvestApiState>,
 ) -> impl axum::response::IntoResponse {
+    use std::collections::{HashMap, HashSet};
+
     use autumn_harvest::build_routing::{
-        all_build_reachability, list_build_policies, merge_reachability,
+        BuildPolicy, all_build_reachability, list_build_policies, merge_reachability,
     };
 
     let pool = match api_state.storage_pool().map_err(map_error) {
@@ -11648,39 +11659,53 @@ async fn list_build_routing_handler(
     };
 
     let stale_threshold = api_state.worker_stale_threshold();
-    let mut per_shard: Vec<Vec<autumn_harvest::build_routing::BuildReachability>> = Vec::new();
+    let mut per_shard_reachability: Vec<Vec<autumn_harvest::build_routing::BuildReachability>> =
+        Vec::new();
     let mut shard_errors: Vec<serde_json::Value> = Vec::new();
 
-    // Policies live on the default shard; on failure, surface the error in
-    // shard_errors and continue so the page still shows cross-shard reachability.
-    let policies = match acquire_conn(pool.default_pool()).await {
-        Ok(mut conn) => match list_build_policies(&mut conn).await.map_err(map_error) {
-            Ok(p) => p,
-            Err(e) => {
-                shard_errors.push(serde_json::json!({
-                    "shard_id": "default",
-                    "error": e.to_string(),
-                }));
-                vec![]
-            }
-        },
-        Err(e) => {
-            shard_errors.push(serde_json::json!({
-                "shard_id": "default",
-                "error": e.to_string(),
-            }));
-            vec![]
-        }
-    };
+    // Read policies AND reachability from every shard so we can detect divergence.
+    // Policy mutations fan out to all shards; a partial-write leaves non-default
+    // shards with a stale active build_id. We surface this as `diverged_queues`.
+    let mut per_shard_policies: HashMap<String, BuildPolicy> = HashMap::new();
+    let mut diverged: HashSet<String> = HashSet::new();
 
     for (shard_id, shard_pool) in pool.iter_shards() {
         match acquire_conn(shard_pool).await {
             Ok(mut conn) => {
+                match list_build_policies(&mut conn).await.map_err(map_error) {
+                    Ok(shard_policies) => {
+                        for policy in shard_policies {
+                            match per_shard_policies.get(&policy.queue_name) {
+                                Some(existing) if existing.build_id != policy.build_id => {
+                                    diverged.insert(policy.queue_name.clone());
+                                    if policy.updated_at > existing.updated_at {
+                                        per_shard_policies
+                                            .insert(policy.queue_name.clone(), policy);
+                                    }
+                                }
+                                Some(existing) if policy.updated_at > existing.updated_at => {
+                                    per_shard_policies.insert(policy.queue_name.clone(), policy);
+                                }
+                                None => {
+                                    per_shard_policies.insert(policy.queue_name.clone(), policy);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        shard_errors.push(serde_json::json!({
+                            "shard_id": shard_id.as_i32(),
+                            "error": e.to_string(),
+                        }));
+                    }
+                }
+
                 match all_build_reachability(&mut conn, stale_threshold)
                     .await
                     .map_err(map_error)
                 {
-                    Ok(r) => per_shard.push(r),
+                    Ok(r) => per_shard_reachability.push(r),
                     Err(e) => {
                         shard_errors.push(serde_json::json!({
                             "shard_id": shard_id.as_i32(),
@@ -11698,10 +11723,16 @@ async fn list_build_routing_handler(
         }
     }
 
-    let reachability = merge_reachability(per_shard);
+    let mut policies: Vec<BuildPolicy> = per_shard_policies.into_values().collect();
+    policies.sort_by(|a, b| a.queue_name.cmp(&b.queue_name));
+    let mut diverged_queues: Vec<String> = diverged.into_iter().collect();
+    diverged_queues.sort();
+
+    let reachability = merge_reachability(per_shard_reachability);
     axum::Json(BuildRoutingResponse {
         policies,
         reachability,
+        diverged_queues,
         shard_errors,
     })
     .into_response()
@@ -11813,13 +11844,11 @@ async fn set_build_policy_handler(
 
 /// `GET /admin/build-routing/compat` — list all compatibility declarations.
 ///
-/// Reads from all shards and merges the results. Compat declarations are fanned
-/// out to every shard on write, but partial-success (207) on write means some
-/// shards may have missed a declaration. Merging across all reachable shards gives
-/// the most complete picture and surfaces any divergence. Entries with the same
+/// Reads from all shards and merges the results. Entries with the same
 /// `(build_id, compatible_with)` key are deduplicated by keeping the latest
-/// `declared_at` timestamp. Unreachable shards are skipped; if no shard succeeds,
-/// the last error is returned as 503.
+/// `declared_at` timestamp. Unreachable shards are listed in `shard_errors` in
+/// the response so operators can distinguish a complete read from a partial one.
+/// If no shard succeeds at all, returns 503.
 async fn list_build_compat_handler(
     Extension(api_state): Extension<HarvestApiState>,
 ) -> impl axum::response::IntoResponse {
@@ -11832,13 +11861,12 @@ async fn list_build_compat_handler(
         Err(e) => return e.into_response(),
     };
 
-    // Merge by (build_id, compatible_with), keeping the latest declared_at so
-    // a shard that received the write most recently wins.
     let mut merged: HashMap<(String, String), BuildCompatEntry> = HashMap::new();
-    let mut last_err: Option<axum::response::Response> = None;
+    let mut shard_errors: Vec<serde_json::Value> = Vec::new();
     let mut any_success = false;
+    let mut last_err: Option<axum::response::Response> = None;
 
-    for (_, shard_pool) in pool.iter_shards() {
+    for (shard_id, shard_pool) in pool.iter_shards() {
         match acquire_conn(shard_pool).await {
             Ok(mut conn) => match list_build_compat(&mut conn).await.map_err(map_error) {
                 Ok(entries) => {
@@ -11855,9 +11883,21 @@ async fn list_build_compat_handler(
                             .or_insert(entry);
                     }
                 }
-                Err(e) => last_err = Some(e.into_response()),
+                Err(e) => {
+                    shard_errors.push(serde_json::json!({
+                        "shard_id": shard_id.as_i32(),
+                        "error": e.to_string(),
+                    }));
+                    last_err = Some(e.into_response());
+                }
             },
-            Err(e) => last_err = Some(e.into_response()),
+            Err(e) => {
+                shard_errors.push(serde_json::json!({
+                    "shard_id": shard_id.as_i32(),
+                    "error": e.to_string(),
+                }));
+                last_err = Some(e.into_response());
+            }
         }
     }
 
@@ -11868,7 +11908,11 @@ async fn list_build_compat_handler(
                 .cmp(&b.build_id)
                 .then(a.compatible_with.cmp(&b.compatible_with))
         });
-        axum::Json(entries).into_response()
+        axum::Json(CompatListResponse {
+            entries,
+            shard_errors,
+        })
+        .into_response()
     } else {
         last_err.unwrap_or_else(|| {
             map_error(autumn_harvest::HarvestError::Config(

@@ -3231,7 +3231,8 @@
       "request_body": null,
       "success_response": {
         "status": 200,
-        "fields": ["policies", "reachability", "shard_errors"]
+        "fields": ["policies", "reachability", "diverged_queues", "shard_errors"],
+        "notes": "diverged_queues lists queue names whose active build_id differs across shards, indicating a partial-write incident. shard_errors lists shards that could not be reached."
       },
       "error_responses": [
         { "status": 503, "description": "Database unavailable." }
@@ -3273,8 +3274,8 @@
       "request_body": null,
       "success_response": {
         "status": 200,
-        "free_form": true,
-        "note": "Array of BuildCompatEntry objects with id, build_id, compatible_with, declared_at."
+        "fields": ["entries", "shard_errors"],
+        "notes": "entries is an array of BuildCompatEntry objects (id, build_id, compatible_with, declared_at). shard_errors lists shards that could not be reached; a non-empty shard_errors means the list may be incomplete."
       },
       "error_responses": [
         { "status": 503, "description": "Database unavailable." }
