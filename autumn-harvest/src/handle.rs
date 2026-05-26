@@ -349,7 +349,6 @@ impl WorkflowHandleClient {
             inner: Arc::new(inner),
         }
     }
-
     /// Get the maximum allowed execution timeout.
     #[must_use]
     pub fn max_workflow_execution_timeout(&self) -> Option<Duration> {
@@ -788,7 +787,6 @@ impl WorkflowHandle {
         crate::store::admit_update_event(conn, self.exec_id, update_id, name.to_string(), input)
             .await?;
         crate::queue::wake_workflow_task(conn, self.exec_id).await?;
-
         let shard = self.shard();
         let start = Instant::now();
         let poll_interval = Duration::from_millis(100);
