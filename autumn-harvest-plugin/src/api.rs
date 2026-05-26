@@ -1656,7 +1656,29 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         // Gated behind the same mgmt auth provider as other management routes.
         .route(
             "/executions/{exec_id}/events/stream",
-            get(stream_execution_events).route_layer(require_admin),
+            get(stream_execution_events).route_layer(require_admin.clone()),
+        )
+        // Build routing management (issue #362): expose build policies,
+        // compatibility declarations, and cross-shard reachability.
+        // Mutating routes are admin-gated; the read route is open to any
+        // authenticated operator (same posture as GET /workers).
+        .route("/admin/build-routing", get(list_build_routing_handler))
+        .route(
+            "/admin/build-routing/policies",
+            post(set_build_policy_handler).route_layer(require_admin.clone()),
+        )
+        .route("/admin/build-routing/compat", get(list_build_compat_handler))
+        .route(
+            "/admin/build-routing/compat",
+            post(declare_compat_handler).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/admin/build-routing/compat/{build_id}/{compat_with}",
+            delete(revoke_compat_handler).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/admin/build-routing/retire",
+            post(retire_build_handler).route_layer(require_admin),
         )
         .layer(Extension(api_state))
 }
@@ -1774,6 +1796,13 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/admin/audit"),
         // ── SSE execution event stream (issue #324) ───────────────────────────
         ("GET", "/executions/{exec_id}/events/stream"),
+        // ── build routing management (issue #362) ─────────────────────────────
+        ("GET", "/admin/build-routing"),
+        ("POST", "/admin/build-routing/policies"),
+        ("GET", "/admin/build-routing/compat"),
+        ("POST", "/admin/build-routing/compat"),
+        ("DELETE", "/admin/build-routing/compat/{build_id}/{compat_with}"),
+        ("POST", "/admin/build-routing/retire"),
     ]
 }
 
@@ -1938,6 +1967,27 @@ pub const fn management_api_request_fields()
         ("POST", "/calendars", Some(&["name", "description"])),
         ("PUT", "/calendars/{name}", Some(&["exclusion_dates"])),
         ("DELETE", "/calendars/{name}", Some(&[])),
+        // ── build routing (issue #362) ────────────────────────────────────────
+        (
+            "POST",
+            "/admin/build-routing/policies",
+            Some(&["queue_name", "build_id", "deployment_name"]),
+        ),
+        (
+            "POST",
+            "/admin/build-routing/compat",
+            Some(&["build_id", "compatible_with"]),
+        ),
+        (
+            "DELETE",
+            "/admin/build-routing/compat/{build_id}/{compat_with}",
+            Some(&[]),
+        ),
+        (
+            "POST",
+            "/admin/build-routing/retire",
+            Some(&["build_id"]),
+        ),
     ]
 }
 
@@ -2299,6 +2349,36 @@ pub const fn management_api_response_fields()
         ("GET", "/admin/audit", None), // Vec<AuditRecord> (external model)
         // ── SSE execution event stream (issue #324) ───────────────────────────
         ("GET", "/executions/{exec_id}/events/stream", None), // text/event-stream
+        // ── build routing (issue #362) ────────────────────────────────────────
+        ("GET", "/admin/build-routing", Some(&["policies", "reachability", "shard_errors"])),
+        (
+            "POST",
+            "/admin/build-routing/policies",
+            Some(&[
+                "id",
+                "queue_name",
+                "build_id",
+                "deployment_name",
+                "created_at",
+                "updated_at",
+            ]),
+        ),
+        ("GET", "/admin/build-routing/compat", None), // Vec<BuildCompatEntry>
+        (
+            "POST",
+            "/admin/build-routing/compat",
+            Some(&["id", "build_id", "compatible_with", "declared_at"]),
+        ),
+        (
+            "DELETE",
+            "/admin/build-routing/compat/{build_id}/{compat_with}",
+            Some(&["revoked"]),
+        ),
+        (
+            "POST",
+            "/admin/build-routing/retire",
+            Some(&["build_id", "safe_to_retire", "open_executions", "pending_tasks"]),
+        ),
     ]
 }
 
@@ -11207,6 +11287,263 @@ async fn get_update_result(
             }),
         )
             .into_response(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Build routing management (issue #362)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, serde::Serialize)]
+struct BuildRoutingResponse {
+    policies: Vec<autumn_harvest::build_routing::BuildPolicy>,
+    reachability: Vec<autumn_harvest::build_routing::BuildReachability>,
+    /// Shards that could not be reached; per-shard reachability data is incomplete.
+    shard_errors: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct SetBuildPolicyBody {
+    queue_name: String,
+    build_id: String,
+    #[serde(default)]
+    deployment_name: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct DeclareCompatBody {
+    build_id: String,
+    compatible_with: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct RevokeCompatResponse {
+    revoked: bool,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RetireBuildBody {
+    build_id: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct RetireBuildResponse {
+    build_id: String,
+    safe_to_retire: bool,
+    open_executions: i64,
+    pending_tasks: i64,
+}
+
+/// `GET /admin/build-routing` — list policies + cross-shard reachability.
+async fn list_build_routing_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+) -> impl axum::response::IntoResponse {
+    use autumn_harvest::build_routing::{
+        all_build_reachability, list_build_policies, merge_reachability,
+    };
+
+    let pool = match api_state.storage_pool().map_err(map_error) {
+        Ok(p) => p,
+        Err(e) => return e.into_response(),
+    };
+
+    let default_pool = pool.default_pool();
+    let policies = match acquire_conn(default_pool).await {
+        Ok(mut conn) => match list_build_policies(&mut conn).await.map_err(map_error) {
+            Ok(p) => p,
+            Err(e) => return e.into_response(),
+        },
+        Err(e) => return e.into_response(),
+    };
+
+    let stale_threshold = api_state.worker_stale_threshold();
+    let mut per_shard: Vec<Vec<autumn_harvest::build_routing::BuildReachability>> = Vec::new();
+    let mut shard_errors: Vec<serde_json::Value> = Vec::new();
+
+    for (shard_id, shard_pool) in pool.iter_shards() {
+        match acquire_conn(shard_pool).await {
+            Ok(mut conn) => {
+                match all_build_reachability(&mut conn, stale_threshold)
+                    .await
+                    .map_err(map_error)
+                {
+                    Ok(r) => per_shard.push(r),
+                    Err(e) => {
+                        shard_errors.push(serde_json::json!({
+                            "shard_id": shard_id.as_i32(),
+                            "error": e.to_string(),
+                        }));
+                    }
+                }
+            }
+            Err(e) => {
+                shard_errors.push(serde_json::json!({
+                    "shard_id": shard_id.as_i32(),
+                    "error": e.to_string(),
+                }));
+            }
+        }
+    }
+
+    let reachability = merge_reachability(per_shard);
+    axum::Json(BuildRoutingResponse {
+        policies,
+        reachability,
+        shard_errors,
+    })
+    .into_response()
+}
+
+/// `POST /admin/build-routing/policies` — set the active build policy for a queue.
+async fn set_build_policy_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+    axum::Json(body): axum::Json<SetBuildPolicyBody>,
+) -> impl axum::response::IntoResponse {
+    use autumn_harvest::build_routing::set_build_policy;
+
+    let pool = match api_state.storage_pool().map_err(map_error) {
+        Ok(p) => p,
+        Err(e) => return e.into_response(),
+    };
+    let mut conn = match acquire_conn(pool.default_pool()).await {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+    let deployment = body.deployment_name.as_deref().filter(|s| !s.is_empty());
+    match set_build_policy(&mut conn, &body.queue_name, &body.build_id, deployment)
+        .await
+        .map_err(map_error)
+    {
+        Ok(policy) => (axum::http::StatusCode::OK, axum::Json(policy)).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// `GET /admin/build-routing/compat` — list all compatibility declarations.
+async fn list_build_compat_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+) -> impl axum::response::IntoResponse {
+    use autumn_harvest::build_routing::list_build_compat;
+
+    let pool = match api_state.storage_pool().map_err(map_error) {
+        Ok(p) => p,
+        Err(e) => return e.into_response(),
+    };
+    let mut conn = match acquire_conn(pool.default_pool()).await {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+    match list_build_compat(&mut conn).await.map_err(map_error) {
+        Ok(entries) => axum::Json(entries).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// `POST /admin/build-routing/compat` — declare that build A can absorb build B's histories.
+async fn declare_compat_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+    axum::Json(body): axum::Json<DeclareCompatBody>,
+) -> impl axum::response::IntoResponse {
+    use autumn_harvest::build_routing::declare_compat;
+
+    let pool = match api_state.storage_pool().map_err(map_error) {
+        Ok(p) => p,
+        Err(e) => return e.into_response(),
+    };
+    let mut conn = match acquire_conn(pool.default_pool()).await {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+    match declare_compat(&mut conn, &body.build_id, &body.compatible_with)
+        .await
+        .map_err(map_error)
+    {
+        Ok(entry) => (axum::http::StatusCode::CREATED, axum::Json(entry)).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// `DELETE /admin/build-routing/compat/{build_id}/{compat_with}` — revoke a declaration.
+async fn revoke_compat_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+    axum::extract::Path((build_id, compat_with)): axum::extract::Path<(String, String)>,
+) -> impl axum::response::IntoResponse {
+    use autumn_harvest::build_routing::revoke_compat;
+
+    let pool = match api_state.storage_pool().map_err(map_error) {
+        Ok(p) => p,
+        Err(e) => return e.into_response(),
+    };
+    let mut conn = match acquire_conn(pool.default_pool()).await {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+    match revoke_compat(&mut conn, &build_id, &compat_with)
+        .await
+        .map_err(map_error)
+    {
+        Ok(revoked) => axum::Json(RevokeCompatResponse { revoked }).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// `POST /admin/build-routing/retire` — confirm a build is safe to retire.
+///
+/// Returns the reachability snapshot. The caller is responsible for stopping
+/// their old workers after confirming `safe_to_retire = true`.
+async fn retire_build_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+    axum::Json(body): axum::Json<RetireBuildBody>,
+) -> impl axum::response::IntoResponse {
+    use autumn_harvest::build_routing::{all_build_reachability, merge_reachability};
+
+    let pool = match api_state.storage_pool().map_err(map_error) {
+        Ok(p) => p,
+        Err(e) => return e.into_response(),
+    };
+    let stale_threshold = api_state.worker_stale_threshold();
+    let mut per_shard = Vec::new();
+
+    for (_, shard_pool) in pool.iter_shards() {
+        if let Ok(mut conn) = acquire_conn(shard_pool).await {
+            if let Ok(r) = all_build_reachability(&mut conn, stale_threshold).await {
+                per_shard.push(r);
+            }
+        }
+    }
+    let merged = merge_reachability(per_shard);
+    let reach = merged
+        .iter()
+        .find(|r| r.build_id == body.build_id.trim())
+        .cloned()
+        .unwrap_or(autumn_harvest::build_routing::BuildReachability {
+            build_id: body.build_id.trim().to_string(),
+            open_executions: 0,
+            pending_tasks: 0,
+            active_workers: 0,
+            stale_workers: 0,
+            safe_to_retire: true,
+        });
+
+    if reach.safe_to_retire {
+        axum::Json(RetireBuildResponse {
+            build_id: reach.build_id,
+            safe_to_retire: true,
+            open_executions: reach.open_executions,
+            pending_tasks: reach.pending_tasks,
+        })
+        .into_response()
+    } else {
+        (
+            axum::http::StatusCode::CONFLICT,
+            axum::Json(RetireBuildResponse {
+                build_id: reach.build_id,
+                safe_to_retire: false,
+                open_executions: reach.open_executions,
+                pending_tasks: reach.pending_tasks,
+            }),
+        )
+            .into_response()
     }
 }
 

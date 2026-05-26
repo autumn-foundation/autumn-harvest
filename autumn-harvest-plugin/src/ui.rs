@@ -53,6 +53,11 @@ use autumn_harvest::schema::{
 use autumn_harvest::signal::send_signal;
 use autumn_harvest::store::admit_update_event;
 use autumn_harvest::types::{ShardId, UpdateId};
+use autumn_harvest::build_routing::{
+    BuildCompatEntry, BuildPolicy, BuildReachability, all_build_reachability,
+    declare_compat, list_build_compat, list_build_policies, merge_reachability,
+    revoke_compat, set_build_policy,
+};
 use autumn_harvest::workers::{WorkerFilters, WorkerHealth, WorkerRow, list_workers};
 
 use crate::api::{
@@ -248,9 +253,38 @@ pub(crate) struct WorkerListParams {
     /// Set to `"true"` to show only stale workers.
     #[serde(default)]
     stale: Option<String>,
+    /// Filter by build ID (exact match).
+    #[serde(default)]
+    build_id: Option<String>,
     /// Auto-refresh interval in seconds (emits a `<meta http-equiv="refresh">` tag).
     #[serde(default)]
     refresh: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub(crate) struct BuildRoutingListParams {
+    /// Flash message forwarded after a form action redirect.
+    #[serde(default)]
+    flash: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BuildRoutingSetPolicyForm {
+    queue_name: String,
+    build_id: String,
+    #[serde(default)]
+    deployment_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BuildRoutingCompatForm {
+    build_id: String,
+    compatible_with: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BuildRoutingRetireForm {
+    build_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -452,7 +486,24 @@ pub fn harvest_ui_router(api_state: HarvestApiState) -> Router<AppState> {
         .route("/workers", get(list_workers_ui))
         .route(
             "/dead-letters",
-            get(list_dead_letters_ui).route_layer(require_admin),
+            get(list_dead_letters_ui).route_layer(require_admin.clone()),
+        )
+        .route("/build-routing", get(list_build_routing_ui))
+        .route(
+            "/build-routing/set-policy",
+            post(build_routing_set_policy_ui).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/build-routing/declare-compat",
+            post(build_routing_declare_compat_ui).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/build-routing/revoke-compat",
+            post(build_routing_revoke_compat_ui).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/build-routing/retire",
+            post(build_routing_retire_ui).route_layer(require_admin),
         )
         .route("/schedules", get(list_schedules_ui))
         .route("/schedules/bulk-pause", post(schedule_bulk_pause_ui))
@@ -1539,6 +1590,12 @@ async fn list_workers_ui(
             if stale_only && row.health != WorkerHealth::Stale {
                 return false;
             }
+            if let Some(ref bf) = params.build_id
+                && !bf.is_empty()
+                && row.worker.build_id != *bf
+            {
+                return false;
+            }
             true
         })
         .collect();
@@ -1572,6 +1629,8 @@ async fn list_workers_ui(
         .filter_map(|(shard_id, result)| result.as_ref().err().map(|e| (*shard_id, e.as_str())))
         .collect();
 
+    let build_id_filter = params.build_id.as_deref().filter(|s| !s.is_empty());
+
     Ok(render_workers_page(
         &stats,
         banner_state,
@@ -1584,6 +1643,7 @@ async fn list_workers_ui(
         status_filter,
         params.shard,
         stale_only,
+        build_id_filter,
         params.refresh,
     ))
 }
@@ -2082,6 +2142,7 @@ fn layout_dead_letters(title: &str, body: &Markup, refresh: Option<u64>) -> Mark
                         a href="workers" { "Workers" }
                         a href="schedules" { "Schedules" }
                         a.active href="dead-letters" { "Dead Letters" }
+                        a href="build-routing" { "Build Routing" }
                     }
                 }
                 main { (body) }
@@ -2104,6 +2165,7 @@ fn render_workers_page(
     status_filter: Option<&str>,
     shard_filter: Option<i32>,
     stale_only: bool,
+    build_id_filter: Option<&str>,
     refresh: Option<u64>,
 ) -> Markup {
     let total_workers: usize = grouped.iter().map(|(_, rows)| rows.len()).sum();
@@ -2115,7 +2177,7 @@ fn render_workers_page(
         (render_fleet_banner(stats, banner_state))
 
         // Filters
-        (render_worker_filters(status_filter, shard_filter, stale_only, limit))
+        (render_worker_filters(status_filter, shard_filter, stale_only, build_id_filter, limit))
 
         // Worker table (grouped by shard if multi-shard)
         @if total_workers == 0 && shard_errors.is_empty() {
@@ -2148,7 +2210,7 @@ fn render_workers_page(
             }
         }
 
-        (render_worker_pagination(page, limit, has_next, status_filter, shard_filter, stale_only))
+        (render_worker_pagination(page, limit, has_next, status_filter, shard_filter, stale_only, build_id_filter))
     };
 
     layout_workers("Workers · Vantage", &body, refresh)
@@ -2183,6 +2245,8 @@ fn render_worker_table(rows: &[WorkerRow], shard_id: ShardId) -> Markup {
                 tr {
                     th { "Worker ID" }
                     th { "Status" }
+                    th { "Build ID" }
+                    th { "Deployment" }
                     th { "Last Heartbeat" }
                     th { "Shard" }
                     th { "In-Flight" }
@@ -2195,6 +2259,23 @@ fn render_worker_table(rows: &[WorkerRow], shard_id: ShardId) -> Markup {
                     tr class=(row_class) {
                         td { code { (short_id(&row.worker.worker_id)) } }
                         td { (worker_status_badge(&row.worker.status, is_stale)) }
+                        td {
+                            @if row.worker.build_id.is_empty() {
+                                span style="color:#475569" { "—" }
+                            } @else {
+                                a href={ "build-routing?build_id=" (url_encode(&row.worker.build_id)) }
+                                  title="View in Build Routing" {
+                                    code { (row.worker.build_id.chars().take(16).collect::<String>()) }
+                                }
+                            }
+                        }
+                        td {
+                            @if let Some(ref dep) = row.worker.deployment_name {
+                                code { (dep) }
+                            } @else {
+                                span style="color:#475569" { "—" }
+                            }
+                        }
                         td {
                             @let rel = relative_time(row.worker.last_heartbeat_at);
                             @let abs = format_timestamp(Some(row.worker.last_heartbeat_at));
@@ -2215,9 +2296,11 @@ fn render_worker_filters(
     status_filter: Option<&str>,
     shard_filter: Option<i32>,
     stale_only: bool,
+    build_id_filter: Option<&str>,
     limit: i64,
 ) -> Markup {
     let shard_value = shard_filter.map(|s| s.to_string()).unwrap_or_default();
+    let build_id_value = build_id_filter.unwrap_or("");
     html! {
         form.filters method="get" action="workers" {
             label {
@@ -2228,6 +2311,10 @@ fn render_worker_filters(
                         option value=(s) selected[status_filter == Some(s)] { (s) }
                     }
                 }
+            }
+            label {
+                "Build ID"
+                input type="text" name="build_id" value=(build_id_value) placeholder="e.g. abc123";
             }
             label {
                 "Shard"
@@ -2257,8 +2344,9 @@ fn render_worker_pagination(
     status_filter: Option<&str>,
     shard_filter: Option<i32>,
     stale_only: bool,
+    build_id_filter: Option<&str>,
 ) -> Markup {
-    let base = build_worker_query_string(limit, status_filter, shard_filter, stale_only);
+    let base = build_worker_query_string(limit, status_filter, shard_filter, stale_only, build_id_filter);
     html! {
         div.pagination {
             @if page > 0 {
@@ -2287,6 +2375,7 @@ fn build_worker_query_string(
     status_filter: Option<&str>,
     shard_filter: Option<i32>,
     stale_only: bool,
+    build_id_filter: Option<&str>,
 ) -> String {
     let mut out = String::new();
     if limit != DEFAULT_PAGE_SIZE {
@@ -2294,6 +2383,9 @@ fn build_worker_query_string(
     }
     if let Some(status) = status_filter {
         let _ = write!(out, "&status={}", url_encode(status));
+    }
+    if let Some(build_id) = build_id_filter {
+        let _ = write!(out, "&build_id={}", url_encode(build_id));
     }
     if let Some(shard) = shard_filter {
         let _ = write!(out, "&shard={shard}");
@@ -2358,6 +2450,7 @@ fn layout_workers(title: &str, body: &Markup, refresh: Option<u64>) -> Markup {
                         a.active href="workers" { "Workers" }
                         a href="schedules" { "Schedules" }
                         a href="dead-letters" { "Dead Letters" }
+                        a href="build-routing" { "Build Routing" }
                     }
                 }
                 main { (body) }
@@ -2908,6 +3001,15 @@ fn render_workflow_detail(
                 @if let Some(timeout) = execution.execution_timeout {
                     (kv("Execution timeout", &format!("{}s", timeout.num_seconds()), false))
                 }
+                @if let Some(ref build_id) = execution.assigned_build_id {
+                    div.k { "Assigned build" }
+                    div.v {
+                        a href={ "../../build-routing?build_id=" (url_encode(build_id)) }
+                           title="View in Build Routing" {
+                            code { (build_id) }
+                        }
+                    }
+                }
                 @if let Some(threshold) = continue_as_new_threshold {
                     (kv("History events", &format!("{total_events} / threshold: {threshold}"), false))
                 } @else {
@@ -3308,6 +3410,7 @@ fn layout(title: &str, body: &Markup, base_href: &str) -> Markup {
                         a href={ (base_href) "workers" } { "Workers" }
                         a href={ (base_href) "schedules" } { "Schedules" }
                         a href={ (base_href) "dead-letters" } { "Dead Letters" }
+                        a href={ (base_href) "build-routing" } { "Build Routing" }
                     }
                 }
                 main { (body) }
@@ -3491,6 +3594,7 @@ fn layout_dag_detail(title: &str, body: &Markup, base_href: &str, refresh: Optio
                         a href={ (base_href) "workers" } { "Workers" }
                         a href={ (base_href) "schedules" } { "Schedules" }
                         a href={ (base_href) "dead-letters" } { "Dead Letters" }
+                        a href={ (base_href) "build-routing" } { "Build Routing" }
                     }
                 }
                 main { (body) }
@@ -3537,6 +3641,452 @@ fn format_run_duration(started_at: DateTime<Utc>, completed_at: Option<DateTime<
         format!("{}m {}s", secs / 60, secs % 60)
     } else {
         format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Build Routing UI page (issue #362)
+// ---------------------------------------------------------------------------
+
+async fn list_build_routing_ui(
+    Extension(api_state): Extension<HarvestApiState>,
+    Query(params): Query<BuildRoutingListParams>,
+) -> Result<Markup, AutumnError> {
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    let is_multi_shard = pool.iter_shards().count() > 1;
+    let stale_threshold = api_state.worker_stale_threshold();
+
+    // Load policies and compat declarations from the default shard.
+    // These are operator-set records that should be consistent across shards.
+    let default_pool = pool.default_pool();
+    let (policies, all_compat) = {
+        let mut conn = acquire_conn(default_pool).await?;
+        let policies = list_build_policies(&mut conn).await.map_err(map_error)?;
+        let compat = list_build_compat(&mut conn).await.map_err(map_error)?;
+        (policies, compat)
+    };
+
+    // Load reachability aggregated across all shards.
+    let mut per_shard_reach: Vec<Vec<BuildReachability>> = Vec::new();
+    let mut shard_errors: Vec<(ShardId, String)> = Vec::new();
+    for (shard_id, shard_pool) in pool.iter_shards() {
+        match acquire_conn(shard_pool).await {
+            Ok(mut conn) => {
+                match all_build_reachability(&mut conn, stale_threshold).await {
+                    Ok(r) => per_shard_reach.push(r),
+                    Err(e) => shard_errors.push((shard_id, e.to_string())),
+                }
+            }
+            Err(e) => shard_errors.push((shard_id, e.to_string())),
+        }
+    }
+    let reachability = merge_reachability(per_shard_reach);
+
+    let shard_error_refs: Vec<(ShardId, &str)> =
+        shard_errors.iter().map(|(s, e)| (*s, e.as_str())).collect();
+
+    Ok(render_build_routing_page(
+        &policies,
+        &all_compat,
+        &reachability,
+        &shard_error_refs,
+        is_multi_shard,
+        params.flash.as_deref(),
+    ))
+}
+
+async fn build_routing_set_policy_ui(
+    Extension(api_state): Extension<HarvestApiState>,
+    Form(form): Form<BuildRoutingSetPolicyForm>,
+) -> Result<axum::response::Response, AutumnError> {
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    let mut conn = acquire_conn(pool.default_pool()).await?;
+
+    let deployment_name = form
+        .deployment_name
+        .as_deref()
+        .filter(|s| !s.is_empty());
+
+    let result = set_build_policy(
+        &mut conn,
+        form.queue_name.trim(),
+        form.build_id.trim(),
+        deployment_name,
+    )
+    .await;
+
+    let flash = match result {
+        Ok(p) => url_encode(&format!(
+            "Build policy for queue '{}' set to '{}'",
+            p.queue_name, p.build_id
+        )),
+        Err(e) => url_encode(&format!("Failed to set build policy: {e}")),
+    };
+    Ok(axum::response::Redirect::to(&format!("build-routing?flash={flash}")).into_response())
+}
+
+async fn build_routing_declare_compat_ui(
+    Extension(api_state): Extension<HarvestApiState>,
+    Form(form): Form<BuildRoutingCompatForm>,
+) -> Result<axum::response::Response, AutumnError> {
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    let mut conn = acquire_conn(pool.default_pool()).await?;
+
+    let result = declare_compat(&mut conn, form.build_id.trim(), form.compatible_with.trim()).await;
+
+    let flash = match result {
+        Ok(e) => url_encode(&format!(
+            "Declared: '{}' compatible with '{}'",
+            e.build_id, e.compatible_with
+        )),
+        Err(e) => url_encode(&format!("Failed to declare compatibility: {e}")),
+    };
+    Ok(axum::response::Redirect::to(&format!("build-routing?flash={flash}")).into_response())
+}
+
+async fn build_routing_revoke_compat_ui(
+    Extension(api_state): Extension<HarvestApiState>,
+    Form(form): Form<BuildRoutingCompatForm>,
+) -> Result<axum::response::Response, AutumnError> {
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    let mut conn = acquire_conn(pool.default_pool()).await?;
+
+    let result = revoke_compat(&mut conn, form.build_id.trim(), form.compatible_with.trim()).await;
+
+    let flash = match result {
+        Ok(true) => url_encode(&format!(
+            "Revoked compatibility: '{}' → '{}'",
+            form.build_id, form.compatible_with
+        )),
+        Ok(false) => url_encode(&format!(
+            "No compatibility declaration found for '{}' → '{}'",
+            form.build_id, form.compatible_with
+        )),
+        Err(e) => url_encode(&format!("Failed to revoke compatibility: {e}")),
+    };
+    Ok(axum::response::Redirect::to(&format!("build-routing?flash={flash}")).into_response())
+}
+
+async fn build_routing_retire_ui(
+    Extension(api_state): Extension<HarvestApiState>,
+    Form(form): Form<BuildRoutingRetireForm>,
+) -> Result<axum::response::Response, AutumnError> {
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    let stale_threshold = api_state.worker_stale_threshold();
+
+    // Check reachability across all shards before allowing retire.
+    let mut per_shard_reach: Vec<Vec<BuildReachability>> = Vec::new();
+    for (_, shard_pool) in pool.iter_shards() {
+        if let Ok(mut conn) = acquire_conn(shard_pool).await {
+            if let Ok(r) = all_build_reachability(&mut conn, stale_threshold).await {
+                per_shard_reach.push(r);
+            }
+        }
+    }
+    let merged = merge_reachability(per_shard_reach);
+    let build_reach = merged.iter().find(|r| r.build_id == form.build_id.trim());
+
+    let flash = match build_reach {
+        Some(r) if !r.safe_to_retire => {
+            url_encode(&format!(
+                "Cannot retire build '{}': {} open executions, {} pending tasks remain",
+                form.build_id, r.open_executions, r.pending_tasks
+            ))
+        }
+        _ => {
+            // Build is safe to retire (or not found, meaning nothing is running on it).
+            // The retire action itself is a no-op at the DB level — the operator
+            // removes their old workers out-of-band. We surface a confirmation message.
+            url_encode(&format!(
+                "Build '{}' is safe to retire — no open executions or pending tasks remain. \
+                 You may now stop all workers running this build.",
+                form.build_id.trim()
+            ))
+        }
+    };
+    Ok(axum::response::Redirect::to(&format!("build-routing?flash={flash}")).into_response())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_build_routing_page(
+    policies: &[BuildPolicy],
+    all_compat: &[BuildCompatEntry],
+    reachability: &[BuildReachability],
+    shard_errors: &[(ShardId, &str)],
+    is_multi_shard: bool,
+    flash: Option<&str>,
+) -> Markup {
+    // Collect all known build IDs from policies and reachability.
+    let is_empty = policies.is_empty() && reachability.is_empty() && all_compat.is_empty();
+
+    let body = html! {
+        h2 { "Build Routing" }
+
+        @if let Some(msg) = flash {
+            div.flash { (msg) }
+        }
+
+        // Shard errors
+        @for (shard_id, error) in shard_errors {
+            div.shard-error {
+                @if is_multi_shard {
+                    strong { "Shard " (shard_id.as_i32()) " error: " }
+                } @else {
+                    strong { "Shard error: " }
+                }
+                (error)
+            }
+        }
+
+        @if is_empty && shard_errors.is_empty() {
+            // Empty state — no build policies, no tagged workers/executions
+            div.card {
+                h3 { "No build routing configured" }
+                p style="color:#94a3b8;font-size:13px;line-height:1.6" {
+                    "No build policies have been set and no executions carry a build tag. "
+                    "Build routing is inactive — all workers can claim any task."
+                }
+                p style="color:#94a3b8;font-size:13px" {
+                    "To start a rolling deploy, follow the operator playbook: "
+                    a href="../../docs/runbooks/safe-deploy.md" { "docs/runbooks/safe-deploy.md" }
+                    "."
+                }
+            }
+        } @else {
+            // Build Policies per queue
+            div.card {
+                h3 { "Build Policies" }
+                @if policies.is_empty() {
+                    p.empty { "No build policies registered." }
+                } @else {
+                    table {
+                        thead {
+                            tr {
+                                th { "Queue" }
+                                th { "Active Build ID" }
+                                th { "Deployment" }
+                                th { "Last Updated" }
+                            }
+                        }
+                        tbody {
+                            @for policy in policies {
+                                tr {
+                                    td { code { (policy.queue_name.clone()) } }
+                                    td { code { (policy.build_id.clone()) } }
+                                    td {
+                                        @if let Some(ref dep) = policy.deployment_name {
+                                            code { (dep) }
+                                        } @else {
+                                            span style="color:#475569" { "—" }
+                                        }
+                                    }
+                                    td { (format_timestamp(Some(policy.updated_at))) }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Build Reachability (aggregated across shards)
+            div.card {
+                h3 { "Build Reachability" }
+                @if reachability.is_empty() {
+                    p.empty { "No build-tagged executions or workers found." }
+                } @else {
+                    table {
+                        thead {
+                            tr {
+                                th { "Build ID" }
+                                th { "Open Executions" }
+                                th { "Pending Tasks" }
+                                th { "Active Workers" }
+                                th { "Stale Workers" }
+                                th { "Status" }
+                                th { "Actions" }
+                            }
+                        }
+                        tbody {
+                            @for r in reachability {
+                                @let status_color = if r.safe_to_retire { "#166534" } else { "#991b1b" };
+                                @let status_bg = if r.safe_to_retire { "#dcfce7" } else { "#fee2e2" };
+                                @let status_label = if r.safe_to_retire { "✓ Safe to retire" } else { "⚠ In use" };
+                                tr {
+                                    td { code { (r.build_id.clone()) } }
+                                    td { (r.open_executions) }
+                                    td { (r.pending_tasks) }
+                                    td { (r.active_workers) }
+                                    td { (r.stale_workers) }
+                                    td {
+                                        span style={ "background:" (status_bg) ";color:" (status_color) ";padding:2px 8px;border-radius:999px;font-size:11px;font-weight:600" } {
+                                            (status_label)
+                                        }
+                                    }
+                                    td {
+                                        @if r.safe_to_retire {
+                                            form method="post" action="build-routing/retire"
+                                                  onsubmit={ "return confirm('Confirm retirement of build " (r.build_id) "? All workers running this build should be stopped after confirmation.')" }
+                                                  style="margin:0" {
+                                                input type="hidden" name="build_id" value=(r.build_id.clone());
+                                                button.danger type="submit"
+                                                    style="background:#166534;color:#dcfce7;border:0;border-radius:6px;padding:4px 10px;font-size:11px;cursor:pointer" {
+                                                    "Retire"
+                                                }
+                                            }
+                                        } @else {
+                                            span style="color:#475569;font-size:12px" { "Not yet safe" }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Compatibility Graph
+            div.card {
+                h3 { "Compatibility Declarations" }
+                p style="color:#94a3b8;font-size:12px;margin-bottom:12px" {
+                    "Workers running build " strong { "A" } " can claim tasks assigned to build " strong { "B" }
+                    " when a declaration " code { "A → B" } " exists here."
+                }
+                @if all_compat.is_empty() {
+                    p.empty { "No compatibility declarations. Workers only claim tasks assigned to their own build." }
+                } @else {
+                    table {
+                        thead {
+                            tr {
+                                th { "Worker Build (A)" }
+                                th { "Compatible With (B)" }
+                                th { "Declared" }
+                                th { "Actions" }
+                            }
+                        }
+                        tbody {
+                            @for entry in all_compat {
+                                tr {
+                                    td { code { (entry.build_id.clone()) } }
+                                    td { code { (entry.compatible_with.clone()) } }
+                                    td { (format_timestamp(Some(entry.declared_at))) }
+                                    td {
+                                        form method="post" action="build-routing/revoke-compat"
+                                              onsubmit={ "return confirm('Revoke compatibility: " (entry.build_id) " → " (entry.compatible_with) "?')" }
+                                              style="margin:0" {
+                                            input type="hidden" name="build_id" value=(entry.build_id.clone());
+                                            input type="hidden" name="compatible_with" value=(entry.compatible_with.clone());
+                                            button type="submit"
+                                                style="background:#450a0a;color:#fca5a5;border:1px solid #991b1b;border-radius:6px;padding:3px 8px;font-size:11px;cursor:pointer" {
+                                                "Revoke"
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Action forms — always visible so operators can configure from an empty state
+        div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:16px" {
+            // Set Build Policy
+            div.card {
+                h3 style="margin-top:0" { "Set Build Policy" }
+                p style="color:#94a3b8;font-size:12px;margin-bottom:12px" {
+                    "Sets which build ID is assigned to new workflow starts on a queue. "
+                    "Does not affect in-flight executions."
+                }
+                form method="post" action="build-routing/set-policy"
+                      style="display:flex;flex-direction:column;gap:10px" {
+                    label style="font-size:12px;color:#94a3b8" {
+                        "Queue name"
+                        input type="text" name="queue_name" required placeholder="e.g. default"
+                            style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
+                    }
+                    label style="font-size:12px;color:#94a3b8" {
+                        "Build ID"
+                        input type="text" name="build_id" required placeholder="e.g. sha-abc123"
+                            style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
+                    }
+                    label style="font-size:12px;color:#94a3b8" {
+                        "Deployment name (optional)"
+                        input type="text" name="deployment_name" placeholder="e.g. prod-v2"
+                            style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
+                    }
+                    button type="submit"
+                        style="background:#2563eb;color:#fff;border:0;border-radius:6px;padding:8px 14px;font-size:13px;cursor:pointer;align-self:flex-start"
+                        onclick="return confirm('Set build policy? New executions on this queue will use the specified build ID.')" {
+                        "Set Policy"
+                    }
+                }
+            }
+
+            // Declare Compatibility
+            div.card {
+                h3 style="margin-top:0" { "Declare Compatibility" }
+                p style="color:#94a3b8;font-size:12px;margin-bottom:12px" {
+                    "Declares that workers running build " strong { "A" }
+                    " can safely replay histories assigned to build " strong { "B" }
+                    ". Only declare after replay tests confirm safety."
+                }
+                form method="post" action="build-routing/declare-compat"
+                      style="display:flex;flex-direction:column;gap:10px" {
+                    label style="font-size:12px;color:#94a3b8" {
+                        "Worker build (A)"
+                        input type="text" name="build_id" required placeholder="e.g. sha-new"
+                            style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
+                    }
+                    label style="font-size:12px;color:#94a3b8" {
+                        "Compatible with (B)"
+                        input type="text" name="compatible_with" required placeholder="e.g. sha-old"
+                            style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
+                    }
+                    button type="submit"
+                        style="background:#2563eb;color:#fff;border:0;border-radius:6px;padding:8px 14px;font-size:13px;cursor:pointer;align-self:flex-start"
+                        onclick="return confirm('Declare compatibility? Ensure replay tests have confirmed the new build can handle histories from the old build.')" {
+                        "Declare"
+                    }
+                }
+            }
+        }
+    };
+
+    layout_build_routing("Build Routing · Vantage", &body, None)
+}
+
+fn layout_build_routing(title: &str, body: &Markup, refresh: Option<u64>) -> Markup {
+    html! {
+        (PreEscaped("<!DOCTYPE html>"))
+        html lang="en" {
+            head {
+                meta charset="utf-8";
+                meta name="viewport" content="width=device-width,initial-scale=1";
+                @if let Some(secs) = refresh {
+                    meta http-equiv="refresh" content=(secs);
+                }
+                title { (title) }
+                style { (PreEscaped(STYLE)) }
+            }
+            body {
+                header {
+                    h1 {
+                        a href="workflows" { "🔭 Vantage" }
+                        span.subtitle { "Harvest dashboard" }
+                    }
+                    nav {
+                        a href="workflows" { "Workflows" }
+                        a href="workers" { "Workers" }
+                        a href="schedules" { "Schedules" }
+                        a href="dead-letters" { "Dead Letters" }
+                        a.active href="build-routing" { "Build Routing" }
+                    }
+                }
+                main { (body) }
+                footer { "Operational dashboard — autumn-harvest" }
+            }
+        }
     }
 }
 
@@ -4640,6 +5190,7 @@ fn layout_schedules(title: &str, body: &Markup, refresh: Option<u64>) -> Markup 
                         a href="workers" { "Workers" }
                         a.active href="schedules" { "Schedules" }
                         a href="dead-letters" { "Dead Letters" }
+                        a href="build-routing" { "Build Routing" }
                     }
                 }
                 main { (body) }
@@ -4862,14 +5413,14 @@ mod tests {
     #[test]
     fn build_worker_query_string_empty_defaults() {
         assert_eq!(
-            build_worker_query_string(DEFAULT_PAGE_SIZE, None, None, false),
+            build_worker_query_string(DEFAULT_PAGE_SIZE, None, None, false, None),
             ""
         );
     }
 
     #[test]
     fn build_worker_query_string_includes_all_params() {
-        let q = build_worker_query_string(10, Some("Active"), Some(1), true);
+        let q = build_worker_query_string(10, Some("Active"), Some(1), true, None);
         assert!(q.contains("limit=10"));
         assert!(q.contains("status=Active"));
         assert!(q.contains("shard=1"));
@@ -5345,5 +5896,219 @@ mod tests {
             html.contains("500"),
             "custom threshold 500 must appear in HTML"
         );
+    }
+
+    // ── Build Routing page unit tests (issue #362 — Red Phase) ─────────────
+
+    #[test]
+    fn layout_build_routing_has_active_nav_link() {
+        let body = html! { p { "test" } };
+        let html = layout_build_routing("Build Routing · Vantage", &body, None).into_string();
+        assert!(
+            html.contains("build-routing"),
+            "layout_build_routing must include the build-routing nav link"
+        );
+        // The active link must be present
+        assert!(
+            html.contains("Build Routing"),
+            "layout_build_routing must show 'Build Routing' label"
+        );
+    }
+
+    #[test]
+    fn layout_includes_build_routing_nav_link() {
+        let body = html! { p { "test" } };
+        let html = layout("Test", &body, "").into_string();
+        assert!(
+            html.contains("build-routing"),
+            "base layout must include a Build Routing nav link"
+        );
+    }
+
+    #[test]
+    fn layout_workers_includes_build_routing_nav_link() {
+        let body = html! { p { "test" } };
+        let html = layout_workers("Test", &body, None).into_string();
+        assert!(
+            html.contains("build-routing"),
+            "layout_workers must include a Build Routing nav link"
+        );
+    }
+
+    #[test]
+    fn layout_dead_letters_includes_build_routing_nav_link() {
+        let body = html! { p { "test" } };
+        let html = layout_dead_letters("Test", &body, None).into_string();
+        assert!(
+            html.contains("build-routing"),
+            "layout_dead_letters must include a Build Routing nav link"
+        );
+    }
+
+    #[test]
+    fn layout_schedules_includes_build_routing_nav_link() {
+        let body = html! { p { "test" } };
+        let html = layout_schedules("Test", &body, None).into_string();
+        assert!(
+            html.contains("build-routing"),
+            "layout_schedules must include a Build Routing nav link"
+        );
+    }
+
+    #[test]
+    fn render_build_routing_page_empty_state_shows_docs_link() {
+        let html =
+            render_build_routing_page(&[], &[], &[], &[], false, None).into_string();
+        assert!(
+            html.contains("No build routing configured")
+                || html.contains("No build policies"),
+            "empty state must show a 'no policies' message"
+        );
+        assert!(
+            html.contains("safe-deploy"),
+            "empty state must link to safe-deploy runbook"
+        );
+    }
+
+    #[test]
+    fn render_build_routing_page_shows_policy_details() {
+        let policy = BuildPolicy {
+            id: uuid::Uuid::new_v4(),
+            queue_name: "test-queue".to_string(),
+            build_id: "abc123".to_string(),
+            deployment_name: Some("prod-v2".to_string()),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let html = render_build_routing_page(&[policy], &[], &[], &[], false, None)
+            .into_string();
+        assert!(html.contains("test-queue"), "must show queue name");
+        assert!(html.contains("abc123"), "must show build_id");
+        assert!(html.contains("prod-v2"), "must show deployment name");
+    }
+
+    #[test]
+    fn render_build_routing_page_shows_reachability() {
+        let reach = BuildReachability {
+            build_id: "sha-old".to_string(),
+            open_executions: 42,
+            pending_tasks: 5,
+            active_workers: 2,
+            stale_workers: 1,
+            safe_to_retire: false,
+        };
+        let html = render_build_routing_page(&[], &[], &[reach], &[], false, None)
+            .into_string();
+        assert!(html.contains("sha-old"), "must show build_id");
+        assert!(html.contains("42"), "must show open_executions count");
+        assert!(html.contains("In use"), "non-safe build must show In use status");
+    }
+
+    #[test]
+    fn render_build_routing_page_retire_enabled_when_safe() {
+        let reach = BuildReachability {
+            build_id: "sha-done".to_string(),
+            open_executions: 0,
+            pending_tasks: 0,
+            active_workers: 0,
+            stale_workers: 0,
+            safe_to_retire: true,
+        };
+        let html = render_build_routing_page(&[], &[], &[reach], &[], false, None)
+            .into_string();
+        assert!(html.contains("Retire"), "retire button must appear when safe_to_retire");
+        assert!(
+            html.contains("Safe to retire"),
+            "status must show Safe to retire"
+        );
+    }
+
+    #[test]
+    fn render_build_routing_page_shows_compat_entries() {
+        let entry = BuildCompatEntry {
+            id: uuid::Uuid::new_v4(),
+            build_id: "sha-new".to_string(),
+            compatible_with: "sha-old".to_string(),
+            declared_at: chrono::Utc::now(),
+        };
+        let html = render_build_routing_page(&[], &[entry], &[], &[], false, None)
+            .into_string();
+        assert!(html.contains("sha-new"), "must show worker build in compat table");
+        assert!(
+            html.contains("sha-old"),
+            "must show compatible_with in compat table"
+        );
+        assert!(html.contains("Revoke"), "must show revoke button for each entry");
+    }
+
+    #[test]
+    fn render_build_routing_page_flash_message_shown() {
+        let html =
+            render_build_routing_page(&[], &[], &[], &[], false, Some("Policy updated")).into_string();
+        assert!(
+            html.contains("Policy updated"),
+            "flash message must appear on page"
+        );
+    }
+
+    #[test]
+    fn render_build_routing_page_has_set_policy_form() {
+        let html =
+            render_build_routing_page(&[], &[], &[], &[], false, None).into_string();
+        assert!(
+            html.contains("set-policy"),
+            "page must include Set Policy form action"
+        );
+        assert!(
+            html.contains("queue_name"),
+            "Set Policy form must include queue_name field"
+        );
+        assert!(
+            html.contains("build_id"),
+            "Set Policy form must include build_id field"
+        );
+    }
+
+    #[test]
+    fn render_build_routing_page_has_declare_compat_form() {
+        let html =
+            render_build_routing_page(&[], &[], &[], &[], false, None).into_string();
+        assert!(
+            html.contains("declare-compat"),
+            "page must include Declare Compat form action"
+        );
+        assert!(
+            html.contains("compatible_with"),
+            "Declare Compat form must include compatible_with field"
+        );
+    }
+
+    #[test]
+    fn render_worker_table_includes_build_id_column() {
+        let html = render_worker_table(&[], ShardId::new(0)).into_string();
+        assert!(
+            html.contains("Build ID"),
+            "worker table header must include Build ID column"
+        );
+        assert!(
+            html.contains("Deployment"),
+            "worker table header must include Deployment column"
+        );
+    }
+
+    #[test]
+    fn render_worker_filters_includes_build_id_filter() {
+        let html =
+            render_worker_filters(None, None, false, None, DEFAULT_PAGE_SIZE).into_string();
+        assert!(
+            html.contains("build_id"),
+            "worker filters must include build_id input"
+        );
+    }
+
+    #[test]
+    fn build_worker_query_string_includes_build_id() {
+        let q = build_worker_query_string(DEFAULT_PAGE_SIZE, None, None, false, Some("abc123"));
+        assert!(q.contains("build_id=abc123"), "query string must include build_id");
     }
 }
