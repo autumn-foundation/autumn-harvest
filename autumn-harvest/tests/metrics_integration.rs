@@ -996,7 +996,7 @@ async fn workflow_hard_cap_dlq_preserves_terminal_attempt_count() {
         .expect("enqueue failed");
 
     diesel::update(queue_dsl::harvest_task_queue.find(task_id))
-        .set(queue_dsl::attempt.eq(3))
+        .set(queue_dsl::attempt.eq(2))
         .execute(&mut conn)
         .await
         .expect("failed to force attempt");

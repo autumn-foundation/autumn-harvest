@@ -97,6 +97,10 @@ required-features = ["db"]
 name = "signal_with_start_tests"
 required-features = ["db"]
 
+[[test]]
+name = "typed_stubs_tests"
+required-features = ["db"]
+
 [[example]]
 name = "signal_with_start_webhook"
 required-features = ["db"]

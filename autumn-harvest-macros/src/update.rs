@@ -49,6 +49,7 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<UpdateAttrs> {
     Ok(result)
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let attrs = match parse_attrs(attr) {
         Ok(a) => a,
@@ -128,6 +129,148 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         },
     );
 
+    let parsed_path = match crate::parse_and_validate_workflow_path(
+        &workflow_name,
+        proc_macro2::Span::call_site(),
+    ) {
+        Ok(p) => p,
+        Err(e) => return e.to_compile_error(),
+    };
+    let workflow_simple_name = parsed_path.workflow_simple_name;
+    let camel_wf = to_pascal_case(&workflow_simple_name);
+    let stub_ident = format_ident!("{camel_wf}Stub");
+    let method_name = format_ident!("update_{fn_name}");
+    let ok_type = extract_ok_type(&func.sig.output);
+
+    let serialize_payload = if param_names.is_empty() {
+        quote! { ::autumn_harvest::serde_json::Value::Null }
+    } else if param_names.len() == 1 {
+        let name = &param_names[0];
+        quote! { ::autumn_harvest::serde_json::to_value(&#name).map_err(::autumn_harvest::error::HarvestError::Serialization)? }
+    } else {
+        quote! { ::autumn_harvest::serde_json::to_value((#(&#param_names),*)).map_err(::autumn_harvest::error::HarvestError::Serialization)? }
+    };
+
+    let method_name_with_timeout = format_ident!("{}_with_timeout", method_name);
+
+    let mod_name = format_ident!("__autumn_update_impl_{fn_name}");
+    let path_tokens = parsed_path.path_tokens;
+    let is_absolute = parsed_path.is_absolute;
+    let leading_colon = if is_absolute {
+        quote! { :: }
+    } else {
+        quote! {}
+    };
+    let nested_path_tokens = if is_absolute
+        || parsed_path
+            .original_module_parts
+            .first()
+            .is_some_and(|s| s == "crate")
+    {
+        path_tokens.clone()
+    } else if parsed_path.original_module_parts.is_empty() {
+        Vec::new()
+    } else {
+        let mut tokens = Vec::new();
+        tokens.push(quote! { super });
+        let first = parsed_path.original_module_parts.first().unwrap();
+        if first == "self" {
+            for p in parsed_path.original_module_parts.iter().skip(1) {
+                let id = format_ident!("{}", p);
+                tokens.push(quote! { #id });
+            }
+        } else {
+            for p in &parsed_path.original_module_parts {
+                let id = format_ident!("{}", p);
+                tokens.push(quote! { #id });
+            }
+        }
+        tokens
+    };
+    let impl_block = if path_tokens.is_empty() {
+        quote! {
+            ::autumn_harvest::cfg_db! {
+                impl #stub_ident {
+                    /// Execute this typed update handler in-process with a default 30-second timeout.
+                    pub async fn #method_name(
+                        conn: &mut ::autumn_harvest::diesel_async::AsyncPgConnection,
+                        handle: &::autumn_harvest::WorkflowHandle,
+                        #(#params),*
+                    ) -> ::autumn_harvest::HarvestResult<#ok_type> {
+                        Self::#method_name_with_timeout(
+                            conn,
+                            handle,
+                            #(#param_names,)*
+                            ::std::time::Duration::from_secs(30)
+                        ).await
+                    }
+
+                    /// Execute this typed update handler in-process with a custom timeout.
+                    pub async fn #method_name_with_timeout(
+                        conn: &mut ::autumn_harvest::diesel_async::AsyncPgConnection,
+                        handle: &::autumn_harvest::WorkflowHandle,
+                        #(#params,)*
+                        timeout: ::std::time::Duration,
+                    ) -> ::autumn_harvest::HarvestResult<#ok_type> {
+                        let args = #serialize_payload;
+                        let raw = handle.execute_update_in_process(
+                            conn,
+                            #workflow_simple_name,
+                            #fn_name_str,
+                            args,
+                            timeout
+                        ).await?;
+                        ::autumn_harvest::serde_json::from_value(raw)
+                            .map_err(::autumn_harvest::error::HarvestError::Serialization)
+                    }
+                }
+            }
+        }
+    } else {
+        quote! {
+            ::autumn_harvest::cfg_db! {
+                mod #mod_name {
+                    use super::*;
+                    use #leading_colon #(#nested_path_tokens::)*#stub_ident;
+                    impl #stub_ident {
+                        /// Execute this typed update handler in-process with a default 30-second timeout.
+                        pub async fn #method_name(
+                            conn: &mut ::autumn_harvest::diesel_async::AsyncPgConnection,
+                            handle: &::autumn_harvest::WorkflowHandle,
+                            #(#params),*
+                        ) -> ::autumn_harvest::HarvestResult<#ok_type> {
+                            Self::#method_name_with_timeout(
+                                conn,
+                                handle,
+                                #(#param_names,)*
+                                ::std::time::Duration::from_secs(30)
+                            ).await
+                        }
+
+                        /// Execute this typed update handler in-process with a custom timeout.
+                        pub async fn #method_name_with_timeout(
+                            conn: &mut ::autumn_harvest::diesel_async::AsyncPgConnection,
+                            handle: &::autumn_harvest::WorkflowHandle,
+                            #(#params,)*
+                            timeout: ::std::time::Duration,
+                        ) -> ::autumn_harvest::HarvestResult<#ok_type> {
+                            let args = #serialize_payload;
+                            let raw = handle.execute_update_in_process(
+                                conn,
+                                #workflow_simple_name,
+                                #fn_name_str,
+                                args,
+                                timeout
+                            ).await?;
+                            ::autumn_harvest::serde_json::from_value(raw)
+                                .map_err(::autumn_harvest::error::HarvestError::Serialization)
+                        }
+                    }
+                }
+            }
+        }
+    };
+
     quote! {
         #func
 
@@ -148,7 +291,7 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
             ::autumn_harvest::UpdateHandlerInfo {
                 name: #fn_name_str,
-                workflow: #workflow_name,
+                workflow: #workflow_simple_name,
                 module: module_path!(),
                 input_type_hint: #input_type_hint,
                 output_type_hint: #output_type_hint,
@@ -157,6 +300,8 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 validator: #validator_expr,
             }
         }
+
+        #impl_block
     }
 }
 
@@ -257,60 +402,17 @@ fn build_input_type_hint(params: &[&syn::FnArg]) -> String {
 }
 
 fn extract_ok_type_hint(output: &syn::ReturnType) -> String {
-    let syn::ReturnType::Type(_, ty) = output else {
-        return "()".to_string();
-    };
-    let syn::Type::Path(type_path) = &**ty else {
-        return type_name_hint(ty);
-    };
-    let Some(last) = type_path.path.segments.last() else {
-        return "()".to_string();
-    };
-    if last.ident != "Result" {
-        return last.ident.to_string();
-    }
-    if let syn::PathArguments::AngleBracketed(ref args) = last.arguments
-        && let Some(syn::GenericArgument::Type(ok_ty)) = args.args.first()
-    {
-        return type_name_hint(ok_ty);
-    }
-    "()".to_string()
+    crate::extract_ok_type_hint(output)
 }
 
 fn type_name_hint(ty: &syn::Type) -> String {
-    match ty {
-        syn::Type::Path(tp) => tp.path.segments.last().map_or_else(
-            || "?".to_string(),
-            |s| {
-                let ident = s.ident.to_string();
-                if let syn::PathArguments::AngleBracketed(ref args) = s.arguments {
-                    let inner: Vec<_> = args
-                        .args
-                        .iter()
-                        .filter_map(|a| {
-                            if let syn::GenericArgument::Type(t) = a {
-                                Some(type_name_hint(t))
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-                    if inner.is_empty() {
-                        ident
-                    } else {
-                        format!("{ident}<{}>", inner.join(", "))
-                    }
-                } else {
-                    ident
-                }
-            },
-        ),
-        syn::Type::Reference(r) => type_name_hint(&r.elem),
-        syn::Type::Tuple(t) if t.elems.is_empty() => "()".to_string(),
-        syn::Type::Tuple(t) => {
-            let parts: Vec<_> = t.elems.iter().map(type_name_hint).collect();
-            format!("({})", parts.join(", "))
-        }
-        _ => "?".to_string(),
-    }
+    crate::type_name_hint(ty)
+}
+
+fn to_pascal_case(s: &str) -> String {
+    crate::to_pascal_case(s)
+}
+
+fn extract_ok_type(output: &syn::ReturnType) -> syn::Type {
+    crate::extract_ok_type(output)
 }
