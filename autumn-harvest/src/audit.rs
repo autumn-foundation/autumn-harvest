@@ -330,6 +330,9 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
     OP_EXTERNAL_ACTIVITY_FAIL,
     OP_WORKER_DRAIN,
     OP_RATE_LIMIT_OVERRIDE,
+    OP_BUILD_POLICY_SET,
+    OP_BUILD_COMPAT_DECLARE,
+    OP_BUILD_COMPAT_REVOKE,
 ];
 
 /// Routes explicitly excluded from audit.
