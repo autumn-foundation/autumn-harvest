@@ -259,32 +259,6 @@ async fn count_task_queue_rows_by_activity(database_url: &str, activity_name: &s
 // Test cases
 // ---------------------------------------------------------------------------
 
-
-#[allow(dead_code)]
-async fn post_large_json(
-    app: &axum::Router,
-    path: &str,
-    body: serde_json::Value,
-) -> (StatusCode, serde_json::Value) {
-    let mut s = serde_json::to_string(&body).unwrap();
-    s.push_str(&" ".repeat(3 * 1024 * 1024)); // > 2MB
-
-    let request = axum::http::Request::builder()
-        .method(axum::http::Method::POST)
-        .uri(path)
-        .header("Content-Type", "application/json")
-        .body(axum::body::Body::from(s))
-        .unwrap();
-
-    let response = app.clone().oneshot(request).await.unwrap();
-    let status = response.status();
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let json = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
-    (status, json)
-}
-
 #[tokio::test]
 async fn bulk_replay_with_empty_filter_returns_400() {
     let (database_url, _container) = setup_test_database_url().await;
