@@ -1357,7 +1357,7 @@ fn detached_spawn_abandon_workflow<'a>(
     })
 }
 
-/// Workflow that spawns a detached child with RequestCancel policy.
+/// Workflow that spawns a detached child with `RequestCancel` policy.
 fn detached_spawn_request_cancel_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,

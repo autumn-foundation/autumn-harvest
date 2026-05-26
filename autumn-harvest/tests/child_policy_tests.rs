@@ -1,6 +1,7 @@
 // Integration tests for ParentClosePolicy and detached child workflow spawns
 // (issue #347). All tests use testcontainers so the `db` feature is required.
 #![cfg(feature = "db")]
+#![allow(clippy::items_after_statements)]
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -167,10 +168,7 @@ async fn wait_for_state(conn: &mut AsyncPgConnection, exec_id: ExecutionId, stat
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     let state = get_state(conn, exec_id).await;
-    panic!(
-        "execution {exec_id} never reached {:?}; current state: {state}",
-        states
-    );
+    panic!("execution {exec_id} never reached {states:?}; current state: {state}");
 }
 
 fn wf_info(name: &'static str, handler: autumn_harvest::info::WorkflowHandlerFn) -> WorkflowInfo {
@@ -379,8 +377,7 @@ async fn child_workflow_cancel_cascade_request_cancel() {
         .any(|s| s == "CANCELLED" || s == "FAILED");
     assert!(
         cascade_applied,
-        "cascade should have cancelled/failed the child; states: {:?}",
-        child_states
+        "cascade should have cancelled/failed the child; states: {child_states:?}"
     );
 }
 
@@ -476,20 +473,16 @@ async fn child_workflow_terminate_cascade_on_parent_failure() {
         .all(|(s, _)| s == "FAILED" || s == "TERMINATED" || s == "CANCELLED");
     assert!(
         all_terminal,
-        "all Terminate-policy children should be terminal after parent failure; rows: {:?}",
-        child_rows
+        "all Terminate-policy children should be terminal after parent failure; rows: {child_rows:?}"
     );
 
     // At least one child's error should contain "ParentClosed".
-    let parent_closed_error = child_rows.iter().any(|(_, err)| {
-        err.as_deref()
-            .map(|e| e.contains("ParentClosed"))
-            .unwrap_or(false)
-    });
+    let parent_closed_error = child_rows
+        .iter()
+        .any(|(_, err)| err.as_deref().is_some_and(|e| e.contains("ParentClosed")));
     assert!(
         parent_closed_error,
-        "Terminate-policy child should have ParentClosed error; rows: {:?}",
-        child_rows
+        "Terminate-policy child should have ParentClosed error; rows: {child_rows:?}"
     );
 }
 

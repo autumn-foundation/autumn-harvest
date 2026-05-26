@@ -455,6 +455,7 @@ mod db_tests {
                 memo: None,
                 search_attrs: None,
                 assigned_build_id: required_build_id.map(str::to_string),
+                parent_close_policy: None,
             })
             .execute(conn)
             .await

@@ -553,6 +553,7 @@ async fn workflow_and_activity_metrics_are_recorded() {
         memo: None,
         search_attrs: None,
         assigned_build_id: None,
+        parent_close_policy: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&exec_row)
@@ -744,6 +745,7 @@ async fn continue_as_new_records_history_size_and_rotation_metrics() {
             memo: None,
             search_attrs: None,
             assigned_build_id: None,
+            parent_close_policy: None,
         })
         .execute(&mut conn)
         .await
@@ -848,6 +850,7 @@ async fn workflow_hard_cap_moves_offender_to_dlq() {
             memo: None,
             search_attrs: None,
             assigned_build_id: None,
+            parent_close_policy: None,
         })
         .execute(&mut conn)
         .await
@@ -964,6 +967,7 @@ async fn workflow_hard_cap_dlq_preserves_terminal_attempt_count() {
             memo: None,
             search_attrs: None,
             assigned_build_id: None,
+            parent_close_policy: None,
         })
         .execute(&mut conn)
         .await
@@ -1080,6 +1084,7 @@ async fn suspended_commands_that_reach_hard_cap_move_to_dlq_immediately() {
                 memo: None,
                 search_attrs: None,
                 assigned_build_id: None,
+                parent_close_policy: None,
             })
             .execute(&mut conn)
             .await
@@ -1257,6 +1262,7 @@ async fn local_activity_retries_stop_when_hard_cap_is_reached() {
             memo: None,
             search_attrs: None,
             assigned_build_id: None,
+            parent_close_policy: None,
         })
         .execute(&mut conn)
         .await
@@ -1405,6 +1411,7 @@ async fn child_hard_cap_dlq_notifies_parent_and_stops_inline_growth() {
             memo: None,
             search_attrs: None,
             assigned_build_id: None,
+            parent_close_policy: None,
         })
         .execute(&mut conn)
         .await

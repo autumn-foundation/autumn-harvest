@@ -436,6 +436,7 @@ mod db_tests {
             memo: None,
             search_attrs: None,
             assigned_build_id: None,
+            parent_close_policy: None,
         };
         diesel::insert_into(harvest_workflow_executions::table)
             .values(&row)

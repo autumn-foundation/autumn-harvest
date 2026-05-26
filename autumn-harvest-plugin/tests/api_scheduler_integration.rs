@@ -690,6 +690,7 @@ async fn seed_dag_run_on_url(database_url: &str, dag_name: &str) -> uuid::Uuid {
             memo: None,
             search_attrs: None,
             assigned_build_id: None,
+            parent_close_policy: None,
         })
         .execute(&mut conn)
         .await
@@ -1008,6 +1009,7 @@ async fn seed_scheduled_activity_task_from_url(
             memo: None,
             search_attrs: None,
             assigned_build_id: None,
+            parent_close_policy: None,
         })
         .execute(&mut conn)
         .await

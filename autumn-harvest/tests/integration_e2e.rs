@@ -481,6 +481,7 @@ async fn insert_workflow_execution(conn: &mut AsyncPgConnection) -> ExecutionId 
         memo: None,
         search_attrs: None,
         assigned_build_id: None,
+        parent_close_policy: None,
     };
 
     diesel::insert_into(harvest_workflow_executions::table)
@@ -3127,6 +3128,7 @@ async fn insert_named_workflow_execution(
         memo: None,
         search_attrs: None,
         assigned_build_id: None,
+        parent_close_policy: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&row)
@@ -6146,6 +6148,7 @@ async fn signal_blocked_workflow_times_out_at_deadline() {
         memo: None,
         search_attrs: None,
         assigned_build_id: None,
+        parent_close_policy: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&row)

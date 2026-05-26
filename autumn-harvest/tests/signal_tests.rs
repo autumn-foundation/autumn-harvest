@@ -83,6 +83,7 @@ async fn test_send_and_load_signals() {
         memo: None,
         search_attrs: None,
         assigned_build_id: None,
+        parent_close_policy: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&new_exec)
@@ -128,6 +129,7 @@ async fn test_mark_signals_consumed() {
         memo: None,
         search_attrs: None,
         assigned_build_id: None,
+        parent_close_policy: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&new_exec)

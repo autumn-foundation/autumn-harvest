@@ -140,6 +140,7 @@ async fn seed_external_handoff(
         memo: None,
         search_attrs: None,
         assigned_build_id: None,
+        parent_close_policy: None,
     };
     diesel::insert_into(autumn_harvest::schema::harvest_workflow_executions::table)
         .values(&execution)

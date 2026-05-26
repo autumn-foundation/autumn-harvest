@@ -5484,6 +5484,7 @@ mod tests {
             search_attrs: None,
             created_at: Utc::now(),
             assigned_build_id: None,
+            parent_close_policy: None,
         }
     }
 
