@@ -36,6 +36,10 @@ use autumn_harvest::audit::{
     OP_WORKFLOW_RESET, OP_WORKFLOW_SIGNAL, SOURCE_API, SOURCE_UI, STATUS_FAILED, STATUS_SUCCEEDED,
     TARGET_SCHEDULE, TARGET_WORKFLOW, insert_audit,
 };
+use autumn_harvest::build_routing::{
+    BuildCompatEntry, BuildPolicy, BuildReachability, all_build_reachability, declare_compat,
+    list_build_compat, list_build_policies, merge_reachability, revoke_compat, set_build_policy,
+};
 use autumn_harvest::cancel_workflow_execution;
 use autumn_harvest::error::{HarvestResult, database_error};
 use autumn_harvest::models::{
@@ -53,11 +57,6 @@ use autumn_harvest::schema::{
 use autumn_harvest::signal::send_signal;
 use autumn_harvest::store::admit_update_event;
 use autumn_harvest::types::{ShardId, UpdateId};
-use autumn_harvest::build_routing::{
-    BuildCompatEntry, BuildPolicy, BuildReachability, all_build_reachability,
-    declare_compat, list_build_compat, list_build_policies, merge_reachability,
-    revoke_compat, set_build_policy,
-};
 use autumn_harvest::workers::{WorkerFilters, WorkerHealth, WorkerRow, list_workers};
 
 use crate::api::{
@@ -2346,7 +2345,13 @@ fn render_worker_pagination(
     stale_only: bool,
     build_id_filter: Option<&str>,
 ) -> Markup {
-    let base = build_worker_query_string(limit, status_filter, shard_filter, stale_only, build_id_filter);
+    let base = build_worker_query_string(
+        limit,
+        status_filter,
+        shard_filter,
+        stale_only,
+        build_id_filter,
+    );
     html! {
         div.pagination {
             @if page > 0 {
@@ -3671,12 +3676,10 @@ async fn list_build_routing_ui(
     let mut shard_errors: Vec<(ShardId, String)> = Vec::new();
     for (shard_id, shard_pool) in pool.iter_shards() {
         match acquire_conn(shard_pool).await {
-            Ok(mut conn) => {
-                match all_build_reachability(&mut conn, stale_threshold).await {
-                    Ok(r) => per_shard_reach.push(r),
-                    Err(e) => shard_errors.push((shard_id, e.to_string())),
-                }
-            }
+            Ok(mut conn) => match all_build_reachability(&mut conn, stale_threshold).await {
+                Ok(r) => per_shard_reach.push(r),
+                Err(e) => shard_errors.push((shard_id, e.to_string())),
+            },
             Err(e) => shard_errors.push((shard_id, e.to_string())),
         }
     }
@@ -3702,10 +3705,7 @@ async fn build_routing_set_policy_ui(
     let pool = api_state.storage_pool().map_err(map_error)?;
     let mut conn = acquire_conn(pool.default_pool()).await?;
 
-    let deployment_name = form
-        .deployment_name
-        .as_deref()
-        .filter(|s| !s.is_empty());
+    let deployment_name = form.deployment_name.as_deref().filter(|s| !s.is_empty());
 
     let result = set_build_policy(
         &mut conn,
@@ -3789,12 +3789,10 @@ async fn build_routing_retire_ui(
     let build_reach = merged.iter().find(|r| r.build_id == form.build_id.trim());
 
     let flash = match build_reach {
-        Some(r) if !r.safe_to_retire => {
-            url_encode(&format!(
-                "Cannot retire build '{}': {} open executions, {} pending tasks remain",
-                form.build_id, r.open_executions, r.pending_tasks
-            ))
-        }
+        Some(r) if !r.safe_to_retire => url_encode(&format!(
+            "Cannot retire build '{}': {} open executions, {} pending tasks remain",
+            form.build_id, r.open_executions, r.pending_tasks
+        )),
         _ => {
             // Build is safe to retire (or not found, meaning nothing is running on it).
             // The retire action itself is a no-op at the DB level — the operator
@@ -5938,11 +5936,9 @@ mod tests {
 
     #[test]
     fn render_build_routing_page_empty_state_shows_docs_link() {
-        let html =
-            render_build_routing_page(&[], &[], &[], &[], false, None).into_string();
+        let html = render_build_routing_page(&[], &[], &[], &[], false, None).into_string();
         assert!(
-            html.contains("No build routing configured")
-                || html.contains("No build policies"),
+            html.contains("No build routing configured") || html.contains("No build policies"),
             "empty state must show a 'no policies' message"
         );
         assert!(
@@ -5961,8 +5957,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
-        let html = render_build_routing_page(&[policy], &[], &[], &[], false, None)
-            .into_string();
+        let html = render_build_routing_page(&[policy], &[], &[], &[], false, None).into_string();
         assert!(html.contains("test-queue"), "must show queue name");
         assert!(html.contains("abc123"), "must show build_id");
         assert!(html.contains("prod-v2"), "must show deployment name");
@@ -5978,11 +5973,13 @@ mod tests {
             stale_workers: 1,
             safe_to_retire: false,
         };
-        let html = render_build_routing_page(&[], &[], &[reach], &[], false, None)
-            .into_string();
+        let html = render_build_routing_page(&[], &[], &[reach], &[], false, None).into_string();
         assert!(html.contains("sha-old"), "must show build_id");
         assert!(html.contains("42"), "must show open_executions count");
-        assert!(html.contains("In use"), "non-safe build must show In use status");
+        assert!(
+            html.contains("In use"),
+            "non-safe build must show In use status"
+        );
     }
 
     #[test]
@@ -5995,9 +5992,11 @@ mod tests {
             stale_workers: 0,
             safe_to_retire: true,
         };
-        let html = render_build_routing_page(&[], &[], &[reach], &[], false, None)
-            .into_string();
-        assert!(html.contains("Retire"), "retire button must appear when safe_to_retire");
+        let html = render_build_routing_page(&[], &[], &[reach], &[], false, None).into_string();
+        assert!(
+            html.contains("Retire"),
+            "retire button must appear when safe_to_retire"
+        );
         assert!(
             html.contains("Safe to retire"),
             "status must show Safe to retire"
@@ -6012,20 +6011,25 @@ mod tests {
             compatible_with: "sha-old".to_string(),
             declared_at: chrono::Utc::now(),
         };
-        let html = render_build_routing_page(&[], &[entry], &[], &[], false, None)
-            .into_string();
-        assert!(html.contains("sha-new"), "must show worker build in compat table");
+        let html = render_build_routing_page(&[], &[entry], &[], &[], false, None).into_string();
+        assert!(
+            html.contains("sha-new"),
+            "must show worker build in compat table"
+        );
         assert!(
             html.contains("sha-old"),
             "must show compatible_with in compat table"
         );
-        assert!(html.contains("Revoke"), "must show revoke button for each entry");
+        assert!(
+            html.contains("Revoke"),
+            "must show revoke button for each entry"
+        );
     }
 
     #[test]
     fn render_build_routing_page_flash_message_shown() {
-        let html =
-            render_build_routing_page(&[], &[], &[], &[], false, Some("Policy updated")).into_string();
+        let html = render_build_routing_page(&[], &[], &[], &[], false, Some("Policy updated"))
+            .into_string();
         assert!(
             html.contains("Policy updated"),
             "flash message must appear on page"
@@ -6034,8 +6038,7 @@ mod tests {
 
     #[test]
     fn render_build_routing_page_has_set_policy_form() {
-        let html =
-            render_build_routing_page(&[], &[], &[], &[], false, None).into_string();
+        let html = render_build_routing_page(&[], &[], &[], &[], false, None).into_string();
         assert!(
             html.contains("set-policy"),
             "page must include Set Policy form action"
@@ -6052,8 +6055,7 @@ mod tests {
 
     #[test]
     fn render_build_routing_page_has_declare_compat_form() {
-        let html =
-            render_build_routing_page(&[], &[], &[], &[], false, None).into_string();
+        let html = render_build_routing_page(&[], &[], &[], &[], false, None).into_string();
         assert!(
             html.contains("declare-compat"),
             "page must include Declare Compat form action"
@@ -6079,8 +6081,7 @@ mod tests {
 
     #[test]
     fn render_worker_filters_includes_build_id_filter() {
-        let html =
-            render_worker_filters(None, None, false, None, DEFAULT_PAGE_SIZE).into_string();
+        let html = render_worker_filters(None, None, false, None, DEFAULT_PAGE_SIZE).into_string();
         assert!(
             html.contains("build_id"),
             "worker filters must include build_id input"
@@ -6090,6 +6091,9 @@ mod tests {
     #[test]
     fn build_worker_query_string_includes_build_id() {
         let q = build_worker_query_string(DEFAULT_PAGE_SIZE, None, None, false, Some("abc123"));
-        assert!(q.contains("build_id=abc123"), "query string must include build_id");
+        assert!(
+            q.contains("build_id=abc123"),
+            "query string must include build_id"
+        );
     }
 }

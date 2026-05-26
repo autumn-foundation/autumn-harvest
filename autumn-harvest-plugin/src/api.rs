@@ -1667,7 +1667,10 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             "/admin/build-routing/policies",
             post(set_build_policy_handler).route_layer(require_admin.clone()),
         )
-        .route("/admin/build-routing/compat", get(list_build_compat_handler))
+        .route(
+            "/admin/build-routing/compat",
+            get(list_build_compat_handler),
+        )
         .route(
             "/admin/build-routing/compat",
             post(declare_compat_handler).route_layer(require_admin.clone()),
@@ -1801,7 +1804,10 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("POST", "/admin/build-routing/policies"),
         ("GET", "/admin/build-routing/compat"),
         ("POST", "/admin/build-routing/compat"),
-        ("DELETE", "/admin/build-routing/compat/{build_id}/{compat_with}"),
+        (
+            "DELETE",
+            "/admin/build-routing/compat/{build_id}/{compat_with}",
+        ),
         ("POST", "/admin/build-routing/retire"),
     ]
 }
@@ -1983,11 +1989,7 @@ pub const fn management_api_request_fields()
             "/admin/build-routing/compat/{build_id}/{compat_with}",
             Some(&[]),
         ),
-        (
-            "POST",
-            "/admin/build-routing/retire",
-            Some(&["build_id"]),
-        ),
+        ("POST", "/admin/build-routing/retire", Some(&["build_id"])),
     ]
 }
 
@@ -2350,7 +2352,11 @@ pub const fn management_api_response_fields()
         // ── SSE execution event stream (issue #324) ───────────────────────────
         ("GET", "/executions/{exec_id}/events/stream", None), // text/event-stream
         // ── build routing (issue #362) ────────────────────────────────────────
-        ("GET", "/admin/build-routing", Some(&["policies", "reachability", "shard_errors"])),
+        (
+            "GET",
+            "/admin/build-routing",
+            Some(&["policies", "reachability", "shard_errors"]),
+        ),
         (
             "POST",
             "/admin/build-routing/policies",
@@ -2377,7 +2383,12 @@ pub const fn management_api_response_fields()
         (
             "POST",
             "/admin/build-routing/retire",
-            Some(&["build_id", "safe_to_retire", "open_executions", "pending_tasks"]),
+            Some(&[
+                "build_id",
+                "safe_to_retire",
+                "open_executions",
+                "pending_tasks",
+            ]),
         ),
     ]
 }
@@ -11512,7 +11523,10 @@ async fn retire_build_handler(
         let r = match all_build_reachability(&mut conn, stale_threshold).await {
             Ok(r) => r,
             Err(e) => {
-                tracing::warn!(shard = shard_id.as_i32(), "build reachability query failed during retire check");
+                tracing::warn!(
+                    shard = shard_id.as_i32(),
+                    "build reachability query failed during retire check"
+                );
                 return map_error(e).into_response();
             }
         };
