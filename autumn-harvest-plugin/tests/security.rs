@@ -749,3 +749,16 @@ async fn eris_require_auth_blocks_submit_batch_operation() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 }
+
+#[tokio::test]
+async fn eris_require_auth_blocks_trigger_schedule() {
+    let app = authenticated_app();
+    let res = app
+        .oneshot(post_json(
+            "/admin/schedules/00000000-0000-0000-0000-000000000001/trigger",
+            "{}",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}

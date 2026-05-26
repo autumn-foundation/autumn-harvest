@@ -33,10 +33,10 @@ use autumn_harvest::audit::{
     OP_DAG_PATCH, OP_DAG_TRIGGER, OP_DLQ_DISCARD_BULK, OP_DLQ_REPLAY, OP_DLQ_REPLAY_BULK,
     OP_EXTERNAL_ACTIVITY_COMPLETE, OP_EXTERNAL_ACTIVITY_FAIL, OP_RETENTION_RUN_NOW,
     OP_SCHEDULE_BACKFILL, OP_SCHEDULE_CREATE, OP_SCHEDULE_DELETE, OP_SCHEDULE_PAUSE,
-    OP_SCHEDULE_RESUME, OP_WORKER_DRAIN, OP_WORKFLOW_CANCEL, OP_WORKFLOW_RESET, OP_WORKFLOW_SIGNAL,
-    OP_WORKFLOW_SIGNAL_WITH_START, OP_WORKFLOW_START, SOURCE_API, STATUS_FAILED, STATUS_SUCCEEDED,
-    TARGET_BATCH, TARGET_DAG, TARGET_DEAD_LETTER, TARGET_EXTERNAL_ACTIVITY, TARGET_RETENTION,
-    TARGET_SCHEDULE, TARGET_WORKER, TARGET_WORKFLOW,
+    OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER, OP_WORKER_DRAIN, OP_WORKFLOW_CANCEL,
+    OP_WORKFLOW_RESET, OP_WORKFLOW_SIGNAL, OP_WORKFLOW_SIGNAL_WITH_START, OP_WORKFLOW_START,
+    SOURCE_API, STATUS_FAILED, STATUS_SUCCEEDED, TARGET_BATCH, TARGET_DAG, TARGET_DEAD_LETTER,
+    TARGET_EXTERNAL_ACTIVITY, TARGET_RETENTION, TARGET_SCHEDULE, TARGET_WORKER, TARGET_WORKFLOW,
 };
 use autumn_harvest::batch::{
     self, BatchAction, BatchExecutorConfig, BatchFilter, BatchJobStatus, BatchJobView,
@@ -1584,6 +1584,7 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .route("/admin/schedules/{id}/pause", post(pause_schedule))
         .route("/admin/schedules/{id}/resume", post(resume_schedule))
         .route("/admin/schedules/{id}/backfill", post(schedule_backfill))
+        .route("/admin/schedules/{id}/trigger", post(trigger_schedule_now))
         .route("/admin/schedules/{id}", delete(delete_schedule))
         .route("/admin/schedules/decisions", get(list_fleet_decisions))
         .route(
@@ -1762,6 +1763,7 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("POST", "/admin/schedules/{id}/pause"),
         ("POST", "/admin/schedules/{id}/resume"),
         ("POST", "/admin/schedules/{id}/backfill"),
+        ("POST", "/admin/schedules/{id}/trigger"),
         ("DELETE", "/admin/schedules/{id}"),
         ("GET", "/admin/schedules/{id}/preview"),
         // ── calendars (issue #337) ────────────────────────────────────────────
@@ -1932,6 +1934,11 @@ pub const fn management_api_request_fields()
             "POST",
             "/admin/schedules/{id}/backfill",
             Some(&["from", "to", "dry_run", "include_paused", "max_count"]),
+        ),
+        (
+            "POST",
+            "/admin/schedules/{id}/trigger",
+            Some(&["reason", "overlap_policy"]),
         ),
         ("DELETE", "/admin/schedules/{id}", Some(&[])),
         // ── calendars (issue #337) ────────────────────────────────────────────
@@ -2265,6 +2272,11 @@ pub const fn management_api_response_fields()
                 "partial_shard_failures",
                 "paused_schedule_warning",
             ]),
+        ),
+        (
+            "POST",
+            "/admin/schedules/{id}/trigger",
+            Some(&["execution_id", "workflow_id", "triggered_at", "outcome"]),
         ),
         ("DELETE", "/admin/schedules/{id}", Some(&["ok"])),
         ("GET", "/admin/schedules/{id}/preview", Some(&["entries"])),
@@ -6564,6 +6576,281 @@ async fn delete_schedule(
         return Err(AutumnError::not_found_msg(format!("schedule {id}")));
     }
     Ok(Json(BasicAck { ok: true }))
+}
+
+// ── Schedule trigger-now (issue #343) ─────────────────────────────────────────
+
+/// Optional request body for `POST /admin/schedules/{id}/trigger`.
+#[derive(Debug, Default, Deserialize)]
+struct ScheduleTriggerRequest {
+    /// Free-text reason recorded in the audit trail.
+    #[serde(default)]
+    reason: Option<String>,
+    /// Optional override of the schedule's configured overlap policy.
+    #[serde(default)]
+    overlap_policy: Option<String>,
+}
+
+/// Query parameters for `POST /admin/schedules/{id}/trigger`.
+#[derive(Debug, Default, Deserialize)]
+struct TriggerScheduleQuery {
+    /// If `true`, trigger even if the schedule is paused.
+    #[serde(default)]
+    force: bool,
+}
+
+/// Response for `POST /admin/schedules/{id}/trigger`.
+#[derive(Debug, Serialize)]
+struct ScheduleTriggerResponse {
+    /// Present when an execution was actually started; absent when skipped by overlap policy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    execution_id: Option<uuid::Uuid>,
+    workflow_id: String,
+    triggered_at: chrono::DateTime<chrono::Utc>,
+    /// `"fired"` when a new execution was started, `"skipped_overlap"` when the
+    /// effective overlap policy suppressed the run.
+    outcome: String,
+}
+
+#[allow(clippy::too_many_lines)]
+async fn trigger_schedule_now(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id): Path<String>,
+    Query(query): Query<TriggerScheduleQuery>,
+    headers: axum::http::HeaderMap,
+    body: Option<Json<ScheduleTriggerRequest>>,
+) -> Result<Json<ScheduleTriggerResponse>, AutumnError> {
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+    let route = "POST /admin/schedules/{id}/trigger";
+    let body = body.map(|Json(b)| b).unwrap_or_default();
+
+    let schedule_id = parse_uuid(&id, "schedule id")?;
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    let runtime = api_state.runtime().map_err(map_error)?;
+
+    let schedule = load_schedule_by_id(&api_state, schedule_id).await?;
+
+    let schedule_display_name = schedule
+        .workflow_name
+        .as_deref()
+        .or(schedule.dag_name.as_deref())
+        .unwrap_or("")
+        .to_string();
+
+    // Reject paused schedules unless ?force=true is passed.
+    if schedule.is_paused && !query.force {
+        if let Ok(mut conn) = acquire_conn(pool.default_pool()).await {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_SCHEDULE_TRIGGER,
+                target_type: TARGET_SCHEDULE,
+                target_id: Some(id.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_FAILED,
+                error_summary: Some("rejected_paused"),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+        }
+        runtime
+            .registry
+            .telemetry()
+            .metrics
+            .record_schedule_manual_trigger(&schedule_display_name, "rejected_paused");
+        return Err(AutumnError::bad_request_msg(format!(
+            "schedule {schedule_id} is paused; pass ?force=true to trigger a paused schedule"
+        ))
+        .with_status(axum::http::StatusCode::CONFLICT));
+    }
+
+    // Resolve the effective overlap policy (body override takes precedence).
+    let effective_overlap_policy = if let Some(ref op_str) = body.overlap_policy {
+        match autumn_harvest::OverlapPolicy::from_user_input(op_str) {
+            Ok(op) => op,
+            Err(e) => {
+                return Err(AutumnError::bad_request_msg(format!(
+                    "invalid overlap_policy: {e}"
+                )));
+            }
+        }
+    } else {
+        autumn_harvest::OverlapPolicy::from_db(&schedule.overlap_policy)
+    };
+
+    // Determine workflow name, input, and queue from the schedule.
+    let (workflow_name, input, queue_name) = match (
+        schedule.workflow_name.as_deref(),
+        schedule.dag_name.as_deref(),
+    ) {
+        (Some(wf_name), _) => {
+            let input = schedule
+                .workflow_input
+                .clone()
+                .unwrap_or(serde_json::Value::Null);
+            let queue = schedule
+                .queue_name
+                .as_deref()
+                .unwrap_or("default")
+                .to_string();
+            (wf_name.to_string(), input, queue)
+        }
+        (None, Some(dag_name)) => {
+            let dag_queue = runtime
+                .dags()
+                .get(dag_name)
+                .and_then(|d| d.default_queue.as_deref())
+                .or(schedule.queue_name.as_deref())
+                .unwrap_or("default")
+                .to_string();
+            (dag_name.to_string(), serde_json::Value::Null, dag_queue)
+        }
+        (None, None) => {
+            return Err(AutumnError::service_unavailable_msg(
+                "schedule row has neither workflow_name nor dag_name",
+            ));
+        }
+    };
+
+    let triggered_at = chrono::Utc::now();
+    // Append a UUID v4 so concurrent trigger calls within the same millisecond each
+    // produce a distinct workflow_id and start independent executions.
+    let workflow_id = format!(
+        "manual-{schedule_id}-{}-{}",
+        triggered_at.timestamp_millis(),
+        uuid::Uuid::new_v4().simple()
+    );
+
+    // Acquire the DB connection early so it is available for both the overlap-skip
+    // audit record and the normal start call.
+    let mut conn = acquire_conn(pool.default_pool()).await?;
+
+    // For Skip policy, fail closed: if the running-count query fails on any shard,
+    // treat it as saturated rather than silently firing through.
+    if effective_overlap_policy == autumn_harvest::OverlapPolicy::Skip {
+        let is_saturated =
+            match query_running_count(&pool, &ScheduleKind::Workflow, &workflow_name).await {
+                Ok(running) => running >= i64::from(schedule.max_active_runs),
+                Err(_) => true,
+            };
+        if is_saturated {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_SCHEDULE_TRIGGER,
+                target_type: TARGET_SCHEDULE,
+                target_id: Some(id.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_SUCCEEDED,
+                error_summary: Some("skipped_overlap"),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+            runtime
+                .registry
+                .telemetry()
+                .metrics
+                .record_schedule_manual_trigger(&schedule_display_name, "skipped_overlap");
+            return Ok(Json(ScheduleTriggerResponse {
+                execution_id: None,
+                workflow_id,
+                triggered_at,
+                outcome: "skipped_overlap".to_string(),
+            }));
+        }
+    }
+
+    // ExecutionId::new() embeds ShardId::UNENCODED, which ShardRouter resolves to
+    // the default shard. This is consistent with how the scheduler fires executions
+    // (all schedule-initiated runs land on the default shard in single-shard
+    // deployments; multi-shard schedule pinning is a follow-up to issue #171).
+    let exec_id = ExecutionId::new();
+
+    let result = start_or_load_workflow_execution(
+        &mut conn,
+        StartWorkflowParams {
+            workflow_name: &workflow_name,
+            workflow_id: &workflow_id,
+            exec_id,
+            input: input.clone(),
+            parent_id: None,
+            queue_name: &queue_name,
+            execution_timeout: None,
+            memo: None,
+            search_attrs: None,
+            reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
+            trace_context: None,
+            max_execution_timeout_ceiling: None,
+            concurrency_key: None,
+            concurrency_limit: None,
+            priority: Priority::default(),
+            max_workflow_input_bytes: 0,
+            start_at: None,
+            delay: None,
+            max_workflow_start_delay: None,
+        },
+    )
+    .await;
+
+    let (exec_id_out, outcome) = match result {
+        Ok(exec_result) => (Some(exec_result.exec_id.as_uuid()), "fired"),
+        Err(e) => {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_SCHEDULE_TRIGGER,
+                target_type: TARGET_SCHEDULE,
+                target_id: Some(id.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_FAILED,
+                error_summary: Some("start_failed"),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+            runtime
+                .registry
+                .telemetry()
+                .metrics
+                .record_schedule_manual_trigger(&schedule_display_name, "start_failed");
+            return Err(map_error(e));
+        }
+    };
+
+    let ar = NewAuditRecord {
+        actor: &actor,
+        operation: OP_SCHEDULE_TRIGGER,
+        target_type: TARGET_SCHEDULE,
+        target_id: Some(id.as_str()),
+        route_or_command: route,
+        request_id: request_id.as_deref(),
+        idempotency_key: None,
+        status: STATUS_SUCCEEDED,
+        error_summary: body.reason.as_deref(),
+        shard_id: None,
+        source: &source,
+    };
+    audit::insert_audit(&mut conn, &ar)
+        .await
+        .map_err(map_error)?;
+
+    runtime
+        .registry
+        .telemetry()
+        .metrics
+        .record_schedule_manual_trigger(&schedule_display_name, outcome);
+
+    Ok(Json(ScheduleTriggerResponse {
+        execution_id: exec_id_out,
+        workflow_id,
+        triggered_at,
+        outcome: outcome.to_string(),
+    }))
 }
 
 // ── Schedule backfill (issue #177) ────────────────────────────────────────────
