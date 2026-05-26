@@ -11793,6 +11793,7 @@ async fn list_build_routing_handler(
 /// Uses fail-forward fan-out: attempts every shard and collects errors rather than
 /// aborting on first failure, so a transient shard outage does not leave routing
 /// state diverged across the remaining shards.
+#[allow(clippy::too_many_lines)]
 async fn set_build_policy_handler(
     headers: axum::http::HeaderMap,
     Extension(api_state): Extension<HarvestApiState>,
@@ -11834,37 +11835,11 @@ async fn set_build_policy_handler(
             }
         }
     }
-    let status = if shard_errors.is_empty() {
-        STATUS_SUCCEEDED
-    } else {
-        STATUS_FAILED
-    };
-    if let Ok(pool) = api_state.storage_pool()
-        && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
-    {
-        let error_summary = if shard_errors.is_empty() {
-            None
-        } else {
-            Some(shard_errors.join("; "))
-        };
-        let ar = NewAuditRecord {
-            actor: &actor,
-            operation: OP_BUILD_POLICY_SET,
-            target_type: TARGET_BUILD_ROUTING,
-            target_id: Some(queue_name),
-            route_or_command: "POST /admin/build-routing/policies",
-            request_id: request_id.as_deref(),
-            idempotency_key: None,
-            status,
-            error_summary: error_summary.as_deref(),
-            shard_id: None,
-            source: &source,
-        };
-        let _ = audit::insert_audit(&mut conn, &ar).await;
-    }
+
+    // If every shard write failed, return 503 before attempting audit.
     if !shard_errors.is_empty() && last_policy.is_none() {
         return (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
             axum::Json(serde_json::json!({ "errors": shard_errors })),
         )
             .into_response();
@@ -11875,6 +11850,64 @@ async fn set_build_policy_handler(
         ))
         .into_response();
     };
+
+    // Audit write is required — fail the response if it cannot be persisted.
+    let status = if shard_errors.is_empty() {
+        STATUS_SUCCEEDED
+    } else {
+        STATUS_FAILED
+    };
+    let error_summary = if shard_errors.is_empty() {
+        None
+    } else {
+        Some(shard_errors.join("; "))
+    };
+    let ar = NewAuditRecord {
+        actor: &actor,
+        operation: OP_BUILD_POLICY_SET,
+        target_type: TARGET_BUILD_ROUTING,
+        target_id: Some(queue_name),
+        route_or_command: "POST /admin/build-routing/policies",
+        request_id: request_id.as_deref(),
+        idempotency_key: None,
+        status,
+        error_summary: error_summary.as_deref(),
+        shard_id: None,
+        source: &source,
+    };
+    match api_state.storage_pool() {
+        Ok(audit_pool) => match acquire_conn(audit_pool.default_pool()).await {
+            Ok(mut conn) => {
+                if let Err(audit_err) = audit::insert_audit(&mut conn, &ar).await {
+                    tracing::error!(
+                        error = %audit_err,
+                        "audit insert failed for build-routing.policy.set"
+                    );
+                    return AutumnError::service_unavailable_msg(format!(
+                        "audit insert failed: {audit_err}"
+                    ))
+                    .into_response();
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "audit DB connection unavailable for build-routing.policy.set"
+                );
+                return AutumnError::service_unavailable_msg("audit DB connection unavailable")
+                    .into_response();
+            }
+        },
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "storage pool unavailable for audit in build-routing.policy.set"
+            );
+            return AutumnError::service_unavailable_msg("audit DB connection unavailable")
+                .into_response();
+        }
+    }
+
     if shard_errors.is_empty() {
         (axum::http::StatusCode::OK, axum::Json(policy)).into_response()
     } else {
@@ -12019,6 +12052,7 @@ async fn list_build_compat_handler(
 ///
 /// Fans out to all shards so every shard's `load_compat_set()` picks up the declaration.
 /// Uses fail-forward fan-out: attempts every shard and collects errors.
+#[allow(clippy::too_many_lines)]
 async fn declare_compat_handler(
     headers: axum::http::HeaderMap,
     Extension(api_state): Extension<HarvestApiState>,
@@ -12059,38 +12093,11 @@ async fn declare_compat_handler(
             }
         }
     }
-    let status = if shard_errors.is_empty() {
-        STATUS_SUCCEEDED
-    } else {
-        STATUS_FAILED
-    };
-    if let Ok(pool) = api_state.storage_pool()
-        && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
-    {
-        let error_summary = if shard_errors.is_empty() {
-            None
-        } else {
-            Some(shard_errors.join("; "))
-        };
-        let target = format!("{build_id}→{compatible_with}");
-        let ar = NewAuditRecord {
-            actor: &actor,
-            operation: OP_BUILD_COMPAT_DECLARE,
-            target_type: TARGET_BUILD_ROUTING,
-            target_id: Some(target.as_str()),
-            route_or_command: "POST /admin/build-routing/compat",
-            request_id: request_id.as_deref(),
-            idempotency_key: None,
-            status,
-            error_summary: error_summary.as_deref(),
-            shard_id: None,
-            source: &source,
-        };
-        let _ = audit::insert_audit(&mut conn, &ar).await;
-    }
+
+    // If every shard write failed, return 503 before attempting audit.
     if !shard_errors.is_empty() && last_entry.is_none() {
         return (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
             axum::Json(serde_json::json!({ "errors": shard_errors })),
         )
             .into_response();
@@ -12101,6 +12108,65 @@ async fn declare_compat_handler(
         ))
         .into_response();
     };
+
+    // Audit write is required — fail the response if it cannot be persisted.
+    let status = if shard_errors.is_empty() {
+        STATUS_SUCCEEDED
+    } else {
+        STATUS_FAILED
+    };
+    let error_summary = if shard_errors.is_empty() {
+        None
+    } else {
+        Some(shard_errors.join("; "))
+    };
+    let target = format!("{build_id}→{compatible_with}");
+    let ar = NewAuditRecord {
+        actor: &actor,
+        operation: OP_BUILD_COMPAT_DECLARE,
+        target_type: TARGET_BUILD_ROUTING,
+        target_id: Some(target.as_str()),
+        route_or_command: "POST /admin/build-routing/compat",
+        request_id: request_id.as_deref(),
+        idempotency_key: None,
+        status,
+        error_summary: error_summary.as_deref(),
+        shard_id: None,
+        source: &source,
+    };
+    match api_state.storage_pool() {
+        Ok(audit_pool) => match acquire_conn(audit_pool.default_pool()).await {
+            Ok(mut conn) => {
+                if let Err(audit_err) = audit::insert_audit(&mut conn, &ar).await {
+                    tracing::error!(
+                        error = %audit_err,
+                        "audit insert failed for build-routing.compat.declare"
+                    );
+                    return AutumnError::service_unavailable_msg(format!(
+                        "audit insert failed: {audit_err}"
+                    ))
+                    .into_response();
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "audit DB connection unavailable for build-routing.compat.declare"
+                );
+                return AutumnError::service_unavailable_msg("audit DB connection unavailable")
+                    .into_response();
+            }
+        },
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "storage pool unavailable for audit in build-routing.compat.declare"
+            );
+            return AutumnError::service_unavailable_msg("audit DB connection unavailable")
+                .into_response();
+        }
+    }
+
     if shard_errors.is_empty() {
         (axum::http::StatusCode::CREATED, axum::Json(entry)).into_response()
     } else {
@@ -12119,6 +12185,7 @@ async fn declare_compat_handler(
 ///
 /// Fans out to all shards. Returns `revoked=true` if any shard had the row.
 /// Uses fail-forward fan-out: attempts every shard and collects errors.
+#[allow(clippy::too_many_lines)]
 async fn revoke_compat_handler(
     headers: axum::http::HeaderMap,
     Extension(api_state): Extension<HarvestApiState>,
@@ -12133,6 +12200,7 @@ async fn revoke_compat_handler(
     let (actor, source, request_id) = audit_context(&headers, &api_state);
 
     let mut any_revoked = false;
+    let mut any_shard_succeeded = false;
     let mut shard_errors: Vec<String> = Vec::new();
     for (shard_id, shard_pool) in pool.iter_shards() {
         let mut conn = match acquire_conn(shard_pool).await {
@@ -12146,41 +12214,83 @@ async fn revoke_compat_handler(
             .await
             .map_err(map_error)
         {
-            Ok(r) => any_revoked |= r,
+            Ok(r) => {
+                any_shard_succeeded = true;
+                any_revoked |= r;
+            }
             Err(e) => {
                 shard_errors.push(format!("shard {}: {e}", shard_id.as_i32()));
             }
         }
     }
+
+    // If every shard write failed, return 503 before attempting audit.
+    if !shard_errors.is_empty() && !any_shard_succeeded {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({ "errors": shard_errors })),
+        )
+            .into_response();
+    }
+
+    // Audit write is required — fail the response if it cannot be persisted.
     let status = if shard_errors.is_empty() {
         STATUS_SUCCEEDED
     } else {
         STATUS_FAILED
     };
-    if let Ok(pool) = api_state.storage_pool()
-        && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
-    {
-        let error_summary = if shard_errors.is_empty() {
-            None
-        } else {
-            Some(shard_errors.join("; "))
-        };
-        let target = format!("{build_id}→{compat_with}");
-        let ar = NewAuditRecord {
-            actor: &actor,
-            operation: OP_BUILD_COMPAT_REVOKE,
-            target_type: TARGET_BUILD_ROUTING,
-            target_id: Some(target.as_str()),
-            route_or_command: "DELETE /admin/build-routing/compat/{build_id}/{compat_with}",
-            request_id: request_id.as_deref(),
-            idempotency_key: None,
-            status,
-            error_summary: error_summary.as_deref(),
-            shard_id: None,
-            source: &source,
-        };
-        let _ = audit::insert_audit(&mut conn, &ar).await;
+    let error_summary = if shard_errors.is_empty() {
+        None
+    } else {
+        Some(shard_errors.join("; "))
+    };
+    let target = format!("{build_id}→{compat_with}");
+    let ar = NewAuditRecord {
+        actor: &actor,
+        operation: OP_BUILD_COMPAT_REVOKE,
+        target_type: TARGET_BUILD_ROUTING,
+        target_id: Some(target.as_str()),
+        route_or_command: "DELETE /admin/build-routing/compat/{build_id}/{compat_with}",
+        request_id: request_id.as_deref(),
+        idempotency_key: None,
+        status,
+        error_summary: error_summary.as_deref(),
+        shard_id: None,
+        source: &source,
+    };
+    match api_state.storage_pool() {
+        Ok(audit_pool) => match acquire_conn(audit_pool.default_pool()).await {
+            Ok(mut conn) => {
+                if let Err(audit_err) = audit::insert_audit(&mut conn, &ar).await {
+                    tracing::error!(
+                        error = %audit_err,
+                        "audit insert failed for build-routing.compat.revoke"
+                    );
+                    return AutumnError::service_unavailable_msg(format!(
+                        "audit insert failed: {audit_err}"
+                    ))
+                    .into_response();
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "audit DB connection unavailable for build-routing.compat.revoke"
+                );
+                return AutumnError::service_unavailable_msg("audit DB connection unavailable")
+                    .into_response();
+            }
+        },
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "storage pool unavailable for audit in build-routing.compat.revoke"
+            );
+            return AutumnError::service_unavailable_msg("audit DB connection unavailable")
+                .into_response();
+        }
     }
+
     if !shard_errors.is_empty() {
         return (
             axum::http::StatusCode::MULTI_STATUS,
