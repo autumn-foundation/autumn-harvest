@@ -78,6 +78,12 @@ pub const OP_RATE_LIMIT_OVERRIDE: &str = "rate_limit_override";
 pub const OP_EXECUTION_STREAM_OPEN: &str = "execution.stream.open";
 /// Audit operation: Closed an SSE execution event stream (issue #324).
 pub const OP_EXECUTION_STREAM_CLOSE: &str = "execution.stream.close";
+/// Audit operation: Set the active build policy for a queue (issue #362).
+pub const OP_BUILD_POLICY_SET: &str = "build_routing.policy.set";
+/// Audit operation: Declared a build compatibility entry (issue #362).
+pub const OP_BUILD_COMPAT_DECLARE: &str = "build_routing.compat.declare";
+/// Audit operation: Revoked a build compatibility entry (issue #362).
+pub const OP_BUILD_COMPAT_REVOKE: &str = "build_routing.compat.revoke";
 
 // ── Target type constants ─────────────────────────────────────────────────────
 
@@ -90,6 +96,7 @@ pub const TARGET_RETENTION: &str = "retention";
 pub const TARGET_EXTERNAL_ACTIVITY: &str = "external_activity";
 pub const TARGET_WORKER: &str = "worker";
 pub const TARGET_RATE_LIMIT: &str = "rate_limit";
+pub const TARGET_BUILD_ROUTING: &str = "build_routing";
 
 // ── Status constants ──────────────────────────────────────────────────────────
 

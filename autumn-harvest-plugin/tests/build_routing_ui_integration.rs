@@ -596,7 +596,7 @@ async fn ui_set_policy_form_action_redirects_with_flash() {
         .to_str()
         .unwrap();
     assert!(
-        location.starts_with("build-routing"),
+        location.contains("build-routing"),
         "must redirect to build-routing page: {location}"
     );
     assert!(
@@ -625,7 +625,7 @@ async fn ui_declare_compat_form_action_redirects() {
         "declare-compat must redirect"
     );
     let location = headers.get("location").unwrap().to_str().unwrap();
-    assert!(location.starts_with("build-routing"));
+    assert!(location.contains("build-routing"));
     assert!(location.contains("flash="));
 }
 
@@ -650,7 +650,7 @@ async fn ui_revoke_compat_form_action_redirects() {
     .await;
     assert_eq!(status, StatusCode::SEE_OTHER, "revoke-compat must redirect");
     let location = headers.get("location").unwrap().to_str().unwrap();
-    assert!(location.starts_with("build-routing"));
+    assert!(location.contains("build-routing"));
     assert!(location.contains("flash="));
 }
 

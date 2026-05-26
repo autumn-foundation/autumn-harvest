@@ -30,13 +30,14 @@ use serde_json::Value;
 
 use autumn_harvest::audit::{
     self, AuditFilters, HEADER_ACTOR, HEADER_REQUEST_ID, HEADER_SOURCE, OP_BATCH_SUBMIT,
-    OP_DAG_PATCH, OP_DAG_TRIGGER, OP_DLQ_DISCARD_BULK, OP_DLQ_REPLAY, OP_DLQ_REPLAY_BULK,
+    OP_BUILD_COMPAT_DECLARE, OP_BUILD_COMPAT_REVOKE, OP_BUILD_POLICY_SET, OP_DAG_PATCH,
+    OP_DAG_TRIGGER, OP_DLQ_DISCARD_BULK, OP_DLQ_REPLAY, OP_DLQ_REPLAY_BULK,
     OP_EXTERNAL_ACTIVITY_COMPLETE, OP_EXTERNAL_ACTIVITY_FAIL, OP_RETENTION_RUN_NOW,
     OP_SCHEDULE_BACKFILL, OP_SCHEDULE_CREATE, OP_SCHEDULE_DELETE, OP_SCHEDULE_PAUSE,
     OP_SCHEDULE_RESUME, OP_WORKER_DRAIN, OP_WORKFLOW_CANCEL, OP_WORKFLOW_RESET, OP_WORKFLOW_SIGNAL,
     OP_WORKFLOW_SIGNAL_WITH_START, OP_WORKFLOW_START, SOURCE_API, STATUS_FAILED, STATUS_SUCCEEDED,
-    TARGET_BATCH, TARGET_DAG, TARGET_DEAD_LETTER, TARGET_EXTERNAL_ACTIVITY, TARGET_RETENTION,
-    TARGET_SCHEDULE, TARGET_WORKER, TARGET_WORKFLOW,
+    TARGET_BATCH, TARGET_BUILD_ROUTING, TARGET_DAG, TARGET_DEAD_LETTER, TARGET_EXTERNAL_ACTIVITY,
+    TARGET_RETENTION, TARGET_SCHEDULE, TARGET_WORKER, TARGET_WORKFLOW,
 };
 use autumn_harvest::batch::{
     self, BatchAction, BatchExecutorConfig, BatchFilter, BatchJobStatus, BatchJobView,
@@ -11409,31 +11410,85 @@ async fn list_build_routing_handler(
 ///
 /// Fans out to all shards so every shard's `get_build_policy()` call sees the new
 /// policy when evaluating `assigned_build_id` at workflow-start time.
+///
+/// Uses fail-forward fan-out: attempts every shard and collects errors rather than
+/// aborting on first failure, so a transient shard outage does not leave routing
+/// state diverged across the remaining shards.
 async fn set_build_policy_handler(
+    headers: axum::http::HeaderMap,
     Extension(api_state): Extension<HarvestApiState>,
     axum::Json(body): axum::Json<SetBuildPolicyBody>,
 ) -> impl axum::response::IntoResponse {
     use autumn_harvest::build_routing::set_build_policy;
+
+    let queue_name = body.queue_name.trim();
+    let build_id = body.build_id.trim();
+    if queue_name.is_empty() || build_id.is_empty() {
+        return AutumnError::bad_request_msg("queue_name and build_id must not be empty")
+            .into_response();
+    }
 
     let pool = match api_state.storage_pool().map_err(map_error) {
         Ok(p) => p,
         Err(e) => return e.into_response(),
     };
     let deployment = body.deployment_name.as_deref().filter(|s| !s.is_empty());
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+
     let mut last_policy = None;
-    for (_, shard_pool) in pool.iter_shards() {
+    let mut shard_errors: Vec<String> = Vec::new();
+    for (shard_id, shard_pool) in pool.iter_shards() {
         let mut conn = match acquire_conn(shard_pool).await {
             Ok(c) => c,
-            Err(e) => return e.into_response(),
+            Err(e) => {
+                shard_errors.push(format!("shard {}: {e}", shard_id.as_i32()));
+                continue;
+            }
         };
-        let policy = match set_build_policy(&mut conn, &body.queue_name, &body.build_id, deployment)
+        match set_build_policy(&mut conn, queue_name, build_id, deployment)
             .await
             .map_err(map_error)
         {
-            Ok(p) => p,
-            Err(e) => return e.into_response(),
+            Ok(p) => last_policy = Some(p),
+            Err(e) => {
+                shard_errors.push(format!("shard {}: {e}", shard_id.as_i32()));
+            }
+        }
+    }
+    let status = if shard_errors.is_empty() {
+        STATUS_SUCCEEDED
+    } else {
+        STATUS_FAILED
+    };
+    if let Ok(pool) = api_state.storage_pool()
+        && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+    {
+        let error_summary = if shard_errors.is_empty() {
+            None
+        } else {
+            Some(shard_errors.join("; "))
         };
-        last_policy = Some(policy);
+        let ar = NewAuditRecord {
+            actor: &actor,
+            operation: OP_BUILD_POLICY_SET,
+            target_type: TARGET_BUILD_ROUTING,
+            target_id: Some(queue_name),
+            route_or_command: "POST /admin/build-routing/policies",
+            request_id: request_id.as_deref(),
+            idempotency_key: None,
+            status,
+            error_summary: error_summary.as_deref(),
+            shard_id: None,
+            source: &source,
+        };
+        let _ = audit::insert_audit(&mut conn, &ar).await;
+    }
+    if !shard_errors.is_empty() && last_policy.is_none() {
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(serde_json::json!({ "errors": shard_errors })),
+        )
+            .into_response();
     }
     let Some(policy) = last_policy else {
         return map_error(autumn_harvest::HarvestError::Config(
@@ -11441,7 +11496,18 @@ async fn set_build_policy_handler(
         ))
         .into_response();
     };
-    (axum::http::StatusCode::OK, axum::Json(policy)).into_response()
+    if shard_errors.is_empty() {
+        (axum::http::StatusCode::OK, axum::Json(policy)).into_response()
+    } else {
+        (
+            axum::http::StatusCode::MULTI_STATUS,
+            axum::Json(serde_json::json!({
+                "policy": policy,
+                "shard_errors": shard_errors,
+            })),
+        )
+            .into_response()
+    }
 }
 
 /// `GET /admin/build-routing/compat` — list all compatibility declarations.
@@ -11467,30 +11533,82 @@ async fn list_build_compat_handler(
 /// `POST /admin/build-routing/compat` — declare that build A can absorb build B's histories.
 ///
 /// Fans out to all shards so every shard's `load_compat_set()` picks up the declaration.
+/// Uses fail-forward fan-out: attempts every shard and collects errors.
 async fn declare_compat_handler(
+    headers: axum::http::HeaderMap,
     Extension(api_state): Extension<HarvestApiState>,
     axum::Json(body): axum::Json<DeclareCompatBody>,
 ) -> impl axum::response::IntoResponse {
     use autumn_harvest::build_routing::declare_compat;
 
+    let build_id = body.build_id.trim();
+    let compatible_with = body.compatible_with.trim();
+    if build_id.is_empty() || compatible_with.is_empty() {
+        return AutumnError::bad_request_msg("build_id and compatible_with must not be empty")
+            .into_response();
+    }
+
     let pool = match api_state.storage_pool().map_err(map_error) {
         Ok(p) => p,
         Err(e) => return e.into_response(),
     };
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+
     let mut last_entry = None;
-    for (_, shard_pool) in pool.iter_shards() {
+    let mut shard_errors: Vec<String> = Vec::new();
+    for (shard_id, shard_pool) in pool.iter_shards() {
         let mut conn = match acquire_conn(shard_pool).await {
             Ok(c) => c,
-            Err(e) => return e.into_response(),
+            Err(e) => {
+                shard_errors.push(format!("shard {}: {e}", shard_id.as_i32()));
+                continue;
+            }
         };
-        let entry = match declare_compat(&mut conn, &body.build_id, &body.compatible_with)
+        match declare_compat(&mut conn, build_id, compatible_with)
             .await
             .map_err(map_error)
         {
-            Ok(e) => e,
-            Err(e) => return e.into_response(),
+            Ok(e) => last_entry = Some(e),
+            Err(e) => {
+                shard_errors.push(format!("shard {}: {e}", shard_id.as_i32()));
+            }
+        }
+    }
+    let status = if shard_errors.is_empty() {
+        STATUS_SUCCEEDED
+    } else {
+        STATUS_FAILED
+    };
+    if let Ok(pool) = api_state.storage_pool()
+        && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+    {
+        let error_summary = if shard_errors.is_empty() {
+            None
+        } else {
+            Some(shard_errors.join("; "))
         };
-        last_entry = Some(entry);
+        let target = format!("{build_id}→{compatible_with}");
+        let ar = NewAuditRecord {
+            actor: &actor,
+            operation: OP_BUILD_COMPAT_DECLARE,
+            target_type: TARGET_BUILD_ROUTING,
+            target_id: Some(target.as_str()),
+            route_or_command: "POST /admin/build-routing/compat",
+            request_id: request_id.as_deref(),
+            idempotency_key: None,
+            status,
+            error_summary: error_summary.as_deref(),
+            shard_id: None,
+            source: &source,
+        };
+        let _ = audit::insert_audit(&mut conn, &ar).await;
+    }
+    if !shard_errors.is_empty() && last_entry.is_none() {
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(serde_json::json!({ "errors": shard_errors })),
+        )
+            .into_response();
     }
     let Some(entry) = last_entry else {
         return map_error(autumn_harvest::HarvestError::Config(
@@ -11498,13 +11616,26 @@ async fn declare_compat_handler(
         ))
         .into_response();
     };
-    (axum::http::StatusCode::CREATED, axum::Json(entry)).into_response()
+    if shard_errors.is_empty() {
+        (axum::http::StatusCode::CREATED, axum::Json(entry)).into_response()
+    } else {
+        (
+            axum::http::StatusCode::MULTI_STATUS,
+            axum::Json(serde_json::json!({
+                "entry": entry,
+                "shard_errors": shard_errors,
+            })),
+        )
+            .into_response()
+    }
 }
 
 /// `DELETE /admin/build-routing/compat/{build_id}/{compat_with}` — revoke a declaration.
 ///
 /// Fans out to all shards. Returns `revoked=true` if any shard had the row.
+/// Uses fail-forward fan-out: attempts every shard and collects errors.
 async fn revoke_compat_handler(
+    headers: axum::http::HeaderMap,
     Extension(api_state): Extension<HarvestApiState>,
     axum::extract::Path((build_id, compat_with)): axum::extract::Path<(String, String)>,
 ) -> impl axum::response::IntoResponse {
@@ -11514,20 +11645,66 @@ async fn revoke_compat_handler(
         Ok(p) => p,
         Err(e) => return e.into_response(),
     };
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+
     let mut any_revoked = false;
-    for (_, shard_pool) in pool.iter_shards() {
+    let mut shard_errors: Vec<String> = Vec::new();
+    for (shard_id, shard_pool) in pool.iter_shards() {
         let mut conn = match acquire_conn(shard_pool).await {
             Ok(c) => c,
-            Err(e) => return e.into_response(),
+            Err(e) => {
+                shard_errors.push(format!("shard {}: {e}", shard_id.as_i32()));
+                continue;
+            }
         };
-        let revoked = match revoke_compat(&mut conn, &build_id, &compat_with)
+        match revoke_compat(&mut conn, &build_id, &compat_with)
             .await
             .map_err(map_error)
         {
-            Ok(r) => r,
-            Err(e) => return e.into_response(),
+            Ok(r) => any_revoked |= r,
+            Err(e) => {
+                shard_errors.push(format!("shard {}: {e}", shard_id.as_i32()));
+            }
+        }
+    }
+    let status = if shard_errors.is_empty() {
+        STATUS_SUCCEEDED
+    } else {
+        STATUS_FAILED
+    };
+    if let Ok(pool) = api_state.storage_pool()
+        && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+    {
+        let error_summary = if shard_errors.is_empty() {
+            None
+        } else {
+            Some(shard_errors.join("; "))
         };
-        any_revoked |= revoked;
+        let target = format!("{build_id}→{compat_with}");
+        let ar = NewAuditRecord {
+            actor: &actor,
+            operation: OP_BUILD_COMPAT_REVOKE,
+            target_type: TARGET_BUILD_ROUTING,
+            target_id: Some(target.as_str()),
+            route_or_command: "DELETE /admin/build-routing/compat/{build_id}/{compat_with}",
+            request_id: request_id.as_deref(),
+            idempotency_key: None,
+            status,
+            error_summary: error_summary.as_deref(),
+            shard_id: None,
+            source: &source,
+        };
+        let _ = audit::insert_audit(&mut conn, &ar).await;
+    }
+    if !shard_errors.is_empty() {
+        return (
+            axum::http::StatusCode::MULTI_STATUS,
+            axum::Json(serde_json::json!({
+                "revoked": any_revoked,
+                "shard_errors": shard_errors,
+            })),
+        )
+            .into_response();
     }
     axum::Json(RevokeCompatResponse {
         revoked: any_revoked,
@@ -11544,6 +11721,10 @@ async fn retire_build_handler(
     axum::Json(body): axum::Json<RetireBuildBody>,
 ) -> impl axum::response::IntoResponse {
     use autumn_harvest::build_routing::{all_build_reachability, merge_reachability};
+
+    if body.build_id.trim().is_empty() {
+        return AutumnError::bad_request_msg("build_id must not be empty").into_response();
+    }
 
     let pool = match api_state.storage_pool().map_err(map_error) {
         Ok(p) => p,

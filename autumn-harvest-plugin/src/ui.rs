@@ -3012,7 +3012,7 @@ fn render_workflow_detail(
                 @if let Some(ref build_id) = execution.assigned_build_id {
                     div.k { "Assigned build" }
                     div.v {
-                        a href={ "../../build-routing?build_id=" (url_encode(build_id)) }
+                        a href={ "../build-routing?build_id=" (url_encode(build_id)) }
                            title="View in Build Routing" {
                             code { (build_id) }
                         }
@@ -3730,29 +3730,48 @@ async fn build_routing_set_policy_ui(
     Extension(api_state): Extension<HarvestApiState>,
     Form(form): Form<BuildRoutingSetPolicyForm>,
 ) -> Result<axum::response::Response, AutumnError> {
+    let queue_name = form.queue_name.trim().to_string();
+    let build_id = form.build_id.trim().to_string();
+    if queue_name.is_empty() || build_id.is_empty() {
+        let flash = url_encode("queue_name and build_id must not be empty");
+        return Ok(
+            axum::response::Redirect::to(&format!("../build-routing?flash={flash}"))
+                .into_response(),
+        );
+    }
     let pool = api_state.storage_pool().map_err(map_error)?;
     let deployment_name = form.deployment_name.as_deref().filter(|s| !s.is_empty());
     // Fan out to all shards so every shard's get_build_policy() sees the new policy
     // when evaluating assigned_build_id at workflow start time.
     let mut last_policy = None;
-    for (_, shard_pool) in pool.iter_shards() {
-        let mut conn = acquire_conn(shard_pool).await?;
-        let p = set_build_policy(
-            &mut conn,
-            form.queue_name.trim(),
-            form.build_id.trim(),
-            deployment_name,
-        )
-        .await
-        .map_err(map_error)?;
-        last_policy = Some(p);
+    let mut shard_errors: Vec<String> = Vec::new();
+    for (shard_id, shard_pool) in pool.iter_shards() {
+        match acquire_conn(shard_pool).await {
+            Ok(mut conn) => {
+                match set_build_policy(&mut conn, &queue_name, &build_id, deployment_name)
+                    .await
+                    .map_err(map_error)
+                {
+                    Ok(p) => last_policy = Some(p),
+                    Err(e) => shard_errors.push(format!("shard {}: {e}", shard_id.as_i32())),
+                }
+            }
+            Err(e) => shard_errors.push(format!("shard {}: {e}", shard_id.as_i32())),
+        }
     }
-    let flash = match last_policy {
-        Some(p) => url_encode(&format!(
-            "Build policy for queue '{}' set to '{}'",
-            p.queue_name, p.build_id
-        )),
-        None => url_encode("No shards configured"),
+    let flash = if shard_errors.is_empty() {
+        match last_policy {
+            Some(p) => url_encode(&format!(
+                "Build policy for queue '{}' set to '{}'",
+                p.queue_name, p.build_id
+            )),
+            None => url_encode("No shards configured"),
+        }
+    } else {
+        url_encode(&format!(
+            "Partial failure setting build policy: {}",
+            shard_errors.join("; ")
+        ))
     };
     Ok(axum::response::Redirect::to(&format!("../build-routing?flash={flash}")).into_response())
 }
@@ -3761,22 +3780,46 @@ async fn build_routing_declare_compat_ui(
     Extension(api_state): Extension<HarvestApiState>,
     Form(form): Form<BuildRoutingCompatForm>,
 ) -> Result<axum::response::Response, AutumnError> {
+    let build_id = form.build_id.trim().to_string();
+    let compatible_with = form.compatible_with.trim().to_string();
+    if build_id.is_empty() || compatible_with.is_empty() {
+        let flash = url_encode("build_id and compatible_with must not be empty");
+        return Ok(
+            axum::response::Redirect::to(&format!("../build-routing?flash={flash}"))
+                .into_response(),
+        );
+    }
     let pool = api_state.storage_pool().map_err(map_error)?;
     // Fan out to all shards so load_compat_set() on each shard picks up the declaration.
     let mut last_entry = None;
-    for (_, shard_pool) in pool.iter_shards() {
-        let mut conn = acquire_conn(shard_pool).await?;
-        let e = declare_compat(&mut conn, form.build_id.trim(), form.compatible_with.trim())
-            .await
-            .map_err(map_error)?;
-        last_entry = Some(e);
+    let mut shard_errors: Vec<String> = Vec::new();
+    for (shard_id, shard_pool) in pool.iter_shards() {
+        match acquire_conn(shard_pool).await {
+            Ok(mut conn) => {
+                match declare_compat(&mut conn, &build_id, &compatible_with)
+                    .await
+                    .map_err(map_error)
+                {
+                    Ok(e) => last_entry = Some(e),
+                    Err(e) => shard_errors.push(format!("shard {}: {e}", shard_id.as_i32())),
+                }
+            }
+            Err(e) => shard_errors.push(format!("shard {}: {e}", shard_id.as_i32())),
+        }
     }
-    let flash = match last_entry {
-        Some(e) => url_encode(&format!(
-            "Declared: '{}' compatible with '{}'",
-            e.build_id, e.compatible_with
-        )),
-        None => url_encode("No shards configured"),
+    let flash = if shard_errors.is_empty() {
+        match last_entry {
+            Some(e) => url_encode(&format!(
+                "Declared: '{}' compatible with '{}'",
+                e.build_id, e.compatible_with
+            )),
+            None => url_encode("No shards configured"),
+        }
+    } else {
+        url_encode(&format!(
+            "Partial failure declaring compat: {}",
+            shard_errors.join("; ")
+        ))
     };
     Ok(axum::response::Redirect::to(&format!("../build-routing?flash={flash}")).into_response())
 }
@@ -3786,16 +3829,29 @@ async fn build_routing_revoke_compat_ui(
     Form(form): Form<BuildRoutingCompatForm>,
 ) -> Result<axum::response::Response, AutumnError> {
     let pool = api_state.storage_pool().map_err(map_error)?;
-    // Fan out revoke to all shards.
+    // Fan out revoke to all shards; collect errors rather than aborting.
     let mut any_revoked = false;
-    for (_, shard_pool) in pool.iter_shards() {
-        let mut conn = acquire_conn(shard_pool).await?;
-        let revoked = revoke_compat(&mut conn, form.build_id.trim(), form.compatible_with.trim())
-            .await
-            .map_err(map_error)?;
-        any_revoked |= revoked;
+    let mut shard_errors: Vec<String> = Vec::new();
+    for (shard_id, shard_pool) in pool.iter_shards() {
+        match acquire_conn(shard_pool).await {
+            Ok(mut conn) => {
+                match revoke_compat(&mut conn, form.build_id.trim(), form.compatible_with.trim())
+                    .await
+                    .map_err(map_error)
+                {
+                    Ok(r) => any_revoked |= r,
+                    Err(e) => shard_errors.push(format!("shard {}: {e}", shard_id.as_i32())),
+                }
+            }
+            Err(e) => shard_errors.push(format!("shard {}: {e}", shard_id.as_i32())),
+        }
     }
-    let flash = if any_revoked {
+    let flash = if !shard_errors.is_empty() {
+        url_encode(&format!(
+            "Partial failure revoking compat: {}",
+            shard_errors.join("; ")
+        ))
+    } else if any_revoked {
         url_encode(&format!(
             "Revoked compatibility: '{}' → '{}'",
             form.build_id, form.compatible_with
@@ -3813,6 +3869,13 @@ async fn build_routing_retire_ui(
     Extension(api_state): Extension<HarvestApiState>,
     Form(form): Form<BuildRoutingRetireForm>,
 ) -> Result<axum::response::Response, AutumnError> {
+    if form.build_id.trim().is_empty() {
+        let flash = url_encode("build_id must not be empty");
+        return Ok(
+            axum::response::Redirect::to(&format!("../build-routing?flash={flash}"))
+                .into_response(),
+        );
+    }
     let pool = api_state.storage_pool().map_err(map_error)?;
     let stale_threshold = api_state.worker_stale_threshold();
 
