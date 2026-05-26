@@ -32,9 +32,10 @@ use serde_json::Value;
 
 use autumn_harvest::Schedule;
 use autumn_harvest::audit::{
-    OP_SCHEDULE_DELETE, OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_WORKFLOW_CANCEL,
-    OP_WORKFLOW_RESET, OP_WORKFLOW_SIGNAL, SOURCE_API, SOURCE_UI, STATUS_FAILED, STATUS_SUCCEEDED,
-    TARGET_SCHEDULE, TARGET_WORKFLOW, insert_audit,
+    OP_BUILD_COMPAT_DECLARE, OP_BUILD_COMPAT_REVOKE, OP_BUILD_POLICY_SET, OP_SCHEDULE_DELETE,
+    OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_WORKFLOW_CANCEL, OP_WORKFLOW_RESET,
+    OP_WORKFLOW_SIGNAL, SOURCE_API, SOURCE_UI, STATUS_FAILED, STATUS_SUCCEEDED,
+    TARGET_BUILD_ROUTING, TARGET_SCHEDULE, TARGET_WORKFLOW, insert_audit,
 };
 use autumn_harvest::build_routing::{
     BuildCompatEntry, BuildPolicy, BuildReachability, all_build_reachability, declare_compat,
@@ -3664,19 +3665,35 @@ async fn list_build_routing_ui(
     let is_multi_shard = pool.iter_shards().count() > 1;
     let stale_threshold = api_state.worker_stale_threshold();
 
-    // Load policies and compat declarations from the default shard.
-    // These are operator-set records that should be consistent across shards.
-    let default_pool = pool.default_pool();
-    let (policies, all_compat) = {
-        let mut conn = acquire_conn(default_pool).await?;
-        let policies = list_build_policies(&mut conn).await.map_err(map_error)?;
-        let compat = list_build_compat(&mut conn).await.map_err(map_error)?;
-        (policies, compat)
+    // Load policies and compat from the default shard. On failure, record the
+    // error and continue — the page still renders cross-shard reachability.
+    let mut shard_errors: Vec<(ShardId, String)> = Vec::new();
+    let (policies, all_compat) = match acquire_conn(pool.default_pool()).await {
+        Ok(mut conn) => {
+            let p = list_build_policies(&mut conn)
+                .await
+                .map_err(map_error)
+                .unwrap_or_else(|e| {
+                    shard_errors.push((ShardId::UNENCODED, e.to_string()));
+                    vec![]
+                });
+            let c = list_build_compat(&mut conn)
+                .await
+                .map_err(map_error)
+                .unwrap_or_else(|e| {
+                    shard_errors.push((ShardId::UNENCODED, e.to_string()));
+                    vec![]
+                });
+            (p, c)
+        }
+        Err(e) => {
+            shard_errors.push((ShardId::UNENCODED, e.to_string()));
+            (vec![], vec![])
+        }
     };
 
     // Load reachability aggregated across all shards.
     let mut per_shard_reach: Vec<Vec<BuildReachability>> = Vec::new();
-    let mut shard_errors: Vec<(ShardId, String)> = Vec::new();
     for (shard_id, shard_pool) in pool.iter_shards() {
         match acquire_conn(shard_pool).await {
             Ok(mut conn) => match all_build_reachability(&mut conn, stale_threshold).await {
@@ -3759,6 +3776,35 @@ async fn build_routing_set_policy_ui(
             Err(e) => shard_errors.push(format!("shard {}: {e}", shard_id.as_i32())),
         }
     }
+    let audit_status = if shard_errors.is_empty() {
+        STATUS_SUCCEEDED
+    } else {
+        STATUS_FAILED
+    };
+    if let Ok(mut conn) = acquire_conn(pool.default_pool()).await {
+        let error_summary = shard_errors.join("; ");
+        let _ = insert_audit(
+            &mut conn,
+            &NewAuditRecord {
+                actor: "ui",
+                operation: OP_BUILD_POLICY_SET,
+                target_type: TARGET_BUILD_ROUTING,
+                target_id: Some(queue_name.as_str()),
+                route_or_command: "POST /ui/build-routing/set-policy",
+                request_id: None,
+                idempotency_key: None,
+                status: audit_status,
+                error_summary: if error_summary.is_empty() {
+                    None
+                } else {
+                    Some(error_summary.as_str())
+                },
+                shard_id: None,
+                source: SOURCE_UI,
+            },
+        )
+        .await;
+    }
     let flash = if shard_errors.is_empty() {
         match last_policy {
             Some(p) => url_encode(&format!(
@@ -3807,6 +3853,36 @@ async fn build_routing_declare_compat_ui(
             Err(e) => shard_errors.push(format!("shard {}: {e}", shard_id.as_i32())),
         }
     }
+    let audit_status = if shard_errors.is_empty() {
+        STATUS_SUCCEEDED
+    } else {
+        STATUS_FAILED
+    };
+    if let Ok(mut conn) = acquire_conn(pool.default_pool()).await {
+        let error_summary = shard_errors.join("; ");
+        let target = format!("{build_id}→{compatible_with}");
+        let _ = insert_audit(
+            &mut conn,
+            &NewAuditRecord {
+                actor: "ui",
+                operation: OP_BUILD_COMPAT_DECLARE,
+                target_type: TARGET_BUILD_ROUTING,
+                target_id: Some(target.as_str()),
+                route_or_command: "POST /ui/build-routing/declare-compat",
+                request_id: None,
+                idempotency_key: None,
+                status: audit_status,
+                error_summary: if error_summary.is_empty() {
+                    None
+                } else {
+                    Some(error_summary.as_str())
+                },
+                shard_id: None,
+                source: SOURCE_UI,
+            },
+        )
+        .await;
+    }
     let flash = if shard_errors.is_empty() {
         match last_entry {
             Some(e) => url_encode(&format!(
@@ -3845,6 +3921,36 @@ async fn build_routing_revoke_compat_ui(
             }
             Err(e) => shard_errors.push(format!("shard {}: {e}", shard_id.as_i32())),
         }
+    }
+    let audit_status = if shard_errors.is_empty() {
+        STATUS_SUCCEEDED
+    } else {
+        STATUS_FAILED
+    };
+    if let Ok(mut conn) = acquire_conn(pool.default_pool()).await {
+        let error_summary = shard_errors.join("; ");
+        let target = format!("{}→{}", form.build_id.trim(), form.compatible_with.trim());
+        let _ = insert_audit(
+            &mut conn,
+            &NewAuditRecord {
+                actor: "ui",
+                operation: OP_BUILD_COMPAT_REVOKE,
+                target_type: TARGET_BUILD_ROUTING,
+                target_id: Some(target.as_str()),
+                route_or_command: "POST /ui/build-routing/revoke-compat",
+                request_id: None,
+                idempotency_key: None,
+                status: audit_status,
+                error_summary: if error_summary.is_empty() {
+                    None
+                } else {
+                    Some(error_summary.as_str())
+                },
+                shard_id: None,
+                source: SOURCE_UI,
+            },
+        )
+        .await;
     }
     let flash = if !shard_errors.is_empty() {
         url_encode(&format!(

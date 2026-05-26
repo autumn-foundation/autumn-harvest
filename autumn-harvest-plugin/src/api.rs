@@ -11359,18 +11359,31 @@ async fn list_build_routing_handler(
         Err(e) => return e.into_response(),
     };
 
-    let default_pool = pool.default_pool();
-    let policies = match acquire_conn(default_pool).await {
-        Ok(mut conn) => match list_build_policies(&mut conn).await.map_err(map_error) {
-            Ok(p) => p,
-            Err(e) => return e.into_response(),
-        },
-        Err(e) => return e.into_response(),
-    };
-
     let stale_threshold = api_state.worker_stale_threshold();
     let mut per_shard: Vec<Vec<autumn_harvest::build_routing::BuildReachability>> = Vec::new();
     let mut shard_errors: Vec<serde_json::Value> = Vec::new();
+
+    // Policies live on the default shard; on failure, surface the error in
+    // shard_errors and continue so the page still shows cross-shard reachability.
+    let policies = match acquire_conn(pool.default_pool()).await {
+        Ok(mut conn) => match list_build_policies(&mut conn).await.map_err(map_error) {
+            Ok(p) => p,
+            Err(e) => {
+                shard_errors.push(serde_json::json!({
+                    "shard_id": "default",
+                    "error": e.to_string(),
+                }));
+                vec![]
+            }
+        },
+        Err(e) => {
+            shard_errors.push(serde_json::json!({
+                "shard_id": "default",
+                "error": e.to_string(),
+            }));
+            vec![]
+        }
+    };
 
     for (shard_id, shard_pool) in pool.iter_shards() {
         match acquire_conn(shard_pool).await {

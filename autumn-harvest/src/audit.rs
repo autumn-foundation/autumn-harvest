@@ -288,6 +288,17 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     ("POST /workers/{worker_id}/drain", RouteClass::Mutating),
     ("POST /admin/rate-limits/{key}", RouteClass::Mutating),
     ("POST /batch-operations", RouteClass::Mutating),
+    // Build routing management (issue #362)
+    ("GET /admin/build-routing", RouteClass::ReadOnly),
+    ("POST /admin/build-routing/policies", RouteClass::Mutating),
+    ("GET /admin/build-routing/compat", RouteClass::ReadOnly),
+    ("POST /admin/build-routing/compat", RouteClass::Mutating),
+    (
+        "DELETE /admin/build-routing/compat/{build_id}/{compat_with}",
+        RouteClass::Mutating,
+    ),
+    // Retire is a read-only reachability check; no DB state is written.
+    ("POST /admin/build-routing/retire", RouteClass::ReadOnly),
 ];
 
 // ── Declarative route manifest ────────────────────────────────────────────────
@@ -366,6 +377,10 @@ pub const EXCLUDED_ROUTES: &[&str] = &[
     "GET /admin/audit",
     // SSE stream is read-only; stream open/close are audited manually in the handler.
     "GET /executions/{exec_id}/events/stream",
+    // Build routing reads and the retire safety check never write audit rows.
+    "GET /admin/build-routing",
+    "GET /admin/build-routing/compat",
+    "POST /admin/build-routing/retire",
 ];
 
 /// Declarative manifest of every route in `harvest_api_router`.
@@ -467,6 +482,23 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ("GET /admin/audit", None),
     // SSE execution event stream (issue #324): read-only; open/close audited in handler.
     ("GET /executions/{exec_id}/events/stream", None),
+    // Build routing management (issue #362)
+    ("GET /admin/build-routing", None),
+    (
+        "POST /admin/build-routing/policies",
+        Some(OP_BUILD_POLICY_SET),
+    ),
+    ("GET /admin/build-routing/compat", None),
+    (
+        "POST /admin/build-routing/compat",
+        Some(OP_BUILD_COMPAT_DECLARE),
+    ),
+    (
+        "DELETE /admin/build-routing/compat/{build_id}/{compat_with}",
+        Some(OP_BUILD_COMPAT_REVOKE),
+    ),
+    // retire is a read-only safety check — no state is mutated.
+    ("POST /admin/build-routing/retire", None),
 ];
 
 // ── Query filters ─────────────────────────────────────────────────────────────
