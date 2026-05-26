@@ -161,6 +161,9 @@ struct WorkflowHandleClientInner {
     update_handlers: Vec<crate::info::UpdateHandlerInfo>,
     query_handlers: Vec<crate::info::QueryHandlerInfo>,
     max_workflow_input_bytes: u64,
+    max_workflow_execution_timeout: Option<Duration>,
+    max_workflow_start_delay: Duration,
+    max_signal_payload_bytes: u64,
 }
 
 impl std::fmt::Debug for WorkflowHandleClientInner {
@@ -177,6 +180,9 @@ impl std::fmt::Debug for WorkflowHandleClientInner {
             .field("update_handlers_count", &self.update_handlers.len())
             .field("query_handlers_count", &self.query_handlers.len())
             .field("max_workflow_input_bytes", &self.max_workflow_input_bytes)
+            .field("max_workflow_execution_timeout", &self.max_workflow_execution_timeout)
+            .field("max_workflow_start_delay", &self.max_workflow_start_delay)
+            .field("max_signal_payload_bytes", &self.max_signal_payload_bytes)
             .finish()
     }
 }
@@ -230,6 +236,9 @@ impl WorkflowHandleClient {
                 update_handlers: Vec::new(),
                 query_handlers: Vec::new(),
                 max_workflow_input_bytes: crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
+                max_workflow_execution_timeout: None,
+                max_workflow_start_delay: crate::builder::DEFAULT_MAX_WORKFLOW_START_DELAY,
+                max_signal_payload_bytes: crate::builder::DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
             }),
         }
     }
@@ -277,6 +286,54 @@ impl WorkflowHandleClient {
         Self {
             inner: Arc::new(inner),
         }
+    }
+
+    /// Add the global max workflow execution timeout ceiling to the client.
+    #[must_use]
+    pub fn with_max_workflow_execution_timeout(self, ceiling: Option<Duration>) -> Self {
+        let mut inner = (*self.inner).clone();
+        inner.max_workflow_execution_timeout = ceiling;
+        Self {
+            inner: Arc::new(inner),
+        }
+    }
+
+    /// Add the global max workflow start delay to the client.
+    #[must_use]
+    pub fn with_max_workflow_start_delay(self, ceiling: Duration) -> Self {
+        let mut inner = (*self.inner).clone();
+        inner.max_workflow_start_delay = ceiling;
+        Self {
+            inner: Arc::new(inner),
+        }
+    }
+
+    /// Add the global max signal payload bytes to the client.
+    #[must_use]
+    pub fn with_max_signal_payload_bytes(self, bytes: u64) -> Self {
+        let mut inner = (*self.inner).clone();
+        inner.max_signal_payload_bytes = bytes;
+        Self {
+            inner: Arc::new(inner),
+        }
+    }
+
+    /// Get the maximum allowed execution timeout.
+    #[must_use]
+    pub fn max_workflow_execution_timeout(&self) -> Option<Duration> {
+        self.inner.max_workflow_execution_timeout
+    }
+
+    /// Get the maximum allowed workflow start delay.
+    #[must_use]
+    pub fn max_workflow_start_delay(&self) -> Duration {
+        self.inner.max_workflow_start_delay
+    }
+
+    /// Get the maximum allowed signal payload bytes.
+    #[must_use]
+    pub fn max_signal_payload_bytes(&self) -> u64 {
+        self.inner.max_signal_payload_bytes
     }
 
     /// Get the effective max workflow input bytes for a workflow.
@@ -342,6 +399,12 @@ impl WorkflowHandle {
     #[must_use]
     pub const fn exec_id(&self) -> ExecutionId {
         self.exec_id
+    }
+
+    /// Return the handle client associated with this handle.
+    #[must_use]
+    pub const fn client(&self) -> &WorkflowHandleClient {
+        &self.client
     }
 
     /// Return the current compact result snapshot without waiting.

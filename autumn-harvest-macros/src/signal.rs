@@ -140,6 +140,19 @@ pub fn signal_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         #(#params),*
                     ) -> ::autumn_harvest::HarvestResult<()> {
                         let payload = #serialize_payload;
+                        let size = ::autumn_harvest::serde_json::to_string(&payload)
+                            .map(|s| s.len() as u64)
+                            .unwrap_or(0);
+                        let limit = handle.client().max_signal_payload_bytes();
+                        if size > limit {
+                            return Err(::autumn_harvest::error::HarvestError::PayloadTooLarge {
+                                kind: ::autumn_harvest::error::PayloadKind::SignalPayload,
+                                observed_bytes: size,
+                                cap_bytes: limit,
+                                workflow_type: #workflow_simple_name.to_string(),
+                                activity_name: None,
+                            });
+                        }
                         ::autumn_harvest::signal::send_signal(
                             conn,
                             handle.exec_id(),
@@ -165,6 +178,19 @@ pub fn signal_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             #(#params),*
                         ) -> ::autumn_harvest::HarvestResult<()> {
                             let payload = #serialize_payload;
+                            let size = ::autumn_harvest::serde_json::to_string(&payload)
+                                .map(|s| s.len() as u64)
+                                .unwrap_or(0);
+                            let limit = handle.client().max_signal_payload_bytes();
+                            if size > limit {
+                                return Err(::autumn_harvest::error::HarvestError::PayloadTooLarge {
+                                    kind: ::autumn_harvest::error::PayloadKind::SignalPayload,
+                                    observed_bytes: size,
+                                    cap_bytes: limit,
+                                    workflow_type: #workflow_simple_name.to_string(),
+                                    activity_name: None,
+                                });
+                            }
                             ::autumn_harvest::signal::send_signal(
                                 conn,
                                 handle.exec_id(),
