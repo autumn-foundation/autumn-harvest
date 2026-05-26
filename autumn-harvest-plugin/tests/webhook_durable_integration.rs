@@ -76,7 +76,7 @@ async fn test_durable_signed_webhook_via_harvest_workflow() {
     });
 
     manager
-        .dispatch(&state, "order.completed", &payload)
+        .dispatch(state, "order.completed", &payload)
         .await
         .unwrap();
 

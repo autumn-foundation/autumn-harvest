@@ -312,7 +312,7 @@ dependencies = [
 [[package]]
 name = "autumn-macros"
 version = "0.4.0"
-source = "git+https://github.com/madmax983/autumn?branch=feature%2Foutbound-webhooks#7de0139cd2eb3779c9f43432005be0649002a6f3"
+source = "git+https://github.com/madmax983/autumn?branch=feature%2Foutbound-webhooks#bfa9ac0e4a64107e405a8b0652e230a05fc06dd2"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -322,7 +322,7 @@ dependencies = [
 [[package]]
 name = "autumn-web"
 version = "0.4.0"
-source = "git+https://github.com/madmax983/autumn?branch=feature%2Foutbound-webhooks#7de0139cd2eb3779c9f43432005be0649002a6f3"
+source = "git+https://github.com/madmax983/autumn?branch=feature%2Foutbound-webhooks#bfa9ac0e4a64107e405a8b0652e230a05fc06dd2"
 dependencies = [
  "aes-gcm",
  "autumn-macros",
@@ -3492,7 +3492,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27c6023962132f4b30eb4c172c91ce92d933da334c59c23cddee82358ddafb0b"
 dependencies = [
  "anyhow",
- "itertools 0.13.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "syn 2.0.117",

@@ -196,7 +196,7 @@ impl Plugin for HarvestPlugin {
                     tracing::info!("on_startup hook: executing start_harvest_runtime");
                     let res = start_harvest_runtime(&state, &slot, &api_state);
                     match &res {
-                        Ok(_) => tracing::info!(
+                        Ok(()) => tracing::info!(
                             "on_startup hook: start_harvest_runtime completed successfully"
                         ),
                         Err(e) => tracing::error!(
@@ -228,6 +228,7 @@ impl Plugin for HarvestPlugin {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn start_harvest_runtime(
     state: &AppState,
     slot: &Arc<Mutex<HarvestRuntimeSlot>>,
@@ -351,12 +352,14 @@ fn start_harvest_runtime(
     .with_query_timeout(query_timeout)
     .with_history_policy(runner.api_runtime().registry().history_policy());
     state.insert_extension(harvest_db_pool.clone());
-    state.insert_extension(workflow_handle_client.clone());
+
+    #[cfg(feature = "webhooks")]
+    let client = workflow_handle_client.clone();
+    state.insert_extension(workflow_handle_client);
 
     #[cfg(feature = "webhooks")]
     {
         tracing::info!("HarvestPlugin: inserting WebhookDelegateExt into AppState extensions");
-        let client = workflow_handle_client;
         let delegate = std::sync::Arc::new(
             move |state: &AppState,
                   sub: autumn_web::webhook_outbound::WebhookSubscription,
@@ -383,12 +386,12 @@ fn start_harvest_runtime(
                         execution_timeout: None,
                         memo: None,
                         search_attrs: None,
-                        reuse_policy: Default::default(),
+                        reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
                         trace_context: None,
                         max_execution_timeout_ceiling: None,
                         concurrency_key: None,
                         concurrency_limit: None,
-                        priority: Default::default(),
+                        priority: autumn_harvest::prelude::Priority::default(),
                         max_workflow_input_bytes,
                         start_at: None,
                         delay: None,

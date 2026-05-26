@@ -20,6 +20,7 @@ pub struct WebhookDeliveryInput {
 }
 
 #[workflow]
+#[allow(clippy::missing_errors_doc)]
 pub async fn webhook_delivery(
     ctx: &WorkflowContext,
     input: WebhookDeliveryInput,
@@ -44,6 +45,7 @@ pub async fn webhook_delivery(
     max_concurrent = 20,
     concurrency_key = "webhooks"
 )]
+#[allow(clippy::missing_errors_doc, clippy::too_many_lines)]
 pub async fn deliver_webhook(
     ctx: &ActivityContext,
     input: WebhookDeliveryInput,
@@ -97,7 +99,7 @@ pub async fn deliver_webhook(
     let signing_payload = format!("{}.{}", timestamp, input.payload);
     let signature =
         autumn_web::security::hmac_sha256_hex(sub.secret.as_bytes(), signing_payload.as_bytes());
-    let signature_header = format!("t={},v1={}", timestamp, signature);
+    let signature_header = format!("t={timestamp},v1={signature}");
 
     let mut request_headers = HashMap::new();
     request_headers.insert("Content-Type".to_owned(), "application/json".to_owned());
@@ -134,7 +136,7 @@ pub async fn deliver_webhook(
         .text_body(input.payload.clone());
 
     let response = req.send().await;
-    let elapsed = start.elapsed().as_millis() as u64;
+    let elapsed = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
     log.elapsed_ms = elapsed;
     log.timestamp = Utc::now();
@@ -144,7 +146,7 @@ pub async fn deliver_webhook(
             let status = res.status();
             log.response_status = Some(status.as_u16());
             let is_success = res.is_success();
-            let body_str = res.text().to_owned();
+            let body_str = res.text();
             log.response_body = Some(body_str);
 
             if is_success {
@@ -152,7 +154,7 @@ pub async fn deliver_webhook(
                 manager.store().log_delivery(log).await.ok();
                 Ok(serde_json::json!({ "delivered": true }))
             } else {
-                let status_err = format!("server returned status: {}", status);
+                let status_err = format!("server returned status: {status}");
                 log.last_error = Some(status_err.clone());
                 manager.store().log_delivery(log).await.ok();
 

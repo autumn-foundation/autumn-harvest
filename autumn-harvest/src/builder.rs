@@ -731,7 +731,7 @@ impl HarvestBuilder {
     }
 
     /// Access mutable worker configuration.
-    pub fn worker_config_mut(&mut self) -> &mut WorkerConfig {
+    pub const fn worker_config_mut(&mut self) -> &mut WorkerConfig {
         &mut self.worker_config
     }
 
