@@ -1,14 +1,14 @@
 #![cfg(feature = "webhooks")]
 
-use std::sync::Arc;
-use std::time::Duration;
-use autumn_web::test::{TestApp, TestDb};
-use autumn_web::webhook_outbound::{
-    InMemoryOutboundWebhookHandler, OutboundWebhookPlugin, WebhookSubscription,
-    WebhookSubscriptionStatus, WebhookOutboundManager
-};
 use autumn_harvest::prelude::WorkerConfig;
 use autumn_harvest_plugin::HarvestPlugin;
+use autumn_web::test::{TestApp, TestDb};
+use autumn_web::webhook_outbound::{
+    InMemoryOutboundWebhookHandler, OutboundWebhookPlugin, WebhookOutboundManager,
+    WebhookSubscription, WebhookSubscriptionStatus,
+};
+use std::sync::Arc;
+use std::time::Duration;
 
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
@@ -17,7 +17,9 @@ async fn test_durable_signed_webhook_via_harvest_workflow() {
 
     // 1. Initialize TestDb and run pending migrations
     let db = TestDb::shared().await;
-    unsafe { std::env::set_var("AUTUMN_DATABASE__URL", db.url()); }
+    unsafe {
+        std::env::set_var("AUTUMN_DATABASE__URL", db.url());
+    }
     autumn_web::migrate::run_pending(db.url(), autumn_web::migrate::FRAMEWORK_MIGRATIONS)
         .expect("failed to run framework migrations");
     autumn_web::migrate::run_pending(db.url(), autumn_harvest::MIGRATIONS)
@@ -25,7 +27,8 @@ async fn test_durable_signed_webhook_via_harvest_workflow() {
 
     // Clean tables before test run
     db.execute_sql("TRUNCATE TABLE autumn_jobs CASCADE").await;
-    db.execute_sql("TRUNCATE TABLE harvest_workflow_executions CASCADE").await;
+    db.execute_sql("TRUNCATE TABLE harvest_workflow_executions CASCADE")
+        .await;
 
     // 2. Setup the Webhook Outbound Plugin with a process-local InMemory handler
     let handler = Arc::new(InMemoryOutboundWebhookHandler::new());

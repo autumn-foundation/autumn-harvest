@@ -1,15 +1,15 @@
 #![cfg(feature = "webhooks")]
 
-use std::collections::HashMap;
-use std::time::Duration;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
+use std::time::Duration;
 
 use autumn_harvest::prelude::*;
 use autumn_web::AppState;
 use autumn_web::webhook_outbound::{
-    WebhookDeliveryLog, WebhookSubscriptionStatus, WebhookOutboundManager
+    WebhookDeliveryLog, WebhookOutboundManager, WebhookSubscriptionStatus,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,28 +55,37 @@ pub async fn deliver_webhook(
         )
     })?;
 
-    let manager = app_state.extension::<WebhookOutboundManager>().ok_or_else(|| {
-        ActivityFailure::non_retryable(
-            "ConfigError",
-            "WebhookOutboundManager not registered in AppState extensions",
-        )
-    })?;
+    let manager = app_state
+        .extension::<WebhookOutboundManager>()
+        .ok_or_else(|| {
+            ActivityFailure::non_retryable(
+                "ConfigError",
+                "WebhookOutboundManager not registered in AppState extensions",
+            )
+        })?;
 
     // Load active subscriptions for topic from the handler
-    let subs = manager.store().get_subscriptions(&input.topic).await.map_err(|e| {
-        ActivityFailure::non_retryable(
-            "StorageError",
-            format!("failed to fetch subscriptions: {e}"),
-        )
-    })?;
+    let subs = manager
+        .store()
+        .get_subscriptions(&input.topic)
+        .await
+        .map_err(|e| {
+            ActivityFailure::non_retryable(
+                "StorageError",
+                format!("failed to fetch subscriptions: {e}"),
+            )
+        })?;
 
-    let sub = subs.into_iter().find(|s| s.id == input.subscription_id).ok_or_else(|| {
-        // If subscription is not active or deleted, fail fast and don't retry
-        ActivityFailure::non_retryable(
-            "SubscriptionNotFound",
-            format!("active subscription {} not found", input.subscription_id),
-        )
-    })?;
+    let sub = subs
+        .into_iter()
+        .find(|s| s.id == input.subscription_id)
+        .ok_or_else(|| {
+            // If subscription is not active or deleted, fail fast and don't retry
+            ActivityFailure::non_retryable(
+                "SubscriptionNotFound",
+                format!("active subscription {} not found", input.subscription_id),
+            )
+        })?;
 
     if sub.status == WebhookSubscriptionStatus::Disabled {
         tracing::info!(subscription_id = %sub.id, "Webhook subscription is disabled; skipping delivery");
@@ -86,10 +95,8 @@ pub async fn deliver_webhook(
     // Stripe-style payload signing: t=<timestamp>,v1=<signature>
     let timestamp = Utc::now().timestamp();
     let signing_payload = format!("{}.{}", timestamp, input.payload);
-    let signature = autumn_web::security::hmac_sha256_hex(
-        sub.secret.as_bytes(),
-        signing_payload.as_bytes(),
-    );
+    let signature =
+        autumn_web::security::hmac_sha256_hex(sub.secret.as_bytes(), signing_payload.as_bytes());
     let signature_header = format!("t={},v1={}", timestamp, signature);
 
     let mut request_headers = HashMap::new();
@@ -148,10 +155,13 @@ pub async fn deliver_webhook(
                 let status_err = format!("server returned status: {}", status);
                 log.last_error = Some(status_err.clone());
                 manager.store().log_delivery(log).await.ok();
-                
+
                 // Return activity failure to trigger Harvest retry
                 if is_dlq {
-                    Err(ActivityFailure::non_retryable("DeliveryFailedPermanent", status_err))
+                    Err(ActivityFailure::non_retryable(
+                        "DeliveryFailedPermanent",
+                        status_err,
+                    ))
                 } else {
                     Err(ActivityFailure::retryable("DeliveryFailed", status_err))
                 }
@@ -163,7 +173,10 @@ pub async fn deliver_webhook(
             manager.store().log_delivery(log).await.ok();
 
             if is_dlq {
-                Err(ActivityFailure::non_retryable("DeliveryFailedPermanent", error_str))
+                Err(ActivityFailure::non_retryable(
+                    "DeliveryFailedPermanent",
+                    error_str,
+                ))
             } else {
                 Err(ActivityFailure::retryable("DeliveryFailed", error_str))
             }
