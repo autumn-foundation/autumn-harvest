@@ -32,12 +32,14 @@ use serde_json::Value;
 
 use autumn_harvest::Schedule;
 use autumn_harvest::audit::{
-    OP_SCHEDULE_DELETE, OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_WORKFLOW_CANCEL,
-    OP_WORKFLOW_RESET, OP_WORKFLOW_SIGNAL, SOURCE_API, SOURCE_UI, STATUS_FAILED, STATUS_SUCCEEDED,
-    TARGET_SCHEDULE, TARGET_WORKFLOW, insert_audit,
+    OP_SCHEDULE_DELETE, OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER,
+    OP_WORKFLOW_CANCEL, OP_WORKFLOW_RESET, OP_WORKFLOW_SIGNAL, SOURCE_API, SOURCE_UI,
+    STATUS_FAILED, STATUS_SUCCEEDED, TARGET_SCHEDULE, TARGET_WORKFLOW, insert_audit,
 };
 use autumn_harvest::cancel_workflow_execution;
 use autumn_harvest::error::{HarvestResult, database_error};
+use autumn_harvest::start_or_load_workflow_execution;
+use autumn_harvest::StartWorkflowParams;
 use autumn_harvest::models::{
     DeadLetter, ExternalTask, HarvestEvent, HarvestSchedule, HarvestSignal, HarvestTimer,
     NewAuditRecord, ScheduleDecision, TaskQueueItem, WorkflowExecution,
@@ -52,7 +54,7 @@ use autumn_harvest::schema::{
 };
 use autumn_harvest::signal::send_signal;
 use autumn_harvest::store::admit_update_event;
-use autumn_harvest::types::{ShardId, UpdateId};
+use autumn_harvest::types::{ExecutionId as HarvestExecutionId, Priority, ShardId, UpdateId, WorkflowIdReusePolicy};
 use autumn_harvest::workers::{WorkerFilters, WorkerHealth, WorkerRow, list_workers};
 
 use crate::api::{
@@ -460,6 +462,7 @@ pub fn harvest_ui_router(api_state: HarvestApiState) -> Router<AppState> {
         .route("/schedules/{id}/pause", post(schedule_pause_ui))
         .route("/schedules/{id}/resume", post(schedule_resume_ui))
         .route("/schedules/{id}/delete", post(schedule_delete_ui))
+        .route("/schedules/{id}/trigger-now", post(schedule_trigger_now_ui))
         .layer(Extension(api_state))
 }
 
@@ -4087,6 +4090,96 @@ async fn schedule_delete_ui(
     schedule_redirect(&flash)
 }
 
+async fn schedule_trigger_now_ui(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id_str): Path<String>,
+) -> axum::response::Response {
+    let found = match find_schedule_row(&api_state, &id_str).await {
+        Ok(f) => f,
+        Err(response) => return response,
+    };
+
+    let flash = if let Some((row, mut conn)) = found {
+        let name = schedule_name(&row);
+        let workflow_name = row
+            .workflow_name
+            .as_deref()
+            .or(row.dag_name.as_deref())
+            .unwrap_or("")
+            .to_string();
+        let input = row.workflow_input.clone().unwrap_or(serde_json::Value::Null);
+        let queue = row
+            .queue_name
+            .as_deref()
+            .unwrap_or("default")
+            .to_string();
+        let triggered_at = chrono::Utc::now();
+        let workflow_id = format!(
+            "manual-{}-{}",
+            row.id,
+            triggered_at.timestamp_millis()
+        );
+        let exec_id = HarvestExecutionId::new();
+
+        let result = start_or_load_workflow_execution(
+            &mut conn,
+            StartWorkflowParams {
+                workflow_name: &workflow_name,
+                workflow_id: &workflow_id,
+                exec_id,
+                input,
+                parent_id: None,
+                queue_name: &queue,
+                execution_timeout: None,
+                memo: None,
+                search_attrs: None,
+                reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
+                trace_context: None,
+                max_execution_timeout_ceiling: None,
+                concurrency_key: None,
+                concurrency_limit: None,
+                priority: Priority::default(),
+                max_workflow_input_bytes: 0,
+                start_at: None,
+                delay: None,
+                max_workflow_start_delay: None,
+            },
+        )
+        .await;
+
+        let ar = NewAuditRecord {
+            actor: "ui",
+            operation: OP_SCHEDULE_TRIGGER,
+            target_type: TARGET_SCHEDULE,
+            target_id: Some(id_str.as_str()),
+            route_or_command: "POST /ui/schedules/trigger-now",
+            request_id: None,
+            idempotency_key: None,
+            status: if result.is_ok() {
+                STATUS_SUCCEEDED
+            } else {
+                STATUS_FAILED
+            },
+            error_summary: if result.is_err() {
+                Some("start_failed")
+            } else {
+                None
+            },
+            shard_id: None,
+            source: SOURCE_API,
+        };
+        let _ = insert_audit(&mut conn, &ar).await;
+
+        match result {
+            Ok(_) => format!("Triggered run of {name}"),
+            Err(e) => format!("Failed to trigger {name}: {e}"),
+        }
+    } else {
+        format!("Schedule {} not found", &id_str[..8.min(id_str.len())])
+    };
+    schedule_redirect(&flash)
+}
+
 async fn schedule_bulk_pause_ui(
     Extension(api_state): Extension<HarvestApiState>,
     Form(params): Form<ScheduleBulkParams>,
@@ -4537,6 +4630,17 @@ fn render_schedule_table(
                                         onsubmit="return confirm('Resume this schedule?')" {
                                         button type="submit" { "Resume" }
                                     }
+                                }
+                                form method="post"
+                                    action={ "schedules/" (id_str) "/trigger-now" }
+                                    onsubmit={
+                                        @if row.is_paused {
+                                            "return confirm('This schedule is paused. Force a manual run anyway?')"
+                                        } @else {
+                                            "return confirm('Trigger a one-off run of this schedule now?')"
+                                        }
+                                    } {
+                                    button.secondary type="submit" { "Run now" }
                                 }
                                 form method="post"
                                     action={ "schedules/" (id_str) "/delete" }

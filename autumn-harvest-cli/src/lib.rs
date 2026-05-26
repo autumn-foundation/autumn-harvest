@@ -893,6 +893,17 @@ enum ScheduleCommand {
         /// Schedule row ID (UUID).
         id: String,
     },
+    /// Trigger an immediate one-off run of a schedule.
+    TriggerNow {
+        /// Schedule row ID (UUID).
+        id: String,
+        /// Optional free-text reason recorded in the audit trail.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Force-trigger even if the schedule is currently paused.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -2923,6 +2934,17 @@ fn schedule_request(command: &ScheduleCommand) -> Result<ApiRequest, CliError> {
                 path: format!("/admin/schedules/{}", path_segment(id)),
                 body: None,
             })
+        }
+        ScheduleCommand::TriggerNow { id, reason, force } => {
+            let mut body = serde_json::Map::new();
+            if let Some(r) = reason {
+                body.insert("reason".to_string(), Value::String(r.clone()));
+            }
+            let mut path = format!("/admin/schedules/{}/trigger", path_segment(id));
+            if *force {
+                path.push_str("?force=true");
+            }
+            Ok(ApiRequest::post(path, Some(Value::Object(body))))
         }
     }
 }
