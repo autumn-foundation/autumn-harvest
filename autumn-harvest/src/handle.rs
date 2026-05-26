@@ -787,22 +787,13 @@ impl WorkflowHandle {
         crate::store::admit_update_event(conn, self.exec_id, update_id, name.to_string(), input)
             .await?;
         crate::queue::wake_workflow_task(conn, self.exec_id).await?;
-        let shard = self.shard();
         let start = Instant::now();
         let poll_interval = Duration::from_millis(100);
 
         loop {
             let result = {
-                let mut temp_conn = self
-                    .client
-                    .inner
-                    .pools
-                    .pool_for(shard)
-                    .get()
-                    .await
-                    .map_err(|error| HarvestError::Database(error.to_string()))?;
                 let h = crate::store::load_history_with_codecs(
-                    &mut temp_conn,
+                    conn,
                     self.exec_id,
                     &self.client.inner.payload_codecs,
                 )

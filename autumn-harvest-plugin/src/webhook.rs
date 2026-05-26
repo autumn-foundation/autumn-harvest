@@ -78,19 +78,57 @@ pub async fn deliver_webhook(
             )
         })?;
 
-    let sub = subs
-        .into_iter()
-        .find(|s| s.id == input.subscription_id)
-        .ok_or_else(|| {
-            // If subscription is not active or deleted, fail fast and don't retry
-            ActivityFailure::non_retryable(
-                "SubscriptionNotFound",
-                format!("active subscription {} not found", input.subscription_id),
-            )
-        })?;
+    let Some(sub) = subs.into_iter().find(|s| s.id == input.subscription_id) else {
+        // If subscription is not active or deleted, fail fast and don't retry,
+        // but write a failed delivery log for auditability before returning.
+        let attempt = ctx.attempt().unwrap_or(1);
+        let log = WebhookDeliveryLog {
+            id: uuid::Uuid::new_v4().to_string(),
+            subscription_id: input.subscription_id.clone(),
+            topic: input.topic.clone(),
+            payload: input.payload.clone(),
+            request_headers: HashMap::new(),
+            response_status: None,
+            response_body: None,
+            elapsed_ms: 0,
+            attempt,
+            max_attempts: 5,
+            is_dlq: false,
+            last_error: Some(format!(
+                "SubscriptionNotFound: active subscription {} not found",
+                input.subscription_id
+            )),
+            timestamp: Utc::now(),
+        };
+        manager.store().log_delivery(log).await.ok();
+
+        return Err(ActivityFailure::non_retryable(
+            "SubscriptionNotFound",
+            format!("active subscription {} not found", input.subscription_id),
+        ));
+    };
 
     if sub.status == WebhookSubscriptionStatus::Disabled {
         tracing::info!(subscription_id = %sub.id, "Webhook subscription is disabled; skipping delivery");
+
+        let attempt = ctx.attempt().unwrap_or(1);
+        let log = WebhookDeliveryLog {
+            id: uuid::Uuid::new_v4().to_string(),
+            subscription_id: sub.id.clone(),
+            topic: input.topic.clone(),
+            payload: input.payload.clone(),
+            request_headers: HashMap::new(),
+            response_status: None,
+            response_body: None,
+            elapsed_ms: 0,
+            attempt,
+            max_attempts: 5,
+            is_dlq: false,
+            last_error: Some("SubscriptionDisabled: Webhook subscription is disabled".to_owned()),
+            timestamp: Utc::now(),
+        };
+        manager.store().log_delivery(log).await.ok();
+
         return Ok(serde_json::json!({ "skipped": true }));
     }
 
@@ -107,7 +145,6 @@ pub async fn deliver_webhook(
 
     let attempt = ctx.attempt().unwrap_or(1);
     let max_attempts = 5;
-    let is_dlq = attempt >= max_attempts;
 
     let mut log = WebhookDeliveryLog {
         id: uuid::Uuid::new_v4().to_string(),
@@ -120,7 +157,7 @@ pub async fn deliver_webhook(
         elapsed_ms: 0,
         attempt,
         max_attempts,
-        is_dlq,
+        is_dlq: false,
         last_error: None,
         timestamp: Utc::now(),
     };
@@ -151,15 +188,18 @@ pub async fn deliver_webhook(
 
             if is_success {
                 log.last_error = None;
+                log.is_dlq = false;
                 manager.store().log_delivery(log).await.ok();
                 Ok(serde_json::json!({ "delivered": true }))
             } else {
                 let status_err = format!("server returned status: {status}");
                 log.last_error = Some(status_err.clone());
+                let is_exhausted = attempt >= max_attempts;
+                log.is_dlq = is_exhausted;
                 manager.store().log_delivery(log).await.ok();
 
                 // Return activity failure to trigger Harvest retry
-                if is_dlq {
+                if is_exhausted {
                     Err(ActivityFailure::non_retryable(
                         "DeliveryFailedPermanent",
                         status_err,
@@ -172,9 +212,11 @@ pub async fn deliver_webhook(
         Err(e) => {
             let error_str = e.to_string();
             log.last_error = Some(error_str.clone());
+            let is_exhausted = attempt >= max_attempts;
+            log.is_dlq = is_exhausted;
             manager.store().log_delivery(log).await.ok();
 
-            if is_dlq {
+            if is_exhausted {
                 Err(ActivityFailure::non_retryable(
                     "DeliveryFailedPermanent",
                     error_str,
