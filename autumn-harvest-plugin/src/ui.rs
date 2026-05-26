@@ -265,6 +265,9 @@ pub(crate) struct BuildRoutingListParams {
     /// Flash message forwarded after a form action redirect.
     #[serde(default)]
     flash: Option<String>,
+    /// When set, filter tables to entries related to this build ID.
+    #[serde(default)]
+    build_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3688,13 +3691,38 @@ async fn list_build_routing_ui(
     let shard_error_refs: Vec<(ShardId, &str)> =
         shard_errors.iter().map(|(s, e)| (*s, e.as_str())).collect();
 
+    // Apply optional build_id filter to narrow tables for drill-down from workers/executions.
+    let build_id_filter = params.build_id.as_deref().filter(|s| !s.is_empty());
+    let filtered_policies: Vec<BuildPolicy> = if let Some(bid) = build_id_filter {
+        policies.into_iter().filter(|p| p.build_id == bid).collect()
+    } else {
+        policies
+    };
+    let filtered_compat: Vec<BuildCompatEntry> = if let Some(bid) = build_id_filter {
+        all_compat
+            .into_iter()
+            .filter(|e| e.build_id == bid || e.compatible_with == bid)
+            .collect()
+    } else {
+        all_compat
+    };
+    let filtered_reach: Vec<BuildReachability> = if let Some(bid) = build_id_filter {
+        reachability
+            .into_iter()
+            .filter(|r| r.build_id == bid)
+            .collect()
+    } else {
+        reachability
+    };
+
     Ok(render_build_routing_page(
-        &policies,
-        &all_compat,
-        &reachability,
+        &filtered_policies,
+        &filtered_compat,
+        &filtered_reach,
         &shard_error_refs,
         is_multi_shard,
         params.flash.as_deref(),
+        build_id_filter,
     ))
 }
 
@@ -3703,26 +3731,30 @@ async fn build_routing_set_policy_ui(
     Form(form): Form<BuildRoutingSetPolicyForm>,
 ) -> Result<axum::response::Response, AutumnError> {
     let pool = api_state.storage_pool().map_err(map_error)?;
-    let mut conn = acquire_conn(pool.default_pool()).await?;
-
     let deployment_name = form.deployment_name.as_deref().filter(|s| !s.is_empty());
-
-    let result = set_build_policy(
-        &mut conn,
-        form.queue_name.trim(),
-        form.build_id.trim(),
-        deployment_name,
-    )
-    .await;
-
-    let flash = match result {
-        Ok(p) => url_encode(&format!(
+    // Fan out to all shards so every shard's get_build_policy() sees the new policy
+    // when evaluating assigned_build_id at workflow start time.
+    let mut last_policy = None;
+    for (_, shard_pool) in pool.iter_shards() {
+        let mut conn = acquire_conn(shard_pool).await?;
+        let p = set_build_policy(
+            &mut conn,
+            form.queue_name.trim(),
+            form.build_id.trim(),
+            deployment_name,
+        )
+        .await
+        .map_err(map_error)?;
+        last_policy = Some(p);
+    }
+    let flash = match last_policy {
+        Some(p) => url_encode(&format!(
             "Build policy for queue '{}' set to '{}'",
             p.queue_name, p.build_id
         )),
-        Err(e) => url_encode(&format!("Failed to set build policy: {e}")),
+        None => url_encode("No shards configured"),
     };
-    Ok(axum::response::Redirect::to(&format!("build-routing?flash={flash}")).into_response())
+    Ok(axum::response::Redirect::to(&format!("../build-routing?flash={flash}")).into_response())
 }
 
 async fn build_routing_declare_compat_ui(
@@ -3730,18 +3762,23 @@ async fn build_routing_declare_compat_ui(
     Form(form): Form<BuildRoutingCompatForm>,
 ) -> Result<axum::response::Response, AutumnError> {
     let pool = api_state.storage_pool().map_err(map_error)?;
-    let mut conn = acquire_conn(pool.default_pool()).await?;
-
-    let result = declare_compat(&mut conn, form.build_id.trim(), form.compatible_with.trim()).await;
-
-    let flash = match result {
-        Ok(e) => url_encode(&format!(
+    // Fan out to all shards so load_compat_set() on each shard picks up the declaration.
+    let mut last_entry = None;
+    for (_, shard_pool) in pool.iter_shards() {
+        let mut conn = acquire_conn(shard_pool).await?;
+        let e = declare_compat(&mut conn, form.build_id.trim(), form.compatible_with.trim())
+            .await
+            .map_err(map_error)?;
+        last_entry = Some(e);
+    }
+    let flash = match last_entry {
+        Some(e) => url_encode(&format!(
             "Declared: '{}' compatible with '{}'",
             e.build_id, e.compatible_with
         )),
-        Err(e) => url_encode(&format!("Failed to declare compatibility: {e}")),
+        None => url_encode("No shards configured"),
     };
-    Ok(axum::response::Redirect::to(&format!("build-routing?flash={flash}")).into_response())
+    Ok(axum::response::Redirect::to(&format!("../build-routing?flash={flash}")).into_response())
 }
 
 async fn build_routing_revoke_compat_ui(
@@ -3749,22 +3786,27 @@ async fn build_routing_revoke_compat_ui(
     Form(form): Form<BuildRoutingCompatForm>,
 ) -> Result<axum::response::Response, AutumnError> {
     let pool = api_state.storage_pool().map_err(map_error)?;
-    let mut conn = acquire_conn(pool.default_pool()).await?;
-
-    let result = revoke_compat(&mut conn, form.build_id.trim(), form.compatible_with.trim()).await;
-
-    let flash = match result {
-        Ok(true) => url_encode(&format!(
+    // Fan out revoke to all shards.
+    let mut any_revoked = false;
+    for (_, shard_pool) in pool.iter_shards() {
+        let mut conn = acquire_conn(shard_pool).await?;
+        let revoked = revoke_compat(&mut conn, form.build_id.trim(), form.compatible_with.trim())
+            .await
+            .map_err(map_error)?;
+        any_revoked |= revoked;
+    }
+    let flash = if any_revoked {
+        url_encode(&format!(
             "Revoked compatibility: '{}' → '{}'",
             form.build_id, form.compatible_with
-        )),
-        Ok(false) => url_encode(&format!(
+        ))
+    } else {
+        url_encode(&format!(
             "No compatibility declaration found for '{}' → '{}'",
             form.build_id, form.compatible_with
-        )),
-        Err(e) => url_encode(&format!("Failed to revoke compatibility: {e}")),
+        ))
     };
-    Ok(axum::response::Redirect::to(&format!("build-routing?flash={flash}")).into_response())
+    Ok(axum::response::Redirect::to(&format!("../build-routing?flash={flash}")).into_response())
 }
 
 async fn build_routing_retire_ui(
@@ -3804,7 +3846,7 @@ async fn build_routing_retire_ui(
             ))
         }
     };
-    Ok(axum::response::Redirect::to(&format!("build-routing?flash={flash}")).into_response())
+    Ok(axum::response::Redirect::to(&format!("../build-routing?flash={flash}")).into_response())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3989,11 +4031,20 @@ fn render_build_routing_page(
     shard_errors: &[(ShardId, &str)],
     is_multi_shard: bool,
     flash: Option<&str>,
+    build_id_filter: Option<&str>,
 ) -> Markup {
     let is_empty = policies.is_empty() && reachability.is_empty() && all_compat.is_empty();
 
     let body = html! {
         h2 { "Build Routing" }
+
+        @if let Some(bid) = build_id_filter {
+            div style="background:#1e293b;border:1px solid #334155;border-radius:8px;padding:10px 14px;margin-bottom:12px;font-size:12px;color:#94a3b8" {
+                "Filtered to build " code style="color:#e2e8f0" { (bid) }
+                " · "
+                a href="build-routing" style="color:#60a5fa" { "Show all builds" }
+            }
+        }
 
         @if let Some(msg) = flash {
             div.flash { (msg) }
@@ -5936,7 +5987,7 @@ mod tests {
 
     #[test]
     fn render_build_routing_page_empty_state_shows_docs_link() {
-        let html = render_build_routing_page(&[], &[], &[], &[], false, None).into_string();
+        let html = render_build_routing_page(&[], &[], &[], &[], false, None, None).into_string();
         assert!(
             html.contains("No build routing configured") || html.contains("No build policies"),
             "empty state must show a 'no policies' message"
@@ -5957,7 +6008,8 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
-        let html = render_build_routing_page(&[policy], &[], &[], &[], false, None).into_string();
+        let html =
+            render_build_routing_page(&[policy], &[], &[], &[], false, None, None).into_string();
         assert!(html.contains("test-queue"), "must show queue name");
         assert!(html.contains("abc123"), "must show build_id");
         assert!(html.contains("prod-v2"), "must show deployment name");
@@ -5973,7 +6025,8 @@ mod tests {
             stale_workers: 1,
             safe_to_retire: false,
         };
-        let html = render_build_routing_page(&[], &[], &[reach], &[], false, None).into_string();
+        let html =
+            render_build_routing_page(&[], &[], &[reach], &[], false, None, None).into_string();
         assert!(html.contains("sha-old"), "must show build_id");
         assert!(html.contains("42"), "must show open_executions count");
         assert!(
@@ -5992,7 +6045,8 @@ mod tests {
             stale_workers: 0,
             safe_to_retire: true,
         };
-        let html = render_build_routing_page(&[], &[], &[reach], &[], false, None).into_string();
+        let html =
+            render_build_routing_page(&[], &[], &[reach], &[], false, None, None).into_string();
         assert!(
             html.contains("Retire"),
             "retire button must appear when safe_to_retire"
@@ -6011,7 +6065,8 @@ mod tests {
             compatible_with: "sha-old".to_string(),
             declared_at: chrono::Utc::now(),
         };
-        let html = render_build_routing_page(&[], &[entry], &[], &[], false, None).into_string();
+        let html =
+            render_build_routing_page(&[], &[entry], &[], &[], false, None, None).into_string();
         assert!(
             html.contains("sha-new"),
             "must show worker build in compat table"
@@ -6028,8 +6083,9 @@ mod tests {
 
     #[test]
     fn render_build_routing_page_flash_message_shown() {
-        let html = render_build_routing_page(&[], &[], &[], &[], false, Some("Policy updated"))
-            .into_string();
+        let html =
+            render_build_routing_page(&[], &[], &[], &[], false, Some("Policy updated"), None)
+                .into_string();
         assert!(
             html.contains("Policy updated"),
             "flash message must appear on page"
@@ -6038,7 +6094,7 @@ mod tests {
 
     #[test]
     fn render_build_routing_page_has_set_policy_form() {
-        let html = render_build_routing_page(&[], &[], &[], &[], false, None).into_string();
+        let html = render_build_routing_page(&[], &[], &[], &[], false, None, None).into_string();
         assert!(
             html.contains("set-policy"),
             "page must include Set Policy form action"
@@ -6055,7 +6111,7 @@ mod tests {
 
     #[test]
     fn render_build_routing_page_has_declare_compat_form() {
-        let html = render_build_routing_page(&[], &[], &[], &[], false, None).into_string();
+        let html = render_build_routing_page(&[], &[], &[], &[], false, None, None).into_string();
         assert!(
             html.contains("declare-compat"),
             "page must include Declare Compat form action"

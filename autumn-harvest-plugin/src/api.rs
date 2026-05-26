@@ -11406,6 +11406,9 @@ async fn list_build_routing_handler(
 }
 
 /// `POST /admin/build-routing/policies` — set the active build policy for a queue.
+///
+/// Fans out to all shards so every shard's `get_build_policy()` call sees the new
+/// policy when evaluating `assigned_build_id` at workflow-start time.
 async fn set_build_policy_handler(
     Extension(api_state): Extension<HarvestApiState>,
     axum::Json(body): axum::Json<SetBuildPolicyBody>,
@@ -11416,18 +11419,29 @@ async fn set_build_policy_handler(
         Ok(p) => p,
         Err(e) => return e.into_response(),
     };
-    let mut conn = match acquire_conn(pool.default_pool()).await {
-        Ok(c) => c,
-        Err(e) => return e.into_response(),
-    };
     let deployment = body.deployment_name.as_deref().filter(|s| !s.is_empty());
-    match set_build_policy(&mut conn, &body.queue_name, &body.build_id, deployment)
-        .await
-        .map_err(map_error)
-    {
-        Ok(policy) => (axum::http::StatusCode::OK, axum::Json(policy)).into_response(),
-        Err(e) => e.into_response(),
+    let mut last_policy = None;
+    for (_, shard_pool) in pool.iter_shards() {
+        let mut conn = match acquire_conn(shard_pool).await {
+            Ok(c) => c,
+            Err(e) => return e.into_response(),
+        };
+        let policy = match set_build_policy(&mut conn, &body.queue_name, &body.build_id, deployment)
+            .await
+            .map_err(map_error)
+        {
+            Ok(p) => p,
+            Err(e) => return e.into_response(),
+        };
+        last_policy = Some(policy);
     }
+    let Some(policy) = last_policy else {
+        return map_error(autumn_harvest::HarvestError::Config(
+            "no shards configured".into(),
+        ))
+        .into_response();
+    };
+    (axum::http::StatusCode::OK, axum::Json(policy)).into_response()
 }
 
 /// `GET /admin/build-routing/compat` — list all compatibility declarations.
@@ -11451,6 +11465,8 @@ async fn list_build_compat_handler(
 }
 
 /// `POST /admin/build-routing/compat` — declare that build A can absorb build B's histories.
+///
+/// Fans out to all shards so every shard's `load_compat_set()` picks up the declaration.
 async fn declare_compat_handler(
     Extension(api_state): Extension<HarvestApiState>,
     axum::Json(body): axum::Json<DeclareCompatBody>,
@@ -11461,20 +11477,33 @@ async fn declare_compat_handler(
         Ok(p) => p,
         Err(e) => return e.into_response(),
     };
-    let mut conn = match acquire_conn(pool.default_pool()).await {
-        Ok(c) => c,
-        Err(e) => return e.into_response(),
-    };
-    match declare_compat(&mut conn, &body.build_id, &body.compatible_with)
-        .await
-        .map_err(map_error)
-    {
-        Ok(entry) => (axum::http::StatusCode::CREATED, axum::Json(entry)).into_response(),
-        Err(e) => e.into_response(),
+    let mut last_entry = None;
+    for (_, shard_pool) in pool.iter_shards() {
+        let mut conn = match acquire_conn(shard_pool).await {
+            Ok(c) => c,
+            Err(e) => return e.into_response(),
+        };
+        let entry = match declare_compat(&mut conn, &body.build_id, &body.compatible_with)
+            .await
+            .map_err(map_error)
+        {
+            Ok(e) => e,
+            Err(e) => return e.into_response(),
+        };
+        last_entry = Some(entry);
     }
+    let Some(entry) = last_entry else {
+        return map_error(autumn_harvest::HarvestError::Config(
+            "no shards configured".into(),
+        ))
+        .into_response();
+    };
+    (axum::http::StatusCode::CREATED, axum::Json(entry)).into_response()
 }
 
 /// `DELETE /admin/build-routing/compat/{build_id}/{compat_with}` — revoke a declaration.
+///
+/// Fans out to all shards. Returns `revoked=true` if any shard had the row.
 async fn revoke_compat_handler(
     Extension(api_state): Extension<HarvestApiState>,
     axum::extract::Path((build_id, compat_with)): axum::extract::Path<(String, String)>,
@@ -11485,17 +11514,25 @@ async fn revoke_compat_handler(
         Ok(p) => p,
         Err(e) => return e.into_response(),
     };
-    let mut conn = match acquire_conn(pool.default_pool()).await {
-        Ok(c) => c,
-        Err(e) => return e.into_response(),
-    };
-    match revoke_compat(&mut conn, &build_id, &compat_with)
-        .await
-        .map_err(map_error)
-    {
-        Ok(revoked) => axum::Json(RevokeCompatResponse { revoked }).into_response(),
-        Err(e) => e.into_response(),
+    let mut any_revoked = false;
+    for (_, shard_pool) in pool.iter_shards() {
+        let mut conn = match acquire_conn(shard_pool).await {
+            Ok(c) => c,
+            Err(e) => return e.into_response(),
+        };
+        let revoked = match revoke_compat(&mut conn, &build_id, &compat_with)
+            .await
+            .map_err(map_error)
+        {
+            Ok(r) => r,
+            Err(e) => return e.into_response(),
+        };
+        any_revoked |= revoked;
     }
+    axum::Json(RevokeCompatResponse {
+        revoked: any_revoked,
+    })
+    .into_response()
 }
 
 /// `POST /admin/build-routing/retire` — confirm a build is safe to retire.
