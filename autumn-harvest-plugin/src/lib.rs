@@ -13,6 +13,9 @@ pub mod ui;
 pub mod version_gate_retirement;
 pub mod version_usage;
 
+#[cfg(feature = "webhooks")]
+pub mod webhook;
+
 pub use api::{
     HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
     management_api_request_fields, management_api_response_fields, management_api_routes,
