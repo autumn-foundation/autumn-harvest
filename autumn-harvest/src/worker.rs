@@ -428,6 +428,7 @@ fn should_requeue_signal_wait(commands: &[WorkflowCommand]) -> bool {
                 | WorkflowCommand::RecordMarker { .. }
                 | WorkflowCommand::RecordUpdateResult { .. }
                 | WorkflowCommand::UpsertSearchAttributes { .. }
+                | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
         )
     });
 
@@ -3742,11 +3743,17 @@ fn terminal_history_event_count(next_event_id: i32, pending_cmds: &[WorkflowComm
         .saturating_add(1)
 }
 
-fn marker_event_count(commands: &[WorkflowCommand]) -> u64 {
+fn pre_suspension_event_count(commands: &[WorkflowCommand]) -> u64 {
     u64::try_from(
         commands
             .iter()
-            .filter(|cmd| matches!(cmd, WorkflowCommand::RecordMarker { .. }))
+            .filter(|cmd| {
+                matches!(
+                    cmd,
+                    WorkflowCommand::RecordMarker { .. }
+                        | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
+                )
+            })
             .count(),
     )
     .unwrap_or(u64::MAX)
@@ -3783,8 +3790,8 @@ async fn suspended_command_event_count(
     commands: &[WorkflowCommand],
 ) -> HarvestResult<u64> {
     let update_events = pending_update_result_event_count(commands);
-    let marker_events = marker_event_count(commands);
-    let bookkeeping_events = update_events.saturating_add(marker_events);
+    let pre_susp_events = pre_suspension_event_count(commands);
+    let bookkeeping_events = update_events.saturating_add(pre_susp_events);
 
     if should_requeue_signal_wait(commands) {
         return Ok(bookkeeping_events);
@@ -4446,7 +4453,8 @@ async fn process_workflow_task(
                 }
             }
         }
-        _ => pending_update_result_event_count(&pending_cmds),
+        _ => pending_update_result_event_count(&pending_cmds)
+            .saturating_add(pre_suspension_event_count(&pending_cmds)),
     };
     let current_history_event_count = u64::try_from(history_events.len())
         .unwrap_or(u64::MAX)
@@ -4504,6 +4512,14 @@ async fn process_workflow_task(
         persist_update_result_commands(conn, prepared.exec_id, &pending_cmds, &mut next_event_id)
             .await?;
         persist_search_attrs_from_commands(conn, prepared.exec_id, &pending_cmds).await?;
+        // Create detached child executions first (DB side-effects only).
+        // Child rows must exist before we write the parent's ChildWorkflowSpawnedDetached
+        // event so that a crash between the two leaves the DB in a retryable state:
+        // on retry the spawn command is re-emitted, child creation is idempotent, and
+        // the parent event is written fresh. The reverse order would produce an orphaned
+        // history event with no corresponding child row.
+        create_detached_child_executions(conn, registry, &prepared.execution, &pending_cmds)
+            .await?;
         // Write pre-terminal events (markers + detached-spawn) in command order,
         // before the terminal event. next_event_id is advanced so persist_workflow_outcome
         // places the terminal event immediately after them.
@@ -4516,11 +4532,6 @@ async fn process_workflow_task(
                     crate::error::HarvestError::Database("Event ID overflow".to_string())
                 })?;
         }
-        // Create any detached child executions emitted alongside the terminal outcome.
-        // SpawnDetachedChildWorkflow is fire-and-forget: the parent does not suspend,
-        // so the command appears in pending_cmds alongside Complete/Fail/ContinuedAsNew.
-        create_detached_child_executions(conn, registry, &prepared.execution, &pending_cmds)
-            .await?;
         // Keep the in-memory execution snapshot current so that
         // persist_workflow_continue_as_new copies the patched attrs to the
         // successor row rather than the stale pre-patch snapshot.
