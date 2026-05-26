@@ -139,7 +139,7 @@ pub fn signal_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         handle: &::autumn_harvest::WorkflowHandle,
                         #(#params),*
                     ) -> ::autumn_harvest::HarvestResult<()> {
-                        handle.validate_workflow_type(#workflow_simple_name).await?;
+                        handle.validate_workflow_type(conn, #workflow_simple_name).await?;
                         let payload = #serialize_payload;
                         let size = ::autumn_harvest::serde_json::to_string(&payload)
                             .map(|s| s.len() as u64)
@@ -178,7 +178,7 @@ pub fn signal_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             handle: &::autumn_harvest::WorkflowHandle,
                             #(#params),*
                         ) -> ::autumn_harvest::HarvestResult<()> {
-                            handle.validate_workflow_type(#workflow_simple_name).await?;
+                            handle.validate_workflow_type(conn, #workflow_simple_name).await?;
                             let payload = #serialize_payload;
                             let size = ::autumn_harvest::serde_json::to_string(&payload)
                                 .map(|s| s.len() as u64)

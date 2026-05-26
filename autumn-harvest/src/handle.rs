@@ -416,8 +416,21 @@ impl WorkflowHandle {
     ///
     /// Returns a [`HarvestError::Config`] mismatch error if the workflow type
     /// does not match, or database/not-found errors if the execution cannot be resolved.
-    pub async fn validate_workflow_type(&self, expected_name: &str) -> HarvestResult<()> {
-        let execution = self.load_execution().await?;
+    pub async fn validate_workflow_type(
+        &self,
+        conn: &mut AsyncPgConnection,
+        expected_name: &str,
+    ) -> HarvestResult<()> {
+        let execution = harvest_workflow_executions::table
+            .find(self.exec_id.as_uuid())
+            .select(WorkflowExecution::as_select())
+            .first(conn)
+            .await
+            .optional()
+            .map_err(database_error)?
+            .ok_or_else(|| {
+                HarvestError::NotFound(format!("workflow execution {}", self.exec_id))
+            })?;
         if execution.workflow_name != expected_name {
             return Err(HarvestError::Config(format!(
                 "workflow type mismatch: execution '{}' has type '{}', but expected '{}'",
@@ -720,13 +733,13 @@ impl WorkflowHandle {
     /// Returns update execution, admission, or polling timeout errors.
     pub async fn execute_update_in_process(
         &self,
-        _conn: &mut AsyncPgConnection,
+        conn: &mut AsyncPgConnection,
         workflow_name: &str,
         name: &str,
         input: Value,
         timeout: Duration,
     ) -> HarvestResult<Value> {
-        self.validate_workflow_type(workflow_name).await?;
+        self.validate_workflow_type(conn, workflow_name).await?;
         let shard = self.shard();
         let mut own_conn = self
             .client
