@@ -15,10 +15,8 @@ use serde_json::{Value, json};
 
 #[workflow]
 #[allow(clippy::missing_errors_doc)]
-pub async fn poll_customer_exports(
-    ctx: &WorkflowContext,
-    mut state: Value,
-) -> HarvestResult<Value> {
+pub async fn poll_customer_exports(ctx: &WorkflowContext, state: Value) -> HarvestResult<Value> {
+    let mut state = state;
     loop {
         let cycle = state.get("cycle").and_then(Value::as_u64).unwrap_or(0);
         let cursor = state.get("cursor").cloned().unwrap_or(Value::Null);

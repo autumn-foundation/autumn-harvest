@@ -99,6 +99,13 @@ pub const METRIC_SCHEDULE_RUNS: &str = "harvest.schedule.runs";
 /// Counter: incremented each time a scheduled run is skipped.
 pub const METRIC_SCHEDULE_SKIPPED: &str = "harvest.schedule.skipped";
 
+/// Counter: incremented each time `POST /admin/schedules/{id}/trigger` fires a
+/// one-off run (issue #343).
+///
+/// Labels: `schedule.name` (low-cardinality), `outcome` (`"fired"` or
+/// `"skipped_overlap"` or `"rejected_paused"`).
+pub const METRIC_SCHEDULE_MANUAL_TRIGGER: &str = "harvest.schedule.manual_trigger";
+
 /// Counter: incremented when a schedule decision write fails due to a database error.
 pub const METRIC_SCHEDULE_DECISION_WRITE_FAILED: &str = "harvest.schedule.decision_write_failed";
 
@@ -628,6 +635,17 @@ pub trait MetricsRecorder: Send + Sync {
     ///
     /// Maps to the counter `harvest.schedule.decision_write_failed`.
     fn record_schedule_decision_write_failed(&self) {}
+
+    /// A manual `POST /admin/schedules/{id}/trigger` call completed (issue #343).
+    ///
+    /// `schedule_name` is the workflow or DAG name the schedule targets
+    /// (low-cardinality, same cardinality as `record_schedule_run`).
+    /// `outcome` is `"fired"`, `"skipped_overlap"`, or `"rejected_paused"`.
+    ///
+    /// Maps to the counter `harvest.schedule.manual_trigger{schedule.name, outcome}`.
+    fn record_schedule_manual_trigger(&self, schedule_name: &str, outcome: &str) {
+        let _ = (schedule_name, outcome);
+    }
 
     /// A query handler invocation completed (issue #234).
     ///

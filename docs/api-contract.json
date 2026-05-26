@@ -2750,6 +2750,91 @@
       ]
     },
     {
+      "method": "POST",
+      "path": "/admin/schedules/{id}/trigger",
+      "category": "schedule",
+      "read_only": false,
+      "description": "Trigger an immediate one-off run of a schedule without advancing its next_fire_at cursor. Reuses the schedule's workflow, input, queue, and overlap policy contract.",
+      "idempotency": "Not strictly idempotent: each call that succeeds starts a new execution with a unique workflow_id derived from the current timestamp.",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Schedule UUID."
+        },
+        {
+          "name": "force",
+          "in": "query",
+          "required": false,
+          "description": "If true, trigger even if the schedule is paused. Default: false."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "reason",
+            "type": "string",
+            "required": false,
+            "description": "Optional free-text reason recorded in the audit trail."
+          },
+          {
+            "name": "overlap_policy",
+            "type": "string",
+            "required": false,
+            "description": "Optional override of the schedule's configured overlap policy (e.g. 'skip', 'buffer_one')."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 200,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "execution_id",
+            "type": "string",
+            "required": false,
+            "description": "UUID of the started execution. Absent when the run was suppressed by overlap policy."
+          },
+          {
+            "name": "workflow_id",
+            "type": "string",
+            "description": "Derived workflow ID for the manual run."
+          },
+          {
+            "name": "triggered_at",
+            "type": "string",
+            "description": "RFC 3339 timestamp when the trigger was processed."
+          },
+          {
+            "name": "outcome",
+            "type": "string",
+            "description": "\"fired\" when a new execution was started; \"skipped_overlap\" when the effective overlap policy suppressed the run."
+          }
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 409,
+          "description": "Schedule is paused and force=true was not passed."
+        },
+        {
+          "status": 404,
+          "description": "Schedule not found."
+        },
+        {
+          "status": 400,
+          "description": "Invalid overlap_policy override."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
       "method": "GET",
       "path": "/admin/schedules/{id}/preview",
       "category": "schedule",

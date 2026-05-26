@@ -11,6 +11,20 @@
 /// resolution local to this crate, where the `migrations/` directory always
 /// ships alongside.
 #[cfg(feature = "db")]
+#[macro_export]
+macro_rules! cfg_db {
+    ($($item:item)*) => {
+        $($item)*
+    };
+}
+
+#[cfg(not(feature = "db"))]
+#[macro_export]
+macro_rules! cfg_db {
+    ($($item:item)*) => {};
+}
+
+#[cfg(feature = "db")]
 pub const MIGRATIONS: diesel_migrations::EmbeddedMigrations =
     diesel_migrations::embed_migrations!();
 
@@ -57,6 +71,8 @@ pub mod failure;
 pub mod guardrail;
 #[cfg(feature = "db")]
 pub mod handle;
+#[cfg(feature = "db")]
+pub mod handle_typed;
 pub mod history_export;
 pub mod info;
 /// `metrics` crate adapter for [`telemetry::MetricsRecorder`].
@@ -188,6 +204,10 @@ pub use handle::{
     StartedWorkflowHandle, WorkflowHandle, WorkflowHandleClient, WorkflowResult,
     WorkflowResultState, start_or_load_workflow_execution_with_handle,
 };
+#[cfg(feature = "db")]
+pub use handle_typed::{
+    TypedSignalWithStartOptions, TypedStartOptions, TypedWorkflowHandle, TypedWorkflowResult,
+};
 pub use history_export::{
     DEFAULT_HISTORY_EXPORT_MAX_BYTES, HISTORY_EXPORT_SCHEMA, HISTORY_EXPORT_VERSION,
     HistoryExportDocument, HistoryExportError, HistoryExportRequest, HistoryExportSizeLimit,
@@ -258,10 +278,19 @@ pub use store::EventHistory;
 pub use models::{AuditRecord, NewAuditRecord};
 
 #[cfg(feature = "db")]
+pub use diesel;
+#[cfg(feature = "db")]
+pub use diesel_async;
+
+#[cfg(feature = "db")]
 pub use queue::{ConcurrencyKeyStats, QueueScalingSignal, QueueTaskCounts, queue_task_counts};
 
 // Allow macro-generated code to use ::autumn_harvest::serde_json
 pub use serde_json;
+// Allow macro-generated code to use ::autumn_harvest::serde
+pub use serde;
+// Allow macro-generated code to use ::autumn_harvest::chrono
+pub use chrono;
 // Allow macro-generated code to use ::autumn_harvest::futures.
 #[doc(hidden)]
 pub use futures;

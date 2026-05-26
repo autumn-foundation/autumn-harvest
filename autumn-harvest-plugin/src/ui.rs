@@ -31,10 +31,11 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use autumn_harvest::Schedule;
+use autumn_harvest::StartWorkflowParams;
 use autumn_harvest::audit::{
     OP_BUILD_COMPAT_DECLARE, OP_BUILD_COMPAT_REVOKE, OP_BUILD_POLICY_SET, OP_SCHEDULE_DELETE,
-    OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_WORKFLOW_CANCEL, OP_WORKFLOW_RESET,
-    OP_WORKFLOW_SIGNAL, SOURCE_API, SOURCE_UI, STATUS_FAILED, STATUS_SUCCEEDED,
+    OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER, OP_WORKFLOW_CANCEL,
+    OP_WORKFLOW_RESET, OP_WORKFLOW_SIGNAL, SOURCE_API, SOURCE_UI, STATUS_FAILED, STATUS_SUCCEEDED,
     TARGET_BUILD_ROUTING, TARGET_SCHEDULE, TARGET_WORKFLOW, insert_audit,
 };
 use autumn_harvest::build_routing::{
@@ -56,14 +57,17 @@ use autumn_harvest::schema::{
     harvest_signals, harvest_task_queue, harvest_timers, harvest_workflow_executions,
 };
 use autumn_harvest::signal::send_signal;
+use autumn_harvest::start_or_load_workflow_execution;
 use autumn_harvest::store::admit_update_event;
-use autumn_harvest::types::{ShardId, UpdateId};
+use autumn_harvest::types::{
+    ExecutionId as HarvestExecutionId, Priority, ShardId, UpdateId, WorkflowIdReusePolicy,
+};
 use autumn_harvest::workers::{WorkerFilters, WorkerHealth, WorkerRow, list_workers};
 
 use crate::api::{
-    HarvestApiState, KNOWN_WORKFLOW_STATES, WorkflowFilters, acquire_conn, db_conn_for_execution,
-    load_execution, load_workflows_from_shards, map_error, parse_execution_id,
-    require_harvest_admin,
+    HarvestApiRuntime, HarvestApiState, KNOWN_WORKFLOW_STATES, WorkflowFilters, acquire_conn,
+    db_conn_for_execution, load_execution, load_workflows_from_shards, map_error,
+    parse_execution_id, require_harvest_admin,
 };
 
 const DEFAULT_PAGE_SIZE: i64 = 25;
@@ -514,6 +518,7 @@ pub fn harvest_ui_router(api_state: HarvestApiState) -> Router<AppState> {
         .route("/schedules/{id}/pause", post(schedule_pause_ui))
         .route("/schedules/{id}/resume", post(schedule_resume_ui))
         .route("/schedules/{id}/delete", post(schedule_delete_ui))
+        .route("/schedules/{id}/trigger-now", post(schedule_trigger_now_ui))
         .layer(Extension(api_state))
 }
 
@@ -4853,6 +4858,227 @@ async fn schedule_delete_ui(
     schedule_redirect(&flash)
 }
 
+/// Inner logic for `schedule_trigger_now_ui` after the connection is acquired.
+/// Handles the Skip overlap check, start call, audit write, and metric emit,
+/// then returns the redirect response so the outer handler stays compact.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn execute_schedule_trigger_ui(
+    conn: &mut crate::api::PoolConn,
+    pool: &crate::HarvestDbPool,
+    runtime: &HarvestApiRuntime,
+    row: &HarvestSchedule,
+    id_str: &str,
+    name: &str,
+    workflow_name: &str,
+    input: serde_json::Value,
+    queue: &str,
+) -> axum::response::Response {
+    // Count RUNNING executions across ALL shards. The async block returns None if
+    // any shard is unreachable — used for fail-closed Skip enforcement.
+    let running_count: Option<i64> = async {
+        let mut total: i64 = 0;
+        for (_, shard_pool) in pool.iter_shards() {
+            let mut c = acquire_conn(shard_pool).await.ok()?;
+            let n: i64 = harvest_workflow_executions::table
+                .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
+                .filter(harvest_workflow_executions::state.eq("RUNNING"))
+                .count()
+                .get_result(&mut c)
+                .await
+                .ok()?;
+            total += n;
+        }
+        Some(total)
+    }
+    .await;
+    if autumn_harvest::OverlapPolicy::from_db(&row.overlap_policy)
+        == autumn_harvest::OverlapPolicy::Skip
+    {
+        match running_count {
+            None => {
+                let ar = build_trigger_audit("ui", id_str, STATUS_FAILED, Some("count_failed"));
+                let _ = insert_audit(conn, &ar).await;
+                runtime
+                    .registry()
+                    .telemetry()
+                    .metrics
+                    .record_schedule_manual_trigger(name, "start_failed");
+                return schedule_redirect(&format!(
+                    "Failed to trigger {name}: could not count active runs"
+                ));
+            }
+            Some(n) if n >= i64::from(row.max_active_runs) => {
+                let ar =
+                    build_trigger_audit("ui", id_str, STATUS_SUCCEEDED, Some("skipped_overlap"));
+                let _ = insert_audit(conn, &ar).await;
+                runtime
+                    .registry()
+                    .telemetry()
+                    .metrics
+                    .record_schedule_manual_trigger(name, "skipped_overlap");
+                return schedule_redirect(&format!(
+                    "Skipped {name}: max_active_runs already reached"
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    let triggered_at = chrono::Utc::now();
+    let workflow_id = format!(
+        "manual-{}-{}-{}",
+        row.id,
+        triggered_at.timestamp_millis(),
+        uuid::Uuid::new_v4().simple()
+    );
+    let exec_id = HarvestExecutionId::new();
+    let result = start_or_load_workflow_execution(
+        conn,
+        StartWorkflowParams {
+            workflow_name,
+            workflow_id: &workflow_id,
+            exec_id,
+            input,
+            parent_id: None,
+            queue_name: queue,
+            execution_timeout: None,
+            memo: None,
+            search_attrs: None,
+            reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
+            trace_context: None,
+            max_execution_timeout_ceiling: None,
+            concurrency_key: None,
+            concurrency_limit: None,
+            priority: Priority::default(),
+            max_workflow_input_bytes: 0,
+            start_at: None,
+            delay: None,
+            max_workflow_start_delay: None,
+        },
+    )
+    .await;
+    let (status, outcome) = if result.is_ok() {
+        (STATUS_SUCCEEDED, "fired")
+    } else {
+        (STATUS_FAILED, "start_failed")
+    };
+    let ar = build_trigger_audit(
+        "ui",
+        id_str,
+        status,
+        result.is_err().then_some("start_failed"),
+    );
+    let _ = insert_audit(conn, &ar).await;
+    runtime
+        .registry()
+        .telemetry()
+        .metrics
+        .record_schedule_manual_trigger(name, outcome);
+    schedule_redirect(&match result {
+        Ok(_) => format!("Triggered run of {name}"),
+        Err(e) => format!("Failed to trigger {name}: {e}"),
+    })
+}
+
+/// Build a `NewAuditRecord` for UI schedule trigger operations.
+const fn build_trigger_audit<'a>(
+    actor: &'a str,
+    target_id: &'a str,
+    status: &'a str,
+    error_summary: Option<&'a str>,
+) -> NewAuditRecord<'a> {
+    NewAuditRecord {
+        actor,
+        operation: OP_SCHEDULE_TRIGGER,
+        target_type: TARGET_SCHEDULE,
+        target_id: Some(target_id),
+        route_or_command: "POST /ui/schedules/trigger-now",
+        request_id: None,
+        idempotency_key: None,
+        status,
+        error_summary,
+        shard_id: None,
+        source: SOURCE_API,
+    }
+}
+
+/// Resolve `(workflow_name, input, queue)` for a manual trigger, consulting the
+/// runtime registry for DAG-backed schedules so the correct default queue is used.
+fn resolve_trigger_params(
+    row: &HarvestSchedule,
+    runtime: &HarvestApiRuntime,
+) -> Result<(String, serde_json::Value, String), String> {
+    match (row.workflow_name.as_deref(), row.dag_name.as_deref()) {
+        (Some(wf), _) => {
+            let q = row.queue_name.as_deref().unwrap_or("default").to_string();
+            Ok((
+                wf.to_string(),
+                row.workflow_input
+                    .clone()
+                    .unwrap_or(serde_json::Value::Null),
+                q,
+            ))
+        }
+        (None, Some(dag)) => {
+            let q = runtime
+                .dags()
+                .get(dag)
+                .and_then(|d| d.default_queue.as_deref())
+                .or(row.queue_name.as_deref())
+                .unwrap_or("default")
+                .to_string();
+            Ok((dag.to_string(), serde_json::Value::Null, q))
+        }
+        (None, None) => Err("schedule has no workflow or dag name".to_string()),
+    }
+}
+
+async fn schedule_trigger_now_ui(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id_str): Path<String>,
+) -> axum::response::Response {
+    let found = match find_schedule_row(&api_state, &id_str).await {
+        Ok(f) => f,
+        Err(response) => return response,
+    };
+    let Some((row, _)) = found else {
+        return schedule_redirect(&format!(
+            "Schedule {} not found",
+            &id_str[..8.min(id_str.len())]
+        ));
+    };
+    let name = schedule_name(&row);
+    let runtime = match api_state.runtime() {
+        Ok(r) => r,
+        Err(e) => return schedule_redirect(&format!("Failed to trigger {name}: {e}")),
+    };
+    let (workflow_name, input, queue) = match resolve_trigger_params(&row, &runtime) {
+        Ok(p) => p,
+        Err(e) => return schedule_redirect(&format!("Failed to trigger {name}: {e}")),
+    };
+    let pool = match api_state.storage_pool() {
+        Ok(p) => p,
+        Err(e) => return schedule_redirect(&format!("Failed to trigger {name}: {e}")),
+    };
+    // Use default_pool() so ExecutionId::new() (ShardId::UNENCODED) and the
+    // connection target agree — consistent with the API handler's routing.
+    let mut conn = match acquire_conn(pool.default_pool()).await {
+        Ok(c) => c,
+        Err(e) => return schedule_redirect(&format!("Failed to trigger {name}: {e}")),
+    };
+    execute_schedule_trigger_ui(
+        &mut conn,
+        &pool,
+        &runtime,
+        &row,
+        &id_str,
+        &name,
+        &workflow_name,
+        input,
+        &queue,
+    )
+    .await
+}
+
 async fn schedule_bulk_pause_ui(
     Extension(api_state): Extension<HarvestApiState>,
     Form(params): Form<ScheduleBulkParams>,
@@ -5303,6 +5529,17 @@ fn render_schedule_table(
                                         onsubmit="return confirm('Resume this schedule?')" {
                                         button type="submit" { "Resume" }
                                     }
+                                }
+                                form method="post"
+                                    action={ "schedules/" (id_str) "/trigger-now" }
+                                    onsubmit={
+                                        @if row.is_paused {
+                                            "return confirm('This schedule is paused. Force a manual run anyway?')"
+                                        } @else {
+                                            "return confirm('Trigger a one-off run of this schedule now?')"
+                                        }
+                                    } {
+                                    button.secondary type="submit" { "Run now" }
                                 }
                                 form method="post"
                                     action={ "schedules/" (id_str) "/delete" }
