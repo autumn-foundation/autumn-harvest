@@ -515,14 +515,28 @@ struct SuspendedWorkflowContext<'a> {
     execute_span: &'a tracing::Span,
 }
 
-/// Collect pre-suspension events from the command list, preserving command order.
+/// Builds the complete ordered event list for a suspension batch by iterating
+/// `commands` in emission order.
 ///
-/// Includes both `MarkerRecorded` (from `RecordMarker`) and
-/// `ChildWorkflowSpawnedDetached` (from `SpawnDetachedChildWorkflow`) so that
-/// the parent history reflects the exact command emission order. All other
-/// command types produce their events through the suspension-path persistence
-/// functions and are not included here.
-fn pre_suspension_events_from_commands(commands: &[WorkflowCommand]) -> Vec<WorkflowEvent> {
+/// For each command:
+/// - `RecordMarker` → `MarkerRecorded`
+/// - `SpawnDetachedChildWorkflow` → `ChildWorkflowSpawnedDetached`
+/// - Any other command → whatever `branch_event(cmd)` returns (`None` = skip)
+///
+/// Preserving exact command emission order is required by the replay engine's
+/// sequential cursor: `match_detached_child_spawn` and all branch-event matchers
+/// use a strict position-based cursor, so `ChildWorkflowSpawnedDetached` events
+/// must appear at the same relative position as their `SpawnDetachedChildWorkflow`
+/// commands rather than always being pre-pended before branch events.
+///
+/// Suspension paths without branch events (signal-wait, activity-wait) call this
+/// via `pre_suspension_events_from_commands`; paths with branch events (schedule-
+/// activity, start-timer, start-child-workflow, schedule-external) pass a closure
+/// that emits the appropriate event for each matching command type.
+fn build_suspension_events<F>(commands: &[WorkflowCommand], mut branch_event: F) -> Vec<WorkflowEvent>
+where
+    F: FnMut(&WorkflowCommand) -> Option<WorkflowEvent>,
+{
     commands
         .iter()
         .filter_map(|cmd| match cmd {
@@ -543,9 +557,16 @@ fn pre_suspension_events_from_commands(commands: &[WorkflowCommand]) -> Vec<Work
                 input: input.clone(),
                 parent_close_policy: *parent_close_policy,
             }),
-            _ => None,
+            other => branch_event(other),
         })
         .collect()
+}
+
+/// Collects `MarkerRecorded` and `ChildWorkflowSpawnedDetached` events in command
+/// emission order for suspension paths that have no branch-specific events
+/// (signal-wait park, activity-wait park).
+fn pre_suspension_events_from_commands(commands: &[WorkflowCommand]) -> Vec<WorkflowEvent> {
+    build_suspension_events(commands, |_| None)
 }
 
 fn extract_single_command<T>(
@@ -1945,8 +1966,9 @@ async fn persist_scheduled_activities(
     assigned_build_id: Option<&str>,
     parent_priority: i32,
 ) -> HarvestResult<()> {
-    let marker_events = pre_suspension_events_from_commands(commands);
-    let mut events = marker_events;
+    // activity_events is built in scheduled_activities order (= ScheduleActivity command order).
+    // After the loop we interleave them with marker/detached-spawn events in full command order.
+    let mut activity_events: Vec<WorkflowEvent> = Vec::with_capacity(scheduled_activities.len());
     let mut enqueued = Vec::with_capacity(scheduled_activities.len());
 
     for scheduled in scheduled_activities {
@@ -2033,7 +2055,7 @@ async fn persist_scheduled_activities(
             params.rate_limit_key = Some(key);
         }
 
-        events.push(WorkflowEvent::ActivityScheduled {
+        activity_events.push(WorkflowEvent::ActivityScheduled {
             activity_id: scheduled.activity_id,
             name: scheduled.name.clone(),
             input: scheduled.input.clone(),
@@ -2051,6 +2073,18 @@ async fn persist_scheduled_activities(
         .in_scope(|| registry.telemetry().capture_trace_context());
         enqueued.push(params);
     }
+
+    // Build the event list in command emission order: markers, detached-spawn events, and
+    // ActivityScheduled events are interleaved at their actual command positions so that
+    // the replay engine's sequential cursor sees the same order as command emission.
+    let mut act_iter = activity_events.into_iter();
+    let events = build_suspension_events(commands, |cmd| {
+        if matches!(cmd, WorkflowCommand::ScheduleActivity { .. }) {
+            act_iter.next()
+        } else {
+            None
+        }
+    });
 
     conn.transaction::<(), HarvestError, _>(|conn| {
         async move {
@@ -2096,16 +2130,19 @@ async fn persist_started_timer(
     };
 
     let is_new = existing.is_none();
-    let marker_events = pre_suspension_events_from_commands(commands);
-    let mut events = marker_events;
-
-    if is_new {
-        let timer_started = WorkflowEvent::TimerStarted {
-            timer_id: timer.timer_id.clone(),
-            duration_secs: timer.duration_secs,
-        };
-        events.push(timer_started);
-    }
+    // Build the event list in command emission order. TimerStarted (for new timers) is
+    // interleaved with marker/detached-spawn events at its actual command position.
+    let mut timer_event = is_new.then(|| WorkflowEvent::TimerStarted {
+        timer_id: timer.timer_id.clone(),
+        duration_secs: timer.duration_secs,
+    });
+    let events = build_suspension_events(commands, |cmd| {
+        if matches!(cmd, WorkflowCommand::StartTimer { .. }) {
+            timer_event.take()
+        } else {
+            None
+        }
+    });
 
     // Emit a span for the timer placement (not to be confused with
     // harvest.timer.fire which is emitted when the timer actually fires).
@@ -2226,8 +2263,50 @@ async fn persist_all_started_child_workflows(
     let parent_exec_id = execution_id_from_uuid(parent_execution.id);
     let queue_name = parent_execution.queue_name.clone();
     let children = children.to_vec();
-    // Compute marker events outside the transaction (WorkflowCommand is not Clone).
-    let marker_events = pre_suspension_events_from_commands(commands);
+    // Pre-compute position-tagged pre-suspension events (markers + detached-spawns) and
+    // the command indices of StartChildWorkflow commands so that inside the transaction —
+    // after learning which children are genuinely new — we can merge everything into a
+    // single event list in command emission order.
+    let pre_events_by_pos: Vec<(usize, WorkflowEvent)> = commands
+        .iter()
+        .enumerate()
+        .filter_map(|(i, cmd)| match cmd {
+            WorkflowCommand::RecordMarker { name, details } => Some((
+                i,
+                WorkflowEvent::MarkerRecorded {
+                    name: name.clone(),
+                    details: details.clone(),
+                },
+            )),
+            WorkflowCommand::SpawnDetachedChildWorkflow {
+                child_id,
+                workflow_name,
+                input,
+                parent_close_policy,
+            } => Some((
+                i,
+                WorkflowEvent::ChildWorkflowSpawnedDetached {
+                    child_id: *child_id,
+                    workflow_name: workflow_name.clone(),
+                    input: input.clone(),
+                    parent_close_policy: *parent_close_policy,
+                },
+            )),
+            _ => None,
+        })
+        .collect();
+    // children[k] corresponds to the k-th StartChildWorkflow command in `commands`.
+    let start_child_cmd_indices: Vec<usize> = commands
+        .iter()
+        .enumerate()
+        .filter_map(|(i, cmd)| {
+            if matches!(cmd, WorkflowCommand::StartChildWorkflow { .. }) {
+                Some(i)
+            } else {
+                None
+            }
+        })
+        .collect();
     let shard_id = parent_execution.shard_id;
 
     // Clone telemetry and execute_span before the transaction closure so they
@@ -2237,7 +2316,8 @@ async fn persist_all_started_child_workflows(
 
     conn.transaction::<(), HarvestError, _>(|conn| {
         let children = children.clone();
-        let marker_events = marker_events.clone();
+        let pre_events_by_pos = pre_events_by_pos.clone();
+        let start_child_cmd_indices = start_child_cmd_indices.clone();
         let queue_name = queue_name.clone();
         let telemetry = telemetry.clone();
         let execute_span = execute_span.clone();
@@ -2285,20 +2365,39 @@ async fn persist_all_started_child_workflows(
                 })
                 .collect();
 
-            // Append marker events + ChildWorkflowStarted for new children to parent.
-            // Use append_single_event rather than append_events(…, next_event_id) so
-            // that each insert re-reads MAX(event_id) under a parent-row FOR UPDATE
-            // lock.  This serializes against concurrent ChildWorkflowCompleted/Failed
-            // appends from sibling children that complete while this parent task is
-            // still RUNNING, preventing a UNIQUE(workflow_exec_id, event_id) collision.
-            let mut parent_events = marker_events;
-            for child in &new_children {
-                parent_events.push(WorkflowEvent::ChildWorkflowStarted {
-                    child_id: child.child_id,
-                    workflow_name: child.workflow_name.clone(),
-                    input: child.input.clone(),
-                });
-            }
+            // Build the parent event list in command emission order.
+            // Markers, detached-spawn events, and ChildWorkflowStarted events are
+            // interleaved at their actual command positions so the replay engine's
+            // sequential cursor sees the same order as command emission.
+            // append_single_event (not append_events) is used so each insert
+            // re-reads MAX(event_id) under the parent-row FOR UPDATE lock, serialising
+            // against concurrent ChildWorkflowCompleted/Failed appends from sibling
+            // children that complete while this parent task is still RUNNING.
+            let new_child_id_set: HashSet<uuid::Uuid> =
+                new_children.iter().map(|c| c.child_id.as_uuid()).collect();
+            let mut child_events_by_pos: Vec<(usize, WorkflowEvent)> = start_child_cmd_indices
+                .iter()
+                .zip(children.iter())
+                .filter_map(|(pos, child)| {
+                    if new_child_id_set.contains(&child.child_id.as_uuid()) {
+                        Some((
+                            *pos,
+                            WorkflowEvent::ChildWorkflowStarted {
+                                child_id: child.child_id,
+                                workflow_name: child.workflow_name.clone(),
+                                input: child.input.clone(),
+                            },
+                        ))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            let mut all_events_by_pos = pre_events_by_pos;
+            all_events_by_pos.append(&mut child_events_by_pos);
+            all_events_by_pos.sort_unstable_by_key(|(i, _)| *i);
+            let parent_events: Vec<WorkflowEvent> =
+                all_events_by_pos.into_iter().map(|(_, e)| e).collect();
             for event in parent_events {
                 store::append_single_event(conn, parent_exec_id, event).await?;
             }
@@ -3159,17 +3258,24 @@ async fn persist_scheduled_external_activity(
         return Ok(());
     }
 
-    let marker_events = pre_suspension_events_from_commands(commands);
-    let awaiting_event = WorkflowEvent::ActivityAwaitingExternal {
+    // Build the event list in command emission order so that ScheduleExternalActivity's
+    // ActivityAwaitingExternal event lands at its actual command position relative to any
+    // markers or detached-spawn events in the same batch.
+    let mut awaiting_event = Some(WorkflowEvent::ActivityAwaitingExternal {
         activity_id: scheduled.activity_id,
         token: scheduled.token,
         name: scheduled.name.clone(),
         input: scheduled.input.clone(),
         queue: scheduled.queue.clone(),
         schedule_to_close_secs: scheduled.schedule_to_close_secs,
-    };
-    let mut events = marker_events;
-    events.push(awaiting_event);
+    });
+    let events = build_suspension_events(commands, |cmd| {
+        if matches!(cmd, WorkflowCommand::ScheduleExternalActivity { .. }) {
+            awaiting_event.take()
+        } else {
+            None
+        }
+    });
 
     conn.transaction::<(), HarvestError, _>(|conn| {
         async move {
