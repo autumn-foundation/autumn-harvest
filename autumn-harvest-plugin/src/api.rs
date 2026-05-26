@@ -2276,7 +2276,7 @@ pub const fn management_api_response_fields()
         (
             "POST",
             "/admin/schedules/{id}/trigger",
-            Some(&["execution_id", "workflow_id", "triggered_at"]),
+            Some(&["execution_id", "workflow_id", "triggered_at", "outcome"]),
         ),
         ("DELETE", "/admin/schedules/{id}", Some(&["ok"])),
         ("GET", "/admin/schedules/{id}/preview", Some(&["entries"])),
@@ -6602,9 +6602,14 @@ struct TriggerScheduleQuery {
 /// Response for `POST /admin/schedules/{id}/trigger`.
 #[derive(Debug, Serialize)]
 struct ScheduleTriggerResponse {
-    execution_id: uuid::Uuid,
+    /// Present when an execution was actually started; absent when skipped by overlap policy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    execution_id: Option<uuid::Uuid>,
     workflow_id: String,
     triggered_at: chrono::DateTime<chrono::Utc>,
+    /// `"fired"` when a new execution was started, `"skipped_overlap"` when the
+    /// effective overlap policy suppressed the run.
+    outcome: String,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -6662,7 +6667,7 @@ async fn trigger_schedule_now(
     }
 
     // Resolve the effective overlap policy (body override takes precedence).
-    let _effective_overlap_policy = if let Some(ref op_str) = body.overlap_policy {
+    let effective_overlap_policy = if let Some(ref op_str) = body.overlap_policy {
         match autumn_harvest::OverlapPolicy::from_user_input(op_str) {
             Ok(op) => op,
             Err(e) => {
@@ -6713,6 +6718,32 @@ async fn trigger_schedule_now(
     // Derive a unique workflow_id from the schedule id and the trigger timestamp
     // so that retrying the same request within the same millisecond is idempotent.
     let workflow_id = format!("manual-{schedule_id}-{}", triggered_at.timestamp_millis());
+
+    // For Skip policy, count running executions across all shards and short-circuit
+    // before creating the execution row. Other policies are handled by the underlying
+    // start_or_load path (which uses AllowDuplicate on the per-call workflow_id).
+    if effective_overlap_policy == autumn_harvest::OverlapPolicy::Skip {
+        let running =
+            query_running_count_best_effort(&pool, &ScheduleKind::Workflow, &workflow_name).await;
+        if running >= i64::from(schedule.max_active_runs) {
+            runtime
+                .registry
+                .telemetry()
+                .metrics
+                .record_schedule_manual_trigger(&schedule_display_name, "skipped_overlap");
+            return Ok(Json(ScheduleTriggerResponse {
+                execution_id: None,
+                workflow_id,
+                triggered_at,
+                outcome: "skipped_overlap".to_string(),
+            }));
+        }
+    }
+
+    // ExecutionId::new() embeds ShardId::UNENCODED, which ShardRouter resolves to
+    // the default shard. This is consistent with how the scheduler fires executions
+    // (all schedule-initiated runs land on the default shard in single-shard
+    // deployments; multi-shard schedule pinning is a follow-up to issue #171).
     let exec_id = ExecutionId::new();
 
     let mut conn = acquire_conn(pool.default_pool()).await?;
@@ -6743,7 +6774,7 @@ async fn trigger_schedule_now(
     .await;
 
     let (exec_id_out, outcome) = match result {
-        Ok(exec_result) => (exec_result.exec_id.as_uuid(), "fired"),
+        Ok(exec_result) => (Some(exec_result.exec_id.as_uuid()), "fired"),
         Err(e) => {
             let ar = NewAuditRecord {
                 actor: &actor,
@@ -6763,7 +6794,7 @@ async fn trigger_schedule_now(
                 .registry
                 .telemetry()
                 .metrics
-                .record_schedule_manual_trigger(&schedule_display_name, "skipped_overlap");
+                .record_schedule_manual_trigger(&schedule_display_name, "start_failed");
             return Err(map_error(e));
         }
     };
@@ -6795,6 +6826,7 @@ async fn trigger_schedule_now(
         execution_id: exec_id_out,
         workflow_id,
         triggered_at,
+        outcome: outcome.to_string(),
     }))
 }
 

@@ -4101,19 +4101,55 @@ async fn schedule_trigger_now_ui(
         Err(response) => return response,
     };
 
-    let flash = if let Some((row, mut conn)) = found {
+    let flash = if let Some((row, _)) = found {
         let name = schedule_name(&row);
-        let workflow_name = row
-            .workflow_name
-            .as_deref()
-            .or(row.dag_name.as_deref())
-            .unwrap_or("")
-            .to_string();
-        let input = row
-            .workflow_input
-            .clone()
-            .unwrap_or(serde_json::Value::Null);
-        let queue = row.queue_name.as_deref().unwrap_or("default").to_string();
+
+        // Resolve workflow name, input, and queue — mirroring the API handler's
+        // logic so DAG-backed schedules get the runtime's default_queue.
+        let runtime = match api_state.runtime() {
+            Ok(r) => r,
+            Err(e) => return schedule_redirect(&format!("Failed to trigger {name}: {e}")),
+        };
+        let (workflow_name, input, queue) =
+            match (row.workflow_name.as_deref(), row.dag_name.as_deref()) {
+                (Some(wf), _) => {
+                    let q = row.queue_name.as_deref().unwrap_or("default").to_string();
+                    (
+                        wf.to_string(),
+                        row.workflow_input
+                            .clone()
+                            .unwrap_or(serde_json::Value::Null),
+                        q,
+                    )
+                }
+                (None, Some(dag)) => {
+                    let q = runtime
+                        .dags()
+                        .get(dag)
+                        .and_then(|d| d.default_queue.as_deref())
+                        .or(row.queue_name.as_deref())
+                        .unwrap_or("default")
+                        .to_string();
+                    (dag.to_string(), serde_json::Value::Null, q)
+                }
+                (None, None) => {
+                    return schedule_redirect(&format!(
+                        "Failed to trigger {name}: schedule has no workflow or dag name"
+                    ));
+                }
+            };
+
+        let pool = match api_state.storage_pool() {
+            Ok(p) => p,
+            Err(e) => return schedule_redirect(&format!("Failed to trigger {name}: {e}")),
+        };
+        // Use default_pool() so that ExecutionId::new() (ShardId::UNENCODED) and
+        // the connection target agree — consistent with the API handler's routing.
+        let mut conn = match acquire_conn(pool.default_pool()).await {
+            Ok(c) => c,
+            Err(e) => return schedule_redirect(&format!("Failed to trigger {name}: {e}")),
+        };
+
         let triggered_at = chrono::Utc::now();
         let workflow_id = format!("manual-{}-{}", row.id, triggered_at.timestamp_millis());
         let exec_id = HarvestExecutionId::new();

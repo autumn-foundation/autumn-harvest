@@ -2795,7 +2795,8 @@
           {
             "name": "execution_id",
             "type": "string",
-            "description": "UUID of the started execution."
+            "required": false,
+            "description": "UUID of the started execution. Absent when the run was suppressed by overlap policy."
           },
           {
             "name": "workflow_id",
@@ -2806,6 +2807,11 @@
             "name": "triggered_at",
             "type": "string",
             "description": "RFC 3339 timestamp when the trigger was processed."
+          },
+          {
+            "name": "outcome",
+            "type": "string",
+            "description": "\"fired\" when a new execution was started; \"skipped_overlap\" when the effective overlap policy suppressed the run."
           }
         ]
       },
