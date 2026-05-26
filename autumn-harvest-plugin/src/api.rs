@@ -2391,7 +2391,7 @@ pub const fn management_api_response_fields()
         (
             "GET",
             "/admin/build-routing/compat",
-            Some(&["entries", "shard_errors"]),
+            Some(&["entries", "diverged_pairs", "shard_errors"]),
         ),
         (
             "POST",
@@ -11616,6 +11616,9 @@ struct BuildRoutingResponse {
 #[derive(Debug, serde::Serialize)]
 struct CompatListResponse {
     entries: Vec<autumn_harvest::build_routing::BuildCompatEntry>,
+    /// Compat pairs present on some shards but absent on others (partial fanout).
+    /// A non-empty list means compatibility is inconsistent across shards for those pairs.
+    diverged_pairs: Vec<serde_json::Value>,
     /// Shards that could not be reached during this read; the list may be incomplete.
     shard_errors: Vec<serde_json::Value>,
 }
@@ -11653,6 +11656,7 @@ struct RetireBuildResponse {
 }
 
 /// `GET /admin/build-routing` — list policies + cross-shard reachability.
+#[allow(clippy::too_many_lines)]
 async fn list_build_routing_handler(
     Extension(api_state): Extension<HarvestApiState>,
 ) -> impl axum::response::IntoResponse {
@@ -11750,6 +11754,20 @@ async fn list_build_routing_handler(
                 diverged.insert(queue_name.clone());
             }
         }
+    }
+
+    // If every shard read failed (errors present, zero successful reads), return 503.
+    // Returning 200 with empty data would mislead callers into treating a DB outage as
+    // "no routing configured", which can cause unsafe rollout decisions.
+    if !shard_errors.is_empty() && per_shard_seen.is_empty() && per_shard_reachability.is_empty() {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({
+                "error": "All shard reads failed; routing state cannot be determined.",
+                "shard_errors": shard_errors,
+            })),
+        )
+            .into_response();
     }
 
     let mut policies: Vec<BuildPolicy> = merged_policies.into_values().collect();
@@ -11878,10 +11896,11 @@ async fn set_build_policy_handler(
 /// `declared_at` timestamp. Unreachable shards are listed in `shard_errors` in
 /// the response so operators can distinguish a complete read from a partial one.
 /// If no shard succeeds at all, returns 503.
+#[allow(clippy::too_many_lines)]
 async fn list_build_compat_handler(
     Extension(api_state): Extension<HarvestApiState>,
 ) -> impl axum::response::IntoResponse {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     use autumn_harvest::build_routing::{BuildCompatEntry, list_build_compat};
 
@@ -11891,6 +11910,10 @@ async fn list_build_compat_handler(
     };
 
     let mut merged: HashMap<(String, String), BuildCompatEntry> = HashMap::new();
+    // Per-shard presence: for each shard that successfully read compat, the set of
+    // (build_id, compatible_with) pairs it returned. Used to detect pairs that exist
+    // on some shards but were missed by others during a partial fanout.
+    let mut per_shard_compat_seen: Vec<HashSet<(String, String)>> = Vec::new();
     let mut shard_errors: Vec<serde_json::Value> = Vec::new();
     let mut any_success = false;
     let mut last_err: Option<axum::response::Response> = None;
@@ -11900,8 +11923,10 @@ async fn list_build_compat_handler(
             Ok(mut conn) => match list_build_compat(&mut conn).await.map_err(map_error) {
                 Ok(entries) => {
                     any_success = true;
+                    let mut seen: HashSet<(String, String)> = HashSet::new();
                     for entry in entries {
                         let key = (entry.build_id.clone(), entry.compatible_with.clone());
+                        seen.insert(key.clone());
                         merged
                             .entry(key)
                             .and_modify(|e| {
@@ -11911,6 +11936,7 @@ async fn list_build_compat_handler(
                             })
                             .or_insert(entry);
                     }
+                    per_shard_compat_seen.push(seen);
                 }
                 Err(e) => {
                     shard_errors.push(serde_json::json!({
@@ -11937,8 +11963,45 @@ async fn list_build_compat_handler(
                 .cmp(&b.build_id)
                 .then(a.compatible_with.cmp(&b.compatible_with))
         });
+
+        // Detect pairs present on at least one shard but absent on another.
+        let mut diverged_pairs: Vec<serde_json::Value> = if per_shard_compat_seen.len() > 1 {
+            let mut pairs: Vec<serde_json::Value> = entries
+                .iter()
+                .filter(|e| {
+                    let key = (e.build_id.clone(), e.compatible_with.clone());
+                    per_shard_compat_seen
+                        .iter()
+                        .any(|seen| !seen.contains(&key))
+                })
+                .map(|e| {
+                    serde_json::json!({
+                        "build_id": e.build_id,
+                        "compatible_with": e.compatible_with,
+                    })
+                })
+                .collect();
+            pairs.sort_by(|a, b| {
+                a["build_id"]
+                    .as_str()
+                    .unwrap_or("")
+                    .cmp(b["build_id"].as_str().unwrap_or(""))
+                    .then(
+                        a["compatible_with"]
+                            .as_str()
+                            .unwrap_or("")
+                            .cmp(b["compatible_with"].as_str().unwrap_or("")),
+                    )
+            });
+            pairs
+        } else {
+            vec![]
+        };
+        diverged_pairs.dedup();
+
         axum::Json(CompatListResponse {
             entries,
+            diverged_pairs,
             shard_errors,
         })
         .into_response()

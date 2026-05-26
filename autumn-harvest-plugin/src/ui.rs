@@ -3408,7 +3408,12 @@ fn url_encode(input: &str) -> String {
 /// surrounding `confirm('...')` or similar inline handler, preventing XSS via
 /// operator-supplied build IDs or queue names.
 fn js_escape(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('\'', "\\'")
+    s.replace('\\', "\\\\")
+        .replace('\'', "\\'")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029")
 }
 
 fn layout(title: &str, body: &Markup, base_href: &str) -> Markup {
@@ -3688,8 +3693,13 @@ async fn list_build_routing_ui(
     let mut policy_map: std::collections::HashMap<String, BuildPolicy> =
         std::collections::HashMap::new();
     let mut diverged_queues: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Per-shard presence tracking for policy and compat: each entry is the set of
+    // queue names / (build_id, compatible_with) pairs returned by one shard that
+    // successfully responded. Used to detect absent rows on healthy shards.
+    let mut per_shard_policy_seen: Vec<std::collections::HashSet<String>> = Vec::new();
     let mut compat_map: std::collections::HashMap<(String, String), BuildCompatEntry> =
         std::collections::HashMap::new();
+    let mut per_shard_compat_seen: Vec<std::collections::HashSet<(String, String)>> = Vec::new();
     let mut per_shard_reach: Vec<Vec<BuildReachability>> = Vec::new();
 
     for (shard_id, shard_pool) in pool.iter_shards() {
@@ -3697,7 +3707,10 @@ async fn list_build_routing_ui(
             Ok(mut conn) => {
                 match list_build_policies(&mut conn).await {
                     Ok(shard_policies) => {
+                        let mut seen: std::collections::HashSet<String> =
+                            std::collections::HashSet::new();
                         for policy in shard_policies {
+                            seen.insert(policy.queue_name.clone());
                             match policy_map.get(&policy.queue_name) {
                                 Some(existing) if existing.build_id != policy.build_id => {
                                     diverged_queues.insert(policy.queue_name.clone());
@@ -3714,13 +3727,17 @@ async fn list_build_routing_ui(
                                 _ => {}
                             }
                         }
+                        per_shard_policy_seen.push(seen);
                     }
                     Err(e) => shard_errors.push((shard_id, e.to_string())),
                 }
                 match list_build_compat(&mut conn).await {
                     Ok(entries) => {
+                        let mut seen: std::collections::HashSet<(String, String)> =
+                            std::collections::HashSet::new();
                         for entry in entries {
                             let key = (entry.build_id.clone(), entry.compatible_with.clone());
+                            seen.insert(key.clone());
                             compat_map
                                 .entry(key)
                                 .and_modify(|e| {
@@ -3730,6 +3747,7 @@ async fn list_build_routing_ui(
                                 })
                                 .or_insert(entry);
                         }
+                        per_shard_compat_seen.push(seen);
                     }
                     Err(e) => shard_errors.push((shard_id, e.to_string())),
                 }
@@ -3741,6 +3759,36 @@ async fn list_build_routing_ui(
             Err(e) => shard_errors.push((shard_id, e.to_string())),
         }
     }
+
+    // Detect absent-row policy divergence (queue on some shards, missing on others).
+    if per_shard_policy_seen.len() > 1 {
+        for queue_name in policy_map.keys() {
+            if per_shard_policy_seen
+                .iter()
+                .any(|seen| !seen.contains(queue_name.as_str()))
+            {
+                diverged_queues.insert(queue_name.clone());
+            }
+        }
+    }
+
+    // Detect compat pairs present on some shards but absent on others.
+    let mut diverged_compat_pairs: Vec<String> = if per_shard_compat_seen.len() > 1 {
+        let mut pairs: Vec<String> = compat_map
+            .keys()
+            .filter(|key| {
+                per_shard_compat_seen
+                    .iter()
+                    .any(|seen| !seen.contains(*key))
+            })
+            .map(|(b, c)| format!("{b} \u{2192} {c}"))
+            .collect();
+        pairs.sort();
+        pairs
+    } else {
+        vec![]
+    };
+    diverged_compat_pairs.dedup();
 
     let mut policies: Vec<BuildPolicy> = policy_map.into_values().collect();
     policies.sort_by(|a, b| a.queue_name.cmp(&b.queue_name));
@@ -3787,6 +3835,7 @@ async fn list_build_routing_ui(
         &filtered_reach,
         &shard_error_refs,
         &diverged_list,
+        &diverged_compat_pairs,
         is_multi_shard,
         params.flash.as_deref(),
         build_id_filter,
@@ -4250,6 +4299,7 @@ fn render_build_routing_page(
     reachability: &[BuildReachability],
     shard_errors: &[(ShardId, &str)],
     diverged_queues: &[String],
+    diverged_compat_pairs: &[String],
     is_multi_shard: bool,
     flash: Option<&str>,
     build_id_filter: Option<&str>,
@@ -4279,6 +4329,18 @@ fn render_build_routing_page(
                 @for (i, q) in diverged_queues.iter().enumerate() {
                     @if i > 0 { ", " }
                     code style="color:#fdba74" { (q) }
+                }
+            }
+        }
+
+        @if !diverged_compat_pairs.is_empty() {
+            div style="background:#431407;border:1px solid #ea580c;border-radius:8px;padding:10px 14px;margin-bottom:12px;font-size:13px;color:#fed7aa" {
+                strong { "Compat divergence detected" }
+                " — the following pairs are declared on some shards but missing on others. "
+                "Re-declare each pair to resync: "
+                @for (i, pair) in diverged_compat_pairs.iter().enumerate() {
+                    @if i > 0 { ", " }
+                    code style="color:#fdba74" { (pair) }
                 }
             }
         }
@@ -6460,8 +6522,8 @@ mod tests {
 
     #[test]
     fn render_build_routing_page_empty_state_shows_docs_link() {
-        let html =
-            render_build_routing_page(&[], &[], &[], &[], &[], false, None, None).into_string();
+        let html = render_build_routing_page(&[], &[], &[], &[], &[], &[], false, None, None)
+            .into_string();
         assert!(
             html.contains("No build routing configured") || html.contains("No build policies"),
             "empty state must show a 'no policies' message"
@@ -6482,7 +6544,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
-        let html = render_build_routing_page(&[policy], &[], &[], &[], &[], false, None, None)
+        let html = render_build_routing_page(&[policy], &[], &[], &[], &[], &[], false, None, None)
             .into_string();
         assert!(html.contains("test-queue"), "must show queue name");
         assert!(html.contains("abc123"), "must show build_id");
@@ -6499,7 +6561,7 @@ mod tests {
             stale_workers: 1,
             safe_to_retire: false,
         };
-        let html = render_build_routing_page(&[], &[], &[reach], &[], &[], false, None, None)
+        let html = render_build_routing_page(&[], &[], &[reach], &[], &[], &[], false, None, None)
             .into_string();
         assert!(html.contains("sha-old"), "must show build_id");
         assert!(html.contains("42"), "must show open_executions count");
@@ -6519,7 +6581,7 @@ mod tests {
             stale_workers: 0,
             safe_to_retire: true,
         };
-        let html = render_build_routing_page(&[], &[], &[reach], &[], &[], false, None, None)
+        let html = render_build_routing_page(&[], &[], &[reach], &[], &[], &[], false, None, None)
             .into_string();
         assert!(
             html.contains("Retire"),
@@ -6539,7 +6601,7 @@ mod tests {
             compatible_with: "sha-old".to_string(),
             declared_at: chrono::Utc::now(),
         };
-        let html = render_build_routing_page(&[], &[entry], &[], &[], &[], false, None, None)
+        let html = render_build_routing_page(&[], &[entry], &[], &[], &[], &[], false, None, None)
             .into_string();
         assert!(
             html.contains("sha-new"),
@@ -6557,9 +6619,18 @@ mod tests {
 
     #[test]
     fn render_build_routing_page_flash_message_shown() {
-        let html =
-            render_build_routing_page(&[], &[], &[], &[], &[], false, Some("Policy updated"), None)
-                .into_string();
+        let html = render_build_routing_page(
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            false,
+            Some("Policy updated"),
+            None,
+        )
+        .into_string();
         assert!(
             html.contains("Policy updated"),
             "flash message must appear on page"
@@ -6568,8 +6639,8 @@ mod tests {
 
     #[test]
     fn render_build_routing_page_has_set_policy_form() {
-        let html =
-            render_build_routing_page(&[], &[], &[], &[], &[], false, None, None).into_string();
+        let html = render_build_routing_page(&[], &[], &[], &[], &[], &[], false, None, None)
+            .into_string();
         assert!(
             html.contains("set-policy"),
             "page must include Set Policy form action"
@@ -6586,8 +6657,8 @@ mod tests {
 
     #[test]
     fn render_build_routing_page_has_declare_compat_form() {
-        let html =
-            render_build_routing_page(&[], &[], &[], &[], &[], false, None, None).into_string();
+        let html = render_build_routing_page(&[], &[], &[], &[], &[], &[], false, None, None)
+            .into_string();
         assert!(
             html.contains("declare-compat"),
             "page must include Declare Compat form action"

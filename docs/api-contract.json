@@ -3274,8 +3274,8 @@
       "request_body": null,
       "success_response": {
         "status": 200,
-        "fields": ["entries", "shard_errors"],
-        "notes": "entries is an array of BuildCompatEntry objects (id, build_id, compatible_with, declared_at). shard_errors lists shards that could not be reached; a non-empty shard_errors means the list may be incomplete."
+        "fields": ["entries", "diverged_pairs", "shard_errors"],
+        "notes": "entries is an array of BuildCompatEntry objects. diverged_pairs lists (build_id, compatible_with) pairs present on some shards but absent on others, indicating a partial fanout incident. shard_errors lists shards that could not be reached; non-empty means the list may be incomplete."
       },
       "error_responses": [
         { "status": 503, "description": "Database unavailable." }
