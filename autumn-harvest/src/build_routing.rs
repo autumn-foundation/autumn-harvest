@@ -507,6 +507,50 @@ pub async fn build_reachability(
     })
 }
 
+/// List all compatibility declarations stored in `harvest_build_compat`.
+///
+/// Rows are ordered by `(build_id, compatible_with)` so the result is
+/// deterministic and easy to page through in the UI.
+///
+/// # Errors
+///
+/// Returns `HarvestError::Database` on failure.
+#[cfg(feature = "db")]
+pub async fn list_build_compat(
+    conn: &mut AsyncPgConnection,
+) -> HarvestResult<Vec<BuildCompatEntry>> {
+    #[derive(diesel::QueryableByName, Debug)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Uuid)]
+        id: Uuid,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        build_id: String,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        compatible_with: String,
+        #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+        declared_at: DateTime<Utc>,
+    }
+
+    let rows: Vec<Row> = diesel::sql_query(
+        "SELECT id, build_id, compatible_with, declared_at \
+         FROM harvest_build_compat \
+         ORDER BY build_id, compatible_with",
+    )
+    .load(conn)
+    .await
+    .map_err(database_error)?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| BuildCompatEntry {
+            id: r.id,
+            build_id: r.build_id,
+            compatible_with: r.compatible_with,
+            declared_at: r.declared_at,
+        })
+        .collect())
+}
+
 /// Return reachability snapshots for all distinct build IDs present across
 /// `harvest_workflow_executions`, `harvest_task_queue`, and `harvest_workers`
 /// on a **single shard**.

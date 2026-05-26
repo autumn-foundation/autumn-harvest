@@ -3220,6 +3220,144 @@
           "description": "SSE notification URL not configured."
         }
       ]
+    },
+    {
+      "method": "GET",
+      "path": "/admin/build-routing",
+      "category": "build_routing",
+      "read_only": true,
+      "description": "List all build policies and cross-shard reachability snapshots for safe rolling deploy observability.",
+      "params": [],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": ["policies", "reachability", "diverged_queues", "shard_errors"],
+        "notes": "diverged_queues lists queue names whose active build_id differs across shards, indicating a partial-write incident. shard_errors lists shards that could not be reached."
+      },
+      "error_responses": [
+        { "status": 503, "description": "Database unavailable." }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/admin/build-routing/policies",
+      "category": "build_routing",
+      "read_only": false,
+      "description": "Set the active build policy for a task queue. New workflow starts on the queue will receive the specified build_id.",
+      "idempotency": "Idempotent by queue_name: re-posting the same queue_name updates the policy in place.",
+      "params": [],
+      "request_body": {
+        "required": true,
+        "free_form": false,
+        "fields": [
+          { "name": "queue_name", "required": true, "description": "Task queue to configure the build policy for." },
+          { "name": "build_id", "required": true, "description": "Build ID to assign to new workflow starts on this queue." },
+          { "name": "deployment_name", "required": false, "description": "Optional human-readable deployment label." }
+        ]
+      },
+      "success_response": {
+        "status": 200,
+        "fields": ["id", "queue_name", "build_id", "deployment_name", "created_at", "updated_at"]
+      },
+      "error_responses": [
+        { "status": 401, "description": "Unauthenticated request." },
+        { "status": 503, "description": "Database unavailable." }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/admin/build-routing/compat",
+      "category": "build_routing",
+      "read_only": true,
+      "description": "List all compatibility declarations between build IDs.",
+      "params": [],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": ["entries", "diverged_pairs", "shard_errors"],
+        "notes": "entries is an array of BuildCompatEntry objects. diverged_pairs lists (build_id, compatible_with) pairs present on some shards but absent on others, indicating a partial fanout incident. shard_errors lists shards that could not be reached; non-empty means the list may be incomplete."
+      },
+      "error_responses": [
+        { "status": 503, "description": "Database unavailable." }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/admin/build-routing/compat",
+      "category": "build_routing",
+      "read_only": false,
+      "description": "Declare that workers running build_id can safely replay histories assigned to compatible_with.",
+      "idempotency": "Idempotent by (build_id, compatible_with): re-declaring the same pair is a no-op.",
+      "params": [],
+      "request_body": {
+        "required": true,
+        "free_form": false,
+        "fields": [
+          { "name": "build_id", "required": true, "description": "The worker build that will process tasks." },
+          { "name": "compatible_with", "required": true, "description": "The assigned build whose tasks the worker build may safely replay." }
+        ]
+      },
+      "success_response": {
+        "status": 201,
+        "fields": ["id", "build_id", "compatible_with", "declared_at"]
+      },
+      "error_responses": [
+        { "status": 401, "description": "Unauthenticated request." },
+        { "status": 503, "description": "Database unavailable." }
+      ]
+    },
+    {
+      "method": "DELETE",
+      "path": "/admin/build-routing/compat/{build_id}/{compat_with}",
+      "category": "build_routing",
+      "read_only": false,
+      "description": "Revoke a compatibility declaration between two build IDs.",
+      "idempotency": "Idempotent: revoking a non-existent pair returns revoked=false without error.",
+      "params": [
+        { "name": "build_id", "in": "path", "required": true, "description": "The worker build." },
+        { "name": "compat_with", "in": "path", "required": true, "description": "The assigned build to remove from the compatibility set." }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": []
+      },
+      "success_response": {
+        "status": 200,
+        "fields": ["revoked"]
+      },
+      "error_responses": [
+        { "status": 401, "description": "Unauthenticated request." },
+        { "status": 503, "description": "Database unavailable." }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/admin/build-routing/retire",
+      "category": "build_routing",
+      "read_only": false,
+      "description": "Check whether a build ID is safe to retire (no open executions, no pending tasks). Returns 409 Conflict when not safe.",
+      "idempotency": "Idempotent: repeated calls reflect current reachability state and do not mutate data.",
+      "params": [],
+      "request_body": {
+        "required": true,
+        "free_form": false,
+        "fields": [
+          { "name": "build_id", "required": true, "description": "The build ID to check for retirement readiness." }
+        ]
+      },
+      "success_response": {
+        "status": 200,
+        "fields": ["build_id", "safe_to_retire", "open_executions", "pending_tasks"]
+      },
+      "error_responses": [
+        { "status": 401, "description": "Unauthenticated request." },
+        {
+          "status": 409,
+          "description": "Build has open executions or pending tasks and cannot be retired yet. Body contains the same fields showing current counts."
+        },
+        { "status": 503, "description": "Database unavailable." }
+      ]
     }
   ]
 }

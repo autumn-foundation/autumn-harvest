@@ -30,13 +30,15 @@ use serde_json::Value;
 
 use autumn_harvest::audit::{
     self, AuditFilters, HEADER_ACTOR, HEADER_REQUEST_ID, HEADER_SOURCE, OP_BATCH_SUBMIT,
-    OP_DAG_PATCH, OP_DAG_TRIGGER, OP_DLQ_DISCARD_BULK, OP_DLQ_REPLAY, OP_DLQ_REPLAY_BULK,
+    OP_BUILD_COMPAT_DECLARE, OP_BUILD_COMPAT_REVOKE, OP_BUILD_POLICY_SET, OP_DAG_PATCH,
+    OP_DAG_TRIGGER, OP_DLQ_DISCARD_BULK, OP_DLQ_REPLAY, OP_DLQ_REPLAY_BULK,
     OP_EXTERNAL_ACTIVITY_COMPLETE, OP_EXTERNAL_ACTIVITY_FAIL, OP_RETENTION_RUN_NOW,
     OP_SCHEDULE_BACKFILL, OP_SCHEDULE_CREATE, OP_SCHEDULE_DELETE, OP_SCHEDULE_PAUSE,
     OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER, OP_WORKER_DRAIN, OP_WORKFLOW_CANCEL,
     OP_WORKFLOW_RESET, OP_WORKFLOW_SIGNAL, OP_WORKFLOW_SIGNAL_WITH_START, OP_WORKFLOW_START,
-    SOURCE_API, STATUS_FAILED, STATUS_SUCCEEDED, TARGET_BATCH, TARGET_DAG, TARGET_DEAD_LETTER,
-    TARGET_EXTERNAL_ACTIVITY, TARGET_RETENTION, TARGET_SCHEDULE, TARGET_WORKER, TARGET_WORKFLOW,
+    SOURCE_API, STATUS_FAILED, STATUS_SUCCEEDED, TARGET_BATCH, TARGET_BUILD_ROUTING, TARGET_DAG,
+    TARGET_DEAD_LETTER, TARGET_EXTERNAL_ACTIVITY, TARGET_RETENTION, TARGET_SCHEDULE, TARGET_WORKER,
+    TARGET_WORKFLOW,
 };
 use autumn_harvest::batch::{
     self, BatchAction, BatchExecutorConfig, BatchFilter, BatchJobStatus, BatchJobView,
@@ -1657,7 +1659,32 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         // Gated behind the same mgmt auth provider as other management routes.
         .route(
             "/executions/{exec_id}/events/stream",
-            get(stream_execution_events).route_layer(require_admin),
+            get(stream_execution_events).route_layer(require_admin.clone()),
+        )
+        // Build routing management (issue #362): expose build policies,
+        // compatibility declarations, and cross-shard reachability.
+        // Mutating routes are admin-gated; the read route is open to any
+        // authenticated operator (same posture as GET /workers).
+        .route("/admin/build-routing", get(list_build_routing_handler))
+        .route(
+            "/admin/build-routing/policies",
+            post(set_build_policy_handler).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/admin/build-routing/compat",
+            get(list_build_compat_handler),
+        )
+        .route(
+            "/admin/build-routing/compat",
+            post(declare_compat_handler).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/admin/build-routing/compat/{build_id}/{compat_with}",
+            delete(revoke_compat_handler).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/admin/build-routing/retire",
+            post(retire_build_handler).route_layer(require_admin),
         )
         .layer(Extension(api_state))
 }
@@ -1776,6 +1803,16 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/admin/audit"),
         // ── SSE execution event stream (issue #324) ───────────────────────────
         ("GET", "/executions/{exec_id}/events/stream"),
+        // ── build routing management (issue #362) ─────────────────────────────
+        ("GET", "/admin/build-routing"),
+        ("POST", "/admin/build-routing/policies"),
+        ("GET", "/admin/build-routing/compat"),
+        ("POST", "/admin/build-routing/compat"),
+        (
+            "DELETE",
+            "/admin/build-routing/compat/{build_id}/{compat_with}",
+        ),
+        ("POST", "/admin/build-routing/retire"),
     ]
 }
 
@@ -1945,6 +1982,23 @@ pub const fn management_api_request_fields()
         ("POST", "/calendars", Some(&["name", "description"])),
         ("PUT", "/calendars/{name}", Some(&["exclusion_dates"])),
         ("DELETE", "/calendars/{name}", Some(&[])),
+        // ── build routing (issue #362) ────────────────────────────────────────
+        (
+            "POST",
+            "/admin/build-routing/policies",
+            Some(&["queue_name", "build_id", "deployment_name"]),
+        ),
+        (
+            "POST",
+            "/admin/build-routing/compat",
+            Some(&["build_id", "compatible_with"]),
+        ),
+        (
+            "DELETE",
+            "/admin/build-routing/compat/{build_id}/{compat_with}",
+            Some(&[]),
+        ),
+        ("POST", "/admin/build-routing/retire", Some(&["build_id"])),
     ]
 }
 
@@ -2311,6 +2365,54 @@ pub const fn management_api_response_fields()
         ("GET", "/admin/audit", None), // Vec<AuditRecord> (external model)
         // ── SSE execution event stream (issue #324) ───────────────────────────
         ("GET", "/executions/{exec_id}/events/stream", None), // text/event-stream
+        // ── build routing (issue #362) ────────────────────────────────────────
+        (
+            "GET",
+            "/admin/build-routing",
+            Some(&[
+                "policies",
+                "reachability",
+                "diverged_queues",
+                "shard_errors",
+            ]),
+        ),
+        (
+            "POST",
+            "/admin/build-routing/policies",
+            Some(&[
+                "id",
+                "queue_name",
+                "build_id",
+                "deployment_name",
+                "created_at",
+                "updated_at",
+            ]),
+        ),
+        (
+            "GET",
+            "/admin/build-routing/compat",
+            Some(&["entries", "diverged_pairs", "shard_errors"]),
+        ),
+        (
+            "POST",
+            "/admin/build-routing/compat",
+            Some(&["id", "build_id", "compatible_with", "declared_at"]),
+        ),
+        (
+            "DELETE",
+            "/admin/build-routing/compat/{build_id}/{compat_with}",
+            Some(&["revoked"]),
+        ),
+        (
+            "POST",
+            "/admin/build-routing/retire",
+            Some(&[
+                "build_id",
+                "safe_to_retire",
+                "open_executions",
+                "pending_tasks",
+            ]),
+        ),
     ]
 }
 
@@ -11494,6 +11596,788 @@ async fn get_update_result(
             }),
         )
             .into_response(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Build routing management (issue #362)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, serde::Serialize)]
+struct BuildRoutingResponse {
+    policies: Vec<autumn_harvest::build_routing::BuildPolicy>,
+    reachability: Vec<autumn_harvest::build_routing::BuildReachability>,
+    /// Queues whose active `build_id` differs across shards, indicating a partial-write incident.
+    diverged_queues: Vec<String>,
+    /// Shards that could not be reached; per-shard data may be incomplete.
+    shard_errors: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct CompatListResponse {
+    entries: Vec<autumn_harvest::build_routing::BuildCompatEntry>,
+    /// Compat pairs present on some shards but absent on others (partial fanout).
+    /// A non-empty list means compatibility is inconsistent across shards for those pairs.
+    diverged_pairs: Vec<serde_json::Value>,
+    /// Shards that could not be reached during this read; the list may be incomplete.
+    shard_errors: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct SetBuildPolicyBody {
+    queue_name: String,
+    build_id: String,
+    #[serde(default)]
+    deployment_name: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct DeclareCompatBody {
+    build_id: String,
+    compatible_with: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct RevokeCompatResponse {
+    revoked: bool,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RetireBuildBody {
+    build_id: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct RetireBuildResponse {
+    build_id: String,
+    safe_to_retire: bool,
+    open_executions: i64,
+    pending_tasks: i64,
+}
+
+/// `GET /admin/build-routing` — list policies + cross-shard reachability.
+#[allow(clippy::too_many_lines)]
+async fn list_build_routing_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+) -> impl axum::response::IntoResponse {
+    use std::collections::{HashMap, HashSet};
+
+    use autumn_harvest::build_routing::{
+        BuildPolicy, all_build_reachability, list_build_policies, merge_reachability,
+    };
+
+    let pool = match api_state.storage_pool().map_err(map_error) {
+        Ok(p) => p,
+        Err(e) => return e.into_response(),
+    };
+
+    let stale_threshold = api_state.worker_stale_threshold();
+    let mut per_shard_reachability: Vec<Vec<autumn_harvest::build_routing::BuildReachability>> =
+        Vec::new();
+    let mut shard_errors: Vec<serde_json::Value> = Vec::new();
+
+    // Read policies AND reachability from every shard so we can detect divergence.
+    // Policy mutations fan out to all shards; a partial-write leaves some shards
+    // with a stale or absent policy row. We surface inconsistencies as `diverged_queues`.
+    //
+    // Divergence cases detected:
+    // 1. Two responding shards have different build_id for the same queue name.
+    // 2. A queue exists on at least one shard but is absent on another (partial write).
+    let mut merged_policies: HashMap<String, BuildPolicy> = HashMap::new();
+    // Each entry is the set of queue names reported by one successfully-read shard.
+    let mut per_shard_seen: Vec<HashSet<String>> = Vec::new();
+    let mut diverged: HashSet<String> = HashSet::new();
+
+    for (shard_id, shard_pool) in pool.iter_shards() {
+        match acquire_conn(shard_pool).await {
+            Ok(mut conn) => {
+                match list_build_policies(&mut conn).await.map_err(map_error) {
+                    Ok(shard_policies) => {
+                        let mut seen_on_shard: HashSet<String> = HashSet::new();
+                        for policy in shard_policies {
+                            seen_on_shard.insert(policy.queue_name.clone());
+                            match merged_policies.get(&policy.queue_name) {
+                                Some(existing) if existing.build_id != policy.build_id => {
+                                    diverged.insert(policy.queue_name.clone());
+                                    if policy.updated_at > existing.updated_at {
+                                        merged_policies.insert(policy.queue_name.clone(), policy);
+                                    }
+                                }
+                                Some(existing) if policy.updated_at > existing.updated_at => {
+                                    merged_policies.insert(policy.queue_name.clone(), policy);
+                                }
+                                None => {
+                                    merged_policies.insert(policy.queue_name.clone(), policy);
+                                }
+                                _ => {}
+                            }
+                        }
+                        per_shard_seen.push(seen_on_shard);
+                    }
+                    Err(e) => {
+                        shard_errors.push(serde_json::json!({
+                            "shard_id": shard_id.as_i32(),
+                            "error": e.to_string(),
+                        }));
+                    }
+                }
+
+                match all_build_reachability(&mut conn, stale_threshold)
+                    .await
+                    .map_err(map_error)
+                {
+                    Ok(r) => per_shard_reachability.push(r),
+                    Err(e) => {
+                        shard_errors.push(serde_json::json!({
+                            "shard_id": shard_id.as_i32(),
+                            "error": e.to_string(),
+                        }));
+                    }
+                }
+            }
+            Err(e) => {
+                shard_errors.push(serde_json::json!({
+                    "shard_id": shard_id.as_i32(),
+                    "error": e.to_string(),
+                }));
+            }
+        }
+    }
+
+    // Case 2: queue present on at least one shard but absent on another.
+    if per_shard_seen.len() > 1 {
+        for queue_name in merged_policies.keys() {
+            if per_shard_seen
+                .iter()
+                .any(|seen| !seen.contains(queue_name.as_str()))
+            {
+                diverged.insert(queue_name.clone());
+            }
+        }
+    }
+
+    // If every shard read failed (errors present, zero successful reads), return 503.
+    // Returning 200 with empty data would mislead callers into treating a DB outage as
+    // "no routing configured", which can cause unsafe rollout decisions.
+    if !shard_errors.is_empty() && per_shard_seen.is_empty() && per_shard_reachability.is_empty() {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({
+                "error": "All shard reads failed; routing state cannot be determined.",
+                "shard_errors": shard_errors,
+            })),
+        )
+            .into_response();
+    }
+
+    let mut policies: Vec<BuildPolicy> = merged_policies.into_values().collect();
+    policies.sort_by(|a, b| a.queue_name.cmp(&b.queue_name));
+    let mut diverged_queues: Vec<String> = diverged.into_iter().collect();
+    diverged_queues.sort();
+
+    let reachability = merge_reachability(per_shard_reachability);
+    axum::Json(BuildRoutingResponse {
+        policies,
+        reachability,
+        diverged_queues,
+        shard_errors,
+    })
+    .into_response()
+}
+
+/// `POST /admin/build-routing/policies` — set the active build policy for a queue.
+///
+/// Fans out to all shards so every shard's `get_build_policy()` call sees the new
+/// policy when evaluating `assigned_build_id` at workflow-start time.
+///
+/// Uses fail-forward fan-out: attempts every shard and collects errors rather than
+/// aborting on first failure, so a transient shard outage does not leave routing
+/// state diverged across the remaining shards.
+#[allow(clippy::too_many_lines)]
+async fn set_build_policy_handler(
+    headers: axum::http::HeaderMap,
+    Extension(api_state): Extension<HarvestApiState>,
+    axum::Json(body): axum::Json<SetBuildPolicyBody>,
+) -> impl axum::response::IntoResponse {
+    use autumn_harvest::build_routing::set_build_policy;
+
+    let queue_name = body.queue_name.trim();
+    let build_id = body.build_id.trim();
+    if queue_name.is_empty() || build_id.is_empty() {
+        return AutumnError::bad_request_msg("queue_name and build_id must not be empty")
+            .into_response();
+    }
+
+    let pool = match api_state.storage_pool().map_err(map_error) {
+        Ok(p) => p,
+        Err(e) => return e.into_response(),
+    };
+    let deployment = body.deployment_name.as_deref().filter(|s| !s.is_empty());
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+
+    let mut last_policy = None;
+    let mut shard_errors: Vec<String> = Vec::new();
+    for (shard_id, shard_pool) in pool.iter_shards() {
+        let mut conn = match acquire_conn(shard_pool).await {
+            Ok(c) => c,
+            Err(e) => {
+                shard_errors.push(format!("shard {}: {e}", shard_id.as_i32()));
+                continue;
+            }
+        };
+        match set_build_policy(&mut conn, queue_name, build_id, deployment)
+            .await
+            .map_err(map_error)
+        {
+            Ok(p) => last_policy = Some(p),
+            Err(e) => {
+                shard_errors.push(format!("shard {}: {e}", shard_id.as_i32()));
+            }
+        }
+    }
+
+    // If every shard write failed, return 503 before attempting audit.
+    if !shard_errors.is_empty() && last_policy.is_none() {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({ "errors": shard_errors })),
+        )
+            .into_response();
+    }
+    let Some(policy) = last_policy else {
+        return map_error(autumn_harvest::HarvestError::Config(
+            "no shards configured".into(),
+        ))
+        .into_response();
+    };
+
+    // Audit write is required — fail the response if it cannot be persisted.
+    let status = if shard_errors.is_empty() {
+        STATUS_SUCCEEDED
+    } else {
+        STATUS_FAILED
+    };
+    let error_summary = if shard_errors.is_empty() {
+        None
+    } else {
+        Some(shard_errors.join("; "))
+    };
+    let ar = NewAuditRecord {
+        actor: &actor,
+        operation: OP_BUILD_POLICY_SET,
+        target_type: TARGET_BUILD_ROUTING,
+        target_id: Some(queue_name),
+        route_or_command: "POST /admin/build-routing/policies",
+        request_id: request_id.as_deref(),
+        idempotency_key: None,
+        status,
+        error_summary: error_summary.as_deref(),
+        shard_id: None,
+        source: &source,
+    };
+    match api_state.storage_pool() {
+        Ok(audit_pool) => match acquire_conn(audit_pool.default_pool()).await {
+            Ok(mut conn) => {
+                if let Err(audit_err) = audit::insert_audit(&mut conn, &ar).await {
+                    tracing::error!(
+                        error = %audit_err,
+                        "audit insert failed for build-routing.policy.set"
+                    );
+                    return AutumnError::service_unavailable_msg(format!(
+                        "audit insert failed: {audit_err}"
+                    ))
+                    .into_response();
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "audit DB connection unavailable for build-routing.policy.set"
+                );
+                return AutumnError::service_unavailable_msg("audit DB connection unavailable")
+                    .into_response();
+            }
+        },
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "storage pool unavailable for audit in build-routing.policy.set"
+            );
+            return AutumnError::service_unavailable_msg("audit DB connection unavailable")
+                .into_response();
+        }
+    }
+
+    if shard_errors.is_empty() {
+        (axum::http::StatusCode::OK, axum::Json(policy)).into_response()
+    } else {
+        (
+            axum::http::StatusCode::MULTI_STATUS,
+            axum::Json(serde_json::json!({
+                "policy": policy,
+                "shard_errors": shard_errors,
+            })),
+        )
+            .into_response()
+    }
+}
+
+/// `GET /admin/build-routing/compat` — list all compatibility declarations.
+///
+/// Reads from all shards and merges the results. Entries with the same
+/// `(build_id, compatible_with)` key are deduplicated by keeping the latest
+/// `declared_at` timestamp. Unreachable shards are listed in `shard_errors` in
+/// the response so operators can distinguish a complete read from a partial one.
+/// If no shard succeeds at all, returns 503.
+#[allow(clippy::too_many_lines)]
+async fn list_build_compat_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+) -> impl axum::response::IntoResponse {
+    use std::collections::{HashMap, HashSet};
+
+    use autumn_harvest::build_routing::{BuildCompatEntry, list_build_compat};
+
+    let pool = match api_state.storage_pool().map_err(map_error) {
+        Ok(p) => p,
+        Err(e) => return e.into_response(),
+    };
+
+    let mut merged: HashMap<(String, String), BuildCompatEntry> = HashMap::new();
+    // Per-shard presence: for each shard that successfully read compat, the set of
+    // (build_id, compatible_with) pairs it returned. Used to detect pairs that exist
+    // on some shards but were missed by others during a partial fanout.
+    let mut per_shard_compat_seen: Vec<HashSet<(String, String)>> = Vec::new();
+    let mut shard_errors: Vec<serde_json::Value> = Vec::new();
+    let mut any_success = false;
+    let mut last_err: Option<axum::response::Response> = None;
+
+    for (shard_id, shard_pool) in pool.iter_shards() {
+        match acquire_conn(shard_pool).await {
+            Ok(mut conn) => match list_build_compat(&mut conn).await.map_err(map_error) {
+                Ok(entries) => {
+                    any_success = true;
+                    let mut seen: HashSet<(String, String)> = HashSet::new();
+                    for entry in entries {
+                        let key = (entry.build_id.clone(), entry.compatible_with.clone());
+                        seen.insert(key.clone());
+                        merged
+                            .entry(key)
+                            .and_modify(|e| {
+                                if entry.declared_at > e.declared_at {
+                                    *e = entry.clone();
+                                }
+                            })
+                            .or_insert(entry);
+                    }
+                    per_shard_compat_seen.push(seen);
+                }
+                Err(e) => {
+                    shard_errors.push(serde_json::json!({
+                        "shard_id": shard_id.as_i32(),
+                        "error": e.to_string(),
+                    }));
+                    last_err = Some(e.into_response());
+                }
+            },
+            Err(e) => {
+                shard_errors.push(serde_json::json!({
+                    "shard_id": shard_id.as_i32(),
+                    "error": e.to_string(),
+                }));
+                last_err = Some(e.into_response());
+            }
+        }
+    }
+
+    if any_success {
+        let mut entries: Vec<BuildCompatEntry> = merged.into_values().collect();
+        entries.sort_by(|a, b| {
+            a.build_id
+                .cmp(&b.build_id)
+                .then(a.compatible_with.cmp(&b.compatible_with))
+        });
+
+        // Detect pairs present on at least one shard but absent on another.
+        let mut diverged_pairs: Vec<serde_json::Value> = if per_shard_compat_seen.len() > 1 {
+            let mut pairs: Vec<serde_json::Value> = entries
+                .iter()
+                .filter(|e| {
+                    let key = (e.build_id.clone(), e.compatible_with.clone());
+                    per_shard_compat_seen
+                        .iter()
+                        .any(|seen| !seen.contains(&key))
+                })
+                .map(|e| {
+                    serde_json::json!({
+                        "build_id": e.build_id,
+                        "compatible_with": e.compatible_with,
+                    })
+                })
+                .collect();
+            pairs.sort_by(|a, b| {
+                a["build_id"]
+                    .as_str()
+                    .unwrap_or("")
+                    .cmp(b["build_id"].as_str().unwrap_or(""))
+                    .then(
+                        a["compatible_with"]
+                            .as_str()
+                            .unwrap_or("")
+                            .cmp(b["compatible_with"].as_str().unwrap_or("")),
+                    )
+            });
+            pairs
+        } else {
+            vec![]
+        };
+        diverged_pairs.dedup();
+
+        axum::Json(CompatListResponse {
+            entries,
+            diverged_pairs,
+            shard_errors,
+        })
+        .into_response()
+    } else {
+        last_err.unwrap_or_else(|| {
+            map_error(autumn_harvest::HarvestError::Config(
+                "no shards configured".into(),
+            ))
+            .into_response()
+        })
+    }
+}
+
+/// `POST /admin/build-routing/compat` — declare that build A can absorb build B's histories.
+///
+/// Fans out to all shards so every shard's `load_compat_set()` picks up the declaration.
+/// Uses fail-forward fan-out: attempts every shard and collects errors.
+#[allow(clippy::too_many_lines)]
+async fn declare_compat_handler(
+    headers: axum::http::HeaderMap,
+    Extension(api_state): Extension<HarvestApiState>,
+    axum::Json(body): axum::Json<DeclareCompatBody>,
+) -> impl axum::response::IntoResponse {
+    use autumn_harvest::build_routing::declare_compat;
+
+    let build_id = body.build_id.trim();
+    let compatible_with = body.compatible_with.trim();
+    if build_id.is_empty() || compatible_with.is_empty() {
+        return AutumnError::bad_request_msg("build_id and compatible_with must not be empty")
+            .into_response();
+    }
+
+    let pool = match api_state.storage_pool().map_err(map_error) {
+        Ok(p) => p,
+        Err(e) => return e.into_response(),
+    };
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+
+    let mut last_entry = None;
+    let mut shard_errors: Vec<String> = Vec::new();
+    for (shard_id, shard_pool) in pool.iter_shards() {
+        let mut conn = match acquire_conn(shard_pool).await {
+            Ok(c) => c,
+            Err(e) => {
+                shard_errors.push(format!("shard {}: {e}", shard_id.as_i32()));
+                continue;
+            }
+        };
+        match declare_compat(&mut conn, build_id, compatible_with)
+            .await
+            .map_err(map_error)
+        {
+            Ok(e) => last_entry = Some(e),
+            Err(e) => {
+                shard_errors.push(format!("shard {}: {e}", shard_id.as_i32()));
+            }
+        }
+    }
+
+    // If every shard write failed, return 503 before attempting audit.
+    if !shard_errors.is_empty() && last_entry.is_none() {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({ "errors": shard_errors })),
+        )
+            .into_response();
+    }
+    let Some(entry) = last_entry else {
+        return map_error(autumn_harvest::HarvestError::Config(
+            "no shards configured".into(),
+        ))
+        .into_response();
+    };
+
+    // Audit write is required — fail the response if it cannot be persisted.
+    let status = if shard_errors.is_empty() {
+        STATUS_SUCCEEDED
+    } else {
+        STATUS_FAILED
+    };
+    let error_summary = if shard_errors.is_empty() {
+        None
+    } else {
+        Some(shard_errors.join("; "))
+    };
+    let target = format!("{build_id}→{compatible_with}");
+    let ar = NewAuditRecord {
+        actor: &actor,
+        operation: OP_BUILD_COMPAT_DECLARE,
+        target_type: TARGET_BUILD_ROUTING,
+        target_id: Some(target.as_str()),
+        route_or_command: "POST /admin/build-routing/compat",
+        request_id: request_id.as_deref(),
+        idempotency_key: None,
+        status,
+        error_summary: error_summary.as_deref(),
+        shard_id: None,
+        source: &source,
+    };
+    match api_state.storage_pool() {
+        Ok(audit_pool) => match acquire_conn(audit_pool.default_pool()).await {
+            Ok(mut conn) => {
+                if let Err(audit_err) = audit::insert_audit(&mut conn, &ar).await {
+                    tracing::error!(
+                        error = %audit_err,
+                        "audit insert failed for build-routing.compat.declare"
+                    );
+                    return AutumnError::service_unavailable_msg(format!(
+                        "audit insert failed: {audit_err}"
+                    ))
+                    .into_response();
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "audit DB connection unavailable for build-routing.compat.declare"
+                );
+                return AutumnError::service_unavailable_msg("audit DB connection unavailable")
+                    .into_response();
+            }
+        },
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "storage pool unavailable for audit in build-routing.compat.declare"
+            );
+            return AutumnError::service_unavailable_msg("audit DB connection unavailable")
+                .into_response();
+        }
+    }
+
+    if shard_errors.is_empty() {
+        (axum::http::StatusCode::CREATED, axum::Json(entry)).into_response()
+    } else {
+        (
+            axum::http::StatusCode::MULTI_STATUS,
+            axum::Json(serde_json::json!({
+                "entry": entry,
+                "shard_errors": shard_errors,
+            })),
+        )
+            .into_response()
+    }
+}
+
+/// `DELETE /admin/build-routing/compat/{build_id}/{compat_with}` — revoke a declaration.
+///
+/// Fans out to all shards. Returns `revoked=true` if any shard had the row.
+/// Uses fail-forward fan-out: attempts every shard and collects errors.
+#[allow(clippy::too_many_lines)]
+async fn revoke_compat_handler(
+    headers: axum::http::HeaderMap,
+    Extension(api_state): Extension<HarvestApiState>,
+    axum::extract::Path((build_id, compat_with)): axum::extract::Path<(String, String)>,
+) -> impl axum::response::IntoResponse {
+    use autumn_harvest::build_routing::revoke_compat;
+
+    let pool = match api_state.storage_pool().map_err(map_error) {
+        Ok(p) => p,
+        Err(e) => return e.into_response(),
+    };
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+
+    let mut any_revoked = false;
+    let mut any_shard_succeeded = false;
+    let mut shard_errors: Vec<String> = Vec::new();
+    for (shard_id, shard_pool) in pool.iter_shards() {
+        let mut conn = match acquire_conn(shard_pool).await {
+            Ok(c) => c,
+            Err(e) => {
+                shard_errors.push(format!("shard {}: {e}", shard_id.as_i32()));
+                continue;
+            }
+        };
+        match revoke_compat(&mut conn, &build_id, &compat_with)
+            .await
+            .map_err(map_error)
+        {
+            Ok(r) => {
+                any_shard_succeeded = true;
+                any_revoked |= r;
+            }
+            Err(e) => {
+                shard_errors.push(format!("shard {}: {e}", shard_id.as_i32()));
+            }
+        }
+    }
+
+    // If every shard write failed, return 503 before attempting audit.
+    if !shard_errors.is_empty() && !any_shard_succeeded {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({ "errors": shard_errors })),
+        )
+            .into_response();
+    }
+
+    // Audit write is required — fail the response if it cannot be persisted.
+    let status = if shard_errors.is_empty() {
+        STATUS_SUCCEEDED
+    } else {
+        STATUS_FAILED
+    };
+    let error_summary = if shard_errors.is_empty() {
+        None
+    } else {
+        Some(shard_errors.join("; "))
+    };
+    let target = format!("{build_id}→{compat_with}");
+    let ar = NewAuditRecord {
+        actor: &actor,
+        operation: OP_BUILD_COMPAT_REVOKE,
+        target_type: TARGET_BUILD_ROUTING,
+        target_id: Some(target.as_str()),
+        route_or_command: "DELETE /admin/build-routing/compat/{build_id}/{compat_with}",
+        request_id: request_id.as_deref(),
+        idempotency_key: None,
+        status,
+        error_summary: error_summary.as_deref(),
+        shard_id: None,
+        source: &source,
+    };
+    match api_state.storage_pool() {
+        Ok(audit_pool) => match acquire_conn(audit_pool.default_pool()).await {
+            Ok(mut conn) => {
+                if let Err(audit_err) = audit::insert_audit(&mut conn, &ar).await {
+                    tracing::error!(
+                        error = %audit_err,
+                        "audit insert failed for build-routing.compat.revoke"
+                    );
+                    return AutumnError::service_unavailable_msg(format!(
+                        "audit insert failed: {audit_err}"
+                    ))
+                    .into_response();
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "audit DB connection unavailable for build-routing.compat.revoke"
+                );
+                return AutumnError::service_unavailable_msg("audit DB connection unavailable")
+                    .into_response();
+            }
+        },
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "storage pool unavailable for audit in build-routing.compat.revoke"
+            );
+            return AutumnError::service_unavailable_msg("audit DB connection unavailable")
+                .into_response();
+        }
+    }
+
+    if !shard_errors.is_empty() {
+        return (
+            axum::http::StatusCode::MULTI_STATUS,
+            axum::Json(serde_json::json!({
+                "revoked": any_revoked,
+                "shard_errors": shard_errors,
+            })),
+        )
+            .into_response();
+    }
+    axum::Json(RevokeCompatResponse {
+        revoked: any_revoked,
+    })
+    .into_response()
+}
+
+/// `POST /admin/build-routing/retire` — confirm a build is safe to retire.
+///
+/// Returns the reachability snapshot. The caller is responsible for stopping
+/// their old workers after confirming `safe_to_retire = true`.
+async fn retire_build_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+    axum::Json(body): axum::Json<RetireBuildBody>,
+) -> impl axum::response::IntoResponse {
+    use autumn_harvest::build_routing::{all_build_reachability, merge_reachability};
+
+    if body.build_id.trim().is_empty() {
+        return AutumnError::bad_request_msg("build_id must not be empty").into_response();
+    }
+
+    let pool = match api_state.storage_pool().map_err(map_error) {
+        Ok(p) => p,
+        Err(e) => return e.into_response(),
+    };
+    let stale_threshold = api_state.worker_stale_threshold();
+    let mut per_shard = Vec::new();
+
+    for (shard_id, shard_pool) in pool.iter_shards() {
+        let mut conn = match acquire_conn(shard_pool).await {
+            Ok(c) => c,
+            Err(e) => return e.into_response(),
+        };
+        let r = match all_build_reachability(&mut conn, stale_threshold).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(
+                    shard = shard_id.as_i32(),
+                    "build reachability query failed during retire check"
+                );
+                return map_error(e).into_response();
+            }
+        };
+        per_shard.push(r);
+    }
+    let merged = merge_reachability(per_shard);
+    let reach = merged
+        .iter()
+        .find(|r| r.build_id == body.build_id.trim())
+        .cloned()
+        .unwrap_or_else(|| autumn_harvest::build_routing::BuildReachability {
+            build_id: body.build_id.trim().to_string(),
+            open_executions: 0,
+            pending_tasks: 0,
+            active_workers: 0,
+            stale_workers: 0,
+            safe_to_retire: true,
+        });
+
+    if reach.safe_to_retire {
+        axum::Json(RetireBuildResponse {
+            build_id: reach.build_id,
+            safe_to_retire: true,
+            open_executions: reach.open_executions,
+            pending_tasks: reach.pending_tasks,
+        })
+        .into_response()
+    } else {
+        (
+            axum::http::StatusCode::CONFLICT,
+            axum::Json(RetireBuildResponse {
+                build_id: reach.build_id,
+                safe_to_retire: false,
+                open_executions: reach.open_executions,
+                pending_tasks: reach.pending_tasks,
+            }),
+        )
+            .into_response()
     }
 }
 
