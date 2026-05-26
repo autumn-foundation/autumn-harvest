@@ -215,6 +215,7 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         let args = #serialize_payload;
                         let raw = handle.execute_update_in_process(
                             conn,
+                            #workflow_simple_name,
                             #fn_name_str,
                             args,
                             timeout
@@ -256,6 +257,7 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             let args = #serialize_payload;
                             let raw = handle.execute_update_in_process(
                                 conn,
+                                #workflow_simple_name,
                                 #fn_name_str,
                                 args,
                                 timeout

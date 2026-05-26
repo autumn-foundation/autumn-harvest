@@ -326,3 +326,93 @@ async fn test_typed_workflow_client_stubs_signal_with_start_payload_cap() {
         err
     );
 }
+
+// ── Dummy Workflow for Mismatch Testing ──────────────────────────────────────
+
+#[workflow]
+async fn dummy_other_workflow(_ctx: &WorkflowContext, input: String) -> Result<String, String> {
+    Ok(input)
+}
+
+#[query(workflow = "dummy_other_workflow")]
+fn dummy_query(_ctx: &WorkflowContext) -> Result<i64, String> {
+    Ok(99)
+}
+
+#[update(workflow = "dummy_other_workflow")]
+async fn dummy_update(_ctx: &WorkflowContext) -> Result<String, String> {
+    Ok("ok".to_string())
+}
+
+#[allow(dead_code)]
+#[signal(workflow = "dummy_other_workflow")]
+fn dummy_signal(_ctx: &WorkflowContext) {}
+
+#[tokio::test]
+async fn test_typed_workflow_client_stubs_mismatch_validation() {
+    let (db_url, _container) = setup_database_url().await;
+    let pool = build_pool(&db_url);
+    let mut conn = pool.get().await.unwrap();
+
+    let client = WorkflowHandleClient::single(pool, db_url.clone());
+
+    // 1. Start onboarding workflow
+    let onboarding_handle = OnboardingStub::start(
+        &mut conn,
+        &client,
+        "onboarding-user-mismatch",
+        OnboardingInput { user_id: 9999 },
+    )
+    .await
+    .unwrap();
+
+    // 2. Query mismatch: call DummyOtherWorkflowStub::query_dummy_query with onboarding_handle
+    let query_err = DummyOtherWorkflowStub::query_dummy_query(onboarding_handle.inner())
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(query_err, autumn_harvest::error::HarvestError::Config(_)),
+        "expected HarvestError::Config due to query workflow type mismatch, got: {:?}",
+        query_err
+    );
+    assert!(
+        query_err.to_string().contains("workflow type mismatch"),
+        "expected mismatch error message, got: {}",
+        query_err
+    );
+
+    // 3. Update mismatch: call DummyOtherWorkflowStub::update_dummy_update with onboarding_handle
+    let update_err =
+        DummyOtherWorkflowStub::update_dummy_update(&mut conn, onboarding_handle.inner())
+            .await
+            .unwrap_err();
+
+    assert!(
+        matches!(update_err, autumn_harvest::error::HarvestError::Config(_)),
+        "expected HarvestError::Config due to update workflow type mismatch, got: {:?}",
+        update_err
+    );
+    assert!(
+        update_err.to_string().contains("workflow type mismatch"),
+        "expected mismatch error message, got: {}",
+        update_err
+    );
+
+    // 4. Signal mismatch: call DummyOtherWorkflowStub::signal_dummy_signal with onboarding_handle
+    let signal_err =
+        DummyOtherWorkflowStub::signal_dummy_signal(&mut conn, onboarding_handle.inner())
+            .await
+            .unwrap_err();
+
+    assert!(
+        matches!(signal_err, autumn_harvest::error::HarvestError::Config(_)),
+        "expected HarvestError::Config due to signal workflow type mismatch, got: {:?}",
+        signal_err
+    );
+    assert!(
+        signal_err.to_string().contains("workflow type mismatch"),
+        "expected mismatch error message, got: {}",
+        signal_err
+    );
+}

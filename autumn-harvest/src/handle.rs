@@ -410,6 +410,23 @@ impl WorkflowHandle {
         &self.client
     }
 
+    /// Verify that the loaded execution belongs to the expected workflow type.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`HarvestError::Config`] mismatch error if the workflow type
+    /// does not match, or database/not-found errors if the execution cannot be resolved.
+    pub async fn validate_workflow_type(&self, expected_name: &str) -> HarvestResult<()> {
+        let execution = self.load_execution().await?;
+        if execution.workflow_name != expected_name {
+            return Err(HarvestError::Config(format!(
+                "workflow type mismatch: execution '{}' has type '{}', but expected '{}'",
+                self.exec_id, execution.workflow_name, expected_name
+            )));
+        }
+        Ok(())
+    }
+
     /// Return the current compact result snapshot without waiting.
     ///
     /// # Errors
@@ -614,6 +631,12 @@ impl WorkflowHandle {
         args: Value,
     ) -> HarvestResult<Value> {
         let execution = self.load_execution().await?;
+        if execution.workflow_name != workflow_info.name {
+            return Err(HarvestError::Config(format!(
+                "workflow type mismatch: execution '{}' has type '{}', but query stub expected '{}'",
+                self.exec_id, execution.workflow_name, workflow_info.name
+            )));
+        }
         if WorkflowResultState::from_execution_state(&execution.state).is_terminal() {
             return Err(HarvestError::WorkflowNotRunning(self.exec_id));
         }
@@ -698,10 +721,12 @@ impl WorkflowHandle {
     pub async fn execute_update_in_process(
         &self,
         _conn: &mut AsyncPgConnection,
+        workflow_name: &str,
         name: &str,
         input: Value,
         timeout: Duration,
     ) -> HarvestResult<Value> {
+        self.validate_workflow_type(workflow_name).await?;
         let shard = self.shard();
         let mut own_conn = self
             .client
