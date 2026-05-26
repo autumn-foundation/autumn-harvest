@@ -15,3 +15,8 @@ ALTER TABLE harvest_workflow_executions
 CREATE INDEX IF NOT EXISTS idx_harvest_executions_deadline
     ON harvest_workflow_executions (deadline_at)
     WHERE state = 'RUNNING' AND deadline_at IS NOT NULL;
+
+-- Parent-close policy for detached child workflows (issue #347).
+-- NULL = awaited child (no cascade). Non-NULL: 'ABANDON', 'REQUEST_CANCEL', 'TERMINATE'.
+ALTER TABLE harvest_workflow_executions
+    ADD COLUMN IF NOT EXISTS parent_close_policy TEXT NULL;
