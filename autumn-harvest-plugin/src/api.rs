@@ -11523,20 +11523,12 @@ async fn set_build_policy_handler(
     }
 }
 
-/// Partial-success response for `GET /admin/build-routing/compat` when the
-/// default shard is temporarily unreachable.
-#[derive(serde::Serialize)]
-struct CompatResponse {
-    entries: Vec<autumn_harvest::build_routing::BuildCompatEntry>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
-}
-
 /// `GET /admin/build-routing/compat` — list all compatibility declarations.
 ///
-/// Reads from the default shard (compat declarations are written to all shards so
-/// any shard holds the same data). Falls back to an empty list with a shard error
-/// on default-pool failure so callers retain partial visibility.
+/// Compat declarations are fanned-out to all shards on write, so any healthy
+/// shard holds the full set. This handler iterates shards in order and returns
+/// the first successful read, giving resilience to a default-shard outage while
+/// keeping the response schema stable (always `Vec<BuildCompatEntry>` or 503).
 async fn list_build_compat_handler(
     Extension(api_state): Extension<HarvestApiState>,
 ) -> impl axum::response::IntoResponse {
@@ -11547,27 +11539,22 @@ async fn list_build_compat_handler(
         Err(e) => return e.into_response(),
     };
 
-    match acquire_conn(pool.default_pool()).await {
-        Ok(mut conn) => match list_build_compat(&mut conn).await.map_err(map_error) {
-            Ok(entries) => axum::Json(entries).into_response(),
-            Err(e) => (
-                axum::http::StatusCode::PARTIAL_CONTENT,
-                axum::Json(CompatResponse {
-                    entries: vec![],
-                    error: Some(e.to_string()),
-                }),
-            )
-                .into_response(),
-        },
-        Err(e) => (
-            axum::http::StatusCode::PARTIAL_CONTENT,
-            axum::Json(CompatResponse {
-                entries: vec![],
-                error: Some(e.to_string()),
-            }),
-        )
-            .into_response(),
+    let mut last_err: Option<axum::response::Response> = None;
+    for (_, shard_pool) in pool.iter_shards() {
+        match acquire_conn(shard_pool).await {
+            Ok(mut conn) => match list_build_compat(&mut conn).await.map_err(map_error) {
+                Ok(entries) => return axum::Json(entries).into_response(),
+                Err(e) => last_err = Some(e.into_response()),
+            },
+            Err(e) => last_err = Some(e.into_response()),
+        }
     }
+    last_err.unwrap_or_else(|| {
+        map_error(autumn_harvest::HarvestError::Config(
+            "no shards configured".into(),
+        ))
+        .into_response()
+    })
 }
 
 /// `POST /admin/build-routing/compat` — declare that build A can absorb build B's histories.
