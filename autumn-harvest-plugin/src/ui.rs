@@ -4095,7 +4095,7 @@ async fn schedule_delete_ui(
 /// Inner logic for `schedule_trigger_now_ui` after the connection is acquired.
 /// Handles the Skip overlap check, start call, audit write, and metric emit,
 /// then returns the redirect response so the outer handler stays compact.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn execute_schedule_trigger_ui(
     conn: &mut crate::api::PoolConn,
     pool: &crate::HarvestDbPool,
