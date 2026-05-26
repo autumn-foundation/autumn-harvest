@@ -11525,36 +11525,70 @@ async fn set_build_policy_handler(
 
 /// `GET /admin/build-routing/compat` — list all compatibility declarations.
 ///
-/// Compat declarations are fanned-out to all shards on write, so any healthy
-/// shard holds the full set. This handler iterates shards in order and returns
-/// the first successful read, giving resilience to a default-shard outage while
-/// keeping the response schema stable (always `Vec<BuildCompatEntry>` or 503).
+/// Reads from all shards and merges the results. Compat declarations are fanned
+/// out to every shard on write, but partial-success (207) on write means some
+/// shards may have missed a declaration. Merging across all reachable shards gives
+/// the most complete picture and surfaces any divergence. Entries with the same
+/// `(build_id, compatible_with)` key are deduplicated by keeping the latest
+/// `declared_at` timestamp. Unreachable shards are skipped; if no shard succeeds,
+/// the last error is returned as 503.
 async fn list_build_compat_handler(
     Extension(api_state): Extension<HarvestApiState>,
 ) -> impl axum::response::IntoResponse {
-    use autumn_harvest::build_routing::list_build_compat;
+    use std::collections::HashMap;
+
+    use autumn_harvest::build_routing::{BuildCompatEntry, list_build_compat};
 
     let pool = match api_state.storage_pool().map_err(map_error) {
         Ok(p) => p,
         Err(e) => return e.into_response(),
     };
 
+    // Merge by (build_id, compatible_with), keeping the latest declared_at so
+    // a shard that received the write most recently wins.
+    let mut merged: HashMap<(String, String), BuildCompatEntry> = HashMap::new();
     let mut last_err: Option<axum::response::Response> = None;
+    let mut any_success = false;
+
     for (_, shard_pool) in pool.iter_shards() {
         match acquire_conn(shard_pool).await {
             Ok(mut conn) => match list_build_compat(&mut conn).await.map_err(map_error) {
-                Ok(entries) => return axum::Json(entries).into_response(),
+                Ok(entries) => {
+                    any_success = true;
+                    for entry in entries {
+                        let key = (entry.build_id.clone(), entry.compatible_with.clone());
+                        merged
+                            .entry(key)
+                            .and_modify(|e| {
+                                if entry.declared_at > e.declared_at {
+                                    *e = entry.clone();
+                                }
+                            })
+                            .or_insert(entry);
+                    }
+                }
                 Err(e) => last_err = Some(e.into_response()),
             },
             Err(e) => last_err = Some(e.into_response()),
         }
     }
-    last_err.unwrap_or_else(|| {
-        map_error(autumn_harvest::HarvestError::Config(
-            "no shards configured".into(),
-        ))
-        .into_response()
-    })
+
+    if any_success {
+        let mut entries: Vec<BuildCompatEntry> = merged.into_values().collect();
+        entries.sort_by(|a, b| {
+            a.build_id
+                .cmp(&b.build_id)
+                .then(a.compatible_with.cmp(&b.compatible_with))
+        });
+        axum::Json(entries).into_response()
+    } else {
+        last_err.unwrap_or_else(|| {
+            map_error(autumn_harvest::HarvestError::Config(
+                "no shards configured".into(),
+            ))
+            .into_response()
+        })
+    }
 }
 
 /// `POST /admin/build-routing/compat` — declare that build A can absorb build B's histories.
