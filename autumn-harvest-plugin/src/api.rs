@@ -2369,7 +2369,12 @@ pub const fn management_api_response_fields()
         (
             "GET",
             "/admin/build-routing",
-            Some(&["policies", "reachability", "shard_errors"]),
+            Some(&[
+                "policies",
+                "reachability",
+                "diverged_queues",
+                "shard_errors",
+            ]),
         ),
         (
             "POST",
@@ -2383,7 +2388,11 @@ pub const fn management_api_response_fields()
                 "updated_at",
             ]),
         ),
-        ("GET", "/admin/build-routing/compat", None), // Vec<BuildCompatEntry>
+        (
+            "GET",
+            "/admin/build-routing/compat",
+            Some(&["entries", "shard_errors"]),
+        ),
         (
             "POST",
             "/admin/build-routing/compat",
@@ -11664,9 +11673,15 @@ async fn list_build_routing_handler(
     let mut shard_errors: Vec<serde_json::Value> = Vec::new();
 
     // Read policies AND reachability from every shard so we can detect divergence.
-    // Policy mutations fan out to all shards; a partial-write leaves non-default
-    // shards with a stale active build_id. We surface this as `diverged_queues`.
-    let mut per_shard_policies: HashMap<String, BuildPolicy> = HashMap::new();
+    // Policy mutations fan out to all shards; a partial-write leaves some shards
+    // with a stale or absent policy row. We surface inconsistencies as `diverged_queues`.
+    //
+    // Divergence cases detected:
+    // 1. Two responding shards have different build_id for the same queue name.
+    // 2. A queue exists on at least one shard but is absent on another (partial write).
+    let mut merged_policies: HashMap<String, BuildPolicy> = HashMap::new();
+    // Each entry is the set of queue names reported by one successfully-read shard.
+    let mut per_shard_seen: Vec<HashSet<String>> = Vec::new();
     let mut diverged: HashSet<String> = HashSet::new();
 
     for (shard_id, shard_pool) in pool.iter_shards() {
@@ -11674,24 +11689,26 @@ async fn list_build_routing_handler(
             Ok(mut conn) => {
                 match list_build_policies(&mut conn).await.map_err(map_error) {
                     Ok(shard_policies) => {
+                        let mut seen_on_shard: HashSet<String> = HashSet::new();
                         for policy in shard_policies {
-                            match per_shard_policies.get(&policy.queue_name) {
+                            seen_on_shard.insert(policy.queue_name.clone());
+                            match merged_policies.get(&policy.queue_name) {
                                 Some(existing) if existing.build_id != policy.build_id => {
                                     diverged.insert(policy.queue_name.clone());
                                     if policy.updated_at > existing.updated_at {
-                                        per_shard_policies
-                                            .insert(policy.queue_name.clone(), policy);
+                                        merged_policies.insert(policy.queue_name.clone(), policy);
                                     }
                                 }
                                 Some(existing) if policy.updated_at > existing.updated_at => {
-                                    per_shard_policies.insert(policy.queue_name.clone(), policy);
+                                    merged_policies.insert(policy.queue_name.clone(), policy);
                                 }
                                 None => {
-                                    per_shard_policies.insert(policy.queue_name.clone(), policy);
+                                    merged_policies.insert(policy.queue_name.clone(), policy);
                                 }
                                 _ => {}
                             }
                         }
+                        per_shard_seen.push(seen_on_shard);
                     }
                     Err(e) => {
                         shard_errors.push(serde_json::json!({
@@ -11723,7 +11740,19 @@ async fn list_build_routing_handler(
         }
     }
 
-    let mut policies: Vec<BuildPolicy> = per_shard_policies.into_values().collect();
+    // Case 2: queue present on at least one shard but absent on another.
+    if per_shard_seen.len() > 1 {
+        for queue_name in merged_policies.keys() {
+            if per_shard_seen
+                .iter()
+                .any(|seen| !seen.contains(queue_name.as_str()))
+            {
+                diverged.insert(queue_name.clone());
+            }
+        }
+    }
+
+    let mut policies: Vec<BuildPolicy> = merged_policies.into_values().collect();
     policies.sort_by(|a, b| a.queue_name.cmp(&b.queue_name));
     let mut diverged_queues: Vec<String> = diverged.into_iter().collect();
     diverged_queues.sort();

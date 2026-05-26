@@ -459,7 +459,9 @@ async fn api_list_compat_works() {
 
     let (status, json) = get_json(&app, "/admin/build-routing/compat").await;
     assert_eq!(status, StatusCode::OK, "list compat must return 200");
-    let entries = json.as_array().expect("must be an array");
+    let entries = json["entries"]
+        .as_array()
+        .expect("response must have entries array");
     assert_eq!(entries.len(), 1, "must have one compat entry");
     assert_eq!(entries[0]["build_id"], "sha-v2");
     assert_eq!(entries[0]["compatible_with"], "sha-v1");
