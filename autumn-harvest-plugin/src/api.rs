@@ -34,10 +34,9 @@ use autumn_harvest::audit::{
     OP_EXTERNAL_ACTIVITY_COMPLETE, OP_EXTERNAL_ACTIVITY_FAIL, OP_RETENTION_RUN_NOW,
     OP_SCHEDULE_BACKFILL, OP_SCHEDULE_CREATE, OP_SCHEDULE_DELETE, OP_SCHEDULE_PAUSE,
     OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER, OP_WORKER_DRAIN, OP_WORKFLOW_CANCEL,
-    OP_WORKFLOW_RESET, OP_WORKFLOW_SIGNAL,
-    OP_WORKFLOW_SIGNAL_WITH_START, OP_WORKFLOW_START, SOURCE_API, STATUS_FAILED, STATUS_SUCCEEDED,
-    TARGET_BATCH, TARGET_DAG, TARGET_DEAD_LETTER, TARGET_EXTERNAL_ACTIVITY, TARGET_RETENTION,
-    TARGET_SCHEDULE, TARGET_WORKER, TARGET_WORKFLOW,
+    OP_WORKFLOW_RESET, OP_WORKFLOW_SIGNAL, OP_WORKFLOW_SIGNAL_WITH_START, OP_WORKFLOW_START,
+    SOURCE_API, STATUS_FAILED, STATUS_SUCCEEDED, TARGET_BATCH, TARGET_DAG, TARGET_DEAD_LETTER,
+    TARGET_EXTERNAL_ACTIVITY, TARGET_RETENTION, TARGET_SCHEDULE, TARGET_WORKER, TARGET_WORKFLOW,
 };
 use autumn_harvest::batch::{
     self, BatchAction, BatchExecutorConfig, BatchFilter, BatchJobStatus, BatchJobView,
@@ -6677,44 +6676,43 @@ async fn trigger_schedule_now(
     };
 
     // Determine workflow name, input, and queue from the schedule.
-    let (workflow_name, input, queue_name) =
-        match (schedule.workflow_name.as_deref(), schedule.dag_name.as_deref()) {
-            (Some(wf_name), _) => {
-                let input = schedule
-                    .workflow_input
-                    .clone()
-                    .unwrap_or(serde_json::Value::Null);
-                let queue = schedule
-                    .queue_name
-                    .as_deref()
-                    .unwrap_or("default")
-                    .to_string();
-                (wf_name.to_string(), input, queue)
-            }
-            (None, Some(dag_name)) => {
-                let dag_queue = runtime
-                    .dags()
-                    .get(dag_name)
-                    .and_then(|d| d.default_queue.as_deref())
-                    .or(schedule.queue_name.as_deref())
-                    .unwrap_or("default")
-                    .to_string();
-                (dag_name.to_string(), serde_json::Value::Null, dag_queue)
-            }
-            (None, None) => {
-                return Err(AutumnError::service_unavailable_msg(
-                    "schedule row has neither workflow_name nor dag_name",
-                ));
-            }
-        };
+    let (workflow_name, input, queue_name) = match (
+        schedule.workflow_name.as_deref(),
+        schedule.dag_name.as_deref(),
+    ) {
+        (Some(wf_name), _) => {
+            let input = schedule
+                .workflow_input
+                .clone()
+                .unwrap_or(serde_json::Value::Null);
+            let queue = schedule
+                .queue_name
+                .as_deref()
+                .unwrap_or("default")
+                .to_string();
+            (wf_name.to_string(), input, queue)
+        }
+        (None, Some(dag_name)) => {
+            let dag_queue = runtime
+                .dags()
+                .get(dag_name)
+                .and_then(|d| d.default_queue.as_deref())
+                .or(schedule.queue_name.as_deref())
+                .unwrap_or("default")
+                .to_string();
+            (dag_name.to_string(), serde_json::Value::Null, dag_queue)
+        }
+        (None, None) => {
+            return Err(AutumnError::service_unavailable_msg(
+                "schedule row has neither workflow_name nor dag_name",
+            ));
+        }
+    };
 
     let triggered_at = chrono::Utc::now();
     // Derive a unique workflow_id from the schedule id and the trigger timestamp
     // so that retrying the same request within the same millisecond is idempotent.
-    let workflow_id = format!(
-        "manual-{schedule_id}-{}",
-        triggered_at.timestamp_millis()
-    );
+    let workflow_id = format!("manual-{schedule_id}-{}", triggered_at.timestamp_millis());
     let exec_id = ExecutionId::new();
 
     let mut conn = acquire_conn(pool.default_pool()).await?;

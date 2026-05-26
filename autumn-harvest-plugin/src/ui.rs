@@ -31,6 +31,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use autumn_harvest::Schedule;
+use autumn_harvest::StartWorkflowParams;
 use autumn_harvest::audit::{
     OP_SCHEDULE_DELETE, OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER,
     OP_WORKFLOW_CANCEL, OP_WORKFLOW_RESET, OP_WORKFLOW_SIGNAL, SOURCE_API, SOURCE_UI,
@@ -38,8 +39,6 @@ use autumn_harvest::audit::{
 };
 use autumn_harvest::cancel_workflow_execution;
 use autumn_harvest::error::{HarvestResult, database_error};
-use autumn_harvest::start_or_load_workflow_execution;
-use autumn_harvest::StartWorkflowParams;
 use autumn_harvest::models::{
     DeadLetter, ExternalTask, HarvestEvent, HarvestSchedule, HarvestSignal, HarvestTimer,
     NewAuditRecord, ScheduleDecision, TaskQueueItem, WorkflowExecution,
@@ -53,8 +52,11 @@ use autumn_harvest::schema::{
     harvest_signals, harvest_task_queue, harvest_timers, harvest_workflow_executions,
 };
 use autumn_harvest::signal::send_signal;
+use autumn_harvest::start_or_load_workflow_execution;
 use autumn_harvest::store::admit_update_event;
-use autumn_harvest::types::{ExecutionId as HarvestExecutionId, Priority, ShardId, UpdateId, WorkflowIdReusePolicy};
+use autumn_harvest::types::{
+    ExecutionId as HarvestExecutionId, Priority, ShardId, UpdateId, WorkflowIdReusePolicy,
+};
 use autumn_harvest::workers::{WorkerFilters, WorkerHealth, WorkerRow, list_workers};
 
 use crate::api::{
@@ -4107,18 +4109,13 @@ async fn schedule_trigger_now_ui(
             .or(row.dag_name.as_deref())
             .unwrap_or("")
             .to_string();
-        let input = row.workflow_input.clone().unwrap_or(serde_json::Value::Null);
-        let queue = row
-            .queue_name
-            .as_deref()
-            .unwrap_or("default")
-            .to_string();
+        let input = row
+            .workflow_input
+            .clone()
+            .unwrap_or(serde_json::Value::Null);
+        let queue = row.queue_name.as_deref().unwrap_or("default").to_string();
         let triggered_at = chrono::Utc::now();
-        let workflow_id = format!(
-            "manual-{}-{}",
-            row.id,
-            triggered_at.timestamp_millis()
-        );
+        let workflow_id = format!("manual-{}-{}", row.id, triggered_at.timestamp_millis());
         let exec_id = HarvestExecutionId::new();
 
         let result = start_or_load_workflow_execution(
