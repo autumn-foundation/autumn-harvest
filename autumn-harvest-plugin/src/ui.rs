@@ -4098,6 +4098,7 @@ async fn schedule_delete_ui(
 #[allow(clippy::too_many_arguments)]
 async fn execute_schedule_trigger_ui(
     conn: &mut crate::api::PoolConn,
+    pool: &crate::HarvestDbPool,
     runtime: &HarvestApiRuntime,
     row: &HarvestSchedule,
     id_str: &str,
@@ -4106,25 +4107,55 @@ async fn execute_schedule_trigger_ui(
     input: serde_json::Value,
     queue: &str,
 ) -> axum::response::Response {
-    let running: i64 = harvest_workflow_executions::table
-        .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
-        .filter(harvest_workflow_executions::state.eq("RUNNING"))
-        .count()
-        .get_result(conn)
-        .await
-        .unwrap_or(0);
+    // Count RUNNING executions across ALL shards. The async block returns None if
+    // any shard is unreachable — used for fail-closed Skip enforcement.
+    let running_count: Option<i64> = async {
+        let mut total: i64 = 0;
+        for (_, shard_pool) in pool.iter_shards() {
+            let mut c = acquire_conn(shard_pool).await.ok()?;
+            let n: i64 = harvest_workflow_executions::table
+                .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
+                .filter(harvest_workflow_executions::state.eq("RUNNING"))
+                .count()
+                .get_result(&mut c)
+                .await
+                .ok()?;
+            total += n;
+        }
+        Some(total)
+    }
+    .await;
     if autumn_harvest::OverlapPolicy::from_db(&row.overlap_policy)
         == autumn_harvest::OverlapPolicy::Skip
-        && running >= i64::from(row.max_active_runs)
     {
-        let ar = build_trigger_audit("ui", id_str, STATUS_SUCCEEDED, Some("skipped_overlap"));
-        let _ = insert_audit(conn, &ar).await;
-        runtime
-            .registry()
-            .telemetry()
-            .metrics
-            .record_schedule_manual_trigger(name, "skipped_overlap");
-        return schedule_redirect(&format!("Skipped {name}: max_active_runs already reached"));
+        match running_count {
+            None => {
+                let ar = build_trigger_audit("ui", id_str, STATUS_FAILED, Some("count_failed"));
+                let _ = insert_audit(conn, &ar).await;
+                runtime
+                    .registry()
+                    .telemetry()
+                    .metrics
+                    .record_schedule_manual_trigger(name, "start_failed");
+                return schedule_redirect(&format!(
+                    "Failed to trigger {name}: could not count active runs"
+                ));
+            }
+            Some(n) if n >= i64::from(row.max_active_runs) => {
+                let ar =
+                    build_trigger_audit("ui", id_str, STATUS_SUCCEEDED, Some("skipped_overlap"));
+                let _ = insert_audit(conn, &ar).await;
+                runtime
+                    .registry()
+                    .telemetry()
+                    .metrics
+                    .record_schedule_manual_trigger(name, "skipped_overlap");
+                return schedule_redirect(&format!(
+                    "Skipped {name}: max_active_runs already reached"
+                ));
+            }
+            Some(_) => {}
+        }
     }
     let triggered_at = chrono::Utc::now();
     let workflow_id = format!(
@@ -4159,24 +4190,16 @@ async fn execute_schedule_trigger_ui(
         },
     )
     .await;
-    let outcome = if result.is_ok() {
-        "fired"
+    let (status, outcome) = if result.is_ok() {
+        (STATUS_SUCCEEDED, "fired")
     } else {
-        "start_failed"
+        (STATUS_FAILED, "start_failed")
     };
     let ar = build_trigger_audit(
         "ui",
         id_str,
-        if result.is_ok() {
-            STATUS_SUCCEEDED
-        } else {
-            STATUS_FAILED
-        },
-        if result.is_err() {
-            Some("start_failed")
-        } else {
-            None
-        },
+        status,
+        result.is_err().then_some("start_failed"),
     );
     let _ = insert_audit(conn, &ar).await;
     runtime
@@ -4184,11 +4207,10 @@ async fn execute_schedule_trigger_ui(
         .telemetry()
         .metrics
         .record_schedule_manual_trigger(name, outcome);
-    let flash = match result {
+    schedule_redirect(&match result {
         Ok(_) => format!("Triggered run of {name}"),
         Err(e) => format!("Failed to trigger {name}: {e}"),
-    };
-    schedule_redirect(&flash)
+    })
 }
 
 /// Build a `NewAuditRecord` for UI schedule trigger operations.
@@ -4279,6 +4301,7 @@ async fn schedule_trigger_now_ui(
     };
     execute_schedule_trigger_ui(
         &mut conn,
+        &pool,
         &runtime,
         &row,
         &id_str,
