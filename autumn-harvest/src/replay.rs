@@ -1516,8 +1516,8 @@ impl HistoryMatcher {
                 } if recorded_name == signal_name => {
                     let output = payload.clone();
                     self.consumed_signal_events.insert(scan_cursor);
-                    self.cursor = first_interleaved_command
-                        .unwrap_or_else(|| scan_cursor.saturating_add(1));
+                    self.cursor =
+                        first_interleaved_command.unwrap_or_else(|| scan_cursor.saturating_add(1));
                     self.advance_to_next_unconsumed_event();
 
                     return HistoryMatch::Matched { output };
@@ -3438,11 +3438,8 @@ mod tests {
             HistoryMatch::Matched { output }
         );
         assert_eq!(
-            matcher.match_detached_child_spawn(
-                "monitor",
-                &Value::Null,
-                ParentClosePolicy::Abandon,
-            ),
+            matcher
+                .match_detached_child_spawn("monitor", &Value::Null, ParentClosePolicy::Abandon,),
             HistoryMatch::DetachedChildSpawned { child_id }
         );
         assert!(!matcher.is_replaying());
@@ -3474,11 +3471,8 @@ mod tests {
             }
         );
         assert_eq!(
-            matcher.match_detached_child_spawn(
-                "monitor",
-                &Value::Null,
-                ParentClosePolicy::Abandon,
-            ),
+            matcher
+                .match_detached_child_spawn("monitor", &Value::Null, ParentClosePolicy::Abandon,),
             HistoryMatch::DetachedChildSpawned { child_id }
         );
     }
@@ -3512,11 +3506,8 @@ mod tests {
             HistoryMatch::Matched { output }
         );
         assert_eq!(
-            matcher.match_detached_child_spawn(
-                "monitor",
-                &Value::Null,
-                ParentClosePolicy::Abandon,
-            ),
+            matcher
+                .match_detached_child_spawn("monitor", &Value::Null, ParentClosePolicy::Abandon,),
             HistoryMatch::DetachedChildSpawned { child_id }
         );
     }
@@ -3545,11 +3536,8 @@ mod tests {
             }
         );
         assert_eq!(
-            matcher.match_detached_child_spawn(
-                "monitor",
-                &Value::Null,
-                ParentClosePolicy::Abandon,
-            ),
+            matcher
+                .match_detached_child_spawn("monitor", &Value::Null, ParentClosePolicy::Abandon,),
             HistoryMatch::DetachedChildSpawned { child_id }
         );
     }
