@@ -181,6 +181,11 @@ pub use dag_linter::{
 pub use dag_profiler::{DagProfile, DagProfiler, ProfilerEvent, ProfilerEventKind};
 #[cfg(any(test, feature = "testing"))]
 pub use dag_simulator::{DagSimulator, DagSimulatorResult};
+
+#[cfg(any(test, feature = "testing"))]
+pub mod dag_chaos;
+#[cfg(any(test, feature = "testing"))]
+pub use dag_chaos::{ChaosResult, DagChaosAnalyzer};
 pub use det_check::{
     DetCheckReport, DetFinding, DetLocation, DetSeverity, DetSuppression, check_dir, check_file,
     check_source,
