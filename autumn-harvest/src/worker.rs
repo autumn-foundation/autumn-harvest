@@ -813,6 +813,12 @@ struct LocalActivityRun {
     last_error: Option<String>,
 }
 
+struct LocalActivityCommandBatch {
+    pre_schedule_events: Vec<WorkflowEvent>,
+    post_schedule_events: Vec<WorkflowEvent>,
+    run: LocalActivityRun,
+}
+
 enum LocalActivityInlineOutcome {
     Complete(Vec<WorkflowEvent>),
     HistoryCapReached {
@@ -829,21 +835,25 @@ fn local_activity_history_cap_reached(next_event_id: i32, cap: Option<u64>) -> O
 
 /// Extract a `RunLocalActivity` command from an owned command list.
 ///
-/// Marker and detached-spawn events are also extracted and returned so the
-/// caller can append them to the event log before the local-activity events.
+/// Marker and detached-spawn events are split around the local activity command
+/// so `LocalActivityScheduled` is written at its actual command position.
 /// The `result_tx` inside the command is dropped immediately — the workflow
 /// coroutine was already dropped when the 100 ms suspension timeout fired, so
 /// nobody is listening on the receiving end.
-fn extract_run_local_activity(
-    commands: Vec<WorkflowCommand>,
-) -> (Vec<WorkflowEvent>, LocalActivityRun) {
+fn extract_run_local_activity(commands: Vec<WorkflowCommand>) -> LocalActivityCommandBatch {
     // ⚡ Bolt: Pre-allocate vector capacity to avoid intermediate allocations
-    let mut prefix_events = Vec::with_capacity(commands.len());
+    let mut pre_schedule_events = Vec::with_capacity(commands.len());
+    let mut post_schedule_events = Vec::new();
     let mut local_run = None;
     for cmd in commands {
         match cmd {
             WorkflowCommand::RecordMarker { name, details } => {
-                prefix_events.push(WorkflowEvent::MarkerRecorded { name, details });
+                let event = WorkflowEvent::MarkerRecorded { name, details };
+                if local_run.is_some() {
+                    post_schedule_events.push(event);
+                } else {
+                    pre_schedule_events.push(event);
+                }
             }
             WorkflowCommand::SpawnDetachedChildWorkflow {
                 child_id,
@@ -851,12 +861,17 @@ fn extract_run_local_activity(
                 input,
                 parent_close_policy,
             } => {
-                prefix_events.push(WorkflowEvent::ChildWorkflowSpawnedDetached {
+                let event = WorkflowEvent::ChildWorkflowSpawnedDetached {
                     child_id,
                     workflow_name,
                     input,
                     parent_close_policy,
-                });
+                };
+                if local_run.is_some() {
+                    post_schedule_events.push(event);
+                } else {
+                    pre_schedule_events.push(event);
+                }
             }
             WorkflowCommand::RunLocalActivity {
                 activity_id,
@@ -884,10 +899,11 @@ fn extract_run_local_activity(
             _ => {} // unexpected alongside RunLocalActivity; ignore
         }
     }
-    (
-        prefix_events,
-        local_run.expect("called only after confirming RunLocalActivity is present"),
-    )
+    LocalActivityCommandBatch {
+        pre_schedule_events,
+        post_schedule_events,
+        run: local_run.expect("called only after confirming RunLocalActivity is present"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1109,11 +1125,15 @@ async fn run_local_activity_inline(
     conn: &mut AsyncPgConnection,
     registry: &HandlerRegistry,
     exec_id: ExecutionId,
-    marker_events: Vec<WorkflowEvent>,
-    run: LocalActivityRun,
+    batch: LocalActivityCommandBatch,
     max_start_to_close: Duration,
     next_event_id: &mut i32,
 ) -> HarvestResult<LocalActivityInlineOutcome> {
+    let LocalActivityCommandBatch {
+        pre_schedule_events,
+        post_schedule_events,
+        run,
+    } = batch;
     let activity = registry.activities.get(&run.name).ok_or_else(|| {
         HarvestError::Config(format!("no activity handler registered for '{}'", run.name))
     })?;
@@ -1128,7 +1148,7 @@ async fn run_local_activity_inline(
 
     // When the worker crashed after appending LocalActivityScheduled but before
     // recording a terminal event, skip re-appending to avoid a duplicate.
-    let mut prefix_events = marker_events;
+    let mut prefix_events = pre_schedule_events;
     if !run.already_scheduled {
         prefix_events.push(WorkflowEvent::LocalActivityScheduled {
             activity_id: run.activity_id,
@@ -1136,6 +1156,7 @@ async fn run_local_activity_inline(
             input: run.input.clone(),
         });
     }
+    prefix_events.extend(post_schedule_events);
     if !prefix_events.is_empty() {
         store::append_events(conn, exec_id, &prefix_events, *next_event_id).await?;
         *next_event_id += i32::try_from(prefix_events.len())
@@ -4403,13 +4424,12 @@ async fn process_workflow_task(
                 {
                     return fail_execution_on_error(conn, task, worker_id, Err::<(), _>(e)).await;
                 }
-                let (markers, local_run) = extract_run_local_activity(commands);
+                let local_batch = extract_run_local_activity(commands);
                 let inline_outcome = run_local_activity_inline(
                     conn,
                     registry,
                     prepared.exec_id,
-                    markers,
-                    local_run,
+                    local_batch,
                     max_local_activity_start_to_close,
                     &mut next_event_id,
                 )
@@ -5811,6 +5831,7 @@ impl Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::ParentClosePolicy;
     use tokio::sync::oneshot;
 
     fn default_runtime_config() -> WorkerRuntimeConfig {
@@ -6055,6 +6076,91 @@ mod tests {
             details: serde_json::json!(2),
         }];
         assert!(!should_requeue_signal_wait(&commands));
+    }
+
+    #[test]
+    fn extract_run_local_activity_preserves_detached_after_local_command() {
+        let child_id = ExecutionId::new();
+        let commands = vec![
+            WorkflowCommand::RunLocalActivity {
+                activity_id: crate::types::ActivityExecId::new(),
+                name: "format_data".to_string(),
+                input: serde_json::Value::Null,
+                start_to_close_secs: None,
+                retry_policy: None,
+                result_tx: oneshot::channel::<Result<serde_json::Value, String>>().0,
+                already_scheduled: false,
+                failed_attempts: 0,
+                last_error: None,
+            },
+            WorkflowCommand::SpawnDetachedChildWorkflow {
+                child_id,
+                workflow_name: "monitor".to_string(),
+                input: serde_json::Value::Null,
+                parent_close_policy: ParentClosePolicy::Abandon,
+            },
+        ];
+
+        let batch = extract_run_local_activity(commands);
+
+        assert!(batch.pre_schedule_events.is_empty());
+        assert_eq!(batch.run.name, "format_data");
+        assert!(
+            matches!(
+                batch.post_schedule_events.as_slice(),
+                [WorkflowEvent::ChildWorkflowSpawnedDetached {
+                    child_id: recorded_child_id,
+                    workflow_name,
+                    input,
+                    parent_close_policy: ParentClosePolicy::Abandon,
+                }] if *recorded_child_id == child_id
+                    && workflow_name == "monitor"
+                    && *input == serde_json::Value::Null
+            ),
+            "detached spawn emitted after RunLocalActivity must be written after LocalActivityScheduled"
+        );
+    }
+
+    #[test]
+    fn extract_run_local_activity_preserves_detached_before_local_command() {
+        let child_id = ExecutionId::new();
+        let commands = vec![
+            WorkflowCommand::SpawnDetachedChildWorkflow {
+                child_id,
+                workflow_name: "monitor".to_string(),
+                input: serde_json::Value::Null,
+                parent_close_policy: ParentClosePolicy::Abandon,
+            },
+            WorkflowCommand::RunLocalActivity {
+                activity_id: crate::types::ActivityExecId::new(),
+                name: "format_data".to_string(),
+                input: serde_json::Value::Null,
+                start_to_close_secs: None,
+                retry_policy: None,
+                result_tx: oneshot::channel::<Result<serde_json::Value, String>>().0,
+                already_scheduled: false,
+                failed_attempts: 0,
+                last_error: None,
+            },
+        ];
+
+        let batch = extract_run_local_activity(commands);
+
+        assert!(batch.post_schedule_events.is_empty());
+        assert!(
+            matches!(
+                batch.pre_schedule_events.as_slice(),
+                [WorkflowEvent::ChildWorkflowSpawnedDetached {
+                    child_id: recorded_child_id,
+                    workflow_name,
+                    input,
+                    parent_close_policy: ParentClosePolicy::Abandon,
+                }] if *recorded_child_id == child_id
+                    && workflow_name == "monitor"
+                    && *input == serde_json::Value::Null
+            ),
+            "detached spawn emitted before RunLocalActivity must stay before LocalActivityScheduled"
+        );
     }
 
     #[test]
