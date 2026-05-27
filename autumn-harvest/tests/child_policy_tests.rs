@@ -9,11 +9,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use autumn_harvest::concurrency::ConcurrencyPolicy;
-use autumn_harvest::info::WorkflowInfo;
+use autumn_harvest::event::WorkflowEvent;
+use autumn_harvest::info::{ActivityInfo, WorkflowInfo};
+use autumn_harvest::models::NewWorkflowExecution;
 use autumn_harvest::types::ParentClosePolicy;
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{
-    ExecutionId, Priority, ShardId, StartWorkflowParams, WorkflowContext,
+    ExecutionId, Priority, ShardId, StartWorkflowParams, WorkflowContext, timeout,
     WorkflowHistoryPolicy, cancel_workflow_execution, start_or_load_workflow_execution,
 };
 use diesel_async::AsyncConnection;
@@ -196,6 +198,40 @@ fn wf_info_with_concurrency(
         concurrency: Some(concurrency),
         max_input_bytes: None,
     }
+}
+
+fn local_activity_info(
+    name: &'static str,
+    handler: autumn_harvest::info::ActivityHandlerFn,
+) -> ActivityInfo {
+    ActivityInfo {
+        name,
+        module: "child_policy_tests",
+        default_retry_policy: None,
+        default_start_to_close: None,
+        default_heartbeat_timeout: None,
+        default_schedule_to_start: None,
+        default_queue: None,
+        max_concurrent: None,
+        concurrency_key: None,
+        is_local: true,
+        max_input_bytes: None,
+        max_result_bytes: None,
+        rate_limit_rps: None,
+        rate_limit_burst: None,
+        rate_limit_key: None,
+        handler,
+    }
+}
+
+async fn load_history_events(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> Vec<WorkflowEvent> {
+    autumn_harvest::store::load_history(conn, exec_id)
+        .await
+        .expect("history should load")
+        .events
 }
 
 async fn wait_for_child_execution(
@@ -412,6 +448,316 @@ async fn detached_child_workflow_uses_registered_concurrency_policy() {
 
     assert_eq!(concurrency_key.as_deref(), Some("acme"));
     assert_eq!(concurrency_cap, Some(2));
+}
+
+#[tokio::test]
+async fn detached_child_continue_as_new_failure_does_not_wake_parent() {
+    let (url, _container) = setup_test_db_url().await;
+    let pool = build_pool(&url);
+
+    fn parent_waits<'a>(
+        ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            ctx.spawn_child_workflow_detached_raw(
+                "detached_continue_as_new_child",
+                serde_json::json!({ "phase": "init" }),
+                ParentClosePolicy::Abandon,
+            )
+            .map_err(|e| e.to_string())?;
+            let _signal = ctx
+                .wait_for_signal("release")
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(serde_json::json!("parent_done"))
+        })
+    }
+
+    fn child_continues<'a>(
+        ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let _ = ctx
+                .continue_as_new(serde_json::json!({ "phase": "next" }))
+                .await;
+            unreachable!("continue_as_new must not resolve")
+        })
+    }
+
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![
+            wf_info("detached_continue_parent", parent_waits),
+            wf_info("detached_continue_as_new_child", child_continues),
+        ],
+        vec![],
+    ));
+
+    let mut conn = AsyncPgConnection::establish(&url)
+        .await
+        .expect("connect failed");
+    let parent_exec_id = start_workflow(
+        &mut conn,
+        "detached_continue_parent",
+        "detached-continue-parent-001",
+        Value::Null,
+    )
+    .await;
+
+    let worker = Arc::new(make_worker(registry));
+    let worker_pool = pool.clone();
+    let worker_ref = worker.clone();
+    let worker_handle = tokio::spawn(async move {
+        let _ = tokio::time::timeout(Duration::from_secs(15), worker_ref.run(&worker_pool)).await;
+    });
+
+    let child_exec_id = wait_for_child_execution(&mut conn, parent_exec_id).await;
+    wait_for_state(&mut conn, child_exec_id, &["FAILED"]).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    worker_handle.abort();
+
+    let parent_history = load_history_events(&mut conn, parent_exec_id).await;
+    assert!(
+        !parent_history
+            .iter()
+            .any(|event| matches!(event, WorkflowEvent::ChildWorkflowFailed { .. })),
+        "detached child continue-as-new failure must not be recorded on parent history: {parent_history:?}"
+    );
+    assert_eq!(get_state(&mut conn, parent_exec_id).await, "RUNNING");
+}
+
+#[tokio::test]
+async fn signal_then_detached_only_remainder_persists_spawn_and_completes() {
+    let (url, _container) = setup_test_db_url().await;
+    let pool = build_pool(&url);
+
+    fn target_waits<'a>(
+        ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let payload = ctx
+                .wait_for_signal("poke")
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(payload)
+        })
+    }
+
+    fn parent_signals_after_detached<'a>(
+        ctx: &'a WorkflowContext,
+        input: Value,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let target = ExecutionId::from_uuid(
+                uuid::Uuid::parse_str(input["target"].as_str().ok_or("missing target")?)
+                    .map_err(|e| e.to_string())?,
+            );
+            ctx.spawn_child_workflow_detached_raw(
+                "signal_remainder_detached_child",
+                Value::Null,
+                ParentClosePolicy::Abandon,
+            )
+            .map_err(|e| e.to_string())?;
+            ctx.signal_external_workflow(target, "poke", serde_json::json!({ "ok": true }))
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(serde_json::json!("parent_done"))
+        })
+    }
+
+    fn long_child<'a>(
+        ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            ctx.timer("hold", 3600).await.map_err(|e| e.to_string())?;
+            Ok(serde_json::json!("child_done"))
+        })
+    }
+
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![
+            wf_info("signal_target_waits", target_waits),
+            wf_info(
+                "signal_then_detached_parent",
+                parent_signals_after_detached,
+            ),
+            wf_info("signal_remainder_detached_child", long_child),
+        ],
+        vec![],
+    ));
+
+    let mut conn = AsyncPgConnection::establish(&url)
+        .await
+        .expect("connect failed");
+    let target_exec_id =
+        start_workflow(&mut conn, "signal_target_waits", "signal-target-001", Value::Null).await;
+    let parent_exec_id = start_workflow(
+        &mut conn,
+        "signal_then_detached_parent",
+        "signal-detached-parent-001",
+        serde_json::json!({ "target": target_exec_id.as_uuid().to_string() }),
+    )
+    .await;
+
+    let worker = Arc::new(make_worker(registry));
+    let worker_pool = pool.clone();
+    let worker_ref = worker.clone();
+    let worker_handle = tokio::spawn(async move {
+        let _ = tokio::time::timeout(Duration::from_secs(20), worker_ref.run(&worker_pool)).await;
+    });
+
+    wait_for_state(&mut conn, parent_exec_id, &["COMPLETED"]).await;
+    wait_for_state(&mut conn, target_exec_id, &["COMPLETED"]).await;
+    let child_exec_id = wait_for_child_execution(&mut conn, parent_exec_id).await;
+    assert_eq!(get_state(&mut conn, child_exec_id).await, "RUNNING");
+
+    worker_handle.abort();
+}
+
+#[tokio::test]
+async fn detached_spawn_before_local_activity_is_persisted() {
+    let (url, _container) = setup_test_db_url().await;
+    let pool = build_pool(&url);
+
+    fn parent_runs_local<'a>(
+        ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            ctx.spawn_child_workflow_detached_raw(
+                "local_detached_child",
+                Value::Null,
+                ParentClosePolicy::Abandon,
+            )
+            .map_err(|e| e.to_string())?;
+            let local = ctx
+                .execute_local_activity_raw("local_ping", Value::Null, None, None)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(local)
+        })
+    }
+
+    fn local_detached_child<'a>(
+        ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            ctx.timer("hold", 3600).await.map_err(|e| e.to_string())?;
+            Ok(serde_json::json!("child_done"))
+        })
+    }
+
+    fn local_ping<'a>(
+        _ctx: &'a autumn_harvest::ActivityContext,
+        _input: Value,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move { Ok(serde_json::json!("pong")) })
+    }
+
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![
+            wf_info("local_detached_parent", parent_runs_local),
+            wf_info("local_detached_child", local_detached_child),
+        ],
+        vec![local_activity_info("local_ping", local_ping)],
+    ));
+
+    let mut conn = AsyncPgConnection::establish(&url)
+        .await
+        .expect("connect failed");
+    let parent_exec_id = start_workflow(
+        &mut conn,
+        "local_detached_parent",
+        "local-detached-parent-001",
+        Value::Null,
+    )
+    .await;
+
+    let worker = Arc::new(make_worker(registry));
+    let worker_pool = pool.clone();
+    let worker_ref = worker.clone();
+    let worker_handle = tokio::spawn(async move {
+        let _ = tokio::time::timeout(Duration::from_secs(20), worker_ref.run(&worker_pool)).await;
+    });
+
+    wait_for_state(&mut conn, parent_exec_id, &["COMPLETED"]).await;
+    let child_exec_id = wait_for_child_execution(&mut conn, parent_exec_id).await;
+    assert_eq!(get_state(&mut conn, child_exec_id).await, "RUNNING");
+
+    worker_handle.abort();
+}
+
+#[tokio::test]
+async fn detached_child_execution_timeout_does_not_wake_parent() {
+    use autumn_harvest::schema::harvest_workflow_executions;
+    use chrono::Utc;
+    use diesel_async::RunQueryDsl;
+
+    let (url, _container) = setup_test_db_url().await;
+    let mut conn = AsyncPgConnection::establish(&url)
+        .await
+        .expect("connect failed");
+    let parent_exec_id = start_workflow(
+        &mut conn,
+        "manual_timeout_parent",
+        "manual-timeout-parent-001",
+        Value::Null,
+    )
+    .await;
+    let child_exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    let child_workflow_id = child_exec_id.to_string();
+    let timeout = chrono::Duration::milliseconds(1);
+
+    diesel::insert_into(harvest_workflow_executions::table)
+        .values(&NewWorkflowExecution {
+            id: child_exec_id.as_uuid(),
+            workflow_name: "manual_timeout_child",
+            workflow_id: &child_workflow_id,
+            run_id: uuid::Uuid::new_v4(),
+            shard_id: 0,
+            input: Value::Null,
+            parent_id: Some(parent_exec_id.as_uuid()),
+            queue_name: "default",
+            execution_timeout: Some(timeout),
+            deadline_at: Some(Utc::now() - chrono::Duration::seconds(1)),
+            memo: None,
+            search_attrs: None,
+            assigned_build_id: None,
+            parent_close_policy: Some(ParentClosePolicy::Abandon.as_str().to_string()),
+        })
+        .execute(&mut conn)
+        .await
+        .expect("child row should insert");
+    autumn_harvest::store::append_events(
+        &mut conn,
+        child_exec_id,
+        &[WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+        }],
+        0,
+    )
+    .await
+    .expect("child started event should append");
+
+    let enforced =
+        timeout::enforce_workflow_execution_timeouts(&mut conn, &autumn_harvest::NoOpMetrics)
+            .await
+            .expect("timeout enforcement should succeed");
+
+    assert_eq!(enforced, 1);
+    wait_for_state(&mut conn, child_exec_id, &["TIMED_OUT"]).await;
+    let parent_history = load_history_events(&mut conn, parent_exec_id).await;
+    assert!(
+        !parent_history
+            .iter()
+            .any(|event| matches!(event, WorkflowEvent::ChildWorkflowFailed { .. })),
+        "detached child timeout must not be recorded on parent history: {parent_history:?}"
+    );
 }
 
 // ── Test 2: RequestCancel cascade when parent is cancelled ────────────────────

@@ -435,6 +435,19 @@ fn should_requeue_signal_wait(commands: &[WorkflowCommand]) -> bool {
     has_wait && only_wait_or_bookkeeping
 }
 
+fn only_bookkeeping_commands(commands: &[WorkflowCommand]) -> bool {
+    !commands.is_empty()
+        && commands.iter().all(|cmd| {
+            matches!(
+                cmd,
+                WorkflowCommand::RecordMarker { .. }
+                    | WorkflowCommand::RecordUpdateResult { .. }
+                    | WorkflowCommand::UpsertSearchAttributes { .. }
+                    | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
+            )
+        })
+}
+
 #[derive(Debug, Clone)]
 struct ScheduledActivityCommand {
     activity_id: ActivityExecId,
@@ -816,7 +829,7 @@ fn local_activity_history_cap_reached(next_event_id: i32, cap: Option<u64>) -> O
 
 /// Extract a `RunLocalActivity` command from an owned command list.
 ///
-/// Marker (`RecordMarker`) events are also extracted and returned so the
+/// Marker and detached-spawn events are also extracted and returned so the
 /// caller can append them to the event log before the local-activity events.
 /// The `result_tx` inside the command is dropped immediately — the workflow
 /// coroutine was already dropped when the 100 ms suspension timeout fired, so
@@ -825,12 +838,25 @@ fn extract_run_local_activity(
     commands: Vec<WorkflowCommand>,
 ) -> (Vec<WorkflowEvent>, LocalActivityRun) {
     // ⚡ Bolt: Pre-allocate vector capacity to avoid intermediate allocations
-    let mut markers = Vec::with_capacity(commands.len());
+    let mut prefix_events = Vec::with_capacity(commands.len());
     let mut local_run = None;
     for cmd in commands {
         match cmd {
             WorkflowCommand::RecordMarker { name, details } => {
-                markers.push(WorkflowEvent::MarkerRecorded { name, details });
+                prefix_events.push(WorkflowEvent::MarkerRecorded { name, details });
+            }
+            WorkflowCommand::SpawnDetachedChildWorkflow {
+                child_id,
+                workflow_name,
+                input,
+                parent_close_policy,
+            } => {
+                prefix_events.push(WorkflowEvent::ChildWorkflowSpawnedDetached {
+                    child_id,
+                    workflow_name,
+                    input,
+                    parent_close_policy,
+                });
             }
             WorkflowCommand::RunLocalActivity {
                 activity_id,
@@ -859,7 +885,7 @@ fn extract_run_local_activity(
         }
     }
     (
-        markers,
+        prefix_events,
         local_run.expect("called only after confirming RunLocalActivity is present"),
     )
 }
@@ -3306,6 +3332,29 @@ async fn persist_scheduled_external_activity(
     .await
 }
 
+async fn persist_bookkeeping_and_requeue_workflow(
+    conn: &mut AsyncPgConnection,
+    task_id: uuid::Uuid,
+    exec_id: ExecutionId,
+    next_event_id: i32,
+    commands: &[WorkflowCommand],
+    sticky: Option<queue::StickyHint<'_>>,
+) -> HarvestResult<()> {
+    let events = pre_suspension_events_from_commands(commands);
+
+    conn.transaction::<(), HarvestError, _>(|conn| {
+        async move {
+            if !events.is_empty() {
+                store::append_events(conn, exec_id, &events, next_event_id).await?;
+            }
+            queue::park_workflow_task(conn, task_id, sticky).await?;
+            queue::wake_workflow_task(conn, exec_id).await
+        }
+        .scope_boxed()
+    })
+    .await
+}
+
 #[allow(clippy::too_many_lines)]
 async fn handle_suspended_workflow(
     conn: &mut AsyncPgConnection,
@@ -3356,6 +3405,16 @@ async fn handle_suspended_workflow(
             context.persistence.exec_id,
             context.persistence.next_event_id,
             &marker_events,
+            sticky,
+        )
+        .await
+    } else if only_bookkeeping_commands(commands) {
+        persist_bookkeeping_and_requeue_workflow(
+            conn,
+            context.persistence.task.id,
+            context.persistence.exec_id,
+            context.persistence.next_event_id,
+            commands,
             sticky,
         )
         .await
@@ -3616,6 +3675,42 @@ async fn prepare_workflow_task_with_cache(
 /// changes the spawn-time logical identity its parent recorded) or orphaning
 /// the parent's `ChildWorkflow*` waiter, neither of which has a sound default
 /// in Phase 1. Callers from a child workflow get an explicit failure instead.
+async fn reject_child_continue_as_new(
+    conn: &mut AsyncPgConnection,
+    persistence: &WorkflowTaskPersistence<'_>,
+    execution: &WorkflowExecution,
+) -> HarvestResult<bool> {
+    let Some(parent_exec_id) = execution.parent_id.map(execution_id_from_uuid) else {
+        return Ok(false);
+    };
+
+    let error = "continue_as_new is not supported in child workflows in this release";
+    if execution.parent_close_policy.is_some() {
+        persist_workflow_failure(
+            conn,
+            persistence.task.id,
+            persistence.exec_id,
+            persistence.next_event_id,
+            persistence.worker_id,
+            error,
+        )
+        .await?;
+    } else {
+        persist_child_workflow_failure(
+            conn,
+            persistence.task.id,
+            persistence.exec_id,
+            persistence.next_event_id,
+            persistence.worker_id,
+            parent_exec_id,
+            error,
+        )
+        .await?;
+    }
+
+    Ok(true)
+}
+
 async fn persist_workflow_continue_as_new(
     conn: &mut AsyncPgConnection,
     persistence: WorkflowTaskPersistence<'_>,
@@ -3624,19 +3719,8 @@ async fn persist_workflow_continue_as_new(
 ) -> HarvestResult<()> {
     use crate::schema::{harvest_signals, harvest_workflow_executions};
 
-    if let Some(parent_exec_id) = execution.parent_id.map(execution_id_from_uuid) {
-        let error =
-            "continue_as_new is not supported in child workflows in this release".to_string();
-        return persist_child_workflow_failure(
-            conn,
-            persistence.task.id,
-            persistence.exec_id,
-            persistence.next_event_id,
-            persistence.worker_id,
-            parent_exec_id,
-            &error,
-        )
-        .await;
+    if reject_child_continue_as_new(conn, &persistence, execution).await? {
+        return Ok(());
     }
 
     // The new execution stays on the same shard so all of its event log,
@@ -4285,6 +4369,13 @@ async fn process_workflow_task(
                 } else {
                     commands
                 };
+                if commands
+                    .iter()
+                    .any(|c| matches!(c, WorkflowCommand::SpawnDetachedChildWorkflow { .. }))
+                {
+                    create_detached_child_executions(conn, registry, &prepared.execution, &commands)
+                        .await?;
+                }
                 let (markers, local_run) = extract_run_local_activity(commands);
                 let inline_outcome = run_local_activity_inline(
                     conn,

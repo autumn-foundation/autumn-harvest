@@ -537,7 +537,9 @@ async fn enforce_workflow_timeout(
             store::append_events(conn, exec_id, &[workflow_event], history.next_event_id).await?;
             update_workflow_execution_timed_out(conn, exec_id, &error).await?;
             queue::fail_task(conn, task.id, &error).await?;
-            if let Some(parent_uuid) = execution.parent_id {
+            if execution.parent_close_policy.is_none()
+                && let Some(parent_uuid) = execution.parent_id
+            {
                 wake_parent_for_child_timeout(
                     conn,
                     execution_id_from_uuid(parent_uuid),
@@ -643,7 +645,7 @@ pub async fn enforce_external_task_timeouts(conn: &mut AsyncPgConnection) -> Har
 /// 1. Appends `WorkflowEvent::WorkflowExecutionTimedOut` to the execution history.
 /// 2. Transitions the execution row to `TIMED_OUT` state.
 /// 3. Cancels/fails the outstanding workflow task in `harvest_task_queue`.
-/// 4. Notifies the parent workflow (if any) via `ChildWorkflowFailed`.
+/// 4. Notifies the parent workflow (for awaited children) via `ChildWorkflowFailed`.
 /// 5. Applies parent-close policy to any running detached children.
 ///
 /// Returns the number of executions that were timed out.
@@ -684,7 +686,11 @@ pub async fn enforce_workflow_execution_timeouts(
         }
         .to_string();
 
-        let parent_uuid = execution.parent_id;
+        let parent_uuid = if execution.parent_close_policy.is_none() {
+            execution.parent_id
+        } else {
+            None
+        };
         let workflow_name = execution.workflow_name.clone();
 
         // true  = timeout transition was committed
