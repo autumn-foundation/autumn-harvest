@@ -165,6 +165,7 @@ struct WorkflowHandleClientInner {
     max_workflow_start_delay: Duration,
     max_signal_payload_bytes: u64,
     query_timeout: Duration,
+    history_policy: crate::context::WorkflowHistoryPolicy,
 }
 
 impl std::fmt::Debug for WorkflowHandleClientInner {
@@ -188,6 +189,7 @@ impl std::fmt::Debug for WorkflowHandleClientInner {
             .field("max_workflow_start_delay", &self.max_workflow_start_delay)
             .field("max_signal_payload_bytes", &self.max_signal_payload_bytes)
             .field("query_timeout", &self.query_timeout)
+            .field("history_policy", &self.history_policy)
             .finish()
     }
 }
@@ -245,6 +247,7 @@ impl WorkflowHandleClient {
                 max_workflow_start_delay: crate::builder::DEFAULT_MAX_WORKFLOW_START_DELAY,
                 max_signal_payload_bytes: crate::builder::DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
                 query_timeout: Duration::from_secs(5),
+                history_policy: crate::context::WorkflowHistoryPolicy::default(),
             }),
         }
     }
@@ -334,6 +337,18 @@ impl WorkflowHandleClient {
         }
     }
 
+    /// Add history size policies to the client.
+    #[must_use]
+    pub fn with_history_policy(
+        self,
+        history_policy: crate::context::WorkflowHistoryPolicy,
+    ) -> Self {
+        let mut inner = (*self.inner).clone();
+        inner.history_policy = history_policy;
+        Self {
+            inner: Arc::new(inner),
+        }
+    }
     /// Get the maximum allowed execution timeout.
     #[must_use]
     pub fn max_workflow_execution_timeout(&self) -> Option<Duration> {
@@ -690,10 +705,11 @@ impl WorkflowHandle {
         .await?;
         drop(conn);
 
-        let ctx = crate::context::WorkflowContext::for_replay_with_state(
+        let ctx = crate::context::WorkflowContext::for_replay_with_state_and_history_policy(
             self.exec_id,
             history.events,
             self.client.inner.shared_state.clone(),
+            self.client.inner.history_policy,
         );
         for q_info in &self.client.inner.query_handlers {
             if q_info.workflow == workflow_info.name {
@@ -771,7 +787,6 @@ impl WorkflowHandle {
         crate::store::admit_update_event(conn, self.exec_id, update_id, name.to_string(), input)
             .await?;
         crate::queue::wake_workflow_task(conn, self.exec_id).await?;
-
         let start = Instant::now();
         let poll_interval = Duration::from_millis(100);
 

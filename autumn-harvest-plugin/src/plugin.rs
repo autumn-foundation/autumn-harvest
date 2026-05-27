@@ -192,7 +192,20 @@ impl Plugin for HarvestPlugin {
             .on_startup(move |state| {
                 let slot = Arc::clone(&startup_slot);
                 let api_state = startup_api_state.clone();
-                async move { start_harvest_runtime(&state, &slot, &api_state) }
+                async move {
+                    tracing::info!("on_startup hook: executing start_harvest_runtime");
+                    let res = start_harvest_runtime(&state, &slot, &api_state);
+                    match &res {
+                        Ok(()) => tracing::info!(
+                            "on_startup hook: start_harvest_runtime completed successfully"
+                        ),
+                        Err(e) => tracing::error!(
+                            "on_startup hook: start_harvest_runtime failed with error: {:?}",
+                            e
+                        ),
+                    }
+                    res
+                }
             })
             .on_shutdown(move || {
                 let slot = Arc::clone(&shutdown_slot);
@@ -215,6 +228,7 @@ impl Plugin for HarvestPlugin {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn start_harvest_runtime(
     state: &AppState,
     slot: &Arc<Mutex<HarvestRuntimeSlot>>,
@@ -252,6 +266,32 @@ fn start_harvest_runtime(
             "harvest plugin builder was already consumed",
         ));
     };
+
+    #[allow(unused_mut)]
+    let mut builder = builder;
+    #[cfg(feature = "webhooks")]
+    {
+        #[allow(unused_imports)]
+        use crate::webhook::{
+            __autumn_activity_info_deliver_webhook, __autumn_workflow_info_webhook_delivery,
+            deliver_webhook, webhook_delivery,
+        };
+        builder = builder
+            .workflows(autumn_harvest::prelude::workflows![webhook_delivery])
+            .activities(autumn_harvest::prelude::activities![deliver_webhook]);
+
+        if !builder
+            .worker_config_mut()
+            .queues
+            .iter()
+            .any(|q| q == "webhooks")
+        {
+            builder
+                .worker_config_mut()
+                .queues
+                .push("webhooks".to_string());
+        }
+    }
 
     let mut built = builder
         .try_build()
@@ -309,9 +349,84 @@ fn start_harvest_runtime(
     .with_max_workflow_execution_timeout(max_workflow_execution_timeout)
     .with_max_workflow_start_delay(max_workflow_start_delay)
     .with_max_signal_payload_bytes(max_signal_payload_bytes)
-    .with_query_timeout(query_timeout);
+    .with_query_timeout(query_timeout)
+    .with_history_policy(runner.api_runtime().registry().history_policy());
     state.insert_extension(harvest_db_pool.clone());
+
+    #[cfg(feature = "webhooks")]
+    let client = workflow_handle_client.clone();
     state.insert_extension(workflow_handle_client);
+
+    #[cfg(feature = "webhooks")]
+    {
+        tracing::info!("HarvestPlugin: inserting WebhookDelegateExt into AppState extensions");
+        let delegate = std::sync::Arc::new(
+            move |state: &AppState,
+                  sub: autumn_web::webhook_outbound::WebhookSubscription,
+                  log: autumn_web::webhook_outbound::WebhookDeliveryLog| {
+                let client = client.clone();
+                let harvest_db = state.extension::<crate::state::HarvestDbPool>();
+                Box::pin(async move {
+                    let workflow_id = format!("webhook-delivery-{}", log.id);
+                    let shard =
+                        client.pick_shard_for_new_workflow("webhook_delivery", &workflow_id);
+                    let exec_id = autumn_harvest::types::ExecutionId::new_for_shard(shard);
+
+                    let start_params = autumn_harvest::execution::StartWorkflowParams {
+                        workflow_name: "webhook_delivery",
+                        workflow_id: &workflow_id,
+                        exec_id,
+                        input: serde_json::json!({
+                            "subscription_id": sub.id,
+                            "topic": log.topic,
+                            "payload": log.payload,
+                        }),
+                        parent_id: None,
+                        queue_name: "webhooks",
+                        execution_timeout: None,
+                        memo: None,
+                        search_attrs: None,
+                        reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
+                        trace_context: None,
+                        max_execution_timeout_ceiling: None,
+                        concurrency_key: None,
+                        concurrency_limit: None,
+                        priority: autumn_harvest::prelude::Priority::default(),
+                        max_workflow_input_bytes,
+                        start_at: None,
+                        delay: None,
+                        max_workflow_start_delay: None,
+                    };
+
+                    let Some(harvest_db) = harvest_db else {
+                        return Err(autumn_web::error::AutumnError::internal_server_error_msg(
+                            "HarvestDbPool not found on AppState extensions",
+                        ));
+                    };
+                    let pool = harvest_db.pool_for(shard).clone();
+                    let mut conn = pool.get().await.map_err(|e| {
+                        autumn_web::error::AutumnError::internal_server_error_msg(e.to_string())
+                    })?;
+
+                    client
+                        .start_or_load(&mut conn, start_params)
+                        .await
+                        .map_err(|e| {
+                            autumn_web::error::AutumnError::internal_server_error_msg(format!(
+                                "failed to start Harvest webhook workflow: {e}"
+                            ))
+                        })?;
+
+                    Ok(())
+                })
+                    as std::pin::Pin<
+                        Box<dyn std::future::Future<Output = autumn_web::AutumnResult<()>> + Send>,
+                    >
+            },
+        );
+        state.insert_extension(autumn_web::webhook_outbound::WebhookDelegateExt(delegate));
+    }
+
     api_state.install_storage_pool(harvest_db_pool);
     let outbox = app_pool.as_ref().and_then(|_| {
         if harvest_config.outbox.enabled {

@@ -13,6 +13,8 @@ categories = ["asynchronous", "database"]
 
 [features]
 unified-dag-execution = ["autumn-harvest/unified-dag-execution"]
+webhooks = ["autumn-harvest/db"]
+
 
 [dependencies]
 autumn-harvest = { version = "0.3.0", path = "../autumn-harvest", features = ["db"] }
@@ -35,6 +37,7 @@ tower = "0.5"
 maud = { version = "0.27", features = ["axum"] }
 
 [dev-dependencies]
+autumn-web = { version = "0.4", features = ["test-support"] }
 autumn-harvest = { version = "0.3.0", path = "../autumn-harvest", features = ["db", "testing"] }
 tower = "0.5"
 testcontainers = { workspace = true }

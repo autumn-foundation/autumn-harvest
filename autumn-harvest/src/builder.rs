@@ -730,6 +730,11 @@ impl HarvestBuilder {
         self
     }
 
+    /// Access mutable worker configuration.
+    pub const fn worker_config_mut(&mut self) -> &mut WorkerConfig {
+        &mut self.worker_config
+    }
+
     #[cfg(feature = "db")]
     /// Set the sharded database pool on the worker config.
     #[must_use]
