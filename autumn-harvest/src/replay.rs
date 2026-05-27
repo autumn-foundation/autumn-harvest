@@ -975,6 +975,7 @@ impl HistoryMatcher {
         // Advance past the ActivityAwaitingExternal event.
         self.cursor += 1;
         let mut scan_cursor = self.cursor;
+        let mut first_interleaved_command = None;
 
         while scan_cursor < self.events.len() {
             if self.is_consumed(scan_cursor) {
@@ -991,9 +992,7 @@ impl HistoryMatcher {
                     let result = HistoryMatch::Matched {
                         output: output.clone(),
                     };
-                    self.cursor = scan_cursor + 1;
-                    self.advance_to_next_unconsumed_event();
-                    return result;
+                    return self.settle_terminal(scan_cursor, first_interleaved_command, result);
                 }
                 WorkflowEvent::ActivityFailedExternally {
                     activity_id: id,
@@ -1004,9 +1003,7 @@ impl HistoryMatcher {
                         error: error.clone(),
                         attempt: 1,
                     };
-                    self.cursor = scan_cursor + 1;
-                    self.advance_to_next_unconsumed_event();
-                    return result;
+                    return self.settle_terminal(scan_cursor, first_interleaved_command, result);
                 }
                 WorkflowEvent::ActivityTimedOut {
                     activity_id: id,
@@ -1015,9 +1012,7 @@ impl HistoryMatcher {
                     let result = HistoryMatch::TimedOut {
                         timeout_type: timeout_type.clone(),
                     };
-                    self.cursor = scan_cursor + 1;
-                    self.advance_to_next_unconsumed_event();
-                    return result;
+                    return self.settle_terminal(scan_cursor, first_interleaved_command, result);
                 }
                 // Deadline-extended events are informational; skip them.
                 WorkflowEvent::ActivityExternalDeadlineExtended {
@@ -1043,6 +1038,10 @@ impl HistoryMatcher {
                 WorkflowEvent::ActivityAwaitingExternal {
                     activity_id: id, ..
                 } if *id == activity_id => {
+                    scan_cursor += 1;
+                }
+                WorkflowEvent::ChildWorkflowSpawnedDetached { .. } => {
+                    first_interleaved_command.get_or_insert(scan_cursor);
                     scan_cursor += 1;
                 }
                 // Update events are transparent to the external activity scan.
@@ -1105,6 +1104,10 @@ impl HistoryMatcher {
         }
 
         // Awaiting event exists in history but no terminal found yet.
+        if let Some(command_cursor) = first_interleaved_command {
+            self.cursor = command_cursor;
+            self.advance_to_next_unconsumed_event();
+        }
         HistoryMatch::AwaitingExternalCompletion { activity_id, token }
     }
 
@@ -1239,6 +1242,7 @@ impl HistoryMatcher {
         // Advance past the ExternalSignalRequested event.
         self.cursor += 1;
         let mut scan_cursor = self.cursor;
+        let mut first_interleaved_command = None;
 
         while scan_cursor < self.events.len() {
             if self.is_consumed(scan_cursor) {
@@ -1248,23 +1252,21 @@ impl HistoryMatcher {
 
             match &self.events[scan_cursor] {
                 WorkflowEvent::ExternalSignalDelivered { signal_id: id } if *id == signal_id => {
-                    self.cursor = scan_cursor + 1;
-                    self.advance_to_next_unconsumed_event();
-                    return HistoryMatch::Matched {
+                    let result = HistoryMatch::Matched {
                         output: serde_json::Value::Null,
                     };
+                    return self.settle_terminal(scan_cursor, first_interleaved_command, result);
                 }
                 WorkflowEvent::ExternalSignalFailed {
                     signal_id: id,
                     reason_code,
                 } if *id == signal_id => {
                     let reason_code = reason_code.clone();
-                    self.cursor = scan_cursor + 1;
-                    self.advance_to_next_unconsumed_event();
-                    return HistoryMatch::ExternalSignalFailed {
+                    let result = HistoryMatch::ExternalSignalFailed {
                         signal_id,
                         reason_code,
                     };
+                    return self.settle_terminal(scan_cursor, first_interleaved_command, result);
                 }
                 // Signals can arrive while the external signal delivery is in-flight.
                 WorkflowEvent::SignalReceived {
@@ -1280,6 +1282,10 @@ impl HistoryMatcher {
                 ev if Self::is_update_event(ev) => {
                     scan_cursor += 1;
                 }
+                WorkflowEvent::ChildWorkflowSpawnedDetached { .. } => {
+                    first_interleaved_command.get_or_insert(scan_cursor);
+                    scan_cursor += 1;
+                }
                 _ => break,
             }
         }
@@ -1288,6 +1294,10 @@ impl HistoryMatcher {
         // Worker crashed between recording the request and the delivery outcome.
         // Return the durable payload so the caller re-sends exactly what was
         // originally recorded, regardless of any code changes since the crash.
+        if let Some(command_cursor) = first_interleaved_command {
+            self.cursor = command_cursor;
+            self.advance_to_next_unconsumed_event();
+        }
         HistoryMatch::ExternalSignalInProgress {
             signal_id,
             payload: recorded_payload,
@@ -3533,6 +3543,81 @@ mod tests {
             matcher.match_signal("approved"),
             HistoryMatch::Matched {
                 output: serde_json::json!({"ok": true})
+            }
+        );
+        assert_eq!(
+            matcher
+                .match_detached_child_spawn("monitor", &Value::Null, ParentClosePolicy::Abandon,),
+            HistoryMatch::DetachedChildSpawned { child_id }
+        );
+    }
+
+    #[test]
+    fn matcher_external_activity_preserves_detached_spawn_before_external_completion() {
+        let activity_id = ActivityExecId::new();
+        let token = ExternalActivityToken::new();
+        let child_id = ExecutionId::new();
+        let output = serde_json::json!({"accepted": true});
+        let events = vec![
+            WorkflowEvent::ActivityAwaitingExternal {
+                activity_id,
+                token,
+                name: "ship_order".into(),
+                input: Value::Null,
+                queue: "fulfillment".into(),
+                schedule_to_close_secs: 60,
+            },
+            WorkflowEvent::ChildWorkflowSpawnedDetached {
+                child_id,
+                workflow_name: "monitor".into(),
+                input: Value::Null,
+                parent_close_policy: ParentClosePolicy::Abandon,
+            },
+            WorkflowEvent::ActivityCompletedExternally {
+                activity_id,
+                token,
+                output: output.clone(),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+
+        assert_eq!(
+            matcher.match_external_activity("ship_order"),
+            HistoryMatch::Matched { output }
+        );
+        assert_eq!(
+            matcher
+                .match_detached_child_spawn("monitor", &Value::Null, ParentClosePolicy::Abandon,),
+            HistoryMatch::DetachedChildSpawned { child_id }
+        );
+    }
+
+    #[test]
+    fn matcher_external_signal_preserves_detached_spawn_before_delivery() {
+        let signal_id = ExternalSignalId::new();
+        let target = ExecutionId::new();
+        let child_id = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::ExternalSignalRequested {
+                signal_id,
+                target,
+                signal_name: "poke".into(),
+                payload: serde_json::json!({"n": 1}),
+            },
+            WorkflowEvent::ChildWorkflowSpawnedDetached {
+                child_id,
+                workflow_name: "monitor".into(),
+                input: Value::Null,
+                parent_close_policy: ParentClosePolicy::Abandon,
+            },
+            WorkflowEvent::ExternalSignalDelivered { signal_id },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+
+        assert_eq!(
+            matcher.match_external_signal(target, "poke"),
+            HistoryMatch::Matched {
+                output: Value::Null
             }
         );
         assert_eq!(

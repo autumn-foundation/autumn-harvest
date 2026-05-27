@@ -156,6 +156,31 @@ fn terminal_detached_spawn_workflow<'a>(
     })
 }
 
+fn activity_and_detached_spawn_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let activity = ctx.execute_activity_raw("batched_work", Value::Null, "default");
+        let detached = async {
+            ctx.spawn_child_workflow_detached_raw(
+                "batched_detached_child",
+                json!({"mode": "audit"}),
+                ParentClosePolicy::Abandon,
+            )
+            .map_err(|e| e.to_string())
+        };
+        let (activity, child_id) = tokio::join!(activity, detached);
+        let activity = activity.map_err(|e| e.to_string())?;
+        let child_id = child_id?;
+
+        Ok(json!({
+            "activity": activity,
+            "child_id": child_id.to_string(),
+        }))
+    })
+}
+
 // ─────────────────────── (a) Happy-path test ─────────────────────────────────
 
 #[tokio::test]
@@ -334,6 +359,45 @@ async fn test_terminal_detached_spawn_records_history_event() {
     assert!(
         spawn_pos < completed_pos,
         "detached spawn should precede terminal event: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_detached_spawn_is_recorded_before_activity_terminal_in_batch() {
+    let outcome = WorkflowTestEnv::new()
+        .mock_activity("batched_work", |_| Ok(json!({"ok": true})))
+        .run(activity_and_detached_spawn_workflow, json!(null))
+        .await;
+
+    assert!(outcome.result.is_ok());
+    let events = outcome.events();
+    let scheduled_pos = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                WorkflowEvent::ActivityScheduled { name, .. } if name == "batched_work"
+            )
+        })
+        .expect("activity should be scheduled");
+    let detached_pos = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                WorkflowEvent::ChildWorkflowSpawnedDetached { workflow_name, .. }
+                    if workflow_name == "batched_detached_child"
+            )
+        })
+        .expect("detached child spawn should be recorded");
+    let completed_pos = events
+        .iter()
+        .position(|event| matches!(event, WorkflowEvent::ActivityCompleted { .. }))
+        .expect("activity should complete");
+
+    assert!(
+        scheduled_pos < detached_pos && detached_pos < completed_pos,
+        "detached spawn should be recorded between activity schedule and terminal: {events:?}"
     );
 }
 

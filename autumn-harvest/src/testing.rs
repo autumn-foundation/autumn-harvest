@@ -1919,15 +1919,18 @@ impl WorkflowTestEnv {
         });
 
         let mut made_progress = false;
+        let mut deferred_events = Vec::new();
         for cmd in commands {
             made_progress |= self.process_command(
                 cmd,
                 signal_will_resolve,
                 history,
+                &mut deferred_events,
                 remaining_signals,
                 call_counts,
             )?;
         }
+        history.extend(deferred_events);
         Ok(made_progress)
     }
 
@@ -1942,6 +1945,7 @@ impl WorkflowTestEnv {
         cmd: WorkflowCommand,
         signal_will_resolve: bool,
         history: &mut Vec<WorkflowEvent>,
+        deferred_events: &mut Vec<WorkflowEvent>,
         remaining_signals: &mut Vec<(String, Value)>,
         call_counts: &mut HashMap<String, u32>,
     ) -> Result<bool, String> {
@@ -1961,7 +1965,7 @@ impl WorkflowTestEnv {
                     input: act_input,
                     queue,
                 });
-                Self::push_activity_terminal(history, activity_id, result);
+                Self::push_activity_terminal(deferred_events, activity_id, result);
                 Ok(true)
             }
 
@@ -1978,7 +1982,7 @@ impl WorkflowTestEnv {
                     name: name.clone(),
                     input: act_input,
                 });
-                Self::push_local_activity_terminal(history, activity_id, result);
+                Self::push_local_activity_terminal(deferred_events, activity_id, result);
                 Ok(true)
             }
 
@@ -1996,21 +2000,24 @@ impl WorkflowTestEnv {
                     timer_id: timer_id.clone(),
                     duration_secs,
                 });
-                history.push(WorkflowEvent::TimerFired { timer_id });
+                deferred_events.push(WorkflowEvent::TimerFired { timer_id });
                 Ok(true)
             }
 
-            WorkflowCommand::WaitForSignal { signal_name, .. } => Ok(remaining_signals
-                .iter()
-                .position(|(n, _)| n == &signal_name)
-                .is_some_and(|pos| {
-                    let (_, payload) = remaining_signals.remove(pos);
-                    history.push(WorkflowEvent::SignalReceived {
-                        signal_name,
-                        payload,
-                    });
-                    true
-                })),
+            WorkflowCommand::WaitForSignal { signal_name, .. } => {
+                let Some(pos) = remaining_signals
+                    .iter()
+                    .position(|(n, _)| n == &signal_name)
+                else {
+                    return Ok(false);
+                };
+                let (_, payload) = remaining_signals.remove(pos);
+                deferred_events.push(WorkflowEvent::SignalReceived {
+                    signal_name,
+                    payload,
+                });
+                Ok(true)
+            }
 
             WorkflowCommand::StartChildWorkflow {
                 child_id,
@@ -2026,10 +2033,12 @@ impl WorkflowTestEnv {
                 });
                 match result {
                     Ok(output) => {
-                        history.push(WorkflowEvent::ChildWorkflowCompleted { child_id, output });
+                        deferred_events
+                            .push(WorkflowEvent::ChildWorkflowCompleted { child_id, output });
                     }
                     Err(error) => {
-                        history.push(WorkflowEvent::ChildWorkflowFailed { child_id, error });
+                        deferred_events
+                            .push(WorkflowEvent::ChildWorkflowFailed { child_id, error });
                     }
                 }
                 Ok(true)
@@ -2051,7 +2060,7 @@ impl WorkflowTestEnv {
                         payload,
                     });
                 }
-                history.push(WorkflowEvent::ExternalSignalDelivered { signal_id });
+                deferred_events.push(WorkflowEvent::ExternalSignalDelivered { signal_id });
                 let _ = result_tx.send(Ok(()));
                 Ok(true)
             }
