@@ -1495,6 +1495,28 @@ async fn replay_detached_spawn_request_cancel_policy_succeeds() {
     );
 }
 
+#[tokio::test]
+async fn replay_detached_spawn_policy_mismatch_detects_non_determinism() {
+    let (exec_id, _child_id, events) = detached_spawn_history(ParentClosePolicy::RequestCancel);
+    let replayer = WorkflowReplayer::new().register_fn(
+        "detached_spawn_abandon_workflow",
+        detached_spawn_abandon_workflow,
+    );
+
+    let report = replayer
+        .replay_from_snapshot(HistorySnapshot {
+            workflow_name: "detached_spawn_abandon_workflow".to_string(),
+            execution_id: exec_id,
+            events,
+        })
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::NonDeterminismDetected { .. }),
+        "policy mismatch must detect non-determinism: {report}"
+    );
+}
+
 // ── (iii) Detached spawn + activity — determinism preserved ─────────────────
 
 #[tokio::test]

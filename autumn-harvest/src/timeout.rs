@@ -466,6 +466,7 @@ async fn commit_workflow_execution_timeout(
                 .await?;
             }
 
+            apply_parent_close_cascade(conn, exec_id).await?;
             Ok(true)
         }
         .scope_boxed()
@@ -643,6 +644,7 @@ pub async fn enforce_external_task_timeouts(conn: &mut AsyncPgConnection) -> Har
 /// 2. Transitions the execution row to `TIMED_OUT` state.
 /// 3. Cancels/fails the outstanding workflow task in `harvest_task_queue`.
 /// 4. Notifies the parent workflow (if any) via `ChildWorkflowFailed`.
+/// 5. Applies parent-close policy to any running detached children.
 ///
 /// Returns the number of executions that were timed out.
 ///
@@ -713,11 +715,6 @@ pub async fn enforce_workflow_execution_timeouts(
             // Row was already non-RUNNING; nothing to do.
             continue;
         }
-
-        // Cascade parent-close policy to any running detached children now that
-        // the parent is committed as TIMED_OUT. Errors are suppressed — the parent
-        // is already terminal and cascade is idempotent.
-        let _ = apply_parent_close_cascade(conn, exec_id).await;
 
         tracing::warn!(
             exec_id = %exec_id,

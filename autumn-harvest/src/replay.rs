@@ -15,7 +15,8 @@ use std::collections::{HashSet, VecDeque};
 use crate::error::TimeoutType;
 use crate::event::WorkflowEvent;
 use crate::types::{
-    ActivityExecId, ExecutionId, ExternalActivityToken, ExternalSignalId, UpdateId,
+    ActivityExecId, ExecutionId, ExternalActivityToken, ExternalSignalId, ParentClosePolicy,
+    UpdateId,
 };
 
 /// Result of matching a workflow command against the event history.
@@ -1658,9 +1659,10 @@ impl HistoryMatcher {
 
     /// Match a detached child workflow spawn against history.
     ///
-    /// Expects `ChildWorkflowSpawnedDetached { workflow_name, input }` at the
-    /// current cursor position. Returns the recorded `child_id` so the workflow
-    /// function gets back the same [`ExecutionId`] across replay cycles.
+    /// Expects `ChildWorkflowSpawnedDetached { workflow_name, input,
+    /// parent_close_policy }` at the current cursor position. Returns the
+    /// recorded `child_id` so the workflow function gets back the same
+    /// [`ExecutionId`] across replay cycles.
     ///
     /// Returns:
     /// - `DetachedChildSpawned { child_id }` when the event matches
@@ -1670,6 +1672,7 @@ impl HistoryMatcher {
         &mut self,
         workflow_name: &str,
         input: &Value,
+        parent_close_policy: ParentClosePolicy,
     ) -> HistoryMatch {
         if !self.prepare_match() {
             return HistoryMatch::NoMatch;
@@ -1680,7 +1683,7 @@ impl HistoryMatcher {
                 child_id,
                 workflow_name: recorded_name,
                 input: recorded_input,
-                ..
+                parent_close_policy: recorded_policy,
             } => {
                 if recorded_name != workflow_name {
                     return HistoryMatch::Diverged {
@@ -1692,6 +1695,18 @@ impl HistoryMatcher {
                     return HistoryMatch::Diverged {
                         expected: format!("DetachedChildWorkflowInput({input})"),
                         actual: format!("DetachedChildWorkflowInput({recorded_input})"),
+                    };
+                }
+                if *recorded_policy != parent_close_policy {
+                    return HistoryMatch::Diverged {
+                        expected: format!(
+                            "DetachedChildWorkflowPolicy({})",
+                            parent_close_policy.as_str()
+                        ),
+                        actual: format!(
+                            "DetachedChildWorkflowPolicy({})",
+                            recorded_policy.as_str()
+                        ),
                     };
                 }
                 let child_id = *child_id;

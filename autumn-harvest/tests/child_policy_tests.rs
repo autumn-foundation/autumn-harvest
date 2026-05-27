@@ -8,12 +8,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use autumn_harvest::concurrency::ConcurrencyPolicy;
 use autumn_harvest::info::WorkflowInfo;
 use autumn_harvest::types::ParentClosePolicy;
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{
     ExecutionId, Priority, ShardId, StartWorkflowParams, WorkflowContext,
-    cancel_workflow_execution, start_or_load_workflow_execution,
+    WorkflowHistoryPolicy, cancel_workflow_execution, start_or_load_workflow_execution,
 };
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
@@ -182,6 +183,78 @@ fn wf_info(name: &'static str, handler: autumn_harvest::info::WorkflowHandlerFn)
     }
 }
 
+fn wf_info_with_concurrency(
+    name: &'static str,
+    handler: autumn_harvest::info::WorkflowHandlerFn,
+    concurrency: ConcurrencyPolicy,
+) -> WorkflowInfo {
+    WorkflowInfo {
+        name,
+        module: "child_policy_tests",
+        handler,
+        execution_timeout: None,
+        concurrency: Some(concurrency),
+        max_input_bytes: None,
+    }
+}
+
+async fn wait_for_child_execution(
+    conn: &mut AsyncPgConnection,
+    parent_exec_id: ExecutionId,
+) -> ExecutionId {
+    use autumn_harvest::schema::harvest_workflow_executions;
+    use diesel::ExpressionMethods;
+    use diesel::OptionalExtension;
+    use diesel::QueryDsl;
+    use diesel_async::RunQueryDsl;
+
+    for _ in 0..100 {
+        if let Some(child_uuid) = harvest_workflow_executions::table
+            .filter(harvest_workflow_executions::parent_id.eq(Some(parent_exec_id.as_uuid())))
+            .select(harvest_workflow_executions::id)
+            .first::<uuid::Uuid>(conn)
+            .await
+            .optional()
+            .expect("child query failed")
+        {
+            return ExecutionId::from_uuid(child_uuid);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    panic!("parent {parent_exec_id} never spawned a detached child");
+}
+
+async fn wait_for_child_task_concurrency(
+    conn: &mut AsyncPgConnection,
+    child_exec_id: ExecutionId,
+) -> (Option<String>, Option<i32>) {
+    use autumn_harvest::schema::harvest_task_queue;
+    use diesel::ExpressionMethods;
+    use diesel::OptionalExtension;
+    use diesel::QueryDsl;
+    use diesel_async::RunQueryDsl;
+
+    for _ in 0..100 {
+        if let Some(policy) = harvest_task_queue::table
+            .filter(harvest_task_queue::workflow_exec_id.eq(Some(child_exec_id.as_uuid())))
+            .select((
+                harvest_task_queue::concurrency_key,
+                harvest_task_queue::concurrency_cap,
+            ))
+            .first::<(Option<String>, Option<i32>)>(conn)
+            .await
+            .optional()
+            .expect("child task query failed")
+        {
+            return policy;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    panic!("detached child {child_exec_id} never received a workflow task");
+}
+
 // ── Test 1: Detached child with Abandon policy outlives parent completion ─────
 
 static CHILD_WAS_STARTED: AtomicBool = AtomicBool::new(false);
@@ -266,6 +339,81 @@ async fn child_workflow_detached_abandon_outlives_parent_completion() {
     );
 }
 
+#[tokio::test]
+async fn detached_child_workflow_uses_registered_concurrency_policy() {
+    let (url, _container) = setup_test_db_url().await;
+    let pool = build_pool(&url);
+
+    fn parent_wf<'a>(
+        ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let _child_id = ctx
+                .spawn_child_workflow_detached_raw(
+                    "capped_detached_child",
+                    serde_json::json!({ "tenant_id": "acme" }),
+                    ParentClosePolicy::Abandon,
+                )
+                .map_err(|e| e.to_string())?;
+            Ok(serde_json::json!("parent_done"))
+        })
+    }
+
+    fn capped_child_wf<'a>(
+        ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            ctx.timer("hold", 3600).await.map_err(|e| e.to_string())?;
+            Ok(serde_json::json!("child_done"))
+        })
+    }
+
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![
+            wf_info("parent_spawns_capped_detached", parent_wf),
+            wf_info_with_concurrency(
+                "capped_detached_child",
+                capped_child_wf,
+                ConcurrencyPolicy {
+                    key_expr: "input.tenant_id",
+                    limit: 2,
+                },
+            ),
+        ],
+        vec![],
+    ));
+
+    let mut conn = AsyncPgConnection::establish(&url)
+        .await
+        .expect("connect failed");
+    let parent_exec_id = start_workflow(
+        &mut conn,
+        "parent_spawns_capped_detached",
+        "detached-concurrency-parent-001",
+        Value::Null,
+    )
+    .await;
+
+    let worker = Arc::new(make_worker(registry));
+    let worker_pool = pool.clone();
+    let worker_ref = worker.clone();
+    let worker_handle = tokio::spawn(async move {
+        let _ = tokio::time::timeout(Duration::from_secs(15), worker_ref.run(&worker_pool)).await;
+    });
+
+    wait_for_state(&mut conn, parent_exec_id, &["COMPLETED"]).await;
+    let child_exec_id = wait_for_child_execution(&mut conn, parent_exec_id).await;
+    let (concurrency_key, concurrency_cap) =
+        wait_for_child_task_concurrency(&mut conn, child_exec_id).await;
+
+    worker_handle.abort();
+
+    assert_eq!(concurrency_key.as_deref(), Some("acme"));
+    assert_eq!(concurrency_cap, Some(2));
+}
+
 // ── Test 2: RequestCancel cascade when parent is cancelled ────────────────────
 
 static CHILD_SAW_CANCEL: AtomicBool = AtomicBool::new(false);
@@ -341,8 +489,7 @@ async fn child_workflow_cancel_cascade_request_cancel() {
         let _ = tokio::time::timeout(Duration::from_secs(20), worker_ref.run(&worker_pool)).await;
     });
 
-    // Give the worker time to start both the parent and child.
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    let child_exec_id = wait_for_child_execution(&mut conn, parent_exec_id).await;
 
     // Operator cancels the parent.
     cancel_workflow_execution(&mut conn, parent_exec_id, "operator cancel test")
@@ -351,34 +498,90 @@ async fn child_workflow_cancel_cascade_request_cancel() {
 
     // Parent should become CANCELLED.
     wait_for_state(&mut conn, parent_exec_id, &["CANCELLED"]).await;
-
-    // Give the cascade time to apply.
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    wait_for_state(&mut conn, child_exec_id, &["CANCELLED", "FAILED"]).await;
 
     worker_handle.abort();
+}
 
-    // Find the child execution and check its state.
-    use autumn_harvest::schema::harvest_workflow_executions;
-    use diesel::ExpressionMethods;
-    use diesel::QueryDsl;
-    use diesel_async::RunQueryDsl;
-    let child_states: Vec<String> = harvest_workflow_executions::table
-        .filter(harvest_workflow_executions::parent_id.eq(Some(parent_exec_id.as_uuid())))
-        .select(harvest_workflow_executions::state)
-        .load::<String>(&mut conn)
+#[tokio::test]
+async fn history_cap_failure_cascades_detached_children() {
+    let (url, _container) = setup_test_db_url().await;
+    let pool = build_pool(&url);
+
+    fn parent_waits_for_signal<'a>(
+        ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let _child_id = ctx
+                .spawn_child_workflow_detached_raw(
+                    "history_cap_child",
+                    Value::Null,
+                    ParentClosePolicy::RequestCancel,
+                )
+                .map_err(|e| e.to_string())?;
+            let _signal = ctx
+                .wait_for_signal("release")
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(serde_json::json!("parent_done"))
+        })
+    }
+
+    fn history_cap_child_wf<'a>(
+        ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            ctx.timer("long_wait", 3600)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(serde_json::json!("child_done"))
+        })
+    }
+
+    let registry = HandlerRegistry::new(
+        vec![
+            wf_info("history_cap_parent", parent_waits_for_signal),
+            wf_info("history_cap_child", history_cap_child_wf),
+        ],
+        vec![],
+    )
+    .with_history_policy(WorkflowHistoryPolicy::default().with_event_hard_cap(3));
+    let registry = Arc::new(registry);
+
+    let mut conn = AsyncPgConnection::establish(&url)
         .await
-        .expect("child query failed");
+        .expect("connect failed");
+    let parent_exec_id = start_workflow(
+        &mut conn,
+        "history_cap_parent",
+        "history-cap-parent-001",
+        Value::Null,
+    )
+    .await;
 
-    assert!(!child_states.is_empty(), "at least one child should exist");
+    let worker = Arc::new(make_worker(registry));
+    let worker_pool = pool.clone();
+    let worker_ref = worker.clone();
+    let worker_handle = tokio::spawn(async move {
+        let _ = tokio::time::timeout(Duration::from_secs(15), worker_ref.run(&worker_pool)).await;
+    });
 
-    // At least one child should be CANCELLED or FAILED (cascade applied).
-    let cascade_applied = child_states
-        .iter()
-        .any(|s| s == "CANCELLED" || s == "FAILED");
-    assert!(
-        cascade_applied,
-        "cascade should have cancelled/failed the child; states: {child_states:?}"
-    );
+    let child_exec_id = wait_for_child_execution(&mut conn, parent_exec_id).await;
+    autumn_harvest::signal::send_signal(
+        &mut conn,
+        parent_exec_id,
+        "release",
+        serde_json::json!({ "ok": true }),
+    )
+    .await
+    .expect("signal should enqueue");
+
+    wait_for_state(&mut conn, parent_exec_id, &["FAILED"]).await;
+    wait_for_state(&mut conn, child_exec_id, &["CANCELLED", "FAILED"]).await;
+
+    worker_handle.abort();
 }
 
 // ── Test 3: Terminate cascade on parent failure ───────────────────────────────

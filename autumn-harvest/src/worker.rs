@@ -1700,6 +1700,21 @@ async fn update_workflow_execution_failed(
     Ok(())
 }
 
+fn resolve_workflow_concurrency(
+    registry: &HandlerRegistry,
+    workflow_name: &str,
+    input: &serde_json::Value,
+) -> (Option<String>, Option<u32>) {
+    registry
+        .workflows
+        .get(workflow_name)
+        .and_then(|info| info.concurrency.as_ref())
+        .map_or((None, None), |policy| {
+            let key = crate::concurrency::resolve_concurrency_key(policy.key_expr, input);
+            (key, Some(policy.limit))
+        })
+}
+
 async fn persist_workflow_completion(
     conn: &mut AsyncPgConnection,
     task_id: uuid::Uuid,
@@ -1715,14 +1730,12 @@ async fn persist_workflow_completion(
         async move {
             store::append_events(conn, exec_id, &[event], next_event_id).await?;
             update_workflow_execution_completed(conn, exec_id, worker_id, &output).await?;
-            queue::complete_task(conn, task_id, output).await
+            queue::complete_task(conn, task_id, output).await?;
+            apply_parent_close_cascade(conn, exec_id).await
         }
         .scope_boxed()
     })
-    .await?;
-    // Cascade parent-close policy to any running detached children.
-    let _ = apply_parent_close_cascade(conn, exec_id).await;
-    Ok(())
+    .await
 }
 
 async fn persist_workflow_failure(
@@ -1746,14 +1759,12 @@ async fn persist_workflow_failure(
             )
             .await?;
             update_workflow_execution_failed(conn, exec_id, worker_id, &error).await?;
-            queue::fail_task(conn, task_id, &error).await
+            queue::fail_task(conn, task_id, &error).await?;
+            apply_parent_close_cascade(conn, exec_id).await
         }
         .scope_boxed()
     })
-    .await?;
-    // Cascade parent-close policy to any running detached children.
-    let _ = apply_parent_close_cascade(conn, exec_id).await;
-    Ok(())
+    .await
 }
 
 /// Append `UpdateCompleted` or `UpdateFailed` events for each
@@ -2435,18 +2446,8 @@ async fn persist_all_started_child_workflows(
                 );
                 params.workflow_exec_id = Some(child.child_id.as_uuid());
                 params.required_build_id = parent_execution.assigned_build_id.clone();
-                // Resolve per-key concurrency policy for the child workflow (issue #247).
-                (params.concurrency_key, params.max_concurrent) = registry
-                    .workflows
-                    .get(&child.workflow_name)
-                    .and_then(|info| info.concurrency.as_ref())
-                    .map_or((None, None), |policy| {
-                        let key = crate::concurrency::resolve_concurrency_key(
-                            policy.key_expr,
-                            &child.input,
-                        );
-                        (key, Some(policy.limit))
-                    });
+                (params.concurrency_key, params.max_concurrent) =
+                    resolve_workflow_concurrency(registry, &child.workflow_name, &child.input);
                 params.trace_context = child_trace_ctxs
                     .get(&child.child_id.as_uuid())
                     .cloned()
@@ -2785,6 +2786,7 @@ async fn persist_child_workflow_completion(
             store::append_events(conn, exec_id, &[event], next_event_id).await?;
             update_workflow_execution_completed(conn, exec_id, worker_id, &output).await?;
             queue::complete_task(conn, task_id, output.clone()).await?;
+            apply_parent_close_cascade(conn, exec_id).await?;
             wake_parent_for_child_completion(conn, parent_exec_id, exec_id, output).await
         }
         .scope_boxed()
@@ -2811,6 +2813,7 @@ async fn persist_child_workflow_failure(
             store::append_events(conn, exec_id, &[workflow_failure], next_event_id).await?;
             update_workflow_execution_failed(conn, exec_id, worker_id, &error).await?;
             queue::fail_task(conn, task_id, &error).await?;
+            apply_parent_close_cascade(conn, exec_id).await?;
             wake_parent_for_child_failure(conn, parent_exec_id, exec_id, &error).await
         }
         .scope_boxed()
@@ -2910,6 +2913,8 @@ async fn create_detached_child_executions(
         );
         params.workflow_exec_id = Some(child_id.as_uuid());
         params.required_build_id = parent_execution.assigned_build_id.clone();
+        (params.concurrency_key, params.max_concurrent) =
+            resolve_workflow_concurrency(registry, workflow_name, input);
         queue::enqueue(conn, &params).await?;
     }
 
@@ -3985,6 +3990,7 @@ async fn move_workflow_to_dlq_for_history_cap(
             .await?;
             update_workflow_execution_failed(conn, exec_id, worker_id, &reason).await?;
             queue::fail_task(conn, task.id, &reason).await?;
+            apply_parent_close_cascade(conn, exec_id).await?;
             if let Some(parent_exec_id) = parent_exec_id {
                 wake_parent_for_child_failure(conn, parent_exec_id, exec_id, &reason).await?;
             }

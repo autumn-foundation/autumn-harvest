@@ -1905,8 +1905,9 @@ impl WorkflowContext {
         input: Value,
         parent_close_policy: crate::types::ParentClosePolicy,
     ) -> HarvestResult<ExecutionId> {
-        let history_match =
-            self.match_history(|m| m.match_detached_child_spawn(workflow_name, &input));
+        let history_match = self.match_history(|m| {
+            m.match_detached_child_spawn(workflow_name, &input, parent_close_policy)
+        });
 
         match history_match {
             HistoryMatch::DetachedChildSpawned { child_id } => {

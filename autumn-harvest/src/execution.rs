@@ -512,6 +512,7 @@ async fn inline_cancel(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> Ha
         .map_err(database_error)?;
     queue::fail_open_tasks_for_execution(conn, exec_id, &format!("workflow cancelled: {reason}"))
         .await?;
+    apply_parent_close_cascade(conn, exec_id).await?;
     Ok(())
 }
 
@@ -619,6 +620,7 @@ pub async fn cancel_workflow_execution(
                 .await?;
 
                 let total_failed_or_deleted = deleted_pending + failed_task_count;
+                apply_parent_close_cascade(conn, exec_id).await?;
 
                 Ok(CancelledWorkflowExecution::newly_cancelled(
                     exec_id,
@@ -629,11 +631,6 @@ pub async fn cancel_workflow_execution(
             .scope_boxed()
         })
         .await?;
-
-    // Apply parent-close cascade to running detached children after the
-    // parent is committed as CANCELLED. Errors are suppressed — the
-    // parent is already terminal and cascade is idempotent.
-    let _ = apply_parent_close_cascade(conn, exec_id).await;
 
     Ok(cancel_result)
 }
@@ -850,6 +847,7 @@ pub async fn terminate_workflow_execution(
                     &format!("workflow terminated: {reason}"),
                 )
                 .await?;
+                apply_parent_close_cascade(conn, exec_id).await?;
 
                 Ok(CancelledWorkflowExecution::newly_cancelled(
                     exec_id,
@@ -860,11 +858,6 @@ pub async fn terminate_workflow_execution(
             .scope_boxed()
         })
         .await?;
-
-    // Apply parent-close cascade to any running detached children after the
-    // parent is committed as CANCELLED/TERMINATED. Errors are suppressed —
-    // the parent is already terminal and cascade is idempotent.
-    let _ = apply_parent_close_cascade(conn, exec_id).await;
 
     Ok(cancel_result)
 }
