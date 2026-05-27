@@ -219,7 +219,7 @@ impl HistoryMatcher {
     ///
     /// When the unexpected event is a `MarkerRecorded` its name is included so
     /// the replayer's `classify_kind` can recognise `"MarkerRecorded(version:…)"`
-    /// and return [`crate::testing::NonDeterminismKind::VersionMarkerMismatch`]
+    /// and return `NonDeterminismKind::VersionMarkerMismatch`
     /// instead of the generic command-level mismatch kind.
     fn actual_event_name(event: &WorkflowEvent) -> String {
         match event {
@@ -832,7 +832,7 @@ impl HistoryMatcher {
 
     /// Like [`match_activity`](Self::match_activity) but also verifies the input payload.
     ///
-    /// Used by the [`WorkflowReplayer`](crate::testing::WorkflowReplayer) to detect
+    /// Used by the `WorkflowReplayer` (in tests) to detect
     /// non-determinism caused by changing an activity's input arguments across deployments.
     #[allow(clippy::too_many_lines)]
     pub fn match_activity_strict(&mut self, activity_name: &str, input: &Value) -> HistoryMatch {
@@ -1736,7 +1736,7 @@ impl HistoryMatcher {
 
     /// Like [`match_local_activity`](Self::match_local_activity) but also verifies the input payload.
     ///
-    /// Used by the [`WorkflowReplayer`](crate::testing::WorkflowReplayer) in strict replay mode.
+    /// Used by the `WorkflowReplayer` (in tests) in strict replay mode.
     pub fn match_local_activity_strict(
         &mut self,
         activity_name: &str,
