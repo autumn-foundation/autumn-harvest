@@ -501,6 +501,10 @@ impl WorkflowEvent {
                 | Self::WorkflowContinuedAsNew { .. }
                 | Self::WorkflowResetTerminated { .. }
                 | Self::WorkflowExecutionTimedOut { .. }
+                // Written to the parent history after the parent's own terminal event;
+                // never consumed by the workflow function itself, so must be skipped
+                // during unconsumed-event checks to avoid false non-determinism reports.
+                | Self::ChildWorkflowCascadeApplied { .. }
         )
     }
 }

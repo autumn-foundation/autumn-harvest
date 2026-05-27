@@ -25,6 +25,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::{HarvestError, HarvestResult, TimeoutType};
 use crate::event::WorkflowEvent;
+use crate::execution::apply_parent_close_cascade;
 use crate::models::{ExternalTask, TaskQueueItem, WorkflowExecution};
 use crate::schema::{harvest_external_tasks, harvest_task_queue, harvest_workflow_executions};
 use crate::telemetry::MetricsRecorder;
@@ -620,8 +621,10 @@ pub async fn enforce_workflow_execution_timeouts(
         let parent_uuid = execution.parent_id;
         let workflow_name = execution.workflow_name.clone();
 
+        // true  = timeout transition was committed
+        // false = row was already non-RUNNING; cascade must not run
         let result = conn
-            .transaction::<(), HarvestError, _>(|conn| {
+            .transaction::<bool, HarvestError, _>(|conn| {
                 let timeout_event = timeout_event.clone();
                 let error_msg = error_msg.clone();
                 async move {
@@ -637,7 +640,7 @@ pub async fn enforce_workflow_execution_timeouts(
 
                     match current_state.as_deref() {
                         Some("RUNNING") => {}
-                        _ => return Ok(()), // Already terminal or gone — skip.
+                        _ => return Ok(false), // Already terminal or gone — skip.
                     }
 
                     // Append the timeout event to history.
@@ -677,21 +680,34 @@ pub async fn enforce_workflow_execution_timeouts(
                         .await?;
                     }
 
-                    Ok(())
+                    Ok(true)
                 }
                 .scope_boxed()
             })
             .await;
 
-        if let Err(error) = result {
-            tracing::error!(
-                exec_id = %exec_id,
-                workflow_name = %workflow_name,
-                error = %error,
-                "failed to enforce workflow execution timeout"
-            );
-            return Err(error);
+        let timed_out_applied = match result {
+            Ok(applied) => applied,
+            Err(error) => {
+                tracing::error!(
+                    exec_id = %exec_id,
+                    workflow_name = %workflow_name,
+                    error = %error,
+                    "failed to enforce workflow execution timeout"
+                );
+                return Err(error);
+            }
+        };
+
+        if !timed_out_applied {
+            // Row was already non-RUNNING; nothing to do.
+            continue;
         }
+
+        // Cascade parent-close policy to any running detached children now that
+        // the parent is committed as TIMED_OUT. Errors are suppressed — the parent
+        // is already terminal and cascade is idempotent.
+        let _ = apply_parent_close_cascade(conn, exec_id).await;
 
         tracing::warn!(
             exec_id = %exec_id,
