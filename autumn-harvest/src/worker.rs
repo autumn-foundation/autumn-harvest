@@ -345,11 +345,13 @@ enum ClaimedTaskKind {
     Activity,
 }
 
-impl ClaimedTaskKind {
-    fn from_db(task_type: &str) -> HarvestResult<Self> {
+impl TryFrom<&str> for ClaimedTaskKind {
+    type Error = HarvestError;
+
+    fn try_from(task_type: &str) -> Result<Self, Self::Error> {
         match task_type {
-            task_type if task_type == TaskType::Workflow.as_str() => Ok(Self::Workflow),
-            task_type if task_type == TaskType::Activity.as_str() => Ok(Self::Activity),
+            t if t == TaskType::Workflow.as_str() => Ok(Self::Workflow),
+            t if t == TaskType::Activity.as_str() => Ok(Self::Activity),
             other => Err(HarvestError::Config(format!(
                 "unsupported task type in queue row: {other}"
             ))),
@@ -4151,22 +4153,18 @@ async fn process_workflow_task(
 
                 // If any signal in the batch was not resolved inline (remains pending/suspended),
                 // we must break the loop and suspend the workflow task.
-                let mut all_resolved = true;
-                for item in &items_clone {
-                    if let SignalBatchItem::Signal(run) = item {
-                        let resolved = new_events.iter().any(|e| match e {
-                            WorkflowEvent::ExternalSignalDelivered { signal_id }
-                            | WorkflowEvent::ExternalSignalFailed { signal_id, .. } => {
-                                *signal_id == run.signal_id
-                            }
-                            _ => false,
-                        });
-                        if !resolved {
-                            all_resolved = false;
-                            break;
+                let all_resolved = items_clone.iter().all(|item| {
+                    let SignalBatchItem::Signal(run) = item else {
+                        return true;
+                    };
+                    new_events.iter().any(|e| match e {
+                        WorkflowEvent::ExternalSignalDelivered { signal_id }
+                        | WorkflowEvent::ExternalSignalFailed { signal_id, .. } => {
+                            *signal_id == run.signal_id
                         }
-                    }
-                }
+                        _ => false,
+                    })
+                });
 
                 if !all_resolved {
                     let mut reconstructed_commands = Vec::with_capacity(items_clone.len());
@@ -4431,7 +4429,7 @@ async fn process_task(
 ) -> HarvestResult<()> {
     let mut conn = pool.get().await.map_err(crate::error::database_error)?;
 
-    match ClaimedTaskKind::from_db(&task.task_type)? {
+    match ClaimedTaskKind::try_from(task.task_type.as_str())? {
         ClaimedTaskKind::Workflow => {
             process_workflow_task(
                 &mut conn,
@@ -5237,7 +5235,7 @@ impl Worker {
 
     /// Spawn a bounded Tokio task for the claimed work item.
     fn dispatch_task(&self, task: TaskQueueItem, pool: &DbPool) {
-        let kind = match ClaimedTaskKind::from_db(&task.task_type) {
+        let kind = match ClaimedTaskKind::try_from(task.task_type.as_str()) {
             Ok(kind) => kind,
             Err(error) => {
                 tracing::error!(
@@ -5572,14 +5570,14 @@ mod tests {
     #[test]
     fn claimed_task_kind_uses_lowercase_db_values() -> Result<(), crate::error::HarvestError> {
         assert_eq!(
-            ClaimedTaskKind::from_db("workflow")?,
+            ClaimedTaskKind::try_from("workflow")?,
             ClaimedTaskKind::Workflow
         );
         assert_eq!(
-            ClaimedTaskKind::from_db("activity")?,
+            ClaimedTaskKind::try_from("activity")?,
             ClaimedTaskKind::Activity
         );
-        assert!(ClaimedTaskKind::from_db("WORKFLOW").is_err());
+        assert!(ClaimedTaskKind::try_from("WORKFLOW").is_err());
         Ok(())
     }
 

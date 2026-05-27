@@ -473,6 +473,12 @@ impl OverlapPolicy {
     /// reading a newer enum value degrades to the safe default.
     #[must_use]
     pub fn from_db(s: &str) -> Self {
+        Self::from(s)
+    }
+}
+
+impl From<&str> for OverlapPolicy {
+    fn from(s: &str) -> Self {
         match s {
             "buffer_one" => Self::BufferOne,
             "buffer_all" => Self::BufferAll,
@@ -481,7 +487,9 @@ impl OverlapPolicy {
             _ => Self::Skip,
         }
     }
+}
 
+impl OverlapPolicy {
     /// Parse an `overlap_policy` value from user-supplied input (e.g. an API request).
     ///
     /// Unlike [`from_db`](Self::from_db) this is strict: an unknown value returns
@@ -539,13 +547,21 @@ impl SkipPolicy {
     /// append-only-schema invariant.
     #[must_use]
     pub fn from_db(s: &str) -> Self {
+        Self::from(s)
+    }
+}
+
+impl From<&str> for SkipPolicy {
+    fn from(s: &str) -> Self {
         match s {
             "run_next_business_day" => Self::RunNextBusinessDay,
             "run_prev_business_day" => Self::RunPrevBusinessDay,
             _ => Self::Skip,
         }
     }
+}
 
+impl SkipPolicy {
     /// Parse a `skip_policy` value from user-supplied input (e.g. an API request).
     ///
     /// # Errors
