@@ -409,6 +409,70 @@ async fn wake_parent_for_child_timeout(
     queue::wake_workflow_task(conn, parent_exec_id).await
 }
 
+async fn commit_workflow_execution_timeout(
+    conn: &mut AsyncPgConnection,
+    exec_id: crate::types::ExecutionId,
+    parent_uuid: Option<uuid::Uuid>,
+    timeout_event: &WorkflowEvent,
+    error_msg: &str,
+) -> HarvestResult<bool> {
+    conn.transaction::<bool, HarvestError, _>(|conn| {
+        let timeout_event = timeout_event.clone();
+        let error_msg = error_msg.to_owned();
+        async move {
+            // Re-check state under lock to guard against concurrent completion.
+            let current_state: Option<String> = harvest_workflow_executions::table
+                .find(exec_id.as_uuid())
+                .for_update()
+                .select(harvest_workflow_executions::state)
+                .first(conn)
+                .await
+                .optional()
+                .map_err(crate::error::database_error)?;
+
+            match current_state.as_deref() {
+                Some("RUNNING") => {}
+                _ => return Ok(false),
+            }
+
+            store::append_single_event(conn, exec_id, timeout_event).await?;
+            update_workflow_execution_timed_out(conn, exec_id, &error_msg).await?;
+
+            let _rows = diesel::update(
+                harvest_task_queue::table
+                    .filter(harvest_task_queue::workflow_exec_id.eq(exec_id.as_uuid()))
+                    .filter(
+                        harvest_task_queue::state
+                            .eq("PENDING")
+                            .or(harvest_task_queue::state.eq("RUNNING")),
+                    ),
+            )
+            .set((
+                harvest_task_queue::state.eq("FAILED"),
+                harvest_task_queue::error.eq(Some(&error_msg)),
+                harvest_task_queue::completed_at.eq(Some(Utc::now())),
+            ))
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+
+            if let Some(parent_uuid) = parent_uuid {
+                wake_parent_for_child_timeout(
+                    conn,
+                    execution_id_from_uuid(parent_uuid),
+                    exec_id,
+                    &error_msg,
+                )
+                .await?;
+            }
+
+            Ok(true)
+        }
+        .scope_boxed()
+    })
+    .await
+}
+
 async fn enforce_activity_timeout(
     conn: &mut AsyncPgConnection,
     task: &TaskQueueItem,
@@ -623,68 +687,14 @@ pub async fn enforce_workflow_execution_timeouts(
 
         // true  = timeout transition was committed
         // false = row was already non-RUNNING; cascade must not run
-        let result = conn
-            .transaction::<bool, HarvestError, _>(|conn| {
-                let timeout_event = timeout_event.clone();
-                let error_msg = error_msg.clone();
-                async move {
-                    // Re-check state under lock to guard against concurrent completion.
-                    let current_state: Option<String> = harvest_workflow_executions::table
-                        .find(exec_id.as_uuid())
-                        .for_update()
-                        .select(harvest_workflow_executions::state)
-                        .first(conn)
-                        .await
-                        .optional()
-                        .map_err(crate::error::database_error)?;
-
-                    match current_state.as_deref() {
-                        Some("RUNNING") => {}
-                        _ => return Ok(false), // Already terminal or gone — skip.
-                    }
-
-                    // Append the timeout event to history.
-                    store::append_single_event(conn, exec_id, timeout_event).await?;
-
-                    // Transition execution to TIMED_OUT.
-                    update_workflow_execution_timed_out(conn, exec_id, &error_msg).await?;
-
-                    // Cancel all outstanding tasks for this execution (workflow and
-                    // activity) to avoid resource leaks when the deadline fires.
-                    let _rows = diesel::update(
-                        harvest_task_queue::table
-                            .filter(harvest_task_queue::workflow_exec_id.eq(exec_id.as_uuid()))
-                            .filter(
-                                harvest_task_queue::state
-                                    .eq("PENDING")
-                                    .or(harvest_task_queue::state.eq("RUNNING")),
-                            ),
-                    )
-                    .set((
-                        harvest_task_queue::state.eq("FAILED"),
-                        harvest_task_queue::error.eq(Some(&error_msg)),
-                        harvest_task_queue::completed_at.eq(Some(Utc::now())),
-                    ))
-                    .execute(conn)
-                    .await
-                    .map_err(crate::error::database_error)?;
-
-                    // Notify parent if this is a child workflow.
-                    if let Some(parent_uuid) = parent_uuid {
-                        wake_parent_for_child_timeout(
-                            conn,
-                            execution_id_from_uuid(parent_uuid),
-                            exec_id,
-                            &error_msg,
-                        )
-                        .await?;
-                    }
-
-                    Ok(true)
-                }
-                .scope_boxed()
-            })
-            .await;
+        let result = commit_workflow_execution_timeout(
+            conn,
+            exec_id,
+            parent_uuid,
+            &timeout_event,
+            &error_msg,
+        )
+        .await;
 
         let timed_out_applied = match result {
             Ok(applied) => applied,
