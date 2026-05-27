@@ -802,61 +802,64 @@ pub async fn terminate_workflow_execution(
         reason.to_string()
     };
 
-    let cancel_result = conn.transaction::<CancelledWorkflowExecution, HarvestError, _>(|conn| {
-        async move {
-            let execution = harvest_workflow_executions::table
-                .find(exec_id.as_uuid())
-                .select(WorkflowExecution::as_select())
-                .for_update()
-                .first(conn)
-                .await
-                .optional()
-                .map_err(database_error)?
-                .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))?;
+    let cancel_result = conn
+        .transaction::<CancelledWorkflowExecution, HarvestError, _>(|conn| {
+            async move {
+                let execution = harvest_workflow_executions::table
+                    .find(exec_id.as_uuid())
+                    .select(WorkflowExecution::as_select())
+                    .for_update()
+                    .first(conn)
+                    .await
+                    .optional()
+                    .map_err(database_error)?
+                    .ok_or_else(|| {
+                        HarvestError::NotFound(format!("workflow execution {exec_id}"))
+                    })?;
 
-            if execution.state == "CANCELLED" {
-                return Ok(CancelledWorkflowExecution::idempotent(exec_id, execution));
-            }
+                if execution.state == "CANCELLED" {
+                    return Ok(CancelledWorkflowExecution::idempotent(exec_id, execution));
+                }
 
-            let history = store::load_history(conn, exec_id).await?;
-            store::append_events(
-                conn,
-                exec_id,
-                &[WorkflowEvent::WorkflowCancelled {
-                    reason: reason.clone(),
-                }],
-                history.next_event_id,
-            )
-            .await?;
+                let history = store::load_history(conn, exec_id).await?;
+                store::append_events(
+                    conn,
+                    exec_id,
+                    &[WorkflowEvent::WorkflowCancelled {
+                        reason: reason.clone(),
+                    }],
+                    history.next_event_id,
+                )
+                .await?;
 
-            // No state-precondition filter: operator override force-writes.
-            diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
-                .set((
-                    harvest_workflow_executions::state.eq("CANCELLED"),
-                    harvest_workflow_executions::output.eq(None::<serde_json::Value>),
-                    harvest_workflow_executions::error.eq(Some(reason.clone())),
-                    harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+                // No state-precondition filter: operator override force-writes.
+                diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
+                    .set((
+                        harvest_workflow_executions::state.eq("CANCELLED"),
+                        harvest_workflow_executions::output.eq(None::<serde_json::Value>),
+                        harvest_workflow_executions::error.eq(Some(reason.clone())),
+                        harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+                    ))
+                    .execute(conn)
+                    .await
+                    .map_err(database_error)?;
+
+                let failed_task_count = queue::fail_open_tasks_for_execution(
+                    conn,
+                    exec_id,
+                    &format!("workflow terminated: {reason}"),
+                )
+                .await?;
+
+                Ok(CancelledWorkflowExecution::newly_cancelled(
+                    exec_id,
+                    reason,
+                    failed_task_count,
                 ))
-                .execute(conn)
-                .await
-                .map_err(database_error)?;
-
-            let failed_task_count = queue::fail_open_tasks_for_execution(
-                conn,
-                exec_id,
-                &format!("workflow terminated: {reason}"),
-            )
-            .await?;
-
-            Ok(CancelledWorkflowExecution::newly_cancelled(
-                exec_id,
-                reason,
-                failed_task_count,
-            ))
-        }
-        .scope_boxed()
-    })
-    .await?;
+            }
+            .scope_boxed()
+        })
+        .await?;
 
     // Apply parent-close cascade to any running detached children after the
     // parent is committed as CANCELLED/TERMINATED. Errors are suppressed —

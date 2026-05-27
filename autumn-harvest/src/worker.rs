@@ -533,7 +533,10 @@ struct SuspendedWorkflowContext<'a> {
 /// via `pre_suspension_events_from_commands`; paths with branch events (schedule-
 /// activity, start-timer, start-child-workflow, schedule-external) pass a closure
 /// that emits the appropriate event for each matching command type.
-fn build_suspension_events<F>(commands: &[WorkflowCommand], mut branch_event: F) -> Vec<WorkflowEvent>
+fn build_suspension_events<F>(
+    commands: &[WorkflowCommand],
+    mut branch_event: F,
+) -> Vec<WorkflowEvent>
 where
     F: FnMut(&WorkflowCommand) -> Option<WorkflowEvent>,
 {
