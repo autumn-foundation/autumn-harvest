@@ -1814,12 +1814,7 @@ impl WorkflowTestEnv {
                     }
                 }
                 terminal => {
-                    return self.finish_terminal_outcome(
-                        terminal,
-                        pending_cmds,
-                        history,
-                        exec_id,
-                    );
+                    return self.finish_terminal_outcome(terminal, pending_cmds, history, exec_id);
                 }
             }
         }
@@ -1863,7 +1858,9 @@ impl WorkflowTestEnv {
                 });
                 Ok(input)
             }
-            WorkflowOutcome::Suspended { .. } => unreachable!("suspended outcomes are handled in run"),
+            WorkflowOutcome::Suspended { .. } => {
+                unreachable!("suspended outcomes are handled in run")
+            }
         };
 
         TestRunOutcome {

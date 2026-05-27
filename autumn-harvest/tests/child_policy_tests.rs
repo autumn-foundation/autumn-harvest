@@ -707,10 +707,7 @@ async fn signal_then_detached_only_remainder_persists_spawn_and_completes() {
     let registry = Arc::new(HandlerRegistry::new(
         vec![
             wf_info("signal_target_waits", target_waits),
-            wf_info(
-                "signal_then_detached_parent",
-                parent_signals_after_detached,
-            ),
+            wf_info("signal_then_detached_parent", parent_signals_after_detached),
             wf_info("signal_remainder_detached_child", long_child),
         ],
         vec![],
@@ -719,8 +716,13 @@ async fn signal_then_detached_only_remainder_persists_spawn_and_completes() {
     let mut conn = AsyncPgConnection::establish(&url)
         .await
         .expect("connect failed");
-    let target_exec_id =
-        start_workflow(&mut conn, "signal_target_waits", "signal-target-001", Value::Null).await;
+    let target_exec_id = start_workflow(
+        &mut conn,
+        "signal_target_waits",
+        "signal-target-001",
+        Value::Null,
+    )
+    .await;
 
     let worker = Arc::new(make_worker(registry));
     let worker_pool = pool.clone();
@@ -1074,7 +1076,10 @@ async fn detached_child_task_receives_trace_context() {
         _input: Value,
     ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
         Box::pin(async move {
-            let _ = ctx.wait_for_signal("release").await.map_err(|e| e.to_string())?;
+            let _ = ctx
+                .wait_for_signal("release")
+                .await
+                .map_err(|e| e.to_string())?;
             Ok(Value::Null)
         })
     }
