@@ -113,6 +113,10 @@ const INIT_SQL: &str = concat!(
 /// (created by build routing) and inserts `assigned_build_id` into
 /// `harvest_workflow_executions`; the build routing migration also alters
 /// `harvest_workers`, so that table must exist first.
+/// The parent-close-policy migration is included because the modern start path
+/// inserts/selects the nullable `parent_close_policy` column even for root
+/// workflows; the test still excludes only the uniqueness/continue-as-new
+/// migrations it is explicitly exercising.
 const LEGACY_INIT_SQL: &str = concat!(
     include_str!("../migrations/20260409000000_harvest_initial/up.sql"),
     "\n",
@@ -129,6 +133,8 @@ const LEGACY_INIT_SQL: &str = concat!(
     include_str!("../migrations/20260514020000_harvest_task_activity_id/up.sql"),
     "\n",
     include_str!("../migrations/20260518000001_harvest_workflow_execution_timeout/up.sql"),
+    "\n",
+    include_str!("../migrations/20260526000001_harvest_parent_close_policy/up.sql"),
     "\n",
     "ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS rate_limit_key TEXT NULL;\n",
 );
