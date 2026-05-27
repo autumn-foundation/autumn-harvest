@@ -19,6 +19,7 @@ use std::pin::Pin;
 use autumn_harvest::context::WorkflowContext;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::testing::{ReplayStatus, WorkflowTestEnv};
+use autumn_harvest::types::ParentClosePolicy;
 use serde_json::{Value, json};
 
 // ──────────────────────────── workflow helpers ────────────────────────────────
@@ -136,6 +137,22 @@ fn cancellable_workflow<'a>(
             .await
             .map_err(|e| e.to_string())?;
         Ok(result)
+    })
+}
+
+fn terminal_detached_spawn_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let child_id = ctx
+            .spawn_child_workflow_detached_raw(
+                "terminal_detached_child",
+                json!({"mode": "audit"}),
+                ParentClosePolicy::Abandon,
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(json!({ "child_id": child_id.to_string() }))
     })
 }
 
@@ -279,6 +296,44 @@ async fn test_child_workflow_stub() {
             .iter()
             .any(|e| matches!(e, WorkflowEvent::ChildWorkflowCompleted { .. })),
         "expected ChildWorkflowCompleted"
+    );
+}
+
+#[tokio::test]
+async fn test_terminal_detached_spawn_records_history_event() {
+    let outcome = WorkflowTestEnv::new()
+        .run(terminal_detached_spawn_workflow, json!(null))
+        .await;
+
+    assert!(outcome.result.is_ok());
+    let events = outcome.events();
+    assert!(
+        events.iter().any(|event| {
+            matches!(
+                event,
+                WorkflowEvent::ChildWorkflowSpawnedDetached {
+                    workflow_name,
+                    input,
+                    parent_close_policy,
+                    ..
+                } if workflow_name == "terminal_detached_child"
+                    && input == &json!({"mode": "audit"})
+                    && *parent_close_policy == ParentClosePolicy::Abandon
+            )
+        }),
+        "terminal detached spawns must be recorded before WorkflowCompleted: {events:?}"
+    );
+    let spawn_pos = events
+        .iter()
+        .position(|event| matches!(event, WorkflowEvent::ChildWorkflowSpawnedDetached { .. }))
+        .expect("spawn event should exist");
+    let completed_pos = events
+        .iter()
+        .position(|event| matches!(event, WorkflowEvent::WorkflowCompleted { .. }))
+        .expect("workflow completed event should exist");
+    assert!(
+        spawn_pos < completed_pos,
+        "detached spawn should precede terminal event: {events:?}"
     );
 }
 

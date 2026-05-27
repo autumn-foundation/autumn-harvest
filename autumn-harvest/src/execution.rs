@@ -512,7 +512,7 @@ async fn inline_cancel(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> Ha
         .map_err(database_error)?;
     queue::fail_open_tasks_for_execution(conn, exec_id, &format!("workflow cancelled: {reason}"))
         .await?;
-    apply_parent_close_cascade(conn, exec_id).await?;
+    Box::pin(apply_parent_close_cascade(conn, exec_id)).await?;
     Ok(())
 }
 
@@ -727,6 +727,7 @@ async fn cascade_cancel_detached_child(
         &format!("workflow cancelled by parent close: {reason}"),
     )
     .await?;
+    Box::pin(apply_parent_close_cascade(conn, exec_id)).await?;
     Ok(())
 }
 
@@ -761,6 +762,7 @@ async fn cascade_terminate_detached_child(
         &format!("workflow terminated by parent close: {reason}"),
     )
     .await?;
+    Box::pin(apply_parent_close_cascade(conn, exec_id)).await?;
     Ok(())
 }
 

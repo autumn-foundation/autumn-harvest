@@ -1773,7 +1773,7 @@ impl WorkflowTestEnv {
         let mut remaining_signals = self.queued_signals.clone();
 
         for _iter in 0..MAX_TEST_ITERATIONS {
-            let (outcome, _pending_cmds, _span) = run_workflow_with_state(
+            let (outcome, pending_cmds, _span) = run_workflow_with_state(
                 exec_id,
                 history.clone(),
                 handler,
@@ -1784,40 +1784,6 @@ impl WorkflowTestEnv {
             .await;
 
             match outcome {
-                WorkflowOutcome::Completed { output } => {
-                    history.push(WorkflowEvent::WorkflowCompleted {
-                        output: output.clone(),
-                    });
-                    return TestRunOutcome {
-                        result: Ok(output),
-                        events: history,
-                        exec_id,
-                        state: self.state.clone(),
-                    };
-                }
-                WorkflowOutcome::Failed { error } => {
-                    history.push(WorkflowEvent::WorkflowFailed {
-                        error: error.clone(),
-                    });
-                    return TestRunOutcome {
-                        result: Err(error),
-                        events: history,
-                        exec_id,
-                        state: self.state.clone(),
-                    };
-                }
-                WorkflowOutcome::ContinuedAsNew { input: new_input } => {
-                    history.push(WorkflowEvent::WorkflowContinuedAsNew {
-                        new_exec_id: ExecutionId::new(),
-                        input: new_input.clone(),
-                    });
-                    return TestRunOutcome {
-                        result: Ok(new_input),
-                        events: history,
-                        exec_id,
-                        state: self.state.clone(),
-                    };
-                }
                 WorkflowOutcome::Suspended { commands } => {
                     let made_progress = match self.process_suspension(
                         commands,
@@ -1847,6 +1813,14 @@ impl WorkflowTestEnv {
                         };
                     }
                 }
+                terminal => {
+                    return self.finish_terminal_outcome(
+                        terminal,
+                        pending_cmds,
+                        history,
+                        exec_id,
+                    );
+                }
             }
         }
 
@@ -1858,6 +1832,72 @@ impl WorkflowTestEnv {
             events: history,
             exec_id,
             state: self.state.clone(),
+        }
+    }
+
+    fn finish_terminal_outcome(
+        &self,
+        outcome: WorkflowOutcome,
+        pending_cmds: Vec<WorkflowCommand>,
+        mut history: Vec<WorkflowEvent>,
+        exec_id: ExecutionId,
+    ) -> TestRunOutcome {
+        Self::record_terminal_pending_commands(pending_cmds, &mut history);
+        let result = match outcome {
+            WorkflowOutcome::Completed { output } => {
+                history.push(WorkflowEvent::WorkflowCompleted {
+                    output: output.clone(),
+                });
+                Ok(output)
+            }
+            WorkflowOutcome::Failed { error } => {
+                history.push(WorkflowEvent::WorkflowFailed {
+                    error: error.clone(),
+                });
+                Err(error)
+            }
+            WorkflowOutcome::ContinuedAsNew { input } => {
+                history.push(WorkflowEvent::WorkflowContinuedAsNew {
+                    new_exec_id: ExecutionId::new(),
+                    input: input.clone(),
+                });
+                Ok(input)
+            }
+            WorkflowOutcome::Suspended { .. } => unreachable!("suspended outcomes are handled in run"),
+        };
+
+        TestRunOutcome {
+            result,
+            events: history,
+            exec_id,
+            state: self.state.clone(),
+        }
+    }
+
+    fn record_terminal_pending_commands(
+        commands: Vec<WorkflowCommand>,
+        history: &mut Vec<WorkflowEvent>,
+    ) {
+        for cmd in commands {
+            match cmd {
+                WorkflowCommand::RecordMarker { name, details } => {
+                    history.push(WorkflowEvent::MarkerRecorded { name, details });
+                }
+                WorkflowCommand::SpawnDetachedChildWorkflow {
+                    child_id,
+                    workflow_name,
+                    input,
+                    parent_close_policy,
+                } => {
+                    history.push(WorkflowEvent::ChildWorkflowSpawnedDetached {
+                        child_id,
+                        workflow_name,
+                        input,
+                        parent_close_policy,
+                    });
+                }
+                _ => {}
+            }
         }
     }
 

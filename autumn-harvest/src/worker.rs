@@ -2862,6 +2862,7 @@ async fn create_detached_child_executions(
     registry: &HandlerRegistry,
     parent_execution: &WorkflowExecution,
     commands: &[WorkflowCommand],
+    execute_span: &tracing::Span,
 ) -> HarvestResult<()> {
     for cmd in commands {
         let WorkflowCommand::SpawnDetachedChildWorkflow {
@@ -2941,6 +2942,15 @@ async fn create_detached_child_executions(
         params.required_build_id = parent_execution.assigned_build_id.clone();
         (params.concurrency_key, params.max_concurrent) =
             resolve_workflow_concurrency(registry, workflow_name, input);
+        params.trace_context = tracing::info_span!(
+            parent: execute_span,
+            "harvest.child_workflow.start",
+            "otel.kind" = "producer",
+            { ATTR_WORKFLOW_ID } = %workflow_name,
+            { ATTR_EXECUTION_ID } = %child_id,
+            { ATTR_SHARD_ID } = parent_execution.shard_id,
+        )
+        .in_scope(|| registry.telemetry().capture_trace_context());
         queue::enqueue(conn, &params).await?;
     }
 
@@ -3902,7 +3912,16 @@ async fn persist_workflow_outcome(
                 .iter()
                 .any(|c| matches!(c, WorkflowCommand::SpawnDetachedChildWorkflow { .. }))
             {
-                create_detached_child_executions(conn, registry, execution, &commands).await?;
+                let result = create_detached_child_executions(
+                    conn,
+                    registry,
+                    execution,
+                    &commands,
+                    execute_span,
+                )
+                .await;
+                fail_execution_on_error(conn, persistence.task, persistence.worker_id, result)
+                    .await?;
             }
             handle_suspended_workflow(
                 conn,
@@ -4311,6 +4330,7 @@ async fn process_workflow_task(
                     prepared.execution.search_attrs.take(),
                     &commands,
                 );
+                let detached_execute_span = execute_span.clone();
                 // Local-activity re-run: drop this iteration's execute span
                 // so the OTel span closes before we start inline execution.
                 drop(execute_span);
@@ -4372,9 +4392,16 @@ async fn process_workflow_task(
                 if commands
                     .iter()
                     .any(|c| matches!(c, WorkflowCommand::SpawnDetachedChildWorkflow { .. }))
+                    && let Err(e) = create_detached_child_executions(
+                        conn,
+                        registry,
+                        &prepared.execution,
+                        &commands,
+                        &detached_execute_span,
+                    )
+                    .await
                 {
-                    create_detached_child_executions(conn, registry, &prepared.execution, &commands)
-                        .await?;
+                    return fail_execution_on_error(conn, task, worker_id, Err::<(), _>(e)).await;
                 }
                 let (markers, local_run) = extract_run_local_activity(commands);
                 let inline_outcome = run_local_activity_inline(
@@ -4724,8 +4751,17 @@ async fn process_workflow_task(
         // on retry the spawn command is re-emitted, child creation is idempotent, and
         // the parent event is written fresh. The reverse order would produce an orphaned
         // history event with no corresponding child row.
-        create_detached_child_executions(conn, registry, &prepared.execution, &pending_cmds)
-            .await?;
+        if let Err(e) = create_detached_child_executions(
+            conn,
+            registry,
+            &prepared.execution,
+            &pending_cmds,
+            &execute_span,
+        )
+        .await
+        {
+            return fail_execution_on_error(conn, task, worker_id, Err::<(), _>(e)).await;
+        }
         // Write pre-terminal events (markers + detached-spawn) in command order,
         // before the terminal event. next_event_id is advanced so persist_workflow_outcome
         // places the terminal event immediately after them.

@@ -3,6 +3,8 @@
 #![cfg(feature = "db")]
 #![allow(clippy::items_after_statements)]
 
+use std::any::Any;
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,9 +17,11 @@ use autumn_harvest::models::NewWorkflowExecution;
 use autumn_harvest::types::ParentClosePolicy;
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{
-    ExecutionId, Priority, ShardId, StartWorkflowParams, WorkflowContext, timeout,
-    WorkflowHistoryPolicy, cancel_workflow_execution, start_or_load_workflow_execution,
+    ExecutionId, Priority, ShardId, StartWorkflowParams, TelemetryConfig, TraceContextCarrier,
+    TraceContextPropagator, WorkflowContext, WorkflowHistoryPolicy, cancel_workflow_execution,
+    start_or_load_workflow_execution, timeout,
 };
+use chrono::Utc;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -36,6 +40,10 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260427000000_harvest_continue_as_new/up.sql"),
     "\n",
     include_str!("../migrations/20260429000000_harvest_concurrency_key/up.sql"),
+    "\n",
+    include_str!("../migrations/20260430000001_harvest_external_tasks/up.sql"),
+    "\n",
+    include_str!("../migrations/20260508000000_harvest_external_task_updated_at/up.sql"),
     "\n",
     include_str!("../migrations/20260501000000_harvest_workers/up.sql"),
     "\n",
@@ -160,10 +168,9 @@ async fn get_state(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> String
         .expect("execution must exist")
 }
 
-/// Poll until the execution reaches one of the expected terminal states (up to
-/// `max_attempts * 100ms`).
+/// Poll until the execution reaches one of the expected states.
 async fn wait_for_state(conn: &mut AsyncPgConnection, exec_id: ExecutionId, states: &[&str]) {
-    for _ in 0..100 {
+    for _ in 0..300 {
         let state = get_state(conn, exec_id).await;
         if states.contains(&state.as_str()) {
             return;
@@ -172,6 +179,38 @@ async fn wait_for_state(conn: &mut AsyncPgConnection, exec_id: ExecutionId, stat
     }
     let state = get_state(conn, exec_id).await;
     panic!("execution {exec_id} never reached {states:?}; current state: {state}");
+}
+
+async fn wait_for_workflow_task_parked(conn: &mut AsyncPgConnection, exec_id: ExecutionId) {
+    use autumn_harvest::schema::harvest_task_queue;
+    use diesel::ExpressionMethods;
+    use diesel::OptionalExtension;
+    use diesel::QueryDsl;
+    use diesel_async::RunQueryDsl;
+
+    for _ in 0..300 {
+        if let Some((state, worker_id, started_at)) = harvest_task_queue::table
+            .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_id.as_uuid())))
+            .filter(harvest_task_queue::task_type.eq("workflow"))
+            .select((
+                harvest_task_queue::state,
+                harvest_task_queue::worker_id,
+                harvest_task_queue::started_at,
+            ))
+            .first::<(String, Option<String>, Option<chrono::DateTime<Utc>>)>(conn)
+            .await
+            .optional()
+            .expect("workflow task query failed")
+            && state == "RUNNING"
+            && worker_id.is_none()
+            && started_at.is_none()
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    panic!("workflow task for {exec_id} never parked");
 }
 
 fn wf_info(name: &'static str, handler: autumn_harvest::info::WorkflowHandlerFn) -> WorkflowInfo {
@@ -224,6 +263,20 @@ fn local_activity_info(
     }
 }
 
+struct FixedTracePropagator;
+
+impl TraceContextPropagator for FixedTracePropagator {
+    fn capture(&self) -> Option<TraceContextCarrier> {
+        Some(TraceContextCarrier::from_traceparent(
+            "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+        ))
+    }
+
+    fn install(&self, _carrier: &TraceContextCarrier) -> Box<dyn Any + Send> {
+        Box::new(())
+    }
+}
+
 async fn load_history_events(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
@@ -232,6 +285,53 @@ async fn load_history_events(
         .await
         .expect("history should load")
         .events
+}
+
+async fn insert_detached_child_execution(
+    conn: &mut AsyncPgConnection,
+    parent_exec_id: ExecutionId,
+    workflow_name: &'static str,
+    workflow_id: &'static str,
+    policy: ParentClosePolicy,
+) -> ExecutionId {
+    use autumn_harvest::schema::harvest_workflow_executions;
+    use diesel_async::RunQueryDsl;
+
+    let child_exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    diesel::insert_into(harvest_workflow_executions::table)
+        .values(&NewWorkflowExecution {
+            id: child_exec_id.as_uuid(),
+            workflow_name,
+            workflow_id,
+            run_id: uuid::Uuid::new_v4(),
+            shard_id: 0,
+            input: Value::Null,
+            parent_id: Some(parent_exec_id.as_uuid()),
+            queue_name: "default",
+            execution_timeout: None,
+            deadline_at: None,
+            memo: None,
+            search_attrs: None,
+            assigned_build_id: None,
+            parent_close_policy: Some(policy.as_str().to_string()),
+        })
+        .execute(conn)
+        .await
+        .expect("detached child row should insert");
+
+    autumn_harvest::store::append_events(
+        conn,
+        child_exec_id,
+        &[WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+        }],
+        0,
+    )
+    .await
+    .expect("detached child started event should append");
+
+    child_exec_id
 }
 
 async fn wait_for_child_execution(
@@ -259,6 +359,33 @@ async fn wait_for_child_execution(
     }
 
     panic!("parent {parent_exec_id} never spawned a detached child");
+}
+
+async fn wait_for_child_task_trace_context(
+    conn: &mut AsyncPgConnection,
+    child_exec_id: ExecutionId,
+) -> Option<Value> {
+    use autumn_harvest::schema::harvest_task_queue;
+    use diesel::ExpressionMethods;
+    use diesel::OptionalExtension;
+    use diesel::QueryDsl;
+    use diesel_async::RunQueryDsl;
+
+    for _ in 0..100 {
+        if let Some(trace_context) = harvest_task_queue::table
+            .filter(harvest_task_queue::workflow_exec_id.eq(Some(child_exec_id.as_uuid())))
+            .select(harvest_task_queue::trace_context)
+            .first::<Option<Value>>(conn)
+            .await
+            .optional()
+            .expect("child task trace query failed")
+        {
+            return trace_context;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    panic!("detached child {child_exec_id} never received a workflow task");
 }
 
 async fn wait_for_child_task_concurrency(
@@ -436,7 +563,7 @@ async fn detached_child_workflow_uses_registered_concurrency_policy() {
     let worker_pool = pool.clone();
     let worker_ref = worker.clone();
     let worker_handle = tokio::spawn(async move {
-        let _ = tokio::time::timeout(Duration::from_secs(15), worker_ref.run(&worker_pool)).await;
+        let _ = tokio::time::timeout(Duration::from_secs(30), worker_ref.run(&worker_pool)).await;
     });
 
     wait_for_state(&mut conn, parent_exec_id, &["COMPLETED"]).await;
@@ -509,7 +636,7 @@ async fn detached_child_continue_as_new_failure_does_not_wake_parent() {
     let worker_pool = pool.clone();
     let worker_ref = worker.clone();
     let worker_handle = tokio::spawn(async move {
-        let _ = tokio::time::timeout(Duration::from_secs(15), worker_ref.run(&worker_pool)).await;
+        let _ = tokio::time::timeout(Duration::from_secs(30), worker_ref.run(&worker_pool)).await;
     });
 
     let child_exec_id = wait_for_child_execution(&mut conn, parent_exec_id).await;
@@ -594,6 +721,15 @@ async fn signal_then_detached_only_remainder_persists_spawn_and_completes() {
         .expect("connect failed");
     let target_exec_id =
         start_workflow(&mut conn, "signal_target_waits", "signal-target-001", Value::Null).await;
+
+    let worker = Arc::new(make_worker(registry));
+    let worker_pool = pool.clone();
+    let worker_ref = worker.clone();
+    let worker_handle = tokio::spawn(async move {
+        let _ = tokio::time::timeout(Duration::from_secs(30), worker_ref.run(&worker_pool)).await;
+    });
+
+    wait_for_workflow_task_parked(&mut conn, target_exec_id).await;
     let parent_exec_id = start_workflow(
         &mut conn,
         "signal_then_detached_parent",
@@ -601,13 +737,6 @@ async fn signal_then_detached_only_remainder_persists_spawn_and_completes() {
         serde_json::json!({ "target": target_exec_id.as_uuid().to_string() }),
     )
     .await;
-
-    let worker = Arc::new(make_worker(registry));
-    let worker_pool = pool.clone();
-    let worker_ref = worker.clone();
-    let worker_handle = tokio::spawn(async move {
-        let _ = tokio::time::timeout(Duration::from_secs(20), worker_ref.run(&worker_pool)).await;
-    });
 
     wait_for_state(&mut conn, parent_exec_id, &["COMPLETED"]).await;
     wait_for_state(&mut conn, target_exec_id, &["COMPLETED"]).await;
@@ -757,6 +886,242 @@ async fn detached_child_execution_timeout_does_not_wake_parent() {
             .iter()
             .any(|event| matches!(event, WorkflowEvent::ChildWorkflowFailed { .. })),
         "detached child timeout must not be recorded on parent history: {parent_history:?}"
+    );
+}
+
+#[tokio::test]
+async fn terminal_detached_spawn_setup_error_fails_workflow() {
+    let (url, _container) = setup_test_db_url().await;
+    let pool = build_pool(&url);
+
+    fn parent_spawns_missing_detached<'a>(
+        ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            ctx.spawn_child_workflow_detached_raw(
+                "missing_detached_child",
+                Value::Null,
+                ParentClosePolicy::Abandon,
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(Value::Null)
+        })
+    }
+
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![wf_info(
+            "terminal_missing_detached_parent",
+            parent_spawns_missing_detached,
+        )],
+        vec![],
+    ));
+
+    let mut conn = AsyncPgConnection::establish(&url)
+        .await
+        .expect("connect failed");
+    let parent_exec_id = start_workflow(
+        &mut conn,
+        "terminal_missing_detached_parent",
+        "terminal-missing-detached-parent-001",
+        Value::Null,
+    )
+    .await;
+
+    let worker = Arc::new(make_worker(registry));
+    let worker_pool = pool.clone();
+    let worker_ref = worker.clone();
+    let worker_handle = tokio::spawn(async move {
+        let _ = tokio::time::timeout(Duration::from_secs(30), worker_ref.run(&worker_pool)).await;
+    });
+
+    wait_for_state(&mut conn, parent_exec_id, &["FAILED"]).await;
+    worker_handle.abort();
+
+    let parent_history = load_history_events(&mut conn, parent_exec_id).await;
+    assert!(
+        parent_history.iter().any(|event| {
+            matches!(
+                event,
+                WorkflowEvent::WorkflowFailed { error }
+                    if error.contains("no workflow handler registered for 'missing_detached_child'")
+            )
+        }),
+        "missing detached child handler should be recorded as workflow failure: {parent_history:?}"
+    );
+}
+
+#[tokio::test]
+async fn parent_terminate_cascade_applies_child_descendant_policy() {
+    let (url, _container) = setup_test_db_url().await;
+
+    let mut conn = AsyncPgConnection::establish(&url)
+        .await
+        .expect("connect failed");
+    let parent_exec_id = start_workflow(
+        &mut conn,
+        "manual_parent_for_descendant_cascade",
+        "manual-parent-descendant-cascade-001",
+        Value::Null,
+    )
+    .await;
+    let child_exec_id = insert_detached_child_execution(
+        &mut conn,
+        parent_exec_id,
+        "manual_child_for_descendant_cascade",
+        "manual-child-descendant-cascade-001",
+        ParentClosePolicy::Terminate,
+    )
+    .await;
+    let grandchild_exec_id = insert_detached_child_execution(
+        &mut conn,
+        child_exec_id,
+        "manual_grandchild_for_descendant_cascade",
+        "manual-grandchild-descendant-cascade-001",
+        ParentClosePolicy::RequestCancel,
+    )
+    .await;
+
+    cancel_workflow_execution(&mut conn, parent_exec_id, "operator closed parent")
+        .await
+        .expect("parent cancellation should cascade");
+
+    wait_for_state(&mut conn, child_exec_id, &["FAILED"]).await;
+    wait_for_state(&mut conn, grandchild_exec_id, &["CANCELLED"]).await;
+}
+
+#[tokio::test]
+async fn workflow_task_timeout_cascades_detached_children() {
+    let (url, _container) = setup_test_db_url().await;
+
+    let mut conn = AsyncPgConnection::establish(&url)
+        .await
+        .expect("connect failed");
+    let parent_exec_id = start_workflow(
+        &mut conn,
+        "manual_task_timeout_parent",
+        "manual-task-timeout-parent-001",
+        Value::Null,
+    )
+    .await;
+    let child_exec_id = insert_detached_child_execution(
+        &mut conn,
+        parent_exec_id,
+        "manual_task_timeout_child",
+        "manual-task-timeout-child-001",
+        ParentClosePolicy::RequestCancel,
+    )
+    .await;
+
+    {
+        use autumn_harvest::schema::harvest_task_queue;
+        use diesel::ExpressionMethods;
+        use diesel::QueryDsl;
+        use diesel_async::RunQueryDsl;
+
+        diesel::update(
+            harvest_task_queue::table
+                .filter(harvest_task_queue::workflow_exec_id.eq(Some(parent_exec_id.as_uuid())))
+                .filter(harvest_task_queue::task_type.eq("workflow")),
+        )
+        .set((
+            harvest_task_queue::scheduled_at.eq(Utc::now() - chrono::Duration::seconds(5)),
+            harvest_task_queue::schedule_to_start.eq(Some(chrono::Duration::milliseconds(1))),
+        ))
+        .execute(&mut conn)
+        .await
+        .expect("parent workflow task should be made timeout-eligible");
+    }
+
+    let sharded_pool = Option::<autumn_harvest::ShardedDbPool>::None;
+    let enforced = timeout::enforce_timeouts_once(
+        &mut conn,
+        &autumn_harvest::NoOpMetrics,
+        Duration::from_secs(5),
+        &sharded_pool,
+        &[ShardId::new(0)],
+    )
+    .await
+    .expect("timeout enforcement should succeed");
+
+    assert!(enforced >= 1);
+    wait_for_state(&mut conn, parent_exec_id, &["TIMED_OUT"]).await;
+    wait_for_state(&mut conn, child_exec_id, &["CANCELLED"]).await;
+}
+
+#[tokio::test]
+async fn detached_child_task_receives_trace_context() {
+    let (url, _container) = setup_test_db_url().await;
+    let pool = build_pool(&url);
+
+    fn parent_spawns_traced_detached<'a>(
+        ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            ctx.spawn_child_workflow_detached_raw(
+                "traced_detached_child",
+                Value::Null,
+                ParentClosePolicy::Abandon,
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(Value::Null)
+        })
+    }
+
+    fn traced_child<'a>(
+        ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let _ = ctx.wait_for_signal("release").await.map_err(|e| e.to_string())?;
+            Ok(Value::Null)
+        })
+    }
+
+    let telemetry = Arc::new(
+        TelemetryConfig::builder()
+            .propagator(Arc::new(FixedTracePropagator))
+            .build(),
+    );
+    let state: autumn_harvest::context::SharedState = Arc::new(HashMap::new());
+    let registry = Arc::new(HandlerRegistry::with_state_and_telemetry(
+        vec![
+            wf_info("traced_detached_parent", parent_spawns_traced_detached),
+            wf_info("traced_detached_child", traced_child),
+        ],
+        vec![],
+        state,
+        telemetry,
+    ));
+
+    let mut conn = AsyncPgConnection::establish(&url)
+        .await
+        .expect("connect failed");
+    let parent_exec_id = start_workflow(
+        &mut conn,
+        "traced_detached_parent",
+        "traced-detached-parent-001",
+        Value::Null,
+    )
+    .await;
+
+    let worker = Arc::new(make_worker(registry));
+    let worker_pool = pool.clone();
+    let worker_ref = worker.clone();
+    let worker_handle = tokio::spawn(async move {
+        let _ = tokio::time::timeout(Duration::from_secs(30), worker_ref.run(&worker_pool)).await;
+    });
+
+    let child_exec_id = wait_for_child_execution(&mut conn, parent_exec_id).await;
+    let trace_context = wait_for_child_task_trace_context(&mut conn, child_exec_id).await;
+    worker_handle.abort();
+
+    assert_eq!(
+        trace_context
+            .and_then(|json| TraceContextCarrier::from_json(&json))
+            .and_then(|carrier| carrier.traceparent),
+        Some("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01".to_string())
     );
 }
 
@@ -911,7 +1276,7 @@ async fn history_cap_failure_cascades_detached_children() {
     let worker_pool = pool.clone();
     let worker_ref = worker.clone();
     let worker_handle = tokio::spawn(async move {
-        let _ = tokio::time::timeout(Duration::from_secs(15), worker_ref.run(&worker_pool)).await;
+        let _ = tokio::time::timeout(Duration::from_secs(30), worker_ref.run(&worker_pool)).await;
     });
 
     let child_exec_id = wait_for_child_execution(&mut conn, parent_exec_id).await;

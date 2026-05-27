@@ -537,6 +537,7 @@ async fn enforce_workflow_timeout(
             store::append_events(conn, exec_id, &[workflow_event], history.next_event_id).await?;
             update_workflow_execution_timed_out(conn, exec_id, &error).await?;
             queue::fail_task(conn, task.id, &error).await?;
+            apply_parent_close_cascade(conn, exec_id).await?;
             if execution.parent_close_policy.is_none()
                 && let Some(parent_uuid) = execution.parent_id
             {
