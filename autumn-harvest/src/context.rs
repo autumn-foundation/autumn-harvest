@@ -1761,7 +1761,11 @@ impl WorkflowContext {
                     rx.await,
                     || format!("child-workflow:{workflow_name}"),
                     1,
-                    || format!("child workflow '{workflow_name}' cancelled: result channel dropped"),
+                    || {
+                        format!(
+                            "child workflow '{workflow_name}' cancelled: result channel dropped"
+                        )
+                    },
                 )
             }
             HistoryMatch::NoMatch => {
@@ -1794,7 +1798,11 @@ impl WorkflowContext {
                     rx.await,
                     || format!("child-workflow:{workflow_name}"),
                     1,
-                    || format!("child workflow '{workflow_name}' cancelled: result channel dropped"),
+                    || {
+                        format!(
+                            "child workflow '{workflow_name}' cancelled: result channel dropped"
+                        )
+                    },
                 )
             }
         }
