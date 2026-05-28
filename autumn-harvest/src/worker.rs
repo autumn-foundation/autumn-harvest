@@ -554,10 +554,14 @@ fn extract_single_command<T>(
     extractor(first_cmd)
 }
 
+/// Extracts all `ScheduleActivity` commands from the workflow task output.
+///
+/// **Performance Note (Bolt ⚡):** We pre-allocate `scheduled` using `Vec::with_capacity(commands.len())`
+/// to eliminate intermediate heap reallocations when a workflow schedules multiple activities.
 fn extract_all_scheduled_activities(
     commands: &[WorkflowCommand],
 ) -> Option<Vec<ScheduledActivityCommand>> {
-    let mut scheduled = Vec::new();
+    let mut scheduled = Vec::with_capacity(commands.len());
 
     for cmd in commands {
         match cmd {
@@ -593,8 +597,12 @@ fn extract_all_scheduled_activities(
     }
 }
 
+/// Extracts all `WaitForActivity` commands from the workflow task output.
+///
+/// **Performance Note (Bolt ⚡):** We pre-allocate `activity_ids` using `Vec::with_capacity(commands.len())`
+/// to avoid dynamic heap reallocations when waiting on many activities concurrently.
 fn extract_all_activity_waits(commands: &[WorkflowCommand]) -> Option<Vec<ActivityExecId>> {
-    let mut activity_ids = Vec::new();
+    let mut activity_ids = Vec::with_capacity(commands.len());
 
     for cmd in commands {
         match cmd {
@@ -888,11 +896,14 @@ fn extract_signal_external_workflow(commands: Vec<WorkflowCommand>) -> Vec<Signa
 ///
 /// `RecordUpdateResult` and `UpsertSearchAttributes` commands are dropped because
 /// the caller persists them before invoking this function.
+///
+/// **Performance Note (Bolt ⚡):** Vectors `signal_items` and `remaining` are pre-allocated to
+/// `commands.len()` to prevent intermediate heap allocations while splitting the command batch.
 fn split_mixed_signal_batch(
     commands: Vec<WorkflowCommand>,
 ) -> (Vec<SignalBatchItem>, Vec<WorkflowCommand>) {
-    let mut signal_items = Vec::new();
-    let mut remaining = Vec::new();
+    let mut signal_items = Vec::with_capacity(commands.len());
+    let mut remaining = Vec::with_capacity(commands.len());
     for cmd in commands {
         match cmd {
             WorkflowCommand::SignalExternalWorkflow {
@@ -939,13 +950,16 @@ fn split_mixed_signal_batch(
 /// original insert committed before the crash. Exact-once delivery requires
 /// storing the `signal_id` as a unique key on `harvest_signals`; that schema
 /// change is deferred to a follow-up migration.
+///
+/// **Performance Note (Bolt ⚡):** `new_events` is pre-allocated with capacity `items.len() * 2`
+/// (accounting for up to two events per signal item) to avoid intermediate heap reallocations.
 async fn persist_external_signal_inline(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
     items: Vec<SignalBatchItem>,
     next_event_id: &mut i32,
 ) -> HarvestResult<Vec<WorkflowEvent>> {
-    let mut new_events: Vec<WorkflowEvent> = Vec::new();
+    let mut new_events: Vec<WorkflowEvent> = Vec::with_capacity(items.len() * 2);
 
     for item in items {
         match item {
