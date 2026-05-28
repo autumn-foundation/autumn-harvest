@@ -67,7 +67,7 @@ pub struct HarvestBuilder {
     /// Server-side ceiling on `execution_timeout` (issue #243).
     ///
     /// When set, any `start_workflow` call that requests an `execution_timeout`
-    /// larger than this ceiling is rejected with [`BuildError::ExecutionTimeoutExceedsCeiling`].
+    /// larger than this ceiling is rejected.
     /// `None` means no ceiling is enforced.
     max_workflow_execution_timeout: Option<Duration>,
     /// Maximum allowed byte length for an activity input payload (issue #252).
@@ -1399,7 +1399,7 @@ pub struct WorkerConfig {
     /// Per-query execution timeout (issue #234).
     ///
     /// When a query handler takes longer than this to complete, the engine
-    /// terminates the handler and returns [`HarvestError::QueryTimedOut`] to
+    /// terminates the handler and returns [`crate::error::HarvestError::QueryTimedOut`] to
     /// the caller. Defaults to **5 seconds**.
     pub query_timeout: Duration,
     /// Anti-starvation aging period for the priority claim query (issue #249).
