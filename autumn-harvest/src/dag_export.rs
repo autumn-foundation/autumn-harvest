@@ -3,6 +3,7 @@
 //! Provides utilities to export workflow DAGs (Directed Acyclic Graphs) into human-readable
 //! and tool-compatible diagram formats such as Mermaid.js and Graphviz DOT.
 //! This is useful for debugging, documentation, and visualizing dependencies.
+use crate::critical_path::CriticalPathResult;
 use crate::dag::DagDefinition;
 use std::fmt::Write;
 
@@ -91,6 +92,116 @@ pub fn export_dot(dag: &DagDefinition) -> Result<String, std::fmt::Error> {
     Ok(out)
 }
 
+/// Exports the DAG definition to a Mermaid.js flowchart, highlighting the critical path.
+///
+/// Nodes on the critical path will be highlighted, and edges between them will be bolded and colored red.
+///
+/// # Errors
+/// Returns `std::fmt::Error` if string formatting fails.
+pub fn export_mermaid_with_critical_path(
+    dag: &DagDefinition,
+    critical_path: &CriticalPathResult,
+) -> Result<String, std::fmt::Error> {
+    let mut out = String::new();
+    writeln!(out, "graph TD")?;
+
+    let tasks = dag.tasks();
+
+    for (i, task) in tasks.iter().enumerate() {
+        writeln!(out, "    t{i}[\"{}\"]", task.activity_name)?;
+    }
+
+    let mut link_index = 0;
+    let mut critical_links = Vec::new();
+
+    for (i, task) in tasks.iter().enumerate() {
+        for &upstream in &task.upstreams {
+            writeln!(out, "    t{upstream} --> t{i}")?;
+
+            // Check if this edge is part of the critical path
+            let is_critical_edge = critical_path
+                .path_indices
+                .windows(2)
+                .any(|w| w[0] == upstream && w[1] == i);
+            if is_critical_edge {
+                critical_links.push(link_index);
+            }
+            link_index += 1;
+        }
+    }
+
+    if !critical_path.path_indices.is_empty() {
+        writeln!(
+            out,
+            "    classDef critical fill:#ffcccc,stroke:#ff0000,stroke-width:2px;"
+        )?;
+
+        let critical_nodes: Vec<String> = critical_path
+            .path_indices
+            .iter()
+            .map(|&i| format!("t{i}"))
+            .collect();
+        writeln!(out, "    class {} critical;", critical_nodes.join(","))?;
+
+        for link_idx in critical_links {
+            writeln!(
+                out,
+                "    linkStyle {link_idx} stroke:#ff0000,stroke-width:2px;"
+            )?;
+        }
+    }
+
+    Ok(out)
+}
+
+/// Exports the DAG definition to Graphviz DOT format, highlighting the critical path.
+///
+/// Nodes and edges on the critical path will be colored red.
+///
+/// # Errors
+/// Returns `std::fmt::Error` if string formatting fails.
+pub fn export_dot_with_critical_path(
+    dag: &DagDefinition,
+    critical_path: &CriticalPathResult,
+) -> Result<String, std::fmt::Error> {
+    let mut out = String::new();
+    writeln!(out, "digraph DAG {{")?;
+
+    let tasks = dag.tasks();
+
+    for (i, task) in tasks.iter().enumerate() {
+        if critical_path.path_indices.contains(&i) {
+            writeln!(
+                out,
+                "    t{i} [label=\"{}\", color=\"red\", style=\"filled\", fillcolor=\"#ffcccc\"];",
+                task.activity_name
+            )?;
+        } else {
+            writeln!(out, "    t{i} [label=\"{}\"];", task.activity_name)?;
+        }
+    }
+
+    for (i, task) in tasks.iter().enumerate() {
+        for &upstream in &task.upstreams {
+            let is_critical_edge = critical_path
+                .path_indices
+                .windows(2)
+                .any(|w| w[0] == upstream && w[1] == i);
+            if is_critical_edge {
+                writeln!(
+                    out,
+                    "    t{upstream} -> t{i} [color=\"red\", penwidth=2.0];"
+                )?;
+            } else {
+                writeln!(out, "    t{upstream} -> t{i};")?;
+            }
+        }
+    }
+
+    writeln!(out, "}}")?;
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,5 +264,44 @@ digraph DAG {
 }
 ";
         assert_eq!(dot, expected_dot);
+    }
+
+    #[test]
+    fn test_export_critical_path() {
+        use crate::critical_path::CriticalPathAnalyzer;
+        use std::time::Duration;
+
+        let mut builder = DagBuilder::new();
+        let start = builder.activity(dummy_activity); // 0
+        let branch1 = builder.activity(dummy_activity2).upstream(&start); // 1
+        let branch2 = builder.activity(dummy_activity3).upstream(&start); // 2
+        let _end = builder
+            .activity(dummy_activity)
+            .upstream(&branch1)
+            .upstream(&branch2); // 3
+
+        let dag = builder.build().unwrap();
+
+        let analyzer = CriticalPathAnalyzer::new(dag.clone())
+            .mock_duration("dummy_activity", Duration::from_secs(1))
+            .mock_duration("dummy_activity2", Duration::from_secs(5)) // Critical path
+            .mock_duration("dummy_activity3", Duration::from_secs(2));
+
+        let cp_result = analyzer.analyze();
+
+        let mermaid = export_mermaid_with_critical_path(&dag, &cp_result).unwrap();
+        assert!(
+            mermaid.contains("classDef critical fill:#ffcccc,stroke:#ff0000,stroke-width:2px;")
+        );
+        assert!(mermaid.contains("linkStyle 0 stroke:#ff0000,stroke-width:2px;")); // t0 -> t1
+        assert!(mermaid.contains("linkStyle 2 stroke:#ff0000,stroke-width:2px;")); // t1 -> t3
+        assert!(mermaid.contains("class t0,t1,t3 critical;"));
+
+        let dot = export_dot_with_critical_path(&dag, &cp_result).unwrap();
+        assert!(dot.contains(
+            "t0 [label=\"dummy_activity\", color=\"red\", style=\"filled\", fillcolor=\"#ffcccc\"];"
+        ));
+        assert!(dot.contains("t0 -> t1 [color=\"red\", penwidth=2.0];"));
+        assert!(dot.contains("t1 -> t3 [color=\"red\", penwidth=2.0];"));
     }
 }
