@@ -11056,20 +11056,6 @@ async fn preview_candidate_schedule_handler(
         ));
     }
 
-    // Paused candidate schedules return no entries.
-    if body.paused {
-        return Ok((
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "entries": [],
-                "is_paused": true,
-                "pause_reason": serde_json::Value::Null,
-                "from": from,
-                "count_requested": count,
-            })),
-        ));
-    }
-
     // Validate jitter before i64 conversion; body.jitter_secs is u64 so an
     // overly large value would overflow chrono::Duration::seconds and panic.
     let jitter_duration = std::time::Duration::from_secs(body.jitter_secs);
@@ -11083,12 +11069,13 @@ async fn preview_candidate_schedule_handler(
     // or less than the interval period, both well within i64 range.
     let jitter_secs = i64::try_from(body.jitter_secs).unwrap_or(i64::MAX);
 
+    // Verify the calendar exists before returning any result so that a typo
+    // here gets a 400 even when the schedule is paused.  Exclusion dates are
+    // only loaded for active schedules further below.
     let calendar_name = body.calendar.as_deref();
-    let excluded_dates = if let Some(cal_name) = calendar_name {
+    if let Some(cal_name) = calendar_name {
         let pool = api_state.storage_pool().map_err(map_error)?;
         let mut conn = acquire_conn(pool.default_pool()).await?;
-        // Verify the calendar exists; silently-empty exclusions on a typo would
-        // confuse operators into thinking the config is valid.
         match get_calendar(&mut conn, cal_name).await {
             Ok(_) => {}
             Err(autumn_harvest::HarvestError::NotFound(_)) => {
@@ -11102,6 +11089,28 @@ async fn preview_candidate_schedule_handler(
             }
             Err(e) => return Err(map_error(e)),
         }
+    }
+
+    // Paused candidate schedules return no entries. All validations above
+    // (schedule_expr, timezone, skip_policy, overlap_policy, jitter, calendar)
+    // run first so the preview rejects the same configs that POST /admin/schedules/workflow
+    // would reject, regardless of pause state.
+    if body.paused {
+        return Ok((
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "entries": [],
+                "is_paused": true,
+                "pause_reason": serde_json::Value::Null,
+                "from": from,
+                "count_requested": count,
+            })),
+        ));
+    }
+
+    let excluded_dates = if let Some(cal_name) = calendar_name {
+        let pool = api_state.storage_pool().map_err(map_error)?;
+        let mut conn = acquire_conn(pool.default_pool()).await?;
         load_exclusions_for_calendar(&mut conn, cal_name)
             .await
             .map_err(map_error)?
