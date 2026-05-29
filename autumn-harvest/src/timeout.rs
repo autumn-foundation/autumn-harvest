@@ -25,6 +25,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::{HarvestError, HarvestResult, TimeoutType};
 use crate::event::WorkflowEvent;
+use crate::execution::apply_parent_close_cascade;
 use crate::models::{ExternalTask, TaskQueueItem, WorkflowExecution};
 use crate::schema::{harvest_external_tasks, harvest_task_queue, harvest_workflow_executions};
 use crate::telemetry::MetricsRecorder;
@@ -408,6 +409,71 @@ async fn wake_parent_for_child_timeout(
     queue::wake_workflow_task(conn, parent_exec_id).await
 }
 
+async fn commit_workflow_execution_timeout(
+    conn: &mut AsyncPgConnection,
+    exec_id: crate::types::ExecutionId,
+    parent_uuid: Option<uuid::Uuid>,
+    timeout_event: &WorkflowEvent,
+    error_msg: &str,
+) -> HarvestResult<bool> {
+    conn.transaction::<bool, HarvestError, _>(|conn| {
+        let timeout_event = timeout_event.clone();
+        let error_msg = error_msg.to_owned();
+        async move {
+            // Re-check state under lock to guard against concurrent completion.
+            let current_state: Option<String> = harvest_workflow_executions::table
+                .find(exec_id.as_uuid())
+                .for_update()
+                .select(harvest_workflow_executions::state)
+                .first(conn)
+                .await
+                .optional()
+                .map_err(crate::error::database_error)?;
+
+            match current_state.as_deref() {
+                Some("RUNNING") => {}
+                _ => return Ok(false),
+            }
+
+            store::append_single_event(conn, exec_id, timeout_event).await?;
+            update_workflow_execution_timed_out(conn, exec_id, &error_msg).await?;
+
+            let _rows = diesel::update(
+                harvest_task_queue::table
+                    .filter(harvest_task_queue::workflow_exec_id.eq(exec_id.as_uuid()))
+                    .filter(
+                        harvest_task_queue::state
+                            .eq("PENDING")
+                            .or(harvest_task_queue::state.eq("RUNNING")),
+                    ),
+            )
+            .set((
+                harvest_task_queue::state.eq("FAILED"),
+                harvest_task_queue::error.eq(Some(&error_msg)),
+                harvest_task_queue::completed_at.eq(Some(Utc::now())),
+            ))
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+
+            if let Some(parent_uuid) = parent_uuid {
+                wake_parent_for_child_timeout(
+                    conn,
+                    execution_id_from_uuid(parent_uuid),
+                    exec_id,
+                    &error_msg,
+                )
+                .await?;
+            }
+
+            apply_parent_close_cascade(conn, exec_id).await?;
+            Ok(true)
+        }
+        .scope_boxed()
+    })
+    .await
+}
+
 async fn enforce_activity_timeout(
     conn: &mut AsyncPgConnection,
     task: &TaskQueueItem,
@@ -471,7 +537,10 @@ async fn enforce_workflow_timeout(
             store::append_events(conn, exec_id, &[workflow_event], history.next_event_id).await?;
             update_workflow_execution_timed_out(conn, exec_id, &error).await?;
             queue::fail_task(conn, task.id, &error).await?;
-            if let Some(parent_uuid) = execution.parent_id {
+            apply_parent_close_cascade(conn, exec_id).await?;
+            if execution.parent_close_policy.is_none()
+                && let Some(parent_uuid) = execution.parent_id
+            {
                 wake_parent_for_child_timeout(
                     conn,
                     execution_id_from_uuid(parent_uuid),
@@ -577,7 +646,8 @@ pub async fn enforce_external_task_timeouts(conn: &mut AsyncPgConnection) -> Har
 /// 1. Appends `WorkflowEvent::WorkflowExecutionTimedOut` to the execution history.
 /// 2. Transitions the execution row to `TIMED_OUT` state.
 /// 3. Cancels/fails the outstanding workflow task in `harvest_task_queue`.
-/// 4. Notifies the parent workflow (if any) via `ChildWorkflowFailed`.
+/// 4. Notifies the parent workflow (for awaited children) via `ChildWorkflowFailed`.
+/// 5. Applies parent-close policy to any running detached children.
 ///
 /// Returns the number of executions that were timed out.
 ///
@@ -617,80 +687,40 @@ pub async fn enforce_workflow_execution_timeouts(
         }
         .to_string();
 
-        let parent_uuid = execution.parent_id;
+        let parent_uuid = if execution.parent_close_policy.is_none() {
+            execution.parent_id
+        } else {
+            None
+        };
         let workflow_name = execution.workflow_name.clone();
 
-        let result = conn
-            .transaction::<(), HarvestError, _>(|conn| {
-                let timeout_event = timeout_event.clone();
-                let error_msg = error_msg.clone();
-                async move {
-                    // Re-check state under lock to guard against concurrent completion.
-                    let current_state: Option<String> = harvest_workflow_executions::table
-                        .find(exec_id.as_uuid())
-                        .for_update()
-                        .select(harvest_workflow_executions::state)
-                        .first(conn)
-                        .await
-                        .optional()
-                        .map_err(crate::error::database_error)?;
+        // true  = timeout transition was committed
+        // false = row was already non-RUNNING; cascade must not run
+        let result = commit_workflow_execution_timeout(
+            conn,
+            exec_id,
+            parent_uuid,
+            &timeout_event,
+            &error_msg,
+        )
+        .await;
 
-                    match current_state.as_deref() {
-                        Some("RUNNING") => {}
-                        _ => return Ok(()), // Already terminal or gone — skip.
-                    }
+        let timed_out_applied = match result {
+            Ok(applied) => applied,
+            Err(error) => {
+                tracing::error!(
+                    exec_id = %exec_id,
+                    workflow_name = %workflow_name,
+                    error = %error,
+                    "failed to enforce workflow execution timeout"
+                );
+                return Err(error);
+            }
+        };
 
-                    // Append the timeout event to history.
-                    store::append_single_event(conn, exec_id, timeout_event).await?;
-
-                    // Transition execution to TIMED_OUT.
-                    update_workflow_execution_timed_out(conn, exec_id, &error_msg).await?;
-
-                    // Cancel all outstanding tasks for this execution (workflow and
-                    // activity) to avoid resource leaks when the deadline fires.
-                    let _rows = diesel::update(
-                        harvest_task_queue::table
-                            .filter(harvest_task_queue::workflow_exec_id.eq(exec_id.as_uuid()))
-                            .filter(
-                                harvest_task_queue::state
-                                    .eq("PENDING")
-                                    .or(harvest_task_queue::state.eq("RUNNING")),
-                            ),
-                    )
-                    .set((
-                        harvest_task_queue::state.eq("FAILED"),
-                        harvest_task_queue::error.eq(Some(&error_msg)),
-                        harvest_task_queue::completed_at.eq(Some(Utc::now())),
-                    ))
-                    .execute(conn)
-                    .await
-                    .map_err(crate::error::database_error)?;
-
-                    // Notify parent if this is a child workflow.
-                    if let Some(parent_uuid) = parent_uuid {
-                        wake_parent_for_child_timeout(
-                            conn,
-                            execution_id_from_uuid(parent_uuid),
-                            exec_id,
-                            &error_msg,
-                        )
-                        .await?;
-                    }
-
-                    Ok(())
-                }
-                .scope_boxed()
-            })
-            .await;
-
-        if let Err(error) = result {
-            tracing::error!(
-                exec_id = %exec_id,
-                workflow_name = %workflow_name,
-                error = %error,
-                "failed to enforce workflow execution timeout"
-            );
-            return Err(error);
+        if !timed_out_applied {
+            // Row was already non-RUNNING; nothing to do.
+            continue;
         }
 
         tracing::warn!(

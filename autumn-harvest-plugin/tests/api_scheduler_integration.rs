@@ -118,6 +118,10 @@ const INIT_SQL: &str = concat!(
     ),
     "\n",
     include_str!("../../autumn-harvest/migrations/20260522000001_harvest_rate_limiting/up.sql"),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260526000001_harvest_parent_close_policy/up.sql"
+    ),
 );
 type HarvestApiApp = axum::Router;
 
@@ -690,6 +694,7 @@ async fn seed_dag_run_on_url(database_url: &str, dag_name: &str) -> uuid::Uuid {
             memo: None,
             search_attrs: None,
             assigned_build_id: None,
+            parent_close_policy: None,
         })
         .execute(&mut conn)
         .await
@@ -1008,6 +1013,7 @@ async fn seed_scheduled_activity_task_from_url(
             memo: None,
             search_attrs: None,
             assigned_build_id: None,
+            parent_close_policy: None,
         })
         .execute(&mut conn)
         .await

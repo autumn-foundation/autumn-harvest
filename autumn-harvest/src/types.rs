@@ -762,6 +762,90 @@ impl fmt::Display for IdempotencyKey {
     }
 }
 
+// ── ParentClosePolicy ─────────────────────────────────────────────────────────
+
+/// Determines what happens to a detached child workflow when its parent
+/// reaches a terminal state (Completed, Failed, Cancelled, Terminated, or
+/// execution-timeout).
+///
+/// This is only relevant for children spawned via
+/// [`WorkflowContext::spawn_child_workflow_detached_raw`]. Children spawned via
+/// the await path (`spawn_child_workflow_raw`) pin the parent alive until the
+/// child terminates — no cascade policy is needed.
+///
+/// The three variants mirror Temporal's `ParentClosePolicy` so that operators
+/// with Temporal experience can map their mental model directly.
+///
+/// ## Default
+///
+/// When calling `spawn_child_workflow_detached_raw`, the default policy is
+/// `RequestCancel`. Children that should outlive their parent unconditionally
+/// must opt in to `Abandon` explicitly.
+///
+/// ## Examples
+///
+/// ```rust
+/// use autumn_harvest::types::ParentClosePolicy;
+///
+/// let policy = ParentClosePolicy::default();
+/// assert_eq!(policy, ParentClosePolicy::RequestCancel);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ParentClosePolicy {
+    /// Children continue independently — no cascade when the parent closes.
+    ///
+    /// Use for "fire-and-forget" fan-out and long-lived monitor patterns where
+    /// the child must outlive the parent regardless of how the parent terminates.
+    Abandon,
+    /// Parent close emits a cancel signal at each child's root. Children
+    /// observe `ctx.is_cancelled()` and may exit cleanly, running compensations
+    /// if needed. This is the **default**.
+    ///
+    /// Use when children should be informed of the parent's demise and given a
+    /// chance to shut down gracefully. Children that ignore cancellation will
+    /// continue running; there is no hard-kill guarantee.
+    #[default]
+    RequestCancel,
+    /// Children are force-failed by the executor without running compensations
+    /// or further activities. The child's terminal event will carry the error
+    /// `"ParentClosed"`.
+    ///
+    /// Use for "tear-down cascade" — when the parent's failure means child
+    /// results are meaningless and immediate cleanup of queue tasks is desired.
+    Terminate,
+}
+
+impl ParentClosePolicy {
+    /// Returns the canonical lowercase string representation used in the DB.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Abandon => "abandon",
+            Self::RequestCancel => "request_cancel",
+            Self::Terminate => "terminate",
+        }
+    }
+}
+
+impl fmt::Display for ParentClosePolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for ParentClosePolicy {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "abandon" => Ok(Self::Abandon),
+            "request_cancel" => Ok(Self::RequestCancel),
+            "terminate" => Ok(Self::Terminate),
+            other => Err(format!("unknown ParentClosePolicy: {other:?}")),
+        }
+    }
+}
+
 // ── BuildId ───────────────────────────────────────────────────────────────────
 
 /// Immutable build identifier advertised by a worker process.

@@ -298,6 +298,8 @@ mod db_tests {
         include_str!("../migrations/20260522000000_harvest_schedule_decisions/up.sql"),
         "\n",
         include_str!("../migrations/20260522000001_harvest_rate_limiting/up.sql"),
+        "\n",
+        include_str!("../migrations/20260526000001_harvest_parent_close_policy/up.sql"),
     );
 
     async fn setup() -> (AsyncPgConnection, ContainerAsync<Postgres>) {
@@ -455,6 +457,7 @@ mod db_tests {
                 memo: None,
                 search_attrs: None,
                 assigned_build_id: required_build_id.map(str::to_string),
+                parent_close_policy: None,
             })
             .execute(conn)
             .await
