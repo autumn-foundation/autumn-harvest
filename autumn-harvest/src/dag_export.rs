@@ -133,7 +133,11 @@ pub fn export_mermaid_gantt(profile: &DagProfile) -> Result<String, std::fmt::Er
 
     for (idx, (name, start, end)) in sorted_tasks {
         writeln!(out, "    section Task {idx}")?;
-        writeln!(out, "    {name} :a{idx}, {start}s, {}s", end.saturating_sub(start))?;
+        writeln!(
+            out,
+            "    {name} :a{idx}, {start}s, {}s",
+            end.saturating_sub(start)
+        )?;
     }
 
     Ok(out)
@@ -332,6 +336,8 @@ digraph DAG {
         let html = export_html_report(&dag, &profile, &cp).unwrap();
         assert!(html.contains("<!DOCTYPE html>"));
         assert!(html.contains("Total Estimated Duration: <span class=\"metric\">5s</span>"));
-        assert!(html.contains("Critical Path: <span class=\"critical-path\">dummy_activity -> dummy_activity2</span>"));
+        assert!(html.contains(
+            "Critical Path: <span class=\"critical-path\">dummy_activity -> dummy_activity2</span>"
+        ));
     }
 }
