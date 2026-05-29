@@ -3209,12 +3209,10 @@ async fn fail_execution_on_error<T>(
     worker_id: &str,
     result: HarvestResult<T>,
 ) -> HarvestResult<T> {
-    let error = match result {
-        Ok(val) => return Ok(val),
-        Err(e) => e,
-    };
-    fail_task_and_execution(conn, task, worker_id, &error.to_string()).await?;
-    Err(error)
+    if let Err(e) = &result {
+        fail_task_and_execution(conn, task, worker_id, &e.to_string()).await?;
+    }
+    result
 }
 
 async fn load_task_execution(
@@ -3222,12 +3220,11 @@ async fn load_task_execution(
     task: &TaskQueueItem,
     exec_id: ExecutionId,
 ) -> HarvestResult<WorkflowExecution> {
-    let error = match load_workflow_execution(conn, exec_id).await {
-        Ok(val) => return Ok(val),
-        Err(e) => e,
-    };
-    fail_task_only(conn, task.id, &error.to_string()).await?;
-    Err(error)
+    let result = load_workflow_execution(conn, exec_id).await;
+    if let Err(e) = &result {
+        fail_task_only(conn, task.id, &e.to_string()).await?;
+    }
+    result
 }
 
 async fn load_workflow_replay_state(
