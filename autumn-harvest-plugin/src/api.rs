@@ -10775,6 +10775,7 @@ struct CandidateSchedulePreviewRequest {
     #[allow(dead_code)] // part of the public request shape; included for spec completeness
     catchup: bool,
     #[serde(default = "default_max_active_runs")]
+    #[allow(dead_code)] // part of the public request shape; included for spec completeness
     max_active_runs: u32,
     #[serde(default)]
     paused: bool,
@@ -10811,7 +10812,6 @@ fn build_preview_entry(
     jitter_secs: i64,
     timezone: &str,
     overlap_policy: &str,
-    max_active_runs: i32,
 ) -> ScheduleFirePreviewEntry {
     let has_jitter = jitter_secs > 0;
 
@@ -10829,10 +10829,13 @@ fn build_preview_entry(
     // Jitter bounds: [pre_jitter_base, pre_jitter_base + jitter_window].
     // Using the calendar-adjusted base (not raw.scheduled_at) ensures deferred
     // entries show bounds on the correct day, not the original excluded date.
+    // try_seconds + checked_add_signed guard against oversized stored values
+    // (e.g. a saturated i64::MAX written by the schedule create path).
     let (jitter_earliest_at, jitter_latest_at) = if has_jitter {
         pre_jitter_base.map_or((None, None), |base| {
-            let latest = base + chrono::Duration::seconds(jitter_secs);
-            (Some(base), Some(latest))
+            let latest =
+                chrono::Duration::try_seconds(jitter_secs).and_then(|d| base.checked_add_signed(d));
+            (Some(base), latest)
         })
     } else {
         (None, None)
@@ -10842,10 +10845,11 @@ fn build_preview_entry(
     let effective_local_at = raw.effective_at.map(|t| format_in_timezone(t, timezone));
 
     // would_skip_if_active: advisory flag set when the overlap policy can silently
-    // drop a firing if max_active_runs are running at dispatch time.
-    let would_skip_if_active = (overlap_policy == "skip" || overlap_policy == "buffer_one")
-        && raw.effective_at.is_some()
-        && max_active_runs > 0;
+    // drop a firing if capacity is saturated at dispatch time. The `max_active_runs > 0`
+    // guard is intentionally absent: max_active_runs = 0 means the scheduler's
+    // `running >= max_active_runs` check is always true, so every firing is dropped.
+    let would_skip_if_active =
+        (overlap_policy == "skip" || overlap_policy == "buffer_one") && raw.effective_at.is_some();
 
     ScheduleFirePreviewEntry {
         scheduled_at: raw.scheduled_at,
@@ -10922,7 +10926,7 @@ async fn preview_schedule_firings_handler(
             Json(serde_json::json!({
                 "entries": [],
                 "is_paused": false,
-                "reason": "manual or no schedule",
+                "pause_reason": serde_json::Value::Null,
                 "from": from,
                 "count_requested": count,
             })),
@@ -10977,14 +10981,7 @@ async fn preview_schedule_firings_handler(
         .iter()
         .zip(pre_jitter_bases.iter())
         .map(|(r, &base)| {
-            build_preview_entry(
-                r,
-                base,
-                jitter_secs,
-                timezone,
-                &schedule.overlap_policy,
-                schedule.max_active_runs,
-            )
+            build_preview_entry(r, base, jitter_secs, timezone, &schedule.overlap_policy)
         })
         .collect();
 
@@ -11111,12 +11108,14 @@ async fn preview_candidate_schedule_handler(
     } else {
         vec![]
     };
-    // When schedule_expr embeds a timezone (cron_tz:<tz>:<expr>), use that
-    // timezone for local_at formatting rather than the body's separate `timezone`
-    // field, which defaults to "UTC" and would produce misleading local times.
+    // Use the timezone embedded in the schedule variant so local_at always
+    // reflects what the DB will store after saving. CronInTimezone carries the
+    // timezone explicitly; Interval and Manual are always UTC-based (Schedule::timezone_str()
+    // returns "UTC" for those variants), so using body.timezone there would show a
+    // timezone that the persisted schedule would not honour.
     let effective_timezone: &str = match &schedule {
         autumn_harvest::policy::Schedule::CronInTimezone { tz, .. } => tz.as_str(),
-        _ => &body.timezone,
+        _ => "UTC",
     };
 
     // Use a deterministic placeholder UUID so jitter offsets are stable per request.
@@ -11147,7 +11146,6 @@ async fn preview_candidate_schedule_handler(
         }
     }
 
-    let max_active_runs = i32::try_from(body.max_active_runs).unwrap_or(i32::MAX);
     let entries: Vec<ScheduleFirePreviewEntry> = raw_entries
         .iter()
         .zip(pre_jitter_bases.iter())
@@ -11158,7 +11156,6 @@ async fn preview_candidate_schedule_handler(
                 jitter_secs,
                 effective_timezone,
                 &body.overlap_policy,
-                max_active_runs,
             )
         })
         .collect();
@@ -13697,7 +13694,7 @@ mod tests {
             reason: "Fired".to_string(),
         };
         // pre_jitter_base = Some(fire) — no calendar adjustment, no jitter.
-        let entry = build_preview_entry(&preview, Some(fire), 0, "UTC", "skip", 1);
+        let entry = build_preview_entry(&preview, Some(fire), 0, "UTC", "skip");
         assert_eq!(entry.reason, "cron", "no-jitter reason must be 'cron'");
         assert!(entry.jitter_earliest_at.is_none());
         assert!(entry.jitter_latest_at.is_none());
@@ -13715,7 +13712,7 @@ mod tests {
             reason: "Fired".to_string(),
         };
         // pre_jitter_base = Some(fire) — calendar-adjusted base BEFORE jitter.
-        let entry = build_preview_entry(&preview, Some(fire), 300, "UTC", "skip", 1);
+        let entry = build_preview_entry(&preview, Some(fire), 300, "UTC", "skip");
         assert_eq!(
             entry.reason, "cron+jitter",
             "jitter reason must be 'cron+jitter'"
@@ -13754,7 +13751,7 @@ mod tests {
             reason: "DeferredFrom:2026-07-04".to_string(),
         };
         // pre_jitter_base = Some(deferred_base) — calendar-adjusted BEFORE jitter.
-        let entry = build_preview_entry(&preview, Some(deferred_base), 300, "UTC", "skip", 1);
+        let entry = build_preview_entry(&preview, Some(deferred_base), 300, "UTC", "skip");
         assert_eq!(
             entry.jitter_earliest_at.unwrap(),
             deferred_base,
@@ -13778,7 +13775,7 @@ mod tests {
             reason: "SkippedByCalendar:us-holidays".to_string(),
         };
         // pre_jitter_base = None — suppressed entries have no base.
-        let entry = build_preview_entry(&preview, None, 0, "UTC", "skip", 1);
+        let entry = build_preview_entry(&preview, None, 0, "UTC", "skip");
         assert_eq!(
             entry.reason, "skipped:calendar-excluded",
             "calendar-suppressed reason must be 'skipped:calendar-excluded'"
@@ -13797,7 +13794,7 @@ mod tests {
             effective_at: Some(deferred),
             reason: "DeferredFrom:2026-07-04".to_string(),
         };
-        let entry = build_preview_entry(&preview, Some(deferred), 0, "UTC", "skip", 1);
+        let entry = build_preview_entry(&preview, Some(deferred), 0, "UTC", "skip");
         assert_eq!(
             entry.reason, "deferred:calendar",
             "calendar-deferred reason must be 'deferred:calendar'"
@@ -13814,7 +13811,7 @@ mod tests {
             effective_at: Some(fire),
             reason: "Fired".to_string(),
         };
-        let entry = build_preview_entry(&preview, Some(fire), 0, "UTC", "skip", 1);
+        let entry = build_preview_entry(&preview, Some(fire), 0, "UTC", "skip");
         assert!(
             entry.would_skip_if_active,
             "skip overlap policy must set would_skip_if_active=true"
@@ -13831,7 +13828,7 @@ mod tests {
             effective_at: Some(fire),
             reason: "Fired".to_string(),
         };
-        let entry = build_preview_entry(&preview, Some(fire), 0, "UTC", "cancel_other", 1);
+        let entry = build_preview_entry(&preview, Some(fire), 0, "UTC", "cancel_other");
         assert!(
             !entry.would_skip_if_active,
             "cancel_other overlap policy must set would_skip_if_active=false"
@@ -13849,10 +13846,51 @@ mod tests {
             reason: "SkippedByCalendar:us-holidays".to_string(),
         };
         // Even with skip policy, a suppressed entry cannot be skipped-if-active.
-        let entry = build_preview_entry(&preview, None, 0, "UTC", "skip", 1);
+        let entry = build_preview_entry(&preview, None, 0, "UTC", "skip");
         assert!(
             !entry.would_skip_if_active,
             "suppressed entries (effective_at=None) must not set would_skip_if_active"
+        );
+    }
+
+    #[test]
+    fn build_preview_entry_would_skip_true_when_max_active_runs_is_zero() {
+        use autumn_harvest::calendar::ScheduleFirePreview;
+        use chrono::TimeZone as _;
+        let fire = chrono::Utc.with_ymd_and_hms(2026, 6, 1, 9, 0, 0).unwrap();
+        let preview = ScheduleFirePreview {
+            scheduled_at: fire,
+            effective_at: Some(fire),
+            reason: "Fired".to_string(),
+        };
+        // max_active_runs = 0 means the scheduler's running >= max_active_runs check is
+        // always true, so every firing is dropped. The advisory must fire.
+        let entry = build_preview_entry(&preview, Some(fire), 0, "UTC", "skip");
+        assert!(
+            entry.would_skip_if_active,
+            "max_active_runs=0 with skip policy must set would_skip_if_active=true"
+        );
+    }
+
+    #[test]
+    fn build_preview_entry_jitter_latest_at_is_none_for_oversized_jitter() {
+        use autumn_harvest::calendar::ScheduleFirePreview;
+        use chrono::TimeZone as _;
+        let fire = chrono::Utc.with_ymd_and_hms(2026, 6, 1, 9, 0, 0).unwrap();
+        let preview = ScheduleFirePreview {
+            scheduled_at: fire,
+            effective_at: Some(fire),
+            reason: "Fired".to_string(),
+        };
+        // i64::MAX seconds overflows chrono Duration creation; must not panic.
+        let entry = build_preview_entry(&preview, Some(fire), i64::MAX, "UTC", "skip");
+        assert!(
+            entry.jitter_earliest_at.is_some(),
+            "jitter_earliest_at must still be present"
+        );
+        assert!(
+            entry.jitter_latest_at.is_none(),
+            "jitter_latest_at must be None when jitter_secs overflows DateTime"
         );
     }
 
