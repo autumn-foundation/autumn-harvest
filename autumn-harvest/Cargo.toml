@@ -97,12 +97,23 @@ required-features = ["db"]
 name = "signal_with_start_tests"
 required-features = ["db"]
 
+[[test]]
+name = "typed_stubs_tests"
+required-features = ["db"]
+
 [[example]]
 name = "signal_with_start_webhook"
 required-features = ["db"]
 
+[[test]]
+name = "cross_workflow_signal_tests"
+required-features = ["db"]
+
 [[example]]
 name = "timezone_cron_schedule"
+
+[[example]]
+name = "collect_approvals"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

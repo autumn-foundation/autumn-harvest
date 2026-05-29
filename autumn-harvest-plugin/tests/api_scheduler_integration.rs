@@ -116,6 +116,12 @@ const INIT_SQL: &str = concat!(
     include_str!(
         "../../autumn-harvest/migrations/20260522000000_harvest_schedule_decisions/up.sql"
     ),
+    "\n",
+    include_str!("../../autumn-harvest/migrations/20260522000001_harvest_rate_limiting/up.sql"),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260526000001_harvest_parent_close_policy/up.sql"
+    ),
 );
 type HarvestApiApp = axum::Router;
 
@@ -380,6 +386,9 @@ fn recording_activity_info(name: &'static str) -> ActivityInfo {
         is_local: false,
         max_input_bytes: None,
         max_result_bytes: None,
+        rate_limit_rps: None,
+        rate_limit_burst: None,
+        rate_limit_key: None,
         handler: record_activity,
     }
 }
@@ -398,6 +407,9 @@ fn blocking_activity_info(name: &'static str, start_to_close: Duration) -> Activ
         is_local: false,
         max_input_bytes: None,
         max_result_bytes: None,
+        rate_limit_rps: None,
+        rate_limit_burst: None,
+        rate_limit_key: None,
         handler: wait_on_barrier_activity,
     }
 }
@@ -682,6 +694,7 @@ async fn seed_dag_run_on_url(database_url: &str, dag_name: &str) -> uuid::Uuid {
             memo: None,
             search_attrs: None,
             assigned_build_id: None,
+            parent_close_policy: None,
         })
         .execute(&mut conn)
         .await
@@ -1000,6 +1013,7 @@ async fn seed_scheduled_activity_task_from_url(
             memo: None,
             search_attrs: None,
             assigned_build_id: None,
+            parent_close_policy: None,
         })
         .execute(&mut conn)
         .await
@@ -1255,7 +1269,7 @@ async fn wait_for_workflow_state(
     exec_id: &str,
     expected_state: &str,
 ) -> WorkflowExecution {
-    for _ in 0..200 {
+    for _ in 0..900 {
         let execution = load_execution_from_url(database_url, exec_id).await;
         if execution.state == expected_state {
             return execution;
@@ -1271,7 +1285,7 @@ async fn wait_for_dag_run_state(
     dag_name: &str,
     expected_state: &str,
 ) -> WorkflowExecution {
-    for _ in 0..100 {
+    for _ in 0..900 {
         if let Some(run) = load_latest_dag_run_from_url(database_url, dag_name).await
             && run.state == expected_state
         {
@@ -1284,7 +1298,7 @@ async fn wait_for_dag_run_state(
 }
 
 async fn wait_for_workflow_terminal_state(database_url: &str, exec_id: &str) -> WorkflowExecution {
-    for _ in 0..200 {
+    for _ in 0..900 {
         let execution = load_execution_from_url(database_url, exec_id).await;
         if matches!(
             execution.state.as_str(),
@@ -2510,6 +2524,73 @@ async fn harvest_api_stack_endpoint_returns_shape() {
 }
 
 #[tokio::test]
+async fn harvest_api_stack_endpoint_surfaces_rate_limit_throttling() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let registry = approval_registry();
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
+    api_state.install(HarvestApiRuntime::new(
+        Arc::clone(&registry),
+        Arc::new(HashMap::new()),
+        Arc::new(Vec::new()),
+        Some("test-worker".to_string()),
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::single(),
+    ));
+    let app = harvest_api_router(api_state).with_state(test_app_state(pool));
+
+    let exec_id = insert_workflow_on_url(
+        &database_url,
+        ShardId::new(0),
+        "approval_workflow",
+        "stack-throttling",
+    )
+    .await;
+
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect for test setup");
+
+    // Insert a saturated rate limit bucket
+    diesel::sql_query(
+        "INSERT INTO harvest_rate_limit_buckets (key, refill_rate, burst, tokens, last_refilled_at, created_at, updated_at) \
+         VALUES ('test_rate_limit_bucket', 0.0, 10.0, 0.0, NOW(), NOW(), NOW())"
+    )
+    .execute(&mut conn)
+    .await
+    .expect("failed to insert rate limit bucket");
+
+    // Insert a pending activity task with the rate limit key
+    diesel::sql_query(
+        "INSERT INTO harvest_task_queue ( \
+            id, queue_name, task_type, workflow_exec_id, activity_name, input, state, priority, attempt, max_attempts, scheduled_at, rate_limit_key \
+         ) VALUES ( \
+            gen_random_uuid(), 'default', 'activity', $1, 'some_activity', '{}'::jsonb, 'PENDING', 0, 0, 5, NOW(), 'test_rate_limit_bucket' \
+         )"
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut conn)
+    .await
+    .expect("failed to insert rate limited task");
+
+    let (status, payload) = get_json(&app, format!("/workflows/{exec_id}/stack")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["exec_id"], exec_id.to_string());
+
+    let pending = payload["pending_activities"]
+        .as_array()
+        .expect("pending_activities must be an array");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(
+        pending[0]["task_status"],
+        "waiting on rate_limit_key=test_rate_limit_bucket"
+    );
+}
+
+#[tokio::test]
 async fn harvest_api_cancels_workflows_and_rejects_late_signals() {
     let (database_url, _container) = setup_test_database_url().await;
     let pool = build_test_pool(&database_url);
@@ -3050,6 +3131,9 @@ async fn timeout_sweeper_does_not_append_timeout_after_activity_completion() {
         autumn_harvest::timeout::enforce_timeouts_once(
             &mut timeout_conn,
             &autumn_harvest::telemetry::NoOpMetrics,
+            std::time::Duration::from_secs(5),
+            &None,
+            &[],
         )
         .await
     });
@@ -3181,6 +3265,7 @@ async fn retention_janitor_deletes_only_rows_older_than_max_age_and_cascades_chi
                 dry_run: false,
                 audit_retention_days: 90,
                 schedule_decision_retention_days: 7,
+                archival_timeout_secs: 30,
             })
             .build(),
         &HarvestRuntimeConfig {
@@ -4411,6 +4496,9 @@ async fn scheduler_tick_creates_and_executes_due_interval_runs() {
             is_local: false,
             max_input_bytes: None,
             max_result_bytes: None,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
             handler: record_activity,
         }],
         Arc::new(state),

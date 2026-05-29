@@ -10,6 +10,7 @@ mod activity;
 mod collect;
 mod dag;
 mod query;
+mod signal;
 mod update;
 mod workflow;
 
@@ -145,6 +146,14 @@ pub fn update(attr: TokenStream, item: TokenStream) -> TokenStream {
     update::update_macro(attr.into(), item.into()).into()
 }
 
+/// Marks a function as a Harvest workflow signal handler.
+///
+/// Generates a typed signal sender method `signal_[signal_name]` on the sibling `[WorkflowName]Stub` struct.
+#[proc_macro_attribute]
+pub fn signal(attr: TokenStream, item: TokenStream) -> TokenStream {
+    signal::signal_macro(attr.into(), item.into()).into()
+}
+
 /// Collects multiple workflow functions into a `Vec<WorkflowInfo>`.
 #[proc_macro]
 pub fn workflows(input: TokenStream) -> TokenStream {
@@ -189,4 +198,183 @@ pub fn queries(input: TokenStream) -> TokenStream {
 #[proc_macro]
 pub fn updates(input: TokenStream) -> TokenStream {
     collect::updates_macro(input.into()).into()
+}
+
+pub(crate) struct WorkflowPath {
+    pub(crate) is_absolute: bool,
+    pub(crate) workflow_simple_name: String,
+    pub(crate) path_tokens: Vec<proc_macro2::TokenStream>,
+    pub(crate) original_module_parts: Vec<String>,
+}
+
+pub(crate) fn parse_and_validate_workflow_path(
+    workflow_name: &str,
+    span: proc_macro2::Span,
+) -> Result<WorkflowPath, syn::Error> {
+    let is_absolute = workflow_name.starts_with("::");
+    let parts: Vec<&str> = workflow_name.split("::").collect();
+
+    // Validate segments
+    for (idx, part) in parts.iter().enumerate() {
+        if part.is_empty() {
+            // An empty segment is only allowed at the very start for absolute paths
+            if idx > 0 || !is_absolute {
+                return Err(syn::Error::new(
+                    span,
+                    format!("invalid workflow path: contains empty segment in '{workflow_name}'"),
+                ));
+            }
+        }
+    }
+
+    let non_empty_parts: Vec<&str> = parts.into_iter().filter(|s| !s.is_empty()).collect();
+    if non_empty_parts.is_empty() {
+        return Err(syn::Error::new(
+            span,
+            format!("invalid workflow path: '{workflow_name}' has no segments"),
+        ));
+    }
+
+    let workflow_simple_name = non_empty_parts.last().unwrap().to_string();
+    let module_parts = &non_empty_parts[..non_empty_parts.len() - 1];
+
+    let mut path_tokens = Vec::new();
+    let mut original_module_parts = Vec::new();
+    for p in module_parts {
+        // Validate that each part is a valid identifier (must start with letter/underscore and contain letters/numbers/underscores)
+        if p.is_empty() {
+            return Err(syn::Error::new(
+                span,
+                format!("invalid workflow path: contains empty segment in '{workflow_name}'"),
+            ));
+        }
+        let first_char = p.chars().next().unwrap();
+        if !first_char.is_alphabetic() && first_char != '_' {
+            return Err(syn::Error::new(
+                span,
+                format!("invalid path segment '{p}' in workflow path '{workflow_name}'"),
+            ));
+        }
+        for c in p.chars().skip(1) {
+            if !c.is_alphanumeric() && c != '_' {
+                return Err(syn::Error::new(
+                    span,
+                    format!("invalid path segment '{p}' in workflow path '{workflow_name}'"),
+                ));
+            }
+        }
+        let id = quote::format_ident!("{}", p);
+        path_tokens.push(quote::quote! { #id });
+        original_module_parts.push(p.to_string());
+    }
+
+    Ok(WorkflowPath {
+        is_absolute,
+        workflow_simple_name,
+        path_tokens,
+        original_module_parts,
+    })
+}
+
+#[allow(clippy::option_if_let_else)]
+pub(crate) fn to_pascal_case(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(first) => {
+            let mut out = first.to_uppercase().collect::<String>();
+            let mut capitalize_next = false;
+            for c in chars {
+                if c == '_' {
+                    capitalize_next = true;
+                } else if capitalize_next {
+                    out.push_str(&c.to_uppercase().collect::<String>());
+                    capitalize_next = false;
+                } else {
+                    out.push(c);
+                }
+            }
+            out
+        }
+    }
+}
+
+pub(crate) fn extract_ok_type(output: &syn::ReturnType) -> syn::Type {
+    let syn::ReturnType::Type(_, ty) = output else {
+        return syn::parse_quote! { () };
+    };
+    let syn::Type::Path(type_path) = &**ty else {
+        return *ty.clone();
+    };
+    let Some(last) = type_path.path.segments.last() else {
+        return *ty.clone();
+    };
+    if last.ident != "Result" && last.ident != "HarvestResult" {
+        return *ty.clone();
+    }
+    if let syn::PathArguments::AngleBracketed(ref args) = last.arguments
+        && let Some(syn::GenericArgument::Type(ok_ty)) = args.args.first()
+    {
+        return ok_ty.clone();
+    }
+    syn::parse_quote! { () }
+}
+
+pub(crate) fn extract_ok_type_hint(output: &syn::ReturnType) -> String {
+    let syn::ReturnType::Type(_, ty) = output else {
+        return "()".to_string();
+    };
+    let syn::Type::Path(type_path) = &**ty else {
+        return type_name_hint(ty);
+    };
+    let Some(last) = type_path.path.segments.last() else {
+        return "()".to_string();
+    };
+    if last.ident != "Result" {
+        return last.ident.to_string();
+    }
+    if let syn::PathArguments::AngleBracketed(ref args) = last.arguments
+        && let Some(syn::GenericArgument::Type(ok_ty)) = args.args.first()
+    {
+        return type_name_hint(ok_ty);
+    }
+    "()".to_string()
+}
+
+pub(crate) fn type_name_hint(ty: &syn::Type) -> String {
+    match ty {
+        syn::Type::Path(tp) => tp.path.segments.last().map_or_else(
+            || "?".to_string(),
+            |s| {
+                let ident = s.ident.to_string();
+                if let syn::PathArguments::AngleBracketed(ref args) = s.arguments {
+                    let inner: Vec<_> = args
+                        .args
+                        .iter()
+                        .filter_map(|a| {
+                            if let syn::GenericArgument::Type(t) = a {
+                                Some(type_name_hint(t))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    if inner.is_empty() {
+                        ident
+                    } else {
+                        format!("{ident}<{}>", inner.join(", "))
+                    }
+                } else {
+                    ident
+                }
+            },
+        ),
+        syn::Type::Reference(r) => type_name_hint(&r.elem),
+        syn::Type::Tuple(t) if t.elems.is_empty() => "()".to_string(),
+        syn::Type::Tuple(t) => {
+            let parts: Vec<_> = t.elems.iter().map(type_name_hint).collect();
+            format!("({})", parts.join(", "))
+        }
+        _ => "?".to_string(),
+    }
 }

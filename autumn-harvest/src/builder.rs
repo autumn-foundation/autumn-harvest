@@ -61,6 +61,7 @@ pub struct HarvestBuilder {
     state: SharedStateMap,
     telemetry: Option<TelemetryConfig>,
     retention: RetentionConfig,
+    history_archiver: Option<Arc<dyn crate::retention::HistoryArchiver>>,
     payload_codecs: PayloadCodecs,
     history_policy: WorkflowHistoryPolicy,
     /// Server-side ceiling on `execution_timeout` (issue #243).
@@ -84,6 +85,8 @@ pub struct HarvestBuilder {
     /// Server-side ceiling on workflow start delay (issue #322).
     /// Default: 365 days.
     max_workflow_start_delay: Option<Duration>,
+    /// Grace window before cross-workflow signaling fails for unknown target (issue #330).
+    unknown_target_grace_window: Option<Duration>,
 }
 
 impl Default for HarvestBuilder {
@@ -100,6 +103,7 @@ impl Default for HarvestBuilder {
             state: std::collections::HashMap::new(),
             telemetry: None,
             retention: crate::retention::RetentionConfig::default(),
+            history_archiver: None,
             payload_codecs: crate::payload_codec::PayloadCodecs::default(),
             history_policy: crate::context::WorkflowHistoryPolicy::default(),
             max_workflow_execution_timeout: None,
@@ -108,6 +112,7 @@ impl Default for HarvestBuilder {
             max_signal_payload_bytes: DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
             max_workflow_input_bytes: DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
             max_workflow_start_delay: None,
+            unknown_target_grace_window: None,
         }
     }
 }
@@ -140,7 +145,11 @@ impl std::fmt::Debug for HarvestBuilder {
             .field("max_signal_payload_bytes", &self.max_signal_payload_bytes)
             .field("max_workflow_input_bytes", &self.max_workflow_input_bytes)
             .field("max_workflow_start_delay", &self.max_workflow_start_delay)
-            .finish()
+            .field(
+                "unknown_target_grace_window",
+                &self.unknown_target_grace_window,
+            )
+            .finish_non_exhaustive()
     }
 }
 
@@ -158,6 +167,7 @@ pub struct BuiltHarvest {
     state: SharedStateMap,
     telemetry: Arc<TelemetryConfig>,
     retention: RetentionConfig,
+    history_archiver: Option<Arc<dyn crate::retention::HistoryArchiver>>,
     payload_codecs: PayloadCodecs,
     history_policy: WorkflowHistoryPolicy,
     /// Server-side ceiling on `execution_timeout` (issue #243). `None` = no ceiling.
@@ -177,6 +187,8 @@ pub struct BuiltHarvest {
     /// Server-side ceiling on workflow start delay (issue #322).
     /// Default: 365 days.
     pub max_workflow_start_delay: Duration,
+    /// Grace window before cross-workflow signaling fails for unknown target (issue #330).
+    pub unknown_target_grace_window: Duration,
 }
 
 impl std::fmt::Debug for BuiltHarvest {
@@ -203,7 +215,30 @@ impl std::fmt::Debug for BuiltHarvest {
             .field("max_signal_payload_bytes", &self.max_signal_payload_bytes)
             .field("max_workflow_input_bytes", &self.max_workflow_input_bytes)
             .field("max_workflow_start_delay", &self.max_workflow_start_delay)
-            .finish()
+            .field(
+                "unknown_target_grace_window",
+                &self.unknown_target_grace_window,
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+/// A float wrapper that implements `Eq` and `PartialEq` by doing bitwise comparison.
+/// Useful for keeping errors `Eq`-compliant.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub struct FloatEq(pub f64);
+
+impl PartialEq for FloatEq {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.to_bits() == other.0.to_bits()
+    }
+}
+
+impl Eq for FloatEq {}
+
+impl std::fmt::Display for FloatEq {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
     }
 }
 
@@ -354,6 +389,30 @@ pub enum HarvestBuilderError {
         /// The unrecognised IANA timezone name.
         name: String,
     },
+
+    /// Two activities sharing a `rate_limit_key` declare different
+    /// `rate_limit_rps` or `rate_limit_burst` values.
+    #[error(
+        "rate_limit_key '{key}' has conflicting rate limit values across activities: {activities:?}"
+    )]
+    RateLimitKeyMismatch {
+        /// The shared rate limit key.
+        key: String,
+        /// Each `(activity_name, rate_limit_rps, Option<rate_limit_burst>)` pair with a conflicting value.
+        activities: Vec<(String, FloatEq, Option<FloatEq>)>,
+    },
+
+    /// An activity declares a `rate_limit_key` but no `rate_limit_rps`.
+    #[error(
+        "activity '{activity}' sets rate_limit_key = \"{key}\" but has no rate_limit_rps; \
+         add rate_limit_rps or remove the rate_limit_key"
+    )]
+    RateLimitKeyWithoutCap {
+        /// The activity name.
+        activity: String,
+        /// The orphaned rate limit key.
+        key: String,
+    },
 }
 
 impl BuiltHarvest {
@@ -465,6 +524,12 @@ impl BuiltHarvest {
     #[must_use]
     pub const fn retention(&self) -> &RetentionConfig {
         &self.retention
+    }
+
+    /// Get the registered pre-retention history archiver hook.
+    #[must_use]
+    pub fn history_archiver(&self) -> Option<&Arc<dyn crate::retention::HistoryArchiver>> {
+        self.history_archiver.as_ref()
     }
 
     /// Override the audit log retention window after the build step.
@@ -665,6 +730,19 @@ impl HarvestBuilder {
         self
     }
 
+    /// Access mutable worker configuration.
+    pub const fn worker_config_mut(&mut self) -> &mut WorkerConfig {
+        &mut self.worker_config
+    }
+
+    #[cfg(feature = "db")]
+    /// Set the sharded database pool on the worker config.
+    #[must_use]
+    pub fn with_sharded_pool(mut self, pool: crate::shard::ShardedDbPool) -> Self {
+        self.worker_config.sharded_pool = Some(pool);
+        self
+    }
+
     /// Register typed shared state visible to workflow and activity handlers.
     ///
     /// State injected here can be retrieved in your handlers by calling
@@ -699,6 +777,13 @@ impl HarvestBuilder {
     #[must_use]
     pub const fn retention(mut self, retention: RetentionConfig) -> Self {
         self.retention = retention;
+        self
+    }
+
+    /// Register a pre-retention history archiver hook.
+    #[must_use]
+    pub fn history_archiver(mut self, archiver: impl crate::retention::HistoryArchiver) -> Self {
+        self.history_archiver = Some(Arc::new(archiver));
         self
     }
 
@@ -800,6 +885,15 @@ impl HarvestBuilder {
         self
     }
 
+    /// Set the grace window before cross-workflow signaling fails for unknown target (issue #330).
+    ///
+    /// Default: 5 seconds.
+    #[must_use]
+    pub const fn unknown_target_grace_window(mut self, window: Duration) -> Self {
+        self.unknown_target_grace_window = Some(window);
+        self
+    }
+
     /// Number of registered workflows (used in tests and diagnostics).
     #[must_use]
     pub const fn workflow_count(&self) -> usize {
@@ -872,12 +966,18 @@ impl HarvestBuilder {
         )?;
         validate_dags_do_not_use_local_activities(&self.dags, &self.activities)?;
         validate_dag_schedules(&self.dags)?;
+        validate_rate_limit_keys(&self.activities)?;
 
         let mut worker_config = self.worker_config;
         let max_workflow_start_delay = self
             .max_workflow_start_delay
             .unwrap_or(worker_config.max_workflow_start_delay);
         worker_config.max_workflow_start_delay = max_workflow_start_delay;
+
+        let unknown_target_grace_window = self
+            .unknown_target_grace_window
+            .unwrap_or(worker_config.unknown_target_grace_window);
+        worker_config.unknown_target_grace_window = unknown_target_grace_window;
 
         Ok(BuiltHarvest {
             workflows: self.workflows,
@@ -890,6 +990,7 @@ impl HarvestBuilder {
             state: self.state,
             telemetry: Arc::new(self.telemetry.unwrap_or_default()),
             retention: self.retention,
+            history_archiver: self.history_archiver,
             payload_codecs: self.payload_codecs.clone(),
             history_policy: self.history_policy,
             max_workflow_execution_timeout: self.max_workflow_execution_timeout,
@@ -898,6 +999,7 @@ impl HarvestBuilder {
             max_signal_payload_bytes: self.max_signal_payload_bytes,
             max_workflow_input_bytes: self.max_workflow_input_bytes,
             max_workflow_start_delay,
+            unknown_target_grace_window,
         })
     }
 }
@@ -1109,6 +1211,72 @@ fn validate_concurrency_keys(
     Ok(())
 }
 
+struct RateLimitKeyEntry {
+    first_rps: f64,
+    first_burst: f64,
+    contributors: Vec<(String, f64, Option<f64>)>,
+}
+
+/// Verify that rate limiting attributes on activities are consistent and valid.
+fn validate_rate_limit_keys(
+    activities: &[crate::info::ActivityInfo],
+) -> Result<(), HarvestBuilderError> {
+    use std::collections::HashMap;
+
+    let mut seen: HashMap<&str, RateLimitKeyEntry> = HashMap::new();
+
+    for activity in activities {
+        // rate_limit_key without rate_limit_rps silently bypasses or breaks — reject it.
+        if let (Some(key), None) = (activity.rate_limit_key, activity.rate_limit_rps) {
+            return Err(HarvestBuilderError::RateLimitKeyWithoutCap {
+                activity: activity.name.to_string(),
+                key: key.to_string(),
+            });
+        }
+
+        // rate_limit_burst without rate_limit_rps is invalid.
+        if activity.rate_limit_burst.is_some() && activity.rate_limit_rps.is_none() {
+            return Err(HarvestBuilderError::InvalidWorkerConfig(format!(
+                "activity '{}' declares rate_limit_burst but no rate_limit_rps",
+                activity.name
+            )));
+        }
+
+        let Some(rps) = activity.rate_limit_rps else {
+            continue;
+        };
+
+        let effective_burst = activity.rate_limit_burst.unwrap_or(rps);
+        let effective_key: &str = activity.rate_limit_key.unwrap_or(activity.name);
+        let entry = seen
+            .entry(effective_key)
+            .or_insert_with(|| RateLimitKeyEntry {
+                first_rps: rps,
+                first_burst: effective_burst,
+                contributors: Vec::new(),
+            });
+        entry
+            .contributors
+            .push((activity.name.to_string(), rps, activity.rate_limit_burst));
+
+        if (entry.first_rps - rps).abs() > 1e-9
+            || (entry.first_burst - effective_burst).abs() > 1e-9
+        {
+            let mapped = entry
+                .contributors
+                .iter()
+                .map(|(name, r, b)| (name.clone(), FloatEq(*r), b.map(FloatEq)))
+                .collect();
+            return Err(HarvestBuilderError::RateLimitKeyMismatch {
+                key: effective_key.to_string(),
+                activities: mapped,
+            });
+        }
+    }
+
+    Ok(())
+}
+
 /// Reject local activities whose `default_start_to_close` exceeds the worker
 /// cap. Failing early gives operators a clear error instead of a runtime surprise.
 fn validate_local_activity_timeouts(
@@ -1247,6 +1415,12 @@ pub struct WorkerConfig {
     /// Maximum allowed start delay for a workflow (issue #322).
     /// Default: 365 days.
     pub max_workflow_start_delay: Duration,
+    /// Grace window before cross-workflow signaling fails for unknown target (issue #330).
+    /// Default: 5 seconds.
+    pub unknown_target_grace_window: Duration,
+    #[cfg(feature = "db")]
+    /// Optional sharded database pool for exact shard routing.
+    pub sharded_pool: Option<crate::shard::ShardedDbPool>,
 }
 
 impl Default for WorkerConfig {
@@ -1268,6 +1442,9 @@ impl Default for WorkerConfig {
             query_timeout: Duration::from_secs(5),
             priority_aging_secs: None,
             max_workflow_start_delay: DEFAULT_MAX_WORKFLOW_START_DELAY,
+            unknown_target_grace_window: Duration::from_secs(5),
+            #[cfg(feature = "db")]
+            sharded_pool: None,
         }
     }
 }
@@ -1402,6 +1579,15 @@ impl WorkerConfig {
         self
     }
 
+    /// Override the unknown target grace window for cross-workflow signaling (issue #330).
+    ///
+    /// Default: 5 seconds.
+    #[must_use]
+    pub const fn with_unknown_target_grace_window(mut self, window: Duration) -> Self {
+        self.unknown_target_grace_window = window;
+        self
+    }
+
     /// Enable sticky cross-worker routing (issue #235).
     ///
     /// Sticky routing is **off by default**. When enabled, each time a workflow
@@ -1433,6 +1619,14 @@ impl WorkerConfig {
     #[must_use]
     pub const fn with_sticky_routing(mut self, config: StickyRoutingConfig) -> Self {
         self.sticky_timeout = config.lease_ttl;
+        self
+    }
+
+    #[cfg(feature = "db")]
+    /// Set the sharded database pool for exact shard routing.
+    #[must_use]
+    pub fn with_sharded_pool(mut self, pool: crate::shard::ShardedDbPool) -> Self {
+        self.sharded_pool = Some(pool);
         self
     }
 }
@@ -1678,6 +1872,9 @@ mod tests {
                 is_local: false,
                 max_input_bytes: None,
                 max_result_bytes: None,
+                rate_limit_rps: None,
+                rate_limit_burst: None,
+                rate_limit_key: None,
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             }])
             .state(String::from("haunted"))
@@ -1719,6 +1916,9 @@ mod tests {
             is_local: false,
             max_input_bytes: None,
             max_result_bytes: None,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
         }
     }
@@ -1737,6 +1937,9 @@ mod tests {
             is_local: true,
             max_input_bytes: None,
             max_result_bytes: None,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
         }
     }
@@ -1995,6 +2198,9 @@ mod tests {
                 is_local: false,
                 max_input_bytes: None,
                 max_result_bytes: None,
+                rate_limit_rps: None,
+                rate_limit_burst: None,
+                rate_limit_key: None,
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             }])
             .try_build();
@@ -2130,6 +2336,89 @@ mod tests {
         assert!(
             result.is_ok(),
             "valid timezone in DAG schedule must be accepted: {result:?}"
+        );
+    }
+
+    #[test]
+    fn builder_rejects_disagreeing_rate_limits_on_same_key() {
+        let act1 = ActivityInfo {
+            name: "act1",
+            module: "test",
+            default_retry_policy: None,
+            default_start_to_close: None,
+            default_heartbeat_timeout: None,
+            default_schedule_to_start: None,
+            default_queue: None,
+            max_concurrent: None,
+            concurrency_key: None,
+            rate_limit_rps: Some(10.0),
+            rate_limit_burst: Some(5.0),
+            rate_limit_key: Some("stripe"),
+            is_local: false,
+            max_input_bytes: None,
+            max_result_bytes: None,
+            handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+        };
+        let act2 = ActivityInfo {
+            name: "act2",
+            module: "test",
+            default_retry_policy: None,
+            default_start_to_close: None,
+            default_heartbeat_timeout: None,
+            default_schedule_to_start: None,
+            default_queue: None,
+            max_concurrent: None,
+            concurrency_key: None,
+            rate_limit_rps: Some(20.0), // mismatched rps!
+            rate_limit_burst: Some(5.0),
+            rate_limit_key: Some("stripe"),
+            is_local: false,
+            max_input_bytes: None,
+            max_result_bytes: None,
+            handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+        };
+
+        let result = HarvestBuilder::new()
+            .activities(vec![act1, act2])
+            .try_build();
+        assert!(
+            matches!(
+                result,
+                Err(HarvestBuilderError::RateLimitKeyMismatch { ref key, .. }) if key == "stripe"
+            ),
+            "expected RateLimitKeyMismatch error, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn builder_rejects_rate_limit_key_without_cap() {
+        let act = ActivityInfo {
+            name: "act1",
+            module: "test",
+            default_retry_policy: None,
+            default_start_to_close: None,
+            default_heartbeat_timeout: None,
+            default_schedule_to_start: None,
+            default_queue: None,
+            max_concurrent: None,
+            concurrency_key: None,
+            rate_limit_rps: None, // Missing RPS!
+            rate_limit_burst: None,
+            rate_limit_key: Some("stripe"),
+            is_local: false,
+            max_input_bytes: None,
+            max_result_bytes: None,
+            handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+        };
+
+        let result = HarvestBuilder::new().activities(vec![act]).try_build();
+        assert!(
+            matches!(
+                result,
+                Err(HarvestBuilderError::RateLimitKeyWithoutCap { ref activity, ref key })
+                    if activity == "act1" && key == "stripe"
+            ),
+            "expected RateLimitKeyWithoutCap error, got: {result:?}"
         );
     }
 }

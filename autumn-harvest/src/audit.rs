@@ -56,6 +56,8 @@ pub const OP_SCHEDULE_RESUME: &str = "schedule.resume";
 pub const OP_SCHEDULE_DELETE: &str = "schedule.delete";
 /// Audit operation: Triggered a backfill for a workflow schedule.
 pub const OP_SCHEDULE_BACKFILL: &str = "schedule.backfill";
+/// Audit operation: Triggered an immediate one-off run of a schedule (issue #343).
+pub const OP_SCHEDULE_TRIGGER: &str = "schedule.trigger";
 /// Audit operation: Replayed a dead-letter queue (DLQ) task.
 pub const OP_DLQ_REPLAY: &str = "dlq.replay";
 /// Audit operation: Bulk-replayed dead-letter queue (DLQ) tasks.
@@ -72,10 +74,18 @@ pub const OP_EXTERNAL_ACTIVITY_COMPLETE: &str = "external_activity.complete";
 pub const OP_EXTERNAL_ACTIVITY_FAIL: &str = "external_activity.fail";
 /// Audit operation: Initiated draining of a worker fleet.
 pub const OP_WORKER_DRAIN: &str = "worker.drain";
+/// Audit operation: Overrode rate-limiting parameters.
+pub const OP_RATE_LIMIT_OVERRIDE: &str = "rate_limit_override";
 /// Audit operation: Opened an SSE execution event stream (issue #324).
 pub const OP_EXECUTION_STREAM_OPEN: &str = "execution.stream.open";
 /// Audit operation: Closed an SSE execution event stream (issue #324).
 pub const OP_EXECUTION_STREAM_CLOSE: &str = "execution.stream.close";
+/// Audit operation: Set the active build policy for a queue (issue #362).
+pub const OP_BUILD_POLICY_SET: &str = "build_routing.policy.set";
+/// Audit operation: Declared a build compatibility entry (issue #362).
+pub const OP_BUILD_COMPAT_DECLARE: &str = "build_routing.compat.declare";
+/// Audit operation: Revoked a build compatibility entry (issue #362).
+pub const OP_BUILD_COMPAT_REVOKE: &str = "build_routing.compat.revoke";
 
 // ── Target type constants ─────────────────────────────────────────────────────
 
@@ -87,6 +97,8 @@ pub const TARGET_BATCH: &str = "batch";
 pub const TARGET_RETENTION: &str = "retention";
 pub const TARGET_EXTERNAL_ACTIVITY: &str = "external_activity";
 pub const TARGET_WORKER: &str = "worker";
+pub const TARGET_RATE_LIMIT: &str = "rate_limit";
+pub const TARGET_BUILD_ROUTING: &str = "build_routing";
 
 // ── Status constants ──────────────────────────────────────────────────────────
 
@@ -213,6 +225,7 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     ("GET /admin/external-handoffs", RouteClass::ReadOnly),
     ("GET /admin/external-handoffs/{token}", RouteClass::ReadOnly),
     ("GET /admin/schedules", RouteClass::ReadOnly),
+    ("GET /admin/rate-limits", RouteClass::ReadOnly),
     ("GET /admin/audit", RouteClass::ReadOnly),
     ("GET /workers/health", RouteClass::ReadOnly),
     ("GET /workers/drain-preview", RouteClass::ReadOnly),
@@ -258,6 +271,7 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     ("POST /admin/schedules/{id}/pause", RouteClass::Mutating),
     ("POST /admin/schedules/{id}/resume", RouteClass::Mutating),
     ("POST /admin/schedules/{id}/backfill", RouteClass::Mutating),
+    ("POST /admin/schedules/{id}/trigger", RouteClass::Mutating),
     ("DELETE /admin/schedules/{id}", RouteClass::Mutating),
     // External activity completion — task-token callbacks from remote workers.
     (
@@ -275,7 +289,19 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
         RouteClass::Mutating,
     ),
     ("POST /workers/{worker_id}/drain", RouteClass::Mutating),
+    ("POST /admin/rate-limits/{key}", RouteClass::Mutating),
     ("POST /batch-operations", RouteClass::Mutating),
+    // Build routing management (issue #362)
+    ("GET /admin/build-routing", RouteClass::ReadOnly),
+    ("POST /admin/build-routing/policies", RouteClass::Mutating),
+    ("GET /admin/build-routing/compat", RouteClass::ReadOnly),
+    ("POST /admin/build-routing/compat", RouteClass::Mutating),
+    (
+        "DELETE /admin/build-routing/compat/{build_id}/{compat_with}",
+        RouteClass::Mutating,
+    ),
+    // Retire is a read-only reachability check; no DB state is written.
+    ("POST /admin/build-routing/retire", RouteClass::ReadOnly),
 ];
 
 // ── Declarative route manifest ────────────────────────────────────────────────
@@ -298,6 +324,7 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
     OP_SCHEDULE_RESUME,
     OP_SCHEDULE_DELETE,
     OP_SCHEDULE_BACKFILL,
+    OP_SCHEDULE_TRIGGER,
     OP_DLQ_REPLAY,
     OP_DLQ_REPLAY_BULK,
     OP_DLQ_DISCARD_BULK,
@@ -306,6 +333,10 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
     OP_EXTERNAL_ACTIVITY_COMPLETE,
     OP_EXTERNAL_ACTIVITY_FAIL,
     OP_WORKER_DRAIN,
+    OP_RATE_LIMIT_OVERRIDE,
+    OP_BUILD_POLICY_SET,
+    OP_BUILD_COMPAT_DECLARE,
+    OP_BUILD_COMPAT_REVOKE,
 ];
 
 /// Routes explicitly excluded from audit.
@@ -340,6 +371,7 @@ pub const EXCLUDED_ROUTES: &[&str] = &[
     "GET /admin/external-handoffs",
     "GET /admin/external-handoffs/{token}",
     "GET /admin/schedules",
+    "GET /admin/rate-limits",
     // Heartbeats are high-volume liveness pings, not operator mutations.
     "POST /activities/external/{token}/heartbeat",
     "GET /workers",
@@ -352,6 +384,10 @@ pub const EXCLUDED_ROUTES: &[&str] = &[
     "GET /admin/audit",
     // SSE stream is read-only; stream open/close are audited manually in the handler.
     "GET /executions/{exec_id}/events/stream",
+    // Build routing reads and the retire safety check never write audit rows.
+    "GET /admin/build-routing",
+    "GET /admin/build-routing/compat",
+    "POST /admin/build-routing/retire",
 ];
 
 /// Declarative manifest of every route in `harvest_api_router`.
@@ -413,6 +449,7 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ("GET /admin/external-handoffs/{token}", None),
     // Schedule management
     ("GET /admin/schedules", None),
+    ("GET /admin/rate-limits", None),
     ("POST /admin/schedules/workflow", Some(OP_SCHEDULE_CREATE)),
     ("POST /admin/schedules/{id}/pause", Some(OP_SCHEDULE_PAUSE)),
     (
@@ -423,6 +460,10 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     (
         "POST /admin/schedules/{id}/backfill",
         Some(OP_SCHEDULE_BACKFILL),
+    ),
+    (
+        "POST /admin/schedules/{id}/trigger",
+        Some(OP_SCHEDULE_TRIGGER),
     ),
     // External activity completion
     (
@@ -440,6 +481,10 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ("GET /workers/{worker_id}", None),
     ("GET /workers/drain-preview", None),
     ("POST /workers/{worker_id}/drain", Some(OP_WORKER_DRAIN)),
+    (
+        "POST /admin/rate-limits/{key}",
+        Some(OP_RATE_LIMIT_OVERRIDE),
+    ),
     // Batch operations
     ("GET /batch-operations", None),
     ("POST /batch-operations", Some(OP_BATCH_SUBMIT)),
@@ -448,6 +493,23 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ("GET /admin/audit", None),
     // SSE execution event stream (issue #324): read-only; open/close audited in handler.
     ("GET /executions/{exec_id}/events/stream", None),
+    // Build routing management (issue #362)
+    ("GET /admin/build-routing", None),
+    (
+        "POST /admin/build-routing/policies",
+        Some(OP_BUILD_POLICY_SET),
+    ),
+    ("GET /admin/build-routing/compat", None),
+    (
+        "POST /admin/build-routing/compat",
+        Some(OP_BUILD_COMPAT_DECLARE),
+    ),
+    (
+        "DELETE /admin/build-routing/compat/{build_id}/{compat_with}",
+        Some(OP_BUILD_COMPAT_REVOKE),
+    ),
+    // retire is a read-only safety check — no state is mutated.
+    ("POST /admin/build-routing/retire", None),
 ];
 
 // ── Query filters ─────────────────────────────────────────────────────────────

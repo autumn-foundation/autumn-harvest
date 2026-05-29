@@ -347,6 +347,12 @@ enum Commands {
         #[command(subcommand)]
         command: ConcurrencyCommand,
     },
+    /// Manage per-activity rate limits.
+    #[command(alias = "rate-limits")]
+    RateLimit {
+        #[command(subcommand)]
+        command: RateLimitCommand,
+    },
     /// Manage batch operations.
     Batch {
         #[command(subcommand)]
@@ -887,6 +893,17 @@ enum ScheduleCommand {
         /// Schedule row ID (UUID).
         id: String,
     },
+    /// Trigger an immediate one-off run of a schedule.
+    TriggerNow {
+        /// Schedule row ID (UUID).
+        id: String,
+        /// Optional free-text reason recorded in the audit trail.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Force-trigger even if the schedule is currently paused.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -901,6 +918,23 @@ enum RetentionCommand {
 enum ConcurrencyCommand {
     /// Show per-key concurrency stats: cap, in-flight, and pending counts.
     Status,
+}
+
+#[derive(Debug, Subcommand)]
+enum RateLimitCommand {
+    /// Show all active per-activity rate limit token buckets and refill rates.
+    Status,
+    /// Insert or dynamically override a rate limit configuration.
+    Set {
+        /// Opaque rate limit identifier key.
+        key: String,
+        /// Rate at which tokens are added to the bucket per second.
+        #[arg(long)]
+        refill_rate: f64,
+        /// Maximum capacity of the token bucket.
+        #[arg(long)]
+        burst: f64,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1107,6 +1141,7 @@ impl Cli {
             Commands::Dlq { command } => Ok(dead_letter_request(command)),
             Commands::Retention { command } => Ok(retention_request(command)),
             Commands::Concurrency { command } => Ok(concurrency_request(command)),
+            Commands::RateLimit { command } => Ok(rate_limit_request(command)),
             Commands::Batch { command } => batch_request(command),
             Commands::Audit { command } => Ok(audit_request(command)),
             Commands::Worker { command } => Ok(worker_request(command)),
@@ -1497,6 +1532,9 @@ fn render_response(cli: &Cli, value: &Value) -> Result<String, CliError> {
     if backfill_wants_table(cli) {
         return Ok(format_backfill_table(value));
     }
+    if rate_limit_wants_table(cli) {
+        return Ok(format_rate_limit_table(value));
+    }
 
     let output = if workflow_children_wants_raw_json(cli) || handoff_wants_raw_json(cli) {
         OutputFormat::Json
@@ -1513,6 +1551,62 @@ fn backfill_wants_table(cli: &Cli) -> bool {
             command: ScheduleCommand::Backfill { .. }
         }
     ) && cli.output == OutputFormat::PrettyJson
+}
+
+fn rate_limit_wants_table(cli: &Cli) -> bool {
+    matches!(
+        &cli.command,
+        Commands::RateLimit {
+            command: RateLimitCommand::Status
+        }
+    ) && cli.output == OutputFormat::PrettyJson
+}
+
+fn format_rate_limit_table(value: &Value) -> String {
+    let Some(items) = value.as_array().filter(|v| !v.is_empty()) else {
+        return "No rate limit buckets found.".to_string();
+    };
+
+    let mut rows: Vec<Vec<String>> = Vec::with_capacity(items.len() + 1);
+    rows.push(vec![
+        "KEY".to_string(),
+        "REFILL_RATE".to_string(),
+        "BURST_CAPACITY".to_string(),
+        "CURRENT_TOKENS".to_string(),
+        "LAST_REFILLED_AT".to_string(),
+    ]);
+
+    for item in items {
+        rows.push(vec![
+            cell_str(item.get("key")),
+            format_f64(item.get("refill_rate")),
+            format_f64(item.get("burst")),
+            format_f64(item.get("tokens")),
+            cell_str(item.get("last_refilled_at")),
+        ]);
+    }
+
+    let widths = (0..rows[0].len())
+        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
+        .collect::<Vec<_>>();
+    rows.iter()
+        .map(|row| {
+            row.iter()
+                .enumerate()
+                .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
+                .collect::<Vec<_>>()
+                .join("  ")
+                .trim_end()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn format_f64(value: Option<&Value>) -> String {
+    value
+        .and_then(Value::as_f64)
+        .map_or_else(String::new, |number| format!("{number:.2}"))
 }
 
 fn format_backfill_table(value: &Value) -> String {
@@ -2841,6 +2935,17 @@ fn schedule_request(command: &ScheduleCommand) -> Result<ApiRequest, CliError> {
                 body: None,
             })
         }
+        ScheduleCommand::TriggerNow { id, reason, force } => {
+            let mut body = serde_json::Map::new();
+            if let Some(r) = reason {
+                body.insert("reason".to_string(), Value::String(r.clone()));
+            }
+            let mut path = format!("/admin/schedules/{}/trigger", path_segment(id));
+            if *force {
+                path.push_str("?force=true");
+            }
+            Ok(ApiRequest::post(path, Some(Value::Object(body))))
+        }
     }
 }
 
@@ -2854,6 +2959,23 @@ fn retention_request(command: &RetentionCommand) -> ApiRequest {
 fn concurrency_request(command: &ConcurrencyCommand) -> ApiRequest {
     match command {
         ConcurrencyCommand::Status => ApiRequest::get("/admin/concurrency"),
+    }
+}
+
+fn rate_limit_request(command: &RateLimitCommand) -> ApiRequest {
+    match command {
+        RateLimitCommand::Status => ApiRequest::get("/admin/rate-limits"),
+        RateLimitCommand::Set {
+            key,
+            refill_rate,
+            burst,
+        } => ApiRequest::post(
+            format!("/admin/rate-limits/{}", path_segment(key)),
+            Some(json!({
+                "refill_rate": refill_rate,
+                "burst": burst,
+            })),
+        ),
     }
 }
 
@@ -4335,5 +4457,58 @@ mod reuse_policy_tests {
         let rendered = render_response(&cli, &payload).expect("table should render");
 
         assert!(rendered.contains("No old-version executions found"));
+    }
+
+    #[test]
+    fn rate_limit_status_builds_get_request() {
+        let req = parse(&["rate-limit", "status"]).api_request().unwrap();
+        assert_eq!(req.method, ApiMethod::Get);
+        assert_eq!(req.path, "/admin/rate-limits");
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn rate_limit_set_builds_post_request() {
+        let req = parse(&[
+            "rate-limit",
+            "set",
+            "my-key",
+            "--refill-rate",
+            "10.5",
+            "--burst",
+            "20",
+        ])
+        .api_request()
+        .unwrap();
+        assert_eq!(req.method, ApiMethod::Post);
+        assert_eq!(req.path, "/admin/rate-limits/my-key");
+        let body = req.body.as_ref().unwrap();
+        assert_eq!(body["refill_rate"].as_f64().unwrap(), 10.5);
+        assert_eq!(body["burst"].as_f64().unwrap(), 20.0);
+    }
+
+    #[test]
+    fn rate_limit_table_renders_headers_and_rows() {
+        let cli = parse(&["rate-limit", "status"]);
+        let payload = json!([
+            {
+                "key": "test-key-1",
+                "refill_rate": 5.0,
+                "burst": 10.0,
+                "tokens": 8.5,
+                "last_refilled_at": "2026-05-22T22:00:00Z"
+            }
+        ]);
+        let rendered = render_response(&cli, &payload).unwrap();
+        assert!(rendered.contains("KEY"));
+        assert!(rendered.contains("REFILL_RATE"));
+        assert!(rendered.contains("BURST_CAPACITY"));
+        assert!(rendered.contains("CURRENT_TOKENS"));
+        assert!(rendered.contains("LAST_REFILLED_AT"));
+        assert!(rendered.contains("test-key-1"));
+        assert!(rendered.contains("5.00"));
+        assert!(rendered.contains("10.00"));
+        assert!(rendered.contains("8.50"));
+        assert!(rendered.contains("2026-05-22T22:00:00Z"));
     }
 }

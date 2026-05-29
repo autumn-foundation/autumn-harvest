@@ -75,6 +75,14 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260518000000_harvest_signal_idempotency/up.sql"),
     "\n",
     include_str!("../migrations/20260518000001_harvest_workflow_execution_timeout/up.sql"),
+    "\n",
+    include_str!("../migrations/20260519000000_harvest_calendar_awareness/up.sql"),
+    "\n",
+    include_str!("../migrations/20260522000000_harvest_schedule_decisions/up.sql"),
+    "\n",
+    include_str!("../migrations/20260522000001_harvest_rate_limiting/up.sql"),
+    "\n",
+    include_str!("../migrations/20260526000001_harvest_parent_close_policy/up.sql"),
 );
 
 // -------------------------------------------------------------------------
@@ -214,6 +222,9 @@ fn build_registry() -> Arc<HandlerRegistry> {
                 is_local: false,
                 max_input_bytes: None,
                 max_result_bytes: None,
+                rate_limit_rps: None,
+                rate_limit_burst: None,
+                rate_limit_key: None,
                 handler: telem_activity,
             },
             ActivityInfo {
@@ -229,6 +240,9 @@ fn build_registry() -> Arc<HandlerRegistry> {
                 is_local: false,
                 max_input_bytes: None,
                 max_result_bytes: None,
+                rate_limit_rps: None,
+                rate_limit_burst: None,
+                rate_limit_key: None,
                 handler: telem_activity,
             },
         ],
@@ -336,6 +350,8 @@ fn all_adr_0001_span_kinds_are_emitted() {
                         deployment_name: None,
                         workflow_cache_size: 1000,
                         priority_aging_secs: None,
+                        unknown_target_grace_window: Duration::from_secs(5),
+                        sharded_pool: None,
                     },
                     registry,
                 )

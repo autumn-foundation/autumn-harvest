@@ -182,6 +182,40 @@ Global mutations are re-applied on every replay, causing double-counting or inco
 
 ---
 
+### HVG008 — Non-deterministic predicates in await_condition (HardBlocker)
+
+| | Example |
+|---|---|
+| **Disallowed** | `ctx.await_condition(|| Instant::now() > start_time)` |
+| **Disallowed** | `ctx.await_condition(|| rand::random())` |
+| **Allowed** | `ctx.await_condition(|| local_approvals_count >= 2)` |
+
+Predicates evaluated inside `await_condition` and `await_condition_timeout` must be purely deterministic projections of workflow local state (variables rehydrated by replaying events). Using non-deterministic values (like the current system time `Instant::now()` or random numbers) inside these closures will yield different results during replay than in the original execution, leading to early/late completion or early/late timer triggers, which causes `NonDeterminismError` during history matching.
+
+**Migration example:**
+
+```rust
+// Before — breaks replay
+#[workflow]
+async fn wait_for_timeout(ctx: &WorkflowContext) -> Result<(), String> {
+    let start = std::time::Instant::now();
+    ctx.await_condition(move || {
+        start.elapsed() >= Duration::from_secs(60) // ← HVG008
+    })
+    .await?;
+    // ...
+}
+
+// After — deterministic
+#[workflow]
+async fn wait_for_timeout(ctx: &WorkflowContext) -> Result<(), String> {
+    ctx.timer("delay-timer", 60).await?; // recorded in history and replays identically
+    // ...
+}
+```
+
+---
+
 ## Machine-readable findings and suppressions
 
 `GuardrailFinding` and `GuardrailSuppression` both implement `serde::Serialize`/`Deserialize` and can be serialized to JSON for CI reports or external tooling.

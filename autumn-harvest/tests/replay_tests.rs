@@ -10,7 +10,7 @@ use std::pin::Pin;
 use autumn_harvest::context::WorkflowContext;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::executor::{WorkflowOutcome, run_workflow};
-use autumn_harvest::types::{ActivityExecId, ExecutionId};
+use autumn_harvest::types::{ActivityExecId, ExecutionId, TimerId};
 use chrono::Utc;
 use serde_json::Value;
 
@@ -577,5 +577,265 @@ async fn local_activity_exhausted_retries_fails_the_workflow() {
             );
         }
         other => panic!("expected Failed, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Await condition workflow handlers and integration tests for TDD RED phase
+// ---------------------------------------------------------------------------
+
+fn await_condition_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let mut approvals = 0;
+        if approvals < 2 {
+            let _ = ctx
+                .wait_for_signal("approved")
+                .await
+                .map_err(|e| e.to_string())?;
+            approvals += 1;
+        }
+        if approvals < 2 {
+            let _ = ctx
+                .wait_for_signal("approved")
+                .await
+                .map_err(|e| e.to_string())?;
+            approvals += 1;
+        }
+        ctx.await_condition(move || approvals >= 2)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({"done": true}))
+    })
+}
+
+fn await_condition_timeout_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let approvals = 0;
+        let met = ctx
+            .await_condition_timeout("my-timer", 60, move || approvals >= 2)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({"met": met}))
+    })
+}
+
+fn await_condition_timeout_happy_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let mut approvals = 0;
+        if approvals < 2 {
+            let _ = ctx
+                .wait_for_signal("approved")
+                .await
+                .map_err(|e| e.to_string())?;
+            approvals += 1;
+        }
+        if approvals < 2 {
+            let _ = ctx
+                .wait_for_signal("approved")
+                .await
+                .map_err(|e| e.to_string())?;
+            approvals += 1;
+        }
+        let met = ctx
+            .await_condition_timeout("my-timer", 60, move || approvals >= 2)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({"met": met}))
+    })
+}
+
+#[tokio::test]
+async fn replay_await_condition_happy_path_completes_when_predicate_met() {
+    let exec_id = ExecutionId::new();
+
+    // History contains 2 "approved" signals. Predicate requires >= 2.
+    let history = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+        },
+        WorkflowEvent::SignalReceived {
+            signal_name: "approved".into(),
+            payload: Value::Null,
+        },
+        WorkflowEvent::SignalReceived {
+            signal_name: "approved".into(),
+            payload: Value::Null,
+        },
+    ];
+
+    let outcome = run_workflow(exec_id, history, await_condition_workflow, Value::Null).await;
+
+    match outcome {
+        WorkflowOutcome::Completed { output } => {
+            assert_eq!(output, serde_json::json!({"done": true}));
+        }
+        other => panic!("expected Completed when predicate is met, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn replay_await_condition_happy_path_suspends_when_predicate_not_met() {
+    let exec_id = ExecutionId::new();
+
+    // History has only 1 signal. Predicate requires >= 2, so it should suspend.
+    let history = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+        },
+        WorkflowEvent::SignalReceived {
+            signal_name: "approved".into(),
+            payload: Value::Null,
+        },
+    ];
+
+    let outcome = run_workflow(exec_id, history, await_condition_workflow, Value::Null).await;
+
+    assert!(
+        matches!(outcome, WorkflowOutcome::Suspended { .. }),
+        "expected Suspended because approvals < 2, got {outcome:?}"
+    );
+}
+
+#[tokio::test]
+async fn replay_await_condition_timeout_resolves_true_if_condition_met() {
+    let exec_id = ExecutionId::new();
+
+    // History has 2 signals. Condition met before timeout.
+    let history = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+        },
+        WorkflowEvent::SignalReceived {
+            signal_name: "approved".into(),
+            payload: Value::Null,
+        },
+        WorkflowEvent::SignalReceived {
+            signal_name: "approved".into(),
+            payload: Value::Null,
+        },
+    ];
+
+    let outcome = run_workflow(
+        exec_id,
+        history,
+        await_condition_timeout_happy_workflow,
+        Value::Null,
+    )
+    .await;
+
+    match outcome {
+        WorkflowOutcome::Completed { output } => {
+            assert_eq!(output, serde_json::json!({"met": true}));
+        }
+        other => panic!("expected Completed(true), got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn replay_await_condition_timeout_resolves_false_if_timer_fires_first() {
+    let exec_id = ExecutionId::new();
+
+    // History shows timer fired. approvals = 0, so condition met = false.
+    let history = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+        },
+        WorkflowEvent::TimerStarted {
+            timer_id: TimerId::new("my-timer"),
+            duration_secs: 60,
+        },
+        WorkflowEvent::TimerFired {
+            timer_id: TimerId::new("my-timer"),
+        },
+    ];
+
+    let outcome = run_workflow(
+        exec_id,
+        history,
+        await_condition_timeout_workflow,
+        Value::Null,
+    )
+    .await;
+
+    match outcome {
+        WorkflowOutcome::Completed { output } => {
+            assert_eq!(output, serde_json::json!({"met": false}));
+        }
+        other => panic!("expected Completed(false), got {other:?}"),
+    }
+}
+
+#[cfg(feature = "testing")]
+fn non_deterministic_await_condition_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        ctx.await_condition(|| {
+            // Predicate evaluates to false on replay, causing early suspension,
+            // but the history has a timer event that expects us to have proceeded.
+            false
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+
+        ctx.timer("subsequent-timer", 5)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({"done": true}))
+    })
+}
+
+#[cfg(feature = "testing")]
+#[tokio::test]
+async fn replay_await_condition_non_deterministic_divergence_fails() {
+    use autumn_harvest::testing::{HistorySnapshot, ReplayStatus, WorkflowReplayer};
+
+    let exec_id = ExecutionId::new();
+
+    // History claims we completed the condition and started a timer.
+    // But on replay, the condition returns false, so the workflow suspends.
+    // The history matcher should catch this divergence and fail the replay.
+    let history = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+        },
+        WorkflowEvent::TimerStarted {
+            timer_id: TimerId::new("subsequent-timer"),
+            duration_secs: 5,
+        },
+    ];
+
+    let report = WorkflowReplayer::new()
+        .register_fn(
+            "non_deterministic",
+            non_deterministic_await_condition_workflow,
+        )
+        .replay_from_snapshot(HistorySnapshot {
+            workflow_name: "non_deterministic".to_string(),
+            execution_id: exec_id,
+            events: history,
+        })
+        .await;
+
+    match report.status {
+        ReplayStatus::NonDeterminismDetected { .. } => {
+            // Success! The replayer detected that the workflow suspended early / diverged.
+        }
+        other => panic!("expected ReplayStatus::NonDeterminismDetected, got {other:?}"),
     }
 }

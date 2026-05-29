@@ -34,6 +34,8 @@ diesel::table! {
         created_at -> Timestamptz,
         /// Build ID assigned to this execution at start time (issue #171).
         assigned_build_id -> Nullable<Text>,
+        /// Parent-close policy for detached children (issue #347). NULL for awaited children.
+        parent_close_policy -> Nullable<Text>,
     }
 }
 
@@ -85,6 +87,7 @@ diesel::table! {
         concurrency_cap -> Nullable<Int4>,
         /// Build ID required to claim this task (issue #171). NULL = any worker.
         required_build_id -> Nullable<Text>,
+        rate_limit_key -> Nullable<Text>,
     }
 }
 
@@ -342,6 +345,20 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    use diesel::sql_types::*;
+
+    harvest_rate_limit_buckets (key) {
+        key -> Text,
+        refill_rate -> Double,
+        burst -> Double,
+        tokens -> Double,
+        last_refilled_at -> Timestamptz,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
 diesel::joinable!(harvest_events -> harvest_workflow_executions (workflow_exec_id));
 diesel::joinable!(harvest_task_queue -> harvest_workflow_executions (workflow_exec_id));
 diesel::joinable!(harvest_signals -> harvest_workflow_executions (workflow_exec_id));
@@ -369,4 +386,5 @@ diesel::allow_tables_to_appear_in_same_query!(
     harvest_calendars,
     harvest_calendar_exclusions,
     harvest_schedule_decisions,
+    harvest_rate_limit_buckets,
 );

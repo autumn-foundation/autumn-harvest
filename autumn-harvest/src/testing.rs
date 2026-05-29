@@ -51,7 +51,7 @@ use crate::context::{SharedState, WorkflowCommand, empty_shared_state};
 use crate::event::WorkflowEvent;
 use crate::executor::{WorkflowOutcome, run_workflow_strict, run_workflow_with_state};
 use crate::info::{WorkflowHandlerFn, WorkflowInfo};
-use crate::types::{ActivityExecId, ExecutionId};
+use crate::types::{ActivityExecId, ExecutionId, ParentClosePolicy};
 
 // ---------------------------------------------------------------------------
 // NonDeterminismKind
@@ -1773,7 +1773,7 @@ impl WorkflowTestEnv {
         let mut remaining_signals = self.queued_signals.clone();
 
         for _iter in 0..MAX_TEST_ITERATIONS {
-            let (outcome, _pending_cmds, _span) = run_workflow_with_state(
+            let (outcome, pending_cmds, _span) = run_workflow_with_state(
                 exec_id,
                 history.clone(),
                 handler,
@@ -1784,40 +1784,6 @@ impl WorkflowTestEnv {
             .await;
 
             match outcome {
-                WorkflowOutcome::Completed { output } => {
-                    history.push(WorkflowEvent::WorkflowCompleted {
-                        output: output.clone(),
-                    });
-                    return TestRunOutcome {
-                        result: Ok(output),
-                        events: history,
-                        exec_id,
-                        state: self.state.clone(),
-                    };
-                }
-                WorkflowOutcome::Failed { error } => {
-                    history.push(WorkflowEvent::WorkflowFailed {
-                        error: error.clone(),
-                    });
-                    return TestRunOutcome {
-                        result: Err(error),
-                        events: history,
-                        exec_id,
-                        state: self.state.clone(),
-                    };
-                }
-                WorkflowOutcome::ContinuedAsNew { input: new_input } => {
-                    history.push(WorkflowEvent::WorkflowContinuedAsNew {
-                        new_exec_id: ExecutionId::new(),
-                        input: new_input.clone(),
-                    });
-                    return TestRunOutcome {
-                        result: Ok(new_input),
-                        events: history,
-                        exec_id,
-                        state: self.state.clone(),
-                    };
-                }
                 WorkflowOutcome::Suspended { commands } => {
                     let made_progress = match self.process_suspension(
                         commands,
@@ -1847,6 +1813,9 @@ impl WorkflowTestEnv {
                         };
                     }
                 }
+                terminal => {
+                    return self.finish_terminal_outcome(terminal, &pending_cmds, history, exec_id);
+                }
             }
         }
 
@@ -1858,6 +1827,113 @@ impl WorkflowTestEnv {
             events: history,
             exec_id,
             state: self.state.clone(),
+        }
+    }
+
+    fn finish_terminal_outcome(
+        &self,
+        outcome: WorkflowOutcome,
+        pending_cmds: &[WorkflowCommand],
+        mut history: Vec<WorkflowEvent>,
+        exec_id: ExecutionId,
+    ) -> TestRunOutcome {
+        Self::record_terminal_pending_commands(pending_cmds, &mut history);
+        let should_record_cascades = matches!(
+            outcome,
+            WorkflowOutcome::Completed { .. } | WorkflowOutcome::Failed { .. }
+        );
+        let result = match outcome {
+            WorkflowOutcome::Completed { output } => {
+                history.push(WorkflowEvent::WorkflowCompleted {
+                    output: output.clone(),
+                });
+                Ok(output)
+            }
+            WorkflowOutcome::Failed { error } => {
+                history.push(WorkflowEvent::WorkflowFailed {
+                    error: error.clone(),
+                });
+                Err(error)
+            }
+            WorkflowOutcome::ContinuedAsNew { input } => {
+                history.push(WorkflowEvent::WorkflowContinuedAsNew {
+                    new_exec_id: ExecutionId::new(),
+                    input: input.clone(),
+                });
+                Ok(input)
+            }
+            WorkflowOutcome::Suspended { .. } => {
+                unreachable!("suspended outcomes are handled in run")
+            }
+        };
+        if should_record_cascades {
+            Self::record_terminal_parent_close_cascades(&mut history);
+        }
+
+        TestRunOutcome {
+            result,
+            events: history,
+            exec_id,
+            state: self.state.clone(),
+        }
+    }
+
+    fn record_terminal_pending_commands(
+        commands: &[WorkflowCommand],
+        history: &mut Vec<WorkflowEvent>,
+    ) {
+        for cmd in commands {
+            match cmd {
+                WorkflowCommand::RecordMarker { name, details } => {
+                    history.push(WorkflowEvent::MarkerRecorded {
+                        name: name.clone(),
+                        details: details.clone(),
+                    });
+                }
+                WorkflowCommand::SpawnDetachedChildWorkflow {
+                    child_id,
+                    workflow_name,
+                    input,
+                    parent_close_policy,
+                } => {
+                    history.push(WorkflowEvent::ChildWorkflowSpawnedDetached {
+                        child_id: *child_id,
+                        workflow_name: workflow_name.clone(),
+                        input: input.clone(),
+                        parent_close_policy: *parent_close_policy,
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn record_terminal_parent_close_cascades(history: &mut Vec<WorkflowEvent>) {
+        let cascaded_children = history
+            .iter()
+            .filter_map(|event| match event {
+                WorkflowEvent::ChildWorkflowSpawnedDetached {
+                    child_id,
+                    parent_close_policy,
+                    ..
+                } if *parent_close_policy != ParentClosePolicy::Abandon => {
+                    let action = match parent_close_policy {
+                        ParentClosePolicy::Abandon => unreachable!("filtered above"),
+                        ParentClosePolicy::RequestCancel => "request_cancel",
+                        ParentClosePolicy::Terminate => "terminate",
+                    };
+                    Some((*child_id, *parent_close_policy, action.to_string()))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        for (child_id, policy, action) in cascaded_children {
+            history.push(WorkflowEvent::ChildWorkflowCascadeApplied {
+                child_id,
+                policy,
+                action,
+            });
         }
     }
 
@@ -1882,15 +1958,18 @@ impl WorkflowTestEnv {
         });
 
         let mut made_progress = false;
+        let mut deferred_events = Vec::new();
         for cmd in commands {
             made_progress |= self.process_command(
                 cmd,
                 signal_will_resolve,
                 history,
+                &mut deferred_events,
                 remaining_signals,
                 call_counts,
             )?;
         }
+        history.extend(deferred_events);
         Ok(made_progress)
     }
 
@@ -1905,6 +1984,7 @@ impl WorkflowTestEnv {
         cmd: WorkflowCommand,
         signal_will_resolve: bool,
         history: &mut Vec<WorkflowEvent>,
+        deferred_events: &mut Vec<WorkflowEvent>,
         remaining_signals: &mut Vec<(String, Value)>,
         call_counts: &mut HashMap<String, u32>,
     ) -> Result<bool, String> {
@@ -1924,7 +2004,7 @@ impl WorkflowTestEnv {
                     input: act_input,
                     queue,
                 });
-                Self::push_activity_terminal(history, activity_id, result);
+                Self::push_activity_terminal(deferred_events, activity_id, result);
                 Ok(true)
             }
 
@@ -1941,7 +2021,7 @@ impl WorkflowTestEnv {
                     name: name.clone(),
                     input: act_input,
                 });
-                Self::push_local_activity_terminal(history, activity_id, result);
+                Self::push_local_activity_terminal(deferred_events, activity_id, result);
                 Ok(true)
             }
 
@@ -1959,21 +2039,24 @@ impl WorkflowTestEnv {
                     timer_id: timer_id.clone(),
                     duration_secs,
                 });
-                history.push(WorkflowEvent::TimerFired { timer_id });
+                deferred_events.push(WorkflowEvent::TimerFired { timer_id });
                 Ok(true)
             }
 
-            WorkflowCommand::WaitForSignal { signal_name, .. } => Ok(remaining_signals
-                .iter()
-                .position(|(n, _)| n == &signal_name)
-                .is_some_and(|pos| {
-                    let (_, payload) = remaining_signals.remove(pos);
-                    history.push(WorkflowEvent::SignalReceived {
-                        signal_name,
-                        payload,
-                    });
-                    true
-                })),
+            WorkflowCommand::WaitForSignal { signal_name, .. } => {
+                let Some(pos) = remaining_signals
+                    .iter()
+                    .position(|(n, _)| n == &signal_name)
+                else {
+                    return Ok(false);
+                };
+                let (_, payload) = remaining_signals.remove(pos);
+                deferred_events.push(WorkflowEvent::SignalReceived {
+                    signal_name,
+                    payload,
+                });
+                Ok(true)
+            }
 
             WorkflowCommand::StartChildWorkflow {
                 child_id,
@@ -1989,10 +2072,12 @@ impl WorkflowTestEnv {
                 });
                 match result {
                     Ok(output) => {
-                        history.push(WorkflowEvent::ChildWorkflowCompleted { child_id, output });
+                        deferred_events
+                            .push(WorkflowEvent::ChildWorkflowCompleted { child_id, output });
                     }
                     Err(error) => {
-                        history.push(WorkflowEvent::ChildWorkflowFailed { child_id, error });
+                        deferred_events
+                            .push(WorkflowEvent::ChildWorkflowFailed { child_id, error });
                     }
                 }
                 Ok(true)
@@ -2016,6 +2101,24 @@ impl WorkflowTestEnv {
                 }
                 history.push(WorkflowEvent::ExternalSignalDelivered { signal_id });
                 let _ = result_tx.send(Ok(()));
+                Ok(true)
+            }
+
+            // Detached child spawn: record the event in history so replay can return
+            // the same child_id. The simulator does not create actual child executions
+            // — it just simulates the parent's history as if the child was spawned.
+            WorkflowCommand::SpawnDetachedChildWorkflow {
+                child_id,
+                workflow_name,
+                input,
+                parent_close_policy,
+            } => {
+                history.push(WorkflowEvent::ChildWorkflowSpawnedDetached {
+                    child_id,
+                    workflow_name,
+                    input,
+                    parent_close_policy,
+                });
                 Ok(true)
             }
 

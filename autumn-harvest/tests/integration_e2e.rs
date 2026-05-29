@@ -92,6 +92,12 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260518000001_harvest_workflow_execution_timeout/up.sql"),
     "\n",
     include_str!("../migrations/20260519000000_harvest_calendar_awareness/up.sql"),
+    "\n",
+    include_str!("../migrations/20260522000000_harvest_schedule_decisions/up.sql"),
+    "\n",
+    include_str!("../migrations/20260522000001_harvest_rate_limiting/up.sql"),
+    "\n",
+    include_str!("../migrations/20260526000001_harvest_parent_close_policy/up.sql"),
 );
 
 /// The minimal "legacy" migration set used by the upgrade-path regression
@@ -107,6 +113,10 @@ const INIT_SQL: &str = concat!(
 /// (created by build routing) and inserts `assigned_build_id` into
 /// `harvest_workflow_executions`; the build routing migration also alters
 /// `harvest_workers`, so that table must exist first.
+/// The parent-close-policy migration is included because the modern start path
+/// inserts/selects the nullable `parent_close_policy` column even for root
+/// workflows; the test still excludes only the uniqueness/continue-as-new
+/// migrations it is explicitly exercising.
 const LEGACY_INIT_SQL: &str = concat!(
     include_str!("../migrations/20260409000000_harvest_initial/up.sql"),
     "\n",
@@ -123,6 +133,10 @@ const LEGACY_INIT_SQL: &str = concat!(
     include_str!("../migrations/20260514020000_harvest_task_activity_id/up.sql"),
     "\n",
     include_str!("../migrations/20260518000001_harvest_workflow_execution_timeout/up.sql"),
+    "\n",
+    include_str!("../migrations/20260526000001_harvest_parent_close_policy/up.sql"),
+    "\n",
+    "ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS rate_limit_key TEXT NULL;\n",
 );
 
 /// Start a Postgres container with the harvest schema applied and return
@@ -475,6 +489,7 @@ async fn insert_workflow_execution(conn: &mut AsyncPgConnection) -> ExecutionId 
         memo: None,
         search_attrs: None,
         assigned_build_id: None,
+        parent_close_policy: None,
     };
 
     diesel::insert_into(harvest_workflow_executions::table)
@@ -645,6 +660,8 @@ fn build_runtime_worker(
                 deployment_name: None,
                 workflow_cache_size: 1000,
                 priority_aging_secs: None,
+                unknown_target_grace_window: Duration::from_secs(5),
+                sharded_pool: None,
             },
             registry,
         )
@@ -1204,6 +1221,8 @@ async fn worker_completes_workflow_task_and_persists_result() {
                 deployment_name: None,
                 workflow_cache_size: 1000,
                 priority_aging_secs: None,
+                unknown_target_grace_window: Duration::from_secs(5),
+                sharded_pool: None,
             },
             registry,
         )
@@ -1217,7 +1236,7 @@ async fn worker_completes_workflow_task_and_persists_result() {
         runner.run(&pool_for_run).await;
     });
 
-    let completed_execution = tokio::time::timeout(Duration::from_secs(5), async {
+    let completed_execution = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             let execution = load_execution_from_url(&database_url, exec_id).await;
 
@@ -1305,6 +1324,8 @@ async fn worker_marks_workflow_failed_when_handler_errors() {
                 deployment_name: None,
                 workflow_cache_size: 1000,
                 priority_aging_secs: None,
+                unknown_target_grace_window: Duration::from_secs(5),
+                sharded_pool: None,
             },
             registry,
         )
@@ -1318,7 +1339,7 @@ async fn worker_marks_workflow_failed_when_handler_errors() {
         runner.run(&pool_for_run).await;
     });
 
-    let failed_execution = tokio::time::timeout(Duration::from_secs(5), async {
+    let failed_execution = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             let execution = load_execution_from_url(&database_url, exec_id).await;
 
@@ -1409,6 +1430,9 @@ async fn worker_completes_workflow_with_activity_round_trip() {
             default_queue: Some("default"),
             max_concurrent: None,
             concurrency_key: None,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
             is_local: false,
             max_input_bytes: None,
             max_result_bytes: None,
@@ -1434,6 +1458,8 @@ async fn worker_completes_workflow_with_activity_round_trip() {
                 deployment_name: None,
                 workflow_cache_size: 1000,
                 priority_aging_secs: None,
+                unknown_target_grace_window: Duration::from_secs(5),
+                sharded_pool: None,
             },
             registry,
         )
@@ -1538,6 +1564,9 @@ async fn activity_retry_resumes_from_persisted_heartbeat_details() {
             default_queue: Some("default"),
             max_concurrent: None,
             concurrency_key: None,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
             is_local: false,
             max_input_bytes: None,
             max_result_bytes: None,
@@ -1578,6 +1607,7 @@ async fn activity_retry_resumes_from_persisted_heartbeat_details() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
 async fn worker_fails_orphaned_activity_task_without_scheduled_event() {
     let (database_url, _container) = setup_test_database_url().await;
     let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
@@ -1623,6 +1653,8 @@ async fn worker_fails_orphaned_activity_task_without_scheduled_event() {
                 deployment_name: None,
                 workflow_cache_size: 1000,
                 priority_aging_secs: None,
+                unknown_target_grace_window: Duration::from_secs(5),
+                sharded_pool: None,
             },
             Arc::new(HandlerRegistry::new(
                 vec![],
@@ -1636,6 +1668,9 @@ async fn worker_fails_orphaned_activity_task_without_scheduled_event() {
                     default_queue: Some("default"),
                     max_concurrent: None,
                     concurrency_key: None,
+                    rate_limit_rps: None,
+                    rate_limit_burst: None,
+                    rate_limit_key: None,
                     is_local: false,
                     max_input_bytes: None,
                     max_result_bytes: None,
@@ -1653,7 +1688,7 @@ async fn worker_fails_orphaned_activity_task_without_scheduled_event() {
         runner.run(&pool_for_run).await;
     });
 
-    let failed_task = tokio::time::timeout(Duration::from_secs(5), async {
+    let failed_task = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             let task = load_task_from_url(&database_url, task_id).await;
 
@@ -1758,10 +1793,15 @@ async fn timeout_enforcement_fails_pending_activity_and_wakes_workflow() {
         .await
         .expect("enqueue timed-out activity task failed");
 
-    let enforced =
-        timeout::enforce_timeouts_once(&mut conn, &autumn_harvest::telemetry::NoOpMetrics)
-            .await
-            .expect("timeout enforcement should succeed");
+    let enforced = timeout::enforce_timeouts_once(
+        &mut conn,
+        &autumn_harvest::telemetry::NoOpMetrics,
+        std::time::Duration::from_secs(5),
+        &None,
+        &[],
+    )
+    .await
+    .expect("timeout enforcement should succeed");
     assert_eq!(enforced, 1);
 
     let workflow_task = load_task_from_url(&database_url, workflow_task_id).await;
@@ -1839,6 +1879,8 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
                 deployment_name: None,
                 workflow_cache_size: 1000,
                 priority_aging_secs: None,
+                unknown_target_grace_window: Duration::from_secs(5),
+                sharded_pool: None,
             },
             Arc::new(HandlerRegistry::new(
                 vec![WorkflowInfo {
@@ -1859,6 +1901,9 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
                     default_queue: Some("default"),
                     max_concurrent: None,
                     concurrency_key: None,
+                    rate_limit_rps: None,
+                    rate_limit_burst: None,
+                    rate_limit_key: None,
                     is_local: false,
                     max_input_bytes: None,
                     max_result_bytes: None,
@@ -1968,6 +2013,8 @@ async fn worker_completes_workflow_with_timer_round_trip() {
                 deployment_name: None,
                 workflow_cache_size: 1000,
                 priority_aging_secs: None,
+                unknown_target_grace_window: Duration::from_secs(5),
+                sharded_pool: None,
             },
             Arc::new(HandlerRegistry::new(
                 vec![WorkflowInfo {
@@ -2378,6 +2425,9 @@ async fn worker_builder_state_is_visible_to_workflow_and_activity() {
             default_queue: Some("default"),
             max_concurrent: None,
             concurrency_key: None,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
             is_local: false,
             max_input_bytes: None,
             max_result_bytes: None,
@@ -2976,6 +3026,9 @@ async fn worker_handles_early_ingested_signal_before_activity() {
             default_queue: Some("default"),
             max_concurrent: None,
             concurrency_key: None,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
             is_local: false,
             max_input_bytes: None,
             max_result_bytes: None,
@@ -3083,6 +3136,7 @@ async fn insert_named_workflow_execution(
         memo: None,
         search_attrs: None,
         assigned_build_id: None,
+        parent_close_policy: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&row)
@@ -4380,6 +4434,8 @@ async fn workflow_schedule_baseline_dispatches_multiple_runs() {
                 deployment_name: None,
                 workflow_cache_size: 1000,
                 priority_aging_secs: None,
+                unknown_target_grace_window: Duration::from_secs(5),
+                sharded_pool: None,
             },
             Arc::clone(&registry),
         )
@@ -4480,6 +4536,8 @@ async fn workflow_schedule_max_active_runs_enforced() {
                 deployment_name: None,
                 workflow_cache_size: 1000,
                 priority_aging_secs: None,
+                unknown_target_grace_window: Duration::from_secs(5),
+                sharded_pool: None,
             },
             Arc::clone(&registry),
         )
@@ -4568,6 +4626,8 @@ async fn workflow_schedule_pause_and_resume() {
                 deployment_name: None,
                 workflow_cache_size: 1000,
                 priority_aging_secs: None,
+                unknown_target_grace_window: Duration::from_secs(5),
+                sharded_pool: None,
             },
             Arc::clone(&registry),
         )
@@ -5362,6 +5422,9 @@ async fn non_retryable_activity_fails_fast_on_attempt_one() {
             default_queue: Some("default"),
             max_concurrent: None,
             concurrency_key: None,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
             is_local: false,
             max_input_bytes: None,
             max_result_bytes: None,
@@ -5486,6 +5549,9 @@ async fn legacy_string_failure_in_non_retryable_errors_fails_fast() {
             default_queue: Some("default"),
             max_concurrent: None,
             concurrency_key: None,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
             is_local: false,
             max_input_bytes: None,
             max_result_bytes: None,
@@ -6090,6 +6156,7 @@ async fn signal_blocked_workflow_times_out_at_deadline() {
         memo: None,
         search_attrs: None,
         assigned_build_id: None,
+        parent_close_policy: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&row)

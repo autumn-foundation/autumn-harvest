@@ -32,9 +32,14 @@ use serde_json::Value;
 
 use autumn_harvest::Schedule;
 use autumn_harvest::audit::{
-    OP_SCHEDULE_DELETE, OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_WORKFLOW_CANCEL,
+    OP_BUILD_COMPAT_DECLARE, OP_BUILD_COMPAT_REVOKE, OP_BUILD_POLICY_SET, OP_SCHEDULE_DELETE,
+    OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER, OP_WORKFLOW_CANCEL,
     OP_WORKFLOW_RESET, OP_WORKFLOW_SIGNAL, SOURCE_API, SOURCE_UI, STATUS_FAILED, STATUS_SUCCEEDED,
-    TARGET_SCHEDULE, TARGET_WORKFLOW, insert_audit,
+    TARGET_BUILD_ROUTING, TARGET_SCHEDULE, TARGET_WORKFLOW, insert_audit,
+};
+use autumn_harvest::build_routing::{
+    BuildCompatEntry, BuildPolicy, BuildReachability, all_build_reachability, declare_compat,
+    list_build_compat, list_build_policies, merge_reachability, revoke_compat, set_build_policy,
 };
 use autumn_harvest::cancel_workflow_execution;
 use autumn_harvest::error::{HarvestResult, database_error};
@@ -51,14 +56,17 @@ use autumn_harvest::schema::{
     harvest_signals, harvest_task_queue, harvest_timers, harvest_workflow_executions,
 };
 use autumn_harvest::signal::send_signal;
+use autumn_harvest::start_or_load_workflow_execution;
 use autumn_harvest::store::admit_update_event;
-use autumn_harvest::types::{ShardId, UpdateId};
+use autumn_harvest::types::{
+    ExecutionId as HarvestExecutionId, Priority, ShardId, UpdateId, WorkflowIdReusePolicy,
+};
 use autumn_harvest::workers::{WorkerFilters, WorkerHealth, WorkerRow, list_workers};
 
 use crate::api::{
-    HarvestApiState, KNOWN_WORKFLOW_STATES, WorkflowFilters, acquire_conn, db_conn_for_execution,
-    load_execution, load_workflows_from_shards, map_error, parse_execution_id,
-    require_harvest_admin,
+    HarvestApiRuntime, HarvestApiState, KNOWN_WORKFLOW_STATES, WorkflowFilters, acquire_conn,
+    db_conn_for_execution, load_execution, load_workflows_from_shards, map_error,
+    parse_execution_id, require_harvest_admin,
 };
 
 const DEFAULT_PAGE_SIZE: i64 = 25;
@@ -248,9 +256,41 @@ pub(crate) struct WorkerListParams {
     /// Set to `"true"` to show only stale workers.
     #[serde(default)]
     stale: Option<String>,
+    /// Filter by build ID (exact match).
+    #[serde(default)]
+    build_id: Option<String>,
     /// Auto-refresh interval in seconds (emits a `<meta http-equiv="refresh">` tag).
     #[serde(default)]
     refresh: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub(crate) struct BuildRoutingListParams {
+    /// Flash message forwarded after a form action redirect.
+    #[serde(default)]
+    flash: Option<String>,
+    /// When set, filter tables to entries related to this build ID.
+    #[serde(default)]
+    build_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BuildRoutingSetPolicyForm {
+    queue_name: String,
+    build_id: String,
+    #[serde(default)]
+    deployment_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BuildRoutingCompatForm {
+    build_id: String,
+    compatible_with: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BuildRoutingRetireForm {
+    build_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -452,7 +492,24 @@ pub fn harvest_ui_router(api_state: HarvestApiState) -> Router<AppState> {
         .route("/workers", get(list_workers_ui))
         .route(
             "/dead-letters",
-            get(list_dead_letters_ui).route_layer(require_admin),
+            get(list_dead_letters_ui).route_layer(require_admin.clone()),
+        )
+        .route("/build-routing", get(list_build_routing_ui))
+        .route(
+            "/build-routing/set-policy",
+            post(build_routing_set_policy_ui).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/build-routing/declare-compat",
+            post(build_routing_declare_compat_ui).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/build-routing/revoke-compat",
+            post(build_routing_revoke_compat_ui).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/build-routing/retire",
+            post(build_routing_retire_ui).route_layer(require_admin),
         )
         .route("/schedules", get(list_schedules_ui))
         .route("/schedules/bulk-pause", post(schedule_bulk_pause_ui))
@@ -460,6 +517,7 @@ pub fn harvest_ui_router(api_state: HarvestApiState) -> Router<AppState> {
         .route("/schedules/{id}/pause", post(schedule_pause_ui))
         .route("/schedules/{id}/resume", post(schedule_resume_ui))
         .route("/schedules/{id}/delete", post(schedule_delete_ui))
+        .route("/schedules/{id}/trigger-now", post(schedule_trigger_now_ui))
         .layer(Extension(api_state))
 }
 
@@ -1550,6 +1608,12 @@ async fn list_workers_ui(
             if stale_only && row.health != WorkerHealth::Stale {
                 return false;
             }
+            if let Some(ref bf) = params.build_id
+                && !bf.is_empty()
+                && row.worker.build_id != *bf
+            {
+                return false;
+            }
             true
         })
         .collect();
@@ -1583,6 +1647,8 @@ async fn list_workers_ui(
         .filter_map(|(shard_id, result)| result.as_ref().err().map(|e| (*shard_id, e.as_str())))
         .collect();
 
+    let build_id_filter = params.build_id.as_deref().filter(|s| !s.is_empty());
+
     Ok(render_workers_page(
         &stats,
         banner_state,
@@ -1595,6 +1661,7 @@ async fn list_workers_ui(
         status_filter,
         params.shard,
         stale_only,
+        build_id_filter,
         params.refresh,
     ))
 }
@@ -2093,6 +2160,7 @@ fn layout_dead_letters(title: &str, body: &Markup, refresh: Option<u64>) -> Mark
                         a href="workers" { "Workers" }
                         a href="schedules" { "Schedules" }
                         a.active href="dead-letters" { "Dead Letters" }
+                        a href="build-routing" { "Build Routing" }
                     }
                 }
                 main { (body) }
@@ -2115,6 +2183,7 @@ fn render_workers_page(
     status_filter: Option<&str>,
     shard_filter: Option<i32>,
     stale_only: bool,
+    build_id_filter: Option<&str>,
     refresh: Option<u64>,
 ) -> Markup {
     let total_workers: usize = grouped.iter().map(|(_, rows)| rows.len()).sum();
@@ -2126,7 +2195,7 @@ fn render_workers_page(
         (render_fleet_banner(stats, banner_state))
 
         // Filters
-        (render_worker_filters(status_filter, shard_filter, stale_only, limit))
+        (render_worker_filters(status_filter, shard_filter, stale_only, build_id_filter, limit))
 
         // Worker table (grouped by shard if multi-shard)
         @if total_workers == 0 && shard_errors.is_empty() {
@@ -2159,7 +2228,7 @@ fn render_workers_page(
             }
         }
 
-        (render_worker_pagination(page, limit, has_next, status_filter, shard_filter, stale_only))
+        (render_worker_pagination(page, limit, has_next, status_filter, shard_filter, stale_only, build_id_filter))
     };
 
     layout_workers("Workers · Vantage", &body, refresh)
@@ -2194,6 +2263,8 @@ fn render_worker_table(rows: &[WorkerRow], shard_id: ShardId) -> Markup {
                 tr {
                     th { "Worker ID" }
                     th { "Status" }
+                    th { "Build ID" }
+                    th { "Deployment" }
                     th { "Last Heartbeat" }
                     th { "Shard" }
                     th { "In-Flight" }
@@ -2206,6 +2277,23 @@ fn render_worker_table(rows: &[WorkerRow], shard_id: ShardId) -> Markup {
                     tr class=(row_class) {
                         td { code { (short_id(&row.worker.worker_id)) } }
                         td { (worker_status_badge(&row.worker.status, is_stale)) }
+                        td {
+                            @if row.worker.build_id.is_empty() {
+                                span style="color:#475569" { "—" }
+                            } @else {
+                                a href={ "build-routing?build_id=" (url_encode(&row.worker.build_id)) }
+                                  title="View in Build Routing" {
+                                    code { (row.worker.build_id.chars().take(16).collect::<String>()) }
+                                }
+                            }
+                        }
+                        td {
+                            @if let Some(ref dep) = row.worker.deployment_name {
+                                code { (dep) }
+                            } @else {
+                                span style="color:#475569" { "—" }
+                            }
+                        }
                         td {
                             @let rel = relative_time(row.worker.last_heartbeat_at);
                             @let abs = format_timestamp(Some(row.worker.last_heartbeat_at));
@@ -2226,9 +2314,11 @@ fn render_worker_filters(
     status_filter: Option<&str>,
     shard_filter: Option<i32>,
     stale_only: bool,
+    build_id_filter: Option<&str>,
     limit: i64,
 ) -> Markup {
     let shard_value = shard_filter.map(|s| s.to_string()).unwrap_or_default();
+    let build_id_value = build_id_filter.unwrap_or("");
     html! {
         form.filters method="get" action="workers" {
             label {
@@ -2239,6 +2329,10 @@ fn render_worker_filters(
                         option value=(s) selected[status_filter == Some(s)] { (s) }
                     }
                 }
+            }
+            label {
+                "Build ID"
+                input type="text" name="build_id" value=(build_id_value) placeholder="e.g. abc123";
             }
             label {
                 "Shard"
@@ -2268,8 +2362,15 @@ fn render_worker_pagination(
     status_filter: Option<&str>,
     shard_filter: Option<i32>,
     stale_only: bool,
+    build_id_filter: Option<&str>,
 ) -> Markup {
-    let base = build_worker_query_string(limit, status_filter, shard_filter, stale_only);
+    let base = build_worker_query_string(
+        limit,
+        status_filter,
+        shard_filter,
+        stale_only,
+        build_id_filter,
+    );
     html! {
         div.pagination {
             @if page > 0 {
@@ -2298,6 +2399,7 @@ fn build_worker_query_string(
     status_filter: Option<&str>,
     shard_filter: Option<i32>,
     stale_only: bool,
+    build_id_filter: Option<&str>,
 ) -> String {
     let mut out = String::new();
     if limit != DEFAULT_PAGE_SIZE {
@@ -2305,6 +2407,9 @@ fn build_worker_query_string(
     }
     if let Some(status) = status_filter {
         let _ = write!(out, "&status={}", url_encode(status));
+    }
+    if let Some(build_id) = build_id_filter {
+        let _ = write!(out, "&build_id={}", url_encode(build_id));
     }
     if let Some(shard) = shard_filter {
         let _ = write!(out, "&shard={shard}");
@@ -2369,6 +2474,7 @@ fn layout_workers(title: &str, body: &Markup, refresh: Option<u64>) -> Markup {
                         a.active href="workers" { "Workers" }
                         a href="schedules" { "Schedules" }
                         a href="dead-letters" { "Dead Letters" }
+                        a href="build-routing" { "Build Routing" }
                     }
                 }
                 main { (body) }
@@ -2919,6 +3025,15 @@ fn render_workflow_detail(
                 @if let Some(timeout) = execution.execution_timeout {
                     (kv("Execution timeout", &format!("{}s", timeout.num_seconds()), false))
                 }
+                @if let Some(ref build_id) = execution.assigned_build_id {
+                    div.k { "Assigned build" }
+                    div.v {
+                        a href={ "../build-routing?build_id=" (url_encode(build_id)) }
+                           title="View in Build Routing" {
+                            code { (build_id) }
+                        }
+                    }
+                }
                 @if let Some(threshold) = continue_as_new_threshold {
                     (kv("History events", &format!("{total_events} / threshold: {threshold}"), false))
                 } @else {
@@ -3297,6 +3412,20 @@ fn url_encode(input: &str) -> String {
     out
 }
 
+/// Escape a string for safe embedding inside a single-quoted JavaScript string literal.
+///
+/// Replaces `\` with `\\` and `'` with `\'` so the value cannot break out of the
+/// surrounding `confirm('...')` or similar inline handler, preventing XSS via
+/// operator-supplied build IDs or queue names.
+fn js_escape(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('\'', "\\'")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029")
+}
+
 fn layout(title: &str, body: &Markup, base_href: &str) -> Markup {
     html! {
         (PreEscaped("<!DOCTYPE html>"))
@@ -3511,6 +3640,7 @@ fn layout_dag_detail(title: &str, body: &Markup, base_href: &str, refresh: Optio
                         a href={ (base_href) "workers" } { "Workers" }
                         a href={ (base_href) "schedules" } { "Schedules" }
                         a href={ (base_href) "dead-letters" } { "Dead Letters" }
+                        a href={ (base_href) "build-routing" } { "Build Routing" }
                     }
                 }
                 main { (body) }
@@ -3556,6 +3686,990 @@ fn format_run_duration(started_at: DateTime<Utc>, completed_at: Option<DateTime<
         format!("{}m {}s", secs / 60, secs % 60)
     } else {
         format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Schedules UI page
+// ---------------------------------------------------------------------------
+
+const DEFAULT_SCHEDULE_PAGE_SIZE: i64 = 50;
+
+type ShardScheduleResult = (ShardId, Result<Vec<HarvestSchedule>, String>);
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ScheduleListParams {
+    #[serde(default)]
+    page: Option<i64>,
+    #[serde(default)]
+    limit: Option<i64>,
+    #[serde(default)]
+    target: Option<String>,
+    /// "Workflow", "Dag", or empty/absent for All.
+    #[serde(default)]
+    kind: Option<String>,
+    /// "Paused", "Active", or empty/absent for All.
+    #[serde(default)]
+    paused: Option<String>,
+    #[serde(default)]
+    shard_id: Option<i32>,
+    #[serde(default)]
+    refresh: Option<u64>,
+    #[serde(default)]
+    flash: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ScheduleBulkParams {
+    #[serde(default)]
+    target: Option<String>,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    paused: Option<String>,
+    #[serde(default)]
+    shard_id: Option<i32>,
+}
+
+fn dag_summary_from_registered(name: &str, dag: &RegisteredDag) -> DagUiSummary {
+    DagUiSummary {
+        name: name.to_string(),
+        schedule_expr: dag.schedule.as_ref().map(schedule_expr_for_ui_summary),
+        task_count: dag.task_count(),
+        is_paused: false,
+        next_run_at: None,
+        max_active_runs: i32::try_from(dag.max_active_runs).unwrap_or(i32::MAX),
+        catchup: dag.catchup,
+    }
+}
+
+fn schedule_expr_for_ui_summary(schedule: &Schedule) -> String {
+    match schedule {
+        Schedule::Cron(expr) => expr.clone(),
+        Schedule::Interval(duration) => {
+            if duration.subsec_nanos() == 0 {
+                format!("@every {}s", duration.as_secs())
+            } else {
+                format!(
+                    "@every {}.{:09}s",
+                    duration.as_secs(),
+                    duration.subsec_nanos()
+                )
+            }
+        }
+        Schedule::Manual => "@manual".to_string(),
+        Schedule::CronInTimezone { expr, tz } => format!("{expr} [{tz}]"),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DagNodeState {
+    Succeeded,
+    Failed,
+    Cancelled,
+    Running,
+    Queued,
+    Skipped,
+    Unknown,
+}
+
+fn render_dag_detail(
+    dag_name: &str,
+    dag: &RegisteredDag,
+    runs: &[WorkflowExecution],
+    selected_run: Option<uuid::Uuid>,
+    selected_node: Option<usize>,
+    refresh: Option<u64>,
+    node_states: &HashMap<usize, DagNodeState>,
+) -> Markup {
+    let too_large = dag.definition.tasks().len() > 200;
+    let selected_task = selected_node.and_then(|idx| dag.definition.tasks().get(idx));
+    let selected_node_state = selected_node
+        .and_then(|idx| node_states.get(&idx).copied())
+        .unwrap_or(DagNodeState::Unknown);
+    let body = html! {
+        h2 { "DAG " code { (dag_name) } " runs" }
+        @if let Some(run_id) = selected_run {
+            p { "Selected run: " code { (run_id) } }
+        }
+        @if too_large {
+            div class="banner Warning" { "Topology has " (dag.definition.tasks().len()) " nodes; graph disabled." }
+        } @else {
+            h3 { "Topology" }
+            table {
+                thead { tr { th { "Node" } th { "Activity" } th { "Trigger Rule" } th { "State" } th { "Upstreams" } } }
+                tbody {
+                    @for (idx, task) in dag.definition.tasks().iter().enumerate() {
+                        tr {
+                            td {
+                                @if let Some(run_id) = selected_run {
+                                    a href={ "?run=" (run_id) "&node=" (idx) } { (idx) }
+                                } @else {
+                                    a href={ "?node=" (idx) } { (idx) }
+                                }
+                            }
+                            td { (task.activity_name.as_str()) }
+                            td { (format!("{:?}", task.trigger_rule)) }
+                            td { (format!("{:?}", node_states.get(&idx).copied().unwrap_or(DagNodeState::Unknown))) }
+                            td {
+                                @for (n, upstream) in task.upstreams.iter().enumerate() {
+                                    @if n > 0 { ", " }
+                                    (upstream)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            @if let Some(task) = selected_task {
+                h3 { "Node panel" }
+                p { "Activity: " code { (task.activity_name.as_str()) } }
+                p { "Trigger rule: " (format!("{:?}", task.trigger_rule)) }
+                p { "Current state: " (format!("{selected_node_state:?}")) }
+            }
+        }
+        table {
+            thead {
+                tr {
+                    th { "Execution" }
+                    th { "State" }
+                    th { "Started" }
+                    th { "Duration" }
+                }
+            }
+            tbody {
+                @for run in runs {
+                    tr {
+                        td { a href={ "../workflows/" (run.id) } { code { (run.id) } } }
+                        td { span class={ "badge " (run.state.to_uppercase()) } { (run.state.as_str()) } }
+                        td { (format_timestamp(Some(run.started_at))) }
+                        td { (format_run_duration(run.started_at, run.completed_at)) }
+                    }
+                }
+            }
+        }
+    };
+    layout_dag_detail(&format!("DAG {dag_name} · Vantage"), &body, "../", refresh)
+}
+
+fn layout_dag_detail(title: &str, body: &Markup, base_href: &str, refresh: Option<u64>) -> Markup {
+    html! {
+        (PreEscaped("<!DOCTYPE html>"))
+        html lang="en" {
+            head {
+                meta charset="utf-8";
+                meta name="viewport" content="width=device-width,initial-scale=1";
+                title { (title) }
+                style { (PreEscaped(STYLE)) }
+                @if let Some(secs) = refresh { meta http-equiv="refresh" content=(secs); }
+            }
+            body {
+                header {
+                    h1 { a href={ (base_href) "workflows" } { "🔭 Vantage" } span.subtitle { "Harvest dashboard" } }
+                    nav {
+                        a href={ (base_href) "workflows" } { "Workflows" }
+                        a.active href={ (base_href) "dags" } { "DAGs" }
+                        a href={ (base_href) "workers" } { "Workers" }
+                        a href={ (base_href) "schedules" } { "Schedules" }
+                        a href={ (base_href) "dead-letters" } { "Dead Letters" }
+                        a href={ (base_href) "build-routing" } { "Build Routing" }
+                    }
+                }
+                main { (body) }
+                footer { "Read-only dashboard — autumn-harvest" }
+            }
+        }
+    }
+}
+
+fn map_node_states(
+    dag: &autumn_harvest::dag::DagDefinition,
+    tasks: &[TaskQueueItem],
+) -> HashMap<usize, DagNodeState> {
+    let mut out = HashMap::new();
+    for (idx, node) in dag.tasks().iter().enumerate() {
+        let mut state = DagNodeState::Unknown;
+        for task in tasks
+            .iter()
+            .filter(|t| t.activity_name.as_deref() == Some(node.activity_name.as_str()))
+        {
+            state = match task.state.as_str() {
+                "FAILED" => DagNodeState::Failed,
+                "CANCELLED" if !matches!(state, DagNodeState::Failed) => DagNodeState::Cancelled,
+                "RUNNING" if state != DagNodeState::Failed => DagNodeState::Running,
+                "PENDING" | "QUEUED" if state == DagNodeState::Unknown => DagNodeState::Queued,
+                "COMPLETED" if state == DagNodeState::Unknown => DagNodeState::Succeeded,
+                "SKIPPED" if state == DagNodeState::Unknown => DagNodeState::Skipped,
+                _ => state,
+            };
+        }
+        out.insert(idx, state);
+    }
+    out
+}
+
+fn format_run_duration(started_at: DateTime<Utc>, completed_at: Option<DateTime<Utc>>) -> String {
+    let Some(end) = completed_at else {
+        return "—".to_string();
+    };
+    let secs = (end - started_at).num_seconds().max(0);
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m {}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Build Routing UI page (issue #362)
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_lines)]
+async fn list_build_routing_ui(
+    Extension(api_state): Extension<HarvestApiState>,
+    Query(params): Query<BuildRoutingListParams>,
+) -> Result<Markup, AutumnError> {
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    let is_multi_shard = pool.iter_shards().count() > 1;
+    let stale_threshold = api_state.worker_stale_threshold();
+
+    // Fan out to every shard to read policies, compat, and reachability.
+    // Policy and compat mutations go to all shards; reading from a single shard
+    // can hide partial-write divergence. We merge by queue_name / (build_id,
+    // compatible_with) and detect queues whose active build_id differs across shards.
+    let mut shard_errors: Vec<(ShardId, String)> = Vec::new();
+    let mut policy_map: std::collections::HashMap<String, BuildPolicy> =
+        std::collections::HashMap::new();
+    let mut diverged_queues: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Per-shard presence tracking for policy and compat: each entry is the set of
+    // queue names / (build_id, compatible_with) pairs returned by one shard that
+    // successfully responded. Used to detect absent rows on healthy shards.
+    let mut per_shard_policy_seen: Vec<std::collections::HashSet<String>> = Vec::new();
+    let mut compat_map: std::collections::HashMap<(String, String), BuildCompatEntry> =
+        std::collections::HashMap::new();
+    let mut per_shard_compat_seen: Vec<std::collections::HashSet<(String, String)>> = Vec::new();
+    let mut per_shard_reach: Vec<Vec<BuildReachability>> = Vec::new();
+
+    for (shard_id, shard_pool) in pool.iter_shards() {
+        match acquire_conn(shard_pool).await {
+            Ok(mut conn) => {
+                match list_build_policies(&mut conn).await {
+                    Ok(shard_policies) => {
+                        let mut seen: std::collections::HashSet<String> =
+                            std::collections::HashSet::new();
+                        for policy in shard_policies {
+                            seen.insert(policy.queue_name.clone());
+                            match policy_map.get(&policy.queue_name) {
+                                Some(existing) if existing.build_id != policy.build_id => {
+                                    diverged_queues.insert(policy.queue_name.clone());
+                                    if policy.updated_at > existing.updated_at {
+                                        policy_map.insert(policy.queue_name.clone(), policy);
+                                    }
+                                }
+                                Some(existing) if policy.updated_at > existing.updated_at => {
+                                    policy_map.insert(policy.queue_name.clone(), policy);
+                                }
+                                None => {
+                                    policy_map.insert(policy.queue_name.clone(), policy);
+                                }
+                                _ => {}
+                            }
+                        }
+                        per_shard_policy_seen.push(seen);
+                    }
+                    Err(e) => shard_errors.push((shard_id, e.to_string())),
+                }
+                match list_build_compat(&mut conn).await {
+                    Ok(entries) => {
+                        let mut seen: std::collections::HashSet<(String, String)> =
+                            std::collections::HashSet::new();
+                        for entry in entries {
+                            let key = (entry.build_id.clone(), entry.compatible_with.clone());
+                            seen.insert(key.clone());
+                            compat_map
+                                .entry(key)
+                                .and_modify(|e| {
+                                    if entry.declared_at > e.declared_at {
+                                        *e = entry.clone();
+                                    }
+                                })
+                                .or_insert(entry);
+                        }
+                        per_shard_compat_seen.push(seen);
+                    }
+                    Err(e) => shard_errors.push((shard_id, e.to_string())),
+                }
+                match all_build_reachability(&mut conn, stale_threshold).await {
+                    Ok(r) => per_shard_reach.push(r),
+                    Err(e) => shard_errors.push((shard_id, e.to_string())),
+                }
+            }
+            Err(e) => shard_errors.push((shard_id, e.to_string())),
+        }
+    }
+
+    // Detect absent-row policy divergence (queue on some shards, missing on others).
+    if per_shard_policy_seen.len() > 1 {
+        for queue_name in policy_map.keys() {
+            if per_shard_policy_seen
+                .iter()
+                .any(|seen| !seen.contains(queue_name.as_str()))
+            {
+                diverged_queues.insert(queue_name.clone());
+            }
+        }
+    }
+
+    // Detect compat pairs present on some shards but absent on others.
+    let mut diverged_compat_pairs: Vec<String> = if per_shard_compat_seen.len() > 1 {
+        let mut pairs: Vec<String> = compat_map
+            .keys()
+            .filter(|key| {
+                per_shard_compat_seen
+                    .iter()
+                    .any(|seen| !seen.contains(*key))
+            })
+            .map(|(b, c)| format!("{b} \u{2192} {c}"))
+            .collect();
+        pairs.sort();
+        pairs
+    } else {
+        vec![]
+    };
+    diverged_compat_pairs.dedup();
+
+    let mut policies: Vec<BuildPolicy> = policy_map.into_values().collect();
+    policies.sort_by(|a, b| a.queue_name.cmp(&b.queue_name));
+    let mut all_compat: Vec<BuildCompatEntry> = compat_map.into_values().collect();
+    all_compat.sort_by(|a, b| {
+        a.build_id
+            .cmp(&b.build_id)
+            .then(a.compatible_with.cmp(&b.compatible_with))
+    });
+    let mut diverged_list: Vec<String> = diverged_queues.into_iter().collect();
+    diverged_list.sort();
+    let reachability = merge_reachability(per_shard_reach);
+
+    let shard_error_refs: Vec<(ShardId, &str)> =
+        shard_errors.iter().map(|(s, e)| (*s, e.as_str())).collect();
+
+    // Apply optional build_id filter to narrow tables for drill-down from workers/executions.
+    let build_id_filter = params.build_id.as_deref().filter(|s| !s.is_empty());
+    let filtered_policies: Vec<BuildPolicy> = if let Some(bid) = build_id_filter {
+        policies.into_iter().filter(|p| p.build_id == bid).collect()
+    } else {
+        policies
+    };
+    let filtered_compat: Vec<BuildCompatEntry> = if let Some(bid) = build_id_filter {
+        all_compat
+            .into_iter()
+            .filter(|e| e.build_id == bid || e.compatible_with == bid)
+            .collect()
+    } else {
+        all_compat
+    };
+    let filtered_reach: Vec<BuildReachability> = if let Some(bid) = build_id_filter {
+        reachability
+            .into_iter()
+            .filter(|r| r.build_id == bid)
+            .collect()
+    } else {
+        reachability
+    };
+
+    Ok(render_build_routing_page(
+        &filtered_policies,
+        &filtered_compat,
+        &filtered_reach,
+        &shard_error_refs,
+        &diverged_list,
+        &diverged_compat_pairs,
+        is_multi_shard,
+        params.flash.as_deref(),
+        build_id_filter,
+    ))
+}
+
+async fn build_routing_set_policy_ui(
+    Extension(api_state): Extension<HarvestApiState>,
+    Form(form): Form<BuildRoutingSetPolicyForm>,
+) -> Result<axum::response::Response, AutumnError> {
+    let queue_name = form.queue_name.trim().to_string();
+    let build_id = form.build_id.trim().to_string();
+    if queue_name.is_empty() || build_id.is_empty() {
+        let flash = url_encode("queue_name and build_id must not be empty");
+        return Ok(
+            axum::response::Redirect::to(&format!("../build-routing?flash={flash}"))
+                .into_response(),
+        );
+    }
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    let deployment_name = form.deployment_name.as_deref().filter(|s| !s.is_empty());
+    // Fan out to all shards so every shard's get_build_policy() sees the new policy
+    // when evaluating assigned_build_id at workflow start time.
+    let mut last_policy = None;
+    let mut shard_errors: Vec<String> = Vec::new();
+    for (shard_id, shard_pool) in pool.iter_shards() {
+        match acquire_conn(shard_pool).await {
+            Ok(mut conn) => {
+                match set_build_policy(&mut conn, &queue_name, &build_id, deployment_name)
+                    .await
+                    .map_err(map_error)
+                {
+                    Ok(p) => last_policy = Some(p),
+                    Err(e) => shard_errors.push(format!("shard {}: {e}", shard_id.as_i32())),
+                }
+            }
+            Err(e) => shard_errors.push(format!("shard {}: {e}", shard_id.as_i32())),
+        }
+    }
+    let audit_status = if shard_errors.is_empty() {
+        STATUS_SUCCEEDED
+    } else {
+        STATUS_FAILED
+    };
+    if let Ok(mut conn) = acquire_conn(pool.default_pool()).await {
+        let error_summary = shard_errors.join("; ");
+        let _ = insert_audit(
+            &mut conn,
+            &NewAuditRecord {
+                actor: "ui",
+                operation: OP_BUILD_POLICY_SET,
+                target_type: TARGET_BUILD_ROUTING,
+                target_id: Some(queue_name.as_str()),
+                route_or_command: "POST /ui/build-routing/set-policy",
+                request_id: None,
+                idempotency_key: None,
+                status: audit_status,
+                error_summary: if error_summary.is_empty() {
+                    None
+                } else {
+                    Some(error_summary.as_str())
+                },
+                shard_id: None,
+                source: SOURCE_UI,
+            },
+        )
+        .await;
+    }
+    let flash = if shard_errors.is_empty() {
+        match last_policy {
+            Some(p) => url_encode(&format!(
+                "Build policy for queue '{}' set to '{}'",
+                p.queue_name, p.build_id
+            )),
+            None => url_encode("No shards configured"),
+        }
+    } else {
+        url_encode(&format!(
+            "Partial failure setting build policy: {}",
+            shard_errors.join("; ")
+        ))
+    };
+    Ok(axum::response::Redirect::to(&format!("../build-routing?flash={flash}")).into_response())
+}
+
+async fn build_routing_declare_compat_ui(
+    Extension(api_state): Extension<HarvestApiState>,
+    Form(form): Form<BuildRoutingCompatForm>,
+) -> Result<axum::response::Response, AutumnError> {
+    let build_id = form.build_id.trim().to_string();
+    let compatible_with = form.compatible_with.trim().to_string();
+    if build_id.is_empty() || compatible_with.is_empty() {
+        let flash = url_encode("build_id and compatible_with must not be empty");
+        return Ok(
+            axum::response::Redirect::to(&format!("../build-routing?flash={flash}"))
+                .into_response(),
+        );
+    }
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    // Fan out to all shards so load_compat_set() on each shard picks up the declaration.
+    let mut last_entry = None;
+    let mut shard_errors: Vec<String> = Vec::new();
+    for (shard_id, shard_pool) in pool.iter_shards() {
+        match acquire_conn(shard_pool).await {
+            Ok(mut conn) => {
+                match declare_compat(&mut conn, &build_id, &compatible_with)
+                    .await
+                    .map_err(map_error)
+                {
+                    Ok(e) => last_entry = Some(e),
+                    Err(e) => shard_errors.push(format!("shard {}: {e}", shard_id.as_i32())),
+                }
+            }
+            Err(e) => shard_errors.push(format!("shard {}: {e}", shard_id.as_i32())),
+        }
+    }
+    let audit_status = if shard_errors.is_empty() {
+        STATUS_SUCCEEDED
+    } else {
+        STATUS_FAILED
+    };
+    if let Ok(mut conn) = acquire_conn(pool.default_pool()).await {
+        let error_summary = shard_errors.join("; ");
+        let target = format!("{build_id}→{compatible_with}");
+        let _ = insert_audit(
+            &mut conn,
+            &NewAuditRecord {
+                actor: "ui",
+                operation: OP_BUILD_COMPAT_DECLARE,
+                target_type: TARGET_BUILD_ROUTING,
+                target_id: Some(target.as_str()),
+                route_or_command: "POST /ui/build-routing/declare-compat",
+                request_id: None,
+                idempotency_key: None,
+                status: audit_status,
+                error_summary: if error_summary.is_empty() {
+                    None
+                } else {
+                    Some(error_summary.as_str())
+                },
+                shard_id: None,
+                source: SOURCE_UI,
+            },
+        )
+        .await;
+    }
+    let flash = if shard_errors.is_empty() {
+        match last_entry {
+            Some(e) => url_encode(&format!(
+                "Declared: '{}' compatible with '{}'",
+                e.build_id, e.compatible_with
+            )),
+            None => url_encode("No shards configured"),
+        }
+    } else {
+        url_encode(&format!(
+            "Partial failure declaring compat: {}",
+            shard_errors.join("; ")
+        ))
+    };
+    Ok(axum::response::Redirect::to(&format!("../build-routing?flash={flash}")).into_response())
+}
+
+async fn build_routing_revoke_compat_ui(
+    Extension(api_state): Extension<HarvestApiState>,
+    Form(form): Form<BuildRoutingCompatForm>,
+) -> Result<axum::response::Response, AutumnError> {
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    // Fan out revoke to all shards; collect errors rather than aborting.
+    let mut any_revoked = false;
+    let mut shard_errors: Vec<String> = Vec::new();
+    for (shard_id, shard_pool) in pool.iter_shards() {
+        match acquire_conn(shard_pool).await {
+            Ok(mut conn) => {
+                match revoke_compat(&mut conn, form.build_id.trim(), form.compatible_with.trim())
+                    .await
+                    .map_err(map_error)
+                {
+                    Ok(r) => any_revoked |= r,
+                    Err(e) => shard_errors.push(format!("shard {}: {e}", shard_id.as_i32())),
+                }
+            }
+            Err(e) => shard_errors.push(format!("shard {}: {e}", shard_id.as_i32())),
+        }
+    }
+    let audit_status = if shard_errors.is_empty() {
+        STATUS_SUCCEEDED
+    } else {
+        STATUS_FAILED
+    };
+    if let Ok(mut conn) = acquire_conn(pool.default_pool()).await {
+        let error_summary = shard_errors.join("; ");
+        let target = format!("{}→{}", form.build_id.trim(), form.compatible_with.trim());
+        let _ = insert_audit(
+            &mut conn,
+            &NewAuditRecord {
+                actor: "ui",
+                operation: OP_BUILD_COMPAT_REVOKE,
+                target_type: TARGET_BUILD_ROUTING,
+                target_id: Some(target.as_str()),
+                route_or_command: "POST /ui/build-routing/revoke-compat",
+                request_id: None,
+                idempotency_key: None,
+                status: audit_status,
+                error_summary: if error_summary.is_empty() {
+                    None
+                } else {
+                    Some(error_summary.as_str())
+                },
+                shard_id: None,
+                source: SOURCE_UI,
+            },
+        )
+        .await;
+    }
+    let flash = if !shard_errors.is_empty() {
+        url_encode(&format!(
+            "Partial failure revoking compat: {}",
+            shard_errors.join("; ")
+        ))
+    } else if any_revoked {
+        url_encode(&format!(
+            "Revoked compatibility: '{}' → '{}'",
+            form.build_id, form.compatible_with
+        ))
+    } else {
+        url_encode(&format!(
+            "No compatibility declaration found for '{}' → '{}'",
+            form.build_id, form.compatible_with
+        ))
+    };
+    Ok(axum::response::Redirect::to(&format!("../build-routing?flash={flash}")).into_response())
+}
+
+async fn build_routing_retire_ui(
+    Extension(api_state): Extension<HarvestApiState>,
+    Form(form): Form<BuildRoutingRetireForm>,
+) -> Result<axum::response::Response, AutumnError> {
+    if form.build_id.trim().is_empty() {
+        let flash = url_encode("build_id must not be empty");
+        return Ok(
+            axum::response::Redirect::to(&format!("../build-routing?flash={flash}"))
+                .into_response(),
+        );
+    }
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    let stale_threshold = api_state.worker_stale_threshold();
+
+    // Check reachability across all shards before allowing retire. Any shard
+    // error propagates immediately — silently skipping a shard could allow
+    // retire when that shard still has active executions.
+    let mut per_shard_reach: Vec<Vec<BuildReachability>> = Vec::new();
+    for (_, shard_pool) in pool.iter_shards() {
+        let mut conn = acquire_conn(shard_pool).await?;
+        let r = all_build_reachability(&mut conn, stale_threshold)
+            .await
+            .map_err(map_error)?;
+        per_shard_reach.push(r);
+    }
+    let merged = merge_reachability(per_shard_reach);
+    let build_reach = merged.iter().find(|r| r.build_id == form.build_id.trim());
+
+    let flash = match build_reach {
+        Some(r) if !r.safe_to_retire => url_encode(&format!(
+            "Cannot retire build '{}': {} open executions, {} pending tasks remain",
+            form.build_id, r.open_executions, r.pending_tasks
+        )),
+        _ => {
+            // Build is safe to retire (or not found, meaning nothing is running on it).
+            // The retire action itself is a no-op at the DB level — the operator
+            // removes their old workers out-of-band. We surface a confirmation message.
+            url_encode(&format!(
+                "Build '{}' is safe to retire — no open executions or pending tasks remain. \
+                 You may now stop all workers running this build.",
+                form.build_id.trim()
+            ))
+        }
+    };
+    Ok(axum::response::Redirect::to(&format!("../build-routing?flash={flash}")).into_response())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_build_policies_card(policies: &[BuildPolicy]) -> Markup {
+    html! {
+        div.card {
+            h3 { "Build Policies" }
+            @if policies.is_empty() {
+                p.empty { "No build policies registered." }
+            } @else {
+                table {
+                    thead { tr { th { "Queue" } th { "Active Build ID" } th { "Deployment" } th { "Last Updated" } } }
+                    tbody {
+                        @for policy in policies {
+                            tr {
+                                td { code { (policy.queue_name.clone()) } }
+                                td { code { (policy.build_id.clone()) } }
+                                td {
+                                    @if let Some(ref dep) = policy.deployment_name {
+                                        code { (dep) }
+                                    } @else {
+                                        span style="color:#475569" { "—" }
+                                    }
+                                }
+                                td { (format_timestamp(Some(policy.updated_at))) }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn render_build_reachability_card(reachability: &[BuildReachability]) -> Markup {
+    html! {
+        div.card {
+            h3 { "Build Reachability" }
+            @if reachability.is_empty() {
+                p.empty { "No build-tagged executions or workers found." }
+            } @else {
+                table {
+                    thead { tr { th { "Build ID" } th { "Open Executions" } th { "Pending Tasks" } th { "Active Workers" } th { "Stale Workers" } th { "Status" } th { "Actions" } } }
+                    tbody {
+                        @for r in reachability {
+                            @let status_color = if r.safe_to_retire { "#166534" } else { "#991b1b" };
+                            @let status_bg = if r.safe_to_retire { "#dcfce7" } else { "#fee2e2" };
+                            @let status_label = if r.safe_to_retire { "✓ Safe to retire" } else { "⚠ In use" };
+                            tr {
+                                td { code { (r.build_id.clone()) } }
+                                td { (r.open_executions) }
+                                td { (r.pending_tasks) }
+                                td { (r.active_workers) }
+                                td { (r.stale_workers) }
+                                td {
+                                    span style={ "background:" (status_bg) ";color:" (status_color) ";padding:2px 8px;border-radius:999px;font-size:11px;font-weight:600" } {
+                                        (status_label)
+                                    }
+                                }
+                                td {
+                                    @if r.safe_to_retire {
+                                        form method="post" action="build-routing/retire"
+                                              onsubmit={ "return confirm('Confirm retirement of build " (js_escape(&r.build_id)) "? All workers running this build should be stopped after confirmation.')" }
+                                              style="margin:0" {
+                                            input type="hidden" name="build_id" value=(r.build_id.clone());
+                                            button.danger type="submit"
+                                                style="background:#166534;color:#dcfce7;border:0;border-radius:6px;padding:4px 10px;font-size:11px;cursor:pointer" {
+                                                "Retire"
+                                            }
+                                        }
+                                    } @else {
+                                        span style="color:#475569;font-size:12px" { "Not yet safe" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn render_compat_card(all_compat: &[BuildCompatEntry]) -> Markup {
+    html! {
+        div.card {
+            h3 { "Compatibility Declarations" }
+            p style="color:#94a3b8;font-size:12px;margin-bottom:12px" {
+                "Workers running build " strong { "A" } " can claim tasks assigned to build " strong { "B" }
+                " when a declaration " code { "A → B" } " exists here."
+            }
+            @if all_compat.is_empty() {
+                p.empty { "No compatibility declarations. Workers only claim tasks assigned to their own build." }
+            } @else {
+                table {
+                    thead { tr { th { "Worker Build (A)" } th { "Compatible With (B)" } th { "Declared" } th { "Actions" } } }
+                    tbody {
+                        @for entry in all_compat {
+                            tr {
+                                td { code { (entry.build_id.clone()) } }
+                                td { code { (entry.compatible_with.clone()) } }
+                                td { (format_timestamp(Some(entry.declared_at))) }
+                                td {
+                                    form method="post" action="build-routing/revoke-compat"
+                                          onsubmit={ "return confirm('Revoke compatibility: " (js_escape(&entry.build_id)) " → " (js_escape(&entry.compatible_with)) "?')" }
+                                          style="margin:0" {
+                                        input type="hidden" name="build_id" value=(entry.build_id.clone());
+                                        input type="hidden" name="compatible_with" value=(entry.compatible_with.clone());
+                                        button type="submit"
+                                            style="background:#450a0a;color:#fca5a5;border:1px solid #991b1b;border-radius:6px;padding:3px 8px;font-size:11px;cursor:pointer" {
+                                            "Revoke"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn render_build_routing_action_forms() -> Markup {
+    let input_style = "display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
+    let btn_style = "background:#2563eb;color:#fff;border:0;border-radius:6px;padding:8px 14px;font-size:13px;cursor:pointer;align-self:flex-start";
+    let label_style = "font-size:12px;color:#94a3b8";
+    html! {
+        div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:16px" {
+            div.card {
+                h3 style="margin-top:0" { "Set Build Policy" }
+                p style="color:#94a3b8;font-size:12px;margin-bottom:12px" {
+                    "Sets which build ID is assigned to new workflow starts on a queue. "
+                    "Does not affect in-flight executions."
+                }
+                form method="post" action="build-routing/set-policy"
+                      style="display:flex;flex-direction:column;gap:10px" {
+                    label style=(label_style) { "Queue name"
+                        input type="text" name="queue_name" required placeholder="e.g. default" style=(input_style);
+                    }
+                    label style=(label_style) { "Build ID"
+                        input type="text" name="build_id" required placeholder="e.g. sha-abc123" style=(input_style);
+                    }
+                    label style=(label_style) { "Deployment name (optional)"
+                        input type="text" name="deployment_name" placeholder="e.g. prod-v2" style=(input_style);
+                    }
+                    button type="submit" style=(btn_style)
+                        onclick="return confirm('Set build policy? New executions on this queue will use the specified build ID.')" {
+                        "Set Policy"
+                    }
+                }
+            }
+            div.card {
+                h3 style="margin-top:0" { "Declare Compatibility" }
+                p style="color:#94a3b8;font-size:12px;margin-bottom:12px" {
+                    "Declares that workers running build " strong { "A" }
+                    " can safely replay histories assigned to build " strong { "B" }
+                    ". Only declare after replay tests confirm safety."
+                }
+                form method="post" action="build-routing/declare-compat"
+                      style="display:flex;flex-direction:column;gap:10px" {
+                    label style=(label_style) { "Worker build (A)"
+                        input type="text" name="build_id" required placeholder="e.g. sha-new" style=(input_style);
+                    }
+                    label style=(label_style) { "Compatible with (B)"
+                        input type="text" name="compatible_with" required placeholder="e.g. sha-old" style=(input_style);
+                    }
+                    button type="submit" style=(btn_style)
+                        onclick="return confirm('Declare compatibility? Ensure replay tests have confirmed the new build can handle histories from the old build.')" {
+                        "Declare"
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn render_build_routing_page(
+    policies: &[BuildPolicy],
+    all_compat: &[BuildCompatEntry],
+    reachability: &[BuildReachability],
+    shard_errors: &[(ShardId, &str)],
+    diverged_queues: &[String],
+    diverged_compat_pairs: &[String],
+    is_multi_shard: bool,
+    flash: Option<&str>,
+    build_id_filter: Option<&str>,
+) -> Markup {
+    let is_empty = policies.is_empty() && reachability.is_empty() && all_compat.is_empty();
+
+    let body = html! {
+        h2 { "Build Routing" }
+
+        @if let Some(bid) = build_id_filter {
+            div style="background:#1e293b;border:1px solid #334155;border-radius:8px;padding:10px 14px;margin-bottom:12px;font-size:12px;color:#94a3b8" {
+                "Filtered to build " code style="color:#e2e8f0" { (bid) }
+                " · "
+                a href="build-routing" style="color:#60a5fa" { "Show all builds" }
+            }
+        }
+
+        @if let Some(msg) = flash {
+            div.flash { (msg) }
+        }
+
+        @if !diverged_queues.is_empty() {
+            div style="background:#431407;border:1px solid #ea580c;border-radius:8px;padding:10px 14px;margin-bottom:12px;font-size:13px;color:#fed7aa" {
+                strong { "Policy divergence detected" }
+                " — the following queues have different active build IDs across shards, "
+                "indicating a partial write failure. Re-apply the policy to resync: "
+                @for (i, q) in diverged_queues.iter().enumerate() {
+                    @if i > 0 { ", " }
+                    code style="color:#fdba74" { (q) }
+                }
+            }
+        }
+
+        @if !diverged_compat_pairs.is_empty() {
+            div style="background:#431407;border:1px solid #ea580c;border-radius:8px;padding:10px 14px;margin-bottom:12px;font-size:13px;color:#fed7aa" {
+                strong { "Compat divergence detected" }
+                " — the following pairs are declared on some shards but missing on others. "
+                "Re-declare each pair to resync: "
+                @for (i, pair) in diverged_compat_pairs.iter().enumerate() {
+                    @if i > 0 { ", " }
+                    code style="color:#fdba74" { (pair) }
+                }
+            }
+        }
+
+        @for (shard_id, error) in shard_errors {
+            div.shard-error {
+                @if is_multi_shard {
+                    strong { "Shard " (shard_id.as_i32()) " error: " }
+                } @else {
+                    strong { "Shard error: " }
+                }
+                (error)
+            }
+        }
+
+        @if is_empty && shard_errors.is_empty() {
+            div.card {
+                @if build_id_filter.is_some() {
+                    h3 { "No results" }
+                    p style="color:#94a3b8;font-size:13px;line-height:1.6" {
+                        "No policies, reachability entries, or compat declarations match the active filter. "
+                        "The build may not exist or may already be retired."
+                    }
+                } @else {
+                    h3 { "No build routing configured" }
+                    p style="color:#94a3b8;font-size:13px;line-height:1.6" {
+                        "No build policies have been set and no executions carry a build tag. "
+                        "Build routing is inactive — all workers can claim any task."
+                    }
+                    p style="color:#94a3b8;font-size:13px" {
+                        "To start a rolling deploy, follow the operator playbook in "
+                        code { "docs/runbooks/safe-deploy.md" }
+                        "."
+                    }
+                }
+            }
+        } @else {
+            (render_build_policies_card(policies))
+            (render_build_reachability_card(reachability))
+            (render_compat_card(all_compat))
+        }
+
+        (render_build_routing_action_forms())
+    };
+
+    layout_build_routing("Build Routing · Vantage", &body, None)
+}
+
+fn layout_build_routing(title: &str, body: &Markup, refresh: Option<u64>) -> Markup {
+    html! {
+        (PreEscaped("<!DOCTYPE html>"))
+        html lang="en" {
+            head {
+                meta charset="utf-8";
+                meta name="viewport" content="width=device-width,initial-scale=1";
+                @if let Some(secs) = refresh {
+                    meta http-equiv="refresh" content=(secs);
+                }
+                title { (title) }
+                style { (PreEscaped(STYLE)) }
+            }
+            body {
+                header {
+                    h1 {
+                        a href="workflows" { "🔭 Vantage" }
+                        span.subtitle { "Harvest dashboard" }
+                    }
+                    nav {
+                        a href="workflows" { "Workflows" }
+                        a href="workers" { "Workers" }
+                        a href="schedules" { "Schedules" }
+                        a href="dead-letters" { "Dead Letters" }
+                        a.active href="build-routing" { "Build Routing" }
+                    }
+                }
+                main { (body) }
+                footer { "Operational dashboard — autumn-harvest" }
+            }
+        }
     }
 }
 
@@ -4106,6 +5220,227 @@ async fn schedule_delete_ui(
     schedule_redirect(&flash)
 }
 
+/// Inner logic for `schedule_trigger_now_ui` after the connection is acquired.
+/// Handles the Skip overlap check, start call, audit write, and metric emit,
+/// then returns the redirect response so the outer handler stays compact.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn execute_schedule_trigger_ui(
+    conn: &mut crate::api::PoolConn,
+    pool: &crate::HarvestDbPool,
+    runtime: &HarvestApiRuntime,
+    row: &HarvestSchedule,
+    id_str: &str,
+    name: &str,
+    workflow_name: &str,
+    input: serde_json::Value,
+    queue: &str,
+) -> axum::response::Response {
+    // Count RUNNING executions across ALL shards. The async block returns None if
+    // any shard is unreachable — used for fail-closed Skip enforcement.
+    let running_count: Option<i64> = async {
+        let mut total: i64 = 0;
+        for (_, shard_pool) in pool.iter_shards() {
+            let mut c = acquire_conn(shard_pool).await.ok()?;
+            let n: i64 = harvest_workflow_executions::table
+                .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
+                .filter(harvest_workflow_executions::state.eq("RUNNING"))
+                .count()
+                .get_result(&mut c)
+                .await
+                .ok()?;
+            total += n;
+        }
+        Some(total)
+    }
+    .await;
+    if autumn_harvest::OverlapPolicy::from_db(&row.overlap_policy)
+        == autumn_harvest::OverlapPolicy::Skip
+    {
+        match running_count {
+            None => {
+                let ar = build_trigger_audit("ui", id_str, STATUS_FAILED, Some("count_failed"));
+                let _ = insert_audit(conn, &ar).await;
+                runtime
+                    .registry()
+                    .telemetry()
+                    .metrics
+                    .record_schedule_manual_trigger(name, "start_failed");
+                return schedule_redirect(&format!(
+                    "Failed to trigger {name}: could not count active runs"
+                ));
+            }
+            Some(n) if n >= i64::from(row.max_active_runs) => {
+                let ar =
+                    build_trigger_audit("ui", id_str, STATUS_SUCCEEDED, Some("skipped_overlap"));
+                let _ = insert_audit(conn, &ar).await;
+                runtime
+                    .registry()
+                    .telemetry()
+                    .metrics
+                    .record_schedule_manual_trigger(name, "skipped_overlap");
+                return schedule_redirect(&format!(
+                    "Skipped {name}: max_active_runs already reached"
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    let triggered_at = chrono::Utc::now();
+    let workflow_id = format!(
+        "manual-{}-{}-{}",
+        row.id,
+        triggered_at.timestamp_millis(),
+        uuid::Uuid::new_v4().simple()
+    );
+    let exec_id = HarvestExecutionId::new();
+    let result = start_or_load_workflow_execution(
+        conn,
+        StartWorkflowParams {
+            workflow_name,
+            workflow_id: &workflow_id,
+            exec_id,
+            input,
+            parent_id: None,
+            queue_name: queue,
+            execution_timeout: None,
+            memo: None,
+            search_attrs: None,
+            reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
+            trace_context: None,
+            max_execution_timeout_ceiling: None,
+            concurrency_key: None,
+            concurrency_limit: None,
+            priority: Priority::default(),
+            max_workflow_input_bytes: 0,
+            start_at: None,
+            delay: None,
+            max_workflow_start_delay: None,
+        },
+    )
+    .await;
+    let (status, outcome) = if result.is_ok() {
+        (STATUS_SUCCEEDED, "fired")
+    } else {
+        (STATUS_FAILED, "start_failed")
+    };
+    let ar = build_trigger_audit(
+        "ui",
+        id_str,
+        status,
+        result.is_err().then_some("start_failed"),
+    );
+    let _ = insert_audit(conn, &ar).await;
+    runtime
+        .registry()
+        .telemetry()
+        .metrics
+        .record_schedule_manual_trigger(name, outcome);
+    schedule_redirect(&match result {
+        Ok(_) => format!("Triggered run of {name}"),
+        Err(e) => format!("Failed to trigger {name}: {e}"),
+    })
+}
+
+/// Build a `NewAuditRecord` for UI schedule trigger operations.
+const fn build_trigger_audit<'a>(
+    actor: &'a str,
+    target_id: &'a str,
+    status: &'a str,
+    error_summary: Option<&'a str>,
+) -> NewAuditRecord<'a> {
+    NewAuditRecord {
+        actor,
+        operation: OP_SCHEDULE_TRIGGER,
+        target_type: TARGET_SCHEDULE,
+        target_id: Some(target_id),
+        route_or_command: "POST /ui/schedules/trigger-now",
+        request_id: None,
+        idempotency_key: None,
+        status,
+        error_summary,
+        shard_id: None,
+        source: SOURCE_API,
+    }
+}
+
+/// Resolve `(workflow_name, input, queue)` for a manual trigger, consulting the
+/// runtime registry for DAG-backed schedules so the correct default queue is used.
+fn resolve_trigger_params(
+    row: &HarvestSchedule,
+    runtime: &HarvestApiRuntime,
+) -> Result<(String, serde_json::Value, String), String> {
+    match (row.workflow_name.as_deref(), row.dag_name.as_deref()) {
+        (Some(wf), _) => {
+            let q = row.queue_name.as_deref().unwrap_or("default").to_string();
+            Ok((
+                wf.to_string(),
+                row.workflow_input
+                    .clone()
+                    .unwrap_or(serde_json::Value::Null),
+                q,
+            ))
+        }
+        (None, Some(dag)) => {
+            let q = runtime
+                .dags()
+                .get(dag)
+                .and_then(|d| d.default_queue.as_deref())
+                .or(row.queue_name.as_deref())
+                .unwrap_or("default")
+                .to_string();
+            Ok((dag.to_string(), serde_json::Value::Null, q))
+        }
+        (None, None) => Err("schedule has no workflow or dag name".to_string()),
+    }
+}
+
+async fn schedule_trigger_now_ui(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id_str): Path<String>,
+) -> axum::response::Response {
+    let found = match find_schedule_row(&api_state, &id_str).await {
+        Ok(f) => f,
+        Err(response) => return response,
+    };
+    let Some((row, _)) = found else {
+        return schedule_redirect(&format!(
+            "Schedule {} not found",
+            &id_str[..8.min(id_str.len())]
+        ));
+    };
+    let name = schedule_name(&row);
+    let runtime = match api_state.runtime() {
+        Ok(r) => r,
+        Err(e) => return schedule_redirect(&format!("Failed to trigger {name}: {e}")),
+    };
+    let (workflow_name, input, queue) = match resolve_trigger_params(&row, &runtime) {
+        Ok(p) => p,
+        Err(e) => return schedule_redirect(&format!("Failed to trigger {name}: {e}")),
+    };
+    let pool = match api_state.storage_pool() {
+        Ok(p) => p,
+        Err(e) => return schedule_redirect(&format!("Failed to trigger {name}: {e}")),
+    };
+    // Use default_pool() so ExecutionId::new() (ShardId::UNENCODED) and the
+    // connection target agree — consistent with the API handler's routing.
+    let mut conn = match acquire_conn(pool.default_pool()).await {
+        Ok(c) => c,
+        Err(e) => return schedule_redirect(&format!("Failed to trigger {name}: {e}")),
+    };
+    execute_schedule_trigger_ui(
+        &mut conn,
+        &pool,
+        &runtime,
+        &row,
+        &id_str,
+        &name,
+        &workflow_name,
+        input,
+        &queue,
+    )
+    .await
+}
+
 async fn schedule_bulk_pause_ui(
     Extension(api_state): Extension<HarvestApiState>,
     Form(params): Form<ScheduleBulkParams>,
@@ -4558,6 +5893,17 @@ fn render_schedule_table(
                                     }
                                 }
                                 form method="post"
+                                    action={ "schedules/" (id_str) "/trigger-now" }
+                                    onsubmit={
+                                        @if row.is_paused {
+                                            "return confirm('This schedule is paused. Force a manual run anyway?')"
+                                        } @else {
+                                            "return confirm('Trigger a one-off run of this schedule now?')"
+                                        }
+                                    } {
+                                    button.secondary type="submit" { "Run now" }
+                                }
+                                form method="post"
                                     action={ "schedules/" (id_str) "/delete" }
                                     onsubmit={ "return confirm('Delete schedule " (id_str) "? This cannot be undone.')" } {
                                     button.danger type="submit" { "Delete" }
@@ -4659,6 +6005,7 @@ fn layout_schedules(title: &str, body: &Markup, refresh: Option<u64>) -> Markup 
                         a href="workers" { "Workers" }
                         a.active href="schedules" { "Schedules" }
                         a href="dead-letters" { "Dead Letters" }
+                        a href="build-routing" { "Build Routing" }
                     }
                 }
                 main { (body) }
@@ -4881,14 +6228,14 @@ mod tests {
     #[test]
     fn build_worker_query_string_empty_defaults() {
         assert_eq!(
-            build_worker_query_string(DEFAULT_PAGE_SIZE, None, None, false),
+            build_worker_query_string(DEFAULT_PAGE_SIZE, None, None, false, None),
             ""
         );
     }
 
     #[test]
     fn build_worker_query_string_includes_all_params() {
-        let q = build_worker_query_string(10, Some("Active"), Some(1), true);
+        let q = build_worker_query_string(10, Some("Active"), Some(1), true, None);
         assert!(q.contains("limit=10"));
         assert!(q.contains("status=Active"));
         assert!(q.contains("shard=1"));
@@ -5332,6 +6679,7 @@ mod tests {
             search_attrs: None,
             created_at: Utc::now(),
             assigned_build_id: None,
+            parent_close_policy: None,
         }
     }
 
@@ -5429,6 +6777,243 @@ mod tests {
         assert!(
             html.contains("500"),
             "custom threshold 500 must appear in HTML"
+        );
+    }
+
+    // ── Build Routing page unit tests (issue #362 — Red Phase) ─────────────
+
+    #[test]
+    fn layout_build_routing_has_active_nav_link() {
+        let body = html! { p { "test" } };
+        let html = layout_build_routing("Build Routing · Vantage", &body, None).into_string();
+        assert!(
+            html.contains("build-routing"),
+            "layout_build_routing must include the build-routing nav link"
+        );
+        // The active link must be present
+        assert!(
+            html.contains("Build Routing"),
+            "layout_build_routing must show 'Build Routing' label"
+        );
+    }
+
+    #[test]
+    fn layout_includes_build_routing_nav_link() {
+        let body = html! { p { "test" } };
+        let html = layout("Test", &body, "").into_string();
+        assert!(
+            html.contains("build-routing"),
+            "base layout must include a Build Routing nav link"
+        );
+    }
+
+    #[test]
+    fn layout_workers_includes_build_routing_nav_link() {
+        let body = html! { p { "test" } };
+        let html = layout_workers("Test", &body, None).into_string();
+        assert!(
+            html.contains("build-routing"),
+            "layout_workers must include a Build Routing nav link"
+        );
+    }
+
+    #[test]
+    fn layout_dead_letters_includes_build_routing_nav_link() {
+        let body = html! { p { "test" } };
+        let html = layout_dead_letters("Test", &body, None).into_string();
+        assert!(
+            html.contains("build-routing"),
+            "layout_dead_letters must include a Build Routing nav link"
+        );
+    }
+
+    #[test]
+    fn layout_schedules_includes_build_routing_nav_link() {
+        let body = html! { p { "test" } };
+        let html = layout_schedules("Test", &body, None).into_string();
+        assert!(
+            html.contains("build-routing"),
+            "layout_schedules must include a Build Routing nav link"
+        );
+    }
+
+    #[test]
+    fn render_build_routing_page_empty_state_shows_docs_link() {
+        let html = render_build_routing_page(&[], &[], &[], &[], &[], &[], false, None, None)
+            .into_string();
+        assert!(
+            html.contains("No build routing configured") || html.contains("No build policies"),
+            "empty state must show a 'no policies' message"
+        );
+        assert!(
+            html.contains("safe-deploy"),
+            "empty state must link to safe-deploy runbook"
+        );
+    }
+
+    #[test]
+    fn render_build_routing_page_shows_policy_details() {
+        let policy = BuildPolicy {
+            id: uuid::Uuid::new_v4(),
+            queue_name: "test-queue".to_string(),
+            build_id: "abc123".to_string(),
+            deployment_name: Some("prod-v2".to_string()),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let html = render_build_routing_page(&[policy], &[], &[], &[], &[], &[], false, None, None)
+            .into_string();
+        assert!(html.contains("test-queue"), "must show queue name");
+        assert!(html.contains("abc123"), "must show build_id");
+        assert!(html.contains("prod-v2"), "must show deployment name");
+    }
+
+    #[test]
+    fn render_build_routing_page_shows_reachability() {
+        let reach = BuildReachability {
+            build_id: "sha-old".to_string(),
+            open_executions: 42,
+            pending_tasks: 5,
+            active_workers: 2,
+            stale_workers: 1,
+            safe_to_retire: false,
+        };
+        let html = render_build_routing_page(&[], &[], &[reach], &[], &[], &[], false, None, None)
+            .into_string();
+        assert!(html.contains("sha-old"), "must show build_id");
+        assert!(html.contains("42"), "must show open_executions count");
+        assert!(
+            html.contains("In use"),
+            "non-safe build must show In use status"
+        );
+    }
+
+    #[test]
+    fn render_build_routing_page_retire_enabled_when_safe() {
+        let reach = BuildReachability {
+            build_id: "sha-done".to_string(),
+            open_executions: 0,
+            pending_tasks: 0,
+            active_workers: 0,
+            stale_workers: 0,
+            safe_to_retire: true,
+        };
+        let html = render_build_routing_page(&[], &[], &[reach], &[], &[], &[], false, None, None)
+            .into_string();
+        assert!(
+            html.contains("Retire"),
+            "retire button must appear when safe_to_retire"
+        );
+        assert!(
+            html.contains("Safe to retire"),
+            "status must show Safe to retire"
+        );
+    }
+
+    #[test]
+    fn render_build_routing_page_shows_compat_entries() {
+        let entry = BuildCompatEntry {
+            id: uuid::Uuid::new_v4(),
+            build_id: "sha-new".to_string(),
+            compatible_with: "sha-old".to_string(),
+            declared_at: chrono::Utc::now(),
+        };
+        let html = render_build_routing_page(&[], &[entry], &[], &[], &[], &[], false, None, None)
+            .into_string();
+        assert!(
+            html.contains("sha-new"),
+            "must show worker build in compat table"
+        );
+        assert!(
+            html.contains("sha-old"),
+            "must show compatible_with in compat table"
+        );
+        assert!(
+            html.contains("Revoke"),
+            "must show revoke button for each entry"
+        );
+    }
+
+    #[test]
+    fn render_build_routing_page_flash_message_shown() {
+        let html = render_build_routing_page(
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            false,
+            Some("Policy updated"),
+            None,
+        )
+        .into_string();
+        assert!(
+            html.contains("Policy updated"),
+            "flash message must appear on page"
+        );
+    }
+
+    #[test]
+    fn render_build_routing_page_has_set_policy_form() {
+        let html = render_build_routing_page(&[], &[], &[], &[], &[], &[], false, None, None)
+            .into_string();
+        assert!(
+            html.contains("set-policy"),
+            "page must include Set Policy form action"
+        );
+        assert!(
+            html.contains("queue_name"),
+            "Set Policy form must include queue_name field"
+        );
+        assert!(
+            html.contains("build_id"),
+            "Set Policy form must include build_id field"
+        );
+    }
+
+    #[test]
+    fn render_build_routing_page_has_declare_compat_form() {
+        let html = render_build_routing_page(&[], &[], &[], &[], &[], &[], false, None, None)
+            .into_string();
+        assert!(
+            html.contains("declare-compat"),
+            "page must include Declare Compat form action"
+        );
+        assert!(
+            html.contains("compatible_with"),
+            "Declare Compat form must include compatible_with field"
+        );
+    }
+
+    #[test]
+    fn render_worker_table_includes_build_id_column() {
+        let html = render_worker_table(&[], ShardId::new(0)).into_string();
+        assert!(
+            html.contains("Build ID"),
+            "worker table header must include Build ID column"
+        );
+        assert!(
+            html.contains("Deployment"),
+            "worker table header must include Deployment column"
+        );
+    }
+
+    #[test]
+    fn render_worker_filters_includes_build_id_filter() {
+        let html = render_worker_filters(None, None, false, None, DEFAULT_PAGE_SIZE).into_string();
+        assert!(
+            html.contains("build_id"),
+            "worker filters must include build_id input"
+        );
+    }
+
+    #[test]
+    fn build_worker_query_string_includes_build_id() {
+        let q = build_worker_query_string(DEFAULT_PAGE_SIZE, None, None, false, Some("abc123"));
+        assert!(
+            q.contains("build_id=abc123"),
+            "query string must include build_id"
         );
     }
 }

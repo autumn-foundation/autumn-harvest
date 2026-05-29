@@ -58,4 +58,108 @@ CLI.
 
 ---
 
+## Lifecycle and parent-close
+
+By default `spawn_child_workflow` *suspends* the parent until the child
+finishes.  Sometimes you want the opposite: launch a child and keep going
+without waiting.  Use `spawn_child_workflow_detached` (or the `_raw`
+variant) and choose what happens to the child when the parent closes.
+
+```rust
+use autumn_harvest::types::ParentClosePolicy;
+```
+
+There are three policies:
+
+| Policy | What happens when the parent reaches a terminal state |
+|--------|------------------------------------------------------|
+| `Abandon` | Child keeps running; nothing changes |
+| `RequestCancel` *(default)* | Child is cancelled gracefully |
+| `Terminate` | Child is force-failed with a `"ParentClosed"` error |
+
+`spawn_child_workflow_detached` returns the child's `ExecutionId`
+immediately.  The parent does **not** suspend — it continues to the next
+line straight away.
+
+### Fan-out: fire many sub-jobs and move on
+
+Use `Abandon` when the parent just wants to kick off independent units of
+work and let them run to completion on their own schedule.
+
+```rust
+#[workflow]
+async fn nightly_report(ctx: &WorkflowContext, tenant_ids: Vec<String>) -> HarvestResult<()> {
+    for tenant_id in tenant_ids {
+        // Each shard runs independently — parent doesn't wait.
+        ctx.spawn_child_workflow_detached(
+            &generate_tenant_report_info(),
+            tenant_id,
+            ParentClosePolicy::Abandon,
+        )?;
+    }
+    // Parent completes here; all children keep running.
+    Ok(())
+}
+```
+
+### Long-lived monitor: side-car that should outlive the parent
+
+`Abandon` also covers "launch once, run forever" patterns — a background
+audit trail, a metrics emitter, or a heartbeat sentinel that has a lifecycle
+independent of the workflow that created it.
+
+```rust
+#[workflow]
+async fn provision_cluster(ctx: &WorkflowContext, cluster_id: String) -> HarvestResult<()> {
+    // Start a long-lived health-check monitor as a sibling.
+    ctx.spawn_child_workflow_detached(
+        &cluster_health_monitor_info(),
+        cluster_id.clone(),
+        ParentClosePolicy::Abandon,
+    )?;
+
+    // Provision resources; monitor runs forever in the background.
+    ctx.execute_activity(&run_terraform_info(), cluster_id).await?;
+    Ok(())
+}
+```
+
+### Tear-down on cancel: cancel child when parent is cancelled
+
+Use `RequestCancel` (the default) when child workflows should be cleaned
+up cooperatively if the parent is cancelled or otherwise closes early.
+
+```rust
+#[workflow]
+async fn reservation_hold(
+    ctx: &WorkflowContext,
+    reservation_id: String,
+) -> HarvestResult<()> {
+    // Spawn a child that holds the seat lock; cancel it if the parent cancels.
+    let lock_id = ctx.spawn_child_workflow_detached(
+        &seat_lock_info(),
+        reservation_id.clone(),
+        ParentClosePolicy::RequestCancel, // the default; shown explicitly for clarity
+    )?;
+
+    // Wait for the user to confirm or for the session to time out.
+    ctx.timer("confirm-deadline", 600).await?;
+
+    // If we get here, confirm the reservation.
+    ctx.execute_activity(&confirm_reservation_info(), reservation_id).await?;
+    Ok(())
+}
+```
+
+If `reservation_hold` is cancelled before the timer fires, the
+`seat_lock` child receives a cancellation request and has a chance to
+release its lock gracefully before stopping.
+
+> **Tip** — `Terminate` is the hard-abort option.  Use it when you need
+> the child gone immediately and cooperative shutdown is not viable.  The
+> child is moved to `FAILED` with `error = "ParentClosed"` and all its
+> pending tasks are cancelled without running any clean-up activities.
+
+---
+
 [← Signals](04-signals.md) · [Index](README.md) · [Next: Idempotency →](06-idempotency.md)

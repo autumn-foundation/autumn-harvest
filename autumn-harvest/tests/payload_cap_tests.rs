@@ -34,6 +34,9 @@ fn fake_activity_info(name: &'static str) -> ActivityInfo {
         is_local: false,
         max_input_bytes: None,
         max_result_bytes: None,
+        rate_limit_rps: None,
+        rate_limit_burst: None,
+        rate_limit_key: None,
         handler: |_ctx, input| Box::pin(async move { Ok(input) }),
     }
 }
@@ -251,6 +254,9 @@ fn activity_info_has_max_input_and_result_bytes_fields() {
         is_local: false,
         max_input_bytes: Some(4 * 1024 * 1024),
         max_result_bytes: Some(8 * 1024 * 1024),
+        rate_limit_rps: None,
+        rate_limit_burst: None,
+        rate_limit_key: None,
         handler: |_ctx, input| Box::pin(async move { Ok(input) }),
     };
     assert_eq!(info.max_input_bytes, Some(4 * 1024 * 1024));

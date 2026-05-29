@@ -16,9 +16,11 @@
 use std::future::Future;
 use std::pin::Pin;
 
+use autumn_harvest::ExecutionId;
 use autumn_harvest::context::WorkflowContext;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::testing::{ReplayStatus, WorkflowTestEnv};
+use autumn_harvest::types::ParentClosePolicy;
 use serde_json::{Value, json};
 
 // ──────────────────────────── workflow helpers ────────────────────────────────
@@ -136,6 +138,108 @@ fn cancellable_workflow<'a>(
             .await
             .map_err(|e| e.to_string())?;
         Ok(result)
+    })
+}
+
+fn terminal_detached_spawn_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let child_id = ctx
+            .spawn_child_workflow_detached_raw(
+                "terminal_detached_child",
+                json!({"mode": "audit"}),
+                ParentClosePolicy::Abandon,
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(json!({ "child_id": child_id.to_string() }))
+    })
+}
+
+fn terminal_policy_detached_spawns_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let request_cancel_child = ctx
+            .spawn_child_workflow_detached_raw(
+                "terminal_request_cancel_child",
+                json!({"mode": "request_cancel"}),
+                ParentClosePolicy::RequestCancel,
+            )
+            .map_err(|e| e.to_string())?;
+        let terminate_child = ctx
+            .spawn_child_workflow_detached_raw(
+                "terminal_terminate_child",
+                json!({"mode": "terminate"}),
+                ParentClosePolicy::Terminate,
+            )
+            .map_err(|e| e.to_string())?;
+        let abandoned_child = ctx
+            .spawn_child_workflow_detached_raw(
+                "terminal_abandoned_child",
+                json!({"mode": "abandon"}),
+                ParentClosePolicy::Abandon,
+            )
+            .map_err(|e| e.to_string())?;
+
+        Ok(json!({
+            "request_cancel_child": request_cancel_child.to_string(),
+            "terminate_child": terminate_child.to_string(),
+            "abandoned_child": abandoned_child.to_string(),
+        }))
+    })
+}
+
+fn activity_and_detached_spawn_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let activity = ctx.execute_activity_raw("batched_work", Value::Null, "default");
+        let detached = async {
+            ctx.spawn_child_workflow_detached_raw(
+                "batched_detached_child",
+                json!({"mode": "audit"}),
+                ParentClosePolicy::Abandon,
+            )
+            .map_err(|e| e.to_string())
+        };
+        let (activity, child_id) = tokio::join!(activity, detached);
+        let activity = activity.map_err(|e| e.to_string())?;
+        let child_id = child_id?;
+
+        Ok(json!({
+            "activity": activity,
+            "child_id": child_id.to_string(),
+        }))
+    })
+}
+
+fn signal_and_detached_spawn_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let target = ExecutionId::from_uuid(
+            uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000123")
+                .map_err(|e| e.to_string())?,
+        );
+        let signal = ctx.signal_external_workflow(target, "refresh", json!({"ok": true}));
+        let detached = async {
+            ctx.spawn_child_workflow_detached_raw(
+                "signal_detached_child",
+                json!({"mode": "audit"}),
+                ParentClosePolicy::Abandon,
+            )
+            .map_err(|e| e.to_string())
+        };
+        let (signal, child_id) = tokio::join!(signal, detached);
+        signal.map_err(|e| e.to_string())?;
+        let child_id = child_id?;
+
+        Ok(json!({ "child_id": child_id.to_string() }))
     })
 }
 
@@ -279,6 +383,199 @@ async fn test_child_workflow_stub() {
             .iter()
             .any(|e| matches!(e, WorkflowEvent::ChildWorkflowCompleted { .. })),
         "expected ChildWorkflowCompleted"
+    );
+}
+
+#[tokio::test]
+async fn test_terminal_detached_spawn_records_history_event() {
+    let outcome = WorkflowTestEnv::new()
+        .run(terminal_detached_spawn_workflow, json!(null))
+        .await;
+
+    assert!(outcome.result.is_ok());
+    let events = outcome.events();
+    assert!(
+        events.iter().any(|event| {
+            matches!(
+                event,
+                WorkflowEvent::ChildWorkflowSpawnedDetached {
+                    workflow_name,
+                    input,
+                    parent_close_policy,
+                    ..
+                } if workflow_name == "terminal_detached_child"
+                    && input == &json!({"mode": "audit"})
+                    && *parent_close_policy == ParentClosePolicy::Abandon
+            )
+        }),
+        "terminal detached spawns must be recorded before WorkflowCompleted: {events:?}"
+    );
+    let spawn_pos = events
+        .iter()
+        .position(|event| matches!(event, WorkflowEvent::ChildWorkflowSpawnedDetached { .. }))
+        .expect("spawn event should exist");
+    let completed_pos = events
+        .iter()
+        .position(|event| matches!(event, WorkflowEvent::WorkflowCompleted { .. }))
+        .expect("workflow completed event should exist");
+    assert!(
+        spawn_pos < completed_pos,
+        "detached spawn should precede terminal event: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_terminal_detached_spawn_records_parent_close_cascades() {
+    let outcome = WorkflowTestEnv::new()
+        .run(terminal_policy_detached_spawns_workflow, json!(null))
+        .await;
+
+    assert!(outcome.result.is_ok());
+    let events = outcome.events();
+    let completed_pos = events
+        .iter()
+        .position(|event| matches!(event, WorkflowEvent::WorkflowCompleted { .. }))
+        .expect("workflow completed event should exist");
+    let request_cancel_child = events
+        .iter()
+        .find_map(|event| match event {
+            WorkflowEvent::ChildWorkflowSpawnedDetached {
+                child_id,
+                workflow_name,
+                ..
+            } if workflow_name == "terminal_request_cancel_child" => Some(*child_id),
+            _ => None,
+        })
+        .expect("request-cancel detached spawn should exist");
+    let terminate_child = events
+        .iter()
+        .find_map(|event| match event {
+            WorkflowEvent::ChildWorkflowSpawnedDetached {
+                child_id,
+                workflow_name,
+                ..
+            } if workflow_name == "terminal_terminate_child" => Some(*child_id),
+            _ => None,
+        })
+        .expect("terminate detached spawn should exist");
+    let abandoned_child = events
+        .iter()
+        .find_map(|event| match event {
+            WorkflowEvent::ChildWorkflowSpawnedDetached {
+                child_id,
+                workflow_name,
+                ..
+            } if workflow_name == "terminal_abandoned_child" => Some(*child_id),
+            _ => None,
+        })
+        .expect("abandoned detached spawn should exist");
+
+    let cascades = events
+        .iter()
+        .enumerate()
+        .filter_map(|(pos, event)| match event {
+            WorkflowEvent::ChildWorkflowCascadeApplied {
+                child_id,
+                policy,
+                action,
+            } => Some((pos, *child_id, *policy, action.as_str())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        cascades.len(),
+        2,
+        "only non-Abandon detached children should cascade: {events:?}"
+    );
+    assert!(cascades.iter().all(|(pos, ..)| *pos > completed_pos));
+    assert!(cascades.iter().any(|(_, child_id, policy, action)| {
+        *child_id == request_cancel_child
+            && *policy == ParentClosePolicy::RequestCancel
+            && *action == "request_cancel"
+    }));
+    assert!(cascades.iter().any(|(_, child_id, policy, action)| {
+        *child_id == terminate_child
+            && *policy == ParentClosePolicy::Terminate
+            && *action == "terminate"
+    }));
+    assert!(
+        !cascades
+            .iter()
+            .any(|(_, child_id, _, _)| *child_id == abandoned_child),
+        "Abandon detached child should not receive a cascade event: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_detached_spawn_is_recorded_before_activity_terminal_in_batch() {
+    let outcome = WorkflowTestEnv::new()
+        .mock_activity("batched_work", |_| Ok(json!({"ok": true})))
+        .run(activity_and_detached_spawn_workflow, json!(null))
+        .await;
+
+    assert!(outcome.result.is_ok());
+    let events = outcome.events();
+    let scheduled_pos = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                WorkflowEvent::ActivityScheduled { name, .. } if name == "batched_work"
+            )
+        })
+        .expect("activity should be scheduled");
+    let detached_pos = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                WorkflowEvent::ChildWorkflowSpawnedDetached { workflow_name, .. }
+                    if workflow_name == "batched_detached_child"
+            )
+        })
+        .expect("detached child spawn should be recorded");
+    let completed_pos = events
+        .iter()
+        .position(|event| matches!(event, WorkflowEvent::ActivityCompleted { .. }))
+        .expect("activity should complete");
+
+    assert!(
+        scheduled_pos < detached_pos && detached_pos < completed_pos,
+        "detached spawn should be recorded between activity schedule and terminal: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_signal_terminal_is_recorded_before_detached_spawn_in_batch() {
+    let outcome = WorkflowTestEnv::new()
+        .run(signal_and_detached_spawn_workflow, json!(null))
+        .await;
+
+    assert!(outcome.result.is_ok());
+    let events = outcome.events();
+    let requested_pos = events
+        .iter()
+        .position(|event| matches!(event, WorkflowEvent::ExternalSignalRequested { .. }))
+        .expect("external signal request should be recorded");
+    let delivered_pos = events
+        .iter()
+        .position(|event| matches!(event, WorkflowEvent::ExternalSignalDelivered { .. }))
+        .expect("external signal delivery should be recorded");
+    let detached_pos = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                WorkflowEvent::ChildWorkflowSpawnedDetached { workflow_name, .. }
+                    if workflow_name == "signal_detached_child"
+            )
+        })
+        .expect("detached child spawn should be recorded");
+
+    assert!(
+        requested_pos < delivered_pos && delivered_pos < detached_pos,
+        "test history must mirror production mixed-signal order: {events:?}"
     );
 }
 

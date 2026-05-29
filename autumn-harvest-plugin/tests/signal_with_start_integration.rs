@@ -71,8 +71,28 @@ const INIT_SQL: &str = concat!(
         "../../autumn-harvest/migrations/20260518000000_harvest_signal_idempotency/up.sql"
     ),
     "\n",
+    include_str!("../../autumn-harvest/migrations/20260517000000_harvest_schedule_jitter/up.sql"),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260517000001_harvest_schedule_overlap_policy/up.sql"
+    ),
+    "\n",
     include_str!(
         "../../autumn-harvest/migrations/20260518000001_harvest_workflow_execution_timeout/up.sql"
+    ),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260519000000_harvest_calendar_awareness/up.sql"
+    ),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260522000000_harvest_schedule_decisions/up.sql"
+    ),
+    "\n",
+    include_str!("../../autumn-harvest/migrations/20260522000001_harvest_rate_limiting/up.sql"),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260526000001_harvest_parent_close_policy/up.sql"
     ),
 );
 

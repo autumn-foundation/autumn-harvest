@@ -351,7 +351,9 @@ impl MermaidExporter {
                 }
                 WorkflowEvent::ChildWorkflowStarted { .. }
                 | WorkflowEvent::ChildWorkflowCompleted { .. }
-                | WorkflowEvent::ChildWorkflowFailed { .. } => {
+                | WorkflowEvent::ChildWorkflowFailed { .. }
+                | WorkflowEvent::ChildWorkflowSpawnedDetached { .. }
+                | WorkflowEvent::ChildWorkflowCascadeApplied { .. } => {
                     self.handle_child_workflow_event(event)?;
                 }
                 WorkflowEvent::SignalReceived { .. } | WorkflowEvent::MarkerRecorded { .. } => {
@@ -569,6 +571,33 @@ impl MermaidExporter {
                 writeln!(
                     self.out,
                     "    Note right of WF: Child Workflow Failed (ID: {child_id}): {safe_error}"
+                )?;
+            }
+            WorkflowEvent::ChildWorkflowSpawnedDetached {
+                child_id,
+                workflow_name,
+                parent_close_policy,
+                ..
+            } => {
+                let participant = format!("Child_{workflow_name}");
+                if self.participants.insert(participant.clone()) {
+                    writeln!(
+                        self.out,
+                        "    participant {participant} as Child: {workflow_name}"
+                    )?;
+                }
+                writeln!(
+                    self.out,
+                    "    WF-->>{participant}: Spawn Detached (ID: {child_id}, policy: {policy})",
+                    policy = parent_close_policy.as_str(),
+                )?;
+            }
+            WorkflowEvent::ChildWorkflowCascadeApplied {
+                child_id, action, ..
+            } => {
+                writeln!(
+                    self.out,
+                    "    Note right of WF: Cascade Applied to Child {child_id}: {action}"
                 )?;
             }
             _ => unreachable!(),

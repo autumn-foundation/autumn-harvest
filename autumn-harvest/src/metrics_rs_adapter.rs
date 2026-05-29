@@ -45,11 +45,13 @@ use metrics::{counter, gauge, histogram};
 
 use crate::telemetry::{
     ActivityStatus, METRIC_ACTIVITY_DURATION, METRIC_ACTIVITY_FAILED, METRIC_DLQ_ENTRIES,
-    METRIC_LABEL_ACTIVITY, METRIC_LABEL_ERROR_TYPE, METRIC_LABEL_KEY, METRIC_LABEL_KIND,
-    METRIC_LABEL_NAME, METRIC_LABEL_NON_RETRYABLE, METRIC_LABEL_QUERY, METRIC_LABEL_QUEUE,
-    METRIC_LABEL_REASON, METRIC_LABEL_SHARD, METRIC_LABEL_STATUS, METRIC_LABEL_WORKFLOW,
-    METRIC_LABEL_WORKFLOW_TYPE, METRIC_QUERY_DURATION, METRIC_QUEUE_DEPTH,
-    METRIC_RETENTION_DELETED, METRIC_SCHEDULE_DECISION_WRITE_FAILED, METRIC_SCHEDULE_RUNS,
+    METRIC_EXTERNAL_SIGNAL_SENT, METRIC_LABEL_ACTIVITY, METRIC_LABEL_ERROR_TYPE, METRIC_LABEL_KEY,
+    METRIC_LABEL_KIND, METRIC_LABEL_NAME, METRIC_LABEL_NON_RETRYABLE, METRIC_LABEL_OUTCOME,
+    METRIC_LABEL_QUERY, METRIC_LABEL_QUEUE, METRIC_LABEL_REASON, METRIC_LABEL_REASON_CODE,
+    METRIC_LABEL_SHARD, METRIC_LABEL_STATUS, METRIC_LABEL_WORKFLOW, METRIC_LABEL_WORKFLOW_TYPE,
+    METRIC_QUERY_DURATION, METRIC_QUEUE_DEPTH, METRIC_RATE_LIMIT_REFILL_RATE,
+    METRIC_RATE_LIMIT_THROTTLED, METRIC_RATE_LIMIT_TOKENS_AVAILABLE, METRIC_RETENTION_DELETED,
+    METRIC_SCHEDULE_DECISION_WRITE_FAILED, METRIC_SCHEDULE_MANUAL_TRIGGER, METRIC_SCHEDULE_RUNS,
     METRIC_SCHEDULE_SKIPPED, METRIC_TIMER_DURATION, METRIC_TIMER_STARTED,
     METRIC_WORKFLOW_CACHE_HIT, METRIC_WORKFLOW_CACHE_MISS, METRIC_WORKFLOW_CONTINUE_AS_NEW,
     METRIC_WORKFLOW_DURATION, METRIC_WORKFLOW_HISTORY_SIZE, METRIC_WORKFLOW_STARTED,
@@ -268,6 +270,56 @@ impl MetricsRecorder for MetricsRsRecorder {
         )
         .increment(1);
     }
+
+    fn record_external_signal_sent(&self, outcome: &str, reason_code: Option<&str>) {
+        if let Some(reason) = reason_code {
+            counter!(
+                METRIC_EXTERNAL_SIGNAL_SENT,
+                METRIC_LABEL_OUTCOME => outcome.to_owned(),
+                METRIC_LABEL_REASON_CODE => reason.to_owned(),
+            )
+            .increment(1);
+        } else {
+            counter!(
+                METRIC_EXTERNAL_SIGNAL_SENT,
+                METRIC_LABEL_OUTCOME => outcome.to_owned(),
+            )
+            .increment(1);
+        }
+    }
+
+    fn record_rate_limit_tokens_available(&self, key: &str, tokens: f64) {
+        gauge!(
+            METRIC_RATE_LIMIT_TOKENS_AVAILABLE,
+            METRIC_LABEL_KEY => key.to_owned(),
+        )
+        .set(tokens);
+    }
+
+    fn record_rate_limit_refill_rate(&self, key: &str, refill_rate: f64) {
+        gauge!(
+            METRIC_RATE_LIMIT_REFILL_RATE,
+            METRIC_LABEL_KEY => key.to_owned(),
+        )
+        .set(refill_rate);
+    }
+
+    fn record_rate_limit_throttled(&self, key: &str) {
+        counter!(
+            METRIC_RATE_LIMIT_THROTTLED,
+            METRIC_LABEL_KEY => key.to_owned(),
+        )
+        .increment(1);
+    }
+
+    fn record_schedule_manual_trigger(&self, schedule_name: &str, outcome: &str) {
+        counter!(
+            METRIC_SCHEDULE_MANUAL_TRIGGER,
+            METRIC_LABEL_NAME => schedule_name.to_owned(),
+            METRIC_LABEL_OUTCOME => outcome.to_owned(),
+        )
+        .increment(1);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -317,6 +369,9 @@ mod tests {
         rec.record_concurrency_key_deferred("cap", 1);
         rec.record_workflow_cache_hit("wf", "q");
         rec.record_workflow_cache_miss("wf", "q");
+        rec.record_rate_limit_tokens_available("rl", 10.0);
+        rec.record_rate_limit_refill_rate("rl", 2.0);
+        rec.record_rate_limit_throttled("rl");
     }
 
     #[test]

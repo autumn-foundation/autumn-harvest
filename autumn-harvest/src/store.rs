@@ -47,6 +47,17 @@ pub struct WorkflowChildCursor {
     pub exec_id: uuid::Uuid,
 }
 
+/// Whether a child workflow was spawned in await or detached mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AwaitMode {
+    /// Parent suspended until the child's terminal result (classic spawn).
+    Awaited,
+    /// Parent did not suspend; child runs independently under a parent-close
+    /// policy.
+    Detached,
+}
+
 /// Operator-facing child workflow row used by management API read models.
 #[derive(Debug, Clone)]
 pub struct WorkflowChildRow {
@@ -58,6 +69,11 @@ pub struct WorkflowChildRow {
     pub error_summary: Option<String>,
     pub shard_id: i32,
     pub depth: u8,
+    /// How this child was spawned (awaited or detached).
+    pub await_mode: AwaitMode,
+    /// For detached children, the policy applied when the parent closes. `None`
+    /// for awaited children.
+    pub parent_close_policy: Option<crate::types::ParentClosePolicy>,
 }
 
 type WorkflowChildProjection = (
@@ -68,6 +84,7 @@ type WorkflowChildProjection = (
     Option<chrono::DateTime<chrono::Utc>>,
     Option<String>,
     i32,
+    Option<String>,
 );
 
 /// Convert in-memory events to insertable rows with sequential event IDs
@@ -478,6 +495,7 @@ pub async fn load_workflow_children(
             harvest_workflow_executions::completed_at,
             harvest_workflow_executions::error,
             harvest_workflow_executions::shard_id,
+            harvest_workflow_executions::parent_close_policy,
         ))
         .load::<WorkflowChildProjection>(conn)
         .await
@@ -485,7 +503,16 @@ pub async fn load_workflow_children(
         .map(|rows| {
             rows.into_iter()
                 .map(
-                    |(id, workflow_name, state, started_at, completed_at, error, shard_id)| {
+                    |(
+                        id,
+                        workflow_name,
+                        state,
+                        started_at,
+                        completed_at,
+                        error,
+                        shard_id,
+                        parent_close_policy,
+                    )| {
                         workflow_child_row_from_parts(
                             id,
                             workflow_name,
@@ -495,6 +522,7 @@ pub async fn load_workflow_children(
                             error,
                             shard_id,
                             depth,
+                            parent_close_policy.as_deref(),
                         )
                     },
                 )
@@ -512,7 +540,15 @@ fn workflow_child_row_from_parts(
     error: Option<String>,
     shard_id: i32,
     depth: u8,
+    parent_close_policy_str: Option<&str>,
 ) -> WorkflowChildRow {
+    let parent_close_policy =
+        parent_close_policy_str.and_then(|s| s.parse::<crate::types::ParentClosePolicy>().ok());
+    let await_mode = if parent_close_policy.is_some() {
+        AwaitMode::Detached
+    } else {
+        AwaitMode::Awaited
+    };
     WorkflowChildRow {
         exec_id: ExecutionId::from_uuid(id),
         workflow_name,
@@ -522,6 +558,8 @@ fn workflow_child_row_from_parts(
         error_summary: summarize_error(error),
         shard_id,
         depth,
+        await_mode,
+        parent_close_policy,
     }
 }
 

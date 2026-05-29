@@ -99,6 +99,13 @@ pub const METRIC_SCHEDULE_RUNS: &str = "harvest.schedule.runs";
 /// Counter: incremented each time a scheduled run is skipped.
 pub const METRIC_SCHEDULE_SKIPPED: &str = "harvest.schedule.skipped";
 
+/// Counter: incremented each time `POST /admin/schedules/{id}/trigger` fires a
+/// one-off run (issue #343).
+///
+/// Labels: `schedule.name` (low-cardinality), `outcome` (`"fired"` or
+/// `"skipped_overlap"` or `"rejected_paused"`).
+pub const METRIC_SCHEDULE_MANUAL_TRIGGER: &str = "harvest.schedule.manual_trigger";
+
 /// Counter: incremented when a schedule decision write fails due to a database error.
 pub const METRIC_SCHEDULE_DECISION_WRITE_FAILED: &str = "harvest.schedule.decision_write_failed";
 
@@ -149,6 +156,9 @@ pub const ATTR_SIGNAL_NAME: &str = "harvest.signal.name";
 /// never be used as a metric label.
 pub const ATTR_TARGET_EXECUTION_ID: &str = "harvest.target.execution.id";
 
+/// OpenTelemetry span attribute: the signal ID for external signal spans.
+pub const ATTR_SIGNAL_ID: &str = "harvest.signal.id";
+
 /// Counter: incremented when a workflow execution is terminated because its
 /// `deadline_at` elapsed before the workflow completed.
 ///
@@ -177,6 +187,15 @@ pub const METRIC_PAYLOAD_BYTES: &str = "harvest.payload.bytes";
 ///
 /// Per ADR-0001 §7, `execution.id` is span-only.
 pub const METRIC_PAYLOAD_REJECTED: &str = "harvest.payload.rejected";
+
+/// Gauge: current available tokens in a rate limit bucket.
+pub const METRIC_RATE_LIMIT_TOKENS_AVAILABLE: &str = "harvest.rate_limit.tokens_available";
+
+/// Gauge: refill rate (tokens per second) for a rate limit bucket.
+pub const METRIC_RATE_LIMIT_REFILL_RATE: &str = "harvest.rate_limit.refill_rate";
+
+/// Counter: incremented when a task claim is throttled/skipped due to rate limiting.
+pub const METRIC_RATE_LIMIT_THROTTLED: &str = "harvest.rate_limit.throttled";
 
 // ---------------------------------------------------------------------------
 // Metric label key constants
@@ -212,6 +231,10 @@ pub const METRIC_LABEL_REASON: &str = "reason";
 pub const METRIC_LABEL_KEY: &str = "key";
 /// Metric label: the query handler name (`query.name`).
 pub const METRIC_LABEL_QUERY: &str = "query.name";
+/// Metric label: terminal outcome (e.g. `"delivered"`, `"failed"`).
+pub const METRIC_LABEL_OUTCOME: &str = "outcome";
+/// Metric label: reason code for external signal failure.
+pub const METRIC_LABEL_REASON_CODE: &str = "reason_code";
 
 // ---------------------------------------------------------------------------
 // TraceContextCarrier
@@ -557,6 +580,27 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = (key, deferred);
     }
 
+    /// Record the current available tokens for a rate limit bucket key.
+    ///
+    /// Maps to the gauge `harvest.rate_limit.tokens_available{key}`.
+    fn record_rate_limit_tokens_available(&self, key: &str, tokens: f64) {
+        let _ = (key, tokens);
+    }
+
+    /// Record the refill rate (tokens per second) for a rate limit bucket key.
+    ///
+    /// Maps to the gauge `harvest.rate_limit.refill_rate{key}`.
+    fn record_rate_limit_refill_rate(&self, key: &str, refill_rate: f64) {
+        let _ = (key, refill_rate);
+    }
+
+    /// Record that a task claim was throttled/skipped due to rate limiting.
+    ///
+    /// Maps to the counter `harvest.rate_limit.throttled{key}`.
+    fn record_rate_limit_throttled(&self, key: &str) {
+        let _ = key;
+    }
+
     /// Current number of entries in the dead-letter queue on one shard.
     ///
     /// Emitted by a periodic background sampler on the same cadence as
@@ -591,6 +635,17 @@ pub trait MetricsRecorder: Send + Sync {
     ///
     /// Maps to the counter `harvest.schedule.decision_write_failed`.
     fn record_schedule_decision_write_failed(&self) {}
+
+    /// A manual `POST /admin/schedules/{id}/trigger` call completed (issue #343).
+    ///
+    /// `schedule_name` is the workflow or DAG name the schedule targets
+    /// (low-cardinality, same cardinality as `record_schedule_run`).
+    /// `outcome` is `"fired"`, `"skipped_overlap"`, or `"rejected_paused"`.
+    ///
+    /// Maps to the counter `harvest.schedule.manual_trigger{schedule.name, outcome}`.
+    fn record_schedule_manual_trigger(&self, schedule_name: &str, outcome: &str) {
+        let _ = (schedule_name, outcome);
+    }
 
     /// A query handler invocation completed (issue #234).
     ///
@@ -660,6 +715,15 @@ pub trait MetricsRecorder: Send + Sync {
     /// `payload.kind` and `workflow.type`.
     fn record_payload_rejected(&self, kind: &crate::error::PayloadKind, workflow_type: &str) {
         let _ = (kind, workflow_type);
+    }
+
+    /// A cross-workflow external signal was sent.
+    ///
+    /// Maps to the counter `harvest.workflow.external_signal.sent` with attributes:
+    /// - `outcome`: `"delivered"` or `"failed"`
+    /// - `reason_code`: `"target_terminal"` or `"target_unknown"` (optional)
+    fn record_external_signal_sent(&self, outcome: &str, reason_code: Option<&str>) {
+        let _ = (outcome, reason_code);
     }
 }
 
