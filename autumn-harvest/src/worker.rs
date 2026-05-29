@@ -4113,11 +4113,10 @@ async fn process_workflow_task(
                 );
                 drop(execute_span);
                 let items = extract_signal_external_workflow(commands);
-                let items_clone = items.clone();
                 let new_events = match persist_external_signal_inline(
                     conn,
                     prepared.exec_id,
-                    items,
+                    items.clone(),
                     &mut next_event_id,
                 )
                 .await
@@ -4128,7 +4127,7 @@ async fn process_workflow_task(
                             .await;
                     }
                 };
-                history_events.extend(new_events.clone());
+                history_events.extend(new_events.iter().cloned());
                 let current_history_event_count =
                     u64::try_from(history_events.len()).unwrap_or(u64::MAX);
                 if let Some(cap) = registry.history_policy().event_hard_cap()
@@ -4152,7 +4151,7 @@ async fn process_workflow_task(
                 // If any signal in the batch was not resolved inline (remains pending/suspended),
                 // we must break the loop and suspend the workflow task.
                 let mut all_resolved = true;
-                for item in &items_clone {
+                for item in &items {
                     if let SignalBatchItem::Signal(run) = item {
                         let resolved = new_events.iter().any(|e| match e {
                             WorkflowEvent::ExternalSignalDelivered { signal_id }
@@ -4169,8 +4168,8 @@ async fn process_workflow_task(
                 }
 
                 if !all_resolved {
-                    let mut reconstructed_commands = Vec::with_capacity(items_clone.len());
-                    for item in items_clone {
+                    let mut reconstructed_commands = Vec::with_capacity(items.len());
+                    for item in items {
                         match item {
                             SignalBatchItem::Marker(_) => {
                                 // Already persisted via persist_external_signal_inline.
