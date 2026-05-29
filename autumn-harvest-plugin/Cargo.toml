@@ -43,6 +43,7 @@ tower = "0.5"
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
 tracing-subscriber = "0.3"
+axum = "0.8.9"
 
 [lints]
 workspace = true
