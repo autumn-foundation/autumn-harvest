@@ -20,6 +20,7 @@ use autumn_harvest::context::WorkflowContext;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::testing::{ReplayStatus, WorkflowTestEnv};
 use autumn_harvest::types::ParentClosePolicy;
+use autumn_harvest::ExecutionId;
 use serde_json::{Value, json};
 
 // ──────────────────────────── workflow helpers ────────────────────────────────
@@ -178,6 +179,32 @@ fn activity_and_detached_spawn_workflow<'a>(
             "activity": activity,
             "child_id": child_id.to_string(),
         }))
+    })
+}
+
+fn signal_and_detached_spawn_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let target = ExecutionId::from_uuid(
+            uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000123")
+                .map_err(|e| e.to_string())?,
+        );
+        let signal = ctx.signal_external_workflow(target, "refresh", json!({"ok": true}));
+        let detached = async {
+            ctx.spawn_child_workflow_detached_raw(
+                "signal_detached_child",
+                json!({"mode": "audit"}),
+                ParentClosePolicy::Abandon,
+            )
+            .map_err(|e| e.to_string())
+        };
+        let (signal, child_id) = tokio::join!(signal, detached);
+        signal.map_err(|e| e.to_string())?;
+        let child_id = child_id?;
+
+        Ok(json!({ "child_id": child_id.to_string() }))
     })
 }
 
@@ -398,6 +425,39 @@ async fn test_detached_spawn_is_recorded_before_activity_terminal_in_batch() {
     assert!(
         scheduled_pos < detached_pos && detached_pos < completed_pos,
         "detached spawn should be recorded between activity schedule and terminal: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_signal_terminal_is_recorded_before_detached_spawn_in_batch() {
+    let outcome = WorkflowTestEnv::new()
+        .run(signal_and_detached_spawn_workflow, json!(null))
+        .await;
+
+    assert!(outcome.result.is_ok());
+    let events = outcome.events();
+    let requested_pos = events
+        .iter()
+        .position(|event| matches!(event, WorkflowEvent::ExternalSignalRequested { .. }))
+        .expect("external signal request should be recorded");
+    let delivered_pos = events
+        .iter()
+        .position(|event| matches!(event, WorkflowEvent::ExternalSignalDelivered { .. }))
+        .expect("external signal delivery should be recorded");
+    let detached_pos = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                WorkflowEvent::ChildWorkflowSpawnedDetached { workflow_name, .. }
+                    if workflow_name == "signal_detached_child"
+            )
+        })
+        .expect("detached child spawn should be recorded");
+
+    assert!(
+        requested_pos < delivered_pos && delivered_pos < detached_pos,
+        "test history must mirror production mixed-signal order: {events:?}"
     );
 }
 

@@ -14,6 +14,7 @@ use uuid::Uuid;
 
 use crate::error::{HarvestError, database_error};
 use crate::event::WorkflowEvent;
+use crate::execution::apply_parent_close_cascade;
 use crate::models::{HarvestEvent, NewWorkflowExecution, WorkflowExecution};
 use crate::queue::{self, EnqueueParams, TaskType};
 use crate::schema::{
@@ -718,6 +719,7 @@ async fn terminate_source_execution(
         .execute(conn)
         .await
         .map_err(database_error)?;
+    apply_parent_close_cascade(conn, source_exec_id).await?;
 
     Ok(())
 }

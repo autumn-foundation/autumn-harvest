@@ -19,11 +19,12 @@ use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfi
 use autumn_harvest::{
     ExecutionId, Priority, ShardId, StartWorkflowParams, TelemetryConfig, TraceContextCarrier,
     TraceContextPropagator, WorkflowContext, WorkflowHistoryPolicy, cancel_workflow_execution,
-    start_or_load_workflow_execution, timeout,
+    WorkflowResetRequest, reset_workflow_execution, start_or_load_workflow_execution, timeout,
 };
 use chrono::Utc;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
+use diesel_async::SimpleAsyncConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use serde_json::Value;
 use testcontainers::ContainerAsync;
@@ -44,6 +45,10 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260430000001_harvest_external_tasks/up.sql"),
     "\n",
     include_str!("../migrations/20260508000000_harvest_external_task_updated_at/up.sql"),
+    "\n",
+    include_str!("../migrations/20260503000000_harvest_workflow_reset/up.sql"),
+    "\n",
+    include_str!("../migrations/20260504000000_harvest_workflow_parent_children/up.sql"),
     "\n",
     include_str!("../migrations/20260501000000_harvest_workers/up.sql"),
     "\n",
@@ -332,6 +337,40 @@ async fn insert_detached_child_execution(
     .expect("detached child started event should append");
 
     child_exec_id
+}
+
+async fn force_parent_close_transition_to_lose(
+    conn: &mut AsyncPgConnection,
+    child_exec_id: ExecutionId,
+) {
+    let suffix = child_exec_id.as_uuid().simple().to_string();
+    let sql = format!(
+        r"
+CREATE OR REPLACE FUNCTION skip_parent_close_transition_{suffix}()
+RETURNS trigger AS $$
+BEGIN
+    IF OLD.id = '{child_id}'::uuid
+       AND OLD.state = 'RUNNING'
+       AND NEW.state IN ('CANCELLED', 'FAILED')
+       AND NEW.error IN ('parent closed', 'ParentClosed') THEN
+        RETURN NULL;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER skip_parent_close_transition_{suffix}
+BEFORE UPDATE ON harvest_workflow_executions
+FOR EACH ROW
+EXECUTE FUNCTION skip_parent_close_transition_{suffix}();
+",
+        suffix = suffix,
+        child_id = child_exec_id.as_uuid(),
+    );
+
+    conn.batch_execute(&sql)
+        .await
+        .expect("race trigger should install");
 }
 
 async fn wait_for_child_execution(
@@ -990,6 +1029,93 @@ async fn parent_terminate_cascade_applies_child_descendant_policy() {
 
     wait_for_state(&mut conn, child_exec_id, &["FAILED"]).await;
     wait_for_state(&mut conn, grandchild_exec_id, &["CANCELLED"]).await;
+}
+
+#[tokio::test]
+async fn cascade_records_child_events_only_after_winning_child_transition() {
+    let (url, _container) = setup_test_db_url().await;
+
+    let mut conn = AsyncPgConnection::establish(&url)
+        .await
+        .expect("connect failed");
+    let parent_exec_id = start_workflow(
+        &mut conn,
+        "manual_parent_for_lost_cascade",
+        "manual-parent-lost-cascade-001",
+        Value::Null,
+    )
+    .await;
+    let child_exec_id = insert_detached_child_execution(
+        &mut conn,
+        parent_exec_id,
+        "manual_child_for_lost_cascade",
+        "manual-child-lost-cascade-001",
+        ParentClosePolicy::RequestCancel,
+    )
+    .await;
+    force_parent_close_transition_to_lose(&mut conn, child_exec_id).await;
+
+    cancel_workflow_execution(&mut conn, parent_exec_id, "operator closed parent")
+        .await
+        .expect("parent cancellation should succeed despite lost child transition");
+
+    let child_history = load_history_events(&mut conn, child_exec_id).await;
+    assert!(
+        !child_history
+            .iter()
+            .any(|event| matches!(event, WorkflowEvent::WorkflowCancelled { .. })),
+        "cascade must not append child cancellation when the guarded child update affects zero rows: {child_history:?}"
+    );
+
+    let parent_history = load_history_events(&mut conn, parent_exec_id).await;
+    assert!(
+        !parent_history.iter().any(|event| matches!(
+            event,
+            WorkflowEvent::ChildWorkflowCascadeApplied { child_id, .. } if *child_id == child_exec_id
+        )),
+        "parent must not record a cascade that did not transition the child: {parent_history:?}"
+    );
+}
+
+#[tokio::test]
+async fn workflow_reset_cascades_detached_children() {
+    let (url, _container) = setup_test_db_url().await;
+
+    let mut conn = AsyncPgConnection::establish(&url)
+        .await
+        .expect("connect failed");
+    let parent_exec_id = start_workflow(
+        &mut conn,
+        "manual_reset_parent",
+        "manual-reset-parent-001",
+        Value::Null,
+    )
+    .await;
+    let child_exec_id = insert_detached_child_execution(
+        &mut conn,
+        parent_exec_id,
+        "manual_reset_child",
+        "manual-reset-child-001",
+        ParentClosePolicy::RequestCancel,
+    )
+    .await;
+
+    reset_workflow_execution(
+        &mut conn,
+        parent_exec_id,
+        WorkflowResetRequest {
+            reset_to_event_id: 0,
+            reason: "operator reset".to_string(),
+            operator_id: "test-operator".to_string(),
+            signal_reapply: autumn_harvest::ResetSignalReapplyPolicy::default(),
+        },
+        None,
+    )
+    .await
+    .expect("reset should succeed");
+
+    wait_for_state(&mut conn, parent_exec_id, &["TERMINATED"]).await;
+    wait_for_state(&mut conn, child_exec_id, &["CANCELLED"]).await;
 }
 
 #[tokio::test]

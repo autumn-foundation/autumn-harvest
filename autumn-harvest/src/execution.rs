@@ -670,15 +670,22 @@ pub(crate) async fn apply_parent_close_cascade(
             .map_err(HarvestError::Config)?;
 
         let action = match policy {
-            ParentClosePolicy::Abandon => continue,
+            ParentClosePolicy::Abandon => None,
             ParentClosePolicy::RequestCancel => {
-                cascade_cancel_detached_child(conn, child_exec_id, "parent closed").await?;
-                "request_cancel"
+                cascade_cancel_detached_child(conn, child_exec_id, "parent closed")
+                    .await?
+                    .then_some("request_cancel")
             }
-            ParentClosePolicy::Terminate => {
-                cascade_terminate_detached_child(conn, child_exec_id, "ParentClosed").await?;
-                "terminate"
-            }
+            ParentClosePolicy::Terminate => cascade_terminate_detached_child(
+                conn,
+                child_exec_id,
+                "ParentClosed",
+            )
+            .await?
+            .then_some("terminate"),
+        };
+        let Some(action) = action else {
+            continue;
         };
 
         store::append_single_event(
@@ -700,18 +707,8 @@ async fn cascade_cancel_detached_child(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
     reason: &str,
-) -> HarvestResult<()> {
-    let history = store::load_history(conn, exec_id).await?;
-    store::append_events(
-        conn,
-        exec_id,
-        &[WorkflowEvent::WorkflowCancelled {
-            reason: reason.to_string(),
-        }],
-        history.next_event_id,
-    )
-    .await?;
-    diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
+) -> HarvestResult<bool> {
+    let updated = diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
         .filter(harvest_workflow_executions::state.eq("RUNNING"))
         .set((
             harvest_workflow_executions::state.eq("CANCELLED"),
@@ -721,6 +718,17 @@ async fn cascade_cancel_detached_child(
         .execute(conn)
         .await
         .map_err(database_error)?;
+    if updated == 0 {
+        return Ok(false);
+    }
+    store::append_single_event(
+        conn,
+        exec_id,
+        WorkflowEvent::WorkflowCancelled {
+            reason: reason.to_string(),
+        },
+    )
+    .await?;
     queue::fail_open_tasks_for_execution(
         conn,
         exec_id,
@@ -728,25 +736,15 @@ async fn cascade_cancel_detached_child(
     )
     .await?;
     Box::pin(apply_parent_close_cascade(conn, exec_id)).await?;
-    Ok(())
+    Ok(true)
 }
 
 async fn cascade_terminate_detached_child(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
     reason: &str,
-) -> HarvestResult<()> {
-    let history = store::load_history(conn, exec_id).await?;
-    store::append_events(
-        conn,
-        exec_id,
-        &[WorkflowEvent::WorkflowFailed {
-            error: reason.to_string(),
-        }],
-        history.next_event_id,
-    )
-    .await?;
-    diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
+) -> HarvestResult<bool> {
+    let updated = diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
         .filter(harvest_workflow_executions::state.eq("RUNNING"))
         .set((
             harvest_workflow_executions::state.eq("FAILED"),
@@ -756,6 +754,17 @@ async fn cascade_terminate_detached_child(
         .execute(conn)
         .await
         .map_err(database_error)?;
+    if updated == 0 {
+        return Ok(false);
+    }
+    store::append_single_event(
+        conn,
+        exec_id,
+        WorkflowEvent::WorkflowFailed {
+            error: reason.to_string(),
+        },
+    )
+    .await?;
     queue::fail_open_tasks_for_execution(
         conn,
         exec_id,
@@ -763,7 +772,7 @@ async fn cascade_terminate_detached_child(
     )
     .await?;
     Box::pin(apply_parent_close_cascade(conn, exec_id)).await?;
-    Ok(())
+    Ok(true)
 }
 
 /// Hard-finalize a workflow execution to `CANCELLED` regardless of its

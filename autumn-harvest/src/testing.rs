@@ -2060,7 +2060,7 @@ impl WorkflowTestEnv {
                         payload,
                     });
                 }
-                deferred_events.push(WorkflowEvent::ExternalSignalDelivered { signal_id });
+                history.push(WorkflowEvent::ExternalSignalDelivered { signal_id });
                 let _ = result_tx.send(Ok(()));
                 Ok(true)
             }
