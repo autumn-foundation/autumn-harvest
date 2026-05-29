@@ -2006,6 +2006,25 @@ pub const fn management_api_request_fields()
             Some(&[]),
         ),
         ("POST", "/admin/build-routing/retire", Some(&["build_id"])),
+        // ── schedule preview (issue #348) ─────────────────────────────────────
+        (
+            "POST",
+            "/admin/schedules/preview",
+            Some(&[
+                "schedule_expr",
+                "timezone",
+                "catchup",
+                "max_active_runs",
+                "paused",
+                "jitter_secs",
+                "overlap_policy",
+                "buffer_all_max",
+                "calendar",
+                "skip_policy",
+                "count",
+                "from",
+            ]),
+        ),
     ]
 }
 
@@ -10781,9 +10800,14 @@ struct CandidateSchedulePreviewRequest {
 /// Convert a raw `ScheduleFirePreview` (from calendar.rs) into the enriched API entry
 /// format required by issue #348. This is the pure transformation function that tests
 /// exercise directly.
+///
+/// `pre_jitter_base` is the calendar-adjusted fire time BEFORE jitter was applied
+/// (i.e., `effective_at` from the original unmodified entry). Jitter bounds are
+/// computed from this base so that deferred-calendar entries report bounds on the
+/// correct (adjusted) day, not the original excluded date.
 fn build_preview_entry(
     raw: &autumn_harvest::calendar::ScheduleFirePreview,
-    _schedule_id: uuid::Uuid,
+    pre_jitter_base: Option<chrono::DateTime<chrono::Utc>>,
     jitter_secs: i64,
     timezone: &str,
     overlap_policy: &str,
@@ -10802,10 +10826,14 @@ fn build_preview_entry(
         "cron".to_string()
     };
 
-    // Jitter bounds: [scheduled_at, scheduled_at + jitter_window].
-    let (jitter_earliest_at, jitter_latest_at) = if has_jitter && raw.effective_at.is_some() {
-        let latest = raw.scheduled_at + chrono::Duration::seconds(jitter_secs);
-        (Some(raw.scheduled_at), Some(latest))
+    // Jitter bounds: [pre_jitter_base, pre_jitter_base + jitter_window].
+    // Using the calendar-adjusted base (not raw.scheduled_at) ensures deferred
+    // entries show bounds on the correct day, not the original excluded date.
+    let (jitter_earliest_at, jitter_latest_at) = if has_jitter {
+        pre_jitter_base.map_or((None, None), |base| {
+            let latest = base + chrono::Duration::seconds(jitter_secs);
+            (Some(base), Some(latest))
+        })
     } else {
         (None, None)
     };
@@ -10927,6 +10955,11 @@ async fn preview_schedule_firings_handler(
         skip_policy,
     );
 
+    // Capture pre-jitter calendar-adjusted bases before modifying entries in-place.
+    // These become the lower bound of the jitter window for deferred-calendar entries.
+    let pre_jitter_bases: Vec<Option<chrono::DateTime<chrono::Utc>>> =
+        raw_entries.iter().map(|e| e.effective_at).collect();
+
     // Apply jitter to each effective_at (mirrors effective_fire_time logic).
     if jitter_secs > 0 {
         let jitter_window = std::time::Duration::from_secs(jitter_secs.cast_unsigned());
@@ -10942,10 +10975,11 @@ async fn preview_schedule_firings_handler(
 
     let entries: Vec<ScheduleFirePreviewEntry> = raw_entries
         .iter()
-        .map(|r| {
+        .zip(pre_jitter_bases.iter())
+        .map(|(r, &base)| {
             build_preview_entry(
                 r,
-                schedule_id,
+                base,
                 jitter_secs,
                 timezone,
                 &schedule.overlap_policy,
@@ -10959,6 +10993,7 @@ async fn preview_schedule_firings_handler(
         Json(serde_json::json!({
             "entries": entries,
             "is_paused": false,
+            "pause_reason": serde_json::Value::Null,
             "from": from,
             "count_requested": count,
         })),
@@ -11076,9 +11111,16 @@ async fn preview_candidate_schedule_handler(
     } else {
         vec![]
     };
+    // When schedule_expr embeds a timezone (cron_tz:<tz>:<expr>), use that
+    // timezone for local_at formatting rather than the body's separate `timezone`
+    // field, which defaults to "UTC" and would produce misleading local times.
+    let effective_timezone: &str = match &schedule {
+        autumn_harvest::policy::Schedule::CronInTimezone { tz, .. } => tz.as_str(),
+        _ => &body.timezone,
+    };
+
     // Use a deterministic placeholder UUID so jitter offsets are stable per request.
     let schedule_id = uuid::Uuid::nil();
-    let timezone = &body.timezone;
 
     let mut raw_entries = preview_schedule_firings(
         &schedule,
@@ -11088,6 +11130,10 @@ async fn preview_candidate_schedule_handler(
         &excluded_dates,
         skip_policy,
     );
+
+    // Capture pre-jitter calendar-adjusted bases before modifying entries in-place.
+    let pre_jitter_bases: Vec<Option<chrono::DateTime<chrono::Utc>>> =
+        raw_entries.iter().map(|e| e.effective_at).collect();
 
     if jitter_secs > 0 {
         let jitter_window = std::time::Duration::from_secs(body.jitter_secs);
@@ -11104,12 +11150,13 @@ async fn preview_candidate_schedule_handler(
     let max_active_runs = i32::try_from(body.max_active_runs).unwrap_or(i32::MAX);
     let entries: Vec<ScheduleFirePreviewEntry> = raw_entries
         .iter()
-        .map(|r| {
+        .zip(pre_jitter_bases.iter())
+        .map(|(r, &base)| {
             build_preview_entry(
                 r,
-                schedule_id,
+                base,
                 jitter_secs,
-                timezone,
+                effective_timezone,
                 &body.overlap_policy,
                 max_active_runs,
             )
@@ -11121,6 +11168,7 @@ async fn preview_candidate_schedule_handler(
         Json(serde_json::json!({
             "entries": entries,
             "is_paused": false,
+            "pause_reason": serde_json::Value::Null,
             "from": from,
             "count_requested": count,
         })),
@@ -13648,7 +13696,8 @@ mod tests {
             effective_at: Some(fire),
             reason: "Fired".to_string(),
         };
-        let entry = build_preview_entry(&preview, uuid::Uuid::nil(), 0, "UTC", "skip", 1);
+        // pre_jitter_base = Some(fire) — no calendar adjustment, no jitter.
+        let entry = build_preview_entry(&preview, Some(fire), 0, "UTC", "skip", 1);
         assert_eq!(entry.reason, "cron", "no-jitter reason must be 'cron'");
         assert!(entry.jitter_earliest_at.is_none());
         assert!(entry.jitter_latest_at.is_none());
@@ -13662,10 +13711,11 @@ mod tests {
         let effective = fire + chrono::Duration::seconds(120);
         let preview = ScheduleFirePreview {
             scheduled_at: fire,
-            effective_at: Some(effective),
+            effective_at: Some(effective), // post-jitter effective_at
             reason: "Fired".to_string(),
         };
-        let entry = build_preview_entry(&preview, uuid::Uuid::nil(), 300, "UTC", "skip", 1);
+        // pre_jitter_base = Some(fire) — calendar-adjusted base BEFORE jitter.
+        let entry = build_preview_entry(&preview, Some(fire), 300, "UTC", "skip", 1);
         assert_eq!(
             entry.reason, "cron+jitter",
             "jitter reason must be 'cron+jitter'"
@@ -13681,12 +13731,39 @@ mod tests {
         assert_eq!(
             entry.jitter_earliest_at.unwrap(),
             fire,
-            "jitter_earliest_at must equal scheduled_at"
+            "jitter_earliest_at must equal pre-jitter base"
         );
         assert_eq!(
             entry.jitter_latest_at.unwrap(),
             fire + chrono::Duration::seconds(300),
-            "jitter_latest_at must equal scheduled_at + jitter_secs"
+            "jitter_latest_at must equal pre_jitter_base + jitter_secs"
+        );
+    }
+
+    #[test]
+    fn build_preview_entry_jitter_bounds_use_deferred_date_not_original() {
+        use autumn_harvest::calendar::ScheduleFirePreview;
+        use chrono::TimeZone as _;
+        // Simulates a July 4 holiday deferred to July 5 with jitter applied.
+        let original = chrono::Utc.with_ymd_and_hms(2026, 7, 4, 9, 0, 0).unwrap();
+        let deferred_base = chrono::Utc.with_ymd_and_hms(2026, 7, 5, 9, 0, 0).unwrap();
+        let deferred_jittered = deferred_base + chrono::Duration::seconds(42);
+        let preview = ScheduleFirePreview {
+            scheduled_at: original,
+            effective_at: Some(deferred_jittered), // calendar-adjusted + jitter
+            reason: "DeferredFrom:2026-07-04".to_string(),
+        };
+        // pre_jitter_base = Some(deferred_base) — calendar-adjusted BEFORE jitter.
+        let entry = build_preview_entry(&preview, Some(deferred_base), 300, "UTC", "skip", 1);
+        assert_eq!(
+            entry.jitter_earliest_at.unwrap(),
+            deferred_base,
+            "jitter_earliest_at must be the deferred date, not the original excluded date"
+        );
+        assert_eq!(
+            entry.jitter_latest_at.unwrap(),
+            deferred_base + chrono::Duration::seconds(300),
+            "jitter_latest_at must be deferred_base + jitter_secs"
         );
     }
 
@@ -13700,7 +13777,8 @@ mod tests {
             effective_at: None,
             reason: "SkippedByCalendar:us-holidays".to_string(),
         };
-        let entry = build_preview_entry(&preview, uuid::Uuid::nil(), 0, "UTC", "skip", 1);
+        // pre_jitter_base = None — suppressed entries have no base.
+        let entry = build_preview_entry(&preview, None, 0, "UTC", "skip", 1);
         assert_eq!(
             entry.reason, "skipped:calendar-excluded",
             "calendar-suppressed reason must be 'skipped:calendar-excluded'"
@@ -13719,7 +13797,7 @@ mod tests {
             effective_at: Some(deferred),
             reason: "DeferredFrom:2026-07-04".to_string(),
         };
-        let entry = build_preview_entry(&preview, uuid::Uuid::nil(), 0, "UTC", "skip", 1);
+        let entry = build_preview_entry(&preview, Some(deferred), 0, "UTC", "skip", 1);
         assert_eq!(
             entry.reason, "deferred:calendar",
             "calendar-deferred reason must be 'deferred:calendar'"
@@ -13736,7 +13814,7 @@ mod tests {
             effective_at: Some(fire),
             reason: "Fired".to_string(),
         };
-        let entry = build_preview_entry(&preview, uuid::Uuid::nil(), 0, "UTC", "skip", 1);
+        let entry = build_preview_entry(&preview, Some(fire), 0, "UTC", "skip", 1);
         assert!(
             entry.would_skip_if_active,
             "skip overlap policy must set would_skip_if_active=true"
@@ -13753,7 +13831,7 @@ mod tests {
             effective_at: Some(fire),
             reason: "Fired".to_string(),
         };
-        let entry = build_preview_entry(&preview, uuid::Uuid::nil(), 0, "UTC", "cancel_other", 1);
+        let entry = build_preview_entry(&preview, Some(fire), 0, "UTC", "cancel_other", 1);
         assert!(
             !entry.would_skip_if_active,
             "cancel_other overlap policy must set would_skip_if_active=false"
@@ -13771,7 +13849,7 @@ mod tests {
             reason: "SkippedByCalendar:us-holidays".to_string(),
         };
         // Even with skip policy, a suppressed entry cannot be skipped-if-active.
-        let entry = build_preview_entry(&preview, uuid::Uuid::nil(), 0, "UTC", "skip", 1);
+        let entry = build_preview_entry(&preview, None, 0, "UTC", "skip", 1);
         assert!(
             !entry.would_skip_if_active,
             "suppressed entries (effective_at=None) must not set would_skip_if_active"
