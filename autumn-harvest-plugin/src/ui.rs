@@ -31,6 +31,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use autumn_harvest::Schedule;
+use autumn_harvest::ShardRouter;
 use autumn_harvest::audit::{
     OP_BUILD_COMPAT_DECLARE, OP_BUILD_COMPAT_REVOKE, OP_BUILD_POLICY_SET, OP_SCHEDULE_DELETE,
     OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER, OP_WORKFLOW_CANCEL,
@@ -43,10 +44,12 @@ use autumn_harvest::build_routing::{
 };
 use autumn_harvest::cancel_workflow_execution;
 use autumn_harvest::error::{HarvestResult, database_error};
+use autumn_harvest::execution::StartWorkflowParams;
 use autumn_harvest::models::{
     DeadLetter, ExternalTask, HarvestEvent, HarvestSchedule, HarvestSignal, HarvestTimer,
     NewAuditRecord, ScheduleDecision, TaskQueueItem, WorkflowExecution,
 };
+use autumn_harvest::policy::TaskStatus;
 use autumn_harvest::reset::{
     ResetSignalReapplyPolicy, WorkflowResetRequest, reset_workflow_execution,
 };
@@ -65,8 +68,8 @@ use autumn_harvest::workers::{WorkerFilters, WorkerHealth, WorkerRow, list_worke
 
 use crate::api::{
     HarvestApiRuntime, HarvestApiState, KNOWN_WORKFLOW_STATES, WorkflowFilters, acquire_conn,
-    db_conn_for_execution, load_execution, load_workflows_from_shards, map_error,
-    parse_execution_id, require_harvest_admin,
+    db_conn_for_execution, db_conn_for_shard, load_execution, load_workflows,
+    load_workflows_from_shards, map_error, parse_execution_id, require_harvest_admin,
 };
 
 const DEFAULT_PAGE_SIZE: i64 = 25;
@@ -556,32 +559,35 @@ async fn list_dags_ui(
         .iter()
         .map(|(name, dag)| (name.clone(), dag_summary_from_registered(name, dag)))
         .collect();
+    let mut shard_errors = Vec::new();
 
-    for (_, shard_result) in schedules {
-        let Ok(rows) = shard_result else {
-            continue;
-        };
-        for row in rows {
-            let Some(dag_name) = row.dag_name.clone() else {
-                continue;
-            };
-            let entry = dags
-                .entry(dag_name.clone())
-                .or_insert_with(|| DagUiSummary {
-                    name: dag_name.clone(),
-                    schedule_expr: row.schedule_expr.clone(),
-                    task_count: 0,
-                    is_paused: row.is_paused,
-                    next_run_at: row.next_run_at,
-                    max_active_runs: row.max_active_runs,
-                    catchup: row.catchup,
-                });
-            merge_dag_schedule_row(entry, &row);
+    for (shard_id, shard_result) in schedules {
+        match shard_result {
+            Ok(rows) => {
+                for row in rows {
+                    let Some(dag_name) = row.dag_name.clone() else {
+                        continue;
+                    };
+                    let entry = dags
+                        .entry(dag_name.clone())
+                        .or_insert_with(|| DagUiSummary {
+                            name: dag_name.clone(),
+                            schedule_expr: row.schedule_expr.clone(),
+                            task_count: 0,
+                            is_paused: row.is_paused,
+                            next_run_at: row.next_run_at,
+                            max_active_runs: row.max_active_runs,
+                            catchup: row.catchup,
+                        });
+                    merge_dag_schedule_row(entry, &row);
+                }
+            }
+            Err(error) => shard_errors.push((shard_id, error)),
         }
     }
     let mut dags = dags.into_values().collect::<Vec<_>>();
     dags.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(render_dag_list(&dags))
+    Ok(render_dag_list(&dags, &shard_errors))
 }
 
 async fn dag_detail_ui(
@@ -599,7 +605,7 @@ async fn dag_detail_ui(
         limit: 50,
         ..WorkflowFilters::default()
     };
-    let runs = load_workflows_from_shards(&api_state, &filters).await?;
+    let runs = load_dag_runs_from_owning_shard(&api_state, &runtime, &dag_name, &filters).await?;
     let requested_run = params
         .run
         .as_deref()
@@ -650,6 +656,21 @@ fn select_dag_run_id(
     requested_run
         .filter(|_| requested_run_is_valid_for_dag)
         .or(fallback_run)
+}
+
+fn dag_run_shard(router: &ShardRouter, dag_name: &str) -> ShardId {
+    router.pick_for_dag(dag_name)
+}
+
+async fn load_dag_runs_from_owning_shard(
+    api_state: &HarvestApiState,
+    runtime: &HarvestApiRuntime,
+    dag_name: &str,
+    filters: &WorkflowFilters,
+) -> Result<Vec<WorkflowExecution>, AutumnError> {
+    let shard = dag_run_shard(runtime.router(), dag_name);
+    let mut conn = db_conn_for_shard(api_state, shard).await?;
+    load_workflows(&mut conn, filters).await.map_err(map_error)
 }
 
 async fn dag_run_exists_for_dag(
@@ -3448,6 +3469,7 @@ fn layout(title: &str, body: &Markup, base_href: &str) -> Markup {
                         a href={ (base_href) "workers" } { "Workers" }
                         a href={ (base_href) "schedules" } { "Schedules" }
                         a href={ (base_href) "dead-letters" } { "Dead Letters" }
+                        a href={ (base_href) "build-routing" } { "Build Routing" }
                     }
                 }
                 main { (body) }
@@ -3457,9 +3479,15 @@ fn layout(title: &str, body: &Markup, base_href: &str) -> Markup {
     }
 }
 
-fn render_dag_list(dags: &[DagUiSummary]) -> Markup {
+fn render_dag_list(dags: &[DagUiSummary], shard_errors: &[(ShardId, String)]) -> Markup {
     let body = html! {
         h2 { "DAGs" }
+        @for (shard_id, error) in shard_errors {
+            div.shard-error {
+                strong { "Shard " (shard_id.as_i32()) " unavailable: " }
+                (error)
+            }
+        }
         table {
             thead {
                 tr {
@@ -3510,237 +3538,6 @@ fn merge_dag_schedule_row(entry: &mut DagUiSummary, row: &HarvestSchedule) {
     entry.next_run_at = row.next_run_at;
     entry.max_active_runs = row.max_active_runs;
     entry.catchup = row.catchup;
-}
-
-fn schedule_expr_for_ui_summary(schedule: &Schedule) -> String {
-    match schedule {
-        Schedule::Cron(expr) => expr.clone(),
-        Schedule::Interval(duration) => {
-            if duration.subsec_nanos() == 0 {
-                format!("@every {}s", duration.as_secs())
-            } else {
-                format!(
-                    "@every {}.{:09}s",
-                    duration.as_secs(),
-                    duration.subsec_nanos()
-                )
-            }
-        }
-        Schedule::Manual => "@manual".to_string(),
-        Schedule::CronInTimezone { expr, tz } => format!("{expr} [{tz}]"),
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DagNodeState {
-    Succeeded,
-    Failed,
-    Running,
-    Queued,
-    Skipped,
-    Unknown,
-}
-
-fn render_dag_detail(
-    dag_name: &str,
-    dag: &RegisteredDag,
-    runs: &[WorkflowExecution],
-    selected_run: Option<uuid::Uuid>,
-    selected_node: Option<usize>,
-    refresh: Option<u64>,
-    node_states: &HashMap<usize, DagNodeState>,
-) -> Markup {
-    let too_large = dag.definition.tasks().len() > 200;
-    let selected_task = selected_node.and_then(|idx| dag.definition.tasks().get(idx));
-    let selected_node_state = selected_node
-        .and_then(|idx| node_states.get(&idx).copied())
-        .unwrap_or(DagNodeState::Unknown);
-    let body = html! {
-        h2 { "DAG " code { (dag_name) } " runs" }
-        @if let Some(run_id) = selected_run {
-            p { "Selected run: " code { (run_id) } }
-        }
-        @if too_large {
-            div class="banner Warning" { "Topology has " (dag.definition.tasks().len()) " nodes; graph disabled." }
-        } @else {
-            h3 { "Topology" }
-            table {
-                thead { tr { th { "Node" } th { "Activity" } th { "Trigger Rule" } th { "State" } th { "Upstreams" } } }
-                tbody {
-                    @for (idx, task) in dag.definition.tasks().iter().enumerate() {
-                        tr {
-                            td {
-                                @if let Some(run_id) = selected_run {
-                                    a href={ "?run=" (run_id) "&node=" (idx) } { (idx) }
-                                } @else {
-                                    a href={ "?node=" (idx) } { (idx) }
-                                }
-                            }
-                            td { (task.activity_name.as_str()) }
-                            td { (format!("{:?}", task.trigger_rule)) }
-                            td { (format!("{:?}", node_states.get(&idx).copied().unwrap_or(DagNodeState::Unknown))) }
-                            td {
-                                @for (n, upstream) in task.upstreams.iter().enumerate() {
-                                    @if n > 0 { ", " }
-                                    (upstream)
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            @if let Some(task) = selected_task {
-                h3 { "Node panel" }
-                p { "Activity: " code { (task.activity_name.as_str()) } }
-                p { "Trigger rule: " (format!("{:?}", task.trigger_rule)) }
-                p { "Current state: " (format!("{selected_node_state:?}")) }
-            }
-        }
-        table {
-            thead {
-                tr {
-                    th { "Execution" }
-                    th { "State" }
-                    th { "Started" }
-                    th { "Duration" }
-                }
-            }
-            tbody {
-                @for run in runs {
-                    tr {
-                        td { a href={ "../workflows/" (run.id) } { code { (run.id) } } }
-                        td { span class={ "badge " (run.state.to_uppercase()) } { (run.state.as_str()) } }
-                        td { (format_timestamp(Some(run.started_at))) }
-                        td { (format_run_duration(run.started_at, run.completed_at)) }
-                    }
-                }
-            }
-        }
-    };
-    layout_dag_detail(&format!("DAG {dag_name} · Vantage"), &body, "../", refresh)
-}
-
-fn layout_dag_detail(title: &str, body: &Markup, base_href: &str, refresh: Option<u64>) -> Markup {
-    html! {
-        (PreEscaped("<!DOCTYPE html>"))
-        html lang="en" {
-            head {
-                meta charset="utf-8";
-                meta name="viewport" content="width=device-width,initial-scale=1";
-                title { (title) }
-                style { (PreEscaped(STYLE)) }
-                @if let Some(secs) = refresh { meta http-equiv="refresh" content=(secs); }
-            }
-            body {
-                header {
-                    h1 { a href={ (base_href) "workflows" } { "🔭 Vantage" } span.subtitle { "Harvest dashboard" } }
-                    nav {
-                        a href={ (base_href) "workflows" } { "Workflows" }
-                        a.active href={ (base_href) "dags" } { "DAGs" }
-                        a href={ (base_href) "workers" } { "Workers" }
-                        a href={ (base_href) "schedules" } { "Schedules" }
-                        a href={ (base_href) "dead-letters" } { "Dead Letters" }
-                        a href={ (base_href) "build-routing" } { "Build Routing" }
-                    }
-                }
-                main { (body) }
-                footer { "Read-only dashboard — autumn-harvest" }
-            }
-        }
-    }
-}
-
-fn map_node_states(
-    dag: &autumn_harvest::dag::DagDefinition,
-    tasks: &[TaskQueueItem],
-) -> HashMap<usize, DagNodeState> {
-    let mut out = HashMap::new();
-    for (idx, node) in dag.tasks().iter().enumerate() {
-        let mut state = DagNodeState::Unknown;
-        for task in tasks
-            .iter()
-            .filter(|t| t.activity_name.as_deref() == Some(node.activity_name.as_str()))
-        {
-            state = match task.state.as_str() {
-                "FAILED" => DagNodeState::Failed,
-                "RUNNING" if state != DagNodeState::Failed => DagNodeState::Running,
-                "PENDING" | "QUEUED" if state == DagNodeState::Unknown => DagNodeState::Queued,
-                "COMPLETED" if state == DagNodeState::Unknown => DagNodeState::Succeeded,
-                "SKIPPED" if state == DagNodeState::Unknown => DagNodeState::Skipped,
-                _ => state,
-            };
-        }
-        out.insert(idx, state);
-    }
-    out
-}
-
-fn format_run_duration(started_at: DateTime<Utc>, completed_at: Option<DateTime<Utc>>) -> String {
-    let Some(end) = completed_at else {
-        return "—".to_string();
-    };
-    let secs = (end - started_at).num_seconds().max(0);
-    if secs < 60 {
-        format!("{secs}s")
-    } else if secs < 3600 {
-        format!("{}m {}s", secs / 60, secs % 60)
-    } else {
-        format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Schedules UI page
-// ---------------------------------------------------------------------------
-
-const DEFAULT_SCHEDULE_PAGE_SIZE: i64 = 50;
-
-type ShardScheduleResult = (ShardId, Result<Vec<HarvestSchedule>, String>);
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct ScheduleListParams {
-    #[serde(default)]
-    page: Option<i64>,
-    #[serde(default)]
-    limit: Option<i64>,
-    #[serde(default)]
-    target: Option<String>,
-    /// "Workflow", "Dag", or empty/absent for All.
-    #[serde(default)]
-    kind: Option<String>,
-    /// "Paused", "Active", or empty/absent for All.
-    #[serde(default)]
-    paused: Option<String>,
-    #[serde(default)]
-    shard_id: Option<i32>,
-    #[serde(default)]
-    refresh: Option<u64>,
-    #[serde(default)]
-    flash: Option<String>,
-}
-
-#[derive(Debug, Deserialize, Default)]
-struct ScheduleBulkParams {
-    #[serde(default)]
-    target: Option<String>,
-    #[serde(default)]
-    kind: Option<String>,
-    #[serde(default)]
-    paused: Option<String>,
-    #[serde(default)]
-    shard_id: Option<i32>,
-}
-
-fn dag_summary_from_registered(name: &str, dag: &RegisteredDag) -> DagUiSummary {
-    DagUiSummary {
-        name: name.to_string(),
-        schedule_expr: dag.schedule.as_ref().map(schedule_expr_for_ui_summary),
-        task_count: dag.task_count(),
-        is_paused: false,
-        next_run_at: None,
-        max_active_runs: i32::try_from(dag.max_active_runs).unwrap_or(i32::MAX),
-        catchup: dag.catchup,
-    }
 }
 
 fn schedule_expr_for_ui_summary(schedule: &Schedule) -> String {
@@ -3889,23 +3686,63 @@ fn map_node_states(
     let mut out = HashMap::new();
     for (idx, node) in dag.tasks().iter().enumerate() {
         let mut state = DagNodeState::Unknown;
+        let mut has_task_row = false;
         for task in tasks
             .iter()
             .filter(|t| t.activity_name.as_deref() == Some(node.activity_name.as_str()))
         {
-            state = match task.state.as_str() {
-                "FAILED" => DagNodeState::Failed,
-                "CANCELLED" if !matches!(state, DagNodeState::Failed) => DagNodeState::Cancelled,
-                "RUNNING" if state != DagNodeState::Failed => DagNodeState::Running,
-                "PENDING" | "QUEUED" if state == DagNodeState::Unknown => DagNodeState::Queued,
-                "COMPLETED" if state == DagNodeState::Unknown => DagNodeState::Succeeded,
-                "SKIPPED" if state == DagNodeState::Unknown => DagNodeState::Skipped,
-                _ => state,
-            };
+            has_task_row = true;
+            state = merge_dag_task_state(state, task.state.as_str());
+        }
+        if !has_task_row {
+            state = infer_skipped_node_state(dag, idx, &out).unwrap_or(state);
         }
         out.insert(idx, state);
     }
     out
+}
+
+fn merge_dag_task_state(current: DagNodeState, task_state: &str) -> DagNodeState {
+    match task_state {
+        "FAILED" => DagNodeState::Failed,
+        "CANCELLED" if !matches!(current, DagNodeState::Failed) => DagNodeState::Cancelled,
+        "RUNNING" if !matches!(current, DagNodeState::Failed | DagNodeState::Cancelled) => {
+            DagNodeState::Running
+        }
+        "PENDING" | "QUEUED" if current == DagNodeState::Unknown => DagNodeState::Queued,
+        "COMPLETED" if current == DagNodeState::Unknown => DagNodeState::Succeeded,
+        "SKIPPED" if current == DagNodeState::Unknown => DagNodeState::Skipped,
+        _ => current,
+    }
+}
+
+fn infer_skipped_node_state(
+    dag: &autumn_harvest::dag::DagDefinition,
+    node_idx: usize,
+    node_states: &HashMap<usize, DagNodeState>,
+) -> Option<DagNodeState> {
+    let node = dag.tasks().get(node_idx)?;
+    let upstream_statuses = node
+        .upstreams
+        .iter()
+        .map(|upstream_idx| {
+            node_states
+                .get(upstream_idx)
+                .copied()
+                .and_then(dag_node_terminal_status)
+        })
+        .collect::<Option<Vec<_>>>()?;
+
+    (!node.trigger_rule.should_run(upstream_statuses.iter())).then_some(DagNodeState::Skipped)
+}
+
+const fn dag_node_terminal_status(state: DagNodeState) -> Option<TaskStatus> {
+    match state {
+        DagNodeState::Succeeded => Some(TaskStatus::Succeeded),
+        DagNodeState::Failed | DagNodeState::Cancelled => Some(TaskStatus::Failed),
+        DagNodeState::Skipped => Some(TaskStatus::Skipped),
+        DagNodeState::Running | DagNodeState::Queued | DagNodeState::Unknown => None,
+    }
 }
 
 fn format_run_duration(started_at: DateTime<Utc>, completed_at: Option<DateTime<Utc>>) -> String {
@@ -6514,12 +6351,21 @@ mod tests {
             max_active_runs: 3,
             catchup: false,
         }];
-        let html = render_dag_list(&dags).into_string();
+        let html = render_dag_list(&dags, &[]).into_string();
         assert!(html.contains("Paused"));
         assert!(html.contains("Next Run"));
         assert!(html.contains("Max Active"));
         assert!(html.contains("Catchup"));
         assert!(html.contains("payments"));
+    }
+
+    #[test]
+    fn render_dag_list_surfaces_schedule_shard_errors() {
+        let html = render_dag_list(&[], &[(ShardId::new(2), "connection refused".to_string())])
+            .into_string();
+
+        assert!(html.contains("Shard 2 unavailable"));
+        assert!(html.contains("connection refused"));
     }
 
     #[test]
@@ -6578,7 +6424,7 @@ mod tests {
     #[test]
     fn render_dag_list_uses_dag_active_nav() {
         let dags = vec![];
-        let html = render_dag_list(&dags).into_string();
+        let html = render_dag_list(&dags, &[]).into_string();
         assert!(html.contains("class=\"active\" href=\"dags\""));
     }
 
@@ -6601,6 +6447,73 @@ mod tests {
         assert_eq!(
             select_dag_run_id(Some(requested), false, Some(newest_listed)),
             Some(newest_listed)
+        );
+    }
+
+    #[test]
+    fn dag_run_shard_matches_router_dag_owner() {
+        let router = autumn_harvest::ShardRouter::new(
+            vec![ShardId::new(0), ShardId::new(1), ShardId::new(2)],
+            vec![ShardId::new(0), ShardId::new(1), ShardId::new(2)],
+            ShardId::new(0),
+        );
+
+        assert_eq!(
+            dag_run_shard(&router, "daily_etl"),
+            router.pick_for_dag("daily_etl")
+        );
+    }
+
+    fn two_node_dag_with_downstream_rule(
+        rule: autumn_harvest::policy::TriggerRule,
+    ) -> (autumn_harvest::dag::DagDefinition, usize, usize) {
+        fn upstream_for_ui_state_test() {}
+        fn downstream_for_ui_state_test() {}
+
+        let mut builder = autumn_harvest::dag::DagBuilder::new();
+        let upstream = builder.activity(upstream_for_ui_state_test);
+        let upstream_idx = upstream.index();
+        let downstream = builder
+            .activity(downstream_for_ui_state_test)
+            .upstream(&upstream)
+            .trigger_rule(rule);
+        let downstream_idx = downstream.index();
+
+        (
+            builder.build().expect("test dag should compile"),
+            upstream_idx,
+            downstream_idx,
+        )
+    }
+
+    #[test]
+    fn dag_node_state_infers_skipped_when_trigger_rule_blocks_unscheduled_node() {
+        let (dag, upstream_idx, downstream_idx) =
+            two_node_dag_with_downstream_rule(autumn_harvest::policy::TriggerRule::AllSuccess);
+        let known_states = HashMap::from([(upstream_idx, DagNodeState::Failed)]);
+
+        assert_eq!(
+            infer_skipped_node_state(&dag, downstream_idx, &known_states),
+            Some(DagNodeState::Skipped)
+        );
+    }
+
+    #[test]
+    fn dag_node_state_stays_unknown_until_upstreams_are_terminal() {
+        let (dag, _, downstream_idx) =
+            two_node_dag_with_downstream_rule(autumn_harvest::policy::TriggerRule::AllSuccess);
+
+        assert_eq!(
+            infer_skipped_node_state(&dag, downstream_idx, &HashMap::new()),
+            None
+        );
+    }
+
+    #[test]
+    fn dag_task_state_cancelled_is_terminal() {
+        assert_eq!(
+            merge_dag_task_state(DagNodeState::Unknown, "CANCELLED"),
+            DagNodeState::Cancelled
         );
     }
 
