@@ -18,8 +18,8 @@ use autumn_harvest::types::ParentClosePolicy;
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{
     ExecutionId, Priority, ShardId, StartWorkflowParams, TelemetryConfig, TraceContextCarrier,
-    TraceContextPropagator, WorkflowContext, WorkflowHistoryPolicy, cancel_workflow_execution,
-    WorkflowResetRequest, reset_workflow_execution, start_or_load_workflow_execution, timeout,
+    TraceContextPropagator, WorkflowContext, WorkflowHistoryPolicy, WorkflowResetRequest,
+    cancel_workflow_execution, reset_workflow_execution, start_or_load_workflow_execution, timeout,
 };
 use chrono::Utc;
 use diesel_async::AsyncConnection;

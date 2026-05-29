@@ -635,6 +635,29 @@ pub async fn cancel_workflow_execution(
     Ok(cancel_result)
 }
 
+/// Count running detached children that would append a parent cascade event.
+pub(crate) async fn parent_close_cascade_event_count(
+    conn: &mut AsyncPgConnection,
+    parent_exec_id: ExecutionId,
+) -> HarvestResult<u64> {
+    let policies: Vec<Option<String>> = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::parent_id.eq(Some(parent_exec_id.as_uuid())))
+        .filter(harvest_workflow_executions::parent_close_policy.is_not_null())
+        .filter(harvest_workflow_executions::state.eq("RUNNING"))
+        .select(harvest_workflow_executions::parent_close_policy)
+        .load::<Option<String>>(conn)
+        .await
+        .map_err(database_error)?;
+
+    policies.into_iter().try_fold(0_u64, |count, policy_opt| {
+        let policy = policy_opt
+            .expect("filtered by is_not_null")
+            .parse::<ParentClosePolicy>()
+            .map_err(HarvestError::Config)?;
+        Ok(count + u64::from(policy != ParentClosePolicy::Abandon))
+    })
+}
+
 /// Apply parent-close cascade to all running detached children of `parent_exec_id`.
 ///
 /// Queries children with `parent_close_policy IS NOT NULL AND state = 'RUNNING'`.
@@ -676,13 +699,11 @@ pub(crate) async fn apply_parent_close_cascade(
                     .await?
                     .then_some("request_cancel")
             }
-            ParentClosePolicy::Terminate => cascade_terminate_detached_child(
-                conn,
-                child_exec_id,
-                "ParentClosed",
-            )
-            .await?
-            .then_some("terminate"),
+            ParentClosePolicy::Terminate => {
+                cascade_terminate_detached_child(conn, child_exec_id, "ParentClosed")
+                    .await?
+                    .then_some("terminate")
+            }
         };
         let Some(action) = action else {
             continue;

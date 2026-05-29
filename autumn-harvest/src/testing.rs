@@ -51,7 +51,7 @@ use crate::context::{SharedState, WorkflowCommand, empty_shared_state};
 use crate::event::WorkflowEvent;
 use crate::executor::{WorkflowOutcome, run_workflow_strict, run_workflow_with_state};
 use crate::info::{WorkflowHandlerFn, WorkflowInfo};
-use crate::types::{ActivityExecId, ExecutionId};
+use crate::types::{ActivityExecId, ExecutionId, ParentClosePolicy};
 
 // ---------------------------------------------------------------------------
 // NonDeterminismKind
@@ -1814,7 +1814,7 @@ impl WorkflowTestEnv {
                     }
                 }
                 terminal => {
-                    return self.finish_terminal_outcome(terminal, pending_cmds, history, exec_id);
+                    return self.finish_terminal_outcome(terminal, &pending_cmds, history, exec_id);
                 }
             }
         }
@@ -1833,11 +1833,15 @@ impl WorkflowTestEnv {
     fn finish_terminal_outcome(
         &self,
         outcome: WorkflowOutcome,
-        pending_cmds: Vec<WorkflowCommand>,
+        pending_cmds: &[WorkflowCommand],
         mut history: Vec<WorkflowEvent>,
         exec_id: ExecutionId,
     ) -> TestRunOutcome {
         Self::record_terminal_pending_commands(pending_cmds, &mut history);
+        let should_record_cascades = matches!(
+            outcome,
+            WorkflowOutcome::Completed { .. } | WorkflowOutcome::Failed { .. }
+        );
         let result = match outcome {
             WorkflowOutcome::Completed { output } => {
                 history.push(WorkflowEvent::WorkflowCompleted {
@@ -1862,6 +1866,9 @@ impl WorkflowTestEnv {
                 unreachable!("suspended outcomes are handled in run")
             }
         };
+        if should_record_cascades {
+            Self::record_terminal_parent_close_cascades(&mut history);
+        }
 
         TestRunOutcome {
             result,
@@ -1872,13 +1879,16 @@ impl WorkflowTestEnv {
     }
 
     fn record_terminal_pending_commands(
-        commands: Vec<WorkflowCommand>,
+        commands: &[WorkflowCommand],
         history: &mut Vec<WorkflowEvent>,
     ) {
         for cmd in commands {
             match cmd {
                 WorkflowCommand::RecordMarker { name, details } => {
-                    history.push(WorkflowEvent::MarkerRecorded { name, details });
+                    history.push(WorkflowEvent::MarkerRecorded {
+                        name: name.clone(),
+                        details: details.clone(),
+                    });
                 }
                 WorkflowCommand::SpawnDetachedChildWorkflow {
                     child_id,
@@ -1887,14 +1897,43 @@ impl WorkflowTestEnv {
                     parent_close_policy,
                 } => {
                     history.push(WorkflowEvent::ChildWorkflowSpawnedDetached {
-                        child_id,
-                        workflow_name,
-                        input,
-                        parent_close_policy,
+                        child_id: *child_id,
+                        workflow_name: workflow_name.clone(),
+                        input: input.clone(),
+                        parent_close_policy: *parent_close_policy,
                     });
                 }
                 _ => {}
             }
+        }
+    }
+
+    fn record_terminal_parent_close_cascades(history: &mut Vec<WorkflowEvent>) {
+        let cascaded_children = history
+            .iter()
+            .filter_map(|event| match event {
+                WorkflowEvent::ChildWorkflowSpawnedDetached {
+                    child_id,
+                    parent_close_policy,
+                    ..
+                } if *parent_close_policy != ParentClosePolicy::Abandon => {
+                    let action = match parent_close_policy {
+                        ParentClosePolicy::Abandon => unreachable!("filtered above"),
+                        ParentClosePolicy::RequestCancel => "request_cancel",
+                        ParentClosePolicy::Terminate => "terminate",
+                    };
+                    Some((*child_id, *parent_close_policy, action.to_string()))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        for (child_id, policy, action) in cascaded_children {
+            history.push(WorkflowEvent::ChildWorkflowCascadeApplied {
+                child_id,
+                policy,
+                action,
+            });
         }
     }
 

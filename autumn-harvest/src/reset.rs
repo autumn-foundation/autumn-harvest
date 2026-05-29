@@ -371,6 +371,17 @@ fn apply_event_to_pending(
             Some(workflow_name.clone()),
             event_id,
         ),
+        WorkflowEvent::ChildWorkflowSpawnedDetached {
+            child_id,
+            workflow_name,
+            ..
+        } => insert_pending(
+            pending,
+            "ChildWorkflowSpawnedDetached",
+            child_id.to_string(),
+            Some(workflow_name.clone()),
+            event_id,
+        ),
         WorkflowEvent::ChildWorkflowCompleted { child_id, .. }
         | WorkflowEvent::ChildWorkflowFailed { child_id, .. } => {
             remove_pending(pending, "ChildWorkflowStarted", &child_id.to_string());
@@ -957,7 +968,7 @@ mod tests {
     use serde_json::Value;
 
     use crate::event::WorkflowEvent;
-    use crate::types::{ActivityExecId, ExecutionId, TimerId};
+    use crate::types::{ActivityExecId, ExecutionId, ParentClosePolicy, TimerId};
 
     use super::{ResetSignalReapplyPolicy, validate_reset_point};
 
@@ -1003,6 +1014,45 @@ mod tests {
         assert_eq!(
             err.unresolved_side_effects[0].side_effect_id,
             activity_id.to_string()
+        );
+    }
+
+    #[test]
+    fn reset_point_rejects_detached_spawn_boundary() {
+        let child_id = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::ChildWorkflowSpawnedDetached {
+                child_id,
+                workflow_name: "sidecar".into(),
+                input: Value::Null,
+                parent_close_policy: ParentClosePolicy::RequestCancel,
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "after-detached-spawn".into(),
+                details: Value::Null,
+            },
+        ];
+
+        let err = validate_reset_point(&events, 1).expect_err("detached child is still unresolved");
+        assert_eq!(err.reset_to_event_id, 1);
+        assert_eq!(err.nearest_valid_before, Some(0));
+        assert_eq!(err.nearest_valid_after, None);
+        assert_eq!(err.unresolved_side_effects.len(), 1);
+        assert_eq!(
+            err.unresolved_side_effects[0].kind,
+            "ChildWorkflowSpawnedDetached"
+        );
+        assert_eq!(
+            err.unresolved_side_effects[0].side_effect_id,
+            child_id.to_string()
+        );
+        assert_eq!(
+            err.unresolved_side_effects[0].name.as_deref(),
+            Some("sidecar")
         );
     }
 

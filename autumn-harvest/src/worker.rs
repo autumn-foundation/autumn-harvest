@@ -28,7 +28,7 @@ use crate::context::{
 use crate::dlq::{self, DeadLetterReason, NewDeadLetterEntry};
 use crate::error::{HarvestError, HarvestResult};
 use crate::event::WorkflowEvent;
-use crate::execution::apply_parent_close_cascade;
+use crate::execution::{apply_parent_close_cascade, parent_close_cascade_event_count};
 use crate::executor::{
     WorkflowExecuteSpanMeta, WorkflowOutcome, run_workflow_with_state_history_policy_and_caps,
 };
@@ -48,7 +48,8 @@ use crate::telemetry::{
     ATTR_WORKFLOW_ID, ActivityStatus, TraceContextCarrier, WorkflowStatus,
 };
 use crate::types::{
-    ActivityExecId, ExecutionId, ExternalActivityToken, IdempotencyKey, TimerId, WorkerId,
+    ActivityExecId, ExecutionId, ExternalActivityToken, IdempotencyKey, ParentClosePolicy, TimerId,
+    WorkerId,
 };
 
 /// Type alias for the deadpool-managed async Diesel connection pool.
@@ -4109,6 +4110,38 @@ fn pre_suspension_event_count(commands: &[WorkflowCommand]) -> u64 {
     .unwrap_or(u64::MAX)
 }
 
+fn pending_detached_parent_close_cascade_event_count(commands: &[WorkflowCommand]) -> u64 {
+    u64::try_from(
+        commands
+            .iter()
+            .filter(|cmd| {
+                matches!(
+                    cmd,
+                    WorkflowCommand::SpawnDetachedChildWorkflow {
+                        parent_close_policy: ParentClosePolicy::RequestCancel
+                            | ParentClosePolicy::Terminate,
+                        ..
+                    }
+                )
+            })
+            .count(),
+    )
+    .unwrap_or(u64::MAX)
+}
+
+async fn terminal_parent_close_cascade_event_count(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    pending_cmds: &[WorkflowCommand],
+) -> HarvestResult<u64> {
+    let persisted = parent_close_cascade_event_count(conn, exec_id).await?;
+    Ok(
+        persisted.saturating_add(pending_detached_parent_close_cascade_event_count(
+            pending_cmds,
+        )),
+    )
+}
+
 async fn new_child_workflow_event_count(
     conn: &mut AsyncPgConnection,
     children: &[StartedChildWorkflowCommand],
@@ -4807,6 +4840,20 @@ async fn process_workflow_task(
     };
 
     let (outcome, pending_cmds, execute_span) = loop_result;
+    let terminal_parent_close_cascade_events = if matches!(
+        &outcome,
+        WorkflowOutcome::Completed { .. } | WorkflowOutcome::Failed { .. }
+    ) {
+        match terminal_parent_close_cascade_event_count(conn, prepared.exec_id, &pending_cmds).await
+        {
+            Ok(count) => count,
+            Err(error) => {
+                return fail_execution_on_error(conn, task, worker_id, Err::<(), _>(error)).await;
+            }
+        }
+    } else {
+        0
+    };
     let pending_durable_event_count = match &outcome {
         WorkflowOutcome::Suspended { commands } => {
             match suspended_command_event_count(conn, task.workflow_exec_id, commands).await {
@@ -4817,8 +4864,13 @@ async fn process_workflow_task(
                 }
             }
         }
-        _ => pending_update_result_event_count(&pending_cmds)
+        WorkflowOutcome::ContinuedAsNew { .. } => pending_update_result_event_count(&pending_cmds)
             .saturating_add(pre_suspension_event_count(&pending_cmds)),
+        WorkflowOutcome::Completed { .. } | WorkflowOutcome::Failed { .. } => {
+            pending_update_result_event_count(&pending_cmds)
+                .saturating_add(pre_suspension_event_count(&pending_cmds))
+                .saturating_add(terminal_parent_close_cascade_events)
+        }
     };
     let current_history_event_count = u64::try_from(history_events.len())
         .unwrap_or(u64::MAX)
@@ -4858,7 +4910,8 @@ async fn process_workflow_task(
     if !matches!(&outcome, WorkflowOutcome::Suspended { .. }) {
         telemetry.metrics.record_workflow_history_size(
             &prepared.execution.workflow_name,
-            terminal_history_event_count(next_event_id, &pending_cmds),
+            terminal_history_event_count(next_event_id, &pending_cmds)
+                .saturating_add(terminal_parent_close_cascade_events),
         );
     }
     if matches!(&outcome, WorkflowOutcome::ContinuedAsNew { .. }) {

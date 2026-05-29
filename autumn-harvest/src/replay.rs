@@ -1322,7 +1322,8 @@ impl HistoryMatcher {
                 }
                 WorkflowEvent::ExternalSignalRequested { .. }
                 | WorkflowEvent::ExternalSignalDelivered { .. }
-                | WorkflowEvent::ExternalSignalFailed { .. } => {
+                | WorkflowEvent::ExternalSignalFailed { .. }
+                | WorkflowEvent::ChildWorkflowSpawnedDetached { .. } => {
                     idx += 1;
                 }
                 WorkflowEvent::TimerStarted { timer_id: id, .. } => {
@@ -2901,6 +2902,29 @@ mod tests {
         let result = matcher.match_activity("resume_work");
         assert_eq!(result, HistoryMatch::Matched { output });
         assert!(!matcher.is_replaying());
+    }
+
+    #[test]
+    fn matcher_timer_started_peek_skips_detached_spawn() {
+        let child_id = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::ChildWorkflowSpawnedDetached {
+                child_id,
+                workflow_name: "condition_sidecar".into(),
+                input: Value::Null,
+                parent_close_policy: ParentClosePolicy::Abandon,
+            },
+            WorkflowEvent::TimerStarted {
+                timer_id: TimerId::new("condition-timeout"),
+                duration_secs: 30,
+            },
+        ];
+        let matcher = HistoryMatcher::new(events);
+
+        assert!(
+            matcher.is_timer_started_next("condition-timeout"),
+            "timer peek should skip an unconsumed detached-spawn event"
+        );
     }
 
     #[test]

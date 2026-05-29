@@ -16,11 +16,11 @@
 use std::future::Future;
 use std::pin::Pin;
 
+use autumn_harvest::ExecutionId;
 use autumn_harvest::context::WorkflowContext;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::testing::{ReplayStatus, WorkflowTestEnv};
 use autumn_harvest::types::ParentClosePolicy;
-use autumn_harvest::ExecutionId;
 use serde_json::{Value, json};
 
 // ──────────────────────────── workflow helpers ────────────────────────────────
@@ -154,6 +154,41 @@ fn terminal_detached_spawn_workflow<'a>(
             )
             .map_err(|e| e.to_string())?;
         Ok(json!({ "child_id": child_id.to_string() }))
+    })
+}
+
+fn terminal_policy_detached_spawns_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let request_cancel_child = ctx
+            .spawn_child_workflow_detached_raw(
+                "terminal_request_cancel_child",
+                json!({"mode": "request_cancel"}),
+                ParentClosePolicy::RequestCancel,
+            )
+            .map_err(|e| e.to_string())?;
+        let terminate_child = ctx
+            .spawn_child_workflow_detached_raw(
+                "terminal_terminate_child",
+                json!({"mode": "terminate"}),
+                ParentClosePolicy::Terminate,
+            )
+            .map_err(|e| e.to_string())?;
+        let abandoned_child = ctx
+            .spawn_child_workflow_detached_raw(
+                "terminal_abandoned_child",
+                json!({"mode": "abandon"}),
+                ParentClosePolicy::Abandon,
+            )
+            .map_err(|e| e.to_string())?;
+
+        Ok(json!({
+            "request_cancel_child": request_cancel_child.to_string(),
+            "terminate_child": terminate_child.to_string(),
+            "abandoned_child": abandoned_child.to_string(),
+        }))
     })
 }
 
@@ -386,6 +421,89 @@ async fn test_terminal_detached_spawn_records_history_event() {
     assert!(
         spawn_pos < completed_pos,
         "detached spawn should precede terminal event: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_terminal_detached_spawn_records_parent_close_cascades() {
+    let outcome = WorkflowTestEnv::new()
+        .run(terminal_policy_detached_spawns_workflow, json!(null))
+        .await;
+
+    assert!(outcome.result.is_ok());
+    let events = outcome.events();
+    let completed_pos = events
+        .iter()
+        .position(|event| matches!(event, WorkflowEvent::WorkflowCompleted { .. }))
+        .expect("workflow completed event should exist");
+    let request_cancel_child = events
+        .iter()
+        .find_map(|event| match event {
+            WorkflowEvent::ChildWorkflowSpawnedDetached {
+                child_id,
+                workflow_name,
+                ..
+            } if workflow_name == "terminal_request_cancel_child" => Some(*child_id),
+            _ => None,
+        })
+        .expect("request-cancel detached spawn should exist");
+    let terminate_child = events
+        .iter()
+        .find_map(|event| match event {
+            WorkflowEvent::ChildWorkflowSpawnedDetached {
+                child_id,
+                workflow_name,
+                ..
+            } if workflow_name == "terminal_terminate_child" => Some(*child_id),
+            _ => None,
+        })
+        .expect("terminate detached spawn should exist");
+    let abandoned_child = events
+        .iter()
+        .find_map(|event| match event {
+            WorkflowEvent::ChildWorkflowSpawnedDetached {
+                child_id,
+                workflow_name,
+                ..
+            } if workflow_name == "terminal_abandoned_child" => Some(*child_id),
+            _ => None,
+        })
+        .expect("abandoned detached spawn should exist");
+
+    let cascades = events
+        .iter()
+        .enumerate()
+        .filter_map(|(pos, event)| match event {
+            WorkflowEvent::ChildWorkflowCascadeApplied {
+                child_id,
+                policy,
+                action,
+            } => Some((pos, *child_id, *policy, action.as_str())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        cascades.len(),
+        2,
+        "only non-Abandon detached children should cascade: {events:?}"
+    );
+    assert!(cascades.iter().all(|(pos, ..)| *pos > completed_pos));
+    assert!(cascades.iter().any(|(_, child_id, policy, action)| {
+        *child_id == request_cancel_child
+            && *policy == ParentClosePolicy::RequestCancel
+            && *action == "request_cancel"
+    }));
+    assert!(cascades.iter().any(|(_, child_id, policy, action)| {
+        *child_id == terminate_child
+            && *policy == ParentClosePolicy::Terminate
+            && *action == "terminate"
+    }));
+    assert!(
+        !cascades
+            .iter()
+            .any(|(_, child_id, _, _)| *child_id == abandoned_child),
+        "Abandon detached child should not receive a cascade event: {events:?}"
     );
 }
 
