@@ -61,7 +61,9 @@ use autumn_harvest::models::{
     AuditRecord, BackfillLogRow, DeadLetter, HarvestCalendar, HarvestSchedule, NewAuditRecord,
     NewBackfillLogRow, RateLimitBucket, ScheduleDecision, WorkflowExecution,
 };
-use autumn_harvest::policy::{Schedule, SkipPolicy, WorkflowSchedule, compute_jitter_offset};
+use autumn_harvest::policy::{
+    Schedule, SkipPolicy, WorkflowSchedule, compute_jitter_offset, validate_jitter,
+};
 use autumn_harvest::queue::{self, ConcurrencyKeyStats};
 use autumn_harvest::reset::{
     ResetInvalidPoint, ResetResult, WorkflowResetError, WorkflowResetRequest,
@@ -10968,6 +10970,7 @@ async fn preview_schedule_firings_handler(
 ///
 /// Returns `400 Bad Request` when the `schedule_expr` or `timezone` is invalid,
 /// so operators get an actionable parse error before committing the config.
+#[allow(clippy::too_many_lines)]
 async fn preview_candidate_schedule_handler(
     Extension(api_state): Extension<HarvestApiState>,
     Json(body): Json<CandidateSchedulePreviewRequest>,
@@ -10978,15 +10981,48 @@ async fn preview_candidate_schedule_handler(
     let from = parse_from_param(body.from.as_deref()).map_err(AutumnError::bad_request_msg)?;
 
     // Validate and parse the schedule expression; return 400 on error.
+    // Infer `field` from the error message so timezone parse failures are
+    // correctly attributed to the `timezone` field, not `schedule_expr`.
     let schedule = match parse_schedule_expr_with_tz(&body.schedule_expr, &body.timezone) {
         Ok(s) => s,
         Err(e) => {
+            let field = if e.to_lowercase().contains("timezone") || e.to_lowercase().contains("tz")
+            {
+                "timezone"
+            } else {
+                "schedule_expr"
+            };
             return Ok((
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": e, "field": "schedule_expr"})),
+                Json(serde_json::json!({"error": e, "field": field})),
             ));
         }
     };
+
+    // Validate skip_policy strictly — from_db silently falls back to Skip.
+    let skip_policy = match SkipPolicy::from_user_input(&body.skip_policy) {
+        Ok(p) => p,
+        Err(bad) => {
+            return Ok((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("unknown skip_policy '{bad}'; valid: skip, run_next_business_day, run_prev_business_day"),
+                    "field": "skip_policy"
+                })),
+            ));
+        }
+    };
+
+    // Validate overlap_policy strictly before it is used in build_preview_entry.
+    if let Err(bad) = autumn_harvest::OverlapPolicy::from_user_input(&body.overlap_policy) {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("unknown overlap_policy '{bad}'; valid: skip, buffer_one, buffer_all, cancel_other, terminate_other"),
+                "field": "overlap_policy"
+            })),
+        ));
+    }
 
     // Paused candidate schedules return no entries.
     if body.paused {
@@ -11002,20 +11038,44 @@ async fn preview_candidate_schedule_handler(
         ));
     }
 
-    let calendar_name = body.calendar.as_deref();
-    let skip_policy = SkipPolicy::from_db(&body.skip_policy);
+    // Validate jitter before i64 conversion; body.jitter_secs is u64 so an
+    // overly large value would overflow chrono::Duration::seconds and panic.
+    let jitter_duration = std::time::Duration::from_secs(body.jitter_secs);
+    if let Err(e) = validate_jitter(&schedule, jitter_duration) {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e, "field": "jitter_secs"})),
+        ));
+    }
+    // Safe after validate_jitter: valid jitter is at most 3600 s for cron,
+    // or less than the interval period, both well within i64 range.
+    let jitter_secs = i64::try_from(body.jitter_secs).unwrap_or(i64::MAX);
 
+    let calendar_name = body.calendar.as_deref();
     let excluded_dates = if let Some(cal_name) = calendar_name {
         let pool = api_state.storage_pool().map_err(map_error)?;
         let mut conn = acquire_conn(pool.default_pool()).await?;
+        // Verify the calendar exists; silently-empty exclusions on a typo would
+        // confuse operators into thinking the config is valid.
+        match get_calendar(&mut conn, cal_name).await {
+            Ok(_) => {}
+            Err(autumn_harvest::HarvestError::NotFound(_)) => {
+                return Ok((
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": format!("calendar '{cal_name}' not found; create it first with POST /calendars"),
+                        "field": "calendar"
+                    })),
+                ));
+            }
+            Err(e) => return Err(map_error(e)),
+        }
         load_exclusions_for_calendar(&mut conn, cal_name)
             .await
             .map_err(map_error)?
     } else {
         vec![]
     };
-
-    let jitter_secs = i64::try_from(body.jitter_secs).unwrap_or(i64::MAX);
     // Use a deterministic placeholder UUID so jitter offsets are stable per request.
     let schedule_id = uuid::Uuid::nil();
     let timezone = &body.timezone;
@@ -13735,6 +13795,72 @@ mod tests {
                 .iter()
                 .any(|(m, p, _)| *m == "POST" && *p == "/admin/schedules/preview"),
             "POST /admin/schedules/preview must be listed in management_api_response_fields"
+        );
+    }
+
+    // ── Candidate preview handler validation (issue #348 follow-up) ──────────
+
+    #[test]
+    fn candidate_request_invalid_skip_policy_fails_deserialization_gracefully() {
+        // The struct accepts any string (validated at handler time), so
+        // deserialization itself must succeed — handler rejects the bad value.
+        let json = r#"{"schedule_expr":"0 9 * * *","skip_policy":"never"}"#;
+        let req: CandidateSchedulePreviewRequest =
+            serde_json::from_str(json).expect("struct accepts any string for skip_policy");
+        assert_eq!(req.skip_policy, "never");
+    }
+
+    #[test]
+    fn candidate_request_invalid_overlap_policy_fails_deserialization_gracefully() {
+        let json = r#"{"schedule_expr":"0 9 * * *","overlap_policy":"unknown"}"#;
+        let req: CandidateSchedulePreviewRequest =
+            serde_json::from_str(json).expect("struct accepts any string for overlap_policy");
+        assert_eq!(req.overlap_policy, "unknown");
+    }
+
+    #[test]
+    fn candidate_request_large_jitter_u64_parses_into_struct() {
+        // u64::MAX is representable in JSON and should parse into the struct;
+        // the handler rejects it via validate_jitter (not a parse error).
+        let json = format!(
+            r#"{{"schedule_expr":"0 9 * * *","jitter_secs":{}}}"#,
+            u64::MAX
+        );
+        let req: CandidateSchedulePreviewRequest =
+            serde_json::from_str(&json).expect("u64::MAX must parse into the struct");
+        assert_eq!(req.jitter_secs, u64::MAX);
+    }
+
+    #[test]
+    fn parse_schedule_error_timezone_field_attributed_correctly() {
+        // "Not/ATimezone" error message from validate_schedule contains "timezone".
+        let result = parse_schedule_expr_with_tz("0 9 * * *", "Not/ATimezone");
+        let err = result.unwrap_err();
+        let field = if err.to_lowercase().contains("timezone") || err.to_lowercase().contains("tz")
+        {
+            "timezone"
+        } else {
+            "schedule_expr"
+        };
+        assert_eq!(
+            field, "timezone",
+            "timezone parse error must be attributed to 'timezone' field, not 'schedule_expr': {err}"
+        );
+    }
+
+    #[test]
+    fn parse_schedule_error_bad_cron_attributed_to_schedule_expr() {
+        let result = parse_schedule_expr_with_tz("not a cron", "UTC");
+        let err = result.unwrap_err();
+        let field = if err.to_lowercase().contains("timezone") || err.to_lowercase().contains("tz")
+        {
+            "timezone"
+        } else {
+            "schedule_expr"
+        };
+        assert_eq!(
+            field, "schedule_expr",
+            "cron parse error must be attributed to 'schedule_expr': {err}"
         );
     }
 }
