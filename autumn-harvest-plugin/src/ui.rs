@@ -518,11 +518,7 @@ async fn list_dags_ui(
                     max_active_runs: row.max_active_runs,
                     catchup: row.catchup,
                 });
-            entry.schedule_expr = row.schedule_expr.clone();
-            entry.is_paused = row.is_paused;
-            entry.next_run_at = row.next_run_at;
-            entry.max_active_runs = row.max_active_runs;
-            entry.catchup = row.catchup;
+            merge_dag_schedule_row(entry, &row);
         }
     }
     let mut dags = dags.into_values().collect::<Vec<_>>();
@@ -550,11 +546,17 @@ async fn dag_detail_ui(
         .run
         .as_deref()
         .and_then(|raw| uuid::Uuid::parse_str(raw).ok());
-    let selected_run = requested_run
-        .filter(|candidate| runs.iter().any(|run| run.id == *candidate))
-        .or_else(|| runs.as_slice().first().map(|r| r.id));
-    let mut node_states = HashMap::<usize, DagNodeState>::new();
-    if let Some(exec_id) = selected_run {
+    let requested_run_is_valid_for_dag = match requested_run {
+        Some(run_id) if runs.iter().any(|run| run.id == run_id) => true,
+        Some(run_id) => dag_run_exists_for_dag(&api_state, &dag_name, run_id).await?,
+        None => false,
+    };
+    let selected_run = select_dag_run_id(
+        requested_run,
+        requested_run_is_valid_for_dag,
+        runs.as_slice().first().map(|r| r.id),
+    );
+    let node_states = if let Some(exec_id) = selected_run {
         let mut conn = db_conn_for_execution(
             &api_state,
             autumn_harvest::types::ExecutionId::from_uuid(exec_id),
@@ -567,8 +569,10 @@ async fn dag_detail_ui(
             .await
             .map_err(database_error)
             .map_err(map_error)?;
-        node_states = map_node_states(&dag.definition, &task_rows);
-    }
+        map_node_states(&dag.definition, &task_rows)
+    } else {
+        HashMap::<usize, DagNodeState>::new()
+    };
     Ok(render_dag_detail(
         &dag_name,
         &dag,
@@ -578,6 +582,38 @@ async fn dag_detail_ui(
         params.refresh,
         &node_states,
     ))
+}
+
+fn select_dag_run_id(
+    requested_run: Option<uuid::Uuid>,
+    requested_run_is_valid_for_dag: bool,
+    fallback_run: Option<uuid::Uuid>,
+) -> Option<uuid::Uuid> {
+    requested_run
+        .filter(|_| requested_run_is_valid_for_dag)
+        .or(fallback_run)
+}
+
+async fn dag_run_exists_for_dag(
+    api_state: &HarvestApiState,
+    dag_name: &str,
+    run_id: uuid::Uuid,
+) -> Result<bool, AutumnError> {
+    let mut conn = db_conn_for_execution(
+        api_state,
+        autumn_harvest::types::ExecutionId::from_uuid(run_id),
+    )
+    .await?;
+    harvest_workflow_executions::table
+        .find(run_id)
+        .filter(harvest_workflow_executions::workflow_name.eq(dag_name))
+        .select(harvest_workflow_executions::id)
+        .first::<uuid::Uuid>(&mut conn)
+        .await
+        .optional()
+        .map(|row| row.is_some())
+        .map_err(database_error)
+        .map_err(map_error)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -3337,6 +3373,16 @@ fn dag_summary_from_registered(name: &str, dag: &RegisteredDag) -> DagUiSummary 
     }
 }
 
+fn merge_dag_schedule_row(entry: &mut DagUiSummary, row: &HarvestSchedule) {
+    if entry.schedule_expr.is_none() {
+        entry.schedule_expr.clone_from(&row.schedule_expr);
+    }
+    entry.is_paused = row.is_paused;
+    entry.next_run_at = row.next_run_at;
+    entry.max_active_runs = row.max_active_runs;
+    entry.catchup = row.catchup;
+}
+
 fn schedule_expr_for_ui_summary(schedule: &Schedule) -> String {
     match schedule {
         Schedule::Cron(expr) => expr.clone(),
@@ -5130,6 +5176,51 @@ mod tests {
     }
 
     #[test]
+    fn dag_schedule_row_merge_preserves_runtime_formatted_expression() {
+        let mut summary = DagUiSummary {
+            name: "subsecond".to_string(),
+            schedule_expr: Some("@every 0.500000000s".to_string()),
+            task_count: 1,
+            is_paused: false,
+            next_run_at: None,
+            max_active_runs: 1,
+            catchup: false,
+        };
+        let mut row = make_schedule(None, Some("subsecond"), true);
+        row.schedule_expr = Some("interval:0".to_string());
+        row.max_active_runs = 3;
+        row.catchup = true;
+
+        merge_dag_schedule_row(&mut summary, &row);
+
+        assert_eq!(
+            summary.schedule_expr.as_deref(),
+            Some("@every 0.500000000s")
+        );
+        assert!(summary.is_paused);
+        assert_eq!(summary.max_active_runs, 3);
+        assert!(summary.catchup);
+    }
+
+    #[test]
+    fn dag_schedule_row_merge_uses_persisted_expression_when_runtime_has_none() {
+        let mut summary = DagUiSummary {
+            name: "manualish".to_string(),
+            schedule_expr: None,
+            task_count: 1,
+            is_paused: false,
+            next_run_at: None,
+            max_active_runs: 1,
+            catchup: false,
+        };
+        let row = make_schedule(None, Some("manualish"), false);
+
+        merge_dag_schedule_row(&mut summary, &row);
+
+        assert_eq!(summary.schedule_expr.as_deref(), Some("0 * * * *"));
+    }
+
+    #[test]
     fn layout_dag_detail_refresh_tag() {
         let body = html! { p { "x" } };
         let html = layout_dag_detail("D", &body, "", Some(30)).into_string();
@@ -5141,7 +5232,29 @@ mod tests {
     fn render_dag_list_uses_dag_active_nav() {
         let dags = vec![];
         let html = render_dag_list(&dags).into_string();
-        assert!(html.contains("a.active href=\"dags\""));
+        assert!(html.contains("class=\"active\" href=\"dags\""));
+    }
+
+    #[test]
+    fn dag_run_selection_accepts_valid_requested_run_not_in_display_page() {
+        let requested = uuid::Uuid::from_u128(1);
+        let newest_listed = uuid::Uuid::from_u128(2);
+
+        assert_eq!(
+            select_dag_run_id(Some(requested), true, Some(newest_listed)),
+            Some(requested)
+        );
+    }
+
+    #[test]
+    fn dag_run_selection_falls_back_when_requested_run_is_not_for_dag() {
+        let requested = uuid::Uuid::from_u128(1);
+        let newest_listed = uuid::Uuid::from_u128(2);
+
+        assert_eq!(
+            select_dag_run_id(Some(requested), false, Some(newest_listed)),
+            Some(newest_listed)
+        );
     }
 
     #[test]
