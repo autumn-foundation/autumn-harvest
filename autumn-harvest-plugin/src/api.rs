@@ -10874,14 +10874,24 @@ fn format_in_timezone(utc: chrono::DateTime<chrono::Utc>, tz_name: &str) -> Stri
 
 /// Parse an optional ISO-8601 `from` string. Returns the parsed instant when
 /// present, `Utc::now()` when absent, and `Err(String)` when the string is
-/// malformed (caller maps this to a 400 response).
+/// malformed or too far in the future (caller maps this to a 400 response).
+///
+/// Years above 9000 are rejected: interval schedules compute `from + period`
+/// repeatedly, and very large `from` values can overflow `DateTime` arithmetic or
+/// produce RFC 3339 strings (year > 9999) that most clients cannot parse.
 fn parse_from_param(from: Option<&str>) -> Result<chrono::DateTime<chrono::Utc>, String> {
     from.map_or_else(
         || Ok(chrono::Utc::now()),
         |s| {
-            chrono::DateTime::parse_from_rfc3339(s)
+            let dt = chrono::DateTime::parse_from_rfc3339(s)
                 .map(|dt| dt.with_timezone(&chrono::Utc))
-                .map_err(|e| format!("invalid `from` timestamp '{s}': {e}"))
+                .map_err(|e| format!("invalid `from` timestamp '{s}': {e}"))?;
+            if chrono::Datelike::year(&dt) > 9000 {
+                return Err(format!(
+                    "invalid `from` timestamp '{s}': year must be \u{2264} 9000"
+                ));
+            }
+            Ok(dt)
         },
     )
 }
@@ -13656,6 +13666,34 @@ mod tests {
         let q: SchedulePreviewQuery =
             serde_json::from_str(r#"{"count": 10}"#).expect("should deserialize");
         assert!(q.from.is_none(), "missing `from` must default to None");
+    }
+
+    #[test]
+    fn parse_from_param_accepts_valid_timestamp() {
+        let result = parse_from_param(Some("2026-06-01T09:00:00Z"));
+        assert!(result.is_ok(), "valid RFC3339 must parse successfully");
+    }
+
+    #[test]
+    fn parse_from_param_rejects_far_future_year() {
+        let result = parse_from_param(Some("9001-01-01T00:00:00Z"));
+        assert!(
+            result.is_err(),
+            "year 9001 must be rejected to prevent DateTime overflow in schedule expansion"
+        );
+        assert!(
+            result.unwrap_err().contains("year must be"),
+            "error message must mention the year limit"
+        );
+    }
+
+    #[test]
+    fn parse_from_param_accepts_year_9000() {
+        let result = parse_from_param(Some("9000-12-31T23:59:59Z"));
+        assert!(
+            result.is_ok(),
+            "year 9000 is the boundary and must be accepted"
+        );
     }
 
     #[test]
