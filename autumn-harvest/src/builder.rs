@@ -67,7 +67,7 @@ pub struct HarvestBuilder {
     /// Server-side ceiling on `execution_timeout` (issue #243).
     ///
     /// When set, any `start_workflow` call that requests an `execution_timeout`
-    /// larger than this ceiling is rejected with [`BuildError::ExecutionTimeoutExceedsCeiling`].
+    /// larger than this ceiling is rejected.
     /// `None` means no ceiling is enforced.
     max_workflow_execution_timeout: Option<Duration>,
     /// Maximum allowed byte length for an activity input payload (issue #252).
@@ -643,7 +643,7 @@ impl HarvestBuilder {
     ///
     /// When the `unified-dag-execution` feature is enabled every DAG whose
     /// `workflow_handler` is populated (i.e. produced by the `#[dag]` macro
-    /// with that feature on) is also auto-registered as a [`WorkflowInfo`] and,
+    /// with that feature on) is also auto-registered as a [`crate::info::WorkflowInfo`] and,
     /// if it carries a schedule attribute, as a [`WorkflowSchedule`]. This
     /// wires unified DAGs into the standard workflow execution and scheduler
     /// paths without requiring separate `.workflow_schedule(...)` calls.
@@ -668,7 +668,7 @@ impl HarvestBuilder {
 
     /// Register declarative query handlers (output of `queries![…]` macro).
     ///
-    /// Each [`QueryHandlerInfo`] is associated with a specific workflow name via
+    /// Each [`crate::info::QueryHandlerInfo`] is associated with a specific workflow name via
     /// the `workflow = "…"` attribute. The runtime uses this list to auto-register
     /// handlers before the workflow function runs, and the management API exposes
     /// them via `GET /workflows/types/{name}/handlers`.
@@ -682,7 +682,7 @@ impl HarvestBuilder {
 
     /// Register declarative update handlers (output of `updates![…]` macro).
     ///
-    /// Each [`UpdateHandlerInfo`] is associated with a specific workflow name via
+    /// Each [`crate::info::UpdateHandlerInfo`] is associated with a specific workflow name via
     /// the `workflow = "…"` attribute. The runtime uses this list to auto-register
     /// handlers before the workflow function runs, and the management API exposes
     /// them via `GET /workflows/types/{name}/handlers`.
@@ -1399,7 +1399,7 @@ pub struct WorkerConfig {
     /// Per-query execution timeout (issue #234).
     ///
     /// When a query handler takes longer than this to complete, the engine
-    /// terminates the handler and returns [`HarvestError::QueryTimedOut`] to
+    /// terminates the handler and returns [`crate::error::HarvestError::QueryTimedOut`] to
     /// the caller. Defaults to **5 seconds**.
     pub query_timeout: Duration,
     /// Anti-starvation aging period for the priority claim query (issue #249).

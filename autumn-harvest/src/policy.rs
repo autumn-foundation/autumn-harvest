@@ -627,10 +627,10 @@ pub struct WorkflowSchedule {
     #[serde(default)]
     pub jitter: Duration,
     /// What to do when a new firing collides with a still-running execution
-    /// from the same schedule. Defaults to [`OverlapPolicy::Skip`].
+    /// from the same schedule. Defaults to [`crate::policy::OverlapPolicy::Skip`].
     #[serde(default)]
     pub overlap_policy: OverlapPolicy,
-    /// Maximum number of pending firings stored under [`OverlapPolicy::BufferAll`].
+    /// Maximum number of pending firings stored under [`crate::policy::OverlapPolicy::BufferAll`].
     /// Past this cap, additional firings are dropped and recorded as skipped with
     /// `reason = "buffer_full"`. Defaults to `100`.
     #[serde(default = "default_buffer_all_max")]
@@ -733,7 +733,7 @@ impl WorkflowSchedule {
         self
     }
 
-    /// Set the maximum buffer size for [`OverlapPolicy::BufferAll`].
+    /// Set the maximum buffer size for [`crate::policy::OverlapPolicy::BufferAll`].
     ///
     /// Firings beyond this cap are dropped and recorded as skipped with
     /// `reason = "buffer_full"`. Has no effect for other overlap policies.

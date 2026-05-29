@@ -2074,7 +2074,7 @@ pub(crate) enum OverlapAction {
 /// Decide what to do with a new firing that can't run immediately.
 ///
 /// `buffered` is the current set of already-buffered fire times.
-/// `buffer_all_max` is the cap for [`OverlapPolicy::BufferAll`].
+/// `buffer_all_max` is the cap for [`crate::policy::OverlapPolicy::BufferAll`].
 #[allow(clippy::missing_const_for_fn)]
 pub(crate) fn apply_overlap_policy(
     policy: OverlapPolicy,
