@@ -25,6 +25,8 @@ use crate::builder::WorkerConfig;
 use crate::context::{
     ActivityContext, SharedState, WorkflowCommand, WorkflowHistoryPolicy, empty_shared_state,
 };
+#[cfg(feature = "db")]
+use crate::context::TransactionalState;
 use crate::dlq::{self, DeadLetterReason, NewDeadLetterEntry};
 use crate::error::{HarvestError, HarvestResult};
 use crate::event::WorkflowEvent;
@@ -3215,6 +3217,13 @@ async fn process_activity_task(
     .with_trace_context(trace_carrier.clone())
     .with_idempotency_key(IdempotencyKey::from_activity_exec_id(activity_id))
     .with_attempt(task_attempt(task));
+    #[cfg(feature = "db")]
+    let ctx = ctx.with_transactional_state(TransactionalState {
+        pool: pool.clone(),
+        exec_id,
+        activity_id,
+        task_id: task.id,
+    });
 
     let telemetry = registry.telemetry().clone();
     // ADR-0001 §3: restore the producer's trace context so the activity span

@@ -318,6 +318,45 @@ pub async fn admit_update_event(
 
 /// Load the full event history for a workflow execution, ordered by `event_id`.
 ///
+/// Lock the workflow execution row `FOR UPDATE` and then load its full event
+/// history.
+///
+/// Acquiring the row lock first ensures that concurrent event appends
+/// (e.g. from a second worker racing on the same task) serialise correctly:
+/// the transaction that holds the lock owns the right to append the next
+/// event batch.
+///
+/// This is an internal helper called by the transactional activity commit
+/// path in [`crate::context::ActivityContext::run_transactional`] and by
+/// several private functions in `worker.rs`.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::NotFound`] when the execution row
+/// does not exist, and [`crate::error::HarvestError::Database`] on any other
+/// query failure.
+pub(crate) async fn lock_and_load_history(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> HarvestResult<EventHistory> {
+    use crate::error::HarvestError;
+    use crate::schema::harvest_workflow_executions::dsl;
+
+    // Acquire a row-level lock so concurrent writers serialize around this
+    // transaction.  We only need the id to confirm the row exists.
+    dsl::harvest_workflow_executions
+        .find(exec_id.as_uuid())
+        .for_update()
+        .select(dsl::id)
+        .first::<uuid::Uuid>(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?
+        .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))?;
+
+    load_history(conn, exec_id).await
+}
+
 /// Deserializes each row's `event_data` JSON back into [`WorkflowEvent`].
 /// The returned [`EventHistory::next_event_id`] is set to one past the last
 /// loaded event (or 0 if the history is empty), ready for use with
