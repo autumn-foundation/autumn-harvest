@@ -2450,9 +2450,7 @@ impl WorkflowContext {
                      use ctx.version() to guard this fan-out if the size change is intentional"
                 )))
             }
-            _ => unreachable!(
-                "match_fan_out_marker only returns Matched, NoMatch, or Diverged"
-            ),
+            _ => unreachable!("match_fan_out_marker only returns Matched, NoMatch, or Diverged"),
         }
     }
 
@@ -2643,15 +2641,18 @@ impl WorkflowContext {
             })
             .collect::<Result<Vec<_>, serde_json::Error>>()?;
 
-        let raw_results = self.execute_activity_fan_out_collect_raw(activities).await?;
+        let raw_results = self
+            .execute_activity_fan_out_collect_raw(activities)
+            .await?;
         let typed: Vec<Result<O, String>> = raw_results
             .into_iter()
-            .map(|slot| {
-                slot.and_then(|v| {
-                    serde_json::from_value::<O>(v).map_err(|e| e.to_string())
-                })
+            .map(|slot| match slot {
+                Ok(v) => serde_json::from_value::<O>(v)
+                    .map(Ok)
+                    .map_err(HarvestError::Serialization),
+                Err(e) => Ok(Err(e)),
             })
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(typed)
     }
 

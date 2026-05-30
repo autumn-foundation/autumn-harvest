@@ -1986,9 +1986,9 @@ impl HistoryMatcher {
                     .as_u64()
                     .and_then(|n| usize::try_from(n).ok())
                     .unwrap_or(0);
-                self.cursor += 1;
-                self.advance_to_next_unconsumed_event();
                 if recorded_count == count {
+                    self.cursor += 1;
+                    self.advance_to_next_unconsumed_event();
                     HistoryMatch::Matched {
                         output: serde_json::json!(count),
                     }

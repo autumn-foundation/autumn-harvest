@@ -23,9 +23,21 @@ fn fan_out_three_parallel<'a>(
 ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
     Box::pin(async move {
         let activities = vec![
-            ("task_a".to_string(), json!("input_a"), "default".to_string()),
-            ("task_b".to_string(), json!("input_b"), "default".to_string()),
-            ("task_c".to_string(), json!("input_c"), "default".to_string()),
+            (
+                "task_a".to_string(),
+                json!("input_a"),
+                "default".to_string(),
+            ),
+            (
+                "task_b".to_string(),
+                json!("input_b"),
+                "default".to_string(),
+            ),
+            (
+                "task_c".to_string(),
+                json!("input_c"),
+                "default".to_string(),
+            ),
         ];
         let results = ctx
             .execute_activity_fan_out_raw(activities)
@@ -125,7 +137,7 @@ fn fan_out_count_changed<'a>(
 ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
     Box::pin(async move {
         // The count is derived from the input so it can differ between runs
-        let n = input.as_u64().unwrap_or(2) as usize;
+        let n = usize::try_from(input.as_u64().unwrap_or(2)).unwrap_or(2);
         let activities: Vec<_> = (0..n)
             .map(|i| (format!("task_{i}"), json!(i), "default".to_string()))
             .collect();
@@ -266,7 +278,10 @@ async fn fan_out_raw_fail_fast_on_first_failure() {
 
     match outcome {
         WorkflowOutcome::Failed { error } => {
-            assert!(error.contains("boom"), "error should mention 'boom', got: {error}");
+            assert!(
+                error.contains("boom"),
+                "error should mention 'boom', got: {error}"
+            );
         }
         other => panic!("expected Failed, got {other:?}"),
     }
@@ -338,7 +353,10 @@ async fn fan_out_collect_all_returns_per_slot_results() {
             // Slot 1: failed
             assert!(results[1].get("err").is_some(), "slot 1 should be err");
             let err_msg = results[1]["err"].as_str().unwrap();
-            assert!(err_msg.contains("slot_1_failed"), "slot 1 error message mismatch");
+            assert!(
+                err_msg.contains("slot_1_failed"),
+                "slot 1 error message mismatch"
+            );
             // Slot 2: ok
             assert!(results[2].get("ok").is_some(), "slot 2 should be ok");
             assert_eq!(results[2]["ok"], json!("also_success"));
@@ -361,14 +379,18 @@ async fn fan_out_empty_activities_returns_empty_vec() {
 
     match outcome {
         WorkflowOutcome::Completed { output } => {
-            assert_eq!(output["count"], json!(0), "empty fan-out should return 0 results");
+            assert_eq!(
+                output["count"],
+                json!(0),
+                "empty fan-out should return 0 results"
+            );
         }
         other => panic!("expected Completed, got {other:?}"),
     }
 }
 
 /// First-time live execution: no history → fan-out suspends emitting commands.
-/// Verifies that the correct WorkflowCommands are emitted.
+/// Verifies that the correct `WorkflowCommand`s are emitted.
 #[tokio::test]
 async fn fan_out_raw_live_execution_emits_marker_and_schedule_commands() {
     let exec_id = ExecutionId::new();
@@ -389,13 +411,19 @@ async fn fan_out_raw_live_execution_emits_marker_and_schedule_commands() {
                     name, ..
                 } if name.starts_with("fan_out:"))
             });
-            assert!(has_marker, "should emit a fan_out marker command; got: {commands:?}");
+            assert!(
+                has_marker,
+                "should emit a fan_out marker command; got: {commands:?}"
+            );
 
             // Should have 3 ScheduleActivity commands
             let schedule_count = commands
                 .iter()
                 .filter(|c| {
-                    matches!(c, autumn_harvest::context::WorkflowCommand::ScheduleActivity { .. })
+                    matches!(
+                        c,
+                        autumn_harvest::context::WorkflowCommand::ScheduleActivity { .. }
+                    )
                 })
                 .count();
             assert_eq!(
@@ -459,8 +487,7 @@ async fn fan_out_count_mismatch_returns_non_deterministic_error() {
     ];
 
     // New code passes input=2 which creates only 2 activities (changed from 3)
-    let outcome =
-        run_workflow(exec_id, history, fan_out_count_changed, json!(2u64)).await;
+    let outcome = run_workflow(exec_id, history, fan_out_count_changed, json!(2u64)).await;
 
     match outcome {
         WorkflowOutcome::Failed { error } => {
@@ -536,8 +563,7 @@ async fn fan_out_dynamic_from_prior_activity_replays_correctly() {
         },
     ];
 
-    let outcome =
-        run_workflow(exec_id, history, fan_out_dynamic_from_prior, Value::Null).await;
+    let outcome = run_workflow(exec_id, history, fan_out_dynamic_from_prior, Value::Null).await;
 
     match outcome {
         WorkflowOutcome::Completed { output } => {
@@ -717,10 +743,7 @@ async fn fan_out_typed_collect_all_returns_per_slot_results() {
 
     let ctx = WorkflowContext::for_replay(exec_id, history);
     let results: Vec<Result<Value, String>> = ctx
-        .execute_activity_fan_out_collect(&info, vec![
-            json!("ok_input"),
-            json!("fail_input"),
-        ])
+        .execute_activity_fan_out_collect(&info, vec![json!("ok_input"), json!("fail_input")])
         .await
         .expect("collect should not fail at the workflow level");
 
@@ -728,7 +751,12 @@ async fn fan_out_typed_collect_all_returns_per_slot_results() {
     assert!(results[0].is_ok(), "slot 0 should be ok");
     assert_eq!(results[0].as_ref().unwrap(), &json!("ok_output"));
     assert!(results[1].is_err(), "slot 1 should be err");
-    assert!(results[1].as_ref().unwrap_err().contains("deliberate_failure"));
+    assert!(
+        results[1]
+            .as_ref()
+            .unwrap_err()
+            .contains("deliberate_failure")
+    );
 }
 
 /// Second fan-out call in the same workflow gets a different sequence number.
@@ -748,9 +776,11 @@ async fn fan_out_two_groups_in_same_workflow() {
                 .await
                 .map_err(|e| e.to_string())?;
             let batch2 = ctx
-                .execute_activity_fan_out_raw(vec![
-                    ("b1".to_string(), json!(null), "default".to_string()),
-                ])
+                .execute_activity_fan_out_raw(vec![(
+                    "b1".to_string(),
+                    json!(null),
+                    "default".to_string(),
+                )])
                 .await
                 .map_err(|e| e.to_string())?;
             Ok(json!({ "b1": batch1, "b2": batch2 }))

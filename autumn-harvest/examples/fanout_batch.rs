@@ -82,7 +82,10 @@ pub async fn fail_fast_batch(
         .execute_activity_fan_out(&process_item_info(), input.items)
         .await
         .map_err(|e| e.to_string())?;
-    println!("[Workflow] fail_fast_batch: all {} items succeeded", results.len());
+    println!(
+        "[Workflow] fail_fast_batch: all {} items succeeded",
+        results.len()
+    );
     Ok(results)
 }
 
@@ -121,10 +124,7 @@ pub async fn collect_all_batch(
 /// `fetch_items`), never from the wall clock or a random number — this is what
 /// keeps fan-out deterministic across replays.
 #[workflow]
-pub async fn dynamic_fan_out(
-    ctx: &WorkflowContext,
-    source: String,
-) -> Result<BatchResult, String> {
+pub async fn dynamic_fan_out(ctx: &WorkflowContext, source: String) -> Result<BatchResult, String> {
     // Step 1: fetch the list from an external source.
     let batch: BatchInput = ctx
         .execute_activity(&fetch_items_info(), source)
@@ -160,7 +160,5 @@ fn main() {
     println!(
         "Register on a HarvestBuilder:\n  .workflows(workflows![fail_fast_batch, collect_all_batch, dynamic_fan_out])"
     );
-    println!(
-        "  .activities(activities![process_item, fetch_items])"
-    );
+    println!("  .activities(activities![process_item, fetch_items])");
 }
