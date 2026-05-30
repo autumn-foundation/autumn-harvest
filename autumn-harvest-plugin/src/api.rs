@@ -6,6 +6,8 @@ use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+pub const MAX_API_PAYLOAD_BYTES: usize = 10 * 1024 * 1024; // 10 MB
+
 use autumn_web::AppState;
 use autumn_web::error::AutumnError;
 use autumn_web::reexports::axum;
@@ -8934,14 +8936,22 @@ fn url_encode_for_redirect(input: &str) -> String {
     out
 }
 
+#[allow(clippy::too_many_lines)]
 async fn bulk_replay_dead_letters_handler(
     Extension(api_state): Extension<HarvestApiState>,
     headers: axum::http::HeaderMap,
-    body: axum::body::Bytes,
+    body: axum::body::Body,
 ) -> axum::response::Response {
     use axum::response::IntoResponse as _;
 
-    let request = match parse_bulk_dlq_request(&headers, &body) {
+    let body_bytes = match axum::body::to_bytes(body, MAX_API_PAYLOAD_BYTES).await {
+        Ok(b) => b,
+        Err(e) => {
+            return AutumnError::bad_request_msg(format!("payload too large: {e}")).into_response();
+        }
+    };
+
+    let request = match parse_bulk_dlq_request(&headers, &body_bytes) {
         Ok(request) => request,
         Err(error) => return error.into_response(),
     };
@@ -9042,14 +9052,22 @@ async fn bulk_replay_dead_letters_handler(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn bulk_discard_dead_letters_handler(
     Extension(api_state): Extension<HarvestApiState>,
     headers: axum::http::HeaderMap,
-    body: axum::body::Bytes,
+    body: axum::body::Body,
 ) -> axum::response::Response {
     use axum::response::IntoResponse as _;
 
-    let request = match parse_bulk_dlq_request(&headers, &body) {
+    let body_bytes = match axum::body::to_bytes(body, MAX_API_PAYLOAD_BYTES).await {
+        Ok(b) => b,
+        Err(e) => {
+            return AutumnError::bad_request_msg(format!("payload too large: {e}")).into_response();
+        }
+    };
+
+    let request = match parse_bulk_dlq_request(&headers, &body_bytes) {
         Ok(request) => request,
         Err(error) => return error.into_response(),
     };
