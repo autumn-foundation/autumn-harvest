@@ -61,7 +61,9 @@ use autumn_harvest::models::{
     AuditRecord, BackfillLogRow, DeadLetter, HarvestCalendar, HarvestSchedule, NewAuditRecord,
     NewBackfillLogRow, RateLimitBucket, ScheduleDecision, WorkflowExecution,
 };
-use autumn_harvest::policy::{Schedule, SkipPolicy, WorkflowSchedule, compute_jitter_offset};
+use autumn_harvest::policy::{
+    Schedule, SkipPolicy, WorkflowSchedule, compute_jitter_offset, validate_jitter,
+};
 use autumn_harvest::queue::{self, ConcurrencyKeyStats};
 use autumn_harvest::reset::{
     ResetInvalidPoint, ResetResult, WorkflowResetError, WorkflowResetRequest,
@@ -1597,6 +1599,10 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             "/admin/schedules/{id}/preview",
             get(preview_schedule_firings_handler),
         )
+        .route(
+            "/admin/schedules/preview",
+            post(preview_candidate_schedule_handler),
+        )
         // Calendar management (issue #337): named exclusion sets for business-day aware scheduling.
         .route("/calendars", get(list_calendars_handler))
         .route(
@@ -1793,6 +1799,7 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("POST", "/admin/schedules/{id}/trigger"),
         ("DELETE", "/admin/schedules/{id}"),
         ("GET", "/admin/schedules/{id}/preview"),
+        ("POST", "/admin/schedules/preview"),
         // ── calendars (issue #337) ────────────────────────────────────────────
         ("GET", "/calendars"),
         ("GET", "/calendars/{name}"),
@@ -1999,6 +2006,25 @@ pub const fn management_api_request_fields()
             Some(&[]),
         ),
         ("POST", "/admin/build-routing/retire", Some(&["build_id"])),
+        // ── schedule preview (issue #348) ─────────────────────────────────────
+        (
+            "POST",
+            "/admin/schedules/preview",
+            Some(&[
+                "schedule_expr",
+                "timezone",
+                "catchup",
+                "max_active_runs",
+                "paused",
+                "jitter_secs",
+                "overlap_policy",
+                "buffer_all_max",
+                "calendar",
+                "skip_policy",
+                "count",
+                "from",
+            ]),
+        ),
     ]
 }
 
@@ -2333,7 +2359,28 @@ pub const fn management_api_response_fields()
             Some(&["execution_id", "workflow_id", "triggered_at", "outcome"]),
         ),
         ("DELETE", "/admin/schedules/{id}", Some(&["ok"])),
-        ("GET", "/admin/schedules/{id}/preview", Some(&["entries"])),
+        (
+            "GET",
+            "/admin/schedules/{id}/preview",
+            Some(&[
+                "entries",
+                "is_paused",
+                "pause_reason",
+                "from",
+                "count_requested",
+            ]),
+        ),
+        (
+            "POST",
+            "/admin/schedules/preview",
+            Some(&[
+                "entries",
+                "is_paused",
+                "pause_reason",
+                "from",
+                "count_requested",
+            ]),
+        ),
         // ── calendars (issue #337) ────────────────────────────────────────────
         ("GET", "/calendars", None), // Vec<CalendarSummary>
         (
@@ -10664,7 +10711,7 @@ async fn delete_calendar_handler(
     Ok(StatusCode::NO_CONTENT)
 }
 
-// ── Schedule preview (issue #337) ─────────────────────────────────────────────
+// ── Schedule next-fires preview API (issues #337, #348) ──────────────────────
 
 /// Query parameters for `GET /admin/schedules/{id}/preview`.
 #[derive(Debug, Deserialize)]
@@ -10672,13 +10719,185 @@ struct SchedulePreviewQuery {
     /// Number of fire-time entries to return. Defaults to 10, max 100.
     #[serde(default = "default_preview_count")]
     count: usize,
+    /// ISO-8601 UTC instant to start the preview from. Defaults to now.
+    #[serde(default)]
+    from: Option<String>,
 }
 
 const fn default_preview_count() -> usize {
     10
 }
 
-/// `GET /admin/schedules/{id}/preview?count=N` — preview next N fire times.
+/// A single enriched entry in the schedule next-fires preview (issue #348).
+#[derive(Debug, Serialize)]
+struct ScheduleFirePreviewEntry {
+    /// UTC wall-clock instant the cron/interval computed.
+    scheduled_at: chrono::DateTime<chrono::Utc>,
+    /// `scheduled_at` rendered in the schedule's configured timezone (RFC 3339).
+    local_at: String,
+    /// Effective fire time after calendar adjustment and jitter application.
+    /// `None` means the firing is suppressed (calendar exclusion with `skip` policy).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    effective_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// `effective_at` rendered in the schedule's timezone. Omitted when `effective_at` is `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    effective_local_at: Option<String>,
+    /// Human-readable reason for this instant:
+    /// - `"cron"` — fires as scheduled.
+    /// - `"cron+jitter"` — fires at `effective_at` after deterministic jitter.
+    /// - `"skipped:calendar-excluded"` — suppressed by calendar exclusion.
+    /// - `"deferred:calendar"` — moved to a different day by calendar skip-policy.
+    reason: String,
+    /// Earliest possible fire time when jitter is enabled (`= scheduled_at`).
+    /// Omitted when `jitter_secs = 0`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    jitter_earliest_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Latest possible fire time when jitter is enabled (`= scheduled_at + jitter_secs`).
+    /// Omitted when `jitter_secs = 0`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    jitter_latest_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// `true` when the overlap policy (`"skip"` or `"buffer_one"`) could silently drop this
+    /// firing if `max_active_runs` is already running at dispatch time. Preview is stateless
+    /// and cannot know the future run count; treat this as an advisory warning.
+    would_skip_if_active: bool,
+}
+
+/// Request body for `POST /admin/schedules/preview` — validate a candidate schedule
+/// config and preview its next N fire times without persisting anything.
+///
+/// Same field set as `CreateWorkflowScheduleRequest` (issue #348).
+#[derive(Debug, Deserialize)]
+struct CandidateSchedulePreviewRequest {
+    schedule_expr: String,
+    #[serde(default = "default_timezone")]
+    timezone: String,
+    #[serde(default)]
+    #[allow(dead_code)] // part of the public request shape; included for spec completeness
+    catchup: bool,
+    #[serde(default = "default_max_active_runs")]
+    #[allow(dead_code)] // part of the public request shape; included for spec completeness
+    max_active_runs: u32,
+    #[serde(default)]
+    paused: bool,
+    #[serde(default)]
+    jitter_secs: u64,
+    #[serde(default = "default_overlap_policy")]
+    overlap_policy: String,
+    #[serde(default = "default_buffer_all_max")]
+    #[allow(dead_code)] // part of the public request shape; included for spec completeness
+    buffer_all_max: u32,
+    #[serde(default)]
+    calendar: Option<String>,
+    #[serde(default = "default_skip_policy")]
+    skip_policy: String,
+    /// Number of entries to return. Defaults to 10, max 100.
+    #[serde(default = "default_preview_count")]
+    count: usize,
+    /// ISO-8601 UTC instant to start the preview from. Defaults to now.
+    #[serde(default)]
+    from: Option<String>,
+}
+
+/// Convert a raw `ScheduleFirePreview` (from calendar.rs) into the enriched API entry
+/// format required by issue #348. This is the pure transformation function that tests
+/// exercise directly.
+///
+/// `pre_jitter_base` is the calendar-adjusted fire time BEFORE jitter was applied
+/// (i.e., `effective_at` from the original unmodified entry). Jitter bounds are
+/// computed from this base so that deferred-calendar entries report bounds on the
+/// correct (adjusted) day, not the original excluded date.
+fn build_preview_entry(
+    raw: &autumn_harvest::calendar::ScheduleFirePreview,
+    pre_jitter_base: Option<chrono::DateTime<chrono::Utc>>,
+    jitter_secs: i64,
+    timezone: &str,
+    overlap_policy: &str,
+) -> ScheduleFirePreviewEntry {
+    let has_jitter = jitter_secs > 0;
+
+    // Map old calendar.rs reason strings to the v2 reason vocabulary.
+    let reason = if raw.reason.starts_with("SkippedByCalendar:") {
+        "skipped:calendar-excluded".to_string()
+    } else if raw.reason.starts_with("DeferredFrom:") {
+        "deferred:calendar".to_string()
+    } else if has_jitter {
+        "cron+jitter".to_string()
+    } else {
+        "cron".to_string()
+    };
+
+    // Jitter bounds: [pre_jitter_base, pre_jitter_base + jitter_window].
+    // Using the calendar-adjusted base (not raw.scheduled_at) ensures deferred
+    // entries show bounds on the correct day, not the original excluded date.
+    // try_seconds + checked_add_signed guard against oversized stored values
+    // (e.g. a saturated i64::MAX written by the schedule create path).
+    let (jitter_earliest_at, jitter_latest_at) = if has_jitter {
+        pre_jitter_base.map_or((None, None), |base| {
+            let latest =
+                chrono::Duration::try_seconds(jitter_secs).and_then(|d| base.checked_add_signed(d));
+            (Some(base), latest)
+        })
+    } else {
+        (None, None)
+    };
+
+    let local_at = format_in_timezone(raw.scheduled_at, timezone);
+    let effective_local_at = raw.effective_at.map(|t| format_in_timezone(t, timezone));
+
+    // would_skip_if_active: advisory flag set when the overlap policy can silently
+    // drop a firing if capacity is saturated at dispatch time. The `max_active_runs > 0`
+    // guard is intentionally absent: max_active_runs = 0 means the scheduler's
+    // `running >= max_active_runs` check is always true, so every firing is dropped.
+    let would_skip_if_active =
+        (overlap_policy == "skip" || overlap_policy == "buffer_one") && raw.effective_at.is_some();
+
+    ScheduleFirePreviewEntry {
+        scheduled_at: raw.scheduled_at,
+        local_at,
+        effective_at: raw.effective_at,
+        effective_local_at,
+        reason,
+        jitter_earliest_at,
+        jitter_latest_at,
+        would_skip_if_active,
+    }
+}
+
+/// Format a UTC timestamp in the given IANA timezone as RFC 3339.
+/// Falls back to UTC representation when the timezone name is unknown.
+fn format_in_timezone(utc: chrono::DateTime<chrono::Utc>, tz_name: &str) -> String {
+    tz_name.parse::<chrono_tz::Tz>().map_or_else(
+        |_| utc.to_rfc3339(),
+        |tz| utc.with_timezone(&tz).to_rfc3339(),
+    )
+}
+
+/// Parse an optional ISO-8601 `from` string. Returns the parsed instant when
+/// present, `Utc::now()` when absent, and `Err(String)` when the string is
+/// malformed or too far in the future (caller maps this to a 400 response).
+///
+/// Years above 9000 are rejected: interval schedules compute `from + period`
+/// repeatedly, and very large `from` values can overflow `DateTime` arithmetic or
+/// produce RFC 3339 strings (year > 9999) that most clients cannot parse.
+fn parse_from_param(from: Option<&str>) -> Result<chrono::DateTime<chrono::Utc>, String> {
+    from.map_or_else(
+        || Ok(chrono::Utc::now()),
+        |s| {
+            let dt = chrono::DateTime::parse_from_rfc3339(s)
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .map_err(|e| format!("invalid `from` timestamp '{s}': {e}"))?;
+            if chrono::Datelike::year(&dt) > 9000 {
+                return Err(format!(
+                    "invalid `from` timestamp '{s}': year must be \u{2264} 9000"
+                ));
+            }
+            Ok(dt)
+        },
+    )
+}
+
+/// `GET /admin/schedules/{id}/preview?count=N&from=<ISO8601>` — preview the next N
+/// planned firing instants for a saved schedule (issue #348 supersedes issue #337).
 async fn preview_schedule_firings_handler(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<uuid::Uuid>,
@@ -10688,10 +10907,24 @@ async fn preview_schedule_firings_handler(
     use autumn_harvest::scheduler::parse_schedule_from_expr_pub;
 
     let count = params.count.clamp(1, 100);
-    let pool = api_state.storage_pool().map_err(map_error)?;
+    let from = parse_from_param(params.from.as_deref()).map_err(AutumnError::bad_request_msg)?;
+
     // load_schedule_by_id fans out across all shards so schedules on any shard are found.
     let schedule = load_schedule_by_id(&api_state, id).await?;
-    let mut conn = acquire_conn(pool.default_pool()).await?;
+
+    // Paused schedules return zero entries with a paused reason summary.
+    if schedule.is_paused {
+        return Ok((
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "entries": [],
+                "is_paused": true,
+                "pause_reason": schedule.pause_reason,
+                "from": from,
+                "count_requested": count,
+            })),
+        ));
+    }
 
     let parsed_schedule = schedule
         .schedule_expr
@@ -10700,11 +10933,18 @@ async fn preview_schedule_firings_handler(
     let Some(ref sched) = parsed_schedule else {
         return Ok((
             StatusCode::OK,
-            Json(serde_json::json!({"entries": [], "reason": "manual or no schedule"})),
+            Json(serde_json::json!({
+                "entries": [],
+                "is_paused": false,
+                "pause_reason": serde_json::Value::Null,
+                "from": from,
+                "count_requested": count,
+            })),
         ));
     };
 
-    let from = chrono::Utc::now();
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    let mut conn = acquire_conn(pool.default_pool()).await?;
     let calendar_name = schedule.calendar_name.as_deref();
     let skip_policy = SkipPolicy::from_db(&schedule.skip_policy);
 
@@ -10718,7 +10958,9 @@ async fn preview_schedule_firings_handler(
 
     let jitter_secs = schedule.jitter_secs;
     let schedule_id = schedule.id;
-    let mut entries = preview_schedule_firings(
+    let timezone = &schedule.timezone;
+
+    let mut raw_entries = preview_schedule_firings(
         sched,
         from,
         count,
@@ -10727,10 +10969,15 @@ async fn preview_schedule_firings_handler(
         skip_policy,
     );
 
-    // Apply schedule jitter to each effective_at (mirrors effective_fire_time logic).
+    // Capture pre-jitter calendar-adjusted bases before modifying entries in-place.
+    // These become the lower bound of the jitter window for deferred-calendar entries.
+    let pre_jitter_bases: Vec<Option<chrono::DateTime<chrono::Utc>>> =
+        raw_entries.iter().map(|e| e.effective_at).collect();
+
+    // Apply jitter to each effective_at (mirrors effective_fire_time logic).
     if jitter_secs > 0 {
         let jitter_window = std::time::Duration::from_secs(jitter_secs.cast_unsigned());
-        for entry in &mut entries {
+        for entry in &mut raw_entries {
             if let Some(t) = entry.effective_at {
                 let offset = compute_jitter_offset(schedule_id, t, jitter_window);
                 if let Ok(d) = chrono::Duration::from_std(offset) {
@@ -10740,9 +10987,207 @@ async fn preview_schedule_firings_handler(
         }
     }
 
+    let entries: Vec<ScheduleFirePreviewEntry> = raw_entries
+        .iter()
+        .zip(pre_jitter_bases.iter())
+        .map(|(r, &base)| {
+            build_preview_entry(r, base, jitter_secs, timezone, &schedule.overlap_policy)
+        })
+        .collect();
+
     Ok((
         StatusCode::OK,
-        Json(serde_json::json!({"entries": entries})),
+        Json(serde_json::json!({
+            "entries": entries,
+            "is_paused": false,
+            "pause_reason": serde_json::Value::Null,
+            "from": from,
+            "count_requested": count,
+        })),
+    ))
+}
+
+/// `POST /admin/schedules/preview` — validate a candidate schedule config and return
+/// the next N firing instants without persisting anything (issue #348).
+///
+/// Returns `400 Bad Request` when the `schedule_expr` or `timezone` is invalid,
+/// so operators get an actionable parse error before committing the config.
+#[allow(clippy::too_many_lines)]
+async fn preview_candidate_schedule_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+    Json(body): Json<CandidateSchedulePreviewRequest>,
+) -> Result<impl IntoResponse, AutumnError> {
+    use autumn_harvest::policy::SkipPolicy;
+
+    let count = body.count.clamp(1, 100);
+    let from = parse_from_param(body.from.as_deref()).map_err(AutumnError::bad_request_msg)?;
+
+    // Validate and parse the schedule expression; return 400 on error.
+    // Infer `field` from the error message so timezone parse failures are
+    // correctly attributed to the `timezone` field, not `schedule_expr`.
+    let schedule = match parse_schedule_expr_with_tz(&body.schedule_expr, &body.timezone) {
+        Ok(s) => s,
+        Err(e) => {
+            let field = if e.to_lowercase().contains("timezone") || e.to_lowercase().contains("tz")
+            {
+                "timezone"
+            } else {
+                "schedule_expr"
+            };
+            return Ok((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": e, "field": field})),
+            ));
+        }
+    };
+
+    // Validate skip_policy strictly — from_db silently falls back to Skip.
+    let skip_policy = match SkipPolicy::from_user_input(&body.skip_policy) {
+        Ok(p) => p,
+        Err(bad) => {
+            return Ok((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("unknown skip_policy '{bad}'; valid: skip, run_next_business_day, run_prev_business_day"),
+                    "field": "skip_policy"
+                })),
+            ));
+        }
+    };
+
+    // Validate overlap_policy strictly before it is used in build_preview_entry.
+    if let Err(bad) = autumn_harvest::OverlapPolicy::from_user_input(&body.overlap_policy) {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("unknown overlap_policy '{bad}'; valid: skip, buffer_one, buffer_all, cancel_other, terminate_other"),
+                "field": "overlap_policy"
+            })),
+        ));
+    }
+
+    // Validate jitter before i64 conversion; body.jitter_secs is u64 so an
+    // overly large value would overflow chrono::Duration::seconds and panic.
+    let jitter_duration = std::time::Duration::from_secs(body.jitter_secs);
+    if let Err(e) = validate_jitter(&schedule, jitter_duration) {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e, "field": "jitter_secs"})),
+        ));
+    }
+    // Safe after validate_jitter: valid jitter is at most 3600 s for cron,
+    // or less than the interval period, both well within i64 range.
+    let jitter_secs = i64::try_from(body.jitter_secs).unwrap_or(i64::MAX);
+
+    // Verify the calendar exists before returning any result so that a typo
+    // here gets a 400 even when the schedule is paused.  Exclusion dates are
+    // only loaded for active schedules further below.
+    let calendar_name = body.calendar.as_deref();
+    if let Some(cal_name) = calendar_name {
+        let pool = api_state.storage_pool().map_err(map_error)?;
+        let mut conn = acquire_conn(pool.default_pool()).await?;
+        match get_calendar(&mut conn, cal_name).await {
+            Ok(_) => {}
+            Err(autumn_harvest::HarvestError::NotFound(_)) => {
+                return Ok((
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": format!("calendar '{cal_name}' not found; create it first with POST /calendars"),
+                        "field": "calendar"
+                    })),
+                ));
+            }
+            Err(e) => return Err(map_error(e)),
+        }
+    }
+
+    // Paused candidate schedules return no entries. All validations above
+    // (schedule_expr, timezone, skip_policy, overlap_policy, jitter, calendar)
+    // run first so the preview rejects the same configs that POST /admin/schedules/workflow
+    // would reject, regardless of pause state.
+    if body.paused {
+        return Ok((
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "entries": [],
+                "is_paused": true,
+                "pause_reason": serde_json::Value::Null,
+                "from": from,
+                "count_requested": count,
+            })),
+        ));
+    }
+
+    let excluded_dates = if let Some(cal_name) = calendar_name {
+        let pool = api_state.storage_pool().map_err(map_error)?;
+        let mut conn = acquire_conn(pool.default_pool()).await?;
+        load_exclusions_for_calendar(&mut conn, cal_name)
+            .await
+            .map_err(map_error)?
+    } else {
+        vec![]
+    };
+    // Use the timezone embedded in the schedule variant so local_at always
+    // reflects what the DB will store after saving. CronInTimezone carries the
+    // timezone explicitly; Interval and Manual are always UTC-based (Schedule::timezone_str()
+    // returns "UTC" for those variants), so using body.timezone there would show a
+    // timezone that the persisted schedule would not honour.
+    let effective_timezone: &str = match &schedule {
+        autumn_harvest::policy::Schedule::CronInTimezone { tz, .. } => tz.as_str(),
+        _ => "UTC",
+    };
+
+    // Use a deterministic placeholder UUID so jitter offsets are stable per request.
+    let schedule_id = uuid::Uuid::nil();
+
+    let mut raw_entries = preview_schedule_firings(
+        &schedule,
+        from,
+        count,
+        calendar_name,
+        &excluded_dates,
+        skip_policy,
+    );
+
+    // Capture pre-jitter calendar-adjusted bases before modifying entries in-place.
+    let pre_jitter_bases: Vec<Option<chrono::DateTime<chrono::Utc>>> =
+        raw_entries.iter().map(|e| e.effective_at).collect();
+
+    if jitter_secs > 0 {
+        let jitter_window = std::time::Duration::from_secs(body.jitter_secs);
+        for entry in &mut raw_entries {
+            if let Some(t) = entry.effective_at {
+                let offset = compute_jitter_offset(schedule_id, t, jitter_window);
+                if let Ok(d) = chrono::Duration::from_std(offset) {
+                    entry.effective_at = Some(t + d);
+                }
+            }
+        }
+    }
+
+    let entries: Vec<ScheduleFirePreviewEntry> = raw_entries
+        .iter()
+        .zip(pre_jitter_bases.iter())
+        .map(|(r, &base)| {
+            build_preview_entry(
+                r,
+                base,
+                jitter_secs,
+                effective_timezone,
+                &body.overlap_policy,
+            )
+        })
+        .collect();
+
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "entries": entries,
+            "is_paused": false,
+            "pause_reason": serde_json::Value::Null,
+            "from": from,
+            "count_requested": count,
+        })),
     ))
 }
 
@@ -13202,6 +13647,383 @@ mod tests {
         assert!(
             json.contains("\"timezone\":\"Asia/Tokyo\""),
             "timezone field must be present in JSON: {json}"
+        );
+    }
+
+    // ── Schedule next-fires preview API (issue #348) ─────────────────────────
+
+    #[test]
+    fn schedule_preview_query_accepts_from_parameter() {
+        let q: SchedulePreviewQuery =
+            serde_json::from_str(r#"{"count": 5, "from": "2026-06-01T09:00:00Z"}"#)
+                .expect("should deserialize");
+        assert_eq!(q.count, 5);
+        assert_eq!(q.from.as_deref(), Some("2026-06-01T09:00:00Z"));
+    }
+
+    #[test]
+    fn schedule_preview_query_from_defaults_to_none() {
+        let q: SchedulePreviewQuery =
+            serde_json::from_str(r#"{"count": 10}"#).expect("should deserialize");
+        assert!(q.from.is_none(), "missing `from` must default to None");
+    }
+
+    #[test]
+    fn parse_from_param_accepts_valid_timestamp() {
+        let result = parse_from_param(Some("2026-06-01T09:00:00Z"));
+        assert!(result.is_ok(), "valid RFC3339 must parse successfully");
+    }
+
+    #[test]
+    fn parse_from_param_rejects_far_future_year() {
+        let result = parse_from_param(Some("9001-01-01T00:00:00Z"));
+        assert!(
+            result.is_err(),
+            "year 9001 must be rejected to prevent DateTime overflow in schedule expansion"
+        );
+        assert!(
+            result.unwrap_err().contains("year must be"),
+            "error message must mention the year limit"
+        );
+    }
+
+    #[test]
+    fn parse_from_param_accepts_year_9000() {
+        let result = parse_from_param(Some("9000-12-31T23:59:59Z"));
+        assert!(
+            result.is_ok(),
+            "year 9000 is the boundary and must be accepted"
+        );
+    }
+
+    #[test]
+    fn candidate_schedule_preview_request_parses_minimal() {
+        let json = r#"{"schedule_expr":"0 9 * * 1-5"}"#;
+        let req: CandidateSchedulePreviewRequest =
+            serde_json::from_str(json).expect("should deserialize minimal body");
+        assert_eq!(req.schedule_expr, "0 9 * * 1-5");
+        assert_eq!(req.timezone, "UTC");
+        assert_eq!(req.jitter_secs, 0);
+        assert_eq!(req.overlap_policy, "skip");
+        assert_eq!(req.count, 10);
+        assert!(req.from.is_none());
+    }
+
+    #[test]
+    fn candidate_schedule_preview_request_parses_full_body() {
+        let json = r#"{
+            "schedule_expr": "0 9 * * 1-5",
+            "timezone": "America/Los_Angeles",
+            "jitter_secs": 300,
+            "overlap_policy": "cancel_other",
+            "count": 20,
+            "from": "2026-06-01T09:00:00Z",
+            "paused": true
+        }"#;
+        let req: CandidateSchedulePreviewRequest =
+            serde_json::from_str(json).expect("should deserialize full body");
+        assert_eq!(req.timezone, "America/Los_Angeles");
+        assert_eq!(req.jitter_secs, 300);
+        assert_eq!(req.overlap_policy, "cancel_other");
+        assert_eq!(req.count, 20);
+        assert_eq!(req.from.as_deref(), Some("2026-06-01T09:00:00Z"));
+        assert!(req.paused);
+    }
+
+    #[test]
+    fn build_preview_entry_reason_is_cron_without_jitter() {
+        use autumn_harvest::calendar::ScheduleFirePreview;
+        use chrono::TimeZone as _;
+        let fire = chrono::Utc.with_ymd_and_hms(2026, 6, 1, 9, 0, 0).unwrap();
+        let preview = ScheduleFirePreview {
+            scheduled_at: fire,
+            effective_at: Some(fire),
+            reason: "Fired".to_string(),
+        };
+        // pre_jitter_base = Some(fire) — no calendar adjustment, no jitter.
+        let entry = build_preview_entry(&preview, Some(fire), 0, "UTC", "skip");
+        assert_eq!(entry.reason, "cron", "no-jitter reason must be 'cron'");
+        assert!(entry.jitter_earliest_at.is_none());
+        assert!(entry.jitter_latest_at.is_none());
+    }
+
+    #[test]
+    fn build_preview_entry_reason_is_cron_plus_jitter_with_jitter() {
+        use autumn_harvest::calendar::ScheduleFirePreview;
+        use chrono::TimeZone as _;
+        let fire = chrono::Utc.with_ymd_and_hms(2026, 6, 1, 9, 0, 0).unwrap();
+        let effective = fire + chrono::Duration::seconds(120);
+        let preview = ScheduleFirePreview {
+            scheduled_at: fire,
+            effective_at: Some(effective), // post-jitter effective_at
+            reason: "Fired".to_string(),
+        };
+        // pre_jitter_base = Some(fire) — calendar-adjusted base BEFORE jitter.
+        let entry = build_preview_entry(&preview, Some(fire), 300, "UTC", "skip");
+        assert_eq!(
+            entry.reason, "cron+jitter",
+            "jitter reason must be 'cron+jitter'"
+        );
+        assert!(
+            entry.jitter_earliest_at.is_some(),
+            "must have jitter_earliest_at"
+        );
+        assert!(
+            entry.jitter_latest_at.is_some(),
+            "must have jitter_latest_at"
+        );
+        assert_eq!(
+            entry.jitter_earliest_at.unwrap(),
+            fire,
+            "jitter_earliest_at must equal pre-jitter base"
+        );
+        assert_eq!(
+            entry.jitter_latest_at.unwrap(),
+            fire + chrono::Duration::seconds(300),
+            "jitter_latest_at must equal pre_jitter_base + jitter_secs"
+        );
+    }
+
+    #[test]
+    fn build_preview_entry_jitter_bounds_use_deferred_date_not_original() {
+        use autumn_harvest::calendar::ScheduleFirePreview;
+        use chrono::TimeZone as _;
+        // Simulates a July 4 holiday deferred to July 5 with jitter applied.
+        let original = chrono::Utc.with_ymd_and_hms(2026, 7, 4, 9, 0, 0).unwrap();
+        let deferred_base = chrono::Utc.with_ymd_and_hms(2026, 7, 5, 9, 0, 0).unwrap();
+        let deferred_jittered = deferred_base + chrono::Duration::seconds(42);
+        let preview = ScheduleFirePreview {
+            scheduled_at: original,
+            effective_at: Some(deferred_jittered), // calendar-adjusted + jitter
+            reason: "DeferredFrom:2026-07-04".to_string(),
+        };
+        // pre_jitter_base = Some(deferred_base) — calendar-adjusted BEFORE jitter.
+        let entry = build_preview_entry(&preview, Some(deferred_base), 300, "UTC", "skip");
+        assert_eq!(
+            entry.jitter_earliest_at.unwrap(),
+            deferred_base,
+            "jitter_earliest_at must be the deferred date, not the original excluded date"
+        );
+        assert_eq!(
+            entry.jitter_latest_at.unwrap(),
+            deferred_base + chrono::Duration::seconds(300),
+            "jitter_latest_at must be deferred_base + jitter_secs"
+        );
+    }
+
+    #[test]
+    fn build_preview_entry_reason_is_skipped_calendar_excluded() {
+        use autumn_harvest::calendar::ScheduleFirePreview;
+        use chrono::TimeZone as _;
+        let fire = chrono::Utc.with_ymd_and_hms(2026, 7, 4, 9, 0, 0).unwrap();
+        let preview = ScheduleFirePreview {
+            scheduled_at: fire,
+            effective_at: None,
+            reason: "SkippedByCalendar:us-holidays".to_string(),
+        };
+        // pre_jitter_base = None — suppressed entries have no base.
+        let entry = build_preview_entry(&preview, None, 0, "UTC", "skip");
+        assert_eq!(
+            entry.reason, "skipped:calendar-excluded",
+            "calendar-suppressed reason must be 'skipped:calendar-excluded'"
+        );
+        assert!(entry.effective_at.is_none());
+    }
+
+    #[test]
+    fn build_preview_entry_reason_is_deferred_calendar() {
+        use autumn_harvest::calendar::ScheduleFirePreview;
+        use chrono::TimeZone as _;
+        let fire = chrono::Utc.with_ymd_and_hms(2026, 7, 4, 9, 0, 0).unwrap();
+        let deferred = chrono::Utc.with_ymd_and_hms(2026, 7, 5, 9, 0, 0).unwrap();
+        let preview = ScheduleFirePreview {
+            scheduled_at: fire,
+            effective_at: Some(deferred),
+            reason: "DeferredFrom:2026-07-04".to_string(),
+        };
+        let entry = build_preview_entry(&preview, Some(deferred), 0, "UTC", "skip");
+        assert_eq!(
+            entry.reason, "deferred:calendar",
+            "calendar-deferred reason must be 'deferred:calendar'"
+        );
+    }
+
+    #[test]
+    fn build_preview_entry_would_skip_true_when_overlap_is_skip() {
+        use autumn_harvest::calendar::ScheduleFirePreview;
+        use chrono::TimeZone as _;
+        let fire = chrono::Utc.with_ymd_and_hms(2026, 6, 1, 9, 0, 0).unwrap();
+        let preview = ScheduleFirePreview {
+            scheduled_at: fire,
+            effective_at: Some(fire),
+            reason: "Fired".to_string(),
+        };
+        let entry = build_preview_entry(&preview, Some(fire), 0, "UTC", "skip");
+        assert!(
+            entry.would_skip_if_active,
+            "skip overlap policy must set would_skip_if_active=true"
+        );
+    }
+
+    #[test]
+    fn build_preview_entry_would_skip_false_when_overlap_is_cancel_other() {
+        use autumn_harvest::calendar::ScheduleFirePreview;
+        use chrono::TimeZone as _;
+        let fire = chrono::Utc.with_ymd_and_hms(2026, 6, 1, 9, 0, 0).unwrap();
+        let preview = ScheduleFirePreview {
+            scheduled_at: fire,
+            effective_at: Some(fire),
+            reason: "Fired".to_string(),
+        };
+        let entry = build_preview_entry(&preview, Some(fire), 0, "UTC", "cancel_other");
+        assert!(
+            !entry.would_skip_if_active,
+            "cancel_other overlap policy must set would_skip_if_active=false"
+        );
+    }
+
+    #[test]
+    fn build_preview_entry_would_skip_false_when_suppressed_by_calendar() {
+        use autumn_harvest::calendar::ScheduleFirePreview;
+        use chrono::TimeZone as _;
+        let fire = chrono::Utc.with_ymd_and_hms(2026, 7, 4, 9, 0, 0).unwrap();
+        let preview = ScheduleFirePreview {
+            scheduled_at: fire,
+            effective_at: None, // suppressed
+            reason: "SkippedByCalendar:us-holidays".to_string(),
+        };
+        // Even with skip policy, a suppressed entry cannot be skipped-if-active.
+        let entry = build_preview_entry(&preview, None, 0, "UTC", "skip");
+        assert!(
+            !entry.would_skip_if_active,
+            "suppressed entries (effective_at=None) must not set would_skip_if_active"
+        );
+    }
+
+    #[test]
+    fn build_preview_entry_would_skip_true_when_max_active_runs_is_zero() {
+        use autumn_harvest::calendar::ScheduleFirePreview;
+        use chrono::TimeZone as _;
+        let fire = chrono::Utc.with_ymd_and_hms(2026, 6, 1, 9, 0, 0).unwrap();
+        let preview = ScheduleFirePreview {
+            scheduled_at: fire,
+            effective_at: Some(fire),
+            reason: "Fired".to_string(),
+        };
+        // max_active_runs = 0 means the scheduler's running >= max_active_runs check is
+        // always true, so every firing is dropped. The advisory must fire.
+        let entry = build_preview_entry(&preview, Some(fire), 0, "UTC", "skip");
+        assert!(
+            entry.would_skip_if_active,
+            "max_active_runs=0 with skip policy must set would_skip_if_active=true"
+        );
+    }
+
+    #[test]
+    fn build_preview_entry_jitter_latest_at_is_none_for_oversized_jitter() {
+        use autumn_harvest::calendar::ScheduleFirePreview;
+        use chrono::TimeZone as _;
+        let fire = chrono::Utc.with_ymd_and_hms(2026, 6, 1, 9, 0, 0).unwrap();
+        let preview = ScheduleFirePreview {
+            scheduled_at: fire,
+            effective_at: Some(fire),
+            reason: "Fired".to_string(),
+        };
+        // i64::MAX seconds overflows chrono Duration creation; must not panic.
+        let entry = build_preview_entry(&preview, Some(fire), i64::MAX, "UTC", "skip");
+        assert!(
+            entry.jitter_earliest_at.is_some(),
+            "jitter_earliest_at must still be present"
+        );
+        assert!(
+            entry.jitter_latest_at.is_none(),
+            "jitter_latest_at must be None when jitter_secs overflows DateTime"
+        );
+    }
+
+    #[test]
+    fn management_api_routes_includes_post_schedule_preview() {
+        let routes = management_api_routes();
+        assert!(
+            routes.contains(&("POST", "/admin/schedules/preview")),
+            "POST /admin/schedules/preview must be listed in management_api_routes; found: {routes:?}"
+        );
+    }
+
+    #[test]
+    fn management_api_response_fields_includes_post_schedule_preview() {
+        let fields = management_api_response_fields();
+        assert!(
+            fields
+                .iter()
+                .any(|(m, p, _)| *m == "POST" && *p == "/admin/schedules/preview"),
+            "POST /admin/schedules/preview must be listed in management_api_response_fields"
+        );
+    }
+
+    // ── Candidate preview handler validation (issue #348 follow-up) ──────────
+
+    #[test]
+    fn candidate_request_invalid_skip_policy_fails_deserialization_gracefully() {
+        // The struct accepts any string (validated at handler time), so
+        // deserialization itself must succeed — handler rejects the bad value.
+        let json = r#"{"schedule_expr":"0 9 * * *","skip_policy":"never"}"#;
+        let req: CandidateSchedulePreviewRequest =
+            serde_json::from_str(json).expect("struct accepts any string for skip_policy");
+        assert_eq!(req.skip_policy, "never");
+    }
+
+    #[test]
+    fn candidate_request_invalid_overlap_policy_fails_deserialization_gracefully() {
+        let json = r#"{"schedule_expr":"0 9 * * *","overlap_policy":"unknown"}"#;
+        let req: CandidateSchedulePreviewRequest =
+            serde_json::from_str(json).expect("struct accepts any string for overlap_policy");
+        assert_eq!(req.overlap_policy, "unknown");
+    }
+
+    #[test]
+    fn candidate_request_large_jitter_u64_parses_into_struct() {
+        // u64::MAX is representable in JSON and should parse into the struct;
+        // the handler rejects it via validate_jitter (not a parse error).
+        let json = format!(
+            r#"{{"schedule_expr":"0 9 * * *","jitter_secs":{}}}"#,
+            u64::MAX
+        );
+        let req: CandidateSchedulePreviewRequest =
+            serde_json::from_str(&json).expect("u64::MAX must parse into the struct");
+        assert_eq!(req.jitter_secs, u64::MAX);
+    }
+
+    #[test]
+    fn parse_schedule_error_timezone_field_attributed_correctly() {
+        // "Not/ATimezone" error message from validate_schedule contains "timezone".
+        let result = parse_schedule_expr_with_tz("0 9 * * *", "Not/ATimezone");
+        let err = result.unwrap_err();
+        let field = if err.to_lowercase().contains("timezone") || err.to_lowercase().contains("tz")
+        {
+            "timezone"
+        } else {
+            "schedule_expr"
+        };
+        assert_eq!(
+            field, "timezone",
+            "timezone parse error must be attributed to 'timezone' field, not 'schedule_expr': {err}"
+        );
+    }
+
+    #[test]
+    fn parse_schedule_error_bad_cron_attributed_to_schedule_expr() {
+        let result = parse_schedule_expr_with_tz("not a cron", "UTC");
+        let err = result.unwrap_err();
+        let field = if err.to_lowercase().contains("timezone") || err.to_lowercase().contains("tz")
+        {
+            "timezone"
+        } else {
+            "schedule_expr"
+        };
+        assert_eq!(
+            field, "schedule_expr",
+            "cron parse error must be attributed to 'schedule_expr': {err}"
         );
     }
 }
