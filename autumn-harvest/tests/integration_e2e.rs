@@ -100,6 +100,8 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260526000001_harvest_parent_close_policy/up.sql"),
     "\n",
     include_str!("../migrations/20260530000000_harvest_schedule_ha_claim/up.sql"),
+    "\n",
+    include_str!("../migrations/20260601000000_harvest_schedule_auto_pause/up.sql"),
 );
 
 /// The minimal "legacy" migration set used by the upgrade-path regression
@@ -245,7 +247,8 @@ async fn drop_dag_runs_migration_copies_legacy_rows_to_workflow_executions() {
     .await
     .expect("drop migration should migrate legacy DAG runs before dropping the table");
 
-    let workflow_id = autumn_harvest::scheduler::scheduled_workflow_id_pub(dag_name, logical_date);
+    // The migration generates IDs in the legacy format (no schedule UUID embedded).
+    let workflow_id = format!("sched:{}:{}", dag_name, logical_date.timestamp());
     let migrated = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::workflow_name.eq(dag_name))
         .filter(harvest_workflow_executions::workflow_id.eq(workflow_id))
@@ -4474,8 +4477,8 @@ async fn workflow_schedule_baseline_dispatches_multiple_runs() {
         .expect("load workflow_ids failed");
     for id in &workflow_ids {
         assert!(
-            id.starts_with(&format!("sched:{wf_name}:")),
-            "workflow_id '{id}' does not match expected sched: prefix"
+            id.starts_with("sched:") && id.contains(&format!(":{wf_name}:")),
+            "workflow_id '{id}' does not match expected sched:[uuid]:{wf_name}:[ts] pattern"
         );
     }
 

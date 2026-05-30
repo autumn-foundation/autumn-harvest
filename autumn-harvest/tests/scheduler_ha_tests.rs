@@ -28,7 +28,7 @@ use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use uuid::Uuid;
 
-// All migrations including the new HA claim migration.
+// All migrations including the new HA claim migration and auto-pause columns.
 const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260409000000_harvest_initial/up.sql"),
     "\n",
@@ -76,6 +76,9 @@ const INIT_SQL: &str = concat!(
     "\n",
     // HA scheduler claim columns (issue #350)
     include_str!("../migrations/20260530000000_harvest_schedule_ha_claim/up.sql"),
+    "\n",
+    // Auto-pause columns (issue #360)
+    include_str!("../migrations/20260601000000_harvest_schedule_auto_pause/up.sql"),
 );
 
 // ── Recording metrics ──────────────────────────────────────────────────────

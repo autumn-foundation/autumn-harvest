@@ -3985,6 +3985,11 @@ async fn persist_workflow_outcome(
     persistence: WorkflowTaskPersistence<'_>,
     outcome: WorkflowOutcome,
     execute_span: &tracing::Span,
+    // When `false` the caller is running inside a transaction and will call
+    // the schedule counter helpers itself AFTER the transaction commits, so
+    // they must not be called here (a failed counter query inside a Postgres
+    // transaction aborts the whole transaction).
+    update_schedule_counter: bool,
 ) -> HarvestResult<()> {
     let parent_exec_id = execution.parent_id.map(execution_id_from_uuid);
     // A detached child has parent_close_policy set (non-null). Detached children
@@ -4006,7 +4011,7 @@ async fn persist_workflow_outcome(
         }
         (WorkflowOutcome::Completed { output }, _) => {
             // Root workflow or detached child completing — no parent wake.
-            persist_workflow_completion(
+            let result = persist_workflow_completion(
                 conn,
                 persistence.task.id,
                 persistence.exec_id,
@@ -4014,10 +4019,19 @@ async fn persist_workflow_outcome(
                 persistence.worker_id,
                 output,
             )
-            .await
+            .await;
+            if result.is_ok() && update_schedule_counter {
+                crate::scheduler::maybe_reset_schedule_failure_counter(
+                    conn,
+                    &execution.workflow_id,
+                    &execution.workflow_name,
+                )
+                .await;
+            }
+            result
         }
         (WorkflowOutcome::Failed { error }, Some(parent_id)) if !is_detached_child => {
-            persist_child_workflow_failure(
+            let result = persist_child_workflow_failure(
                 conn,
                 persistence.task.id,
                 persistence.exec_id,
@@ -4026,11 +4040,21 @@ async fn persist_workflow_outcome(
                 parent_id,
                 &error,
             )
-            .await
+            .await;
+            if result.is_ok() && update_schedule_counter {
+                crate::scheduler::maybe_increment_schedule_failure_counter(
+                    conn,
+                    &execution.workflow_id,
+                    &execution.workflow_name,
+                    registry.telemetry().metrics.as_ref(),
+                )
+                .await;
+            }
+            result
         }
         (WorkflowOutcome::Failed { error }, _) => {
             // Root workflow or detached child failing — no parent wake.
-            persist_workflow_failure(
+            let result = persist_workflow_failure(
                 conn,
                 persistence.task.id,
                 persistence.exec_id,
@@ -4038,7 +4062,17 @@ async fn persist_workflow_outcome(
                 persistence.worker_id,
                 &error,
             )
-            .await
+            .await;
+            if result.is_ok() && update_schedule_counter {
+                crate::scheduler::maybe_increment_schedule_failure_counter(
+                    conn,
+                    &execution.workflow_id,
+                    &execution.workflow_name,
+                    registry.telemetry().metrics.as_ref(),
+                )
+                .await;
+            }
+            result
         }
         (WorkflowOutcome::Suspended { commands }, _) => {
             handle_suspended_workflow(
@@ -4070,6 +4104,13 @@ async fn persist_terminal_outcome_with_pending_commands(
     pending_cmds: &[WorkflowCommand],
     execute_span: &tracing::Span,
 ) -> HarvestResult<()> {
+    // Capture counter action before `outcome` is consumed by the closure.
+    let counter_action = match &outcome {
+        WorkflowOutcome::Completed { .. } => Some(false), // reset
+        WorkflowOutcome::Failed { .. } => Some(true),     // increment
+        _ => None,
+    };
+
     conn.transaction::<(), HarvestError, _>(|conn| {
         let mut next_event_id = persistence.next_event_id;
         async move {
@@ -4096,6 +4137,9 @@ async fn persist_terminal_outcome_with_pending_commands(
             create_detached_child_executions(conn, registry, execution, pending_cmds, execute_span)
                 .await?;
 
+            // `update_schedule_counter: false` — counter updates run AFTER this
+            // transaction commits (below) to avoid aborting the transaction on a
+            // best-effort query failure.
             persist_workflow_outcome(
                 conn,
                 registry,
@@ -4106,12 +4150,38 @@ async fn persist_terminal_outcome_with_pending_commands(
                 },
                 outcome,
                 execute_span,
+                false,
             )
             .await
         }
         .scope_boxed()
     })
-    .await
+    .await?;
+
+    // Best-effort schedule counter updates run outside the transaction so a
+    // counter query failure never rolls back the completed/failed execution.
+    match counter_action {
+        Some(false) => {
+            crate::scheduler::maybe_reset_schedule_failure_counter(
+                conn,
+                &execution.workflow_id,
+                &execution.workflow_name,
+            )
+            .await;
+        }
+        Some(true) => {
+            crate::scheduler::maybe_increment_schedule_failure_counter(
+                conn,
+                &execution.workflow_id,
+                &execution.workflow_name,
+                registry.telemetry().metrics.as_ref(),
+            )
+            .await;
+        }
+        None => {}
+    }
+
+    Ok(())
 }
 
 fn pending_update_result_event_count(commands: &[WorkflowCommand]) -> u64 {
@@ -5013,6 +5083,7 @@ async fn process_workflow_task(
             persistence,
             outcome,
             &execute_span,
+            true,
         )
         .await?;
     }

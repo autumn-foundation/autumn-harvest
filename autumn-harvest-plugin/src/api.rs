@@ -19,6 +19,7 @@ use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, patch, post, put};
+use diesel::BoolExpressionMethods;
 use diesel::ExpressionMethods;
 use diesel::OptionalExtension;
 use diesel::QueryDsl;
@@ -1284,6 +1285,12 @@ struct ScheduleEntry {
     calendar_name: Option<String>,
     /// What to do when the fire date is calendar-excluded (issue #337).
     skip_policy: String,
+    /// Auto-pause after this many consecutive execution failures (issue #360). `null` = disabled.
+    consecutive_failure_limit: Option<i32>,
+    /// Current consecutive failure count (issue #360). Resets to 0 on success or resume.
+    consecutive_failure_count: i32,
+    /// Timestamp when the schedule was automatically paused (issue #360). `null` = not auto-paused.
+    auto_paused_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Optional request body for `POST /admin/schedules/{id}/pause` and `…/resume`.
@@ -1332,6 +1339,10 @@ struct CreateWorkflowScheduleRequest {
     /// Valid values: `"skip"`, `"run_next_business_day"`, `"run_prev_business_day"`.
     #[serde(default = "default_skip_policy")]
     skip_policy: String,
+    /// Auto-pause after this many consecutive `FAILED`/`TIMED_OUT` execution completions.
+    /// `null` (the default) disables auto-pause (issue #360).
+    #[serde(default)]
+    consecutive_failure_limit: Option<u32>,
 }
 
 fn default_queue_name() -> String {
@@ -6360,6 +6371,9 @@ async fn list_schedules(
                 buffer_all_max: s.buffer_all_max,
                 calendar_name: s.calendar_name,
                 skip_policy: s.skip_policy,
+                consecutive_failure_limit: s.consecutive_failure_limit,
+                consecutive_failure_count: s.consecutive_failure_count,
+                auto_paused_at: s.auto_paused_at,
             }
         })
         .collect();
@@ -6430,6 +6444,9 @@ async fn get_schedule(
         buffer_all_max: s.buffer_all_max,
         calendar_name: s.calendar_name.clone(),
         skip_policy: s.skip_policy.clone(),
+        consecutive_failure_limit: s.consecutive_failure_limit,
+        consecutive_failure_count: s.consecutive_failure_count,
+        auto_paused_at: s.auto_paused_at,
     }))
 }
 
@@ -6728,6 +6745,9 @@ async fn upsert_workflow_schedule_and_read_back(
         buffer_all_max: row.buffer_all_max,
         calendar_name: row.calendar_name,
         skip_policy: row.skip_policy,
+        consecutive_failure_limit: row.consecutive_failure_limit,
+        consecutive_failure_count: row.consecutive_failure_count,
+        auto_paused_at: row.auto_paused_at,
     })
 }
 
@@ -6861,6 +6881,7 @@ async fn create_workflow_schedule(
         execution_timeout: None,
         calendar: request.calendar.clone(),
         skip_policy,
+        consecutive_failure_limit: request.consecutive_failure_limit,
     };
     let entry = match upsert_workflow_schedule_and_read_back(&mut conn, &ws).await {
         Ok(e) => e,
@@ -7003,17 +7024,26 @@ async fn set_schedule_paused(
             .map_err(database_error)
             .map_err(map_error)?
         } else {
-            // Resume: clear metadata only on the transition true → false.
+            // Resume: clear manual-pause metadata AND auto-pause state (issue #360).
+            // Reset consecutive_failure_count to 0 so the counter starts fresh
+            // and does not immediately re-trigger auto-pause on the next tick.
+            // The filter matches `is_paused = true OR auto_paused_at IS NOT NULL`
+            // so an auto-paused schedule can be resumed even when `is_paused = false`,
+            // while a fully-active schedule receives no unnecessary UPDATE.
             diesel::update(
-                dsl::harvest_schedules
-                    .find(id)
-                    .filter(dsl::is_paused.ne(false)),
+                dsl::harvest_schedules.find(id).filter(
+                    dsl::is_paused
+                        .ne(false)
+                        .or(dsl::auto_paused_at.is_not_null()),
+                ),
             )
             .set((
                 dsl::is_paused.eq(false),
                 dsl::paused_at.eq(None::<chrono::DateTime<chrono::Utc>>),
                 dsl::paused_by.eq(None::<&str>),
                 dsl::pause_reason.eq(None::<&str>),
+                dsl::auto_paused_at.eq(None::<chrono::DateTime<chrono::Utc>>),
+                dsl::consecutive_failure_count.eq(0),
                 dsl::updated_at.eq(now),
             ))
             .execute(&mut conn)
@@ -7751,7 +7781,8 @@ async fn schedule_backfill(
         // Workflow IDs are derived from original_slot (not fire_time), so duplicate
         // detection must use the same set of timestamps that dispatch will use.
         let original_slots: Vec<_> = timestamp_pairs.iter().map(|(orig, _)| *orig).collect();
-        let already_exists = count_existing_in_window(&pool, &kind, &name, &original_slots).await;
+        let already_exists =
+            count_existing_in_window(&pool, &kind, schedule_id, &name, &original_slots).await;
         let remaining = total.saturating_sub(already_exists);
         let available_slots = usize::try_from((max_active - running).max(0)).unwrap_or(0);
         let would_dispatch = remaining.min(available_slots);
@@ -7931,7 +7962,20 @@ async fn schedule_backfill(
 
                 // Use original_slot (pre-calendar-rebase) for ID so that two distinct
                 // logical slots that calendar-adjust to the same fire_time do not collide.
-                let workflow_id = scheduled_workflow_id_pub(&wf_name, *original_slot);
+                let workflow_id = scheduled_workflow_id_pub(schedule_id, &wf_name, *original_slot);
+                let legacy_workflow_id = {
+                    let micros = original_slot.timestamp_subsec_micros();
+                    if micros == 0 {
+                        format!("sched:{}:{}", wf_name, original_slot.timestamp())
+                    } else {
+                        format!(
+                            "sched:{}:{}.{:06}",
+                            wf_name,
+                            original_slot.timestamp(),
+                            micros
+                        )
+                    }
+                };
                 // Match the scheduler: ExecutionId::new() encodes ShardId::UNENCODED so
                 // the execution lands on the default shard, same as tick_one_workflow_schedule.
                 let exec_id = ExecutionId::new();
@@ -7956,7 +8000,11 @@ async fn schedule_backfill(
                 // sealed workflow IDs because the timestamp was already dispatched.
                 let prior_check = harvest_workflow_executions::table
                     .filter(harvest_workflow_executions::workflow_name.eq(&wf_name))
-                    .filter(harvest_workflow_executions::workflow_id.eq(&workflow_id))
+                    .filter(
+                        harvest_workflow_executions::workflow_id
+                            .eq(&workflow_id)
+                            .or(harvest_workflow_executions::workflow_id.eq(&legacy_workflow_id)),
+                    )
                     .count()
                     .get_result::<i64>(&mut conn)
                     .await;
@@ -8051,7 +8099,20 @@ async fn schedule_backfill(
                     continue;
                 };
                 // Use original_slot for ID, same as the workflow path above.
-                let workflow_id = scheduled_workflow_id_pub(&dag_name, *original_slot);
+                let workflow_id = scheduled_workflow_id_pub(schedule_id, &dag_name, *original_slot);
+                let legacy_workflow_id = {
+                    let micros = original_slot.timestamp_subsec_micros();
+                    if micros == 0 {
+                        format!("sched:{}:{}", dag_name, original_slot.timestamp())
+                    } else {
+                        format!(
+                            "sched:{}:{}.{:06}",
+                            dag_name,
+                            original_slot.timestamp(),
+                            micros
+                        )
+                    }
+                };
                 let exec_id = autumn_harvest::types::ExecutionId::new_for_shard(shard_id);
                 let dag_queue = schedule
                     .queue_name
@@ -8065,7 +8126,11 @@ async fn schedule_backfill(
                 // a duplicate would be created for the same scheduled slot.
                 let prior_check = harvest_workflow_executions::table
                     .filter(harvest_workflow_executions::workflow_name.eq(&dag_name))
-                    .filter(harvest_workflow_executions::workflow_id.eq(&workflow_id))
+                    .filter(
+                        harvest_workflow_executions::workflow_id
+                            .eq(&workflow_id)
+                            .or(harvest_workflow_executions::workflow_id.eq(&legacy_workflow_id)),
+                    )
                     .count()
                     .get_result::<i64>(&mut conn)
                     .await;
@@ -8269,6 +8334,7 @@ async fn query_running_count_best_effort(
 async fn count_existing_in_window(
     pool: &HarvestDbPool,
     kind: &ScheduleKind,
+    schedule_id: uuid::Uuid,
     name: &str,
     timestamps: &[chrono::DateTime<chrono::Utc>],
 ) -> usize {
@@ -8278,10 +8344,22 @@ async fn count_existing_in_window(
     let mut total = 0usize;
     match kind {
         ScheduleKind::Workflow => {
-            let workflow_ids: Vec<String> = timestamps
+            let mut workflow_ids: Vec<String> = timestamps
                 .iter()
-                .map(|ts| scheduled_workflow_id_pub(name, *ts))
+                .map(|ts| scheduled_workflow_id_pub(schedule_id, name, *ts))
                 .collect();
+            let legacy_ids: Vec<String> = timestamps
+                .iter()
+                .map(|ts| {
+                    let micros = ts.timestamp_subsec_micros();
+                    if micros == 0 {
+                        format!("sched:{}:{}", name, ts.timestamp())
+                    } else {
+                        format!("sched:{}:{}.{:06}", name, ts.timestamp(), micros)
+                    }
+                })
+                .collect();
+            workflow_ids.extend(legacy_ids);
             for (_, shard_pool) in pool.iter_shards() {
                 let Ok(mut conn) = acquire_conn(shard_pool).await else {
                     continue;
@@ -8297,10 +8375,22 @@ async fn count_existing_in_window(
             }
         }
         ScheduleKind::Dag => {
-            let workflow_ids: Vec<String> = timestamps
+            let mut workflow_ids: Vec<String> = timestamps
                 .iter()
-                .map(|ts| scheduled_workflow_id_pub(name, *ts))
+                .map(|ts| scheduled_workflow_id_pub(schedule_id, name, *ts))
                 .collect();
+            let legacy_ids: Vec<String> = timestamps
+                .iter()
+                .map(|ts| {
+                    let micros = ts.timestamp_subsec_micros();
+                    if micros == 0 {
+                        format!("sched:{}:{}", name, ts.timestamp())
+                    } else {
+                        format!("sched:{}:{}.{:06}", name, ts.timestamp(), micros)
+                    }
+                })
+                .collect();
+            workflow_ids.extend(legacy_ids);
             for (_, shard_pool) in pool.iter_shards() {
                 let Ok(mut conn) = acquire_conn(shard_pool).await else {
                     continue;
@@ -14204,6 +14294,9 @@ mod tests {
             buffer_all_max: 100,
             calendar_name: None,
             skip_policy: "skip".to_string(),
+            consecutive_failure_limit: None,
+            consecutive_failure_count: 0,
+            auto_paused_at: None,
         };
         let json = serde_json::to_string(&entry).expect("serialize");
         assert!(

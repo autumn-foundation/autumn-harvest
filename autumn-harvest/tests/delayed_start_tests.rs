@@ -54,6 +54,8 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260526000001_harvest_parent_close_policy/up.sql"),
     "\n",
     include_str!("../migrations/20260530000000_harvest_schedule_ha_claim/up.sql"),
+    "\n",
+    include_str!("../migrations/20260601000000_harvest_schedule_auto_pause/up.sql"),
 );
 
 async fn setup_test_db() -> (AsyncPgConnection, ContainerAsync<Postgres>) {
@@ -212,6 +214,7 @@ async fn test_delayed_start_validation() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
 async fn test_delayed_start_no_premature_dispatch() {
     let container = Postgres::default()
         .with_init_sql(INIT_SQL.to_string().into_bytes())
@@ -314,12 +317,18 @@ async fn test_delayed_start_no_premature_dispatch() {
     assert_eq!(tasks_mid.len(), 1);
     assert_eq!(tasks_mid[0].state, "PENDING");
 
-    // Sleep until scheduled time passes (3 seconds delay + buffer)
-    tokio::time::sleep(Duration::from_secs(3)).await;
-
-    // Verify task is now executed and finished (no longer pending, or marked COMPLETED / deleted, wait, what happens to compelted workflow tasks?
-    // Let's check history or execution state)
-    let exec_final = load_execution(&mut conn, exec_id).await;
+    // Sleep/poll until scheduled time passes and execution finishes (up to 10 seconds)
+    let exec_final = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let exec = load_execution(&mut conn, exec_id).await;
+            if exec.state == "COMPLETED" {
+                break exec;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("Workflow should complete within 10 seconds");
     assert_eq!(exec_final.state, "COMPLETED");
 
     worker.shutdown();

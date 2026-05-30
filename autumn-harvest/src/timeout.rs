@@ -523,6 +523,7 @@ async fn enforce_workflow_timeout(
     task: &TaskQueueItem,
     exec_id: crate::types::ExecutionId,
     reason: &TimeoutReason,
+    metrics: &dyn MetricsRecorder,
 ) -> HarvestResult<()> {
     let execution = load_workflow_execution(conn, exec_id).await?;
     let error = timeout_error(&execution.workflow_name, reason);
@@ -553,7 +554,20 @@ async fn enforce_workflow_timeout(
         }
         .scope_boxed()
     })
-    .await
+    .await?;
+
+    // Best-effort: count task-level timeouts toward the schedule auto-pause threshold.
+    // Called AFTER the transaction commits to avoid aborting the transition on a
+    // counter query failure.
+    crate::scheduler::maybe_increment_schedule_failure_counter(
+        conn,
+        &execution.workflow_id,
+        &execution.workflow_name,
+        metrics,
+    )
+    .await;
+
+    Ok(())
 }
 
 /// Enforce schedule-to-close timeouts for pending external activity tasks.
@@ -731,6 +745,17 @@ pub async fn enforce_workflow_execution_timeouts(
         );
 
         metrics.record_workflow_timeout(&workflow_name, &execution.queue_name);
+
+        // Best-effort: count execution timeouts toward the auto-pause threshold.
+        // `workflow_id` encodes the schedule UUID so the update is scoped to the
+        // triggering schedule and does not cross-contaminate sibling schedules.
+        crate::scheduler::maybe_increment_schedule_failure_counter(
+            conn,
+            &execution.workflow_id,
+            &workflow_name,
+            metrics,
+        )
+        .await;
     }
 
     Ok(count)
@@ -1013,8 +1038,14 @@ pub async fn enforce_timeouts_once(
                     .await
             }
             ("workflow", Some(exec_uuid)) => {
-                enforce_workflow_timeout(conn, &task, execution_id_from_uuid(exec_uuid), &reason)
-                    .await
+                enforce_workflow_timeout(
+                    conn,
+                    &task,
+                    execution_id_from_uuid(exec_uuid),
+                    &reason,
+                    metrics,
+                )
+                .await
             }
             _ => queue::fail_task(conn, task.id, &timeout_error(&task.task_type, &reason)).await,
         };
