@@ -96,6 +96,16 @@ const INIT_SQL: &str = concat!(
     ),
     "\n",
     include_str!("../../autumn-harvest/migrations/20260522000001_harvest_rate_limiting/up.sql"),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260526000001_harvest_parent_close_policy/up.sql"
+    ),
+    "\n",
+    include_str!("../../autumn-harvest/migrations/20260530000000_harvest_schedule_ha_claim/up.sql"),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260601000000_harvest_schedule_auto_pause/up.sql"
+    ),
 );
 
 async fn setup_test_database_url() -> (String, ContainerAsync<Postgres>) {
@@ -332,6 +342,23 @@ async fn workflows_page_nav_includes_build_routing() {
 async fn workers_page_nav_includes_build_routing() {
     let (database_url, _container) = setup_test_database_url().await;
     let pool = build_test_pool(&database_url);
+
+    // Register a worker so the worker table actually renders (empty state omits the table headers)
+    let mut conn = AsyncPgConnection::establish(&database_url).await.unwrap();
+    register_worker(
+        &mut conn,
+        "worker-test",
+        &["default".to_string()],
+        &[0],
+        4,
+        "localhost",
+        None,
+        "sha-v1",
+        Some("prod-v1"),
+    )
+    .await
+    .unwrap();
+
     let api_state = build_api_state_with_pool(&pool);
     let app = harvest_ui_router(api_state).with_state(test_app_state());
 

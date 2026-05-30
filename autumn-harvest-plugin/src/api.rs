@@ -7963,6 +7963,19 @@ async fn schedule_backfill(
                 // Use original_slot (pre-calendar-rebase) for ID so that two distinct
                 // logical slots that calendar-adjust to the same fire_time do not collide.
                 let workflow_id = scheduled_workflow_id_pub(schedule_id, &wf_name, *original_slot);
+                let legacy_workflow_id = {
+                    let micros = original_slot.timestamp_subsec_micros();
+                    if micros == 0 {
+                        format!("sched:{}:{}", wf_name, original_slot.timestamp())
+                    } else {
+                        format!(
+                            "sched:{}:{}.{:06}",
+                            wf_name,
+                            original_slot.timestamp(),
+                            micros
+                        )
+                    }
+                };
                 // Match the scheduler: ExecutionId::new() encodes ShardId::UNENCODED so
                 // the execution lands on the default shard, same as tick_one_workflow_schedule.
                 let exec_id = ExecutionId::new();
@@ -7987,7 +8000,11 @@ async fn schedule_backfill(
                 // sealed workflow IDs because the timestamp was already dispatched.
                 let prior_check = harvest_workflow_executions::table
                     .filter(harvest_workflow_executions::workflow_name.eq(&wf_name))
-                    .filter(harvest_workflow_executions::workflow_id.eq(&workflow_id))
+                    .filter(
+                        harvest_workflow_executions::workflow_id
+                            .eq(&workflow_id)
+                            .or(harvest_workflow_executions::workflow_id.eq(&legacy_workflow_id)),
+                    )
                     .count()
                     .get_result::<i64>(&mut conn)
                     .await;
@@ -8083,6 +8100,19 @@ async fn schedule_backfill(
                 };
                 // Use original_slot for ID, same as the workflow path above.
                 let workflow_id = scheduled_workflow_id_pub(schedule_id, &dag_name, *original_slot);
+                let legacy_workflow_id = {
+                    let micros = original_slot.timestamp_subsec_micros();
+                    if micros == 0 {
+                        format!("sched:{}:{}", dag_name, original_slot.timestamp())
+                    } else {
+                        format!(
+                            "sched:{}:{}.{:06}",
+                            dag_name,
+                            original_slot.timestamp(),
+                            micros
+                        )
+                    }
+                };
                 let exec_id = autumn_harvest::types::ExecutionId::new_for_shard(shard_id);
                 let dag_queue = schedule
                     .queue_name
@@ -8096,7 +8126,11 @@ async fn schedule_backfill(
                 // a duplicate would be created for the same scheduled slot.
                 let prior_check = harvest_workflow_executions::table
                     .filter(harvest_workflow_executions::workflow_name.eq(&dag_name))
-                    .filter(harvest_workflow_executions::workflow_id.eq(&workflow_id))
+                    .filter(
+                        harvest_workflow_executions::workflow_id
+                            .eq(&workflow_id)
+                            .or(harvest_workflow_executions::workflow_id.eq(&legacy_workflow_id)),
+                    )
                     .count()
                     .get_result::<i64>(&mut conn)
                     .await;
@@ -8310,10 +8344,22 @@ async fn count_existing_in_window(
     let mut total = 0usize;
     match kind {
         ScheduleKind::Workflow => {
-            let workflow_ids: Vec<String> = timestamps
+            let mut workflow_ids: Vec<String> = timestamps
                 .iter()
                 .map(|ts| scheduled_workflow_id_pub(schedule_id, name, *ts))
                 .collect();
+            let legacy_ids: Vec<String> = timestamps
+                .iter()
+                .map(|ts| {
+                    let micros = ts.timestamp_subsec_micros();
+                    if micros == 0 {
+                        format!("sched:{}:{}", name, ts.timestamp())
+                    } else {
+                        format!("sched:{}:{}.{:06}", name, ts.timestamp(), micros)
+                    }
+                })
+                .collect();
+            workflow_ids.extend(legacy_ids);
             for (_, shard_pool) in pool.iter_shards() {
                 let Ok(mut conn) = acquire_conn(shard_pool).await else {
                     continue;
@@ -8329,10 +8375,22 @@ async fn count_existing_in_window(
             }
         }
         ScheduleKind::Dag => {
-            let workflow_ids: Vec<String> = timestamps
+            let mut workflow_ids: Vec<String> = timestamps
                 .iter()
                 .map(|ts| scheduled_workflow_id_pub(schedule_id, name, *ts))
                 .collect();
+            let legacy_ids: Vec<String> = timestamps
+                .iter()
+                .map(|ts| {
+                    let micros = ts.timestamp_subsec_micros();
+                    if micros == 0 {
+                        format!("sched:{}:{}", name, ts.timestamp())
+                    } else {
+                        format!("sched:{}:{}.{:06}", name, ts.timestamp(), micros)
+                    }
+                })
+                .collect();
+            workflow_ids.extend(legacy_ids);
             for (_, shard_pool) in pool.iter_shards() {
                 let Ok(mut conn) = acquire_conn(shard_pool).await else {
                     continue;

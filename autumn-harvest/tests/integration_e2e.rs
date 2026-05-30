@@ -100,6 +100,8 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260526000001_harvest_parent_close_policy/up.sql"),
     "\n",
     include_str!("../migrations/20260530000000_harvest_schedule_ha_claim/up.sql"),
+    "\n",
+    include_str!("../migrations/20260601000000_harvest_schedule_auto_pause/up.sql"),
 );
 
 /// The minimal "legacy" migration set used by the upgrade-path regression
@@ -4475,8 +4477,8 @@ async fn workflow_schedule_baseline_dispatches_multiple_runs() {
         .expect("load workflow_ids failed");
     for id in &workflow_ids {
         assert!(
-            id.starts_with(&format!("sched:{wf_name}:")),
-            "workflow_id '{id}' does not match expected sched: prefix"
+            id.starts_with("sched:") && id.contains(&format!(":{wf_name}:")),
+            "workflow_id '{id}' does not match expected sched:[uuid]:{wf_name}:[ts] pattern"
         );
     }
 

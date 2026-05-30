@@ -124,6 +124,10 @@ const INIT_SQL: &str = concat!(
     ),
     "\n",
     include_str!("../../autumn-harvest/migrations/20260530000000_harvest_schedule_ha_claim/up.sql"),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260601000000_harvest_schedule_auto_pause/up.sql"
+    ),
 );
 type HarvestApiApp = axum::Router;
 
@@ -4732,9 +4736,10 @@ async fn concurrent_scheduler_ticks_dispatch_due_workflow_schedule_once() {
         .await
         .expect("scheduled workflow execution should exist");
     assert!(
-        execution
-            .workflow_id
-            .starts_with(&format!("sched:{workflow_name}:")),
+        execution.workflow_id.starts_with("sched:")
+            && execution
+                .workflow_id
+                .contains(&format!(":{workflow_name}:")),
         "scheduled workflow id must be deterministic for duplicate suppression"
     );
     assert_eq!(
