@@ -3464,9 +3464,7 @@ impl ActivityContext {
             return Ok(());
         };
         tx.send(payload).await.map_err(|_| {
-            HarvestError::ActivityCancelled(
-                "activity cancelled: heartbeat channel closed".into(),
-            )
+            HarvestError::ActivityCancelled("activity cancelled: heartbeat channel closed".into())
         })?;
 
         Ok(())
@@ -4002,7 +4000,10 @@ mod tests {
 
         let result = ctx.heartbeat(serde_json::json!({})).await;
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), HarvestError::ActivityCancelled(_)));
+        assert!(matches!(
+            result.unwrap_err(),
+            HarvestError::ActivityCancelled(_)
+        ));
     }
 
     #[test]

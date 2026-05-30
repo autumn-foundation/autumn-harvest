@@ -728,6 +728,7 @@ async fn uncooperative_activity_is_hard_aborted_after_grace_period() {
 //
 // An activity that calls ctx.heartbeat() in a loop exits early (and sets the
 // probe flag) within one heartbeat interval after the workflow is cancelled.
+#[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn activity_exits_early_on_workflow_cancellation() {
     let (database_url, _container) = setup_test_database_url().await;
