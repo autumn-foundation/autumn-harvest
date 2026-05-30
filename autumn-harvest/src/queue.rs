@@ -583,6 +583,27 @@ pub async fn concurrency_key_stats(
 /// observed after the activity has successfully finished.
 ///
 /// # Errors
+/// Lock the task queue row `FOR UPDATE` and return its current `state`.
+///
+/// Used by [`crate::context::ActivityContext::run_transactional`] to verify
+/// the task is still `RUNNING` before committing the transactional activity
+/// result.  Returns `None` when the row no longer exists.
+pub(crate) async fn task_state_for_update(
+    conn: &mut AsyncPgConnection,
+    task_id: Uuid,
+) -> HarvestResult<Option<String>> {
+    use crate::schema::harvest_task_queue::dsl;
+
+    dsl::harvest_task_queue
+        .find(task_id)
+        .for_update()
+        .select(dsl::state)
+        .first::<String>(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)
+}
+
 ///
 /// Returns [`crate::error::HarvestError::Database`] on update failure.
 pub async fn complete_task(

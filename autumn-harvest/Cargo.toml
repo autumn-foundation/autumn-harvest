@@ -109,6 +109,10 @@ required-features = ["db"]
 name = "cross_workflow_signal_tests"
 required-features = ["db"]
 
+[[test]]
+name = "transactional_activity_tests"
+required-features = ["db"]
+
 [[example]]
 name = "timezone_cron_schedule"
 

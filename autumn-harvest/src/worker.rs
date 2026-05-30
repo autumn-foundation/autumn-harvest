@@ -22,6 +22,8 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use crate::builder::WorkerConfig;
+#[cfg(feature = "db")]
+use crate::context::TransactionalState;
 use crate::context::{
     ActivityContext, SharedState, WorkflowCommand, WorkflowHistoryPolicy, empty_shared_state,
 };
@@ -2835,6 +2837,20 @@ async fn finalize_activity_failure(
                 return Ok(());
             };
             if state != "RUNNING" {
+                // If the task reached COMPLETED before the handler returned
+                // (e.g. via run_transactional) and the handler then returned
+                // Err, the error is discarded — the workflow already observed
+                // ActivityCompleted.  Emit a warning so the misuse is visible.
+                if state == "COMPLETED" {
+                    tracing::warn!(
+                        task_id = %task.id,
+                        activity_name = %activity_name,
+                        "activity handler returned Err but task is already COMPLETED \
+                         (run_transactional committed it); the error is discarded and \
+                         the workflow observes ActivityCompleted — run_transactional \
+                         must be the final expression in the activity handler"
+                    );
+                }
                 return Ok(());
             }
             store::append_events(conn, exec_id, &[failed_event], history.next_event_id).await?;
@@ -3170,31 +3186,42 @@ async fn execute_activity_future_with_cancellation(
 #[allow(clippy::too_many_lines)]
 async fn process_activity_task(
     pool: &DbPool,
-    conn: &mut AsyncPgConnection,
     registry: &HandlerRegistry,
     task: &TaskQueueItem,
     worker_id: &str,
     cancellation_grace_period: Duration,
 ) -> HarvestResult<()> {
     let Some(exec_uuid) = task.workflow_exec_id else {
-        return fail_task_only(conn, task.id, "activity task missing workflow_exec_id").await;
+        let mut conn = pool.get().await.map_err(crate::error::database_error)?;
+        return fail_task_only(&mut conn, task.id, "activity task missing workflow_exec_id").await;
     };
     let Some(activity_name) = task.activity_name.as_deref() else {
-        return fail_task_only(conn, task.id, "activity task missing activity_name").await;
+        let mut conn = pool.get().await.map_err(crate::error::database_error)?;
+        return fail_task_only(&mut conn, task.id, "activity task missing activity_name").await;
     };
     let exec_id = execution_id_from_uuid(exec_uuid);
 
     let Some(activity) = registry.activities.get(activity_name) else {
         let error = format!("no activity handler registered for '{activity_name}'");
-        fail_task_and_execution(conn, task, worker_id, &error).await?;
+        let mut conn = pool.get().await.map_err(crate::error::database_error)?;
+        fail_task_and_execution(&mut conn, task, worker_id, &error).await?;
         return Err(HarvestError::Config(error));
     };
 
-    let started_result =
-        append_activity_started_if_pending(conn, task, exec_id, activity_name, worker_id).await;
-    let Some(activity_id) = fail_execution_on_error(conn, task, worker_id, started_result).await?
-    else {
-        return Ok(());
+    // Setup phase: acquire a connection, append ActivityStarted, then drop it
+    // so the pool slot is free before the handler runs.  This prevents a
+    // deadlock when `run_transactional` needs a second slot from the same pool
+    // while max_size connections are already claimed by concurrent activity tasks.
+    let activity_id = {
+        let mut conn = pool.get().await.map_err(crate::error::database_error)?;
+        let started_result =
+            append_activity_started_if_pending(&mut conn, task, exec_id, activity_name, worker_id)
+                .await;
+        match fail_execution_on_error(&mut conn, task, worker_id, started_result).await? {
+            Some(id) => id,
+            None => return Ok(()),
+        }
+        // conn is dropped here, returning the slot to the pool
     };
 
     let cancel = CancellationToken::new();
@@ -3215,6 +3242,21 @@ async fn process_activity_task(
     .with_trace_context(trace_carrier.clone())
     .with_idempotency_key(IdempotencyKey::from_activity_exec_id(activity_id))
     .with_attempt(task_attempt(task));
+    // Compute cap before the handler so run_transactional can enforce it
+    // inside the transaction (before ActivityCompleted is committed).
+    let effective_result_cap = activity
+        .max_result_bytes
+        .map_or(registry.max_activity_result_bytes, |per_activity| {
+            per_activity.max(registry.max_activity_result_bytes)
+        });
+    #[cfg(feature = "db")]
+    let ctx = ctx.with_transactional_state(TransactionalState {
+        pool: pool.clone(),
+        exec_id,
+        activity_id,
+        task_id: task.id,
+        max_result_bytes: effective_result_cap,
+    });
 
     let telemetry = registry.telemetry().clone();
     // ADR-0001 §3: restore the producer's trace context so the activity span
@@ -3247,14 +3289,6 @@ async fn process_activity_task(
         span,
     )
     .await;
-
-    let effective_result_cap = registry
-        .activities
-        .get(activity_name)
-        .and_then(|a| a.max_result_bytes)
-        .map_or(registry.max_activity_result_bytes, |per_activity| {
-            per_activity.max(registry.max_activity_result_bytes)
-        });
 
     // Pre-normalize oversized results to non-retryable failures BEFORE emitting
     // metrics so that an Ok result above the cap is counted as Failed, not Completed.
@@ -3313,13 +3347,16 @@ async fn process_activity_task(
     cancel.cancel();
     drop(activity_future);
 
+    // Finalization phase: re-acquire a connection now that the handler is done.
+    let mut conn = pool.get().await.map_err(crate::error::database_error)?;
     let retry_policy_result = configured_retry_policy(task);
-    let retry_policy = fail_execution_on_error(conn, task, worker_id, retry_policy_result).await?;
+    let retry_policy =
+        fail_execution_on_error(&mut conn, task, worker_id, retry_policy_result).await?;
 
     // activity_result is already cap-normalized (oversized Ok → non-retryable Err);
     // pass 0 so handle_activity_result skips the redundant cap check.
     handle_activity_result(
-        conn,
+        &mut conn,
         task,
         exec_id,
         activity_id,
@@ -5026,9 +5063,13 @@ async fn process_task(
             .await
         }
         ClaimedTaskKind::Activity => {
+            // Drop the connection before the handler runs: run_transactional
+            // acquires a second pool slot inside the handler, and holding this
+            // one during execution would cause a deadlock when max_size
+            // connections are all claimed by concurrent activity tasks.
+            drop(conn);
             process_activity_task(
                 pool,
-                &mut conn,
                 registry.as_ref(),
                 &task,
                 worker_id,

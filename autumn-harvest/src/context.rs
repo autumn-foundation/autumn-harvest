@@ -97,6 +97,29 @@ type ActivityCancellationPool =
 const DURABLE_CANCELLATION_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
 const NO_HEARTBEAT_FLUSHER_REASON: &str = "heartbeats are not supported for this activity context because no heartbeat flusher is attached";
+
+/// State needed by [`ActivityContext::run_transactional`] to bind user writes
+/// to the same Postgres transaction as the `ActivityCompleted` event.
+///
+/// Attached to a regular (non-local) activity context by the worker before
+/// dispatching the activity handler.  `None` on test contexts and local
+/// activity contexts; calling `run_transactional` without this state returns
+/// a descriptive error.
+#[cfg(feature = "db")]
+pub struct TransactionalState {
+    /// Pool to acquire the transactional connection from.
+    pub(crate) pool: ActivityCancellationPool,
+    /// Workflow execution that owns this activity invocation.
+    pub(crate) exec_id: crate::types::ExecutionId,
+    /// Unique ID of this activity invocation attempt.
+    pub(crate) activity_id: crate::types::ActivityExecId,
+    /// Task queue row ID — used to lock and complete the task atomically.
+    pub(crate) task_id: uuid::Uuid,
+    /// Maximum serialized result size in bytes (0 = unlimited).  Checked
+    /// inside the transaction so an oversized result is caught before
+    /// `ActivityCompleted` is committed.
+    pub(crate) max_result_bytes: u64,
+}
 const LOCAL_ACTIVITY_HEARTBEAT_REASON: &str =
     "local activities do not support heartbeats; use a regular activity";
 
@@ -3197,6 +3220,12 @@ pub struct ActivityContext {
     /// Which attempt of the logical activity invocation this context represents.
     /// `1` for the first attempt. Stable retries share a key but differ here.
     attempt: Option<u32>,
+    /// State needed by [`Self::run_transactional`].
+    ///
+    /// `None` for test contexts, local activity contexts, and any context that
+    /// was not constructed by the worker's regular activity dispatch path.
+    #[cfg(feature = "db")]
+    transactional_state: Option<TransactionalState>,
 }
 
 impl ActivityContext {
@@ -3223,6 +3252,8 @@ impl ActivityContext {
             trace_context: None,
             idempotency_key: None,
             attempt: None,
+            #[cfg(feature = "db")]
+            transactional_state: None,
         }
     }
 
@@ -3254,6 +3285,7 @@ impl ActivityContext {
             trace_context: None,
             idempotency_key: None,
             attempt: None,
+            transactional_state: None,
         }
     }
 
@@ -3273,6 +3305,8 @@ impl ActivityContext {
             trace_context: None,
             idempotency_key: None,
             attempt: None,
+            #[cfg(feature = "db")]
+            transactional_state: None,
         }
     }
 
@@ -3314,6 +3348,18 @@ impl ActivityContext {
     #[must_use]
     pub const fn with_attempt(mut self, attempt: u32) -> Self {
         self.attempt = Some(attempt);
+        self
+    }
+
+    /// Attach the transactional state needed by [`Self::run_transactional`].
+    ///
+    /// Called by the worker after the `ActivityStarted` event is committed so
+    /// the `activity_id` is stable.  Not available on test or local-activity
+    /// contexts.
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub(crate) fn with_transactional_state(mut self, state: TransactionalState) -> Self {
+        self.transactional_state = Some(state);
         self
     }
 
@@ -3561,6 +3607,228 @@ impl ActivityContext {
                 check.task_id
             ))),
         }
+    }
+
+    /// Run user domain writes and commit the `ActivityCompleted` event in a
+    /// single atomic Postgres transaction.
+    ///
+    /// This is the primary API for transactional activities (issue #352).  When
+    /// your activity body and harvest share the same Postgres cluster, wrapping
+    /// domain writes in `run_transactional` eliminates the dual-write problem:
+    /// if the worker crashes between "did the work" and "recorded the work" no
+    /// duplicate effects are produced on retry, even without idempotency keys.
+    ///
+    /// # How it works
+    ///
+    /// `f` receives a `&mut AsyncPgConnection` that is inside the same
+    /// transaction harvest will use to append `ActivityCompleted` and mark the
+    /// task complete.  If `f` returns `Ok(value)`:
+    ///
+    /// * harvest appends `ActivityCompleted { output: value }` within the same
+    ///   transaction
+    /// * the task row is set to `COMPLETED`
+    /// * the workflow is woken
+    /// * the transaction commits — user writes and the event are visible together
+    ///
+    /// If `f` returns `Err(e)` the transaction is rolled back: user writes are
+    /// discarded and the activity's error propagates through the normal retry
+    /// and `ActivityFailed` path.
+    ///
+    /// # Constraints
+    ///
+    /// * **Not supported for local activities.** Local activities run inline on
+    ///   the workflow worker and do not have a dedicated DB connection.  Calling
+    ///   `run_transactional` on a local activity context returns `Err`.
+    /// * **DB must be the same cluster.** The connection comes from harvest's
+    ///   own worker pool.  Cross-cluster atomicity is not possible — use the
+    ///   traditional idempotency-key pattern for that case.
+    /// * **Must be the final expression.** Once `run_transactional` returns
+    ///   `Ok`, harvest has already committed `ActivityCompleted` and marked
+    ///   the task `COMPLETED`.  Any fallible work done by the activity *after*
+    ///   this call cannot roll back the committed event — if it fails, the
+    ///   workflow still observes success.  Always return the result of
+    ///   `run_transactional` directly; do not use `?` on it and then do more
+    ///   work.
+    /// * **Keep bodies short.** The Postgres row lock held during `f` blocks
+    ///   concurrent event appends for the same workflow execution.  Long-running
+    ///   bodies (> a few seconds) will delay other activities and should use
+    ///   regular activities with idempotency keys instead.
+    /// * **Heartbeating is unaffected** — `ctx.heartbeat()` still works
+    ///   normally outside the `run_transactional` closure.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(String)` when:
+    /// * this context has no transactional pool attached (e.g. test contexts
+    ///   or local activities),
+    /// * a DB connection cannot be acquired from the pool,
+    /// * `f` returns `Err(e)` (the user error is propagated as-is), or
+    /// * the harvest finalization (event append / task complete / workflow wake)
+    ///   fails.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use autumn_harvest::prelude::*;
+    ///
+    /// #[activity(start_to_close = "30s")]
+    /// async fn create_order(ctx: &ActivityContext, order: Order) -> Result<OrderId, String> {
+    ///     ctx.run_transactional(|conn| Box::pin(async move {
+    ///         diesel::insert_into(orders::table)
+    ///             .values(&NewOrder::from(&order))
+    ///             .execute(conn)
+    ///             .await
+    ///             .map_err(|e| e.to_string())?;
+    ///         Ok(order.id)
+    ///     })).await
+    /// }
+    /// ```
+    #[cfg(feature = "db")]
+    pub async fn run_transactional<T, F>(&self, f: F) -> Result<T, String>
+    where
+        F: for<'conn> FnOnce(
+                &'conn mut diesel_async::AsyncPgConnection,
+            ) -> futures::future::BoxFuture<'conn, Result<T, String>>
+            + Send,
+        T: serde::Serialize + Send,
+    {
+        // Two-level error type so the user's original Err(String) propagates
+        // unchanged.  Wrapping it in HarvestError::Config would stringify as
+        // "invalid configuration: …" which breaks non_retryable_errors matching
+        // and corrupts the ActivityFailed payload seen by the retry policy.
+        // Defined before any statements to satisfy clippy::items_after_statements.
+        enum TxError {
+            /// User closure returned Err — propagated verbatim.
+            User(String),
+            /// Internal harvest error (lock, append, DB).
+            Harvest(HarvestError),
+            /// Structured `ActivityFailure` JSON payload (e.g. `PayloadTooLarge`)
+            /// that must reach `handle_activity_result` as-is so the failure
+            /// parser can mark it non-retryable.
+            Payload(String),
+        }
+        impl From<HarvestError> for TxError {
+            fn from(e: HarvestError) -> Self {
+                Self::Harvest(e)
+            }
+        }
+        impl From<diesel::result::Error> for TxError {
+            fn from(e: diesel::result::Error) -> Self {
+                Self::Harvest(crate::error::database_error(e))
+            }
+        }
+
+        use diesel_async::AsyncConnection as _;
+        use scoped_futures::ScopedFutureExt as _;
+
+        let Some(txn) = &self.transactional_state else {
+            return Err(
+                "ctx.run_transactional() is not supported for this activity context: \
+                 transactional activities require a regular (non-local) activity whose \
+                 worker pool shares the harvest Postgres cluster; \
+                 test contexts and local activities do not have a transactional pool attached"
+                    .to_string(),
+            );
+        };
+
+        let exec_id = txn.exec_id;
+        let activity_id = txn.activity_id;
+        let task_id = txn.task_id;
+        let max_result_bytes = txn.max_result_bytes;
+
+        let mut conn =
+            txn.pool.get().await.map_err(|e| {
+                format!("transactional activity failed to acquire DB connection: {e}")
+            })?;
+
+        conn.transaction::<T, TxError, _>(|conn| {
+            async move {
+                // Run user domain writes.
+                let user_result = f(conn).await.map_err(TxError::User)?;
+
+                // Serialize the result for the event log.
+                let output =
+                    serde_json::to_value(&user_result).map_err(HarvestError::Serialization)?;
+
+                // Enforce the result-size cap before committing.  The worker's
+                // post-handler cap check runs after the handler returns, which
+                // is too late for transactional activities — the event would
+                // already be committed.  Rolling back here ensures an oversized
+                // result never lands in harvest_events.
+                if max_result_bytes > 0 {
+                    let observed = serde_json::to_string(&output).map_or(0, |s| s.len() as u64);
+                    if observed > max_result_bytes {
+                        use crate::failure::IntoActivityErrorString as _;
+                        let payload = crate::failure::ActivityFailure::non_retryable(
+                            "PayloadTooLarge",
+                            format!(
+                                "transactional activity result exceeds cap: \
+                                 {observed} bytes (cap {max_result_bytes} bytes)"
+                            ),
+                        )
+                        .into_error_payload();
+                        return Err(TxError::Payload(payload));
+                    }
+                }
+
+                // Lock the execution row first (consistent with the rest of the
+                // codebase: harvest_workflow_executions → harvest_task_queue)
+                // and load history so we can compute the next sequential
+                // event_id before appending.
+                let history = crate::store::lock_and_load_history(conn, exec_id).await?;
+
+                // Idempotency guard: verify the task is still RUNNING before
+                // we commit.  If it's already COMPLETED (e.g. this is a
+                // crash-recovery attempt where the first transaction succeeded)
+                // we roll back the user writes so the caller sees a clean
+                // slate, matching the "exactly-once" contract.
+                match crate::queue::task_state_for_update(conn, task_id).await? {
+                    Some(ref s) if s == "RUNNING" => {}
+                    Some(other) => {
+                        return Err(TxError::Harvest(HarvestError::Config(format!(
+                            "transactional activity task {task_id} is in state '{other}', \
+                             not RUNNING; rolling back user writes (the ActivityCompleted \
+                             event was already committed by a prior attempt)"
+                        ))));
+                    }
+                    None => {
+                        return Err(TxError::Harvest(HarvestError::Config(format!(
+                            "transactional activity task {task_id} no longer exists; \
+                             rolling back user writes"
+                        ))));
+                    }
+                }
+
+                // Append ActivityCompleted within the same transaction.
+                let completion_event = crate::event::WorkflowEvent::ActivityCompleted {
+                    activity_id,
+                    output: output.clone(),
+                };
+                crate::store::append_events(
+                    conn,
+                    exec_id,
+                    &[completion_event],
+                    history.next_event_id,
+                )
+                .await?;
+
+                // Mark the task COMPLETED.
+                crate::queue::complete_task(conn, task_id, output).await?;
+
+                // Wake the workflow so it can pick up the ActivityCompleted
+                // result on its next execution cycle.
+                crate::queue::wake_workflow_task(conn, exec_id).await?;
+
+                Ok(user_result)
+            }
+            .scope_boxed()
+        })
+        .await
+        .map_err(|e| match e {
+            TxError::User(s) => s,
+            TxError::Harvest(he) => he.to_string(),
+            TxError::Payload(p) => p,
+        })
     }
 
     /// Constructor for testing -- no heartbeat channel, default cancel token.
