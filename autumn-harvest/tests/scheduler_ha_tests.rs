@@ -82,6 +82,7 @@ const INIT_SQL: &str = concat!(
 
 #[derive(Debug, Clone)]
 struct FireAttempt {
+    #[allow(dead_code)]
     schedule_name: String,
     outcome: String,
 }
@@ -179,7 +180,7 @@ async fn insert_due_schedule(conn: &mut AsyncPgConnection, wf_name: &str) -> Uui
 
 // ── Tests ──────────────────────────────────────────────────────────────────
 
-/// The METRIC_SCHEDULE_FIRE_ATTEMPTS constant must be defined with the expected
+/// The `METRIC_SCHEDULE_FIRE_ATTEMPTS` constant must be defined with the expected
 /// value. This test is the compile-time RED marker for the constant.
 #[test]
 fn metric_constant_schedule_fire_attempts_is_defined() {
@@ -202,7 +203,7 @@ fn metrics_recorder_has_fire_attempt_method() {
     assert_eq!(got[1].outcome, "lost_race");
 }
 
-/// A due schedule whose claim token is live (fire_claimed_until in the future)
+/// A due schedule whose claim token is live (`fire_claimed_until` in the future)
 /// must NOT be fired by a second tick — the claim is respected and no execution
 /// is created.
 #[tokio::test]
@@ -265,10 +266,10 @@ async fn test_live_claim_prevents_double_fire() {
     );
 }
 
-/// An expired claim (fire_claimed_until in the past) must be overridden:
+/// An expired claim (`fire_claimed_until` in the past) must be overridden:
 /// the tick re-claims the slot and fires the schedule exactly once.
 /// This is the crash-recovery path — a replica that crashed after claiming
-/// but before advancing next_run_at should be retried by a healthy peer.
+/// but before advancing `next_run_at` should be retried by a healthy peer.
 #[tokio::test]
 async fn test_expired_claim_is_overridden_for_crash_recovery() {
     let (mut conn, url, _c) = setup_db().await;

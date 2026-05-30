@@ -1369,11 +1369,10 @@ async fn tick_workflow_schedules(
         let claim_rows_affected: usize = diesel::sql_query(
             "UPDATE harvest_schedules \
              SET fire_claim_token = gen_random_uuid(), \
-                 fire_claimed_until = $1 + INTERVAL '30 seconds' \
-             WHERE id = $2 \
-               AND (fire_claim_token IS NULL OR fire_claimed_until < $1)",
+                 fire_claimed_until = NOW() + INTERVAL '30 seconds' \
+             WHERE id = $1 \
+               AND (fire_claim_token IS NULL OR fire_claimed_until < NOW())",
         )
-        .bind::<diesel::sql_types::Timestamptz, _>(now)
         .bind::<diesel::sql_types::Uuid, _>(schedule.id)
         .execute(conn)
         .await
