@@ -245,7 +245,8 @@ async fn drop_dag_runs_migration_copies_legacy_rows_to_workflow_executions() {
     .await
     .expect("drop migration should migrate legacy DAG runs before dropping the table");
 
-    let workflow_id = autumn_harvest::scheduler::scheduled_workflow_id_pub(dag_name, logical_date);
+    // The migration generates IDs in the legacy format (no schedule UUID embedded).
+    let workflow_id = format!("sched:{}:{}", dag_name, logical_date.timestamp());
     let migrated = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::workflow_name.eq(dag_name))
         .filter(harvest_workflow_executions::workflow_id.eq(workflow_id))

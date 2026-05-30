@@ -14236,6 +14236,9 @@ mod tests {
             buffer_all_max: 100,
             calendar_name: None,
             skip_policy: "skip".to_string(),
+            consecutive_failure_limit: None,
+            consecutive_failure_count: 0,
+            auto_paused_at: None,
         };
         let json = serde_json::to_string(&entry).expect("serialize");
         assert!(

@@ -6146,6 +6146,9 @@ mod tests {
             skip_policy: "skip".to_string(),
             fire_claim_token: None,
             fire_claimed_until: None,
+            consecutive_failure_limit: None,
+            consecutive_failure_count: 0,
+            auto_paused_at: None,
         }
     }
 

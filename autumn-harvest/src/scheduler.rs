@@ -1152,13 +1152,23 @@ async fn upsert_workflow_schedule(
             dsl::consecutive_failure_limit.eq(ws
                 .consecutive_failure_limit
                 .map(|n| i32::try_from(n).unwrap_or(i32::MAX))),
-            // Clear auto_paused_at when the limit is removed so the schedule
-            // resumes firing without requiring a manual operator resume call.
-            dsl::auto_paused_at.eq(ws.consecutive_failure_limit.and(existing.auto_paused_at)),
         ))
         .execute(conn)
         .await
         .map_err(crate::error::database_error)?;
+
+    // Clear auto_paused_at only when disabling the feature (limit = None or Some(0)).
+    // When the limit is positive we deliberately leave the DB value untouched so a
+    // concurrent failure-counter auto-pause (set by the worker completion path) is
+    // never silently overwritten by a redeployment upsert.
+    let limit_disabled = ws.consecutive_failure_limit.is_none_or(|n| n == 0);
+    if limit_disabled {
+        diesel::update(dsl::harvest_schedules.find(existing.id))
+            .set(dsl::auto_paused_at.eq(None::<DateTime<Utc>>))
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+    }
 
     dsl::harvest_schedules
         .find(existing.id)
@@ -1688,22 +1698,47 @@ async fn tick_one_workflow_schedule(
     };
 
     // ── Auto-pause check (issue #360) ─────────────────────────────────────────
-    // If the schedule has a non-zero consecutive_failure_limit and the stored
-    // counter has reached (or exceeded) that limit, auto-pause the schedule
-    // rather than dispatching another run that is likely to fail again.
-    //
-    // The counter is maintained by the worker completion path
-    // (`maybe_increment_schedule_failure_counter` / `maybe_reset_schedule_failure_counter`
-    // in scheduler.rs) so this check is O(1): just read the column that is already
-    // loaded in the schedule row.  A limit of 0 is treated as disabled (same as NULL)
-    // so that a misconfigured `Some(0)` never traps every first tick.
+    // Re-read auto_paused_at and consecutive_failure_count from DB to guard
+    // against a concurrent worker completion that set auto_paused_at after this
+    // tick loaded the schedule row.  This is the only field that can be written
+    // by a racing path while the HA claim is held; the single SELECT is cheaper
+    // than reloading the full row.
+    let (db_failure_count, db_auto_paused_at): (i32, Option<DateTime<Utc>>) =
+        dsl::harvest_schedules
+            .find(schedule.id)
+            .select((dsl::consecutive_failure_count, dsl::auto_paused_at))
+            .first(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+
+    if db_auto_paused_at.is_some() {
+        // Already auto-paused by a concurrent worker; release the claim and stop.
+        diesel::update(
+            dsl::harvest_schedules
+                .find(schedule.id)
+                .filter(dsl::fire_claim_token.eq(Some(claim_token))),
+        )
+        .set((
+            dsl::fire_claim_token.eq(Option::<uuid::Uuid>::None),
+            dsl::fire_claimed_until.eq(Option::<DateTime<Utc>>::None),
+            dsl::updated_at.eq(now),
+        ))
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+        return Ok(());
+    }
+
+    // If the schedule has a non-zero consecutive_failure_limit and the fresh
+    // counter has reached (or exceeded) that limit, auto-pause now.
+    // A limit of 0 is treated as disabled (same as NULL).
     if let Some(limit) = schedule.consecutive_failure_limit
         && limit > 0
-        && schedule.consecutive_failure_count >= limit
+        && db_failure_count >= limit
     {
         tracing::info!(
             workflow_name = %wf_name,
-            consecutive_failure_count = schedule.consecutive_failure_count,
+            consecutive_failure_count = db_failure_count,
             consecutive_failure_limit = limit,
             "harvest: auto-pausing schedule after consecutive failures"
         );
