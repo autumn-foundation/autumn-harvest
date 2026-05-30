@@ -425,6 +425,15 @@ impl HistoryMatcher {
                 ev if Self::is_update_event(ev) => {
                     scan_cursor += 1;
                 }
+                // Fan-out markers (and any other MarkerRecorded) can be
+                // interleaved when a fan-out runs concurrently with this
+                // activity (e.g. via tokio::join!). Track as an interleaved
+                // command so the cursor returns to it after matching the
+                // terminal event.
+                WorkflowEvent::MarkerRecorded { .. } => {
+                    first_interleaved_command.get_or_insert(scan_cursor);
+                    scan_cursor += 1;
+                }
                 // Any other event type is unexpected mid-activity
                 _ => break,
             }
@@ -552,6 +561,11 @@ impl HistoryMatcher {
                     scan_cursor += 1;
                 }
                 ev if Self::is_update_event(ev) => {
+                    scan_cursor += 1;
+                }
+                // Fan-out markers can be interleaved during concurrent execution.
+                WorkflowEvent::MarkerRecorded { .. } => {
+                    first_interleaved_command.get_or_insert(scan_cursor);
                     scan_cursor += 1;
                 }
                 _ => break,
