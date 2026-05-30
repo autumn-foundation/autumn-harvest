@@ -1279,6 +1279,7 @@ fn parse_schedule_from_expr(expr: &str) -> Option<Schedule> {
     )
 }
 
+#[allow(clippy::too_many_lines)]
 async fn tick_workflow_schedules(
     conn: &mut AsyncPgConnection,
     current_shard: ShardId,
@@ -1351,6 +1352,44 @@ async fn tick_workflow_schedules(
             .as_deref()
             .and_then(parse_schedule_from_expr);
         let catchup = schedule.catchup;
+
+        // ── HA claim (issue #350) ─────────────────────────────────────────────
+        // Atomically claim this due slot so concurrent replicas in a multi-
+        // replica deployment never double-fire the same schedule.
+        //
+        // The UPDATE only succeeds when no live claim is held on this row
+        // (`fire_claim_token IS NULL OR fire_claimed_until < NOW()`). If another
+        // replica already claimed the slot in the same tick window, the UPDATE
+        // matches zero rows and we skip — emitting a `lost_race` metric so
+        // operators can verify exclusivity in Grafana.
+        //
+        // Crash-recovery window: if this replica crashes after claiming but
+        // before advancing next_run_at, the claim expires after 30 s and any
+        // healthy peer retries the slot on its next tick.
+        let claim_rows_affected: usize = diesel::sql_query(
+            "UPDATE harvest_schedules \
+             SET fire_claim_token = gen_random_uuid(), \
+                 fire_claimed_until = $1 + INTERVAL '30 seconds' \
+             WHERE id = $2 \
+               AND (fire_claim_token IS NULL OR fire_claimed_until < $1)",
+        )
+        .bind::<diesel::sql_types::Timestamptz, _>(now)
+        .bind::<diesel::sql_types::Uuid, _>(schedule.id)
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+        if claim_rows_affected == 0 {
+            metrics.record_schedule_fire_attempt(wf_name, "lost_race");
+            tracing::debug!(
+                schedule_id = %schedule.id,
+                workflow_name = %wf_name,
+                "harvest: schedule slot claim lost to peer replica; skipping this tick"
+            );
+            continue;
+        }
+        metrics.record_schedule_fire_attempt(wf_name, "claimed");
+
         if let Err(error) = tick_one_workflow_schedule(
             conn,
             wf_name,
@@ -1369,6 +1408,16 @@ async fn tick_workflow_schedules(
                 error = %error, workflow_name = %wf_name,
                 "harvest: workflow schedule tick failed; continuing to next schedule"
             );
+            // Clear the claim on error so a peer can retry promptly instead of
+            // waiting the full 30-second expiry window.
+            let _ = diesel::sql_query(
+                "UPDATE harvest_schedules \
+                 SET fire_claim_token = NULL, fire_claimed_until = NULL \
+                 WHERE id = $1",
+            )
+            .bind::<diesel::sql_types::Uuid, _>(schedule.id)
+            .execute(conn)
+            .await;
         }
     }
 
@@ -1561,7 +1610,12 @@ async fn tick_one_workflow_schedule(
                 )
                 .await;
                 diesel::update(dsl::harvest_schedules.find(schedule.id))
-                    .set((dsl::next_run_at.eq(next), dsl::updated_at.eq(now)))
+                    .set((
+                        dsl::next_run_at.eq(next),
+                        dsl::fire_claim_token.eq(Option::<uuid::Uuid>::None),
+                        dsl::fire_claimed_until.eq(Option::<DateTime<Utc>>::None),
+                        dsl::updated_at.eq(now),
+                    ))
                     .execute(conn)
                     .await
                     .map_err(crate::error::database_error)?;
@@ -1636,7 +1690,12 @@ async fn tick_one_workflow_schedule(
                 )
                 .await;
                 diesel::update(dsl::harvest_schedules.find(schedule.id))
-                    .set((dsl::next_run_at.eq(next), dsl::updated_at.eq(now)))
+                    .set((
+                        dsl::next_run_at.eq(next),
+                        dsl::fire_claim_token.eq(Option::<uuid::Uuid>::None),
+                        dsl::fire_claimed_until.eq(Option::<DateTime<Utc>>::None),
+                        dsl::updated_at.eq(now),
+                    ))
                     .execute(conn)
                     .await
                     .map_err(crate::error::database_error)?;
@@ -1680,6 +1739,8 @@ async fn tick_one_workflow_schedule(
                     .set((
                         dsl::next_run_at.eq(next),
                         dsl::buffered_runs.eq(buffered_runs_to_json(&buffered)),
+                        dsl::fire_claim_token.eq(Option::<uuid::Uuid>::None),
+                        dsl::fire_claimed_until.eq(Option::<DateTime<Utc>>::None),
                         dsl::updated_at.eq(now),
                     ))
                     .execute(conn)
@@ -1926,6 +1987,12 @@ async fn tick_one_workflow_schedule(
         .set((
             dsl::last_run_at.eq(effective_last_run_at),
             dsl::next_run_at.eq(effective_next_run_at),
+            // Clear the HA claim so the column stays clean after a successful
+            // fire. next_run_at is now in the future so the row would not be
+            // re-selected anyway, but clearing keeps the schema intention clear
+            // and avoids stale tokens accumulating.
+            dsl::fire_claim_token.eq(Option::<uuid::Uuid>::None),
+            dsl::fire_claimed_until.eq(Option::<DateTime<Utc>>::None),
             dsl::updated_at.eq(now),
         ))
         .execute(conn)

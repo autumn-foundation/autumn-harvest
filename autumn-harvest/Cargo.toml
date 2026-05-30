@@ -86,6 +86,10 @@ name = "replayer_integration_tests"
 required-features = ["testing", "db"]
 
 [[test]]
+name = "scheduler_ha_tests"
+required-features = ["db"]
+
+[[test]]
 name = "build_routing_tests"
 required-features = ["db"]
 

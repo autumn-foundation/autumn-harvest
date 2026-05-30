@@ -320,3 +320,41 @@ queue; replay safety is the reason this alert exists.
 
 Escalate to the release owner when production work is stuck behind build
 compatibility or when rollback requires reverse compatibility declarations.
+
+## harvest_schedule_ha_domination
+
+### Triage steps
+
+1. Check the `lost_race / (lost_race + claimed)` ratio in Grafana for the last 5–10 minutes.
+2. Query Postgres for stuck claim tokens:
+   ```sql
+   SELECT id, workflow_name, fire_claim_token, fire_claimed_until, next_run_at
+   FROM harvest_schedules
+   WHERE fire_claimed_until IS NOT NULL
+   ORDER BY fire_claimed_until DESC
+   LIMIT 10;
+   ```
+3. Verify all replicas share the same `DATABASE_URL` and shard routing configuration.
+4. Run `harvest worker health --output json` to confirm fleet coverage.
+
+### Likely causes
+
+- One or more replicas point to a **different Postgres instance** than the majority of the fleet (the "different DB" replica claims a disjoint set; others always see it as locked).
+- Incorrect `shard_assignments` exclude most replicas from the affected shard.
+- A stuck or crashed replica's claim token has not expired (token older than 30 s + tick interval is a bug; see escalation).
+
+### False positives
+
+In a **single-replica deployment** or **initial startup** before the first tick, `lost_race = 0` and `claimed = 1 per tick`. This alert should never fire for single-replica deployments (ratio is always 0).
+
+In a **two-replica deployment**, healthy steady-state is approximately `lost_race ≈ claimed` (each replica wins about half the slots at the tick boundary). The 0.98 threshold ensures this alert does not fire for expected contention.
+
+### Safe actions
+
+Fix the database configuration so all replicas share the same shard pools. Do not manually clear `fire_claim_token` rows unless you have confirmed the claiming replica has stopped; the 30-second TTL handles crash recovery automatically.
+
+### Escalation criteria
+
+Escalate to the platform owner if:
+- A `fire_claim_token` row has `fire_claimed_until` more than 2 minutes in the past and `next_run_at` has not advanced (indicates the claiming process is alive but wedged without completing the fire or clearing the claim — this should not happen with the current implementation and would indicate a bug).
+- The alert fires on a single-replica deployment (indicates a misconfiguration or metric collection error).

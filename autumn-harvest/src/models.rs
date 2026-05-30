@@ -325,6 +325,12 @@ pub struct HarvestSchedule {
     pub calendar_name: Option<String>,
     /// What to do when the fire date is calendar-excluded (issue #337).
     pub skip_policy: String,
+    /// Token set by the replica that atomically claimed this slot for firing (issue #350).
+    /// NULL = no claim held. Cleared when `next_run_at` is advanced after a successful fire.
+    pub fire_claim_token: Option<Uuid>,
+    /// UTC expiry for the current claim (issue #350). When past, any replica may re-claim
+    /// (crash-recovery path). NULL when `fire_claim_token` is NULL.
+    pub fire_claimed_until: Option<DateTime<Utc>>,
 }
 
 /// Insert struct for registering a new schedule (DAG or workflow).

@@ -148,6 +148,13 @@ diesel::table! {
         calendar_name -> Nullable<Text>,
         /// What to do when the fire date is calendar-excluded (issue #337).
         skip_policy -> Text,
+        /// Token held by the replica that claimed this slot for firing (issue #350).
+        /// NULL means no replica currently holds a claim on this schedule row.
+        fire_claim_token -> Nullable<Uuid>,
+        /// Absolute UTC expiry of the current fire claim (issue #350).
+        /// When `fire_claimed_until < NOW()` the claim is expired and any replica
+        /// may re-claim the slot (crash-recovery path).
+        fire_claimed_until -> Nullable<Timestamptz>,
     }
 }
 
