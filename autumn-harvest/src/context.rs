@@ -115,6 +115,10 @@ pub struct TransactionalState {
     pub(crate) activity_id: crate::types::ActivityExecId,
     /// Task queue row ID — used to lock and complete the task atomically.
     pub(crate) task_id: uuid::Uuid,
+    /// Maximum serialized result size in bytes (0 = unlimited).  Checked
+    /// inside the transaction so an oversized result is caught before
+    /// `ActivityCompleted` is committed.
+    pub(crate) max_result_bytes: u64,
 }
 const LOCAL_ACTIVITY_HEARTBEAT_REASON: &str =
     "local activities do not support heartbeats; use a regular activity";
@@ -3656,8 +3660,14 @@ impl ActivityContext {
         // and corrupts the ActivityFailed payload seen by the retry policy.
         // Defined before any statements to satisfy clippy::items_after_statements.
         enum TxError {
+            /// User closure returned Err — propagated verbatim.
             User(String),
+            /// Internal harvest error (lock, append, DB).
             Harvest(HarvestError),
+            /// Structured `ActivityFailure` JSON payload (e.g. `PayloadTooLarge`)
+            /// that must reach `handle_activity_result` as-is so the failure
+            /// parser can mark it non-retryable.
+            Payload(String),
         }
         impl From<HarvestError> for TxError {
             fn from(e: HarvestError) -> Self {
@@ -3686,6 +3696,7 @@ impl ActivityContext {
         let exec_id = txn.exec_id;
         let activity_id = txn.activity_id;
         let task_id = txn.task_id;
+        let max_result_bytes = txn.max_result_bytes;
 
         let mut conn =
             txn.pool.get().await.map_err(|e| {
@@ -3700,6 +3711,27 @@ impl ActivityContext {
                 // Serialize the result for the event log.
                 let output =
                     serde_json::to_value(&user_result).map_err(HarvestError::Serialization)?;
+
+                // Enforce the result-size cap before committing.  The worker's
+                // post-handler cap check runs after the handler returns, which
+                // is too late for transactional activities — the event would
+                // already be committed.  Rolling back here ensures an oversized
+                // result never lands in harvest_events.
+                if max_result_bytes > 0 {
+                    let observed = serde_json::to_string(&output).map_or(0, |s| s.len() as u64);
+                    if observed > max_result_bytes {
+                        use crate::failure::IntoActivityErrorString as _;
+                        let payload = crate::failure::ActivityFailure::non_retryable(
+                            "PayloadTooLarge",
+                            format!(
+                                "transactional activity result exceeds cap: \
+                                 {observed} bytes (cap {max_result_bytes} bytes)"
+                            ),
+                        )
+                        .into_error_payload();
+                        return Err(TxError::Payload(payload));
+                    }
+                }
 
                 // Lock the execution row first (consistent with the rest of the
                 // codebase: harvest_workflow_executions → harvest_task_queue)
@@ -3757,6 +3789,7 @@ impl ActivityContext {
         .map_err(|e| match e {
             TxError::User(s) => s,
             TxError::Harvest(he) => he.to_string(),
+            TxError::Payload(p) => p,
         })
     }
 

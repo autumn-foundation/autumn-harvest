@@ -3242,12 +3242,20 @@ async fn process_activity_task(
     .with_trace_context(trace_carrier.clone())
     .with_idempotency_key(IdempotencyKey::from_activity_exec_id(activity_id))
     .with_attempt(task_attempt(task));
+    // Compute cap before the handler so run_transactional can enforce it
+    // inside the transaction (before ActivityCompleted is committed).
+    let effective_result_cap = activity
+        .max_result_bytes
+        .map_or(registry.max_activity_result_bytes, |per_activity| {
+            per_activity.max(registry.max_activity_result_bytes)
+        });
     #[cfg(feature = "db")]
     let ctx = ctx.with_transactional_state(TransactionalState {
         pool: pool.clone(),
         exec_id,
         activity_id,
         task_id: task.id,
+        max_result_bytes: effective_result_cap,
     });
 
     let telemetry = registry.telemetry().clone();
@@ -3281,14 +3289,6 @@ async fn process_activity_task(
         span,
     )
     .await;
-
-    let effective_result_cap = registry
-        .activities
-        .get(activity_name)
-        .and_then(|a| a.max_result_bytes)
-        .map_or(registry.max_activity_result_bytes, |per_activity| {
-            per_activity.max(registry.max_activity_result_bytes)
-        });
 
     // Pre-normalize oversized results to non-retryable failures BEFORE emitting
     // metrics so that an Ok result above the cap is counted as Failed, not Completed.
