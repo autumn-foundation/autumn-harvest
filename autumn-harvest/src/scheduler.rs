@@ -2329,10 +2329,11 @@ async fn drain_buffered_schedule_runs(
 
     let now = Utc::now();
 
-    // Query schedules that have buffered runs and are not paused.
+    // Query schedules that have buffered runs and are not paused (manually or auto-paused).
     let pending: Vec<HarvestSchedule> = dsl::harvest_schedules
         .filter(dsl::workflow_name.is_not_null())
         .filter(dsl::is_paused.eq(false))
+        .filter(dsl::auto_paused_at.is_null())
         .filter(diesel::dsl::sql::<diesel::sql_types::Bool>(
             "jsonb_array_length(buffered_runs) > 0",
         ))
@@ -2546,6 +2547,7 @@ pub(crate) async fn maybe_increment_schedule_failure_counter(
         match dsl::harvest_schedules
             .filter(dsl::workflow_name.eq(workflow_name))
             .filter(dsl::consecutive_failure_limit.is_not_null())
+            .filter(dsl::consecutive_failure_limit.gt(0))
             .filter(dsl::auto_paused_at.is_null())
             .select(dsl::id)
             .load(conn)
@@ -2571,6 +2573,7 @@ pub(crate) async fn maybe_increment_schedule_failure_counter(
             dsl::harvest_schedules
                 .find(id)
                 .filter(dsl::consecutive_failure_limit.is_not_null())
+                .filter(dsl::consecutive_failure_limit.gt(0))
                 .filter(dsl::auto_paused_at.is_null()),
         )
         .set((
