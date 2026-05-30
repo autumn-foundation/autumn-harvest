@@ -130,6 +130,18 @@ pub enum HarvestError {
     #[error("workflow cancelled: {0}")]
     Cancelled(String),
 
+    /// An in-flight activity was notified that its owning workflow has been
+    /// cancelled.
+    ///
+    /// Returned by [`ActivityContext::heartbeat`](crate::context::ActivityContext::heartbeat)
+    /// and [`ActivityContext::check_cancellation`](crate::context::ActivityContext::check_cancellation)
+    /// when the task queue row has been marked cancelled or the worker's
+    /// cancellation token has been triggered.  Activities should treat this as a
+    /// signal to stop work and return early; the workflow-level cancellation
+    /// event is recorded separately.
+    #[error("activity cancelled: {0}")]
+    ActivityCancelled(String),
+
     /// The workflow was forcibly terminated.
     #[error("workflow terminated: {0}")]
     Terminated(String),
@@ -353,6 +365,35 @@ impl From<diesel::result::Error> for HarvestError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn activity_cancelled_variant_exists_and_displays_correctly() {
+        let e = HarvestError::ActivityCancelled("workflow was cancelled".into());
+        let msg = e.to_string();
+        assert!(
+            msg.contains("workflow was cancelled"),
+            "ActivityCancelled display should include the reason; got: {msg}"
+        );
+        assert!(
+            msg.contains("activity cancelled"),
+            "ActivityCancelled display should contain 'activity cancelled'; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn activity_cancelled_is_distinct_from_cancelled() {
+        let activity = HarvestError::ActivityCancelled("reason".into());
+        let workflow = HarvestError::Cancelled("reason".into());
+        assert_ne!(
+            activity.to_string(),
+            workflow.to_string(),
+            "ActivityCancelled and Cancelled should have distinct display strings"
+        );
+        assert!(
+            !matches!(workflow, HarvestError::ActivityCancelled(_)),
+            "Cancelled must not match ActivityCancelled pattern"
+        );
+    }
 
     #[test]
     fn harvest_error_is_std_error() {
