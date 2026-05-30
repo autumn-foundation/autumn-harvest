@@ -2628,6 +2628,12 @@ impl WorkflowContext {
         I: serde::Serialize,
         O: serde::de::DeserializeOwned,
     {
+        if info.is_local {
+            return Err(HarvestError::Config(format!(
+                "activity '{}' is marked local = true; fan-out requires remote activities",
+                info.name
+            )));
+        }
         let queue = info.default_queue.unwrap_or("default").to_string();
         let activities = inputs
             .into_iter()
@@ -2671,6 +2677,12 @@ impl WorkflowContext {
         I: serde::Serialize,
         O: serde::de::DeserializeOwned,
     {
+        if info.is_local {
+            return Err(HarvestError::Config(format!(
+                "activity '{}' is marked local = true; fan-out requires remote activities",
+                info.name
+            )));
+        }
         let queue = info.default_queue.unwrap_or("default").to_string();
         let activities = inputs
             .into_iter()
