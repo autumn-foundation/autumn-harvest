@@ -731,6 +731,17 @@ pub async fn enforce_workflow_execution_timeouts(
         );
 
         metrics.record_workflow_timeout(&workflow_name, &execution.queue_name);
+
+        // Best-effort: count execution timeouts toward the auto-pause threshold.
+        // `workflow_id` encodes the schedule UUID so the update is scoped to the
+        // triggering schedule and does not cross-contaminate sibling schedules.
+        crate::scheduler::maybe_increment_schedule_failure_counter(
+            conn,
+            &execution.workflow_id,
+            &workflow_name,
+            metrics,
+        )
+        .await;
     }
 
     Ok(count)
