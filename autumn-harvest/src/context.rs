@@ -3410,9 +3410,9 @@ impl ActivityContext {
     /// The `details` payload is serialized to JSON and forwarded to the worker's
     /// heartbeat loop, which batches writes to the database. On retry, the last
     /// successfully flushed payload from the previous attempt is available via
-    /// [`Self::heartbeat_details`]. Always check the return value -- an
-    /// `Err(Cancelled)` means the workflow was cancelled and the activity should
-    /// wind down promptly.
+    /// [`Self::heartbeat_details`]. Always check the return value — an
+    /// `Err(ActivityCancelled)` means the owning workflow was cancelled and the
+    /// activity should wind down promptly.
     ///
     /// Within a single attempt, heartbeat payloads are last-write-wins and are
     /// not read back through this context. Call [`Self::heartbeat_details`] at
@@ -3428,7 +3428,7 @@ impl ActivityContext {
     /// for chunk in 0..100 {
     ///     // Downloading...
     ///
-    ///     // Heartbeat with the current progress
+    ///     // Heartbeat with current progress; exit early on cancellation.
     ///     ctx.heartbeat(serde_json::json!({"progress": chunk})).await?;
     /// }
     /// # Ok(())
@@ -3437,13 +3437,16 @@ impl ActivityContext {
     ///
     /// # Errors
     ///
-    /// - [`HarvestError::Cancelled`] if the cancellation token has been triggered
-    ///   or the heartbeat channel is closed.
+    /// - [`HarvestError::ActivityCancelled`] if the cancellation token has been
+    ///   triggered, the owning workflow execution has reached a cancelling or
+    ///   terminal state, or the heartbeat channel is closed.
     /// - [`HarvestError::Serialization`] if `details` fails to serialize.
+    /// - [`HarvestError::Config`] for local activities, which do not support
+    ///   heartbeating.
     pub async fn heartbeat(&self, details: impl serde::Serialize) -> crate::HarvestResult<()> {
         // Check cancellation first -- fast path.
         if self.cancel.is_cancelled() {
-            return Err(HarvestError::Cancelled(
+            return Err(HarvestError::ActivityCancelled(
                 "activity cancelled via cancellation token".into(),
             ));
         }
@@ -3461,9 +3464,38 @@ impl ActivityContext {
             return Ok(());
         };
         tx.send(payload).await.map_err(|_| {
-            HarvestError::Cancelled("activity cancelled: heartbeat channel closed".into())
+            HarvestError::ActivityCancelled(
+                "activity cancelled: heartbeat channel closed".into(),
+            )
         })?;
 
+        Ok(())
+    }
+
+    /// Check whether the owning workflow has been cancelled.
+    ///
+    /// This is a lightweight convenience that works for both regular and local
+    /// activities.  It checks the worker's cancellation token first (fast
+    /// path), then performs a throttled durable check against the task queue
+    /// row (db feature only) to catch cancellations that arrived while the
+    /// activity was not heartbeating.
+    ///
+    /// Activities that perform long-running loops should call this periodically
+    /// to exit cleanly when the owning workflow is cancelled.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::ActivityCancelled`] when cancellation has been
+    /// requested.  Returns [`Ok(())`] otherwise.
+    #[cfg_attr(not(feature = "db"), allow(clippy::unused_async))]
+    pub async fn check_cancellation(&self) -> crate::HarvestResult<()> {
+        if self.cancel.is_cancelled() {
+            return Err(HarvestError::ActivityCancelled(
+                "activity cancelled via cancellation token".into(),
+            ));
+        }
+        #[cfg(feature = "db")]
+        self.check_durable_cancellation().await?;
         Ok(())
     }
 
@@ -3508,17 +3540,17 @@ impl ActivityContext {
             Some((state, Some(error)))
                 if state == "FAILED" && error.contains("workflow cancelled") =>
             {
-                Err(HarvestError::Cancelled(error))
+                Err(HarvestError::ActivityCancelled(error))
             }
-            Some((state, Some(error))) => Err(HarvestError::Cancelled(format!(
+            Some((state, Some(error))) => Err(HarvestError::ActivityCancelled(format!(
                 "activity task {} is no longer running ({state}): {error}",
                 check.task_id
             ))),
-            Some((state, None)) => Err(HarvestError::Cancelled(format!(
+            Some((state, None)) => Err(HarvestError::ActivityCancelled(format!(
                 "activity task {} is no longer running ({state})",
                 check.task_id
             ))),
-            None => Err(HarvestError::Cancelled(format!(
+            None => Err(HarvestError::ActivityCancelled(format!(
                 "activity task {} is no longer present",
                 check.task_id
             ))),
@@ -3899,11 +3931,47 @@ mod tests {
         // Now is_cancelled() should return true.
         assert!(ctx.is_cancelled());
 
-        // Heartbeat should return Cancelled error.
+        // Heartbeat should return ActivityCancelled error.
         let result = ctx.heartbeat(serde_json::json!({})).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(matches!(err, HarvestError::Cancelled(_)));
+        assert!(matches!(err, HarvestError::ActivityCancelled(_)));
+    }
+
+    #[tokio::test]
+    async fn activity_check_cancellation_returns_ok_when_not_cancelled() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let ctx = ActivityContext::new(Arc::new(HashMap::new()), Some(tx), cancel);
+        assert!(ctx.check_cancellation().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn activity_check_cancellation_returns_activity_cancelled_when_token_set() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let ctx = ActivityContext::new(Arc::new(HashMap::new()), Some(tx), cancel.clone());
+        cancel.cancel();
+        let result = ctx.check_cancellation().await;
+        assert!(
+            matches!(result, Err(HarvestError::ActivityCancelled(_))),
+            "check_cancellation should return ActivityCancelled when token is set"
+        );
+    }
+
+    #[tokio::test]
+    async fn activity_check_cancellation_works_without_heartbeat_channel() {
+        // Local activities have no heartbeat channel; check_cancellation must
+        // still detect token cancellation correctly.
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let ctx = ActivityContext::new(Arc::new(HashMap::new()), None, cancel.clone());
+        assert!(ctx.check_cancellation().await.is_ok());
+        cancel.cancel();
+        let result = ctx.check_cancellation().await;
+        assert!(
+            matches!(result, Err(HarvestError::ActivityCancelled(_))),
+            "check_cancellation on token-less context should still fire on cancel"
+        );
     }
 
     #[cfg(feature = "db")]
@@ -3934,7 +4002,7 @@ mod tests {
 
         let result = ctx.heartbeat(serde_json::json!({})).await;
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), HarvestError::Cancelled(_)));
+        assert!(matches!(result.unwrap_err(), HarvestError::ActivityCancelled(_)));
     }
 
     #[test]
