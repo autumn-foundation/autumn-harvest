@@ -758,3 +758,33 @@ fn schedule_backfill_body_fields_are_documented() {
         "--include-paused",
     ]);
 }
+
+// ── start-batch (issue #357) ──────────────────────────────────────────────────
+
+#[test]
+fn start_batch_is_covered() {
+    assert_covered(&[
+        "start-batch",
+        "--items-json",
+        r#"[{"workflow_name":"onboarding","workflow_id":"w1"}]"#,
+    ]);
+}
+
+#[test]
+fn start_batch_body_fields_are_documented() {
+    assert_body_fields_documented(&[
+        "start-batch",
+        "--items-json",
+        r#"[{"workflow_name":"onboarding","workflow_id":"w1"}]"#,
+    ]);
+}
+
+#[test]
+fn start_batch_atomic_body_fields_are_documented() {
+    assert_body_fields_documented(&[
+        "start-batch",
+        "--items-json",
+        r#"[{"workflow_name":"onboarding"}]"#,
+        "--atomic",
+    ]);
+}

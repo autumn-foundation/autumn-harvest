@@ -214,6 +214,13 @@ pub enum CliError {
         label: &'static str,
     },
 
+    /// A required input source (file or inline JSON) was not provided.
+    #[error("{label}")]
+    MissingInput {
+        /// User-facing message.
+        label: &'static str,
+    },
+
     /// HTTP transport failed.
     #[error("request failed: {0}")]
     Request(#[from] reqwest::Error),
@@ -423,6 +430,33 @@ enum Commands {
     Events {
         #[command(subcommand)]
         command: EventsCommand,
+    },
+    /// Start N workflow executions in one batched request (issue #357).
+    ///
+    /// Reads newline-delimited JSON (NDJSON) items from a file or inline JSON
+    /// array and submits them as a single `POST /workflows/batch_start` call.
+    ///
+    /// Each NDJSON line must be a JSON object with at least a `workflow_name`
+    /// key.  Optional keys: `workflow_id`, `input`, `search_attributes`,
+    /// `idempotency_key`.
+    ///
+    /// Exits non-zero when `--atomic` is set and any item is rejected.
+    #[command(name = "start-batch")]
+    StartBatch {
+        /// NDJSON file of workflow start items. Use `-` to read from stdin.
+        ///
+        /// Conflicts with `--items-json`.
+        #[arg(long, value_name = "PATH", conflicts_with = "items_json")]
+        file: Option<PathBuf>,
+        /// Inline JSON array of workflow start items.
+        ///
+        /// Conflicts with `--file`.
+        #[arg(long, conflicts_with = "file")]
+        items_json: Option<String>,
+        /// Require all-or-nothing semantics: if any item fails validation the
+        /// entire batch is rejected with no executions inserted.
+        #[arg(long, default_value_t = false)]
+        atomic: bool,
     },
 }
 
@@ -1176,6 +1210,11 @@ impl Cli {
             )),
             Commands::Tui => unreachable!("Tui command handles its own requests"),
             Commands::Events { .. } => unreachable!("Events command handles its own requests"),
+            Commands::StartBatch {
+                file,
+                items_json,
+                atomic,
+            } => start_batch_request(file.as_deref(), items_json.as_deref(), *atomic),
         }
     }
 }
@@ -3072,6 +3111,55 @@ fn batch_request(command: &BatchCommand) -> Result<ApiRequest, CliError> {
             ))
         }
     }
+}
+
+/// Build the `POST /workflows/batch_start` request (issue #357).
+///
+/// Reads NDJSON items from `file` or parses `items_json` as a JSON array,
+/// then wraps them in `{ "items": [...], "atomic": <bool> }`.
+fn start_batch_request(
+    file: Option<&Path>,
+    items_json: Option<&str>,
+    atomic: bool,
+) -> Result<ApiRequest, CliError> {
+    let items: Value = match (file, items_json) {
+        (Some(path), None) => {
+            // NDJSON: one JSON object per non-empty line.
+            let raw = read_json_file(path, "NDJSON items")?;
+            let mut arr = Vec::new();
+            for line in raw.lines() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let item: Value =
+                    serde_json::from_str(trimmed).map_err(|source| CliError::InvalidJson {
+                        label: "NDJSON items",
+                        source,
+                    })?;
+                arr.push(item);
+            }
+            Value::Array(arr)
+        }
+        (None, Some(inline)) => {
+            serde_json::from_str(inline).map_err(|source| CliError::InvalidJson {
+                label: "items JSON",
+                source,
+            })?
+        }
+        (None, None) => {
+            return Err(CliError::MissingInput {
+                label: "start-batch requires --file or --items-json",
+            });
+        }
+        (Some(_), Some(_)) => unreachable!("clap conflicts_with prevents both being set"),
+    };
+
+    let body = json!({
+        "items": items,
+        "atomic": atomic,
+    });
+    Ok(ApiRequest::post("/workflows/batch_start", Some(body)))
 }
 
 fn dead_letter_request(command: &DeadLetterCommand) -> ApiRequest {

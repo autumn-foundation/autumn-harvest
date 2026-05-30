@@ -309,6 +309,8 @@ fn start_harvest_runtime(
     api_state.set_max_workflow_execution_timeout(built.max_workflow_execution_timeout);
     // Propagate the server-side start delay ceiling (issue #322).
     api_state.set_max_workflow_start_delay(built.worker_config().max_workflow_start_delay);
+    // Propagate batch start caps from builder config (issue #357).
+    api_state.set_batch_start_config(&built.batch_start_config);
 
     // Apply the api_state audit retention override only when explicitly set,
     // so that builder-level retention config is not silently clobbered.
