@@ -3478,13 +3478,23 @@ impl ActivityContext {
     /// row (db feature only) to catch cancellations that arrived while the
     /// activity was not heartbeating.
     ///
-    /// Activities that perform long-running loops should call this periodically
-    /// to exit cleanly when the owning workflow is cancelled.
+    /// Regular activities that perform long-running loops should call this
+    /// periodically to exit cleanly when the owning workflow is cancelled.
+    /// The call is cheap when the durable-check interval has not elapsed.
+    ///
+    /// # Local activities
+    ///
+    /// This method is a **no-op** for local activities.  Local activities are
+    /// created with a fresh, disconnected cancellation token and no durable
+    /// queue-row check, so both paths always return `Ok(())` regardless of
+    /// workflow state.  For local activities, cancellation is surfaced on the
+    /// enclosing [`WorkflowContext`]: call [`WorkflowContext::check_cancellation`]
+    /// after each local-activity step to detect it.
     ///
     /// # Errors
     ///
     /// Returns [`HarvestError::ActivityCancelled`] when cancellation has been
-    /// requested.  Returns [`Ok(())`] otherwise.
+    /// requested (regular activities only).  Returns [`Ok(())`] otherwise.
     #[cfg_attr(not(feature = "db"), allow(clippy::unused_async))]
     pub async fn check_cancellation(&self) -> crate::HarvestResult<()> {
         if self.cancel.is_cancelled() {
@@ -3535,20 +3545,18 @@ impl ActivityContext {
 
         match row {
             Some((state, _)) if state == "RUNNING" => Ok(()),
-            Some((state, Some(error)))
-                if state == "FAILED" && error.contains("workflow cancelled") =>
-            {
+            Some((_, Some(error))) if error.contains("workflow cancelled") => {
                 Err(HarvestError::ActivityCancelled(error))
             }
-            Some((state, Some(error))) => Err(HarvestError::ActivityCancelled(format!(
+            Some((state, Some(error))) => Err(HarvestError::Cancelled(format!(
                 "activity task {} is no longer running ({state}): {error}",
                 check.task_id
             ))),
-            Some((state, None)) => Err(HarvestError::ActivityCancelled(format!(
+            Some((state, None)) => Err(HarvestError::Cancelled(format!(
                 "activity task {} is no longer running ({state})",
                 check.task_id
             ))),
-            None => Err(HarvestError::ActivityCancelled(format!(
+            None => Err(HarvestError::Cancelled(format!(
                 "activity task {} is no longer present",
                 check.task_id
             ))),
