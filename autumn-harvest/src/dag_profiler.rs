@@ -32,6 +32,56 @@ pub struct DagProfile {
     pub timeline: Vec<ProfilerEvent>,
 }
 
+impl DagProfile {
+    /// Export the timeline in Chrome Trace Event format.
+    ///
+    /// This format can be loaded into `chrome://tracing` or Perfetto UI
+    /// for a visual representation of task concurrency and execution time.
+    #[must_use]
+    pub fn export_chrome_trace(&self) -> String {
+        use std::cmp::Reverse;
+        use std::collections::{BinaryHeap, HashMap};
+
+        let mut events = Vec::new();
+        let mut active_lanes: HashMap<usize, u32> = HashMap::new();
+        let mut free_lanes: BinaryHeap<Reverse<u32>> = BinaryHeap::new();
+        let mut next_lane = 1;
+
+        for event in &self.timeline {
+            #[allow(clippy::cast_possible_truncation)]
+            let ts = event.time.as_micros() as u64;
+
+            match &event.kind {
+                ProfilerEventKind::TaskStarted(task_id, name) => {
+                    let tid = if let Some(Reverse(lane)) = free_lanes.pop() {
+                        lane
+                    } else {
+                        let lane = next_lane;
+                        next_lane += 1;
+                        lane
+                    };
+
+                    active_lanes.insert(*task_id, tid);
+
+                    events.push(format!(
+                        r#"{{"name":"{name}","cat":"activity","ph":"B","ts":{ts},"pid":1,"tid":{tid}}}"#
+                    ));
+                }
+                ProfilerEventKind::TaskCompleted(task_id, name) => {
+                    if let Some(tid) = active_lanes.remove(task_id) {
+                        events.push(format!(
+                            r#"{{"name":"{name}","cat":"activity","ph":"E","ts":{ts},"pid":1,"tid":{tid}}}"#
+                        ));
+                        free_lanes.push(Reverse(tid));
+                    }
+                }
+            }
+        }
+
+        format!("[{}]", events.join(","))
+    }
+}
+
 /// A discrete-event simulator to profile DAG execution.
 pub struct DagProfiler {
     dag: DagDefinition,
@@ -235,5 +285,49 @@ mod tests {
         assert_eq!(profile.total_duration, Duration::from_secs(6));
         // max concurrency is 2 because B and C run at the same time.
         assert_eq!(profile.peak_concurrency, 2);
+    }
+
+    #[test]
+    fn test_export_chrome_trace() {
+        let profile = DagProfile {
+            total_duration: Duration::from_secs(5),
+            peak_concurrency: 2,
+            timeline: vec![
+                ProfilerEvent {
+                    time: Duration::from_secs(0),
+                    kind: ProfilerEventKind::TaskStarted(0, "A".into()),
+                },
+                ProfilerEvent {
+                    time: Duration::from_secs(0),
+                    kind: ProfilerEventKind::TaskStarted(1, "B".into()),
+                },
+                ProfilerEvent {
+                    time: Duration::from_secs(2),
+                    kind: ProfilerEventKind::TaskCompleted(0, "A".into()),
+                },
+                ProfilerEvent {
+                    time: Duration::from_secs(3),
+                    kind: ProfilerEventKind::TaskStarted(2, "C".into()),
+                },
+                ProfilerEvent {
+                    time: Duration::from_secs(5),
+                    kind: ProfilerEventKind::TaskCompleted(1, "B".into()),
+                },
+                ProfilerEvent {
+                    time: Duration::from_secs(5),
+                    kind: ProfilerEventKind::TaskCompleted(2, "C".into()),
+                },
+            ],
+        };
+
+        let json = profile.export_chrome_trace();
+
+        assert!(json.starts_with('['));
+        assert!(json.ends_with(']'));
+        assert!(json.contains(r#""name":"A""#));
+        assert!(json.contains(r#""name":"B""#));
+        assert!(json.contains(r#""name":"C""#));
+        assert!(json.contains(r#""ph":"B""#));
+        assert!(json.contains(r#""ph":"E""#));
     }
 }
