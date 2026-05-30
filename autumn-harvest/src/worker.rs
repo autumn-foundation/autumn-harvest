@@ -426,29 +426,15 @@ fn should_requeue_signal_wait(commands: &[WorkflowCommand]) -> bool {
     let only_wait_or_bookkeeping = commands.iter().all(|cmd| {
         matches!(
             cmd,
-            WorkflowCommand::WaitForSignal { .. }
-                | WorkflowCommand::SignalExternalWorkflow { .. }
-                | WorkflowCommand::RecordMarker { .. }
-                | WorkflowCommand::RecordUpdateResult { .. }
-                | WorkflowCommand::UpsertSearchAttributes { .. }
-                | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
-        )
+            WorkflowCommand::WaitForSignal { .. } | WorkflowCommand::SignalExternalWorkflow { .. }
+        ) || cmd.is_bookkeeping()
     });
 
     has_wait && only_wait_or_bookkeeping
 }
 
 fn only_bookkeeping_commands(commands: &[WorkflowCommand]) -> bool {
-    !commands.is_empty()
-        && commands.iter().all(|cmd| {
-            matches!(
-                cmd,
-                WorkflowCommand::RecordMarker { .. }
-                    | WorkflowCommand::RecordUpdateResult { .. }
-                    | WorkflowCommand::UpsertSearchAttributes { .. }
-                    | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
-            )
-        })
+    !commands.is_empty() && commands.iter().all(WorkflowCommand::is_bookkeeping)
 }
 
 #[derive(Debug, Clone)]
@@ -616,19 +602,10 @@ fn extract_single_command<T>(
     commands: &[WorkflowCommand],
     extractor: impl Fn(&WorkflowCommand) -> Option<T>,
 ) -> Option<T> {
-    // RecordUpdateResult, RecordMarker, UpsertSearchAttributes, and
-    // SpawnDetachedChildWorkflow are bookkeeping / fire-and-forget commands
-    // that have already been (or are about to be) processed; they do not count
-    // toward the suspension-type determination.
-    let mut iter = commands.iter().filter(|cmd| {
-        !matches!(
-            cmd,
-            WorkflowCommand::RecordMarker { .. }
-                | WorkflowCommand::RecordUpdateResult { .. }
-                | WorkflowCommand::UpsertSearchAttributes { .. }
-                | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
-        )
-    });
+    // Bookkeeping commands (like RecordUpdateResult, RecordMarker, etc.) have
+    // already been (or are about to be) processed; they do not count toward
+    // the suspension-type determination.
+    let mut iter = commands.iter().filter(|cmd| !cmd.is_bookkeeping());
 
     let first_cmd = iter.next()?;
 
@@ -647,11 +624,10 @@ fn extract_all_scheduled_activities(
     let mut scheduled = Vec::new();
 
     for cmd in commands {
+        if cmd.is_bookkeeping() {
+            continue;
+        }
         match cmd {
-            WorkflowCommand::RecordMarker { .. }
-            | WorkflowCommand::RecordUpdateResult { .. }
-            | WorkflowCommand::UpsertSearchAttributes { .. }
-            | WorkflowCommand::SpawnDetachedChildWorkflow { .. } => {}
             WorkflowCommand::ScheduleActivity {
                 activity_id,
                 name,
@@ -685,11 +661,10 @@ fn extract_all_activity_waits(commands: &[WorkflowCommand]) -> Option<Vec<Activi
     let mut activity_ids = Vec::new();
 
     for cmd in commands {
+        if cmd.is_bookkeeping() {
+            continue;
+        }
         match cmd {
-            WorkflowCommand::RecordMarker { .. }
-            | WorkflowCommand::RecordUpdateResult { .. }
-            | WorkflowCommand::UpsertSearchAttributes { .. }
-            | WorkflowCommand::SpawnDetachedChildWorkflow { .. } => {}
             WorkflowCommand::WaitForActivity { activity_id, .. } => activity_ids.push(*activity_id),
             _ => return None,
         }
@@ -736,11 +711,7 @@ fn extract_started_timer_for_suspension(
             WorkflowCommand::StartTimer { .. }
                 | WorkflowCommand::WaitForSignal { .. }
                 | WorkflowCommand::SignalExternalWorkflow { .. }
-                | WorkflowCommand::RecordMarker { .. }
-                | WorkflowCommand::RecordUpdateResult { .. }
-                | WorkflowCommand::UpsertSearchAttributes { .. }
-                | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
-        )
+        ) || cmd.is_bookkeeping()
     });
 
     if is_valid { Some(first_timer) } else { None }
@@ -753,18 +724,8 @@ fn extract_started_timer_for_suspension(
 fn extract_all_started_child_workflows(
     commands: &[WorkflowCommand],
 ) -> Option<Vec<StartedChildWorkflowCommand>> {
-    let non_markers: Vec<&WorkflowCommand> = commands
-        .iter()
-        .filter(|c| {
-            !matches!(
-                c,
-                WorkflowCommand::RecordMarker { .. }
-                    | WorkflowCommand::RecordUpdateResult { .. }
-                    | WorkflowCommand::UpsertSearchAttributes { .. }
-                    | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
-            )
-        })
-        .collect();
+    let non_markers: Vec<&WorkflowCommand> =
+        commands.iter().filter(|c| !c.is_bookkeeping()).collect();
 
     if non_markers.is_empty() {
         return None;
