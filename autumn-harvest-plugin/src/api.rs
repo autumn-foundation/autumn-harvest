@@ -1555,9 +1555,15 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .route("/workflows", get(list_workflows))
         // Static /workflows/batch_start must be registered before any /workflows/{param}
         // routes so axum does not capture the literal segment as a path parameter.
+        // The body limit is raised to the configured max_total_bytes ceiling so
+        // Axum does not reject valid large batches before the handler can check.
         .route(
             "/workflows/batch_start",
-            post(batch_start_workflows).route_layer(require_admin.clone()),
+            post(batch_start_workflows)
+                .route_layer(require_admin.clone())
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    usize::try_from(DEFAULT_BATCH_START_MAX_BYTES).unwrap_or(usize::MAX),
+                )),
         )
         .route(
             "/workflows/{id}/history/export",
@@ -4722,10 +4728,17 @@ async fn batch_start_workflows(
         .max_workflow_execution_timeout()
         .map(|d| chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX));
 
-    // ── OTel span wrapping the batch (issue #357 telemetry AC) ───────────────
-    // Attributes recorded: batch.size, batch.atomic, batch.shards_touched,
-    // batch.rejected_count.  The span is created before any DB work so all
-    // shard round-trips are children of it.
+    // ── OTel batch span — created before any DB work (issue #357 telemetry AC) ─
+    // Dynamic attributes (shards_touched, rejected_count) are recorded via
+    // span.record() after the loop; the span is dropped at end of scope.
+    let batch_span = tracing::info_span!(
+        "harvest.batch.start",
+        "batch.size" = request.items.len(),
+        "batch.atomic" = request.atomic,
+        "batch.shards_touched" = tracing::field::Empty,
+        "batch.rejected_count" = tracing::field::Empty,
+    );
+
     let mut results: Vec<BatchStartItemResult> = Vec::with_capacity(request.items.len());
 
     // Pre-populate with the pre-validation rejections so indexes stay aligned.
@@ -4735,68 +4748,50 @@ async fn batch_start_workflows(
         results.push(r);
     }
 
-    let mut shards_touched: std::collections::HashSet<i32> = std::collections::HashSet::new();
     let mut rejected_count = pre_rejected_idxs.len();
 
+    // ── Phase 1: compute routing data and group valid items by shard ──────────
+    // Precomputing workflow_ids here ensures the same value is used for shard
+    // selection and for start_or_load_workflow_execution below.
+    let mut shard_groups: std::collections::BTreeMap<ShardId, Vec<(usize, String)>> =
+        std::collections::BTreeMap::new();
     for (idx, item) in request.items.iter().enumerate() {
         if pre_rejected_idxs.contains(&idx) {
             continue;
         }
-
         let workflow_id = item
             .workflow_id
             .clone()
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let input = item.input.clone().unwrap_or(Value::Null);
-
-        let effective_wf_cap = runtime
-            .registry
-            .workflows
-            .get(&item.workflow_name)
-            .and_then(|info| info.max_input_bytes)
-            .map_or(max_wf_input_bytes, |per_wf| per_wf.max(max_wf_input_bytes));
-
-        let (concurrency_key, concurrency_limit) = runtime
-            .registry
-            .workflows
-            .get(&item.workflow_name)
-            .and_then(|info| info.concurrency.as_ref())
-            .map_or((None, None), |policy| {
-                let key =
-                    autumn_harvest::concurrency::resolve_concurrency_key(policy.key_expr, &input);
-                (key, Some(policy.limit))
-            });
-
         let shard = runtime
             .router
             .pick_for_new_workflow(&item.workflow_name, &workflow_id);
-        shards_touched.insert(shard.as_i32());
-        let exec_id = ExecutionId::new_for_shard(shard);
+        shard_groups
+            .entry(shard)
+            .or_default()
+            .push((idx, workflow_id));
+    }
 
-        let trace_ctx = tracing::info_span!(
-            "harvest.workflow.schedule",
-            "otel.kind" = "producer",
-            { ATTR_WORKFLOW_ID } = %item.workflow_name,
-            { ATTR_EXECUTION_ID } = %exec_id,
-            { ATTR_SHARD_ID } = i64::from(shard.as_i32()),
-            { ATTR_QUEUE } = %queue_name,
-        )
-        .in_scope(|| runtime.registry.telemetry().capture_trace_context());
-
-        let conn_result = db_conn_for_shard(&api_state, shard).await;
+    // ── Phase 2: per-shard, acquire ONE connection and process all items ──────
+    // O(shards) connection acquisitions instead of O(items).
+    for (shard, shard_items) in &shard_groups {
+        let conn_result = db_conn_for_shard(&api_state, *shard).await;
         let mut conn = match conn_result {
             Ok(c) => c,
             Err(e) => {
-                rejected_count += 1;
-                results.push(BatchStartItemResult {
-                    index: idx,
-                    status: BatchStartItemStatus::Rejected,
-                    execution_id: None,
-                    error: Some(e.to_string()),
-                });
+                // All items on this shard are rejected due to connection failure.
+                let err_str = e.to_string();
+                for (idx, _) in shard_items {
+                    rejected_count += 1;
+                    results.push(BatchStartItemResult {
+                        index: *idx,
+                        status: BatchStartItemStatus::Rejected,
+                        execution_id: None,
+                        error: Some(err_str.clone()),
+                    });
+                }
                 if request.atomic {
-                    // Shard connection failed in atomic mode: abort entire batch.
-                    let _ = audit_batch_start_failure(
+                    let () = audit_batch_start_failure(
                         &api_state,
                         &actor,
                         &source,
@@ -4805,14 +4800,12 @@ async fn batch_start_workflows(
                         "atomic batch rejected: shard connection failure",
                     )
                     .await;
+                    results.sort_by_key(|r| r.index);
                     return (
                         StatusCode::CONFLICT,
                         Json(BatchStartRejectedResponse {
                             message: "atomic batch aborted: shard connection failure".to_string(),
-                            rejected: results
-                                .into_iter()
-                                .filter(|r| r.status == BatchStartItemStatus::Rejected)
-                                .collect(),
+                            rejected: results,
                         }),
                     )
                         .into_response();
@@ -4821,95 +4814,162 @@ async fn batch_start_workflows(
             }
         };
 
-        let start_result = start_or_load_workflow_execution(
-            &mut conn,
-            StartWorkflowParams {
-                workflow_name: &item.workflow_name,
-                workflow_id: &workflow_id,
-                exec_id,
-                input,
-                parent_id: None,
-                queue_name: &queue_name,
-                execution_timeout: None,
-                memo: None,
-                search_attrs: item.search_attributes.clone(),
-                reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
-                trace_context: trace_ctx,
-                max_execution_timeout_ceiling: max_exec_timeout_ceiling,
-                concurrency_key,
-                concurrency_limit,
-                priority: Priority::default(),
-                max_workflow_input_bytes: effective_wf_cap,
-                start_at: None,
-                delay: None,
-                max_workflow_start_delay: None,
-            },
-        )
-        .await;
+        for (idx, workflow_id) in shard_items {
+            let item = &request.items[*idx];
+            let input = item.input.clone().unwrap_or(Value::Null);
 
-        match start_result {
-            Ok(new_exec_id) => {
-                // Emit per-execution `harvest.workflow.started` metric so existing
-                // dashboards and alert thresholds are unaffected (issue #357 telemetry AC).
-                runtime
-                    .registry
-                    .telemetry()
-                    .metrics
-                    .record_workflow_started(&item.workflow_name, &queue_name);
+            // Workflow-specific cap takes precedence; global cap is the fallback.
+            let effective_wf_cap = runtime
+                .registry
+                .workflows
+                .get(&item.workflow_name)
+                .and_then(|info| info.max_input_bytes)
+                .unwrap_or(max_wf_input_bytes);
 
-                results.push(BatchStartItemResult {
-                    index: idx,
-                    status: BatchStartItemStatus::Started,
-                    execution_id: Some(new_exec_id.exec_id.to_string()),
-                    error: None,
+            let (concurrency_key, concurrency_limit) = runtime
+                .registry
+                .workflows
+                .get(&item.workflow_name)
+                .and_then(|info| info.concurrency.as_ref())
+                .map_or((None, None), |policy| {
+                    let key = autumn_harvest::concurrency::resolve_concurrency_key(
+                        policy.key_expr,
+                        &input,
+                    );
+                    (key, Some(policy.limit))
                 });
-            }
-            Err(e) => {
-                rejected_count += 1;
-                let err_str = e.to_string();
-                if request.atomic {
-                    let _ = audit_batch_start_failure(
-                        &api_state,
-                        &actor,
-                        &source,
-                        request_id.as_deref(),
-                        route,
-                        "atomic batch rejected: start failure",
-                    )
-                    .await;
-                    return (
-                        StatusCode::CONFLICT,
-                        Json(BatchStartRejectedResponse {
-                            message: format!("atomic batch aborted: item {idx} failed: {err_str}"),
-                            rejected: vec![BatchStartItemResult {
-                                index: idx,
-                                status: BatchStartItemStatus::Rejected,
-                                execution_id: None,
-                                error: Some(err_str),
-                            }],
-                        }),
-                    )
-                        .into_response();
+
+            let exec_id = ExecutionId::new_for_shard(*shard);
+
+            let trace_ctx = tracing::info_span!(
+                "harvest.workflow.schedule",
+                "otel.kind" = "producer",
+                { ATTR_WORKFLOW_ID } = %item.workflow_name,
+                { ATTR_EXECUTION_ID } = %exec_id,
+                { ATTR_SHARD_ID } = i64::from(shard.as_i32()),
+                { ATTR_QUEUE } = %queue_name,
+            )
+            .in_scope(|| runtime.registry.telemetry().capture_trace_context());
+
+            let start_result = start_or_load_workflow_execution(
+                &mut conn,
+                StartWorkflowParams {
+                    workflow_name: &item.workflow_name,
+                    workflow_id,
+                    exec_id,
+                    input,
+                    parent_id: None,
+                    queue_name: &queue_name,
+                    execution_timeout: None,
+                    memo: None,
+                    search_attrs: item.search_attributes.clone(),
+                    reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
+                    trace_context: trace_ctx,
+                    max_execution_timeout_ceiling: max_exec_timeout_ceiling,
+                    concurrency_key,
+                    concurrency_limit,
+                    priority: Priority::default(),
+                    max_workflow_input_bytes: effective_wf_cap,
+                    start_at: None,
+                    delay: None,
+                    max_workflow_start_delay: None,
+                },
+            )
+            .await;
+
+            match start_result {
+                Ok(started) => {
+                    // `harvest.workflow.started` is emitted by the worker on first
+                    // claim (attempt == 1, no scheduling events). Emitting it here
+                    // too would double-count every batch-started workflow vs. those
+                    // started via the single-start endpoint. Do NOT call
+                    // record_workflow_started here.
+                    //
+                    // If AllowDuplicate returned an existing execution, report it as
+                    // rejected so callers know no new execution was inserted.
+                    if started.created {
+                        results.push(BatchStartItemResult {
+                            index: *idx,
+                            status: BatchStartItemStatus::Started,
+                            execution_id: Some(started.exec_id.to_string()),
+                            error: None,
+                        });
+                    } else {
+                        rejected_count += 1;
+                        results.push(BatchStartItemResult {
+                            index: *idx,
+                            status: BatchStartItemStatus::Rejected,
+                            execution_id: Some(started.exec_id.to_string()),
+                            error: Some(format!(
+                                "workflow_id '{workflow_id}' already has an existing execution"
+                            )),
+                        });
+                        if request.atomic {
+                            let () = audit_batch_start_failure(
+                                &api_state,
+                                &actor,
+                                &source,
+                                request_id.as_deref(),
+                                route,
+                                "atomic batch rejected: duplicate workflow_id",
+                            )
+                            .await;
+                            results.sort_by_key(|r| r.index);
+                            return (
+                                StatusCode::CONFLICT,
+                                Json(BatchStartRejectedResponse {
+                                    message: format!(
+                                        "atomic batch aborted: item {idx} has an existing \
+                                         execution for workflow_id '{workflow_id}'"
+                                    ),
+                                    rejected: results,
+                                }),
+                            )
+                                .into_response();
+                        }
+                    }
                 }
-                results.push(BatchStartItemResult {
-                    index: idx,
-                    status: BatchStartItemStatus::Rejected,
-                    execution_id: None,
-                    error: Some(err_str),
-                });
+                Err(e) => {
+                    rejected_count += 1;
+                    let err_str = e.to_string();
+                    results.push(BatchStartItemResult {
+                        index: *idx,
+                        status: BatchStartItemStatus::Rejected,
+                        execution_id: None,
+                        error: Some(err_str.clone()),
+                    });
+                    if request.atomic {
+                        // Return all results so the client knows which items
+                        // started before the failure (broken-atomicity visibility).
+                        let () = audit_batch_start_failure(
+                            &api_state,
+                            &actor,
+                            &source,
+                            request_id.as_deref(),
+                            route,
+                            "atomic batch rejected: start failure",
+                        )
+                        .await;
+                        results.sort_by_key(|r| r.index);
+                        return (
+                            StatusCode::CONFLICT,
+                            Json(BatchStartRejectedResponse {
+                                message: format!(
+                                    "atomic batch aborted: item {idx} failed: {err_str}"
+                                ),
+                                rejected: results,
+                            }),
+                        )
+                            .into_response();
+                    }
+                }
             }
         }
     }
 
-    // ── Emit batch-level OTel span (issue #357 telemetry AC) ─────────────────
-    tracing::info_span!(
-        "harvest.batch.start",
-        "batch.size" = request.items.len(),
-        "batch.atomic" = request.atomic,
-        "batch.shards_touched" = shards_touched.len(),
-        "batch.rejected_count" = rejected_count,
-    )
-    .in_scope(|| {});
+    // Record dynamic attributes now that we have the final counts.
+    batch_span.record("batch.shards_touched", shard_groups.len());
+    batch_span.record("batch.rejected_count", rejected_count);
 
     // ── Audit the overall batch start ────────────────────────────────────────
     let started_count = results

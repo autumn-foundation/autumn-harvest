@@ -8,12 +8,13 @@ fn parse(args: &[&str]) -> Cli {
 }
 
 /// Write a temp file with NDJSON content and return its path.
-fn write_ndjson_file(lines: &[&str]) -> std::path::PathBuf {
+/// The returned `TempPath` deletes the file when dropped.
+fn write_ndjson_file(lines: &[&str]) -> tempfile::TempPath {
     let mut tmp = tempfile::NamedTempFile::new().expect("tmp file");
     for line in lines {
         writeln!(tmp, "{line}").expect("write line");
     }
-    tmp.into_temp_path().keep().expect("keep")
+    tmp.into_temp_path()
 }
 
 #[test]
