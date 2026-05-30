@@ -2497,15 +2497,15 @@ impl WorkflowContext {
         &self,
         activities: Vec<(String, Value, String)>,
     ) -> HarvestResult<Vec<Value>> {
-        if activities.is_empty() {
-            return Ok(Vec::new());
-        }
-
         self.check_cancellation()?;
 
         let seq = self.next_fan_out_seq();
         let count = activities.len();
         self.check_fan_out_count(seq, count)?;
+
+        if activities.is_empty() {
+            return Ok(Vec::new());
+        }
 
         let futures: Vec<_> = activities
             .into_iter()
@@ -2552,26 +2552,28 @@ impl WorkflowContext {
         &self,
         activities: Vec<(String, Value, String)>,
     ) -> HarvestResult<Vec<Result<Value, String>>> {
-        if activities.is_empty() {
-            return Ok(Vec::new());
-        }
-
         self.check_cancellation()?;
 
         let seq = self.next_fan_out_seq();
         let count = activities.len();
         self.check_fan_out_count(seq, count)?;
 
+        if activities.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let futures: Vec<_> = activities
             .into_iter()
             .map(|(name, input, queue)| async move {
-                self.execute_activity_raw(&name, input, &queue)
-                    .await
-                    .map_err(|e| e.to_string())
+                match self.execute_activity_raw(&name, input, &queue).await {
+                    Ok(v) => Ok(Ok(v)),
+                    Err(e @ HarvestError::ActivityFailed { .. }) => Ok(Err(e.to_string())),
+                    Err(e) => Err(e),
+                }
             })
             .collect();
 
-        Ok(futures::future::join_all(futures).await)
+        futures::future::try_join_all(futures).await
     }
 
     /// Typed fail-fast fan-out: run the same activity for every input in
