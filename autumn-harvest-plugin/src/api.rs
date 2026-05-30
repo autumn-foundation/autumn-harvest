@@ -46,8 +46,8 @@ use autumn_harvest::batch::{
     BatchSubmission,
 };
 use autumn_harvest::batch_start::{
-    BatchStartConfig, BatchStartItem, BatchStartItemResult, BatchStartItemStatus,
-    DEFAULT_BATCH_START_MAX_BYTES, DEFAULT_BATCH_START_MAX_ITEMS,
+    BATCH_START_BODY_HARD_LIMIT, BatchStartConfig, BatchStartItem, BatchStartItemResult,
+    BatchStartItemStatus, DEFAULT_BATCH_START_MAX_BYTES, DEFAULT_BATCH_START_MAX_ITEMS,
 };
 use autumn_harvest::calendar::{
     BackfillSlot, calendar_excludes_weekends, create_calendar, delete_calendar, get_calendar,
@@ -1561,10 +1561,13 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             "/workflows/batch_start",
             post(batch_start_workflows)
                 .route_layer(require_admin.clone())
-                // Disable Axum's 2 MiB default so operators can raise
-                // BatchStartConfig.max_total_bytes above 10 MiB; the handler
-                // enforces the configured cap via api_state.batch_start_max_bytes().
-                .layer(axum::extract::DefaultBodyLimit::disable()),
+                // Replace Axum's 2 MiB default with the absolute hard ceiling so
+                // bodies are bounded before buffering while still allowing operators
+                // to raise BatchStartConfig.max_total_bytes up to 100 MiB. The
+                // handler enforces the configured cap via api_state.batch_start_max_bytes().
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    usize::try_from(BATCH_START_BODY_HARD_LIMIT).unwrap_or(usize::MAX),
+                )),
         )
         .route(
             "/workflows/{id}/history/export",
@@ -1837,6 +1840,8 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/workers/drain-preview"),
         ("POST", "/workers/{worker_id}/drain"),
         ("GET", "/workers/{worker_id}/pinned"),
+        // ── batch workflow start (issue #357) ─────────────────────────────────
+        ("POST", "/workflows/batch_start"),
         // ── batch operations (issue #102) ─────────────────────────────────────
         ("GET", "/batch-operations"),
         ("POST", "/batch-operations"),
@@ -1934,6 +1939,8 @@ pub const fn management_api_request_fields()
                 "idempotency_key",
             ]),
         ),
+        // ── batch workflow start (issue #357) ─────────────────────────────────
+        ("POST", "/workflows/batch_start", Some(&["items", "atomic"])),
         ("POST", "/workflows/{id}/cancel", Some(&["reason"])),
         (
             "POST",

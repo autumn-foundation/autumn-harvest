@@ -16,6 +16,13 @@ pub const DEFAULT_BATCH_START_MAX_ITEMS: usize = 1000;
 /// Default maximum serialised byte length for a batch-start request body: 10 MiB.
 pub const DEFAULT_BATCH_START_MAX_BYTES: u64 = 10 * 1024 * 1024;
 
+/// Absolute hard ceiling on the Axum-level body buffer for batch-start: 100 MiB.
+///
+/// Allows operators to raise `BatchStartConfig.max_total_bytes` above the
+/// 10 MiB default while still bounding pre-handler memory usage. Requests
+/// above this ceiling are rejected before any bytes reach the handler.
+pub const BATCH_START_BODY_HARD_LIMIT: u64 = 100 * 1024 * 1024;
+
 /// Hard caps applied to every `POST /workflows/batch_start` request (issue #357).
 ///
 /// Both values are checked before any execution row is inserted. Requests that
