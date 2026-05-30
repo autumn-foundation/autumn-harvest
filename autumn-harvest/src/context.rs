@@ -3675,6 +3675,12 @@ impl ActivityContext {
                 let output = serde_json::to_value(&user_result)
                     .map_err(HarvestError::Serialization)?;
 
+                // Lock the execution row first (consistent with the rest of the
+                // codebase: harvest_workflow_executions → harvest_task_queue)
+                // and load history so we can compute the next sequential
+                // event_id before appending.
+                let history = crate::store::lock_and_load_history(conn, exec_id).await?;
+
                 // Idempotency guard: verify the task is still RUNNING before
                 // we commit.  If it's already COMPLETED (e.g. this is a
                 // crash-recovery attempt where the first transaction succeeded)
@@ -3696,10 +3702,6 @@ impl ActivityContext {
                         )));
                     }
                 }
-
-                // Lock the execution row and load history so we can compute the
-                // next sequential event_id before appending.
-                let history = crate::store::lock_and_load_history(conn, exec_id).await?;
 
                 // Append ActivityCompleted within the same transaction.
                 let completion_event = crate::event::WorkflowEvent::ActivityCompleted {

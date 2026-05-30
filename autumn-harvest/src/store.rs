@@ -358,6 +358,7 @@ pub(crate) async fn lock_and_load_history(
 }
 
 /// Deserializes each row's `event_data` JSON back into [`WorkflowEvent`].
+///
 /// The returned [`EventHistory::next_event_id`] is set to one past the last
 /// loaded event (or 0 if the history is empty), ready for use with
 /// [`append_events()`].
