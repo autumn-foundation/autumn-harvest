@@ -3643,6 +3643,26 @@ impl ActivityContext {
             + Send,
         T: serde::Serialize + Send,
     {
+        // Two-level error type so the user's original Err(String) propagates
+        // unchanged.  Wrapping it in HarvestError::Config would stringify as
+        // "invalid configuration: …" which breaks non_retryable_errors matching
+        // and corrupts the ActivityFailed payload seen by the retry policy.
+        // Defined before any statements to satisfy clippy::items_after_statements.
+        enum TxError {
+            User(String),
+            Harvest(HarvestError),
+        }
+        impl From<HarvestError> for TxError {
+            fn from(e: HarvestError) -> Self {
+                Self::Harvest(e)
+            }
+        }
+        impl From<diesel::result::Error> for TxError {
+            fn from(e: diesel::result::Error) -> Self {
+                Self::Harvest(crate::error::database_error(e))
+            }
+        }
+
         use diesel_async::AsyncConnection as _;
         use scoped_futures::ScopedFutureExt as _;
 
@@ -3660,20 +3680,19 @@ impl ActivityContext {
         let activity_id = txn.activity_id;
         let task_id = txn.task_id;
 
-        let mut conn = txn.pool.get().await.map_err(|e| {
-            format!("transactional activity failed to acquire DB connection: {e}")
-        })?;
+        let mut conn =
+            txn.pool.get().await.map_err(|e| {
+                format!("transactional activity failed to acquire DB connection: {e}")
+            })?;
 
-        conn.transaction::<T, HarvestError, _>(|conn| {
+        conn.transaction::<T, TxError, _>(|conn| {
             async move {
                 // Run user domain writes.
-                let user_result = f(conn)
-                    .await
-                    .map_err(HarvestError::Config)?;
+                let user_result = f(conn).await.map_err(TxError::User)?;
 
                 // Serialize the result for the event log.
-                let output = serde_json::to_value(&user_result)
-                    .map_err(HarvestError::Serialization)?;
+                let output =
+                    serde_json::to_value(&user_result).map_err(HarvestError::Serialization)?;
 
                 // Lock the execution row first (consistent with the rest of the
                 // codebase: harvest_workflow_executions → harvest_task_queue)
@@ -3689,17 +3708,17 @@ impl ActivityContext {
                 match crate::queue::task_state_for_update(conn, task_id).await? {
                     Some(ref s) if s == "RUNNING" => {}
                     Some(other) => {
-                        return Err(HarvestError::Config(format!(
+                        return Err(TxError::Harvest(HarvestError::Config(format!(
                             "transactional activity task {task_id} is in state '{other}', \
                              not RUNNING; rolling back user writes (the ActivityCompleted \
                              event was already committed by a prior attempt)"
-                        )));
+                        ))));
                     }
                     None => {
-                        return Err(HarvestError::Config(format!(
+                        return Err(TxError::Harvest(HarvestError::Config(format!(
                             "transactional activity task {task_id} no longer exists; \
                              rolling back user writes"
-                        )));
+                        ))));
                     }
                 }
 
@@ -3728,7 +3747,10 @@ impl ActivityContext {
             .scope_boxed()
         })
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| match e {
+            TxError::User(s) => s,
+            TxError::Harvest(he) => he.to_string(),
+        })
     }
 
     /// Constructor for testing -- no heartbeat channel, default cancel token.

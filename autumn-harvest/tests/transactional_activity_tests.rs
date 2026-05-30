@@ -18,21 +18,23 @@ use autumn_harvest::models::WorkflowExecution;
 use autumn_harvest::prelude::*;
 use autumn_harvest::schema::harvest_workflow_executions;
 use autumn_harvest::types::ExecutionId;
-use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use autumn_harvest::types::Priority;
-use autumn_harvest::{StartWorkflowParams, WorkflowIdReusePolicy, start_or_load_workflow_execution};
+use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
+use autumn_harvest::{
+    StartWorkflowParams, WorkflowIdReusePolicy, start_or_load_workflow_execution,
+};
 
 /// Holds either a live testcontainers handle (keeps the container running) or
 /// nothing when a pre-existing database is used via `TEST_DATABASE_URL`.
 #[allow(dead_code)]
 enum DbHandle {
-    Container(testcontainers::ContainerAsync<Postgres>),
+    Container(Box<testcontainers::ContainerAsync<Postgres>>),
     External,
 }
 
 /// Serializes integration tests that share a `user_records` table when run
-/// against a single Postgres instance (i.e. when TEST_DATABASE_URL is set).
-static DB_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// against a single Postgres instance (i.e. when `TEST_DATABASE_URL` is set).
+static DB_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 // ---------------------------------------------------------------------------
 // Migration SQL (same set as integration_e2e.rs)
@@ -105,9 +107,7 @@ async fn setup_db() -> (String, DbHandle) {
         let mut conn = AsyncPgConnection::establish(&url)
             .await
             .expect("connect to TEST_DATABASE_URL");
-        conn.batch_execute(INIT_SQL)
-            .await
-            .unwrap_or(());  // ignore "already exists" errors on repeat runs
+        conn.batch_execute(INIT_SQL).await.unwrap_or(()); // ignore "already exists" errors on repeat runs
         return (url, DbHandle::External);
     }
 
@@ -120,10 +120,10 @@ async fn setup_db() -> (String, DbHandle) {
     let host = container.get_host().await.expect("get host");
     let port = container.get_host_port_ipv4(5432).await.expect("get port");
     let db_url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
-    (db_url, DbHandle::Container(container))
+    (db_url, DbHandle::Container(Box::new(container)))
 }
 
-async fn make_pool(db_url: &str) -> DbPool {
+fn make_pool(db_url: &str) -> DbPool {
     let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
         diesel_async::AsyncPgConnection,
     >::new(db_url);
@@ -134,9 +134,7 @@ async fn make_pool(db_url: &str) -> DbPool {
 }
 
 async fn load_execution(db_url: &str, exec_id: ExecutionId) -> WorkflowExecution {
-    let mut conn = AsyncPgConnection::establish(db_url)
-        .await
-        .expect("connect");
+    let mut conn = AsyncPgConnection::establish(db_url).await.expect("connect");
     harvest_workflow_executions::table
         .find(exec_id.as_uuid())
         .select(WorkflowExecution::as_select())
@@ -156,7 +154,7 @@ async fn wait_for_state(db_url: &str, exec_id: ExecutionId, target: &str) {
         }
     })
     .await
-    .unwrap_or_else(|_| panic!("workflow did not reach '{target}' within timeout"))
+    .unwrap_or_else(|_| panic!("workflow did not reach '{target}' within timeout"));
 }
 
 fn make_worker(_db_url: &str, registry: Arc<HandlerRegistry>) -> Arc<Worker> {
@@ -195,9 +193,7 @@ struct CountRow {
 }
 
 async fn count_user_records(db_url: &str) -> i64 {
-    let mut conn = AsyncPgConnection::establish(db_url)
-        .await
-        .expect("connect");
+    let mut conn = AsyncPgConnection::establish(db_url).await.expect("connect");
     let rows = diesel::sql_query("SELECT COUNT(*)::bigint AS n FROM user_records")
         .load::<CountRow>(&mut conn)
         .await
@@ -206,9 +202,7 @@ async fn count_user_records(db_url: &str) -> i64 {
 }
 
 async fn count_activity_completed_events(db_url: &str, exec_id: ExecutionId) -> i64 {
-    let mut conn = AsyncPgConnection::establish(db_url)
-        .await
-        .expect("connect");
+    let mut conn = AsyncPgConnection::establish(db_url).await.expect("connect");
     let rows = diesel::sql_query(
         "SELECT COUNT(*)::bigint AS n FROM harvest_events \
          WHERE workflow_exec_id = $1 AND event_data->>'type' = 'ActivityCompleted'",
@@ -243,15 +237,14 @@ async fn insert_record_txn(ctx: &ActivityContext, value: String) -> Result<(), S
 
 /// Inserts a row but returns `Err` — the transaction must roll back.
 #[activity(start_to_close = "30s")]
-async fn insert_then_fail_txn(ctx: &ActivityContext, _value: String) -> Result<(), String> {
+async fn insert_then_fail_txn(ctx: &ActivityContext, value: String) -> Result<(), String> {
+    let _ = value;
     ctx.run_transactional(|conn| {
         Box::pin(async move {
-            diesel::sql_query(
-                "INSERT INTO user_records (value) VALUES ('should_be_rolled_back')",
-            )
-            .execute(conn)
-            .await
-            .map_err(|e| e.to_string())?;
+            diesel::sql_query("INSERT INTO user_records (value) VALUES ('should_be_rolled_back')")
+                .execute(conn)
+                .await
+                .map_err(|e| e.to_string())?;
             // Deliberately fail after the insert
             Err("intentional failure".to_string())
         })
@@ -260,14 +253,16 @@ async fn insert_then_fail_txn(ctx: &ActivityContext, _value: String) -> Result<(
 }
 
 #[workflow]
-async fn happy_txn_workflow(ctx: &WorkflowContext, _input: ()) -> Result<(), String> {
+async fn happy_txn_workflow(ctx: &WorkflowContext, input: ()) -> Result<(), String> {
+    let () = input;
     ctx.execute_activity(&insert_record_txn_info(), "hello".to_string())
         .await
         .map_err(|e| e.to_string())
 }
 
 #[workflow]
-async fn failing_txn_workflow(ctx: &WorkflowContext, _input: ()) -> Result<(), String> {
+async fn failing_txn_workflow(ctx: &WorkflowContext, input: ()) -> Result<(), String> {
+    let () = input;
     ctx.execute_activity(&insert_then_fail_txn_info(), "fail".to_string())
         .await
         .map_err(|e| e.to_string())
@@ -281,7 +276,7 @@ async fn failing_txn_workflow(ctx: &WorkflowContext, _input: ()) -> Result<(), S
 /// event after a successful transactional activity.
 #[tokio::test]
 async fn transactional_activity_happy_path_atomic_commit() {
-    let _guard = DB_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _guard = DB_TEST_LOCK.lock().await;
     let (db_url, _container) = setup_db().await;
     let mut setup_conn = AsyncPgConnection::establish(&db_url)
         .await
@@ -291,7 +286,7 @@ async fn transactional_activity_happy_path_atomic_commit() {
         .await
         .expect("create user_records");
 
-    let pool = make_pool(&db_url).await;
+    let pool = make_pool(&db_url);
     let registry = Arc::new(HandlerRegistry::new(
         vec![happy_txn_workflow_info()],
         vec![insert_record_txn_info()],
@@ -354,7 +349,7 @@ async fn transactional_activity_happy_path_atomic_commit() {
 /// The workflow fails (no retry policy configured on the activity).
 #[tokio::test]
 async fn transactional_activity_err_rolls_back_user_writes() {
-    let _guard = DB_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _guard = DB_TEST_LOCK.lock().await;
     let (db_url, _container) = setup_db().await;
     let mut setup_conn = AsyncPgConnection::establish(&db_url)
         .await
@@ -364,7 +359,7 @@ async fn transactional_activity_err_rolls_back_user_writes() {
         .await
         .expect("create user_records");
 
-    let pool = make_pool(&db_url).await;
+    let pool = make_pool(&db_url);
     let registry = Arc::new(HandlerRegistry::new(
         vec![failing_txn_workflow_info()],
         vec![insert_then_fail_txn_info()],
