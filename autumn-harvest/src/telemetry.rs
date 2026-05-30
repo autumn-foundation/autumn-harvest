@@ -197,6 +197,20 @@ pub const METRIC_RATE_LIMIT_REFILL_RATE: &str = "harvest.rate_limit.refill_rate"
 /// Counter: incremented when a task claim is throttled/skipped due to rate limiting.
 pub const METRIC_RATE_LIMIT_THROTTLED: &str = "harvest.rate_limit.throttled";
 
+/// Counter: incremented on each scheduler tick-loop fire attempt for a due schedule slot.
+///
+/// Labels:
+/// - `schedule` — the workflow or DAG name (low-cardinality).
+/// - `outcome` — one of:
+///   - `"claimed"` — this replica atomically claimed the slot and will fire it.
+///   - `"lost_race"` — another replica already holds a live claim for this
+///     slot; this replica skips it without firing.
+///
+/// Use this metric to verify in Grafana / your alert stack that contention is
+/// happening, claims are exclusive, and no replica is silently dominating the
+/// fire path. See `docs/runbooks/ha-deployment.md` for thresholds.
+pub const METRIC_SCHEDULE_FIRE_ATTEMPTS: &str = "harvest.schedule.fire_attempts";
+
 // ---------------------------------------------------------------------------
 // Metric label key constants
 // Used by MetricsRecorder implementations to avoid string literals at call
@@ -644,6 +658,19 @@ pub trait MetricsRecorder: Send + Sync {
     ///
     /// Maps to the counter `harvest.schedule.manual_trigger{schedule.name, outcome}`.
     fn record_schedule_manual_trigger(&self, schedule_name: &str, outcome: &str) {
+        let _ = (schedule_name, outcome);
+    }
+
+    /// A tick-loop fire attempt for a due schedule slot (issue #350).
+    ///
+    /// `schedule_name` is the workflow or DAG name (low-cardinality).
+    /// `outcome` is one of:
+    /// - `"claimed"` — this replica won the atomic claim race and will fire.
+    /// - `"lost_race"` — another replica already holds a live claim for this
+    ///   slot; this replica skips it without firing.
+    ///
+    /// Maps to the counter [`METRIC_SCHEDULE_FIRE_ATTEMPTS`].
+    fn record_schedule_fire_attempt(&self, schedule_name: &str, outcome: &str) {
         let _ = (schedule_name, outcome);
     }
 

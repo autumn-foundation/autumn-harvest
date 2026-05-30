@@ -371,6 +371,37 @@
         "GET /api/harvest/workers/health"
       ],
       "runbook": "docs/runbooks/harvest-alerts.md#harvest_no_compatible_worker"
+    },
+    {
+      "id": "harvest_schedule_ha_domination",
+      "status": "enforceable",
+      "signal_source": "harvest.schedule.fire_attempts counter with outcome label (issue #350).",
+      "default_threshold": "Ticket when lost_race / (lost_race + claimed) > 0.98 for any 5-minute window. Indicates one replica is winning nearly all schedule claims, which may signal a topology misconfiguration or a clock skew on the Postgres server.",
+      "severity": "ticket",
+      "owner_persona": "runtime on-call",
+      "description": "One replica is winning nearly all schedule-slot claims. In a healthy N-replica deployment, claims should be roughly evenly distributed. Extreme skew suggests a misconfiguration where one replica points to a different database than the others, or its shard assignments exclude it from competing.",
+      "first_action": "harvest preflight --output json && inspect harvest_schedules.fire_claim_token for stuck tokens",
+      "dependencies": [
+        {
+          "ref": "#350",
+          "status": "shipped",
+          "surface": "harvest.schedule.fire_attempts{outcome=claimed|lost_race} counter emitted by tick_workflow_schedules"
+        }
+      ],
+      "prometheus": {
+        "mode": "native",
+        "notes": "Requires harvest.schedule.fire_attempts to be exported. outcome label is low-cardinality (two values). Do NOT add execution.id or schedule.id as labels.",
+        "expressions": [
+          {
+            "kind": "promql",
+            "expr": "sum(rate(harvest_schedule_fire_attempts_total{outcome=\"lost_race\"}[5m])) / (sum(rate(harvest_schedule_fire_attempts_total{outcome=\"lost_race\"}[5m])) + sum(rate(harvest_schedule_fire_attempts_total{outcome=\"claimed\"}[5m]))) > 0.98"
+          }
+        ]
+      },
+      "management_checks": [
+        "SELECT id, workflow_name, fire_claim_token, fire_claimed_until FROM harvest_schedules WHERE fire_claimed_until IS NOT NULL ORDER BY fire_claimed_until DESC LIMIT 10;"
+      ],
+      "runbook": "docs/runbooks/harvest-alerts.md#harvest_schedule_ha_domination"
     }
   ]
 }

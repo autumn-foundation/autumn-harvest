@@ -6144,6 +6144,8 @@ mod tests {
             buffer_all_max: 100,
             calendar_name: None,
             skip_policy: "skip".to_string(),
+            fire_claim_token: None,
+            fire_claimed_until: None,
         }
     }
 
