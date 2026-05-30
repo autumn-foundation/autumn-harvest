@@ -94,7 +94,10 @@ impl RecordingMetrics {
 
 impl MetricsRecorder for RecordingMetrics {
     fn record_schedule_auto_paused(&self, schedule_name: &str) {
-        self.auto_paused.lock().unwrap().push(schedule_name.to_owned());
+        self.auto_paused
+            .lock()
+            .unwrap()
+            .push(schedule_name.to_owned());
     }
 }
 
@@ -196,8 +199,7 @@ fn metrics_recorder_has_auto_paused_method() {
 fn workflow_schedule_builder_has_consecutive_failure_limit() {
     use autumn_harvest::policy::{Schedule, WorkflowSchedule};
 
-    let sched = WorkflowSchedule::new("my_wf", Schedule::Manual)
-        .with_consecutive_failure_limit(5);
+    let sched = WorkflowSchedule::new("my_wf", Schedule::Manual).with_consecutive_failure_limit(5);
     assert_eq!(sched.consecutive_failure_limit, Some(5));
 }
 
@@ -264,9 +266,7 @@ async fn schedule_auto_pauses_after_consecutive_failures() {
 
     // No new execution must have been created.
     let exec_count: i64 = autumn_harvest::schema::harvest_workflow_executions::table
-        .filter(
-            autumn_harvest::schema::harvest_workflow_executions::dsl::workflow_name.eq(wf_name),
-        )
+        .filter(autumn_harvest::schema::harvest_workflow_executions::dsl::workflow_name.eq(wf_name))
         .count()
         .get_result(&mut check)
         .await
@@ -331,14 +331,15 @@ async fn auto_paused_schedule_remains_paused_on_subsequent_ticks() {
     );
 
     let exec_count: i64 = autumn_harvest::schema::harvest_workflow_executions::table
-        .filter(
-            autumn_harvest::schema::harvest_workflow_executions::dsl::workflow_name.eq(wf_name),
-        )
+        .filter(autumn_harvest::schema::harvest_workflow_executions::dsl::workflow_name.eq(wf_name))
         .count()
         .get_result(&mut check)
         .await
         .expect("count executions");
-    assert_eq!(exec_count, 0, "no execution must be created on a paused schedule");
+    assert_eq!(
+        exec_count, 0,
+        "no execution must be created on a paused schedule"
+    );
 }
 
 /// Resuming a schedule (clearing `auto_paused_at` and resetting
@@ -373,18 +374,16 @@ async fn schedule_resumes_and_resets_failure_count() {
         .expect("resume schedule");
 
     // Verify the schedule is no longer auto-paused and count is reset.
-    let (auto_paused_at, failure_count): (
-        Option<chrono::DateTime<Utc>>,
-        i32,
-    ) = harvest_schedules::table
-        .find(sched_id)
-        .select((
-            harvest_schedules::dsl::auto_paused_at,
-            harvest_schedules::dsl::consecutive_failure_count,
-        ))
-        .first(&mut conn)
-        .await
-        .expect("select after resume");
+    let (auto_paused_at, failure_count): (Option<chrono::DateTime<Utc>>, i32) =
+        harvest_schedules::table
+            .find(sched_id)
+            .select((
+                harvest_schedules::dsl::auto_paused_at,
+                harvest_schedules::dsl::consecutive_failure_count,
+            ))
+            .first(&mut conn)
+            .await
+            .expect("select after resume");
     assert!(
         auto_paused_at.is_none(),
         "auto_paused_at must be NULL after resume"
@@ -417,9 +416,7 @@ async fn schedule_resumes_and_resets_failure_count() {
 
     // The tick should have fired the schedule, creating an execution.
     let exec_count: i64 = autumn_harvest::schema::harvest_workflow_executions::table
-        .filter(
-            autumn_harvest::schema::harvest_workflow_executions::dsl::workflow_name.eq(wf_name),
-        )
+        .filter(autumn_harvest::schema::harvest_workflow_executions::dsl::workflow_name.eq(wf_name))
         .count()
         .get_result(&mut check)
         .await
@@ -493,9 +490,7 @@ async fn schedule_fires_when_below_failure_limit() {
 
     // Execution must have been created.
     let exec_count: i64 = autumn_harvest::schema::harvest_workflow_executions::table
-        .filter(
-            autumn_harvest::schema::harvest_workflow_executions::dsl::workflow_name.eq(wf_name),
-        )
+        .filter(autumn_harvest::schema::harvest_workflow_executions::dsl::workflow_name.eq(wf_name))
         .count()
         .get_result(&mut check)
         .await
@@ -577,9 +572,7 @@ async fn schedule_without_limit_never_auto_pauses() {
     );
 
     let exec_count: i64 = autumn_harvest::schema::harvest_workflow_executions::table
-        .filter(
-            autumn_harvest::schema::harvest_workflow_executions::dsl::workflow_name.eq(wf_name),
-        )
+        .filter(autumn_harvest::schema::harvest_workflow_executions::dsl::workflow_name.eq(wf_name))
         .count()
         .get_result(&mut check)
         .await

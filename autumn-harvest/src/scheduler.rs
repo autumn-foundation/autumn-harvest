@@ -1149,8 +1149,9 @@ async fn upsert_workflow_schedule(
             dsl::buffered_runs.eq(new_buffered_runs),
             dsl::calendar_name.eq(ws.calendar.as_deref()),
             dsl::skip_policy.eq(ws.skip_policy.as_str()),
-            dsl::consecutive_failure_limit
-                .eq(ws.consecutive_failure_limit.map(|n| i32::try_from(n).unwrap_or(i32::MAX))),
+            dsl::consecutive_failure_limit.eq(ws
+                .consecutive_failure_limit
+                .map(|n| i32::try_from(n).unwrap_or(i32::MAX))),
         ))
         .execute(conn)
         .await
@@ -2515,7 +2516,10 @@ pub(crate) async fn maybe_increment_schedule_failure_counter(
         .filter(dsl::workflow_name.eq(workflow_name))
         .filter(dsl::consecutive_failure_limit.is_not_null())
         .filter(dsl::auto_paused_at.is_null())
-        .select((dsl::consecutive_failure_count, dsl::consecutive_failure_limit))
+        .select((
+            dsl::consecutive_failure_count,
+            dsl::consecutive_failure_limit,
+        ))
         .load(conn)
         .await
         .map_err(crate::error::database_error);
