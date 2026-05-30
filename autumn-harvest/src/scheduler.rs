@@ -1149,6 +1149,8 @@ async fn upsert_workflow_schedule(
             dsl::buffered_runs.eq(new_buffered_runs),
             dsl::calendar_name.eq(ws.calendar.as_deref()),
             dsl::skip_policy.eq(ws.skip_policy.as_str()),
+            dsl::consecutive_failure_limit
+                .eq(ws.consecutive_failure_limit.map(|n| i32::try_from(n).unwrap_or(i32::MAX))),
         ))
         .execute(conn)
         .await
@@ -1294,6 +1296,8 @@ async fn tick_workflow_schedules(
     let due: Vec<HarvestSchedule> = dsl::harvest_schedules
         .filter(dsl::workflow_name.is_not_null())
         .filter(dsl::is_paused.eq(false))
+        // Auto-paused schedules (issue #360) are excluded from the due list.
+        .filter(dsl::auto_paused_at.is_null())
         .filter(dsl::next_run_at.is_not_null())
         .filter(dsl::next_run_at.le(now))
         .order(dsl::next_run_at.asc())
@@ -1664,6 +1668,44 @@ async fn tick_one_workflow_schedule(
     } else {
         (vec![], false, crate::policy::SkipPolicy::Skip)
     };
+
+    // ── Auto-pause check (issue #360) ─────────────────────────────────────────
+    // If the schedule has a non-zero consecutive_failure_limit and the stored
+    // counter has reached (or exceeded) that limit, auto-pause the schedule
+    // rather than dispatching another run that is likely to fail again.
+    //
+    // The counter is maintained by the worker completion path
+    // (`maybe_increment_schedule_failure_counter` / `maybe_reset_schedule_failure_counter`
+    // in scheduler.rs) so this check is O(1): just read the column that is already
+    // loaded in the schedule row.  A limit of 0 is treated as disabled (same as NULL)
+    // so that a misconfigured `Some(0)` never traps every first tick.
+    if let Some(limit) = schedule.consecutive_failure_limit
+        && limit > 0
+        && schedule.consecutive_failure_count >= limit
+    {
+        tracing::info!(
+            workflow_name = %wf_name,
+            consecutive_failure_count = schedule.consecutive_failure_count,
+            consecutive_failure_limit = limit,
+            "harvest: auto-pausing schedule after consecutive failures"
+        );
+        diesel::update(
+            dsl::harvest_schedules
+                .find(schedule.id)
+                .filter(dsl::fire_claim_token.eq(Some(claim_token))),
+        )
+        .set((
+            dsl::auto_paused_at.eq(Some(now)),
+            dsl::fire_claim_token.eq(Option::<uuid::Uuid>::None),
+            dsl::fire_claimed_until.eq(Option::<DateTime<Utc>>::None),
+            dsl::updated_at.eq(now),
+        ))
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+        metrics.record_schedule_auto_paused(wf_name);
+        return Ok(());
+    }
 
     let mut running: i64 = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::workflow_name.eq(wf_name))
@@ -2437,6 +2479,155 @@ async fn drain_buffered_schedule_runs(
     }
 
     Ok(())
+}
+
+// ── Worker-completion helpers (issue #360) ────────────────────────────────────
+//
+// These functions are called from the worker completion path (`worker.rs`) after
+// a schedule-triggered execution reaches a terminal state.  They are best-effort:
+// errors are logged but never propagated back to the task loop — the workflow task
+// result has already been committed at that point.
+//
+// Only executions whose `workflow_id` starts with `"sched:"` are considered
+// schedule-triggered.  All other executions are ignored.
+
+/// Increment the consecutive failure counter for the schedule associated with
+/// `workflow_name` when a schedule-triggered execution reaches `FAILED` or
+/// `TIMED_OUT`.  If the counter now equals or exceeds the configured limit,
+/// auto-pause the schedule and emit the `harvest.schedule.auto_paused` metric.
+#[cfg(feature = "db")]
+pub(crate) async fn maybe_increment_schedule_failure_counter(
+    conn: &mut diesel_async::AsyncPgConnection,
+    workflow_id: &str,
+    workflow_name: &str,
+    metrics: &std::sync::Arc<dyn crate::telemetry::MetricsRecorder>,
+) {
+    use crate::schema::harvest_schedules::dsl;
+
+    if !workflow_id.starts_with("sched:") {
+        return;
+    }
+
+    let now = Utc::now();
+
+    // Read schedules that have a limit configured and are not already auto-paused.
+    let updated_rows: Result<Vec<(i32, Option<i32>)>, _> = dsl::harvest_schedules
+        .filter(dsl::workflow_name.eq(workflow_name))
+        .filter(dsl::consecutive_failure_limit.is_not_null())
+        .filter(dsl::auto_paused_at.is_null())
+        .select((dsl::consecutive_failure_count, dsl::consecutive_failure_limit))
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error);
+
+    let rows = match updated_rows {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                workflow_name,
+                "harvest: failed to read schedule for failure counter increment"
+            );
+            return;
+        }
+    };
+
+    for (current_count, limit_opt) in rows {
+        let Some(limit) = limit_opt else { continue };
+        let new_count = current_count.saturating_add(1);
+        let should_auto_pause = new_count >= limit && limit > 0;
+
+        if should_auto_pause {
+            let result = diesel::update(
+                dsl::harvest_schedules
+                    .filter(dsl::workflow_name.eq(workflow_name))
+                    .filter(dsl::consecutive_failure_limit.is_not_null())
+                    .filter(dsl::auto_paused_at.is_null()),
+            )
+            .set((
+                dsl::consecutive_failure_count.eq(new_count),
+                dsl::auto_paused_at.eq(Some(now)),
+                dsl::updated_at.eq(now),
+            ))
+            .execute(conn)
+            .await;
+
+            if let Err(e) = result {
+                tracing::warn!(
+                    error = %e,
+                    workflow_name,
+                    "harvest: failed to auto-pause schedule after consecutive failures"
+                );
+            } else {
+                tracing::info!(
+                    workflow_name,
+                    consecutive_failure_count = new_count,
+                    consecutive_failure_limit = limit,
+                    "harvest: schedule auto-paused after consecutive execution failures"
+                );
+                metrics.record_schedule_auto_paused(workflow_name);
+            }
+        } else {
+            let result = diesel::update(
+                dsl::harvest_schedules
+                    .filter(dsl::workflow_name.eq(workflow_name))
+                    .filter(dsl::consecutive_failure_limit.is_not_null())
+                    .filter(dsl::auto_paused_at.is_null()),
+            )
+            .set((
+                dsl::consecutive_failure_count.eq(new_count),
+                dsl::updated_at.eq(now),
+            ))
+            .execute(conn)
+            .await;
+
+            if let Err(e) = result {
+                tracing::warn!(
+                    error = %e,
+                    workflow_name,
+                    "harvest: failed to increment schedule failure counter"
+                );
+            }
+        }
+    }
+}
+
+/// Reset the consecutive failure counter to zero for the schedule associated with
+/// `workflow_name` when a schedule-triggered execution reaches `COMPLETED`.
+/// Also clears `auto_paused_at` so the schedule resumes firing automatically.
+#[cfg(feature = "db")]
+pub(crate) async fn maybe_reset_schedule_failure_counter(
+    conn: &mut diesel_async::AsyncPgConnection,
+    workflow_id: &str,
+    workflow_name: &str,
+) {
+    use crate::schema::harvest_schedules::dsl;
+
+    if !workflow_id.starts_with("sched:") {
+        return;
+    }
+
+    let now = Utc::now();
+    let result = diesel::update(
+        dsl::harvest_schedules
+            .filter(dsl::workflow_name.eq(workflow_name))
+            .filter(dsl::consecutive_failure_limit.is_not_null())
+            .filter(dsl::consecutive_failure_count.gt(0)),
+    )
+    .set((
+        dsl::consecutive_failure_count.eq(0),
+        dsl::updated_at.eq(now),
+    ))
+    .execute(conn)
+    .await;
+
+    if let Err(e) = result {
+        tracing::warn!(
+            error = %e,
+            workflow_name,
+            "harvest: failed to reset schedule failure counter on completion"
+        );
+    }
 }
 
 #[cfg(test)]

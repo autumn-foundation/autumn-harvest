@@ -211,6 +211,16 @@ pub const METRIC_RATE_LIMIT_THROTTLED: &str = "harvest.rate_limit.throttled";
 /// fire path. See `docs/runbooks/ha-deployment.md` for thresholds.
 pub const METRIC_SCHEDULE_FIRE_ATTEMPTS: &str = "harvest.schedule.fire_attempts";
 
+/// Counter emitted once each time a schedule is automatically paused after
+/// `consecutive_failure_limit` consecutive execution failures (issue #360).
+///
+/// Labels:
+///   - `"schedule"` — the workflow name bound to the schedule.
+///
+/// Alert threshold: `harvest_schedule_auto_paused_total > 0` over any 5-minute
+/// window. Each auto-pause event means operator action is required to resume.
+pub const METRIC_SCHEDULE_AUTO_PAUSED: &str = "harvest.schedule.auto_paused";
+
 // ---------------------------------------------------------------------------
 // Metric label key constants
 // Used by MetricsRecorder implementations to avoid string literals at call
@@ -672,6 +682,19 @@ pub trait MetricsRecorder: Send + Sync {
     /// Maps to the counter [`METRIC_SCHEDULE_FIRE_ATTEMPTS`].
     fn record_schedule_fire_attempt(&self, schedule_name: &str, outcome: &str) {
         let _ = (schedule_name, outcome);
+    }
+
+    /// A schedule was automatically paused after reaching `consecutive_failure_limit`
+    /// consecutive execution failures (issue #360).
+    ///
+    /// `schedule_name` is the workflow name bound to the schedule (low-cardinality).
+    /// Emitted once per auto-pause event. Operators should alert on
+    /// `harvest_schedule_auto_paused_total > 0` and resume the schedule once
+    /// the underlying issue is resolved.
+    ///
+    /// Maps to the counter [`METRIC_SCHEDULE_AUTO_PAUSED`].
+    fn record_schedule_auto_paused(&self, schedule_name: &str) {
+        let _ = schedule_name;
     }
 
     /// A query handler invocation completed (issue #234).

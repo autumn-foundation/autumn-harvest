@@ -653,6 +653,13 @@ pub struct WorkflowSchedule {
     /// Default: [`SkipPolicy::Skip`] (suppress the firing).
     #[serde(default)]
     pub skip_policy: SkipPolicy,
+    /// Auto-pause after this many consecutive `FAILED`/`TIMED_OUT` execution completions.
+    ///
+    /// `None` (the default) disables auto-pause — existing schedules are unaffected.
+    /// When set, the scheduler pauses the schedule automatically and emits the
+    /// `harvest.schedule.auto_paused` metric. Resume via the management API to restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consecutive_failure_limit: Option<u32>,
 }
 
 const fn default_buffer_all_max() -> u32 {
@@ -682,6 +689,7 @@ impl WorkflowSchedule {
             execution_timeout: None,
             calendar: None,
             skip_policy: SkipPolicy::Skip,
+            consecutive_failure_limit: None,
         }
     }
 
@@ -777,6 +785,19 @@ impl WorkflowSchedule {
     #[must_use]
     pub const fn with_skip_policy(mut self, policy: SkipPolicy) -> Self {
         self.skip_policy = policy;
+        self
+    }
+
+    /// Auto-pause this schedule after `limit` consecutive `FAILED` or `TIMED_OUT` execution
+    /// completions. The scheduler emits `harvest.schedule.auto_paused` and stops
+    /// firing until the operator resumes via `POST /admin/schedules/{id}/resume`.
+    ///
+    /// Passing `None` disables auto-pause (the default). Passing `Some(0)` is
+    /// treated as disabled — a limit of zero would auto-pause on the very first
+    /// tick before any execution has a chance to run.
+    #[must_use]
+    pub const fn with_consecutive_failure_limit(mut self, limit: u32) -> Self {
+        self.consecutive_failure_limit = Some(limit);
         self
     }
 }

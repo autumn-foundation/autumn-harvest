@@ -4006,7 +4006,7 @@ async fn persist_workflow_outcome(
         }
         (WorkflowOutcome::Completed { output }, _) => {
             // Root workflow or detached child completing — no parent wake.
-            persist_workflow_completion(
+            let result = persist_workflow_completion(
                 conn,
                 persistence.task.id,
                 persistence.exec_id,
@@ -4014,10 +4014,21 @@ async fn persist_workflow_outcome(
                 persistence.worker_id,
                 output,
             )
-            .await
+            .await;
+            // Best-effort: update the schedule failure counter after the transaction
+            // commits. A failure here never rolls back the completed execution.
+            if result.is_ok() {
+                crate::scheduler::maybe_reset_schedule_failure_counter(
+                    conn,
+                    &execution.workflow_id,
+                    &execution.workflow_name,
+                )
+                .await;
+            }
+            result
         }
         (WorkflowOutcome::Failed { error }, Some(parent_id)) if !is_detached_child => {
-            persist_child_workflow_failure(
+            let result = persist_child_workflow_failure(
                 conn,
                 persistence.task.id,
                 persistence.exec_id,
@@ -4026,11 +4037,21 @@ async fn persist_workflow_outcome(
                 parent_id,
                 &error,
             )
-            .await
+            .await;
+            if result.is_ok() {
+                crate::scheduler::maybe_increment_schedule_failure_counter(
+                    conn,
+                    &execution.workflow_id,
+                    &execution.workflow_name,
+                    &registry.telemetry().metrics,
+                )
+                .await;
+            }
+            result
         }
         (WorkflowOutcome::Failed { error }, _) => {
             // Root workflow or detached child failing — no parent wake.
-            persist_workflow_failure(
+            let result = persist_workflow_failure(
                 conn,
                 persistence.task.id,
                 persistence.exec_id,
@@ -4038,7 +4059,19 @@ async fn persist_workflow_outcome(
                 persistence.worker_id,
                 &error,
             )
-            .await
+            .await;
+            // Best-effort: update the schedule failure counter after the transaction
+            // commits. A failure here never rolls back the failed execution.
+            if result.is_ok() {
+                crate::scheduler::maybe_increment_schedule_failure_counter(
+                    conn,
+                    &execution.workflow_id,
+                    &execution.workflow_name,
+                    &registry.telemetry().metrics,
+                )
+                .await;
+            }
+            result
         }
         (WorkflowOutcome::Suspended { commands }, _) => {
             handle_suspended_workflow(

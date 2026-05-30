@@ -155,6 +155,16 @@ diesel::table! {
         /// When `fire_claimed_until < NOW()` the claim is expired and any replica
         /// may re-claim the slot (crash-recovery path).
         fire_claimed_until -> Nullable<Timestamptz>,
+        /// Number of consecutive failures required before the schedule auto-pauses
+        /// (issue #360). NULL = auto-pause disabled (existing behaviour).
+        consecutive_failure_limit -> Nullable<Int4>,
+        /// Running count of consecutive schedule-triggered execution failures.
+        /// Incremented by the worker completion path on `FAILED`/`TIMED_OUT`;
+        /// reset to 0 on `COMPLETED` or on operator resume. Default 0.
+        consecutive_failure_count -> Int4,
+        /// Set to `NOW()` when `consecutive_failure_count` reaches `consecutive_failure_limit`.
+        /// NULL = schedule is not auto-paused.
+        auto_paused_at -> Nullable<Timestamptz>,
     }
 }
 

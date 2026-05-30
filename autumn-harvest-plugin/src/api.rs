@@ -1284,6 +1284,12 @@ struct ScheduleEntry {
     calendar_name: Option<String>,
     /// What to do when the fire date is calendar-excluded (issue #337).
     skip_policy: String,
+    /// Auto-pause after this many consecutive execution failures (issue #360). `null` = disabled.
+    consecutive_failure_limit: Option<i32>,
+    /// Current consecutive failure count (issue #360). Resets to 0 on success or resume.
+    consecutive_failure_count: i32,
+    /// Timestamp when the schedule was automatically paused (issue #360). `null` = not auto-paused.
+    auto_paused_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Optional request body for `POST /admin/schedules/{id}/pause` and `…/resume`.
@@ -6360,6 +6366,9 @@ async fn list_schedules(
                 buffer_all_max: s.buffer_all_max,
                 calendar_name: s.calendar_name,
                 skip_policy: s.skip_policy,
+                consecutive_failure_limit: s.consecutive_failure_limit,
+                consecutive_failure_count: s.consecutive_failure_count,
+                auto_paused_at: s.auto_paused_at,
             }
         })
         .collect();
@@ -6430,6 +6439,9 @@ async fn get_schedule(
         buffer_all_max: s.buffer_all_max,
         calendar_name: s.calendar_name.clone(),
         skip_policy: s.skip_policy.clone(),
+        consecutive_failure_limit: s.consecutive_failure_limit,
+        consecutive_failure_count: s.consecutive_failure_count,
+        auto_paused_at: s.auto_paused_at,
     }))
 }
 
@@ -6728,6 +6740,9 @@ async fn upsert_workflow_schedule_and_read_back(
         buffer_all_max: row.buffer_all_max,
         calendar_name: row.calendar_name,
         skip_policy: row.skip_policy,
+        consecutive_failure_limit: row.consecutive_failure_limit,
+        consecutive_failure_count: row.consecutive_failure_count,
+        auto_paused_at: row.auto_paused_at,
     })
 }
 
@@ -6861,6 +6876,7 @@ async fn create_workflow_schedule(
         execution_timeout: None,
         calendar: request.calendar.clone(),
         skip_policy,
+        consecutive_failure_limit: None,
     };
     let entry = match upsert_workflow_schedule_and_read_back(&mut conn, &ws).await {
         Ok(e) => e,
@@ -7003,23 +7019,25 @@ async fn set_schedule_paused(
             .map_err(database_error)
             .map_err(map_error)?
         } else {
-            // Resume: clear metadata only on the transition true → false.
-            diesel::update(
-                dsl::harvest_schedules
-                    .find(id)
-                    .filter(dsl::is_paused.ne(false)),
-            )
-            .set((
-                dsl::is_paused.eq(false),
-                dsl::paused_at.eq(None::<chrono::DateTime<chrono::Utc>>),
-                dsl::paused_by.eq(None::<&str>),
-                dsl::pause_reason.eq(None::<&str>),
-                dsl::updated_at.eq(now),
-            ))
-            .execute(&mut conn)
-            .await
-            .map_err(database_error)
-            .map_err(map_error)?
+            // Resume: clear manual-pause metadata AND auto-pause state (issue #360).
+            // Reset consecutive_failure_count to 0 so the counter starts fresh
+            // and does not immediately re-trigger auto-pause on the next tick.
+            // The filter intentionally matches on `is_paused OR auto_paused_at IS NOT NULL`
+            // so an auto-paused schedule can be resumed even when `is_paused = false`.
+            diesel::update(dsl::harvest_schedules.find(id))
+                .set((
+                    dsl::is_paused.eq(false),
+                    dsl::paused_at.eq(None::<chrono::DateTime<chrono::Utc>>),
+                    dsl::paused_by.eq(None::<&str>),
+                    dsl::pause_reason.eq(None::<&str>),
+                    dsl::auto_paused_at.eq(None::<chrono::DateTime<chrono::Utc>>),
+                    dsl::consecutive_failure_count.eq(0),
+                    dsl::updated_at.eq(now),
+                ))
+                .execute(&mut conn)
+                .await
+                .map_err(database_error)
+                .map_err(map_error)?
         };
 
         if rows_updated == 0 {

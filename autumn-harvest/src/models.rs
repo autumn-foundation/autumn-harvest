@@ -331,6 +331,12 @@ pub struct HarvestSchedule {
     /// UTC expiry for the current claim (issue #350). When past, any replica may re-claim
     /// (crash-recovery path). NULL when `fire_claim_token` is NULL.
     pub fire_claimed_until: Option<DateTime<Utc>>,
+    /// Auto-pause threshold (issue #360). NULL = auto-pause disabled.
+    pub consecutive_failure_limit: Option<i32>,
+    /// Running count of consecutive schedule-triggered execution failures (issue #360).
+    pub consecutive_failure_count: i32,
+    /// Set to the timestamp when the schedule was auto-paused (issue #360). NULL = not auto-paused.
+    pub auto_paused_at: Option<DateTime<Utc>>,
 }
 
 /// Insert struct for registering a new schedule (DAG or workflow).
