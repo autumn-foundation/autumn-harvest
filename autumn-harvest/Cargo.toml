@@ -123,6 +123,9 @@ name = "timezone_cron_schedule"
 [[example]]
 name = "collect_approvals"
 
+[[example]]
+name = "fanout_batch"
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 testcontainers = { workspace = true }

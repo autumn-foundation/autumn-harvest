@@ -590,6 +590,10 @@ pub struct WorkflowContext {
     history_policy: WorkflowHistoryPolicy,
     /// Monotonically increasing counter for generating activity sequence IDs.
     activity_seq: Mutex<u32>,
+    /// Monotonically increasing counter for naming fan-out count markers.
+    /// Each `execute_activity_fan_out*` call increments this once so each
+    /// fan-out group has a stable, unique marker name across replays.
+    fan_out_seq: Mutex<u32>,
     /// Shared typed state map (same `AppState` extras as the web server).
     state: SharedState,
     /// In-memory query handlers (not persisted to history).
@@ -724,6 +728,7 @@ impl WorkflowContext {
             start_time,
             history_policy,
             activity_seq: Mutex::new(0),
+            fan_out_seq: Mutex::new(0),
             state,
             query_registry: Mutex::new(QueryRegistry::new()),
             declarative_queries: Mutex::new(std::collections::HashMap::new()),
@@ -804,6 +809,7 @@ impl WorkflowContext {
             start_time,
             history_policy: WorkflowHistoryPolicy::default(),
             activity_seq: Mutex::new(0),
+            fan_out_seq: Mutex::new(0),
             state,
             query_registry: Mutex::new(QueryRegistry::new()),
             declarative_queries: Mutex::new(std::collections::HashMap::new()),
@@ -834,6 +840,7 @@ impl WorkflowContext {
             start_time,
             history_policy: WorkflowHistoryPolicy::default(),
             activity_seq: Mutex::new(0),
+            fan_out_seq: Mutex::new(0),
             state: empty_shared_state(),
             query_registry: Mutex::new(QueryRegistry::new()),
             declarative_queries: Mutex::new(std::collections::HashMap::new()),
@@ -2406,6 +2413,302 @@ impl WorkflowContext {
                 "signal '{signal_name}' to {target}: result channel dropped"
             ))),
         }
+    }
+
+    // ── Fan-out / parallel activities (issue #359) ───────────────────────────
+
+    /// Generate the next fan-out sequence number for marker naming.
+    fn next_fan_out_seq(&self) -> u32 {
+        let mut seq = self.fan_out_seq.lock().expect("fan_out_seq lock poisoned");
+        *seq += 1;
+        *seq
+    }
+
+    /// Record or verify the fan-out count in event history.
+    ///
+    /// On **live execution** (past end of history): pushes a `RecordMarker`
+    /// command so future replays can verify the collection length.
+    ///
+    /// On **replay**: matches the `MarkerRecorded` event and compares the
+    /// recorded count with the current count. Returns a
+    /// [`HarvestError::NonDeterministic`] when they differ.
+    fn check_fan_out_count(&self, seq: u32, count: usize) -> HarvestResult<()> {
+        let marker_result = self.match_history(|m| m.match_fan_out_marker(seq, count));
+        match marker_result {
+            HistoryMatch::NoMatch => {
+                self.push_command(WorkflowCommand::RecordMarker {
+                    name: format!("fan_out:{seq}"),
+                    details: Value::from(count as u64),
+                });
+                Ok(())
+            }
+            HistoryMatch::Matched { .. } => Ok(()),
+            HistoryMatch::Diverged { expected, actual } => {
+                Err(HarvestError::NonDeterministic(format!(
+                    "fan_out #{seq}: history has {expected} but current code supplies {actual} — \
+                     the input collection changed size between deploy and replay; \
+                     use ctx.version() to guard this fan-out if the size change is intentional"
+                )))
+            }
+            _ => unreachable!("match_fan_out_marker only returns Matched, NoMatch, or Diverged"),
+        }
+    }
+
+    /// Execute N activities **in parallel** (fail-fast variant).
+    ///
+    /// Dispatches every `(name, input, queue)` tuple concurrently and returns
+    /// a `Vec` of outputs in the **same order as the input slice**, regardless
+    /// of completion order.  Returns on the **first** activity failure — all
+    /// sibling activities are still recorded in history and their results are
+    /// replayed correctly, but the workflow function receives only the first
+    /// error.
+    ///
+    /// # Replay safety
+    ///
+    /// A `MarkerRecorded { name: "fan_out:{n}", details: <count> }` event is
+    /// appended immediately before the activity events on the first live run.
+    /// On replay the count is verified; if the input collection has grown or
+    /// shrunk since the original run,
+    /// [`HarvestError::NonDeterministic`] is returned before any activity is
+    /// dispatched.
+    ///
+    /// The input collection **must** be derived from already-recorded state
+    /// (workflow input, prior activity outputs, signals) — never from
+    /// non-deterministic sources such as the system clock or a random number.
+    ///
+    /// # Cancellation
+    ///
+    /// Checks `is_cancelled()` before dispatching.  Returns
+    /// [`HarvestError::Cancelled`] immediately when the workflow has been
+    /// cancelled.
+    ///
+    /// # Errors
+    ///
+    /// - [`HarvestError::NonDeterministic`] if `activities.len()` differs
+    ///   from the count recorded in history.
+    /// - [`HarvestError::Cancelled`] if the workflow was cancelled.
+    /// - [`HarvestError::ActivityFailed`] (or other activity error) on the
+    ///   first failure in the group.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    pub async fn execute_activity_fan_out_raw(
+        &self,
+        activities: Vec<(String, Value, String)>,
+    ) -> HarvestResult<Vec<Value>> {
+        self.fan_out_raw_impl(activities, None, None).await
+    }
+
+    async fn fan_out_raw_impl(
+        &self,
+        activities: Vec<(String, Value, String)>,
+        retry: Option<crate::policy::RetryPolicy>,
+        timeout: Option<std::time::Duration>,
+    ) -> HarvestResult<Vec<Value>> {
+        self.check_cancellation()?;
+
+        let seq = self.next_fan_out_seq();
+        let count = activities.len();
+        self.check_fan_out_count(seq, count)?;
+
+        if activities.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let futures: Vec<_> = activities
+            .into_iter()
+            .map(|(name, input, queue)| {
+                let retry = retry.clone();
+                async move {
+                    self.execute_activity_raw_with_opts(&name, input, &queue, retry, timeout)
+                        .await
+                }
+            })
+            .collect();
+
+        futures::future::try_join_all(futures).await
+    }
+
+    /// Execute N activities **in parallel** (collect-all variant).
+    ///
+    /// Dispatches every `(name, input, queue)` tuple concurrently and returns
+    /// a `Vec<Result<Value, String>>` in the **same order as the input slice**.
+    /// Unlike [`execute_activity_fan_out_raw`](Self::execute_activity_fan_out_raw),
+    /// **all** activities run to completion regardless of failures — per-slot
+    /// errors are captured in the returned `Err` variants rather than aborting
+    /// the fan-out early.
+    ///
+    /// # Replay safety
+    ///
+    /// Same count-marker semantics as the fail-fast variant.
+    ///
+    /// # Cancellation
+    ///
+    /// Checks `is_cancelled()` before dispatching.  Returns
+    /// `Err(HarvestError::Cancelled)` immediately when the workflow has been
+    /// cancelled.
+    ///
+    /// # Errors
+    ///
+    /// - [`HarvestError::NonDeterministic`] if `activities.len()` differs
+    ///   from the count recorded in history.
+    /// - [`HarvestError::Cancelled`] if the workflow was cancelled.
+    ///
+    /// Individual per-slot failures are returned as `Err(String)` inside the
+    /// `Vec`; the outer `Result` only fails for engine-level errors.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    pub async fn execute_activity_fan_out_collect_raw(
+        &self,
+        activities: Vec<(String, Value, String)>,
+    ) -> HarvestResult<Vec<Result<Value, String>>> {
+        self.fan_out_collect_raw_impl(activities, None, None).await
+    }
+
+    async fn fan_out_collect_raw_impl(
+        &self,
+        activities: Vec<(String, Value, String)>,
+        retry: Option<crate::policy::RetryPolicy>,
+        timeout: Option<std::time::Duration>,
+    ) -> HarvestResult<Vec<Result<Value, String>>> {
+        self.check_cancellation()?;
+
+        let seq = self.next_fan_out_seq();
+        let count = activities.len();
+        self.check_fan_out_count(seq, count)?;
+
+        if activities.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let futures: Vec<_> = activities
+            .into_iter()
+            .map(|(name, input, queue)| {
+                let retry = retry.clone();
+                async move {
+                    match self
+                        .execute_activity_raw_with_opts(&name, input, &queue, retry, timeout)
+                        .await
+                    {
+                        Ok(v) => Ok(Ok(v)),
+                        Err(
+                            e
+                            @ (HarvestError::ActivityFailed { .. } | HarvestError::Timeout { .. }),
+                        ) => Ok(Err(e.to_string())),
+                        Err(e) => Err(e),
+                    }
+                }
+            })
+            .collect();
+
+        futures::future::try_join_all(futures).await
+    }
+
+    /// Typed fail-fast fan-out: run the same activity for every input in
+    /// `inputs` in parallel and return the outputs in input order.
+    ///
+    /// All slots share the same `ActivityInfo` (name, queue, retry defaults).
+    /// Use [`execute_activity_fan_out_raw`](Self::execute_activity_fan_out_raw)
+    /// for heterogeneous activity names.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Serialization`] if any input cannot be
+    /// serialized.  Propagates all errors from
+    /// [`execute_activity_fan_out_raw`](Self::execute_activity_fan_out_raw).
+    pub async fn execute_activity_fan_out<I, O>(
+        &self,
+        info: &crate::info::ActivityInfo,
+        inputs: Vec<I>,
+    ) -> HarvestResult<Vec<O>>
+    where
+        I: serde::Serialize,
+        O: serde::de::DeserializeOwned,
+    {
+        if info.is_local {
+            return Err(HarvestError::Config(format!(
+                "activity '{}' is marked local = true; fan-out requires remote activities",
+                info.name
+            )));
+        }
+        let queue = info.default_queue.unwrap_or("default").to_string();
+        let activities = inputs
+            .into_iter()
+            .map(|i| {
+                let json_input = serde_json::to_value(i)?;
+                Ok((info.name.to_string(), json_input, queue.clone()))
+            })
+            .collect::<Result<Vec<_>, serde_json::Error>>()?;
+
+        let raw_results = self
+            .fan_out_raw_impl(
+                activities,
+                info.default_retry_policy.clone(),
+                info.default_start_to_close,
+            )
+            .await?;
+        raw_results
+            .into_iter()
+            .map(|v| serde_json::from_value(v).map_err(HarvestError::Serialization))
+            .collect()
+    }
+
+    /// Typed collect-all fan-out: run the same activity for every input in
+    /// `inputs` in parallel and return per-slot `Result<O, String>` in input order.
+    ///
+    /// All slots share the same `ActivityInfo`.  Use
+    /// [`execute_activity_fan_out_collect_raw`](Self::execute_activity_fan_out_collect_raw)
+    /// for heterogeneous activity names.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Serialization`] if any input cannot be
+    /// serialized.  Propagates engine-level errors from
+    /// [`execute_activity_fan_out_collect_raw`](Self::execute_activity_fan_out_collect_raw).
+    pub async fn execute_activity_fan_out_collect<I, O>(
+        &self,
+        info: &crate::info::ActivityInfo,
+        inputs: Vec<I>,
+    ) -> HarvestResult<Vec<Result<O, String>>>
+    where
+        I: serde::Serialize,
+        O: serde::de::DeserializeOwned,
+    {
+        if info.is_local {
+            return Err(HarvestError::Config(format!(
+                "activity '{}' is marked local = true; fan-out requires remote activities",
+                info.name
+            )));
+        }
+        let queue = info.default_queue.unwrap_or("default").to_string();
+        let activities = inputs
+            .into_iter()
+            .map(|i| {
+                let json_input = serde_json::to_value(i)?;
+                Ok((info.name.to_string(), json_input, queue.clone()))
+            })
+            .collect::<Result<Vec<_>, serde_json::Error>>()?;
+
+        let raw_results = self
+            .fan_out_collect_raw_impl(
+                activities,
+                info.default_retry_policy.clone(),
+                info.default_start_to_close,
+            )
+            .await?;
+        let typed: Vec<Result<O, String>> = raw_results
+            .into_iter()
+            .map(|slot| match slot {
+                Ok(v) => serde_json::from_value::<O>(v)
+                    .map(Ok)
+                    .map_err(HarvestError::Serialization),
+                Err(e) => Ok(Err(e)),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(typed)
     }
 
     // ── External activity completion ───────────────────────────────────

@@ -425,6 +425,15 @@ impl HistoryMatcher {
                 ev if Self::is_update_event(ev) => {
                     scan_cursor += 1;
                 }
+                // Fan-out markers (and any other MarkerRecorded) can be
+                // interleaved when a fan-out runs concurrently with this
+                // activity (e.g. via tokio::join!). Track as an interleaved
+                // command so the cursor returns to it after matching the
+                // terminal event.
+                WorkflowEvent::MarkerRecorded { .. } => {
+                    first_interleaved_command.get_or_insert(scan_cursor);
+                    scan_cursor += 1;
+                }
                 // Any other event type is unexpected mid-activity
                 _ => break,
             }
@@ -552,6 +561,11 @@ impl HistoryMatcher {
                     scan_cursor += 1;
                 }
                 ev if Self::is_update_event(ev) => {
+                    scan_cursor += 1;
+                }
+                // Fan-out markers can be interleaved during concurrent execution.
+                WorkflowEvent::MarkerRecorded { .. } => {
+                    first_interleaved_command.get_or_insert(scan_cursor);
                     scan_cursor += 1;
                 }
                 _ => break,
@@ -828,6 +842,33 @@ impl HistoryMatcher {
     ) -> HistoryMatch {
         if let Some(command_cursor) = first_interleaved_command {
             self.consumed_out_of_order_events.insert(terminal_cursor);
+            // Also mark any ActivityStarted/Heartbeat events for the settled
+            // activity that appear between the interleaved command and the
+            // terminal. Without this, after the cursor rewinds to the
+            // interleaved command and the marker/fan-out branch is replayed,
+            // those progress events remain unconsumed and the next workflow
+            // command match diverges against them.
+            let activity_id = match &self.events[terminal_cursor] {
+                WorkflowEvent::ActivityCompleted { activity_id, .. }
+                | WorkflowEvent::ActivityFailed { activity_id, .. }
+                | WorkflowEvent::ActivityTimedOut { activity_id, .. } => Some(*activity_id),
+                _ => None,
+            };
+            if let Some(aid) = activity_id {
+                for idx in command_cursor..terminal_cursor {
+                    match &self.events[idx] {
+                        WorkflowEvent::ActivityStarted {
+                            activity_id: id, ..
+                        }
+                        | WorkflowEvent::ActivityHeartbeat {
+                            activity_id: id, ..
+                        } if *id == aid => {
+                            self.consumed_out_of_order_events.insert(idx);
+                        }
+                        _ => {}
+                    }
+                }
+            }
             self.cursor = command_cursor;
         } else {
             self.cursor = terminal_cursor + 1;
@@ -1955,6 +1996,54 @@ impl HistoryMatcher {
             // No marker at current position — old workflow that didn't have
             // this version gate. Don't advance cursor.
             _ => min_version,
+        }
+    }
+
+    // ── Fan-out / parallel activities (issue #359) ───────────────────────────
+
+    /// Match the count marker for a fan-out group against history.
+    ///
+    /// On the **first live execution** (past end of history) returns
+    /// [`HistoryMatch::NoMatch`] so the caller can emit a `RecordMarker`
+    /// command for replay.
+    ///
+    /// During **replay** expects a `MarkerRecorded { name: "fan_out:{seq}", … }`
+    /// event at the current cursor. Returns:
+    ///
+    /// - [`HistoryMatch::Matched`] — marker found and recorded count equals `count`.
+    /// - [`HistoryMatch::Diverged`] — recorded count differs from `count`
+    ///   (non-deterministic collection resize detected), or a different event
+    ///   type was at this cursor position.
+    /// - [`HistoryMatch::NoMatch`] — past end of history (live execution).
+    pub fn match_fan_out_marker(&mut self, seq: u32, count: usize) -> HistoryMatch {
+        let marker_name = format!("fan_out:{seq}");
+        if !self.prepare_match() {
+            return HistoryMatch::NoMatch;
+        }
+
+        match &self.events[self.cursor] {
+            WorkflowEvent::MarkerRecorded { name, details } if *name == marker_name => {
+                let recorded_count = details
+                    .as_u64()
+                    .and_then(|n| usize::try_from(n).ok())
+                    .unwrap_or(0);
+                if recorded_count == count {
+                    self.cursor += 1;
+                    self.advance_to_next_unconsumed_event();
+                    HistoryMatch::Matched {
+                        output: serde_json::json!(count),
+                    }
+                } else {
+                    HistoryMatch::Diverged {
+                        expected: format!("fan_out:{seq}(count={recorded_count})"),
+                        actual: format!("fan_out:{seq}(count={count})"),
+                    }
+                }
+            }
+            other => HistoryMatch::Diverged {
+                expected: format!("MarkerRecorded({marker_name})"),
+                actual: Self::actual_event_name(other),
+            },
         }
     }
 
