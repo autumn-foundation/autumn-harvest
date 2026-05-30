@@ -31,7 +31,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use autumn_harvest::Schedule;
-use autumn_harvest::StartWorkflowParams;
+use autumn_harvest::ShardRouter;
 use autumn_harvest::audit::{
     OP_BUILD_COMPAT_DECLARE, OP_BUILD_COMPAT_REVOKE, OP_BUILD_POLICY_SET, OP_SCHEDULE_DELETE,
     OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER, OP_WORKFLOW_CANCEL,
@@ -44,10 +44,12 @@ use autumn_harvest::build_routing::{
 };
 use autumn_harvest::cancel_workflow_execution;
 use autumn_harvest::error::{HarvestResult, database_error};
+use autumn_harvest::execution::StartWorkflowParams;
 use autumn_harvest::models::{
     DeadLetter, ExternalTask, HarvestEvent, HarvestSchedule, HarvestSignal, HarvestTimer,
     NewAuditRecord, ScheduleDecision, TaskQueueItem, WorkflowExecution,
 };
+use autumn_harvest::policy::TaskStatus;
 use autumn_harvest::reset::{
     ResetSignalReapplyPolicy, WorkflowResetRequest, reset_workflow_execution,
 };
@@ -66,8 +68,8 @@ use autumn_harvest::workers::{WorkerFilters, WorkerHealth, WorkerRow, list_worke
 
 use crate::api::{
     HarvestApiRuntime, HarvestApiState, KNOWN_WORKFLOW_STATES, WorkflowFilters, acquire_conn,
-    db_conn_for_execution, load_execution, load_workflows_from_shards, map_error,
-    parse_execution_id, require_harvest_admin,
+    db_conn_for_execution, db_conn_for_shard, load_execution, load_workflows,
+    load_workflows_from_shards, map_error, parse_execution_id, require_harvest_admin,
 };
 
 const DEFAULT_PAGE_SIZE: i64 = 25;
@@ -557,38 +559,35 @@ async fn list_dags_ui(
         .iter()
         .map(|(name, dag)| (name.clone(), dag_summary_from_registered(name, dag)))
         .collect();
+    let mut shard_errors = Vec::new();
 
-    for (_, shard_result) in schedules {
-        let Ok(rows) = shard_result else {
-            continue;
-        };
-        for row in rows {
-            let Some(dag_name) = row.dag_name.clone() else {
-                continue;
-            };
-            let entry = dags
-                .entry(dag_name.clone())
-                .or_insert_with(|| DagUiSummary {
-                    name: dag_name.clone(),
-                    schedule_expr: row.schedule_expr.clone(),
-                    task_count: 0,
-                    is_paused: row.is_paused,
-                    next_run_at: row.next_run_at,
-                    max_active_runs: row.max_active_runs,
-                    catchup: row.catchup,
-                });
-            if entry.schedule_expr.is_none() {
-                entry.schedule_expr.clone_from(&row.schedule_expr);
+    for (shard_id, shard_result) in schedules {
+        match shard_result {
+            Ok(rows) => {
+                for row in rows {
+                    let Some(dag_name) = row.dag_name.clone() else {
+                        continue;
+                    };
+                    let entry = dags
+                        .entry(dag_name.clone())
+                        .or_insert_with(|| DagUiSummary {
+                            name: dag_name.clone(),
+                            schedule_expr: row.schedule_expr.clone(),
+                            task_count: 0,
+                            is_paused: row.is_paused,
+                            next_run_at: row.next_run_at,
+                            max_active_runs: row.max_active_runs,
+                            catchup: row.catchup,
+                        });
+                    merge_dag_schedule_row(entry, &row);
+                }
             }
-            entry.is_paused = row.is_paused;
-            entry.next_run_at = row.next_run_at;
-            entry.max_active_runs = row.max_active_runs;
-            entry.catchup = row.catchup;
+            Err(error) => shard_errors.push((shard_id, error)),
         }
     }
     let mut dags = dags.into_values().collect::<Vec<_>>();
     dags.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(render_dag_list(&dags))
+    Ok(render_dag_list(&dags, &shard_errors))
 }
 
 async fn dag_detail_ui(
@@ -606,36 +605,21 @@ async fn dag_detail_ui(
         limit: 50,
         ..WorkflowFilters::default()
     };
-    let runs = load_workflows_from_shards(&api_state, &filters).await?;
+    let runs = load_dag_runs_from_owning_shard(&api_state, &runtime, &dag_name, &filters).await?;
     let requested_run = params
         .run
         .as_deref()
         .and_then(|raw| uuid::Uuid::parse_str(raw).ok());
-    let selected_run = if let Some(candidate) = requested_run {
-        if runs.iter().any(|run| run.id == candidate) {
-            Some(candidate)
-        } else {
-            let mut conn = db_conn_for_execution(
-                &api_state,
-                autumn_harvest::types::ExecutionId::from_uuid(candidate),
-            )
-            .await?;
-            let exists = harvest_workflow_executions::table
-                .filter(harvest_workflow_executions::id.eq(candidate))
-                .select(WorkflowExecution::as_select())
-                .first::<WorkflowExecution>(&mut conn)
-                .await
-                .optional()
-                .map_err(database_error)
-                .map_err(map_error)?;
-            exists
-                .filter(|run| run.workflow_name == dag_name)
-                .map(|run| run.id)
-                .or_else(|| runs.as_slice().first().map(|r| r.id))
-        }
-    } else {
-        runs.as_slice().first().map(|r| r.id)
+    let requested_run_is_valid_for_dag = match requested_run {
+        Some(run_id) if runs.iter().any(|run| run.id == run_id) => true,
+        Some(run_id) => dag_run_exists_for_dag(&api_state, &dag_name, run_id).await?,
+        None => false,
     };
+    let selected_run = select_dag_run_id(
+        requested_run,
+        requested_run_is_valid_for_dag,
+        runs.as_slice().first().map(|r| r.id),
+    );
     let node_states = if let Some(exec_id) = selected_run {
         let mut conn = db_conn_for_execution(
             &api_state,
@@ -662,6 +646,53 @@ async fn dag_detail_ui(
         params.refresh,
         &node_states,
     ))
+}
+
+fn select_dag_run_id(
+    requested_run: Option<uuid::Uuid>,
+    requested_run_is_valid_for_dag: bool,
+    fallback_run: Option<uuid::Uuid>,
+) -> Option<uuid::Uuid> {
+    requested_run
+        .filter(|_| requested_run_is_valid_for_dag)
+        .or(fallback_run)
+}
+
+fn dag_run_shard(router: &ShardRouter, dag_name: &str) -> ShardId {
+    router.pick_for_dag(dag_name)
+}
+
+async fn load_dag_runs_from_owning_shard(
+    api_state: &HarvestApiState,
+    runtime: &HarvestApiRuntime,
+    dag_name: &str,
+    filters: &WorkflowFilters,
+) -> Result<Vec<WorkflowExecution>, AutumnError> {
+    let shard = dag_run_shard(runtime.router(), dag_name);
+    let mut conn = db_conn_for_shard(api_state, shard).await?;
+    load_workflows(&mut conn, filters).await.map_err(map_error)
+}
+
+async fn dag_run_exists_for_dag(
+    api_state: &HarvestApiState,
+    dag_name: &str,
+    run_id: uuid::Uuid,
+) -> Result<bool, AutumnError> {
+    let mut conn = db_conn_for_execution(
+        api_state,
+        autumn_harvest::types::ExecutionId::from_uuid(run_id),
+    )
+    .await?;
+    harvest_workflow_executions::table
+        .find(run_id)
+        .filter(harvest_workflow_executions::workflow_name.eq(dag_name))
+        .select(harvest_workflow_executions::id)
+        .first::<uuid::Uuid>(&mut conn)
+        .await
+        .optional()
+        .map(|row| row.is_some())
+        .map_err(database_error)
+        .map_err(map_error)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -3448,9 +3479,15 @@ fn layout(title: &str, body: &Markup, base_href: &str) -> Markup {
     }
 }
 
-fn render_dag_list(dags: &[DagUiSummary]) -> Markup {
+fn render_dag_list(dags: &[DagUiSummary], shard_errors: &[(ShardId, String)]) -> Markup {
     let body = html! {
         h2 { "DAGs" }
+        @for (shard_id, error) in shard_errors {
+            div.shard-error {
+                strong { "Shard " (shard_id.as_i32()) " unavailable: " }
+                (error)
+            }
+        }
         table {
             thead {
                 tr {
@@ -3491,6 +3528,16 @@ fn dag_summary_from_registered(name: &str, dag: &RegisteredDag) -> DagUiSummary 
         max_active_runs: i32::try_from(dag.max_active_runs).unwrap_or(i32::MAX),
         catchup: dag.catchup,
     }
+}
+
+fn merge_dag_schedule_row(entry: &mut DagUiSummary, row: &HarvestSchedule) {
+    if entry.schedule_expr.is_none() {
+        entry.schedule_expr.clone_from(&row.schedule_expr);
+    }
+    entry.is_paused = row.is_paused;
+    entry.next_run_at = row.next_run_at;
+    entry.max_active_runs = row.max_active_runs;
+    entry.catchup = row.catchup;
 }
 
 fn schedule_expr_for_ui_summary(schedule: &Schedule) -> String {
@@ -3637,25 +3684,75 @@ fn map_node_states(
     tasks: &[TaskQueueItem],
 ) -> HashMap<usize, DagNodeState> {
     let mut out = HashMap::new();
+    let mut has_task_row = vec![false; dag.tasks().len()];
+
     for (idx, node) in dag.tasks().iter().enumerate() {
         let mut state = DagNodeState::Unknown;
         for task in tasks
             .iter()
             .filter(|t| t.activity_name.as_deref() == Some(node.activity_name.as_str()))
         {
-            state = match task.state.as_str() {
-                "FAILED" => DagNodeState::Failed,
-                "CANCELLED" if !matches!(state, DagNodeState::Failed) => DagNodeState::Cancelled,
-                "RUNNING" if state != DagNodeState::Failed => DagNodeState::Running,
-                "PENDING" | "QUEUED" if state == DagNodeState::Unknown => DagNodeState::Queued,
-                "COMPLETED" if state == DagNodeState::Unknown => DagNodeState::Succeeded,
-                "SKIPPED" if state == DagNodeState::Unknown => DagNodeState::Skipped,
-                _ => state,
-            };
+            has_task_row[idx] = true;
+            state = merge_dag_task_state(state, task.state.as_str());
         }
         out.insert(idx, state);
     }
+
+    for level in dag.execution_levels() {
+        for idx in level {
+            if !has_task_row[*idx]
+                && out.get(idx).copied() == Some(DagNodeState::Unknown)
+                && let Some(state) = infer_skipped_node_state(dag, *idx, &out)
+            {
+                out.insert(*idx, state);
+            }
+        }
+    }
+
     out
+}
+
+fn merge_dag_task_state(current: DagNodeState, task_state: &str) -> DagNodeState {
+    match task_state {
+        "FAILED" => DagNodeState::Failed,
+        "CANCELLED" if !matches!(current, DagNodeState::Failed) => DagNodeState::Cancelled,
+        "RUNNING" if !matches!(current, DagNodeState::Failed | DagNodeState::Cancelled) => {
+            DagNodeState::Running
+        }
+        "PENDING" | "QUEUED" if current == DagNodeState::Unknown => DagNodeState::Queued,
+        "COMPLETED" if current == DagNodeState::Unknown => DagNodeState::Succeeded,
+        "SKIPPED" if current == DagNodeState::Unknown => DagNodeState::Skipped,
+        _ => current,
+    }
+}
+
+fn infer_skipped_node_state(
+    dag: &autumn_harvest::dag::DagDefinition,
+    node_idx: usize,
+    node_states: &HashMap<usize, DagNodeState>,
+) -> Option<DagNodeState> {
+    let node = dag.tasks().get(node_idx)?;
+    let upstream_statuses = node
+        .upstreams
+        .iter()
+        .map(|upstream_idx| {
+            node_states
+                .get(upstream_idx)
+                .copied()
+                .and_then(dag_node_terminal_status)
+        })
+        .collect::<Option<Vec<_>>>()?;
+
+    (!node.trigger_rule.should_run(upstream_statuses.iter())).then_some(DagNodeState::Skipped)
+}
+
+const fn dag_node_terminal_status(state: DagNodeState) -> Option<TaskStatus> {
+    match state {
+        DagNodeState::Succeeded => Some(TaskStatus::Succeeded),
+        DagNodeState::Failed | DagNodeState::Cancelled => Some(TaskStatus::Failed),
+        DagNodeState::Skipped => Some(TaskStatus::Skipped),
+        DagNodeState::Running | DagNodeState::Queued | DagNodeState::Unknown => None,
+    }
 }
 
 fn format_run_duration(started_at: DateTime<Utc>, completed_at: Option<DateTime<Utc>>) -> String {
@@ -6264,12 +6361,66 @@ mod tests {
             max_active_runs: 3,
             catchup: false,
         }];
-        let html = render_dag_list(&dags).into_string();
+        let html = render_dag_list(&dags, &[]).into_string();
         assert!(html.contains("Paused"));
         assert!(html.contains("Next Run"));
         assert!(html.contains("Max Active"));
         assert!(html.contains("Catchup"));
         assert!(html.contains("payments"));
+    }
+
+    #[test]
+    fn render_dag_list_surfaces_schedule_shard_errors() {
+        let html = render_dag_list(&[], &[(ShardId::new(2), "connection refused".to_string())])
+            .into_string();
+
+        assert!(html.contains("Shard 2 unavailable"));
+        assert!(html.contains("connection refused"));
+    }
+
+    #[test]
+    fn dag_schedule_row_merge_preserves_runtime_formatted_expression() {
+        let mut summary = DagUiSummary {
+            name: "subsecond".to_string(),
+            schedule_expr: Some("@every 0.500000000s".to_string()),
+            task_count: 1,
+            is_paused: false,
+            next_run_at: None,
+            max_active_runs: 1,
+            catchup: false,
+        };
+        let mut row = make_schedule(None, Some("subsecond"), true);
+        row.schedule_expr = Some("interval:0".to_string());
+        row.max_active_runs = 3;
+        row.catchup = true;
+
+        merge_dag_schedule_row(&mut summary, &row);
+
+        assert_eq!(
+            summary.schedule_expr.as_deref(),
+            Some("@every 0.500000000s")
+        );
+        assert!(summary.is_paused);
+        assert_eq!(summary.max_active_runs, 3);
+        assert!(summary.catchup);
+    }
+
+    #[test]
+    fn dag_schedule_row_merge_uses_persisted_expression_when_runtime_has_none() {
+        let mut summary = DagUiSummary {
+            name: "manualish".to_string(),
+            schedule_expr: None,
+            task_count: 1,
+            is_paused: false,
+            next_run_at: None,
+            max_active_runs: 1,
+            catchup: false,
+        };
+        let row = make_schedule(None, Some("manualish"), false);
+
+        merge_dag_schedule_row(&mut summary, &row);
+
+        assert_eq!(summary.schedule_expr.as_deref(), Some("0 * * * *"));
     }
 
     #[test]
@@ -6283,9 +6434,171 @@ mod tests {
     #[test]
     fn render_dag_list_uses_dag_active_nav() {
         let dags = vec![];
-        let html = render_dag_list(&dags).into_string();
-        assert!(html.contains("href=\"dags\">DAGs</a>"));
-        assert!(html.contains("class=\"active\""));
+        let html = render_dag_list(&dags, &[]).into_string();
+        assert!(html.contains("class=\"active\" href=\"dags\""));
+    }
+
+    #[test]
+    fn dag_run_selection_accepts_valid_requested_run_not_in_display_page() {
+        let requested = uuid::Uuid::from_u128(1);
+        let newest_listed = uuid::Uuid::from_u128(2);
+
+        assert_eq!(
+            select_dag_run_id(Some(requested), true, Some(newest_listed)),
+            Some(requested)
+        );
+    }
+
+    #[test]
+    fn dag_run_selection_falls_back_when_requested_run_is_not_for_dag() {
+        let requested = uuid::Uuid::from_u128(1);
+        let newest_listed = uuid::Uuid::from_u128(2);
+
+        assert_eq!(
+            select_dag_run_id(Some(requested), false, Some(newest_listed)),
+            Some(newest_listed)
+        );
+    }
+
+    #[test]
+    fn dag_run_shard_matches_router_dag_owner() {
+        let router = autumn_harvest::ShardRouter::new(
+            vec![ShardId::new(0), ShardId::new(1), ShardId::new(2)],
+            vec![ShardId::new(0), ShardId::new(1), ShardId::new(2)],
+            ShardId::new(0),
+        );
+
+        assert_eq!(
+            dag_run_shard(&router, "daily_etl"),
+            router.pick_for_dag("daily_etl")
+        );
+    }
+
+    fn two_node_dag_with_downstream_rule(
+        rule: autumn_harvest::policy::TriggerRule,
+    ) -> (autumn_harvest::dag::DagDefinition, usize, usize) {
+        fn upstream_for_ui_state_test() {}
+        fn downstream_for_ui_state_test() {}
+
+        let mut builder = autumn_harvest::dag::DagBuilder::new();
+        let upstream = builder.activity(upstream_for_ui_state_test);
+        let upstream_idx = upstream.index();
+        let downstream = builder
+            .activity(downstream_for_ui_state_test)
+            .upstream(&upstream)
+            .trigger_rule(rule);
+        let downstream_idx = downstream.index();
+
+        (
+            builder.build().expect("test dag should compile"),
+            upstream_idx,
+            downstream_idx,
+        )
+    }
+
+    fn out_of_order_two_node_dag() -> (autumn_harvest::dag::DagDefinition, usize, usize) {
+        fn out_of_order_downstream_for_ui_state_test() {}
+        fn out_of_order_upstream_for_ui_state_test() {}
+
+        let mut builder = autumn_harvest::dag::DagBuilder::new();
+        let downstream = builder
+            .activity(out_of_order_downstream_for_ui_state_test)
+            .trigger_rule(autumn_harvest::policy::TriggerRule::AllSuccess);
+        let downstream_idx = downstream.index();
+        let upstream = builder.activity(out_of_order_upstream_for_ui_state_test);
+        let upstream_idx = upstream.index();
+        let _downstream = downstream.upstream(&upstream);
+
+        (
+            builder.build().expect("test dag should compile"),
+            upstream_idx,
+            downstream_idx,
+        )
+    }
+
+    fn task_queue_item_for_activity(activity_name: &str, state: &str) -> TaskQueueItem {
+        let now = Utc::now();
+        TaskQueueItem {
+            id: uuid::Uuid::new_v4(),
+            queue_name: "default".to_string(),
+            task_type: "ACTIVITY".to_string(),
+            workflow_exec_id: Some(uuid::Uuid::new_v4()),
+            activity_name: Some(activity_name.to_string()),
+            activity_id: None,
+            input: Value::Null,
+            state: state.to_string(),
+            priority: 0,
+            worker_id: None,
+            attempt: 0,
+            max_attempts: 1,
+            scheduled_at: now,
+            started_at: None,
+            completed_at: None,
+            last_heartbeat_at: None,
+            heartbeat_details: None,
+            heartbeat_timeout: None,
+            start_to_close: None,
+            schedule_to_start: None,
+            retry_policy: None,
+            output: None,
+            error: None,
+            sticky_worker_id: None,
+            sticky_until: None,
+            sticky_timeout: None,
+            trace_context: None,
+            concurrency_key: None,
+            concurrency_cap: None,
+            required_build_id: None,
+            rate_limit_key: None,
+        }
+    }
+
+    #[test]
+    fn dag_node_state_infers_skipped_when_trigger_rule_blocks_unscheduled_node() {
+        let (dag, upstream_idx, downstream_idx) =
+            two_node_dag_with_downstream_rule(autumn_harvest::policy::TriggerRule::AllSuccess);
+        let known_states = HashMap::from([(upstream_idx, DagNodeState::Failed)]);
+
+        assert_eq!(
+            infer_skipped_node_state(&dag, downstream_idx, &known_states),
+            Some(DagNodeState::Skipped)
+        );
+    }
+
+    #[test]
+    fn dag_node_state_infers_skipped_when_upstream_declared_after_downstream() {
+        let (dag, upstream_idx, downstream_idx) = out_of_order_two_node_dag();
+        assert_eq!(
+            dag.execution_levels(),
+            &[vec![upstream_idx], vec![downstream_idx]]
+        );
+
+        let task_rows = vec![task_queue_item_for_activity(
+            dag.tasks()[upstream_idx].activity_name.as_str(),
+            "FAILED",
+        )];
+        let states = map_node_states(&dag, &task_rows);
+
+        assert_eq!(states.get(&downstream_idx), Some(&DagNodeState::Skipped));
+    }
+
+    #[test]
+    fn dag_node_state_stays_unknown_until_upstreams_are_terminal() {
+        let (dag, _, downstream_idx) =
+            two_node_dag_with_downstream_rule(autumn_harvest::policy::TriggerRule::AllSuccess);
+
+        assert_eq!(
+            infer_skipped_node_state(&dag, downstream_idx, &HashMap::new()),
+            None
+        );
+    }
+
+    #[test]
+    fn dag_task_state_cancelled_is_terminal() {
+        assert_eq!(
+            merge_dag_task_state(DagNodeState::Unknown, "CANCELLED"),
+            DagNodeState::Cancelled
+        );
     }
 
     #[test]

@@ -9421,7 +9421,7 @@ pub(crate) async fn db_conn_for_execution(
     acquire_conn(pool.pool_for_execution(exec_id)).await
 }
 
-async fn db_conn_for_shard(
+pub(crate) async fn db_conn_for_shard(
     api_state: &HarvestApiState,
     shard: ShardId,
 ) -> Result<PoolConn, AutumnError> {
