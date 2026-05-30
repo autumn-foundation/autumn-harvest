@@ -1406,6 +1406,7 @@ async fn tick_workflow_schedules(
             logical_date,
             now,
             current_shard,
+            my_claim_token,
             registry,
             metrics,
         )
@@ -1530,6 +1531,7 @@ async fn tick_one_workflow_schedule(
     logical_date: DateTime<Utc>,
     now: DateTime<Utc>,
     current_shard: ShardId,
+    claim_token: uuid::Uuid,
     registry: &crate::worker::HandlerRegistry,
     metrics: &Arc<dyn crate::telemetry::MetricsRecorder>,
 ) -> HarvestResult<()> {
@@ -1549,15 +1551,20 @@ async fn tick_one_workflow_schedule(
         if now < effective_fire_time {
             // Release the HA claim so peers are not blocked for the full 30 s
             // TTL while the jitter window elapses. The next tick re-claims
-            // once the effective fire time has passed.
-            diesel::update(dsl::harvest_schedules.find(schedule.id))
-                .set((
-                    dsl::fire_claim_token.eq(Option::<uuid::Uuid>::None),
-                    dsl::fire_claimed_until.eq(Option::<DateTime<Utc>>::None),
-                ))
-                .execute(conn)
-                .await
-                .map_err(crate::error::database_error)?;
+            // once the effective fire time has passed. Guard by token so a
+            // slow late-running tick cannot clear a successor's live claim.
+            diesel::update(
+                dsl::harvest_schedules
+                    .find(schedule.id)
+                    .filter(dsl::fire_claim_token.eq(Some(claim_token))),
+            )
+            .set((
+                dsl::fire_claim_token.eq(Option::<uuid::Uuid>::None),
+                dsl::fire_claimed_until.eq(Option::<DateTime<Utc>>::None),
+            ))
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?;
             return Ok(());
         }
     }
@@ -1629,16 +1636,20 @@ async fn tick_one_workflow_schedule(
                     i16::try_from(current_shard.as_i32()).unwrap_or(0),
                 )
                 .await;
-                diesel::update(dsl::harvest_schedules.find(schedule.id))
-                    .set((
-                        dsl::next_run_at.eq(next),
-                        dsl::fire_claim_token.eq(Option::<uuid::Uuid>::None),
-                        dsl::fire_claimed_until.eq(Option::<DateTime<Utc>>::None),
-                        dsl::updated_at.eq(now),
-                    ))
-                    .execute(conn)
-                    .await
-                    .map_err(crate::error::database_error)?;
+                diesel::update(
+                    dsl::harvest_schedules
+                        .find(schedule.id)
+                        .filter(dsl::fire_claim_token.eq(Some(claim_token))),
+                )
+                .set((
+                    dsl::next_run_at.eq(next),
+                    dsl::fire_claim_token.eq(Option::<uuid::Uuid>::None),
+                    dsl::fire_claimed_until.eq(Option::<DateTime<Utc>>::None),
+                    dsl::updated_at.eq(now),
+                ))
+                .execute(conn)
+                .await
+                .map_err(crate::error::database_error)?;
                 return Ok(());
             }
             Some(_adjusted) => {
@@ -1709,16 +1720,20 @@ async fn tick_one_workflow_schedule(
                     i16::try_from(current_shard.as_i32()).unwrap_or(0),
                 )
                 .await;
-                diesel::update(dsl::harvest_schedules.find(schedule.id))
-                    .set((
-                        dsl::next_run_at.eq(next),
-                        dsl::fire_claim_token.eq(Option::<uuid::Uuid>::None),
-                        dsl::fire_claimed_until.eq(Option::<DateTime<Utc>>::None),
-                        dsl::updated_at.eq(now),
-                    ))
-                    .execute(conn)
-                    .await
-                    .map_err(crate::error::database_error)?;
+                diesel::update(
+                    dsl::harvest_schedules
+                        .find(schedule.id)
+                        .filter(dsl::fire_claim_token.eq(Some(claim_token))),
+                )
+                .set((
+                    dsl::next_run_at.eq(next),
+                    dsl::fire_claim_token.eq(Option::<uuid::Uuid>::None),
+                    dsl::fire_claimed_until.eq(Option::<DateTime<Utc>>::None),
+                    dsl::updated_at.eq(now),
+                ))
+                .execute(conn)
+                .await
+                .map_err(crate::error::database_error)?;
                 return Ok(());
             }
             OverlapAction::Buffer { fire_time } => {
@@ -1755,17 +1770,21 @@ async fn tick_one_workflow_schedule(
                     i16::try_from(current_shard.as_i32()).unwrap_or(0),
                 )
                 .await;
-                diesel::update(dsl::harvest_schedules.find(schedule.id))
-                    .set((
-                        dsl::next_run_at.eq(next),
-                        dsl::buffered_runs.eq(buffered_runs_to_json(&buffered)),
-                        dsl::fire_claim_token.eq(Option::<uuid::Uuid>::None),
-                        dsl::fire_claimed_until.eq(Option::<DateTime<Utc>>::None),
-                        dsl::updated_at.eq(now),
-                    ))
-                    .execute(conn)
-                    .await
-                    .map_err(crate::error::database_error)?;
+                diesel::update(
+                    dsl::harvest_schedules
+                        .find(schedule.id)
+                        .filter(dsl::fire_claim_token.eq(Some(claim_token))),
+                )
+                .set((
+                    dsl::next_run_at.eq(next),
+                    dsl::buffered_runs.eq(buffered_runs_to_json(&buffered)),
+                    dsl::fire_claim_token.eq(Option::<uuid::Uuid>::None),
+                    dsl::fire_claimed_until.eq(Option::<DateTime<Utc>>::None),
+                    dsl::updated_at.eq(now),
+                ))
+                .execute(conn)
+                .await
+                .map_err(crate::error::database_error)?;
                 return Ok(());
             }
             OverlapAction::CancelAndProceed => {
@@ -2003,21 +2022,24 @@ async fn tick_one_workflow_schedule(
             next_run_after_plan
         }
     });
-    diesel::update(dsl::harvest_schedules.find(schedule.id))
-        .set((
-            dsl::last_run_at.eq(effective_last_run_at),
-            dsl::next_run_at.eq(effective_next_run_at),
-            // Clear the HA claim so the column stays clean after a successful
-            // fire. next_run_at is now in the future so the row would not be
-            // re-selected anyway, but clearing keeps the schema intention clear
-            // and avoids stale tokens accumulating.
-            dsl::fire_claim_token.eq(Option::<uuid::Uuid>::None),
-            dsl::fire_claimed_until.eq(Option::<DateTime<Utc>>::None),
-            dsl::updated_at.eq(now),
-        ))
-        .execute(conn)
-        .await
-        .map_err(crate::error::database_error)?;
+    diesel::update(
+        dsl::harvest_schedules
+            .find(schedule.id)
+            .filter(dsl::fire_claim_token.eq(Some(claim_token))),
+    )
+    .set((
+        dsl::last_run_at.eq(effective_last_run_at),
+        dsl::next_run_at.eq(effective_next_run_at),
+        // Clear the HA claim so the column stays clean after a successful
+        // fire. Guarded by token so a slow late tick cannot overwrite a
+        // successor replica's live claim if the 30 s TTL expired.
+        dsl::fire_claim_token.eq(Option::<uuid::Uuid>::None),
+        dsl::fire_claimed_until.eq(Option::<DateTime<Utc>>::None),
+        dsl::updated_at.eq(now),
+    ))
+    .execute(conn)
+    .await
+    .map_err(crate::error::database_error)?;
 
     Ok(())
 }
