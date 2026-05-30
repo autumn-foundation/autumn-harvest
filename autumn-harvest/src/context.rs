@@ -2497,6 +2497,15 @@ impl WorkflowContext {
         &self,
         activities: Vec<(String, Value, String)>,
     ) -> HarvestResult<Vec<Value>> {
+        self.fan_out_raw_impl(activities, None, None).await
+    }
+
+    async fn fan_out_raw_impl(
+        &self,
+        activities: Vec<(String, Value, String)>,
+        retry: Option<crate::policy::RetryPolicy>,
+        timeout: Option<std::time::Duration>,
+    ) -> HarvestResult<Vec<Value>> {
         self.check_cancellation()?;
 
         let seq = self.next_fan_out_seq();
@@ -2509,8 +2518,12 @@ impl WorkflowContext {
 
         let futures: Vec<_> = activities
             .into_iter()
-            .map(|(name, input, queue)| async move {
-                self.execute_activity_raw(&name, input, &queue).await
+            .map(|(name, input, queue)| {
+                let retry = retry.clone();
+                async move {
+                    self.execute_activity_raw_with_opts(&name, input, &queue, retry, timeout)
+                        .await
+                }
             })
             .collect();
 
@@ -2552,6 +2565,15 @@ impl WorkflowContext {
         &self,
         activities: Vec<(String, Value, String)>,
     ) -> HarvestResult<Vec<Result<Value, String>>> {
+        self.fan_out_collect_raw_impl(activities, None, None).await
+    }
+
+    async fn fan_out_collect_raw_impl(
+        &self,
+        activities: Vec<(String, Value, String)>,
+        retry: Option<crate::policy::RetryPolicy>,
+        timeout: Option<std::time::Duration>,
+    ) -> HarvestResult<Vec<Result<Value, String>>> {
         self.check_cancellation()?;
 
         let seq = self.next_fan_out_seq();
@@ -2564,13 +2586,20 @@ impl WorkflowContext {
 
         let futures: Vec<_> = activities
             .into_iter()
-            .map(|(name, input, queue)| async move {
-                match self.execute_activity_raw(&name, input, &queue).await {
-                    Ok(v) => Ok(Ok(v)),
-                    Err(
-                        e @ (HarvestError::ActivityFailed { .. } | HarvestError::Timeout { .. }),
-                    ) => Ok(Err(e.to_string())),
-                    Err(e) => Err(e),
+            .map(|(name, input, queue)| {
+                let retry = retry.clone();
+                async move {
+                    match self
+                        .execute_activity_raw_with_opts(&name, input, &queue, retry, timeout)
+                        .await
+                    {
+                        Ok(v) => Ok(Ok(v)),
+                        Err(
+                            e
+                            @ (HarvestError::ActivityFailed { .. } | HarvestError::Timeout { .. }),
+                        ) => Ok(Err(e.to_string())),
+                        Err(e) => Err(e),
+                    }
                 }
             })
             .collect();
@@ -2608,7 +2637,13 @@ impl WorkflowContext {
             })
             .collect::<Result<Vec<_>, serde_json::Error>>()?;
 
-        let raw_results = self.execute_activity_fan_out_raw(activities).await?;
+        let raw_results = self
+            .fan_out_raw_impl(
+                activities,
+                info.default_retry_policy.clone(),
+                info.default_start_to_close,
+            )
+            .await?;
         raw_results
             .into_iter()
             .map(|v| serde_json::from_value(v).map_err(HarvestError::Serialization))
@@ -2646,7 +2681,11 @@ impl WorkflowContext {
             .collect::<Result<Vec<_>, serde_json::Error>>()?;
 
         let raw_results = self
-            .execute_activity_fan_out_collect_raw(activities)
+            .fan_out_collect_raw_impl(
+                activities,
+                info.default_retry_policy.clone(),
+                info.default_start_to_close,
+            )
             .await?;
         let typed: Vec<Result<O, String>> = raw_results
             .into_iter()
