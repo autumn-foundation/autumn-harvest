@@ -4,6 +4,7 @@ use std::any::{Any, TypeId};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::batch_start::BatchStartConfig;
 use crate::context::{SharedStateMap, WorkflowHistoryPolicy};
 use crate::info::{ActivityInfo, DagInfo, QueryHandlerInfo, UpdateHandlerInfo, WorkflowInfo};
 use crate::payload_codec::{PayloadCodec, PayloadCodecs};
@@ -87,6 +88,8 @@ pub struct HarvestBuilder {
     max_workflow_start_delay: Option<Duration>,
     /// Grace window before cross-workflow signaling fails for unknown target (issue #330).
     unknown_target_grace_window: Option<Duration>,
+    /// Hard caps for `POST /workflows/batch_start` (issue #357).
+    batch_start_config: BatchStartConfig,
 }
 
 impl Default for HarvestBuilder {
@@ -113,6 +116,7 @@ impl Default for HarvestBuilder {
             max_workflow_input_bytes: DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
             max_workflow_start_delay: None,
             unknown_target_grace_window: None,
+            batch_start_config: BatchStartConfig::default(),
         }
     }
 }
@@ -149,6 +153,7 @@ impl std::fmt::Debug for HarvestBuilder {
                 "unknown_target_grace_window",
                 &self.unknown_target_grace_window,
             )
+            .field("batch_start_config", &self.batch_start_config)
             .finish_non_exhaustive()
     }
 }
@@ -189,6 +194,8 @@ pub struct BuiltHarvest {
     pub max_workflow_start_delay: Duration,
     /// Grace window before cross-workflow signaling fails for unknown target (issue #330).
     pub unknown_target_grace_window: Duration,
+    /// Hard caps for `POST /workflows/batch_start` (issue #357).
+    pub batch_start_config: BatchStartConfig,
 }
 
 impl std::fmt::Debug for BuiltHarvest {
@@ -219,6 +226,7 @@ impl std::fmt::Debug for BuiltHarvest {
                 "unknown_target_grace_window",
                 &self.unknown_target_grace_window,
             )
+            .field("batch_start_config", &self.batch_start_config)
             .finish_non_exhaustive()
     }
 }
@@ -894,6 +902,17 @@ impl HarvestBuilder {
         self
     }
 
+    /// Override the hard caps for `POST /workflows/batch_start` (issue #357).
+    ///
+    /// Defaults: `max_items_per_batch = 1000`, `max_total_bytes = 10 MiB`.
+    /// Both limits are checked before any execution row is inserted; exceeding
+    /// either returns `413 Payload Too Large`.
+    #[must_use]
+    pub const fn batch_start_config(mut self, config: BatchStartConfig) -> Self {
+        self.batch_start_config = config;
+        self
+    }
+
     /// Number of registered workflows (used in tests and diagnostics).
     #[must_use]
     pub const fn workflow_count(&self) -> usize {
@@ -1000,6 +1019,7 @@ impl HarvestBuilder {
             max_workflow_input_bytes: self.max_workflow_input_bytes,
             max_workflow_start_delay,
             unknown_target_grace_window,
+            batch_start_config: self.batch_start_config,
         })
     }
 }
@@ -2420,5 +2440,34 @@ mod tests {
             ),
             "expected RateLimitKeyWithoutCap error, got: {result:?}"
         );
+    }
+
+    // ── BatchStartConfig (issue #357) ─────────────────────────────────────────
+
+    #[test]
+    fn built_harvest_batch_start_config_defaults_to_spec_values() {
+        use crate::batch_start::{DEFAULT_BATCH_START_MAX_BYTES, DEFAULT_BATCH_START_MAX_ITEMS};
+        let built = HarvestBuilder::new().build();
+        assert_eq!(
+            built.batch_start_config.max_items_per_batch,
+            DEFAULT_BATCH_START_MAX_ITEMS
+        );
+        assert_eq!(
+            built.batch_start_config.max_total_bytes,
+            DEFAULT_BATCH_START_MAX_BYTES
+        );
+    }
+
+    #[test]
+    fn harvest_builder_batch_start_config_overrides_are_propagated() {
+        use crate::batch_start::BatchStartConfig;
+        let custom = BatchStartConfig {
+            max_items_per_batch: 500,
+            max_total_bytes: 5 * 1024 * 1024,
+        };
+        let built = HarvestBuilder::new()
+            .batch_start_config(custom.clone())
+            .build();
+        assert_eq!(built.batch_start_config, custom);
     }
 }

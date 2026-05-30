@@ -35,6 +35,8 @@ pub mod analyzer;
 pub mod audit;
 /// Batch operations for fleet-wide workflow cancel/terminate/signal (issue #102).
 pub mod batch;
+/// Batch workflow start types: caps and per-item request/result structs (issue #357).
+pub mod batch_start;
 /// Worker build-id routing for safe rolling deploys (issue #171).
 #[cfg(feature = "db")]
 pub mod build_routing;

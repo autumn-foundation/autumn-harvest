@@ -66,6 +66,8 @@ pub const OP_DLQ_REPLAY_BULK: &str = "dlq.replay.bulk";
 pub const OP_DLQ_DISCARD_BULK: &str = "dlq.discard.bulk";
 /// Audit operation: Submitted a batch processing job.
 pub const OP_BATCH_SUBMIT: &str = "batch.submit";
+/// Audit operation: Atomically started a batch of workflow executions (issue #357).
+pub const OP_BATCH_START: &str = "batch.start";
 /// Audit operation: Triggered a retention sweep manually.
 pub const OP_RETENTION_RUN_NOW: &str = "retention.run_now";
 /// Audit operation: Completed an external activity.
@@ -291,6 +293,8 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     ("POST /workers/{worker_id}/drain", RouteClass::Mutating),
     ("POST /admin/rate-limits/{key}", RouteClass::Mutating),
     ("POST /batch-operations", RouteClass::Mutating),
+    // Batch workflow start (issue #357)
+    ("POST /workflows/batch_start", RouteClass::Mutating),
     // Build routing management (issue #362)
     ("GET /admin/build-routing", RouteClass::ReadOnly),
     ("POST /admin/build-routing/policies", RouteClass::Mutating),
@@ -329,6 +333,7 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
     OP_DLQ_REPLAY_BULK,
     OP_DLQ_DISCARD_BULK,
     OP_BATCH_SUBMIT,
+    OP_BATCH_START,
     OP_RETENTION_RUN_NOW,
     OP_EXTERNAL_ACTIVITY_COMPLETE,
     OP_EXTERNAL_ACTIVITY_FAIL,
@@ -489,6 +494,8 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ("GET /batch-operations", None),
     ("POST /batch-operations", Some(OP_BATCH_SUBMIT)),
     ("GET /batch-operations/{id}", None),
+    // Batch workflow start (issue #357)
+    ("POST /workflows/batch_start", Some(OP_BATCH_START)),
     // Audit log (read-only)
     ("GET /admin/audit", None),
     // SSE execution event stream (issue #324): read-only; open/close audited in handler.

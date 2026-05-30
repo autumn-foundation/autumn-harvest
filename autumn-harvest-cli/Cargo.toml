@@ -30,5 +30,8 @@ path = "src/main.rs"
 name = "harvest-replay"
 path = "src/bin/harvest_replay.rs"
 
+[dev-dependencies]
+tempfile = "3"
+
 [lints]
 workspace = true

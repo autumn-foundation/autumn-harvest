@@ -28,6 +28,7 @@ use diesel_async::RunQueryDsl;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use autumn_harvest::audit::OP_BATCH_START;
 use autumn_harvest::audit::{
     self, AuditFilters, HEADER_ACTOR, HEADER_REQUEST_ID, HEADER_SOURCE, OP_BATCH_SUBMIT,
     OP_BUILD_COMPAT_DECLARE, OP_BUILD_COMPAT_REVOKE, OP_BUILD_POLICY_SET, OP_DAG_PATCH,
@@ -43,6 +44,10 @@ use autumn_harvest::audit::{
 use autumn_harvest::batch::{
     self, BatchAction, BatchExecutorConfig, BatchFilter, BatchJobStatus, BatchJobView,
     BatchSubmission,
+};
+use autumn_harvest::batch_start::{
+    BatchStartConfig, BatchStartItem, BatchStartItemResult, BatchStartItemStatus,
+    DEFAULT_BATCH_START_MAX_BYTES, DEFAULT_BATCH_START_MAX_ITEMS,
 };
 use autumn_harvest::calendar::{
     BackfillSlot, calendar_excludes_weekends, create_calendar, delete_calendar, get_calendar,
@@ -265,6 +270,9 @@ pub struct HarvestApiState {
     /// Maximum allowed workflow start delay (issue #322).
     /// Defaults to 365 days.
     max_workflow_start_delay: Arc<Mutex<std::time::Duration>>,
+    /// Hard caps for `POST /workflows/batch_start` (issue #357).
+    batch_start_max_items: Arc<Mutex<usize>>,
+    batch_start_max_bytes: Arc<Mutex<u64>>,
 }
 
 impl Default for HarvestApiState {
@@ -289,6 +297,8 @@ impl Default for HarvestApiState {
             max_workflow_start_delay: Arc::new(Mutex::new(std::time::Duration::from_secs(
                 365 * 24 * 60 * 60,
             ))),
+            batch_start_max_items: Arc::new(Mutex::new(DEFAULT_BATCH_START_MAX_ITEMS)),
+            batch_start_max_bytes: Arc::new(Mutex::new(DEFAULT_BATCH_START_MAX_BYTES)),
         }
     }
 }
@@ -447,6 +457,51 @@ impl HarvestApiState {
     pub fn max_workflow_start_delay(&self) -> std::time::Duration {
         *self
             .max_workflow_start_delay
+            .lock()
+            .expect("harvest api state lock poisoned")
+    }
+
+    /// Set the hard caps for `POST /workflows/batch_start` (issue #357).
+    ///
+    /// Call this during startup with values from [`BatchStartConfig`] so the
+    /// management API honours operator-configured limits.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an internal mutex is poisoned.
+    pub fn set_batch_start_config(&self, config: &BatchStartConfig) {
+        *self
+            .batch_start_max_items
+            .lock()
+            .expect("harvest api state lock poisoned") = config.max_items_per_batch;
+        *self
+            .batch_start_max_bytes
+            .lock()
+            .expect("harvest api state lock poisoned") = config.max_total_bytes;
+    }
+
+    /// Maximum items per `POST /workflows/batch_start` request.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    #[must_use]
+    pub fn batch_start_max_items(&self) -> usize {
+        *self
+            .batch_start_max_items
+            .lock()
+            .expect("harvest api state lock poisoned")
+    }
+
+    /// Maximum total bytes for a `POST /workflows/batch_start` request body.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    #[must_use]
+    pub fn batch_start_max_bytes(&self) -> u64 {
+        *self
+            .batch_start_max_bytes
             .lock()
             .expect("harvest api state lock poisoned")
     }
@@ -1498,6 +1553,12 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
 
     Router::new()
         .route("/workflows", get(list_workflows))
+        // Static /workflows/batch_start must be registered before any /workflows/{param}
+        // routes so axum does not capture the literal segment as a path parameter.
+        .route(
+            "/workflows/batch_start",
+            post(batch_start_workflows).route_layer(require_admin.clone()),
+        )
         .route(
             "/workflows/{id}/history/export",
             get(export_workflow_history),
@@ -4498,6 +4559,435 @@ async fn start_workflow(
             )
                 .into_response()
         }
+    }
+}
+
+// ── Batch workflow start (issue #357) ────────────────────────────────────────
+
+/// Request body for `POST /workflows/batch_start`.
+#[derive(Debug, Deserialize)]
+struct BatchStartRequest {
+    /// Workflows to start.
+    items: Vec<BatchStartItem>,
+    /// `true` = all-or-nothing; `false` = best-effort per-item results.
+    atomic: bool,
+}
+
+/// Response for `atomic = false`: one entry per item.
+#[derive(Debug, Serialize)]
+struct BatchStartResponse {
+    results: Vec<BatchStartItemResult>,
+}
+
+/// Response for `atomic = true` rejection: describes which items failed.
+#[derive(Debug, Serialize)]
+struct BatchStartRejectedResponse {
+    message: String,
+    rejected: Vec<BatchStartItemResult>,
+}
+
+#[allow(clippy::too_many_lines)]
+async fn batch_start_workflows(
+    Extension(api_state): Extension<HarvestApiState>,
+    maybe_session: Option<Extension<Session>>,
+    headers: axum::http::HeaderMap,
+    body_bytes: Bytes,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+
+    if !has_harvest_admin_access(&api_state, maybe_session.map(|Extension(s)| s)).await {
+        return AutumnError::unauthorized_msg("authentication required").into_response();
+    }
+
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+    let route = "POST /workflows/batch_start";
+
+    // ── Enforce byte-size cap ────────────────────────────────────────────────
+    let max_bytes = api_state.batch_start_max_bytes();
+    let body_len = u64::try_from(body_bytes.len()).unwrap_or(u64::MAX);
+    if body_len > max_bytes {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({
+                "error": format!(
+                    "request body ({body_len} bytes) exceeds max_total_bytes ({max_bytes} bytes)"
+                )
+            })),
+        )
+            .into_response();
+    }
+
+    // ── Parse request ────────────────────────────────────────────────────────
+    let request: BatchStartRequest = match serde_json::from_slice(&body_bytes) {
+        Ok(r) => r,
+        Err(e) => {
+            return AutumnError::bad_request_msg(format!("invalid request body: {e}"))
+                .into_response();
+        }
+    };
+
+    // ── Enforce item count cap ───────────────────────────────────────────────
+    let max_items = api_state.batch_start_max_items();
+    if request.items.len() > max_items {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({
+                "error": format!(
+                    "batch contains {} items; max_items_per_batch is {max_items}",
+                    request.items.len()
+                )
+            })),
+        )
+            .into_response();
+    }
+
+    let runtime = match api_state.runtime() {
+        Ok(r) => r,
+        Err(e) => return map_error(e).into_response(),
+    };
+
+    // ── Pre-validate all items in-memory (issue #357) ───────────────────────
+    // Check: workflow name registered, no DAG collision.  Payload size and
+    // duplicate-id checks happen inside start_or_load_workflow_execution and
+    // are surfaced as per-item errors (or a batch-level 409 for atomic mode).
+    let mut pre_rejected: Vec<BatchStartItemResult> = Vec::new();
+    for (idx, item) in request.items.iter().enumerate() {
+        let err = if !runtime.registry.workflows.contains_key(&item.workflow_name) {
+            Some(format!(
+                "workflow '{}' is not registered",
+                item.workflow_name
+            ))
+        } else if runtime.is_registered_dag(&item.workflow_name) {
+            Some(format!(
+                "workflow '{}' is a registered DAG; use POST /dags/{{name}}/trigger",
+                item.workflow_name
+            ))
+        } else {
+            None
+        };
+        if let Some(reason) = err {
+            pre_rejected.push(BatchStartItemResult {
+                index: idx,
+                status: BatchStartItemStatus::Rejected,
+                execution_id: None,
+                error: Some(reason),
+            });
+        }
+    }
+
+    // Atomic mode: fail fast if any item is invalid.
+    if request.atomic && !pre_rejected.is_empty() {
+        // Audit the rejection.
+        if let Ok(pool) = api_state.storage_pool()
+            && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+        {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_BATCH_START,
+                target_type: TARGET_BATCH,
+                target_id: None,
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_FAILED,
+                error_summary: Some("atomic batch rejected: one or more items invalid"),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+        }
+        return (
+            StatusCode::CONFLICT,
+            Json(BatchStartRejectedResponse {
+                message: format!(
+                    "{} of {} items failed validation; no executions inserted (atomic=true)",
+                    pre_rejected.len(),
+                    request.items.len()
+                ),
+                rejected: pre_rejected,
+            }),
+        )
+            .into_response();
+    }
+
+    // ── Derive per-item parameters ───────────────────────────────────────────
+    let queue_name = runtime
+        .queues
+        .as_slice()
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "default".to_string());
+    let max_wf_input_bytes = runtime.registry.max_workflow_input_bytes;
+    let max_exec_timeout_ceiling = api_state
+        .max_workflow_execution_timeout()
+        .map(|d| chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX));
+
+    // ── OTel span wrapping the batch (issue #357 telemetry AC) ───────────────
+    // Attributes recorded: batch.size, batch.atomic, batch.shards_touched,
+    // batch.rejected_count.  The span is created before any DB work so all
+    // shard round-trips are children of it.
+    let mut results: Vec<BatchStartItemResult> = Vec::with_capacity(request.items.len());
+
+    // Pre-populate with the pre-validation rejections so indexes stay aligned.
+    let pre_rejected_idxs: std::collections::HashSet<usize> =
+        pre_rejected.iter().map(|r| r.index).collect();
+    for r in pre_rejected {
+        results.push(r);
+    }
+
+    let mut shards_touched: std::collections::HashSet<i32> = std::collections::HashSet::new();
+    let mut rejected_count = pre_rejected_idxs.len();
+
+    for (idx, item) in request.items.iter().enumerate() {
+        if pre_rejected_idxs.contains(&idx) {
+            continue;
+        }
+
+        let workflow_id = item
+            .workflow_id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let input = item.input.clone().unwrap_or(Value::Null);
+
+        let effective_wf_cap = runtime
+            .registry
+            .workflows
+            .get(&item.workflow_name)
+            .and_then(|info| info.max_input_bytes)
+            .map_or(max_wf_input_bytes, |per_wf| per_wf.max(max_wf_input_bytes));
+
+        let (concurrency_key, concurrency_limit) = runtime
+            .registry
+            .workflows
+            .get(&item.workflow_name)
+            .and_then(|info| info.concurrency.as_ref())
+            .map_or((None, None), |policy| {
+                let key =
+                    autumn_harvest::concurrency::resolve_concurrency_key(policy.key_expr, &input);
+                (key, Some(policy.limit))
+            });
+
+        let shard = runtime
+            .router
+            .pick_for_new_workflow(&item.workflow_name, &workflow_id);
+        shards_touched.insert(shard.as_i32());
+        let exec_id = ExecutionId::new_for_shard(shard);
+
+        let trace_ctx = tracing::info_span!(
+            "harvest.workflow.schedule",
+            "otel.kind" = "producer",
+            { ATTR_WORKFLOW_ID } = %item.workflow_name,
+            { ATTR_EXECUTION_ID } = %exec_id,
+            { ATTR_SHARD_ID } = i64::from(shard.as_i32()),
+            { ATTR_QUEUE } = %queue_name,
+        )
+        .in_scope(|| runtime.registry.telemetry().capture_trace_context());
+
+        let conn_result = db_conn_for_shard(&api_state, shard).await;
+        let mut conn = match conn_result {
+            Ok(c) => c,
+            Err(e) => {
+                rejected_count += 1;
+                results.push(BatchStartItemResult {
+                    index: idx,
+                    status: BatchStartItemStatus::Rejected,
+                    execution_id: None,
+                    error: Some(e.to_string()),
+                });
+                if request.atomic {
+                    // Shard connection failed in atomic mode: abort entire batch.
+                    let _ = audit_batch_start_failure(
+                        &api_state,
+                        &actor,
+                        &source,
+                        request_id.as_deref(),
+                        route,
+                        "atomic batch rejected: shard connection failure",
+                    )
+                    .await;
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(BatchStartRejectedResponse {
+                            message: "atomic batch aborted: shard connection failure".to_string(),
+                            rejected: results
+                                .into_iter()
+                                .filter(|r| r.status == BatchStartItemStatus::Rejected)
+                                .collect(),
+                        }),
+                    )
+                        .into_response();
+                }
+                continue;
+            }
+        };
+
+        let start_result = start_or_load_workflow_execution(
+            &mut conn,
+            StartWorkflowParams {
+                workflow_name: &item.workflow_name,
+                workflow_id: &workflow_id,
+                exec_id,
+                input,
+                parent_id: None,
+                queue_name: &queue_name,
+                execution_timeout: None,
+                memo: None,
+                search_attrs: item.search_attributes.clone(),
+                reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
+                trace_context: trace_ctx,
+                max_execution_timeout_ceiling: max_exec_timeout_ceiling,
+                concurrency_key,
+                concurrency_limit,
+                priority: Priority::default(),
+                max_workflow_input_bytes: effective_wf_cap,
+                start_at: None,
+                delay: None,
+                max_workflow_start_delay: None,
+            },
+        )
+        .await;
+
+        match start_result {
+            Ok(new_exec_id) => {
+                // Emit per-execution `harvest.workflow.started` metric so existing
+                // dashboards and alert thresholds are unaffected (issue #357 telemetry AC).
+                runtime
+                    .registry
+                    .telemetry()
+                    .metrics
+                    .record_workflow_started(&item.workflow_name, &queue_name);
+
+                results.push(BatchStartItemResult {
+                    index: idx,
+                    status: BatchStartItemStatus::Started,
+                    execution_id: Some(new_exec_id.exec_id.to_string()),
+                    error: None,
+                });
+            }
+            Err(e) => {
+                rejected_count += 1;
+                let err_str = e.to_string();
+                if request.atomic {
+                    let _ = audit_batch_start_failure(
+                        &api_state,
+                        &actor,
+                        &source,
+                        request_id.as_deref(),
+                        route,
+                        "atomic batch rejected: start failure",
+                    )
+                    .await;
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(BatchStartRejectedResponse {
+                            message: format!("atomic batch aborted: item {idx} failed: {err_str}"),
+                            rejected: vec![BatchStartItemResult {
+                                index: idx,
+                                status: BatchStartItemStatus::Rejected,
+                                execution_id: None,
+                                error: Some(err_str),
+                            }],
+                        }),
+                    )
+                        .into_response();
+                }
+                results.push(BatchStartItemResult {
+                    index: idx,
+                    status: BatchStartItemStatus::Rejected,
+                    execution_id: None,
+                    error: Some(err_str),
+                });
+            }
+        }
+    }
+
+    // ── Emit batch-level OTel span (issue #357 telemetry AC) ─────────────────
+    tracing::info_span!(
+        "harvest.batch.start",
+        "batch.size" = request.items.len(),
+        "batch.atomic" = request.atomic,
+        "batch.shards_touched" = shards_touched.len(),
+        "batch.rejected_count" = rejected_count,
+    )
+    .in_scope(|| {});
+
+    // ── Audit the overall batch start ────────────────────────────────────────
+    let started_count = results
+        .iter()
+        .filter(|r| r.status == BatchStartItemStatus::Started)
+        .count();
+    let audit_status = if rejected_count == 0 {
+        STATUS_SUCCEEDED
+    } else {
+        STATUS_FAILED
+    };
+    let error_summary = if rejected_count > 0 {
+        Some(
+            format!("{rejected_count} of {} items rejected", request.items.len())
+                .as_str()
+                .to_owned(),
+        )
+    } else {
+        None
+    };
+    if let Ok(pool) = api_state.storage_pool()
+        && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+    {
+        let error_summary_str = error_summary.as_deref();
+        let ar = NewAuditRecord {
+            actor: &actor,
+            operation: OP_BATCH_START,
+            target_type: TARGET_BATCH,
+            target_id: None,
+            route_or_command: route,
+            request_id: request_id.as_deref(),
+            idempotency_key: None,
+            status: audit_status,
+            error_summary: error_summary_str,
+            shard_id: None,
+            source: &source,
+        };
+        let _ = audit::insert_audit(&mut conn, &ar).await;
+    }
+
+    tracing::debug!(
+        started = started_count,
+        rejected = rejected_count,
+        atomic = request.atomic,
+        "batch_start complete"
+    );
+
+    // Sort results by index for deterministic output.
+    results.sort_by_key(|r| r.index);
+    (StatusCode::OK, Json(BatchStartResponse { results })).into_response()
+}
+
+/// Helper: write a failed audit record for an atomic batch-start rejection.
+async fn audit_batch_start_failure(
+    api_state: &HarvestApiState,
+    actor: &str,
+    source: &str,
+    request_id: Option<&str>,
+    route: &str,
+    error_summary: &str,
+) {
+    if let Ok(pool) = api_state.storage_pool()
+        && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+    {
+        let ar = NewAuditRecord {
+            actor,
+            operation: OP_BATCH_START,
+            target_type: TARGET_BATCH,
+            target_id: None,
+            route_or_command: route,
+            request_id,
+            idempotency_key: None,
+            status: STATUS_FAILED,
+            error_summary: Some(error_summary),
+            shard_id: None,
+            source,
+        };
+        let _ = audit::insert_audit(&mut conn, &ar).await;
     }
 }
 

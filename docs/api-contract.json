@@ -1782,6 +1782,48 @@
       ]
     },
     {
+      "method": "POST",
+      "path": "/workflows/batch_start",
+      "category": "batch",
+      "read_only": false,
+      "description": "Start N workflow executions in one batched request. atomic=true validates all items first; if any are invalid the entire batch is rejected with 409 and zero rows are inserted. atomic=false returns per-item results.",
+      "params": [],
+      "request_body": {
+        "required": true,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "items",
+            "required": true,
+            "description": "Array of { workflow_name, workflow_id?, input?, search_attributes?, idempotency_key? } objects."
+          },
+          {
+            "name": "atomic",
+            "required": true,
+            "description": "true = all-or-nothing; false = best-effort per-item results."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 200,
+        "free_form": true
+      },
+      "error_responses": [
+        {
+          "status": 409,
+          "description": "atomic=true and at least one item failed validation."
+        },
+        {
+          "status": 413,
+          "description": "Request exceeds max_items_per_batch or max_total_bytes."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
       "method": "GET",
       "path": "/health",
       "category": "health",
