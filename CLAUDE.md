@@ -405,6 +405,46 @@ Errors: `QueryHandlerNotFound` (404), `WorkflowNotRunning` (409), `QueryHandlerP
 
 Configure the per-query timeout via `WorkerConfig::default().with_query_timeout(Duration::from_secs(10))` (default 5 s). Queries are replay-safe: they never emit `WorkflowCommand`s and leave zero footprint in `harvest_events`.
 
+### Fan-out / Parallel Activities
+
+`WorkflowContext` exposes first-class fan-out for dispatching N activities in parallel and collecting results in input order.  Two semantics are available:
+
+| Method | Semantics |
+|--------|-----------|
+| `execute_activity_fan_out(info, inputs)` | Fail-fast: returns `Ok(Vec<O>)` or the **first** `Err` |
+| `execute_activity_fan_out_collect(info, inputs)` | Collect-all: returns `Ok(Vec<Result<O, String>>)` — per-slot errors |
+| `execute_activity_fan_out_raw(activities)` | Raw fail-fast: `Vec<(String, Value, String)>` input |
+| `execute_activity_fan_out_collect_raw(activities)` | Raw collect-all |
+
+```rust
+// Typed, homogeneous fan-out — all slots run the same activity
+// (≤ 3 lines of code measured from the example):
+let results: Vec<ItemResult> = ctx
+    .execute_activity_fan_out(&process_item_info(), items)
+    .await
+    .map_err(|e| e.to_string())?;
+
+// Collect-all — per-slot Vec<Result<O, String>>:
+let per_slot: Vec<Result<ItemResult, String>> = ctx
+    .execute_activity_fan_out_collect(&process_item_info(), items)
+    .await
+    .map_err(|e| e.to_string())?;
+
+// Raw heterogeneous fan-out:
+let results = ctx.execute_activity_fan_out_raw(vec![
+    ("send_email".to_string(), json!(addr1), "email-workers".to_string()),
+    ("send_sms".to_string(),   json!(phone), "sms-workers".to_string()),
+]).await.map_err(|e| e.to_string())?;
+```
+
+**Determinism rule — the input collection MUST be derived from already-recorded state** (workflow input, prior activity outputs, signals).  Never derive the collection from non-deterministic sources such as the system clock, `rand`, or an in-process counter.  If the collection is derived from a prior activity output, that output is in history and is therefore deterministic.
+
+**Replay mechanics**: a `MarkerRecorded { name: "fan_out:{n}" }` event is appended before the activity events on the first live run.  On replay the recorded count is compared to the current collection length; if they differ, `HarvestError::NonDeterministic` is returned immediately rather than silently corrupting results.
+
+**Cancellation**: both methods check `ctx.is_cancelled()` before dispatching and return `HarvestError::Cancelled` if the workflow has been cancelled.
+
+See `autumn-harvest/examples/fanout_batch.rs` for a complete end-to-end example covering all three shapes (static N, dynamic N from a prior activity, and collect-all with partial failure).
+
 ### Local Activities
 
 Local activities run **inline on the workflow worker task** — they are never enqueued to `harvest_task_queue` and never dispatched to a remote worker. Their results are still recorded durably in `harvest_events` (`LocalActivityScheduled`, `LocalActivityCompleted`, `LocalActivityFailed`) so deterministic replay works identically to regular activities.

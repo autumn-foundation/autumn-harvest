@@ -1958,6 +1958,54 @@ impl HistoryMatcher {
         }
     }
 
+    // ── Fan-out / parallel activities (issue #359) ───────────────────────────
+
+    /// Match the count marker for a fan-out group against history.
+    ///
+    /// On the **first live execution** (past end of history) returns
+    /// [`HistoryMatch::NoMatch`] so the caller can emit a `RecordMarker`
+    /// command for replay.
+    ///
+    /// During **replay** expects a `MarkerRecorded { name: "fan_out:{seq}", … }`
+    /// event at the current cursor. Returns:
+    ///
+    /// - [`HistoryMatch::Matched`] — marker found and recorded count equals `count`.
+    /// - [`HistoryMatch::Diverged`] — recorded count differs from `count`
+    ///   (non-deterministic collection resize detected), or a different event
+    ///   type was at this cursor position.
+    /// - [`HistoryMatch::NoMatch`] — past end of history (live execution).
+    pub fn match_fan_out_marker(&mut self, seq: u32, count: usize) -> HistoryMatch {
+        let marker_name = format!("fan_out:{seq}");
+        if !self.prepare_match() {
+            return HistoryMatch::NoMatch;
+        }
+
+        match &self.events[self.cursor] {
+            WorkflowEvent::MarkerRecorded { name, details } if *name == marker_name => {
+                let recorded_count = details
+                    .as_u64()
+                    .and_then(|n| usize::try_from(n).ok())
+                    .unwrap_or(0);
+                self.cursor += 1;
+                self.advance_to_next_unconsumed_event();
+                if recorded_count == count {
+                    HistoryMatch::Matched {
+                        output: serde_json::json!(count),
+                    }
+                } else {
+                    HistoryMatch::Diverged {
+                        expected: format!("fan_out:{seq}(count={recorded_count})"),
+                        actual: format!("fan_out:{seq}(count={count})"),
+                    }
+                }
+            }
+            other => HistoryMatch::Diverged {
+                expected: format!("MarkerRecorded({marker_name})"),
+                actual: Self::actual_event_name(other),
+            },
+        }
+    }
+
     // ── Update primitive (issue #140) ─────────────────────────────────────
 
     /// Look up the recorded result for a specific update by `update_id`.
