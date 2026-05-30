@@ -3684,21 +3684,31 @@ fn map_node_states(
     tasks: &[TaskQueueItem],
 ) -> HashMap<usize, DagNodeState> {
     let mut out = HashMap::new();
+    let mut has_task_row = vec![false; dag.tasks().len()];
+
     for (idx, node) in dag.tasks().iter().enumerate() {
         let mut state = DagNodeState::Unknown;
-        let mut has_task_row = false;
         for task in tasks
             .iter()
             .filter(|t| t.activity_name.as_deref() == Some(node.activity_name.as_str()))
         {
-            has_task_row = true;
+            has_task_row[idx] = true;
             state = merge_dag_task_state(state, task.state.as_str());
-        }
-        if !has_task_row {
-            state = infer_skipped_node_state(dag, idx, &out).unwrap_or(state);
         }
         out.insert(idx, state);
     }
+
+    for level in dag.execution_levels() {
+        for idx in level {
+            if !has_task_row[*idx]
+                && out.get(idx).copied() == Some(DagNodeState::Unknown)
+                && let Some(state) = infer_skipped_node_state(dag, *idx, &out)
+            {
+                out.insert(*idx, state);
+            }
+        }
+    }
+
     out
 }
 
@@ -6486,6 +6496,63 @@ mod tests {
         )
     }
 
+    fn out_of_order_two_node_dag() -> (autumn_harvest::dag::DagDefinition, usize, usize) {
+        fn out_of_order_downstream_for_ui_state_test() {}
+        fn out_of_order_upstream_for_ui_state_test() {}
+
+        let mut builder = autumn_harvest::dag::DagBuilder::new();
+        let downstream = builder
+            .activity(out_of_order_downstream_for_ui_state_test)
+            .trigger_rule(autumn_harvest::policy::TriggerRule::AllSuccess);
+        let downstream_idx = downstream.index();
+        let upstream = builder.activity(out_of_order_upstream_for_ui_state_test);
+        let upstream_idx = upstream.index();
+        let _downstream = downstream.upstream(&upstream);
+
+        (
+            builder.build().expect("test dag should compile"),
+            upstream_idx,
+            downstream_idx,
+        )
+    }
+
+    fn task_queue_item_for_activity(activity_name: &str, state: &str) -> TaskQueueItem {
+        let now = Utc::now();
+        TaskQueueItem {
+            id: uuid::Uuid::new_v4(),
+            queue_name: "default".to_string(),
+            task_type: "ACTIVITY".to_string(),
+            workflow_exec_id: Some(uuid::Uuid::new_v4()),
+            activity_name: Some(activity_name.to_string()),
+            activity_id: None,
+            input: Value::Null,
+            state: state.to_string(),
+            priority: 0,
+            worker_id: None,
+            attempt: 0,
+            max_attempts: 1,
+            scheduled_at: now,
+            started_at: None,
+            completed_at: None,
+            last_heartbeat_at: None,
+            heartbeat_details: None,
+            heartbeat_timeout: None,
+            start_to_close: None,
+            schedule_to_start: None,
+            retry_policy: None,
+            output: None,
+            error: None,
+            sticky_worker_id: None,
+            sticky_until: None,
+            sticky_timeout: None,
+            trace_context: None,
+            concurrency_key: None,
+            concurrency_cap: None,
+            required_build_id: None,
+            rate_limit_key: None,
+        }
+    }
+
     #[test]
     fn dag_node_state_infers_skipped_when_trigger_rule_blocks_unscheduled_node() {
         let (dag, upstream_idx, downstream_idx) =
@@ -6496,6 +6563,23 @@ mod tests {
             infer_skipped_node_state(&dag, downstream_idx, &known_states),
             Some(DagNodeState::Skipped)
         );
+    }
+
+    #[test]
+    fn dag_node_state_infers_skipped_when_upstream_declared_after_downstream() {
+        let (dag, upstream_idx, downstream_idx) = out_of_order_two_node_dag();
+        assert_eq!(
+            dag.execution_levels(),
+            &[vec![upstream_idx], vec![downstream_idx]]
+        );
+
+        let task_rows = vec![task_queue_item_for_activity(
+            dag.tasks()[upstream_idx].activity_name.as_str(),
+            "FAILED",
+        )];
+        let states = map_node_states(&dag, &task_rows);
+
+        assert_eq!(states.get(&downstream_idx), Some(&DagNodeState::Skipped));
     }
 
     #[test]
