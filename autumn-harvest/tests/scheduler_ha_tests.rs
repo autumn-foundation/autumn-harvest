@@ -109,10 +109,7 @@ impl MetricsRecorder for RecordingMetrics {
 // ── Test helpers ───────────────────────────────────────────────────────────
 
 async fn setup_db() -> (AsyncPgConnection, String, ContainerAsync<Postgres>) {
-    let container = Postgres::default()
-        .start()
-        .await
-        .expect("postgres start");
+    let container = Postgres::default().start().await.expect("postgres start");
     let host = container.get_host().await.expect("host");
     let port = container.get_host_port_ipv4(5432).await.expect("port");
     let url = format!("postgresql://postgres:postgres@{host}:{port}/postgres");
@@ -125,11 +122,7 @@ fn noop_handler<'a>(
     _ctx: &'a WorkflowContext,
     _input: serde_json::Value,
 ) -> std::pin::Pin<
-    Box<
-        dyn std::future::Future<Output = Result<serde_json::Value, String>>
-            + Send
-            + 'a,
-    >,
+    Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>,
 > {
     Box::pin(async { Ok(serde_json::Value::Null) })
 }
@@ -322,7 +315,10 @@ async fn test_expired_claim_is_overridden_for_crash_recovery() {
         .get_result(&mut check)
         .await
         .expect("count executions");
-    assert_eq!(count, 1, "exactly one execution after crash-recovery re-claim");
+    assert_eq!(
+        count, 1,
+        "exactly one execution after crash-recovery re-claim"
+    );
 
     // The claim token must be NULL after a successful fire.
     let token_after: Option<Uuid> = harvest_schedules::table
