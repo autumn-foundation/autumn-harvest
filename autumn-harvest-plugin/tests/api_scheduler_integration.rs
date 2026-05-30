@@ -5560,6 +5560,7 @@ async fn scheduler_tick_removes_legacy_workflow_only_dag_schedule_from_old_shard
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn scheduler_tick_removes_stale_classic_dag_schedule_from_old_shard() {
     let ((shard0_url, shard1_url), _container) = setup_sharded_test_database_urls().await;
     let router = two_shard_router();
