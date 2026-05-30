@@ -34,6 +34,8 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260522000001_harvest_rate_limiting/up.sql"),
     "\n",
     include_str!("../migrations/20260526000001_harvest_parent_close_policy/up.sql"),
+    "\n",
+    include_str!("../migrations/20260530000000_harvest_schedule_ha_claim/up.sql"),
 );
 
 async fn setup_test_db() -> (
