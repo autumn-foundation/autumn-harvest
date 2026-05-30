@@ -3600,6 +3600,13 @@ impl ActivityContext {
     /// * **DB must be the same cluster.** The connection comes from harvest's
     ///   own worker pool.  Cross-cluster atomicity is not possible — use the
     ///   traditional idempotency-key pattern for that case.
+    /// * **Must be the final expression.** Once `run_transactional` returns
+    ///   `Ok`, harvest has already committed `ActivityCompleted` and marked
+    ///   the task `COMPLETED`.  Any fallible work done by the activity *after*
+    ///   this call cannot roll back the committed event — if it fails, the
+    ///   workflow still observes success.  Always return the result of
+    ///   `run_transactional` directly; do not use `?` on it and then do more
+    ///   work.
     /// * **Keep bodies short.** The Postgres row lock held during `f` blocks
     ///   concurrent event appends for the same workflow execution.  Long-running
     ///   bodies (> a few seconds) will delay other activities and should use

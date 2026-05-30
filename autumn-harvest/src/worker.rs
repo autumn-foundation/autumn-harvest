@@ -2837,6 +2837,20 @@ async fn finalize_activity_failure(
                 return Ok(());
             };
             if state != "RUNNING" {
+                // If the task reached COMPLETED before the handler returned
+                // (e.g. via run_transactional) and the handler then returned
+                // Err, the error is discarded — the workflow already observed
+                // ActivityCompleted.  Emit a warning so the misuse is visible.
+                if state == "COMPLETED" {
+                    tracing::warn!(
+                        task_id = %task.id,
+                        activity_name = %activity_name,
+                        "activity handler returned Err but task is already COMPLETED \
+                         (run_transactional committed it); the error is discarded and \
+                         the workflow observes ActivityCompleted — run_transactional \
+                         must be the final expression in the activity handler"
+                    );
+                }
                 return Ok(());
             }
             store::append_events(conn, exec_id, &[failed_event], history.next_event_id).await?;

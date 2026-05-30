@@ -87,6 +87,25 @@ idempotency key and accept at-least-once semantics instead.
 
 ## Restrictions
 
+- **Must be the final expression.** Once `run_transactional` returns `Ok`,
+  harvest has already committed `ActivityCompleted` and marked the task
+  `COMPLETED`. Any fallible work done by the activity *after* this call cannot
+  roll back the committed event — if it fails, the workflow still observes
+  success. Always return the result of `run_transactional` directly:
+
+  ```rust
+  // ✅ Correct — run_transactional is the final expression
+  ctx.run_transactional(|conn| Box::pin(async move { ... })).await
+
+  // ❌ Wrong — failure in do_more_work() is silently discarded by the workflow
+  ctx.run_transactional(|conn| Box::pin(async move { ... })).await?;
+  do_more_work().await?;
+  Ok(())
+  ```
+
+  If the activity function fails after `run_transactional`, a `WARN`-level log
+  entry is emitted so the misuse is observable in production.
+
 - **Not available in local activities.** Local activities run on the workflow
   worker and have no DB connection attached. Calling `run_transactional` on a
   local-activity context returns a descriptive `Err` rather than panicking.
