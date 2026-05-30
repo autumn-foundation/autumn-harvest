@@ -144,7 +144,7 @@ fn make_pool(url: &str) -> DbPool {
         .expect("pool")
 }
 
-/// Insert a due schedule with a consecutive_failure_limit and return its id.
+/// Insert a due schedule with a `consecutive_failure_limit` and return its id.
 async fn insert_schedule_with_failure_limit(
     conn: &mut AsyncPgConnection,
     wf_name: &str,
