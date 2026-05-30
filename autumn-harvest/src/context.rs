@@ -2514,7 +2514,22 @@ impl WorkflowContext {
             })
             .collect();
 
-        futures::future::try_join_all(futures).await
+        // join_all (not try_join_all) ensures ALL sibling futures are polled even
+        // when one slot fails, consuming their history events. try_join_all would
+        // drop sibling futures on the first Err, leaving their ActivityScheduled /
+        // terminal events unconsumed in the replay cursor and corrupting any
+        // subsequent command matching if the caller catches the error and continues.
+        let all_results = futures::future::join_all(futures).await;
+        let mut first_err: Option<HarvestError> = None;
+        let mut values = Vec::with_capacity(all_results.len());
+        for result in all_results {
+            match result {
+                Ok(v) if first_err.is_none() => values.push(v),
+                Err(e) if first_err.is_none() => first_err = Some(e),
+                _ => {}
+            }
+        }
+        first_err.map_or_else(|| Ok(values), Err)
     }
 
     /// Execute N activities **in parallel** (collect-all variant).
@@ -2567,7 +2582,9 @@ impl WorkflowContext {
             .map(|(name, input, queue)| async move {
                 match self.execute_activity_raw(&name, input, &queue).await {
                     Ok(v) => Ok(Ok(v)),
-                    Err(e @ HarvestError::ActivityFailed { .. }) => Ok(Err(e.to_string())),
+                    Err(
+                        e @ (HarvestError::ActivityFailed { .. } | HarvestError::Timeout { .. }),
+                    ) => Ok(Err(e.to_string())),
                     Err(e) => Err(e),
                 }
             })
