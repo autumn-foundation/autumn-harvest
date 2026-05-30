@@ -1357,23 +1357,31 @@ async fn tick_workflow_schedules(
         // Atomically claim this due slot so concurrent replicas in a multi-
         // replica deployment never double-fire the same schedule.
         //
-        // The UPDATE only succeeds when no live claim is held on this row
-        // (`fire_claim_token IS NULL OR fire_claimed_until < NOW()`). If another
-        // replica already claimed the slot in the same tick window, the UPDATE
-        // matches zero rows and we skip — emitting a `lost_race` metric so
-        // operators can verify exclusivity in Grafana.
+        // The UPDATE guards on both the claim expiry (fire_claim_token IS NULL
+        // OR fire_claimed_until < NOW()) AND the logical slot (next_run_at =
+        // logical_date). The next_run_at guard prevents a stale-snapshot race:
+        // if a peer has already fired this slot and advanced next_run_at, our
+        // claim UPDATE matches zero rows and we skip cleanly.
+        //
+        // We generate the token client-side so we can reference it in the error
+        // cleanup path — preventing a slow late-running tick from clearing a
+        // successor replica's live claim after the 30 s TTL has expired.
         //
         // Crash-recovery window: if this replica crashes after claiming but
         // before advancing next_run_at, the claim expires after 30 s and any
         // healthy peer retries the slot on its next tick.
+        let my_claim_token = uuid::Uuid::new_v4();
         let claim_rows_affected: usize = diesel::sql_query(
             "UPDATE harvest_schedules \
-             SET fire_claim_token = gen_random_uuid(), \
+             SET fire_claim_token = $1, \
                  fire_claimed_until = NOW() + INTERVAL '30 seconds' \
-             WHERE id = $1 \
+             WHERE id = $2 \
+               AND next_run_at = $3 \
                AND (fire_claim_token IS NULL OR fire_claimed_until < NOW())",
         )
+        .bind::<diesel::sql_types::Uuid, _>(my_claim_token)
         .bind::<diesel::sql_types::Uuid, _>(schedule.id)
+        .bind::<diesel::sql_types::Timestamptz, _>(logical_date)
         .execute(conn)
         .await
         .map_err(crate::error::database_error)?;
@@ -1407,14 +1415,16 @@ async fn tick_workflow_schedules(
                 error = %error, workflow_name = %wf_name,
                 "harvest: workflow schedule tick failed; continuing to next schedule"
             );
-            // Clear the claim on error so a peer can retry promptly instead of
-            // waiting the full 30-second expiry window.
+            // Clear our own claim on error so a peer can retry promptly. Guard
+            // on the token so a slow late-running tick doesn't clear a
+            // successor's live claim if the 30 s TTL has already expired.
             let _ = diesel::sql_query(
                 "UPDATE harvest_schedules \
                  SET fire_claim_token = NULL, fire_claimed_until = NULL \
-                 WHERE id = $1",
+                 WHERE id = $1 AND fire_claim_token = $2",
             )
             .bind::<diesel::sql_types::Uuid, _>(schedule.id)
+            .bind::<diesel::sql_types::Uuid, _>(my_claim_token)
             .execute(conn)
             .await;
         }
@@ -1537,6 +1547,17 @@ async fn tick_one_workflow_schedule(
         let effective_fire_time =
             logical_date + chrono::Duration::from_std(jitter_offset).unwrap_or_default();
         if now < effective_fire_time {
+            // Release the HA claim so peers are not blocked for the full 30 s
+            // TTL while the jitter window elapses. The next tick re-claims
+            // once the effective fire time has passed.
+            diesel::update(dsl::harvest_schedules.find(schedule.id))
+                .set((
+                    dsl::fire_claim_token.eq(Option::<uuid::Uuid>::None),
+                    dsl::fire_claimed_until.eq(Option::<DateTime<Utc>>::None),
+                ))
+                .execute(conn)
+                .await
+                .map_err(crate::error::database_error)?;
             return Ok(());
         }
     }
