@@ -1561,9 +1561,10 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             "/workflows/batch_start",
             post(batch_start_workflows)
                 .route_layer(require_admin.clone())
-                .layer(axum::extract::DefaultBodyLimit::max(
-                    usize::try_from(DEFAULT_BATCH_START_MAX_BYTES).unwrap_or(usize::MAX),
-                )),
+                // Disable Axum's 2 MiB default so operators can raise
+                // BatchStartConfig.max_total_bytes above 10 MiB; the handler
+                // enforces the configured cap via api_state.batch_start_max_bytes().
+                .layer(axum::extract::DefaultBodyLimit::disable()),
         )
         .route(
             "/workflows/{id}/history/export",
@@ -4824,7 +4825,11 @@ async fn batch_start_workflows(
                 .workflows
                 .get(&item.workflow_name)
                 .and_then(|info| info.max_input_bytes)
-                .unwrap_or(max_wf_input_bytes);
+                .map_or(max_wf_input_bytes, |per_wf| {
+                    // Per-workflow limits only raise the global floor; consistent
+                    // with single-start and signal-with-start paths.
+                    per_wf.max(max_wf_input_bytes)
+                });
 
             let (concurrency_key, concurrency_limit) = runtime
                 .registry
