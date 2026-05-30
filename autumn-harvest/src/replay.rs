@@ -842,6 +842,33 @@ impl HistoryMatcher {
     ) -> HistoryMatch {
         if let Some(command_cursor) = first_interleaved_command {
             self.consumed_out_of_order_events.insert(terminal_cursor);
+            // Also mark any ActivityStarted/Heartbeat events for the settled
+            // activity that appear between the interleaved command and the
+            // terminal. Without this, after the cursor rewinds to the
+            // interleaved command and the marker/fan-out branch is replayed,
+            // those progress events remain unconsumed and the next workflow
+            // command match diverges against them.
+            let activity_id = match &self.events[terminal_cursor] {
+                WorkflowEvent::ActivityCompleted { activity_id, .. }
+                | WorkflowEvent::ActivityFailed { activity_id, .. }
+                | WorkflowEvent::ActivityTimedOut { activity_id, .. } => Some(*activity_id),
+                _ => None,
+            };
+            if let Some(aid) = activity_id {
+                for idx in command_cursor..terminal_cursor {
+                    match &self.events[idx] {
+                        WorkflowEvent::ActivityStarted {
+                            activity_id: id, ..
+                        }
+                        | WorkflowEvent::ActivityHeartbeat {
+                            activity_id: id, ..
+                        } if *id == aid => {
+                            self.consumed_out_of_order_events.insert(idx);
+                        }
+                        _ => {}
+                    }
+                }
+            }
             self.cursor = command_cursor;
         } else {
             self.cursor = terminal_cursor + 1;
