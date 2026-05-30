@@ -2304,7 +2304,12 @@ fn render_worker_table(rows: &[WorkerRow], shard_id: ShardId) -> Markup {
                             } @else {
                                 a href={ "build-routing?build_id=" (url_encode(&row.worker.build_id)) }
                                   title="View in Build Routing" {
-                                    code { (row.worker.build_id.chars().take(16).collect::<String>()) }
+                                    @let short_build = if let Some((idx, _)) = row.worker.build_id.char_indices().nth(16) {
+                                        &row.worker.build_id[..idx]
+                                    } else {
+                                        &row.worker.build_id
+                                    };
+                                    code { (short_build) }
                                 }
                             }
                         }
@@ -3418,7 +3423,11 @@ fn badge_class(state: &str) -> &'static str {
 }
 
 fn short_id(id: &str) -> String {
-    id.chars().take(8).collect::<String>() + "…"
+    if let Some((idx, _)) = id.char_indices().nth(8) {
+        format!("{}…", &id[..idx])
+    } else {
+        format!("{id}…")
+    }
 }
 
 fn url_encode(input: &str) -> String {
