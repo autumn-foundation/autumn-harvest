@@ -6,6 +6,8 @@ use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+pub const MAX_API_PAYLOAD_BYTES: usize = 10 * 1024 * 1024;
+
 use autumn_web::AppState;
 use autumn_web::error::AutumnError;
 use autumn_web::reexports::axum;
@@ -13,7 +15,6 @@ use autumn_web::session::Session;
 use axum::Extension;
 use axum::Json;
 use axum::Router;
-use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
@@ -4605,7 +4606,7 @@ async fn batch_start_workflows(
     Extension(api_state): Extension<HarvestApiState>,
     maybe_session: Option<Extension<Session>>,
     headers: axum::http::HeaderMap,
-    body_bytes: Bytes,
+    body: axum::body::Body,
 ) -> axum::response::Response {
     use axum::response::IntoResponse as _;
 
@@ -4616,20 +4617,23 @@ async fn batch_start_workflows(
     let (actor, source, request_id) = audit_context(&headers, &api_state);
     let route = "POST /workflows/batch_start";
 
-    // ── Enforce byte-size cap ────────────────────────────────────────────────
     let max_bytes = api_state.batch_start_max_bytes();
-    let body_len = u64::try_from(body_bytes.len()).unwrap_or(u64::MAX);
-    if body_len > max_bytes {
-        return (
-            StatusCode::PAYLOAD_TOO_LARGE,
-            Json(serde_json::json!({
-                "error": format!(
-                    "request body ({body_len} bytes) exceeds max_total_bytes ({max_bytes} bytes)"
-                )
-            })),
-        )
-            .into_response();
-    }
+    #[allow(clippy::cast_possible_truncation)]
+    let max_bytes_usize = max_bytes as usize;
+    let body_bytes = match axum::body::to_bytes(body, max_bytes_usize).await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "request body exceeds max_total_bytes ({max_bytes} bytes): {e}"
+                    )
+                })),
+            )
+                .into_response();
+        }
+    };
 
     // ── Parse request ────────────────────────────────────────────────────────
     let request: BatchStartRequest = match serde_json::from_slice(&body_bytes) {
@@ -5919,18 +5923,24 @@ struct QueryWorkflowResponse {
 /// The request body is optional. Clients may omit the body entirely or send
 /// `Content-Type: application/json` with an empty body; both default `args`
 /// to `null`. A non-empty body must be `{"args": <value>}`.
+#[allow(clippy::too_many_lines)]
 async fn query_workflow_post(
     Extension(api_state): Extension<HarvestApiState>,
     Path((id, query_name)): Path<(String, String)>,
-    body: Bytes,
+    body: axum::body::Body,
 ) -> Result<Json<QueryWorkflowResponse>, AutumnError> {
     let exec_id = parse_execution_id(&id)?;
     let ctx = hydrate_ctx_for_query(&api_state, exec_id).await?;
     let start = Instant::now(); // measure handler invocation latency, not hydration cost
-    let args: Value = if body.is_empty() {
+
+    let body_bytes = axum::body::to_bytes(body, MAX_API_PAYLOAD_BYTES)
+        .await
+        .map_err(|e| AutumnError::bad_request_msg(format!("failed to read payload: {e}")))?;
+
+    let args: Value = if body_bytes.is_empty() {
         Value::Null
     } else {
-        serde_json::from_slice::<QueryWorkflowRequest>(&body)
+        serde_json::from_slice::<QueryWorkflowRequest>(&body_bytes)
             .map(|r| r.args)
             .map_err(|e| AutumnError::bad_request_msg(format!("invalid JSON body: {e}")))?
     };
@@ -8934,14 +8944,23 @@ fn url_encode_for_redirect(input: &str) -> String {
     out
 }
 
+#[allow(clippy::too_many_lines)]
 async fn bulk_replay_dead_letters_handler(
     Extension(api_state): Extension<HarvestApiState>,
     headers: axum::http::HeaderMap,
-    body: axum::body::Bytes,
+    body: axum::body::Body,
 ) -> axum::response::Response {
     use axum::response::IntoResponse as _;
 
-    let request = match parse_bulk_dlq_request(&headers, &body) {
+    let body_bytes = match axum::body::to_bytes(body, MAX_API_PAYLOAD_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            return AutumnError::bad_request_msg(format!("failed to read payload: {e}"))
+                .into_response();
+        }
+    };
+
+    let request = match parse_bulk_dlq_request(&headers, &body_bytes) {
         Ok(request) => request,
         Err(error) => return error.into_response(),
     };
@@ -9042,14 +9061,23 @@ async fn bulk_replay_dead_letters_handler(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn bulk_discard_dead_letters_handler(
     Extension(api_state): Extension<HarvestApiState>,
     headers: axum::http::HeaderMap,
-    body: axum::body::Bytes,
+    body: axum::body::Body,
 ) -> axum::response::Response {
     use axum::response::IntoResponse as _;
 
-    let request = match parse_bulk_dlq_request(&headers, &body) {
+    let body_bytes = match axum::body::to_bytes(body, MAX_API_PAYLOAD_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            return AutumnError::bad_request_msg(format!("failed to read payload: {e}"))
+                .into_response();
+        }
+    };
+
+    let request = match parse_bulk_dlq_request(&headers, &body_bytes) {
         Ok(request) => request,
         Err(error) => return error.into_response(),
     };
