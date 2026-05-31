@@ -44,6 +44,8 @@ pub const OP_WORKFLOW_CANCEL: &str = "workflow.cancel";
 pub const OP_WORKFLOW_RESET: &str = "workflow.reset";
 /// Audit operation: Manually triggered a DAG execution.
 pub const OP_DAG_TRIGGER: &str = "dag.trigger";
+/// Audit operation: Retried a DAG run from a failed node (issue #366).
+pub const OP_DAG_RETRY: &str = "dag.retry";
 /// Audit operation: Applied a hot-patch to an active DAG.
 pub const OP_DAG_PATCH: &str = "dag.patch";
 /// Audit operation: Created a new workflow schedule.

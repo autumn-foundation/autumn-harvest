@@ -862,6 +862,30 @@ enum DagCommand {
         /// Registered DAG name.
         dag_name: String,
     },
+    /// Retry a failed DAG run from one or more failed nodes (issue #366).
+    ///
+    /// Re-executes the named node(s) and every node declared downstream of
+    /// them, carrying over the recorded results of all upstream nodes. Use
+    /// `--dry-run` first to preview the resolved reset point and the exact
+    /// re-execute / carry-over sets without committing.
+    Retry {
+        /// Registered (unified) DAG name.
+        dag_name: String,
+        /// The failed DAG run's execution id.
+        run_exec_id: String,
+        /// Node (activity) name to retry from. Repeatable.
+        #[arg(long = "from-node", value_name = "NODE", required = true)]
+        from_node: Vec<String>,
+        /// Operator-supplied recovery reason (recorded in the audit trail).
+        #[arg(long)]
+        reason: String,
+        /// Operator identity for audit. Defaults to the global `--actor`.
+        #[arg(long)]
+        operator_id: Option<String>,
+        /// Preview the plan without committing any write.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1170,7 +1194,7 @@ impl Cli {
             Commands::Workflow { command } => workflow_request(command),
             Commands::History { command } => Ok(history_request(command)),
             Commands::Handoff { command } => handoff_request(command),
-            Commands::Dag { command } => dag_request(command),
+            Commands::Dag { command } => dag_request(command, self.actor.as_deref()),
             Commands::Schedule { command } => schedule_request(command),
             Commands::Dlq { command } => Ok(dead_letter_request(command)),
             Commands::Retention { command } => Ok(retention_request(command)),
@@ -2871,7 +2895,7 @@ fn heartbeat_handoff_request(
     ))
 }
 
-fn dag_request(command: &DagCommand) -> Result<ApiRequest, CliError> {
+fn dag_request(command: &DagCommand, actor: Option<&str>) -> Result<ApiRequest, CliError> {
     match command {
         DagCommand::List => Ok(ApiRequest::get("/dags")),
         DagCommand::Runs { dag_name } => Ok(ApiRequest::get(format!(
@@ -2902,6 +2926,33 @@ fn dag_request(command: &DagCommand) -> Result<ApiRequest, CliError> {
             format!("/dags/{}", path_segment(dag_name)),
             json!({ "paused": false }),
         )),
+        DagCommand::Retry {
+            dag_name,
+            run_exec_id,
+            from_node,
+            reason,
+            operator_id,
+            dry_run,
+        } => {
+            let operator = operator_id
+                .as_deref()
+                .or(actor)
+                .unwrap_or("cli")
+                .to_string();
+            Ok(ApiRequest::post(
+                format!(
+                    "/dags/{}/runs/{}/retry",
+                    path_segment(dag_name),
+                    path_segment(run_exec_id)
+                ),
+                Some(json!({
+                    "from_nodes": from_node,
+                    "reason": reason,
+                    "operator_id": operator,
+                    "dry_run": dry_run,
+                })),
+            ))
+        }
     }
 }
 

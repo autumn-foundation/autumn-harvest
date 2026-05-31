@@ -77,6 +77,15 @@ pub struct WorkflowResetRequest {
     pub operator_id: String,
     #[serde(default)]
     pub signal_reapply: ResetSignalReapplyPolicy,
+    /// When `true`, the source execution may be in a terminal failure state
+    /// (`FAILED`, `CANCELLED`, `TIMED_OUT`) instead of `RUNNING`. This opt-in is
+    /// used by the DAG retry-from-failed-node operator surface (issue #366),
+    /// which forks a *failed* DAG run; a terminal DAG run is the common case
+    /// there. `COMPLETED` and `TERMINATED` sources are always rejected. The
+    /// standalone `/workflows/{id}/reset` endpoint leaves this at its `false`
+    /// default and keeps its strict `RUNNING`-only contract.
+    #[serde(default)]
+    pub allow_terminal_source: bool,
 }
 
 impl WorkflowResetRequest {
@@ -493,7 +502,7 @@ pub async fn preview_workflow_reset(
 ) -> Result<ResetPlan, WorkflowResetError> {
     let request = request.normalized();
     let execution = load_source_execution(conn, exec_id, false).await?;
-    validate_source_execution(exec_id, &execution)?;
+    validate_source_execution(exec_id, &execution, request.allow_terminal_source)?;
     let rows = load_event_rows(conn, exec_id).await?;
     let events = decode_events(&rows)?;
     let mut plan = validate_reset_point(&events, request.reset_to_event_id)?;
@@ -519,7 +528,7 @@ pub async fn reset_workflow_execution(
     conn.transaction::<ResetResult, WorkflowResetError, _>(|conn| {
         async move {
             let source = load_source_execution(conn, exec_id, true).await?;
-            validate_source_execution(exec_id, &source)?;
+            validate_source_execution(exec_id, &source, request.allow_terminal_source)?;
 
             let rows = load_event_rows(conn, exec_id).await?;
             let events = decode_events(&rows)?;
@@ -572,8 +581,22 @@ pub async fn reset_workflow_execution(
 fn validate_source_execution(
     exec_id: ExecutionId,
     execution: &WorkflowExecution,
+    allow_terminal_source: bool,
 ) -> Result<(), WorkflowResetError> {
-    if execution.state != "RUNNING" {
+    if allow_terminal_source {
+        // DAG retry-from-failed-node (issue #366): a failed DAG run is terminal,
+        // so RUNNING is no longer required. A non-failure terminal state
+        // (COMPLETED / TERMINATED) is still rejected — there is nothing to retry.
+        match execution.state.as_str() {
+            "RUNNING" | "FAILED" | "CANCELLED" | "TIMED_OUT" => {}
+            other => {
+                return Err(WorkflowResetError::TerminalSource {
+                    exec_id,
+                    state: other.to_string(),
+                });
+            }
+        }
+    } else if execution.state != "RUNNING" {
         return Err(WorkflowResetError::TerminalSource {
             exec_id,
             state: execution.state.clone(),

@@ -1112,6 +1112,7 @@ async fn workflow_reset_cascades_detached_children() {
             reason: "operator reset".to_string(),
             operator_id: "test-operator".to_string(),
             signal_reapply: autumn_harvest::ResetSignalReapplyPolicy::default(),
+            allow_terminal_source: false,
         },
         None,
     )

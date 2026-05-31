@@ -1167,6 +1167,7 @@ async fn reset_workflow_ui(
         reason,
         operator_id: actor.clone(),
         signal_reapply: ResetSignalReapplyPolicy::default(),
+        allow_terminal_source: false,
     };
 
     let runtime = api_state.runtime().ok();
