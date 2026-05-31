@@ -10,7 +10,7 @@
 //! sources such as the wall clock or a random number generator.
 //!
 //! Run with:
-//!   cargo run --example fanout_batch
+//!   cargo run --example `fanout_batch`
 
 use autumn_harvest::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -39,6 +39,7 @@ pub struct BatchResult {
 /// Mock activity: processes one item. Returns an error for items starting
 /// with "bad_" so the collect-all example can show partial failure.
 #[activity(start_to_close = "10s")]
+#[allow(clippy::missing_errors_doc, clippy::unused_async)]
 pub async fn process_item(_ctx: &ActivityContext, item: String) -> Result<ItemResult, String> {
     if item.starts_with("bad_") {
         return Err(format!("rejected: {item}"));
@@ -51,6 +52,7 @@ pub async fn process_item(_ctx: &ActivityContext, item: String) -> Result<ItemRe
 
 /// Mock "list items" activity that returns a list from some external source.
 #[activity(start_to_close = "5s")]
+#[allow(clippy::missing_errors_doc, clippy::unused_async)]
 pub async fn fetch_items(_ctx: &ActivityContext, source: String) -> Result<BatchInput, String> {
     // Simulates fetching a batch from a queue, database, or message broker.
     println!("[Activity] fetch_items from source: {source}");
@@ -73,6 +75,7 @@ pub async fn fetch_items(_ctx: &ActivityContext, source: String) -> Result<Batch
 ///     .await.map_err(|e| e.to_string())?;
 /// ```
 #[workflow]
+#[allow(clippy::missing_errors_doc)]
 pub async fn fail_fast_batch(
     ctx: &WorkflowContext,
     input: BatchInput,
@@ -91,6 +94,7 @@ pub async fn fail_fast_batch(
 
 /// Collect-all fan-out: process all items; gather per-slot success / failure.
 #[workflow]
+#[allow(clippy::missing_errors_doc)]
 pub async fn collect_all_batch(
     ctx: &WorkflowContext,
     input: BatchInput,
@@ -124,6 +128,7 @@ pub async fn collect_all_batch(
 /// `fetch_items`), never from the wall clock or a random number — this is what
 /// keeps fan-out deterministic across replays.
 #[workflow]
+#[allow(clippy::missing_errors_doc)]
 pub async fn dynamic_fan_out(ctx: &WorkflowContext, source: String) -> Result<BatchResult, String> {
     // Step 1: fetch the list from an external source.
     let batch: BatchInput = ctx
