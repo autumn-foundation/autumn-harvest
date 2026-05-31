@@ -286,14 +286,35 @@ pub async fn replay_dead_letter(
             // execution so the replayed task is subject to the same constraints.
             if let Some(exec_id) = params.workflow_exec_id {
                 use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
-                let row: Option<(Option<String>, String)> = exec_dsl::harvest_workflow_executions
-                    .find(exec_id)
-                    .select((exec_dsl::assigned_build_id, exec_dsl::workflow_name))
-                    .first(conn)
-                    .await
-                    .optional()
-                    .map_err(crate::error::database_error)?;
-                if let Some((build_id, workflow_name)) = row {
+                let row: Option<(Option<String>, String, String)> =
+                    exec_dsl::harvest_workflow_executions
+                        .find(exec_id)
+                        .select((
+                            exec_dsl::assigned_build_id,
+                            exec_dsl::workflow_name,
+                            exec_dsl::state,
+                        ))
+                        .first(conn)
+                        .await
+                        .optional()
+                        .map_err(crate::error::database_error)?;
+                if let Some((build_id, workflow_name, state)) = row {
+                    // Refuse to revive a task into a workflow that has already
+                    // reached a terminal state. Re-running the activity/workflow
+                    // task would execute user code and append events against a
+                    // dead execution, corrupting its history (issue #367). This
+                    // is what makes a poison-pill activity DLQ entry — whose
+                    // owning workflow is failed at quarantine time —
+                    // non-replayable.
+                    if state != "RUNNING" {
+                        return Err(HarvestError::WorkflowNotRunning(
+                            exec_id.to_string().parse().map_err(|_| {
+                                HarvestError::Database(format!(
+                                    "execution id {exec_id} is not a valid ExecutionId"
+                                ))
+                            })?,
+                        ));
+                    }
                     params.required_build_id = build_id;
                     // Concurrency policy lives on WorkflowInfo and governs
                     // workflow-task slots only.  Activity tasks are not subject

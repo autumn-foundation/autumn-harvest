@@ -107,14 +107,24 @@ async fn setup_db() -> (AsyncPgConnection, ContainerAsync<Postgres>) {
 
 /// Insert a RUNNING workflow execution and return its id.
 async fn insert_running_workflow(conn: &mut AsyncPgConnection, workflow_id: &str) -> Uuid {
+    insert_workflow_with_state(conn, workflow_id, "RUNNING").await
+}
+
+/// Insert a workflow execution in the given state and return its id.
+async fn insert_workflow_with_state(
+    conn: &mut AsyncPgConnection,
+    workflow_id: &str,
+    state: &str,
+) -> Uuid {
     let id = Uuid::new_v4();
     diesel::sql_query(
         "INSERT INTO harvest_workflow_executions \
          (id, workflow_name, workflow_id, shard_id, state, input) \
-         VALUES ($1, 'crasher_wf', $2, 0, 'RUNNING', '{}'::jsonb)",
+         VALUES ($1, 'crasher_wf', $2, 0, $3, '{}'::jsonb)",
     )
     .bind::<diesel::sql_types::Uuid, _>(id)
     .bind::<diesel::sql_types::Text, _>(workflow_id)
+    .bind::<diesel::sql_types::Text, _>(state)
     .execute(conn)
     .await
     .expect("insert workflow execution");
@@ -366,4 +376,76 @@ async fn threshold_zero_never_quarantines() {
     assert_eq!(state, "PENDING");
     assert_eq!(strikes, 100);
     assert_eq!(workflow_state(&mut conn, exec_id).await, "RUNNING");
+}
+
+#[tokio::test]
+async fn clean_reschedule_resets_crash_streak() {
+    let (mut conn, _container) = setup_db().await;
+    let exec_id = insert_running_workflow(&mut conn, "wf-reset").await;
+    // A task that accrued strikes from prior crashes.
+    let task_id = insert_running_task(&mut conn, Some(exec_id), "some-worker", 2).await;
+
+    // A clean continuation (suspension / retryable-error reschedule) must reset
+    // the streak so the threshold measures *consecutive* crashes.
+    autumn_harvest::queue::reschedule_task(&mut conn, task_id, chrono::Utc::now())
+        .await
+        .expect("reschedule");
+
+    let (state, strikes, _worker) = task_state(&mut conn, task_id).await;
+    assert_eq!(state, "PENDING");
+    assert_eq!(strikes, 0, "clean progress resets the crash streak");
+}
+
+#[tokio::test]
+async fn replay_into_terminal_workflow_is_rejected() {
+    use autumn_harvest::dlq::{NewDeadLetterEntry, dead_letter, replay_dead_letter};
+    use autumn_harvest::error::HarvestError;
+
+    let (mut conn, _container) = setup_db().await;
+    // Owning workflow is already terminal (as it is right after poison-pill
+    // quarantine fails it).
+    let exec_id = insert_workflow_with_state(&mut conn, "wf-terminal", "FAILED").await;
+    let dlq_id = dead_letter(
+        &mut conn,
+        &NewDeadLetterEntry {
+            original_task_id: Uuid::new_v4(),
+            queue_name: "default".to_string(),
+            task_type: "ACTIVITY".to_string(),
+            workflow_exec_id: Some(exec_id),
+            activity_name: Some("charge_card".to_string()),
+            input: serde_json::json!({}),
+            error: "poison".to_string(),
+            attempts: 3,
+        },
+    )
+    .await
+    .expect("dlq insert");
+
+    let result = replay_dead_letter(&mut conn, dlq_id, None).await;
+    assert!(
+        matches!(result, Err(HarvestError::WorkflowNotRunning(_))),
+        "replay into a terminal workflow must be rejected, got {result:?}"
+    );
+
+    // The DLQ row is left intact — nothing was enqueued or deleted.
+    let remaining: i64 =
+        diesel::sql_query("SELECT COUNT(*)::bigint AS count FROM harvest_dead_letters")
+            .get_result::<CountRow>(&mut conn)
+            .await
+            .expect("count dlq")
+            .count;
+    assert_eq!(remaining, 1, "rejected replay must not delete the DLQ row");
+    let enqueued: i64 =
+        diesel::sql_query("SELECT COUNT(*)::bigint AS count FROM harvest_task_queue")
+            .get_result::<CountRow>(&mut conn)
+            .await
+            .expect("count tasks")
+            .count;
+    assert_eq!(enqueued, 0, "rejected replay must not enqueue a task");
+}
+
+#[derive(QueryableByName)]
+struct CountRow {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    count: i64,
 }
