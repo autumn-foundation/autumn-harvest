@@ -95,6 +95,26 @@ valid boundary and a hint to wait for it to settle or cancel the run first.
 
 ---
 
+## Limitation: build-id routing and topology changes
+
+The retry resolves the fork point and the re-execute / carry-over node sets from
+the **currently registered** DAG topology, but the forked run inherits the
+**source run's pinned build** (`assigned_build_id`, per the #148 reset and the
+safe-deploy contract). That is consistent with reset's "resume under current
+code" model and is correct whenever the topology is unchanged.
+
+If you use **worker build-id routing** (Phase 3.7 — opt-in, off by default) *and*
+the DAG topology changed since the source run *and* the old and new builds are
+not compatible, the worker that replays the fork can execute a different DAG
+definition than the one used to pick the cut. The retry could then re-run an
+already-successful node or fork at the wrong boundary.
+
+In that situation: dry-run first and confirm the node sets, prefer retrying on a
+build whose topology matches the source run, or start a fresh run. A
+build-compatibility gate is tracked as follow-up work; v1 does not enforce it.
+
+---
+
 ## Audit trail
 
 `reason` and `operator_id` are **required**. They are recorded in the

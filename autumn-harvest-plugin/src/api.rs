@@ -5963,6 +5963,14 @@ async fn retry_dag_run(
     }
 
     // Walk the recorded history and resolve the node request to a reset point.
+    //
+    // NOTE (v1 limitation, issue #366): this resolves the cut and node sets from
+    // the *currently registered* `dag.definition`, while the #148 fork preserves
+    // the source run's pinned `assigned_build_id` (reset.rs). If worker build-id
+    // routing is in use (Phase 3.7, opt-in) AND the DAG topology changed across
+    // an incompatible deploy, the worker that replays the fork may run a
+    // different definition than the one used to pick the cut. v1 does not gate on
+    // build compatibility; see docs/runbooks/dag-retry-from-failed-node.md.
     let history = match store::load_history(&mut conn, exec_id).await {
         Ok(h) => h,
         Err(e) => return map_error(e).into_response(),
