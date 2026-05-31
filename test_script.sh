@@ -1,0 +1,1 @@
+sed -i 's/history_events.extend(new_events.clone());/\/\/ Use `.extend(new_events.iter().cloned())` instead of `.extend(new_events.clone())`\n                \/\/ to avoid allocating an intermediate `Vec` when appending new events, saving a heap allocation.\n                history_events.extend(new_events.iter().cloned());/' ./autumn-harvest/src/worker.rs

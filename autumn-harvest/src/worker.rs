@@ -4788,7 +4788,9 @@ async fn process_workflow_task(
                             .await;
                     }
                 };
-                history_events.extend(new_events.clone());
+                // Use `.extend(new_events.iter().cloned())` instead of `.extend(new_events.clone())`
+                // to avoid allocating an intermediate `Vec` when appending new events, saving a heap allocation.
+                history_events.extend(new_events.iter().cloned());
                 let current_history_event_count =
                     u64::try_from(history_events.len()).unwrap_or(u64::MAX);
                 if let Some(cap) = registry.history_policy().event_hard_cap()

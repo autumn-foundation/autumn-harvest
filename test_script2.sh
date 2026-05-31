@@ -1,0 +1,1 @@
+sed -i 's/\/\/ Use \`.extend(new_events.iter().cloned())\` instead of \`.extend(new_events.clone())\`/\/\/ We use \`.extend(new_events.iter().cloned())\` instead of \`.extend(new_events.clone())\`/' ./autumn-harvest/src/worker.rs
