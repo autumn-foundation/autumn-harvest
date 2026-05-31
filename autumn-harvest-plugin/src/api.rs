@@ -5868,6 +5868,17 @@ async fn retry_dag_run(
             .into_response();
     }
 
+    // `operator_id` is the mandatory, authoritative "who" for this endpoint, so
+    // it is the audit actor unless an explicit `X-Harvest-Actor` was supplied
+    // (i.e. the actor extractor returned something other than the anonymous
+    // default). This keeps committed retries attributable instead of recording
+    // `anonymous` when the runbook curl / CLI only sets `operator_id`.
+    let actor = if actor == "anonymous" {
+        request.operator_id.trim().to_string()
+    } else {
+        actor
+    };
+
     let runtime = match api_state.runtime() {
         Ok(rt) => rt,
         Err(e) => return map_error(e).into_response(),
