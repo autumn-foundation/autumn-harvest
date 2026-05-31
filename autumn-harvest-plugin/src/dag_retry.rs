@@ -28,7 +28,7 @@
 //! the whole level, re-executing the failed node and its same-level siblings
 //! together. Upstream nodes are always carried over.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use autumn_harvest::dag::DagDefinition;
 use autumn_harvest::event::WorkflowEvent;
@@ -79,12 +79,13 @@ pub enum DagRetryResolveError {
         /// The full sorted list of declared node names, for the error body.
         declared: Vec<String>,
     },
-    /// One or more requested node names map to more than one task in the DAG
-    /// (the DAG reuses the same activity for multiple nodes). v1 cannot tell
-    /// which occurrence the operator means, so the retry is rejected rather than
-    /// silently targeting every occurrence.
+    /// The DAG reuses the same activity name across multiple nodes. Because the
+    /// retry resolver maps node name -> task -> events purely by name, any
+    /// duplicate name makes the reset-point and node enumeration ambiguous, so
+    /// retry-from-node is rejected for the whole DAG in v1 (not just when the
+    /// duplicated node is named directly).
     AmbiguousNodes {
-        /// The requested node names that resolve to multiple tasks.
+        /// The activity names that are reused across more than one node.
         nodes: Vec<String>,
     },
     /// One or more requested nodes were never attempted on the source run.
@@ -323,25 +324,26 @@ pub fn resolve_retry_plan(
         return Err(DagRetryResolveError::UnknownNodes { unknown, declared });
     }
 
-    // (a.1) Reject ambiguous requests: a node name that maps to more than one
-    // task (the DAG reuses the activity) cannot be safely targeted in v1.
-    let ambiguous: Vec<String> = {
-        let mut seen = BTreeSet::new();
-        from_nodes
-            .iter()
-            .filter(|n| {
-                def.tasks()
-                    .iter()
-                    .filter(|t| &t.activity_name == *n)
-                    .count()
-                    > 1
-            })
-            .filter(|n| seen.insert((*n).clone()))
-            .cloned()
+    // (a.1) Reject DAGs that reuse an activity name across nodes. The retry
+    // resolver maps node name -> task -> events purely by activity name, so any
+    // duplicate name — whether named directly in `from_nodes` or reached through
+    // level/downstream expansion — makes `earliest_schedule_index` and the
+    // carried/re-execute enumeration ambiguous (it could match an unrelated
+    // earlier occurrence and move the cut too far back). v1 requires unique node
+    // names for retry; reject the whole DAG otherwise.
+    let duplicated: Vec<String> = {
+        let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+        for task in def.tasks() {
+            *counts.entry(task.activity_name.as_str()).or_insert(0) += 1;
+        }
+        counts
+            .into_iter()
+            .filter(|(_, c)| *c > 1)
+            .map(|(name, _)| name.to_string())
             .collect()
     };
-    if !ambiguous.is_empty() {
-        return Err(DagRetryResolveError::AmbiguousNodes { nodes: ambiguous });
+    if !duplicated.is_empty() {
+        return Err(DagRetryResolveError::AmbiguousNodes { nodes: duplicated });
     }
 
     // (b) Every requested node must have been attempted, and (c) be in a
@@ -454,6 +456,16 @@ mod tests {
         let nb = builder.activity(b).upstream(&na);
         let _nb2 = builder.activity(b).upstream(&nb);
         builder.build().expect("duplicate-name dag builds")
+    }
+
+    fn duplicate_name_elsewhere_dag() -> DagDefinition {
+        // a -> c (the unique node we retry) and a -> b -> b (b reused elsewhere)
+        let mut builder = DagBuilder::new();
+        let na = builder.activity(a);
+        let _nc = builder.activity(c).upstream(&na);
+        let nb = builder.activity(b).upstream(&na);
+        let _nb2 = builder.activity(b).upstream(&nb);
+        builder.build().expect("dag builds")
     }
 
     fn scheduled(name: &str, id: ActivityExecId) -> WorkflowEvent {
@@ -680,6 +692,29 @@ mod tests {
             failed(ib),
         ];
         let err = resolve_retry_plan(&def, &events, &["b".to_string()]).unwrap_err();
+        assert_eq!(
+            err,
+            DagRetryResolveError::AmbiguousNodes {
+                nodes: vec!["b".to_string()]
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_rejects_dag_with_duplicate_name_even_for_unique_target() {
+        // Codex P2: retrying a *unique* failed node (c) must still be rejected
+        // when the DAG reuses an activity name elsewhere (b), because name-based
+        // matching could move the cut to the unrelated occurrence.
+        let def = duplicate_name_elsewhere_dag();
+        let (ia, ic) = (ActivityExecId::new(), ActivityExecId::new());
+        let events = vec![
+            started(),
+            scheduled("a", ia),
+            completed(ia),
+            scheduled("c", ic),
+            failed(ic),
+        ];
+        let err = resolve_retry_plan(&def, &events, &["c".to_string()]).unwrap_err();
         assert_eq!(
             err,
             DagRetryResolveError::AmbiguousNodes {
