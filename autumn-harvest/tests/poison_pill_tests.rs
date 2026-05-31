@@ -444,6 +444,57 @@ async fn replay_into_terminal_workflow_is_rejected() {
     assert_eq!(enqueued, 0, "rejected replay must not enqueue a task");
 }
 
+#[tokio::test]
+async fn poison_pill_counts_toward_schedule_auto_pause() {
+    let (mut conn, _container) = setup_db().await;
+
+    // A schedule with an auto-pause failure limit.
+    let schedule_id = Uuid::new_v4();
+    diesel::sql_query(
+        "INSERT INTO harvest_schedules \
+         (id, workflow_name, schedule_expr, timezone, catchup, max_active_runs, is_paused, \
+          next_run_at, jitter_secs, overlap_policy, buffered_runs, buffer_all_max, skip_policy, \
+          consecutive_failure_limit) \
+         VALUES ($1, 'crasher_wf', 'interval:60', 'UTC', false, 10, false, \
+                 NOW(), 0, 'skip', '[]'::jsonb, 100, 'skip', 5)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(schedule_id)
+    .execute(&mut conn)
+    .await
+    .expect("insert schedule");
+
+    // A schedule-triggered execution: workflow_id encodes the schedule UUID.
+    let workflow_id = format!("sched:{schedule_id}:crasher_wf:0");
+    let exec_id = insert_running_workflow(&mut conn, &workflow_id).await;
+    // crash_strikes = 2 → next reclaim makes 3 == threshold → quarantine.
+    let _task_id = insert_running_task(&mut conn, Some(exec_id), "dead-worker-x", 2).await;
+    let metrics = RecordingMetrics::default();
+
+    let summary = reclaim_orphaned_tasks(&mut conn, 3, 10, &metrics)
+        .await
+        .expect("reclaim");
+    assert_eq!(summary.quarantined, 1);
+
+    // The terminal poison-pill failure was counted toward the schedule's
+    // consecutive-failure tally (issue #360 interaction).
+    let row: FailRow =
+        diesel::sql_query("SELECT consecutive_failure_count FROM harvest_schedules WHERE id = $1")
+            .bind::<diesel::sql_types::Uuid, _>(schedule_id)
+            .get_result(&mut conn)
+            .await
+            .expect("load schedule");
+    assert_eq!(
+        row.consecutive_failure_count, 1,
+        "poison-pill workflow failure must count toward schedule auto-pause"
+    );
+}
+
+#[derive(QueryableByName)]
+struct FailRow {
+    #[diesel(sql_type = diesel::sql_types::Integer)]
+    consecutive_failure_count: i32,
+}
+
 #[derive(QueryableByName)]
 struct CountRow {
     #[diesel(sql_type = diesel::sql_types::BigInt)]

@@ -223,32 +223,38 @@ mod scanner {
     /// `WorkflowFailed` event path (issue #367 AC4 — no new event variant).
     ///
     /// Only transitions executions still in `RUNNING`; a workflow that already
-    /// reached a terminal state is left untouched.
+    /// reached a terminal state is left untouched. Returns the
+    /// `(workflow_id, workflow_name)` of the execution when (and only when) it
+    /// actually transitioned `RUNNING` → `FAILED`, so the caller can count the
+    /// failure toward schedule auto-pause once the transaction commits.
     async fn fail_owning_workflow(
         conn: &mut AsyncPgConnection,
         exec_id: ExecutionId,
         error: &str,
-    ) -> HarvestResult<()> {
+    ) -> HarvestResult<Option<(String, String)>> {
         use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
 
-        let current: Option<(String, Option<uuid::Uuid>, Option<String>)> =
-            exec_dsl::harvest_workflow_executions
-                .find(exec_id.as_uuid())
-                .for_update()
-                .select((
-                    exec_dsl::state,
-                    exec_dsl::parent_id,
-                    exec_dsl::parent_close_policy,
-                ))
-                .first(conn)
-                .await
-                .optional()
-                .map_err(crate::error::database_error)?;
-        let Some((state, parent_id, parent_close_policy)) = current else {
-            return Ok(());
+        type ExecRow = (String, Option<uuid::Uuid>, Option<String>, String, String);
+        let current: Option<ExecRow> = exec_dsl::harvest_workflow_executions
+            .find(exec_id.as_uuid())
+            .for_update()
+            .select((
+                exec_dsl::state,
+                exec_dsl::parent_id,
+                exec_dsl::parent_close_policy,
+                exec_dsl::workflow_id,
+                exec_dsl::workflow_name,
+            ))
+            .first(conn)
+            .await
+            .optional()
+            .map_err(crate::error::database_error)?;
+        let Some((state, parent_id, parent_close_policy, workflow_id, workflow_name)) = current
+        else {
+            return Ok(None);
         };
         if state != "RUNNING" {
-            return Ok(());
+            return Ok(None);
         }
 
         let history = crate::store::load_history(conn, exec_id).await?;
@@ -323,7 +329,7 @@ mod scanner {
             .await?;
             crate::queue::wake_workflow_task(conn, parent_exec_id).await?;
         }
-        Ok(())
+        Ok(Some((workflow_id, workflow_name)))
     }
 
     /// Quarantine an orphaned poison-pill task: move it to the dead-letter
@@ -363,11 +369,14 @@ mod scanner {
         };
         let workflow_exec_id = task.workflow_exec_id;
 
-        let acted = conn
-            .transaction::<bool, HarvestError, _>(|conn| {
+        // The transaction returns whether the row was acted on, plus the owning
+        // workflow's (id, name) when it was actually failed RUNNING → FAILED so
+        // the schedule failure counter can be bumped after commit.
+        let (acted, failed_workflow): (bool, Option<(String, String)>) = conn
+            .transaction::<(bool, Option<(String, String)>), HarvestError, _>(|conn| {
                 async move {
                     let Some(worker_id) = worker else {
-                        return Ok(false);
+                        return Ok((false, None));
                     };
                     let current: Option<(String, Option<String>, i32)> = dsl::harvest_task_queue
                         .find(task_id)
@@ -382,10 +391,10 @@ mod scanner {
                             if state == "RUNNING"
                                 && wid == worker_id
                                 && strikes == prior_strikes => {}
-                        _ => return Ok(false),
+                        _ => return Ok((false, None)),
                     }
                     if !worker_still_dead(conn, &worker_id, worker_stale_secs).await? {
-                        return Ok(false);
+                        return Ok((false, None));
                     }
 
                     dead_letter(conn, &entry).await?;
@@ -402,11 +411,14 @@ mod scanner {
                         .await
                         .map_err(crate::error::database_error)?;
 
-                    if let Some(exec_uuid) = workflow_exec_id {
-                        fail_owning_workflow(conn, execution_id_from_uuid(exec_uuid), &error)
-                            .await?;
-                    }
-                    Ok(true)
+                    let failed_workflow = match workflow_exec_id {
+                        Some(exec_uuid) => {
+                            fail_owning_workflow(conn, execution_id_from_uuid(exec_uuid), &error)
+                                .await?
+                        }
+                        None => None,
+                    };
+                    Ok((true, failed_workflow))
                 }
                 .scope_boxed()
             })
@@ -414,6 +426,19 @@ mod scanner {
 
         if acted {
             metrics.record_task_quarantined(&task.queue_name, QUARANTINE_REASON);
+            // Best-effort: count the poison-pill workflow failure toward the
+            // schedule auto-pause threshold (issue #360), mirroring the normal
+            // failure and timeout paths. Runs after the transaction commits so
+            // a counter error can never abort the quarantine.
+            if let Some((workflow_id, workflow_name)) = failed_workflow {
+                crate::scheduler::maybe_increment_schedule_failure_counter(
+                    conn,
+                    &workflow_id,
+                    &workflow_name,
+                    metrics,
+                )
+                .await;
+            }
         }
         Ok(acted)
     }
