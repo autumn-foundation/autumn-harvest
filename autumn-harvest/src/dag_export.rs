@@ -91,6 +91,73 @@ pub fn export_dot(dag: &DagDefinition) -> Result<String, std::fmt::Error> {
     Ok(out)
 }
 
+/// Exports a DAG execution profile to a Mermaid.js Gantt chart.
+///
+/// # Examples
+///
+/// ```rust
+/// # #[cfg(feature = "testing")]
+/// # {
+/// use autumn_harvest::dag::DagBuilder;
+/// use autumn_harvest::dag_profiler::DagProfiler;
+/// use autumn_harvest::dag_export::export_mermaid_gantt;
+/// use std::time::Duration;
+///
+/// fn my_activity() {}
+/// fn my_other_activity() {}
+///
+/// let mut builder = DagBuilder::new();
+/// let a = builder.activity(my_activity);
+/// let b = builder.activity(my_other_activity).upstream(&a);
+/// let dag = builder.build().unwrap();
+///
+/// let profiler = DagProfiler::new(dag).mock_duration("my_activity", Duration::from_secs(2));
+/// let profile = profiler.profile();
+///
+/// let gantt = export_mermaid_gantt(&profile).unwrap();
+/// assert!(gantt.contains("gantt"));
+/// assert!(gantt.contains("dateFormat x"));
+/// # }
+/// ```
+///
+/// # Errors
+/// Returns `std::fmt::Error` if string formatting fails.
+#[cfg(feature = "testing")]
+pub fn export_mermaid_gantt(
+    profile: &crate::dag_profiler::DagProfile,
+) -> Result<String, std::fmt::Error> {
+    let mut out = String::new();
+    writeln!(out, "gantt")?;
+    writeln!(out, "    title DAG Execution Profile")?;
+    writeln!(out, "    dateFormat x")?;
+    writeln!(out, "    axisFormat %M:%S")?;
+    writeln!(out, "    section Tasks")?;
+
+    let mut start_times = std::collections::HashMap::new();
+
+    for event in &profile.timeline {
+        match &event.kind {
+            crate::dag_profiler::ProfilerEventKind::TaskStarted(id, name) => {
+                start_times.insert(*id, (name.clone(), event.time));
+            }
+            crate::dag_profiler::ProfilerEventKind::TaskCompleted(id, _) => {
+                if let Some((name, start_time)) = start_times.remove(id) {
+                    writeln!(
+                        out,
+                        "    t{} ({}) : {}, {}",
+                        id,
+                        name,
+                        start_time.as_millis(),
+                        event.time.as_millis()
+                    )?;
+                }
+            }
+        }
+    }
+
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
