@@ -13,8 +13,9 @@ use autumn_web::session::Session;
 use axum::Extension;
 use axum::Json;
 use axum::Router;
-use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
+
+pub const MAX_API_PAYLOAD_BYTES: usize = 10 * 1024 * 1024; // 10MB
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::IntoResponse;
@@ -4684,9 +4685,17 @@ async fn batch_start_workflows(
     Extension(api_state): Extension<HarvestApiState>,
     maybe_session: Option<Extension<Session>>,
     headers: axum::http::HeaderMap,
-    body_bytes: Bytes,
+    body: axum::body::Body,
 ) -> axum::response::Response {
     use axum::response::IntoResponse as _;
+
+    #[allow(clippy::cast_possible_truncation)]
+    let body_bytes = match axum::body::to_bytes(body, MAX_API_PAYLOAD_BYTES).await {
+        Ok(b) => b,
+        Err(e) => {
+            return AutumnError::bad_request_msg(format!("payload error: {e}")).into_response();
+        }
+    };
 
     if !has_harvest_admin_access(&api_state, maybe_session.map(|Extension(s)| s)).await {
         return AutumnError::unauthorized_msg("authentication required").into_response();
@@ -6343,15 +6352,20 @@ struct QueryWorkflowResponse {
 async fn query_workflow_post(
     Extension(api_state): Extension<HarvestApiState>,
     Path((id, query_name)): Path<(String, String)>,
-    body: Bytes,
+    body: axum::body::Body,
 ) -> Result<Json<QueryWorkflowResponse>, AutumnError> {
+    #[allow(clippy::cast_possible_truncation)]
+    let body_bytes = axum::body::to_bytes(body, MAX_API_PAYLOAD_BYTES)
+        .await
+        .map_err(|e| AutumnError::bad_request_msg(format!("payload error: {e}")))?;
+
     let exec_id = parse_execution_id(&id)?;
     let ctx = hydrate_ctx_for_query(&api_state, exec_id).await?;
     let start = Instant::now(); // measure handler invocation latency, not hydration cost
-    let args: Value = if body.is_empty() {
+    let args: Value = if body_bytes.is_empty() {
         Value::Null
     } else {
-        serde_json::from_slice::<QueryWorkflowRequest>(&body)
+        serde_json::from_slice::<QueryWorkflowRequest>(&body_bytes)
             .map(|r| r.args)
             .map_err(|e| AutumnError::bad_request_msg(format!("invalid JSON body: {e}")))?
     };
@@ -9434,14 +9448,23 @@ fn url_encode_for_redirect(input: &str) -> String {
     out
 }
 
+#[allow(clippy::too_many_lines)]
 async fn bulk_replay_dead_letters_handler(
     Extension(api_state): Extension<HarvestApiState>,
     headers: axum::http::HeaderMap,
-    body: axum::body::Bytes,
+    body: axum::body::Body,
 ) -> axum::response::Response {
     use axum::response::IntoResponse as _;
 
-    let request = match parse_bulk_dlq_request(&headers, &body) {
+    #[allow(clippy::cast_possible_truncation)]
+    let body_bytes = match axum::body::to_bytes(body, MAX_API_PAYLOAD_BYTES).await {
+        Ok(b) => b,
+        Err(e) => {
+            return AutumnError::bad_request_msg(format!("payload error: {e}")).into_response();
+        }
+    };
+
+    let request = match parse_bulk_dlq_request(&headers, &body_bytes) {
         Ok(request) => request,
         Err(error) => return error.into_response(),
     };
@@ -9542,14 +9565,23 @@ async fn bulk_replay_dead_letters_handler(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn bulk_discard_dead_letters_handler(
     Extension(api_state): Extension<HarvestApiState>,
     headers: axum::http::HeaderMap,
-    body: axum::body::Bytes,
+    body: axum::body::Body,
 ) -> axum::response::Response {
     use axum::response::IntoResponse as _;
 
-    let request = match parse_bulk_dlq_request(&headers, &body) {
+    #[allow(clippy::cast_possible_truncation)]
+    let body_bytes = match axum::body::to_bytes(body, MAX_API_PAYLOAD_BYTES).await {
+        Ok(b) => b,
+        Err(e) => {
+            return AutumnError::bad_request_msg(format!("payload error: {e}")).into_response();
+        }
+    };
+
+    let request = match parse_bulk_dlq_request(&headers, &body_bytes) {
         Ok(request) => request,
         Err(error) => return error.into_response(),
     };
