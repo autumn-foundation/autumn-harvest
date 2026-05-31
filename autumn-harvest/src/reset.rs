@@ -81,10 +81,15 @@ pub struct WorkflowResetRequest {
     /// (`FAILED`, `CANCELLED`, `TIMED_OUT`) instead of `RUNNING`. This opt-in is
     /// used by the DAG retry-from-failed-node operator surface (issue #366),
     /// which forks a *failed* DAG run; a terminal DAG run is the common case
-    /// there. `COMPLETED` and `TERMINATED` sources are always rejected. The
-    /// standalone `/workflows/{id}/reset` endpoint leaves this at its `false`
-    /// default and keeps its strict `RUNNING`-only contract.
-    #[serde(default)]
+    /// there. `COMPLETED` and `TERMINATED` sources are always rejected.
+    ///
+    /// **Not settable from the wire.** This field is `#[serde(skip)]` so the
+    /// public `POST /workflows/{id}/reset` endpoint — which deserializes this
+    /// struct directly — can never enable it; the request body always
+    /// deserializes it to `false`, preserving that endpoint's strict
+    /// `RUNNING`-only contract. Only in-process callers (the DAG retry handler)
+    /// set it via struct construction.
+    #[serde(skip)]
     pub allow_terminal_source: bool,
 }
 
@@ -1206,6 +1211,25 @@ mod tests {
         assert!(
             err.message
                 .contains("continue-as-new histories cannot be reset")
+        );
+    }
+
+    #[test]
+    fn allow_terminal_source_is_not_settable_from_the_wire() {
+        // The public POST /workflows/{id}/reset endpoint deserializes this
+        // struct directly; a malicious/mistaken body must not be able to flip
+        // the terminal-source escape hatch on.
+        let body = serde_json::json!({
+            "reset_to_event_id": 1,
+            "reason": "x",
+            "operator_id": "y",
+            "allow_terminal_source": true
+        });
+        let request: super::WorkflowResetRequest =
+            serde_json::from_value(body).expect("body deserializes");
+        assert!(
+            !request.allow_terminal_source,
+            "allow_terminal_source must remain false when set via the request body"
         );
     }
 }

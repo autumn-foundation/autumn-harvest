@@ -79,6 +79,14 @@ pub enum DagRetryResolveError {
         /// The full sorted list of declared node names, for the error body.
         declared: Vec<String>,
     },
+    /// One or more requested node names map to more than one task in the DAG
+    /// (the DAG reuses the same activity for multiple nodes). v1 cannot tell
+    /// which occurrence the operator means, so the retry is rejected rather than
+    /// silently targeting every occurrence.
+    AmbiguousNodes {
+        /// The requested node names that resolve to multiple tasks.
+        nodes: Vec<String>,
+    },
     /// One or more requested nodes were never attempted on the source run.
     NotAttempted {
         /// The requested node names with no `ActivityScheduled` event.
@@ -266,6 +274,27 @@ pub fn resolve_retry_plan(
         return Err(DagRetryResolveError::UnknownNodes { unknown, declared });
     }
 
+    // (a.1) Reject ambiguous requests: a node name that maps to more than one
+    // task (the DAG reuses the activity) cannot be safely targeted in v1.
+    let ambiguous: Vec<String> = {
+        let mut seen = BTreeSet::new();
+        from_nodes
+            .iter()
+            .filter(|n| {
+                def.tasks()
+                    .iter()
+                    .filter(|t| &t.activity_name == *n)
+                    .count()
+                    > 1
+            })
+            .filter(|n| seen.insert((*n).clone()))
+            .cloned()
+            .collect()
+    };
+    if !ambiguous.is_empty() {
+        return Err(DagRetryResolveError::AmbiguousNodes { nodes: ambiguous });
+    }
+
     // (b) Every requested node must have been attempted, and (c) be in a
     // non-Succeeded state on the source run.
     let mut not_attempted = Vec::new();
@@ -364,6 +393,15 @@ mod tests {
             .upstream(&nc)
             .upstream(&nd);
         builder.build().expect("fanout dag builds")
+    }
+
+    fn duplicate_name_dag() -> DagDefinition {
+        // a -> b -> b  (activity `b` reused for two distinct nodes)
+        let mut builder = DagBuilder::new();
+        let na = builder.activity(a);
+        let nb = builder.activity(b).upstream(&na);
+        let _nb2 = builder.activity(b).upstream(&nb);
+        builder.build().expect("duplicate-name dag builds")
     }
 
     fn scheduled(name: &str, id: ActivityExecId) -> WorkflowEvent {
@@ -577,6 +615,26 @@ mod tests {
     }
 
     // ---- resolve: validation errors --------------------------------------
+
+    #[test]
+    fn resolve_ambiguous_duplicate_node_name_is_rejected() {
+        let def = duplicate_name_dag();
+        let (ia, ib) = (ActivityExecId::new(), ActivityExecId::new());
+        let events = vec![
+            started(),
+            scheduled("a", ia),
+            completed(ia),
+            scheduled("b", ib),
+            failed(ib),
+        ];
+        let err = resolve_retry_plan(&def, &events, &["b".to_string()]).unwrap_err();
+        assert_eq!(
+            err,
+            DagRetryResolveError::AmbiguousNodes {
+                nodes: vec!["b".to_string()]
+            }
+        );
+    }
 
     #[test]
     fn resolve_empty_from_nodes_is_rejected() {

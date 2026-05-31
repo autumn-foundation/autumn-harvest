@@ -5779,6 +5779,14 @@ fn dag_retry_resolve_error_response(
             unknown_nodes: Some(unknown),
             declared_nodes: Some(declared),
         },
+        E::AmbiguousNodes { nodes } => DagRetryNodeErrorResponse {
+            message: format!(
+                "node name(s) {nodes:?} map to more than one task (the DAG reuses the activity); \
+                 retry-from-node cannot disambiguate them in v1"
+            ),
+            unknown_nodes: None,
+            declared_nodes: None,
+        },
         E::NotAttempted { nodes } => DagRetryNodeErrorResponse {
             message: format!(
                 "node(s) {nodes:?} were never attempted on this run; nothing to retry"
