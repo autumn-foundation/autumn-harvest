@@ -1,0 +1,321 @@
+#![cfg(feature = "db")]
+//! Poison-pill task quarantine integration tests — issue #367.
+//!
+//! A poison-pill task crashes the worker process instead of returning a clean
+//! `Err`, leaving its row stuck in `RUNNING`. These tests exercise the
+//! worker-liveness-driven orphan-reclaim scanner end-to-end against a real
+//! Postgres container:
+//!
+//! - An orphan under the threshold is re-queued with an incremented strike.
+//! - An orphan that reaches the threshold is quarantined to the DLQ, its queue
+//!   row is FAILED, its owning workflow is failed terminally, and the
+//!   `harvest.task.quarantined` metric is emitted.
+//! - A task whose worker is still heartbeating is never reclaimed.
+//! - A threshold of 0 disables quarantine (legacy requeue-forever behaviour).
+
+use std::sync::Mutex;
+
+use autumn_harvest::dlq::DeadLetterReason;
+use autumn_harvest::poison_pill::{QUARANTINE_REASON, reclaim_orphaned_tasks};
+use autumn_harvest::telemetry::MetricsRecorder;
+use diesel::prelude::*;
+use diesel_async::AsyncConnection;
+use diesel_async::AsyncPgConnection;
+use diesel_async::RunQueryDsl;
+use diesel_async::SimpleAsyncConnection;
+use testcontainers::ContainerAsync;
+use testcontainers_modules::postgres::Postgres;
+use testcontainers_modules::testcontainers::runners::AsyncRunner;
+use uuid::Uuid;
+
+const INIT_SQL: &str = concat!(
+    include_str!("../migrations/20260409000000_harvest_initial/up.sql"),
+    "\n",
+    include_str!("../migrations/20260424000001_harvest_trace_context/up.sql"),
+    "\n",
+    include_str!("../migrations/20260505000000_harvest_heartbeat_details/up.sql"),
+    "\n",
+    include_str!("../migrations/20260427000000_harvest_continue_as_new/up.sql"),
+    "\n",
+    include_str!("../migrations/20260429000000_harvest_concurrency_key/up.sql"),
+    "\n",
+    include_str!("../migrations/20260430000000_harvest_workflow_schedules/up.sql"),
+    "\n",
+    include_str!("../migrations/20260430000001_harvest_external_tasks/up.sql"),
+    "\n",
+    include_str!("../migrations/20260508000000_harvest_external_task_updated_at/up.sql"),
+    "\n",
+    include_str!("../migrations/20260506000000_harvest_audit_log/up.sql"),
+    "\n",
+    include_str!("../migrations/20260501000000_harvest_workers/up.sql"),
+    "\n",
+    include_str!("../migrations/20260508010000_harvest_workers_drain_deadline/up.sql"),
+    "\n",
+    include_str!("../migrations/20260509000000_harvest_build_routing/up.sql"),
+    "\n",
+    include_str!("../migrations/20260513000000_harvest_schedule_pause_metadata/up.sql"),
+    "\n",
+    include_str!("../migrations/20260514020000_harvest_task_activity_id/up.sql"),
+    "\n",
+    include_str!("../migrations/20260518000000_harvest_signal_idempotency/up.sql"),
+    "\n",
+    include_str!("../migrations/20260517000000_harvest_schedule_jitter/up.sql"),
+    "\n",
+    include_str!("../migrations/20260517000001_harvest_schedule_overlap_policy/up.sql"),
+    "\n",
+    include_str!("../migrations/20260518000001_harvest_workflow_execution_timeout/up.sql"),
+    "\n",
+    include_str!("../migrations/20260519000000_harvest_calendar_awareness/up.sql"),
+    "\n",
+    include_str!("../migrations/20260522000000_harvest_schedule_decisions/up.sql"),
+    "\n",
+    include_str!("../migrations/20260522000001_harvest_rate_limiting/up.sql"),
+    "\n",
+    include_str!("../migrations/20260526000001_harvest_parent_close_policy/up.sql"),
+    "\n",
+    include_str!("../migrations/20260530000000_harvest_schedule_ha_claim/up.sql"),
+    "\n",
+    include_str!("../migrations/20260601000000_harvest_schedule_auto_pause/up.sql"),
+    "\n",
+    // Poison-pill crash_strikes column (issue #367)
+    include_str!("../migrations/20260601000001_harvest_poison_pill_strikes/up.sql"),
+);
+
+#[derive(Debug, Default)]
+struct RecordingMetrics {
+    quarantined: Mutex<Vec<(String, String)>>,
+}
+
+impl MetricsRecorder for RecordingMetrics {
+    fn record_task_quarantined(&self, queue: &str, reason: &str) {
+        self.quarantined
+            .lock()
+            .unwrap()
+            .push((queue.to_owned(), reason.to_owned()));
+    }
+}
+
+async fn setup_db() -> (AsyncPgConnection, ContainerAsync<Postgres>) {
+    let container = Postgres::default().start().await.expect("postgres start");
+    let host = container.get_host().await.expect("host");
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let url = format!("postgresql://postgres:postgres@{host}:{port}/postgres");
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    conn.batch_execute(INIT_SQL).await.expect("migration");
+    (conn, container)
+}
+
+/// Insert a RUNNING workflow execution and return its id.
+async fn insert_running_workflow(conn: &mut AsyncPgConnection, workflow_id: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    diesel::sql_query(
+        "INSERT INTO harvest_workflow_executions \
+         (id, workflow_name, workflow_id, shard_id, state, input) \
+         VALUES ($1, 'crasher_wf', $2, 0, 'RUNNING', '{}'::jsonb)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(id)
+    .bind::<diesel::sql_types::Text, _>(workflow_id)
+    .execute(conn)
+    .await
+    .expect("insert workflow execution");
+    id
+}
+
+/// Insert a RUNNING task claimed by `worker_id` with the given crash-strike
+/// count and no live worker row. Returns the task id.
+async fn insert_running_task(
+    conn: &mut AsyncPgConnection,
+    workflow_exec_id: Option<Uuid>,
+    worker_id: &str,
+    crash_strikes: i32,
+) -> Uuid {
+    let id = Uuid::new_v4();
+    diesel::sql_query(
+        "INSERT INTO harvest_task_queue \
+         (id, queue_name, task_type, workflow_exec_id, input, state, worker_id, \
+          attempt, max_attempts, started_at, crash_strikes) \
+         VALUES ($1, 'default', 'activity', $2, '{}'::jsonb, 'RUNNING', $3, \
+                 1, 3, NOW() - INTERVAL '1 hour', $4)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(id)
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Uuid>, _>(workflow_exec_id)
+    .bind::<diesel::sql_types::Text, _>(worker_id)
+    .bind::<diesel::sql_types::Integer, _>(crash_strikes)
+    .execute(conn)
+    .await
+    .expect("insert running task");
+    id
+}
+
+/// Register a worker row with a fresh heartbeat (i.e. a live worker).
+async fn insert_live_worker(conn: &mut AsyncPgConnection, worker_id: &str) {
+    diesel::sql_query(
+        "INSERT INTO harvest_workers \
+         (worker_id, last_heartbeat_at, max_concurrency, host) \
+         VALUES ($1, NOW(), 10, 'localhost')",
+    )
+    .bind::<diesel::sql_types::Text, _>(worker_id)
+    .execute(conn)
+    .await
+    .expect("insert live worker");
+}
+
+#[derive(QueryableByName)]
+struct DlqRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    error: String,
+    #[diesel(sql_type = diesel::sql_types::Uuid)]
+    original_task_id: Uuid,
+}
+
+async fn task_state(conn: &mut AsyncPgConnection, task_id: Uuid) -> (String, i32, Option<String>) {
+    #[derive(QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        state: String,
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        crash_strikes: i32,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        worker_id: Option<String>,
+    }
+    let row: Row = diesel::sql_query(
+        "SELECT state, crash_strikes, worker_id FROM harvest_task_queue WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(task_id)
+    .get_result(conn)
+    .await
+    .expect("load task state");
+    (row.state, row.crash_strikes, row.worker_id)
+}
+
+async fn workflow_state(conn: &mut AsyncPgConnection, exec_id: Uuid) -> String {
+    #[derive(QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        state: String,
+    }
+    let row: Row = diesel::sql_query("SELECT state FROM harvest_workflow_executions WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(exec_id)
+        .get_result(conn)
+        .await
+        .expect("load workflow state");
+    row.state
+}
+
+#[tokio::test]
+async fn orphan_under_threshold_is_requeued() {
+    let (mut conn, _container) = setup_db().await;
+    let exec_id = insert_running_workflow(&mut conn, "wf-requeue").await;
+    let task_id = insert_running_task(&mut conn, Some(exec_id), "dead-worker-1", 0).await;
+    let metrics = RecordingMetrics::default();
+
+    let summary = reclaim_orphaned_tasks(&mut conn, 3, 10, &metrics)
+        .await
+        .expect("reclaim");
+
+    assert_eq!(summary.requeued, 1, "orphan should be re-queued");
+    assert_eq!(summary.quarantined, 0);
+
+    let (state, strikes, worker) = task_state(&mut conn, task_id).await;
+    assert_eq!(state, "PENDING", "re-queued back to PENDING");
+    assert_eq!(strikes, 1, "crash strike recorded");
+    assert_eq!(worker, None, "dead worker's claim cleared");
+    // Workflow keeps running — a requeue is not terminal.
+    assert_eq!(workflow_state(&mut conn, exec_id).await, "RUNNING");
+    assert!(metrics.quarantined.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn orphan_at_threshold_is_quarantined() {
+    let (mut conn, _container) = setup_db().await;
+    let exec_id = insert_running_workflow(&mut conn, "wf-quarantine").await;
+    // crash_strikes = 2; the next reclaim makes it 3 == threshold → quarantine.
+    let task_id = insert_running_task(&mut conn, Some(exec_id), "dead-worker-2", 2).await;
+    let metrics = RecordingMetrics::default();
+
+    let summary = reclaim_orphaned_tasks(&mut conn, 3, 10, &metrics)
+        .await
+        .expect("reclaim");
+
+    assert_eq!(summary.quarantined, 1, "orphan should be quarantined");
+    assert_eq!(summary.requeued, 0);
+
+    // Queue row is terminal FAILED — never re-dispatched again.
+    let (state, _strikes, _worker) = task_state(&mut conn, task_id).await;
+    assert_eq!(state, "FAILED");
+
+    // Owning workflow failed terminally (AC4).
+    assert_eq!(workflow_state(&mut conn, exec_id).await, "FAILED");
+
+    // DLQ row carries the typed PoisonPill reason with strikes + worker (AC5).
+    let rows: Vec<DlqRow> =
+        diesel::sql_query("SELECT error, original_task_id FROM harvest_dead_letters")
+            .get_results(&mut conn)
+            .await
+            .expect("load dlq");
+    assert_eq!(rows.len(), 1, "exactly one DLQ row");
+    assert_eq!(rows[0].original_task_id, task_id);
+    let reason: DeadLetterReason =
+        serde_json::from_str(&rows[0].error).expect("DLQ error is typed reason");
+    match reason {
+        DeadLetterReason::PoisonPill {
+            crash_strikes,
+            last_worker_id,
+        } => {
+            assert_eq!(crash_strikes, 3);
+            assert_eq!(last_worker_id.as_deref(), Some("dead-worker-2"));
+        }
+        DeadLetterReason::HistoryCapExceeded { .. } => {
+            panic!("expected PoisonPill reason, got HistoryCapExceeded")
+        }
+    }
+
+    // Metric emitted with queue + reason labels (AC6).
+    let recorded = metrics.quarantined.lock().unwrap().clone();
+    assert_eq!(
+        recorded,
+        vec![("default".to_string(), QUARANTINE_REASON.to_string())]
+    );
+}
+
+#[tokio::test]
+async fn live_worker_task_is_not_reclaimed() {
+    let (mut conn, _container) = setup_db().await;
+    let task_id = insert_running_task(&mut conn, None, "live-worker", 0).await;
+    insert_live_worker(&mut conn, "live-worker").await;
+    let metrics = RecordingMetrics::default();
+
+    let summary = reclaim_orphaned_tasks(&mut conn, 3, 10, &metrics)
+        .await
+        .expect("reclaim");
+
+    assert_eq!(
+        summary.total(),
+        0,
+        "live worker's task must not be reclaimed"
+    );
+    let (state, strikes, worker) = task_state(&mut conn, task_id).await;
+    assert_eq!(state, "RUNNING");
+    assert_eq!(strikes, 0);
+    assert_eq!(worker.as_deref(), Some("live-worker"));
+}
+
+#[tokio::test]
+async fn threshold_zero_never_quarantines() {
+    let (mut conn, _container) = setup_db().await;
+    let exec_id = insert_running_workflow(&mut conn, "wf-disabled").await;
+    // Very high strike count, but quarantine disabled (threshold 0).
+    let task_id = insert_running_task(&mut conn, Some(exec_id), "dead-worker-3", 99).await;
+    let metrics = RecordingMetrics::default();
+
+    let summary = reclaim_orphaned_tasks(&mut conn, 0, 10, &metrics)
+        .await
+        .expect("reclaim");
+
+    assert_eq!(summary.quarantined, 0, "threshold 0 disables quarantine");
+    assert_eq!(summary.requeued, 1, "still re-queued (legacy loop)");
+    let (state, strikes, _worker) = task_state(&mut conn, task_id).await;
+    assert_eq!(state, "PENDING");
+    assert_eq!(strikes, 100);
+    assert_eq!(workflow_state(&mut conn, exec_id).await, "RUNNING");
+}

@@ -88,6 +88,10 @@ diesel::table! {
         /// Build ID required to claim this task (issue #171). NULL = any worker.
         required_build_id -> Nullable<Text>,
         rate_limit_key -> Nullable<Text>,
+        /// Number of times this task was reclaimed from a dead worker without
+        /// completing (issue #367). Quarantined to the DLQ once it reaches the
+        /// operator-configured poison-pill threshold. Distinct from `attempt`.
+        crash_strikes -> Int4,
     }
 }
 

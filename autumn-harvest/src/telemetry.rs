@@ -166,6 +166,14 @@ pub const ATTR_SIGNAL_ID: &str = "harvest.signal.id";
 /// `execution.id` stays span-only per the cardinality rule (ADR-0001 §7).
 pub const METRIC_WORKFLOW_TIMEOUT: &str = "harvest.workflow.timeout";
 
+/// Counter: incremented each time a poison-pill task is quarantined to the
+/// dead-letter queue after crashing `poison_pill_threshold` workers in a row
+/// (issue #367).
+///
+/// Labeled by `queue` (task queue name) and `reason`
+/// (`"poison_pill"`). `execution.id` stays span-only per ADR-0001 §7.
+pub const METRIC_TASK_QUARANTINED: &str = "harvest.task.quarantined";
+
 /// Histogram: observed payload size in bytes at each write boundary (issue #252).
 ///
 /// Emitted for every payload written to `harvest_events`, regardless of whether
@@ -741,6 +749,14 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = (workflow_name, queue);
     }
 
+    /// A poison-pill task was quarantined to the dead-letter queue after
+    /// crashing the configured number of workers in a row (issue #367).
+    ///
+    /// Maps to the counter `harvest.task.quarantined{queue, reason}`.
+    fn record_task_quarantined(&self, queue: &str, reason: &str) {
+        let _ = (queue, reason);
+    }
+
     /// A payload was observed at a write boundary (issue #252).
     ///
     /// Called for every payload written (accepted or rejected) to
@@ -941,6 +957,7 @@ mod tests {
         );
         assert_eq!(METRIC_RETENTION_DELETED, "harvest.retention.deleted");
         assert_eq!(METRIC_WORKFLOW_TIMEOUT, "harvest.workflow.timeout");
+        assert_eq!(METRIC_TASK_QUARANTINED, "harvest.task.quarantined");
     }
 
     #[test]

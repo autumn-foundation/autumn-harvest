@@ -107,6 +107,14 @@ pub enum DeadLetterReason {
         cap: u64,
         workflow_type: String,
     },
+    /// A task crashed the worker process `crash_strikes` times in a row
+    /// (issue #367). The orphan-reclaim scanner quarantined it instead of
+    /// re-dispatching it to crash another worker. `last_worker_id` is the
+    /// worker that held the row when the final strike was observed.
+    PoisonPill {
+        crash_strikes: i32,
+        last_worker_id: Option<String>,
+    },
 }
 
 impl std::fmt::Display for DeadLetterReason {
@@ -613,6 +621,25 @@ mod tests {
 
         assert_eq!(back, reason);
         assert!(json.contains("HistoryCapExceeded"));
+    }
+
+    #[test]
+    fn dead_letter_reason_poison_pill_is_typed_json() {
+        let reason = DeadLetterReason::PoisonPill {
+            crash_strikes: 3,
+            last_worker_id: Some("worker-7".into()),
+        };
+
+        let json = reason.to_string();
+        let back: DeadLetterReason =
+            serde_json::from_str(&json).expect("typed reason should deserialize");
+
+        assert_eq!(back, reason);
+        // Carries the discriminator distinguishing it from clean retry exhaustion,
+        // plus the crash-strike count and last worker for triage (issue #367 AC5).
+        assert!(json.contains("PoisonPill"));
+        assert!(json.contains("crash_strikes"));
+        assert!(json.contains("worker-7"));
     }
 
     #[test]

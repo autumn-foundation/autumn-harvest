@@ -355,6 +355,7 @@ fn all_adr_0001_span_kinds_are_emitted() {
                         workflow_cache_size: 1000,
                         priority_aging_secs: None,
                         unknown_target_grace_window: Duration::from_secs(5),
+                        poison_pill_threshold: 3,
                         sharded_pool: None,
                     },
                     registry,

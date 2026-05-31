@@ -211,6 +211,12 @@ pub struct TaskQueueItem {
     pub required_build_id: Option<String>,
     /// Optional rate limit key to throttle execution throughput.
     pub rate_limit_key: Option<String>,
+    /// Consecutive worker crashes attributed to this task (issue #367).
+    ///
+    /// Incremented each time the orphan-reclaim scanner reclaims this row from
+    /// a dead worker without it having completed. When it reaches the
+    /// configured poison-pill threshold the task is quarantined to the DLQ.
+    pub crash_strikes: i32,
 }
 
 /// Insert struct for enqueuing a new task.
