@@ -5623,18 +5623,22 @@ impl Worker {
         );
         // Worker-stale threshold mirrors the fleet-health classifier:
         // 2 × heartbeat interval, with a 1 s floor for sub-second intervals.
-        let worker_stale_secs = i64::try_from(
-            self.config
-                .worker_heartbeat_interval
-                .as_secs()
-                .saturating_mul(2),
-        )
-        .unwrap_or(i64::MAX)
-        .max(1);
+        // Double *before* rounding to whole seconds so a fractional interval
+        // (e.g. 1500ms → 3s, not 2s) keeps the documented liveness window, and
+        // cap at one year so an absurd interval can never overflow the
+        // chrono::Duration arithmetic in the reclaim path.
+        let doubled = self.config.worker_heartbeat_interval.saturating_mul(2);
+        let worker_stale_secs = i64::try_from(doubled.as_secs())
+            .unwrap_or(crate::poison_pill::MAX_WORKER_STALE_SECS)
+            .saturating_add(i64::from(doubled.subsec_nanos() > 0))
+            .clamp(1, crate::poison_pill::MAX_WORKER_STALE_SECS);
         let poison_pill_reclaimer = crate::poison_pill::spawn_poison_pill_reclaimer(
             pool.clone(),
             self.shutdown.clone(),
-            self.config.poll_interval,
+            // Orphan reclaim is background maintenance: sweep at the heartbeat
+            // cadence rather than the (much shorter) task poll interval to keep
+            // the liveness scan off the hot path.
+            self.config.worker_heartbeat_interval,
             self.config.poison_pill_threshold,
             worker_stale_secs,
             self.registry.telemetry().clone(),

@@ -130,12 +130,14 @@ async fn insert_running_task(
     crash_strikes: i32,
 ) -> Uuid {
     let id = Uuid::new_v4();
+    // A stale last_heartbeat_at from the dead attempt is set so the requeue
+    // path can be observed to clear it.
     diesel::sql_query(
         "INSERT INTO harvest_task_queue \
          (id, queue_name, task_type, workflow_exec_id, input, state, worker_id, \
-          attempt, max_attempts, started_at, crash_strikes) \
+          attempt, max_attempts, started_at, last_heartbeat_at, crash_strikes) \
          VALUES ($1, 'default', 'activity', $2, '{}'::jsonb, 'RUNNING', $3, \
-                 1, 3, NOW() - INTERVAL '1 hour', $4)",
+                 1, 3, NOW() - INTERVAL '1 hour', NOW() - INTERVAL '1 hour', $4)",
     )
     .bind::<diesel::sql_types::Uuid, _>(id)
     .bind::<diesel::sql_types::Nullable<diesel::sql_types::Uuid>, _>(workflow_exec_id)
@@ -144,6 +146,23 @@ async fn insert_running_task(
     .execute(conn)
     .await
     .expect("insert running task");
+    id
+}
+
+/// Insert a PENDING sibling activity task for `workflow_exec_id`. Returns its id.
+async fn insert_pending_task(conn: &mut AsyncPgConnection, workflow_exec_id: Uuid) -> Uuid {
+    let id = Uuid::new_v4();
+    diesel::sql_query(
+        "INSERT INTO harvest_task_queue \
+         (id, queue_name, task_type, workflow_exec_id, input, state, \
+          attempt, max_attempts) \
+         VALUES ($1, 'default', 'activity', $2, '{}'::jsonb, 'PENDING', 0, 3)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(id)
+    .bind::<diesel::sql_types::Uuid, _>(workflow_exec_id)
+    .execute(conn)
+    .await
+    .expect("insert pending sibling task");
     id
 }
 
@@ -188,6 +207,24 @@ async fn task_state(conn: &mut AsyncPgConnection, task_id: Uuid) -> (String, i32
     (row.state, row.crash_strikes, row.worker_id)
 }
 
+async fn task_last_heartbeat(
+    conn: &mut AsyncPgConnection,
+    task_id: Uuid,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    #[derive(QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
+        last_heartbeat_at: Option<chrono::DateTime<chrono::Utc>>,
+    }
+    let row: Row =
+        diesel::sql_query("SELECT last_heartbeat_at FROM harvest_task_queue WHERE id = $1")
+            .bind::<diesel::sql_types::Uuid, _>(task_id)
+            .get_result(conn)
+            .await
+            .expect("load task heartbeat");
+    row.last_heartbeat_at
+}
+
 async fn workflow_state(conn: &mut AsyncPgConnection, exec_id: Uuid) -> String {
     #[derive(QueryableByName)]
     struct Row {
@@ -220,6 +257,10 @@ async fn orphan_under_threshold_is_requeued() {
     assert_eq!(state, "PENDING", "re-queued back to PENDING");
     assert_eq!(strikes, 1, "crash strike recorded");
     assert_eq!(worker, None, "dead worker's claim cleared");
+    // The dead attempt's stale heartbeat must be cleared so the fresh attempt
+    // is not immediately timed out by the COALESCE scanner.
+    let heartbeat = task_last_heartbeat(&mut conn, task_id).await;
+    assert!(heartbeat.is_none(), "stale heartbeat cleared on requeue");
     // Workflow keeps running — a requeue is not terminal.
     assert_eq!(workflow_state(&mut conn, exec_id).await, "RUNNING");
     assert!(metrics.quarantined.lock().unwrap().is_empty());
@@ -231,6 +272,8 @@ async fn orphan_at_threshold_is_quarantined() {
     let exec_id = insert_running_workflow(&mut conn, "wf-quarantine").await;
     // crash_strikes = 2; the next reclaim makes it 3 == threshold → quarantine.
     let task_id = insert_running_task(&mut conn, Some(exec_id), "dead-worker-2", 2).await;
+    // A sibling activity still PENDING for the same execution.
+    let sibling_id = insert_pending_task(&mut conn, exec_id).await;
     let metrics = RecordingMetrics::default();
 
     let summary = reclaim_orphaned_tasks(&mut conn, 3, 10, &metrics)
@@ -243,6 +286,11 @@ async fn orphan_at_threshold_is_quarantined() {
     // Queue row is terminal FAILED — never re-dispatched again.
     let (state, _strikes, _worker) = task_state(&mut conn, task_id).await;
     assert_eq!(state, "FAILED");
+
+    // Sibling task is drained so it can never be claimed after the workflow
+    // has already failed.
+    let (sibling_state, _, _) = task_state(&mut conn, sibling_id).await;
+    assert_eq!(sibling_state, "FAILED", "sibling task drained on poison");
 
     // Owning workflow failed terminally (AC4).
     assert_eq!(workflow_state(&mut conn, exec_id).await, "FAILED");

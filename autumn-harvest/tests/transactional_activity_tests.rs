@@ -88,6 +88,8 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260530000000_harvest_schedule_ha_claim/up.sql"),
     "\n",
     include_str!("../migrations/20260601000000_harvest_schedule_auto_pause/up.sql"),
+    "\n",
+    include_str!("../migrations/20260601000001_harvest_poison_pill_strikes/up.sql"),
 );
 
 const CREATE_USER_RECORDS: &str = "

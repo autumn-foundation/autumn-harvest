@@ -64,6 +64,14 @@ impl ReclaimSummary {
     }
 }
 
+/// Upper bound (one year, in seconds) applied to the worker-stale threshold.
+///
+/// The reclaim path multiplies this value into a Postgres `INTERVAL` and into a
+/// [`chrono::Duration`]; clamping here keeps both well inside their valid range
+/// so an absurd `worker_heartbeat_interval` can never overflow or panic. A
+/// one-year staleness window is already far beyond any sane fleet config.
+pub const MAX_WORKER_STALE_SECS: i64 = 31_536_000;
+
 /// SQL selecting `RUNNING` tasks whose claiming worker is no longer live.
 ///
 /// A worker is considered dead when no `harvest_workers` row carries its
@@ -93,6 +101,7 @@ pub const fn orphaned_running_tasks_query() -> &'static str {
 #[cfg(feature = "db")]
 mod scanner {
     use chrono::Utc;
+    use diesel::BoolExpressionMethods;
     use diesel::ExpressionMethods;
     use diesel::OptionalExtension;
     use diesel::QueryDsl;
@@ -191,6 +200,12 @@ mod scanner {
                         dsl::started_at.eq(None::<chrono::DateTime<Utc>>),
                         dsl::sticky_worker_id.eq(None::<String>),
                         dsl::sticky_until.eq(None::<chrono::DateTime<Utc>>),
+                        // Clear the dead attempt's heartbeat timestamp so the
+                        // fresh attempt is not immediately timed out by the
+                        // COALESCE(last_heartbeat_at, started_at) scanner.
+                        // heartbeat_details is preserved so a retry can still
+                        // read the last flushed checkpoint.
+                        dsl::last_heartbeat_at.eq(None::<chrono::DateTime<Utc>>),
                         dsl::crash_strikes.eq(new_strikes),
                         dsl::scheduled_at.eq(Utc::now()),
                     ))
@@ -260,6 +275,33 @@ mod scanner {
         .execute(conn)
         .await
         .map_err(crate::error::database_error)?;
+
+        // Drain any sibling tasks still open for this execution. `claim_task`
+        // filters only on task state, so without this a PENDING/RUNNING sibling
+        // activity could be claimed and run user code after the workflow has
+        // already failed (the timeout/cancellation paths drain for this same
+        // reason). The quarantined task itself is already FAILED.
+        {
+            use crate::schema::harvest_task_queue::dsl as task_dsl;
+            diesel::update(
+                task_dsl::harvest_task_queue
+                    .filter(task_dsl::workflow_exec_id.eq(exec_id.as_uuid()))
+                    .filter(
+                        task_dsl::state
+                            .eq("PENDING")
+                            .or(task_dsl::state.eq("RUNNING")),
+                    ),
+            )
+            .set((
+                task_dsl::state.eq("FAILED"),
+                task_dsl::error.eq(Some(error.to_string())),
+                task_dsl::completed_at.eq(Some(Utc::now())),
+            ))
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+        }
+
         apply_parent_close_cascade(conn, exec_id).await?;
 
         // Wake a parent that is blocked on this child. When a parent-close
@@ -396,6 +438,10 @@ mod scanner {
         worker_stale_secs: i64,
         metrics: &dyn MetricsRecorder,
     ) -> HarvestResult<ReclaimSummary> {
+        // Clamp once at the entry point so neither the SQL interval arithmetic
+        // nor the chrono::Duration re-check (in `worker_still_dead`) can ever
+        // overflow on an out-of-range caller value.
+        let worker_stale_secs = worker_stale_secs.clamp(0, super::MAX_WORKER_STALE_SECS);
         let orphans: Vec<TaskQueueItem> = diesel::sql_query(orphaned_running_tasks_query())
             .bind::<diesel::sql_types::BigInt, _>(worker_stale_secs)
             .load(conn)
