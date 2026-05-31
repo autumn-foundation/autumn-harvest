@@ -4969,7 +4969,13 @@ async fn schedule_pause_ui(
         let _ = insert_audit(&mut conn, &ar).await;
         format!("Paused {name}")
     } else {
-        format!("Paused schedule {}", &id_str[..8.min(id_str.len())])
+        format!(
+            "Paused schedule {}",
+            id_str
+                .char_indices()
+                .nth(8)
+                .map_or(id_str.as_str(), |(i, _)| &id_str[..i])
+        )
     };
     schedule_redirect(&flash)
 }
@@ -5018,7 +5024,13 @@ async fn schedule_resume_ui(
         let _ = insert_audit(&mut conn, &ar).await;
         format!("Resumed {name}")
     } else {
-        format!("Resumed schedule {}", &id_str[..8.min(id_str.len())])
+        format!(
+            "Resumed schedule {}",
+            id_str
+                .char_indices()
+                .nth(8)
+                .map_or(id_str.as_str(), |(i, _)| &id_str[..i])
+        )
     };
     schedule_redirect(&flash)
 }
@@ -5059,11 +5071,20 @@ async fn schedule_delete_ui(
         } else {
             format!(
                 "Schedule {} was already deleted",
-                &id_str[..8.min(id_str.len())]
+                id_str
+                    .char_indices()
+                    .nth(8)
+                    .map_or(id_str.as_str(), |(i, _)| &id_str[..i])
             )
         }
     } else {
-        format!("Schedule {} not found", &id_str[..8.min(id_str.len())])
+        format!(
+            "Schedule {} not found",
+            id_str
+                .char_indices()
+                .nth(8)
+                .map_or(id_str.as_str(), |(i, _)| &id_str[..i])
+        )
     };
     schedule_redirect(&flash)
 }
@@ -5253,7 +5274,10 @@ async fn schedule_trigger_now_ui(
     let Some((row, _)) = found else {
         return schedule_redirect(&format!(
             "Schedule {} not found",
-            &id_str[..8.min(id_str.len())]
+            id_str
+                .char_indices()
+                .nth(8)
+                .map_or(id_str.as_str(), |(i, _)| &id_str[..i])
         ));
     };
     let name = schedule_name(&row);
