@@ -77,6 +77,20 @@ pub struct WorkflowResetRequest {
     pub operator_id: String,
     #[serde(default)]
     pub signal_reapply: ResetSignalReapplyPolicy,
+    /// When `true`, the source execution may be in a terminal failure state
+    /// (`FAILED`, `CANCELLED`, `TIMED_OUT`) instead of `RUNNING`. This opt-in is
+    /// used by the DAG retry-from-failed-node operator surface (issue #366),
+    /// which forks a *failed* DAG run; a terminal DAG run is the common case
+    /// there. `COMPLETED` and `TERMINATED` sources are always rejected.
+    ///
+    /// **Not settable from the wire.** This field is `#[serde(skip)]` so the
+    /// public `POST /workflows/{id}/reset` endpoint — which deserializes this
+    /// struct directly — can never enable it; the request body always
+    /// deserializes it to `false`, preserving that endpoint's strict
+    /// `RUNNING`-only contract. Only in-process callers (the DAG retry handler)
+    /// set it via struct construction.
+    #[serde(skip)]
+    pub allow_terminal_source: bool,
 }
 
 impl WorkflowResetRequest {
@@ -493,7 +507,7 @@ pub async fn preview_workflow_reset(
 ) -> Result<ResetPlan, WorkflowResetError> {
     let request = request.normalized();
     let execution = load_source_execution(conn, exec_id, false).await?;
-    validate_source_execution(exec_id, &execution)?;
+    validate_source_execution(exec_id, &execution, request.allow_terminal_source)?;
     let rows = load_event_rows(conn, exec_id).await?;
     let events = decode_events(&rows)?;
     let mut plan = validate_reset_point(&events, request.reset_to_event_id)?;
@@ -519,7 +533,7 @@ pub async fn reset_workflow_execution(
     conn.transaction::<ResetResult, WorkflowResetError, _>(|conn| {
         async move {
             let source = load_source_execution(conn, exec_id, true).await?;
-            validate_source_execution(exec_id, &source)?;
+            validate_source_execution(exec_id, &source, request.allow_terminal_source)?;
 
             let rows = load_event_rows(conn, exec_id).await?;
             let events = decode_events(&rows)?;
@@ -572,8 +586,22 @@ pub async fn reset_workflow_execution(
 fn validate_source_execution(
     exec_id: ExecutionId,
     execution: &WorkflowExecution,
+    allow_terminal_source: bool,
 ) -> Result<(), WorkflowResetError> {
-    if execution.state != "RUNNING" {
+    if allow_terminal_source {
+        // DAG retry-from-failed-node (issue #366): a failed DAG run is terminal,
+        // so RUNNING is no longer required. A non-failure terminal state
+        // (COMPLETED / TERMINATED) is still rejected — there is nothing to retry.
+        match execution.state.as_str() {
+            "RUNNING" | "FAILED" | "CANCELLED" | "TIMED_OUT" => {}
+            other => {
+                return Err(WorkflowResetError::TerminalSource {
+                    exec_id,
+                    state: other.to_string(),
+                });
+            }
+        }
+    } else if execution.state != "RUNNING" {
         return Err(WorkflowResetError::TerminalSource {
             exec_id,
             state: execution.state.clone(),
@@ -716,8 +744,20 @@ async fn terminate_source_execution(
     )
     .await?;
 
+    // Seal the source run as TERMINATED. The state filter guards against a
+    // concurrent reset double-sealing the same row. For the standalone reset
+    // path only `RUNNING` is reachable; the DAG retry path (issue #366) accepts
+    // terminal failure states via `allow_terminal_source`, so those must also be
+    // sealed here — otherwise the update would match zero rows and leave the
+    // source in `FAILED`/`CANCELLED`/`TIMED_OUT`, defeating the caller's
+    // `TERMINATED` re-fork guard.
+    let sealable_states: Vec<&str> = if request.allow_terminal_source {
+        vec!["RUNNING", "FAILED", "CANCELLED", "TIMED_OUT"]
+    } else {
+        vec!["RUNNING"]
+    };
     diesel::update(harvest_workflow_executions::table.find(source_exec_id.as_uuid()))
-        .filter(harvest_workflow_executions::state.eq("RUNNING"))
+        .filter(harvest_workflow_executions::state.eq_any(sealable_states))
         .set((
             harvest_workflow_executions::state.eq("TERMINATED"),
             harvest_workflow_executions::output.eq(None::<Value>),
@@ -1171,6 +1211,25 @@ mod tests {
         assert!(
             err.message
                 .contains("continue-as-new histories cannot be reset")
+        );
+    }
+
+    #[test]
+    fn allow_terminal_source_is_not_settable_from_the_wire() {
+        // The public POST /workflows/{id}/reset endpoint deserializes this
+        // struct directly; a malicious/mistaken body must not be able to flip
+        // the terminal-source escape hatch on.
+        let body = serde_json::json!({
+            "reset_to_event_id": 1,
+            "reason": "x",
+            "operator_id": "y",
+            "allow_terminal_source": true
+        });
+        let request: super::WorkflowResetRequest =
+            serde_json::from_value(body).expect("body deserializes");
+        assert!(
+            !request.allow_terminal_source,
+            "allow_terminal_source must remain false when set via the request body"
         );
     }
 }

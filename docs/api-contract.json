@@ -1000,6 +1000,83 @@
     },
     {
       "method": "POST",
+      "path": "/dags/{dag_name}/runs/{run_exec_id}/retry",
+      "category": "dag",
+      "read_only": false,
+      "description": "Retry a failed DAG run from one or more failed nodes (issue #366). Composes on top of workflow reset (#148): re-executes the named node(s) and their declared downstream, carrying over upstream results. Unified DAGs only.",
+      "idempotency": "Not idempotent: a committed retry forks a new DAG run.",
+      "params": [
+        {
+          "name": "dag_name",
+          "in": "path",
+          "required": true,
+          "description": "Registered (unified) DAG name."
+        },
+        {
+          "name": "run_exec_id",
+          "in": "path",
+          "required": true,
+          "description": "Execution id of the failed DAG run to retry."
+        }
+      ],
+      "request_body": {
+        "required": true,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "from_nodes",
+            "required": true,
+            "description": "Non-empty array of declared DAG node names to retry from."
+          },
+          {
+            "name": "reason",
+            "required": true,
+            "description": "Operator recovery reason (recorded in the audit trail and WorkflowResetFork event)."
+          },
+          {
+            "name": "operator_id",
+            "required": true,
+            "description": "Operator identity for audit."
+          },
+          {
+            "name": "dry_run",
+            "required": false,
+            "description": "When true, compute and return the plan without performing any write."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 201,
+        "note": "Returns 200 (not 201) when dry_run is true: the plan is computed and returned without any write, and new_run_exec_id / events_carried_over are omitted.",
+        "free_form": false,
+        "fields": [
+          { "name": "dry_run", "description": "True for a dry-run preview." },
+          { "name": "dag_name", "description": "The DAG name." },
+          { "name": "source_run_exec_id", "description": "The source DAG run execution id." },
+          { "name": "reset_to_event_id", "description": "Resolved 0-based reset event id passed to the #148 reset." },
+          { "name": "nodes_to_re_execute", "description": "Nodes that will re-execute on the new run." },
+          { "name": "nodes_carried_over", "description": "Nodes whose recorded results are carried over." },
+          { "name": "new_run_exec_id", "description": "The forked DAG run execution id (omitted on dry run)." },
+          { "name": "events_carried_over", "description": "Number of carried-over events on the new run (omitted on dry run)." }
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Empty/unknown/unattempted/already-succeeded node, or a classic (non-unified) DAG."
+        },
+        {
+          "status": 404,
+          "description": "DAG not registered, or the run is not a run of that DAG."
+        },
+        {
+          "status": 409,
+          "description": "Run succeeded (use a fresh run), run still running (cancel first), or reset boundary mid unresolved side effect (remediation hint included)."
+        }
+      ]
+    },
+    {
+      "method": "POST",
       "path": "/dags/{dag_name}/trigger",
       "category": "dag",
       "read_only": false,

@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **DAG retry-from-failed-node** (issue #366). New management route
+  `POST /api/harvest/dags/{dag_name}/runs/{run_exec_id}/retry` with body
+  `{ from_nodes, reason, operator_id, dry_run }` lets an operator re-run a failed
+  unified-DAG run from a specific failed node (and its declared downstream)
+  without re-executing successful upstream nodes. It is a thin orchestrator that
+  resolves `(dag_name, run_exec_id, from_nodes)` to a single `reset_to_event_id`
+  by walking the DAG topology and the recorded history, then delegates to the
+  existing workflow-reset internals (#148). No new `WorkflowEvent` variant and no
+  migration. The reset reason is augmented with `dag_retry: nodes=[...]` so the
+  audit trail (#158) reads cleanly. `dry_run: true` returns the resolved reset
+  point and the explicit re-execute / carry-over node sets without writing.
+  Source-state gating: `COMPLETED` → `409` (use a fresh run), `RUNNING` → `409`
+  (cancel first), `FAILED`/`CANCELLED`/`TIMED_OUT` accepted; classic
+  (non-unified) DAGs are rejected with `400` (see #256 step 5); a node name that
+  maps to more than one task (DAG reuses the activity) is rejected `400`. A reset
+  point that lands inside an unresolved *upstream* side effect returns `409` with
+  a remediation hint. Semantics are **level-granular**: retrying any node
+  auto-widens to its full execution level plus downstream closure (upstream
+  always carried over), so the failed node's same-level siblings re-run with it
+  and there is no "name the succeeded sibling to widen" dead-end.
+  `WorkflowResetRequest.allow_terminal_source` is `#[serde(skip)]`, so it cannot
+  be enabled from the public reset endpoint body. New CLI subcommand
+  `autumn-harvest dag retry <dag> <run-id>
+  --from-node <node> --reason <text> [--dry-run]`. Runbook at
+  `docs/runbooks/dag-retry-from-failed-node.md`. The core
+  `WorkflowResetRequest` gains an opt-in `allow_terminal_source` flag (default
+  `false`) so the DAG-retry path can fork a terminal *failed* run; the standalone
+  `/workflows/{id}/reset` endpoint keeps its strict `RUNNING`-only contract.
+
 - **Worker-pool scaling signal and metrics endpoints** (issue #325).
   Expose KEDA/HPA compatible worker-pool scaling signal endpoint (`GET /admin/queues/scaling`)
   and Prometheus metrics scraping endpoint (`GET /admin/metrics`). Per-queue metrics include

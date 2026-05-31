@@ -389,6 +389,20 @@ fn dag_unpause_is_covered() {
     assert_covered(&["dag", "unpause", "my_dag"]);
 }
 
+#[test]
+fn dag_retry_is_covered() {
+    assert_covered(&[
+        "dag",
+        "retry",
+        "my_dag",
+        "11111111-2222-3333-4444-555555555555",
+        "--from-node",
+        "step_6",
+        "--reason",
+        "incident",
+    ]);
+}
+
 // ── schedules ─────────────────────────────────────────────────────────────────
 
 #[test]
@@ -621,6 +635,20 @@ fn dag_pause_body_fields_are_documented() {
 #[test]
 fn dag_unpause_body_fields_are_documented() {
     assert_body_fields_documented(&["dag", "unpause", "my_dag"]);
+}
+
+#[test]
+fn dag_retry_body_fields_are_documented() {
+    assert_body_fields_documented(&[
+        "dag",
+        "retry",
+        "my_dag",
+        "11111111-2222-3333-4444-555555555555",
+        "--from-node",
+        "step_6",
+        "--reason",
+        "incident",
+    ]);
 }
 
 #[test]

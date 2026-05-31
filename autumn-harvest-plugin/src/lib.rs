@@ -2,6 +2,7 @@
 
 pub mod api;
 pub mod config;
+pub mod dag_retry;
 pub mod outbox;
 pub mod plugin;
 pub mod preflight;
