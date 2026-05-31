@@ -130,16 +130,10 @@ pub fn declared_nodes(def: &DagDefinition) -> Vec<String> {
     names.into_iter().collect()
 }
 
-/// Compute the downstream closure (inclusive of the requested nodes) over the
-/// DAG's declared edges, returned as a set of node (activity) names.
-///
-/// Edges are encoded as `DagTask.upstreams` (reverse edges); this builds the
-/// forward adjacency and does a breadth-first reach from every task index whose
-/// activity name is in `from_nodes`.
-#[must_use]
-pub fn downstream_closure(def: &DagDefinition, from_nodes: &BTreeSet<String>) -> BTreeSet<String> {
+/// Forward adjacency for the DAG: `forward[u]` lists the tasks that declare task
+/// `u` as an upstream (`DagTask.upstreams` is reverse edges).
+fn forward_adjacency(def: &DagDefinition) -> Vec<Vec<usize>> {
     let tasks = def.tasks();
-    // Forward adjacency: forward[u] = tasks that declare u as an upstream.
     let mut forward: Vec<Vec<usize>> = vec![Vec::new(); tasks.len()];
     for (idx, task) in tasks.iter().enumerate() {
         for &up in &task.upstreams {
@@ -148,24 +142,79 @@ pub fn downstream_closure(def: &DagDefinition, from_nodes: &BTreeSet<String>) ->
             }
         }
     }
+    forward
+}
 
-    let mut queue: VecDeque<usize> = VecDeque::new();
-    let mut seen: BTreeSet<usize> = BTreeSet::new();
-    for (idx, task) in tasks.iter().enumerate() {
-        if from_nodes.contains(&task.activity_name) && seen.insert(idx) {
-            queue.push_back(idx);
-        }
-    }
-
+/// Breadth-first downstream reach over task indices, inclusive of the seeds.
+fn closure_indices(def: &DagDefinition, seeds: &BTreeSet<usize>) -> BTreeSet<usize> {
+    let forward = forward_adjacency(def);
+    let mut queue: VecDeque<usize> = seeds.iter().copied().collect();
+    let mut seen: BTreeSet<usize> = seeds.clone();
     while let Some(idx) = queue.pop_front() {
-        for &down in &forward[idx] {
-            if seen.insert(down) {
-                queue.push_back(down);
+        if idx < forward.len() {
+            for &down in &forward[idx] {
+                if seen.insert(down) {
+                    queue.push_back(down);
+                }
             }
         }
     }
+    seen
+}
 
-    seen.into_iter()
+/// Compute the downstream closure (inclusive of the requested nodes) over the
+/// DAG's declared edges, returned as a set of node (activity) names.
+#[must_use]
+pub fn downstream_closure(def: &DagDefinition, from_nodes: &BTreeSet<String>) -> BTreeSet<String> {
+    let tasks = def.tasks();
+    let seeds: BTreeSet<usize> = tasks
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| from_nodes.contains(&t.activity_name))
+        .map(|(i, _)| i)
+        .collect();
+    closure_indices(def, &seeds)
+        .into_iter()
+        .map(|i| tasks[i].activity_name.clone())
+        .collect()
+}
+
+/// Expand the requested nodes to the re-execute set under **level-granular**
+/// semantics (issue #366, operator choice): every node in the same execution
+/// level as a requested node, plus the downstream closure of that whole level.
+///
+/// This lands the reset cut on the clean boundary before the failed node's
+/// parallel level, so the failed node and its same-level siblings re-run
+/// together — and an operator never has to name an already-succeeded sibling to
+/// move the boundary earlier.
+#[must_use]
+fn level_granular_reexecute_set(
+    def: &DagDefinition,
+    requested: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let tasks = def.tasks();
+    let requested_indices: BTreeSet<usize> = tasks
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| requested.contains(&t.activity_name))
+        .map(|(i, _)| i)
+        .collect();
+
+    // Seed with every task in any execution level that contains a requested node.
+    let mut seeds: BTreeSet<usize> = BTreeSet::new();
+    for level in def.execution_levels() {
+        if level.iter().any(|i| requested_indices.contains(i)) {
+            seeds.extend(level.iter().copied());
+        }
+    }
+    // Fall back to the requested indices themselves if (defensively) no level
+    // matched, so the set is never empty for a valid request.
+    if seeds.is_empty() {
+        seeds = requested_indices;
+    }
+
+    closure_indices(def, &seeds)
+        .into_iter()
         .map(|i| tasks[i].activity_name.clone())
         .collect()
 }
@@ -318,9 +367,12 @@ pub fn resolve_retry_plan(
         });
     }
 
-    // Re-execute set = requested nodes + their declared downstream closure.
+    // Re-execute set = the failed node's full execution level + that level's
+    // downstream closure (level-granular semantics). Landing the cut before the
+    // whole level means an operator never has to name an already-succeeded
+    // sibling to move the boundary earlier.
     let requested: BTreeSet<String> = from_nodes.iter().cloned().collect();
-    let reexecute = downstream_closure(def, &requested);
+    let reexecute = level_granular_reexecute_set(def, &requested);
 
     // Reset point: just before the earliest scheduling of any re-execute node.
     let first_idx =
@@ -534,7 +586,7 @@ mod tests {
     // ---- resolve: fanout (level-granular) --------------------------------
 
     #[test]
-    fn resolve_fanout_retry_from_c_cut_lands_before_failed_node() {
+    fn resolve_fanout_retry_from_c_widens_to_level() {
         let def = fanout_dag();
         let (ia, ib, ic, id) = (
             ActivityExecId::new(),
@@ -542,7 +594,7 @@ mod tests {
             ActivityExecId::new(),
             ActivityExecId::new(),
         );
-        // Parallel level schedules b, c, d adjacently, then completions arrive.
+        // Parallel level schedules b, c, d adjacently (b first), then completions.
         // 0 started,1 schedA,2 compA,3 schedB,4 schedC,5 schedD,6 compB,7 compD,8 failC
         let events = vec![
             started(),
@@ -556,20 +608,20 @@ mod tests {
             failed(ic),
         ];
         let plan = resolve_retry_plan(&def, &events, &["c".to_string()]).expect("plan");
-        // re-execute set = {c, e}; earliest scheduling = schedC at index 4 -> reset to 3.
-        // At event id 3 (schedB) b is still pending, so the management layer's
-        // #148 validator will reject this with 409; the resolver itself just
-        // reports the cut and the honest enumeration.
-        assert_eq!(plan.reset_to_event_id, 3);
-        // Carried over = nodes scheduled at idx <= 3 = {a, b}.
-        assert_eq!(
-            plan.nodes_carried_over,
-            vec!["a".to_string(), "b".to_string()]
-        );
-        // Everything else may re-run.
+        // Level-granular: retrying c widens to its whole level {b, c, d} + e, so
+        // the cut lands before the level's earliest scheduling (schedB at 3) ->
+        // reset to 2 (a clean boundary right after compA). No dead-end even though
+        // b and d succeeded first.
+        assert_eq!(plan.reset_to_event_id, 2);
+        assert_eq!(plan.nodes_carried_over, vec!["a".to_string()]);
         assert_eq!(
             plan.nodes_to_re_execute,
-            vec!["c".to_string(), "d".to_string(), "e".to_string()]
+            vec![
+                "b".to_string(),
+                "c".to_string(),
+                "d".to_string(),
+                "e".to_string()
+            ]
         );
     }
 

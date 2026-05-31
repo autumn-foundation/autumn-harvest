@@ -1047,6 +1047,7 @@
       },
       "success_response": {
         "status": 201,
+        "note": "Returns 200 (not 201) when dry_run is true: the plan is computed and returned without any write, and new_run_exec_id / events_carried_over are omitted.",
         "free_form": false,
         "fields": [
           { "name": "dry_run", "description": "True for a dry-run preview." },

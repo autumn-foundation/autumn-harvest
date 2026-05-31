@@ -73,22 +73,25 @@ autumn-harvest dag retry nightly_etl "$RUN_EXEC_ID" \
 
 ## What gets re-executed (level-granular semantics)
 
-The new run is forked at the **clean boundary before the earliest scheduling of
-the failed node and its declared downstream**. Concretely:
+The new run is forked at the **clean boundary before the failed node's
+execution level**. Concretely:
 
 - **Linear DAG** (`a → b → c → d`, `c` failed): retry from `c` carries `a` and
   `b`, then re-dispatches `c` (succeeds with the fixed cause) and `d`.
-- **Fan-out DAG** (`a → {b, c, d} → e`): retrying a node that shares a *parallel*
-  level re-executes the **whole level** plus the downstream join, because the
-  durable history cannot fork mid-level without stranding a sibling. Upstream
-  (`a`) is always carried over. The dry-run output lists every node that
-  re-runs, so widen or narrow `from_nodes` until the plan matches your intent.
+- **Fan-out DAG** (`a → {b, c, d} → e`): retrying *any* node in a parallel level
+  re-executes the **whole level** plus its downstream join, because the durable
+  history cannot fork mid-level without stranding a sibling. You only name the
+  failed node — its same-level siblings are pulled in automatically (even if they
+  already succeeded), so there is never a "name the succeeded sibling to widen"
+  dead-end. Upstream (`a`) is always carried over.
 
-If the requested fork point falls inside an **unresolved** side effect (a
-parallel sibling that never settled — e.g. a run cancelled mid-flight), the
-endpoint returns `409 Conflict` with the nearest valid boundary and the hint to
-*wait for parallel siblings to settle, or include them in `from_nodes` to widen
-the retry set*.
+The dry-run output lists every node that will re-run, so you can confirm the
+blast radius before committing.
+
+If the fork point falls inside an **unresolved upstream** side effect (an
+upstream activity, timer, or child workflow that never settled — e.g. a run
+cancelled mid-flight), the endpoint returns `409 Conflict` with the nearest
+valid boundary and a hint to wait for it to settle or cancel the run first.
 
 ---
 
@@ -109,6 +112,6 @@ the retry set*.
 | `400` | `from_nodes` empty; an unknown node (the response lists the declared nodes); a node that was never attempted; or a node that already succeeded. |
 | `400` | The DAG is classic (non-unified). |
 | `404` | The DAG name is not registered, or the run is not a run of that DAG. |
-| `409` | The run succeeded (use a fresh run); the run is still running (cancel first); or the fork point lands inside an unresolved side effect (remediation hint included). |
+| `409` | The run succeeded (use a fresh run); the run is still running (cancel first); or the fork point lands inside an unresolved upstream side effect (remediation hint included). |
 | `201` | Retry committed; `new_run_exec_id` identifies the forked run. |
 | `200` | Dry-run plan (no write performed). |

@@ -695,39 +695,35 @@ async fn retry_unknown_node_lists_declared() {
     );
 }
 
-// ── (g) reset boundary mid-unresolved-side-effect -> 409 + remediation ──────
+// ── (g) reset boundary inside an unresolved upstream side effect -> 409 ──────
 
 #[tokio::test]
-async fn retry_mid_parallel_level_with_unsettled_sibling_is_conflict() {
+async fn retry_with_unresolved_upstream_side_effect_is_conflict() {
     let (url, _container) = setup_database().await;
     let pool = build_pool(&url);
     let app = build_app(&pool);
     let mut conn = establish(&url).await;
 
-    // Fan-out run cancelled while a sibling (step_b) was still in flight:
-    // step_b scheduled before step_c, but step_b never recorded a terminal
-    // event. Retrying step_c lands the cut at the boundary right after step_b's
-    // (unresolved) scheduling, which the #148 validator rejects -> 409.
-    // 0 WfStarted,1 schedA,2 compA,3 schedB,4 schedC,5 failC,6 WorkflowCancelled
-    let (ia, ib, ic) = (
-        ActivityExecId::new(),
-        ActivityExecId::new(),
-        ActivityExecId::new(),
-    );
+    // Under level-granular semantics the cut lands before the failed node's
+    // whole level, so the only way to land inside an unresolved side effect is
+    // an UPSTREAM one. Here step_a was scheduled but never settled (the run was
+    // cancelled while it was in flight) yet step_b was recorded as failed.
+    // Retrying step_b cuts before step_b's level, where step_a is still pending,
+    // so the #148 validator rejects the boundary -> 409 with a remediation hint.
+    // 0 WfStarted,1 schedA,2 schedB,3 failB,4 WorkflowCancelled
+    let (ia, ib) = (ActivityExecId::new(), ActivityExecId::new());
     let events = vec![
-        sched("step_a", ia),
-        completed(ia),
-        sched("step_b", ib), // never completes -> unresolved at the cut
-        sched("step_c", ic),
-        failed(ic),
+        sched("step_a", ia), // never completes -> unresolved upstream at the cut
+        sched("step_b", ib),
+        failed(ib),
         WorkflowEvent::WorkflowCancelled {
             reason: "operator cancelled".to_string(),
         },
     ];
     let exec_id = seed_run(
         &mut conn,
-        "fanout_retry_dag",
-        "fan-mid",
+        "linear_retry_dag",
+        "lin-mid",
         events,
         "CANCELLED",
     )
@@ -735,8 +731,8 @@ async fn retry_mid_parallel_level_with_unsettled_sibling_is_conflict() {
 
     let (status, body) = post_json(
         &app,
-        &format!("/dags/fanout_retry_dag/runs/{exec_id}/retry"),
-        json!({ "from_nodes": ["step_c"], "reason": "x", "operator_id": "oncall" }),
+        &format!("/dags/linear_retry_dag/runs/{exec_id}/retry"),
+        json!({ "from_nodes": ["step_b"], "reason": "x", "operator_id": "oncall" }),
     )
     .await;
 
@@ -745,7 +741,7 @@ async fn retry_mid_parallel_level_with_unsettled_sibling_is_conflict() {
         body["remediation"]
             .as_str()
             .unwrap_or_default()
-            .contains("widen the retry set"),
+            .contains("upstream"),
         "409 should carry a remediation hint: {body}"
     );
     assert!(body["nearest_valid_before"].is_i64());

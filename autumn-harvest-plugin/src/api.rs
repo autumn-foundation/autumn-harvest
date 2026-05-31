@@ -5827,7 +5827,8 @@ fn dag_retry_invalid_point_response(invalid: &ResetInvalidPoint) -> axum::respon
             nearest_valid_before: invalid.nearest_valid_before,
             nearest_valid_after: invalid.nearest_valid_after,
             remediation:
-                "wait for parallel siblings to settle, or include them in `from_nodes` to widen the retry set"
+                "an upstream side effect (activity, timer, or child workflow) is still unresolved \
+                 at the fork point; wait for it to settle or cancel the run first, then retry"
                     .to_string(),
         }),
     )
