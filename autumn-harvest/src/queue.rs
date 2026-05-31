@@ -854,6 +854,11 @@ pub async fn reschedule_task(
         dsl::worker_id.eq(None::<String>),
         dsl::started_at.eq(None::<chrono::DateTime<Utc>>),
         dsl::last_heartbeat_at.eq(None::<chrono::DateTime<Utc>>),
+        // Clean continuation (suspension or retryable-error reschedule) means
+        // the task made progress without crashing a worker, so the poison-pill
+        // crash streak resets — the threshold measures *consecutive* crashes
+        // (issue #367).
+        dsl::crash_strikes.eq(0),
         dsl::scheduled_at.eq(scheduled_at),
     ))
     .returning(dsl::queue_name)

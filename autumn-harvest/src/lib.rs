@@ -87,6 +87,7 @@ pub mod info;
 #[cfg(feature = "metrics-rs")]
 pub mod metrics_rs_adapter;
 pub mod payload_codec;
+pub mod poison_pill;
 pub mod policy;
 pub mod pool;
 pub mod prelude;

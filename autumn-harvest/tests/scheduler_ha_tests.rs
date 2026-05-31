@@ -79,6 +79,8 @@ const INIT_SQL: &str = concat!(
     "\n",
     // Auto-pause columns (issue #360)
     include_str!("../migrations/20260601000000_harvest_schedule_auto_pause/up.sql"),
+    "\n",
+    include_str!("../migrations/20260601000001_harvest_poison_pill_strikes/up.sql"),
 );
 
 // ── Recording metrics ──────────────────────────────────────────────────────

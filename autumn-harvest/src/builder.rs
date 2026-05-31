@@ -1438,6 +1438,18 @@ pub struct WorkerConfig {
     /// Grace window before cross-workflow signaling fails for unknown target (issue #330).
     /// Default: 5 seconds.
     pub unknown_target_grace_window: Duration,
+    /// Consecutive worker crashes a task may cause before it is quarantined to
+    /// the dead-letter queue instead of re-queued (issue #367).
+    ///
+    /// When the orphan-reclaim scanner reclaims a task from a dead worker, it
+    /// increments the task's `crash_strikes`. Once `crash_strikes` reaches this
+    /// threshold the task is moved to the DLQ and its owning workflow is failed
+    /// terminally, rather than being re-dispatched to crash another worker.
+    ///
+    /// Defaults to **3**. Set to `0` to disable quarantine entirely (reclaimed
+    /// poison pills are re-queued indefinitely — the legacy retry-loop
+    /// behaviour).
+    pub poison_pill_threshold: i32,
     #[cfg(feature = "db")]
     /// Optional sharded database pool for exact shard routing.
     pub sharded_pool: Option<crate::shard::ShardedDbPool>,
@@ -1463,6 +1475,7 @@ impl Default for WorkerConfig {
             priority_aging_secs: None,
             max_workflow_start_delay: DEFAULT_MAX_WORKFLOW_START_DELAY,
             unknown_target_grace_window: Duration::from_secs(5),
+            poison_pill_threshold: 3,
             #[cfg(feature = "db")]
             sharded_pool: None,
         }
@@ -1587,6 +1600,26 @@ impl WorkerConfig {
     #[must_use]
     pub const fn with_priority_aging_secs(mut self, secs: u32) -> Self {
         self.priority_aging_secs = if secs == 0 { None } else { Some(secs) };
+        self
+    }
+
+    /// Set the poison-pill quarantine threshold (issue #367).
+    ///
+    /// A task that crashes `threshold` workers in a row is quarantined to the
+    /// dead-letter queue instead of being re-dispatched. Set to `0` to disable
+    /// quarantine (reclaimed poison pills are re-queued indefinitely).
+    ///
+    /// ## Example
+    ///
+    /// ```rust
+    /// use autumn_harvest::builder::WorkerConfig;
+    ///
+    /// let config = WorkerConfig::default().with_poison_pill_threshold(5);
+    /// assert_eq!(config.poison_pill_threshold, 5);
+    /// ```
+    #[must_use]
+    pub const fn with_poison_pill_threshold(mut self, threshold: i32) -> Self {
+        self.poison_pill_threshold = threshold;
         self
     }
 
@@ -2122,6 +2155,23 @@ mod tests {
             config.max_local_activity_start_to_close,
             Duration::from_secs(60)
         );
+    }
+
+    #[test]
+    fn worker_config_poison_pill_threshold_defaults_to_3() {
+        assert_eq!(WorkerConfig::default().poison_pill_threshold, 3);
+    }
+
+    #[test]
+    fn worker_config_with_poison_pill_threshold_overrides() {
+        let config = WorkerConfig::default().with_poison_pill_threshold(7);
+        assert_eq!(config.poison_pill_threshold, 7);
+    }
+
+    #[test]
+    fn worker_config_poison_pill_threshold_zero_disables() {
+        let config = WorkerConfig::default().with_poison_pill_threshold(0);
+        assert_eq!(config.poison_pill_threshold, 0);
     }
 
     #[test]

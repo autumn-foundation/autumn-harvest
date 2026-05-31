@@ -113,6 +113,9 @@ pub struct WorkerRuntimeConfig {
     pub priority_aging_secs: Option<u32>,
     /// Grace window before cross-workflow signaling fails for unknown target (issue #330).
     pub unknown_target_grace_window: Duration,
+    /// Consecutive worker crashes a task may cause before quarantine (issue #367).
+    /// `0` disables quarantine (reclaimed poison pills are re-queued forever).
+    pub poison_pill_threshold: i32,
     #[cfg(feature = "db")]
     /// Optional sharded database pool for exact shard routing.
     pub sharded_pool: Option<crate::shard::ShardedDbPool>,
@@ -154,6 +157,7 @@ impl From<WorkerConfig> for WorkerRuntimeConfig {
             workflow_cache_size: cfg.workflow_cache_size,
             priority_aging_secs: cfg.priority_aging_secs,
             unknown_target_grace_window: cfg.unknown_target_grace_window,
+            poison_pill_threshold: cfg.poison_pill_threshold,
             #[cfg(feature = "db")]
             sharded_pool: cfg.sharded_pool,
         }
@@ -5445,6 +5449,7 @@ struct WorkerMonitoringHandles {
     rate_limit_sampler: tokio::task::JoinHandle<()>,
     dlq_depth_samplers: Vec<tokio::task::JoinHandle<()>>,
     timeout_checker: tokio::task::JoinHandle<()>,
+    poison_pill_reclaimer: tokio::task::JoinHandle<()>,
 }
 
 impl Worker {
@@ -5616,6 +5621,28 @@ impl Worker {
             self.config.sharded_pool.clone(),
             self.config.shard_assignments.clone(),
         );
+        // Worker-stale threshold mirrors the fleet-health classifier:
+        // 2 × heartbeat interval, with a 1 s floor for sub-second intervals.
+        // Double *before* rounding to whole seconds so a fractional interval
+        // (e.g. 1500ms → 3s, not 2s) keeps the documented liveness window, and
+        // cap at one year so an absurd interval can never overflow the
+        // chrono::Duration arithmetic in the reclaim path.
+        let doubled = self.config.worker_heartbeat_interval.saturating_mul(2);
+        let worker_stale_secs = i64::try_from(doubled.as_secs())
+            .unwrap_or(crate::poison_pill::MAX_WORKER_STALE_SECS)
+            .saturating_add(i64::from(doubled.subsec_nanos() > 0))
+            .clamp(1, crate::poison_pill::MAX_WORKER_STALE_SECS);
+        let poison_pill_reclaimer = crate::poison_pill::spawn_poison_pill_reclaimer(
+            pool.clone(),
+            self.shutdown.clone(),
+            // Orphan reclaim is background maintenance: sweep at the heartbeat
+            // cadence rather than the (much shorter) task poll interval to keep
+            // the liveness scan off the hot path.
+            self.config.worker_heartbeat_interval,
+            self.config.poison_pill_threshold,
+            worker_stale_secs,
+            self.registry.telemetry().clone(),
+        );
 
         WorkerMonitoringHandles {
             queue_depth_sampler,
@@ -5623,6 +5650,7 @@ impl Worker {
             rate_limit_sampler,
             dlq_depth_samplers,
             timeout_checker,
+            poison_pill_reclaimer,
         }
     }
 
@@ -5720,6 +5748,13 @@ impl Worker {
                 worker_id = %self.config.worker_id,
                 error = %error,
                 "timeout checker task failed during shutdown"
+            );
+        }
+        if let Err(error) = monitors.poison_pill_reclaimer.await {
+            tracing::warn!(
+                worker_id = %self.config.worker_id,
+                error = %error,
+                "poison-pill reclaimer task failed during shutdown"
             );
         }
         if let Err(error) = monitors.queue_depth_sampler.await {
@@ -6107,6 +6142,7 @@ mod tests {
             workflow_cache_size: 1000,
             priority_aging_secs: None,
             unknown_target_grace_window: Duration::from_secs(5),
+            poison_pill_threshold: 3,
             #[cfg(feature = "db")]
             sharded_pool: None,
         }
@@ -6169,6 +6205,7 @@ mod tests {
             priority_aging_secs: None,
             max_workflow_start_delay: Duration::from_secs(365 * 24 * 3600),
             unknown_target_grace_window: Duration::from_secs(5),
+            poison_pill_threshold: 3,
             #[cfg(feature = "db")]
             sharded_pool: None,
         };

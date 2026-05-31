@@ -88,6 +88,8 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260530000000_harvest_schedule_ha_claim/up.sql"),
     "\n",
     include_str!("../migrations/20260601000000_harvest_schedule_auto_pause/up.sql"),
+    "\n",
+    include_str!("../migrations/20260601000001_harvest_poison_pill_strikes/up.sql"),
 );
 
 const CREATE_USER_RECORDS: &str = "
@@ -182,6 +184,7 @@ fn make_worker(_db_url: &str, registry: Arc<HandlerRegistry>) -> Arc<Worker> {
                 workflow_cache_size: 100,
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
+                poison_pill_threshold: 3,
                 sharded_pool: None,
             },
             registry,

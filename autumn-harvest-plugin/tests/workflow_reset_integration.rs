@@ -101,6 +101,10 @@ const INIT_SQL: &str = concat!(
     "
 ",
     include_str!("../../autumn-harvest/migrations/20260530000000_harvest_schedule_ha_claim/up.sql"),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260601000001_harvest_poison_pill_strikes/up.sql"
+    ),
 );
 
 type HarvestApiApp = axum::Router;
@@ -162,6 +166,7 @@ fn build_reset_worker(registry: Arc<HandlerRegistry>) -> Arc<Worker> {
                 workflow_cache_size: 1000,
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
+                poison_pill_threshold: 3,
                 sharded_pool: None,
             },
             registry,

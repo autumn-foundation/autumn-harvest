@@ -62,6 +62,8 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260530000000_harvest_schedule_ha_claim/up.sql"),
     "\n",
     include_str!("../migrations/20260601000000_harvest_schedule_auto_pause/up.sql"),
+    "\n",
+    include_str!("../migrations/20260601000001_harvest_poison_pill_strikes/up.sql"),
 );
 
 async fn setup_test_db() -> (AsyncPgConnection, ContainerAsync<Postgres>) {
@@ -452,6 +454,7 @@ async fn running_activity_heartbeat_observes_workflow_cancellation() {
                 workflow_cache_size: 1000,
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
+                poison_pill_threshold: 3,
                 sharded_pool: None,
             },
             registry,
@@ -631,6 +634,7 @@ async fn uncooperative_activity_is_hard_aborted_after_grace_period() {
                 workflow_cache_size: 1000,
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
+                poison_pill_threshold: 3,
                 sharded_pool: None,
             },
             registry,
@@ -762,6 +766,7 @@ async fn activity_exits_early_on_workflow_cancellation() {
                 workflow_cache_size: 1000,
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
+                poison_pill_threshold: 3,
                 sharded_pool: None,
             },
             registry,
@@ -887,6 +892,7 @@ async fn activity_without_cancellation_check_completes_normally() {
                 workflow_cache_size: 1000,
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
+                poison_pill_threshold: 3,
                 sharded_pool: None,
             },
             registry,

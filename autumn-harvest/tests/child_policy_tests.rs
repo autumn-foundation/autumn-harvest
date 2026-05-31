@@ -71,6 +71,8 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260530000000_harvest_schedule_ha_claim/up.sql"),
     "\n",
     include_str!("../migrations/20260601000000_harvest_schedule_auto_pause/up.sql"),
+    "\n",
+    include_str!("../migrations/20260601000001_harvest_poison_pill_strikes/up.sql"),
 );
 
 async fn setup_test_db_url() -> (String, ContainerAsync<Postgres>) {
@@ -120,6 +122,7 @@ fn make_worker(registry: Arc<HandlerRegistry>) -> Worker {
             workflow_cache_size: 100,
             priority_aging_secs: None,
             unknown_target_grace_window: Duration::from_secs(5),
+            poison_pill_threshold: 3,
             #[cfg(feature = "db")]
             sharded_pool: None,
         },
