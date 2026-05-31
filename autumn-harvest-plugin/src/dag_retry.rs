@@ -165,9 +165,12 @@ pub fn downstream_closure(def: &DagDefinition, from_nodes: &BTreeSet<String>) ->
 /// Determine the outcome of a single node (by activity name) on the source run.
 #[must_use]
 pub fn node_outcome(events: &[WorkflowEvent], node: &str) -> NodeOutcome {
-    // Find the activity_id of the first ActivityScheduled with this name.
+    // Find the activity_id of the *latest* ActivityScheduled with this name.
+    // If a node was scheduled more than once (e.g. a re-dispatched attempt with
+    // a fresh activity_id), the latest attempt is the one whose terminal state
+    // is authoritative — the earlier attempts are superseded.
     let mut scheduled_id = None;
-    for event in events {
+    for event in events.iter().rev() {
         if let WorkflowEvent::ActivityScheduled {
             activity_id, name, ..
         } = event
@@ -181,7 +184,7 @@ pub fn node_outcome(events: &[WorkflowEvent], node: &str) -> NodeOutcome {
         return NodeOutcome::NotAttempted;
     };
 
-    // Completion wins over any earlier failed attempt.
+    // Completion wins over any earlier failed attempt for this activity_id.
     for event in events {
         if let WorkflowEvent::ActivityCompleted {
             activity_id: id, ..
@@ -439,6 +442,22 @@ mod tests {
         assert_eq!(node_outcome(&events, "a"), NodeOutcome::Succeeded);
         assert_eq!(node_outcome(&events, "c"), NodeOutcome::Failed);
         assert_eq!(node_outcome(&events, "d"), NodeOutcome::NotAttempted);
+    }
+
+    #[test]
+    fn node_outcome_uses_latest_attempt_when_rescheduled() {
+        // A node scheduled twice: first attempt (id1) failed, a later attempt
+        // (id2) succeeded. The latest attempt is authoritative -> Succeeded.
+        let id1 = ActivityExecId::new();
+        let id2 = ActivityExecId::new();
+        let events = vec![
+            started(),
+            scheduled("c", id1),
+            failed(id1),
+            scheduled("c", id2),
+            completed(id2),
+        ];
+        assert_eq!(node_outcome(&events, "c"), NodeOutcome::Succeeded);
     }
 
     // ---- resolve: linear -------------------------------------------------

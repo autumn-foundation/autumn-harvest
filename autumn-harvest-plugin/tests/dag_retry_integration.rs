@@ -424,7 +424,8 @@ async fn retry_linear_dag_from_failed_node_carries_upstream_and_completes() {
         WorkflowEvent::ActivityScheduled { name, .. } if name == "step_b"
     )));
 
-    // Source is sealed.
+    // Source is sealed to TERMINATED (not left FAILED) so a second retry of the
+    // same source run is rejected — no duplicate forks.
     let source_state: String = harvest_workflow_executions::table
         .find(exec_id.as_uuid())
         .select(harvest_workflow_executions::state)
@@ -432,6 +433,22 @@ async fn retry_linear_dag_from_failed_node_carries_upstream_and_completes() {
         .await
         .unwrap();
     assert_eq!(source_state, "TERMINATED");
+
+    let (dup_status, _dup_body) = post_json(
+        &app,
+        &format!("/dags/linear_retry_dag/runs/{exec_id}/retry"),
+        json!({
+            "from_nodes": ["step_c"],
+            "reason": "second attempt",
+            "operator_id": "oncall"
+        }),
+    )
+    .await;
+    assert_eq!(
+        dup_status,
+        StatusCode::CONFLICT,
+        "a sealed (TERMINATED) source must not be retried again"
+    );
 
     // Drive the fork to completion: c and d re-dispatch and succeed.
     let worker = build_worker();

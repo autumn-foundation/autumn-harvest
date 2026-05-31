@@ -739,8 +739,20 @@ async fn terminate_source_execution(
     )
     .await?;
 
+    // Seal the source run as TERMINATED. The state filter guards against a
+    // concurrent reset double-sealing the same row. For the standalone reset
+    // path only `RUNNING` is reachable; the DAG retry path (issue #366) accepts
+    // terminal failure states via `allow_terminal_source`, so those must also be
+    // sealed here — otherwise the update would match zero rows and leave the
+    // source in `FAILED`/`CANCELLED`/`TIMED_OUT`, defeating the caller's
+    // `TERMINATED` re-fork guard.
+    let sealable_states: Vec<&str> = if request.allow_terminal_source {
+        vec!["RUNNING", "FAILED", "CANCELLED", "TIMED_OUT"]
+    } else {
+        vec!["RUNNING"]
+    };
     diesel::update(harvest_workflow_executions::table.find(source_exec_id.as_uuid()))
-        .filter(harvest_workflow_executions::state.eq("RUNNING"))
+        .filter(harvest_workflow_executions::state.eq_any(sealable_states))
         .set((
             harvest_workflow_executions::state.eq("TERMINATED"),
             harvest_workflow_executions::output.eq(None::<Value>),
