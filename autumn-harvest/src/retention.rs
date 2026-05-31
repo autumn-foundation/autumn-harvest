@@ -339,69 +339,69 @@ impl RetentionRuntime {
                 }
 
                 // Workflow-history retention: only when max_age is configured.
-                if let Some(max_age) = config.max_age() {
-                    let cutoff =
-                        Utc::now() - chrono::Duration::from_std(max_age).unwrap_or_default();
-                    let tick_futures = pools.iter_shards().map(|(shard, pool)| {
-                        let pool = pool.clone();
-                        let config = config.clone();
-                        let metrics = Arc::clone(&metrics);
-                        let archiver = archiver.clone();
-                        let cursor = scan_cursors.get(&shard).copied().flatten();
-                        async move {
-                            let started = Instant::now();
-                            let tick = run_shard_tick(
-                                pool,
-                                shard,
-                                cutoff,
-                                &config,
-                                archiver,
-                                cursor,
-                                Arc::clone(&metrics),
-                            )
-                            .await;
-                            (shard, started, tick)
-                        }
-                    });
-
-                    for (shard, started, tick) in join_all(tick_futures).await {
-                        let mut result = RetentionTickResult {
-                            shard: u16::try_from(shard.as_i32()).unwrap_or(0),
-                            ran_at: Some(Utc::now()),
-                            duration_ms: started.elapsed().as_millis(),
-                            ..RetentionTickResult::default()
-                        };
-                        match tick {
-                            Ok(ok) => {
-                                scan_cursors.insert(shard, ok.next_cursor);
-                                result.candidate_count = ok.candidate_count;
-                                result.deleted_count = ok.deleted_count;
-                                result.oldest_age_secs_skipped = ok.oldest_age_secs_skipped;
-                                tracing::info!(
-                                    shard = %shard,
-                                    candidates = ok.candidate_count,
-                                    deleted = ok.deleted_count,
-                                    oldest_age_secs_skipped = ok.oldest_age_secs_skipped,
-                                    duration_ms = result.duration_ms,
-                                    dry_run = config.dry_run,
-                                    "harvest retention tick completed"
-                                );
-                                #[allow(clippy::cast_precision_loss)]
-                                metrics.record_retention_tick(
-                                    u16::try_from(shard.as_i32()).unwrap_or(0),
-                                    ok.candidate_count as u64,
-                                    ok.deleted_count as u64,
-                                    result.duration_ms as f64 / 1000.0,
-                                );
-                            }
-                            Err(error) => {
-                                result.last_error = Some(error.to_string());
-                                scan_cursors.insert(shard, None);
-                                tracing::warn!(shard = %shard, error = %error, "harvest retention tick failed");
-                            }
-                        }
-                        monitor_task.update(shard, result);
+                let Some(max_age) = config.max_age() else {
+                    continue;
+                };
+                let cutoff = Utc::now() - chrono::Duration::from_std(max_age).unwrap_or_default();
+                let tick_futures = pools.iter_shards().map(|(shard, pool)| {
+                    let pool = pool.clone();
+                    let config = config.clone();
+                    let metrics = Arc::clone(&metrics);
+                    let archiver = archiver.clone();
+                    let cursor = scan_cursors.get(&shard).copied().flatten();
+                    async move {
+                        let started = Instant::now();
+                        let tick = run_shard_tick(
+                            pool,
+                            shard,
+                            cutoff,
+                            &config,
+                            archiver,
+                            cursor,
+                            Arc::clone(&metrics),
+                        )
+                        .await;
+                        (shard, started, tick)
                     }
+                });
+
+                for (shard, started, tick) in join_all(tick_futures).await {
+                    let mut result = RetentionTickResult {
+                        shard: u16::try_from(shard.as_i32()).unwrap_or(0),
+                        ran_at: Some(Utc::now()),
+                        duration_ms: started.elapsed().as_millis(),
+                        ..RetentionTickResult::default()
+                    };
+                    match tick {
+                        Ok(ok) => {
+                            scan_cursors.insert(shard, ok.next_cursor);
+                            result.candidate_count = ok.candidate_count;
+                            result.deleted_count = ok.deleted_count;
+                            result.oldest_age_secs_skipped = ok.oldest_age_secs_skipped;
+                            tracing::info!(
+                                shard = %shard,
+                                candidates = ok.candidate_count,
+                                deleted = ok.deleted_count,
+                                oldest_age_secs_skipped = ok.oldest_age_secs_skipped,
+                                duration_ms = result.duration_ms,
+                                dry_run = config.dry_run,
+                                "harvest retention tick completed"
+                            );
+                            #[allow(clippy::cast_precision_loss)]
+                            metrics.record_retention_tick(
+                                u16::try_from(shard.as_i32()).unwrap_or(0),
+                                ok.candidate_count as u64,
+                                ok.deleted_count as u64,
+                                result.duration_ms as f64 / 1000.0,
+                            );
+                        }
+                        Err(error) => {
+                            result.last_error = Some(error.to_string());
+                            scan_cursors.insert(shard, None);
+                            tracing::warn!(shard = %shard, error = %error, "harvest retention tick failed");
+                        }
+                    }
+                    monitor_task.update(shard, result);
                 }
 
                 // Purge old audit records once per tick, best-effort.
