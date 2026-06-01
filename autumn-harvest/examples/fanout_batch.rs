@@ -10,7 +10,7 @@
 //! sources such as the wall clock or a random number generator.
 //!
 //! Run with:
-//!   cargo run --example fanout_batch
+//!   `cargo run --example fanout_batch`
 
 use autumn_harvest::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -38,7 +38,12 @@ pub struct BatchResult {
 
 /// Mock activity: processes one item. Returns an error for items starting
 /// with "bad_" so the collect-all example can show partial failure.
+///
+/// # Errors
+///
+/// Returns an error if the item string starts with `"bad_"`.
 #[activity(start_to_close = "10s")]
+#[allow(clippy::unused_async)]
 pub async fn process_item(_ctx: &ActivityContext, item: String) -> Result<ItemResult, String> {
     if item.starts_with("bad_") {
         return Err(format!("rejected: {item}"));
@@ -50,7 +55,12 @@ pub async fn process_item(_ctx: &ActivityContext, item: String) -> Result<ItemRe
 }
 
 /// Mock "list items" activity that returns a list from some external source.
+///
+/// # Errors
+///
+/// This mock activity never returns an error, but the signature supports it.
 #[activity(start_to_close = "5s")]
+#[allow(clippy::unused_async)]
 pub async fn fetch_items(_ctx: &ActivityContext, source: String) -> Result<BatchInput, String> {
     // Simulates fetching a batch from a queue, database, or message broker.
     println!("[Activity] fetch_items from source: {source}");
@@ -72,6 +82,10 @@ pub async fn fetch_items(_ctx: &ActivityContext, source: String) -> Result<Batch
 /// let results = ctx.execute_activity_fan_out(&process_item_info(), input.items)
 ///     .await.map_err(|e| e.to_string())?;
 /// ```
+///
+/// # Errors
+///
+/// Returns an error if any of the fanned-out `process_item` activities fail.
 #[workflow]
 pub async fn fail_fast_batch(
     ctx: &WorkflowContext,
@@ -90,6 +104,11 @@ pub async fn fail_fast_batch(
 }
 
 /// Collect-all fan-out: process all items; gather per-slot success / failure.
+///
+/// # Errors
+///
+/// Returns an error if the engine fails to schedule or execute the fan-out step
+/// (e.g. payload too large), though individual activity failures are collected.
 #[workflow]
 pub async fn collect_all_batch(
     ctx: &WorkflowContext,
@@ -123,6 +142,11 @@ pub async fn collect_all_batch(
 /// The collection is always derived from durable recorded state (the output of
 /// `fetch_items`), never from the wall clock or a random number — this is what
 /// keeps fan-out deterministic across replays.
+///
+/// # Errors
+///
+/// Returns an error if the `fetch_items` activity fails or if the engine
+/// fails to schedule the fan-out collection.
 #[workflow]
 pub async fn dynamic_fan_out(ctx: &WorkflowContext, source: String) -> Result<BatchResult, String> {
     // Step 1: fetch the list from an external source.
