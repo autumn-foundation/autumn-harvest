@@ -105,6 +105,10 @@ const INIT_SQL: &str = concat!(
     include_str!(
         "../../autumn-harvest/migrations/20260601000001_harvest_poison_pill_strikes/up.sql"
     ),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260601000002_harvest_ownership_metadata/up.sql"
+    ),
 );
 
 type HarvestApiApp = axum::Router;
@@ -233,6 +237,10 @@ async fn seed_execution(
             start_at: None,
             delay: None,
             max_workflow_start_delay: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
         },
     )
     .await
@@ -464,6 +472,10 @@ async fn reset_fork_completes_with_current_code_and_observes_buffered_signal() {
             execution_timeout: None,
             concurrency: None,
             max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
         }],
         vec![],
     ));

@@ -74,3 +74,20 @@ fn workflow_concurrency_macro_sets_policy() {
     assert_eq!(policy.key_expr, "input.tenant_id");
     assert_eq!(policy.limit, 10);
 }
+
+#[workflow(
+    owner = "billing",
+    runbook = "https://wiki.acme.com/runbook",
+    severity = "sev2"
+)]
+async fn metadata_workflow(_ctx: &WorkflowContext) -> Result<(), String> {
+    Ok(())
+}
+
+#[test]
+fn workflow_metadata_attributes() {
+    let info = __autumn_workflow_info_metadata_workflow();
+    assert_eq!(info.owner, Some("billing"));
+    assert_eq!(info.runbook_url, Some("https://wiki.acme.com/runbook"));
+    assert_eq!(info.severity, Some("sev2"));
+}

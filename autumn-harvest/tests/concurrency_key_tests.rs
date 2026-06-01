@@ -18,6 +18,10 @@ fn workflow_info_has_concurrency_fields() {
         execution_timeout: None,
         concurrency: None,
         max_input_bytes: None,
+
+        owner: None,
+        runbook_url: None,
+        severity: None,
     };
     assert!(info.concurrency.is_none());
 }
@@ -34,6 +38,10 @@ fn workflow_info_with_concurrency_policy() {
             limit: 10,
         }),
         max_input_bytes: None,
+
+        owner: None,
+        runbook_url: None,
+        severity: None,
     };
     let policy = info.concurrency.expect("should have concurrency policy");
     assert_eq!(policy.key_expr, "input.tenant_id");

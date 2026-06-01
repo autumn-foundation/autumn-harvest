@@ -338,6 +338,7 @@ mod scanner {
     ///
     /// Returns `true` if the task was quarantined, `false` if a concurrent
     /// actor already handled the row.
+    #[allow(clippy::too_many_lines)]
     async fn quarantine_orphan(
         conn: &mut AsyncPgConnection,
         task: &TaskQueueItem,
@@ -354,9 +355,28 @@ mod scanner {
         };
         let error = reason.to_string();
 
+        let (owner, severity) = match task.workflow_exec_id {
+            Some(exec_uuid) => {
+                use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
+                use diesel::OptionalExtension;
+                use diesel::QueryDsl;
+                use diesel_async::RunQueryDsl;
+                exec_dsl::harvest_workflow_executions
+                    .find(exec_uuid)
+                    .select((exec_dsl::owner, exec_dsl::severity))
+                    .first::<(Option<String>, Option<String>)>(conn)
+                    .await
+                    .optional()
+                    .map_err(crate::error::database_error)?
+                    .unwrap_or((None, None))
+            }
+            None => (None, None),
+        };
+
         let task_id = task.id;
         let worker = task.worker_id.clone();
         let prior_strikes = task.crash_strikes;
+
         let entry = NewDeadLetterEntry {
             original_task_id: task.id,
             queue_name: task.queue_name.clone(),
@@ -366,6 +386,8 @@ mod scanner {
             input: task.input.clone(),
             error: error.clone(),
             attempts: task.attempt,
+            owner,
+            severity,
         };
         let workflow_exec_id = task.workflow_exec_id;
 

@@ -24,7 +24,11 @@ use serde_json::{Value, json};
 
 /// Per-tenant onboarding: provisions resources then waits for either a
 /// completion signal or a `cancel_onboarding` cancellation signal.
-#[workflow]
+#[workflow(
+    owner = "platform",
+    runbook = "https://wiki.acme.com/onboarding-runbook",
+    severity = "sev3"
+)]
 pub async fn onboarding(ctx: &WorkflowContext, input: Value) -> HarvestResult<Value> {
     let tenant_id = input["tenant_id"].as_str().unwrap_or("unknown").to_owned();
 
@@ -63,7 +67,11 @@ pub async fn onboarding(ctx: &WorkflowContext, input: Value) -> HarvestResult<Va
 /// Uses `ctx.signal_external_workflow` for deterministic, replay-safe delivery.
 /// A `target_terminal` or `target_unknown` result means the onboarding already
 /// finished — treated as a no-op (not an error) for the cancellation saga.
-#[workflow]
+#[workflow(
+    owner = "platform",
+    runbook = "https://wiki.acme.com/cancel-runbook",
+    severity = "sev2"
+)]
 pub async fn tenant_cancel(ctx: &WorkflowContext, input: Value) -> HarvestResult<Value> {
     let tenant_id = input["tenant_id"].as_str().unwrap_or("unknown").to_owned();
     let exec_ids: Vec<String> = input["onboarding_exec_ids"]

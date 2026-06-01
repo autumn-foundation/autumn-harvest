@@ -118,6 +118,10 @@ const INIT_SQL: &str = concat!(
     include_str!(
         "../../autumn-harvest/migrations/20260601000001_harvest_poison_pill_strikes/up.sql"
     ),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260601000002_harvest_ownership_metadata/up.sql"
+    ),
 );
 
 // -------------------------------------------------------------------------
@@ -208,6 +212,10 @@ async fn start_workflow_stores_captured_trace_context_in_task_queue() {
             execution_timeout: None,
             concurrency: None,
             max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
         }],
         vec![],
         Arc::new(HashMap::new()),
@@ -298,6 +306,10 @@ async fn start_workflow_leaves_trace_context_null_when_no_propagator() {
             execution_timeout: None,
             concurrency: None,
             max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
         }],
         vec![],
     ));

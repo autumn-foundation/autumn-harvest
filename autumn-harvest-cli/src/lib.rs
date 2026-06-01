@@ -308,6 +308,7 @@ enum Commands {
         command: ShardCommand,
     },
     /// Manage workflow executions.
+    #[command(alias = "workflows")]
     Workflow {
         #[command(subcommand)]
         command: WorkflowCommand,
@@ -555,6 +556,7 @@ enum ShardCommand {
 #[derive(Debug, Subcommand)]
 enum WorkflowCommand {
     /// List workflow executions.
+    #[command(alias = "ls")]
     List {
         /// Maximum number of rows to return.
         #[arg(long, value_parser = clap::value_parser!(i64).range(1..=200))]
@@ -570,6 +572,9 @@ enum WorkflowCommand {
         /// AND multiple predicates together.
         #[arg(long = "search-attr", value_name = "KEY=VALUE")]
         search_attr: Vec<String>,
+        /// Filter by owner (exact match).
+        #[arg(long)]
+        owner: Option<String>,
     },
     /// Get one workflow execution and event history.
     Get {
@@ -2494,11 +2499,13 @@ fn workflow_request(command: &WorkflowCommand) -> Result<ApiRequest, CliError> {
             state,
             workflow_name,
             search_attr,
+            owner,
         } => Ok(ApiRequest::get(build_workflow_list_path(
             *limit,
             state,
             workflow_name.as_deref(),
             search_attr,
+            owner.as_deref(),
         )?)),
         WorkflowCommand::Get { execution_id } => Ok(ApiRequest::get(format!(
             "/workflows/{}",
@@ -3498,6 +3505,7 @@ fn build_workflow_list_path(
     states: &[String],
     workflow_name: Option<&str>,
     search_attrs: &[String],
+    owner: Option<&str>,
 ) -> Result<String, CliError> {
     let mut params: Vec<(&'static str, String)> = Vec::new();
     if let Some(value) = limit {
@@ -3516,6 +3524,9 @@ fn build_workflow_list_path(
             .split_once('=')
             .ok_or_else(|| CliError::InvalidSearchAttr { value: raw.clone() })?;
         params.push(("search_attr", format!("{key}:{value}")));
+    }
+    if let Some(o) = owner {
+        params.push(("owner", o.to_string()));
     }
 
     if params.is_empty() {

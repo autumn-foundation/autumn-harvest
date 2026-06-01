@@ -11,6 +11,9 @@ struct DagAttrs {
     max_active_runs: u32,
     default_queue: Option<String>,
     jitter: Option<String>,
+    owner: Option<String>,
+    runbook: Option<String>,
+    severity: Option<String>,
 }
 
 fn parse_attrs(attr: TokenStream) -> syn::Result<DagAttrs> {
@@ -40,9 +43,27 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<DagAttrs> {
             let value: LitStr = meta.value()?.parse()?;
             result.jitter = Some(value.value());
             Ok(())
+        } else if meta.path.is_ident("owner") {
+            let value: LitStr = meta.value()?.parse()?;
+            result.owner = Some(value.value());
+            Ok(())
+        } else if meta.path.is_ident("runbook") {
+            let value: LitStr = meta.value()?.parse()?;
+            result.runbook = Some(value.value());
+            Ok(())
+        } else if meta.path.is_ident("severity") {
+            let value: LitStr = meta.value()?.parse()?;
+            let s = value.value();
+            if s != "sev1" && s != "sev2" && s != "sev3" && s != "sev4" {
+                return Err(meta.error(format!(
+                    "invalid severity level: '{s}'; expected 'sev1', 'sev2', 'sev3', or 'sev4'"
+                )));
+            }
+            result.severity = Some(s);
+            Ok(())
         } else {
             Err(meta.error(
-                "unsupported attribute: expected schedule, catchup, max_active_runs, default_queue, or jitter",
+                "unsupported attribute: expected schedule, catchup, max_active_runs, default_queue, jitter, owner, runbook, or severity",
             ))
         }
     })
@@ -100,8 +121,14 @@ pub fn dag_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // feature is enabled on the proc-macro crate (transitively enabled by
     // `autumn-harvest/unified-dag-execution`).
     #[cfg(feature = "unified-dag-execution")]
-    let workflow_companion =
-        emit_workflow_companion(fn_name, &fn_name_str, attrs.default_queue.as_ref());
+    let workflow_companion = emit_workflow_companion(
+        fn_name,
+        &fn_name_str,
+        attrs.default_queue.as_ref(),
+        attrs.owner.as_deref(),
+        attrs.runbook.as_deref(),
+        attrs.severity.as_deref(),
+    );
 
     #[cfg(not(feature = "unified-dag-execution"))]
     let workflow_companion = quote! {};
@@ -247,6 +274,19 @@ pub fn dag_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         workflow_handler: None,
     };
 
+    let owner_expr = attrs
+        .owner
+        .as_deref()
+        .map_or_else(|| quote! { None }, |s| quote! { Some(#s) });
+    let runbook_url_expr = attrs
+        .runbook
+        .as_deref()
+        .map_or_else(|| quote! { None }, |s| quote! { Some(#s) });
+    let severity_expr = attrs
+        .severity
+        .as_deref()
+        .map_or_else(|| quote! { None }, |s| quote! { Some(#s) });
+
     quote! {
         #input_fn
 
@@ -266,6 +306,9 @@ pub fn dag_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 jitter: #jitter_expr,
                 overlap_policy: ::autumn_harvest::OverlapPolicy::Skip,
                 buffer_all_max: 100u32,
+                owner: #owner_expr,
+                runbook_url: #runbook_url_expr,
+                severity: #severity_expr,
             }
         }
 
@@ -281,6 +324,9 @@ fn emit_workflow_companion(
     fn_name: &syn::Ident,
     fn_name_str: &str,
     default_queue: Option<&String>,
+    owner: Option<&str>,
+    runbook: Option<&str>,
+    severity: Option<&str>,
 ) -> TokenStream {
     let companion_name = format_ident!("__autumn_workflow_info_{fn_name}");
 
@@ -288,6 +334,10 @@ fn emit_workflow_companion(
         || quote! { ::autumn_harvest::DagBuilder::new() },
         |q| quote! { ::autumn_harvest::DagBuilder::with_default_queue(#q) },
     );
+
+    let owner_expr = owner.map_or_else(|| quote! { None }, |s| quote! { Some(#s) });
+    let runbook_url_expr = runbook.map_or_else(|| quote! { None }, |s| quote! { Some(#s) });
+    let severity_expr = severity.map_or_else(|| quote! { None }, |s| quote! { Some(#s) });
 
     quote! {
         /// Shadow `WorkflowInfo` for this DAG, emitted when the
@@ -326,8 +376,8 @@ fn emit_workflow_companion(
                         // Per-task status accumulator indexed by task index.
                         let __n = __tasks.len();
                         let mut __statuses: ::std::vec::Vec<
-                            ::std::option::Option<::autumn_harvest::policy::TaskStatus>,
-                        > = vec![None; __n];
+                            ::autumn_harvest::policy::TaskStatus,
+                        > = vec![::autumn_harvest::policy::TaskStatus::Skipped; __n];
 
                         // Walk levels in order; tasks within each level are
                         // dispatched before awaiting completions so independent
@@ -357,18 +407,12 @@ fn emit_workflow_companion(
                                     ::autumn_harvest::policy::TaskStatus,
                                 > = __upstreams
                                     .iter()
-                                    .map(|&__i| {
-                                        __statuses[__i].unwrap_or(
-                                            ::autumn_harvest::policy::TaskStatus::Skipped,
-                                        )
-                                    })
+                                    .map(|&__i| __statuses[__i])
                                     .collect();
                                 let __should_run: bool = __trigger_rule.should_run(&__ups);
 
                                 if !__should_run {
-                                    __statuses[__task_idx] = Some(
-                                        ::autumn_harvest::policy::TaskStatus::Skipped,
-                                    );
+                                    __statuses[__task_idx] = ::autumn_harvest::policy::TaskStatus::Skipped;
                                     continue; // skip to next task in this level
                                 }
 
@@ -424,12 +468,12 @@ fn emit_workflow_companion(
                                 ::autumn_harvest::futures::future::join_all(__activity_futs).await
                             {
                                 let (__task_idx, __status) = __activity_result?;
-                                __statuses[__task_idx] = Some(__status);
+                                __statuses[__task_idx] = __status;
                             }
                         }
 
                         let __any_failed = __statuses.iter().any(|s| {
-                            matches!(s, Some(::autumn_harvest::policy::TaskStatus::Failed))
+                            matches!(s, ::autumn_harvest::policy::TaskStatus::Failed)
                         });
                         if __any_failed {
                             return Err("one or more DAG tasks failed".to_owned());
@@ -441,6 +485,9 @@ fn emit_workflow_companion(
                 execution_timeout: None,
                 concurrency: ::std::option::Option::None,
                 max_input_bytes: ::std::option::Option::None,
+                owner: #owner_expr,
+                runbook_url: #runbook_url_expr,
+                severity: #severity_expr,
             }
         }
     }

@@ -114,6 +114,10 @@ const INIT_SQL: &str = concat!(
     include_str!(
         "../../autumn-harvest/migrations/20260601000001_harvest_poison_pill_strikes/up.sql"
     ),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260601000002_harvest_ownership_metadata/up.sql"
+    ),
 );
 
 async fn setup_test_database_url() -> (String, ContainerAsync<Postgres>) {
@@ -236,6 +240,10 @@ fn echo_registry() -> Arc<HandlerRegistry> {
             execution_timeout: None,
             concurrency: None,
             max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
         }],
         vec![],
     ))
@@ -334,6 +342,10 @@ async fn insert_workflow_on_url(
             start_at: None,
             delay: None,
             max_workflow_start_delay: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
         },
     )
     .await
@@ -392,6 +404,8 @@ async fn insert_dead_letter_on_url(
             input: json!({ "ordinal": ordinal, "workflow": workflow_name }),
             error: format!("{workflow_name} failed at attempt {ordinal}: downstream timeout with enough text to truncate"),
             attempts: i32::try_from(ordinal + 1).expect("ordinal fits i32"),
+            owner: None,
+            severity: None,
         },
     )
     .await
@@ -1928,6 +1942,10 @@ async fn insert_child_workflow_on_url(
             start_at: None,
             delay: None,
             max_workflow_start_delay: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
         },
     )
     .await
@@ -2467,6 +2485,10 @@ async fn detail_page_shows_custom_continue_as_new_threshold() {
                 execution_timeout: None,
                 concurrency: None,
                 max_input_bytes: None,
+
+                owner: None,
+                runbook_url: None,
+                severity: None,
             }],
             vec![],
         )

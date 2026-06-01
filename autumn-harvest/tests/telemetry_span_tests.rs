@@ -89,6 +89,8 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260601000000_harvest_schedule_auto_pause/up.sql"),
     "\n",
     include_str!("../migrations/20260601000001_harvest_poison_pill_strikes/up.sql"),
+    "\n",
+    include_str!("../migrations/20260601000002_harvest_ownership_metadata/up.sql"),
 );
 
 // -------------------------------------------------------------------------
@@ -204,6 +206,10 @@ fn build_registry() -> Arc<HandlerRegistry> {
                 execution_timeout: None,
                 concurrency: None,
                 max_input_bytes: None,
+
+                owner: None,
+                runbook_url: None,
+                severity: None,
             },
             WorkflowInfo {
                 name: "telem_child_wf",
@@ -212,6 +218,10 @@ fn build_registry() -> Arc<HandlerRegistry> {
                 execution_timeout: None,
                 concurrency: None,
                 max_input_bytes: None,
+
+                owner: None,
+                runbook_url: None,
+                severity: None,
             },
         ],
         vec![
@@ -328,6 +338,9 @@ fn all_adr_0001_span_kinds_are_emitted() {
                     start_at: None,
                     delay: None,
                     max_workflow_start_delay: None,
+                    owner: None,
+                    runbook_url: None,
+                    severity: None,
                 },
             )
             .await

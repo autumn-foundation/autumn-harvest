@@ -611,6 +611,9 @@ mod tests {
             execution_timeout: None,
             concurrency: None,
             max_input_bytes: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
         }
     }
 
@@ -650,6 +653,9 @@ mod tests {
             jitter: ::std::time::Duration::ZERO,
             overlap_policy: autumn_harvest::OverlapPolicy::Skip,
             buffer_all_max: 100,
+            owner: None,
+            runbook_url: None,
+            severity: None,
         }
     }
 

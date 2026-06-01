@@ -129,6 +129,11 @@ td code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;c
 .badge.Active{background:#166534;color:#dcfce7}
 .badge.Draining{background:#92400e;color:#fef3c7}
 .badge.Stopped{background:#334155;color:#e2e8f0}
+.badge-owner{background:#312e81;color:#c7d2fe;border:1px solid #4338ca}
+.badge-sev-sev1{background:#7f1d1d;color:#fee2e2;border:1px solid #b91c1c}
+.badge-sev-sev2{background:#7c2d12;color:#ffedd5;border:1px solid #c2410c}
+.badge-sev-sev3{background:#713f12;color:#fef9c3;border:1px solid #a16207}
+.badge-sev-sev4{background:#065f46;color:#d1fae5;border:1px solid #047857}
 .banner{padding:12px 16px;border-radius:8px;margin-bottom:20px;font-size:13px;font-weight:500}
 .banner.Healthy{background:#14532d;color:#bbf7d0;border:1px solid #166534}
 .banner.Degraded{background:#431407;color:#fed7aa;border:1px solid #92400e}
@@ -3061,6 +3066,31 @@ fn render_workflow_detail(
                 } @else {
                     (kv("History events", &total_events.to_string(), false))
                 }
+                @if let Some(ref owner) = execution.owner {
+                    div.k { "Owner" }
+                    div.v {
+                        span class="badge badge-owner" { (owner) }
+                    }
+                }
+                @if let Some(ref sev) = execution.severity {
+                    @let sev_class = match sev.to_lowercase().as_str() {
+                        "sev1" => "badge-sev-sev1",
+                        "sev2" => "badge-sev-sev2",
+                        "sev3" => "badge-sev-sev3",
+                        "sev4" => "badge-sev-sev4",
+                        _ => "",
+                    };
+                    div.k { "Severity" }
+                    div.v {
+                        span class={ "badge " (sev_class) } { (sev.to_uppercase()) }
+                    }
+                }
+                @if let Some(ref rb) = execution.runbook_url {
+                    div.k { "Runbook" }
+                    div.v {
+                        a href=(rb) target="_blank" rel="noopener noreferrer" { (rb) }
+                    }
+                }
             }
         }
 
@@ -5141,6 +5171,14 @@ async fn execute_schedule_trigger_ui(
         uuid::Uuid::new_v4().simple()
     );
     let exec_id = HarvestExecutionId::new();
+    let (owner, runbook_url, severity) = runtime
+        .registry()
+        .workflows
+        .get(workflow_name)
+        .map_or((None, None, None), |info| {
+            (info.owner, info.runbook_url, info.severity)
+        });
+
     let result = start_or_load_workflow_execution(
         conn,
         StartWorkflowParams {
@@ -5163,6 +5201,9 @@ async fn execute_schedule_trigger_ui(
             start_at: None,
             delay: None,
             max_workflow_start_delay: None,
+            owner,
+            runbook_url,
+            severity,
         },
     )
     .await;
@@ -6684,6 +6725,9 @@ mod tests {
             created_at: Utc::now(),
             assigned_build_id: None,
             parent_close_policy: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
         }
     }
 

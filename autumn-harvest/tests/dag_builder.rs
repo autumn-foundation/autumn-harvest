@@ -112,6 +112,10 @@ fn harvest_builder_collects_dags() {
         jitter: ::std::time::Duration::ZERO,
         overlap_policy: autumn_harvest::OverlapPolicy::Skip,
         buffer_all_max: 100,
+
+        owner: None,
+        runbook_url: None,
+        severity: None,
     }]);
 
     assert_eq!(builder.dag_count(), 1);

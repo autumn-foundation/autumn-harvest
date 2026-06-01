@@ -1699,6 +1699,9 @@ mod tests {
             execution_timeout: None,
             concurrency: None,
             max_input_bytes: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
         }
     }
 
@@ -1717,6 +1720,9 @@ mod tests {
             jitter: ::std::time::Duration::ZERO,
             overlap_policy: crate::policy::OverlapPolicy::Skip,
             buffer_all_max: 100,
+            owner: None,
+            runbook_url: None,
+            severity: None,
         }
     }
 
@@ -1736,6 +1742,9 @@ mod tests {
             jitter: ::std::time::Duration::ZERO,
             overlap_policy: crate::policy::OverlapPolicy::Skip,
             buffer_all_max: 100,
+            owner: None,
+            runbook_url: None,
+            severity: None,
         }
     }
 
@@ -2113,6 +2122,9 @@ mod tests {
                     limit: 0,
                 }),
                 max_input_bytes: None,
+                owner: None,
+                runbook_url: None,
+                severity: None,
             }])
             .try_build();
         let err = result.unwrap_err();
@@ -2141,6 +2153,9 @@ mod tests {
                     limit: 5,
                 }),
                 max_input_bytes: None,
+                owner: None,
+                runbook_url: None,
+                severity: None,
             }])
             .try_build();
         assert!(result.is_ok());
@@ -2372,6 +2387,9 @@ mod tests {
             jitter: std::time::Duration::ZERO,
             overlap_policy: crate::policy::OverlapPolicy::Skip,
             buffer_all_max: 100,
+            owner: None,
+            runbook_url: None,
+            severity: None,
         };
         let result = HarvestBuilder::new().dags(vec![dag]).try_build();
         assert!(
@@ -2401,6 +2419,9 @@ mod tests {
             jitter: std::time::Duration::ZERO,
             overlap_policy: crate::policy::OverlapPolicy::Skip,
             buffer_all_max: 100,
+            owner: None,
+            runbook_url: None,
+            severity: None,
         };
         let result = HarvestBuilder::new().dags(vec![dag]).try_build();
         assert!(

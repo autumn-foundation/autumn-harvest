@@ -110,6 +110,10 @@ const INIT_SQL: &str = concat!(
     include_str!(
         "../../autumn-harvest/migrations/20260601000001_harvest_poison_pill_strikes/up.sql"
     ),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260601000002_harvest_ownership_metadata/up.sql"
+    ),
 );
 
 async fn setup_test_database_url() -> (String, ContainerAsync<Postgres>) {
@@ -148,6 +152,10 @@ fn minimal_registry() -> Arc<HandlerRegistry> {
             execution_timeout: None,
             concurrency: None,
             max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
         }],
         vec![],
     ))
@@ -550,6 +558,10 @@ async fn api_retire_build_returns_conflict_when_not_safe() {
             start_at: None,
             delay: None,
             max_workflow_start_delay: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
         },
     )
     .await
@@ -803,6 +815,7 @@ async fn build_routing_page_displays_flash_message() {
 ///   6. Observe reachability — `sha-v1` now safe to retire.
 ///   7. Assert `safe_to_retire` only flips after all old executions complete.
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn two_build_rolling_deploy_full_lifecycle() {
     let (database_url, _container) = setup_test_database_url().await;
     let pool = build_test_pool(&database_url);
@@ -834,6 +847,10 @@ async fn two_build_rolling_deploy_full_lifecycle() {
                 start_at: None,
                 delay: None,
                 max_workflow_start_delay: None,
+
+                owner: None,
+                runbook_url: None,
+                severity: None,
             },
         )
         .await

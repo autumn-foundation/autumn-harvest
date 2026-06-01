@@ -799,6 +799,9 @@ async fn insert_fork_execution(
         search_attrs: source.search_attrs.clone(),
         assigned_build_id: source.assigned_build_id.clone(),
         parent_close_policy: None, // reset fork is a fresh root execution
+        owner: source.owner.as_deref(),
+        runbook_url: source.runbook_url.as_deref(),
+        severity: source.severity.as_deref(),
     };
 
     diesel::insert_into(harvest_workflow_executions::table)

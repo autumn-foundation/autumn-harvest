@@ -24,6 +24,9 @@ struct WorkflowAttrs {
     /// Per-workflow-type cap override in bytes (issue #252). Parsed from
     /// `#[workflow(max_input_bytes = "8MiB")]` at compile time.
     max_input_bytes: Option<u64>,
+    owner: Option<String>,
+    runbook: Option<String>,
+    severity: Option<String>,
 }
 
 fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
@@ -31,6 +34,9 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
         execution_timeout: None,
         concurrency: None,
         max_input_bytes: None,
+        owner: None,
+        runbook: None,
+        severity: None,
     };
 
     syn::meta::parser(|meta| {
@@ -82,9 +88,27 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
             })?;
             result.max_input_bytes = Some(bytes);
             Ok(())
+        } else if meta.path.is_ident("owner") {
+            let value: LitStr = meta.value()?.parse()?;
+            result.owner = Some(value.value());
+            Ok(())
+        } else if meta.path.is_ident("runbook") {
+            let value: LitStr = meta.value()?.parse()?;
+            result.runbook = Some(value.value());
+            Ok(())
+        } else if meta.path.is_ident("severity") {
+            let value: LitStr = meta.value()?.parse()?;
+            let s = value.value();
+            if s != "sev1" && s != "sev2" && s != "sev3" && s != "sev4" {
+                return Err(meta.error(format!(
+                    "invalid severity level: '{s}'; expected 'sev1', 'sev2', 'sev3', or 'sev4'"
+                )));
+            }
+            result.severity = Some(s);
+            Ok(())
         } else {
             Err(meta.error(
-                "unsupported attribute: expected `execution_timeout`, `concurrency`, or `max_input_bytes`",
+                "unsupported attribute: expected `execution_timeout`, `concurrency`, `max_input_bytes`, `owner`, `runbook`, or `severity`",
             ))
         }
     })
@@ -214,6 +238,19 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! { ::autumn_harvest::serde_json::to_value((#(&#param_names),*)).map_err(::autumn_harvest::error::HarvestError::Serialization)? }
     };
 
+    let owner_expr = attrs
+        .owner
+        .as_deref()
+        .map_or_else(|| quote! { None }, |s| quote! { Some(#s) });
+    let runbook_url_expr = attrs
+        .runbook
+        .as_deref()
+        .map_or_else(|| quote! { None }, |s| quote! { Some(#s) });
+    let severity_expr = attrs
+        .severity
+        .as_deref()
+        .map_or_else(|| quote! { None }, |s| quote! { Some(#s) });
+
     quote! {
         #input_fn
 
@@ -230,6 +267,9 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 execution_timeout: #execution_timeout_expr,
                 concurrency: #concurrency_expr,
                 max_input_bytes: #max_input_bytes_expr,
+                owner: #owner_expr,
+                runbook_url: #runbook_url_expr,
+                severity: #severity_expr,
             }
         }
 
@@ -343,6 +383,9 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         start_at: opts.start_at,
                         delay: opts.delay,
                         max_workflow_start_delay: ::std::option::Option::Some(max_workflow_start_delay),
+                        owner: info.owner,
+                        runbook_url: info.runbook_url,
+                        severity: info.severity,
                     };
 
                     let started = client.start_or_load(conn, params).await?;
@@ -420,6 +463,9 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         idempotency_key: opts.idempotency_key,
                         max_workflow_input_bytes: client.max_workflow_input_bytes(info.max_input_bytes),
                         max_signal_payload_bytes: opts.max_signal_payload_bytes.unwrap_or_else(|| client.max_signal_payload_bytes()),
+                        owner: info.owner,
+                        runbook_url: info.runbook_url,
+                        severity: info.severity,
                     };
 
                     let outcome = ::autumn_harvest::execution::signal_with_start_workflow_execution(conn, params).await?;

@@ -88,6 +88,8 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260601000000_harvest_schedule_auto_pause/up.sql"),
     "\n",
     include_str!("../migrations/20260601000001_harvest_poison_pill_strikes/up.sql"),
+    "\n",
+    include_str!("../migrations/20260601000002_harvest_ownership_metadata/up.sql"),
 );
 
 // ---------------------------------------------------------------------------
@@ -590,6 +592,10 @@ async fn workflow_and_activity_metrics_are_recorded() {
         search_attrs: None,
         assigned_build_id: None,
         parent_close_policy: None,
+
+        owner: None,
+        runbook_url: None,
+        severity: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&exec_row)
@@ -633,6 +639,10 @@ async fn workflow_and_activity_metrics_are_recorded() {
             execution_timeout: None,
             concurrency: None,
             max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
         }],
         vec![ActivityInfo {
             name: "metrics_activity",
@@ -782,6 +792,10 @@ async fn continue_as_new_records_history_size_and_rotation_metrics() {
             search_attrs: None,
             assigned_build_id: None,
             parent_close_policy: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
         })
         .execute(&mut conn)
         .await
@@ -821,6 +835,10 @@ async fn continue_as_new_records_history_size_and_rotation_metrics() {
             execution_timeout: None,
             concurrency: None,
             max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
         }],
         vec![],
         autumn_harvest::context::empty_shared_state(),
@@ -887,6 +905,10 @@ async fn workflow_hard_cap_moves_offender_to_dlq() {
             search_attrs: None,
             assigned_build_id: None,
             parent_close_policy: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
         })
         .execute(&mut conn)
         .await
@@ -933,6 +955,10 @@ async fn workflow_hard_cap_moves_offender_to_dlq() {
             execution_timeout: None,
             concurrency: None,
             max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
         }],
         vec![],
         autumn_harvest::context::empty_shared_state(),
@@ -959,7 +985,7 @@ async fn workflow_hard_cap_moves_offender_to_dlq() {
         "execution error should identify hard cap reason, got: {error}"
     );
 
-    let dead_letters = dlq::list_dead_letters(&mut conn, 10)
+    let dead_letters = dlq::list_dead_letters(&mut conn, 10, None)
         .await
         .expect("failed to list DLQ rows");
     let dlq_row = dead_letters
@@ -1004,6 +1030,10 @@ async fn workflow_hard_cap_dlq_preserves_terminal_attempt_count() {
             search_attrs: None,
             assigned_build_id: None,
             parent_close_policy: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
         })
         .execute(&mut conn)
         .await
@@ -1051,6 +1081,10 @@ async fn workflow_hard_cap_dlq_preserves_terminal_attempt_count() {
                 execution_timeout: None,
                 concurrency: None,
                 max_input_bytes: None,
+
+                owner: None,
+                runbook_url: None,
+                severity: None,
             }],
             vec![],
         )
@@ -1069,7 +1103,7 @@ async fn workflow_hard_cap_dlq_preserves_terminal_attempt_count() {
     worker.shutdown();
     handle.await.expect("worker task should join cleanly");
 
-    let dead_letters = dlq::list_dead_letters(&mut conn, 10)
+    let dead_letters = dlq::list_dead_letters(&mut conn, 10, None)
         .await
         .expect("failed to list DLQ rows");
     let dlq_row = dead_letters
@@ -1121,6 +1155,10 @@ async fn suspended_commands_that_reach_hard_cap_move_to_dlq_immediately() {
                 search_attrs: None,
                 assigned_build_id: None,
                 parent_close_policy: None,
+
+                owner: None,
+                runbook_url: None,
+                severity: None,
             })
             .execute(&mut conn)
             .await
@@ -1171,6 +1209,10 @@ async fn suspended_commands_that_reach_hard_cap_move_to_dlq_immediately() {
                 execution_timeout: None,
                 concurrency: None,
                 max_input_bytes: None,
+
+                owner: None,
+                runbook_url: None,
+                severity: None,
             },
             WorkflowInfo {
                 name: "history_cap_never_finishing_child",
@@ -1179,6 +1221,10 @@ async fn suspended_commands_that_reach_hard_cap_move_to_dlq_immediately() {
                 execution_timeout: None,
                 concurrency: None,
                 max_input_bytes: None,
+
+                owner: None,
+                runbook_url: None,
+                severity: None,
             },
         ],
         vec![ActivityInfo {
@@ -1219,7 +1265,7 @@ async fn suspended_commands_that_reach_hard_cap_move_to_dlq_immediately() {
     worker.shutdown();
     handle.await.expect("worker task should join cleanly");
 
-    let dead_letters = dlq::list_dead_letters(&mut conn, 10)
+    let dead_letters = dlq::list_dead_letters(&mut conn, 10, None)
         .await
         .expect("failed to list DLQ rows");
 
@@ -1299,6 +1345,10 @@ async fn local_activity_retries_stop_when_hard_cap_is_reached() {
             search_attrs: None,
             assigned_build_id: None,
             parent_close_policy: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
         })
         .execute(&mut conn)
         .await
@@ -1345,6 +1395,10 @@ async fn local_activity_retries_stop_when_hard_cap_is_reached() {
             execution_timeout: None,
             concurrency: None,
             max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
         }],
         vec![ActivityInfo {
             name: "history_cap_always_failing_local",
@@ -1408,7 +1462,7 @@ async fn local_activity_retries_stop_when_hard_cap_is_reached() {
         history.events
     );
 
-    let dead_letters = dlq::list_dead_letters(&mut conn, 10)
+    let dead_letters = dlq::list_dead_letters(&mut conn, 10, None)
         .await
         .expect("failed to list DLQ rows");
     assert!(
@@ -1448,6 +1502,10 @@ async fn detached_parent_close_cascade_counts_against_history_cap() {
             search_attrs: None,
             assigned_build_id: None,
             parent_close_policy: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
         })
         .execute(&mut conn)
         .await
@@ -1489,6 +1547,10 @@ async fn detached_parent_close_cascade_counts_against_history_cap() {
                 execution_timeout: None,
                 concurrency: None,
                 max_input_bytes: None,
+
+                owner: None,
+                runbook_url: None,
+                severity: None,
             },
             WorkflowInfo {
                 name: "history_cap_never_finishing_child",
@@ -1497,6 +1559,10 @@ async fn detached_parent_close_cascade_counts_against_history_cap() {
                 execution_timeout: None,
                 concurrency: None,
                 max_input_bytes: None,
+
+                owner: None,
+                runbook_url: None,
+                severity: None,
             },
         ],
         vec![],
@@ -1555,7 +1621,7 @@ async fn detached_parent_close_cascade_counts_against_history_cap() {
         "detached child rows should not be created after cap breach: {children:?}"
     );
 
-    let dead_letters = dlq::list_dead_letters(&mut conn, 10)
+    let dead_letters = dlq::list_dead_letters(&mut conn, 10, None)
         .await
         .expect("failed to list DLQ rows");
     assert!(
@@ -1595,6 +1661,10 @@ async fn child_hard_cap_dlq_notifies_parent_and_stops_inline_growth() {
             search_attrs: None,
             assigned_build_id: None,
             parent_close_policy: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
         })
         .execute(&mut conn)
         .await
@@ -1636,6 +1706,10 @@ async fn child_hard_cap_dlq_notifies_parent_and_stops_inline_growth() {
                 execution_timeout: None,
                 concurrency: None,
                 max_input_bytes: None,
+
+                owner: None,
+                runbook_url: None,
+                severity: None,
             },
             WorkflowInfo {
                 name: "child_breaches_history_cap_inline",
@@ -1644,6 +1718,10 @@ async fn child_hard_cap_dlq_notifies_parent_and_stops_inline_growth() {
                 execution_timeout: None,
                 concurrency: None,
                 max_input_bytes: None,
+
+                owner: None,
+                runbook_url: None,
+                severity: None,
             },
         ],
         vec![ActivityInfo {
@@ -1729,7 +1807,7 @@ async fn child_hard_cap_dlq_notifies_parent_and_stops_inline_growth() {
         child_history.events
     );
 
-    let dead_letters = dlq::list_dead_letters(&mut conn, 10)
+    let dead_letters = dlq::list_dead_letters(&mut conn, 10, None)
         .await
         .expect("failed to list DLQ rows");
     assert!(
@@ -1758,6 +1836,9 @@ async fn dlq_depth_sampler_emits_dlq_entries_metric() {
         input: serde_json::json!({}),
         error: "intentional test failure".to_string(),
         attempts: 3,
+
+        owner: None,
+        severity: None,
     };
     dlq::dead_letter(&mut conn, &dlq_entry)
         .await

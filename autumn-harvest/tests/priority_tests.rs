@@ -243,6 +243,10 @@ fn start_workflow_params_has_priority_field() {
         start_at: None,
         delay: None,
         max_workflow_start_delay: None,
+
+        owner: None,
+        runbook_url: None,
+        severity: None,
     };
 
     assert_eq!(params.priority, Priority::High);
@@ -274,6 +278,10 @@ fn start_workflow_params_default_priority_is_normal() {
         start_at: None,
         delay: None,
         max_workflow_start_delay: None,
+
+        owner: None,
+        runbook_url: None,
+        severity: None,
     };
 
     assert_eq!(params.priority, Priority::Normal);
