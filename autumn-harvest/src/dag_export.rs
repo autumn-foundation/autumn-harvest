@@ -48,6 +48,52 @@ pub fn export_mermaid(dag: &DagDefinition) -> Result<String, std::fmt::Error> {
     Ok(out)
 }
 
+/// Exports the DAG execution profile to Chrome Trace Event format.
+///
+/// # Errors
+/// Returns `std::fmt::Error` if string formatting fails.
+#[cfg(feature = "testing")]
+pub fn export_chrome_trace(
+    profile: &crate::dag_profiler::DagProfile,
+) -> Result<String, std::fmt::Error> {
+    let mut events = Vec::new();
+    let mut starts: std::collections::HashMap<usize, (std::time::Duration, String)> =
+        std::collections::HashMap::new();
+
+    for event in &profile.timeline {
+        match &event.kind {
+            crate::dag_profiler::ProfilerEventKind::TaskStarted(id, name) => {
+                starts.insert(*id, (event.time, name.clone()));
+            }
+            crate::dag_profiler::ProfilerEventKind::TaskCompleted(id, _) => {
+                if let Some((start_time, name)) = starts.remove(id) {
+                    let ts = start_time.as_micros();
+                    let dur = event.time.saturating_sub(start_time).as_micros();
+                    events.push((name, ts, dur, *id));
+                }
+            }
+        }
+    }
+
+    events.sort_by_key(|e| e.1); // Sort by ts
+
+    let mut out = String::from("[\n");
+    for (i, e) in events.iter().enumerate() {
+        write!(
+            out,
+            "  {{\"name\": \"{}\", \"cat\": \"task\", \"ph\": \"X\", \"ts\": {}, \"dur\": {}, \"pid\": 1, \"tid\": {}}}",
+            e.0, e.1, e.2, e.3
+        )?;
+        if i < events.len() - 1 {
+            out.push_str(",\n");
+        } else {
+            out.push('\n');
+        }
+    }
+    out.push(']');
+    Ok(out)
+}
+
 /// Exports the DAG definition to Graphviz DOT format.
 ///
 /// # Examples
@@ -95,10 +141,47 @@ pub fn export_dot(dag: &DagDefinition) -> Result<String, std::fmt::Error> {
 mod tests {
     use super::*;
     use crate::dag::DagBuilder;
+    #[cfg(feature = "testing")]
+    use crate::dag_profiler::{DagProfile, ProfilerEvent, ProfilerEventKind};
 
     fn dummy_activity() {}
     fn dummy_activity2() {}
     fn dummy_activity3() {}
+
+    #[cfg(feature = "testing")]
+    #[test]
+    fn test_export_chrome_trace() {
+        let profile = DagProfile {
+            total_duration: std::time::Duration::from_secs(5),
+            peak_concurrency: 1,
+            timeline: vec![
+                ProfilerEvent {
+                    time: std::time::Duration::from_secs(0),
+                    kind: ProfilerEventKind::TaskStarted(0, "activity_a".to_string()),
+                },
+                ProfilerEvent {
+                    time: std::time::Duration::from_secs(2),
+                    kind: ProfilerEventKind::TaskCompleted(0, "activity_a".to_string()),
+                },
+                ProfilerEvent {
+                    time: std::time::Duration::from_secs(2),
+                    kind: ProfilerEventKind::TaskStarted(1, "activity_b".to_string()),
+                },
+                ProfilerEvent {
+                    time: std::time::Duration::from_secs(5),
+                    kind: ProfilerEventKind::TaskCompleted(1, "activity_b".to_string()),
+                },
+            ],
+        };
+
+        let trace = export_chrome_trace(&profile).unwrap();
+        assert!(trace.contains("\"name\": \"activity_a\""));
+        assert!(trace.contains("\"ts\": 0"));
+        assert!(trace.contains("\"dur\": 2000000"));
+        assert!(trace.contains("\"name\": \"activity_b\""));
+        assert!(trace.contains("\"ts\": 2000000"));
+        assert!(trace.contains("\"dur\": 3000000"));
+    }
 
     #[test]
     fn test_export_empty_dag() {
