@@ -354,6 +354,7 @@ fn start_harvest_runtime(
     .with_query_timeout(query_timeout)
     .with_history_policy(runner.api_runtime().registry().history_policy());
     state.insert_extension(harvest_db_pool.clone());
+    state.insert_extension(runner.api_runtime().registry().clone());
 
     #[cfg(feature = "webhooks")]
     let client = workflow_handle_client.clone();
@@ -368,6 +369,17 @@ fn start_harvest_runtime(
                   log: autumn_web::webhook_outbound::WebhookDeliveryLog| {
                 let client = client.clone();
                 let harvest_db = state.extension::<crate::state::HarvestDbPool>();
+
+                let (owner, runbook_url, severity) = state
+                    .extension::<std::sync::Arc<autumn_harvest::worker::HandlerRegistry>>()
+                    .and_then(|registry| {
+                        registry
+                            .workflows
+                            .get("webhook_delivery")
+                            .map(|wf| (wf.owner, wf.runbook_url, wf.severity))
+                    })
+                    .unwrap_or((None, None, None));
+
                 Box::pin(async move {
                     let workflow_id = format!("webhook-delivery-{}", log.id);
                     let shard =
@@ -398,6 +410,9 @@ fn start_harvest_runtime(
                         start_at: None,
                         delay: None,
                         max_workflow_start_delay: None,
+                        owner,
+                        runbook_url,
+                        severity,
                     };
 
                     let Some(harvest_db) = harvest_db else {

@@ -283,6 +283,16 @@ pub(crate) async fn dispatch_workflow_start_request(
         .await
         .map_err(database_error)?;
 
+    let (owner, runbook_url, severity) = state
+        .extension::<std::sync::Arc<autumn_harvest::worker::HandlerRegistry>>()
+        .and_then(|registry| {
+            registry
+                .workflows
+                .get(&request.workflow_name)
+                .map(|wf| (wf.owner, wf.runbook_url, wf.severity))
+        })
+        .unwrap_or((None, None, None));
+
     let start = start_or_load_workflow_execution(
         &mut conn,
         StartWorkflowParams {
@@ -305,9 +315,9 @@ pub(crate) async fn dispatch_workflow_start_request(
             start_at: None,
             delay: None,
             max_workflow_start_delay: None,
-            owner: None,
-            runbook_url: None,
-            severity: None,
+            owner,
+            runbook_url,
+            severity,
         },
     )
     .await?;
