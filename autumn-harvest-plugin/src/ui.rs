@@ -2147,14 +2147,14 @@ fn dead_letter_task_kind_label(task_type: &str) -> &'static str {
     }
 }
 
+/// Truncates a string by char boundary instead of using `.chars().take().collect()`
+/// to prevent intermediate heap allocations for the truncated chunk.
 fn truncate_error(error: &str) -> String {
     const LIMIT: usize = 96;
-    let mut chars = error.chars();
-    let truncated = chars.by_ref().take(LIMIT).collect::<String>();
-    if chars.next().is_some() {
-        format!("{truncated}...")
+    if let Some((idx, _)) = error.char_indices().nth(LIMIT) {
+        format!("{}...", &error[..idx])
     } else {
-        truncated
+        error.to_string()
     }
 }
 
@@ -3418,8 +3418,11 @@ fn badge_class(state: &str) -> &'static str {
     }
 }
 
+/// Truncates ID string using string slicing at a verified char boundary instead of
+/// `.chars().take().collect()` to avoid intermediate heap allocations.
 fn short_id(id: &str) -> String {
-    id.chars().take(8).collect::<String>() + "…"
+    let idx = id.char_indices().nth(8).map_or(id.len(), |(i, _)| i);
+    format!("{}…", &id[..idx])
 }
 
 fn url_encode(input: &str) -> String {
