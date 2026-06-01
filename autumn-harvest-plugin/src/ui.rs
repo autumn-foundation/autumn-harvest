@@ -6556,7 +6556,6 @@ mod tests {
             concurrency_cap: None,
             required_build_id: None,
             rate_limit_key: None,
-            circuit_breaker: None,
             crash_strikes: 0,
         }
     }
