@@ -75,16 +75,38 @@ impl CircuitPhase {
     }
 }
 
+/// Opaque token returned by [`CircuitBreakerRegistry::on_dispatch`] and handed
+/// back to [`CircuitBreakerRegistry::on_result`].
+///
+/// It carries the breaker's *generation* at dispatch time. Every state-resetting
+/// transition (trip, recover-to-closed, operator force-open, operator
+/// force-close) bumps the generation, so a result whose token predates the
+/// current generation is a **stale straggler** — an attempt that started before
+/// a trip or before a manual reset — and is fenced out: it can neither resolve
+/// the half-open probe early nor immediately re-trip a just-closed breaker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DispatchToken {
+    generation: u64,
+    is_probe: bool,
+}
+
+impl DispatchToken {
+    /// Whether this dispatch was admitted as the single half-open probe.
+    #[must_use]
+    pub const fn is_probe(self) -> bool {
+        self.is_probe
+    }
+}
+
 /// Outcome of consulting the breaker before dispatching an activity attempt.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DispatchDecision {
-    /// Proceed with the dispatch.
+    /// Proceed with the dispatch. The caller must pass `token` back to
+    /// [`CircuitBreakerRegistry::on_result`] so the breaker can fence stale
+    /// results by generation.
     Allow {
-        /// `true` when this dispatch is the single half-open probe admitted
-        /// after a cooldown. The caller must pass this back to
-        /// [`CircuitBreakerRegistry::on_result`] so the breaker only acts on the
-        /// probe's own outcome and ignores stragglers from before the trip.
-        is_probe: bool,
+        /// Generation-stamped token (see [`DispatchToken`]).
+        token: DispatchToken,
     },
     /// Short-circuit the attempt: the breaker is open.
     ShortCircuit {
@@ -164,6 +186,10 @@ struct BreakerState {
     /// Operator pin: while set, dispatches always short-circuit and results are
     /// ignored until an operator force-closes.
     forced_open: bool,
+    /// Monotonic generation counter bumped on every state-resetting transition
+    /// (trip / close / force-open / force-close). A result whose dispatch token
+    /// carries an older generation is a stale straggler and is fenced out.
+    generation: u64,
 }
 
 impl Default for BreakerState {
@@ -175,6 +201,7 @@ impl Default for BreakerState {
             opened_at_wall: None,
             probe_in_flight: false,
             forced_open: false,
+            generation: 0,
         }
     }
 }
@@ -190,12 +217,19 @@ impl BreakerState {
         }
     }
 
+    /// Bump the generation so any attempt dispatched before this transition is
+    /// fenced out of `on_result`.
+    const fn bump_generation(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+    }
+
     fn trip(&mut self, now: Instant) {
         self.phase = CircuitPhase::Open;
         self.opened_at = Some(now);
         self.opened_at_wall = Some(Utc::now());
         self.failures.clear();
         self.probe_in_flight = false;
+        self.bump_generation();
     }
 
     fn close(&mut self) {
@@ -204,6 +238,7 @@ impl BreakerState {
         self.opened_at = None;
         self.opened_at_wall = None;
         self.probe_in_flight = false;
+        self.bump_generation();
     }
 }
 
@@ -267,7 +302,12 @@ impl CircuitBreakerRegistry {
     #[must_use]
     pub fn on_dispatch(&self, activity_name: &str, now: Instant) -> DispatchDecision {
         let Some(&policy) = self.policies.get(activity_name) else {
-            return DispatchDecision::Allow { is_probe: false };
+            return DispatchDecision::Allow {
+                token: DispatchToken {
+                    generation: 0,
+                    is_probe: false,
+                },
+            };
         };
         let mut states = self.lock();
         let st = states.entry(activity_name.to_string()).or_default();
@@ -281,8 +321,15 @@ impl CircuitBreakerRegistry {
             };
         }
 
+        let allow = |st: &BreakerState, is_probe: bool| DispatchDecision::Allow {
+            token: DispatchToken {
+                generation: st.generation,
+                is_probe,
+            },
+        };
+
         match st.phase {
-            CircuitPhase::Closed => DispatchDecision::Allow { is_probe: false },
+            CircuitPhase::Closed => allow(st, false),
             CircuitPhase::Open => {
                 let opened = st.opened_at.unwrap_or(now);
                 let elapsed = now.saturating_duration_since(opened);
@@ -290,7 +337,7 @@ impl CircuitBreakerRegistry {
                     // Cooldown elapsed: admit exactly one probe.
                     st.phase = CircuitPhase::HalfOpen;
                     st.probe_in_flight = true;
-                    DispatchDecision::Allow { is_probe: true }
+                    allow(st, true)
                 } else {
                     DispatchDecision::ShortCircuit {
                         opened_at: st.opened_at_wall,
@@ -300,14 +347,17 @@ impl CircuitBreakerRegistry {
             }
             CircuitPhase::HalfOpen => {
                 if st.probe_in_flight {
-                    // A probe is already running; keep short-circuiting.
+                    // A probe is already running; no further dispatch is admitted
+                    // until it completes and transitions the breaker. Advertise
+                    // no retry-after so callers don't busy-loop on a `0s` hint —
+                    // the outcome is gated on the probe, not a timer.
                     DispatchDecision::ShortCircuit {
                         opened_at: st.opened_at_wall,
-                        retry_after: Some(Duration::ZERO),
+                        retry_after: None,
                     }
                 } else {
                     st.probe_in_flight = true;
-                    DispatchDecision::Allow { is_probe: true }
+                    allow(st, true)
                 }
             }
         }
@@ -315,13 +365,13 @@ impl CircuitBreakerRegistry {
 
     /// Record the outcome of a dispatched attempt.
     ///
-    /// `is_probe` must be the flag returned by the matching
-    /// [`on_dispatch`](Self::on_dispatch) call ([`DispatchDecision::Allow`]'s
-    /// `is_probe`). Only the admitted half-open probe drives the
-    /// half-open → closed/open transition; a straggler attempt that started
-    /// before the trip and finishes after a probe was admitted carries
-    /// `is_probe = false` and is ignored, so it can neither prematurely close
-    /// the breaker nor restart the cooldown.
+    /// `token` must be the [`DispatchToken`] returned by the matching
+    /// [`on_dispatch`](Self::on_dispatch) call. Its generation fences stale
+    /// stragglers: any result whose token predates the breaker's current
+    /// generation — an attempt dispatched before a trip, a recovery, or an
+    /// operator force-open/force-close — is ignored, so it can neither resolve
+    /// the half-open probe early nor immediately re-trip a just-reset breaker.
+    /// The probe transition is additionally gated on `token.is_probe`.
     ///
     /// Only [`AttemptOutcome::RetryableFailure`] contributes to tripping the
     /// breaker. A [`AttemptOutcome::NonRetryableFailure`] is a permanent
@@ -335,7 +385,7 @@ impl CircuitBreakerRegistry {
         &self,
         activity_name: &str,
         outcome: AttemptOutcome,
-        is_probe: bool,
+        token: DispatchToken,
         now: Instant,
     ) -> Option<CircuitTransition> {
         let &policy = self.policies.get(activity_name)?;
@@ -344,6 +394,15 @@ impl CircuitBreakerRegistry {
 
         if st.forced_open {
             // Operator-pinned: ignore organic results until force-closed.
+            return None;
+        }
+
+        // Generation fence: an attempt dispatched before the breaker's last
+        // state-resetting transition (trip / close / force-open / force-close)
+        // is stale and must not move the breaker. This subsumes the half-open
+        // straggler case AND the "pre-force-close failure re-trips the reset"
+        // case in one check.
+        if token.generation != st.generation {
             return None;
         }
 
@@ -373,9 +432,9 @@ impl CircuitBreakerRegistry {
             }
             CircuitPhase::HalfOpen => {
                 // Only the admitted probe decides the half-open outcome. A
-                // straggler from before the trip (is_probe = false) must not
-                // close the breaker early or restart the cooldown.
-                if !is_probe {
+                // same-generation non-probe (shouldn't normally happen, but be
+                // defensive) must not close the breaker early or restart cooldown.
+                if !token.is_probe {
                     return None;
                 }
                 st.probe_in_flight = false;
@@ -393,6 +452,44 @@ impl CircuitBreakerRegistry {
         }
     }
 
+    /// Record a retryable failure observed **out of band** — i.e. not from a
+    /// handler return value with a dispatch token, but from an enforcement path
+    /// such as an activity start-to-close / heartbeat timeout (issue #369).
+    ///
+    /// A timeout against a protected downstream is a transient/downstream-style
+    /// failure that should count toward tripping the breaker, but the worker
+    /// that dispatched the attempt may be gone, so there is no token to pass.
+    /// This applies closed-phase accounting (and trips at threshold) without a
+    /// token; it intentionally does **not** resolve a half-open probe (only the
+    /// admitted probe's own result does that) and is ignored while the breaker
+    /// is already open or operator-forced.
+    ///
+    /// Returns `Some(CircuitTransition::Tripped)` if this failure opened the
+    /// breaker. Activities without a policy are ignored (`None`).
+    pub fn on_external_failure(
+        &self,
+        activity_name: &str,
+        now: Instant,
+    ) -> Option<CircuitTransition> {
+        let &policy = self.policies.get(activity_name)?;
+        let mut states = self.lock();
+        let st = states.entry(activity_name.to_string()).or_default();
+
+        // Only count while closed and not operator-pinned. While open/half-open
+        // the cooldown/probe machinery already governs recovery.
+        if st.forced_open || st.phase != CircuitPhase::Closed {
+            return None;
+        }
+        st.failures.push_back(now);
+        st.prune(now, policy.window);
+        if st.failures.len() >= policy.failure_threshold as usize {
+            st.trip(now);
+            Some(CircuitTransition::Tripped)
+        } else {
+            None
+        }
+    }
+
     /// Operator action: pin the breaker open for manual incident response.
     pub fn force_open(&self, activity_name: &str, now: Instant) {
         let mut states = self.lock();
@@ -402,6 +499,8 @@ impl CircuitBreakerRegistry {
         st.opened_at = Some(now);
         st.opened_at_wall = Some(Utc::now());
         st.probe_in_flight = false;
+        // Fence any attempt dispatched before this manual pin.
+        st.bump_generation();
     }
 
     /// Operator action: clear any pin and reset the breaker to closed so normal
@@ -496,13 +595,25 @@ mod tests {
         CircuitBreakerRegistry::new(p)
     }
 
-    // Convenience wrappers so closed-phase tests (which never deal with probes)
-    // stay readable: a non-probe retryable failure / success.
+    /// Dispatch and return the admitted token, panicking if short-circuited.
+    fn dispatch(reg: &CircuitBreakerRegistry, now: Instant) -> DispatchToken {
+        match reg.on_dispatch("send_email", now) {
+            DispatchDecision::Allow { token } => token,
+            DispatchDecision::ShortCircuit { .. } => {
+                panic!("expected Allow, got ShortCircuit")
+            }
+        }
+    }
+
+    // Convenience wrappers that model the real flow (dispatch → report) with a
+    // fresh, current-generation token so closed-phase tests stay readable.
     fn fail(reg: &CircuitBreakerRegistry, now: Instant) -> Option<CircuitTransition> {
-        reg.on_result("send_email", AttemptOutcome::RetryableFailure, false, now)
+        let token = dispatch(reg, now);
+        reg.on_result("send_email", AttemptOutcome::RetryableFailure, token, now)
     }
     fn succeed(reg: &CircuitBreakerRegistry, now: Instant) -> Option<CircuitTransition> {
-        reg.on_result("send_email", AttemptOutcome::Success, false, now)
+        let token = dispatch(reg, now);
+        reg.on_result("send_email", AttemptOutcome::Success, token, now)
     }
 
     /// `true` if the decision allows dispatch (regardless of probe flag).
@@ -516,10 +627,24 @@ mod tests {
         let now = Instant::now();
         assert_eq!(
             reg.on_dispatch("anything", now),
-            DispatchDecision::Allow { is_probe: false }
+            DispatchDecision::Allow {
+                token: DispatchToken {
+                    generation: 0,
+                    is_probe: false,
+                },
+            }
         );
+        let untracked_token = DispatchToken {
+            generation: 0,
+            is_probe: false,
+        };
         assert_eq!(
-            reg.on_result("anything", AttemptOutcome::RetryableFailure, false, now),
+            reg.on_result(
+                "anything",
+                AttemptOutcome::RetryableFailure,
+                untracked_token,
+                now
+            ),
             None
         );
         assert!(reg.snapshot("anything", now).is_none());
@@ -530,10 +655,8 @@ mod tests {
     fn closed_breaker_allows_dispatch() {
         let reg = registry();
         let now = Instant::now();
-        assert_eq!(
-            reg.on_dispatch("send_email", now),
-            DispatchDecision::Allow { is_probe: false }
-        );
+        let token = dispatch(&reg, now);
+        assert!(!token.is_probe());
         let snap = reg.snapshot("send_email", now).unwrap();
         assert_eq!(snap.state, "closed");
         assert_eq!(snap.rolling_failure_count, 0);
@@ -580,11 +703,12 @@ mod tests {
         let reg = registry();
         let now = Instant::now();
         for _ in 0..50 {
+            let token = dispatch(&reg, now);
             assert_eq!(
                 reg.on_result(
                     "send_email",
                     AttemptOutcome::NonRetryableFailure,
-                    false,
+                    token,
                     now
                 ),
                 None
@@ -648,10 +772,8 @@ mod tests {
         }
         let probe_time = t0 + Duration::from_secs(61);
         // First dispatch after cooldown is admitted as the probe.
-        assert_eq!(
-            reg.on_dispatch("send_email", probe_time),
-            DispatchDecision::Allow { is_probe: true }
-        );
+        let probe = dispatch(&reg, probe_time);
+        assert!(probe.is_probe());
         assert_eq!(
             reg.snapshot("send_email", probe_time).unwrap().state,
             "half_open"
@@ -663,7 +785,7 @@ mod tests {
         ));
         // Probe succeeds: breaker closes.
         assert_eq!(
-            reg.on_result("send_email", AttemptOutcome::Success, true, probe_time),
+            reg.on_result("send_email", AttemptOutcome::Success, probe, probe_time),
             Some(CircuitTransition::Closed)
         );
         assert_eq!(
@@ -681,16 +803,14 @@ mod tests {
             fail(&reg, t0);
         }
         let probe_time = t0 + Duration::from_secs(61);
-        assert_eq!(
-            reg.on_dispatch("send_email", probe_time),
-            DispatchDecision::Allow { is_probe: true }
-        );
+        let probe = dispatch(&reg, probe_time);
+        assert!(probe.is_probe());
         // Probe fails: breaker re-opens.
         assert_eq!(
             reg.on_result(
                 "send_email",
                 AttemptOutcome::RetryableFailure,
-                true,
+                probe,
                 probe_time
             ),
             Some(CircuitTransition::Tripped)
@@ -708,41 +828,27 @@ mod tests {
 
     #[test]
     fn stale_straggler_result_does_not_resolve_half_open_probe() {
-        // Scenario: the breaker trips while earlier attempts are still running.
-        // After the cooldown a probe is admitted; then one of those pre-trip
-        // stragglers finishes. Its result (is_probe = false) must NOT close or
-        // re-open the breaker — only the admitted probe decides.
+        // Scenario: the breaker trips while an earlier attempt is still running.
+        // After the cooldown a probe is admitted; then that pre-trip straggler
+        // finishes. Its token carries the old generation, so it must NOT close
+        // or re-open the breaker — only the admitted probe decides.
         let reg = registry();
         let t0 = Instant::now();
+        // A real in-flight attempt dispatched while still closed (pre-trip).
+        let straggler = dispatch(&reg, t0);
+        // Independently, three failures trip the breaker (bumping the generation).
         for _ in 0..3 {
             fail(&reg, t0);
         }
         let probe_time = t0 + Duration::from_secs(61);
-        // Admit the probe.
+        // Admit the probe (a new, current-generation token).
+        let probe = dispatch(&reg, probe_time);
+        assert!(probe.is_probe());
+        // The straggler SUCCESS (old generation) arrives — ignored, stays half-open.
         assert_eq!(
-            reg.on_dispatch("send_email", probe_time),
-            DispatchDecision::Allow { is_probe: true }
-        );
-        // A straggler SUCCESS arrives — must be ignored, breaker stays half-open.
-        assert_eq!(
-            reg.on_result("send_email", AttemptOutcome::Success, false, probe_time),
+            reg.on_result("send_email", AttemptOutcome::Success, straggler, probe_time),
             None,
-            "a stale straggler success must not close the breaker"
-        );
-        assert_eq!(
-            reg.snapshot("send_email", probe_time).unwrap().state,
-            "half_open"
-        );
-        // A straggler FAILURE arrives — also ignored, no re-trip / cooldown reset.
-        assert_eq!(
-            reg.on_result(
-                "send_email",
-                AttemptOutcome::RetryableFailure,
-                false,
-                probe_time
-            ),
-            None,
-            "a stale straggler failure must not re-open the breaker"
+            "a stale-generation straggler success must not close the breaker"
         );
         assert_eq!(
             reg.snapshot("send_email", probe_time).unwrap().state,
@@ -750,12 +856,41 @@ mod tests {
         );
         // The real probe now succeeds and closes the breaker.
         assert_eq!(
-            reg.on_result("send_email", AttemptOutcome::Success, true, probe_time),
+            reg.on_result("send_email", AttemptOutcome::Success, probe, probe_time),
             Some(CircuitTransition::Closed)
         );
         assert_eq!(
             reg.snapshot("send_email", probe_time).unwrap().state,
             "closed"
+        );
+    }
+
+    #[test]
+    fn pre_force_close_failure_does_not_re_trip_after_reset() {
+        // Operator force-opens during an outage, then force-closes while an
+        // older attempt is still in flight. That pre-close failure must not
+        // immediately re-trip the just-reset breaker (issue: low threshold).
+        let reg = registry();
+        let now = Instant::now();
+        // An attempt dispatched while closed, before any operator action.
+        let stale = dispatch(&reg, now);
+        // Operator pins open, then resets to closed (each bumps the generation).
+        reg.force_open("send_email", now);
+        reg.force_close("send_email");
+        assert_eq!(reg.snapshot("send_email", now).unwrap().state, "closed");
+        // The stale pre-close failure lands — fenced out by generation, so the
+        // breaker stays closed and the operator's reset stands.
+        assert_eq!(
+            reg.on_result("send_email", AttemptOutcome::RetryableFailure, stale, now),
+            None,
+            "a pre-force-close failure must not re-trip the reset breaker"
+        );
+        assert_eq!(reg.snapshot("send_email", now).unwrap().state, "closed");
+        assert_eq!(
+            reg.snapshot("send_email", now)
+                .unwrap()
+                .rolling_failure_count,
+            0
         );
     }
 
@@ -781,8 +916,17 @@ mod tests {
             reg.on_dispatch("send_email", now + Duration::from_secs(600)),
             DispatchDecision::ShortCircuit { .. }
         ));
-        // Organic successes do not auto-close a forced-open breaker.
-        assert_eq!(succeed(&reg, now), None);
+        // Organic successes do not auto-close a forced-open breaker. (Dispatch
+        // short-circuits while forced, so feed a result with any token — the
+        // forced-open guard ignores it regardless.)
+        let any_token = DispatchToken {
+            generation: 0,
+            is_probe: false,
+        };
+        assert_eq!(
+            reg.on_result("send_email", AttemptOutcome::Success, any_token, now),
+            None
+        );
         assert_eq!(reg.snapshot("send_email", now).unwrap().state, "open");
     }
 

@@ -3081,6 +3081,7 @@ async fn worker_does_not_append_completion_after_activity_timeout() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn timeout_sweeper_does_not_append_timeout_after_activity_completion() {
     let (database_url, _container) = setup_test_database_url().await;
     let pool = build_test_pool(&database_url);
@@ -3146,6 +3147,7 @@ async fn timeout_sweeper_does_not_append_timeout_after_activity_completion() {
             std::time::Duration::from_secs(5),
             &None,
             &[],
+            None,
         )
         .await
     });

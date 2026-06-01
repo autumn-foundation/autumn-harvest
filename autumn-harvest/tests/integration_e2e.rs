@@ -1816,6 +1816,7 @@ async fn timeout_enforcement_fails_pending_activity_and_wakes_workflow() {
         std::time::Duration::from_secs(5),
         &None,
         &[],
+        None,
     )
     .await
     .expect("timeout enforcement should succeed");

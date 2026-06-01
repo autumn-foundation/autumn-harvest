@@ -58,22 +58,32 @@ fn declared_breaker_trips_and_short_circuits() {
     let now = Instant::now();
 
     // 10 consecutive retryable failures within the window trip the breaker.
+    // Model the real flow: dispatch (to get a current-generation token) then
+    // report the failure.
     for _ in 0..9 {
+        let token = match breakers.on_dispatch("flaky_downstream", now) {
+            DispatchDecision::Allow { token } => token,
+            DispatchDecision::ShortCircuit { .. } => panic!("expected Allow"),
+        };
         assert_eq!(
             breakers.on_result(
                 "flaky_downstream",
                 AttemptOutcome::RetryableFailure,
-                false,
+                token,
                 now
             ),
             None
         );
     }
+    let token = match breakers.on_dispatch("flaky_downstream", now) {
+        DispatchDecision::Allow { token } => token,
+        DispatchDecision::ShortCircuit { .. } => panic!("expected Allow"),
+    };
     assert_eq!(
         breakers.on_result(
             "flaky_downstream",
             AttemptOutcome::RetryableFailure,
-            false,
+            token,
             now
         ),
         Some(CircuitTransition::Tripped)
@@ -96,12 +106,16 @@ fn untracked_activity_never_short_circuits() {
     let now = Instant::now();
     // Even after many failures, an activity without a policy always dispatches.
     for _ in 0..100 {
-        breakers.on_result("no_breaker", AttemptOutcome::RetryableFailure, false, now);
+        let token = match breakers.on_dispatch("no_breaker", now) {
+            DispatchDecision::Allow { token } => token,
+            DispatchDecision::ShortCircuit { .. } => panic!("expected Allow"),
+        };
+        breakers.on_result("no_breaker", AttemptOutcome::RetryableFailure, token, now);
     }
-    assert_eq!(
+    assert!(matches!(
         breakers.on_dispatch("no_breaker", now),
-        DispatchDecision::Allow { is_probe: false }
-    );
+        DispatchDecision::Allow { .. }
+    ));
     assert!(breakers.snapshot("no_breaker", now).is_none());
 }
 
@@ -127,10 +141,10 @@ fn force_open_and_close_through_shared_registry() {
     let snap = breakers.snapshot("flaky_downstream", now).unwrap();
     assert_eq!(snap.state, "closed");
     assert!(!snap.forced_open);
-    assert_eq!(
+    assert!(matches!(
         breakers.on_dispatch("flaky_downstream", now),
-        DispatchDecision::Allow { is_probe: false }
-    );
+        DispatchDecision::Allow { .. }
+    ));
 }
 
 /// Local activities bypass the dispatch path the breaker is enforced on, so a

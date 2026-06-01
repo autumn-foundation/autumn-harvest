@@ -9,7 +9,8 @@ pub use crate::calendar::{
     Calendar, ScheduleFirePreview, apply_skip_policy, calendar_excludes_weekends, is_excluded_date,
 };
 pub use crate::circuit_breaker::{
-    CircuitBreakerRegistry, CircuitPhase, CircuitSnapshot, CircuitTransition, DispatchDecision,
+    AttemptOutcome, CircuitBreakerRegistry, CircuitPhase, CircuitSnapshot, CircuitTransition,
+    DispatchDecision, DispatchToken,
 };
 pub use crate::context::{ActivityContext, WorkflowContext};
 pub use crate::dag::{DagBuildError, DagBuilder, DagDefinition, DagTask, DagTaskRef};

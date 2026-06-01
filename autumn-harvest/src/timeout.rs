@@ -479,43 +479,64 @@ async fn enforce_activity_timeout(
     task: &TaskQueueItem,
     exec_id: crate::types::ExecutionId,
     reason: &TimeoutReason,
+    circuit_breakers: Option<&crate::circuit_breaker::CircuitBreakerRegistry>,
+    metrics: &dyn MetricsRecorder,
 ) -> HarvestResult<()> {
     let Some(activity_name) = task.activity_name.as_deref() else {
         return queue::fail_task(conn, task.id, &timeout_error("activity", reason)).await;
     };
     let error = timeout_error(activity_name, reason);
 
-    conn.transaction::<(), HarvestError, _>(|conn| {
-        let error = error.clone();
-        async move {
-            let history = lock_workflow_execution_and_load_history(conn, exec_id).await?;
-            let Some(state) = task_state_for_update(conn, task.id).await? else {
-                return Ok(());
-            };
-            if state != expected_task_state_for_timeout(reason) {
-                return Ok(());
-            }
-            let activity_id =
-                match pending_activity_id_for_task(&history.events, task, activity_name) {
-                    Ok(Some(activity_id)) => activity_id,
-                    Ok(None) => return Ok(()),
-                    Err(missing_error) => {
-                        let fallback = missing_error.to_string();
-                        queue::fail_task(conn, task.id, &fallback).await?;
-                        return Ok(());
-                    }
+    // Did we actually append a timeout (vs. a no-op because the task already
+    // moved on)? Only a real enforcement should count toward the breaker.
+    let enforced = conn
+        .transaction::<bool, HarvestError, _>(|conn| {
+            let error = error.clone();
+            async move {
+                let history = lock_workflow_execution_and_load_history(conn, exec_id).await?;
+                let Some(state) = task_state_for_update(conn, task.id).await? else {
+                    return Ok(false);
                 };
-            let timeout_event = WorkflowEvent::ActivityTimedOut {
-                activity_id,
-                timeout_type: reason.timeout_type(),
-            };
-            store::append_events(conn, exec_id, &[timeout_event], history.next_event_id).await?;
-            queue::fail_task(conn, task.id, &error).await?;
-            queue::wake_workflow_task(conn, exec_id).await
-        }
-        .scope_boxed()
-    })
-    .await
+                if state != expected_task_state_for_timeout(reason) {
+                    return Ok(false);
+                }
+                let activity_id =
+                    match pending_activity_id_for_task(&history.events, task, activity_name) {
+                        Ok(Some(activity_id)) => activity_id,
+                        Ok(None) => return Ok(false),
+                        Err(missing_error) => {
+                            let fallback = missing_error.to_string();
+                            queue::fail_task(conn, task.id, &fallback).await?;
+                            return Ok(false);
+                        }
+                    };
+                let timeout_event = WorkflowEvent::ActivityTimedOut {
+                    activity_id,
+                    timeout_type: reason.timeout_type(),
+                };
+                store::append_events(conn, exec_id, &[timeout_event], history.next_event_id)
+                    .await?;
+                queue::fail_task(conn, task.id, &error).await?;
+                queue::wake_workflow_task(conn, exec_id).await?;
+                Ok(true)
+            }
+            .scope_boxed()
+        })
+        .await?;
+
+    // Circuit breaker (issue #369): a start-to-close / heartbeat timeout against
+    // a protected downstream is a retryable, downstream-style failure that the
+    // handler-result path never sees (the worker may be gone). Record it
+    // out-of-band so a hanging downstream trips the breaker just like an
+    // explicit error would.
+    if enforced
+        && let Some(breakers) = circuit_breakers
+        && breakers.on_external_failure(activity_name, std::time::Instant::now())
+            == Some(crate::circuit_breaker::CircuitTransition::Tripped)
+    {
+        metrics.record_circuit_tripped(activity_name);
+    }
+    Ok(())
 }
 
 async fn enforce_workflow_timeout(
@@ -1027,6 +1048,7 @@ pub async fn enforce_timeouts_once(
     unknown_target_grace_window: Duration,
     sharded_pool: &Option<crate::shard::ShardedDbPool>,
     shard_assignments: &[crate::types::ShardId],
+    circuit_breakers: Option<&crate::circuit_breaker::CircuitBreakerRegistry>,
 ) -> HarvestResult<usize> {
     let timed_out = find_timed_out_tasks(conn).await?;
     let mut count = timed_out.len();
@@ -1034,8 +1056,15 @@ pub async fn enforce_timeouts_once(
     for (task, reason) in timed_out {
         let result = match (task.task_type.as_str(), task.workflow_exec_id) {
             ("activity", Some(exec_uuid)) => {
-                enforce_activity_timeout(conn, &task, execution_id_from_uuid(exec_uuid), &reason)
-                    .await
+                enforce_activity_timeout(
+                    conn,
+                    &task,
+                    execution_id_from_uuid(exec_uuid),
+                    &reason,
+                    circuit_breakers,
+                    metrics,
+                )
+                .await
             }
             ("workflow", Some(exec_uuid)) => {
                 enforce_workflow_timeout(
@@ -1082,6 +1111,7 @@ pub async fn enforce_timeouts_once(
 ///
 /// Stops when the cancellation token is triggered.
 #[must_use]
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_timeout_checker(
     pool: Pool<AsyncPgConnection>,
     cancel: CancellationToken,
@@ -1090,6 +1120,7 @@ pub fn spawn_timeout_checker(
     unknown_target_grace_window: Duration,
     sharded_pool: Option<crate::shard::ShardedDbPool>,
     shard_assignments: Vec<crate::types::ShardId>,
+    circuit_breakers: std::sync::Arc<crate::circuit_breaker::CircuitBreakerRegistry>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -1110,6 +1141,7 @@ pub fn spawn_timeout_checker(
                     unknown_target_grace_window,
                     &sharded_pool,
                     &shard_assignments,
+                    Some(&circuit_breakers),
                 )
                 .await
                 {

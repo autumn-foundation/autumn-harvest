@@ -3274,12 +3274,12 @@ async fn process_activity_task(
     // doomed work against a downstream that is known to be down.
     let circuit_breakers = registry.circuit_breakers();
     let dispatch_decision = circuit_breakers.on_dispatch(activity_name, std::time::Instant::now());
-    // `is_probe` is threaded into `on_result` below so only the admitted
-    // half-open probe drives the breaker's recovery/re-trip transition.
-    let circuit_is_probe = matches!(
-        dispatch_decision,
-        crate::circuit_breaker::DispatchDecision::Allow { is_probe: true }
-    );
+    // The dispatch token is threaded into `on_result` below so the breaker can
+    // fence stale stragglers by generation and gate the half-open probe.
+    let circuit_token = match dispatch_decision {
+        crate::circuit_breaker::DispatchDecision::Allow { token } => Some(token),
+        crate::circuit_breaker::DispatchDecision::ShortCircuit { .. } => None,
+    };
     if let crate::circuit_breaker::DispatchDecision::ShortCircuit {
         opened_at,
         retry_after,
@@ -3386,6 +3386,12 @@ async fn process_activity_task(
         span,
     )
     .await;
+    // Whether this attempt was driven by cancellation: the observer cancels the
+    // token when the workflow/task is cancelled mid-flight. A cancellation is
+    // not evidence the downstream is unhealthy, so it must not count toward the
+    // circuit breaker (issue #369 review). Captured before the unconditional
+    // `cancel.cancel()` below.
+    let was_cancelled = cancel.is_cancelled();
 
     // Pre-normalize oversized results to non-retryable failures BEFORE emitting
     // metrics so that an Ok result above the cap is counted as Failed, not Completed.
@@ -3459,19 +3465,29 @@ async fn process_activity_task(
     // Classification mirrors the retry decision (`failure_is_non_retryable`),
     // so it honours both the typed `non_retryable` flag and the retry policy's
     // `non_retryable_errors` list, including legacy `Err(String)` failures.
-    let circuit_outcome = match activity_result.as_ref() {
-        Ok(_) => crate::circuit_breaker::AttemptOutcome::Success,
-        Err(payload) if failure_is_non_retryable(payload, retry_policy.as_ref()) => {
-            crate::circuit_breaker::AttemptOutcome::NonRetryableFailure
-        }
-        Err(_) => crate::circuit_breaker::AttemptOutcome::RetryableFailure,
+    // A cancellation-driven result is not evidence the downstream is unhealthy
+    // (the workflow/task was cancelled out from under the attempt), so it is
+    // excluded from breaker accounting entirely — neither a trip nor a probe
+    // resolution. Only genuine handler outcomes feed the breaker.
+    let circuit_outcome = if was_cancelled {
+        None
+    } else {
+        Some(match activity_result.as_ref() {
+            Ok(_) => crate::circuit_breaker::AttemptOutcome::Success,
+            Err(payload) if failure_is_non_retryable(payload, retry_policy.as_ref()) => {
+                crate::circuit_breaker::AttemptOutcome::NonRetryableFailure
+            }
+            Err(_) => crate::circuit_breaker::AttemptOutcome::RetryableFailure,
+        })
     };
-    if let Some(transition) = circuit_breakers.on_result(
-        activity_name,
-        circuit_outcome,
-        circuit_is_probe,
-        std::time::Instant::now(),
-    ) {
+    // `circuit_token` is always `Some` here: the short-circuit path returned
+    // early above, so reaching this point means the attempt was dispatched.
+    if let Some(transition) = circuit_token
+        .zip(circuit_outcome)
+        .and_then(|(token, outcome)| {
+            circuit_breakers.on_result(activity_name, outcome, token, std::time::Instant::now())
+        })
+    {
         match transition {
             crate::circuit_breaker::CircuitTransition::Tripped => {
                 telemetry.metrics.record_circuit_tripped(activity_name);
@@ -5745,6 +5761,7 @@ impl Worker {
             self.config.unknown_target_grace_window,
             self.config.sharded_pool.clone(),
             self.config.shard_assignments.clone(),
+            self.registry.circuit_breakers(),
         );
         // Worker-stale threshold mirrors the fleet-health classifier:
         // 2 × heartbeat interval, with a 1 s floor for sub-second intervals.
