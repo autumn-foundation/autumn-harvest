@@ -1489,26 +1489,36 @@ pub(crate) fn chrono_duration_from_secs(
     })
 }
 
+/// Whether `error` is non-retryable under the same rules `next_retry_delay`
+/// applies: the typed-payload `non_retryable` flag *and* the retry policy's
+/// `non_retryable_errors` list (which also matches legacy `Err(String)` values
+/// the typed flag never sees). The circuit breaker reuses this so a burst of
+/// permanent failures — typed or legacy — never trips the circuit.
+fn failure_is_non_retryable(error: &str, retry_policy: Option<&RetryPolicy>) -> bool {
+    let typed = parse_typed_payload(error);
+    if typed.as_ref().is_some_and(|f| f.non_retryable) {
+        return true;
+    }
+    if let Some(policy) = retry_policy {
+        let typed_error_type = typed.as_ref().map(|f| f.error_type.as_str());
+        return policy.is_non_retryable(typed_error_type, error);
+    }
+    false
+}
+
 fn next_retry_delay(
     task: &TaskQueueItem,
     error: &str,
     retry_policy: Option<&RetryPolicy>,
 ) -> HarvestResult<Option<chrono::Duration>> {
-    // Only consult the structured `error_type` when the payload was actually
-    // the typed wire format — passing the synthetic "Error" fallback would
-    // make a pre-existing `non_retryable_errors = ["Error"]` policy halt
-    // retries on every legacy `Err(String)` failure.
-    let typed = parse_typed_payload(error);
-    if typed.as_ref().is_some_and(|f| f.non_retryable) {
+    // Non-retryable (typed flag or policy `non_retryable_errors`, incl. legacy
+    // `Err(String)`) short-circuits all remaining attempts. See
+    // `failure_is_non_retryable` for the shared rule.
+    if failure_is_non_retryable(error, retry_policy) {
         return Ok(None);
     }
 
     if let Some(policy) = retry_policy {
-        let typed_error_type = typed.as_ref().map(|f| f.error_type.as_str());
-        if policy.is_non_retryable(typed_error_type, error) {
-            return Ok(None);
-        }
-
         return policy
             .next_delay_with_seed(task_attempt(task), retry_stream_seed(task))
             .map(|delay| chrono_duration_from_std(delay, "retry delay"))
@@ -3431,16 +3441,30 @@ async fn process_activity_task(
             .metrics
             .record_activity_failed(activity_name, "", error_type, *non_retryable);
     }
+    cancel.cancel();
+    drop(activity_future);
+
+    // Finalization phase: re-acquire a connection now that the handler is done.
+    let mut conn = pool.get().await.map_err(crate::error::database_error)?;
+    let retry_policy_result = configured_retry_policy(task);
+    let retry_policy =
+        fail_execution_on_error(&mut conn, task, worker_id, retry_policy_result).await?;
+
     // Circuit breaker (issue #369): record this attempt's outcome. A close →
     // open trip (or half-open re-open) and a recovery to closed are surfaced as
     // the `harvest.activity.circuit.{tripped,closed}` counters so existing
     // alerting picks them up. Only retryable (downstream-style) failures trip
     // the breaker — a non-retryable permanent error (bad input) proves the
     // downstream answered and must not open the circuit for healthy callers.
-    let circuit_outcome = match failure_info.as_ref() {
-        None => crate::circuit_breaker::AttemptOutcome::Success,
-        Some((_, true, _)) => crate::circuit_breaker::AttemptOutcome::NonRetryableFailure,
-        Some((_, false, _)) => crate::circuit_breaker::AttemptOutcome::RetryableFailure,
+    // Classification mirrors the retry decision (`failure_is_non_retryable`),
+    // so it honours both the typed `non_retryable` flag and the retry policy's
+    // `non_retryable_errors` list, including legacy `Err(String)` failures.
+    let circuit_outcome = match activity_result.as_ref() {
+        Ok(_) => crate::circuit_breaker::AttemptOutcome::Success,
+        Err(payload) if failure_is_non_retryable(payload, retry_policy.as_ref()) => {
+            crate::circuit_breaker::AttemptOutcome::NonRetryableFailure
+        }
+        Err(_) => crate::circuit_breaker::AttemptOutcome::RetryableFailure,
     };
     if let Some(transition) = circuit_breakers.on_result(
         activity_name,
@@ -3457,14 +3481,6 @@ async fn process_activity_task(
             }
         }
     }
-    cancel.cancel();
-    drop(activity_future);
-
-    // Finalization phase: re-acquire a connection now that the handler is done.
-    let mut conn = pool.get().await.map_err(crate::error::database_error)?;
-    let retry_policy_result = configured_retry_policy(task);
-    let retry_policy =
-        fail_execution_on_error(&mut conn, task, worker_id, retry_policy_result).await?;
 
     // activity_result is already cap-normalized (oversized Ok → non-retryable Err);
     // pass 0 so handle_activity_result skips the redundant cap check.

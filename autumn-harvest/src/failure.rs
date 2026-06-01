@@ -95,28 +95,37 @@ impl ActivityFailure {
     /// `opened_at` is the wall-clock instant the breaker tripped (if known) and
     /// `retry_after` is how long until a half-open probe is admitted; both are
     /// carried in `details` so workflow code and operators can read them.
+    ///
+    /// `retry_after` is `None` when the breaker is operator-forced open: no
+    /// probe is admitted on any timer, so callers must not derive a retry delay
+    /// from this failure — recovery requires an explicit force-close. In that
+    /// case `details.forced` is `true` and `retry_after_secs` is omitted.
     #[must_use]
     pub fn circuit_open(
         activity_name: &str,
         opened_at: Option<chrono::DateTime<chrono::Utc>>,
-        retry_after: std::time::Duration,
+        retry_after: Option<std::time::Duration>,
     ) -> Self {
-        let retry_after_secs = retry_after.as_secs_f64();
-        let mut details = serde_json::json!({
-            "activity_name": activity_name,
-            "retry_after_secs": retry_after_secs,
-        });
+        let mut details = serde_json::json!({ "activity_name": activity_name });
         if let Some(opened) = opened_at {
             details["opened_at"] = serde_json::json!(opened.to_rfc3339());
         }
-        Self::non_retryable(
-            ERROR_TYPE_CIRCUIT_OPEN,
+        let message = if let Some(after) = retry_after {
+            let secs = after.as_secs_f64();
+            details["retry_after_secs"] = serde_json::json!(secs);
             format!(
                 "circuit breaker open for activity '{activity_name}'; \
-                 retry after {retry_after_secs:.1}s"
-            ),
-        )
-        .with_details(details)
+                 retry after {secs:.1}s"
+            )
+        } else {
+            // Operator-forced open: indefinite until force-close.
+            details["forced"] = serde_json::json!(true);
+            format!(
+                "circuit breaker forced open for activity '{activity_name}'; \
+                 no automatic probe — awaiting operator force-close"
+            )
+        };
+        Self::non_retryable(ERROR_TYPE_CIRCUIT_OPEN, message).with_details(details)
     }
 }
 
@@ -367,7 +376,7 @@ mod tests {
         let f = ActivityFailure::circuit_open(
             "send_email",
             Some(chrono::Utc::now()),
-            std::time::Duration::from_secs(42),
+            Some(std::time::Duration::from_secs(42)),
         );
         assert_eq!(f.error_type, ERROR_TYPE_CIRCUIT_OPEN);
         assert_eq!(f.error_type, "CircuitOpen");
@@ -376,6 +385,21 @@ mod tests {
         assert_eq!(details["activity_name"], "send_email");
         assert!((details["retry_after_secs"].as_f64().unwrap() - 42.0).abs() < 0.001);
         assert!(details.get("opened_at").is_some());
+        assert!(details.get("forced").is_none());
+    }
+
+    #[test]
+    fn circuit_open_forced_omits_retry_after_and_flags_forced() {
+        // An operator-forced-open breaker admits no probe on any timer, so the
+        // failure must not advertise a retry-after callers could wait on.
+        let f = ActivityFailure::circuit_open("send_email", None, None);
+        assert!(f.non_retryable);
+        let details = f.details.expect("details carry the breaker context");
+        assert_eq!(details["forced"], true);
+        assert!(
+            details.get("retry_after_secs").is_none(),
+            "forced-open must not advertise a retry-after"
+        );
     }
 
     #[test]
@@ -383,9 +407,12 @@ mod tests {
         // Replay safety: the synthesised failure must survive the same wire
         // envelope every other typed failure uses, so the recorded
         // ActivityFailed event reproduces the CircuitOpen outcome on replay.
-        let payload =
-            ActivityFailure::circuit_open("charge_card", None, std::time::Duration::from_secs(5))
-                .into_error_payload();
+        let payload = ActivityFailure::circuit_open(
+            "charge_card",
+            None,
+            Some(std::time::Duration::from_secs(5)),
+        )
+        .into_error_payload();
         let (error_type, non_retryable, _) = parse_error_payload(&payload);
         assert_eq!(error_type, "CircuitOpen");
         assert!(non_retryable);

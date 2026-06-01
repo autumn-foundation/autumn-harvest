@@ -90,8 +90,11 @@ pub enum DispatchDecision {
     ShortCircuit {
         /// Wall-clock instant at which the breaker last tripped, if known.
         opened_at: Option<DateTime<Utc>>,
-        /// How long until a half-open probe will be admitted.
-        retry_after: Duration,
+        /// How long until a half-open probe will be admitted. `None` when the
+        /// breaker is **operator-forced open**: no probe is admitted on any
+        /// timer, so there is no meaningful retry-after to advertise — recovery
+        /// requires an explicit `force-close`.
+        retry_after: Option<Duration>,
     },
 }
 
@@ -270,9 +273,11 @@ impl CircuitBreakerRegistry {
         let st = states.entry(activity_name.to_string()).or_default();
 
         if st.forced_open {
+            // Operator-forced: no probe is admitted on any timer, so advertise
+            // no retry-after — recovery requires an explicit force-close.
             return DispatchDecision::ShortCircuit {
                 opened_at: st.opened_at_wall,
-                retry_after: policy.cooldown,
+                retry_after: None,
             };
         }
 
@@ -289,7 +294,7 @@ impl CircuitBreakerRegistry {
                 } else {
                     DispatchDecision::ShortCircuit {
                         opened_at: st.opened_at_wall,
-                        retry_after: policy.cooldown.saturating_sub(elapsed),
+                        retry_after: Some(policy.cooldown.saturating_sub(elapsed)),
                     }
                 }
             }
@@ -298,7 +303,7 @@ impl CircuitBreakerRegistry {
                     // A probe is already running; keep short-circuiting.
                     DispatchDecision::ShortCircuit {
                         opened_at: st.opened_at_wall,
-                        retry_after: Duration::ZERO,
+                        retry_after: Some(Duration::ZERO),
                     }
                 } else {
                     st.probe_in_flight = true;
@@ -601,8 +606,9 @@ mod tests {
         // Immediately after trip: short-circuit with retry_after ~= cooldown.
         match reg.on_dispatch("send_email", t0) {
             DispatchDecision::ShortCircuit { retry_after, .. } => {
-                assert!(retry_after <= Duration::from_secs(60));
-                assert!(retry_after > Duration::from_secs(59));
+                let after = retry_after.expect("cooldown-based open advertises a retry-after");
+                assert!(after <= Duration::from_secs(60));
+                assert!(after > Duration::from_secs(59));
             }
             DispatchDecision::Allow { .. } => panic!("expected ShortCircuit, got Allow"),
         }
@@ -761,10 +767,15 @@ mod tests {
         let snap = reg.snapshot("send_email", now).unwrap();
         assert_eq!(snap.state, "open");
         assert!(snap.forced_open);
-        assert!(matches!(
+        // Forced-open advertises no retry-after: no probe is admitted on any
+        // timer, so callers must not derive a wait interval.
+        assert_eq!(
             reg.on_dispatch("send_email", now),
-            DispatchDecision::ShortCircuit { .. }
-        ));
+            DispatchDecision::ShortCircuit {
+                opened_at: snap.last_trip,
+                retry_after: None,
+            }
+        );
         // Even far past the cooldown, a forced-open breaker never probes.
         assert!(matches!(
             reg.on_dispatch("send_email", now + Duration::from_secs(600)),
