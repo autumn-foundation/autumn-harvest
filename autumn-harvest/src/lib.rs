@@ -45,6 +45,9 @@ pub mod cache;
 /// Calendar-aware schedule filtering: named exclusion sets, skip policies, and
 /// schedule preview generation (issue #337).
 pub mod calendar;
+/// Per-activity circuit breaker that fast-fails dispatch during downstream
+/// outages (issue #369).
+pub mod circuit_breaker;
 /// Per-key concurrency limits for tenant fair-share scheduling (issue #247).
 pub mod concurrency;
 pub mod context;

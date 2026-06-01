@@ -28,6 +28,14 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Stable error-type name for circuit-breaker short-circuit failures (issue #369).
+///
+/// Synthesised when an activity's circuit breaker is open. Workflow authors
+/// match on this in their `Err` arm to compensate, branch, or fail; operators
+/// filter metrics by it. A circuit-open failure is always non-retryable for the
+/// in-flight attempt.
+pub const ERROR_TYPE_CIRCUIT_OPEN: &str = "CircuitOpen";
+
 /// Typed failure carrier for activity handlers.
 ///
 /// ## Backward compatibility
@@ -76,6 +84,39 @@ impl ActivityFailure {
     pub fn with_details(mut self, value: serde_json::Value) -> Self {
         self.details = Some(value);
         self
+    }
+
+    /// Construct the non-retryable failure used when an activity's circuit
+    /// breaker is open (issue #369).
+    ///
+    /// The `error_type` is always [`ERROR_TYPE_CIRCUIT_OPEN`] and the failure is
+    /// non-retryable so the in-flight attempt terminates immediately instead of
+    /// burning the retry curve against a downstream that is known to be down.
+    /// `opened_at` is the wall-clock instant the breaker tripped (if known) and
+    /// `retry_after` is how long until a half-open probe is admitted; both are
+    /// carried in `details` so workflow code and operators can read them.
+    #[must_use]
+    pub fn circuit_open(
+        activity_name: &str,
+        opened_at: Option<chrono::DateTime<chrono::Utc>>,
+        retry_after: std::time::Duration,
+    ) -> Self {
+        let retry_after_secs = retry_after.as_secs_f64();
+        let mut details = serde_json::json!({
+            "activity_name": activity_name,
+            "retry_after_secs": retry_after_secs,
+        });
+        if let Some(opened) = opened_at {
+            details["opened_at"] = serde_json::json!(opened.to_rfc3339());
+        }
+        Self::non_retryable(
+            ERROR_TYPE_CIRCUIT_OPEN,
+            format!(
+                "circuit breaker open for activity '{activity_name}'; \
+                 retry after {retry_after_secs:.1}s"
+            ),
+        )
+        .with_details(details)
     }
 }
 
@@ -319,5 +360,34 @@ mod tests {
         let payload = ActivityFailure::retryable("Transient", "retry me").into_error_payload();
         let (_, non_retryable, _) = parse_error_payload(&payload);
         assert!(!non_retryable);
+    }
+
+    #[test]
+    fn circuit_open_is_non_retryable_typed_failure() {
+        let f = ActivityFailure::circuit_open(
+            "send_email",
+            Some(chrono::Utc::now()),
+            std::time::Duration::from_secs(42),
+        );
+        assert_eq!(f.error_type, ERROR_TYPE_CIRCUIT_OPEN);
+        assert_eq!(f.error_type, "CircuitOpen");
+        assert!(f.non_retryable, "circuit-open must skip retries");
+        let details = f.details.expect("details carry the breaker context");
+        assert_eq!(details["activity_name"], "send_email");
+        assert!((details["retry_after_secs"].as_f64().unwrap() - 42.0).abs() < 0.001);
+        assert!(details.get("opened_at").is_some());
+    }
+
+    #[test]
+    fn circuit_open_round_trips_through_wire_format() {
+        // Replay safety: the synthesised failure must survive the same wire
+        // envelope every other typed failure uses, so the recorded
+        // ActivityFailed event reproduces the CircuitOpen outcome on replay.
+        let payload =
+            ActivityFailure::circuit_open("charge_card", None, std::time::Duration::from_secs(5))
+                .into_error_payload();
+        let (error_type, non_retryable, _) = parse_error_payload(&payload);
+        assert_eq!(error_type, "CircuitOpen");
+        assert!(non_retryable);
     }
 }

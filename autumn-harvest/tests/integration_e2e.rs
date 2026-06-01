@@ -1445,6 +1445,7 @@ async fn worker_completes_workflow_with_activity_round_trip() {
             rate_limit_rps: None,
             rate_limit_burst: None,
             rate_limit_key: None,
+            circuit_breaker: None,
             is_local: false,
             max_input_bytes: None,
             max_result_bytes: None,
@@ -1580,6 +1581,7 @@ async fn activity_retry_resumes_from_persisted_heartbeat_details() {
             rate_limit_rps: None,
             rate_limit_burst: None,
             rate_limit_key: None,
+            circuit_breaker: None,
             is_local: false,
             max_input_bytes: None,
             max_result_bytes: None,
@@ -1685,6 +1687,7 @@ async fn worker_fails_orphaned_activity_task_without_scheduled_event() {
                     rate_limit_rps: None,
                     rate_limit_burst: None,
                     rate_limit_key: None,
+                    circuit_breaker: None,
                     is_local: false,
                     max_input_bytes: None,
                     max_result_bytes: None,
@@ -1919,6 +1922,7 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
                     rate_limit_rps: None,
                     rate_limit_burst: None,
                     rate_limit_key: None,
+                    circuit_breaker: None,
                     is_local: false,
                     max_input_bytes: None,
                     max_result_bytes: None,
@@ -2444,6 +2448,7 @@ async fn worker_builder_state_is_visible_to_workflow_and_activity() {
             rate_limit_rps: None,
             rate_limit_burst: None,
             rate_limit_key: None,
+            circuit_breaker: None,
             is_local: false,
             max_input_bytes: None,
             max_result_bytes: None,
@@ -3045,6 +3050,7 @@ async fn worker_handles_early_ingested_signal_before_activity() {
             rate_limit_rps: None,
             rate_limit_burst: None,
             rate_limit_key: None,
+            circuit_breaker: None,
             is_local: false,
             max_input_bytes: None,
             max_result_bytes: None,
@@ -5378,6 +5384,16 @@ fn always_legacy_string_failure_activity<'a>(
     Box::pin(async move { Err("foo".to_string()) })
 }
 
+/// Activity handler that always fails with a *retryable* error, simulating a
+/// downstream outage (issue #369). The circuit breaker should observe these
+/// failures and trip, after which the worker short-circuits dispatch.
+fn always_retryable_failure_activity<'a>(
+    _ctx: &'a ActivityContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move { Err("downstream is down".to_string()) })
+}
+
 /// End-to-end fail-fast for a typed `ActivityFailure` flagged `non_retryable`:
 /// the activity must fail on attempt 1 (skipping the retry policy entirely),
 /// the `ActivityFailed` event in history must carry the structured
@@ -5444,6 +5460,7 @@ async fn non_retryable_activity_fails_fast_on_attempt_one() {
             rate_limit_rps: None,
             rate_limit_burst: None,
             rate_limit_key: None,
+            circuit_breaker: None,
             is_local: false,
             max_input_bytes: None,
             max_result_bytes: None,
@@ -5515,6 +5532,128 @@ async fn non_retryable_activity_fails_fast_on_attempt_one() {
     assert_eq!(execution.state, "FAILED");
 }
 
+/// End-to-end circuit breaker (issue #369): an activity configured with a
+/// `CircuitBreakerPolicy` (threshold 1) against a downstream that is hard-down.
+///
+/// Attempt 1 dispatches normally (breaker closed) and fails with a retryable
+/// error, which trips the breaker. Attempt 2 (the retry) is short-circuited by
+/// the open breaker and recorded as a non-retryable `ActivityFailed` with
+/// `error_type = "CircuitOpen"`, terminating the workflow without burning the
+/// rest of the retry curve. The `CircuitOpen` failure lives in the workflow's
+/// own event history exactly like any other activity failure, so replay
+/// reproduces the same outcome regardless of breaker state at replay time
+/// (no new `WorkflowEvent` variant is introduced).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
+async fn circuit_breaker_short_circuits_after_tripping() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect to Postgres container");
+
+    let exec_id = insert_workflow_execution(&mut conn).await;
+    let workflow_input = serde_json::json!({"to": "alice@example.com"});
+
+    let started_events = vec![WorkflowEvent::WorkflowStarted {
+        input: workflow_input.clone(),
+        timestamp: Utc::now(),
+    }];
+    store::append_events(&mut conn, exec_id, &started_events, 0)
+        .await
+        .expect("append WorkflowStarted failed");
+
+    let mut params = EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
+    params.workflow_exec_id = Some(exec_id.as_uuid());
+    params.scheduled_at = Utc::now() - chrono::Duration::seconds(5);
+    queue::enqueue(&mut conn, &params)
+        .await
+        .expect("enqueue workflow task failed");
+
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![WorkflowInfo {
+            name: "e2e_test_workflow",
+            module: "integration_e2e",
+            handler: workflow_with_activity,
+            execution_timeout: None,
+            concurrency: None,
+            max_input_bytes: None,
+        }],
+        vec![ActivityInfo {
+            name: "send_email",
+            module: "integration_e2e",
+            // Allow up to 5 retries — but the breaker (threshold 1) trips on the
+            // first failure and short-circuits the retry as a CircuitOpen.
+            default_retry_policy: Some(autumn_harvest::RetryPolicy::exponential(
+                5,
+                Duration::from_millis(10),
+            )),
+            default_start_to_close: None,
+            default_heartbeat_timeout: None,
+            default_schedule_to_start: None,
+            default_queue: Some("default"),
+            max_concurrent: None,
+            concurrency_key: None,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
+            // Trip after a single failure; long cooldown so it stays open.
+            circuit_breaker: Some(autumn_harvest::policy::CircuitBreakerPolicy::new(
+                1,
+                Duration::from_secs(60),
+                Duration::from_secs(300),
+            )),
+            is_local: false,
+            max_input_bytes: None,
+            max_result_bytes: None,
+            handler: always_retryable_failure_activity,
+        }],
+    ));
+
+    let worker = build_runtime_worker("worker-circuit-breaker", 1, 1, registry);
+    let pool = build_test_pool(&database_url);
+    let handle = spawn_test_worker(Arc::clone(&worker), pool);
+
+    let execution = wait_for_execution_state(&database_url, exec_id, "FAILED").await;
+    worker.shutdown();
+    handle.await.expect("worker task should join");
+
+    let history = load_history_from_url(&database_url, exec_id).await;
+
+    // The breaker short-circuited a dispatch: history carries a non-retryable
+    // ActivityFailed with error_type "CircuitOpen".
+    let circuit_open = history
+        .events
+        .iter()
+        .find_map(|ev| match ev {
+            WorkflowEvent::ActivityFailed {
+                error_type,
+                non_retryable,
+                ..
+            } if error_type == "CircuitOpen" => Some(*non_retryable),
+            _ => None,
+        })
+        .expect("history must contain a CircuitOpen ActivityFailed once the breaker trips");
+    assert!(
+        circuit_open,
+        "CircuitOpen failures must be non-retryable terminal for the in-flight attempt"
+    );
+
+    // The breaker prevented the full retry curve from running: far fewer than
+    // the 5 configured attempts were dispatched (attempt 1 ran, the rest were
+    // short-circuited terminally).
+    let activity_started = history
+        .events
+        .iter()
+        .filter(|ev| matches!(ev, WorkflowEvent::ActivityStarted { .. }))
+        .count();
+    assert!(
+        activity_started <= 2,
+        "breaker must curb retries; saw {activity_started} ActivityStarted events"
+    );
+
+    assert_eq!(execution.state, "FAILED");
+}
+
 /// Back-compat mirror: an activity returning a legacy `Err("foo")` short-
 /// circuits retries when `RetryPolicy::non_retryable_errors` contains `"foo"`,
 /// exactly as before #227. Confirms the legacy resolution path is still
@@ -5571,6 +5710,7 @@ async fn legacy_string_failure_in_non_retryable_errors_fails_fast() {
             rate_limit_rps: None,
             rate_limit_burst: None,
             rate_limit_key: None,
+            circuit_breaker: None,
             is_local: false,
             max_input_bytes: None,
             max_result_bytes: None,

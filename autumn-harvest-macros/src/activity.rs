@@ -22,6 +22,9 @@ struct ActivityAttrs {
     rate_limit_rps: Option<f64>,
     rate_limit_burst: Option<f64>,
     rate_limit_key: Option<String>,
+    /// Circuit-breaker policy expression (issue #369), e.g.
+    /// `CircuitBreakerPolicy::new(10, Duration::from_secs(30), Duration::from_secs(60))`.
+    circuit_breaker: Option<Expr>,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -40,6 +43,7 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<ActivityAttrs> {
         rate_limit_rps: None,
         rate_limit_burst: None,
         rate_limit_key: None,
+        circuit_breaker: None,
     };
 
     syn::meta::parser(|meta| {
@@ -129,12 +133,18 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<ActivityAttrs> {
             let value: LitStr = meta.value()?.parse()?;
             result.rate_limit_key = Some(value.value());
             Ok(())
+        } else if meta.path.is_ident("circuit_breaker") {
+            // Parse as Expr so nested constructor calls with commas work, e.g.
+            // `circuit_breaker = CircuitBreakerPolicy::new(10, w, c)`.
+            let value: Expr = meta.value()?.parse()?;
+            result.circuit_breaker = Some(value);
+            Ok(())
         } else {
             Err(meta.error(
                 "unsupported attribute: expected retry, start_to_close, heartbeat_timeout, \
                  schedule_to_start, queue, max_concurrent, concurrency_key, local, \
                  max_input_bytes, max_result_bytes, rate_limit_rps, rate_limit_burst, \
-                 or rate_limit_key",
+                 rate_limit_key, or circuit_breaker",
             ))
         }
     })
@@ -394,6 +404,11 @@ pub fn activity_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
+    let circuit_breaker_expr = attrs
+        .circuit_breaker
+        .as_ref()
+        .map_or_else(|| quote! { None }, |expr| quote! { Some(#expr) });
+
     quote! {
         #input_fn
 
@@ -415,6 +430,7 @@ pub fn activity_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 rate_limit_rps: #rate_limit_rps_expr,
                 rate_limit_burst: #rate_limit_burst_expr,
                 rate_limit_key: #rate_limit_key_expr,
+                circuit_breaker: #circuit_breaker_expr,
                 handler: |ctx, input| {
                     ::std::boxed::Box::pin(async move {
                         #dispatch

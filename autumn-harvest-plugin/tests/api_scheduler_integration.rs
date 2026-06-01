@@ -399,6 +399,7 @@ fn recording_activity_info(name: &'static str) -> ActivityInfo {
         rate_limit_rps: None,
         rate_limit_burst: None,
         rate_limit_key: None,
+        circuit_breaker: None,
         handler: record_activity,
     }
 }
@@ -420,6 +421,7 @@ fn blocking_activity_info(name: &'static str, start_to_close: Duration) -> Activ
         rate_limit_rps: None,
         rate_limit_burst: None,
         rate_limit_key: None,
+        circuit_breaker: None,
         handler: wait_on_barrier_activity,
     }
 }
@@ -4512,6 +4514,7 @@ async fn scheduler_tick_creates_and_executes_due_interval_runs() {
             rate_limit_rps: None,
             rate_limit_burst: None,
             rate_limit_key: None,
+            circuit_breaker: None,
             handler: record_activity,
         }],
         Arc::new(state),

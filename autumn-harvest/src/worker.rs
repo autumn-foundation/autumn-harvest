@@ -196,6 +196,11 @@ pub struct HandlerRegistry {
     pub max_activity_result_bytes: u64,
     /// Maximum allowed bytes for a signal payload (enforced at signal-send time).
     pub max_signal_payload_bytes: u64,
+    /// Per-activity circuit breakers (issue #369), shared with the management
+    /// API so both the worker dispatch path and operators observe the same
+    /// in-process state. Built from the registered activities' declared
+    /// [`CircuitBreakerPolicy`](crate::policy::CircuitBreakerPolicy)s.
+    circuit_breakers: Arc<crate::circuit_breaker::CircuitBreakerRegistry>,
 }
 
 impl HandlerRegistry {
@@ -237,9 +242,13 @@ impl HandlerRegistry {
             .into_iter()
             .map(|w| (w.name.to_string(), w))
             .collect();
-        let activities = activities
+        let activities: HashMap<String, ActivityInfo> = activities
             .into_iter()
             .map(|a| (a.name.to_string(), a))
+            .collect();
+        let circuit_policies: HashMap<String, crate::policy::CircuitBreakerPolicy> = activities
+            .iter()
+            .filter_map(|(name, info)| info.circuit_breaker.map(|p| (name.clone(), p)))
             .collect();
         Self {
             workflows,
@@ -253,6 +262,9 @@ impl HandlerRegistry {
             max_workflow_input_bytes: crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
             max_activity_result_bytes: crate::builder::DEFAULT_MAX_ACTIVITY_RESULT_BYTES,
             max_signal_payload_bytes: crate::builder::DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
+            circuit_breakers: Arc::new(crate::circuit_breaker::CircuitBreakerRegistry::new(
+                circuit_policies,
+            )),
         }
     }
 
@@ -322,6 +334,15 @@ impl HandlerRegistry {
         &self.telemetry
     }
 
+    /// Access the per-activity circuit-breaker registry (issue #369).
+    ///
+    /// Shared (behind an `Arc`) with the management API so operators observe
+    /// and force the same in-process breaker state the worker enforces.
+    #[must_use]
+    pub fn circuit_breakers(&self) -> Arc<crate::circuit_breaker::CircuitBreakerRegistry> {
+        Arc::clone(&self.circuit_breakers)
+    }
+
     /// History-size guardrails applied to workflow contexts run by this registry.
     #[must_use]
     pub const fn history_policy(&self) -> WorkflowHistoryPolicy {
@@ -343,6 +364,7 @@ impl std::fmt::Debug for HandlerRegistry {
             .field("max_workflow_input_bytes", &self.max_workflow_input_bytes)
             .field("max_activity_result_bytes", &self.max_activity_result_bytes)
             .field("max_signal_payload_bytes", &self.max_signal_payload_bytes)
+            .field("circuit_breakers", &self.circuit_breakers)
             .finish()
     }
 }
@@ -3228,6 +3250,53 @@ async fn process_activity_task(
         // conn is dropped here, returning the slot to the pool
     };
 
+    // Circuit breaker (issue #369): consult the breaker before running the
+    // handler. When open, short-circuit with a non-retryable `CircuitOpen`
+    // failure recorded as an ordinary `ActivityFailed` event (so replay is
+    // unaffected and the append-only contract holds) instead of dispatching
+    // doomed work against a downstream that is known to be down.
+    let circuit_breakers = registry.circuit_breakers();
+    if let crate::circuit_breaker::DispatchDecision::ShortCircuit {
+        opened_at,
+        retry_after,
+    } = circuit_breakers.on_dispatch(activity_name, std::time::Instant::now())
+    {
+        use crate::failure::IntoActivityErrorString as _;
+        let payload =
+            crate::failure::ActivityFailure::circuit_open(activity_name, opened_at, retry_after)
+                .into_error_payload();
+        let telemetry = registry.telemetry().clone();
+        telemetry.metrics.record_activity_completed_with_error_type(
+            activity_name,
+            &task.queue_name,
+            0.0,
+            ActivityStatus::Failed,
+            Some(crate::failure::ERROR_TYPE_CIRCUIT_OPEN),
+        );
+        telemetry.metrics.record_activity_failed(
+            activity_name,
+            "",
+            crate::failure::ERROR_TYPE_CIRCUIT_OPEN,
+            true,
+        );
+        let mut conn = pool.get().await.map_err(crate::error::database_error)?;
+        let retry_policy_result = configured_retry_policy(task);
+        let retry_policy =
+            fail_execution_on_error(&mut conn, task, worker_id, retry_policy_result).await?;
+        return handle_activity_result(
+            &mut conn,
+            task,
+            exec_id,
+            activity_id,
+            worker_id,
+            retry_policy.as_ref(),
+            Err(payload),
+            0,
+            activity_name,
+        )
+        .await;
+    }
+
     let cancel = CancellationToken::new();
     let heartbeat_tx =
         crate::heartbeat::spawn_heartbeat_flusher(task.id, pool.clone(), cancel.clone());
@@ -3347,6 +3416,22 @@ async fn process_activity_task(
         telemetry
             .metrics
             .record_activity_failed(activity_name, "", error_type, *non_retryable);
+    }
+    // Circuit breaker (issue #369): record this attempt's outcome. A close →
+    // open trip (or half-open re-open) and a recovery to closed are surfaced as
+    // the `harvest.activity.circuit.{tripped,closed}` counters so existing
+    // alerting picks them up.
+    if let Some(transition) =
+        circuit_breakers.on_result(activity_name, activity_result.is_ok(), std::time::Instant::now())
+    {
+        match transition {
+            crate::circuit_breaker::CircuitTransition::Tripped => {
+                telemetry.metrics.record_circuit_tripped(activity_name);
+            }
+            crate::circuit_breaker::CircuitTransition::Closed => {
+                telemetry.metrics.record_circuit_closed(activity_name);
+            }
+        }
     }
     cancel.cancel();
     drop(activity_future);
@@ -6260,6 +6345,7 @@ mod tests {
             rate_limit_rps: None,
             rate_limit_burst: None,
             rate_limit_key: None,
+            circuit_breaker: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
         };
 

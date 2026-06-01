@@ -90,9 +90,14 @@ pub const OP_BUILD_POLICY_SET: &str = "build_routing.policy.set";
 pub const OP_BUILD_COMPAT_DECLARE: &str = "build_routing.compat.declare";
 /// Audit operation: Revoked a build compatibility entry (issue #362).
 pub const OP_BUILD_COMPAT_REVOKE: &str = "build_routing.compat.revoke";
+/// Audit operation: Forced an activity circuit breaker open (issue #369).
+pub const OP_CIRCUIT_FORCE_OPEN: &str = "circuit.force_open";
+/// Audit operation: Forced an activity circuit breaker closed (issue #369).
+pub const OP_CIRCUIT_FORCE_CLOSE: &str = "circuit.force_close";
 
 // ── Target type constants ─────────────────────────────────────────────────────
 
+pub const TARGET_CIRCUIT: &str = "circuit";
 pub const TARGET_WORKFLOW: &str = "workflow";
 pub const TARGET_DAG: &str = "dag";
 pub const TARGET_SCHEDULE: &str = "schedule";

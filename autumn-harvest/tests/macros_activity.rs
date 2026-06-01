@@ -35,6 +35,16 @@ async fn retryable_local(_ctx: &ActivityContext) -> Result<(), String> {
     Ok(())
 }
 
+// Activity with a circuit-breaker policy (issue #369).
+#[activity(
+    start_to_close = "30s",
+    circuit_breaker = CircuitBreakerPolicy::new(10, Duration::from_secs(30), Duration::from_secs(60))
+)]
+async fn breaker_activity(_ctx: &ActivityContext, addr: String) -> Result<(), String> {
+    let _ = addr;
+    Ok(())
+}
+
 #[test]
 fn activity_companion_returns_name() {
     let info = __autumn_activity_info_simple_activity();
@@ -42,6 +52,20 @@ fn activity_companion_returns_name() {
     assert!(info.default_retry_policy.is_none());
     assert_eq!(info.default_queue, None);
     assert!(!info.is_local);
+    // Activities without a declared policy retain today's behaviour (no breaker).
+    assert!(info.circuit_breaker.is_none());
+}
+
+#[test]
+fn circuit_breaker_attribute_populates_activity_info() {
+    let info = __autumn_activity_info_breaker_activity();
+    assert_eq!(info.name, "breaker_activity");
+    let policy = info
+        .circuit_breaker
+        .expect("circuit_breaker attribute should populate ActivityInfo");
+    assert_eq!(policy.failure_threshold, 10);
+    assert_eq!(policy.window, Duration::from_secs(30));
+    assert_eq!(policy.cooldown, Duration::from_secs(60));
 }
 
 #[test]

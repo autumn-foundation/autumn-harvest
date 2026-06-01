@@ -44,8 +44,9 @@
 use metrics::{counter, gauge, histogram};
 
 use crate::telemetry::{
-    ActivityStatus, METRIC_ACTIVITY_DURATION, METRIC_ACTIVITY_FAILED, METRIC_DLQ_ENTRIES,
-    METRIC_EXTERNAL_SIGNAL_SENT, METRIC_LABEL_ACTIVITY, METRIC_LABEL_ERROR_TYPE, METRIC_LABEL_KEY,
+    ActivityStatus, METRIC_ACTIVITY_DURATION, METRIC_ACTIVITY_FAILED, METRIC_CIRCUIT_CLOSED,
+    METRIC_CIRCUIT_TRIPPED, METRIC_DLQ_ENTRIES, METRIC_EXTERNAL_SIGNAL_SENT,
+    METRIC_LABEL_ACTIVITY, METRIC_LABEL_ACTIVITY_NAME, METRIC_LABEL_ERROR_TYPE, METRIC_LABEL_KEY,
     METRIC_LABEL_KIND, METRIC_LABEL_NAME, METRIC_LABEL_NON_RETRYABLE, METRIC_LABEL_OUTCOME,
     METRIC_LABEL_QUERY, METRIC_LABEL_QUEUE, METRIC_LABEL_REASON, METRIC_LABEL_REASON_CODE,
     METRIC_LABEL_SHARD, METRIC_LABEL_STATUS, METRIC_LABEL_WORKFLOW, METRIC_LABEL_WORKFLOW_TYPE,
@@ -344,6 +345,22 @@ impl MetricsRecorder for MetricsRsRecorder {
             METRIC_TASK_QUARANTINED,
             METRIC_LABEL_QUEUE => queue.to_owned(),
             METRIC_LABEL_REASON => reason.to_owned(),
+        )
+        .increment(1);
+    }
+
+    fn record_circuit_tripped(&self, activity_name: &str) {
+        counter!(
+            METRIC_CIRCUIT_TRIPPED,
+            METRIC_LABEL_ACTIVITY_NAME => activity_name.to_owned(),
+        )
+        .increment(1);
+    }
+
+    fn record_circuit_closed(&self, activity_name: &str) {
+        counter!(
+            METRIC_CIRCUIT_CLOSED,
+            METRIC_LABEL_ACTIVITY_NAME => activity_name.to_owned(),
         )
         .increment(1);
     }

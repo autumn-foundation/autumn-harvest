@@ -271,6 +271,7 @@ fn local_activity_info(
         rate_limit_rps: None,
         rate_limit_burst: None,
         rate_limit_key: None,
+        circuit_breaker: None,
         handler,
     }
 }
