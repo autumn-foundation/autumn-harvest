@@ -664,7 +664,7 @@
       "request_body": {
         "required": false,
         "free_form": true,
-        "description": "Optional signal payload — the entire body is passed verbatim to the signal handler.",
+        "description": "Optional signal payload \u2014 the entire body is passed verbatim to the signal handler.",
         "fields": []
       },
       "success_response": {
@@ -849,7 +849,7 @@
           "name": "wait",
           "in": "query",
           "required": false,
-          "description": "admitted — return when validated; completed — block until handler returns (default)."
+          "description": "admitted \u2014 return when validated; completed \u2014 block until handler returns (default)."
         },
         {
           "name": "timeout_secs",
@@ -910,7 +910,7 @@
           "name": "update_id",
           "in": "path",
           "required": true,
-          "description": "Update UUID returned by POST …/update/{name}."
+          "description": "Update UUID returned by POST \u2026/update/{name}."
         }
       ],
       "request_body": null,
@@ -1050,38 +1050,14 @@
         "note": "Returns 200 (not 201) when dry_run is true: the plan is computed and returned without any write, and new_run_exec_id / events_carried_over are omitted.",
         "free_form": false,
         "fields": [
-          {
-            "name": "dry_run",
-            "description": "True for a dry-run preview."
-          },
-          {
-            "name": "dag_name",
-            "description": "The DAG name."
-          },
-          {
-            "name": "source_run_exec_id",
-            "description": "The source DAG run execution id."
-          },
-          {
-            "name": "reset_to_event_id",
-            "description": "Resolved 0-based reset event id passed to the #148 reset."
-          },
-          {
-            "name": "nodes_to_re_execute",
-            "description": "Nodes that will re-execute on the new run."
-          },
-          {
-            "name": "nodes_carried_over",
-            "description": "Nodes whose recorded results are carried over."
-          },
-          {
-            "name": "new_run_exec_id",
-            "description": "The forked DAG run execution id (omitted on dry run)."
-          },
-          {
-            "name": "events_carried_over",
-            "description": "Number of carried-over events on the new run (omitted on dry run)."
-          }
+          { "name": "dry_run", "description": "True for a dry-run preview." },
+          { "name": "dag_name", "description": "The DAG name." },
+          { "name": "source_run_exec_id", "description": "The source DAG run execution id." },
+          { "name": "reset_to_event_id", "description": "Resolved 0-based reset event id passed to the #148 reset." },
+          { "name": "nodes_to_re_execute", "description": "Nodes that will re-execute on the new run." },
+          { "name": "nodes_carried_over", "description": "Nodes whose recorded results are carried over." },
+          { "name": "new_run_exec_id", "description": "The forked DAG run execution id (omitted on dry run)." },
+          { "name": "events_carried_over", "description": "Number of carried-over events on the new run (omitted on dry run)." }
         ]
       },
       "error_responses": [
@@ -1242,12 +1218,12 @@
           {
             "name": "failed_after",
             "required": false,
-            "description": "RFC 3339 timestamp — only replay entries failed after this time."
+            "description": "RFC 3339 timestamp \u2014 only replay entries failed after this time."
           },
           {
             "name": "failed_before",
             "required": false,
-            "description": "RFC 3339 timestamp — only replay entries failed before this time."
+            "description": "RFC 3339 timestamp \u2014 only replay entries failed before this time."
           },
           {
             "name": "limit",
@@ -1308,12 +1284,12 @@
           {
             "name": "failed_after",
             "required": false,
-            "description": "RFC 3339 timestamp — only discard entries failed after this time."
+            "description": "RFC 3339 timestamp \u2014 only discard entries failed after this time."
           },
           {
             "name": "failed_before",
             "required": false,
-            "description": "RFC 3339 timestamp — only discard entries failed before this time."
+            "description": "RFC 3339 timestamp \u2014 only discard entries failed before this time."
           },
           {
             "name": "limit",
@@ -1566,7 +1542,7 @@
           "name": "limit",
           "in": "query",
           "required": false,
-          "description": "Maximum number of workers to return [1–500]."
+          "description": "Maximum number of workers to return [1\u2013500]."
         }
       ],
       "request_body": null,
@@ -1816,7 +1792,7 @@
           {
             "name": "signal_name",
             "required": false,
-            "description": "Signal name — required when action is Signal."
+            "description": "Signal name \u2014 required when action is Signal."
           },
           {
             "name": "signal_payload",
@@ -1887,6 +1863,7 @@
       "path": "/workflows/batch_start",
       "category": "batch",
       "read_only": false,
+      "idempotency": "Idempotent per item: each item may carry an idempotency_key (issue #357); a retried batch carrying the same keys does not start duplicate executions. The batch envelope itself is not idempotent without per-item keys.",
       "description": "Start N workflow executions in one batched request. atomic=true validates all items first; if any are invalid the entire batch is rejected with 409 and zero rows are inserted. atomic=false returns per-item results.",
       "params": [],
       "request_body": {
@@ -2448,13 +2425,13 @@
           "name": "updated_after",
           "in": "query",
           "required": false,
-          "description": "RFC 3339 timestamp — include executions updated after this time."
+          "description": "RFC 3339 timestamp \u2014 include executions updated after this time."
         },
         {
           "name": "updated_before",
           "in": "query",
           "required": false,
-          "description": "RFC 3339 timestamp — include executions updated before this time."
+          "description": "RFC 3339 timestamp \u2014 include executions updated before this time."
         },
         {
           "name": "shard_id",
@@ -2546,13 +2523,13 @@
           "name": "due_before",
           "in": "query",
           "required": false,
-          "description": "RFC 3339 timestamp — only return handoffs due before this time."
+          "description": "RFC 3339 timestamp \u2014 only return handoffs due before this time."
         },
         {
           "name": "updated_before",
           "in": "query",
           "required": false,
-          "description": "RFC 3339 timestamp — only return handoffs last updated before this time."
+          "description": "RFC 3339 timestamp \u2014 only return handoffs last updated before this time."
         },
         {
           "name": "limit",
@@ -3197,66 +3174,18 @@
       "request_body": {
         "free_form": false,
         "fields": [
-          {
-            "name": "schedule_expr",
-            "type": "string",
-            "description": "Cron, interval, or manual expression (same format as POST /admin/schedules/workflow)."
-          },
-          {
-            "name": "timezone",
-            "type": "string",
-            "description": "IANA timezone for cron evaluation. Defaults to UTC."
-          },
-          {
-            "name": "catchup",
-            "type": "boolean",
-            "description": "Whether missed fires should be caught up. Informational only in preview; defaults to false."
-          },
-          {
-            "name": "max_active_runs",
-            "type": "integer",
-            "description": "Maximum concurrent runs. Used to set would_skip_if_active. Defaults to 1."
-          },
-          {
-            "name": "paused",
-            "type": "boolean",
-            "description": "If true, returns empty entries with is_paused=true."
-          },
-          {
-            "name": "jitter_secs",
-            "type": "integer",
-            "description": "Jitter window in seconds. 0 disables jitter. Validated via validate_jitter."
-          },
-          {
-            "name": "overlap_policy",
-            "type": "string",
-            "description": "One of: skip, buffer_one, buffer_all, cancel_other, terminate_other. Defaults to skip."
-          },
-          {
-            "name": "buffer_all_max",
-            "type": "integer",
-            "description": "Max buffered slots under buffer_all. Defaults to 100."
-          },
-          {
-            "name": "calendar",
-            "type": "string",
-            "description": "Optional named calendar for exclusion filtering. Returns 400 if not found."
-          },
-          {
-            "name": "skip_policy",
-            "type": "string",
-            "description": "One of: skip, run_next_business_day, run_prev_business_day. Defaults to skip."
-          },
-          {
-            "name": "count",
-            "type": "integer",
-            "description": "Number of entries to return. Defaults to 10, max 100."
-          },
-          {
-            "name": "from",
-            "type": "string",
-            "description": "ISO-8601 UTC start instant. Defaults to now."
-          }
+          { "name": "schedule_expr", "type": "string", "description": "Cron, interval, or manual expression (same format as POST /admin/schedules/workflow)." },
+          { "name": "timezone", "type": "string", "description": "IANA timezone for cron evaluation. Defaults to UTC." },
+          { "name": "catchup", "type": "boolean", "description": "Whether missed fires should be caught up. Informational only in preview; defaults to false." },
+          { "name": "max_active_runs", "type": "integer", "description": "Maximum concurrent runs. Used to set would_skip_if_active. Defaults to 1." },
+          { "name": "paused", "type": "boolean", "description": "If true, returns empty entries with is_paused=true." },
+          { "name": "jitter_secs", "type": "integer", "description": "Jitter window in seconds. 0 disables jitter. Validated via validate_jitter." },
+          { "name": "overlap_policy", "type": "string", "description": "One of: skip, buffer_one, buffer_all, cancel_other, terminate_other. Defaults to skip." },
+          { "name": "buffer_all_max", "type": "integer", "description": "Max buffered slots under buffer_all. Defaults to 100." },
+          { "name": "calendar", "type": "string", "description": "Optional named calendar for exclusion filtering. Returns 400 if not found." },
+          { "name": "skip_policy", "type": "string", "description": "One of: skip, run_next_business_day, run_prev_business_day. Defaults to skip." },
+          { "name": "count", "type": "integer", "description": "Number of entries to return. Defaults to 10, max 100." },
+          { "name": "from", "type": "string", "description": "ISO-8601 UTC start instant. Defaults to now." }
         ]
       },
       "success_response": {
@@ -3532,7 +3461,7 @@
       "path": "/admin/audit",
       "category": "audit",
       "read_only": true,
-      "description": "Browse the audit trail of management API mutations. Read-only — the audit log itself is never mutated through this surface.",
+      "description": "Browse the audit trail of management API mutations. Read-only \u2014 the audit log itself is never mutated through this surface.",
       "params": [
         {
           "name": "actor",
@@ -3568,13 +3497,13 @@
           "name": "since",
           "in": "query",
           "required": false,
-          "description": "RFC 3339 timestamp — only return records after this time."
+          "description": "RFC 3339 timestamp \u2014 only return records after this time."
         },
         {
           "name": "before",
           "in": "query",
           "required": false,
-          "description": "RFC 3339 timestamp — only return records before this time."
+          "description": "RFC 3339 timestamp \u2014 only return records before this time."
         },
         {
           "name": "limit",
@@ -3655,19 +3584,11 @@
       "request_body": null,
       "success_response": {
         "status": 200,
-        "fields": [
-          "policies",
-          "reachability",
-          "diverged_queues",
-          "shard_errors"
-        ],
+        "fields": ["policies", "reachability", "diverged_queues", "shard_errors"],
         "notes": "diverged_queues lists queue names whose active build_id differs across shards, indicating a partial-write incident. shard_errors lists shards that could not be reached."
       },
       "error_responses": [
-        {
-          "status": 503,
-          "description": "Database unavailable."
-        }
+        { "status": 503, "description": "Database unavailable." }
       ]
     },
     {
@@ -3682,43 +3603,18 @@
         "required": true,
         "free_form": false,
         "fields": [
-          {
-            "name": "queue_name",
-            "required": true,
-            "description": "Task queue to configure the build policy for."
-          },
-          {
-            "name": "build_id",
-            "required": true,
-            "description": "Build ID to assign to new workflow starts on this queue."
-          },
-          {
-            "name": "deployment_name",
-            "required": false,
-            "description": "Optional human-readable deployment label."
-          }
+          { "name": "queue_name", "required": true, "description": "Task queue to configure the build policy for." },
+          { "name": "build_id", "required": true, "description": "Build ID to assign to new workflow starts on this queue." },
+          { "name": "deployment_name", "required": false, "description": "Optional human-readable deployment label." }
         ]
       },
       "success_response": {
         "status": 200,
-        "fields": [
-          "id",
-          "queue_name",
-          "build_id",
-          "deployment_name",
-          "created_at",
-          "updated_at"
-        ]
+        "fields": ["id", "queue_name", "build_id", "deployment_name", "created_at", "updated_at"]
       },
       "error_responses": [
-        {
-          "status": 401,
-          "description": "Unauthenticated request."
-        },
-        {
-          "status": 503,
-          "description": "Database unavailable."
-        }
+        { "status": 401, "description": "Unauthenticated request." },
+        { "status": 503, "description": "Database unavailable." }
       ]
     },
     {
@@ -3731,18 +3627,11 @@
       "request_body": null,
       "success_response": {
         "status": 200,
-        "fields": [
-          "entries",
-          "diverged_pairs",
-          "shard_errors"
-        ],
+        "fields": ["entries", "diverged_pairs", "shard_errors"],
         "notes": "entries is an array of BuildCompatEntry objects. diverged_pairs lists (build_id, compatible_with) pairs present on some shards but absent on others, indicating a partial fanout incident. shard_errors lists shards that could not be reached; non-empty means the list may be incomplete."
       },
       "error_responses": [
-        {
-          "status": 503,
-          "description": "Database unavailable."
-        }
+        { "status": 503, "description": "Database unavailable." }
       ]
     },
     {
@@ -3757,36 +3646,17 @@
         "required": true,
         "free_form": false,
         "fields": [
-          {
-            "name": "build_id",
-            "required": true,
-            "description": "The worker build that will process tasks."
-          },
-          {
-            "name": "compatible_with",
-            "required": true,
-            "description": "The assigned build whose tasks the worker build may safely replay."
-          }
+          { "name": "build_id", "required": true, "description": "The worker build that will process tasks." },
+          { "name": "compatible_with", "required": true, "description": "The assigned build whose tasks the worker build may safely replay." }
         ]
       },
       "success_response": {
         "status": 201,
-        "fields": [
-          "id",
-          "build_id",
-          "compatible_with",
-          "declared_at"
-        ]
+        "fields": ["id", "build_id", "compatible_with", "declared_at"]
       },
       "error_responses": [
-        {
-          "status": 401,
-          "description": "Unauthenticated request."
-        },
-        {
-          "status": 503,
-          "description": "Database unavailable."
-        }
+        { "status": 401, "description": "Unauthenticated request." },
+        { "status": 503, "description": "Database unavailable." }
       ]
     },
     {
@@ -3797,18 +3667,8 @@
       "description": "Revoke a compatibility declaration between two build IDs.",
       "idempotency": "Idempotent: revoking a non-existent pair returns revoked=false without error.",
       "params": [
-        {
-          "name": "build_id",
-          "in": "path",
-          "required": true,
-          "description": "The worker build."
-        },
-        {
-          "name": "compat_with",
-          "in": "path",
-          "required": true,
-          "description": "The assigned build to remove from the compatibility set."
-        }
+        { "name": "build_id", "in": "path", "required": true, "description": "The worker build." },
+        { "name": "compat_with", "in": "path", "required": true, "description": "The assigned build to remove from the compatibility set." }
       ],
       "request_body": {
         "required": false,
@@ -3817,19 +3677,11 @@
       },
       "success_response": {
         "status": 200,
-        "fields": [
-          "revoked"
-        ]
+        "fields": ["revoked"]
       },
       "error_responses": [
-        {
-          "status": 401,
-          "description": "Unauthenticated request."
-        },
-        {
-          "status": 503,
-          "description": "Database unavailable."
-        }
+        { "status": 401, "description": "Unauthenticated request." },
+        { "status": 503, "description": "Database unavailable." }
       ]
     },
     {
@@ -3844,35 +3696,20 @@
         "required": true,
         "free_form": false,
         "fields": [
-          {
-            "name": "build_id",
-            "required": true,
-            "description": "The build ID to check for retirement readiness."
-          }
+          { "name": "build_id", "required": true, "description": "The build ID to check for retirement readiness." }
         ]
       },
       "success_response": {
         "status": 200,
-        "fields": [
-          "build_id",
-          "safe_to_retire",
-          "open_executions",
-          "pending_tasks"
-        ]
+        "fields": ["build_id", "safe_to_retire", "open_executions", "pending_tasks"]
       },
       "error_responses": [
-        {
-          "status": 401,
-          "description": "Unauthenticated request."
-        },
+        { "status": 401, "description": "Unauthenticated request." },
         {
           "status": 409,
           "description": "Build has open executions or pending tasks and cannot be retired yet. Body contains the same fields showing current counts."
         },
-        {
-          "status": 503,
-          "description": "Database unavailable."
-        }
+        { "status": 503, "description": "Database unavailable." }
       ]
     }
   ]
