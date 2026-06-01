@@ -246,6 +246,15 @@ pub fn activity_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             )
             .to_compile_error();
         }
+        if attrs.circuit_breaker.is_some() {
+            return syn::Error::new_spanned(
+                input_fn.sig.fn_token,
+                "local activities do not support circuit_breaker; \
+                 the circuit breaker is enforced on the task-dispatch path, which \
+                 local activities bypass by running inline on the workflow worker",
+            )
+            .to_compile_error();
+        }
     }
 
     let fn_name = &input_fn.sig.ident;

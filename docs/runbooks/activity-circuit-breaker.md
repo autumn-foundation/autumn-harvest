@@ -61,6 +61,18 @@ The three knobs are:
 | `window` | Rolling window over which failures are counted. |
 | `cooldown` | Time the breaker stays open before admitting one half-open probe. |
 
+> **Only retryable failures count toward a trip.** A *non-retryable*
+> `ActivityFailure` (a permanent per-request error such as bad input or a
+> validation failure) proves the downstream is reachable enough to give a
+> definitive answer, so it never contributes to opening the breaker — a burst of
+> bad requests cannot trip the circuit and starve healthy callers. Only
+> transient/downstream-style retryable failures move the breaker toward open.
+>
+> **Local activities cannot declare a circuit breaker.** The breaker is enforced
+> on the task-dispatch path, which local activities (`local = true`) bypass by
+> running inline on the workflow worker; the `#[activity]` macro rejects
+> `circuit_breaker` on a local activity at compile time.
+
 ## Handling `CircuitOpen` in workflow code
 
 The failure flows through the typed activity-failure surface (#227), so workflow

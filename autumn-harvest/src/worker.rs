@@ -246,8 +246,15 @@ impl HandlerRegistry {
             .into_iter()
             .map(|a| (a.name.to_string(), a))
             .collect();
+        // Circuit breakers are enforced on the task-dispatch path
+        // (`process_activity_task`), which local activities bypass by running
+        // inline. The `#[activity]` macro rejects `circuit_breaker` on local
+        // activities at compile time; this filter is the defensive equivalent
+        // for hand-built `ActivityInfo`s so a local activity never registers a
+        // breaker that can appear configured in the admin API yet never trips.
         let circuit_policies: HashMap<String, crate::policy::CircuitBreakerPolicy> = activities
             .iter()
+            .filter(|(_, info)| !info.is_local)
             .filter_map(|(name, info)| info.circuit_breaker.map(|p| (name.clone(), p)))
             .collect();
         Self {
@@ -3256,10 +3263,17 @@ async fn process_activity_task(
     // unaffected and the append-only contract holds) instead of dispatching
     // doomed work against a downstream that is known to be down.
     let circuit_breakers = registry.circuit_breakers();
+    let dispatch_decision = circuit_breakers.on_dispatch(activity_name, std::time::Instant::now());
+    // `is_probe` is threaded into `on_result` below so only the admitted
+    // half-open probe drives the breaker's recovery/re-trip transition.
+    let circuit_is_probe = matches!(
+        dispatch_decision,
+        crate::circuit_breaker::DispatchDecision::Allow { is_probe: true }
+    );
     if let crate::circuit_breaker::DispatchDecision::ShortCircuit {
         opened_at,
         retry_after,
-    } = circuit_breakers.on_dispatch(activity_name, std::time::Instant::now())
+    } = dispatch_decision
     {
         use crate::failure::IntoActivityErrorString as _;
         let payload =
@@ -3420,10 +3434,18 @@ async fn process_activity_task(
     // Circuit breaker (issue #369): record this attempt's outcome. A close →
     // open trip (or half-open re-open) and a recovery to closed are surfaced as
     // the `harvest.activity.circuit.{tripped,closed}` counters so existing
-    // alerting picks them up.
+    // alerting picks them up. Only retryable (downstream-style) failures trip
+    // the breaker — a non-retryable permanent error (bad input) proves the
+    // downstream answered and must not open the circuit for healthy callers.
+    let circuit_outcome = match failure_info.as_ref() {
+        None => crate::circuit_breaker::AttemptOutcome::Success,
+        Some((_, true, _)) => crate::circuit_breaker::AttemptOutcome::NonRetryableFailure,
+        Some((_, false, _)) => crate::circuit_breaker::AttemptOutcome::RetryableFailure,
+    };
     if let Some(transition) = circuit_breakers.on_result(
         activity_name,
-        activity_result.is_ok(),
+        circuit_outcome,
+        circuit_is_probe,
         std::time::Instant::now(),
     ) {
         match transition {
