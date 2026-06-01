@@ -226,7 +226,9 @@ impl CircuitBreakerRegistry {
         // The state is just counters/timestamps, so recovering the inner value
         // is always safe and far preferable to cascading a panic across the
         // worker hot path.
-        self.states.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.states
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Decide whether to allow a dispatch of `activity_name` at `now`.
@@ -463,10 +465,20 @@ mod tests {
         let now = Instant::now();
         reg.on_result("send_email", false, now);
         reg.on_result("send_email", false, now);
-        assert_eq!(reg.snapshot("send_email", now).unwrap().rolling_failure_count, 2);
+        assert_eq!(
+            reg.snapshot("send_email", now)
+                .unwrap()
+                .rolling_failure_count,
+            2
+        );
         // A success clears the rolling window.
         assert_eq!(reg.on_result("send_email", true, now), None);
-        assert_eq!(reg.snapshot("send_email", now).unwrap().rolling_failure_count, 0);
+        assert_eq!(
+            reg.snapshot("send_email", now)
+                .unwrap()
+                .rolling_failure_count,
+            0
+        );
     }
 
     #[test]
@@ -518,7 +530,12 @@ mod tests {
             None,
             "stale failures should not contribute to the threshold"
         );
-        assert_eq!(reg.snapshot("send_email", t0 + Duration::from_secs(31)).unwrap().state, "closed");
+        assert_eq!(
+            reg.snapshot("send_email", t0 + Duration::from_secs(31))
+                .unwrap()
+                .state,
+            "closed"
+        );
     }
 
     #[test]
@@ -530,8 +547,14 @@ mod tests {
         }
         let probe_time = t0 + Duration::from_secs(61);
         // First dispatch after cooldown is admitted as the probe.
-        assert_eq!(reg.on_dispatch("send_email", probe_time), DispatchDecision::Allow);
-        assert_eq!(reg.snapshot("send_email", probe_time).unwrap().state, "half_open");
+        assert_eq!(
+            reg.on_dispatch("send_email", probe_time),
+            DispatchDecision::Allow
+        );
+        assert_eq!(
+            reg.snapshot("send_email", probe_time).unwrap().state,
+            "half_open"
+        );
         // While the probe is in flight, other dispatches short-circuit.
         assert!(matches!(
             reg.on_dispatch("send_email", probe_time),
@@ -542,8 +565,14 @@ mod tests {
             reg.on_result("send_email", true, probe_time),
             Some(CircuitTransition::Closed)
         );
-        assert_eq!(reg.snapshot("send_email", probe_time).unwrap().state, "closed");
-        assert_eq!(reg.on_dispatch("send_email", probe_time), DispatchDecision::Allow);
+        assert_eq!(
+            reg.snapshot("send_email", probe_time).unwrap().state,
+            "closed"
+        );
+        assert_eq!(
+            reg.on_dispatch("send_email", probe_time),
+            DispatchDecision::Allow
+        );
     }
 
     #[test]
@@ -554,13 +583,19 @@ mod tests {
             reg.on_result("send_email", false, t0);
         }
         let probe_time = t0 + Duration::from_secs(61);
-        assert_eq!(reg.on_dispatch("send_email", probe_time), DispatchDecision::Allow);
+        assert_eq!(
+            reg.on_dispatch("send_email", probe_time),
+            DispatchDecision::Allow
+        );
         // Probe fails: breaker re-opens.
         assert_eq!(
             reg.on_result("send_email", false, probe_time),
             Some(CircuitTransition::Tripped)
         );
-        assert_eq!(reg.snapshot("send_email", probe_time).unwrap().state, "open");
+        assert_eq!(
+            reg.snapshot("send_email", probe_time).unwrap().state,
+            "open"
+        );
         // And the cooldown clock restarts from the probe failure.
         assert!(matches!(
             reg.on_dispatch("send_email", probe_time),
@@ -626,8 +661,12 @@ mod tests {
         for _ in 0..3 {
             reg.on_result("send_email", false, t0);
         }
-        let snap = reg.snapshot("send_email", t0 + Duration::from_secs(20)).unwrap();
-        let remaining = snap.time_until_probe_secs.expect("open breaker reports probe ETA");
+        let snap = reg
+            .snapshot("send_email", t0 + Duration::from_secs(20))
+            .unwrap();
+        let remaining = snap
+            .time_until_probe_secs
+            .expect("open breaker reports probe ETA");
         // 60s cooldown - 20s elapsed ~= 40s.
         assert!((remaining - 40.0).abs() < 1.0, "remaining was {remaining}");
     }

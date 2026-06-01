@@ -36,11 +36,11 @@ use autumn_harvest::audit::{
     OP_CIRCUIT_FORCE_OPEN, OP_DAG_PATCH, OP_DAG_RETRY, OP_DAG_TRIGGER, OP_DLQ_DISCARD_BULK,
     OP_DLQ_REPLAY, OP_DLQ_REPLAY_BULK, OP_EXTERNAL_ACTIVITY_COMPLETE, OP_EXTERNAL_ACTIVITY_FAIL,
     OP_RETENTION_RUN_NOW, OP_SCHEDULE_BACKFILL, OP_SCHEDULE_CREATE, OP_SCHEDULE_DELETE,
-    OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER, OP_WORKER_DRAIN, OP_WORKFLOW_CANCEL,
-    OP_WORKFLOW_RESET, OP_WORKFLOW_SIGNAL, OP_WORKFLOW_SIGNAL_WITH_START, OP_WORKFLOW_START,
-    SOURCE_API, STATUS_SUCCEEDED, STATUS_FAILED, TARGET_BATCH, TARGET_BUILD_ROUTING, TARGET_CIRCUIT,
-    TARGET_DAG, TARGET_DEAD_LETTER, TARGET_EXTERNAL_ACTIVITY, TARGET_RETENTION, TARGET_SCHEDULE,
-    TARGET_WORKER, TARGET_WORKFLOW,
+    OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER, OP_WORKER_DRAIN,
+    OP_WORKFLOW_CANCEL, OP_WORKFLOW_RESET, OP_WORKFLOW_SIGNAL, OP_WORKFLOW_SIGNAL_WITH_START,
+    OP_WORKFLOW_START, SOURCE_API, STATUS_FAILED, STATUS_SUCCEEDED, TARGET_BATCH,
+    TARGET_BUILD_ROUTING, TARGET_CIRCUIT, TARGET_DAG, TARGET_DEAD_LETTER, TARGET_EXTERNAL_ACTIVITY,
+    TARGET_RETENTION, TARGET_SCHEDULE, TARGET_WORKER, TARGET_WORKFLOW,
 };
 use autumn_harvest::batch::{
     self, BatchAction, BatchExecutorConfig, BatchFilter, BatchJobStatus, BatchJobView,
@@ -10310,11 +10310,14 @@ async fn force_circuit(
         let _ = audit::insert_audit(&mut conn, &ar).await;
     }
 
-    breakers.snapshot(activity_name, now).map(Json).ok_or_else(|| {
-        AutumnError::not_found_msg(format!(
-            "no circuit breaker configured for activity '{activity_name}'"
-        ))
-    })
+    breakers
+        .snapshot(activity_name, now)
+        .map(Json)
+        .ok_or_else(|| {
+            AutumnError::not_found_msg(format!(
+                "no circuit breaker configured for activity '{activity_name}'"
+            ))
+        })
 }
 
 // ---------------------------------------------------------------------------

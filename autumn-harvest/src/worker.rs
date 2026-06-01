@@ -3421,9 +3421,11 @@ async fn process_activity_task(
     // open trip (or half-open re-open) and a recovery to closed are surfaced as
     // the `harvest.activity.circuit.{tripped,closed}` counters so existing
     // alerting picks them up.
-    if let Some(transition) =
-        circuit_breakers.on_result(activity_name, activity_result.is_ok(), std::time::Instant::now())
-    {
+    if let Some(transition) = circuit_breakers.on_result(
+        activity_name,
+        activity_result.is_ok(),
+        std::time::Instant::now(),
+    ) {
         match transition {
             crate::circuit_breaker::CircuitTransition::Tripped => {
                 telemetry.metrics.record_circuit_tripped(activity_name);

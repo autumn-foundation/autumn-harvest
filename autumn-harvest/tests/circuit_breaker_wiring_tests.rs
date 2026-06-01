@@ -33,10 +33,7 @@ async fn no_breaker(_ctx: &ActivityContext, addr: String) -> Result<(), String> 
 }
 
 fn registry() -> HandlerRegistry {
-    HandlerRegistry::new(
-        vec![],
-        activities![flaky_downstream, no_breaker],
-    )
+    HandlerRegistry::new(vec![], activities![flaky_downstream, no_breaker])
 }
 
 #[test]
@@ -101,7 +98,12 @@ fn force_open_and_close_through_shared_registry() {
     let now = Instant::now();
 
     breakers.force_open("flaky_downstream", now);
-    assert!(breakers.snapshot("flaky_downstream", now).unwrap().forced_open);
+    assert!(
+        breakers
+            .snapshot("flaky_downstream", now)
+            .unwrap()
+            .forced_open
+    );
     assert!(matches!(
         breakers.on_dispatch("flaky_downstream", now),
         DispatchDecision::ShortCircuit { .. }
