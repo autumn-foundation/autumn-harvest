@@ -562,6 +562,9 @@ fn line_comment_start(line: &str) -> Option<usize> {
 }
 
 fn next_char(line: &str, pos: usize) -> Option<(char, usize)> {
+    if !line.is_char_boundary(pos) {
+        return None;
+    }
     let ch = line[pos..].chars().next()?;
     Some((ch, pos + ch.len_utf8()))
 }
