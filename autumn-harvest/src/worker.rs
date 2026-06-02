@@ -1268,11 +1268,11 @@ async fn run_local_activity_inline(
                 run.name, run.failed_attempts
             )
         });
-        return Err(HarvestError::ActivityFailed {
-            name: run.name.clone(),
-            attempt: run.failed_attempts,
-            source: error.into(),
-        });
+        return Err(HarvestError::activity_failed(
+            run.name.clone(),
+            run.failed_attempts,
+            &error,
+        ));
     }
 
     for attempt in start_attempt..=max_attempts {
@@ -6066,12 +6066,23 @@ impl Worker {
             }
         };
 
+        // Activities whose circuit breaker is open are exempted from the
+        // rate-limit gate / token decrement in the claim query (issue #369), so
+        // an open-circuit task is claimed immediately and fast-failed by the
+        // in-process breaker in `process_activity_task` rather than being paced
+        // by — and burning tokens from — the downstream's rate-limit bucket.
+        let open_circuit_activities = self
+            .registry
+            .circuit_breakers()
+            .open_activity_names(std::time::Instant::now());
+
         match queue::claim_task(
             &mut conn,
             &self.config.queues,
             &self.config.worker_id,
             &self.config.build_id,
             self.config.priority_aging_secs,
+            &open_circuit_activities,
         )
         .await
         {

@@ -76,20 +76,34 @@ The three knobs are:
 ## Handling `CircuitOpen` in workflow code
 
 The failure flows through the typed activity-failure surface (#227), so workflow
-code matches on it like any other error:
+code branches on the typed error class — **not** by parsing the human message.
+`HarvestError` exposes the recorded `error_type` / `details` (preserved through
+replay) via accessors:
 
 ```rust
-use autumn_harvest::error::HarvestError;
-
 match ctx.execute_activity(&charge_card_info(), req).await {
     Ok(receipt) => { /* happy path */ }
-    Err(HarvestError::ActivityFailed { error_type, .. }) if error_type == "CircuitOpen" => {
+    Err(e) if e.is_circuit_open() => {
         // Downstream is down. Compensate / branch / defer instead of retrying.
+        // `details.retry_after_secs` is present for a cooldown-based open;
+        // `details.forced == true` (and no retry_after_secs) for an
+        // operator-forced pin.
+        let retry_after = e
+            .activity_details()
+            .and_then(|d| d.get("retry_after_secs"))
+            .and_then(serde_json::Value::as_f64);
+        let _ = retry_after;
         saga.compensate_all().await?;
     }
     Err(e) => return Err(e.to_string()),
 }
 ```
+
+`e.activity_error_type()` returns the stable class string (e.g. `"CircuitOpen"`)
+for any `ActivityFailed`; `e.activity_details()` returns the structured payload.
+These are deterministic on replay — a workflow that saw `CircuitOpen` sees the
+same typed failure (and `retry_after_secs`) every replay, regardless of the
+breaker's live state at replay time.
 
 ## Decision matrix — circuit breaker vs. retry / jitter / rate limit
 
@@ -117,6 +131,13 @@ Rules of thumb:
   dispatch; retry + jitter handle individual transient failures; the breaker
   trips when those retries are consistently failing; non-retryable failures
   bypass all of the above for permanent per-request errors.
+- **Open circuit bypasses the rate limit**: when an activity declares **both**
+  `rate_limit_*` and `circuit_breaker`, an open breaker exempts that activity's
+  tasks from the rate-limit gate in the claim query — they are claimed
+  immediately and fast-failed with `CircuitOpen` rather than being paced by (or
+  consuming tokens from) the downstream's bucket. So during an outage
+  `CircuitOpen` propagates at full speed and the token bucket is preserved for
+  real calls once the breaker recovers.
 
 ## Observability
 

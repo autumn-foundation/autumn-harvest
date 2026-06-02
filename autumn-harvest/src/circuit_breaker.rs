@@ -490,6 +490,32 @@ impl CircuitBreakerRegistry {
         }
     }
 
+    /// Names of activities whose breaker is currently **open** (tripped on a
+    /// cooldown timer, or operator-forced) at `now` — i.e. a fresh dispatch
+    /// would short-circuit rather than run.
+    ///
+    /// A half-open breaker is **excluded**: it has a probe slot available, so
+    /// its tasks should still be claimable. Used by the worker to let the queue
+    /// claim path fast-fail open-circuit tasks without first passing the
+    /// rate-limit gate or burning a rate-limit token (issue #369).
+    #[must_use]
+    pub fn open_activity_names(&self, now: Instant) -> Vec<String> {
+        let mut states = self.lock();
+        self.policies
+            .iter()
+            .filter_map(|(name, policy)| {
+                let st = states.entry(name.clone()).or_default();
+                let is_open = st.forced_open
+                    || (st.phase == CircuitPhase::Open && {
+                        // Still within cooldown? Then no probe is admitted yet.
+                        let opened = st.opened_at.unwrap_or(now);
+                        now.saturating_duration_since(opened) < policy.cooldown
+                    });
+                is_open.then(|| name.clone())
+            })
+            .collect()
+    }
+
     /// Operator action: pin the breaker open for manual incident response.
     pub fn force_open(&self, activity_name: &str, now: Instant) {
         let mut states = self.lock();

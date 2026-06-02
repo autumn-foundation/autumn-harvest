@@ -290,6 +290,7 @@ pub async fn claim_task(
     worker_id: &str,
     worker_build_id: &str,
     priority_aging_secs: Option<u32>,
+    open_circuit_activities: &[String],
 ) -> HarvestResult<Option<TaskQueueItem>> {
     // Two-phase claim using a CTE to avoid holding advisory locks during
     // broad WHERE filtering.
@@ -357,6 +358,7 @@ pub async fn claim_task(
                ) \
                AND ( \
                    rate_limit_key IS NULL \
+                   OR activity_name = ANY($5) \
                    OR EXISTS ( \
                        SELECT 1 FROM harvest_rate_limit_buckets b \
                        WHERE b.key = harvest_task_queue.rate_limit_key \
@@ -405,6 +407,7 @@ pub async fn claim_task(
                 last_refilled_at = NOW() \
             FROM claimed \
             WHERE b.key = claimed.rate_limit_key \
+              AND NOT (claimed.activity_name = ANY($5)) \
             RETURNING b.key \
         ) \
         SELECT * FROM claimed",
@@ -413,6 +416,7 @@ pub async fn claim_task(
     .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
     .bind::<diesel::sql_types::Text, _>(worker_build_id)
     .bind::<diesel::sql_types::Nullable<diesel::sql_types::BigInt>, _>(aging_secs_i64)
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(open_circuit_activities)
     .load(conn)
     .await
     .map_err(crate::error::database_error)?;

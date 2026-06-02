@@ -29,10 +29,18 @@ pub enum HistoryMatch {
     },
     /// History contains a failure for this command.
     Failed {
-        /// String representation of the failure.
+        /// Human-readable failure message.
         error: String,
         /// Attempt number for the failed action.
         attempt: u32,
+        /// Stable, low-cardinality error-type class recorded with the failure
+        /// (issue #227 / #369), e.g. `"CircuitOpen"`. `"Error"` for legacy
+        /// `Err(String)` failures. Carried so the consumer can build a typed
+        /// [`HarvestError::ActivityFailed`] without parsing the message.
+        error_type: String,
+        /// Optional structured details recorded with a typed failure (e.g.
+        /// `retry_after_secs` / `forced` for `CircuitOpen`). `None` otherwise.
+        details: Option<Value>,
     },
     /// History contains a timeout for this command.
     TimedOut {
@@ -302,11 +310,15 @@ impl HistoryMatcher {
                     activity_id: id,
                     error,
                     attempt,
+                    error_type,
+                    details,
                     ..
                 } if *id == activity_id => {
                     let result = HistoryMatch::Failed {
                         error: error.clone(),
                         attempt: *attempt,
+                        error_type: error_type.clone(),
+                        details: details.clone(),
                     };
                     return self.settle_terminal(scan_cursor, first_interleaved_command, result);
                 }
@@ -481,9 +493,14 @@ impl HistoryMatcher {
                     error,
                     attempt,
                 } if *id == activity_id => {
+                    // Local activities carry no typed failure payload (and may
+                    // not declare a circuit breaker), so the error-type is the
+                    // legacy "Error" fallback with no structured details.
                     let result = HistoryMatch::Failed {
                         error: error.clone(),
                         attempt: *attempt,
+                        error_type: "Error".to_string(),
+                        details: None,
                     };
                     return self.settle_terminal(scan_cursor, first_interleaved_command, result);
                 }
@@ -1043,6 +1060,8 @@ impl HistoryMatcher {
                     let result = HistoryMatch::Failed {
                         error: error.clone(),
                         attempt: 1,
+                        error_type: "Error".to_string(),
+                        details: None,
                     };
                     return self.settle_terminal(scan_cursor, first_interleaved_command, result);
                 }
@@ -1734,7 +1753,12 @@ impl HistoryMatcher {
                     self.consumed_out_of_order_events.insert(scan_cursor);
                     self.cursor = start_cursor + 1;
                     self.advance_to_next_unconsumed_event();
-                    return HistoryMatch::Failed { error, attempt: 1 };
+                    return HistoryMatch::Failed {
+                        error,
+                        attempt: 1,
+                        error_type: "Error".to_string(),
+                        details: None,
+                    };
                 }
                 _ => scan_cursor += 1,
             }
@@ -2080,6 +2104,8 @@ impl HistoryMatcher {
                     return HistoryMatch::Failed {
                         error: error.clone(),
                         attempt: 1,
+                        error_type: "Error".to_string(),
+                        details: None,
                     };
                 }
                 _ => {}
@@ -2209,6 +2235,8 @@ mod tests {
             HistoryMatch::Failed {
                 error: "SMTP connection refused".into(),
                 attempt: 3,
+                error_type: "Error".into(),
+                details: None,
             }
         );
     }
@@ -2494,6 +2522,8 @@ mod tests {
             HistoryMatch::Failed {
                 error: "child failed".into(),
                 attempt: 1,
+                error_type: "Error".into(),
+                details: None,
             }
         );
     }
@@ -3334,6 +3364,8 @@ mod tests {
             HistoryMatch::Failed {
                 error: "transient".into(),
                 attempt: 1,
+                error_type: "Error".into(),
+                details: None,
             }
         );
     }
