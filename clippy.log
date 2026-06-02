@@ -1,0 +1,102 @@
+    Checking autumn-harvest-cli v0.3.0 (/app/autumn-harvest-cli)
+    Checking autumn-harvest-plugin v0.3.0 (/app/autumn-harvest-plugin)
+    Checking quickstart v0.3.0 (/app/examples/quickstart)
+    Checking standalone-runner v0.3.0 (/app/examples/standalone-runner)
+    Checking billing-autumn-web v0.3.0 (/app/examples/billing-autumn-web)
+    Checking autumn-harvest v0.3.0 (/app/autumn-harvest)
+error: item in documentation is missing backticks
+  --> autumn-harvest/examples/fanout_batch.rs:13:27
+   |
+13 | //!   cargo run --example fanout_batch
+   |                           ^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#doc_markdown
+   = note: `-D clippy::doc-markdown` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(clippy::doc_markdown)]`
+help: try
+   |
+13 - //!   cargo run --example fanout_batch
+13 + //!   cargo run --example `fanout_batch`
+   |
+
+error: docs for function returning `Result` missing `# Errors` section
+  --> autumn-harvest/examples/fanout_batch.rs:42:1
+   |
+42 | pub async fn process_item(_ctx: &ActivityContext, item: String) -> Result<ItemResult, String> {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#missing_errors_doc
+   = note: `-D clippy::missing-errors-doc` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(clippy::missing_errors_doc)]`
+
+error: docs for function returning `Result` missing `# Errors` section
+  --> autumn-harvest/examples/fanout_batch.rs:54:1
+   |
+54 | pub async fn fetch_items(_ctx: &ActivityContext, source: String) -> Result<BatchInput, String> {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#missing_errors_doc
+
+error: docs for function returning `Result` missing `# Errors` section
+  --> autumn-harvest/examples/fanout_batch.rs:76:1
+   |
+76 | / pub async fn fail_fast_batch(
+77 | |     ctx: &WorkflowContext,
+78 | |     input: BatchInput,
+79 | | ) -> Result<Vec<ItemResult>, String> {
+   | |____________________________________^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#missing_errors_doc
+
+error: docs for function returning `Result` missing `# Errors` section
+  --> autumn-harvest/examples/fanout_batch.rs:94:1
+   |
+94 | / pub async fn collect_all_batch(
+95 | |     ctx: &WorkflowContext,
+96 | |     input: BatchInput,
+97 | | ) -> Result<BatchResult, String> {
+   | |________________________________^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#missing_errors_doc
+
+error: docs for function returning `Result` missing `# Errors` section
+   --> autumn-harvest/examples/fanout_batch.rs:127:1
+    |
+127 | pub async fn dynamic_fan_out(ctx: &WorkflowContext, source: String) -> Result<BatchResult, String> {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#missing_errors_doc
+
+error: unused `async` for function with no await statements
+  --> autumn-harvest/examples/fanout_batch.rs:42:1
+   |
+42 | / pub async fn process_item(_ctx: &ActivityContext, item: String) -> Res...
+43 | |     if item.starts_with("bad_") {
+44 | |         return Err(format!("rejected: {item}"));
+...  |
+49 | |     })
+50 | | }
+   | |_^
+   |
+   = help: consider removing the `async` from this function
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#unused_async
+   = note: `-D clippy::unused-async` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(clippy::unused_async)]`
+
+error: unused `async` for function with no await statements
+  --> autumn-harvest/examples/fanout_batch.rs:54:1
+   |
+54 | / pub async fn fetch_items(_ctx: &ActivityContext, source: String) -> Re...
+55 | |     // Simulates fetching a batch from a queue, database, or message b...
+56 | |     println!("[Activity] fetch_items from source: {source}");
+57 | |     Ok(BatchInput {
+...  |
+63 | |     })
+64 | | }
+   | |_^
+   |
+   = help: consider removing the `async` from this function
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#unused_async
+
+error: could not compile `autumn-harvest` (example "fanout_batch") due to 8 previous errors
+warning: build failed, waiting for other jobs to finish...

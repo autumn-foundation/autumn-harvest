@@ -553,6 +553,27 @@ impl Drop for RetentionLeaseGuard {
 }
 
 #[cfg(feature = "db")]
+async fn build_history_export_doc(
+    conn: &mut diesel_async::AsyncPgConnection,
+    candidate: &CandidateExecution,
+    shard: ShardId,
+) -> Result<crate::history_export::HistoryExportDocument, HarvestError> {
+    let exec_id = crate::types::ExecutionId::from_uuid(candidate.id);
+    let history = crate::store::load_history(conn, exec_id).await?;
+    let req = crate::history_export::HistoryExportRequest {
+        workflow_name: candidate.workflow_name.clone(),
+        execution_id: exec_id,
+        shard_id: shard.as_i32(),
+        state: candidate.state.clone(),
+        events: history.events,
+        exported_at: chrono::Utc::now(),
+        payload_policy: crate::history_export::HistoryPayloadPolicy::Full,
+        max_bytes: Some(usize::MAX),
+    };
+    crate::history_export::export_history(req).map_err(|e| HarvestError::Database(e.to_string()))
+}
+
+#[cfg(feature = "db")]
 #[allow(clippy::too_many_lines)]
 async fn run_shard_tick(
     pool: crate::worker::DbPool,
@@ -711,41 +732,17 @@ async fn run_shard_tick(
             }
 
             let mut doc = None;
+            let exec_id = crate::types::ExecutionId::from_uuid(candidate.id);
             if !config.dry_run && archiver.is_some() {
-                let exec_id = crate::types::ExecutionId::from_uuid(candidate.id);
-                match crate::store::load_history(&mut conn, exec_id).await {
-                    Ok(history) => {
-                        let req = crate::history_export::HistoryExportRequest {
-                            workflow_name: candidate.workflow_name.clone(),
-                            execution_id: exec_id,
-                            shard_id: shard.as_i32(),
-                            state: candidate.state.clone(),
-                            events: history.events,
-                            exported_at: chrono::Utc::now(),
-                            payload_policy: crate::history_export::HistoryPayloadPolicy::Full,
-                            max_bytes: Some(usize::MAX),
-                        };
-                        match crate::history_export::export_history(req) {
-                            Ok(document) => {
-                                doc = Some((exec_id, document));
-                            }
-                            Err(error) => {
-                                tracing::error!(
-                                    execution_id = %exec_id,
-                                    error = %error,
-                                    "failed to serialize history export; skipping deletion"
-                                );
-                                has_failed = true;
-                                batch_failed = true;
-                                break;
-                            }
-                        }
+                match build_history_export_doc(&mut conn, &candidate, shard).await {
+                    Ok(document) => {
+                        doc = Some((exec_id, document));
                     }
                     Err(error) => {
                         tracing::error!(
                             execution_id = %exec_id,
                             error = %error,
-                            "failed to load history events for retention candidate; skipping deletion"
+                            "failed to load or serialize history export for retention candidate; skipping deletion"
                         );
                         has_failed = true;
                         batch_failed = true;
