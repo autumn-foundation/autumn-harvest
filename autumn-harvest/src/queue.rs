@@ -321,21 +321,25 @@ pub async fn claim_task(
     // boosted by floor(wait_seconds / K) to prevent indefinite starvation.
     // A NULL value (or 0, which the builder normalizes to None) disables aging.
     //
-    // Circuit-breaker rate-limit bypass (issue #369, $5): activities whose
-    // breaker is fully open (cooldown not yet elapsed, or operator-forced) are
-    // short-circuited in process_activity_task without touching the downstream,
-    // so they must not be paced by — or burn tokens from — the downstream's
-    // rate-limit bucket. Such tasks skip the rate-limit gate at claim time and
-    // are excluded from the token decrement.
+    // Circuit-breaker rate-limit gate bypass (issue #369, $5): activities whose
+    // breaker is currently short-circuiting all dispatches (fully open, or
+    // operator-forced) are claimed in process_activity_task without touching the
+    // downstream, so they must remain claimable even when the rate-limit bucket
+    // is empty — otherwise `CircuitOpen` could not propagate during an outage.
+    // Such tasks skip the rate-limit *gate* at claim time.
     //
-    // The concurrency cap is deliberately NOT bypassed. The `$5` snapshot is
-    // computed in `poll_once` before this query runs, so it can be stale: a
-    // breaker may close (probe succeeds) between the snapshot and the moment
-    // `process_activity_task` calls `on_dispatch`, in which case the handler
-    // actually runs and hits the downstream. Skipping a missed token decrement
-    // is a benign over-permissiveness, but skipping the concurrency cap on a
-    // real downstream call would let an activity exceed its `max_concurrent`
-    // limit, so the cap is always enforced regardless of breaker state.
+    // The token *debit*, by contrast, always runs at claim time (it is no longer
+    // skipped here). The `$5` snapshot is computed in `poll_once` before this
+    // query runs, so it can be stale: a breaker may close between the snapshot
+    // and the authoritative `on_dispatch` in process_activity_task, in which case
+    // the handler actually runs as a real downstream call. Debiting at claim and
+    // refunding only when the dispatch genuinely short-circuits (see
+    // `refund_rate_limit_token`) keeps net token consumption authoritative — a
+    // real call always consumes a token and a no-op short-circuit never does —
+    // without depending on the stale snapshot for correctness.
+    //
+    // The concurrency cap is never bypassed (same staleness reasoning): a real
+    // call that raced past a closing breaker must still respect `max_concurrent`.
     let aging_secs_i64: Option<i64> = priority_aging_secs.map(i64::from);
 
     let result: Vec<TaskQueueItem> = diesel::sql_query(
@@ -423,7 +427,6 @@ pub async fn claim_task(
                 last_refilled_at = NOW() \
             FROM claimed \
             WHERE b.key = claimed.rate_limit_key \
-              AND NOT (claimed.activity_name = ANY($5)) \
             RETURNING b.key \
         ) \
         SELECT * FROM claimed",
@@ -1212,6 +1215,33 @@ pub async fn check_throttled_keys(
     .map_err(crate::error::database_error)?;
 
     Ok(rows.into_iter().map(|r| r.rate_limit_key).collect())
+}
+
+/// Refund a single rate-limit token to `key`'s bucket (capped at burst).
+///
+/// Used by the circuit breaker (issue #369): a task whose activity was open at
+/// claim time has its token debited by [`claim_task`] like any other, but if the
+/// authoritative `on_dispatch` check then short-circuits it (no real downstream
+/// call is made), the debited token must be returned so an outage does not slowly
+/// drain the bucket and throttle recovery. Mirrors the debit math (apply pending
+/// refill, then `+1.0` instead of `-1.0`) so the bucket stays consistent. A
+/// missing bucket row (no rate limit configured) is a no-op.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub async fn refund_rate_limit_token(conn: &mut AsyncPgConnection, key: &str) -> HarvestResult<()> {
+    diesel::sql_query(
+        "UPDATE harvest_rate_limit_buckets \
+         SET tokens = LEAST(burst, tokens + EXTRACT(EPOCH FROM (NOW() - last_refilled_at)) * refill_rate + 1.0), \
+             last_refilled_at = NOW() \
+         WHERE key = $1",
+    )
+    .bind::<diesel::sql_types::Text, _>(key)
+    .execute(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

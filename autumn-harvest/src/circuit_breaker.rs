@@ -551,25 +551,39 @@ impl CircuitBreakerRegistry {
 
     /// Operator action: clear any pin and reset the breaker to closed so normal
     /// tracking resumes ("I know the downstream is back, close it now").
+    ///
+    /// Idempotent: if the breaker is **already** closed and not operator-forced,
+    /// this is a no-op. A repeated force-close (operator retry / idempotency
+    /// replay) must not bump the generation or clear the failure window again —
+    /// doing so would fence out the results of attempts admitted by the first
+    /// close and discard failures they have since accumulated, which could mask
+    /// an outage re-emerging right after the reset. Only the first close fences
+    /// pre-close work.
     pub fn force_close(&self, activity_name: &str) {
         let mut states = self.lock();
         let st = states.entry(activity_name.to_string()).or_default();
+        if !st.forced_open && st.phase == CircuitPhase::Closed {
+            return;
+        }
         st.forced_open = false;
         st.close();
     }
 
     /// Return the names of activities whose breaker is currently short-circuiting
     /// **all** dispatches — used by [`crate::queue::claim_task`] to bypass the
-    /// rate-limit gate (and skip the token decrement) for tasks that will be
-    /// short-circuited immediately without touching the downstream. The
-    /// concurrency cap is *not* bypassed: the snapshot can be stale by the time
-    /// the task is dispatched, so the cap is always enforced to keep real
-    /// downstream calls within `max_concurrent`.
+    /// rate-limit *gate* so these tasks stay claimable even when the bucket is
+    /// empty (otherwise `CircuitOpen` could not propagate during an outage). The
+    /// token *debit* is NOT skipped on this signal: the snapshot can be stale by
+    /// the time the task is dispatched, so the token is debited at claim and
+    /// refunded only if the authoritative `on_dispatch` short-circuits (see
+    /// [`crate::queue::refund_rate_limit_token`]). The concurrency cap is never
+    /// bypassed either, for the same staleness reason — a real call that raced
+    /// past a closing breaker must still respect `max_concurrent`.
     ///
     /// Includes:
     /// - Activities in the `Open` phase whose cooldown has **not yet elapsed**.
-    ///   Every `on_dispatch` call for these short-circuits; no downstream call
-    ///   is made, so consuming a rate-limit token would be wasteful.
+    ///   Every `on_dispatch` call for these short-circuits, so they should stay
+    ///   claimable regardless of bucket level.
     /// - Activities in the `Open` phase that are **operator-forced** open
     ///   (no cooldown, never probed until force-closed).
     /// - Activities in the `HalfOpen` phase with `probe_in_flight = true`: a
@@ -1042,6 +1056,51 @@ mod tests {
         assert!(!snap.forced_open);
         assert_eq!(snap.rolling_failure_count, 0);
         assert!(allowed(&reg.on_dispatch("send_email", now)));
+    }
+
+    // A repeated force-close on an already-closed, unforced breaker must be a
+    // no-op: it must not bump the generation (fencing post-close attempts) or
+    // clear failures those attempts have legitimately accumulated.
+    #[test]
+    fn duplicate_force_close_is_a_noop() {
+        let reg = registry();
+        let now = Instant::now();
+        for _ in 0..3 {
+            fail(&reg, now);
+        }
+        reg.force_close("send_email");
+        assert_eq!(reg.snapshot("send_email", now).unwrap().state, "closed");
+
+        // After the close, fresh attempts begin and a couple legitimately fail
+        // (a new outage is emerging). These must keep accumulating toward a trip.
+        fail(&reg, now);
+        fail(&reg, now);
+        assert_eq!(
+            reg.snapshot("send_email", now)
+                .unwrap()
+                .rolling_failure_count,
+            2,
+            "post-close failures must accumulate toward a re-trip"
+        );
+
+        // An operator/idempotency retry of force-close on the already-closed
+        // breaker must NOT wipe that accumulating window...
+        reg.force_close("send_email");
+        assert_eq!(
+            reg.snapshot("send_email", now)
+                .unwrap()
+                .rolling_failure_count,
+            2,
+            "duplicate force-close must not clear the post-close failure window"
+        );
+
+        // ...and the generation must be unchanged, so a third failure still trips
+        // the breaker (its in-flight token from this generation is not fenced).
+        assert_eq!(
+            fail(&reg, now),
+            Some(CircuitTransition::Tripped),
+            "the re-emerging outage must still trip after a duplicate force-close"
+        );
     }
 
     #[test]

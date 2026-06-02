@@ -3304,6 +3304,22 @@ async fn process_activity_task(
             true,
         );
         let mut conn = pool.get().await.map_err(crate::error::database_error)?;
+        // Refund the rate-limit token (issue #369): `claim_task` debited it like
+        // any other claim, but this dispatch short-circuited without making a
+        // real downstream call. Refunding keeps net consumption authoritative
+        // (a no-op short-circuit never burns a token) regardless of whether the
+        // claim-time open-circuit snapshot was stale.
+        if let Some(key) = task.rate_limit_key.as_deref()
+            && let Err(error) = queue::refund_rate_limit_token(&mut conn, key).await
+        {
+            // Best-effort: a failed refund only means the bucket drains slightly
+            // faster during an outage; it must not fail the task.
+            tracing::warn!(
+                rate_limit_key = %key,
+                error = %error,
+                "failed to refund rate-limit token for short-circuited activity"
+            );
+        }
         let retry_policy_result = configured_retry_policy(task);
         let retry_policy =
             fail_execution_on_error(&mut conn, task, worker_id, retry_policy_result).await?;
