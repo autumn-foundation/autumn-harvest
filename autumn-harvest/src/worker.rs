@@ -3332,10 +3332,34 @@ async fn process_activity_task(
         let started_result =
             append_activity_started_if_pending(&mut conn, task, exec_id, activity_name, worker_id)
                 .await;
-        match fail_execution_on_error(&mut conn, task, worker_id, started_result).await? {
-            Some(id) => id,
-            None => return Ok(()),
-        }
+        let Some(id) = fail_execution_on_error(&mut conn, task, worker_id, started_result).await?
+        else {
+            // The activity will not run: it already has a terminal event, or the
+            // task row stopped being RUNNING (cancelled / timed out concurrently).
+            // Undo the side effects of the dispatch decision for this no-op so the
+            // breaker and bucket aren't left skewed:
+            //   - release any half-open probe `on_dispatch` admitted, or the
+            //     breaker would stay HalfOpen with probe_in_flight forever and
+            //     short-circuit every later attempt (no-op for non-probe tokens);
+            //   - refund the token reserved above for the call that won't happen
+            //     (only reached when the reservation succeeded — see the guard).
+            if let Some(token) = circuit_token {
+                circuit_breakers.on_cancelled(activity_name, token, std::time::Instant::now());
+            }
+            if circuit_token.is_some()
+                && activity.circuit_breaker.is_some()
+                && let Some(key) = task.rate_limit_key.as_deref()
+                && let Err(error) = queue::refund_rate_limit_token(&mut conn, key).await
+            {
+                tracing::warn!(
+                    rate_limit_key = %key,
+                    error = %error,
+                    "failed to refund rate-limit token after a no-op activity start"
+                );
+            }
+            return Ok(());
+        };
+        id
         // conn is dropped here, returning the slot to the pool
     };
 

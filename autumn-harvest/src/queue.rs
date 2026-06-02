@@ -1330,6 +1330,35 @@ pub async fn try_consume_rate_limit_token(
     Ok(outcome.is_some_and(|o| o.debited))
 }
 
+/// Return one rate-limit token previously reserved by
+/// [`try_consume_rate_limit_token`] (capped at burst).
+///
+/// Used by the circuit breaker (issue #369) on the rare path where a token was
+/// reserved for a genuine call that then turns out not to run — e.g. the activity
+/// already has a terminal event, or the task row stopped being `RUNNING`
+/// (cancelled/timed out concurrently) between the reservation and appending
+/// `ActivityStarted`. Refunding keeps the bucket accurate (a call that never
+/// happened consumes no token), symmetric with a short-circuit reserving nothing.
+/// Mirrors the debit math (apply pending refill, then `+1.0`). A missing bucket
+/// row is a no-op.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub async fn refund_rate_limit_token(conn: &mut AsyncPgConnection, key: &str) -> HarvestResult<()> {
+    diesel::sql_query(
+        "UPDATE harvest_rate_limit_buckets \
+         SET tokens = LEAST(burst, tokens + EXTRACT(EPOCH FROM (NOW() - last_refilled_at)) * refill_rate + 1.0), \
+             last_refilled_at = NOW() \
+         WHERE key = $1",
+    )
+    .bind::<diesel::sql_types::Text, _>(key)
+    .execute(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
