@@ -131,13 +131,20 @@ Rules of thumb:
   dispatch; retry + jitter handle individual transient failures; the breaker
   trips when those retries are consistently failing; non-retryable failures
   bypass all of the above for permanent per-request errors.
-- **Open circuit bypasses the rate limit**: when an activity declares **both**
-  `rate_limit_*` and `circuit_breaker`, an open breaker exempts that activity's
-  tasks from the rate-limit gate in the claim query — they are claimed
-  immediately and fast-failed with `CircuitOpen` rather than being paced by (or
-  consuming tokens from) the downstream's bucket. So during an outage
-  `CircuitOpen` propagates at full speed and the token bucket is preserved for
-  real calls once the breaker recovers.
+- **Rate limiting moves to dispatch for breaker activities**: when an activity
+  declares **both** `rate_limit_*` and `circuit_breaker`, its rate limiting is
+  enforced at *dispatch* rather than at claim time. The claim query skips the
+  rate-limit gate and token debit for any activity with a breaker, so a
+  `CircuitOpen` short-circuit is always claimable and fast-fails at full speed
+  during an outage (never paced by, or burning tokens from, the downstream's
+  bucket). A *genuine* call — admitted by the authoritative `on_dispatch` check —
+  atomically reserves one token at dispatch; if the bucket is empty the task is
+  rescheduled (one refill interval ahead) instead of running, so a real call can
+  never exceed the rate limit. This dispatch-time enforcement is gated on the
+  real breaker decision, which avoids the claim-vs-dispatch staleness window (the
+  breaker state is in-process and can change between claim and dispatch). Plain
+  rate-limited activities without a breaker are unaffected — they still gate and
+  debit at claim time.
 
 ## Observability
 

@@ -252,6 +252,12 @@ impl BreakerState {
 #[derive(Debug)]
 pub struct CircuitBreakerRegistry {
     policies: HashMap<String, CircuitBreakerPolicy>,
+    /// Sorted list of every activity name with a declared policy. Precomputed
+    /// once so the worker's claim hot path can pass it to `claim_task` without
+    /// allocating per poll. These activities have their rate limiting enforced
+    /// at *dispatch* (issue #369), so the claim query skips the rate-limit gate
+    /// and token debit for them.
+    tracked_names: Vec<String>,
     states: Mutex<HashMap<String, BreakerState>>,
 }
 
@@ -259,8 +265,11 @@ impl CircuitBreakerRegistry {
     /// Build a registry from `(activity_name, policy)` pairs.
     #[must_use]
     pub fn new(policies: HashMap<String, CircuitBreakerPolicy>) -> Self {
+        let mut tracked_names: Vec<String> = policies.keys().cloned().collect();
+        tracked_names.sort_unstable();
         Self {
             policies,
+            tracked_names,
             states: Mutex::new(HashMap::new()),
         }
     }
@@ -569,59 +578,18 @@ impl CircuitBreakerRegistry {
         st.close();
     }
 
-    /// Return the names of activities whose breaker is currently short-circuiting
-    /// **all** dispatches — used by [`crate::queue::claim_task`] to bypass the
-    /// rate-limit *gate* so these tasks stay claimable even when the bucket is
-    /// empty (otherwise `CircuitOpen` could not propagate during an outage). The
-    /// token *debit* is NOT skipped on this signal: the snapshot can be stale by
-    /// the time the task is dispatched, so the token is debited at claim and
-    /// refunded only if the authoritative `on_dispatch` short-circuits (see
-    /// [`crate::queue::refund_rate_limit_token`]). The concurrency cap is never
-    /// bypassed either, for the same staleness reason — a real call that raced
-    /// past a closing breaker must still respect `max_concurrent`.
-    ///
-    /// Includes:
-    /// - Activities in the `Open` phase whose cooldown has **not yet elapsed**.
-    ///   Every `on_dispatch` call for these short-circuits, so they should stay
-    ///   claimable regardless of bucket level.
-    /// - Activities in the `Open` phase that are **operator-forced** open
-    ///   (no cooldown, never probed until force-closed).
-    /// - Activities in the `HalfOpen` phase with `probe_in_flight = true`: a
-    ///   probe is already in-flight; every concurrent dispatch short-circuits
-    ///   until the probe resolves.
-    ///
-    /// Explicitly excludes:
-    /// - Open activities whose cooldown **has elapsed**: the very next
-    ///   `on_dispatch` call will transition to `HalfOpen` and admit the probe
-    ///   (a real downstream call), so the corresponding task should flow
-    ///   through the normal rate-limit gate so that probe consumes a token.
+    /// The sorted set of every activity name with a declared circuit-breaker
+    /// policy. Passed by the worker to [`crate::queue::claim_task`] so the claim
+    /// query can skip the rate-limit gate **and** token debit for these
+    /// activities: their rate limiting is enforced authoritatively at *dispatch*
+    /// instead (issue #369). Enforcing at dispatch — gated on the real
+    /// [`on_dispatch`](Self::on_dispatch) decision — is what lets `CircuitOpen`
+    /// short-circuits propagate at full speed during an outage while still
+    /// guaranteeing a genuine downstream call never runs without a token. The
+    /// set is static (fixed at construction), so this returns a cheap slice.
     #[must_use]
-    pub fn open_activity_names(&self, now: Instant) -> Vec<String> {
-        let states = self.lock();
-        states
-            .iter()
-            .filter(|(name, st)| {
-                let Some(&policy) = self.policies.get(name.as_str()) else {
-                    return false;
-                };
-                match st.phase {
-                    CircuitPhase::Open => {
-                        if st.forced_open {
-                            // No cooldown for forced-open: always short-circuits.
-                            return true;
-                        }
-                        let opened = st.opened_at.unwrap_or(now);
-                        let elapsed = now.saturating_duration_since(opened);
-                        // Exclude once cooldown has elapsed: the next on_dispatch
-                        // will be the probe (a real downstream call).
-                        elapsed < policy.cooldown
-                    }
-                    CircuitPhase::HalfOpen => st.probe_in_flight,
-                    CircuitPhase::Closed => false,
-                }
-            })
-            .map(|(name, _)| name.clone())
-            .collect()
+    pub fn tracked_activity_names(&self) -> &[String] {
+        &self.tracked_names
     }
 
     /// Observable snapshot for a single activity, or `None` if it has no policy.
@@ -1139,59 +1107,34 @@ mod tests {
         assert_eq!(p.failure_threshold, 1);
     }
 
-    // open_activity_names correctly reflects which activities are short-circuiting
-    // all dispatches: Open-with-cooldown-active, forced-open, and HalfOpen-with-probe-in-flight.
-    // Once cooldown elapses the activity is removed (next dispatch will be the probe).
+    // tracked_activity_names returns the static, sorted set of every activity
+    // with a declared policy regardless of current breaker phase — the worker
+    // passes it to claim_task to skip claim-time rate limiting (enforced at
+    // dispatch instead).
     #[test]
-    fn open_activity_names_reflects_short_circuit_state() {
-        let reg = registry();
-        let t0 = Instant::now();
+    fn tracked_activity_names_lists_all_policies_sorted() {
+        let mut p = HashMap::new();
+        p.insert("zeta".to_string(), policy());
+        p.insert("alpha".to_string(), policy());
+        let reg = CircuitBreakerRegistry::new(p);
+        assert_eq!(reg.tracked_activity_names(), ["alpha", "zeta"]);
 
-        // Closed: not in the bypass list.
-        assert!(reg.open_activity_names(t0).is_empty());
+        // The set is phase-independent: tripping a breaker does not change it.
+        let now = Instant::now();
+        for _ in 0..3 {
+            let token = match reg.on_dispatch("alpha", now) {
+                DispatchDecision::Allow { token } => token,
+                DispatchDecision::ShortCircuit { .. } => unreachable!(),
+            };
+            reg.on_result("alpha", AttemptOutcome::RetryableFailure, token, now);
+        }
+        assert_eq!(reg.snapshot("alpha", now).unwrap().state, "open");
+        assert_eq!(reg.tracked_activity_names(), ["alpha", "zeta"]);
 
-        // Trip the breaker.
-        let mut now = t0;
-        fail(&reg, now);
-        fail(&reg, now);
-        fail(&reg, now);
-        let snap = reg.snapshot("send_email", now).unwrap();
-        assert_eq!(snap.state, "open");
-
-        // Fully open, cooldown not yet elapsed → in the bypass list.
-        assert_eq!(
-            reg.open_activity_names(now),
-            vec!["send_email".to_string()],
-            "Open with active cooldown must be in bypass list"
-        );
-
-        // Advance past cooldown (registry uses 60s cooldown). Phase is still Open
-        // (on_dispatch not called yet) but the next on_dispatch will admit the probe
-        // (a real downstream call), so the activity must be removed from the bypass list.
-        now = t0 + Duration::from_secs(61);
         assert!(
-            reg.open_activity_names(now).is_empty(),
-            "Open with elapsed cooldown must not be in bypass list (probe imminent)"
-        );
-
-        // Admit the probe (on_dispatch transitions Open→HalfOpen, probe_in_flight=true).
-        let probe_token = dispatch(&reg, now);
-        assert!(probe_token.is_probe());
-        let snap = reg.snapshot("send_email", now).unwrap();
-        assert_eq!(snap.state, "half_open");
-
-        // Probe in-flight: all concurrent dispatches short-circuit → in bypass list.
-        assert_eq!(
-            reg.open_activity_names(now),
-            vec!["send_email".to_string()],
-            "HalfOpen with probe_in_flight must be in bypass list"
-        );
-
-        // Probe succeeds → closed → removed from bypass list.
-        reg.on_result("send_email", AttemptOutcome::Success, probe_token, now);
-        assert!(
-            reg.open_activity_names(now).is_empty(),
-            "Closed breaker must not be in bypass list after recovery"
+            CircuitBreakerRegistry::empty()
+                .tracked_activity_names()
+                .is_empty()
         );
     }
 

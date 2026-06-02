@@ -290,7 +290,7 @@ pub async fn claim_task(
     worker_id: &str,
     worker_build_id: &str,
     priority_aging_secs: Option<u32>,
-    open_circuit_activities: &[String],
+    circuit_breaker_activities: &[String],
 ) -> HarvestResult<Option<TaskQueueItem>> {
     // Two-phase claim using a CTE to avoid holding advisory locks during
     // broad WHERE filtering.
@@ -321,25 +321,24 @@ pub async fn claim_task(
     // boosted by floor(wait_seconds / K) to prevent indefinite starvation.
     // A NULL value (or 0, which the builder normalizes to None) disables aging.
     //
-    // Circuit-breaker rate-limit gate bypass (issue #369, $5): activities whose
-    // breaker is currently short-circuiting all dispatches (fully open, or
-    // operator-forced) are claimed in process_activity_task without touching the
-    // downstream, so they must remain claimable even when the rate-limit bucket
-    // is empty — otherwise `CircuitOpen` could not propagate during an outage.
-    // Such tasks skip the rate-limit *gate* at claim time.
+    // Circuit-breaker rate limiting (issue #369, $5 = the static set of activity
+    // names that have a circuit-breaker policy): for these activities the
+    // rate-limit *gate* and token *debit* are BOTH skipped at claim time. Rate
+    // limiting is instead enforced authoritatively at dispatch, gated on the real
+    // `on_dispatch` decision in process_activity_task: a genuine downstream call
+    // atomically consumes a token (`try_consume_rate_limit_token`, rescheduling
+    // if none is available) while a `CircuitOpen` short-circuit consumes nothing.
     //
-    // The token *debit*, by contrast, always runs at claim time (it is no longer
-    // skipped here). The `$5` snapshot is computed in `poll_once` before this
-    // query runs, so it can be stale: a breaker may close between the snapshot
-    // and the authoritative `on_dispatch` in process_activity_task, in which case
-    // the handler actually runs as a real downstream call. Debiting at claim and
-    // refunding only when the dispatch genuinely short-circuits (see
-    // `refund_rate_limit_token`) keeps net token consumption authoritative — a
-    // real call always consumes a token and a no-op short-circuit never does —
-    // without depending on the stale snapshot for correctness.
+    // This avoids the claim-vs-dispatch staleness race: the breaker state is
+    // in-process and can change between claim and dispatch, so any claim-time
+    // rate-limit decision keyed on breaker phase is necessarily approximate.
+    // Moving it to dispatch lets short-circuits stay claimable at full speed
+    // during an outage (no gate) while guaranteeing a real call never runs
+    // without a token (authoritative debit). Non-circuit rate-limited activities
+    // are unaffected — they gate and debit at claim as before.
     //
-    // The concurrency cap is never bypassed (same staleness reasoning): a real
-    // call that raced past a closing breaker must still respect `max_concurrent`.
+    // The concurrency cap is never bypassed: a real call must always respect
+    // `max_concurrent`.
     let aging_secs_i64: Option<i64> = priority_aging_secs.map(i64::from);
 
     let result: Vec<TaskQueueItem> = diesel::sql_query(
@@ -427,6 +426,7 @@ pub async fn claim_task(
                 last_refilled_at = NOW() \
             FROM claimed \
             WHERE b.key = claimed.rate_limit_key \
+              AND NOT (claimed.activity_name = ANY($5)) \
             RETURNING b.key \
         ) \
         SELECT * FROM claimed",
@@ -435,7 +435,7 @@ pub async fn claim_task(
     .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
     .bind::<diesel::sql_types::Text, _>(worker_build_id)
     .bind::<diesel::sql_types::Nullable<diesel::sql_types::BigInt>, _>(aging_secs_i64)
-    .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(open_circuit_activities)
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(circuit_breaker_activities)
     .load(conn)
     .await
     .map_err(crate::error::database_error)?;
@@ -898,6 +898,58 @@ pub async fn reschedule_task(
     Ok(())
 }
 
+/// Defer a `RUNNING` task back to `PENDING` for a rate-limit retry **without
+/// counting it as an attempt** (issue #369).
+///
+/// Used by the dispatch-time rate-limit gate for circuit-breaker activities:
+/// when no token is available the handler never runs, so [`claim_task`]'s
+/// `attempt + 1` increment must be undone — otherwise repeated deferrals would
+/// silently drain the retry budget and DLQ the task before it ever executed.
+/// Otherwise mirrors [`reschedule_task`] (clean continuation: resets the
+/// poison-pill crash streak and re-notifies the queue).
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on update failure.
+pub async fn defer_rate_limited_task(
+    conn: &mut AsyncPgConnection,
+    task_id: Uuid,
+    scheduled_at: chrono::DateTime<Utc>,
+) -> HarvestResult<()> {
+    use crate::schema::harvest_task_queue::dsl;
+
+    let queue_name = diesel::update(
+        dsl::harvest_task_queue
+            .find(task_id)
+            .filter(dsl::state.eq("RUNNING")),
+    )
+    .set((
+        dsl::state.eq("PENDING"),
+        dsl::worker_id.eq(None::<String>),
+        dsl::started_at.eq(None::<chrono::DateTime<Utc>>),
+        dsl::last_heartbeat_at.eq(None::<chrono::DateTime<Utc>>),
+        dsl::crash_strikes.eq(0),
+        // Undo the claim-time attempt increment: a rate-limit deferral is not an
+        // execution, so it must not consume the retry budget.
+        dsl::attempt.eq(diesel::dsl::sql::<diesel::sql_types::Integer>(
+            "GREATEST(attempt - 1, 0)",
+        )),
+        dsl::scheduled_at.eq(scheduled_at),
+    ))
+    .returning(dsl::queue_name)
+    .get_result::<String>(conn)
+    .await
+    .optional()
+    .map_err(crate::error::database_error)?
+    .ok_or_else(|| {
+        crate::error::HarvestError::NotFound(format!("task queue item {task_id} is not running"))
+    })?;
+
+    crate::notify::notify_task_enqueued(conn, &queue_name, task_id).await?;
+
+    Ok(())
+}
+
 /// Hint for sticky cross-worker routing when parking or enqueueing a task.
 ///
 /// When both fields are set, the task is pinned to `worker_id` for `timeout`
@@ -1217,31 +1269,61 @@ pub async fn check_throttled_keys(
     Ok(rows.into_iter().map(|r| r.rate_limit_key).collect())
 }
 
-/// Refund a single rate-limit token to `key`'s bucket (capped at burst).
+/// Atomically consume one rate-limit token from `key`'s bucket at dispatch time.
 ///
-/// Used by the circuit breaker (issue #369): a task whose activity was open at
-/// claim time has its token debited by [`claim_task`] like any other, but if the
-/// authoritative `on_dispatch` check then short-circuits it (no real downstream
-/// call is made), the debited token must be returned so an outage does not slowly
-/// drain the bucket and throttle recovery. Mirrors the debit math (apply pending
-/// refill, then `+1.0` instead of `-1.0`) so the bucket stays consistent. A
-/// missing bucket row (no rate limit configured) is a no-op.
+/// Returns `true` if a token was available and debited (the caller may proceed
+/// with the real downstream call), or `false` if the bucket is empty (the caller
+/// must defer — e.g. reschedule the task — rather than run the call).
+///
+/// Used by the circuit breaker (issue #369): activities with a breaker skip the
+/// claim-time rate-limit gate and debit entirely (see [`claim_task`]); their rate
+/// limiting is enforced *here*, gated on the authoritative `on_dispatch`
+/// decision, so a `CircuitOpen` short-circuit consumes no token while a genuine
+/// call atomically reserves one. The check-and-debit is a single UPDATE so two
+/// concurrent dispatches cannot both reserve the last token. A missing bucket row
+/// (no rate limit configured for the key) is treated as "no limit" → `true`.
+///
+/// Mirrors the claim-time debit math (apply pending refill, then `-1.0`).
 ///
 /// # Errors
 ///
 /// Returns [`crate::error::HarvestError::Database`] on query failure.
-pub async fn refund_rate_limit_token(conn: &mut AsyncPgConnection, key: &str) -> HarvestResult<()> {
-    diesel::sql_query(
-        "UPDATE harvest_rate_limit_buckets \
-         SET tokens = LEAST(burst, tokens + EXTRACT(EPOCH FROM (NOW() - last_refilled_at)) * refill_rate + 1.0), \
-             last_refilled_at = NOW() \
-         WHERE key = $1",
+pub async fn try_consume_rate_limit_token(
+    conn: &mut AsyncPgConnection,
+    key: &str,
+) -> HarvestResult<bool> {
+    // RETURNING distinguishes the two zero-row cases via a CTE: `present` tells
+    // us whether the bucket row exists at all (missing = no limit = allow),
+    // while `debited` is non-empty only when a token was actually available.
+    #[derive(diesel::QueryableByName)]
+    struct Outcome {
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        bucket_exists: bool,
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        debited: bool,
+    }
+
+    let outcome: Option<Outcome> = diesel::sql_query(
+        "WITH debited AS ( \
+             UPDATE harvest_rate_limit_buckets \
+             SET tokens = LEAST(burst, tokens + EXTRACT(EPOCH FROM (NOW() - last_refilled_at)) * refill_rate) - 1.0, \
+                 last_refilled_at = NOW() \
+             WHERE key = $1 \
+               AND LEAST(burst, tokens + EXTRACT(EPOCH FROM (NOW() - last_refilled_at)) * refill_rate) >= 1.0 \
+             RETURNING key \
+        ) \
+        SELECT \
+            EXISTS (SELECT 1 FROM harvest_rate_limit_buckets WHERE key = $1) AS bucket_exists, \
+            EXISTS (SELECT 1 FROM debited) AS debited",
     )
     .bind::<diesel::sql_types::Text, _>(key)
-    .execute(conn)
+    .get_result(conn)
     .await
+    .optional()
     .map_err(crate::error::database_error)?;
-    Ok(())
+
+    // No bucket configured for this key (missing row) → not rate limited → allow.
+    Ok(outcome.is_none_or(|o| o.debited || !o.bucket_exists))
 }
 
 // ---------------------------------------------------------------------------

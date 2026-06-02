@@ -3226,6 +3226,16 @@ async fn execute_activity_future_with_cancellation(
     .await
 }
 
+/// Fallback defer delay when a rate-limited circuit-breaker activity has no
+/// configured `rate_limit_rps` to derive a one-token refill interval from.
+const RATE_LIMIT_DEFER_FALLBACK: Duration = Duration::from_millis(250);
+/// Lower clamp on the dispatch-time rate-limit defer delay, so a very high RPS
+/// can't spin the reschedule loop hot.
+const RATE_LIMIT_DEFER_MIN: Duration = Duration::from_millis(50);
+/// Upper clamp on the dispatch-time rate-limit defer delay, so a very low RPS
+/// still re-evaluates `on_dispatch` (the breaker may have changed) reasonably soon.
+const RATE_LIMIT_DEFER_MAX: Duration = Duration::from_secs(5);
+
 #[allow(clippy::too_many_lines)]
 async fn process_activity_task(
     pool: &DbPool,
@@ -3303,23 +3313,10 @@ async fn process_activity_task(
             crate::failure::ERROR_TYPE_CIRCUIT_OPEN,
             true,
         );
+        // No rate-limit bookkeeping here: `claim_task` skipped the gate and debit
+        // for circuit-breaker activities (issue #369), so a short-circuit consumes
+        // no token. Only a genuine call (the Allow path below) reserves one.
         let mut conn = pool.get().await.map_err(crate::error::database_error)?;
-        // Refund the rate-limit token (issue #369): `claim_task` debited it like
-        // any other claim, but this dispatch short-circuited without making a
-        // real downstream call. Refunding keeps net consumption authoritative
-        // (a no-op short-circuit never burns a token) regardless of whether the
-        // claim-time open-circuit snapshot was stale.
-        if let Some(key) = task.rate_limit_key.as_deref()
-            && let Err(error) = queue::refund_rate_limit_token(&mut conn, key).await
-        {
-            // Best-effort: a failed refund only means the bucket drains slightly
-            // faster during an outage; it must not fail the task.
-            tracing::warn!(
-                rate_limit_key = %key,
-                error = %error,
-                "failed to refund rate-limit token for short-circuited activity"
-            );
-        }
         let retry_policy_result = configured_retry_policy(task);
         let retry_policy =
             fail_execution_on_error(&mut conn, task, worker_id, retry_policy_result).await?;
@@ -3335,6 +3332,41 @@ async fn process_activity_task(
             activity_name,
         )
         .await;
+    }
+
+    // Dispatch-time rate limiting (issue #369): a circuit-breaker activity skips
+    // the claim-time gate/debit, so a genuine call (this Allow path) must reserve
+    // a token here, gated on the authoritative `on_dispatch` decision above. This
+    // is the only place a real call consumes a token, so it can never run below
+    // zero — unlike a claim-time bypass keyed on the stale in-process breaker
+    // state. If no token is available we reschedule rather than run the handler.
+    if activity.circuit_breaker.is_some()
+        && let Some(key) = task.rate_limit_key.as_deref()
+    {
+        let mut conn = pool.get().await.map_err(crate::error::database_error)?;
+        if !queue::try_consume_rate_limit_token(&mut conn, key).await? {
+            // Bucket empty: defer this real call. Reschedule one token's refill
+            // ahead (clamped) so the task is re-claimed and re-evaluated against
+            // a fresh `on_dispatch` once a token is likely available.
+            let refill_delay = activity
+                .rate_limit_rps
+                .filter(|rps| *rps > 0.0)
+                .map_or(RATE_LIMIT_DEFER_FALLBACK, |rps| {
+                    Duration::from_secs_f64(1.0 / rps)
+                })
+                .clamp(RATE_LIMIT_DEFER_MIN, RATE_LIMIT_DEFER_MAX);
+            registry
+                .telemetry()
+                .metrics
+                .record_rate_limit_throttled(key);
+            let scheduled_at = chrono::Utc::now()
+                + chrono::Duration::from_std(refill_delay).unwrap_or_else(|_| {
+                    chrono::Duration::from_std(RATE_LIMIT_DEFER_MAX)
+                        .unwrap_or(chrono::Duration::seconds(5))
+                });
+            queue::defer_rate_limited_task(&mut conn, task.id, scheduled_at).await?;
+            return Ok(());
+        }
     }
 
     let cancel = CancellationToken::new();
@@ -6088,15 +6120,14 @@ impl Worker {
             }
         };
 
-        // Activities whose circuit breaker is open are exempted from the
-        // rate-limit gate / token decrement in the claim query (issue #369), so
-        // an open-circuit task is claimed immediately and fast-failed by the
-        // in-process breaker in `process_activity_task` rather than being paced
-        // by — and burning tokens from — the downstream's rate-limit bucket.
-        let open_circuit_activities = self
-            .registry
-            .circuit_breakers()
-            .open_activity_names(std::time::Instant::now());
+        // Activities with a circuit breaker skip the claim-time rate-limit gate
+        // and token debit entirely (issue #369): their rate limiting is enforced
+        // authoritatively at dispatch in `process_activity_task`, gated on the
+        // real `on_dispatch` decision, so a `CircuitOpen` short-circuit is claimed
+        // and fast-failed at full speed during an outage while a genuine call
+        // still atomically reserves a token. The set is static.
+        let circuit_breakers = self.registry.circuit_breakers();
+        let circuit_breaker_activities = circuit_breakers.tracked_activity_names();
 
         match queue::claim_task(
             &mut conn,
@@ -6104,7 +6135,7 @@ impl Worker {
             &self.config.worker_id,
             &self.config.build_id,
             self.config.priority_aging_secs,
-            &open_circuit_activities,
+            circuit_breaker_activities,
         )
         .await
         {
