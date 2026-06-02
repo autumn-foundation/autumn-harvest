@@ -321,18 +321,26 @@ pub async fn claim_task(
     // boosted by floor(wait_seconds / K) to prevent indefinite starvation.
     // A NULL value (or 0, which the builder normalizes to None) disables aging.
     //
-    // Circuit-breaker bypass (issue #369, $5): activities whose breaker is
-    // fully open or half-open-with-probe-in-flight will be short-circuited
-    // immediately in process_activity_task without touching the downstream.
-    // Bypassing the rate-limit gate lets those tasks be claimed quickly even
-    // when tokens are exhausted, and bypassing the concurrency cap avoids
-    // blocking no-op short-circuits behind a saturated key.  The token
-    // decrement is also skipped — no real downstream call is made.
+    // Circuit-breaker rate-limit bypass (issue #369, $5): activities whose
+    // breaker is fully open (cooldown not yet elapsed, or operator-forced) are
+    // short-circuited in process_activity_task without touching the downstream,
+    // so they must not be paced by — or burn tokens from — the downstream's
+    // rate-limit bucket. Such tasks skip the rate-limit gate at claim time and
+    // are excluded from the token decrement.
+    //
+    // The concurrency cap is deliberately NOT bypassed. The `$5` snapshot is
+    // computed in `poll_once` before this query runs, so it can be stale: a
+    // breaker may close (probe succeeds) between the snapshot and the moment
+    // `process_activity_task` calls `on_dispatch`, in which case the handler
+    // actually runs and hits the downstream. Skipping a missed token decrement
+    // is a benign over-permissiveness, but skipping the concurrency cap on a
+    // real downstream call would let an activity exceed its `max_concurrent`
+    // limit, so the cap is always enforced regardless of breaker state.
     let aging_secs_i64: Option<i64> = priority_aging_secs.map(i64::from);
 
     let result: Vec<TaskQueueItem> = diesel::sql_query(
         "WITH candidate AS ( \
-             SELECT id, task_type, concurrency_key, concurrency_cap, rate_limit_key, activity_name \
+             SELECT id, task_type, concurrency_key, concurrency_cap, rate_limit_key \
              FROM harvest_task_queue \
              WHERE queue_name = ANY($2) \
                AND state = 'PENDING' \
@@ -346,7 +354,6 @@ pub async fn claim_task(
                AND ( \
                    concurrency_key IS NULL \
                    OR concurrency_cap IS NULL \
-                   OR harvest_task_queue.activity_name = ANY($5) \
                    OR ( \
                        SELECT COUNT(*) FROM harvest_task_queue inner_q \
                        WHERE inner_q.concurrency_key = harvest_task_queue.concurrency_key \
@@ -394,7 +401,6 @@ pub async fn claim_task(
             WHERE harvest_task_queue.id = candidate.id \
               AND ( \
                   candidate.concurrency_key IS NULL \
-                  OR candidate.activity_name = ANY($5) \
                   OR ( \
                       pg_try_advisory_xact_lock(hashtext(candidate.concurrency_key)::bigint) \
                       AND ( \

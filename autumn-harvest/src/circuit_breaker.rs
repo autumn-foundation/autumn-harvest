@@ -406,20 +406,18 @@ impl CircuitBreakerRegistry {
             return None;
         }
 
-        // A non-retryable failure proves the downstream answered definitively,
-        // so it behaves like a success for breaker accounting (it neither trips
-        // the breaker nor fails a probe).
-        let healthy = matches!(
-            outcome,
-            AttemptOutcome::Success | AttemptOutcome::NonRetryableFailure
-        );
-
         match st.phase {
-            CircuitPhase::Closed => {
-                if healthy {
+            CircuitPhase::Closed => match outcome {
+                // A success clears the rolling failure window.
+                AttemptOutcome::Success => {
                     st.failures.clear();
                     None
-                } else {
+                }
+                // A non-retryable (permanent per-request) error is excluded from
+                // trip counts entirely: it is neither downstream sickness nor
+                // proof of health, so it leaves the rolling window untouched.
+                AttemptOutcome::NonRetryableFailure => None,
+                AttemptOutcome::RetryableFailure => {
                     st.failures.push_back(now);
                     st.prune(now, policy.window);
                     if st.failures.len() >= policy.failure_threshold as usize {
@@ -429,7 +427,7 @@ impl CircuitBreakerRegistry {
                         None
                     }
                 }
-            }
+            },
             CircuitPhase::HalfOpen => {
                 // Only the admitted probe decides the half-open outcome. A
                 // same-generation non-probe (shouldn't normally happen, but be
@@ -437,13 +435,27 @@ impl CircuitBreakerRegistry {
                 if !token.is_probe {
                     return None;
                 }
-                st.probe_in_flight = false;
-                if healthy {
-                    st.close();
-                    Some(CircuitTransition::Closed)
-                } else {
-                    st.trip(now);
-                    Some(CircuitTransition::Tripped)
+                match outcome {
+                    // The probe reached the downstream and it answered: recovered.
+                    AttemptOutcome::Success => {
+                        st.close();
+                        Some(CircuitTransition::Closed)
+                    }
+                    // The probe failed transiently: the downstream is still down.
+                    AttemptOutcome::RetryableFailure => {
+                        st.trip(now);
+                        Some(CircuitTransition::Tripped)
+                    }
+                    // A non-retryable per-request error (e.g. bad input) does NOT
+                    // prove the downstream recovered — the error may have been
+                    // produced before the dependency was even touched. Treat the
+                    // probe as inconclusive: release the probe slot and re-arm the
+                    // cooldown so a fresh probe is admitted later, but emit no
+                    // transition (it is neither a recovery nor a downstream trip).
+                    AttemptOutcome::NonRetryableFailure => {
+                        st.trip(now);
+                        None
+                    }
                 }
             }
             // A result arriving while fully open (no probe admitted) is a
@@ -490,6 +502,40 @@ impl CircuitBreakerRegistry {
         }
     }
 
+    /// Release breaker accounting for a dispatch that was **cancelled** mid-flight
+    /// (the workflow or task was cancelled out from under the attempt).
+    ///
+    /// A cancellation is not evidence about downstream health, so it never trips
+    /// the breaker and never resolves a probe as a successful downstream call.
+    /// Ordinary closed-state cancellations are therefore a no-op.
+    ///
+    /// The one case that *must* be handled: if the cancelled attempt held the
+    /// single half-open probe, simply dropping its outcome would leave the
+    /// breaker stuck in `HalfOpen` with `probe_in_flight = true` forever, so
+    /// every later dispatch would short-circuit and no probe could ever be
+    /// admitted. Here we release the probe slot and re-arm the cooldown (via the
+    /// same state reset as a trip) so a fresh probe is admitted after the next
+    /// cooldown — without emitting a trip/close transition.
+    ///
+    /// Generation-fenced like [`on_result`](Self::on_result): a token predating
+    /// the breaker's current generation is stale and ignored.
+    pub fn on_cancelled(&self, activity_name: &str, token: DispatchToken, now: Instant) {
+        if !self.policies.contains_key(activity_name) {
+            return;
+        }
+        let mut states = self.lock();
+        let st = states.entry(activity_name.to_string()).or_default();
+
+        if st.forced_open || token.generation != st.generation {
+            return;
+        }
+        // Only the in-flight half-open probe needs releasing; everything else
+        // (closed-state cancellation, fully-open straggler) is a no-op.
+        if token.is_probe && st.phase == CircuitPhase::HalfOpen && st.probe_in_flight {
+            st.trip(now);
+        }
+    }
+
     /// Operator action: pin the breaker open for manual incident response.
     pub fn force_open(&self, activity_name: &str, now: Instant) {
         let mut states = self.lock();
@@ -514,8 +560,11 @@ impl CircuitBreakerRegistry {
 
     /// Return the names of activities whose breaker is currently short-circuiting
     /// **all** dispatches — used by [`crate::queue::claim_task`] to bypass the
-    /// rate-limit gate and concurrency-cap check for tasks that will be
-    /// short-circuited immediately without touching the downstream.
+    /// rate-limit gate (and skip the token decrement) for tasks that will be
+    /// short-circuited immediately without touching the downstream. The
+    /// concurrency cap is *not* bypassed: the snapshot can be stale by the time
+    /// the task is dispatched, so the cap is always enforced to keep real
+    /// downstream calls within `max_concurrent`.
     ///
     /// Includes:
     /// - Activities in the `Open` phase whose cooldown has **not yet elapsed**.
@@ -1084,6 +1133,102 @@ mod tests {
         assert!(
             reg.open_activity_names(now).is_empty(),
             "Closed breaker must not be in bypass list after recovery"
+        );
+    }
+
+    // A half-open probe that returns a non-retryable (bad-input) error must NOT
+    // close the breaker: a per-request error doesn't prove the downstream
+    // recovered. It is inconclusive — the breaker re-arms its cooldown and waits
+    // for another probe, emitting no transition.
+    #[test]
+    fn half_open_nonretryable_probe_is_inconclusive_and_rearms() {
+        let reg = registry();
+        let t0 = Instant::now();
+        for _ in 0..3 {
+            fail(&reg, t0);
+        }
+        let probe_time = t0 + Duration::from_secs(61);
+        let probe = dispatch(&reg, probe_time);
+        assert!(probe.is_probe());
+
+        // A non-retryable probe result neither closes nor trips: no transition.
+        assert_eq!(
+            reg.on_result(
+                "send_email",
+                AttemptOutcome::NonRetryableFailure,
+                probe,
+                probe_time
+            ),
+            None,
+            "non-retryable probe must not close (or trip) the breaker"
+        );
+        // The breaker stays open (re-armed) — it did NOT close on bad input.
+        assert_eq!(
+            reg.snapshot("send_email", probe_time).unwrap().state,
+            "open",
+            "inconclusive probe must leave the breaker open, not closed"
+        );
+        // Cooldown restarts from the inconclusive probe; immediate dispatch still
+        // short-circuits, and a fresh probe is admitted only after another cooldown.
+        assert!(matches!(
+            reg.on_dispatch("send_email", probe_time),
+            DispatchDecision::ShortCircuit { .. }
+        ));
+        let next_probe = dispatch(&reg, probe_time + Duration::from_secs(61));
+        assert!(
+            next_probe.is_probe(),
+            "a fresh probe must be admitted after the re-armed cooldown"
+        );
+    }
+
+    // A cancellation that hits the single half-open probe must release the probe
+    // slot, or the breaker would stay HalfOpen with probe_in_flight=true forever
+    // and short-circuit every later dispatch with no probe ever admitted.
+    #[test]
+    fn cancelled_half_open_probe_is_released_and_rearms() {
+        let reg = registry();
+        let t0 = Instant::now();
+        for _ in 0..3 {
+            fail(&reg, t0);
+        }
+        let probe_time = t0 + Duration::from_secs(61);
+        let probe = dispatch(&reg, probe_time);
+        assert!(probe.is_probe());
+        // While the probe is "in flight", further dispatches short-circuit.
+        assert!(matches!(
+            reg.on_dispatch("send_email", probe_time),
+            DispatchDecision::ShortCircuit { .. }
+        ));
+
+        // The probe attempt is cancelled out from under us.
+        reg.on_cancelled("send_email", probe, probe_time);
+
+        // The breaker is re-armed (open), NOT wedged half-open with a dangling
+        // probe. A fresh probe is admitted after the next cooldown.
+        assert_eq!(
+            reg.snapshot("send_email", probe_time).unwrap().state,
+            "open"
+        );
+        let next_probe = dispatch(&reg, probe_time + Duration::from_secs(61));
+        assert!(
+            next_probe.is_probe(),
+            "after a cancelled probe, a fresh probe must eventually be admitted"
+        );
+    }
+
+    // A cancellation in the ordinary closed state must be a complete no-op: it is
+    // not a downstream failure and must not count toward tripping the breaker.
+    #[test]
+    fn cancelled_closed_state_attempt_is_a_noop() {
+        let reg = registry();
+        let now = Instant::now();
+        let token = dispatch(&reg, now);
+        reg.on_cancelled("send_email", token, now);
+        let snap = reg.snapshot("send_email", now).unwrap();
+        assert_eq!(snap.state, "closed");
+        assert_eq!(
+            snap.rolling_failure_count, 0,
+            "a closed-state cancellation must not count as a failure"
         );
     }
 }

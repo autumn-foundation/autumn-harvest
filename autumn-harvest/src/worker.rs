@@ -3468,8 +3468,14 @@ async fn process_activity_task(
     // A cancellation-driven result is not evidence the downstream is unhealthy
     // (the workflow/task was cancelled out from under the attempt), so it is
     // excluded from breaker accounting entirely — neither a trip nor a probe
-    // resolution. Only genuine handler outcomes feed the breaker.
+    // resolution. But if the cancelled attempt held the single half-open probe,
+    // its slot must still be released via `on_cancelled`, or the breaker would
+    // stay HalfOpen with `probe_in_flight = true` forever and short-circuit every
+    // later dispatch. Only genuine handler outcomes feed the breaker as outcomes.
     let circuit_outcome = if was_cancelled {
+        if let Some(token) = circuit_token {
+            circuit_breakers.on_cancelled(activity_name, token, std::time::Instant::now());
+        }
         None
     } else {
         Some(match activity_result.as_ref() {
