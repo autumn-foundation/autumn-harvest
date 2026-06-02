@@ -366,6 +366,7 @@ mod db_tests {
             None,
             "v1.0",
             None,
+            &[],
         )
         .await
         .unwrap();
@@ -379,6 +380,7 @@ mod db_tests {
             None,
             "v2.0",
             None,
+            &[],
         )
         .await
         .unwrap();
@@ -616,6 +618,7 @@ mod db_tests {
             None,
             "v1.0",
             None,
+            &[],
         )
         .await
         .unwrap();
@@ -629,6 +632,7 @@ mod db_tests {
             None,
             "v2.0",
             None,
+            &[],
         )
         .await
         .unwrap();
