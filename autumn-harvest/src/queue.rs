@@ -1272,16 +1272,24 @@ pub async fn check_throttled_keys(
 /// Atomically consume one rate-limit token from `key`'s bucket at dispatch time.
 ///
 /// Returns `true` if a token was available and debited (the caller may proceed
-/// with the real downstream call), or `false` if the bucket is empty (the caller
-/// must defer — e.g. reschedule the task — rather than run the call).
+/// with the real downstream call), or `false` if no token could be reserved and
+/// the caller must defer (e.g. reschedule the task) rather than run the call.
 ///
 /// Used by the circuit breaker (issue #369): activities with a breaker skip the
 /// claim-time rate-limit gate and debit entirely (see [`claim_task`]); their rate
 /// limiting is enforced *here*, gated on the authoritative `on_dispatch`
 /// decision, so a `CircuitOpen` short-circuit consumes no token while a genuine
 /// call atomically reserves one. The check-and-debit is a single UPDATE so two
-/// concurrent dispatches cannot both reserve the last token. A missing bucket row
-/// (no rate limit configured for the key) is treated as "no limit" → `true`.
+/// concurrent dispatches cannot both reserve the last token.
+///
+/// **Fails closed:** returns `false` both when the bucket is empty *and* when the
+/// bucket row is missing. Because the claim-time gate is skipped for these
+/// activities, this is the sole rate-limit enforcement point; treating a missing
+/// bucket as "allow" would let a configured limit run unthrottled if bucket
+/// auto-registration failed or the row was deleted. A `rate_limit_key` is only
+/// set when a limit is configured (so a bucket should exist), and deferring until
+/// it does matches the old claim-time gate, which also would not admit the task
+/// without a bucket row.
 ///
 /// Mirrors the claim-time debit math (apply pending refill, then `-1.0`).
 ///
@@ -1292,17 +1300,15 @@ pub async fn try_consume_rate_limit_token(
     conn: &mut AsyncPgConnection,
     key: &str,
 ) -> HarvestResult<bool> {
-    // RETURNING distinguishes the two zero-row cases via a CTE: `present` tells
-    // us whether the bucket row exists at all (missing = no limit = allow),
-    // while `debited` is non-empty only when a token was actually available.
     #[derive(diesel::QueryableByName)]
     struct Outcome {
-        #[diesel(sql_type = diesel::sql_types::Bool)]
-        bucket_exists: bool,
         #[diesel(sql_type = diesel::sql_types::Bool)]
         debited: bool,
     }
 
+    // A single conditional UPDATE: the row is debited only if a token is
+    // available. `RETURNING`/`EXISTS` reports whether the debit happened; a
+    // missing bucket row or an empty bucket both yield `debited = false`.
     let outcome: Option<Outcome> = diesel::sql_query(
         "WITH debited AS ( \
              UPDATE harvest_rate_limit_buckets \
@@ -1312,9 +1318,7 @@ pub async fn try_consume_rate_limit_token(
                AND LEAST(burst, tokens + EXTRACT(EPOCH FROM (NOW() - last_refilled_at)) * refill_rate) >= 1.0 \
              RETURNING key \
         ) \
-        SELECT \
-            EXISTS (SELECT 1 FROM harvest_rate_limit_buckets WHERE key = $1) AS bucket_exists, \
-            EXISTS (SELECT 1 FROM debited) AS debited",
+        SELECT EXISTS (SELECT 1 FROM debited) AS debited",
     )
     .bind::<diesel::sql_types::Text, _>(key)
     .get_result(conn)
@@ -1322,8 +1326,8 @@ pub async fn try_consume_rate_limit_token(
     .optional()
     .map_err(crate::error::database_error)?;
 
-    // No bucket configured for this key (missing row) → not rate limited → allow.
-    Ok(outcome.is_none_or(|o| o.debited || !o.bucket_exists))
+    // Fail closed: only proceed when a token was actually reserved.
+    Ok(outcome.is_some_and(|o| o.debited))
 }
 
 // ---------------------------------------------------------------------------

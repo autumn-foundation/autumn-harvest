@@ -3261,10 +3261,72 @@ async fn process_activity_task(
         return Err(HarvestError::Config(error));
     };
 
-    // Setup phase: acquire a connection, append ActivityStarted, then drop it
-    // so the pool slot is free before the handler runs.  This prevents a
-    // deadlock when `run_transactional` needs a second slot from the same pool
-    // while max_size connections are already claimed by concurrent activity tasks.
+    // Circuit breaker (issue #369): consult the breaker before doing anything
+    // durable. `on_dispatch` is a pure in-process decision (it may admit the
+    // half-open probe), so it is safe to run before we append ActivityStarted.
+    let circuit_breakers = registry.circuit_breakers();
+    let dispatch_decision = circuit_breakers.on_dispatch(activity_name, std::time::Instant::now());
+    // The dispatch token is threaded into `on_result` below so the breaker can
+    // fence stale stragglers by generation and gate the half-open probe.
+    let circuit_token = match dispatch_decision {
+        crate::circuit_breaker::DispatchDecision::Allow { token } => Some(token),
+        crate::circuit_breaker::DispatchDecision::ShortCircuit { .. } => None,
+    };
+
+    // Dispatch-time rate limiting (issue #369): a circuit-breaker activity skips
+    // the claim-time rate-limit gate/debit, so a genuine call (Allow) must reserve
+    // a token here, gated on the authoritative `on_dispatch` decision. This runs
+    // BEFORE appending ActivityStarted so a deferred (rate-limited) task leaves no
+    // event behind — otherwise every defer/reclaim cycle would append a *duplicate*
+    // ActivityStarted (an activity stays "pending" until a terminal event, so the
+    // start event does not make `append_activity_started_if_pending` idempotent).
+    // A short-circuit reserves nothing; only a real call consumes a token. The
+    // `circuit_token.is_some()` guard means "decision is Allow"; the breaker guard
+    // restricts this to activities whose claim-time rate limiting was skipped.
+    if circuit_token.is_some()
+        && activity.circuit_breaker.is_some()
+        && let Some(key) = task.rate_limit_key.as_deref()
+    {
+        let mut conn = pool.get().await.map_err(crate::error::database_error)?;
+        if !queue::try_consume_rate_limit_token(&mut conn, key).await? {
+            // No token available (bucket empty, or fail-closed when the bucket
+            // row is missing): defer this real call instead of running it.
+            //
+            // Releasing any half-open probe slot this dispatch just admitted is
+            // essential — `on_dispatch` set `probe_in_flight = true`, and if we
+            // returned without resolving it the breaker would stay HalfOpen
+            // forever and short-circuit every later attempt. A rate-limit defer
+            // is not a downstream health signal, so `on_cancelled` re-arms the
+            // cooldown (rather than tripping or closing) and a fresh probe is
+            // admitted once the cooldown re-elapses.
+            if let Some(token) = circuit_token {
+                circuit_breakers.on_cancelled(activity_name, token, std::time::Instant::now());
+            }
+            let refill_delay = activity
+                .rate_limit_rps
+                .filter(|rps| *rps > 0.0)
+                .map_or(RATE_LIMIT_DEFER_FALLBACK, |rps| {
+                    Duration::from_secs_f64(1.0 / rps)
+                })
+                .clamp(RATE_LIMIT_DEFER_MIN, RATE_LIMIT_DEFER_MAX);
+            registry
+                .telemetry()
+                .metrics
+                .record_rate_limit_throttled(key);
+            let scheduled_at = chrono::Utc::now()
+                + chrono::Duration::from_std(refill_delay)
+                    .unwrap_or_else(|_| chrono::Duration::seconds(5));
+            queue::defer_rate_limited_task(&mut conn, task.id, scheduled_at).await?;
+            return Ok(());
+        }
+    }
+
+    // Setup phase: append ActivityStarted, then drop the connection so the pool
+    // slot is free before the handler runs (prevents a deadlock when
+    // `run_transactional` needs a second slot while max_size connections are held
+    // by concurrent activity tasks). Appended AFTER the rate-limit reservation so
+    // a deferred task never records a start it did not run; serves both the
+    // short-circuit path (start + CircuitOpen failure) and the real-call path.
     let activity_id = {
         let mut conn = pool.get().await.map_err(crate::error::database_error)?;
         let started_result =
@@ -3277,19 +3339,6 @@ async fn process_activity_task(
         // conn is dropped here, returning the slot to the pool
     };
 
-    // Circuit breaker (issue #369): consult the breaker before running the
-    // handler. When open, short-circuit with a non-retryable `CircuitOpen`
-    // failure recorded as an ordinary `ActivityFailed` event (so replay is
-    // unaffected and the append-only contract holds) instead of dispatching
-    // doomed work against a downstream that is known to be down.
-    let circuit_breakers = registry.circuit_breakers();
-    let dispatch_decision = circuit_breakers.on_dispatch(activity_name, std::time::Instant::now());
-    // The dispatch token is threaded into `on_result` below so the breaker can
-    // fence stale stragglers by generation and gate the half-open probe.
-    let circuit_token = match dispatch_decision {
-        crate::circuit_breaker::DispatchDecision::Allow { token } => Some(token),
-        crate::circuit_breaker::DispatchDecision::ShortCircuit { .. } => None,
-    };
     if let crate::circuit_breaker::DispatchDecision::ShortCircuit {
         opened_at,
         retry_after,
@@ -3313,9 +3362,6 @@ async fn process_activity_task(
             crate::failure::ERROR_TYPE_CIRCUIT_OPEN,
             true,
         );
-        // No rate-limit bookkeeping here: `claim_task` skipped the gate and debit
-        // for circuit-breaker activities (issue #369), so a short-circuit consumes
-        // no token. Only a genuine call (the Allow path below) reserves one.
         let mut conn = pool.get().await.map_err(crate::error::database_error)?;
         let retry_policy_result = configured_retry_policy(task);
         let retry_policy =
@@ -3332,41 +3378,6 @@ async fn process_activity_task(
             activity_name,
         )
         .await;
-    }
-
-    // Dispatch-time rate limiting (issue #369): a circuit-breaker activity skips
-    // the claim-time gate/debit, so a genuine call (this Allow path) must reserve
-    // a token here, gated on the authoritative `on_dispatch` decision above. This
-    // is the only place a real call consumes a token, so it can never run below
-    // zero — unlike a claim-time bypass keyed on the stale in-process breaker
-    // state. If no token is available we reschedule rather than run the handler.
-    if activity.circuit_breaker.is_some()
-        && let Some(key) = task.rate_limit_key.as_deref()
-    {
-        let mut conn = pool.get().await.map_err(crate::error::database_error)?;
-        if !queue::try_consume_rate_limit_token(&mut conn, key).await? {
-            // Bucket empty: defer this real call. Reschedule one token's refill
-            // ahead (clamped) so the task is re-claimed and re-evaluated against
-            // a fresh `on_dispatch` once a token is likely available.
-            let refill_delay = activity
-                .rate_limit_rps
-                .filter(|rps| *rps > 0.0)
-                .map_or(RATE_LIMIT_DEFER_FALLBACK, |rps| {
-                    Duration::from_secs_f64(1.0 / rps)
-                })
-                .clamp(RATE_LIMIT_DEFER_MIN, RATE_LIMIT_DEFER_MAX);
-            registry
-                .telemetry()
-                .metrics
-                .record_rate_limit_throttled(key);
-            let scheduled_at = chrono::Utc::now()
-                + chrono::Duration::from_std(refill_delay).unwrap_or_else(|_| {
-                    chrono::Duration::from_std(RATE_LIMIT_DEFER_MAX)
-                        .unwrap_or(chrono::Duration::seconds(5))
-                });
-            queue::defer_rate_limited_task(&mut conn, task.id, scheduled_at).await?;
-            return Ok(());
-        }
     }
 
     let cancel = CancellationToken::new();
